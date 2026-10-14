@@ -39,6 +39,8 @@ pub fn cmd_load(db: &Path, control: &Path) -> Result<()> {
 ///    advance — the seqlock's closing Release makes the new root
 ///    visible to readers as a whole, never half-written).
 pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
+    let image = crate::cmd_daemon::rollback_image(db_bytes.to_vec());
+    let db_bytes = image.as_slice();
     let mut ctrl = Controller::open_or_create(control).context("open controller")?;
 
     let arena_path = ctrl.arena_path();
@@ -78,6 +80,41 @@ pub fn load_into_arena(control: &Path, db_bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Bead ley-line-open-2bd77c: a WAL-mode database file loaded as-is
+    /// published a WAL-stamped image no in-memory reader can open.
+    #[test]
+    fn a_loaded_wal_database_opens_in_an_in_memory_reader() {
+        let td = TempDir::new().unwrap();
+        let db_path = td.path().join("wal.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1), (2), (3);")
+                .unwrap();
+        }
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert_eq!(&bytes[18..20], &[2, 2], "the file is WAL-stamped");
+
+        let arena = td.path().join("load.arena");
+        let ctrl = td.path().join("load.ctrl");
+        let _mmap = leyline_core::create_arena(&arena, 2 * 1024 * 1024).unwrap();
+        Controller::open_or_create(&ctrl)
+            .unwrap()
+            .set_arena(&arena.to_string_lossy(), 2 * 1024 * 1024)
+            .unwrap();
+        load_into_arena(&ctrl, &bytes).unwrap();
+
+        let graph = leyline_fs::SqliteGraph::from_arena(&ctrl).unwrap();
+        let rows: i64 = graph
+            .conn()
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
+    }
 
     #[test]
     fn load_errors_when_arena_path_unset() {

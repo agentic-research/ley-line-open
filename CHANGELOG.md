@@ -76,6 +76,23 @@ context, scoping notes, and review history are recoverable.
   schema and `cli-lib` that cited "ADR-0041 P1/P2" for proposals now
   cite ADR-0042.
 
+- **A daemon-published arena opens in an in-memory reader** (bead
+  `ley-line-open-2bd77c`). The live database is WAL-mode, and the image
+  the daemon published kept the WAL stamp in its header (bytes 18 and 19).
+  `sqlite3_deserialize` of a WAL-stamped image fails every query with
+  `SQLITE_CANTOPEN`, so `leyline inspect --control-path`,
+  `SqliteGraph::from_arena` and the `leyline_fs` FFI could not read a
+  daemon's arena. The published image is now stamped rollback-mode, and
+  `current_root` hashes exactly the published bytes. `leyline load`
+  normalises a WAL-mode `.db` the same way. mache opens images as files
+  and was not affected. Found by an end-to-end test of the v0.20.5
+  binary.
+
+- **`leyline daemon --mount` fails in a build without the `mount`
+  feature** (bead `ley-line-open-2be4a7`). The release binaries are built
+  without it, and the daemon ran headless when asked to mount, so the
+  caller got no mount and no failure. It now refuses at startup and names
+  the feature.
 ## [0.20.5] — 2026-10-13
 
 Publication safety. A publisher that dies mid-publish no longer wedges

@@ -212,6 +212,22 @@ fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
 }
 
 /// Run the daemon with explicit additive behavior options.
+/// Refuse a mount this build cannot provide. A daemon asked to mount that
+/// ran headless instead gave its caller no mount and no failure (bead
+/// `ley-line-open-2be4a7`).
+fn mount_is_available(mount: Option<&Path>) -> Result<()> {
+    #[cfg(not(feature = "mount"))]
+    if let Some(path) = mount {
+        anyhow::bail!(
+            "cannot mount at {}: this leyline was built without the `mount` feature. \
+             Build with `--features mount`, or omit --mount to run headless.",
+            path.display()
+        );
+    }
+    let _ = mount;
+    Ok(())
+}
+
 pub async fn run_daemon_with_options(
     config: DaemonConfig,
     ext: Arc<dyn DaemonExt>,
@@ -237,6 +253,7 @@ pub async fn run_daemon_with_options(
     let arena = arena.as_path();
     let control = control.as_deref();
     let mount = mount.as_deref();
+    mount_is_available(mount)?;
     let source = source.as_deref();
     let backend = backend.as_str();
     let language = language.as_deref();
@@ -689,8 +706,9 @@ pub async fn run_daemon_with_options(
     };
     #[cfg(not(feature = "mount"))]
     {
+        // `mount_is_available` refused a mount path above.
         let _ = (mount, backend, nfs_port);
-        eprintln!("headless mode (mount features not compiled)");
+        eprintln!("headless mode (no mount)");
     }
 
     // 7. Extension post-mount.
@@ -1317,8 +1335,25 @@ pub fn try_snapshot_or_log(
 ///    together under the seqlock. Its error aborts the snapshot;
 ///    callers (snapshot_or_log) move the daemon into Error phase so
 ///    operators see it.
+/// `image` as a standalone rollback-mode database. The live db is WAL-mode,
+/// and its serialized image keeps the WAL stamp in header bytes 18 and 19
+/// (file format write and read versions, 2 = WAL). `sqlite3_deserialize`
+/// of a WAL-stamped image fails every query with `SQLITE_CANTOPEN`, so a
+/// published image must say 1 (rollback) there (bead
+/// `ley-line-open-2bd77c`). The pages are unchanged.
+pub(crate) fn rollback_image(mut image: Vec<u8>) -> Vec<u8> {
+    if let Some(versions) = image.get_mut(18..20) {
+        versions.fill(1);
+    }
+    image
+}
+
 pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
-    let db_bytes = conn.serialize("main").context("serialize living db")?;
+    let db_bytes = rollback_image(
+        conn.serialize("main")
+            .context("serialize living db")?
+            .to_vec(),
+    );
 
     let mut ctrl =
         leyline_core::Controller::open_or_create(ctrl_path).context("open controller")?;
@@ -2579,6 +2614,60 @@ mod tests {
             msg.contains("projection-v4") || msg.contains("nid"),
             "the refusal must name the version mismatch, got: {msg}",
         );
+    }
+
+    #[test]
+    fn a_mount_this_build_cannot_provide_is_refused() {
+        assert!(
+            mount_is_available(None).is_ok(),
+            "headless is always available"
+        );
+        let asked = mount_is_available(Some(Path::new("/mnt/x")));
+        #[cfg(not(feature = "mount"))]
+        {
+            let err = asked.unwrap_err().to_string();
+            assert!(err.contains("`mount` feature"), "{err}");
+            assert!(err.contains("/mnt/x"), "{err}");
+        }
+        #[cfg(feature = "mount")]
+        assert!(asked.is_ok());
+    }
+
+    #[test]
+    fn a_published_image_opens_in_an_in_memory_reader() {
+        // Bead ley-line-open-2bd77c: the live db is WAL-mode, and its
+        // serialized image carried the WAL stamp (header bytes 18/19 = 2).
+        // sqlite3_deserialize of a WAL-stamped image fails every query with
+        // SQLITE_CANTOPEN, so no in-memory reader could open a published
+        // arena. The published image is a standalone rollback-mode database.
+        let dir = TempDir::new().unwrap();
+        let arena_path = dir.path().join("img.arena");
+        let ctrl_path = dir.path().join("img.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+        let _mmap = leyline_core::create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+        leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
+            .unwrap();
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE img_rows (id INTEGER PRIMARY KEY, payload TEXT);
+             INSERT INTO img_rows (payload) VALUES ('one'), ('two');",
+        )
+        .unwrap();
+
+        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+        let graph = leyline_fs::SqliteGraph::from_arena(&ctrl_path).unwrap();
+        let rows: i64 = graph
+            .conn()
+            .query_row("SELECT count(*) FROM img_rows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        let live_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live_mode.to_lowercase(), "wal", "the live db stays WAL");
     }
 
     #[test]

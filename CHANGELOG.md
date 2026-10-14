@@ -10,6 +10,72 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `propose` requires `base`, and `any` is the explicit "no
+  check"** (bead `ley-line-open-5dc3a5`). `ProposedWrite.base` was
+  optional, and an agent that omitted it silently got last-writer-wins.
+  A write without `base` is now refused as a malformed request; an
+  empty or non-hex `base` is refused as `malformed_base`; `any` writes
+  whatever the file holds. The MCP `propose` schema lists `base` as
+  required.
+
+- **Breaking: every `propose` refusal is typed, and a stale one names
+  every file that moved** (bead `ley-line-open-5dc3a5`). The response's
+  `stale {path, expected, current}` is replaced by
+  `refusal {reason, path, moved}`. `reason` is one of `stale`,
+  `outside_grant`, `no_such_file`, `duplicate_path`, `different_roots`,
+  `no_tree_root`, `syntax`, `malformed_base`, `no_stored_blob` and
+  `empty`; `moved` lists `{path, expected, current}` for each moved
+  file, where `stale` named only the first. A response with `ok: false`
+  and no `refusal` is an internal error. In Rust,
+  `source_write::propose` returns a `Refusal` error for each case. The
+  daemon schema (`daemon.capnp`) gains `ProposalRefusal` and the
+  `RefusalReason` enum, the Go bindings are regenerated, and
+  `SCHEMA_VERSION` moves to 0.21.0. Move clients of `propose` with this
+  release.
+
+### Fixed
+
+- **An applied proposal is reported as applied** (bead
+  `ley-line-open-5db28e`). When the head write, an index build or the
+  publish failed after `COMMIT`, the daemon answered `{ok: false}` and
+  skipped the publish although the bytes had landed, and through the
+  mount the edit ran the refusal path. The steps after `COMMIT` now run
+  to the end and report their failure beside the result: `propose`
+  answers `ok: true` with `post_commit_error`, always publishes, and the
+  mount's writer answers `Ok`. `leyline splice` reports that the splice
+  landed. A whole-tree parse still fails on a head it cannot advance.
+
+- **The head is replaced atomically** (bead `ley-line-open-5db28e`). It
+  was truncated and rewritten in place, so a crash mid-write left a head
+  the chain refuses, and every later proposal committed and then failed.
+  It is now written to a temp file, synced, renamed over the old head,
+  and the directory synced; a failed write leaves the previous head
+  readable.
+
+- **A rolled-back proposal leaves the capnp sidecars unchanged** (bead
+  `ley-line-open-5db28e`). `ast.capnp` and `source.capnp` were
+  truncated inside the transaction and kept the rolled-back rows. They
+  are now written beside the old ones and renamed into place after
+  `COMMIT`; a pass that rolls back removes its temp files.
+
+- **`read_source` returns the hash `propose` compares** (bead
+  `ley-line-open-5dc3a5`). It hashed the bytes it fetched while
+  `propose` compared `_source.content_hash`; it now returns the column,
+  so the two agree by construction. A file whose `content_hash` is NULL
+  is refused as `no_stored_blob` for every blob base: the zero hash used
+  to stand in for the missing one, so `Base::Blob(ZERO)` matched it.
+
+- **The protocol gate runs `read_source` and `propose` against a real
+  source** (bead `ley-line-open-5dc3a5`). It ran them on an empty
+  database and checked only `ok`. It now seeds a file and compares the
+  key sets of a real read, a stale refusal, a typed refusal and an
+  applied proposal with a post-commit failure against the fixtures,
+  which the Go gate decodes into the typed bindings. Comments in the
+  schema and `cli-lib` that cited "ADR-0041 P1/P2" for proposals now
+  cite ADR-0042.
+
 ## [0.20.5] — 2026-10-13
 
 Publication safety. A publisher that dies mid-publish no longer wedges

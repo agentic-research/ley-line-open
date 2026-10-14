@@ -777,6 +777,31 @@ pub struct ParseResult {
     pub tree_root: leyline_core::Hash,
 }
 
+/// A pass whose transaction committed. The steps after `COMMIT` (moving
+/// the sidecars into place, the index builds, the head write) change no
+/// committed row, so their failure is reported beside the result, not in
+/// place of it: the rows landed either way (bead `ley-line-open-5db28e`).
+#[derive(Debug)]
+pub(crate) struct Committed {
+    pub result: ParseResult,
+    /// What failed after `COMMIT`, if anything. The arena holds the
+    /// committed rows; its head or sidecars may still describe the
+    /// previous pass until a later pass succeeds.
+    pub post_commit: Option<anyhow::Error>,
+}
+
+impl Committed {
+    /// The result, or the post-commit failure as the pass's error: what a
+    /// whole-tree parse reports, since its head is the run's receipt (bead
+    /// `ley-line-open-0c8ee7`).
+    fn into_result(self) -> Result<ParseResult> {
+        match self.post_commit {
+            None => Ok(self.result),
+            Some(e) => Err(e),
+        }
+    }
+}
+
 /// Bytes a pass reads from memory instead of from disk.
 enum InMemory<'a> {
     /// ADR-0040 D3: the files one proposal writes, keyed by `_source.id`;
@@ -959,18 +984,19 @@ pub fn parse_into_conn(
     lang_filter: Option<&str>,
     scope: Option<&[String]>,
 ) -> Result<ParseResult> {
-    parse_into_conn_with(conn, source, lang_filter, scope, None)
+    parse_into_conn_with(conn, source, lang_filter, scope, None)?.into_result()
 }
 
 /// Project written files through the cold parse (ADR-0040 D3), in one pass
 /// and one transaction. The pass is scoped to `written`'s paths and reads
 /// their bytes from it, never from disk; any written file that fails to
-/// parse rolls the whole pass back.
+/// parse rolls the whole pass back. `Ok` means the transaction committed;
+/// a failure after `COMMIT` rides in [`Committed::post_commit`].
 pub(crate) fn parse_written_files(
     conn: &Connection,
     source: &Path,
     written: &BTreeMap<String, Vec<u8>>,
-) -> Result<ParseResult> {
+) -> Result<Committed> {
     let scope: Vec<String> = written.keys().cloned().collect();
     parse_into_conn_with(
         conn,
@@ -991,7 +1017,7 @@ pub(crate) fn parse_tree_from_memory(
     source: &Path,
     files: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ParseResult> {
-    parse_into_conn_with(conn, source, None, None, Some(InMemory::Tree(files)))
+    parse_into_conn_with(conn, source, None, None, Some(InMemory::Tree(files)))?.into_result()
 }
 
 fn parse_into_conn_with(
@@ -1000,7 +1026,7 @@ fn parse_into_conn_with(
     lang_filter: Option<&str>,
     scope: Option<&[String]>,
     memory: Option<InMemory<'_>>,
-) -> Result<ParseResult> {
+) -> Result<Committed> {
     // The bytes of `rel`, when this pass reads it from memory.
     let written_bytes = |rel: &str| -> Option<&Vec<u8>> { memory.as_ref()?.bytes(rel) };
     let tree_in_memory = match &memory {
@@ -1503,11 +1529,13 @@ fn parse_into_conn_with(
     conn.pragma_update(None, "defer_foreign_keys", "ON")?;
 
     // capnp dual-write (bead `ley-line-open-cdf098`) — open snapshot
-    // files alongside the SQL writes. Truncate-and-rewrite semantics:
-    // each parse run produces a fresh snapshot of `_ast` and `_source`.
+    // files alongside the SQL writes. Each parse run produces a fresh
+    // snapshot of `_ast` and `_source`, written beside the previous one and
+    // renamed over it only after `COMMIT`, so a pass that rolls back leaves
+    // the previous snapshot in place (bead `ley-line-open-5db28e`).
     // `:memory:` connections skip (no path to write next to). The
     // segment-hashing → Σ root advance is bead `ley-line-open-ce55b1`.
-    let (mut ast_writer, mut source_writer) = sibling_snapshot_writers(conn);
+    let (mut ast_writer, mut source_writer, sidecars) = sibling_snapshot_writers(conn);
 
     // Per-table row buffers. Owned strings/values so we can hand
     // ToSql references to params_from_iter without lifetime gymnastics
@@ -2176,7 +2204,25 @@ fn parse_into_conn_with(
     tx_guard.armed = false;
     let sub_commit_end = std::time::Instant::now();
 
-    let head_handle = db_path_for_head.map(|p| {
+    // From here the rows are committed. Every later step changes no query
+    // result; a failure is collected and reported beside the result rather
+    // than in place of it, and the remaining steps still run (bead
+    // `ley-line-open-5db28e`).
+    let mut post_commit: Vec<anyhow::Error> = Vec::new();
+
+    // The new sidecars replace the previous ones. The head hashes them, so
+    // when they could not be moved into place the head is not advanced over
+    // the previous sidecars.
+    let sidecars_in_place = match sidecars.commit() {
+        Ok(()) => true,
+        Err(e) => {
+            post_commit.push(e.context(
+                "the capnp sidecars of a committed parse were not replaced; the head was not advanced",
+            ));
+            false
+        }
+    };
+    let head_handle = db_path_for_head.filter(|_| sidecars_in_place).map(|p| {
         std::thread::spawn(move || -> Result<()> {
             write_head_for_path(&p, unbound_facts, tree_root, parser_id)
         })
@@ -2199,14 +2245,18 @@ fn parse_into_conn_with(
     // resulting index is empty; the mache flow paths build their own
     // schema with the indexes mache needs, so skipping here is safe.
     // See bead `ley-line-open-cbbedf` Attack 3.
-    create_post_load_indexes_skip_unused(conn)?;
+    if let Err(e) = create_post_load_indexes_skip_unused(conn) {
+        post_commit.push(e.context("building the post-load indexes after a committed parse"));
+    }
     // Unified code-fact IR (ADR-0027): the `symbols`/`fact_edges` traversal
     // indexes (idx_symbols_node/kind, idx_edges_src/dst) are deferred to here
     // — same rationale as the other post-load indexes: one sorted scan per
     // index is cheaper than incremental B-tree maintenance during the insert.
     // The UNIQUE symbol_id index the FK targets was built earlier (pre-insert)
     // by create_ir_tables and is not rebuilt here.
-    create_ir_indexes(conn)?;
+    if let Err(e) = create_ir_indexes(conn) {
+        post_commit.push(e.context("building the IR indexes after a committed parse"));
+    }
     let sub_index_end = std::time::Instant::now();
 
     let insert_elapsed = insert_start.elapsed();
@@ -2238,27 +2288,26 @@ fn parse_into_conn_with(
     // with post-COMMIT index creation. `:memory:` connections skipped (no
     // head_handle in that case).
     //
-    // A head-write failure fails the parse (bead `ley-line-open-0c8ee7`).
-    // It used to log and return Ok: the rows are committed, so the parse
+    // A head-write failure is reported (bead `ley-line-open-0c8ee7`). It
+    // used to log and return Ok: the rows are committed, so the parse
     // "worked". But the head is what names what was committed — the run
     // receipt, and since ADR-0040 D1 the tree identity — and a parse whose
     // head could not be advanced (a corrupt existing head the chain refuses
     // to re-root over, an unwritable sidecar, a signing-key error) must say
     // so, not advertise a head that still describes the previous tree. The
-    // rows stay committed either way; the error tells the caller the arena
-    // and its head disagree until the cause is fixed.
+    // rows stay committed either way: the failure rides beside the result
+    // in `Committed::post_commit`, and a whole-tree parse turns it into its
+    // error (bead `ley-line-open-5db28e`).
     let head_write_start = std::time::Instant::now();
     if let Some(h) = head_handle {
         match h.join() {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err(e.context(
-                    "Σ head write after a committed parse failed; the rows are committed but the head was not advanced",
-                ));
-            }
-            Err(_) => anyhow::bail!(
+            Ok(Err(e)) => post_commit.push(e.context(
+                "Σ head write after a committed parse failed; the rows are committed but the head was not advanced",
+            )),
+            Err(_) => post_commit.push(anyhow::anyhow!(
                 "Σ head-write thread panicked after a committed parse; the rows are committed but the head was not advanced"
-            ),
+            )),
         }
     }
     let head_write_elapsed = head_write_start.elapsed();
@@ -2296,14 +2345,27 @@ fn parse_into_conn_with(
     // weren't parsed, so the caller's "did this run produce data for
     // every file" check stays honest. The dedicated summary field makes
     // it easy for clients to distinguish skip-by-size from parse failure.
-    Ok(ParseResult {
-        parsed,
-        unchanged,
-        deleted,
-        errors: errors + oversized,
-        changed_files,
-        tree_root,
+    Ok(Committed {
+        result: ParseResult {
+            parsed,
+            unchanged,
+            deleted,
+            errors: errors + oversized,
+            changed_files,
+            tree_root,
+        },
+        post_commit: combine_post_commit(post_commit),
     })
+}
+
+/// One error for the steps that failed after `COMMIT`: the only one with
+/// its chain intact, or every message when several failed.
+fn combine_post_commit(mut failures: Vec<anyhow::Error>) -> Option<anyhow::Error> {
+    if failures.len() > 1 {
+        let all: Vec<String> = failures.iter().map(|e| format!("{e:#}")).collect();
+        return Some(anyhow::anyhow!("{}", all.join("; ")));
+    }
+    failures.pop()
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,15 +2794,11 @@ fn write_head_for_path(
             h.set_signer_kid(kid.as_bytes());
         }
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&head_path)
-        .with_context(|| format!("open head {}", head_path.display()))?;
-    leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(&src, &mut f)
-        .context("write Head capnp record")?;
-    Ok(())
+    let mut bytes = Vec::new();
+    leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(&src, &mut bytes)
+        .context("encode Head capnp record")?;
+    replace_file_atomically(&head_path, &bytes)
+        .with_context(|| format!("write head {}", head_path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2762,7 +2820,12 @@ fn write_head_for_path(
 /// system-call rate drops by ~30×. See bead `ley-line-open-9ccbc7`.
 type CapnpWriter = BufWriter<std::fs::File>;
 
-fn sibling_snapshot_writers(conn: &Connection) -> (Option<CapnpWriter>, Option<CapnpWriter>) {
+fn sibling_snapshot_writers(
+    conn: &Connection,
+) -> (Option<CapnpWriter>, Option<CapnpWriter>, PendingSidecars) {
+    let mut pending = PendingSidecars {
+        renames: Vec::new(),
+    };
     let row: rusqlite::Result<String> = conn.query_row(
         "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
         [],
@@ -2770,23 +2833,97 @@ fn sibling_snapshot_writers(conn: &Connection) -> (Option<CapnpWriter>, Option<C
     );
     let db_path = match row {
         Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => return (None, None),
+        _ => return (None, None, pending),
     };
 
-    let ast_path = with_extension(&db_path, "ast.capnp");
-    let source_path = with_extension(&db_path, "source.capnp");
-
-    let open = |p: &Path| -> Option<CapnpWriter> {
-        std::fs::OpenOptions::new()
+    let mut open = |ext: &str| -> Option<CapnpWriter> {
+        let path = with_extension(&db_path, ext);
+        let temp = temp_path_for(&path);
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(p)
-            .ok()
-            .map(BufWriter::new)
+            .open(&temp)
+            .ok()?;
+        pending.renames.push((temp, path));
+        Some(BufWriter::new(file))
     };
 
-    (open(&ast_path), open(&source_path))
+    let ast = open("ast.capnp");
+    let source = open("source.capnp");
+    (ast, source, pending)
+}
+
+/// The sidecars a pass is writing, each in a temp file beside the one it
+/// replaces. [`PendingSidecars::commit`] renames them into place after the
+/// pass's `COMMIT`; dropped uncommitted (the pass failed and rolled back),
+/// it removes them, so the previous sidecars stay as they were (bead
+/// `ley-line-open-5db28e`).
+struct PendingSidecars {
+    /// `(temp, final)` pairs.
+    renames: Vec<(PathBuf, PathBuf)>,
+}
+
+impl PendingSidecars {
+    fn commit(mut self) -> Result<()> {
+        for (temp, path) in std::mem::take(&mut self.renames) {
+            if let Err(e) = std::fs::rename(&temp, &path) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e).with_context(|| format!("move sidecar into {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingSidecars {
+    fn drop(&mut self) {
+        for (temp, _) in &self.renames {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
+/// The temp file a replacement of `path` is written to before it is
+/// renamed over `path`: `foo.head.capnp` → `foo.head.capnp.tmp`.
+fn temp_path_for(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// Replace `path` with `bytes` atomically: the bytes go to a temp file
+/// beside it, are synced, and the temp file is renamed over `path`, and
+/// the directory is synced so the rename survives a crash. A reader sees
+/// the previous file or the new one, never a partial one; a write that
+/// fails leaves the previous file as it was (bead `ley-line-open-5db28e`).
+fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let temp = temp_path_for(path);
+    let written = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp)
+            .with_context(|| format!("open {}", temp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("write {}", temp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync {}", temp.display()))?;
+        std::fs::rename(&temp, path)
+            .with_context(|| format!("rename {} over {}", temp.display(), path.display()))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return written;
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("sync directory {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// `set_extension` replaces only the *last* dotted component, so
@@ -5811,5 +5948,79 @@ mod tests {
             !td.path().join(".ast.capnp").exists() && !td.path().join(".source.capnp").exists(),
             "T8.3: :memory: parse must not produce capnp snapshots",
         );
+    }
+
+    /// Bead `ley-line-open-5db28e`: the head is replaced, never rewritten in
+    /// place. A reader holding the previous head reads it whole after the
+    /// next head lands, so a crash mid-write cannot leave a head that
+    /// `read_head_for_chain` refuses. Rewritten in place, the held handle
+    /// reads the new (or a truncated) head through the same inode.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn a_head_write_replaces_the_file_and_never_rewrites_it_in_place() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("atomic.db");
+        std::fs::write(&db, b"").unwrap();
+        write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO).unwrap();
+        let head = head_path_for(&db);
+        let before = std::fs::read(&head).unwrap();
+        let mut held = std::fs::File::open(&head).unwrap();
+
+        write_head_for_path(
+            &db,
+            7,
+            leyline_core::Hash::from_bytes([1u8; 32]),
+            leyline_core::Hash::ZERO,
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        held.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, before, "the previous head's bytes are untouched");
+        let after = std::fs::read(&head).unwrap();
+        assert_ne!(after, before, "the new head is in place");
+        assert_eq!(
+            read_head_for_chain(&head).unwrap().1,
+            3,
+            "the chain is at generation 2"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file is left: {leftovers:?}");
+    }
+
+    /// Bead `ley-line-open-5db28e`: a head write that fails leaves the
+    /// previous head readable, so the next write chains onto it. The
+    /// failure is a directory the writer cannot create its new file in.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn a_failed_head_write_leaves_the_previous_head_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let heads = dir.path().join("heads");
+        std::fs::create_dir(&heads).unwrap();
+        let db = heads.join("failed.db");
+        std::fs::write(&db, b"").unwrap();
+        write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO).unwrap();
+        let head = head_path_for(&db);
+        let before = std::fs::read(&head).unwrap();
+
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let wrote = write_head_for_path(
+            &db,
+            7,
+            leyline_core::Hash::from_bytes([1u8; 32]),
+            leyline_core::Hash::ZERO,
+        );
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(wrote.is_err(), "the write cannot land: {wrote:?}");
+        assert_eq!(std::fs::read(&head).unwrap(), before);
+        assert_eq!(read_head_for_chain(&head).unwrap().1, 2);
     }
 }

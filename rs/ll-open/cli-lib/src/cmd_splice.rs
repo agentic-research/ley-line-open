@@ -22,8 +22,14 @@ pub fn cmd_splice(db: &Path, node: &str, text: &str) -> Result<()> {
         .with_context(|| format!("node path {node:?} has no source file"))?;
     let len = new_source.len();
     // ADR-0040 D3: the caller names the database, so it holds the whole grant.
-    crate::source_write::write(&conn, &crate::source_write::Grant::Whole, &rel, new_source)?;
+    let written =
+        crate::source_write::write(&conn, &crate::source_write::Grant::Whole, &rel, new_source)?;
     drop(conn);
+    if let Some(problem) = written.post_commit_error {
+        anyhow::bail!(
+            "spliced '{node}' ({len} source bytes are committed), but a step after the commit failed: {problem}"
+        );
+    }
     log::info!("Spliced '{node}': source {len} bytes");
     Ok(())
 }
@@ -98,6 +104,23 @@ mod tests {
             "World",
             "reprojection must refresh the node record, not just _source",
         );
+        Ok(())
+    }
+
+    /// Bead `ley-line-open-5db28e`: a splice whose head write fails after
+    /// its commit says the splice landed, and the bytes are on disk.
+    #[test]
+    fn cmd_splice_reports_a_landed_splice_whose_head_write_failed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("proj.db");
+        let _tree = project_html(&db, b"<p>Hello</p>")?;
+        std::fs::write(crate::cmd_parse::head_path_for(&db), b"not a head")?;
+
+        let err = cmd_splice(&db, "test.html/element/text", "World")
+            .expect_err("the failed head write is reported");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("are committed"), "{msg}");
+        assert_eq!(read_source(&db)?, b"<p>World</p>");
         Ok(())
     }
 

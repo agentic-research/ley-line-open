@@ -181,13 +181,8 @@ impl std::fmt::Display for Refusal {
                 "the arena stores no blob for '{path}', so no blob base matches it"
             ),
             Refusal::Stale(moved) => {
-                for (i, m) in moved.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str("; ")?;
-                    }
-                    write!(f, "{m}")?;
-                }
-                Ok(())
+                let each: Vec<String> = moved.iter().map(Stale::to_string).collect();
+                f.write_str(&each.join("; "))
             }
         }
     }
@@ -382,9 +377,12 @@ impl leyline_fs::graph::SourceWriter for MountWriter {
                 Ok(())
             }
             Err(err) => match err.downcast::<Refusal>() {
-                Ok(Refusal::Stale(mut moved)) if !moved.is_empty() => {
+                Ok(Refusal::Stale(moved)) => {
                     // A one-file proposal: its one moved file.
-                    let stale = moved.swap_remove(0);
+                    let stale = moved
+                        .into_iter()
+                        .next()
+                        .expect("a stale refusal names a moved file");
                     Err(leyline_fs::graph::StaleWrite {
                         source_id: stale.path,
                         expected: stale.expected,

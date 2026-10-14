@@ -2358,14 +2358,11 @@ fn parse_into_conn_with(
     })
 }
 
-/// One error for the steps that failed after `COMMIT`: the only one with
-/// its chain intact, or every message when several failed.
-fn combine_post_commit(mut failures: Vec<anyhow::Error>) -> Option<anyhow::Error> {
-    if failures.len() > 1 {
-        let all: Vec<String> = failures.iter().map(|e| format!("{e:#}")).collect();
-        return Some(anyhow::anyhow!("{}", all.join("; ")));
-    }
-    failures.pop()
+/// One error for the steps that failed after `COMMIT`, naming each with
+/// its full chain of context.
+fn combine_post_commit(failures: Vec<anyhow::Error>) -> Option<anyhow::Error> {
+    let all: Vec<String> = failures.iter().map(|e| format!("{e:#}")).collect();
+    (!all.is_empty()).then(|| anyhow::anyhow!("{}", all.join("; ")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2918,7 +2915,8 @@ fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temp);
         return written;
     }
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+    let path = std::path::absolute(path).with_context(|| format!("resolve {}", path.display()))?;
+    if let Some(dir) = path.parent() {
         std::fs::File::open(dir)
             .and_then(|d| d.sync_all())
             .with_context(|| format!("sync directory {}", dir.display()))?;

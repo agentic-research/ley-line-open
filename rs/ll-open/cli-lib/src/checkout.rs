@@ -271,9 +271,11 @@ pub fn reconcile(
             }
             continue;
         };
+        // `meta` is `Some` exactly when the file is on disk: anything else
+        // there left the loop above.
         let disk = match &meta {
-            Some(m) if on_disk && stats.get(rel) == Some(&stat_pair(m)) => Some(held),
-            Some(_) if on_disk => {
+            Some(m) if stats.get(rel) == Some(&stat_pair(m)) => Some(held),
+            Some(_) => {
                 hashed += 1;
                 match std::fs::read(&abs) {
                     Ok(bytes) => Some(bytes.hash()),
@@ -283,7 +285,7 @@ pub fn reconcile(
                     }
                 }
             }
-            _ => None,
+            None => None,
         };
         match classify(disk, held, indexed) {
             Action::Nothing => {}
@@ -654,6 +656,7 @@ mod tests {
         let scope = ["a.go".to_string(), "b.go".to_string()];
         let r = reconcile(&c.conn, &c.src, None, Some(&scope)).unwrap();
         assert_eq!(r.materialized, ["a.go"]);
+        assert_eq!(r.hashed, 2, "both files' stats moved, so both were read");
         assert_eq!(disk(&c, "a.go").as_deref(), Some(A2));
         assert_eq!(indexed(&c, "a.go"), Some(h(A2)));
         assert_eq!(r.parse.as_ref().unwrap().changed_files, ["b.go"]);
@@ -769,6 +772,30 @@ mod tests {
         let conn = Connection::open(dir.path().join("live.db")).unwrap();
         reconcile(&conn, &src, Some("go"), None).unwrap();
         let index = hashes(&conn, "SELECT path, blob_hash FROM _checkout_index").unwrap();
+        assert_eq!(index.keys().collect::<Vec<_>>(), ["a.go"]);
+    }
+
+    /// A path out of the tree, a directory, and a file over the parse size
+    /// limit are not checkout files: a reconcile scoped to them reads,
+    /// parses and indexes nothing.
+    #[test]
+    fn a_path_that_is_not_a_checkout_file_is_left_alone() {
+        let c = checkout(&[("a.go", A)]);
+        let outside = c.src.parent().unwrap().join("escape.go");
+        std::fs::write(&outside, A).unwrap();
+        std::fs::create_dir_all(c.src.join("d.go")).unwrap();
+        let limit = crate::cmd_parse::MAX_PARSE_FILE_SIZE as usize;
+        std::fs::write(c.src.join("big.go"), "x".repeat(limit + 1)).unwrap();
+
+        let scope = [
+            "../escape.go".to_string(),
+            "d.go".to_string(),
+            "big.go".to_string(),
+        ];
+        let r = reconcile(&c.conn, &c.src, None, Some(&scope)).unwrap();
+        assert!(r.parse.is_none(), "{:?}", r.parse);
+        assert_eq!(r.hashed, 0);
+        let index = hashes(&c.conn, "SELECT path, blob_hash FROM _checkout_index").unwrap();
         assert_eq!(index.keys().collect::<Vec<_>>(), ["a.go"]);
     }
 

@@ -213,11 +213,11 @@ fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
 
 /// Refuse a mount this build cannot provide. A daemon asked to mount that
 /// ran headless instead gave its caller no mount and no failure (bead
-/// `ley-line-open-2be4a7`). A build with the `mount` feature provides
-/// every mount, so the check exists only without it.
-#[cfg(not(feature = "mount"))]
-fn refuse_unavailable_mount(mount: Option<&Path>) -> Result<()> {
-    if let Some(path) = mount {
+/// `ley-line-open-2be4a7`). `compiled` says whether this build has the
+/// `mount` feature; it is an argument so both answers are tested in any
+/// build.
+fn refuse_unavailable_mount(mount: Option<&Path>, compiled: bool) -> Result<()> {
+    if let (Some(path), false) = (mount, compiled) {
         anyhow::bail!(
             "cannot mount at {}: this leyline was built without the `mount` feature. \
              Build with `--features mount`, or omit --mount to run headless.",
@@ -253,8 +253,7 @@ pub async fn run_daemon_with_options(
     let arena = arena.as_path();
     let control = control.as_deref();
     let mount = mount.as_deref();
-    #[cfg(not(feature = "mount"))]
-    refuse_unavailable_mount(mount)?;
+    refuse_unavailable_mount(mount, cfg!(feature = "mount"))?;
     let source = source.as_deref();
     let backend = backend.as_str();
     let language = language.as_deref();
@@ -2619,16 +2618,13 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "mount"))]
     #[test]
     fn a_mount_this_build_cannot_provide_is_refused() {
-        assert!(
-            refuse_unavailable_mount(None).is_ok(),
-            "headless is always available"
-        );
-        let err = refuse_unavailable_mount(Some(Path::new("/mnt/x")))
-            .unwrap_err()
-            .to_string();
+        let at = Some(Path::new("/mnt/x"));
+        assert!(refuse_unavailable_mount(None, false).is_ok(), "headless");
+        assert!(refuse_unavailable_mount(None, true).is_ok(), "headless");
+        assert!(refuse_unavailable_mount(at, true).is_ok(), "a mount build");
+        let err = refuse_unavailable_mount(at, false).unwrap_err().to_string();
         assert!(err.contains("`mount` feature"), "{err}");
         assert!(err.contains("/mnt/x"), "{err}");
     }

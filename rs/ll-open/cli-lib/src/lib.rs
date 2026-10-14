@@ -4,6 +4,7 @@
 //! a wrapper enum by downstream binaries (e.g. the private `leyline` binary
 //! that adds `daemon`, `embed`, `send`, etc.).
 
+pub mod checkout;
 #[cfg(feature = "cdc")]
 pub mod cmd_cdc;
 pub mod cmd_daemon;

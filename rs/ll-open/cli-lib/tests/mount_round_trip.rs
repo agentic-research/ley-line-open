@@ -97,6 +97,7 @@ fn projection_graph(src: &Path) -> SqliteGraphAdapter {
 fn mount_writer() -> Arc<dyn leyline_fs::graph::SourceWriter> {
     Arc::new(leyline_cli_lib::source_write::MountWriter {
         grant: leyline_cli_lib::source_write::Grant::Whole,
+        checkout: None,
     })
 }
 

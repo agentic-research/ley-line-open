@@ -128,6 +128,12 @@ The FUSE/NFS mount, `leyline splice`, `batch_splice`, and cloister's mediator al
 writer touches `_source.content`, `nodes.record` or the arena directly. ADR-0029 §2.2 said this
 and no code did it; this ADR makes it the only write path.
 
+The write path writes the store and never a file. A daemon with a `--source` directory then
+materializes each accepted write into that directory, after `COMMIT`, and reconciles the
+directory against the store and a checkout index at startup and on every change (bead
+`ley-line-open-60f39f`, `cli-lib/src/checkout.rs`; R3 of the proposed ADR-0043). An arena with
+no source directory has no checkout, and its writes reach no file.
+
 ### D4 — The in-process mount reads `live.db` through the WAL reader pool
 
 The daemon's socket readers already read the live WAL database through N pooled connections with

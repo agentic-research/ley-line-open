@@ -37,6 +37,26 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A daemon restart keeps accepted proposals** (bead
+  `ley-line-open-60f39f`). `leyline daemon --source <dir>` stored an
+  accepted proposal (the `propose` op, or a mount edit) and never wrote
+  `<dir>`, and the warm-start reparse then saw the file's disk bytes
+  differ from the store and re-ingested them over the proposal; the git
+  watcher and `reparse` did the same. The daemon now checks `<dir>` out:
+  `_checkout_index` (in `live.db`, LLO-private) records per path the
+  blob last written into the directory or read from it. An accepted
+  proposal commits, is written into the directory (temp file, `fsync`,
+  `rename`), and only then advances the index. Startup, the watcher and
+  `reparse` over the checkout compare the directory and the store each
+  against the index: the store's moves are written out, the directory's
+  edits are ingested, and a path both changed to different bytes is a
+  conflict that overwrites neither side, is logged, and is recorded in
+  `_checkout_conflict` (readable through the `query` op). A crash
+  between the commit and the file write is written out at the next
+  start. A materialization that fails rides in `post_commit_error`.
+  A daemon without `--source` writes no file. In Rust,
+  `source_write::MountWriter` gains `checkout: Option<PathBuf>`.
+
 - **An applied proposal is reported as applied** (bead
   `ley-line-open-5db28e`). When the head write, an index build or the
   publish failed after `COMMIT`, the daemon answered `{ok: false}` and

@@ -1007,6 +1007,47 @@ pub(crate) fn parse_written_files(
     )
 }
 
+/// Parse a daemon's checkout from disk, except the files in `kept`, whose
+/// bytes come from `kept` whether or not the directory holds them (bead
+/// `ley-line-open-60f39f`). `kept` carries the stored bytes of each
+/// checkout conflict, so a pass over the directory cannot replace them with
+/// the directory's bytes or delete them for being absent there.
+pub(crate) fn parse_checkout(
+    conn: &Connection,
+    source: &Path,
+    lang_filter: Option<&str>,
+    scope: Option<&[String]>,
+    kept: &BTreeMap<String, Vec<u8>>,
+) -> Result<ParseResult> {
+    parse_into_conn_with(
+        conn,
+        source,
+        lang_filter,
+        scope,
+        Some(InMemory::Written(kept)),
+    )?
+    .into_result()
+}
+
+/// The language a file under the tree is parsed as: by extension, then by
+/// file name (Dockerfile and the like), and `None` when the pass would
+/// skip it, including when `lang_filter` names another language.
+pub(crate) fn file_language(path: &Path, lang_filter: Option<TsLanguage>) -> Option<TsLanguage> {
+    let lang = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(TsLanguage::from_extension)
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(TsLanguage::from_filename)
+        })?;
+    match lang_filter {
+        Some(filter) if lang != filter => None,
+        _ => Some(lang),
+    }
+}
+
 /// Project a whole tree whose bytes are `files` (`_source.id` → bytes)
 /// through the cold parse, as if `source` held exactly those files
 /// (ADR-0040 D6). Nothing is read from disk and `source` need not exist; it
@@ -1064,6 +1105,18 @@ fn parse_into_conn_with(
         // walks dominated by stat/readdir cost, not Vec resizing.
         let mut v = Vec::new();
         collect_files(source, &mut v)?;
+        // A file read from memory is in the tree whether or not the
+        // directory holds it (a checkout conflict whose directory side
+        // was deleted, `parse_checkout`).
+        if let Some(InMemory::Written(written)) = &memory {
+            let walked: HashSet<PathBuf> = v.iter().cloned().collect();
+            v.extend(
+                written
+                    .keys()
+                    .map(|rel| source.join(rel))
+                    .filter(|abs| !walked.contains(abs)),
+            );
+        }
         v
     };
 
@@ -1210,25 +1263,9 @@ fn parse_into_conn_with(
     let mut oversized = 0u64;
 
     for path in &files {
-        // Try extension first, then filename for extensionless files (Dockerfile, etc).
-        let lang = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(TsLanguage::from_extension)
-            .or_else(|| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(TsLanguage::from_filename)
-            });
-        let lang = match lang {
-            Some(l) => l,
-            None => continue,
-        };
-        if let Some(filter) = lang_filter
-            && lang != filter
-        {
+        let Some(lang) = file_language(path, lang_filter) else {
             continue;
-        }
+        };
 
         let rel = path.strip_prefix(source).unwrap_or(path);
         let rel_str = rel.to_string_lossy().to_string();

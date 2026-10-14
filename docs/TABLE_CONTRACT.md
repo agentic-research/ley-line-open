@@ -187,6 +187,19 @@ manifest falls back to it (`chunked.rs:936-946`, freshness gate `:789`).
 | `content_manifest` | Per-node chunk sequence, keyed `(node_id, seq)`. **Has no root** — it is a lookup index, not an identity domain. ADR-0032 §D3's `manifestRoot` is proposed, not implemented. |
 | `content_manifest_meta` | Freshness witness per node — the basis a manifest was built against, so a stale manifest is refused rather than trusted. |
 
+**Daemon checkout** (bead `ley-line-open-60f39f`, `rs/ll-open/cli-lib/src/checkout.rs`):
+
+These tables are **private to the daemon** that owns a `--source`
+directory. They are not part of the SQL projection ABI, no consumer reads
+them, `leyline parse` never creates them, and changes to them do not bump
+`leyline-schema`. They live in `live.db`, so a published arena image
+carries them.
+
+| Table | Purpose |
+|-------|---------|
+| `_checkout_index` | `path TEXT PRIMARY KEY` → `blob_hash BLOB`: the blob last written into the source directory or read from it — git's index. Startup, the watcher, `reparse` and every accepted proposal compare the directory and `_source.content_hash` each against it. |
+| `_checkout_conflict` | Paths whose directory bytes and stored bytes both moved, to different bytes, since the index: `disk_hash` (NULL when deleted on disk), `stored_hash`, `index_hash`. Neither side is overwritten; the row leaves when the two agree. |
+
 **Analysis substrate** (added v0.7.2 per `docs/decades/analysis-substrate.md`) — a *derived analysis facility*, not an identity domain; the word "substrate" here is the decade's name, not a claim about content addressing:
 
 | Table | Purpose |
@@ -236,6 +249,7 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
 | `content_chunks` / `content_manifest` / `content_manifest_meta` | CDC derived chunk cache — private, not part of the SQL projection ABI |
+| `_checkout*` | daemon checkout of its `--source` directory — private, not part of the SQL projection ABI |
 
 ## Composition Model
 

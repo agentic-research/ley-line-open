@@ -20,9 +20,12 @@
 //! `fsync`, `leyline serve` flushes its image to the arena, and `leyline
 //! splice` writes a file-backed database in place.
 //!
-//! The bytes land in the arena only. A later full-tree parse that reads the
-//! file from disk replaces them with the disk bytes, as it replaces any other
-//! arena state that disagrees with the working tree.
+//! The bytes land in the arena only; this module never writes a file. A
+//! daemon with a source directory materializes accepted writes into it
+//! after they commit, and reconciles the directory against the store at
+//! startup and on every change, so a later parse of the directory does not
+//! replace an accepted write with older bytes from disk
+//! ([`crate::checkout`], bead `ley-line-open-60f39f`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -347,6 +350,10 @@ pub fn write(conn: &Connection, grant: &Grant, path: &str, bytes: Vec<u8>) -> Re
 #[cfg(feature = "mount")]
 pub struct MountWriter {
     pub grant: Grant,
+    /// The daemon's source directory, into which an accepted edit is
+    /// materialized after it commits ([`crate::checkout`]); `None` for a
+    /// mount with no checkout, whose edits land in the arena only.
+    pub checkout: Option<PathBuf>,
 }
 
 #[cfg(feature = "mount")]
@@ -373,6 +380,20 @@ impl leyline_fs::graph::SourceWriter for MountWriter {
             Ok(accepted) => {
                 if let Some(problem) = accepted.post_commit_error {
                     log::warn!("mount write to '{source_id}' landed; after it: {problem}");
+                }
+                if let Some(dir) = &self.checkout {
+                    let paths = [source_id.to_string()];
+                    match crate::checkout::reconcile(conn, dir, None, Some(&paths)) {
+                        Ok(reconciled) => {
+                            if let Some(problem) = reconciled.problems() {
+                                log::warn!("mount write to '{source_id}' landed; {problem}");
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "mount write to '{source_id}' landed; the source directory was \
+                             not brought up to it: {e:#}"
+                        ),
+                    }
                 }
                 Ok(())
             }
@@ -1176,6 +1197,7 @@ mod tests {
         let a = arena(&[("a.go", A), ("b.go", B)]);
         let narrow = MountWriter {
             grant: Grant::Paths(BTreeSet::from(["b.go".to_string()])),
+            checkout: None,
         };
         let err = narrow
             .write(&a.conn, "a.go", A2.as_bytes().to_vec(), None)
@@ -1184,6 +1206,7 @@ mod tests {
 
         let whole = MountWriter {
             grant: Grant::Whole,
+            checkout: None,
         };
         whole
             .write(&a.conn, "a.go", A2.as_bytes().to_vec(), None)
@@ -1192,6 +1215,35 @@ mod tests {
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
             A2.as_bytes(),
         );
+        assert_eq!(
+            std::fs::read_to_string(a._src.path().join("a.go")).unwrap(),
+            A,
+            "a mount without a checkout writes no file",
+        );
+    }
+
+    /// A mount over a daemon's checkout materializes the edit it accepted
+    /// into the source directory (bead `ley-line-open-60f39f`).
+    #[cfg(feature = "mount")]
+    #[test]
+    fn the_mount_writer_materializes_into_its_checkout() {
+        use leyline_fs::graph::SourceWriter;
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let src = a._src.path().to_path_buf();
+        crate::checkout::ensure_tables(&a.conn).unwrap();
+        MountWriter {
+            grant: Grant::Whole,
+            checkout: Some(src.clone()),
+        }
+        .write(
+            &a.conn,
+            "a.go",
+            A2.as_bytes().to_vec(),
+            Some(A.as_bytes().hash()),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(src.join("a.go")).unwrap(), A2);
+        assert_eq!(std::fs::read_to_string(src.join("b.go")).unwrap(), B);
     }
 
     /// The mount's writer checks the base the mount hands it, and answers a
@@ -1204,6 +1256,7 @@ mod tests {
         let a = arena(&[("a.go", A), ("b.go", B)]);
         let writer = MountWriter {
             grant: Grant::Whole,
+            checkout: None,
         };
         writer
             .write(
@@ -1242,6 +1295,7 @@ mod tests {
         corrupt_head(&a);
         MountWriter {
             grant: Grant::Whole,
+            checkout: None,
         }
         .write(
             &a.conn,
@@ -1270,6 +1324,7 @@ mod tests {
         let mut graph = SqliteGraphAdapter::new_writable(image.as_ref()).unwrap();
         graph.set_source_writer(std::sync::Arc::new(MountWriter {
             grant: Grant::Whole,
+            checkout: None,
         }));
         let leaf = "a.go/package_clause/package_identifier";
         let body = "a.go/function_declaration/block";

@@ -175,10 +175,10 @@ pub enum BaseRequest {
         id: String,
     },
     /// Read-only: a whole source file by its `_source.id`, with the blob
-    /// hash a later `propose` names as its base (ADR-0041 P2).
+    /// hash a later `propose` names as its base (ADR-0042 P2).
     ReadSource(ReadSourceRequest),
     /// Mutating: several files written as one change through the daemon's
-    /// single writer, applied whole or refused whole (ADR-0041 P1).
+    /// single writer, applied whole or refused whole (ADR-0042 P1).
     Propose(ProposeRequest),
     FindCallers {
         token: String,
@@ -616,9 +616,10 @@ pub struct ProposeRequest {
 pub struct ProposedWriteInput {
     /// The file's `_source.id`.
     pub path: String,
-    /// The blob hash (64 hex chars) the author read, from `read_source`;
-    /// empty means no check.
-    #[serde(default)]
+    /// Required: the blob hash (64 hex chars) the author read, from
+    /// `read_source`, or [`crate::source_write::BASE_ANY`] to write without
+    /// a check. A write that omits it is refused rather than silently
+    /// overwriting (bead `ley-line-open-5dc3a5`).
     pub base: String,
     /// The file's new content.
     pub content: String,

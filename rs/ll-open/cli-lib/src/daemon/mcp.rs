@@ -199,10 +199,13 @@ pub fn tool_registry() -> Vec<McpTool> {
         McpTool {
             name: "propose",
             description: "Write several source files as one change: applied whole, or refused \
-                          whole. Give each write the `blob_hash` you read from `read_source` as \
-                          its `base`; if any file moved since, nothing is written and `stale` \
-                          names the file and its current blob hash, so you can re-read and \
-                          retry. An empty `base` writes without a check.",
+                          whole. Every write needs a `base`: the `blob_hash` you read from \
+                          `read_source`, or `any` to write without a check. A refused proposal \
+                          writes nothing and carries `refusal {reason, path, moved}`; when files \
+                          moved since you read them, `reason` is `stale` and `moved` names each \
+                          with its current blob hash, so you can re-read and retry. An applied \
+                          proposal answers `ok` with each file's new `blob_hash`, and \
+                          `post_commit_error` when a step after the commit failed.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -213,10 +216,13 @@ pub fn tool_registry() -> Vec<McpTool> {
                             "type": "object",
                             "properties": {
                                 "path": {"type": "string"},
-                                "base": {"type": "string"},
+                                "base": {
+                                    "type": "string",
+                                    "description": "The `blob_hash` from `read_source`, or `any` for no check."
+                                },
                                 "content": {"type": "string"}
                             },
-                            "required": ["path", "content"]
+                            "required": ["path", "base", "content"]
                         }
                     }
                 },
@@ -602,7 +608,7 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
             advertised_prefix: "",
             upstream_names: vec!["status", "snapshot", "reparse", "enrich"],
         },
-        // Write — the one op that changes source bytes (ADR-0041 P1), in its
+        // Write — the one op that changes source bytes (ADR-0042 P1), in its
         // own group so a policy can grant reads without writes.
         CloisterGroupDecl {
             name: "write",

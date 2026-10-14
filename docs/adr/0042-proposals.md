@@ -38,25 +38,31 @@ ______________________________________________________________________
 ### P1 — A proposal is the unit of change, and one SQLite transaction
 
 ```
-propose(grant, writes) -> Accepted { blobs, tree_root } | Refused
+propose(grant, writes) -> Accepted { blobs, tree_root, post_commit_error } | Refused(Refusal)
 
 writes = [ Proposed { path, base, bytes } ]
 base   = Any | Blob(hash of the bytes the author read)
 ```
 
-The single writer refuses a proposal before touching anything when a path is outside the grant, a
-base no longer matches, a file does not parse, a path repeats, or the files are under different
-roots. Otherwise it applies every file in one parse pass and one SQLite transaction, which includes
-the sweep and the `_meta` stamps (`derived_from`). Only `CREATE INDEX IF NOT EXISTS`, which changes
-no query result, and the head write run after `COMMIT`. A proposal is acknowledged only after its
-WAL frames are synced (`synchronous=FULL`). D3's `write(grant, path, bytes)` is the one-file
-`Base::Any` case.
+The single writer refuses a proposal before touching anything when it writes nothing, a path is
+outside the grant, names no file or repeats, a base no longer matches or names a blob the arena
+does not store, the files are under different roots, or a file does not parse. A refusal is typed
+(`Refusal`, one reason per case) and a stale one names every file that moved. Otherwise it applies
+every file in one parse pass and one SQLite transaction, which includes the sweep and the `_meta`
+stamps (`derived_from`). The new `ast.capnp` / `source.capnp` sidecars are written beside the old
+ones and renamed into place after `COMMIT`, so a proposal that rolls back leaves them unchanged.
+Only `CREATE INDEX IF NOT EXISTS`, which changes no query result, the sidecar renames and the head
+write run after `COMMIT`; the head is written to a temp file, synced and renamed. A step after
+`COMMIT` that fails does not make the proposal a failure: it is applied, and the failure is
+reported beside it (`post_commit_error`). A proposal is acknowledged only after its WAL frames are
+synced (`synchronous=FULL`). D3's `write(grant, path, bytes)` is the one-file `Base::Any` case.
 
 ### P2 — Bases are compare-and-swap over the bytes the write replaces
 
-- **File** (implemented) — the file's current `source_blobs` hash must equal the base. This is HTTP
-  `If-Match` with a content hash as the entity tag. A refusal is typed (`Stale { path, expected,
-  current }`).
+- **File** (implemented) — the file's `_source.content_hash` must equal the base. This is HTTP
+  `If-Match` with a content hash as the entity tag. A refusal is typed (`Stale`, naming every moved
+  file's `{ path, expected, current }`). A file with no stored blob (a NULL `content_hash`)
+  matches no blob base.
 - **Node** (not implemented) — `base = (file_blob, locator, span_hash)`: the file blob the author
   read, the node's locator there, and BLAKE3 of the node's exact byte span. The writer re-resolves
   the locator into the current file and refuses unless it resolves to exactly one node whose span
@@ -84,9 +90,13 @@ accepted with persisted, scheme-tagged keys, and claims per key family only what
 ### P4 — How a proposal begins and ends
 
 - **Explicit, over the daemon** (implemented) — `read_source {path}` returns content, `blob_hash`
-  and `tree_root`; `propose {writes: [{path, base, content}]}` answers `stale {path, expected,
-  current}` on a moved base. Both are MCP tools; `propose` is in its own cloister group, `write`.
-  This is the only form that checks against what an agent actually read.
+  (the file's `_source.content_hash`, the value `propose` compares) and `tree_root`;
+  `propose {writes: [{path, base, content}]}` requires `base`: a `blob_hash`, or `any` for no
+  check. A refusal answers `refusal {reason, path, moved}`; on moved bases `reason` is `stale` and
+  `moved` lists every `{path, expected, current}`. An applied proposal answers `ok` and, when a
+  step after its commit failed, `post_commit_error`. Both are MCP tools; `propose` is in its own
+  cloister group, `write`. This is the only form that checks against what an agent actually
+  read.
 - **Implicit, through the mount** (implemented for files) — an edit's base is the file's stored
   bytes when it is opened for writing (FUSE) or at the first write after the last flush (NFS). A
   stale flush is refused: FUSE `ESTALE`, NFS an I/O error (`NFS3ERR_STALE` means a dead file handle
@@ -116,13 +126,17 @@ ______________________________________________________________________
 | `propose` with file bases, typed `Stale` | `d25ec4` | #439 |
 | daemon `read_source` / `propose`, MCP, schema 0.20.3 | `609525` | #440 |
 | mount bases, `ESTALE`, refused edits discarded, fsync reports refusals | `843e03` | — |
+| typed refusals, required `base`, applied-after-commit, atomic head and sidecars, schema 0.20.5 | `5db28e`, `5dc3a5` | — |
 
 ## Falsifiers
 
 | # | Claim | Test |
 |---|---|---|
 | G1 | a proposal is atomic | three files, one invalid: nothing lands (`a_proposal_with_one_invalid_file_changes_nothing`); a failure at the `derived_from` stamp leaves the image byte-identical (`a_write_that_fails_after_its_rows_leaves_the_arena_unchanged`) |
-| G2 | a stale file base is refused | `a_stale_base_is_refused_and_names_what_moved`; over the daemon, `propose_applies_against_what_was_read_and_refuses_a_stale_base` |
+| G2 | a stale file base is refused | `a_stale_base_is_refused_and_names_what_moved`, `a_stale_refusal_names_every_moved_file`; over the daemon, `propose_applies_against_what_was_read_and_refuses_a_stale_base` |
+| G2b | every refusal is typed and changes nothing | `every_refusal_is_typed_and_changes_nothing`, `propose_refusals_carry_their_reason_and_path`, `daemon_protocol_gate_proposals_produce_the_fixture_shapes` |
+| G2c | a committed proposal is reported applied | `a_proposal_whose_head_write_fails_after_commit_is_applied`, `propose_reports_an_applied_proposal_as_applied_when_its_head_write_fails`, `the_mount_writer_answers_ok_when_the_edit_landed` |
+| G2d | a rolled-back proposal leaves the head and sidecars readable | `a_rolled_back_proposal_leaves_the_sidecars_byte_identical`, `a_head_write_replaces_the_file_and_never_rewrites_it_in_place`, `a_failed_head_write_leaves_the_previous_head_readable` |
 | G3 | the mount refuses a moved file | `a_refused_edit_restores_the_node_and_reports_stale`, `the_mount_writer_refuses_a_moved_file_as_stale`, `a_stale_refusal_answers_estale_and_others_eio` |
 | G4 | node bases allow disjoint edits | (open) two node-based proposals on different functions of one file both land |
 | G5 | node bases cover trivia | (open) a comment edit inside F refuses a stale node base on F |

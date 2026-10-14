@@ -10,6 +10,21 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.20.5] — 2026-10-13
+
+Publication safety. A publisher that dies mid-publish no longer wedges
+readers of the control block, and a reader facing an abandoned publish
+stays on the last snapshot it read instead of an empty one. Every
+publisher now takes a publish lock on the control file; mache's matching
+release takes the same lock, so move mache and leyline together. Mount
+edits stay out of the database until their flush lands, so a snapshot no
+longer publishes half an edit. This also corrects v0.20.4's claim that a
+refused mount edit is discarded: through the real write path its text
+stayed in the node and was published. Found by a design review of the
+proposal stack. The wire stays v1 with `SCHEMA_VERSION` 0.20.4 (no schema
+change), the projection stays `projection-v6`, and the control block
+stays VERSION 3.
+
 ### Fixed
 
 - **An unflushed mount edit no longer reaches the database, so a snapshot

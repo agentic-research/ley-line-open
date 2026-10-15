@@ -81,6 +81,45 @@ FLUSH or FSYNC carrying it, so the backend refuses writable mappings: DAX serves
 reads, and the writable working tree is served without DAX or with per-inode DAX (`dax=inode`) on
 read-only files only.
 
+#### Read freshness
+
+Decided in bead `ley-line-open-e6269a`; built in `rs/ll-open/storefs` (beads `789e0f`, `e650d7`).
+
+**No invalidation channel exists.** The backend cannot tell the guest that a path changed. libkrun's
+device offers no `VIRTIO_FS_F_NOTIFICATION`, configures no notification queue, and answers
+`notify_reply` with `ENOSYS`; Linux's client has no receiver either: `fs/fuse/virtio_fs.c` at v6.12
+and at master defines only `enum { VQ_HIPRIO, VQ_REQUEST }` and an empty `feature_table`
+(`docs/benchmarks/2026-10-15-vf3-virtiofs.md`, "Source check"). A guest's cached entry, attribute
+or page is therefore as fresh as its timeout or the next OPEN.
+
+**Caching is required for speed.** The V-F3 run (same document) measured a storefs-shaped backend
+with zero timeouts and `DIRECT_IO` at 29–82× APFS on tree walks (`find` issues 364k requests for
+20,857 files). Long timeouts, READDIRPLUS and page-cached read-only opens bring warm walks to
+1.0–2.3× APFS.
+
+**The contract:**
+
+- **OPEN always reaches the backend** and reads the path's current blob. A read-only open returns
+  `KEEP_CACHE` only when that blob is the one the previous open of the inode served (that open
+  read-only); otherwise it omits `KEEP_CACHE` and the guest drops the file's pages at the open.
+  File contents are thereby current at every open (open-to-close consistency from content
+  addressing, without notifications). OPENDIR applies the same rule to a directory's listing and
+  sets `CACHE_DIR`.
+- **Write opens stay `DIRECT_IO`**, the writeback cache stays off, and WRITE checks the handle's base
+  against the path's current `content_hash`: a stale base is `ESTALE` from `write(2)` itself, and
+  FLUSH and FSYNC keep their checks. No write guarantee depends on a timeout.
+- **Timeouts adapt to change.** Entry, attribute and negative-entry timeouts are long (default 60 s)
+  for a path with no recent change and short (default 1 s) for a path, and its parent directory,
+  changed within a window (default 60 s): changed by a proposal the backend landed, or observed
+  changed when the backend next served it in a different state than it last served. All three
+  values are configuration.
+- **What stays stale:** another writer's change to a path the guest holds a long timeout for is
+  invisible to `stat` and LOOKUP (including a cached negative entry) until that timeout expires.
+  A notification path in libkrun and the Linux client would remove this bound; neither exists.
+
+READDIRPLUS reaches the backend through the vendored libkrun's `DynFileSystem` (patch
+`0004`, `rs/third_party/libkrun-patches/`).
+
 ### V4 — The host mount is compatibility
 
 The NFS and FUSE host mounts remain for people and for tools that need a directory on the host.

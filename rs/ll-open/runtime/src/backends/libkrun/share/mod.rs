@@ -64,6 +64,12 @@ pub struct Attr {
     /// 512-byte blocks.
     pub blocks: u64,
     pub blksize: u32,
+    /// `st_atime`, `st_mtime` and `st_ctime`, since the Unix epoch. git
+    /// decides from them (with the size and inode) whether a file needs
+    /// rehashing.
+    pub atime: Duration,
+    pub mtime: Duration,
+    pub ctime: Duration,
 }
 
 /// A LOOKUP reply. `inode` 0 is a negative entry: the name does not exist,

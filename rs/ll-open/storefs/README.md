@@ -147,6 +147,42 @@ caches what it can prove unchanged and keeps the rest short:
   timeout: OPEN, WRITE, FLUSH and FSYNC always reach the store, and WRITE
   refuses a stale base with `ESTALE`.
 
+### File times
+
+Bead `ley-line-open-b8100d`. git decides whether to rehash a file from its
+stat (size, mtime, ctime, inode), so a same-size edit must move the times
+the guest is told, and an unchanged file must keep them. Every `Attr`
+carries `mtime`, since the Unix epoch; the adapter reports it as `st_atime`,
+`st_mtime` and `st_ctime`.
+
+- **Source.** The store records no time per file (`_source` holds content
+  and its hash; `_checkout_index` holds blobs), and the crate adds no
+  persisted state, so times come from the change tracking `StoreFs`
+  already does for "Read freshness". A path's time is the `Clock`'s origin
+  (`Clock::origin`: the wall-clock time `MonotonicClock` read at its
+  creation) plus the `Clock::now` reading of the latest change recorded to
+  it, or the origin alone when none was recorded.
+- **What moves it.** A change to a path moves its time and its parent
+  directory's: a proposal `StoreFs` lands (FLUSH, FSYNC, SETATTR of a size,
+  UNLINK, RENAME), another writer's proposal observed when `StoreFs` next
+  serves the path in another state (the rule "Read freshness" records
+  changes by), and a change only the session holds (CREATE, MKDIR, RMDIR,
+  UNLINK or RENAME of a session file or directory, a FLUSH of a file the
+  store cannot hold). An OPENDIR that lists other names or kinds than the
+  previous OPENDIR of the directory moves the directory's time: another
+  writer created or removed an entry in it. Session changes leave the
+  timeouts alone; the guest made them.
+- **Monotonic.** Each change takes `now`, or the nanosecond after the
+  path's previous time when that is later, so two changes in one clock
+  reading report two times, and no change reports the origin.
+- **Through the guest's cache.** A reply's times are cached with its
+  attributes; a changed path's attribute timeout is `Freshness::changed`,
+  so the next GETATTR or LOOKUP after it expires carries the new time. A
+  WRITE invalidates the guest's cached attributes for the file, so the
+  guest's own edit shows its new time at the `stat` after its `close`.
+- **Per session.** A new `StoreFs` has a new origin: every path reports a
+  new time once, and git rehashes each file once, then trusts the stat.
+
 ## Not supported
 
 - Renaming a directory that holds anything (`EXDEV`: `mv` copies), and
@@ -160,7 +196,8 @@ caches what it can prove unchanged and keeps the rest short:
   orphaned inode.
 - Invalidation: the guest learns of another writer's change at OPEN or when
   a timeout expires, never by notification (see "Read freshness").
-- Mode, owner, and times; extended attributes; links; locks.
+- Mode and owner, and setting times (SETATTR carries none; see "File
+  times" for the times reported); extended attributes; links; locks.
 - Files the store holds no blob for (`_source.content_hash` NULL) do not
   exist for the guest.
 - DAX (ADR-0044 V3): the core serves reads per request.

@@ -190,6 +190,25 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **`git status` in a guest missed a same-size edit** (bead
+  `ley-line-open-b8100d`). The virtio-fs share reported every file time as
+  zero, and git decides whether to rehash a file from its stat (size,
+  mtime, ctime, inode): after its first run, an edit that kept the file's
+  size was invisible to `git status`. Every attribute reply now carries an
+  access, modification and change time (one value, since the Unix epoch):
+  the clock's origin (the wall-clock time `StoreFs` was created) for a
+  path no change was recorded for, then the time of the latest change
+  `StoreFs` recorded to it — a proposal it landed, another writer's
+  proposal observed when it next serves the path, a change to a file or
+  directory only the session holds — strictly increasing per path. A
+  directory's time moves when an entry is created, removed or renamed in
+  it, or an OPENDIR lists other names than the previous one. No state is
+  persisted: a new `StoreFs` reports its own origin, so git rehashes each
+  file once per session. The share wire's `Attr` gains `atime`, `mtime`
+  and `ctime`, which `ShareFs` transcribes into `stat`. The in-guest
+  end-to-end test gains scenario (m): two successive same-size edits are
+  each reported by `git status --porcelain`.
+
 - **A guest read a grown file cut to its old size** (bead
   `ley-line-open-f210c2`, found by the in-guest end-to-end test). An OPEN
   reply carries no attributes, and the guest bounds a cached read by the

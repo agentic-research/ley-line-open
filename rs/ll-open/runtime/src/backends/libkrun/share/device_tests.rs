@@ -82,6 +82,9 @@ const FILE_ATTR: Attr = Attr {
     size: 1234,
     blocks: 3,
     blksize: 4096,
+    atime: Duration::new(1_760_000_001, 11),
+    mtime: Duration::new(1_760_000_002, 22),
+    ctime: Duration::new(1_760_000_003, 33),
 };
 
 const DIR_ATTR: Attr = Attr {
@@ -91,6 +94,9 @@ const DIR_ATTR: Attr = Attr {
     size: 0,
     blocks: 0,
     blksize: 4096,
+    atime: Duration::new(1_760_000_004, 44),
+    mtime: Duration::new(1_760_000_005, 55),
+    ctime: Duration::new(1_760_000_006, 66),
 };
 
 fn file_entry() -> Entry {
@@ -113,6 +119,19 @@ fn assert_stat(st: &Stat, attr: &Attr) {
     assert_eq!(st.st_size as u64, attr.size);
     assert_eq!(st.st_blocks as u64, attr.blocks);
     assert_eq!(st.st_blksize as u32, attr.blksize);
+    let time = |secs: i64, nanos: i64| Duration::new(secs as u64, nanos as u32);
+    assert_eq!(
+        time(st.st_atime as i64, st.st_atime_nsec as i64),
+        attr.atime
+    );
+    assert_eq!(
+        time(st.st_mtime as i64, st.st_mtime_nsec as i64),
+        attr.mtime
+    );
+    assert_eq!(
+        time(st.st_ctime as i64, st.st_ctime_nsec as i64),
+        attr.ctime
+    );
 }
 
 fn assert_entry(entry: &KrunEntry, expected: &Entry) {

@@ -10,6 +10,52 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: the store is a git-shaped tree; parsing is a projection over
+  it; a proposal whose base moved merges three ways** (bead
+  `ley-line-open-bb8aa6`, ADR-0045).
+  - The store's manifest is the new table `_tree (path, mode, blob_hash,
+    mtime, size)`: every walked file of any language with its git mode
+    (`100644`, `100755`, `120000` for a symlink whose blob is its target),
+    and every directory, empty ones included. `_source` keeps only the
+    files the parse projects. `--language` narrows the projection, not the
+    store or the checkout.
+  - `treeRoot` folds `_tree`: a tree of regular files, all projected, with
+    no empty directory, keeps its root; an executable, a symlink, an empty
+    directory or an unprojected file moves it (ADR-0045 T2).
+  - A file that does not parse cleanly is stored and diagnosed in the new
+    table `_parse_diagnostics`: syntax errors are projected with their
+    error nodes; a binary or oversized file is stored with no projection
+    rows. `projection-v7`; a v6 arena is refused at parse open and rebuilt
+    cold.
+  - `source_write::propose_with(.., Rules::Tree)` takes any bytes at any
+    plain path, `Change::Write { bytes, mode }`, `Mkdir`, `Rmdir`, and
+    `rename_dir`; a write against a moved base is merged with `gix-merge`
+    0.17.0's text driver (new dependency, MIT OR Apache-2.0, sharing gix
+    0.84's `gix-*` set) and lands as the write (`Accepted::merged`);
+    overlapping hunks refuse with `Refusal::Conflict` naming the base line
+    ranges. New refusals `Exists`, `NotEmpty`, `NotADirectory`,
+    `IsADirectory`; `NoStoredBlob` is removed (every manifest entry names
+    its blob). `source_write::propose` keeps ADR-0042's rules
+    (`Rules::ParsedFilesOnly`) for the virtio-fs core until ADR-0045 phase
+    4.
+  - A file deleted from the store leaves its directories; the checkout no
+    longer removes emptied directories. The checkout materializes modes,
+    symlinks and directories, ingests them from the directory, and its
+    index records each entry's mode.
+  - Daemon wire (`daemon.capnp`, schema 0.20.5 unreleased): `read_source`
+    reads any stored file and answers its `mode`; `ProposedWrite` gains
+    `mode` and `WriteKind` gains `mkdir` and `rmdir`; `StaleRefusal` gains
+    `conflicts` (`LineRange {start, end}`, base lines, 0-based half-open);
+    `ProposeResponse` gains `merged`; `RefusalReason` gains `exists`,
+    `not_empty`, `not_a_directory`, `is_a_directory`, and retires `syntax`,
+    `no_language` and `no_stored_blob` (ordinals kept, renamed
+    `retired_*`, never sent). The socket's `propose` no longer refuses a
+    file that does not parse or a file in no projected language, and
+    merges a moved base. Go bindings regenerated. Move clients of
+    `propose` with this release.
+
 ### Added
 
 - **Agents run in a libkrun guest whose `/work` is the daemon's store**

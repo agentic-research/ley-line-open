@@ -882,6 +882,10 @@ enum InMemory<'a> {
     },
 }
 
+/// The `_meta` key a whole-directory pass records its `--language` filter
+/// under; a proposal's pass projects under it (ADR-0045 T3).
+pub(crate) const PROJECTION_LANGUAGE_KEY: &str = "projection_language";
+
 /// What a pass read from memory changes in the manifest beyond file bytes
 /// (ADR-0045 T1): a written file's mode (absent: the entry's current mode,
 /// or regular for a new file), and directories made and removed.
@@ -1201,7 +1205,18 @@ fn parse_into_conn_with(
         bail!("{} is not a directory", source.display());
     }
 
-    let lang_filter = lang_filter
+    // A whole-directory pass records its `--language` filter; a proposal's
+    // pass, which names none, projects under the one recorded, so the
+    // projection is the same whichever path wrote a file (ADR-0045 T3).
+    let recorded_filter = match (&memory, lang_filter) {
+        (Some(InMemory::Written { .. }), None) => get_meta(conn, PROJECTION_LANGUAGE_KEY)
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    let filter_name = lang_filter.map(str::to_string).or(recorded_filter);
+    let lang_filter = filter_name
+        .as_deref()
         .map(TsLanguage::from_name)
         .transpose()
         .context("invalid --lang")?;
@@ -2378,6 +2393,14 @@ fn parse_into_conn_with(
         .unwrap_or_default()
         .as_secs();
     set_meta(conn, "parse_time", &now.to_string())?;
+    if scope.is_none() && tree_in_memory.is_none() {
+        match &filter_name {
+            Some(name) => set_meta(conn, PROJECTION_LANGUAGE_KEY, name)?,
+            None => {
+                conn.execute("DELETE FROM _meta WHERE key = ?1", [PROJECTION_LANGUAGE_KEY])?;
+            }
+        }
+    }
     // Merkle-AST IR generation lineage (ADR-0027): the head.capnp root shape
     // changed (span left symbol identity), so this is a new schema
     // generation. Bump the meta marker so consumers can tell the merkle-AST

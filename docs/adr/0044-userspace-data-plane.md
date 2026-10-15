@@ -102,9 +102,13 @@ with zero timeouts and `DIRECT_IO` at 29–82× APFS on tree walks (`find` issue
 - **OPEN always reaches the backend** and reads the path's current blob. A read-only open returns
   `KEEP_CACHE` only when that blob is the one the previous open of the inode served (that open
   read-only); otherwise it omits `KEEP_CACHE` and the guest drops the file's pages at the open.
-  File contents are thereby current at every open (open-to-close consistency from content
-  addressing, without notifications). OPENDIR applies the same rule to a directory's listing and
-  sets `CACHE_DIR`.
+  An OPEN reply carries no attributes, and the guest bounds a cached read by the size its cached
+  attributes hold, so a read-only open serving a blob of another size than the last reply carrying
+  the inode's attributes told the guest is `DIRECT_IO`: its reads reach the whole blob (bead
+  `f210c2`; the in-guest test read a grown file cut to its old size before this rule). File
+  contents are thereby current at every open (open-to-close consistency from content addressing,
+  without notifications). OPENDIR applies the same rule to a directory's listing and sets
+  `CACHE_DIR`.
 - **Write opens stay `DIRECT_IO`**, the writeback cache stays off, and WRITE checks the handle's base
   against the path's current `content_hash`: a stale base is `ESTALE` from `write(2)` itself, and
   FLUSH and FSYNC keep their checks. No write guarantee depends on a timeout.
@@ -252,11 +256,47 @@ upper filesystem (xattrs, whiteouts, rename) are unmeasured.
 
 ## Phases
 
-| Phase | Scope | Bead |
-|---|---|---|
-| A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib | `f1c46f` |
-| B | the store-backed `DynFileSystem`: reads from the checkout's ref, writes as proposals, refusals as Linux errno | `f1ea99` |
-| C | agents run in a guest whose working tree is that share; the end-to-end scenarios run inside the guest; V-F2 and V-F3 measured | `f210c2` |
+| Phase | Scope | Bead | Status |
+|---|---|---|---|
+| A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib | `f1c46f` | Done (#464) |
+| B | the store-backed `DynFileSystem`: reads from the checkout's ref, writes as proposals, refusals as Linux errno | `f1ea99` | Done (#463) |
+| C | agents run in a guest whose working tree is that share; the end-to-end scenarios run inside the guest; V-F2 and V-F3 measured | `f210c2` | Done on macOS/HVF: the in-guest scenarios pass (below). V-F3 was measured by the spike harness (`docs/benchmarks/2026-10-15-vf3-virtiofs.md`), not through the daemon's share; V-F2 (dtrace) is not measured; Linux/KVM not run |
+
+## Phase C results (bead `ley-line-open-f210c2`, 2026-10-15)
+
+**How it is wired.** The VMM runs in the `leyline-krun-worker` process and the store lives in the
+daemon, so the share crosses a process boundary on one connected UNIX socket pair: the daemon's
+libkrun backend (`KrunWorkerBackend::with_workspace_shares`) opens the run's share before it
+spawns the worker and passes one end as an inherited descriptor (`--workspace-share-fd`); the
+worker's virtio-fs device (`ShareFs`, libkrun's `DynFileSystem`) forwards each FUSE request down
+it (`backends::libkrun::share`: JSON header, READ and WRITE bytes as raw payload), and the daemon
+answers from `StoreShare` (the storefs README "Adapter" mapping) over a `StoreFs` on its own
+`DaemonContext`: the share and the socket propose on one writer, and a landed share proposal is
+written into the checkout and published to the arena as a socket proposal is. The grant scopes
+the share (`read`/`list` see, `mutate`/`commit` propose), and the share opens only when the
+store's `treeRoot` (ADR-0040 D1, the tagged fold over `_source`) is the grant's `graphRoot` (not
+`Controller.current_root`, not `Head.rootHash`). The guest init mounts the share at `/work`
+(libkrun patch `0005`, `KRUN_VIRTIOFS_MOUNTS`) and starts the workload there.
+
+**The test.** `rs/ll-open/cli/tests/agent_in_guest.rs` runs the real `leyline execution-daemon
+--backend micro-vm --source <checkout>` and starts an execution/v1 run over the socket whose
+RunGrant carries a WorkspaceGrant. The workload is a static guest program using file syscalls,
+`git` and `rg` (Alpine aarch64, `tools/guest_tools.sh`); it and the test coordinate through files
+in the store. macOS 26.6.2 arm64, Hypervisor.framework, libkrunfw 5.5.0, settled timeout 3 s:
+
+| # | Scenario | Guest syscall result | Host check (socket and checkout) |
+|---|---|---|---|
+| a | read a file | `read(2)` a.go: 37 bytes, the stored blob | — |
+| b | open/write/close edit | `close(2)` = 0 | `read_source` and the checkout hold the edit |
+| c | socket proposal to a file the guest holds open | `write(2)` = -1, `errno=116` (`ESTALE`); `close(2)` = 0 | b.go holds the socket proposal, not the guest's bytes |
+| d | unparseable edit | `fsync(2)` = -1 `errno=5` (`EIO`); `close(2)` = -1 `errno=5` | c.go unchanged in the store and the checkout |
+| e | create, unlink, write-temp-then-rename | `close(2)` = 0; `unlink(2)` = 0; `rename(2)` = 0, a.go reads back the save | n.go created, d.go deleted, a.go holds the save; the temp file reached neither |
+| f | `git status`, `rg` over `/work` | `git status --porcelain` lists ` M a.go`, ` M b.go`, ` D d.go`, `?? n.go`; `rg -n` finds `n.go:3`; `rg --files` lists the tree | — |
+| g | host proposal, then the guest's next open; TTL bound | `open`/`read` g.go returns the new 88 bytes; `stat(2)` of t.go (never opened) shows the old size right after the proposal and the new size after 2.81 s (settled 3 s) | — |
+| h | `kill -9` the daemon and restart | — | every accepted guest edit, the deletion, and both host proposals are in the store and the checkout |
+
+The first run found a defect in (g): the guest read the new blob cut to the 37 bytes its cached
+attributes held (V3 "Read freshness", now fixed by the `DIRECT_IO` rule above).
 
 ## Beads
 

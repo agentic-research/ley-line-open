@@ -1213,7 +1213,10 @@ fn parse_into_conn_with(
         let mut v: Vec<PathBuf> = Vec::with_capacity(scope.len());
         for rel in scope {
             let abs = source.join(rel);
-            if !removed(rel) && (abs.exists() || written_bytes(rel).is_some()) {
+            // A symlink on disk is stored by the tree sync, never parsed
+            // through to its target (ADR-0045 T3).
+            let regular_file = std::fs::symlink_metadata(&abs).is_ok_and(|m| m.is_file());
+            if !removed(rel) && (regular_file || written_bytes(rel).is_some()) {
                 v.push(abs);
             }
         }
@@ -1399,6 +1402,8 @@ fn parse_into_conn_with(
     // projected, with their blob and their first syntax error if any.
     let mut unprojected: BTreeMap<String, String> = BTreeMap::new();
     let mut projected_now: HashMap<String, ([u8; 32], Option<SyntaxError>)> = HashMap::new();
+    // Symlinks written by this pass: stored, not projected, no diagnostic.
+    let mut unprojected_links: Vec<String> = Vec::new();
 
     for path in &files {
         let Some(lang) = file_language(path, lang_filter) else {
@@ -1411,6 +1416,29 @@ fn parse_into_conn_with(
         // A written file has no stat pair: its mtime is the write's, its size
         // the written bytes'.
         let written_here = written_bytes(&rel_str);
+        // A symlink is stored, never projected (ADR-0045 T3): bytes written
+        // with the symlink mode, or over a symlink without naming a mode,
+        // are its target. A file it replaces leaves the projection.
+        if written_here.is_some() {
+            let mode = match memory
+                .as_ref()
+                .and_then(|m| m.edits().modes.get(&rel_str).copied())
+            {
+                Some(mode) => Some(mode),
+                None => match crate::tree::exists(conn)
+                    .then(|| crate::tree::entry(conn, &rel_str))
+                    .transpose()?
+                    .flatten()
+                {
+                    Some(crate::tree::Entry::File { mode, .. }) => Some(mode),
+                    _ => None,
+                },
+            };
+            if mode == Some(crate::tree::Mode::Symlink) {
+                unprojected_links.push(rel_str);
+                continue;
+            }
+        }
         let (file_mtime, file_size) = match written_here {
             Some(bytes) => (mtime, bytes.len() as i64),
             None => {
@@ -1582,8 +1610,9 @@ fn parse_into_conn_with(
             delete_file_rows(conn, rel)?;
         }
     }
-    // A file that grew past the parse's size limit leaves the projection.
-    for rel in unprojected.keys() {
+    // A file that grew past the parse's size limit, or became a symlink,
+    // leaves the projection.
+    for rel in unprojected.keys().chain(&unprojected_links) {
         if old_index.contains_key(rel) {
             delete_file_rows(conn, rel)?;
             deleted += 1;
@@ -4292,6 +4321,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 mod tree_sync;
+pub(crate) use tree_sync::{disk_mode, link_bytes};
 
 #[cfg(test)]
 mod tree_tests;

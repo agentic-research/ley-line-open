@@ -35,6 +35,9 @@ use anyhow::{Context, Result, bail};
 use leyline_core::Hash;
 use rusqlite::{Connection, OptionalExtension};
 
+pub use crate::tree::Mode;
+use crate::tree::Entry;
+
 /// The paths a writer may change: ADR-0029's sub-manifest of paths, the
 /// ring-2 slice grant. `Whole` is the grant the arena's owner holds — the
 /// daemon over its own source tree, `leyline serve` over its own arena, and
@@ -83,17 +86,25 @@ pub enum Base {
     Absent,
 }
 
-/// What a proposal does at one path.
+/// What a proposal does at one path (ADR-0042 P1a, ADR-0045 T4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Change {
     /// The file's new bytes: a replace, or a create when the base is
-    /// [`Base::Absent`].
-    Write(Vec<u8>),
-    /// The file leaves the store, with every row its parse produced.
+    /// [`Base::Absent`]. `mode: None` keeps the entry's mode (a create is
+    /// regular); a symlink's bytes are its target.
+    Write { bytes: Vec<u8>, mode: Option<Mode> },
+    /// The file leaves the store, with every row its parse produced. Its
+    /// directories stay.
     Delete,
+    /// A directory entry, with its missing parents. Its base is
+    /// [`Base::Absent`].
+    Mkdir,
+    /// A directory entry leaves; nothing may remain under it once the
+    /// proposal's other changes apply. Its base is [`Base::Any`].
+    Rmdir,
 }
 
-/// One path a proposal changes: its `_source.id`, the base its author read,
+/// One path a proposal changes: its `_tree` path, the base its author read,
 /// and the change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposed {
@@ -104,12 +115,26 @@ pub struct Proposed {
 
 impl Proposed {
     /// The file at `path` holds `bytes`: a replace against `base`, or a
-    /// create when `base` is [`Base::Absent`].
+    /// create when `base` is [`Base::Absent`]. The entry keeps its mode.
     pub fn write(path: impl Into<String>, base: Base, bytes: Vec<u8>) -> Self {
         Proposed {
             path: path.into(),
             base,
-            change: Change::Write(bytes),
+            change: Change::Write { bytes, mode: None },
+        }
+    }
+
+    /// [`Proposed::write`] that also sets the entry's mode: `chmod` is a
+    /// write of the current bytes with a new mode, and a symlink is a write
+    /// of its target with [`Mode::Symlink`].
+    pub fn write_mode(path: impl Into<String>, base: Base, bytes: Vec<u8>, mode: Mode) -> Self {
+        Proposed {
+            path: path.into(),
+            base,
+            change: Change::Write {
+                bytes,
+                mode: Some(mode),
+            },
         }
     }
 
@@ -126,6 +151,39 @@ impl Proposed {
             change: Change::Delete,
         }
     }
+
+    /// A new directory at `path`.
+    pub fn mkdir(path: impl Into<String>) -> Self {
+        Proposed {
+            path: path.into(),
+            base: Base::Absent,
+            change: Change::Mkdir,
+        }
+    }
+
+    /// The directory at `path` leaves the store.
+    pub fn rmdir(path: impl Into<String>) -> Self {
+        Proposed {
+            path: path.into(),
+            base: Base::Any,
+            change: Change::Rmdir,
+        }
+    }
+}
+
+/// Which rules a proposal is decided under (ADR-0045 "Phases").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rules {
+    /// ADR-0045: any bytes at any plain path, modes and directories; a file
+    /// that does not parse is stored with a diagnostic; a moved base
+    /// merges three ways.
+    Tree,
+    /// ADR-0042 as it stood: a create needs a language the parse projects,
+    /// every written file must parse, and a moved base refuses. The
+    /// virtio-fs core (`leyline-storefs`) and the compatibility mounts
+    /// propose under these until ADR-0045 phase 4 moves them to
+    /// [`Rules::Tree`] and this variant goes.
+    ParsedFilesOnly,
 }
 
 /// A path that moved since its author read it: one entry of
@@ -181,26 +239,41 @@ pub enum Refusal {
     /// A file is under a different tree root than the proposal's first
     /// file; one proposal projects one tree.
     DifferentRoots { path: String, detail: String },
-    /// A file's bytes do not parse cleanly in its language.
+    /// A file's bytes do not parse cleanly in its language. Decided only
+    /// under [`Rules::ParsedFilesOnly`]; goes with it in ADR-0045 phase 4.
     Syntax { path: String, detail: String },
-    /// A base is neither a blob hash nor the "no check" sentinel. Decided
-    /// by the daemon, which reads bases off the wire.
+    /// A base does not fit its change: a replace or delete names a blob
+    /// hash or `any`, a create or mkdir `absent`, an rmdir `any`.
     MalformedBase { path: String },
-    /// The arena stores no blob for a file (its `content_hash` is NULL), so
-    /// no blob base can match it.
-    NoStoredBlob { path: String },
     /// Paths moved since their author read them: every one that moved. A
     /// create whose path now holds a file is stale with no expected blob.
     Stale(Vec<Stale>),
-    /// A created path names no language the parse projects, so the store
-    /// cannot hold it.
+    /// A created path names no language the parse projects. Decided only
+    /// under [`Rules::ParsedFilesOnly`]; goes with it in ADR-0045 phase 4.
     NoLanguage { path: String },
     /// A created path is not a plain relative path: empty, absolute, or
     /// with an empty, `.` or `..` component.
     MalformedPath { path: String },
-    /// A created path is under a file, or is a directory of other files,
-    /// once the proposal's deletes are applied: `other` names that file.
+    /// A created path is under a file once the proposal's deletes are
+    /// applied: `other` names that file.
     PathConflict { path: String, other: String },
+    /// Paths moved since their author read them and at least one moved
+    /// file's merge conflicted (ADR-0045 T5): `moved` names every path that
+    /// could not land, as [`Refusal::Stale`] does, and `conflicts` the base
+    /// line ranges where the two sides overlap, per conflicting path.
+    Conflict {
+        moved: Vec<Stale>,
+        conflicts: std::collections::BTreeMap<String, Vec<crate::merge::LineRange>>,
+    },
+    /// A directory is made where the store holds an entry, or a file is
+    /// created where it holds a directory.
+    Exists { path: String },
+    /// A directory is removed with entries left under it.
+    NotEmpty { path: String },
+    /// A directory removal names a file.
+    NotADirectory { path: String },
+    /// A file write or delete names a directory.
+    IsADirectory { path: String },
 }
 
 impl Refusal {
@@ -208,7 +281,7 @@ impl Refusal {
     /// [`Refusal::Stale`], which names its files in its list.
     pub fn path(&self) -> Option<&str> {
         match self {
-            Refusal::Empty | Refusal::Stale(_) => None,
+            Refusal::Empty | Refusal::Stale(_) | Refusal::Conflict { .. } => None,
             Refusal::OutsideGrant { path }
             | Refusal::NoSuchFile { path }
             | Refusal::DuplicatePath { path }
@@ -216,10 +289,21 @@ impl Refusal {
             | Refusal::DifferentRoots { path, .. }
             | Refusal::Syntax { path, .. }
             | Refusal::MalformedBase { path }
-            | Refusal::NoStoredBlob { path }
             | Refusal::NoLanguage { path }
             | Refusal::MalformedPath { path }
-            | Refusal::PathConflict { path, .. } => Some(path),
+            | Refusal::PathConflict { path, .. }
+            | Refusal::Exists { path }
+            | Refusal::NotEmpty { path }
+            | Refusal::NotADirectory { path }
+            | Refusal::IsADirectory { path } => Some(path),
+        }
+    }
+
+    /// Every path that moved, for the two refusals that name them.
+    pub fn moved(&self) -> &[Stale] {
+        match self {
+            Refusal::Stale(moved) | Refusal::Conflict { moved, .. } => moved,
+            _ => &[],
         }
     }
 }
@@ -258,14 +342,35 @@ impl std::fmt::Display for Refusal {
                 "'{path}' cannot be created: the store holds '{other}', and one is the \
                  other's directory"
             ),
-            Refusal::NoStoredBlob { path } => write!(
-                f,
-                "the arena stores no blob for '{path}', so no blob base matches it"
-            ),
             Refusal::Stale(moved) => {
                 let each: Vec<String> = moved.iter().map(Stale::to_string).collect();
                 f.write_str(&each.join("; "))
             }
+            Refusal::Conflict { moved, conflicts } => {
+                let each: Vec<String> = moved
+                    .iter()
+                    .map(|m| match conflicts.get(&m.path) {
+                        Some(ranges) => {
+                            let lines: Vec<String> = ranges
+                                .iter()
+                                .map(|r| format!("{}..{}", r.start + 1, r.end + 1))
+                                .collect();
+                            format!(
+                                "{m}, and its changes overlap the other writer's at base lines {}",
+                                lines.join(", ")
+                            )
+                        }
+                        None => m.to_string(),
+                    })
+                    .collect();
+                f.write_str(&each.join("; "))
+            }
+            Refusal::Exists { path } => write!(f, "'{path}' exists"),
+            Refusal::NotEmpty { path } => {
+                write!(f, "the directory '{path}' is not empty")
+            }
+            Refusal::NotADirectory { path } => write!(f, "'{path}' is not a directory"),
+            Refusal::IsADirectory { path } => write!(f, "'{path}' is a directory"),
         }
     }
 }
@@ -287,6 +392,12 @@ pub struct Accepted {
     pub blobs: std::collections::BTreeMap<String, Hash>,
     /// The paths the proposal deleted.
     pub removed: BTreeSet<String>,
+    /// The written paths whose base had moved and whose bytes are the
+    /// three-way merge (ADR-0045 T5): what landed is not what was sent.
+    pub merged: BTreeSet<String>,
+    /// The directories the proposal made, and removed.
+    pub mkdirs: BTreeSet<String>,
+    pub rmdirs: BTreeSet<String>,
     /// The arena's `treeRoot` after the proposal.
     pub tree_root: Hash,
     /// A step after `COMMIT` that failed (moving the sidecars into place,
@@ -320,7 +431,23 @@ pub struct Accepted {
 /// arena has one writer: the daemon's writer lock, or the one process that
 /// owns a file-backed database.
 pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Result<Accepted> {
-    use leyline_core::ContentAddressed;
+    propose_with(conn, grant, writes, Rules::ParsedFilesOnly)
+}
+
+/// [`propose`] under `rules`. Under [`Rules::Tree`] (ADR-0045) a path holds
+/// any bytes with a mode, directories are made and removed, a written file
+/// that does not parse is stored with a diagnostic, and a write whose base
+/// moved is merged three ways with what the path holds: a clean merge lands
+/// as the write ([`Accepted::merged`]), overlapping hunks refuse
+/// ([`Refusal::Conflict`]), and a moved symlink, a moved file that is not
+/// UTF-8, a moved delete and a create over other bytes refuse
+/// ([`Refusal::Stale`]).
+pub fn propose_with(
+    conn: &Connection,
+    grant: &Grant,
+    writes: Vec<Proposed>,
+    rules: Rules,
+) -> Result<Accepted> {
     if writes.is_empty() {
         return Err(Refusal::Empty.into());
     }
@@ -331,94 +458,267 @@ pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Resul
         .into());
     }
 
-    // Every path's row, and every base checked, before anything else: a
-    // stale refusal names every path that moved.
+    propose_checked(conn, writes, rules)
+}
+
+/// One path of a proposal once its base has been checked (and, for a
+/// moved base under [`Rules::Tree`], merged).
+struct Plan {
+    path: String,
+    /// The entry the store holds at the path now.
+    current: Option<Entry>,
+    change: Change,
+}
+
+/// What [`decide_one`] made of one path.
+enum Decided {
+    Plan(Plan),
+    /// The path's base moved and its change cannot land; `conflicts` are
+    /// the merge's overlapping base ranges, when there was a merge.
+    Moved {
+        stale: Stale,
+        conflicts: Option<Vec<crate::merge::LineRange>>,
+    },
+}
+
+/// The base and change of `w` checked against the store's entry at its
+/// path (ADR-0042 P2, ADR-0045 T4, T5). A refusal of this path alone is an
+/// `Err`; a moved base is [`Decided::Moved`], so every moved path is named.
+fn decide_one(conn: &Connection, w: Proposed, rules: Rules) -> Result<Decided> {
+    let current = crate::tree::entry(conn, &w.path)?;
+    let path = w.path;
+    let stale = |expected: Option<Hash>, current: Option<Hash>, path: &str| Decided::Moved {
+        stale: Stale {
+            path: path.to_string(),
+            expected,
+            current,
+        },
+        conflicts: None,
+    };
+    let plan = |change: Change| Decided::Plan(Plan {
+        path: path.clone(),
+        current,
+        change,
+    });
+    match (&w.change, w.base, current) {
+        // Shapes: a create names `Absent`, a delete does not; a mkdir names
+        // `Absent` and an rmdir `Any`.
+        (Change::Delete, Base::Absent, _)
+        | (Change::Mkdir, Base::Any | Base::Blob(_), _)
+        | (Change::Rmdir, Base::Absent | Base::Blob(_), _) => {
+            Err(Refusal::MalformedBase { path }.into())
+        }
+        (Change::Mkdir, Base::Absent, None) if !plain_relative(&path) => {
+            Err(Refusal::MalformedPath { path }.into())
+        }
+        (Change::Mkdir, Base::Absent, None) => Ok(plan(w.change)),
+        (Change::Mkdir, Base::Absent, Some(_)) => Err(Refusal::Exists { path }.into()),
+        (Change::Rmdir, Base::Any, None) => Err(Refusal::NoSuchFile { path }.into()),
+        (Change::Rmdir, Base::Any, Some(Entry::File { .. })) => {
+            Err(Refusal::NotADirectory { path }.into())
+        }
+        (Change::Rmdir, Base::Any, Some(Entry::Dir)) => Ok(plan(w.change)),
+        // A create.
+        (Change::Write { .. }, Base::Absent, None) if !plain_relative(&path) => {
+            Err(Refusal::MalformedPath { path }.into())
+        }
+        (Change::Write { .. }, Base::Absent, None) => {
+            if rules == Rules::ParsedFilesOnly
+                && crate::cmd_parse::file_language(Path::new(&path), None).is_none()
+            {
+                return Err(Refusal::NoLanguage { path }.into());
+            }
+            Ok(plan(w.change))
+        }
+        (Change::Write { .. }, Base::Absent, Some(Entry::Dir)) => {
+            Err(Refusal::Exists { path }.into())
+        }
+        (Change::Write { bytes, mode }, Base::Absent, Some(Entry::File { mode: held, blob })) => {
+            use leyline_core::ContentAddressed;
+            // A create of exactly what the path holds changes nothing and
+            // is accepted (ADR-0045 T5).
+            let identical =
+                bytes.as_slice().hash() == blob && mode.is_none_or(|m| m == held);
+            if rules == Rules::Tree && identical {
+                Ok(plan(w.change))
+            } else {
+                Ok(stale(None, Some(blob), &path))
+            }
+        }
+        // A replace or delete.
+        (Change::Write { .. } | Change::Delete, _, Some(Entry::Dir)) => {
+            Err(Refusal::IsADirectory { path }.into())
+        }
+        (Change::Write { .. } | Change::Delete, Base::Any, None) => {
+            Err(Refusal::NoSuchFile { path }.into())
+        }
+        (Change::Write { .. } | Change::Delete, Base::Blob(expected), None) => {
+            Ok(stale(Some(expected), None, &path))
+        }
+        (Change::Write { .. } | Change::Delete, Base::Any, Some(Entry::File { .. })) => {
+            Ok(plan(w.change))
+        }
+        (Change::Write { .. } | Change::Delete, Base::Blob(expected), Some(Entry::File { blob, .. }))
+            if blob == expected =>
+        {
+            Ok(plan(w.change))
+        }
+        (Change::Delete, Base::Blob(expected), Some(Entry::File { blob, .. })) => {
+            Ok(stale(Some(expected), Some(blob), &path))
+        }
+        (
+            Change::Write { bytes, mode },
+            Base::Blob(expected),
+            Some(Entry::File {
+                mode: held,
+                blob: theirs,
+            }),
+        ) => {
+            if rules == Rules::ParsedFilesOnly
+                || held == Mode::Symlink
+                || *mode == Some(Mode::Symlink)
+            {
+                return Ok(stale(Some(expected), Some(theirs), &path));
+            }
+            let (Some(base), Some(current)) = (
+                crate::tree::blob_bytes(conn, expected)?,
+                crate::tree::blob_bytes(conn, theirs)?,
+            ) else {
+                return Ok(stale(Some(expected), Some(theirs), &path));
+            };
+            match crate::merge::merge(&base, bytes, &current) {
+                crate::merge::Merged::Clean(merged) => Ok(plan(Change::Write {
+                    bytes: merged,
+                    mode: *mode,
+                })),
+                crate::merge::Merged::Conflict(ranges) => Ok(Decided::Moved {
+                    stale: Stale {
+                        path,
+                        expected: Some(expected),
+                        current: Some(theirs),
+                    },
+                    conflicts: Some(ranges),
+                }),
+                crate::merge::Merged::Binary => Ok(stale(Some(expected), Some(theirs), &path)),
+            }
+        }
+    }
+}
+
+fn propose_checked(conn: &Connection, writes: Vec<Proposed>, rules: Rules) -> Result<Accepted> {
+    use leyline_core::ContentAddressed;
+    // Every path's entry, and every base checked (and merged), before
+    // anything else: a stale refusal names every path that moved.
     let mut seen = BTreeSet::new();
     let mut moved = Vec::new();
+    let mut conflicts = std::collections::BTreeMap::new();
     let mut plans = Vec::with_capacity(writes.len());
+    let mut merged = BTreeSet::new();
     for w in writes {
         if !seen.insert(w.path.clone()) {
             return Err(Refusal::DuplicatePath { path: w.path }.into());
         }
-        if w.base == Base::Absent && w.change == Change::Delete {
-            return Err(Refusal::MalformedBase { path: w.path }.into());
-        }
-        let row: Option<(String, Option<String>, Option<Vec<u8>>)> = conn
-            .query_row(
-                "SELECT language, path, content_hash FROM _source WHERE id = ?1",
-                [&w.path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let Some((language, abs_path, held)) = row else {
-            match w.base {
-                Base::Any => return Err(Refusal::NoSuchFile { path: w.path }.into()),
-                Base::Blob(expected) => moved.push(Stale {
-                    path: w.path.clone(),
-                    expected: Some(expected),
-                    current: None,
-                }),
-                Base::Absent => {
-                    if !plain_relative(&w.path) {
-                        return Err(Refusal::MalformedPath { path: w.path }.into());
-                    }
-                    let Some(lang) = crate::cmd_parse::file_language(Path::new(&w.path), None)
-                    else {
-                        return Err(Refusal::NoLanguage { path: w.path }.into());
-                    };
-                    plans.push(Plan {
-                        path: w.path,
-                        stored: None,
-                        language: lang,
-                        change: w.change,
-                    });
-                }
-            }
-            continue;
+        let sent = match &w.change {
+            Change::Write { bytes, .. } => Some(bytes.as_slice().hash()),
+            _ => None,
         };
-        let held = held
-            .and_then(|h| <[u8; 32]>::try_from(h).ok())
-            .map(Hash::from_bytes);
-        match (w.base, held) {
-            (Base::Any, _) => {}
-            (Base::Blob(_) | Base::Absent, None) => {
-                return Err(Refusal::NoStoredBlob { path: w.path }.into());
+        match decide_one(conn, w, rules)? {
+            Decided::Plan(plan) => {
+                if let (Change::Write { bytes, .. }, Some(sent)) = (&plan.change, sent)
+                    && bytes.as_slice().hash() != sent
+                {
+                    merged.insert(plan.path.clone());
+                }
+                plans.push(plan);
             }
-            (Base::Blob(expected), Some(current)) if current == expected => {}
-            (base, Some(current)) => moved.push(Stale {
-                path: w.path.clone(),
-                expected: match base {
-                    Base::Blob(expected) => Some(expected),
-                    _ => None,
-                },
-                current: Some(current),
-            }),
+            Decided::Moved {
+                stale,
+                conflicts: ranges,
+            } => {
+                if let Some(ranges) = ranges {
+                    conflicts.insert(stale.path.clone(), ranges);
+                }
+                moved.push(stale);
+            }
         }
-        plans.push(Plan {
-            path: w.path,
-            stored: Some(Stored { abs_path }),
-            language: leyline_ts::languages::TsLanguage::from_name(&language)?,
-            change: w.change,
-        });
+    }
+    if !conflicts.is_empty() {
+        return Err(Refusal::Conflict { moved, conflicts }.into());
     }
     if !moved.is_empty() {
         return Err(Refusal::Stale(moved).into());
     }
 
-    // One proposal projects one tree: every stored file's recorded root,
-    // or the root the store's last parse recorded when it names none.
+    let root = proposal_root(conn, &plans)?;
+    check_structure(conn, &plans)?;
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut blobs = std::collections::BTreeMap::new();
+    let mut removed = BTreeSet::new();
+    let mut edits = crate::cmd_parse::TreeEdits::default();
+    for plan in plans {
+        match plan.change {
+            Change::Write { bytes, mode } => {
+                if rules == Rules::ParsedFilesOnly
+                    && let Some(lang) = crate::cmd_parse::file_language(Path::new(&plan.path), None)
+                    && let Err(e) = leyline_ts::splice::check_syntax(&bytes, lang.ts_language())
+                {
+                    return Err(Refusal::Syntax {
+                        path: plan.path,
+                        detail: format!("{e:#}"),
+                    }
+                    .into());
+                }
+                if let Some(mode) = mode {
+                    edits.modes.insert(plan.path.clone(), mode);
+                }
+                blobs.insert(plan.path.clone(), bytes.as_slice().hash());
+                files.insert(plan.path, bytes);
+            }
+            Change::Delete => {
+                removed.insert(plan.path);
+            }
+            Change::Mkdir => {
+                edits.mkdirs.insert(plan.path);
+            }
+            Change::Rmdir => {
+                edits.rmdirs.insert(plan.path);
+            }
+        }
+    }
+
+    let committed = crate::cmd_parse::parse_written_files(conn, &root, &files, &removed, &edits)?;
+    Ok(Accepted {
+        blobs,
+        removed,
+        merged,
+        mkdirs: edits.mkdirs,
+        rmdirs: edits.rmdirs,
+        tree_root: committed.result.tree_root,
+        post_commit_error: committed.post_commit.map(|e| format!("{e:#}")),
+    })
+}
+
+/// The directory the proposal's tree is rooted at: every projected file's
+/// recorded root (`_source.path`), which must agree, or the root the
+/// store's last parse recorded (`_meta.source_root`) when none is named.
+fn proposal_root(conn: &Connection, plans: &[Plan]) -> Result<PathBuf> {
     let mut root: Option<PathBuf> = None;
-    for plan in &plans {
-        let Some(stored) = &plan.stored else {
+    for plan in plans {
+        let row: Option<Option<String>> = conn
+            .prepare_cached("SELECT path FROM _source WHERE id = ?1")?
+            .query_row([&plan.path], |r| r.get(0))
+            .optional()?;
+        let Some(abs_path) = row else {
             continue;
         };
-        let Some(abs_path) = &stored.abs_path else {
+        let Some(abs_path) = abs_path else {
             return Err(Refusal::NoTreeRoot {
                 path: plan.path.clone(),
             }
             .into());
         };
-        let file_root = tree_root_dir(Path::new(abs_path), &plan.path)?;
+        let file_root = tree_root_dir(Path::new(&abs_path), &plan.path)?;
         match &root {
             None => root = Some(file_root),
             Some(r) if *r != file_root => {
@@ -435,72 +735,100 @@ pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Resul
             Some(_) => {}
         }
     }
-    let root = match root {
-        Some(root) => root,
-        None => recorded_root(conn)?.ok_or_else(|| Refusal::NoTreeRoot {
-            path: plans[0].path.clone(),
-        })?,
-    };
+    match root {
+        Some(root) => Ok(root),
+        None => recorded_root(conn)?.ok_or_else(|| {
+            Refusal::NoTreeRoot {
+                path: plans[0].path.clone(),
+            }
+            .into()
+        }),
+    }
+}
 
-    let removed: BTreeSet<String> = plans
+/// The tree the proposal leaves must be a tree (ADR-0045 T1): no created
+/// entry under a file, and no removed directory with an entry left under
+/// it.
+fn check_structure(conn: &Connection, plans: &[Plan]) -> Result<()> {
+    let leaving: BTreeSet<&str> = plans
         .iter()
-        .filter(|p| p.change == Change::Delete)
-        .map(|p| p.path.clone())
-        .collect();
-    let created: Vec<&str> = plans
-        .iter()
-        .filter(|p| p.stored.is_none())
+        .filter(|p| matches!(p.change, Change::Delete | Change::Rmdir))
         .map(|p| p.path.as_str())
         .collect();
-    if let Some(conflict) = path_conflict(conn, &created, &removed)? {
-        return Err(conflict.into());
+    let created: Vec<&Plan> = plans
+        .iter()
+        .filter(|p| p.current.is_none() && matches!(p.change, Change::Write { .. } | Change::Mkdir))
+        .collect();
+    let created_files: BTreeSet<&str> = created
+        .iter()
+        .filter(|p| matches!(p.change, Change::Write { .. }))
+        .map(|p| p.path.as_str())
+        .collect();
+    for plan in &created {
+        for dir in crate::tree::parents(&plan.path) {
+            let held_file = !leaving.contains(dir)
+                && matches!(crate::tree::entry(conn, dir)?, Some(Entry::File { .. }));
+            if held_file || created_files.contains(dir) {
+                return Err(Refusal::PathConflict {
+                    path: plan.path.clone(),
+                    other: dir.to_string(),
+                }
+                .into());
+            }
+        }
     }
-
-    let mut files = std::collections::BTreeMap::new();
-    let mut blobs = std::collections::BTreeMap::new();
-    for plan in plans {
-        let Change::Write(bytes) = plan.change else {
-            continue;
-        };
-        if let Err(e) = leyline_ts::splice::check_syntax(&bytes, plan.language.ts_language()) {
-            return Err(Refusal::Syntax {
-                path: plan.path,
-                detail: format!("{e:#}"),
+    for plan in plans.iter().filter(|p| p.change == Change::Rmdir) {
+        let prefix = format!("{}/", plan.path);
+        let left = crate::tree::under(conn, &plan.path)?
+            .into_iter()
+            .any(|(under, _)| !leaving.contains(under.as_str()));
+        let added = created.iter().any(|c| c.path.starts_with(&prefix));
+        if left || added {
+            return Err(Refusal::NotEmpty {
+                path: plan.path.clone(),
             }
             .into());
         }
-        blobs.insert(plan.path.clone(), bytes.as_slice().hash());
-        files.insert(plan.path, bytes);
     }
-
-    let committed = crate::cmd_parse::parse_written_files(
-        conn,
-        &root,
-        &files,
-        &removed,
-        &crate::cmd_parse::TreeEdits::default(),
-    )?;
-    Ok(Accepted {
-        blobs,
-        removed,
-        tree_root: committed.result.tree_root,
-        post_commit_error: committed.post_commit.map(|e| format!("{e:#}")),
-    })
+    Ok(())
 }
 
-/// One path of a proposal once its base has been checked: `stored` is
-/// `None` for a create.
-struct Plan {
-    path: String,
-    stored: Option<Stored>,
-    language: leyline_ts::languages::TsLanguage,
-    change: Change,
-}
-
-/// What the store records of a file a proposal replaces or deletes.
-struct Stored {
-    /// `_source.path`, from which the file's tree root is derived.
-    abs_path: Option<String>,
+/// A directory rename as one proposal (ADR-0045 T4): every file under
+/// `from` deleted against the blob it holds and created at the same place
+/// under `to` with its bytes and mode, every directory removed and made
+/// again under `to`, and `from` itself. Refused before anything is planned
+/// when `from` is not a directory or `to` holds an entry with entries
+/// under it; an empty directory at `to` is replaced.
+pub fn rename_dir(conn: &Connection, from: &str, to: &str) -> Result<Vec<Proposed>> {
+    if crate::tree::entry(conn, from)? != Some(Entry::Dir) {
+        bail!("rename of '{from}': not a directory in the store");
+    }
+    if !plain_relative(to) || to.starts_with(&format!("{from}/")) {
+        bail!("rename of '{from}' to '{to}': not a plain path outside it");
+    }
+    let mut writes = Vec::new();
+    match crate::tree::entry(conn, to)? {
+        None => writes.push(Proposed::mkdir(to)),
+        Some(Entry::Dir) if crate::tree::under(conn, to)?.is_empty() => {}
+        Some(_) => bail!("rename of '{from}' to '{to}': '{to}' exists and is not an empty directory"),
+    }
+    writes.push(Proposed::rmdir(from));
+    for (path, entry) in crate::tree::under(conn, from)? {
+        let moved_to = format!("{to}{}", &path[from.len()..]);
+        match entry {
+            Entry::Dir => {
+                writes.push(Proposed::rmdir(path));
+                writes.push(Proposed::mkdir(moved_to));
+            }
+            Entry::File { mode, blob } => {
+                let bytes = crate::tree::blob_bytes(conn, blob)?
+                    .with_context(|| format!("rename of '{path}': the store holds no blob {blob}"))?;
+                writes.push(Proposed::delete(path, Base::Blob(blob)));
+                writes.push(Proposed::write_mode(moved_to, Base::Absent, bytes, mode));
+            }
+        }
+    }
+    Ok(writes)
 }
 
 /// Whether the store can hold a file at `path`: a plain relative path in a
@@ -533,46 +861,6 @@ fn recorded_root(conn: &Connection) -> Result<Option<PathBuf>> {
         )
         .optional()?;
     Ok(root.map(PathBuf::from))
-}
-
-/// The first created path that is under a file, or is the directory of
-/// another file, once `removed` leaves the store: the store holds files,
-/// and a path cannot be both.
-fn path_conflict(
-    conn: &Connection,
-    created: &[&str],
-    removed: &BTreeSet<String>,
-) -> Result<Option<Refusal>> {
-    let mut under = conn.prepare_cached(
-        "SELECT id FROM _source WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id",
-    )?;
-    let mut exact = conn.prepare_cached("SELECT 1 FROM _source WHERE id = ?1")?;
-    for &path in created {
-        let conflict = |other: &str| Refusal::PathConflict {
-            path: path.to_string(),
-            other: other.to_string(),
-        };
-        // A file at one of the path's directories.
-        for (i, _) in path.match_indices('/') {
-            let dir = &path[..i];
-            let held = !removed.contains(dir) && exact.exists([dir])?;
-            if held || created.contains(&dir) {
-                return Ok(Some(conflict(dir)));
-            }
-        }
-        // A file under the path, as if it were a directory.
-        let prefix = format!("{path}/");
-        let stored = under
-            .query_map([&prefix], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if let Some(other) = stored.iter().find(|id| !removed.contains(*id)) {
-            return Ok(Some(conflict(other)));
-        }
-        if let Some(other) = created.iter().find(|c| c.starts_with(&prefix)) {
-            return Ok(Some(conflict(other)));
-        }
-    }
-    Ok(None)
 }
 
 /// Write `bytes` as the content of the file `path` names, whatever it holds:
@@ -681,6 +969,9 @@ fn tree_root_dir(abs: &Path, rel: &str) -> Result<PathBuf> {
             )
         })
 }
+
+#[cfg(test)]
+mod tree_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1323,39 +1614,23 @@ mod tests {
         );
     }
 
-    /// Bead `ley-line-open-5dc3a5`: a file whose `content_hash` is NULL has
-    /// no stored blob, so no blob base matches it — not even the zero hash
-    /// that once stood in for the missing one. `Base::Any` still writes it.
+    /// Bead `ley-line-open-5dc3a5`, as ADR-0045 T1 leaves it: bases are
+    /// checked against the manifest, whose file entries always name a blob.
+    /// A manifest entry without one is a broken store, not a refusal: every
+    /// proposal naming it fails closed and nothing lands.
     #[test]
-    fn a_file_with_no_stored_blob_refuses_every_blob_base() {
+    fn a_manifest_entry_without_a_blob_fails_closed() {
         let a = arena(&[("a.go", A)]);
         a.conn
-            .execute(
-                "UPDATE _source SET content_hash = NULL WHERE id = 'a.go'",
-                [],
-            )
+            .execute("UPDATE _tree SET blob_hash = NULL WHERE path = 'a.go'", [])
             .unwrap();
         let before = whole_image(&a.conn);
-        let err = propose(
-            &a.conn,
-            &Grant::Whole,
-            vec![proposed("a.go", Base::Blob(Hash::ZERO), A2)],
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<Refusal>(),
-            Some(&Refusal::NoStoredBlob {
-                path: "a.go".to_string()
-            }),
-            "{err:#}"
-        );
+        for base in [Base::Blob(Hash::ZERO), Base::Any] {
+            let err = propose(&a.conn, &Grant::Whole, vec![proposed("a.go", base, A2)]).unwrap_err();
+            assert!(err.downcast_ref::<Refusal>().is_none(), "{err:#}");
+            assert!(format!("{err:#}").contains("no blob_hash"), "{err:#}");
+        }
         assert!(whole_image(&a.conn) == before, "nothing lands");
-        propose(
-            &a.conn,
-            &Grant::Whole,
-            vec![proposed("a.go", Base::Any, A2)],
-        )
-        .unwrap();
     }
 
     /// One proposal is one tree: files recorded under different roots are
@@ -1873,8 +2148,9 @@ mod tests {
     }
 
     /// A create the store cannot hold is refused before anything changes:
-    /// a path no language claims, a path that is not plain and relative,
-    /// a path under a file, a path that is the directory of a file.
+    /// a path no language claims (under the strict rules), a path that is
+    /// not plain and relative, a path under a file, a path that is a
+    /// directory.
     #[test]
     fn a_create_the_store_cannot_hold_is_refused() {
         let a = arena(&[("a.go", A), ("lib.go/b.go", B)]);
@@ -1912,18 +2188,19 @@ mod tests {
                 other: "a.go".into()
             }
         );
+        // ADR-0045 T1: `lib.go` is a directory entry, so a file there
+        // exists already.
         assert_eq!(
             refused(vec![create("lib.go")]),
-            Refusal::PathConflict {
-                path: "lib.go".into(),
-                other: "lib.go/b.go".into()
+            Refusal::Exists {
+                path: "lib.go".into()
             }
         );
         assert_eq!(
             refused(vec![create("n/c.go"), create("n/c.go/d.go")]),
             Refusal::PathConflict {
-                path: "n/c.go".into(),
-                other: "n/c.go/d.go".into()
+                path: "n/c.go/d.go".into(),
+                other: "n/c.go".into()
             }
         );
         assert_eq!(

@@ -1075,29 +1075,27 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
 
 /// A whole source file by its `_source.id`, with its blob hash and the
 /// arena's `treeRoot`, read in one transaction so the three agree. The blob
-/// hash is the file's `_source.content_hash` — the column a later `propose`
-/// compares its base against (ADR-0042 P2), not a hash recomputed here, so
-/// the two agree by construction.
+/// hash is the file's manifest entry's `blob_hash` (ADR-0045 T1) — the
+/// value a later `propose` compares its base against (ADR-0042 P2), not a
+/// hash recomputed here, so the two agree by construction.
 fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String> {
-    use rusqlite::OptionalExtension;
     let path = req.path.as_str();
     ctx.with_read(|conn| {
         conn.execute_batch("BEGIN")?;
         let read = (|| -> Result<(String, String, Option<leyline_core::Hash>)> {
-            let (bytes, blob_hash): (Vec<u8>, Vec<u8>) = conn
-                .query_row(
-                    "SELECT b.blob_bytes, s.content_hash FROM _source s \
-                       JOIN source_blobs b ON b.blob_hash = s.content_hash \
-                      WHERE s.id = ?1",
-                    [path],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?
+            // The manifest entry (ADR-0045 T1) is what `propose` checks a
+            // base against, so the hash is read from the same row.
+            let entry = crate::tree::entry(conn, path)?
                 .with_context(|| format!("read_source: no stored source for '{path}'"))?;
+            let crate::tree::Entry::File { blob, .. } = entry else {
+                anyhow::bail!("read_source: '{path}' is a directory");
+            };
+            let bytes = crate::tree::blob_bytes(conn, blob)?
+                .with_context(|| format!("read_source: the store holds no blob {blob} for '{path}'"))?;
             let tree_root = crate::tree_root::DerivedFrom::read(conn)?.map(|d| d.tree_root);
             let content = String::from_utf8(bytes)
                 .with_context(|| format!("read_source: '{path}' is not UTF-8"))?;
-            Ok((content, hex::encode(blob_hash), tree_root))
+            Ok((content, blob.to_string(), tree_root))
         })();
         conn.execute_batch("COMMIT")?;
         let (content, blob_hash, tree_root) = read?;
@@ -1270,11 +1268,15 @@ fn set_refusal(
         Refusal::NoTreeRoot { .. } => R::NoTreeRoot,
         Refusal::Syntax { .. } => R::Syntax,
         Refusal::MalformedBase { .. } => R::MalformedBase,
-        Refusal::NoStoredBlob { .. } => R::NoStoredBlob,
         Refusal::Empty => R::Empty,
         Refusal::NoLanguage { .. } => R::NoLanguage,
         Refusal::MalformedPath { .. } => R::MalformedPath,
         Refusal::PathConflict { .. } => R::PathConflict,
+        Refusal::Conflict { .. } => R::Stale,
+        Refusal::Exists { .. }
+        | Refusal::NotEmpty { .. }
+        | Refusal::NotADirectory { .. }
+        | Refusal::IsADirectory { .. } => R::PathConflict,
     });
     if let Some(path) = refusal.path() {
         out.set_path(path);
@@ -4584,9 +4586,10 @@ mod tests {
     }
 
     /// Bead `ley-line-open-5dc3a5`: `read_source` returns the hash
-    /// `propose` compares — the file's `_source.content_hash` — so a read
-    /// followed by a propose against it agrees by construction, even when
-    /// the stored key is not the hash of the bytes it names.
+    /// `propose` compares — the file's manifest entry's `blob_hash`
+    /// (ADR-0045 T1) — so a read followed by a propose against it agrees by
+    /// construction, even when the stored key is not the hash of the bytes
+    /// it names.
     #[tokio::test]
     async fn read_source_returns_the_hash_propose_compares() {
         let (_dir, ctx) = setup_parsed();
@@ -4596,10 +4599,7 @@ mod tests {
                 "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
                 rusqlite::params![key, PROPOSE_A.as_bytes()],
             )?;
-            conn.execute(
-                "UPDATE _source SET content_hash = ?1 WHERE id = 'a.go'",
-                [&key],
-            )?;
+            conn.execute("UPDATE _tree SET blob_hash = ?1 WHERE path = 'a.go'", [&key])?;
             Ok(())
         })
         .unwrap();

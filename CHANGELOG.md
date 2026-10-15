@@ -37,6 +37,12 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **`leyline inspect --query` prints every value** (bead
+  `ley-line-open-12c0fa`). It read each column as text and printed
+  integers, reals, NULLs and blobs as empty strings, so `SELECT count(*)`
+  answered nothing. Numbers print as numbers, NULL as `NULL`, and blobs as
+  SQL hex literals (`x'00ff'`).
+
 - **An NFS mount edit made before another writer moved the file is
   refused** (bead `ley-line-open-6116c9`). The mount handle's base was
   taken at the file's first uncommitted WRITE. A macOS client holds

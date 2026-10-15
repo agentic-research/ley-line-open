@@ -126,8 +126,9 @@ types the virtio-fs backend uses.
 ## Spike results (bead `ley-line-open-bb8cc1`, 2026-10-14)
 
 Source read: libkrun tag `v1.19.4` (Apache-2.0, `src/devices/Cargo.toml`). Run on macOS 26.6.2
-arm64 with Homebrew libkrunfw 5.5.0. Prototype: `spikes/virtiofs-backend/` (a standalone
-cargo workspace outside `rs/`, never built by CI or release); `run.sh` clones the tag, applies `libkrun-v1.19.4-custom-fs.patch`, builds, signs and boots the guest.
+arm64 with Homebrew libkrunfw 5.5.0. Prototype: `spikes/virtiofs-backend/` on branch
+`spike/bb8cc1-virtiofs-backend` (a standalone cargo workspace outside `rs/`, never built by CI or
+release); `run.sh` clones the tag, applies `libkrun-v1.19.4-custom-fs.patch`, builds, signs and boots the guest.
 
 **Q1 — how the backend plugs in.**
 

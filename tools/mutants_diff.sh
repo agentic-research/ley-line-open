@@ -638,10 +638,22 @@ fi
 # which `-E` excludes because subprocess tests, not lib tests, kill it. It is
 # claimed here so the pairing check stays honest — the moment that crate grows
 # a mutable helper, the claim is a lie and the exclude list needs a real slice.
+cli_binary_only=0
 if package_changed_in_diff ll-open/cli; then
     claim_package ll-open/cli
     echo "NOTE: ll-open/cli carries only 'replace main', which -E excludes;"
     echo "      its behavior is gated by leyline-cli-lib's slice."
+    cli_binary_only=1
+fi
+
+# The planner gives a binary-only diff the `cli` leg so the pairing check has a
+# claim to satisfy; that leg has, by policy, nothing to mutate. Say so and stop,
+# as NO MUTABLE LINES does, instead of calling the plan misconfigured.
+if [ "$SCOPE" = cli ] && [ "$ran_slice" -eq 0 ] && [ "$cli_binary_only" -eq 1 ]; then
+    echo "NO MUTABLE LINES: scope 'cli' — the diff changes only ll-open/cli, whose"
+    echo "                  one mutant is excluded. This is NOT a pass; no"
+    echo "                  mutation testing ran in this scope."
+    exit 0
 fi
 
 if [ "$SCOPE" = all ]; then

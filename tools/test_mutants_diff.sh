@@ -21,6 +21,10 @@ case " $* " in
       *cli-mutants-only.diff*|*runtime-tests-only.diff*)
         printf '%s\n' 'll-open/cli-lib/src/daemon/client.rs:65:9: fixture mutant'
         ;;
+      *plan-cli-binary.diff*)
+        # What the real listing shows for the clap binary: `main` only.
+        printf '%s\n' 'll-open/cli/src/main.rs:12:5: replace main with ()'
+        ;;
       *)
         printf '%s\n' 'll-open/runtime/src/authorization.rs:65:9: fixture mutant'
         ;;
@@ -304,6 +308,20 @@ diff --git a/ll-open/cli/src/main.rs b/ll-open/cli/src/main.rs
 +++ b/ll-open/cli/src/main.rs
 DIFF
 plan_is "$fixture_dir/plan-cli-binary.diff" 'cli'
+
+# ...and the `cli` leg that plan starts must finish. The binary's only mutant
+# is excluded by policy, so the leg reports that and exits 0; MISCONFIGURED
+# here failed every PR that touched only ll-open/cli (PR #464).
+if ! out=$(cd "$repo_root/rs" && PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+    "$repo_root/tools/mutants_diff.sh" "$fixture_dir/plan-cli-binary.diff" cli 2>&1); then
+    echo "a cli-binary-only diff failed its planned cli leg:" >&2
+    echo "$out" >&2
+    exit 1
+fi
+case "$out" in
+    *"ll-open/cli carries only 'replace main'"*) ;;
+    *) echo "the cli leg did not say why nothing ran: $out" >&2; exit 1 ;;
+esac
 
 # The planner emits a scope for ANY Rust change in its package, tests included.
 # It runs no cargo, so it cannot know what will enumerate; the leg asks

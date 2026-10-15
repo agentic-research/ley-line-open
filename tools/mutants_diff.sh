@@ -21,6 +21,14 @@
 # nothing, from a path prefix. Generate with `git diff --relative=rs`.
 set -eu
 
+# cargo-mutants builds a copy of rs/ outside the repository, where the
+# repository-root .cargo/config.toml is not on cargo's config search path. That
+# file points libkrun's guest-init compiler (CC_LINUX) at tools/krun_init_cc.sh;
+# without it the vendored libkrun cannot build off Linux. Carry it as an
+# absolute path; an explicit CC_LINUX still wins (ley-line-open-f1c46f).
+: "${CC_LINUX:=$(CDPATH='' cd -P -- "$(dirname "$0")" && pwd -P)/krun_init_cc.sh}"
+export CC_LINUX
+
 DIFF=${1:?usage: mutants_diff.sh <diff-file>}
 SCOPE=${2:-all}
 test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }

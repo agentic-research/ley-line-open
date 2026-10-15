@@ -6,6 +6,12 @@ Capability-resolved execution lifecycle and isolation backends (`execution/v1`).
 
 - **`authorization`** — `AuthorizedExecution`, `EvidenceVerifier` (+ `CasDsseEvidenceVerifier`, `MetadataOnlyEvidenceVerifier`, `RejectUnverifiedEvidence`), `SignedGrant`/`GrantSignature`, `SchemaIntent`/`SchemaLimits` — the trust boundary between an execution request and permission to run it.
 - **`backends`** — isolation backend implementations: `native` (process), `native_backend`, `libkrun` (microVM). `Backend` is the trait each implements; `BackendCapabilities` / `BackendClass` describe what a backend can enforce.
+- **`backends::libkrun`** — the microVM tier. `KrunWorkerBackend` supervises the `leyline-krun-worker` binary; the worker runs the guest through `api::LinkedKrunApi`, libkrun linked from [`third_party/libkrun`](../../../third_party/README.md) (upstream v1.19.4 plus LLO's patches, ADR-0044). `PreparedVm::add_virtiofs_backend` attaches a virtio-fs share whose FUSE requests a `DynFileSystem` in the VMM process answers (re-exported as `api::DynFileSystem` and `api::virtio_fs`).
+
+## Features
+
+- **`vmm`** (default) — links libkrun and builds `leyline-krun-worker`. A crate that only supervises the worker turns default features off and does not compile libkrun (`leyline-cli-lib`, `leyline-cli`). Building it compiles libkrun's Linux guest init with `$CC_LINUX`, which the repository's `.cargo/config.toml` points at `tools/krun_init_cc.sh` (the host `cc` on Linux, `zig cc` elsewhere). A consumer outside this repository sets `CC_LINUX` itself or turns the feature off.
+- At run time the worker loads one library, libkrunfw (the guest kernel), at `krun_create_ctx`, after its sandbox is applied: grant it with `--runtime-file` and put its directory on the loader path.
 - **`confinement`** — ADR-0035's single-declaration manifest: one `cloister/confinement/v1` value from which the applied `nono::CapabilitySet`, the `confinementDigest`, and the digest a backend commits to are all projections, so they cannot drift relative to each other. (Before this existed, `build_process_capabilities` compiled a hardcoded policy with no relationship to the grant's named digest — PR #312 finding 2.)
 - **`service`** — `ExecutionService` / `ExecutionResolver`, the orchestration layer driving a request through authorization → backend selection → run.
 - **`transport`** — wire-facing types for the execution surface.
@@ -16,7 +22,7 @@ Capability-resolved execution lifecycle and isolation backends (`execution/v1`).
 
 - **`leyline-cli-lib`** — hosts the `llo_execution_*` daemon ops (`capabilities`, `provision`, `status`, `start`, `inspect`, `cancel`, `collect`, `cleanup`).
 - **`leyline-cli`**.
-- **cloister** (external, `rs/crates/host-runtime`) — depends on this crate directly via git-rev pin, gated behind its own `llo-execution` feature (`dep:leyline-runtime`), because `leyline-runtime` pulls in `nono` unconditionally as its enforcement mechanism.
+- **cloister** (external, `rs/crates/host-runtime`) — depends on this crate directly via git-rev pin, gated behind its own `llo-execution` feature (`dep:leyline-runtime`), because `leyline-runtime` pulls in `nono` unconditionally as its enforcement mechanism. With default features it also compiles the linked VMM; see `vmm` above.
 
 ## Correctness stance
 

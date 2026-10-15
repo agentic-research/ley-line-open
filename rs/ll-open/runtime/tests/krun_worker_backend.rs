@@ -51,13 +51,10 @@ fn backend_with_worker(
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -91,15 +88,12 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
     let cas = fixture.path().join("cas");
     fs::create_dir(&cas).expect("CAS");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root: cas,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -136,13 +130,10 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -203,13 +194,10 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -239,13 +227,10 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -284,13 +269,10 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -338,13 +320,10 @@ printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":fal
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -372,13 +351,10 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -408,13 +384,10 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let backend = Arc::new(KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root,
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -478,14 +451,11 @@ fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
         let ephemeral_root = fixture.path().join("runs");
         fs::create_dir(&cas_root).expect("CAS");
         fs::create_dir(&ephemeral_root).expect("ephemeral root");
-        let libkrun = fixture.path().join("libkrun.dylib");
-        fs::write(&libkrun, b"library").expect("library fixture");
 
         let backend = KrunWorkerBackend::new(KrunWorkerConfig {
             worker,
             cas_root,
             ephemeral_root,
-            libkrun,
             runtime_files: Vec::new(),
             devices: Vec::new(),
             ready_timeout: READY_TIMEOUT,
@@ -588,7 +558,7 @@ fn readiness_announcing_another_run_is_rejected() {
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
 
-/// `configured()` is a six-term `&&` chain, and until now nothing observed any
+/// `configured()` is a five-term `&&` chain, and until now nothing observed any
 /// individual term: every `&&` in it, plus the whole function's return, could
 /// be mutated without a test noticing. A backend that reports itself available
 /// while missing its worker binary or its CAS root fails at `start` instead of
@@ -598,7 +568,7 @@ fn readiness_announcing_another_run_is_rejected() {
 /// The native tier already pins this shape in
 /// `every_native_resource_is_required_independently`; this is its microVM
 /// counterpart. Each case removes exactly one resource and leaves the other
-/// five intact, which is what makes it a test of that term rather than of the
+/// four intact, which is what makes it a test of that term rather than of the
 /// conjunction.
 #[test]
 fn every_libkrun_resource_is_required_independently() {
@@ -607,14 +577,12 @@ fn every_libkrun_resource_is_required_independently() {
     let worker = fixture.path().join("worker");
     let cas_root = fixture.path().join("cas");
     let ephemeral_root = fixture.path().join("runs");
-    let libkrun = fixture.path().join("libkrun.dylib");
     let runtime_file = fixture.path().join("runtime");
     let device = fixture.path().join("device");
     fs::write(&worker, "#!/bin/sh\n").expect("worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("runs");
-    fs::write(&libkrun, b"library").expect("library");
     fs::write(&runtime_file, b"runtime").expect("runtime file");
     fs::write(&device, b"device").expect("device");
 
@@ -622,7 +590,6 @@ fn every_libkrun_resource_is_required_independently() {
         worker: worker.clone(),
         cas_root: cas_root.clone(),
         ephemeral_root: ephemeral_root.clone(),
-        libkrun: libkrun.clone(),
         runtime_files: vec![runtime_file.clone()],
         devices: vec![device.clone()],
         ready_timeout: READY_TIMEOUT,
@@ -650,11 +617,6 @@ fn every_libkrun_resource_is_required_independently() {
         ("ephemeral root", {
             let mut c = complete();
             c.ephemeral_root = missing.clone();
-            c
-        }),
-        ("libkrun library", {
-            let mut c = complete();
-            c.libkrun = missing.clone();
             c
         }),
         ("runtime file", {

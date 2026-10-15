@@ -6,7 +6,11 @@ version: '3'
 
 tasks:
   test:
-    desc: Run embedded execution runtime tests (fake-worker contracts; no host VM required)
+    desc: >-
+      Run embedded execution runtime tests (fake-worker contracts and the
+      linked libkrun without a hypervisor). Set LEYLINE_LIBKRUNFW_PATH to
+      libkrunfw to also boot real guests; LEYLINE_REQUIRE_HYPERVISOR makes
+      their absence fail instead of skip.
     dir: '{{.TASKFILE_DIR}}/../..'
     env:
       # Local developer toolchains commonly configure sccache globally. The

@@ -4,3 +4,11 @@
 # serializing Cargo compilation or changing the linker on other targets.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--threads=2"]
+
+# The vendored libkrun (rs/third_party/libkrun) compiles its guest init from C
+# for Linux on the target's architecture. tools/krun_init_cc.sh picks the
+# compiler per host; an explicit CC_LINUX in the environment wins (bead
+# ley-line-open-f1c46f). libkrun's build script splits this value on
+# whitespace, so the checkout path must not contain spaces.
+[env]
+CC_LINUX = { value = "tools/krun_init_cc.sh", relative = true }

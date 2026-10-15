@@ -38,7 +38,8 @@ full = ["lsp", "mount", "vec", "validate", "hdc", "text-search", "cdc"]
 
 [dependencies]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }
-leyline-runtime = { path = "../runtime" }
+# Supervises the krun worker; does not link the VMM (leyline-runtime/vmm).
+leyline-runtime = { path = "../runtime", default-features = false }
 clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 dirs = "6"

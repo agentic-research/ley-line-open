@@ -172,11 +172,10 @@ impl<S: Store> StoreShare<S> {
                 let opened = self.fs.opendir(inode)?;
                 Reply::Opened {
                     handle: 0,
-                    flags: if opened.keep_cache {
-                        FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE
-                    } else {
-                        FOPEN_CACHE_DIR
-                    },
+                    flags: fopen_bits(&[
+                        (true, FOPEN_CACHE_DIR),
+                        (opened.keep_cache, FOPEN_KEEP_CACHE),
+                    ]),
                 }
             }
             Request::Readdir { inode, offset } => Reply::Dir {

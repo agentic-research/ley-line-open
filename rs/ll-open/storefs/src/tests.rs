@@ -13,23 +13,23 @@ use tempfile::TempDir;
 use super::open_flags::{O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use super::*;
 
-const A: &str = "package a\n\nfunc A() int { return 1 }\n";
-const A_EDIT: &str = "package a\n\nfunc A() int { return 2 }\n";
-const A_OTHER: &str = "package a\n\nfunc A() int { return 3 }\n";
+pub(crate) const A: &str = "package a\n\nfunc A() int { return 1 }\n";
+pub(crate) const A_EDIT: &str = "package a\n\nfunc A() int { return 2 }\n";
+pub(crate) const A_OTHER: &str = "package a\n\nfunc A() int { return 3 }\n";
 const A_SHORT: &str = "package a\n";
 const A_TAILED: &str = "package a\n\nfunc A() int { return 1 }\n// tail\n";
-const A_BROKEN: &str = "package a\n\nfunc A( {\n";
-const B: &str = "package pkg\n\nfunc B() string { return \"b\" }\n";
+pub(crate) const A_BROKEN: &str = "package a\n\nfunc A( {\n";
+pub(crate) const B: &str = "package pkg\n\nfunc B() string { return \"b\" }\n";
 const C: &str = "package sub\n\nfunc C() {}\n";
 const D: &str = "package secret\n\nfunc D() {}\n";
 
 /// The timeout of a path no change was recorded for within [`WINDOW`].
-const TTL: Duration = Duration::from_secs(7);
+pub(crate) const TTL: Duration = Duration::from_secs(7);
 /// The timeout of a path changed within [`WINDOW`].
-const SHORT: Duration = Duration::from_millis(250);
+pub(crate) const SHORT: Duration = Duration::from_millis(250);
 const WINDOW: Duration = Duration::from_secs(30);
 
-fn freshness() -> Freshness {
+pub(crate) fn freshness() -> Freshness {
     Freshness {
         settled: TTL,
         changed: SHORT,
@@ -39,10 +39,10 @@ fn freshness() -> Freshness {
 
 /// A clock the test moves: no test sleeps.
 #[derive(Default)]
-struct TestClock(parking_lot::Mutex<Duration>);
+pub(crate) struct TestClock(parking_lot::Mutex<Duration>);
 
 impl TestClock {
-    fn advance(&self, by: Duration) {
+    pub(crate) fn advance(&self, by: Duration) {
         *self.0.lock() += by;
     }
 }
@@ -53,14 +53,14 @@ impl Clock for TestClock {
     }
 }
 
-struct Fixture {
-    _db_dir: TempDir,
-    src: TempDir,
-    fs: StoreFs<Arc<LiveDb>>,
-    clock: Arc<TestClock>,
+pub(crate) struct Fixture {
+    pub(crate) _db_dir: TempDir,
+    pub(crate) src: TempDir,
+    pub(crate) fs: StoreFs<Arc<LiveDb>>,
+    pub(crate) clock: Arc<TestClock>,
 }
 
-fn whole() -> Scope {
+pub(crate) fn whole() -> Scope {
     Scope {
         see: Grant::Whole,
         propose: Grant::Whole,
@@ -74,7 +74,7 @@ fn paths(list: &[&str]) -> Grant {
 /// A store cold-parsed from a source tree holding `a.go` (`a_text`),
 /// `pkg/b.go`, `pkg/sub/c.go` and `secret/d.go`; with `checkout`, the source
 /// tree is attached as the checkout accepted proposals are written into.
-fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
+pub(crate) fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
     let src = tempfile::tempdir().unwrap();
     for (rel, text) in [
         ("a.go", a_text),
@@ -109,13 +109,13 @@ fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
     }
 }
 
-fn fixture(scope: Scope) -> Fixture {
+pub(crate) fn fixture(scope: Scope) -> Fixture {
     fixture_with(scope, false, A)
 }
 
 /// What the daemon's `read_source` answers for `path`: the bytes of the
 /// blob `_source.content_hash` names, and that hash.
-fn read_source(f: &Fixture, path: &str) -> (Vec<u8>, Hash) {
+pub(crate) fn read_source(f: &Fixture, path: &str) -> (Vec<u8>, Hash) {
     f.fs.store()
         .with_read(|conn| {
             let (bytes, hash): (Vec<u8>, Vec<u8>) = conn.query_row(
@@ -130,7 +130,7 @@ fn read_source(f: &Fixture, path: &str) -> (Vec<u8>, Hash) {
 }
 
 /// Another writer (a socket `propose`, another agent) lands `text` at `path`.
-fn other_writer(f: &Fixture, path: &str, text: &str) {
+pub(crate) fn other_writer(f: &Fixture, path: &str, text: &str) {
     f.fs.store()
         .with_write(|conn| {
             source_write::propose(
@@ -176,7 +176,7 @@ fn passes(f: &Fixture) -> i64 {
         .unwrap()
 }
 
-fn on_disk(f: &Fixture, path: &str) -> Option<String> {
+pub(crate) fn on_disk(f: &Fixture, path: &str) -> Option<String> {
     std::fs::read_to_string(f.src.path().join(path)).ok()
 }
 
@@ -197,7 +197,7 @@ fn create_file(f: &Fixture, parent: u64, name: &str, text: &str) -> (u64, Result
 }
 
 /// The inode of `path`, found by LOOKUP from the root.
-fn ino(f: &Fixture, path: &str) -> u64 {
+pub(crate) fn ino(f: &Fixture, path: &str) -> u64 {
     path.split('/').fold(ROOT_INODE, |parent, name| {
         f.fs.lookup(parent, name.as_bytes()).unwrap().attr.inode
     })
@@ -357,6 +357,75 @@ fn an_accepted_flush_lands_in_the_store_and_advances_the_handles_base() {
 
     let reopened = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle;
     assert_eq!(read_all(&f, reopened), A_OTHER.as_bytes());
+}
+
+/// A store that counts [`Store::publish`] calls, and fails them when asked.
+struct Publishing {
+    inner: Arc<LiveDb>,
+    published: std::sync::atomic::AtomicUsize,
+    fail: bool,
+}
+
+impl Store for Publishing {
+    fn with_read<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.inner.with_read(f)
+    }
+
+    fn with_write<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.inner.with_write(f)
+    }
+
+    fn publish(&self) -> anyhow::Result<()> {
+        self.published
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            anyhow::bail!("the arena is full");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn each_landed_proposal_is_published_and_a_refused_one_is_not() {
+    for fail in [false, true] {
+        let f = fixture(whole());
+        let store = Arc::new(Publishing {
+            inner: Arc::clone(f.fs.store()),
+            published: Default::default(),
+            fail,
+        });
+        let fs = StoreFs::new(Arc::clone(&store), whole(), Options::default());
+        let a = fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.inode;
+        let published = || store.published.load(std::sync::atomic::Ordering::SeqCst);
+
+        let h = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
+        fs.write(h, 0, A_BROKEN.as_bytes()).unwrap();
+        assert_eq!(fs.flush(h), Err(Errno::EIO));
+        assert_eq!(published(), 0, "a refused proposal publishes nothing");
+
+        fs.setattr(
+            a,
+            Some(h),
+            SetAttr {
+                size: Some(0),
+                ..SetAttr::default()
+            },
+        )
+        .unwrap();
+        fs.write(h, 0, A_EDIT.as_bytes()).unwrap();
+        // A failed publish does not refuse what the store committed: the
+        // daemon reports it after the commit, and the next publish repairs it.
+        assert_eq!(fs.flush(h), Ok(()), "fail={fail}");
+        assert_eq!(published(), 1);
+        assert_eq!(read_source(&f, "a.go").0, A_EDIT.as_bytes());
+        assert_eq!(fs.flush(h), Ok(()));
+        assert_eq!(published(), 1, "nothing staged: no proposal, no publish");
+        fs.unlink(ROOT_INODE, b"a.go").unwrap();
+        assert_eq!(published(), 2, "a delete is a landed proposal");
+    }
+    // The default publishes nothing and succeeds.
+    let f = fixture(whole());
+    assert!(f.fs.store().publish().is_ok());
 }
 
 #[test]
@@ -1515,6 +1584,7 @@ fn a_read_only_open_keeps_the_guests_pages_only_while_the_blob_is_unchanged() {
     assert!(read_open(&f, a).keep_cache);
     assert!(!read_open(&f, ino(&f, "pkg/b.go")).keep_cache, "per file");
 
+    // Same size: the guest's cached size still describes the new blob.
     other_writer(&f, "a.go", A_OTHER);
     let after = read_open(&f, a);
     assert_eq!((after.keep_cache, after.direct_io), (false, false));
@@ -1540,6 +1610,64 @@ fn a_read_only_open_keeps_the_guests_pages_only_while_the_blob_is_unchanged() {
     let notes = ino(&f, "notes.txt");
     assert!(!read_open(&f, notes).keep_cache);
     assert!(!read_open(&f, notes).keep_cache);
+}
+
+/// The guest bounds a cached read by the size its cached attributes hold;
+/// an OPEN reply carries no attributes. A read-only open serving a blob of
+/// another size than the last attributes the guest was told is therefore
+/// direct I/O, so its reads reach the whole current blob. Found by the
+/// in-guest end-to-end test (bead `ley-line-open-f210c2`): after another
+/// writer grew a file, the guest's next open read back the new blob cut to
+/// the old size.
+#[test]
+fn an_open_serving_another_size_than_the_guest_was_told_is_direct_io() {
+    let f = fixture(whole());
+    let a = ino(&f, "a.go"); // LOOKUP: the guest is told A's size
+    other_writer(&f, "a.go", A_TAILED);
+    let grown = f.fs.open(a, O_RDONLY).unwrap();
+    assert_eq!((grown.keep_cache, grown.direct_io), (false, true));
+    assert_eq!(read_all(&f, grown.handle), A_TAILED.as_bytes());
+    f.fs.release(grown.handle);
+    // The open told the guest no size: the next one is direct I/O too.
+    assert!(read_open(&f, a).direct_io);
+
+    // A GETATTR tells it the new size; opens are cached again.
+    let (attr, _) = f.fs.getattr(a, None).unwrap();
+    assert_eq!(attr.size, A_TAILED.len() as u64);
+    assert!(!read_open(&f, a).direct_io);
+
+    // A LOOKUP, READDIRPLUS, or a SETATTR's reply tells it too.
+    other_writer(&f, "a.go", A_SHORT);
+    assert!(read_open(&f, a).direct_io);
+    f.fs.lookup(ROOT_INODE, b"a.go").unwrap();
+    assert!(!read_open(&f, a).direct_io);
+    other_writer(&f, "a.go", A);
+    assert!(read_open(&f, a).direct_io);
+    f.fs.readdirplus(ROOT_INODE, 0).unwrap();
+    assert!(!read_open(&f, a).direct_io);
+    other_writer(&f, "a.go", A_TAILED);
+    let w = f.fs.open(a, O_RDWR).unwrap();
+    f.fs.setattr(
+        a,
+        Some(w.handle),
+        SetAttr {
+            size: Some(A_SHORT.len() as u64),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    f.fs.release(w.handle);
+    assert!(
+        read_open(&f, a).direct_io,
+        "the SETATTR reply told the staged size, not the stored one"
+    );
+    f.fs.getattr(a, None).unwrap();
+    assert!(!read_open(&f, a).direct_io);
+
+    // A created file's entry tells its (empty) size.
+    let (entry, h) = f.fs.create(ROOT_INODE, b"n.go", O_RDWR).unwrap();
+    f.fs.release(h);
+    assert!(!read_open(&f, entry.attr.inode).direct_io);
 }
 
 #[test]

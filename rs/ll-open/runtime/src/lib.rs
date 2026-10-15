@@ -23,6 +23,6 @@ pub use error::{ErrorCode, ExecutionError};
 pub use model::{
     BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, CeilingMechanism, DigestRef,
     EnforcedCeilings, ExecutionRequest, ReceiptContext, ResourceLimits, RunEventRecord,
-    RunInspection, RunReceiptData, RunRecord, RunState,
+    RunInspection, RunReceiptData, RunRecord, RunState, WorkspaceGrant, WorkspaceOperation,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

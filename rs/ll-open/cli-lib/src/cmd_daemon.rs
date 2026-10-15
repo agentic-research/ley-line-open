@@ -199,6 +199,24 @@ pub async fn run_execution_daemon_with_options(
     .await
 }
 
+/// [`run_execution_daemon_with_options`], publishing the daemon's context to
+/// `context` once it exists: the embedder's workspace-share provider serves
+/// a run's `/work` from that context's store, on the socket's one writer
+/// (ADR-0044 V5).
+pub async fn run_execution_daemon_with_context(
+    config: DaemonConfig,
+    handler: Arc<dyn ExecutionHandler>,
+    options: DaemonOptions,
+    context: crate::daemon::ContextSlot,
+) -> Result<()> {
+    run_daemon_with_options(
+        config,
+        Arc::new(ExecutionDaemonExt::new(handler).with_context_slot(context)),
+        execution_daemon_options(options),
+    )
+    .await
+}
+
 /// The execution surface always publishes under its own discovery name,
 /// whatever the caller passed. Sharing `default.sock` with the substrate
 /// daemon means whichever starts second silently steals the other's clients:
@@ -563,6 +581,9 @@ pub async fn run_daemon_with_options(
         text_search,
         sheaf,
     });
+    // Before the socket: whatever the extension serves from the context
+    // shares the socket's one writer from the first request on.
+    ext.on_context(&ctx);
 
     // Spawn the embed-queue drainer: query ops promote node_ids; this loop
     // drains them in priority order and refreshes the sidecar VectorIndex.
@@ -3057,6 +3078,55 @@ mod tests {
         context_over(ctrl_path, ext, source, writer)
     }
 
+    /// An execution handler with nothing behind it.
+    struct NoExecution;
+
+    impl crate::daemon::execution::ExecutionHandler for NoExecution {
+        fn capabilities(&self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn provision(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn start(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn status(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn inspect(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn collect(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cleanup(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cancel(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// A run's workspace share is served from the daemon's own context: the
+    /// execution extension hands the context it is given to the slot its
+    /// embedder holds, once.
+    #[tokio::test]
+    async fn the_execution_extension_publishes_the_daemon_context_to_its_slot() {
+        let dir = TempDir::new().unwrap();
+        let slot = crate::daemon::ContextSlot::default();
+        let ext = crate::daemon::ExecutionDaemonExt::new(Arc::new(NoExecution))
+            .with_context_slot(Arc::clone(&slot));
+        let ctx = test_ctx(&dir.path().join("slot.ctrl"), Arc::new(NoExt), dir.path());
+        assert!(slot.get().is_none());
+        ext.on_context(&ctx);
+        assert!(Arc::ptr_eq(slot.get().expect("published"), &ctx));
+
+        // Without a slot the hook does nothing (and the trait default too).
+        crate::daemon::ExecutionDaemonExt::new(Arc::new(NoExecution)).on_context(&ctx);
+        NoExt.on_context(&ctx);
+    }
+
     /// A daemon context over `writer`, the live db's writer connection at
     /// `live_db_path_for(ctrl_path)`, whose checkout is `source`.
     fn context_over(
@@ -3606,7 +3676,7 @@ mod tests {
 
         let error = run_execution_daemon_with_options(
             rejected_execution_config(&tmp.path().join("execution-options.arena")),
-            handler,
+            Arc::clone(&handler),
             DaemonOptions {
                 cdc: Some(crate::CdcTarget::Nodes),
                 ..DaemonOptions::default()
@@ -3614,6 +3684,16 @@ mod tests {
         )
         .await
         .expect_err("execution daemon options entry point must preserve admission");
+        assert!(format!("{error:#}").contains("--mcp-allow-public"));
+
+        let error = run_execution_daemon_with_context(
+            rejected_execution_config(&tmp.path().join("execution-context.arena")),
+            handler,
+            DaemonOptions::default(),
+            crate::daemon::ContextSlot::default(),
+        )
+        .await
+        .expect_err("execution daemon context entry point must preserve admission");
         assert!(format!("{error:#}").contains("--mcp-allow-public"));
     }
 

@@ -201,6 +201,7 @@ fn request(replay_key: &str) -> ExecutionRequest {
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
         confinement_manifest: None,
+        workspaces: Vec::new(),
         limits: ResourceLimits {
             vcpus: 2,
             memory_mib: 2048,

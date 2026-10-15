@@ -40,9 +40,22 @@ full = ["lsp", "mount", "vec", "validate", "hdc", "text-search", "cdc"]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }
 # Supervises the krun worker; does not link the VMM (leyline-runtime/vmm).
 leyline-runtime = { path = "../runtime", default-features = false }
+# Serves a microVM run's granted workspace from the daemon's store
+# (ADR-0044 V5): DaemonShares and the StoreShare adapter.
+leyline-storefs = { path = "../storefs" }
 clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 dirs = "6"
 env_logger = "0.11"
 libc = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# tests/agent_in_guest.rs: builds the execution/v1 RunSpec and RunGrant a
+# caller sends, and the guest rootfs manifest.
+blake3 = { workspace = true }
+capnp = { workspace = true }
+capnp-json = { workspace = true }
+leyline-public-schema = { path = "../../ll-core/public-schema" }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

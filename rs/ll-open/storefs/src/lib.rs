@@ -55,6 +55,15 @@ use leyline_core::Hash;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 
+pub mod daemon;
+pub mod share;
+pub use daemon::{DaemonShares, scope_for};
+pub use share::StoreShare;
+
+#[cfg(test)]
+mod daemon_tests;
+#[cfg(test)]
+mod share_tests;
 #[cfg(test)]
 mod tests;
 
@@ -224,6 +233,14 @@ pub struct OpenedDir {
 pub trait Store: Send + Sync {
     fn with_read<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T>;
     fn with_write<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T>;
+
+    /// Publish the store after a proposal landed, as the daemon's
+    /// `propose` op does after its commit: out-of-process readers see the
+    /// change. A failure does not undo the proposal; the next publish
+    /// serializes the whole store. The default publishes nothing.
+    fn publish(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// The daemon's living database: its reader pool and its single writer.
@@ -248,6 +265,10 @@ impl<S: Store> Store for Arc<S> {
 
     fn with_write<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
         S::with_write(self, f)
+    }
+
+    fn publish(&self) -> anyhow::Result<()> {
+        S::publish(self)
     }
 }
 
@@ -384,6 +405,10 @@ struct Served {
     pages: HashMap<u64, Hash>,
     /// Per directory inode, the listing the previous OPENDIR served.
     listings: HashMap<u64, BTreeMap<String, Kind>>,
+    /// Per file inode, the size the last reply carrying its attributes
+    /// (LOOKUP, GETATTR, SETATTR, READDIRPLUS, CREATE) told the guest: what
+    /// the guest bounds a cached read by.
+    told: HashMap<u64, u64>,
 }
 
 impl Served {
@@ -455,7 +480,9 @@ impl<S: Store> StoreFs<S> {
     /// LOOKUP: the entry `name` names in the directory `parent`.
     pub fn lookup(&self, parent: u64, name: &[u8]) -> Result<Entry, Errno> {
         let path = self.child(parent, name)?;
-        self.entry(&path)
+        let entry = self.entry(&path)?;
+        self.tell(&entry.attr);
+        Ok(entry)
     }
 
     /// GETATTR. With a handle, the size is the bytes that handle serves.
@@ -465,7 +492,15 @@ impl<S: Store> StoreFs<S> {
         if let Some(open) = handle.and_then(|h| self.handle(h).ok()) {
             attr.size = open.lock().bytes.len() as u64;
         }
+        self.tell(&attr);
         Ok((attr, self.timeout(&path)))
+    }
+
+    /// Record the size a reply tells the guest a file has.
+    fn tell(&self, attr: &Attr) {
+        if attr.kind == Kind::File {
+            self.served.lock().told.insert(attr.inode, attr.size);
+        }
     }
 
     /// The negative-entry timeout for a LOOKUP of `name` in `parent` that
@@ -499,6 +534,7 @@ impl<S: Store> StoreFs<S> {
                 },
             };
             let attr = self.attr_of(&path, kind, size);
+            self.tell(&attr);
             let entry = DirEntry {
                 inode: attr.inode,
                 offset: i as u64 + 1,
@@ -561,15 +597,20 @@ impl<S: Store> StoreFs<S> {
         if truncate {
             bytes.clear();
         }
-        let keep_cache = {
+        let (keep_cache, stale_size) = {
             let mut served = self.served.lock();
-            match &base {
+            let keep_cache = match &base {
                 Base::Blob(blob) if !writable => served.pages.insert(inode, *blob) == Some(*blob),
                 _ => {
                     served.pages.remove(&inode);
                     false
                 }
-            }
+            };
+            let told = served.told.get(&inode).copied();
+            (
+                keep_cache,
+                told.is_some_and(|size| size != bytes.len() as u64),
+            )
         };
         let handle = self.new_handle(Handle {
             path,
@@ -578,10 +619,13 @@ impl<S: Store> StoreFs<S> {
             dirty: truncate,
             writable,
         });
+        // The guest bounds a cached read by the size it was last told; the
+        // OPEN reply carries none. Serving another size, reads bypass the
+        // cache so they reach the whole blob.
         Ok(Opened {
             handle,
             keep_cache,
-            direct_io: writable,
+            direct_io: writable || stale_size,
         })
     }
 
@@ -701,7 +745,9 @@ impl<S: Store> StoreFs<S> {
             dirty: true,
             writable: flags & open_flags::O_ACCMODE != open_flags::O_RDONLY,
         });
-        Ok((self.entry(&path)?, handle))
+        let entry = self.entry(&path)?;
+        self.tell(&entry.attr);
+        Ok((entry, handle))
     }
 
     /// MKDIR: a directory for this session, visible until RMDIR; nothing is
@@ -963,6 +1009,9 @@ impl<S: Store> StoreFs<S> {
             })?;
         if let Some(problem) = &accepted.post_commit_error {
             log::warn!("proposal to '{named}' landed; after it: {problem}");
+        }
+        if let Err(e) = self.store.publish() {
+            log::warn!("proposal to '{named}' landed; publishing it failed: {e:#}");
         }
         let now = self.clock.now();
         let mut served = self.served.lock();

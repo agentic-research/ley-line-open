@@ -74,11 +74,62 @@ fn main() {
 }
 "#;
 
+/// Set in the child when the guest init, not the guest, mounts the share:
+/// the VMM lists it in `KRUN_VIRTIOFS_MOUNTS` (LLO libkrun patch 0005) and
+/// makes it the working directory.
+const INIT_MOUNTS: &str = "LEYLINE_TEST_VIRTIOFS_INIT_MOUNTS";
+
+/// A guest that mounts nothing: it reads `hello.txt` from its working
+/// directory, which must be the share init mounted, and must not see the
+/// mount list in its environment.
+const GUEST_MOUNTED_BY_INIT: &str = r#"
+fn main() {
+    let cwd = std::env::current_dir().unwrap();
+    println!("guest cwd: {}", cwd.display());
+    if std::env::var_os("KRUN_VIRTIOFS_MOUNTS").is_some() {
+        println!("guest saw KRUN_VIRTIOFS_MOUNTS");
+        std::process::exit(4);
+    }
+    let read = match std::fs::read_to_string("hello.txt") {
+        Ok(read) => read,
+        Err(error) => {
+            println!("guest read failed: {error}");
+            std::process::exit(3);
+        }
+    };
+    println!("guest read: {}", read.trim_end());
+    let expected = format!("{}\n", std::env::var("EXPECT").unwrap());
+    std::process::exit(if read == expected && cwd.as_os_str() == "/llo" { 0 } else { 1 });
+}
+"#;
+
 #[test]
 fn a_guest_reads_a_file_the_linked_vmm_serves_from_memory() {
     if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
         enter_guest(PathBuf::from(rootfs));
     }
+    boot(
+        "a_guest_reads_a_file_the_linked_vmm_serves_from_memory",
+        GUEST,
+        false,
+    );
+}
+
+#[test]
+fn the_guest_init_mounts_the_share_the_vmm_lists_before_the_workload_runs() {
+    if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
+        enter_guest(PathBuf::from(rootfs));
+    }
+    boot(
+        "the_guest_init_mounts_the_share_the_vmm_lists_before_the_workload_runs",
+        GUEST_MOUNTED_BY_INIT,
+        true,
+    );
+}
+
+/// Boot `guest` through the entitled re-exec of test `name` and check what
+/// it printed.
+fn boot(name: &str, guest: &str, init_mounts: bool) {
     let _serial = common::serial();
     let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
         return;
@@ -87,9 +138,11 @@ fn a_guest_reads_a_file_the_linked_vmm_serves_from_memory() {
 
     let rootfs = fixture.path().join("rootfs");
     fs::create_dir_all(rootfs.join("bin")).expect("rootfs bin");
-    fs::create_dir(rootfs.join("llo")).expect("mount point");
+    if !init_mounts {
+        fs::create_dir(rootfs.join("llo")).expect("mount point");
+    }
     let source = fixture.path().join("guest.rs");
-    fs::write(&source, GUEST).expect("guest source");
+    fs::write(&source, guest).expect("guest source");
     let guest = rootfs.join("bin/guest");
     hypervisor::compile_guest(&source, &guest);
     fs::set_permissions(&guest, fs::Permissions::from_mode(0o755)).expect("guest mode");
@@ -106,13 +159,12 @@ fn a_guest_reads_a_file_the_linked_vmm_serves_from_memory() {
             .as_nanos()
     );
     let (library_var, library_dir) = hypervisor::library_path_env(&libkrunfw);
-    let mut child = Command::new(&vmm)
-        .args([
-            "a_guest_reads_a_file_the_linked_vmm_serves_from_memory",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+    let mut command = Command::new(&vmm);
+    if init_mounts {
+        command.env(INIT_MOUNTS, "1");
+    }
+    let mut child = command
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env(VMM_CHILD, &rootfs)
         .env(TOKEN, &token)
         .env(library_var, library_dir)
@@ -153,6 +205,11 @@ fn a_guest_reads_a_file_the_linked_vmm_serves_from_memory() {
 /// status.
 fn enter_guest(rootfs: PathBuf) -> ! {
     let token = std::env::var(TOKEN).expect("token from the parent");
+    let init_mounts = std::env::var_os(INIT_MOUNTS).is_some();
+    let mut environment = vec![c(&format!("EXPECT={token}"))];
+    if init_mounts {
+        environment.push(c("KRUN_VIRTIOFS_MOUNTS=llo:/llo"));
+    }
     let config = KrunConfig {
         run_id: "virtiofs-backend".into(),
         rootfs: ResolvedRootfs {
@@ -164,8 +221,8 @@ fn enter_guest(rootfs: PathBuf) -> ! {
         },
         executable: c("/bin/guest"),
         arguments: vec![c("guest")],
-        environment: vec![c(&format!("EXPECT={token}"))],
-        workdir: c("/"),
+        environment,
+        workdir: c(if init_mounts { "/llo" } else { "/" }),
         vcpus: 1,
         ram_mib: 256,
         wall_time_ms: 30_000,

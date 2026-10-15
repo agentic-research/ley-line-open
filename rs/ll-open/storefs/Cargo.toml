@@ -13,8 +13,14 @@ publish = false
 # here. The dependency points down: cli-lib never depends on this crate, and
 # neither may leyline-runtime (cli-lib depends on it), so the libkrun adapter
 # is built by whoever links both — see README.md.
-leyline-cli-lib = { path = "../cli-lib" }
+# Default features off: the CLI that links this crate picks cli-lib's
+# features; nothing here needs lsp, hdc or cdc.
+leyline-cli-lib = { path = "../cli-lib", default-features = false }
 leyline-core = { path = "../../ll-core/core" }
+# The share wire (`backends::libkrun::share`): the request and reply types the
+# adapter answers, and the workspace-share seam the libkrun backend calls.
+# Without `vmm`: the daemon serves shares; it never links the VMM.
+leyline-runtime = { path = "../runtime", default-features = false }
 anyhow = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
@@ -22,3 +28,5 @@ rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A daemon context's event router spawns its dispatch loop on a runtime.
+tokio = { workspace = true, features = ["rt", "macros"] }

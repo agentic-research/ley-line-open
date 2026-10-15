@@ -5,8 +5,12 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
-use leyline_runtime::backends::libkrun::worker::{WorkerEvent, WorkerOptions};
-use leyline_runtime::{DigestRef, ErrorCode, ExecutionRequest, ResourceLimits};
+use leyline_runtime::backends::libkrun::worker::{
+    WORKSPACE_SHARE_FD_ARG, WorkerEvent, WorkerOptions,
+};
+use leyline_runtime::{
+    DigestRef, ErrorCode, ExecutionRequest, ResourceLimits, WorkspaceGrant, WorkspaceOperation,
+};
 use tempfile::TempDir;
 
 mod common;
@@ -38,6 +42,7 @@ fn request_fixture(cas: &TempDir) -> ExecutionRequest {
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
         confinement_manifest: None,
+        workspaces: Vec::new(),
         limits: ResourceLimits {
             vcpus: 1,
             memory_mib: 512,
@@ -109,6 +114,118 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
             .expect("immutable executable"),
         b"probe-v1"
     );
+}
+
+fn base_options() -> Vec<OsString> {
+    ["--cas-root", "/cas", "--run-root", "/run-root"]
+        .map(OsString::from)
+        .to_vec()
+}
+
+#[test]
+fn worker_options_name_the_inherited_workspace_share() {
+    let _serial = common::serial();
+    let options = WorkerOptions::parse(base_options()).expect("no share");
+    assert_eq!(options.workspace_share_fd, None);
+
+    let mut arguments = base_options();
+    arguments.extend([WORKSPACE_SHARE_FD_ARG, "7"].map(OsString::from));
+    let options = WorkerOptions::parse(arguments.clone()).expect("a share");
+    assert_eq!(options.workspace_share_fd, Some(7));
+
+    arguments.extend([WORKSPACE_SHARE_FD_ARG, "8"].map(OsString::from));
+    let error = WorkerOptions::parse(arguments).expect_err("one share");
+    assert!(error.detail.contains(WORKSPACE_SHARE_FD_ARG), "{error:?}");
+
+    for bad in ["seven", "-1", ""] {
+        let mut arguments = base_options();
+        arguments.extend([WORKSPACE_SHARE_FD_ARG, bad].map(OsString::from));
+        let error = WorkerOptions::parse(arguments).expect_err("not a descriptor");
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("descriptor"), "{bad}: {error:?}");
+    }
+}
+
+/// Runs the worker binary on `request` with `extra` arguments and answers
+/// its structured failure.
+fn worker_failure(request: &ExecutionRequest, extra: &[&str]) -> leyline_runtime::ExecutionError {
+    let run_root = TempDir::new().expect("run root");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"))
+        .args(["--cas-root", "/nonexistent-cas", "--run-root"])
+        .arg(run_root.path())
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first-party worker");
+    serde_json::to_writer(child.stdin.as_mut().expect("worker stdin"), request)
+        .expect("write worker request");
+    child.stdin.take().expect("close worker stdin").flush().ok();
+    let output = child.wait_with_output().expect("worker output");
+    assert!(!output.status.success());
+    let event: WorkerEvent = serde_json::from_slice(&output.stderr).expect("structured error");
+    let WorkerEvent::Failed { error } = event else {
+        panic!("expected failed worker event, got {event:?}");
+    };
+    error
+}
+
+fn grant(name: &str) -> WorkspaceGrant {
+    WorkspaceGrant {
+        name: name.into(),
+        graph_root: format!("blake3-256:{}", "e".repeat(64)),
+        expected_generation: 0,
+        operations: vec![WorkspaceOperation::Read],
+    }
+}
+
+/// The share a worker is handed must be the one its run is granted, and a
+/// socket: each mismatch is refused before the rootfs is touched (the CAS
+/// root here does not exist, so any later failure would name it instead).
+#[test]
+fn a_worker_refuses_a_share_that_does_not_match_its_grant() {
+    let _serial = common::serial();
+    let cas = TempDir::new().expect("CAS");
+    let plain = request_fixture(&cas);
+    let granted = ExecutionRequest {
+        workspaces: vec![grant("repo")],
+        ..plain.clone()
+    };
+
+    let error = worker_failure(&granted, &[]);
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(error.detail.contains("\"repo\""), "{error:?}");
+
+    let error = worker_failure(&plain, &[WORKSPACE_SHARE_FD_ARG, "0"]);
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(error.detail.contains("no workspace"), "{error:?}");
+
+    // Descriptor 0 is the worker's stdin, a pipe.
+    let error = worker_failure(&granted, &[WORKSPACE_SHARE_FD_ARG, "0"]);
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(error.detail.contains("not a socket"), "{error:?}");
+
+    let error = worker_failure(&granted, &[WORKSPACE_SHARE_FD_ARG, "917"]);
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(error.detail.contains("917"), "{error:?}");
+
+    let two = ExecutionRequest {
+        workspaces: vec![grant("repo"), grant("docs")],
+        ..plain.clone()
+    };
+    let error = worker_failure(&two, &[WORKSPACE_SHARE_FD_ARG, "0"]);
+    assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+
+    // The guest init's mount list is the worker's to set: a workload's
+    // environment may not name it.
+    let mut reserved = plain;
+    reserved
+        .public_environment
+        .insert("KRUN_VIRTIOFS_MOUNTS".into(), "llo:/".into());
+    let error = worker_failure(&reserved, &[]);
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(error.detail.contains("KRUN_VIRTIOFS_MOUNTS"), "{error:?}");
 }
 
 #[test]

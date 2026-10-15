@@ -14,7 +14,7 @@ use leyline_core::ContentAddressed;
 use leyline_envelope::{Envelope, VerifyingKey};
 use leyline_public_schema::execution_capnp;
 
-use crate::{BackendClass, ExecutionError};
+use crate::{BackendClass, ExecutionError, WorkspaceGrant, WorkspaceOperation};
 
 pub const EXECUTION_SCHEMA_VERSION: &str = "cloister/execution/v1";
 pub const EXECUTION_CAPABILITY: &str = "urn:signet:cap:execute:run";
@@ -380,6 +380,9 @@ pub struct AuthorizedExecution {
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
     pub intent: SchemaIntent,
+    /// The grant's `workspaces`, each with exactly the operations it
+    /// permits. Validated to resolve exactly `intent.workspace_inputs`.
+    pub workspaces: Vec<WorkspaceGrant>,
 }
 
 /// Owned, policy-free intent extracted from the generated `RunSpec` reader.
@@ -556,7 +559,7 @@ pub fn authorize_with_verifier(
         ));
     }
     validate_limits(spec.get_requested_limits(), grant.get_limits())?;
-    validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
+    let workspaces = validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
     let intent = read_intent(&spec)?;
 
     let mut has_execution_capability = false;
@@ -616,6 +619,7 @@ pub fn authorize_with_verifier(
         backend,
         allowed_egress,
         intent,
+        workspaces,
     })
 }
 
@@ -975,7 +979,7 @@ fn validate_workspaces(
     resolved: capnp::Result<
         capnp::struct_list::Reader<'_, execution_capnp::workspace_grant::Owned>,
     >,
-) -> Result<(), ExecutionError> {
+) -> Result<Vec<WorkspaceGrant>, ExecutionError> {
     let requested = requested
         .map_err(|error| ExecutionError::invalid(format!("invalid workspaceInputs: {error}")))?;
     let resolved = resolved
@@ -989,7 +993,7 @@ fn validate_workspaces(
             ))
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
-    let resolved = resolved
+    let grants = resolved
         .iter()
         .map(|workspace| {
             let name = text(workspace.get_name(), "grant workspace name")?;
@@ -1002,9 +1006,26 @@ fn validate_workspaces(
                     "grant workspace {name} has no authorized operations"
                 )));
             }
-            Ok((name, graph_root))
+            let operations = operations
+                .iter()
+                .map(|operation| {
+                    operation.map(workspace_operation).map_err(|error| {
+                        ExecutionError::invalid(format!("invalid operation for {name}: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            Ok(WorkspaceGrant {
+                name,
+                graph_root,
+                expected_generation: workspace.get_expected_generation(),
+                operations,
+            })
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
+    let resolved: Vec<(String, String)> = grants
+        .iter()
+        .map(|grant| (grant.name.clone(), grant.graph_root.clone()))
+        .collect();
 
     // A grant must resolve exactly the requested workspace set.  A strict
     // equality check prevents an omitted workspace from silently becoming an
@@ -1023,5 +1044,15 @@ fn validate_workspaces(
             "grant workspaces must exactly match RunSpec.workspaceInputs",
         ));
     }
-    Ok(())
+    Ok(grants)
+}
+
+fn workspace_operation(operation: execution_capnp::WorkspaceOperation) -> WorkspaceOperation {
+    match operation {
+        execution_capnp::WorkspaceOperation::Read => WorkspaceOperation::Read,
+        execution_capnp::WorkspaceOperation::List => WorkspaceOperation::List,
+        execution_capnp::WorkspaceOperation::Query => WorkspaceOperation::Query,
+        execution_capnp::WorkspaceOperation::Mutate => WorkspaceOperation::Mutate,
+        execution_capnp::WorkspaceOperation::Commit => WorkspaceOperation::Commit,
+    }
 }

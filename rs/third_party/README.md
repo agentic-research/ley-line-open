@@ -61,6 +61,12 @@ Prepared as an upstream pull request; not yet submitted. Each is one
    it a backend answered `ENOSYS` and the guest sent one LOOKUP per name.
    Measured in `docs/benchmarks/2026-10-15-vf3-virtiofs.md` (bead
    `ley-line-open-789e0f`).
+5. `0005` — **init: mount the virtio-fs devices `KRUN_VIRTIOFS_MOUNTS`
+   lists.** The guest init mounts each `tag:/directory` pair the VMM lists
+   before the workload runs, and refuses to start the workload when one does
+   not mount. The libkrun worker lists a run's workspace share (`work:/work`,
+   bead `ley-line-open-f210c2`), so an unmodified workload starts in its
+   working tree without calling `mount(2)`.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

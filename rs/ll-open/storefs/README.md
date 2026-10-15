@@ -7,8 +7,10 @@ deletes and renames as ADR-0042 proposals (bead `ley-line-open-47fb03`,
 ADR-0042 P1a). Every answer is data or a **Linux** errno: the guest is Linux
 whatever the host is (macOS `ESTALE` is 70; the guest needs 116).
 
-This crate holds no libkrun code. Phase C adapts `StoreFs` onto the patched
-libkrun's `DynFileSystem` trait; see "Adapter" below.
+This crate holds no libkrun code. `StoreShare` answers a guest's virtio-fs
+requests from `StoreFs`, and `DaemonShares` serves an execution/v1 run's
+granted workspace from the daemon's own store (ADR-0044 phase C, bead
+`ley-line-open-f210c2`); see "Adapter" below.
 
 ## Contract
 
@@ -86,11 +88,15 @@ may only see `0444`; a directory the scope may propose a path under is
 ### Store and concurrency
 
 `Store` is the daemon's connection discipline: `with_read` on a reader pool,
-`with_write` on its one writer. It is implemented for `LiveDb` (the daemon's
-living database) and `Arc<S>`. Any number of handles stage concurrently; each
-proposal holds the writer for the propose and the checkout reconcile, as the
-daemon's `propose` op does. Of two handles that read the same blob, the first
-to flush lands and the second is `ESTALE`.
+`with_write` on its one writer, and `publish` after a proposal landed. It is
+implemented for `LiveDb` (the daemon's living database; `publish` does
+nothing), `DaemonContext` (a running daemon; `publish` snapshots the living
+database into its arena, as the `propose` op does after its commit) and
+`Arc<S>`. Any number of handles stage concurrently; each proposal holds the
+writer for the propose and the checkout reconcile, as the daemon's `propose`
+op does, then publishes; a failed publish is logged and does not refuse the
+committed proposal. Of two handles that read the same blob, the first to
+flush lands and the second is `ESTALE`.
 
 Reads resolve `_source.content_hash` to `source_blobs`: the one checkout
 ADR-0043 names today. Inode numbers are stable per path for the life of a
@@ -115,7 +121,13 @@ caches what it can prove unchanged and keeps the rest short:
   this open and reads the current blob. A write open (and CREATE) is
   `direct_io`, never `keep_cache`, so every WRITE reaches the base check.
   A file only the session holds never sets `keep_cache`. OPENDIR applies
-  the same rule to a directory's names and kinds.
+  the same rule to a directory's names and kinds. An OPEN reply carries no
+  attributes, and the guest bounds a cached read by the size its cached
+  attributes hold: a read-only open serving a blob of another size than
+  the last LOOKUP, GETATTR, SETATTR, READDIRPLUS or CREATE reply told the
+  guest for the inode is `direct_io`, so its reads reach the whole blob
+  (bead `ley-line-open-f210c2`: without it the guest read a grown file cut
+  to its old size).
 - **Adaptive timeouts.** `Options::freshness` is `Freshness { settled,
   changed, window }`, default 60 s, 1 s, 60 s. A path is *recently changed*
   at time `now` when `StoreFs` recorded a change to it at `t0` with
@@ -152,15 +164,41 @@ caches what it can prove unchanged and keeps the rest short:
 - Files the store holds no blob for (`_source.content_hash` NULL) do not
   exist for the guest.
 - DAX (ADR-0044 V3): the core serves reads per request.
-- Publication: an accepted proposal is committed to the living database and
-  visible to its readers at once; snapshotting it to the arena stays with
-  the caller, as for `source_write`.
+- Publication beyond `Store::publish`: an accepted proposal is committed to
+  the living database and visible to its readers at once, and the store's
+  `publish` runs after it (a `DaemonContext` snapshots to its arena; a bare
+  `LiveDb` publishes nothing).
 - A directory's LOOKUP or GETATTR scans `_source` for a visible file under
   it.
 
 ## Adapter (phase C)
 
-The adapter implements libkrun's `DynFileSystem` over `StoreFs`:
+The VMM runs in the `leyline-krun-worker` process; the store lives in the
+daemon. The adapter therefore has two halves joined by the share wire
+(`leyline_runtime::backends::libkrun::share`: one FUSE request and reply per
+frame, JSON header, READ and WRITE bytes as raw payload, on a socket pair the
+daemon's libkrun backend hands the worker):
+
+- `StoreShare` (this crate) answers each `Request` from `StoreFs` and makes
+  every FUSE-level decision below. Its replies are in FUSE's vocabulary:
+  inode numbers, `st_mode` bits, Linux errno values, `FOPEN_*` and
+  `FUSE_*` bits, `DT_*` types, timeouts.
+- `ShareFs` (`leyline-runtime`, `vmm` feature) is libkrun's `DynFileSystem`
+  over any `FsService`: it transcribes each reply into libkrun's types and
+  decides nothing. `ShareFs<StoreShare<S>>` is `DynFileSystem` over
+  `StoreFs` in one process; the worker uses `ShareFs<RemoteFs>`.
+
+`DaemonShares` is the daemon's `WorkspaceShares`: for a run granted a
+workspace it opens a `StoreShare` over a `StoreFs` on the daemon's own
+`DaemonContext` (so the share and the socket propose on one writer, and a
+landed share proposal reaches the checkout and the arena as a socket
+proposal does), when the store's `treeRoot` (ADR-0040 D1) is the grant's
+`graphRoot`, scoped by `scope_for(operations)`: `read`/`list` see the whole
+tree, `mutate`/`commit` propose anywhere in it, `query` neither.
+`expectedGeneration` is carried and not consulted: the `graphRoot` check
+pins the tree.
+
+The mapping:
 
 - `Errno(n)` → `io::Error::from_raw_os_error(n)`, untranslated (the values
   are already Linux).
@@ -195,12 +233,13 @@ The adapter implements libkrun's `DynFileSystem` over `StoreFs`:
   flag but `RENAME_NOREPLACE` is `EINVAL`).
 - READDIR: `DirEntry { ino, offset, type_: DT_REG (8) / DT_DIR (4), name }`
   into `add_entry` until it returns 0.
-- FORGET, RELEASEDIR, ACCESS, STATFS stay adapter-local. `dax_host_addr`
-  stays `ENOSYS`.
+- FORGET, RELEASEDIR, ACCESS, STATFS stay local to `ShareFs`.
+  `dax_host_addr` stays `ENOSYS`.
+- A reply of the wrong kind for its request, and an unreachable daemon, are
+  `EIO`; a broken share socket stays broken (every later request is `EIO`).
 
 Dependency direction: this crate depends on `leyline-cli-lib`, which
-depends on `leyline-runtime`. The runtime therefore cannot depend on this
-crate; its libkrun backend takes an `Arc<dyn DynFileSystem>` from its caller,
-and the adapter lives here (behind a feature) or in a crate above both. The
-daemon wiring implements `Store` for `DaemonContext` (delegating to
-`with_read`/`with_write`) and builds `Scope` from the run's `WorkspaceGrant`.
+depends on `leyline-runtime` without `vmm`. The wire and `ShareFs` live in
+the runtime; this crate implements the wire's `FsService` and
+`WorkspaceShares`; `leyline-cli` wires `DaemonShares` into the libkrun
+backend (`leyline execution-daemon --backend micro-vm --source <dir>`).

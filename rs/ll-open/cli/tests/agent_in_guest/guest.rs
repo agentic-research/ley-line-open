@@ -1,0 +1,320 @@
+// The agent in the guest (ADR-0044 phase C, bead ley-line-open-f210c2).
+//
+// Runs as the workload of an execution/v1 run, in /work: the store-backed
+// virtio-fs share the guest init mounted. It uses file syscalls and two
+// ordinary tools (git, rg), nothing LLO-specific. It talks to the host
+// test only through files in the store: it writes `sync/guest.md` (each
+// write a proposal the host reads over the socket) and waits on
+// `sync/host.md` (each open reads the current blob).
+//
+// Each scenario's outcome is a line `PASS (x) ...` or `FAIL (x) ...` naming
+// the syscall and its errno; the lines are written to `report.md` at the
+// end. `mod seed` is prepended by the host.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::IntoRawFd;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+extern "C" {
+    fn close(fd: i32) -> i32;
+}
+
+const ESTALE: i32 = 116;
+const EIO: i32 = 5;
+
+#[derive(Default)]
+struct Report(Vec<String>);
+
+impl Report {
+    fn pass(&mut self, scenario: &str, what: String) {
+        self.line(format!("PASS ({scenario}) {what}"));
+    }
+    fn fail(&mut self, scenario: &str, what: String) {
+        self.line(format!("FAIL ({scenario}) {what}"));
+    }
+    fn check(&mut self, scenario: &str, ok: bool, what: String) {
+        if ok {
+            self.pass(scenario, what)
+        } else {
+            self.fail(scenario, what)
+        }
+    }
+    fn line(&mut self, line: String) {
+        println!("{line}");
+        self.0.push(line);
+    }
+}
+
+fn errno_of(error: &std::io::Error) -> i32 {
+    error.raw_os_error().unwrap_or(-1)
+}
+
+/// close(2), reporting its errno: Rust's `File` drop discards it.
+fn close_file(file: File) -> Result<(), i32> {
+    let fd = file.into_raw_fd();
+    // SAFETY: `fd` is an open descriptor this function now owns.
+    if unsafe { close(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(errno_of(&std::io::Error::last_os_error()))
+    }
+}
+
+fn show(result: Result<(), i32>) -> String {
+    match result {
+        Ok(()) => "0".into(),
+        Err(errno) => format!("-1 errno={errno}"),
+    }
+}
+
+/// open(O_WRONLY|O_CREAT|O_TRUNC), write, close: what `echo > path` does.
+fn save(path: &str, text: &str) -> Result<(), String> {
+    let mut file = File::create(path).map_err(|e| format!("open {path}: errno={}", errno_of(&e)))?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| format!("write {path}: errno={}", errno_of(&e)))?;
+    close_file(file).map_err(|errno| format!("close {path}: errno={errno}"))
+}
+
+fn read(path: &str) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| format!("read {path}: errno={}", errno_of(&e)))
+}
+
+/// Tell the host this step is done: `st-<step>` lands in the store.
+fn signal(step: char) {
+    if let Err(error) = save(seed::GUEST_SYNC, &format!("st-{step}\n")) {
+        println!("FAIL signal {step}: {error}");
+        std::process::exit(2);
+    }
+}
+
+/// Wait for the host's `go-<step>`, reopening the file each time.
+fn wait(step: char) {
+    let want = format!("go-{step}\n");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if read(seed::HOST_SYNC).as_deref() == Ok(want.as_str()) {
+            return;
+        }
+        if Instant::now() > deadline {
+            println!("FAIL waiting for {want:?}");
+            std::process::exit(3);
+        }
+        std::hint::spin_loop();
+    }
+}
+
+fn run(program: &str, args: &[&str]) -> (bool, String) {
+    match Command::new(program)
+        .args(args)
+        .env("HOME", "/tmp")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+    {
+        Ok(output) => (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ),
+        Err(error) => (false, format!("spawn {program}: {error}")),
+    }
+}
+
+fn main() {
+    let mut r = Report::default();
+    let cwd = std::env::current_dir().map(|d| d.display().to_string());
+    r.check(
+        "setup",
+        cwd.as_deref().ok() == Some("/work"),
+        format!("the workload starts in {cwd:?}, mounted by init"),
+    );
+
+    // (a) A read is the stored bytes.
+    match read("a.go") {
+        Ok(text) => r.check(
+            "a",
+            text == seed::A,
+            format!("read(2) a.go: {} bytes, the stored blob: {}", text.len(), text == seed::A),
+        ),
+        Err(error) => r.fail("a", error),
+    }
+
+    // (b) An edit through open/write/close lands.
+    match save("a.go", seed::A_EDIT) {
+        Ok(()) => r.pass("b", "open(O_TRUNC)/write/close a.go: close=0".into()),
+        Err(error) => r.fail("b", error),
+    }
+    signal('b');
+    wait('b');
+
+    // (c) A socket proposal moves a file the guest holds open: the guest's
+    // write(2) is ESTALE and nothing of it lands.
+    match OpenOptions::new().read(true).write(true).open("b.go") {
+        Ok(mut file) => {
+            let mut held = String::new();
+            let _ = file.read_to_string(&mut held);
+            signal('c');
+            wait('c');
+            match file.write(seed::B_GUEST.as_bytes()) {
+                Err(e) if errno_of(&e) == ESTALE => r.pass(
+                    "c",
+                    format!("write(2) b.go after the host's proposal: -1 errno={ESTALE} (ESTALE)"),
+                ),
+                Err(e) => r.fail("c", format!("write(2) b.go: errno={}, not ESTALE", errno_of(&e))),
+                Ok(n) => r.fail("c", format!("write(2) b.go wrote {n} bytes over a moved base")),
+            }
+            r.line(format!("NOTE (c) close(2) b.go = {}", show(close_file(file))));
+        }
+        Err(e) => r.fail("c", format!("open b.go: errno={}", errno_of(&e))),
+    }
+    signal('C');
+    wait('C');
+
+    // (d) An edit the store cannot parse: fsync(2) and close(2) are EIO.
+    match OpenOptions::new().write(true).truncate(true).open("c.go") {
+        Ok(mut file) => {
+            let wrote = file.write_all(seed::C_BROKEN.as_bytes());
+            let fsync = file.sync_all().map_err(|e| errno_of(&e));
+            let closed = close_file(file);
+            r.check(
+                "d",
+                wrote.is_ok() && fsync == Err(EIO) && closed == Err(EIO),
+                format!(
+                    "unparseable c.go: write ok={}, fsync(2) = {}, close(2) = {} (EIO={EIO})",
+                    wrote.is_ok(),
+                    show(fsync),
+                    show(closed)
+                ),
+            );
+        }
+        Err(e) => r.fail("d", format!("open c.go: errno={}", errno_of(&e))),
+    }
+    signal('d');
+    wait('d');
+
+    // (e) create, unlink, and a write-temp-then-rename save.
+    match save("n.go", seed::N) {
+        Ok(()) => r.pass("e", "creat n.go/write/close: close=0".into()),
+        Err(error) => r.fail("e", error),
+    }
+    match fs::remove_file("d.go") {
+        Ok(()) => r.pass("e", "unlink(2) d.go = 0".into()),
+        Err(e) => r.fail("e", format!("unlink(2) d.go: errno={}", errno_of(&e))),
+    }
+    let renamed = save(seed::A_TEMP, seed::A_RENAMED)
+        .and_then(|()| {
+            fs::rename(seed::A_TEMP, "a.go")
+                .map_err(|e| format!("rename(2) {} -> a.go: errno={}", seed::A_TEMP, errno_of(&e)))
+        })
+        .and_then(|()| read("a.go"));
+    match renamed {
+        Ok(text) => r.check(
+            "e",
+            text == seed::A_RENAMED,
+            format!(
+                "write {} + rename(2) -> a.go = 0; a.go reads back the saved bytes: {}",
+                seed::A_TEMP,
+                text == seed::A_RENAMED
+            ),
+        ),
+        Err(error) => r.fail("e", error),
+    }
+    signal('e');
+    wait('e');
+
+    // (f) git and rg over /work.
+    let (ok, status) = run(
+        "/usr/bin/git",
+        &[
+            "-c",
+            "safe.directory=*",
+            "--git-dir=/repo.git",
+            "--work-tree=/work",
+            "status",
+            "--porcelain",
+        ],
+    );
+    let lines: Vec<&str> = status.lines().collect();
+    let expected = [" M a.go", " M b.go", " D d.go", "?? n.go"];
+    r.check(
+        "f",
+        ok && expected.iter().all(|line| lines.contains(line)),
+        format!("git status --porcelain over /work: exit ok={ok}; {lines:?}"),
+    );
+    let (ok, found) = run("/usr/bin/rg", &["-n", "--no-heading", "func N", "."]);
+    r.check(
+        "f",
+        ok && found.lines().any(|line| line.ends_with("n.go:3:func N() int { return 7 }")),
+        format!("rg -n 'func N' .: exit ok={ok}; {:?}", found.trim_end()),
+    );
+    let (ok, files) = run("/usr/bin/rg", &["--files", "."]);
+    let mut listed: Vec<&str> = files.lines().collect();
+    listed.sort_unstable();
+    r.check(
+        "f",
+        ok && listed.iter().any(|f| f.ends_with("n.go")) && !listed.iter().any(|f| f.ends_with("d.go")),
+        format!("rg --files .: {listed:?}"),
+    );
+
+    // (g) Fresh at open, and the attribute timeout bounds a stale stat.
+    let before = read("g.go");
+    let cached = fs::metadata("g.go").map(|m| m.len());
+    r.check(
+        "g",
+        before.as_deref() == Ok(seed::G) && cached.as_ref().ok() == Some(&(seed::G.len() as u64)),
+        format!("read g.go = stored bytes; stat size = {cached:?}"),
+    );
+    // t.go is only ever stat'ed: its size turns over when the cached
+    // attributes expire, and no later.
+    let t_cached = fs::metadata("t.go").map(|m| m.len());
+    signal('g');
+    wait('g');
+    let proposed_at = Instant::now();
+    let t_stale = fs::metadata("t.go").map(|m| m.len());
+    let stale = fs::metadata("g.go").map(|m| m.len());
+    r.line(format!(
+        "NOTE (g) stat(2) g.go right after the host's proposal: size {stale:?} (stored {}, now {})",
+        seed::G.len(),
+        seed::G_HOST.len()
+    ));
+    match read("g.go") {
+        Ok(text) => r.check(
+            "g",
+            text == seed::G_HOST,
+            format!(
+                "open/read g.go after the host's proposal: the new bytes ({} bytes): {}",
+                text.len(),
+                text == seed::G_HOST
+            ),
+        ),
+        Err(error) => r.fail("g", error),
+    }
+    let bound = Duration::from_millis(seed::SETTLED_MS);
+    let turned = loop {
+        match fs::metadata("t.go") {
+            Ok(m) if m.len() == seed::T_HOST.len() as u64 => break Some(proposed_at.elapsed()),
+            _ if proposed_at.elapsed() > bound + Duration::from_secs(2) => break None,
+            _ => std::hint::spin_loop(),
+        }
+    };
+    r.check(
+        "g",
+        t_cached.as_ref().ok() == Some(&(seed::T.len() as u64))
+            && turned.is_some_and(|after| after <= bound + Duration::from_millis(250)),
+        format!(
+            "stat(2) t.go (never opened): {t_cached:?} before the host's proposal, {t_stale:?} \
+             right after it, {} bytes after {turned:?}; settled timeout {bound:?}",
+            seed::T_HOST.len()
+        ),
+    );
+
+    let text = format!("{}\n", r.0.join("\n"));
+    if let Err(error) = save(seed::REPORT, &text) {
+        println!("FAIL report: {error}");
+    }
+    signal('z');
+}

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
@@ -17,7 +20,28 @@ use super::super::process::{
     SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
     finish_failed_start, read_readiness_line, supervise_worker,
 };
-use super::worker::WorkerEvent;
+use super::share::{FsService, WorkspaceShares, serve};
+use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent};
+
+/// Keep `worker_end` open across the worker's `exec` and name its descriptor
+/// on the command line. The descriptor is created close-on-exec, as every
+/// descriptor here is, so a process another thread spawns concurrently does
+/// not inherit it; only this child clears the flag, after its fork.
+fn inherit_share(command: &mut Command, worker_end: &UnixStream) {
+    let fd = worker_end.as_raw_fd();
+    command.arg(WORKSPACE_SHARE_FD_ARG).arg(fd.to_string());
+    // SAFETY: the closure runs in the forked child before exec and makes
+    // only fcntl calls, which are async-signal-safe; `fd` is open in the
+    // child because the parent holds `worker_end` until after spawn returns.
+    unsafe {
+        command.pre_exec(move || {
+            let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
+            let flags = rustix::io::fcntl_getfd(fd)?;
+            rustix::io::fcntl_setfd(fd, flags.difference(rustix::io::FdFlags::CLOEXEC))?;
+            Ok(())
+        });
+    }
+}
 
 const LABELS: SupervisionLabels = SupervisionLabels {
     worker: "libkrun worker",
@@ -50,6 +74,9 @@ pub struct KrunWorkerConfig {
 
 pub struct KrunWorkerBackend {
     config: KrunWorkerConfig,
+    /// Serves a run's granted workspace as the guest's `/work`. `None`: a
+    /// run granted a workspace is refused, since nothing could deliver it.
+    shares: Option<Arc<dyn WorkspaceShares>>,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
@@ -66,11 +93,45 @@ impl KrunWorkerBackend {
     pub fn new(config: KrunWorkerConfig) -> Self {
         Self {
             config,
+            shares: None,
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             completion_cv: Arc::new(Condvar::new()),
+        }
+    }
+
+    /// Serve each run's granted workspace from `shares` (ADR-0044 V5).
+    pub fn with_workspace_shares(mut self, shares: Arc<dyn WorkspaceShares>) -> Self {
+        self.shares = Some(shares);
+        self
+    }
+
+    /// The service for the run's granted workspace, if it has one. The tier
+    /// attaches one workspace, as the guest's `/work`; a grant nothing can
+    /// serve refuses the run rather than starting it without its workspace.
+    fn workspace_share(
+        &self,
+        request: &ExecutionRequest,
+    ) -> Result<Option<Arc<dyn FsService>>, ExecutionError> {
+        match request.workspaces.as_slice() {
+            [] => Ok(None),
+            [grant] => {
+                let shares = self.shares.as_ref().ok_or_else(|| {
+                    ExecutionError::unsupported(format!(
+                        "the run is granted workspace {:?}, and this libkrun backend \
+                         serves no workspace shares (start the daemon with a source \
+                         tree)",
+                        grant.name
+                    ))
+                })?;
+                shares.open(&request.run_id, grant).map(Some)
+            }
+            grants => Err(ExecutionError::unsupported(format!(
+                "the microVM tier attaches one workspace as /work; the run is granted {}",
+                grants.len()
+            ))),
         }
     }
 
@@ -159,6 +220,11 @@ impl Backend for KrunWorkerBackend {
             });
         }
 
+        // The share is opened before anything is spawned or created: a
+        // refusal (no provider, a provider refusing the grant) leaves no
+        // run root and no worker.
+        let share = self.workspace_share(request)?;
+
         let rootfs = TempDirBuilder::new()
             .prefix("leyline-run-")
             .tempdir_in(&self.config.ephemeral_root)
@@ -188,6 +254,25 @@ impl Backend for KrunWorkerBackend {
             command.arg("--tsi-hijack-inet");
         }
         configure_process_group(&mut command);
+        // The workspace share: one end of a connected socket pair is
+        // inherited by the worker, whose virtio-fs device sends the guest's
+        // requests down it; this process answers them from the store.
+        let share = match share {
+            Some(service) => match UnixStream::pair() {
+                Ok((daemon_end, worker_end)) => {
+                    inherit_share(&mut command, &worker_end);
+                    Some((service, daemon_end, worker_end))
+                }
+                Err(error) => {
+                    return Err(finish_failed_start(
+                        rootfs,
+                        LABELS,
+                        ExecutionError::backend(format!("create workspace share socket: {error}")),
+                    ));
+                }
+            },
+            None => None,
+        };
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -199,6 +284,17 @@ impl Backend for KrunWorkerBackend {
                 ));
             }
         };
+        // The worker holds its end now; dropping ours makes the worker's
+        // exit the share's end of stream, which ends the serving thread.
+        if let Some((service, daemon_end, worker_end)) = share {
+            drop(worker_end);
+            std::thread::spawn(move || {
+                let (mut reader, mut writer) = (&daemon_end, &daemon_end);
+                // An I/O error means the worker is gone: its device answers
+                // EIO from then on, and the run's own exit is supervised.
+                let _ = serve(&mut reader, &mut writer, service.as_ref());
+            });
+        }
         let mut stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {

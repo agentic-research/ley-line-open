@@ -12,6 +12,41 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **Agents run in a libkrun guest whose `/work` is the daemon's store**
+  (bead `ley-line-open-f210c2`, ADR-0044 phase C). An execution/v1 run
+  whose RunGrant carries a `WorkspaceGrant` gets that workspace as a
+  virtio-fs share at `/work`, its working directory; the agent uses its
+  own file syscalls and no LLO tool.
+  - `leyline execution-daemon --backend micro-vm --source <dir>`
+    (`--language`, `--workspace-ttl-ms`, `--workspace-changed-ttl-ms`,
+    `--workspace-change-window-ms`) serves each run's share from its own
+    store: reads on its reader pool, proposals on its one writer, each
+    landed proposal written into the source directory and published to the
+    arena, as the socket's `propose` op does. The share opens only when the
+    store's `treeRoot` (ADR-0040 D1) is the grant's `graphRoot`; `read` and
+    `list` let the guest see the tree, `mutate` and `commit` let it propose.
+  - `leyline_runtime::backends::libkrun::share`: the FUSE request and
+    reply wire between the VMM worker and the daemon (JSON header, READ and
+    WRITE bytes as raw payload), `serve`, `RemoteFs`, the `WorkspaceShares`
+    seam, and `ShareFs` (`vmm`), libkrun's `DynFileSystem` over any
+    `FsService`. `KrunWorkerBackend::with_workspace_shares` hands the
+    worker one end of a socket pair (`--workspace-share-fd`); the worker
+    checks it is a socket matching the grant and attaches it under tag
+    `work`.
+  - `leyline-storefs`: `StoreShare` (the README "Adapter" mapping),
+    `impl Store for DaemonContext`, `Store::publish`, `DaemonShares`,
+    `scope_for`.
+  - `leyline-cli-lib`: `DaemonExt::on_context`, `ContextSlot`,
+    `ExecutionDaemonExt::with_context_slot`,
+    `run_execution_daemon_with_context`.
+  - libkrun patch `0005`: the guest init mounts the virtio-fs devices
+    `KRUN_VIRTIOFS_MOUNTS` lists (`tag:/dir`, comma-separated) before the
+    workload runs and refuses to start it when one does not mount. A
+    workload's `publicEnvironment` may not set the variable.
+  - `tests/agent_in_guest.rs` (leyline-cli) runs scenarios (a)–(h) inside
+    the guest against the real daemon; `tools/guest_tools.sh` fetches the
+    guest's git and ripgrep (Alpine aarch64, SHA-256 pinned).
+
 - **storefs read freshness: READDIRPLUS, fresh-at-open page caching,
   adaptive timeouts** (beads `ley-line-open-789e0f`, `e650d7`, decided in
   `e6269a`; ADR-0044 V3 "Read freshness"). libkrun patch `0004` forwards
@@ -99,6 +134,16 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: execution/v1 carries workspace grants to the backend**
+  (bead `ley-line-open-f210c2`). `AuthorizedExecution.workspaces` and
+  `ExecutionRequest.workspaces` hold each RunGrant `WorkspaceGrant` (name,
+  graph root, expected generation, operations); the catalog resolver
+  carries them, and the service refuses a resolver that changes them
+  (`identity-policy-mismatch`). Both structs gained a field: struct
+  literals outside this repository need `workspaces`. A microVM run granted
+  a workspace is refused (`unsupported-backend`) when the backend has no
+  `WorkspaceShares`, and when it is granted more than one.
+
 - **Breaking (`leyline-storefs`): `Options::ttl` is replaced by
   `Options::freshness`, `open` returns `Opened`, and WRITE refuses a stale
   base** (bead `ley-line-open-e650d7`). A WRITE on a handle whose blob base
@@ -144,6 +189,15 @@ context, scoping notes, and review history are recoverable.
   release.
 
 ### Fixed
+
+- **A guest read a grown file cut to its old size** (bead
+  `ley-line-open-f210c2`, found by the in-guest end-to-end test). An OPEN
+  reply carries no attributes, and the guest bounds a cached read by the
+  size it holds: after another writer grew `g.go` from 37 to 88 bytes the
+  guest's next open read the new blob's first 37 bytes. `StoreFs` records
+  the size each LOOKUP, GETATTR, SETATTR, READDIRPLUS and CREATE reply
+  tells the guest, and answers a read-only open that serves another size
+  with `direct_io`.
 
 - **A daemon restart keeps accepted proposals** (bead
   `ley-line-open-60f39f`). `leyline daemon --source <dir>` stored an

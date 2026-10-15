@@ -1,7 +1,16 @@
 use std::ffi::OsString;
 #[cfg(feature = "vmm")]
 use std::io::{Read, Write};
+#[cfg(feature = "vmm")]
+use std::os::fd::{BorrowedFd, FromRawFd};
+#[cfg(feature = "vmm")]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+#[cfg(feature = "vmm")]
+use std::sync::Arc;
+
+#[cfg(feature = "vmm")]
+use rustix::fs::FileType;
 
 use crate::ExecutionError;
 #[cfg(feature = "vmm")]
@@ -19,7 +28,101 @@ use super::confinement::{
 #[cfg(feature = "vmm")]
 use super::plan::{DirectoryRootfsResolver, compile_plan};
 #[cfg(feature = "vmm")]
+use super::share::{RemoteFs, ShareFs};
+#[cfg(feature = "vmm")]
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
+
+/// The worker option naming the inherited descriptor of the run's workspace
+/// share: one end of a connected UNIX socket whose peer, in the daemon,
+/// answers the share's FUSE requests (`super::share`).
+pub const WORKSPACE_SHARE_FD_ARG: &str = "--workspace-share-fd";
+
+/// The virtio-fs tag of the workspace share.
+pub const WORKSPACE_TAG: &str = "work";
+
+/// Where the guest sees its workspace, and its working directory.
+pub const WORKSPACE_DIR: &str = "/work";
+
+/// The guest init's mount list (LLO libkrun patch 0005): comma-separated
+/// `tag:directory` pairs init mounts as virtio-fs before the workload runs.
+pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
+
+/// Refuse a workload environment that names the guest init's mount list:
+/// which shares the guest mounts, and where, is the worker's decision.
+#[cfg(feature = "vmm")]
+fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), ExecutionError> {
+    if request.public_environment.contains_key(VIRTIOFS_MOUNTS_ENV) {
+        return Err(ExecutionError::invalid(format!(
+            "publicEnvironment may not set {VIRTIOFS_MOUNTS_ENV}: the worker sets the \
+             guest's virtio-fs mounts"
+        )));
+    }
+    Ok(())
+}
+
+/// The run's workspace share: the inherited socket named by
+/// [`WORKSPACE_SHARE_FD_ARG`], when the run is granted a workspace. A share
+/// without a grant, a grant without a share, and a descriptor that is not a
+/// socket are refused; the tier attaches one workspace.
+#[cfg(feature = "vmm")]
+fn workspace_share(
+    request: &ExecutionRequest,
+    fd: Option<i32>,
+) -> Result<Option<UnixStream>, ExecutionError> {
+    match (request.workspaces.as_slice(), fd) {
+        ([], None) => Ok(None),
+        ([], Some(_)) => Err(ExecutionError::invalid(
+            "the worker was handed a workspace share, and the run is granted no workspace",
+        )),
+        ([grant], None) => Err(ExecutionError::invalid(format!(
+            "the run is granted workspace {:?}, and the worker was handed no share",
+            grant.name
+        ))),
+        ([_], Some(fd)) => {
+            // SAFETY: borrowed only for the fstat below; ownership is taken
+            // once the descriptor is known to be an open socket.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            let stat = rustix::fs::fstat(borrowed).map_err(|error| {
+                ExecutionError::invalid(format!(
+                    "workspace share descriptor {fd} is not open: {error}"
+                ))
+            })?;
+            if FileType::from_raw_mode(stat.st_mode as _) != FileType::Socket {
+                return Err(ExecutionError::invalid(format!(
+                    "workspace share descriptor {fd} is not a socket"
+                )));
+            }
+            // SAFETY: the descriptor is open, a socket, and inherited for
+            // this purpose alone; nothing else in the worker names it.
+            Ok(Some(unsafe { UnixStream::from_raw_fd(fd) }))
+        }
+        (grants, _) => Err(ExecutionError::unsupported(format!(
+            "the microVM tier attaches one workspace as {WORKSPACE_DIR}; the run is granted {}",
+            grants.len()
+        ))),
+    }
+}
+
+/// Have the guest init mount the workspace share at [`WORKSPACE_DIR`] and
+/// start the workload there. The executable stays the rootfs's: the plan's
+/// guest-relative path is anchored at `/`, since init would otherwise
+/// resolve it against the share.
+#[cfg(feature = "vmm")]
+fn mount_workspace(config: &mut super::plan::KrunConfig) {
+    config.environment.push(
+        std::ffi::CString::new(format!(
+            "{VIRTIOFS_MOUNTS_ENV}={WORKSPACE_TAG}:{WORKSPACE_DIR}"
+        ))
+        .expect("static mount entry has no NUL"),
+    );
+    config.workdir = std::ffi::CString::new(WORKSPACE_DIR).expect("static workdir has no NUL");
+    if !config.executable.as_bytes().starts_with(b"/") {
+        let mut absolute = b"/".to_vec();
+        absolute.extend_from_slice(config.executable.as_bytes());
+        config.executable =
+            std::ffi::CString::new(absolute).expect("a CString's bytes have no NUL");
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerOptions {
@@ -39,6 +142,10 @@ pub struct WorkerOptions {
     /// guest's ordinary sockets are silently rerouted, and what the host can
     /// reach is decided by the port map instead of by what was granted.
     pub tsi_hijack_inet: bool,
+    /// The inherited descriptor of the run's workspace share
+    /// ([`WORKSPACE_SHARE_FD_ARG`]), set by the backend that spawned this
+    /// worker for a run granted a workspace.
+    pub workspace_share_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +173,7 @@ impl WorkerOptions {
         let mut devices = Vec::new();
 
         let mut tsi_hijack_inet = false;
+        let mut workspace_share_fd = None;
 
         while let Some(argument) = arguments.next() {
             // Checked before a value is consumed: this is the one valueless
@@ -85,6 +193,19 @@ impl WorkerOptions {
                 Some("--run-root") if run_root.is_none() => run_root = Some(value.into()),
                 Some("--runtime-file") => runtime_files.push(value.into()),
                 Some("--device") => devices.push(value.into()),
+                Some(WORKSPACE_SHARE_FD_ARG) if workspace_share_fd.is_none() => {
+                    let fd = value
+                        .to_str()
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .filter(|fd| *fd >= 0)
+                        .ok_or_else(|| {
+                            ExecutionError::invalid(format!(
+                                "{WORKSPACE_SHARE_FD_ARG} {} is not a file descriptor number",
+                                value.to_string_lossy()
+                            ))
+                        })?;
+                    workspace_share_fd = Some(fd);
+                }
                 _ => {
                     return Err(ExecutionError::invalid(format!(
                         "unknown or duplicate worker option: {}",
@@ -102,6 +223,7 @@ impl WorkerOptions {
             runtime_files,
             devices,
             tsi_hijack_inet,
+            workspace_share_fd,
         })
     }
 }
@@ -139,8 +261,16 @@ pub fn execute_with_ready(
     request: &ExecutionRequest,
     on_ready: impl FnOnce(&WorkerEvent) -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
+    // Checked before anything is read or materialized: the share is the
+    // run's granted workspace or nothing, and the guest init's mount list
+    // is the worker's alone.
+    refuse_reserved_environment(request)?;
+    let share = workspace_share(request, options.workspace_share_fd)?;
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
     let mut config = compile_plan(&resolver, request)?;
+    if share.is_some() {
+        mount_workspace(&mut config);
+    }
     // `compile_plan` hardcodes 0 — a workload cannot widen its own boundary
     // through the request. Hijacking is applied here, from the operator's
     // command line, and nowhere else.
@@ -259,9 +389,68 @@ pub fn execute_with_ready(
     apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
     let vm: PreparedVm<'_> = prepare_vm(&LinkedKrunApi, &config)?;
+    if let Some(stream) = share {
+        vm.add_virtiofs_backend(
+            WORKSPACE_TAG,
+            0,
+            Arc::new(ShareFs::new(RemoteFs::new(stream))),
+        )?;
+    }
     on_ready(&WorkerEvent::Ready {
         run_id: config.run_id.clone(),
         confinement_digest: manifest.confinement_digest()?,
     })?;
     vm.enter()
+}
+
+#[cfg(all(test, feature = "vmm"))]
+mod tests {
+    use std::ffi::CString;
+    use std::path::PathBuf;
+
+    use super::super::plan::{KrunConfig, ResolvedRootfs};
+    use super::mount_workspace;
+    use crate::DigestRef;
+
+    #[test]
+    fn a_mounted_workspace_is_the_guests_working_directory() {
+        let mut config = KrunConfig {
+            run_id: "run".into(),
+            rootfs: ResolvedRootfs {
+                digest: DigestRef {
+                    algorithm: "blake3-256".into(),
+                    value: "0".repeat(64),
+                },
+                canonical_path: PathBuf::from("/rootfs"),
+            },
+            // Guest-relative, as `compile_plan` passes the catalog's path.
+            executable: CString::new("bin/agent").unwrap(),
+            arguments: Vec::new(),
+            environment: vec![CString::new("MODE=audit").unwrap()],
+            workdir: CString::new("/").unwrap(),
+            vcpus: 1,
+            ram_mib: 256,
+            wall_time_ms: 1_000,
+            tsi_features: 0,
+            port_map: Vec::new(),
+            vsock_unix_map: Vec::new(),
+        };
+        mount_workspace(&mut config);
+        assert_eq!(
+            config.environment,
+            vec![
+                CString::new("MODE=audit").unwrap(),
+                CString::new("KRUN_VIRTIOFS_MOUNTS=work:/work").unwrap(),
+            ]
+        );
+        assert_eq!(config.workdir, CString::new("/work").unwrap());
+        // The executable is the rootfs's, wherever the workload starts: a
+        // relative path would resolve against /work, the share.
+        assert_eq!(config.executable, CString::new("/bin/agent").unwrap());
+
+        let mut absolute = config;
+        absolute.executable = CString::new("/usr/bin/agent").unwrap();
+        mount_workspace(&mut absolute);
+        assert_eq!(absolute.executable, CString::new("/usr/bin/agent").unwrap());
+    }
 }

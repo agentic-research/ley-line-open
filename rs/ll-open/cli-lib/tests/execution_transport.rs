@@ -72,6 +72,7 @@ impl ExecutionResolver for Resolver {
             // one implementation.
             confinement_digest: authorized.confinement_digest.clone(),
             confinement_manifest: authorized.confinement_manifest.clone(),
+            workspaces: authorized.workspaces.clone(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 64,

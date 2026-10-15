@@ -13,7 +13,8 @@ use leyline_runtime::transport::{
 };
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
-    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits,
+    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits, WorkspaceGrant,
+    WorkspaceOperation,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -955,6 +956,137 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
         .expect_err("duplicate workspace names are ambiguous authority");
 }
 
+/// A spec requesting `repo` and `docs`, and a grant resolving both with the
+/// given operations and generations, `docs` first.
+fn two_workspace_grant(
+    repo: Vec<execution_capnp::WorkspaceOperation>,
+    docs: Vec<execution_capnp::WorkspaceOperation>,
+) -> (Vec<u8>, Vec<u8>) {
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &a), ("docs", &b)]);
+    let confinement = "b".repeat(64);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![("docs", &b, docs), ("repo", &a, repo)],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    // Generations, set on a copy of the grant: 7 on `docs`, 9 on `repo`.
+    let mut input = grant.as_slice();
+    let reader = capnp::serialize::read_message(&mut input, ReaderOptions::new()).unwrap();
+    let mut message = Builder::new_default();
+    message
+        .set_root(
+            reader
+                .get_root::<execution_capnp::run_grant::Reader<'_>>()
+                .unwrap(),
+        )
+        .unwrap();
+    {
+        let root = message
+            .get_root::<execution_capnp::run_grant::Builder<'_>>()
+            .unwrap();
+        let mut workspaces = root.get_workspaces().unwrap();
+        workspaces.reborrow().get(0).set_expected_generation(7);
+        workspaces.get(1).set_expected_generation(9);
+    }
+    let mut grant = Vec::new();
+    capnp::serialize::write_message(&mut grant, &message).unwrap();
+    (spec, grant)
+}
+
+#[test]
+fn an_authorized_run_carries_each_workspace_grant_in_grant_order() {
+    use execution_capnp::WorkspaceOperation as Op;
+    let (spec, grant) = two_workspace_grant(
+        vec![Op::Read, Op::List, Op::Mutate, Op::Commit],
+        vec![Op::Read, Op::Query],
+    );
+    let authorized = authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect("an exact workspace grant authorizes");
+    assert_eq!(
+        authorized.workspaces,
+        vec![
+            WorkspaceGrant {
+                name: "docs".into(),
+                graph_root: format!("blake3-256:{}", "b".repeat(64)),
+                expected_generation: 7,
+                operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Query],
+            },
+            WorkspaceGrant {
+                name: "repo".into(),
+                graph_root: format!("blake3-256:{}", "a".repeat(64)),
+                expected_generation: 9,
+                operations: vec![
+                    WorkspaceOperation::Read,
+                    WorkspaceOperation::List,
+                    WorkspaceOperation::Mutate,
+                    WorkspaceOperation::Commit,
+                ],
+            },
+        ]
+    );
+}
+
+/// A resolver that resolves as [`TestResolver`] and then drops the grant's
+/// workspace authority.
+struct DroppingResolver;
+
+impl ExecutionResolver for DroppingResolver {
+    fn resolve(
+        &self,
+        authorized: &leyline_runtime::authorization::AuthorizedExecution,
+    ) -> Result<ExecutionRequest, ExecutionError> {
+        let mut request = TestResolver.resolve(authorized)?;
+        request.workspaces.clear();
+        Ok(request)
+    }
+}
+
+#[test]
+fn the_service_refuses_a_resolver_that_changes_the_granted_workspaces() {
+    use execution_capnp::WorkspaceOperation as Op;
+    let (spec, grant) = two_workspace_grant(vec![Op::Read], vec![Op::Read]);
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let service = ExecutionService::new(RecordingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-workspaces")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &policy, &DroppingResolver)
+        .expect_err("a resolver must carry the granted workspaces");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
+    assert!(error.detail.contains("workspaces"), "{error}");
+    service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect("a resolver that carries them starts the run");
+}
+
 #[test]
 fn rejects_grant_with_a_confinement_policy_the_backend_will_not_enforce() {
     let spec = spec_bytes();
@@ -1059,6 +1191,7 @@ impl ExecutionResolver for TestResolver {
             // vacuously as a result.
             confinement_digest: authorized.confinement_digest.clone(),
             confinement_manifest: authorized.confinement_manifest.clone(),
+            workspaces: authorized.workspaces.clone(),
             limits: ResourceLimits {
                 vcpus: 1,
                 memory_mib: 128,

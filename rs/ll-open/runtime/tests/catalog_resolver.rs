@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use leyline_runtime::{
     ArtifactIdentity, AuthorizedExecution, CatalogBuilder, CatalogResolver, DigestRef, ErrorCode,
-    ExecutionResolver, SchemaIntent, SchemaLimits, WorkspaceInput,
+    ExecutionResolver, SchemaIntent, SchemaLimits, WorkspaceGrant, WorkspaceInput,
+    WorkspaceOperation,
 };
 
 fn authorized() -> AuthorizedExecution {
@@ -36,6 +37,12 @@ fn authorized() -> AuthorizedExecution {
                 output_bytes: 0,
             },
         },
+        workspaces: vec![WorkspaceGrant {
+            name: "repo".into(),
+            graph_root: "blake3-256:graph".into(),
+            expected_generation: 4,
+            operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+        }],
     }
 }
 
@@ -91,6 +98,9 @@ fn catalog_resolver_binds_artifact_and_workspace_to_guest_request() {
     assert_eq!(request.limits.vcpus, 2);
     assert_eq!(request.limits.memory_mib, 2);
     assert_eq!(request.limits.wall_time_ms, 2_000);
+    // Carried, never chosen: the grant's workspace authority, operations
+    // and generation included, reaches the backend unchanged.
+    assert_eq!(request.workspaces, authorized().workspaces);
 }
 
 #[test]

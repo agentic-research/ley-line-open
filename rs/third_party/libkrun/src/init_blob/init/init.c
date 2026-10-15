@@ -1198,6 +1198,49 @@ char *clone_str(const char *str)
 }
 
 #if __linux__
+/*
+ * Mount each virtio-fs device listed in KRUN_VIRTIOFS_MOUNTS, a
+ * comma-separated list of "tag:/directory" pairs, creating each directory.
+ * An entry that is malformed or does not mount stops the guest before the
+ * workload runs: a workload must not start without a filesystem its
+ * embedder attached for it. The variable is removed from the environment
+ * the workload inherits.
+ */
+static int mount_virtiofs_list()
+{
+    char *list, *pair, *dir, *save = NULL;
+
+    list = clone_str(getenv("KRUN_VIRTIOFS_MOUNTS"));
+    if (list == NULL) {
+        return 0;
+    }
+    for (pair = strtok_r(list, ",", &save); pair != NULL;
+         pair = strtok_r(NULL, ",", &save)) {
+        dir = strchr(pair, ':');
+        if (dir == NULL || dir == pair || dir[1] != '/') {
+            printf("KRUN_VIRTIOFS_MOUNTS: malformed entry '%s'\n", pair);
+            free(list);
+            return -1;
+        }
+        *dir++ = '\0';
+        if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
+            perror("mkdir(KRUN_VIRTIOFS_MOUNTS)");
+            free(list);
+            return -1;
+        }
+        if (mount(pair, dir, "virtiofs", 0, NULL) < 0) {
+            perror("mount(KRUN_VIRTIOFS_MOUNTS)");
+            free(list);
+            return -1;
+        }
+    }
+    free(list);
+    unsetenv("KRUN_VIRTIOFS_MOUNTS");
+    return 0;
+}
+#endif
+
+#if __linux__
 static bool tsi_enabled()
 {
     const char *const option = "tsi_hijack";
@@ -1400,6 +1443,11 @@ int main(int argc, char **argv)
 
     if (mount(NULL, "/", NULL, MS_REC | MS_SHARED, NULL) < 0) {
         perror("Couldn't set shared propagation on the root mount");
+        exit(-1);
+    }
+
+    if (mount_virtiofs_list() < 0) {
+        printf("Couldn't mount KRUN_VIRTIOFS_MOUNTS, bailing out\n");
         exit(-1);
     }
 #endif

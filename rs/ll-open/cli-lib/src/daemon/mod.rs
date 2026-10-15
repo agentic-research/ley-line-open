@@ -45,6 +45,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use events::EventRouter;
+
+/// Where a running daemon's context is published for code that serves its
+/// store outside the socket ([`DaemonExt::on_context`]); empty until the
+/// daemon has built it.
+pub type ContextSlot = Arc<std::sync::OnceLock<Arc<DaemonContext>>>;
 pub use execution::ExecutionDaemonExt;
 pub use ext::{DaemonExt, NoExt};
 

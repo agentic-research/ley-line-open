@@ -19,6 +19,31 @@ enum ExecutionBackendKind {
     MicroVm,
 }
 
+/// How long a guest may cache what a workspace share tells it (ADR-0044 V3,
+/// "Read freshness"; `leyline_storefs::Freshness`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::Args)]
+struct WorkspaceFreshness {
+    /// Entry and attribute timeout of a path with no recent change.
+    #[arg(long, default_value_t = 60_000)]
+    workspace_ttl_ms: u64,
+    /// Entry and attribute timeout of a recently changed path.
+    #[arg(long, default_value_t = 1_000)]
+    workspace_changed_ttl_ms: u64,
+    /// How long a change keeps a path's timeouts short.
+    #[arg(long, default_value_t = 60_000)]
+    workspace_change_window_ms: u64,
+}
+
+impl WorkspaceFreshness {
+    fn freshness(self) -> leyline_storefs::Freshness {
+        leyline_storefs::Freshness {
+            settled: Duration::from_millis(self.workspace_ttl_ms),
+            changed: Duration::from_millis(self.workspace_changed_ttl_ms),
+            window: Duration::from_millis(self.workspace_change_window_ms),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     #[command(flatten)]
@@ -98,6 +123,20 @@ enum Cmd {
         /// Signet/NotMe/Interlace verifier instead.
         #[arg(long, default_value_t = false)]
         allow_unverified_evidence: bool,
+
+        /// Source directory the daemon's store is parsed from and its
+        /// accepted proposals are written back into. With `--backend
+        /// micro-vm`, a run whose grant carries a workspace sees this store
+        /// as its `/work` (ADR-0044); without it, such a run is refused.
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Language filter for `--source`.
+        #[arg(long)]
+        language: Option<String>,
+
+        #[command(flatten)]
+        workspace: WorkspaceFreshness,
     },
 
     /// Run the daemon: arena + mount + UDS socket for coordination.
@@ -297,6 +336,9 @@ async fn main() -> Result<()> {
             cdc,
             cdc_target,
             allow_unverified_evidence,
+            source,
+            language,
+            workspace,
         } => {
             if !worker.is_file() {
                 bail!(
@@ -330,9 +372,9 @@ async fn main() -> Result<()> {
                 mount: None,
                 backend: cmd_serve::default_backend(),
                 nfs_port: 0,
-                language: None,
+                language,
                 timeout: None,
-                source: None,
+                source: source.clone(),
                 mcp_port: None,
                 mcp_bind: None,
                 mcp_allow_public: false,
@@ -398,6 +440,18 @@ async fn main() -> Result<()> {
                                 tsi_hijack_inet,
                             },
                         );
+                    // With a source tree, a run's granted workspace is that
+                    // tree's store, served from this daemon's context: the
+                    // share and the socket propose on one writer.
+                    let context = leyline_cli_lib::daemon::ContextSlot::default();
+                    let backend = if source.is_some() {
+                        backend.with_workspace_shares(Arc::new(leyline_storefs::DaemonShares::new(
+                            Arc::clone(&context),
+                            workspace.freshness(),
+                        )))
+                    } else {
+                        backend
+                    };
                     let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::MicroVm,
@@ -409,13 +463,14 @@ async fn main() -> Result<()> {
                             Arc::clone(&verifier),
                         ),
                     );
-                    leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
+                    leyline_cli_lib::cmd_daemon::run_execution_daemon_with_context(
                         config,
                         handler,
                         leyline_cli_lib::cmd_daemon::DaemonOptions {
                             cdc: cdc.then_some(cdc_target),
                             ..Default::default()
                         },
+                        context,
                     )
                     .await
                 }
@@ -650,6 +705,75 @@ mod tests {
             } => {
                 assert_eq!(backend, ExecutionBackendKind::MicroVm);
                 assert_eq!(devices, vec![PathBuf::from("/dev/null")]);
+            }
+            _ => panic!("expected execution-daemon command"),
+        }
+    }
+
+    const EXECUTION_DAEMON: [&str; 10] = [
+        "leyline",
+        "execution-daemon",
+        "--cas-root",
+        "/cas",
+        "--run-root",
+        "/runs",
+        "--worker",
+        "/worker",
+        "--catalog",
+        "/catalog.json",
+    ];
+
+    /// A source tree is what a run's workspace share serves; without one
+    /// the daemon serves none, and the share's timeouts default to
+    /// `Freshness::default()`.
+    #[test]
+    fn execution_daemon_serves_workspaces_from_a_source_tree() {
+        let cli = Cli::try_parse_from(EXECUTION_DAEMON).unwrap();
+        match cli.command {
+            Cmd::ExecutionDaemon {
+                source,
+                language,
+                workspace,
+                ..
+            } => {
+                assert_eq!(source, None);
+                assert_eq!(language, None);
+                assert_eq!(workspace.freshness(), leyline_storefs::Freshness::default());
+            }
+            _ => panic!("expected execution-daemon command"),
+        }
+
+        let mut arguments = EXECUTION_DAEMON.to_vec();
+        arguments.extend([
+            "--source",
+            "/repo",
+            "--language",
+            "go",
+            "--workspace-ttl-ms",
+            "4000",
+            "--workspace-changed-ttl-ms",
+            "250",
+            "--workspace-change-window-ms",
+            "9000",
+        ]);
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        match cli.command {
+            Cmd::ExecutionDaemon {
+                source,
+                language,
+                workspace,
+                ..
+            } => {
+                assert_eq!(source, Some(PathBuf::from("/repo")));
+                assert_eq!(language.as_deref(), Some("go"));
+                assert_eq!(
+                    workspace.freshness(),
+                    leyline_storefs::Freshness {
+                        settled: Duration::from_millis(4000),
+                        changed: Duration::from_millis(250),
+                        window: Duration::from_millis(9000),
+                    }
+                );
             }
             _ => panic!("expected execution-daemon command"),
         }

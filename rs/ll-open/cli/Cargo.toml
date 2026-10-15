@@ -40,7 +40,10 @@ full = ["lsp", "mount", "vec", "validate", "hdc", "text-search", "cdc"]
 leyline-cli-lib = { path = "../cli-lib", default-features = false }
 # Supervises the krun worker; does not link the VMM (leyline-runtime/vmm).
 leyline-runtime = { path = "../runtime", default-features = false }
-clap = { workspace = true, features = ["derive"] }
+# Serves a microVM run's granted workspace from the daemon's store
+# (ADR-0044 V5): DaemonShares and the StoreShare adapter.
+leyline-storefs = { path = "../storefs" }
+clap ={ workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 dirs = "6"
 env_logger = "0.11"

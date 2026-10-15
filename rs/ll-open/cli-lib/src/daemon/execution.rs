@@ -30,17 +30,35 @@ pub trait ExecutionHandler: Send + Sync {
 /// extension never accepts host paths from a request.
 pub struct ExecutionDaemonExt {
     handler: Arc<dyn ExecutionHandler>,
+    context: Option<super::ContextSlot>,
 }
 
 impl ExecutionDaemonExt {
     pub fn new(handler: Arc<dyn ExecutionHandler>) -> Self {
-        Self { handler }
+        Self {
+            handler,
+            context: None,
+        }
+    }
+
+    /// Publish the daemon's context to `slot` once it exists: the embedder's
+    /// workspace-share provider serves runs from it (ADR-0044 V5).
+    pub fn with_context_slot(mut self, slot: super::ContextSlot) -> Self {
+        self.context = Some(slot);
+        self
     }
 }
 
 impl super::DaemonExt for ExecutionDaemonExt {
     fn execution_handler(&self) -> Option<Arc<dyn ExecutionHandler>> {
         Some(Arc::clone(&self.handler))
+    }
+
+    fn on_context(&self, ctx: &Arc<super::DaemonContext>) {
+        if let Some(slot) = &self.context {
+            // One daemon, one context: a second call keeps the first.
+            let _ = slot.set(Arc::clone(ctx));
+        }
     }
 }
 

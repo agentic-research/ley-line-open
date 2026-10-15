@@ -51,6 +51,12 @@ pub trait DaemonExt: Send + Sync {
     /// events from background tasks.
     fn on_init(&self, _emitter: EventEmitter) {}
 
+    /// Called once the daemon's context exists, before the UDS socket
+    /// accepts a request. An extension that serves the store from outside
+    /// the socket (the execution extension's workspace shares) keeps it
+    /// here, so that path and the socket share one writer.
+    fn on_context(&self, _ctx: &Arc<super::DaemonContext>) {}
+
     /// Called after mount is complete. Spawn background tasks here.
     ///
     /// Receives the control path (for arena access) and event router (for

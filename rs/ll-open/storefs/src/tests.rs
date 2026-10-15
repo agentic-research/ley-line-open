@@ -359,6 +359,75 @@ fn an_accepted_flush_lands_in_the_store_and_advances_the_handles_base() {
     assert_eq!(read_all(&f, reopened), A_OTHER.as_bytes());
 }
 
+/// A store that counts [`Store::publish`] calls, and fails them when asked.
+struct Publishing {
+    inner: Arc<LiveDb>,
+    published: std::sync::atomic::AtomicUsize,
+    fail: bool,
+}
+
+impl Store for Publishing {
+    fn with_read<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.inner.with_read(f)
+    }
+
+    fn with_write<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.inner.with_write(f)
+    }
+
+    fn publish(&self) -> anyhow::Result<()> {
+        self.published
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            anyhow::bail!("the arena is full");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn each_landed_proposal_is_published_and_a_refused_one_is_not() {
+    for fail in [false, true] {
+        let f = fixture(whole());
+        let store = Arc::new(Publishing {
+            inner: Arc::clone(f.fs.store()),
+            published: Default::default(),
+            fail,
+        });
+        let fs = StoreFs::new(Arc::clone(&store), whole(), Options::default());
+        let a = fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.inode;
+        let published = || store.published.load(std::sync::atomic::Ordering::SeqCst);
+
+        let h = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
+        fs.write(h, 0, A_BROKEN.as_bytes()).unwrap();
+        assert_eq!(fs.flush(h), Err(Errno::EIO));
+        assert_eq!(published(), 0, "a refused proposal publishes nothing");
+
+        fs.setattr(
+            a,
+            Some(h),
+            SetAttr {
+                size: Some(0),
+                ..SetAttr::default()
+            },
+        )
+        .unwrap();
+        fs.write(h, 0, A_EDIT.as_bytes()).unwrap();
+        // A failed publish does not refuse what the store committed: the
+        // daemon reports it after the commit, and the next publish repairs it.
+        assert_eq!(fs.flush(h), Ok(()), "fail={fail}");
+        assert_eq!(published(), 1);
+        assert_eq!(read_source(&f, "a.go").0, A_EDIT.as_bytes());
+        assert_eq!(fs.flush(h), Ok(()));
+        assert_eq!(published(), 1, "nothing staged: no proposal, no publish");
+        fs.unlink(ROOT_INODE, b"a.go").unwrap();
+        assert_eq!(published(), 2, "a delete is a landed proposal");
+    }
+    // The default publishes nothing and succeeds.
+    let f = fixture(whole());
+    assert!(f.fs.store().publish().is_ok());
+}
+
 #[test]
 fn an_accepted_flush_is_written_into_an_attached_checkout_and_its_index_advances() {
     let f = fixture_with(whole(), true, A);

@@ -55,7 +55,9 @@ use leyline_core::Hash;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 
+pub mod daemon;
 pub mod share;
+pub use daemon::{DaemonShares, scope_for};
 pub use share::StoreShare;
 
 #[cfg(test)]
@@ -227,6 +229,14 @@ pub struct OpenedDir {
 pub trait Store: Send + Sync {
     fn with_read<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T>;
     fn with_write<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T>;
+
+    /// Publish the store after a proposal landed, as the daemon's
+    /// `propose` op does after its commit: out-of-process readers see the
+    /// change. A failure does not undo the proposal; the next publish
+    /// serializes the whole store. The default publishes nothing.
+    fn publish(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// The daemon's living database: its reader pool and its single writer.
@@ -251,6 +261,10 @@ impl<S: Store> Store for Arc<S> {
 
     fn with_write<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
         S::with_write(self, f)
+    }
+
+    fn publish(&self) -> anyhow::Result<()> {
+        S::publish(self)
     }
 }
 
@@ -966,6 +980,9 @@ impl<S: Store> StoreFs<S> {
             })?;
         if let Some(problem) = &accepted.post_commit_error {
             log::warn!("proposal to '{named}' landed; after it: {problem}");
+        }
+        if let Err(e) = self.store.publish() {
+            log::warn!("proposal to '{named}' landed; publishing it failed: {e:#}");
         }
         let now = self.clock.now();
         let mut served = self.served.lock();

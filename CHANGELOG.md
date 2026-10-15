@@ -10,6 +10,25 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- **`leyline-storefs`: the store-backed filesystem core for the virtio-fs
+  device** (bead `ley-line-open-f1ea99`, ADR-0044 V2). A new crate,
+  `rs/ll-open/storefs`, whose `StoreFs` answers LOOKUP, GETATTR, READDIR,
+  OPEN, READ, WRITE, FLUSH, FSYNC, RELEASE and SETATTR from the store
+  (`_source` → `source_blobs`) with Linux errno values. An open for writing
+  records the blob it read as its base; WRITE and `ftruncate` stage bytes
+  on the handle; FLUSH and FSYNC propose them through
+  `source_write::propose` on the store's one writer and, when a checkout is
+  attached, bring it up to the accepted bytes. A stale base answers
+  `ESTALE` (116), a path outside the grant `EACCES` (13), a syntax refusal
+  and every other failure `EIO` (5). `Scope { see, propose }` carries a
+  run's `WorkspaceGrant` resolved to paths: unseen paths are `ENOENT`.
+  CREATE, MKDIR, UNLINK, RMDIR and RENAME are `EPERM`: the store has no
+  create, delete or move. The crate adds no persisted state and no libkrun
+  code; phase C adapts it onto libkrun's `DynFileSystem`. The contract is in
+  `rs/ll-open/storefs/README.md`.
+
 ### Changed
 
 - **Breaking: `propose` requires `base`, and `any` is the explicit "no

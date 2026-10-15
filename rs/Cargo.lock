@@ -4718,6 +4718,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "leyline-storefs"
+version = "0.20.5"
+dependencies = [
+ "anyhow",
+ "leyline-cli-lib",
+ "leyline-core",
+ "log",
+ "parking_lot",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "leyline-text-search"
 version = "0.20.5"
 dependencies = [

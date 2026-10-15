@@ -365,6 +365,9 @@ impl Backend for NativeWorkerBackend {
         });
         Ok(BackendRun {
             backend_id: "native-nono/1".into(),
+            // The native worker inherits its standard streams and nothing
+            // else.
+            channels: Vec::new(),
         })
     }
 

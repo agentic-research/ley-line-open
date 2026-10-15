@@ -291,9 +291,15 @@ pub fn collect_json<B: crate::Backend>(
         enforced.set_vcpus(to_schema_mechanism(receipt_data.enforced.vcpus));
         enforced.set_memory(to_schema_mechanism(receipt_data.enforced.memory));
     }
+    // The backend evidence document: the backend, and every channel its
+    // worker held beyond the confinement manifest (the workspace share).
+    // The event log already has its own field, `eventLogRoot`.
     let mut evidence = backend.reborrow().init_evidence();
-    evidence.set_media_type("application/vnd.leyline.backend-evidence");
-    set_digest(evidence.init_digest(), &receipt_data.event_log_root)?;
+    evidence.set_media_type(crate::BackendEvidenceDocument::MEDIA_TYPE);
+    set_digest(
+        evidence.init_digest(),
+        &receipt_data.backend_evidence.digest(),
+    )?;
     let mut roots = receipt
         .reborrow()
         .init_input_roots(receipt_data.context.input_roots.len() as u32);

@@ -5,18 +5,18 @@ use std::io::{Read, Write};
 use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(feature = "vmm")]
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 #[cfg(feature = "vmm")]
 use std::sync::Arc;
 
 #[cfg(feature = "vmm")]
 use rustix::fs::FileType;
 
-use crate::ExecutionError;
-#[cfg(feature = "vmm")]
-use crate::ExecutionRequest;
 #[cfg(feature = "vmm")]
 use crate::confinement::ConfinementManifest;
+use crate::{ExecutionError, ExecutionRequest, WorkerChannel};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "vmm")]
@@ -148,6 +148,150 @@ pub struct WorkerOptions {
     pub workspace_share_fd: Option<i32>,
 }
 
+/// One descriptor a worker holds beyond its standard streams: its number in
+/// the worker, and the channel it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InheritedDescriptor {
+    pub descriptor: i32,
+    pub channel: WorkerChannel,
+}
+
+/// The descriptors a worker for `request`, handed the share descriptor
+/// `share_fd`, holds beyond its standard streams: the share, for a run
+/// granted one workspace, and nothing else.
+///
+/// The one declaration both processes derive: the backend from what it
+/// hands the worker, the worker from what it was handed. The worker refuses
+/// to start holding any descriptor this does not name
+/// ([`refuse_undeclared_descriptors`]), and the backend refuses a readiness
+/// that declares anything else.
+pub fn declared_descriptors(
+    request: &ExecutionRequest,
+    share_fd: Option<i32>,
+) -> Vec<InheritedDescriptor> {
+    match (request.workspaces.as_slice(), share_fd) {
+        ([grant], Some(descriptor)) => vec![InheritedDescriptor {
+            descriptor,
+            channel: WorkerChannel::WorkspaceShare {
+                workspace: grant.name.clone(),
+                graph_root: grant.graph_root.clone(),
+            },
+        }],
+        // Every other pairing is refused by `workspace_share` before the
+        // declaration is used.
+        _ => Vec::new(),
+    }
+}
+
+/// Standard input (the request), output, and error (readiness and failure
+/// events): the descriptors every worker holds without declaring them.
+const STANDARD_STREAMS: [i32; 3] = [0, 1, 2];
+
+/// The descriptors in `held` that are neither a standard stream nor
+/// declared.
+fn undeclared_descriptors(
+    held: &std::collections::BTreeSet<i32>,
+    declared: &[InheritedDescriptor],
+) -> Vec<i32> {
+    held.iter()
+        .copied()
+        .filter(|fd| {
+            !STANDARD_STREAMS.contains(fd) && !declared.iter().any(|d| d.descriptor == *fd)
+        })
+        .collect()
+}
+
+/// Every descriptor open in this process, listed from `/dev/fd` (on Linux a
+/// link to `/proc/self/fd`). The listing's own directory descriptor appears
+/// in it and is closed once the listing is dropped, so only the descriptors
+/// still open afterwards are answered.
+fn held_descriptors() -> Result<std::collections::BTreeSet<i32>, ExecutionError> {
+    let listed: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| {
+            ExecutionError::backend(format!(
+                "list this worker's open descriptors in /dev/fd: {error}"
+            ))
+        })?
+        .iter()
+        .filter_map(|name| name.to_str()?.parse().ok())
+        .collect();
+    Ok(listed
+        .into_iter()
+        .filter(|&fd| {
+            // SAFETY: borrowed for one fcntl that only reads the flags; a
+            // closed number answers EBADF.
+            rustix::io::fcntl_getfd(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }).is_ok()
+        })
+        .collect())
+}
+
+/// Refuse to run holding a descriptor `declared` does not name.
+///
+/// An inherited descriptor is authority no sandbox profile governs: nono
+/// confines what this process may open, not what it already holds. So the
+/// worker checks, before it reads the rootfs or applies its confinement,
+/// that what it holds is its standard streams and its declared channels and
+/// nothing else, and refuses otherwise rather than carry an undescribed
+/// channel into the run.
+pub fn refuse_undeclared_descriptors(
+    declared: &[InheritedDescriptor],
+) -> Result<(), ExecutionError> {
+    let undeclared = undeclared_descriptors(&held_descriptors()?, declared);
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    let declared: Vec<i32> = declared.iter().map(|d| d.descriptor).collect();
+    Err(ExecutionError::identity_mismatch(format!(
+        "the worker holds undeclared inherited descriptor(s) {undeclared:?}: it declares \
+         its standard streams and {declared:?}, and starts with nothing else"
+    )))
+}
+
+/// Have `command`'s child inherit its standard streams and `keep`, and no
+/// other descriptor of this process.
+///
+/// Every descriptor Rust's standard library opens is close-on-exec, but a
+/// process can inherit others from its own parent (a build tool's jobserver
+/// pipes, a shell's redirections) or open them through C code, and each
+/// would pass on to the worker, which refuses to start holding them
+/// ([`refuse_undeclared_descriptors`]). So the spawner lists its open
+/// descriptors before the fork and the child marks each one above the
+/// standard streams close-on-exec, except `keep`, whose flag it clears. A
+/// descriptor opened without close-on-exec between the listing and the fork
+/// still reaches the worker, and the worker's refusal is what catches it.
+pub fn inherit_only(command: &mut Command, keep: &[i32]) -> Result<(), ExecutionError> {
+    let held: Vec<i32> = held_descriptors()?
+        .into_iter()
+        .filter(|fd| !STANDARD_STREAMS.contains(fd))
+        .collect();
+    let keep = keep.to_vec();
+    // SAFETY: the closure runs in the forked child before exec, allocates
+    // nothing, and makes only fcntl calls, which are async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+            for &fd in held.iter().filter(|fd| !keep.contains(fd)) {
+                let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
+                // Closed since the listing: nothing to inherit.
+                if let Ok(flags) = fcntl_getfd(fd) {
+                    fcntl_setfd(fd, flags | FdFlags::CLOEXEC)?;
+                }
+            }
+            for &fd in &keep {
+                let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
+                fcntl_setfd(fd, fcntl_getfd(fd)?.difference(FdFlags::CLOEXEC))?;
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerEvent {
@@ -158,6 +302,10 @@ pub enum WorkerEvent {
         /// `backends::native::WorkerEvent`.
         #[serde(default)]
         confinement_digest: String,
+        /// Every descriptor the worker holds beyond its standard streams
+        /// ([`declared_descriptors`]), verified open before readiness.
+        #[serde(default)]
+        inherited: Vec<InheritedDescriptor>,
     },
     Failed {
         error: ExecutionError,
@@ -266,6 +414,10 @@ pub fn execute_with_ready(
     // is the worker's alone.
     refuse_reserved_environment(request)?;
     let share = workspace_share(request, options.workspace_share_fd)?;
+    // Before the rootfs is read or anything else is opened: what this
+    // process holds is its standard streams and the declared share.
+    let inherited = declared_descriptors(request, options.workspace_share_fd);
+    refuse_undeclared_descriptors(&inherited)?;
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
     let mut config = compile_plan(&resolver, request)?;
     if share.is_some() {
@@ -399,6 +551,7 @@ pub fn execute_with_ready(
     on_ready(&WorkerEvent::Ready {
         run_id: config.run_id.clone(),
         confinement_digest: manifest.confinement_digest()?,
+        inherited,
     })?;
     vm.enter()
 }

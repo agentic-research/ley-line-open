@@ -29,6 +29,7 @@ impl Backend for CompletingBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "transport-test/1".into(),
+            channels: Vec::new(),
         })
     }
 

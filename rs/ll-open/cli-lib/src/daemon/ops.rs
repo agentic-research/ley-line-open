@@ -691,10 +691,26 @@ fn op_reparse(
     // Parse directly into the living db. Classified as `with_write` —
     // `parse_into_conn` runs INSERT/UPDATE/COMMIT under the guard.
     // Bead `ley-line-open-ba8294` Phase 2 intent-marking.
+    //
+    // A reparse of the daemon's own checkout reconciles it (bead
+    // `ley-line-open-60f39f`): a file whose store moved since the directory
+    // last agreed is not replaced with the directory's older bytes.
+    let checkout = ctx
+        .source_dir
+        .as_deref()
+        .filter(|dir| same_directory(dir, &source_dir));
     ctx.state.write().phase = DaemonPhase::Parsing;
-    let result = match ctx
-        .with_write(|conn| crate::cmd_parse::parse_into_conn(conn, &source_dir, lang, scope))
-    {
+    let parsed = ctx.with_write(|conn| match checkout {
+        Some(dir) => {
+            let reconciled = crate::checkout::reconcile(conn, dir, lang, scope)?;
+            if let Some(problems) = reconciled.problems() {
+                log::warn!("reparse: checkout: {problems}");
+            }
+            Ok(reconciled.parse)
+        }
+        None => crate::cmd_parse::parse_into_conn(conn, &source_dir, lang, scope).map(Some),
+    });
+    let result = match parsed {
         Ok(r) => r,
         Err(e) => {
             ctx.state.write().phase = DaemonPhase::Error(format!("reparse failed: {e:#}"));
@@ -717,17 +733,32 @@ fn op_reparse(
         builder.init_root();
     root.set_ok(true);
     root.set_current_root(&current_root);
-    root.set_parsed(result.parsed as u64);
-    root.set_unchanged(result.unchanged as u64);
-    root.set_deleted(result.deleted as u64);
-    root.set_errors(result.errors as u64);
-    let mut changed = root.init_changed_files(result.changed_files.len() as u32);
-    for (i, f) in result.changed_files.iter().enumerate() {
+    // A scoped reconcile that ingested nothing ran no parse: every count is
+    // 0 and no file changed.
+    let changed_files: &[String] = match &result {
+        Some(result) => {
+            root.set_parsed(result.parsed);
+            root.set_unchanged(result.unchanged);
+            root.set_deleted(result.deleted);
+            root.set_errors(result.errors);
+            &result.changed_files
+        }
+        None => &[],
+    };
+    let mut changed = root.init_changed_files(changed_files.len() as u32);
+    for (i, f) in changed_files.iter().enumerate() {
         changed.set(i as u32, f);
     }
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::reparse_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
+}
+
+/// Whether two paths name one directory once symlinks resolve; a path that
+/// does not resolve is compared as written.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    resolve(a) == resolve(b)
 }
 
 fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> Result<String> {
@@ -1125,10 +1156,19 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
             })
         })
         .collect();
+    // A daemon with a source directory materializes the accepted files into
+    // it under the same writer lock, after the commit (bead
+    // `ley-line-open-60f39f`): a crash in between leaves the proposal in the
+    // store, and the next reconcile writes it out.
     let outcome = match writes {
-        Ok(writes) => {
-            ctx.with_write(|conn| crate::source_write::propose(conn, &Grant::Whole, writes))
-        }
+        Ok(writes) => ctx.with_write(|conn| {
+            let accepted = crate::source_write::propose(conn, &Grant::Whole, writes)?;
+            let checkout = ctx.source_dir.as_deref().map(|dir| {
+                let paths: Vec<String> = accepted.blobs.keys().cloned().collect();
+                crate::checkout::reconcile(conn, dir, ctx.lang_filter.as_deref(), Some(&paths))
+            });
+            Ok((accepted, checkout))
+        }),
         Err(refusal) => Err(refusal.into()),
     };
 
@@ -1136,11 +1176,18 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
     let mut root: leyline_public_schema::daemon_capnp::propose_response::Builder =
         builder.init_root();
     match outcome {
-        Ok(accepted) => {
+        Ok((accepted, checkout)) => {
             // Publish whatever happened after the commit: the rows are
             // committed, and a publish that fails here is repaired by the
             // next one, which serializes the whole database.
             let mut post_commit: Vec<String> = accepted.post_commit_error.into_iter().collect();
+            match checkout {
+                Some(Ok(reconciled)) => post_commit.extend(reconciled.problems()),
+                Some(Err(e)) => post_commit.push(format!(
+                    "the source directory was not brought up to the proposal: {e:#}"
+                )),
+                None => {}
+            }
             if let Err(e) = snapshot_living_db(ctx) {
                 post_commit.push(format!("publish after a committed proposal failed: {e:#}"));
             }
@@ -4383,6 +4430,43 @@ mod tests {
     /// not turn an applied proposal into a reported failure. The response
     /// says it was applied, names the blobs, and reports the failure
     /// beside them; the daemon still publishes.
+    /// A daemon without a source directory has no checkout: an accepted
+    /// proposal lands in the store and nowhere else (ADR-0040 D3, bead
+    /// `ley-line-open-60f39f`).
+    #[tokio::test]
+    async fn a_headless_daemon_writes_nothing_to_disk() {
+        let (dir, ctx) = setup_parsed();
+        assert!(ctx.source_dir.is_none(), "setup_parsed is headless");
+        let src = dir.path().join("src");
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": hex_hash(PROPOSE_A), "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r.get("post_commit_error").is_none(), "{r}");
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(read["content"], PROPOSE_A2);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            PROPOSE_A
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&src)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a.go", "b.go"],
+            "nothing was staged beside the files"
+        );
+    }
+
     #[tokio::test]
     async fn propose_reports_an_applied_proposal_as_applied_when_its_head_write_fails() {
         let (_dir, ctx) = setup_parsed();

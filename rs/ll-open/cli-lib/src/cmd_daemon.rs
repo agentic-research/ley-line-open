@@ -688,9 +688,12 @@ pub async fn run_daemon_with_options(
         let source = Arc::new(crate::daemon::live_graph::LiveDbSource::new(ctx.clone()));
         let mut graph = leyline_fs::graph::SqliteGraphAdapter::live(source)?;
         // ADR-0040 D3: an edit to a parsed file goes through the one write
-        // path. The daemon owns its tree, so the mount holds the whole grant.
+        // path. The daemon owns its tree, so the mount holds the whole grant,
+        // and an accepted edit is materialized into its checkout (bead
+        // `ley-line-open-60f39f`).
         graph.set_source_writer(Arc::new(crate::source_write::MountWriter {
             grant: crate::source_write::Grant::Whole,
+            checkout: ctx.source_dir.clone(),
         }));
         if let Some(lang_ext) = language {
             let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
@@ -1092,11 +1095,14 @@ fn verify_source_root_matches(conn: &rusqlite::Connection, current_source: &Path
     );
 }
 
-/// Run a full-tree parse + log the standard `N parsed, N unchanged, N
-/// deleted, N errors` summary. Shared by the warm-start and cold-start
-/// branches of `init_living_db`. The `kind` prefix lets each branch
-/// label its log line ("incremental reparse" vs "parsing") while
-/// keeping the summary format identical so log scrapers see one shape.
+/// Reconcile the whole checkout of `source_dir` (bead
+/// `ley-line-open-60f39f`): materialize what the store accepted while the
+/// directory did not receive it, ingest what changed in the directory while
+/// the daemon was down, report conflicts, and parse the tree. Logs the
+/// standard `N parsed, N unchanged, N deleted, N errors` summary and a
+/// checkout line. Shared by the warm-start and cold-start branches of
+/// `init_living_db`; the `kind` prefix labels the first log line
+/// ("incremental reparse" vs "parsing").
 fn run_initial_parse(
     conn: &rusqlite::Connection,
     source_dir: &Path,
@@ -1104,11 +1110,22 @@ fn run_initial_parse(
     kind: &str,
 ) -> Result<()> {
     eprintln!("{kind} {} ...", source_dir.display());
-    let result = crate::cmd_parse::parse_into_conn(conn, source_dir, language, None)?;
+    let reconciled = crate::checkout::reconcile(conn, source_dir, language, None)?;
+    if let Some(result) = &reconciled.parse {
+        eprintln!(
+            "{} parsed, {} unchanged, {} deleted, {} errors",
+            result.parsed, result.unchanged, result.deleted, result.errors,
+        );
+    }
     eprintln!(
-        "{} parsed, {} unchanged, {} deleted, {} errors",
-        result.parsed, result.unchanged, result.deleted, result.errors,
+        "checkout: {} materialized, {} conflicts, {} files read to compare",
+        reconciled.materialized.len(),
+        reconciled.conflicts.len(),
+        reconciled.hashed,
     );
+    if let Some(problems) = reconciled.problems() {
+        eprintln!("warn: checkout: {problems}");
+    }
     Ok(())
 }
 
@@ -1580,6 +1597,11 @@ async fn git_watch_loop(
             last_head = current_head;
         }
 
+        // 3. Reconcile the checkout (bead `ley-line-open-60f39f`), scoped to
+        //    the paths whose dirty state moved so we don't re-stat the
+        //    entire source tree on every tick.
+        let scope = watch_scope(head_changed, &last_dirty, &current_dirty);
+
         if dirty_changed {
             let new_files: Vec<&String> = current_dirty.difference(&last_dirty).collect();
             if !new_files.is_empty() {
@@ -1595,19 +1617,24 @@ async fn git_watch_loop(
             last_dirty = current_dirty;
         }
 
-        // 3. Incremental reparse, scoped to the dirty set so we don't re-stat
-        //    the entire source tree on every tick.
         ctx.state.write().phase = DaemonPhase::Parsing;
         let lang = ctx.lang_filter.as_deref();
-        let dirty_vec: Vec<String> = last_dirty.iter().cloned().collect();
-        let scope: Option<&[String]> = if dirty_vec.is_empty() {
-            None
-        } else {
-            Some(dirty_vec.as_slice())
-        };
         let guard = ctx.live_db.writer.lock();
-        match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang, scope) {
-            Ok(result) => {
+        // A materialized file changes no projected row, only the checkout
+        // index, which the periodic snapshot publishes.
+        let reconciled = crate::checkout::reconcile(&guard, source_dir, lang, scope.as_deref())
+            .map(|reconciled| {
+                if let Some(problems) = reconciled.problems() {
+                    log::warn!("watch: checkout: {problems}");
+                }
+                reconciled.parse
+            });
+        match reconciled {
+            Ok(None) => {
+                drop(guard);
+                ctx.state.write().phase = DaemonPhase::Ready;
+            }
+            Ok(Some(result)) => {
                 if result.parsed > 0 || result.deleted > 0 {
                     eprintln!(
                         "watch: {} parsed, {} unchanged, {} deleted",
@@ -1672,6 +1699,23 @@ async fn git_watch_loop(
             }
         }
     }
+}
+
+/// The paths one watcher tick reconciles: the whole checkout when HEAD
+/// moved, else every path whose git dirty state moved — dirty now, or dirty
+/// at the last tick and clean now, since a revert changes the file too.
+fn watch_scope(
+    head_changed: bool,
+    last: &std::collections::HashSet<String>,
+    current: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    (!head_changed).then(|| {
+        last.union(current)
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
+            .collect()
+    })
 }
 
 /// Run the enrichment pipeline scoped to `changed_files` and emit
@@ -3010,6 +3054,18 @@ mod tests {
         let live_db_path = live_db_path_for(ctrl_path);
         let writer = rusqlite::Connection::open(&live_db_path).unwrap();
         configure_wal(&writer).unwrap();
+        context_over(ctrl_path, ext, source, writer)
+    }
+
+    /// A daemon context over `writer`, the live db's writer connection at
+    /// `live_db_path_for(ctrl_path)`, whose checkout is `source`.
+    fn context_over(
+        ctrl_path: &Path,
+        ext: Arc<dyn DaemonExt>,
+        source: &Path,
+        writer: rusqlite::Connection,
+    ) -> Arc<DaemonContext> {
+        let live_db_path = live_db_path_for(ctrl_path);
         let live_db = crate::daemon::db_pool::LiveDb::new(writer, &live_db_path, 4).unwrap();
         #[cfg(feature = "vec")]
         let vec_index = {
@@ -3039,6 +3095,269 @@ mod tests {
             text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         })
+    }
+
+    // ── The checkout across restarts (bead `ley-line-open-60f39f`) ─────
+    //
+    // Each test runs daemon lifetimes through the startup path a real
+    // daemon runs: `setup_arena`, `init_living_db` (cold, then warm), and
+    // the first publish. Dropping a lifetime's context is a kill: nothing
+    // runs at exit, so what the next start sees is what was committed.
+
+    const CHECKOUT_A: &str = "package a\n\nfunc A() int { return 1 }\n";
+    const CHECKOUT_PROPOSED: &str = "package a\n\nfunc A() int { return 2 }\n";
+    const CHECKOUT_EDITED: &str = "package a\n\nfunc A() int { return 3 }\n";
+    const CHECKOUT_B: &str = "package a\n\nfunc B() string { return \"b\" }\n";
+
+    /// A source directory holding `a.go` and `b.go`, and a state directory
+    /// for the arena, controller and live db.
+    fn checkout_fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(src.join("a.go"), CHECKOUT_A).unwrap();
+        std::fs::write(src.join("b.go"), CHECKOUT_B).unwrap();
+        (dir, src, state)
+    }
+
+    /// One daemon lifetime over `src`, started the way `run_daemon` starts.
+    fn boot(state: &Path, src: &Path) -> Arc<DaemonContext> {
+        let ctrl = cmd_serve::setup_arena(
+            &state.join("arena"),
+            8 * 1024 * 1024,
+            Some(&state.join("arena.ctrl")),
+        )
+        .unwrap();
+        let live = live_db_path_for(&ctrl);
+        let conn = init_living_db(&ctrl, &live, Some(src), Some("go"), false).unwrap();
+        snapshot_to_arena(&conn, &ctrl).unwrap();
+        context_over(&ctrl, Arc::new(NoExt), src, conn)
+    }
+
+    fn op(ctx: &Arc<DaemonContext>, request: serde_json::Value) -> serde_json::Value {
+        let out = crate::daemon::ops::handle_base_op_value(ctx, request).expect("a base op");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    fn read_source(ctx: &Arc<DaemonContext>, path: &str) -> serde_json::Value {
+        op(ctx, serde_json::json!({"op": "read_source", "path": path}))
+    }
+
+    /// Propose `content` for `path` against what `path` holds now.
+    fn propose_over(ctx: &Arc<DaemonContext>, path: &str, content: &str) -> serde_json::Value {
+        let base = read_source(ctx, path)["blob_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        op(
+            ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": path, "base": base, "content": content},
+            ]}),
+        )
+    }
+
+    /// What the checkout's conflict record holds for `path`, read through
+    /// the daemon's `query` op.
+    fn conflict_rows(ctx: &Arc<DaemonContext>, path: &str) -> Vec<serde_json::Value> {
+        let r = op(
+            ctx,
+            serde_json::json!({"op": "query", "sql": format!(
+                "SELECT path, hex(disk_hash) AS disk, hex(stored_hash) AS stored \
+                   FROM _checkout_conflict WHERE path = '{path}'"
+            )}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        r["rows"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn upper_hex(text: &str) -> String {
+        use leyline_core::ContentAddressed;
+        text.as_bytes().hash().to_string().to_uppercase()
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_an_accepted_proposal_and_the_directory_holds_it() {
+        let (_dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        let accepted = propose_over(&ctx, "a.go", CHECKOUT_PROPOSED);
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert!(accepted.get("post_commit_error").is_none(), "{accepted}");
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED,
+            "an accepted proposal is materialized into the source directory",
+        );
+        drop(ctx);
+
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_PROPOSED);
+        assert_eq!(read_source(&ctx, "b.go")["content"], CHECKOUT_B);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_commit_and_materialization_is_materialized_at_restart() {
+        let (_dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        // The file cannot be staged: a directory sits where its temp file goes.
+        let staging = crate::checkout::staging_path(&src.join("a.go"));
+        std::fs::create_dir(&staging).unwrap();
+        let accepted = propose_over(&ctx, "a.go", CHECKOUT_PROPOSED);
+        assert_eq!(accepted["ok"], true, "the proposal commits: {accepted}");
+        assert!(
+            accepted["post_commit_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("a.go")),
+            "the failed materialization is reported: {accepted}",
+        );
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_A
+        );
+        drop(ctx);
+        std::fs::remove_dir(&staging).unwrap();
+
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_PROPOSED);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED,
+            "startup materializes the proposal instead of reverting it",
+        );
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_edit_made_while_the_daemon_was_down_is_ingested() {
+        let (_dir, src, state) = checkout_fixture();
+        drop(boot(&state, &src));
+        std::fs::write(src.join("a.go"), CHECKOUT_EDITED).unwrap();
+        std::fs::remove_file(src.join("b.go")).unwrap();
+        std::fs::write(src.join("c.go"), CHECKOUT_B).unwrap();
+
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_EDITED);
+        assert_eq!(
+            read_source(&ctx, "b.go")["ok"],
+            false,
+            "a deleted file leaves"
+        );
+        assert_eq!(read_source(&ctx, "c.go")["content"], CHECKOUT_B);
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+        drop(ctx);
+
+        // The ingest was recorded: the next start changes nothing.
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_EDITED);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_EDITED
+        );
+        assert!(!src.join("b.go").exists(), "a deleted file is not restored");
+    }
+
+    #[tokio::test]
+    async fn both_sides_changed_is_a_conflict_that_keeps_both() {
+        let (_dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        let staging = crate::checkout::staging_path(&src.join("a.go"));
+        std::fs::create_dir(&staging).unwrap();
+        assert_eq!(propose_over(&ctx, "a.go", CHECKOUT_PROPOSED)["ok"], true);
+        drop(ctx);
+        std::fs::remove_dir(&staging).unwrap();
+        // While the daemon is down, a person edits the file it never wrote.
+        std::fs::write(src.join("a.go"), CHECKOUT_EDITED).unwrap();
+
+        let ctx = boot(&state, &src);
+        assert_eq!(
+            read_source(&ctx, "a.go")["content"],
+            CHECKOUT_PROPOSED,
+            "the store keeps the proposal",
+        );
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_EDITED,
+            "the directory keeps the edit",
+        );
+        assert_eq!(
+            conflict_rows(&ctx, "a.go"),
+            vec![serde_json::json!({
+                "path": "a.go",
+                "disk": upper_hex(CHECKOUT_EDITED),
+                "stored": upper_hex(CHECKOUT_PROPOSED),
+            })],
+        );
+        drop(ctx);
+
+        // Proposing the directory's bytes resolves it.
+        let ctx = boot(&state, &src);
+        assert_eq!(propose_over(&ctx, "a.go", CHECKOUT_EDITED)["ok"], true);
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+        drop(ctx);
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_EDITED);
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+    }
+
+    /// `reparse` over the daemon's own checkout reconciles it: a proposal
+    /// the directory never received is written out, not replaced by the
+    /// directory's older bytes. A reparse of another directory parses it.
+    #[tokio::test]
+    async fn a_reparse_of_the_checkout_reconciles_it() {
+        let (dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        let staging = crate::checkout::staging_path(&src.join("a.go"));
+        std::fs::create_dir(&staging).unwrap();
+        assert_eq!(propose_over(&ctx, "a.go", CHECKOUT_PROPOSED)["ok"], true);
+        std::fs::remove_dir(&staging).unwrap();
+
+        let r = op(&ctx, serde_json::json!({"op": "reparse"}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_PROPOSED);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED
+        );
+
+        // Scoped to a file with nothing to ingest: no parse ran.
+        let quiet = op(
+            &ctx,
+            serde_json::json!({"op": "reparse", "files": ["a.go"]}),
+        );
+        assert_eq!(quiet["ok"], true, "{quiet}");
+        assert_eq!(quiet["parsed"], "0", "{quiet}");
+
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("c.go"), CHECKOUT_B).unwrap();
+        let r = op(
+            &ctx,
+            serde_json::json!({"op": "reparse", "source": other.to_string_lossy()}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["parsed"], "1", "{r}");
+    }
+
+    #[test]
+    fn the_watcher_reconciles_every_path_whose_dirty_state_moved() {
+        let set = |paths: &[&str]| -> std::collections::HashSet<String> {
+            paths.iter().map(|p| p.to_string()).collect()
+        };
+        assert_eq!(
+            watch_scope(false, &set(&["a.go", "b.go"]), &set(&["b.go", "c.go"])),
+            Some(vec![
+                "a.go".to_string(),
+                "b.go".to_string(),
+                "c.go".to_string()
+            ]),
+        );
+        assert_eq!(watch_scope(true, &set(&["a.go"]), &set(&[])), None);
     }
 
     /// Subscribe to one topic, return the event receiver.

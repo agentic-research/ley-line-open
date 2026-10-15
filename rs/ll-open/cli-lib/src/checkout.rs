@@ -1410,6 +1410,17 @@ mod tests {
             write_into(&src, "run.sh", b"#!/bin/sh\necho\n").unwrap();
             let mode = std::fs::metadata(&script).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755);
+
+            // A file written over a symlink is a new regular file: it does
+            // not take the link's permissions (`lrwxr-xr-x`).
+            std::fs::write(src.join("plain"), "p\n").unwrap();
+            std::fs::set_permissions(src.join("plain"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            std::os::unix::fs::symlink("plain", src.join("over")).unwrap();
+            write_into(&src, "over", b"x\n").unwrap();
+            let over = std::fs::symlink_metadata(src.join("over")).unwrap();
+            assert!(over.is_file());
+            assert_eq!(over.permissions().mode() & 0o111, 0, "not executable");
         }
     }
 

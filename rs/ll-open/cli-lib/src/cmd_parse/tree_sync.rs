@@ -162,7 +162,10 @@ pub(super) fn sync(
                             },
                         );
                     }
-                    Ok(_) => {}
+                    // A socket, a fifo or a device is no tree entry.
+                    Ok(_) => {
+                        seen.insert(rel.clone(), Seen::Gone);
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         seen.insert(rel.clone(), Seen::Gone);
                     }
@@ -219,14 +222,10 @@ pub(super) fn sync(
             continue;
         }
         tree::remove(conn, rel)?;
-        // A directory gone from disk takes what the store held under it.
-        if was == Some(Entry::Dir)
-            && !whole
-            && !memory.is_some_and(|m| m.edits().rmdirs.contains(rel))
-        {
-            for (under, _) in tree::under(conn, rel)? {
-                tree::remove(conn, &under)?;
-            }
+        // A directory that leaves takes what the store held under it (a
+        // directory gone from disk; an rmdir has nothing under it).
+        for (under, _) in tree::under(conn, rel)? {
+            tree::remove(conn, &under)?;
         }
     }
     for (rel, s) in &seen {
@@ -259,13 +258,12 @@ pub(super) fn sync(
                 };
                 let mode = disk_mode(&meta);
                 let stat = stat_of(&meta);
-                let fresh = !outcomes.projected.contains_key(rel.as_str())
-                    && !outcomes.unprojected.contains_key(rel.as_str());
-                if fresh
-                    && matches!(was, Some(Entry::File { mode: m, .. }) if m == mode)
+                // The stat cache, as git's index: a file whose mode and
+                // stat match what the walk last stored is not read again.
+                if matches!(was, Some(Entry::File { mode: m, .. }) if m == mode)
                     && stats.get(rel.as_str()) == Some(&stat)
                 {
-                    continue; // unchanged since the walk last stored it
+                    continue;
                 }
                 // A symlink's blob is its target; a projected file's blob
                 // is already stored; any other file is read.
@@ -290,13 +288,9 @@ pub(super) fn sync(
             (None, Some((hash, _))) => Hash::from_bytes(*hash),
             (None, None) => continue,
         };
-        // A file whose bytes changed and that this pass did not take up
-        // (a file the parse does not project) has no diagnostic.
-        let changed = was.and_then(Entry::blob) != Some(blob);
-        if changed
-            && !outcomes.projected.contains_key(rel.as_str())
-            && !outcomes.unprojected.contains_key(rel.as_str())
-        {
+        // A file whose bytes changed loses the diagnostic its old bytes
+        // had; the loops below set one again for a file the parse took up.
+        if was.and_then(Entry::blob) != Some(blob) {
             tree::set_diagnostic(conn, rel, None)?;
         }
         tree::put_file(conn, rel, mode, blob, stat)?;

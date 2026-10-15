@@ -4539,6 +4539,10 @@ mod tests {
             ]}),
         );
         assert_eq!(r["ok"], true, "{r}");
+        assert!(
+            r.get("merged").is_none(),
+            "nothing merged, no `merged`: {r}"
+        );
         let run = call(
             &ctx,
             serde_json::json!({"op": "read_source", "path": "bin/run"}),

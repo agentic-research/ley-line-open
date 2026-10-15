@@ -215,3 +215,156 @@ fn a_scoped_pass_stores_an_unprojected_file_in_its_scope() {
     let all: Vec<String> = crate::tree::entries(&conn).unwrap().into_keys().collect();
     assert_eq!(all, ["a.go", "deep", "deep/notes.txt"]);
 }
+
+fn scoped(conn: &Connection, root: &Path, paths: &[&str]) {
+    let scope: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+    parse_into_conn(conn, root, None, Some(&scope)).unwrap();
+}
+
+/// A scoped pass (the watcher's) reads each path's kind from disk: a
+/// symlink is stored as one, a path gone from disk or turned into a socket
+/// leaves, a directory gone from disk takes its entries, and a path it
+/// cannot stat is left as the store holds it.
+#[cfg(unix)]
+#[test]
+fn a_scoped_pass_follows_each_paths_kind_on_disk() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+    write(root, "a.go", GO.as_bytes());
+    write(root, "gone.txt", b"g\n");
+    write(root, "sock.txt", b"s\n");
+    write(root, "d/x.txt", b"x\n");
+    write(root, "locked/y.txt", b"y\n");
+    let conn = Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, root, None, None).unwrap();
+
+    std::os::unix::fs::symlink("a.go", root.join("link")).unwrap();
+    std::fs::remove_file(root.join("gone.txt")).unwrap();
+    std::fs::remove_file(root.join("sock.txt")).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("sock.txt")).unwrap();
+    std::fs::remove_dir_all(root.join("d")).unwrap();
+    chmod(root, "locked", 0o000);
+    scoped(
+        &conn,
+        root,
+        &["link", "gone.txt", "sock.txt", "d", "locked/y.txt"],
+    );
+    chmod(root, "locked", 0o755);
+
+    let all = crate::tree::entries(&conn).unwrap();
+    assert_eq!(all.get("link"), Some(&file(Mode::Symlink, b"a.go")));
+    for gone in ["gone.txt", "sock.txt", "d", "d/x.txt"] {
+        assert!(!all.contains_key(gone), "{gone} left the store: {all:?}");
+    }
+    assert_eq!(
+        all.get("locked/y.txt"),
+        Some(&file(Mode::Regular, b"y\n")),
+        "a path the pass cannot stat keeps its entry"
+    );
+}
+
+/// The walk's stat cache is trusted as git's index is: a file whose mode
+/// and stat match what the walk stored is not read again.
+#[test]
+fn a_file_whose_stat_matches_the_store_is_not_read_again() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+    write(root, "notes.txt", b"one\n");
+    let conn = Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, root, None, None).unwrap();
+    let mtime = std::fs::metadata(root.join("notes.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    write(root, "notes.txt", b"two\n");
+    std::fs::File::options()
+        .write(true)
+        .open(root.join("notes.txt"))
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    parse_into_conn(&conn, root, None, None).unwrap();
+    assert_eq!(
+        crate::tree::entry(&conn, "notes.txt").unwrap(),
+        Some(file(Mode::Regular, b"one\n"))
+    );
+}
+
+/// A diagnostic belongs to the bytes it describes: a stat-only change
+/// keeps it; new bytes the parse does not take up drop it.
+#[test]
+fn a_diagnostic_survives_a_touch_and_leaves_with_its_bytes() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+    write(root, "a.go", b"package a\n\nfunc A( {\n");
+    let conn = Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, root, None, None).unwrap();
+    assert!(crate::tree::diagnostic(&conn, "a.go").unwrap().is_some());
+
+    // The same bytes, a new mtime: the parse skips it by its hash.
+    write(root, "a.go", b"package a\n\nfunc A( {\n");
+    parse_into_conn(&conn, root, None, None).unwrap();
+    assert!(
+        crate::tree::diagnostic(&conn, "a.go").unwrap().is_some(),
+        "the bytes did not change"
+    );
+
+    // New bytes under a filter that does not project the file.
+    write(root, "a.go", b"package a\n\nfunc B( {\n");
+    parse_into_conn(&conn, root, Some("python"), None).unwrap();
+    assert_eq!(crate::tree::diagnostic(&conn, "a.go").unwrap(), None);
+}
+
+/// A scoped pass naming no filter keeps the one a whole pass recorded, so
+/// a later proposal projects under it.
+#[test]
+fn a_scoped_pass_keeps_the_recorded_language_filter() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+    write(root, "a.go", GO.as_bytes());
+    let conn = Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, root, Some("go"), None).unwrap();
+    write(root, "b.go", GO.as_bytes());
+    scoped(&conn, root, &["b.go"]);
+    assert_eq!(
+        get_meta(&conn, PROJECTION_LANGUAGE_KEY).unwrap().as_deref(),
+        Some("go")
+    );
+    parse_into_conn(&conn, root, None, None).unwrap();
+    assert_eq!(get_meta(&conn, PROJECTION_LANGUAGE_KEY).unwrap(), None);
+}
+
+/// A file that leaves the projection without leaving the store (it became
+/// a symlink) takes the presentation rows of the directory it emptied.
+#[test]
+fn a_file_leaving_the_projection_sweeps_its_emptied_directory() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+    write(root, "a.go", GO.as_bytes());
+    write(root, "sub/b.go", GO.as_bytes());
+    let conn = Connection::open_in_memory().unwrap();
+    parse_into_conn(&conn, root, None, None).unwrap();
+    let dirs = |conn: &Connection| -> i64 {
+        conn.query_row("SELECT count(*) FROM nodes WHERE nid < -1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(dirs(&conn), 1, "sub's presentation row");
+    parse_written_files(
+        &conn,
+        root,
+        &BTreeMap::from([("sub/b.go".to_string(), b"a.go".to_vec())]),
+        &std::collections::BTreeSet::new(),
+        &TreeEdits {
+            modes: BTreeMap::from([("sub/b.go".to_string(), Mode::Symlink)]),
+            ..TreeEdits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(dirs(&conn), 0, "sub holds no projected file");
+    assert_eq!(
+        crate::tree::entry(&conn, "sub/b.go").unwrap(),
+        Some(file(Mode::Symlink, b"a.go"))
+    );
+}

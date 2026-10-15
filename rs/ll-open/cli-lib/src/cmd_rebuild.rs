@@ -616,6 +616,33 @@ mod tests {
         }
     }
 
+    /// ADR-0045: ring 0 carries directories. A whole rebuild reproduces an
+    /// empty directory (and so the stamped `treeRoot`); a rebuild of named
+    /// files carries only the directories above them.
+    #[test]
+    fn a_rebuild_carries_empty_directories_for_the_whole_tree_only() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.go"), A).unwrap();
+        std::fs::create_dir_all(src.path().join("empty")).unwrap();
+        let from = Connection::open_in_memory().unwrap();
+        crate::cmd_parse::parse_into_conn(&from, src.path(), None, None).unwrap();
+
+        let whole = Connection::open_in_memory().unwrap();
+        rebuild(&from, &whole, &Grant::Whole).unwrap();
+        assert_eq!(
+            crate::tree::entry(&whole, "empty").unwrap(),
+            Some(crate::tree::Entry::Dir)
+        );
+        let some = Connection::open_in_memory().unwrap();
+        rebuild(
+            &from,
+            &some,
+            &Grant::Paths(BTreeSet::from(["a.go".to_string()])),
+        )
+        .unwrap();
+        assert_eq!(crate::tree::entry(&some, "empty").unwrap(), None);
+    }
+
     #[test]
     fn a_missing_blob_fails_the_rebuild() {
         let a = arena(FILES);

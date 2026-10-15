@@ -48,24 +48,10 @@ pub fn merge(base: &[u8], ours: &[u8], theirs: &[u8]) -> Merged {
     );
     match resolution {
         Resolution::Complete | Resolution::CompleteWithAutoResolvedConflict => Merged::Clean(out),
-        Resolution::Conflict => {
-            let ranges = conflict_ranges(base, ours, theirs);
-            // gix-merge found a conflict; when the overlap rule below names
-            // none, the whole base is named rather than nothing.
-            Merged::Conflict(if ranges.is_empty() {
-                vec![LineRange {
-                    start: 0,
-                    end: base_lines(base),
-                }]
-            } else {
-                ranges
-            })
-        }
+        // The ranges are computed with gix-merge's own overlap rule over the
+        // same hunks, so a conflict names at least one.
+        Resolution::Conflict => Merged::Conflict(conflict_ranges(base, ours, theirs)),
     }
-}
-
-fn base_lines(base: &[u8]) -> u32 {
-    imara_diff::sources::byte_lines(base).count() as u32
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +202,22 @@ mod tests {
                 LineRange { start: 2, end: 3 },
                 LineRange { start: 6, end: 7 },
             ])
+        );
+    }
+
+    /// An insertion of one side before a change of the other, at another
+    /// line, does not overlap it: only the real conflict is named.
+    #[test]
+    fn an_insertion_elsewhere_is_not_part_of_a_conflict() {
+        let ours = BASE
+            .replace("package a\n", "package a\n// ours\n")
+            .replace("return 3", "return 30");
+        let theirs = BASE
+            .replace("return 2", "return 20")
+            .replace("return 3", "return 33");
+        assert_eq!(
+            merge(BASE.as_bytes(), ours.as_bytes(), theirs.as_bytes()),
+            Merged::Conflict(vec![LineRange { start: 6, end: 7 }])
         );
     }
 

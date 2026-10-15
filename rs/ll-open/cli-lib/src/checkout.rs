@@ -501,28 +501,24 @@ fn write_file(dir: &Path, rel: &str, bytes: &[u8], mode: Option<Mode>) -> Result
         let mut file = std::fs::File::create(&staging)
             .with_context(|| format!("stage {}", staging.display()))?;
         file.write_all(bytes)?;
-        let existing = std::fs::symlink_metadata(&target)
-            .ok()
-            .filter(|m| m.is_file())
-            .map(|m| m.permissions());
-        let permissions = match existing {
-            Some(p) => Some(p),
-            None if mode.is_some() => Some(file.metadata()?.permissions()),
-            None => None,
+        // The file it replaces keeps its permissions; a new file has the
+        // staged file's. A mode sets the execute bits where the read bits
+        // are (git's rule), or clears them.
+        let mut permissions = match std::fs::symlink_metadata(&target) {
+            Ok(m) if m.is_file() => m.permissions(),
+            _ => file.metadata()?.permissions(),
         };
-        if let Some(mut permissions) = permissions {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let bits = permissions.mode();
-                match mode {
-                    Some(Mode::Executable) => permissions.set_mode(bits | ((bits & 0o444) >> 2)),
-                    Some(_) => permissions.set_mode(bits & !0o111),
-                    None => {}
-                }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bits = permissions.mode() & !0o111;
+            match mode {
+                Some(Mode::Executable) => permissions.set_mode(bits + ((bits & 0o444) >> 2)),
+                Some(_) => permissions.set_mode(bits),
+                None => {}
             }
-            file.set_permissions(permissions)?;
         }
+        file.set_permissions(permissions)?;
         file.sync_all()?;
         std::fs::rename(&staging, &target)
             .with_context(|| format!("rename {} over {}", staging.display(), target.display()))?;
@@ -1309,6 +1305,33 @@ mod tests {
         assert!(!c.src.join("empty/inner").exists() && c.src.join("empty").is_dir());
         assert!(std::fs::symlink_metadata(c.src.join("link")).is_err());
         assert_eq!(mode_of("a.go") & 0o111, 0);
+
+        // Execute bits follow the read bits (git's rule): a file only its
+        // owner reads becomes executable by its owner only; a new file
+        // created executable is executable.
+        std::fs::set_permissions(c.src.join("b.go"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        reconcile(&c.conn, &c.src, None, None).unwrap();
+        tree(vec![
+            Proposed::write_mode("b.go", Base::Any, B.into(), Mode::Executable),
+            Proposed::write_mode(
+                "new.sh",
+                Base::Absent,
+                "#!/bin/sh\n".into(),
+                Mode::Executable,
+            ),
+        ]);
+        reconcile(&c.conn, &c.src, None, Some(&scope(&["b.go", "new.sh"]))).unwrap();
+        assert_eq!(mode_of("b.go"), 0o700);
+        assert_eq!(mode_of("new.sh") & 0o111, 0o111);
+        tree(vec![Proposed::write_mode(
+            "b.go",
+            Base::Any,
+            B.into(),
+            Mode::Regular,
+        )]);
+        reconcile(&c.conn, &c.src, None, Some(&scope(&["b.go"]))).unwrap();
+        assert_eq!(mode_of("b.go"), 0o600);
 
         // The directory side: a mode, a link and a directory are ingested.
         std::fs::set_permissions(c.src.join("b.go"), std::fs::Permissions::from_mode(0o755))

@@ -720,7 +720,9 @@ fn check_structure(conn: &Connection, plans: &[Plan]) -> Result<()> {
         .collect();
     let created: Vec<&Plan> = plans
         .iter()
-        .filter(|p| p.current.is_none() && matches!(p.change, Change::Write { .. } | Change::Mkdir))
+        // A plan for a path the store does not hold is a create or an
+        // mkdir: every other change to such a path was refused.
+        .filter(|p| p.current.is_none())
         .collect();
     let created_files: BTreeSet<&str> = created
         .iter()

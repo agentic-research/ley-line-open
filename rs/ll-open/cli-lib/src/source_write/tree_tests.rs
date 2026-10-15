@@ -371,6 +371,80 @@ fn modes_and_symlinks_are_proposals() {
     )
     .unwrap_err();
     assert!(matches!(refused(err), Refusal::Stale(_)));
+
+    // A symlink rewritten without naming a mode stays a symlink, and is
+    // still not projected.
+    tree_propose(
+        &s,
+        vec![Proposed::write(
+            "link.go",
+            Base::Blob(h("a.go")),
+            "run.sh".into(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        crate::tree::entry(&s.conn, "link.go").unwrap(),
+        Some(Entry::File {
+            mode: Mode::Symlink,
+            blob: h("run.sh")
+        })
+    );
+    assert!(!projected(&s, "link.go"));
+
+    // A regular file whose base moved does not merge into a symlink.
+    tree_propose(
+        &s,
+        vec![Proposed::write(
+            "a.go",
+            Base::Any,
+            A.replace("return 3", "return 4").into(),
+        )],
+    )
+    .unwrap();
+    let err = tree_propose(
+        &s,
+        vec![Proposed::write_mode(
+            "a.go",
+            Base::Blob(h(A)),
+            "b.go".into(),
+            Mode::Symlink,
+        )],
+    )
+    .unwrap_err();
+    assert!(matches!(refused(err), Refusal::Stale(_)));
+
+    // A create of the bytes a path holds under another mode is stale: it
+    // would change the entry.
+    let held = A.replace("return 3", "return 4");
+    let err = tree_propose(
+        &s,
+        vec![Proposed::write_mode(
+            "a.go",
+            Base::Absent,
+            held.into(),
+            Mode::Executable,
+        )],
+    )
+    .unwrap_err();
+    assert!(matches!(refused(err), Refusal::Stale(_)));
+}
+
+/// A directory change is inside a path grant only when the grant names a
+/// path under the directory.
+#[test]
+fn a_path_grant_covers_directories_under_its_paths() {
+    let s = store(&[("a.go", Node::File(A, Mode::Regular))]);
+    let grant = Grant::Paths(BTreeSet::from(["pkg/b.go".to_string()]));
+    let err = propose(&s.conn, &grant, vec![Proposed::mkdir("other")]).unwrap_err();
+    assert_eq!(
+        refused(err),
+        Refusal::OutsideGrant {
+            path: "other".into()
+        }
+    );
+    propose(&s.conn, &grant, vec![Proposed::mkdir("pkg")]).unwrap();
+    assert!(grant.covers_dir("pkg") && !grant.covers_dir("pk") && Grant::Whole.covers_dir("x"));
 }
 
 /// T4: directories are entries a proposal makes and removes.
@@ -551,5 +625,18 @@ fn a_directory_rename_is_one_proposal() {
     // Onto an existing directory with entries: refused, nothing moves.
     let err = rename_dir(&s.conn, "lib/deep", "lib").unwrap_err();
     assert!(format!("{err:#}").contains("lib"), "{err:#}");
+    // Into itself, onto a path that is not plain, or from a file: refused.
+    for (from, to) in [("lib", "lib/inner"), ("lib", "../out"), ("a.go", "b")] {
+        assert!(rename_dir(&s.conn, from, to).is_err(), "{from} -> {to}");
+    }
+    // Onto an empty directory: it is replaced.
+    tree_propose(&s, vec![Proposed::mkdir("target")]).unwrap();
+    let writes = rename_dir(&s.conn, "lib/empty", "target").unwrap();
+    tree_propose(&s, writes).unwrap();
+    assert_eq!(
+        crate::tree::entry(&s.conn, "target").unwrap(),
+        Some(Entry::Dir)
+    );
+    assert_eq!(crate::tree::entry(&s.conn, "lib/empty").unwrap(), None);
     let _ = &s.src;
 }

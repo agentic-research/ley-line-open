@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Thu, 15 Oct 2026 11:38:59 -0600
+Subject: [PATCH] init: mount the virtio-fs devices KRUN_VIRTIOFS_MOUNTS lists
+
+An embedder that attaches a virtio-fs device besides the root (a host
+directory with krun_add_virtiofs, or its own backend with
+krun_add_virtiofs_backend) has no way to have the guest mount it before
+the workload runs: init mounts only the root and the pseudo filesystems,
+so the workload itself has to call mount(2), which an unmodified program
+(a shell, an editor, an agent harness) does not.
+
+Read KRUN_VIRTIOFS_MOUNTS, a comma-separated list of "tag:/directory"
+pairs, after the root is set up and before the working directory is
+entered; create each directory and mount the tag there as virtiofs. A
+malformed entry or a failed mount stops the guest before the workload
+starts, and the variable is removed from the workload's environment.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+Signed-off-by: jamestexas <18285880+jamestexas@users.noreply.github.com>
+---
+ src/init_blob/init/init.c | 48 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
+index 8778483..2b76ef2 100644
+--- a/src/init_blob/init/init.c
++++ b/src/init_blob/init/init.c
+@@ -1197,6 +1197,49 @@ char *clone_str(const char *str)
+     return strdup(str);
+ }
+ 
++#if __linux__
++/*
++ * Mount each virtio-fs device listed in KRUN_VIRTIOFS_MOUNTS, a
++ * comma-separated list of "tag:/directory" pairs, creating each directory.
++ * An entry that is malformed or does not mount stops the guest before the
++ * workload runs: a workload must not start without a filesystem its
++ * embedder attached for it. The variable is removed from the environment
++ * the workload inherits.
++ */
++static int mount_virtiofs_list()
++{
++    char *list, *pair, *dir, *save = NULL;
++
++    list = clone_str(getenv("KRUN_VIRTIOFS_MOUNTS"));
++    if (list == NULL) {
++        return 0;
++    }
++    for (pair = strtok_r(list, ",", &save); pair != NULL;
++         pair = strtok_r(NULL, ",", &save)) {
++        dir = strchr(pair, ':');
++        if (dir == NULL || dir == pair || dir[1] != '/') {
++            printf("KRUN_VIRTIOFS_MOUNTS: malformed entry '%s'\n", pair);
++            free(list);
++            return -1;
++        }
++        *dir++ = '\0';
++        if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
++            perror("mkdir(KRUN_VIRTIOFS_MOUNTS)");
++            free(list);
++            return -1;
++        }
++        if (mount(pair, dir, "virtiofs", 0, NULL) < 0) {
++            perror("mount(KRUN_VIRTIOFS_MOUNTS)");
++            free(list);
++            return -1;
++        }
++    }
++    free(list);
++    unsetenv("KRUN_VIRTIOFS_MOUNTS");
++    return 0;
++}
++#endif
++
+ #if __linux__
+ static bool tsi_enabled()
+ {
+@@ -1402,6 +1445,11 @@ int main(int argc, char **argv)
+         perror("Couldn't set shared propagation on the root mount");
+         exit(-1);
+     }
++
++    if (mount_virtiofs_list() < 0) {
++        printf("Couldn't mount KRUN_VIRTIOFS_MOUNTS, bailing out\n");
++        exit(-1);
++    }
+ #endif
+ 
+     setsid();
+-- 
+2.50.1 (Apple Git-155)
+

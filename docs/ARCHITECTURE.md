@@ -376,6 +376,7 @@ Architectural decisions that shape LLO today:
 | [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` | Proposed — D1, D3, D4 and D6 shipped (v0.20.2); D5 open; D7 is ADR-0041 |
 | [ADR-0041](adr/0041-publication-snapshots.md) | Publication — immutable snapshot files of whole proposals under control block v4 with `(epoch, seq)`; `current_root` retired for `treeRoot`; one producer; transport carries what proposals carry | Proposed — no implementation exists |
 | [ADR-0042](adr/0042-proposals.md) | Proposals — a write names the bytes its author read and is applied whole or refused whole; file bases, daemon `read_source`/`propose`, mount `ESTALE`; node bases and the closure check open | Proposed — file bases, one-transaction writes, durable acknowledgement, daemon ops and mount bases implemented (#437-#440, `843e03`) |
+| [ADR-0044](adr/0044-userspace-data-plane.md) | Agents use a userspace data plane — in-process reads over the mmap snapshot, proposals through a shared-memory ring with typed replies; the NFS/FUSE mount is compatibility | Proposed |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 

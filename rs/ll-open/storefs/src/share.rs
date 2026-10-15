@@ -250,7 +250,3 @@ fn wire_dirent(dirent: &DirEntry) -> WireDirEntry {
         name: dirent.name.as_bytes().to_vec(),
     }
 }
-
-#[cfg(test)]
-#[path = "share_tests.rs"]
-mod tests;

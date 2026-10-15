@@ -274,8 +274,9 @@ fn read_frame(reader: &mut impl Read) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> 
             Err(error) => return Err(error),
         }
     }
-    let header_len = frame_len(u32::from_le_bytes(lengths[..4].try_into().unwrap()) as usize)?;
-    let payload_len = frame_len(u32::from_le_bytes(lengths[4..].try_into().unwrap()) as usize)?;
+    let [h0, h1, h2, h3, p0, p1, p2, p3] = lengths;
+    let header_len = frame_len(u32::from_le_bytes([h0, h1, h2, h3]) as usize)?;
+    let payload_len = frame_len(u32::from_le_bytes([p0, p1, p2, p3]) as usize)?;
     let mut header = vec![0; header_len as usize];
     reader.read_exact(&mut header)?;
     let mut payload = vec![0; payload_len as usize];
@@ -376,3 +377,6 @@ impl FsService for RemoteFs {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "vmm"))]
+mod device_tests;

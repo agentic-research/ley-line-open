@@ -61,6 +61,10 @@ pub use daemon::{DaemonShares, scope_for};
 pub use share::StoreShare;
 
 #[cfg(test)]
+mod daemon_tests;
+#[cfg(test)]
+mod share_tests;
+#[cfg(test)]
 mod tests;
 
 /// A Linux errno value: what a refused request answers the guest.

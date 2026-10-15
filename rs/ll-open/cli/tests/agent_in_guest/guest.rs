@@ -101,7 +101,7 @@ fn wait(step: char) {
             println!("FAIL waiting for {want:?}");
             std::process::exit(3);
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::hint::spin_loop();
     }
 }
 
@@ -298,7 +298,7 @@ fn main() {
         match fs::metadata("t.go") {
             Ok(m) if m.len() == seed::T_HOST.len() as u64 => break Some(proposed_at.elapsed()),
             _ if proposed_at.elapsed() > bound + Duration::from_secs(2) => break None,
-            _ => std::thread::sleep(Duration::from_millis(10)),
+            _ => std::hint::spin_loop(),
         }
     };
     r.check(

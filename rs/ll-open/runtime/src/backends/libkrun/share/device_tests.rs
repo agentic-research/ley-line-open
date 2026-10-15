@@ -1,3 +1,6 @@
+//! `ShareFs`: each FUSE request transcribed onto the wire, each reply into
+//! libkrun's types.
+
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
@@ -5,11 +8,11 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use super::super::{
+use super::device::{ShareFs, Stat};
+use super::{
     Attr, DT_DIR, DT_REG, DirEntry, Entry, FOPEN_CACHE_DIR, FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE,
     FUSE_DO_READDIRPLUS, FsService, Reply, Request,
 };
-use super::{ShareFs, Stat};
 use crate::backends::libkrun::api::DynFileSystem;
 use crate::backends::libkrun::api::virtio_fs::filesystem::{
     Context, DirEntry as KrunDirEntry, Entry as KrunEntry, Extensions, FsOptions, OpenOptions,
@@ -551,7 +554,7 @@ fn the_wire_bits_are_libkruns_fuse_bits() {
     );
     assert_eq!(
         FsOptions::WRITEBACK_CACHE.bits(),
-        super::super::FUSE_WRITEBACK_CACHE
+        super::FUSE_WRITEBACK_CACHE
     );
     assert_eq!(OpenOptions::DIRECT_IO.bits(), FOPEN_DIRECT_IO);
     assert_eq!(OpenOptions::KEEP_CACHE.bits(), FOPEN_KEEP_CACHE);

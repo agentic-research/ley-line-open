@@ -377,7 +377,3 @@ impl<F: FsService> DynFileSystem for ShareFs<F> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "device_tests.rs"]
-mod tests;

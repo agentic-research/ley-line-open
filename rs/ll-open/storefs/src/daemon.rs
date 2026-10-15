@@ -154,7 +154,3 @@ impl WorkspaceShares for DaemonShares {
         ))))
     }
 }
-
-#[cfg(test)]
-#[path = "daemon_tests.rs"]
-mod tests;

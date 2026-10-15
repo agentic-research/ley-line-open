@@ -29,6 +29,11 @@
 //! - (h) the daemon is killed with SIGKILL and restarted: the accepted
 //!   guest edits persist in the store and the checkout.
 //!
+//! Every wait is a poll of the condition itself (a socket `read_source`, a
+//! run status) with a deadline that fails only on a genuine hang; there is
+//! no notification to wait on, and no sleep: the probe interval is the
+//! round trip.
+//!
 //! Gated like the runtime's hypervisor tests: it runs where
 //! `LEYLINE_LIBKRUNFW_PATH` names libkrunfw and reports a skip (not a pass)
 //! elsewhere; `LEYLINE_REQUIRE_HYPERVISOR` turns the skip into a failure.
@@ -232,7 +237,7 @@ impl Host {
                 "the daemon did not become ready; log:\n{}",
                 self.log(lifetime)
             );
-            std::thread::sleep(Duration::from_millis(50));
+            std::hint::spin_loop();
         }
     }
 
@@ -464,7 +469,7 @@ fn await_guest(host: &Host, daemon: &Daemon, run_id: &str, step: char) {
             stored(&daemon.sock, seed::REPORT),
             host.log("run")
         );
-        std::thread::sleep(Duration::from_millis(20));
+        std::hint::spin_loop();
     }
 }
 
@@ -649,7 +654,7 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
             break status;
         }
         assert!(Instant::now() < deadline, "the run did not end: {status}");
-        std::thread::sleep(Duration::from_millis(50));
+        std::hint::spin_loop();
     };
     results.check(
         "run",

@@ -63,7 +63,8 @@ trait that a libkrun patch adds beside libkrun's private, generic `FileSystem` (
 - **Refusals** answer the request with a Linux errno (the guest is Linux whatever the host is):
   `ESTALE` for a moved base, `EIO` for a syntax refusal. The Linux FUSE client returns FLUSH and
   FSYNC errors to `close` and `fsync`, so every refusal reaches the agent. The spike measured this
-  on macOS.
+  on macOS. *Amended by ADR-0045:* a file that does not parse is stored with a diagnostic, not
+  refused, and a moved base is merged three ways; only overlapping edits are `ESTALE`.
 
 ### V3 — Reads come from immutable blobs; only the write path is served per operation
 
@@ -111,7 +112,9 @@ with zero timeouts and `DIRECT_IO` at 29–82× APFS on tree walks (`find` issue
   `CACHE_DIR`.
 - **Write opens stay `DIRECT_IO`**, the writeback cache stays off, and WRITE checks the handle's base
   against the path's current `content_hash`: a stale base is `ESTALE` from `write(2)` itself, and
-  FLUSH and FSYNC keep their checks. No write guarantee depends on a timeout.
+  FLUSH and FSYNC keep their checks. No write guarantee depends on a timeout. *Reversed by
+  ADR-0045 T6:* WRITE stages whatever the store holds; FLUSH and FSYNC decide, merging a moved
+  base and answering `ESTALE` only for overlapping edits.
 - **Timeouts adapt to change.** Entry, attribute and negative-entry timeouts are long (default 60 s)
   for a path with no recent change and short (default 1 s) for a path, and its parent directory,
   changed within a window (default 60 s): changed by a proposal the backend landed, or observed

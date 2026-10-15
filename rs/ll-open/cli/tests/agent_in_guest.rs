@@ -17,9 +17,13 @@
 //!
 //! - (a) a read is the stored bytes;
 //! - (b) an open/write/close edit lands in the store and the checkout;
-//! - (c) a socket proposal to a file the guest holds open: write(2) ESTALE,
-//!   nothing lands;
-//! - (d) an unparseable edit: fsync(2) and close(2) EIO, nothing lands;
+//! - (c) a socket proposal to a file the guest holds open, other lines than
+//!   the guest's edit: write(2) stages, close(2) lands the three-way merge
+//!   (ADR-0045 T5, T6);
+//! - (C) the same line changed by both: fsync(2) and close(2) ESTALE, the
+//!   host's bytes stay;
+//! - (d) a half-written edit lands, with a `_parse_diagnostics` row
+//!   (ADR-0045 T3);
 //! - (e) create, unlink, and write-temp-then-rename land and reach the
 //!   checkout;
 //! - (f) `git status` and `rg` (Alpine aarch64 binaries in the guest rootfs,
@@ -30,6 +34,9 @@
 //!   `git status --porcelain` after it (` M`, then `MM` after `git add`):
 //!   the share's file times move with each edit (bead
 //!   `ley-line-open-b8100d`);
+//! - (p) a README edit, a file in no projected language, `chmod +x`, a
+//!   symlink, an empty directory and a directory rename persist in the
+//!   store and the checkout (ADR-0045 T1, T4);
 //! - (h) the daemon is killed with SIGKILL and restarted: the accepted
 //!   guest edits persist in the store and the checkout.
 //!
@@ -251,6 +258,53 @@ impl Host {
 
     fn on_disk(&self, path: &str) -> Option<String> {
         fs::read_to_string(self.checkout.join(path)).ok()
+    }
+
+    /// The daemon's diagnostic for `path` (ADR-0045 T3), read from its
+    /// living database: whether the file is projected, and the message.
+    fn diagnostic(&self, path: &str) -> Option<(bool, String)> {
+        let live = self.path("daemon.ctrl").with_extension("live.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            &live,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        conn.query_row(
+            "SELECT projected, message FROM _parse_diagnostics WHERE path = ?1",
+            [path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    }
+
+    /// (p) and (h): the mode, the symlink and the directories the guest
+    /// made, over the socket and in the checkout.
+    fn check_tree(&self, daemon: &Daemon, results: &mut Results, scenario: &str) {
+        let script = call(&daemon.sock, json!({"op": "read_source", "path": "run.sh"}));
+        let executable = fs::metadata(self.checkout.join("run.sh"))
+            .map(|m| m.permissions().mode() & 0o111)
+            .ok();
+        results.check(
+            scenario,
+            script["mode"] == "100755" && executable == Some(0o111),
+            format!("run.sh is 100755 in the store ({}) and executable on disk ({executable:?})", script["mode"]),
+        );
+        let link = call(&daemon.sock, json!({"op": "read_source", "path": "link.go"}));
+        let on_disk = fs::read_link(self.checkout.join("link.go")).ok();
+        results.check(
+            scenario,
+            link["mode"] == "120000"
+                && link["content"] == "a.go"
+                && on_disk.as_deref() == Some(Path::new("a.go")),
+            format!("link.go is a symlink to a.go in the store ({link}) and on disk ({on_disk:?})"),
+        );
+        results.check(
+            scenario,
+            self.checkout.join("empty").is_dir()
+                && self.checkout.join("lib").is_dir()
+                && !self.checkout.join("pkg").exists(),
+            "the empty directory and the renamed one are in the checkout; pkg is gone".into(),
+        );
     }
 }
 
@@ -592,29 +646,47 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
     );
     go(&daemon, 'b');
 
-    // (c) a socket proposal moves b.go under the guest's open handle.
+    // (c) a socket proposal moves b.go under the guest's open handle; the
+    // two changed different lines, so both land, merged (ADR-0045 T5).
     await_guest(&host, &daemon, &run_id, 'c');
-    let (_, before) = read_source(&daemon.sock, "b.go").expect("b.go");
     propose(&daemon.sock, "b.go", seed::B_HOST);
     go(&daemon, 'c');
     await_guest(&host, &daemon, &run_id, 'C');
     results.check(
         "c",
-        stored(&daemon.sock, "b.go").as_deref() == Some(seed::B_HOST)
-            && host.on_disk("b.go").as_deref() == Some(seed::B_HOST),
-        format!(
-            "b.go holds the socket proposal, not the guest's write (tree root before it: {before})"
-        ),
+        stored(&daemon.sock, "b.go").as_deref() == Some(seed::B_MERGED)
+            && host.on_disk("b.go").as_deref() == Some(seed::B_MERGED),
+        "b.go holds the socket proposal and the guest's edit, merged, in the store and the \
+         checkout"
+            .into(),
     );
     go(&daemon, 'C');
 
-    // (d) the unparseable edit landed nowhere.
+    // (C) the same line, changed by both: the host's bytes stay.
+    await_guest(&host, &daemon, &run_id, 'x');
+    propose(&daemon.sock, "b.go", seed::B_HOST_AGAIN);
+    go(&daemon, 'x');
+    await_guest(&host, &daemon, &run_id, 'X');
+    results.check(
+        "C",
+        stored(&daemon.sock, "b.go").as_deref() == Some(seed::B_HOST_AGAIN)
+            && host.on_disk("b.go").as_deref() == Some(seed::B_HOST_AGAIN),
+        "b.go holds the socket proposal; the guest's overlapping edit landed nowhere".into(),
+    );
+    go(&daemon, 'X');
+
+    // (d) the half-written edit landed, with a diagnostic.
     await_guest(&host, &daemon, &run_id, 'd');
+    let diagnostic = host.diagnostic("c.go");
     results.check(
         "d",
-        stored(&daemon.sock, "c.go").as_deref() == Some(seed::C)
-            && host.on_disk("c.go").as_deref() == Some(seed::C),
-        "c.go is unchanged in the store and the checkout".into(),
+        stored(&daemon.sock, "c.go").as_deref() == Some(seed::C_BROKEN)
+            && host.on_disk("c.go").as_deref() == Some(seed::C_BROKEN)
+            && diagnostic.as_ref().is_some_and(|(projected, _)| *projected),
+        format!(
+            "c.go holds the half-written bytes in the store and the checkout; its diagnostic: \
+             {diagnostic:?}"
+        ),
     );
     go(&daemon, 'd');
 
@@ -647,6 +719,24 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
     propose(&daemon.sock, "t.go", seed::T_HOST);
     go(&daemon, 'g');
 
+    // (p) every file the guest made is in the store and the checkout.
+    await_guest(&host, &daemon, &run_id, 'p');
+    for (path, text) in [
+        ("README.md", seed::README_EDIT),
+        ("notes", seed::NOTES),
+        ("run.sh", seed::RUN_SH),
+        ("lib/x.go", seed::LIB_X),
+    ] {
+        results.check(
+            "p",
+            stored(&daemon.sock, path).as_deref() == Some(text)
+                && host.on_disk(path).as_deref() == Some(text),
+            format!("{path} is in the store and the checkout"),
+        );
+    }
+    host.check_tree(&daemon, &mut results, "p");
+    go(&daemon, 'p');
+
     await_guest(&host, &daemon, &run_id, 'z');
     let deadline = Instant::now() + STEP;
     let terminal = loop {
@@ -677,13 +767,16 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
     let daemon = host.daemon("restart");
     let expected: BTreeMap<&str, Option<&str>> = BTreeMap::from([
         ("a.go", Some(seed::A_RENAMED)),
-        ("b.go", Some(seed::B_HOST)),
-        ("c.go", Some(seed::C)),
+        ("b.go", Some(seed::B_HOST_AGAIN)),
+        ("c.go", Some(seed::C_BROKEN)),
         ("d.go", None),
         ("n.go", Some(seed::N)),
         ("g.go", Some(seed::G_HOST)),
         ("t.go", Some(seed::T_HOST)),
         ("m.go", Some(seed::M_TWO)),
+        ("README.md", Some(seed::README_EDIT)),
+        ("notes", Some(seed::NOTES)),
+        ("lib/x.go", Some(seed::LIB_X)),
     ]);
     for (path, text) in &expected {
         results.check(
@@ -696,12 +789,13 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
             ),
         );
     }
+    host.check_tree(&daemon, &mut results, "h");
     drop(daemon);
 
     let mut lines: Vec<String> = report.lines().map(str::to_owned).collect();
     lines.extend(results.0);
     eprintln!("agent-in-guest results:\n{}", lines.join("\n"));
-    let scenarios = ["a", "b", "c", "d", "e", "f", "g", "m", "h"];
+    let scenarios = ["a", "b", "c", "C", "d", "e", "f", "g", "m", "p", "h"];
     for scenario in scenarios {
         assert!(
             lines

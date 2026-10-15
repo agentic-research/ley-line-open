@@ -36,10 +36,28 @@ context, scoping notes, and review history are recoverable.
     0.84's `gix-*` set) and lands as the write (`Accepted::merged`);
     overlapping hunks refuse with `Refusal::Conflict` naming the base line
     ranges. New refusals `Exists`, `NotEmpty`, `NotADirectory`,
-    `IsADirectory`; `NoStoredBlob` is removed (every manifest entry names
-    its blob). `source_write::propose` keeps ADR-0042's rules
-    (`Rules::ParsedFilesOnly`) for the virtio-fs core until ADR-0045 phase
-    4.
+    `IsADirectory`; removed: `Refusal::Syntax`, `Refusal::NoLanguage`,
+    `Refusal::NoStoredBlob` (every manifest entry names its blob) and
+    `source_write::can_hold`. `Grant::covers_dir` admits a directory
+    change under a granted path.
+  - **storefs (ADR-0045 phase 4):** every file the guest makes lands in the
+    store (no session-only files); MKDIR, RMDIR, a directory RENAME (one
+    proposal over every path under it; no more `EXDEV`), SETATTR of the mode
+    (`chmod`, `fchmod`) and SYMLINK are proposals, READLINK answers a
+    symlink's target, and `Kind::Symlink` is served as `S_IFLNK`/`DT_LNK`.
+    WRITE no longer answers `ESTALE` for a moved base (reverses bead
+    `e650d7`): it stages, and FLUSH/FSYNC merge; a clean merge lands, the
+    handle serves the merged bytes, and the next read-only open drops the
+    guest's pages; overlapping edits are `ESTALE`. A half-written file lands
+    with a diagnostic. `errno_for` maps the directory refusals to `EEXIST`,
+    `ENOTEMPTY`, `ENOTDIR`, `EISDIR`. The share wire gains `Request::Symlink`
+    and `Request::Readlink` and `DT_LNK`; libkrun patch `0006` forwards
+    READLINK and SYMLINK through `DynFileSystem`. The compatibility mount's
+    `MountWriter` proposes under the same rules.
+  - `tests/agent_in_guest.rs` adds scenarios (c) merge, (C) conflict, (d)
+    half-written file with a diagnostic, and (p) README, a file in no
+    projected language, `chmod +x`, a symlink, an empty directory and a
+    directory rename, each checked again after the restart (h).
   - A file deleted from the store leaves its directories; the checkout no
     longer removes emptied directories. The checkout materializes modes,
     symlinks and directories, ingests them from the directory, and its

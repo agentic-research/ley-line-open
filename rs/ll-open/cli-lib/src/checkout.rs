@@ -1239,12 +1239,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checkout_materializes_modes_symlinks_and_empty_dirs() {
-        use crate::source_write::{Rules, propose_with};
         use std::os::unix::fs::PermissionsExt;
         let c = checkout(&[("a.go", A), ("b.go", B)]);
-        let tree = |writes: Vec<Proposed>| {
-            propose_with(&c.conn, &Grant::Whole, writes, Rules::Tree).unwrap()
-        };
+        let tree = |writes: Vec<Proposed>| propose(&c.conn, &Grant::Whole, writes).unwrap();
         tree(vec![
             Proposed::write_mode("a.go", Base::Blob(h(A)), A.into(), Mode::Executable),
             Proposed::write_mode("link", Base::Absent, "a.go".into(), Mode::Symlink),

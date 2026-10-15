@@ -1205,7 +1205,7 @@ fn parse_write(w: ProposedWriteInput) -> Result<crate::source_write::Proposed> {
 /// publish) fails: that failure rides in `post_commit_error` (beads
 /// `ley-line-open-5db28e`, `ley-line-open-5dc3a5`).
 fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
-    use crate::source_write::{Grant, Refusal, Rules};
+    use crate::source_write::{Grant, Refusal};
     let writes: Result<Vec<_>> = req.writes.into_iter().map(parse_write).collect();
     // A daemon with a source directory materializes the accepted files into
     // it, and removes the deleted ones, under the same writer lock, after
@@ -1213,8 +1213,7 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
     // the proposal in the store, and the next reconcile carries it out.
     let outcome = writes.and_then(|writes| {
         ctx.with_write(|conn| {
-            let accepted =
-                crate::source_write::propose_with(conn, &Grant::Whole, writes, Rules::Tree)?;
+            let accepted = crate::source_write::propose(conn, &Grant::Whole, writes)?;
             let checkout = ctx.source_dir.as_deref().map(|dir| {
                 let paths: Vec<String> = accepted
                     .blobs
@@ -1303,10 +1302,6 @@ fn set_refusal(
         Refusal::NotEmpty { .. } => R::NotEmpty,
         Refusal::NotADirectory { .. } => R::NotADirectory,
         Refusal::IsADirectory { .. } => R::IsADirectory,
-        // Decided only under `Rules::ParsedFilesOnly`, which the socket
-        // never proposes under (ADR-0045 "Phases"); retired on the wire.
-        Refusal::Syntax { .. } => R::RetiredSyntax,
-        Refusal::NoLanguage { .. } => R::RetiredNoLanguage,
     });
     if let Some(path) = refusal.path() {
         out.set_path(path);

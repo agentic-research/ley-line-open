@@ -237,11 +237,7 @@ fn getattr_and_setattr_answer_attributes_with_their_timeout() {
             ttl: TTL
         }
     );
-    for (mode, uid, gid) in [
-        (Some(0o600), None, None),
-        (None, Some(1), None),
-        (None, None, Some(1)),
-    ] {
+    for (mode, uid, gid) in [(None, Some(1), None), (None, None, Some(1))] {
         assert_eq!(
             s.call(Request::Setattr {
                 inode: a,
@@ -252,7 +248,7 @@ fn getattr_and_setattr_answer_attributes_with_their_timeout() {
                 gid,
             }),
             Reply::Error { errno: 1 },
-            "EPERM: the store holds no mode or owner"
+            "EPERM: the store holds no owner"
         );
     }
     assert_eq!(
@@ -410,23 +406,31 @@ fn an_edit_lands_through_write_and_flush_and_a_stale_or_broken_one_does_not() {
     assert_eq!(s.call(Request::Fsync { handle: h }), Reply::Done);
     assert_eq!(s.call(Request::Release { handle: h }), Reply::Done);
 
-    // Another writer moves the file under an open handle: WRITE is ESTALE,
-    // the Linux value (macOS's is 70).
+    // Another writer moves the file under an open handle and changes the
+    // line this edit changes: WRITE stages, FLUSH is ESTALE, the Linux
+    // value (macOS's is 70) (ADR-0045 T6).
     let (h, _) = opened(s.call(Request::Open {
         inode: a,
-        flags: O_RDWR,
+        flags: O_RDWR | O_TRUNC,
     }));
     other_writer(&f, "a.go", A_OTHER);
+    let overlapping = A_EDIT.replace("return 2", "return 9");
     assert_eq!(
         s.call(Request::Write {
             handle: h,
             offset: 0,
-            data: b"x".to_vec()
+            data: overlapping.as_bytes().to_vec()
         }),
+        Reply::Written {
+            size: overlapping.len() as u32
+        }
+    );
+    assert_eq!(
+        s.call(Request::Flush { handle: h }),
         Reply::Error { errno: ESTALE }
     );
 
-    // An unparseable edit is EIO at FLUSH and FSYNC; nothing lands.
+    // An unparseable edit lands at FLUSH, with a diagnostic (ADR-0045 T3).
     let (h, _) = opened(s.call(Request::Open {
         inode: a,
         flags: O_RDWR | O_TRUNC,
@@ -436,15 +440,9 @@ fn an_edit_lands_through_write_and_flush_and_a_stale_or_broken_one_does_not() {
         offset: 0,
         data: A_BROKEN.as_bytes().to_vec(),
     });
-    assert_eq!(
-        s.call(Request::Flush { handle: h }),
-        Reply::Error { errno: 5 }
-    );
-    assert_eq!(
-        s.call(Request::Fsync { handle: h }),
-        Reply::Error { errno: 5 }
-    );
-    assert_eq!(read_source(&f, "a.go").0, A_OTHER.as_bytes());
+    assert_eq!(s.call(Request::Flush { handle: h }), Reply::Done);
+    assert_eq!(s.call(Request::Fsync { handle: h }), Reply::Done);
+    assert_eq!(read_source(&f, "a.go").0, A_BROKEN.as_bytes());
     assert_eq!(
         s.call(Request::Read {
             handle: 999,

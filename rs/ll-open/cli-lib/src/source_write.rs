@@ -57,6 +57,18 @@ impl Grant {
             Grant::Paths(paths) => paths.contains(path),
         }
     }
+
+    /// Whether the directory `dir` is inside this grant: the whole tree, or
+    /// a granted path under it.
+    pub fn covers_dir(&self, dir: &str) -> bool {
+        match self {
+            Grant::Whole => true,
+            Grant::Paths(paths) => {
+                let prefix = format!("{dir}/");
+                paths.iter().any(|p| p.starts_with(&prefix))
+            }
+        }
+    }
 }
 
 /// What a write produced.
@@ -171,21 +183,6 @@ impl Proposed {
     }
 }
 
-/// Which rules a proposal is decided under (ADR-0045 "Phases").
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Rules {
-    /// ADR-0045: any bytes at any plain path, modes and directories; a file
-    /// that does not parse is stored with a diagnostic; a moved base
-    /// merges three ways.
-    Tree,
-    /// ADR-0042 as it stood: a create needs a language the parse projects,
-    /// every written file must parse, and a moved base refuses. The
-    /// virtio-fs core (`leyline-storefs`) and the compatibility mounts
-    /// propose under these until ADR-0045 phase 4 moves them to
-    /// [`Rules::Tree`] and this variant goes.
-    ParsedFilesOnly,
-}
-
 /// A path that moved since its author read it: one entry of
 /// [`Refusal::Stale`]. `None` is "no file": a create's base, or a file
 /// deleted since its author read it.
@@ -239,18 +236,12 @@ pub enum Refusal {
     /// A file is under a different tree root than the proposal's first
     /// file; one proposal projects one tree.
     DifferentRoots { path: String, detail: String },
-    /// A file's bytes do not parse cleanly in its language. Decided only
-    /// under [`Rules::ParsedFilesOnly`]; goes with it in ADR-0045 phase 4.
-    Syntax { path: String, detail: String },
     /// A base does not fit its change: a replace or delete names a blob
     /// hash or `any`, a create or mkdir `absent`, an rmdir `any`.
     MalformedBase { path: String },
     /// Paths moved since their author read them: every one that moved. A
     /// create whose path now holds a file is stale with no expected blob.
     Stale(Vec<Stale>),
-    /// A created path names no language the parse projects. Decided only
-    /// under [`Rules::ParsedFilesOnly`]; goes with it in ADR-0045 phase 4.
-    NoLanguage { path: String },
     /// A created path is not a plain relative path: empty, absolute, or
     /// with an empty, `.` or `..` component.
     MalformedPath { path: String },
@@ -287,9 +278,7 @@ impl Refusal {
             | Refusal::DuplicatePath { path }
             | Refusal::NoTreeRoot { path }
             | Refusal::DifferentRoots { path, .. }
-            | Refusal::Syntax { path, .. }
             | Refusal::MalformedBase { path }
-            | Refusal::NoLanguage { path }
             | Refusal::MalformedPath { path }
             | Refusal::PathConflict { path, .. }
             | Refusal::Exists { path }
@@ -324,15 +313,11 @@ impl std::fmt::Display for Refusal {
                  (it was not produced by `leyline parse` or the daemon)"
             ),
             Refusal::DifferentRoots { path, detail } => write!(f, "'{path}' is {detail}"),
-            Refusal::Syntax { path, detail } => write!(f, "'{path}': {detail}"),
             Refusal::MalformedBase { path } => write!(
                 f,
                 "the base for '{path}' does not fit its change: a replace or delete names a \
-                 64-hex-char blob hash or \"{BASE_ANY}\", a create names \"{BASE_ABSENT}\""
-            ),
-            Refusal::NoLanguage { path } => write!(
-                f,
-                "'{path}' names no language the parse projects, so the store cannot hold it"
+                 64-hex-char blob hash or \"{BASE_ANY}\", a create or mkdir names \
+                 \"{BASE_ABSENT}\", an rmdir \"{BASE_ANY}\""
             ),
             Refusal::MalformedPath { path } => {
                 write!(f, "'{path}' is not a plain relative path")
@@ -417,11 +402,19 @@ pub struct Accepted {
 /// [`Base::Any`] replace or delete) names no file; when any base no longer
 /// matches its path (every moved path is named: a create over a file, a
 /// change to a file that moved or was deleted) or names a blob the arena
-/// does not store; when a created path is not plain and relative, names no
-/// language the parse projects, or is under a file or the directory of one;
-/// when the arena does not record where a file's tree is rooted, or the
-/// files are under different roots; or when any written file's bytes do not
-/// parse cleanly in its language.
+/// does not store; when a created path is not plain and relative, or is
+/// under a file; when a directory change does not fit what the path holds;
+/// or when the arena does not record where a file's tree is rooted, or the
+/// files are under different roots.
+///
+/// ADR-0045: a path holds any bytes with a mode, directories are made and
+/// removed, a written file that does not parse is stored with a
+/// diagnostic, and a write whose base moved is merged three ways with what
+/// the path holds: a clean merge lands as the write ([`Accepted::merged`]),
+/// overlapping hunks refuse ([`Refusal::Conflict`]), and a moved symlink, a
+/// moved file that is not UTF-8, a moved delete and a create over other
+/// bytes refuse ([`Refusal::Stale`]).
+///
 /// Any failure inside the projection rolls the whole proposal back and is
 /// an untyped error. `Ok` means the proposal committed, even when a step
 /// after `COMMIT` failed ([`Accepted::post_commit_error`]).
@@ -431,38 +424,27 @@ pub struct Accepted {
 /// arena has one writer: the daemon's writer lock, or the one process that
 /// owns a file-backed database.
 pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Result<Accepted> {
-    propose_with(conn, grant, writes, Rules::ParsedFilesOnly)
-}
-
-/// [`propose`] under `rules`. Under [`Rules::Tree`] (ADR-0045) a path holds
-/// any bytes with a mode, directories are made and removed, a written file
-/// that does not parse is stored with a diagnostic, and a write whose base
-/// moved is merged three ways with what the path holds: a clean merge lands
-/// as the write ([`Accepted::merged`]), overlapping hunks refuse
-/// ([`Refusal::Conflict`]), and a moved symlink, a moved file that is not
-/// UTF-8, a moved delete and a create over other bytes refuse
-/// ([`Refusal::Stale`]).
-pub fn propose_with(
-    conn: &Connection,
-    grant: &Grant,
-    writes: Vec<Proposed>,
-    rules: Rules,
-) -> Result<Accepted> {
     if writes.is_empty() {
         return Err(Refusal::Empty.into());
     }
-    if let Some(w) = writes.iter().find(|w| !grant.covers(&w.path)) {
+    // A directory change is inside a path grant when the grant names a path
+    // under the directory.
+    let covered = |w: &Proposed| match w.change {
+        Change::Mkdir | Change::Rmdir => grant.covers_dir(&w.path),
+        Change::Write { .. } | Change::Delete => grant.covers(&w.path),
+    };
+    if let Some(w) = writes.iter().find(|w| !covered(w)) {
         return Err(Refusal::OutsideGrant {
             path: w.path.clone(),
         }
         .into());
     }
 
-    propose_checked(conn, writes, rules)
+    propose_checked(conn, writes)
 }
 
 /// One path of a proposal once its base has been checked (and, for a
-/// moved base under [`Rules::Tree`], merged).
+/// moved base, merged).
 struct Plan {
     path: String,
     /// The entry the store holds at the path now.
@@ -484,7 +466,7 @@ enum Decided {
 /// The base and change of `w` checked against the store's entry at its
 /// path (ADR-0042 P2, ADR-0045 T4, T5). A refusal of this path alone is an
 /// `Err`; a moved base is [`Decided::Moved`], so every moved path is named.
-fn decide_one(conn: &Connection, w: Proposed, rules: Rules) -> Result<Decided> {
+fn decide_one(conn: &Connection, w: Proposed) -> Result<Decided> {
     let current = crate::tree::entry(conn, &w.path)?;
     let path = w.path;
     let stale = |expected: Option<Hash>, current: Option<Hash>, path: &str| Decided::Moved {
@@ -522,14 +504,7 @@ fn decide_one(conn: &Connection, w: Proposed, rules: Rules) -> Result<Decided> {
         (Change::Write { .. }, Base::Absent, None) if !plain_relative(&path) => {
             Err(Refusal::MalformedPath { path }.into())
         }
-        (Change::Write { .. }, Base::Absent, None) => {
-            if rules == Rules::ParsedFilesOnly
-                && crate::cmd_parse::file_language(Path::new(&path), None).is_none()
-            {
-                return Err(Refusal::NoLanguage { path }.into());
-            }
-            Ok(plan(w.change))
-        }
+        (Change::Write { .. }, Base::Absent, None) => Ok(plan(w.change)),
         (Change::Write { .. }, Base::Absent, Some(Entry::Dir)) => {
             Err(Refusal::Exists { path }.into())
         }
@@ -539,7 +514,7 @@ fn decide_one(conn: &Connection, w: Proposed, rules: Rules) -> Result<Decided> {
             // is accepted (ADR-0045 T5).
             let identical =
                 bytes.as_slice().hash() == blob && mode.is_none_or(|m| m == held);
-            if rules == Rules::Tree && identical {
+            if identical {
                 Ok(plan(w.change))
             } else {
                 Ok(stale(None, Some(blob), &path))
@@ -574,10 +549,7 @@ fn decide_one(conn: &Connection, w: Proposed, rules: Rules) -> Result<Decided> {
                 blob: theirs,
             }),
         ) => {
-            if rules == Rules::ParsedFilesOnly
-                || held == Mode::Symlink
-                || *mode == Some(Mode::Symlink)
-            {
+            if held == Mode::Symlink || *mode == Some(Mode::Symlink) {
                 return Ok(stale(Some(expected), Some(theirs), &path));
             }
             let (Some(base), Some(current)) = (
@@ -605,7 +577,7 @@ fn decide_one(conn: &Connection, w: Proposed, rules: Rules) -> Result<Decided> {
     }
 }
 
-fn propose_checked(conn: &Connection, writes: Vec<Proposed>, rules: Rules) -> Result<Accepted> {
+fn propose_checked(conn: &Connection, writes: Vec<Proposed>) -> Result<Accepted> {
     use leyline_core::ContentAddressed;
     // Every path's entry, and every base checked (and merged), before
     // anything else: a stale refusal names every path that moved.
@@ -622,7 +594,7 @@ fn propose_checked(conn: &Connection, writes: Vec<Proposed>, rules: Rules) -> Re
             Change::Write { bytes, .. } => Some(bytes.as_slice().hash()),
             _ => None,
         };
-        match decide_one(conn, w, rules)? {
+        match decide_one(conn, w)? {
             Decided::Plan(plan) => {
                 if let (Change::Write { bytes, .. }, Some(sent)) = (&plan.change, sent)
                     && bytes.as_slice().hash() != sent
@@ -659,16 +631,6 @@ fn propose_checked(conn: &Connection, writes: Vec<Proposed>, rules: Rules) -> Re
     for plan in plans {
         match plan.change {
             Change::Write { bytes, mode } => {
-                if rules == Rules::ParsedFilesOnly
-                    && let Some(lang) = crate::cmd_parse::file_language(Path::new(&plan.path), None)
-                    && let Err(e) = leyline_ts::splice::check_syntax(&bytes, lang.ts_language())
-                {
-                    return Err(Refusal::Syntax {
-                        path: plan.path,
-                        detail: format!("{e:#}"),
-                    }
-                    .into());
-                }
                 if let Some(mode) = mode {
                     edits.modes.insert(plan.path.clone(), mode);
                 }
@@ -829,17 +791,6 @@ pub fn rename_dir(conn: &Connection, from: &str, to: &str) -> Result<Vec<Propose
         }
     }
     Ok(writes)
-}
-
-/// Whether the store can hold a file at `path`: a plain relative path in a
-/// language the parse projects, so a create of it is not refused for its
-/// name ([`Refusal::MalformedPath`], [`Refusal::NoLanguage`]). With
-/// `lang_filter` (a checkout's `--language`), only that language: a file
-/// in another one is never written into the checkout, and the checkout's
-/// next whole-directory parse would drop it from the store.
-pub fn can_hold(path: &str, lang_filter: Option<&str>) -> bool {
-    let filter = lang_filter.and_then(|l| leyline_ts::languages::TsLanguage::from_name(l).ok());
-    plain_relative(path) && crate::cmd_parse::file_language(Path::new(path), filter).is_some()
 }
 
 /// Whether `path` is a plain relative path: one or more `/`-separated
@@ -1231,21 +1182,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_write_that_does_not_parse_is_refused_with_no_side_effect() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = whole_image(&a.conn);
-        let err = write(
-            &a.conn,
-            &Grant::Whole,
-            "a.go",
-            b"package a\nfunc (".to_vec(),
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("syntax errors"), "{err:#}");
-        assert_eq!(whole_image(&a.conn), before);
-    }
-
     /// ADR-0045 T3 (reverses the rollback this test used to pin): a written
     /// file the parse cannot project (the NUL byte the binary-file rule
     /// rejects) is stored, leaves the projection, and carries a diagnostic.
@@ -1442,8 +1378,8 @@ mod tests {
         assert_eq!(w.tree_root, cold_root);
     }
 
-    /// A proposal is applied whole or not at all: one file that does not
-    /// parse refuses the others.
+    /// A proposal is applied whole or not at all: one change the store
+    /// refuses refuses the others.
     #[test]
     fn a_proposal_with_one_invalid_file_changes_nothing() {
         let a = arena(&[("a.go", A), ("b.go", B)]);
@@ -1451,10 +1387,7 @@ mod tests {
         let err = propose(
             &a.conn,
             &Grant::Whole,
-            vec![
-                proposed("a.go", blob(A), A2),
-                proposed("b.go", blob(B), "package a\nfunc ("),
-            ],
+            vec![proposed("a.go", blob(A), A2), Proposed::rmdir("b.go")],
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("b.go"), "{err:#}");
@@ -1464,9 +1397,10 @@ mod tests {
         );
     }
 
-    /// A base is the blob its author read. When the file has moved since,
-    /// the proposal is refused, says which file moved and to what, and
-    /// changes nothing: a stale overwrite never wins.
+    /// A base is the blob its author read. When the file has moved since
+    /// and the two edits overlap, the proposal is refused, says which file
+    /// moved, to what, and where they overlap, and changes nothing: a stale
+    /// overwrite never wins (ADR-0045 T5).
     #[test]
     fn a_stale_base_is_refused_and_names_what_moved() {
         let a = arena(&[("a.go", A), ("b.go", B)]);
@@ -1484,11 +1418,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.downcast_ref::<Refusal>(),
-            Some(&Refusal::Stale(vec![Stale {
-                path: "a.go".to_string(),
-                expected: Some(A.as_bytes().hash()),
-                current: Some(A2.as_bytes().hash()),
-            }])),
+            Some(&Refusal::Conflict {
+                moved: vec![Stale {
+                    path: "a.go".to_string(),
+                    expected: Some(A.as_bytes().hash()),
+                    current: Some(A2.as_bytes().hash()),
+                }],
+                conflicts: std::collections::BTreeMap::from([(
+                    "a.go".to_string(),
+                    vec![crate::merge::LineRange { start: 2, end: 3 }]
+                )]),
+            }),
             "a typed stale refusal: {err:#}"
         );
         assert!(
@@ -1511,15 +1451,19 @@ mod tests {
         let a = arena(&[("a.go", A), ("b.go", B)]);
         write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
         write(&a.conn, &Grant::Whole, "b.go", B2.as_bytes().to_vec()).unwrap();
+        // Each edit overlaps the other writer's on the same line.
+        let a_ours = A.replace("return 1", "return 7");
+        let b_ours = B.replace("\"c\"", "\"x\"");
         let err = propose(
             &a.conn,
             &Grant::Whole,
-            vec![proposed("a.go", blob(A), A), proposed("b.go", blob(B), B)],
+            vec![proposed("a.go", blob(A), &a_ours), proposed("b.go", blob(B), &b_ours)],
         )
         .unwrap_err();
+        let refusal = err.downcast_ref::<Refusal>().expect("typed");
         assert_eq!(
-            err.downcast_ref::<Refusal>(),
-            Some(&Refusal::Stale(vec![
+            refusal.moved(),
+            [
                 Stale {
                     path: "a.go".to_string(),
                     expected: Some(A.as_bytes().hash()),
@@ -1530,7 +1474,7 @@ mod tests {
                     expected: Some(B.as_bytes().hash()),
                     current: Some(B2.as_bytes().hash()),
                 },
-            ])),
+            ],
             "{err:#}"
         );
         let message = err.to_string();
@@ -1580,14 +1524,12 @@ mod tests {
                 path: "a.go".to_string()
             }
         );
-        let Refusal::Syntax { path, detail } = refusal(
-            &Grant::Whole,
-            vec![proposed("a.go", Base::Any, "package a\nfunc (")],
-        ) else {
-            panic!("a syntax refusal");
-        };
-        assert_eq!(path, "a.go");
-        assert!(detail.contains("syntax errors"), "{detail}");
+        assert_eq!(
+            refusal(&Grant::Whole, vec![Proposed::rmdir("a.go")]),
+            Refusal::NotADirectory {
+                path: "a.go".to_string()
+            }
+        );
         assert_eq!(whole_image(&a.conn), before);
 
         a.conn
@@ -2126,8 +2068,8 @@ mod tests {
         let before = whole_image(&a.conn);
         for target in [
             Proposed::create("b.go", A.as_bytes().to_vec()),
-            Proposed::create("c.go", b"package a\nfunc (".to_vec()),
-            Proposed::create("c.txt", A.as_bytes().to_vec()),
+            Proposed::create("b.go/c.go", A.as_bytes().to_vec()),
+            Proposed::create("../c.go", A.as_bytes().to_vec()),
         ] {
             let err = propose(
                 &a.conn,
@@ -2148,9 +2090,8 @@ mod tests {
     }
 
     /// A create the store cannot hold is refused before anything changes:
-    /// a path no language claims (under the strict rules), a path that is
-    /// not plain and relative, a path under a file, a path that is a
-    /// directory.
+    /// a path that is not plain and relative, a path under a file, a path
+    /// that is a directory.
     #[test]
     fn a_create_the_store_cannot_hold_is_refused() {
         let a = arena(&[("a.go", A), ("lib.go/b.go", B)]);
@@ -2160,12 +2101,6 @@ mod tests {
         };
         let create = |path: &str| Proposed::create(path, C.as_bytes().to_vec());
 
-        assert_eq!(
-            refused(vec![create("notes.txt")]),
-            Refusal::NoLanguage {
-                path: "notes.txt".into()
-            }
-        );
         for path in [
             "",
             "/abs.go",

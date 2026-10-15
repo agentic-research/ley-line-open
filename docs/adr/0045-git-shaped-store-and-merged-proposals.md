@@ -1,6 +1,6 @@
 # ADR-0045 — The store is a git-shaped tree, parsing is a projection over it, and a moved base merges
 
-**Status:** Accepted (2026-10-15, owner direction); built in phases (below)
+**Status:** Accepted (2026-10-15, owner direction); phases 1–4 built (below)
 **Bead:** `ley-line-open-bb8aa6`
 **Amends:** ADR-0042 (P1a "what the store can hold", P2 "there is no merge", P4/P5 syntax
 refusals), ADR-0044 (V2 refusal errnos, V3 "Read freshness": WRITE-time `ESTALE`)
@@ -241,11 +241,11 @@ store deleted is removed and its directory is left in place (T1).
 | 1 | this ADR | Done |
 | 2 | `_tree`, `_parse_diagnostics`; the walk ingests every file; proposals with modes, symlinks, directories and merges; the checkout's modes, symlinks and directories | Done |
 | 3 | the daemon wire: `mode`, `mkdir`/`rmdir`, conflict ranges, retired `syntax`/`no_language` | Done |
-| 4 | storefs: every file to the store, MKDIR/RMDIR/directory RENAME/SETATTR mode/symlink as proposals, WRITE stages, FLUSH merges; the in-guest end-to-end scenarios | Open (after the concurrent storefs and runtime changes merge) |
+| 4 | storefs: every file to the store, MKDIR/RMDIR/directory RENAME/SETATTR mode/symlink as proposals, WRITE stages, FLUSH merges; libkrun patch `0006` (READLINK, SYMLINK through `DynFileSystem`); the in-guest end-to-end scenarios | Done |
 
-Until phase 4, `source_write::propose` keeps ADR-0042's rules for the virtio-fs core alone
-(`Rules::ParsedFilesOnly`: a create needs a projected language, a file must parse, a moved base
-refuses); every other writer uses `Rules::Tree`.
+During phases 2 and 3 `source_write::propose` kept ADR-0042's rules for the virtio-fs core alone
+(a `Rules::ParsedFilesOnly` mode); phase 4 moved storefs and the compatibility mounts to these
+rules and removed that mode, `Refusal::Syntax`, `Refusal::NoLanguage` and `can_hold`.
 
 ## Falsifiers
 
@@ -258,4 +258,4 @@ refuses); every other writer uses `Rules::Tree`.
 | M5 | directories are entries | `mkdir_and_rmdir_are_proposals`, `a_directory_rename_is_one_proposal` |
 | M6 | the checkout carries modes, symlinks and directories | `checkout_materializes_modes_symlinks_and_empty_dirs` |
 | M7 | the wire carries it | `daemon_protocol_gate_proposals_produce_the_fixture_shapes` (fixtures for `mode`, `mkdir`, `conflicts`) |
-| M8 | in the guest | (phase 4) `agent_in_guest.rs`: two writers on different lines both land; same lines `ESTALE`; README, `chmod +x`, symlink, empty directory, directory rename and a half-written Go file persist |
+| M8 | in the guest | `agent_in_guest.rs` scenarios (c), (C), (d), (p), (h): two writers on different lines both land; same lines `ESTALE`; README, `chmod +x`, symlink, empty directory, directory rename and a half-written Go file persist across a daemon restart; storefs `tree_tests` |

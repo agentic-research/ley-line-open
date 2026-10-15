@@ -1,4 +1,4 @@
-//! ADR-0045 T4, T5 through `propose_with(.., Rules::Tree)`: any bytes at
+//! ADR-0045 T4, T5 through `propose`: any bytes at
 //! any plain path, modes, symlinks and directories are proposals; a moved
 //! base merges three ways and overlapping hunks refuse with their ranges.
 //! Every accepted proposal lands the `treeRoot` a cold parse of the
@@ -78,7 +78,7 @@ fn cold_root(tree: &[(&str, Node)]) -> Hash {
 }
 
 fn tree_propose(s: &Store, writes: Vec<Proposed>) -> Result<Accepted> {
-    propose_with(&s.conn, &Grant::Whole, writes, Rules::Tree)
+    propose(&s.conn, &Grant::Whole, writes)
 }
 
 fn refused(err: anyhow::Error) -> Refusal {
@@ -127,14 +127,11 @@ fn a_create_of_any_bytes_lands_in_the_store() {
 }
 
 /// T3: a write that does not parse lands, projected with its error nodes,
-/// with a diagnostic; the strict rules still refuse it.
+/// with a diagnostic.
 #[test]
 fn an_unparseable_write_lands_with_a_diagnostic() {
     let s = store(&[("a.go", Node::File(A, Mode::Regular))]);
     let half = "package a\n\nfunc A() int { return\n";
-    let strict = propose(&s.conn, &Grant::Whole, vec![Proposed::write("a.go", Base::Blob(h(A)), half.into())]);
-    assert!(matches!(refused(strict.unwrap_err()), Refusal::Syntax { .. }));
-
     let accepted = tree_propose(&s, vec![Proposed::write("a.go", Base::Blob(h(A)), half.into())]).unwrap();
     assert_eq!(stored_text(&s, "a.go").as_deref(), Some(half));
     assert!(projected(&s, "a.go"));

@@ -4655,6 +4655,7 @@ dependencies = [
  "leyline-runtime",
  "leyline-storefs",
  "libc",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

@@ -320,10 +320,8 @@ impl BackendEvidenceDocument {
 
     /// `blake3-256:<hex>` over [`Self::canonical_bytes`].
     pub fn digest(&self) -> String {
-        format!(
-            "blake3-256:{}",
-            blake3::hash(&self.canonical_bytes()).to_hex()
-        )
+        use leyline_core::ContentAddressed;
+        format!("blake3-256:{}", self.canonical_bytes().hash())
     }
 }
 

@@ -130,9 +130,39 @@ accepted with persisted, scheme-tagged keys, and claims per key family only what
   server process — gets its base at the WRITE, and a change landed between the client's read and
   that WRITE is overwritten, not refused; (2) the base is per file, not per node, so a client that
   edits node A from a cache older than its latest server READ of node B of the same file is
-  checked against B's read and not refused; (3) a refusal only the COMMIT can make — the file moved
-  between the WRITE and the COMMIT (another node of the same file committed first), or the edit
-  does not parse — discards the edit, but a macOS client does not report it.
+  checked against B's read and not refused; (3) see the refusals a COMMIT makes, below.
+- **Refusals a macOS client reports** (bead `bc5a6a`) — measured end to end with the server's
+  request log on a macOS NFS mount: `write`+`fsync`+`close` of a node sends WRITE (UNSTABLE), COMMIT
+  at `fsync`, and one GETATTR at `close`. A refused COMMIT (`NFS3ERR_IO` or `NFS3ERR_STALE`) is
+  ignored and `fsync` returns success; an error on the GETATTR at `close` (`NFS3ERR_STALE`,
+  `NFS3ERR_IO`, `NFS3ERR_NOSPC` tried) is ignored too, `close` returns success, and after
+  `NFS3ERR_STALE` the client re-LOOKUPs the node; a COMMIT answered `NFS3_OK` with a new write
+  verifier does not make the client resend its WRITEs. Only a refused WRITE reaches the agent: it
+  surfaces as `EIO`/`ESTALE` at `fsync`. The mount therefore refuses at the WRITE every edit whose
+  refusal it can decide there, and makes a refusal only the COMMIT can decide visible as a stale
+  handle:
+  - a WRITE or truncate to a node of a file while the mount has an edit to another node of that
+    file staged is refused `NFS3ERR_IO` (typed `EditInProgress`, recorded in `_errors`): the staged
+    edit's COMMIT moves the file under the second edit's base, so its COMMIT would be refused. The
+    second node's edit lands once the first's COMMIT has;
+  - an UNSTABLE WRITE that is a whole dirty range of its client — it starts at 0 or off a page
+    boundary and ends off one — and leaves the node's file unparseable is refused `NFS3ERR_IO`, its
+    edit (with any truncate before it) discarded and recorded in `_errors`. A client sends a range
+    as one WRITE per buffer, at buffer boundaries, in any order (measured on macOS: 131072-byte
+    chunks at multiples of 131072, the tail sent before chunks below it), so a WRITE that ends on a
+    page boundary, or starts on one past 0, may be one chunk of several and is left to the COMMIT;
+  - a refused COMMIT, a refused idle commit of a bare truncate, a refused commit before a
+    structural operation, and the WRITE refusal above retire the node's file handle: the next
+    operation on it answers `NFS3ERR_STALE`, the client re-LOOKUPs, and the new handle reads the
+    stored node, so the client stops serving the refused bytes from its cache. The refusal is in
+    `_errors` (recorded by the discard).
+
+  Residual, not reported to a macOS client though nothing of the edit lands: a COMMIT refused
+  because the file moved between the WRITE and the COMMIT; a syntax refusal of an edit whose WRITEs
+  all end on page boundaries or that spans more than one chunk; a bare truncate (`: > f`, no
+  WRITE) that does not parse; and any other write-path refusal at COMMIT. An edit that writes two
+  disjoint ranges of one node past a buffer boundary is checked at the first range's WRITE, before
+  the second arrives.
 - **Explicit, through the mount** (not implemented) — `.staging/` (in `leyline-vcs`, unmounted
   today) served by the mount; writes under it record bases at first read; `.commit` proposes them.
 - **Lifecycle points** (not implemented) — a jj or git commit, the end of a confined run (cloister's
@@ -158,7 +188,8 @@ ______________________________________________________________________
 | daemon `read_source` / `propose`, MCP, schema 0.20.3 | `609525` | #440 |
 | mount bases, `ESTALE`, refused edits discarded, fsync reports refusals | `843e03` | — |
 | typed refusals, required `base`, applied-after-commit, atomic head and sidecars, schema 0.20.5 | `5db28e`, `5dc3a5` | — |
-| NFS mount bases taken at READ, a stale WRITE refused, bases kept after a COMMIT | `6116c9` | — |
+| NFS mount bases taken at READ, a stale WRITE refused, bases kept after a COMMIT | `6116c9` | #458 |
+| NFS refusals at the WRITE: a second staged node, an unparseable whole range; a refused COMMIT retires the handle | `bc5a6a` | — |
 
 ## Falsifiers
 
@@ -170,6 +201,7 @@ ______________________________________________________________________
 | G2c | a committed proposal is reported applied | `a_proposal_whose_head_write_fails_after_commit_is_applied`, `propose_reports_an_applied_proposal_as_applied_when_its_head_write_fails`, `the_mount_writer_answers_ok_when_the_edit_landed` |
 | G2d | a rolled-back proposal leaves the head and sidecars readable | `a_rolled_back_proposal_leaves_the_sidecars_byte_identical`, `a_head_write_replaces_the_file_and_never_rewrites_it_in_place`, `a_failed_head_write_leaves_the_previous_head_readable` |
 | G3 | the mount refuses a moved file | `a_refused_edit_restores_the_node_and_reports_stale`, `the_mount_writer_refuses_a_moved_file_as_stale`, `a_stale_refusal_answers_estale_and_others_eio` |
+| G3b | an NFS refusal reaches the client | `an_unparseable_whole_write_is_refused_at_the_write`, `a_write_to_a_second_node_of_a_file_with_an_edit_staged_is_refused`, `a_refused_commit_retires_the_nodes_handle`; end to end on macOS, `fsync` raises `EIO` for an unparseable node edit |
 | G4 | node bases allow disjoint edits | (open) two node-based proposals on different functions of one file both land |
 | G5 | node bases cover trivia | (open) a comment edit inside F refuses a stale node base on F |
 | G6 | twins refuse rather than misdirect | (open) `#[cfg]` twins after an ordinal shift |

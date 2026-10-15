@@ -131,6 +131,16 @@ pub trait Graph: Send + Sync {
         Ok(())
     }
 
+    /// The [`MOUNT_HANDLE`] edit to node `id` is whole as far as its client
+    /// knows: refuse it now if the file it makes does not parse, and
+    /// discard it as a refused flush is discarded (bead
+    /// `ley-line-open-bc5a6a`). An NFS client reports a refused WRITE and
+    /// ignores a refused COMMIT, so the syntax check the write path makes
+    /// at the commit is made at the WRITE too. Default no-op.
+    fn check_edit(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// [`Self::note_base`] for the edit made through `handle`: each open
     /// handle edits against its own base (bead `ley-line-open-5da276`).
     /// Default: the handle is ignored.
@@ -299,6 +309,32 @@ impl std::fmt::Display for StaleWrite {
 }
 
 impl std::error::Error for StaleWrite {}
+
+/// A mount edit to one node of a file refused because the mount handle has
+/// an edit to another node of that file staged (bead
+/// `ley-line-open-bc5a6a`). The staged edit's commit moves the file under
+/// this edit's base, so this edit's commit would be refused; it is refused
+/// at its write instead, which an NFS client reports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditInProgress {
+    /// The node whose edit was refused.
+    pub node: String,
+    /// The node of the same file whose edit is staged.
+    pub staged: String,
+}
+
+impl std::fmt::Display for EditInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "edit to '{}' refused: '{}' of the same file has an edit staged; \
+             commit it (fsync or close) first",
+            self.node, self.staged
+        )
+    }
+}
+
+impl std::error::Error for EditInProgress {}
 
 /// A private in-memory copy of an arena image: one writer, a pool of
 /// deserialised readers refreshed from the writer's bytes after each write.
@@ -569,13 +605,7 @@ impl SqliteGraphAdapter {
             }
             !edits.is_empty()
         });
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) \
-             VALUES (?1, 0, 0, ?2, ?3)",
-            rusqlite::params![node_id, format!("{refused:#}"), now_nanos()],
-        ) {
-            log::warn!("recording the refusal of '{node_id}' failed: {e:#}");
-        }
+        Self::record_refusal(conn, node_id, refused);
     }
 
     /// Whether an edit to `nid` is spliced into its file on flush: the node
@@ -677,6 +707,61 @@ impl SqliteGraphAdapter {
             .into());
         }
         Ok(())
+    }
+
+    /// Refuse a [`MOUNT_HANDLE`] write or truncate to node `id` while the
+    /// handle has an edit to another node of the same file staged (bead
+    /// `ley-line-open-bc5a6a`). The first edit's commit moves the file,
+    /// so the second's commit would be refused against its base, and a
+    /// macOS client ignores a refused COMMIT: the refusal must come at the
+    /// WRITE. The refusal is recorded in `_errors` for `id`. A FUSE handle
+    /// edits one node, and its flush reports its own refusal.
+    #[cfg(feature = "splice")]
+    fn refuse_second_node(
+        &self,
+        conn: &Connection,
+        handle: Handle,
+        id: &str,
+        nid: i64,
+    ) -> Result<()> {
+        if handle != MOUNT_HANDLE {
+            return Ok(());
+        }
+        let Some((file_id, _)) = Self::source_of(conn, nid)? else {
+            return Ok(());
+        };
+        let staged = self
+            .pending
+            .lock()
+            .iter()
+            .find(|(other, edits)| {
+                other.as_str() != id
+                    && edits.contains_key(&handle)
+                    && Self::in_file(conn, other, file_id)
+            })
+            .map(|(other, _)| other.clone());
+        let Some(staged) = staged else {
+            return Ok(());
+        };
+        let refused = anyhow::Error::new(EditInProgress {
+            node: id.to_string(),
+            staged,
+        });
+        Self::record_refusal(conn, id, &refused);
+        Err(refused)
+    }
+
+    /// Record `refused` in `_errors` for `node_id`. Best effort: the
+    /// refusal is what the caller must see.
+    #[cfg(feature = "splice")]
+    fn record_refusal(conn: &Connection, node_id: &str, refused: &anyhow::Error) {
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) \
+             VALUES (?1, 0, 0, ?2, ?3)",
+            rusqlite::params![node_id, format!("{refused:#}"), now_nanos()],
+        ) {
+            log::warn!("recording the refusal of '{node_id}' failed: {e:#}");
+        }
     }
 
     /// An adapter over somebody else's live database (ADR-0040 D4): reads
@@ -953,10 +1038,12 @@ impl SqliteGraphAdapter {
 
             // The edit's base is the file before the handle's first write,
             // or the one an NFS READ took; a mount write to a file that
-            // moved since that base is refused before it is staged.
+            // moved since that base, or to a second node of a file the
+            // mount is editing, is refused before it is staged.
             #[cfg(feature = "splice")]
             {
                 self.refuse_moved(guard.conn(), handle, nid)?;
+                self.refuse_second_node(guard.conn(), handle, id, nid)?;
                 self.take_base(guard.conn(), handle, nid)?;
             }
 
@@ -1529,6 +1616,7 @@ impl Graph for SqliteGraphAdapter {
             #[cfg(feature = "splice")]
             if Self::is_spliced(conn, nid) {
                 self.refuse_moved(conn, handle, nid)?;
+                self.refuse_second_node(conn, handle, id, nid)?;
                 self.take_base(conn, handle, nid)?;
                 self.pending
                     .lock()
@@ -1622,6 +1710,51 @@ impl Graph for SqliteGraphAdapter {
 
     fn flush_node(&self, id: &str) -> Result<()> {
         self.flush_node_as(MOUNT_HANDLE, id)
+    }
+
+    fn check_edit(&self, id: &str) -> Result<()> {
+        #[cfg(feature = "splice")]
+        {
+            let Some(content) = self
+                .pending
+                .lock()
+                .get(id)
+                .and_then(|edits| edits.get(&MOUNT_HANDLE))
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let guard = self.writer_guard();
+            let conn = guard.conn();
+            let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
+                return Ok(());
+            };
+            let Some((file_id, source_id)) = Self::source_of(conn, nid)? else {
+                return Ok(());
+            };
+            // The check the write path makes (`source_write`): the spliced
+            // file parses in its language.
+            let checked = (|| -> Result<()> {
+                let text = String::from_utf8_lossy(&content);
+                let bytes = leyline_ts::splice::splice(conn, nid, &text)?;
+                let language: String = conn.query_row(
+                    "SELECT language FROM _source WHERE id = ?1",
+                    [&source_id],
+                    |r| r.get(0),
+                )?;
+                let lang = leyline_ts::languages::TsLanguage::from_name(&language)?;
+                leyline_ts::splice::check_syntax(&bytes, lang.ts_language())
+                    .with_context(|| format!("edit to '{source_id}' refused"))
+            })();
+            if let Err(refused) = checked {
+                self.discard_file(conn, MOUNT_HANDLE, id, file_id, &refused);
+                drop(guard);
+                self.refresh_readers()?;
+                return Err(refused);
+            }
+        }
+        let _ = id;
+        Ok(())
     }
 
     fn release(&self, handle: Handle) -> Result<()> {
@@ -2438,6 +2571,10 @@ impl Graph for HotSwapGraph {
 
     fn flush_node(&self, id: &str) -> Result<()> {
         self.maybe_swap()?.flush_node(id)
+    }
+
+    fn check_edit(&self, id: &str) -> Result<()> {
+        self.maybe_swap()?.check_edit(id)
     }
 
     fn note_base_as(&self, handle: Handle, id: &str) -> Result<()> {
@@ -3962,9 +4099,11 @@ mod tests {
         let tag = "test.html/element/start_tag";
         let tag_name = "test.html/element/start_tag/tag_name";
         let text = "test.html/element/text";
-        adapter.write_content(tag, b"<q>", 0)?;
-        adapter.write_content(tag_name, b"q", 0)?;
-        adapter.write_content(text, b"world", 0)?;
+        // Three handles: the mount handle edits one node of a file at a
+        // time (bead `ley-line-open-bc5a6a`).
+        adapter.write_content_as(1, tag, b"<q>", 0)?;
+        adapter.write_content_as(2, tag_name, b"q", 0)?;
+        adapter.write_content_as(3, text, b"world", 0)?;
 
         adapter.remove_node(tag)?;
         let pending = adapter.pending.lock();
@@ -4201,33 +4340,42 @@ mod tests {
         Ok(())
     }
 
-    /// The mount handle (NFS) edits two nodes of one file, as two clients
-    /// with no opens to tell them apart do. Once one lands, the other was
-    /// made against bytes the file no longer holds and is refused as stale.
-    /// Before, the first flush dropped the file's base and the second
-    /// landed unchecked.
+    /// The mount handle (NFS) edits one node of a file at a time (bead
+    /// `ley-line-open-bc5a6a`). A write or truncate to a second node while
+    /// an edit to the first is pending is refused, typed
+    /// [`EditInProgress`], and recorded in `_errors` for the node: the
+    /// first edit's flush would move the file under the second, and an NFS
+    /// client reports a refused WRITE where it ignores a refused COMMIT.
+    /// Once the first lands, the second lands. A FUSE handle's edit to
+    /// another node is not the mount handle's, and is not refused. Before,
+    /// the second write was taken and only its flush refused as stale.
     #[test]
     #[cfg(feature = "splice")]
-    fn the_mount_handle_keeps_a_base_while_an_edit_to_its_file_is_pending() -> Result<()> {
+    fn the_mount_handle_edits_one_node_of_a_file_at_a_time() -> Result<()> {
         let adapter = checked_adapter(b"<p>hello</p>\n<p>there</p>\n")?;
         let x = "test.html/element_0/text";
         let y = "test.html/element_1/text";
+        let in_progress =
+            |r: Result<()>| r.is_err_and(|e| e.downcast_ref::<EditInProgress>().is_some());
         adapter.write_content(x, b"world", 0)?;
+        assert!(in_progress(adapter.write_content(y, b"again", 0).map(drop)));
+        assert!(in_progress(adapter.truncate(y)));
+        assert!(adapter.write_content(x, b"!", 5).is_ok(), "the same node");
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, y)?, b"there");
+        let recorded: String = adapter.writer_guard().conn().query_row(
+            "SELECT message FROM _errors WHERE node_id = ?1",
+            [y],
+            |r| r.get(0),
+        )?;
+        assert!(recorded.contains(x), "{recorded}");
+        adapter.write_content_as(7, y, b"fused", 0)?;
+        adapter.release(7)?;
+
+        adapter.flush_node(x)?;
         adapter.write_content(y, b"again", 0)?;
         adapter.flush_node(y)?;
-        assert!(is_stale(adapter.flush_node(x)));
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"hello");
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"world!");
         assert_eq!(read_as(&adapter, MOUNT_HANDLE, y)?, b"again");
-
-        // The refusal keeps the base: an edit made with no read of the
-        // moved file is refused too, at its write (bead
-        // `ley-line-open-6116c9`). A read with nothing pending re-takes it,
-        // and the edit after it lands.
-        assert!(is_stale(adapter.write_content(x, b"later", 0).map(drop)));
-        adapter.note_read(x)?;
-        adapter.write_content(x, b"later", 0)?;
-        adapter.flush_node(x)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"later");
         Ok(())
     }
 
@@ -4327,6 +4475,45 @@ mod tests {
         graph.note_read(TEXT)?;
         graph.batch_splice(&[(TEXT.to_string(), Some("moved".to_string()))])?;
         assert!(is_stale(graph.write_content(TEXT, b"late", 0).map(drop)));
+
+        // The mount's syntax check reaches the adapter: an unparseable
+        // edit is refused and discarded.
+        graph.note_read(TEXT)?;
+        graph.write_content(TEXT, b"\0", 0)?;
+        assert!(graph.check_edit(TEXT).is_err());
+        assert_eq!(read_as(&graph, MOUNT_HANDLE, TEXT)?, b"moved");
+        Ok(())
+    }
+
+    /// The mount handle's edit is checked before its flush (bead
+    /// `ley-line-open-bc5a6a`): one whose file does not parse is refused,
+    /// discarded so the node reads as stored, and recorded in `_errors`;
+    /// one that parses stays pending for its flush; a node with no edit
+    /// passes. A FUSE handle's edit is not the mount handle's and is not
+    /// checked.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_checked_edit_that_does_not_parse_is_discarded() -> Result<()> {
+        let adapter = checked_adapter(b"<p>hello</p>\n")?;
+        adapter.check_edit(TEXT)?;
+        adapter.write_content_as(A, TEXT, b"\0", 0)?;
+        adapter.check_edit(TEXT)?;
+        adapter.release(A)?;
+
+        adapter.write_content(TEXT, b"world", 0)?;
+        adapter.check_edit(TEXT)?;
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"world");
+        adapter.write_content(TEXT, b"\0", 0)?;
+        let err = adapter.check_edit(TEXT).unwrap_err();
+        assert!(format!("{err:#}").contains("syntax"), "{err:#}");
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"hello");
+        assert!(adapter.pending.lock().is_empty());
+        let recorded: String = adapter.writer_guard().conn().query_row(
+            "SELECT message FROM _errors WHERE node_id = ?1",
+            [TEXT],
+            |r| r.get(0),
+        )?;
+        assert!(recorded.contains("syntax"), "{recorded}");
         Ok(())
     }
 

@@ -37,6 +37,31 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A refused NFS mount edit reaches the agent** (bead
+  `ley-line-open-bc5a6a`). A macOS NFS client ignores a refused COMMIT:
+  measured, `fsync` and `close` returned success with the COMMIT
+  answered `NFS3ERR_IO` or `NFS3ERR_STALE`, the GETATTR at `close`
+  answered an error, or the COMMIT answered with a new write verifier.
+  An edit that only the COMMIT refused was discarded while the agent was
+  told it landed, and the client went on serving the refused bytes from
+  its cache. Now a WRITE or truncate to a node of a file while the mount
+  has an edit to another node of that file staged is refused `EIO` at
+  the WRITE (`EditInProgress`), and lands once the staged edit has. An
+  UNSTABLE WRITE that is a whole dirty range (starts at 0 or off a page
+  boundary, ends off one) and leaves its file unparseable is refused
+  `EIO` at the WRITE (new `Graph::check_edit`, forwarded by
+  `HotSwapGraph`), its edit discarded; `fsync` raises `EIO` (measured
+  end to end on macOS). Any refused commit — COMMIT, idle truncate,
+  before a structural operation — and the syntax refusal retire the
+  node's file handle: the next operation answers `NFS3ERR_STALE`, the
+  client looks the node up again, and reads the stored bytes. Each
+  refusal is recorded in `_errors`. Not reported to a macOS client,
+  though nothing lands: a COMMIT refused because the file moved between
+  the WRITE and the COMMIT, a syntax refusal of an edit sent in more
+  than one chunk or ending on a page boundary, and a bare truncate that
+  does not parse. Behaviour change: the mount edits one node of a file
+  at a time.
+
 - **`leyline inspect --query` prints every value** (bead
   `ley-line-open-12c0fa`). It read each column as text and printed
   integers, reals, NULLs and blobs as empty strings, so `SELECT count(*)`

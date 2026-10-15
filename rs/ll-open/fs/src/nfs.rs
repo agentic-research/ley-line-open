@@ -4,7 +4,7 @@ use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,12 +17,28 @@ pub const COMMIT_IDLE: Duration = Duration::from_millis(200);
 /// How often the server checks for a standing truncate.
 const COMMIT_TICK: Duration = Duration::from_millis(50);
 
+/// The smallest page size a client splits writes at. A client sends a
+/// dirty range as one WRITE per buffer, at buffer boundaries (multiples of
+/// its page size), in any order; measured on macOS: 131072-byte chunks at
+/// multiples of 131072, the tail sent before the chunks below it.
+const PAGE: u64 = 4096;
+
+/// Whether a WRITE is a whole dirty range of its client, not one chunk of
+/// several: it starts where no chunk of a longer range can (at 0, or off a
+/// page boundary) and ends where none can continue (off a page boundary).
+fn whole_range(offset: u64, len: usize) -> bool {
+    let end = offset + len as u64;
+    (offset == 0 || !offset.is_multiple_of(PAGE)) && !end.is_multiple_of(PAGE)
+}
+
 /// The status a refused edit answers: `NFS3ERR_STALE` when the file moved
-/// since the edit's base was taken (ADR-0042 P2), `other` for any other
-/// refusal.
+/// since the edit's base was taken (ADR-0042 P2), `NFS3ERR_IO` when another
+/// node of the file has an edit staged, `other` for any other refusal.
 fn refusal_status(err: &anyhow::Error, other: nfsstat3) -> nfsstat3 {
     if err.downcast_ref::<crate::graph::StaleWrite>().is_some() {
         nfsstat3::NFS3ERR_STALE
+    } else if err.downcast_ref::<crate::graph::EditInProgress>().is_some() {
+        nfsstat3::NFS3ERR_IO
     } else {
         other
     }
@@ -63,11 +79,17 @@ fn refusal_status(err: &anyhow::Error, other: nfsstat3) -> nfsstat3 {
 /// socket proposal, another mount, a batch splice, or the COMMIT of another
 /// node of the same file — is refused `NFS3ERR_STALE` before it is staged,
 /// and a COMMIT whose file moved after its WRITEs is refused the same way
-/// and its change discarded. The WRITE refusal is the one a macOS client
-/// reports (`ESTALE` at fsync or close); it ignores a failed COMMIT, so a
-/// refusal that only the COMMIT can make — the file moved between the
-/// WRITE and the COMMIT, or the edit does not parse — is not reported to
-/// it, though nothing of the edit lands. Not
+/// and its change discarded. A WRITE or truncate to a node of a file while
+/// another node of that file has an edit staged is refused `NFS3ERR_IO`
+/// before it is staged: the staged edit's COMMIT would move the file under
+/// it (bead `ley-line-open-bc5a6a`). A macOS client reports a refused
+/// WRITE (`ESTALE` or `EIO` at fsync or close) and ignores a refused
+/// COMMIT, so a COMMIT refused for any reason — the file moved between the
+/// WRITE and the COMMIT, the edit does not parse, the write path refused
+/// it — retires the node's file handle: the node is named in
+/// the refused set, and the server's next operation on that handle
+/// answers `NFS3ERR_STALE`, and a LOOKUP of the node gives a new handle.
+/// The same holds for a refused idle or structural commit. Not
 /// refused: an edit from a cache the client filled with no READ to this
 /// server and no landed edit through it (a previous mount or server
 /// process), whose base is taken at its WRITE; and, the base being per
@@ -78,6 +100,9 @@ fn refusal_status(err: &anyhow::Error, other: nfsstat3) -> nfsstat3 {
 pub struct Staged {
     graph: Arc<dyn Graph>,
     nodes: Mutex<HashMap<String, Stage>>,
+    /// Nodes whose commit was refused, until the server retires their
+    /// file handle.
+    refused: Mutex<HashSet<String>>,
 }
 
 /// What a staged node is waiting for.
@@ -94,7 +119,28 @@ impl Staged {
         Self {
             graph,
             nodes: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Commit node `id`'s staged edit through the graph's flush. A refused
+    /// flush names the node in the refused set and is returned.
+    fn flush(&self, id: &str) -> anyhow::Result<()> {
+        self.graph.flush_node(id).inspect_err(|_| {
+            self.refused.lock().insert(id.to_string());
+        })
+    }
+
+    /// Node `id`'s staged edit was refused before its commit: it is no
+    /// longer staged, and its handle is retired.
+    fn refuse(&self, id: &str) {
+        self.nodes.lock().remove(id);
+        self.refused.lock().insert(id.to_string());
+    }
+
+    /// Whether node `id`'s commit was refused since this was last asked.
+    fn take_refused(&self, id: &str) -> bool {
+        self.refused.lock().remove(id)
     }
 
     /// A truncate of a node already written waits, with the write, for its
@@ -111,12 +157,12 @@ impl Staged {
     }
 
     /// Commit one node through the graph's flush (the one write path), if
-    /// it has anything staged. A refused flush is returned: the node's
-    /// bytes stay in its record, unapplied to the source.
+    /// it has anything staged. A refused flush is returned, and the edit is
+    /// not applied to the source.
     fn commit_node(&self, id: &str) -> anyhow::Result<()> {
         let staged = self.nodes.lock().remove(id).is_some();
         if staged {
-            self.graph.flush_node(id)?;
+            self.flush(id)?;
         }
         Ok(())
     }
@@ -126,7 +172,7 @@ impl Staged {
     pub fn commit(&self) {
         let ids: Vec<String> = self.nodes.lock().drain().map(|(id, _)| id).collect();
         for id in ids {
-            if let Err(e) = self.graph.flush_node(&id) {
+            if let Err(e) = self.flush(&id) {
                 log::warn!("NFS commit of {id} refused: {e:#}");
             }
         }
@@ -150,7 +196,7 @@ impl Staged {
             due
         };
         for id in &due {
-            if let Err(e) = self.graph.flush_node(id) {
+            if let Err(e) = self.flush(id) {
                 log::warn!("NFS commit of {id} refused: {e:#}");
             }
         }
@@ -192,7 +238,12 @@ impl LeylineNfs {
         self.staged.clone()
     }
 
+    /// Node `id`'s file handle: a new one if its commit was refused, which
+    /// retires the old one.
     fn ensure_ino(&self, id: &str) -> u64 {
+        if self.staged.take_refused(id) {
+            self.retire(id);
+        }
         let mut id_map = self.id_to_ino.lock();
         if let Some(&ino) = id_map.get(id) {
             return ino;
@@ -205,12 +256,30 @@ impl LeylineNfs {
         ino
     }
 
+    /// The node a file handle names. A retired handle — one whose node's
+    /// commit was refused — answers `NFS3ERR_STALE`: a macOS client ignores
+    /// a refused COMMIT, and reports a stale handle from the next operation
+    /// on it (bead `ley-line-open-bc5a6a`).
     fn resolve_id(&self, ino: fileid3) -> Result<String, nfsstat3> {
-        self.ino_to_id
+        let id = self
+            .ino_to_id
             .lock()
             .get(&ino)
             .cloned()
-            .ok_or(nfsstat3::NFS3ERR_STALE)
+            .ok_or(nfsstat3::NFS3ERR_STALE)?;
+        if self.staged.take_refused(&id) {
+            self.retire(&id);
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        Ok(id)
+    }
+
+    /// Drop node `id`'s file handle: the old handle no longer resolves, and
+    /// the next LOOKUP of the node allocates a new one.
+    fn retire(&self, id: &str) {
+        if let Some(ino) = self.id_to_ino.lock().remove(id) {
+            self.ino_to_id.lock().remove(&ino);
+        }
     }
 
     fn node_to_fattr3(&self, ino: fileid3, node: &Node) -> fattr3 {
@@ -430,7 +499,10 @@ impl NFSFileSystem for LeylineNfs {
     /// before it is answered. A refused commit fails the write. A write to
     /// a file that moved since the mount's base is refused `NFS3ERR_STALE`
     /// before it is staged: macOS reports a failed WRITE at fsync, and
-    /// ignores a failed COMMIT (bead `ley-line-open-6116c9`).
+    /// ignores a failed COMMIT (bead `ley-line-open-6116c9`). An UNSTABLE
+    /// write that is a whole dirty range (`whole_range`) and leaves its
+    /// file unparseable is refused `NFS3ERR_IO`, its edit discarded and its
+    /// handle retired (bead `ley-line-open-bc5a6a`).
     async fn write_stable(
         &self,
         id: fileid3,
@@ -448,6 +520,16 @@ impl NFSFileSystem for LeylineNfs {
         self.staged.stage_write(&node_id);
         if stable {
             self.commit(id, 0, 0).await?;
+        } else if whole_range(offset, data.len()) {
+            // The client has sent all it holds of this range: an edit whose
+            // file does not parse is refused here, where the client reports
+            // it, not at the COMMIT, where a macOS client ignores it (bead
+            // `ley-line-open-bc5a6a`).
+            self.graph.check_edit(&node_id).map_err(|e| {
+                log::warn!("NFS write to {node_id} refused: {e:#}");
+                self.staged.refuse(&node_id);
+                nfsstat3::NFS3ERR_IO
+            })?;
         }
 
         let node = self
@@ -461,9 +543,10 @@ impl NFSFileSystem for LeylineNfs {
     /// The client's COMMIT (at fsync or close): splice the node's staged
     /// bytes into its file. The whole node is committed whatever range is
     /// named, since a file is spliced whole. A refused splice fails the
-    /// COMMIT, so the fsync or close reports it: `NFS3ERR_STALE` (`ESTALE`
-    /// at the client) when the file moved since the edit's base was taken,
-    /// `NFS3ERR_IO` otherwise.
+    /// COMMIT — `NFS3ERR_STALE` when the file moved since the edit's base
+    /// was taken, `NFS3ERR_IO` otherwise — and retires the node's file
+    /// handle, since a macOS client ignores the failed COMMIT and reports
+    /// the stale handle from its next operation on the node.
     async fn commit(&self, id: fileid3, _offset: u64, _count: u32) -> Result<(), nfsstat3> {
         let node_id = self.resolve_id(id)?;
         self.staged.commit_node(&node_id).map_err(|e| {
@@ -939,7 +1022,11 @@ mod tests {
         }
 
         async fn read_all(nfs: &LeylineNfs, ino: fileid3) -> Vec<u8> {
-            nfs.read(ino, 0, 4096).await.unwrap().0
+            read_all_of(nfs, ino, 4096).await
+        }
+
+        async fn read_all_of(nfs: &LeylineNfs, ino: fileid3, count: u32) -> Vec<u8> {
+            nfs.read(ino, 0, count).await.unwrap().0
         }
 
         /// Committing truncates as if the idle window had passed.
@@ -1015,37 +1102,230 @@ mod tests {
                 nfs.commit(ino, 0, 0).await,
                 Err(nfsstat3::NFS3ERR_IO)
             ));
+            let ino = text_leaf(&nfs).await;
             assert!(matches!(
                 nfs.write_stable(ino, 0, b"HELLO", true).await,
                 Err(nfsstat3::NFS3ERR_IO)
             ));
         }
 
-        /// Two clients edit two nodes of one file with UNSTABLE writes; the
-        /// second's COMMIT lands. The first client's edit was made against
-        /// the file before it, so its COMMIT is refused `NFS3ERR_STALE`
-        /// (the client's fsync or close sees `ESTALE`) and the node reads
-        /// as stored. Before, the first COMMIT dropped the file's base and
-        /// the second landed unchecked over bytes its client never read.
+        /// An edit to a second node of a file while the mount has an edit to
+        /// another node of it staged is refused at its WRITE (bead
+        /// `ley-line-open-bc5a6a`): the first COMMIT moves the file under
+        /// the second edit's base, so its COMMIT would be refused, and a
+        /// macOS client does not report a refused COMMIT. Once the first
+        /// lands, the second node's edit lands. Before, the second WRITE was
+        /// staged and only its COMMIT refused, which the client ignored.
         #[tokio::test]
-        async fn a_commit_against_a_file_that_moved_is_refused_stale() {
+        async fn a_write_to_a_second_node_of_a_file_with_an_edit_staged_is_refused() {
             let (nfs, recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
             let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
             let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
             nfs.write(x, 0, b"world").await.unwrap();
+            assert!(matches!(
+                nfs.write(y, 0, b"again").await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+            assert!(matches!(
+                nfs.setattr(y, size(0)).await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+            assert_eq!(read_all(&nfs, y).await, b"there", "nothing staged");
+            nfs.write(x, 5, b"!").await.unwrap();
+            nfs.commit(x, 0, 0).await.unwrap();
             nfs.write(y, 0, b"again").await.unwrap();
             nfs.commit(y, 0, 0).await.unwrap();
-            assert!(matches!(
-                nfs.commit(x, 0, 0).await,
-                Err(nfsstat3::NFS3ERR_STALE)
-            ));
             assert_eq!(
-                recorder.writes.lock().len(),
-                2,
-                "both COMMITs reach the write path, which checks the base"
+                *recorder.writes.lock(),
+                vec![
+                    b"<p>world!</p>\n<p>there</p>\n".to_vec(),
+                    b"<p>world!</p>\n<p>again</p>\n".to_vec()
+                ]
             );
-            assert_eq!(read_all(&nfs, x).await, b"hello");
-            assert_eq!(read_all(&nfs, y).await, b"again");
+        }
+
+        /// A write path that refuses every edit, as it refuses one whose
+        /// file does not parse.
+        struct Refusing;
+
+        impl SourceWriter for Refusing {
+            fn write(
+                &self,
+                _conn: &Connection,
+                source_id: &str,
+                _bytes: Vec<u8>,
+                _base: Option<leyline_core::Hash>,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("'{source_id}': modified source has syntax errors")
+            }
+        }
+
+        fn refusing_nfs() -> LeylineNfs {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "test.html",
+            )
+            .unwrap();
+            let mut adapter = SqliteGraphAdapter::new_writable(&db).unwrap();
+            adapter.set_source_writer(Arc::new(Refusing));
+            LeylineNfs::new(Arc::new(adapter))
+        }
+
+        /// Whether every operation on `ino` is refused `NFS3ERR_STALE`.
+        async fn retired(nfs: &LeylineNfs, ino: fileid3) -> bool {
+            matches!(nfs.getattr(ino).await, Err(nfsstat3::NFS3ERR_STALE))
+                && matches!(nfs.read(ino, 0, 64).await, Err(nfsstat3::NFS3ERR_STALE))
+                && matches!(nfs.write(ino, 0, b"x").await, Err(nfsstat3::NFS3ERR_STALE))
+                && matches!(
+                    nfs.setattr(ino, size(0)).await,
+                    Err(nfsstat3::NFS3ERR_STALE)
+                )
+                && matches!(nfs.commit(ino, 0, 0).await, Err(nfsstat3::NFS3ERR_STALE))
+        }
+
+        /// A refused COMMIT retires the node's file handle (bead
+        /// `ley-line-open-bc5a6a`): every later operation on it is refused
+        /// `NFS3ERR_STALE`, which a macOS client reports, where it ignores
+        /// the refused COMMIT. A LOOKUP of the node gives a new handle,
+        /// which reads the stored node. Before, the old handle went on
+        /// answering, and the client served the refused bytes from its
+        /// cache as if they had landed.
+        #[tokio::test]
+        async fn a_refused_commit_retires_the_nodes_handle() {
+            let nfs = refusing_nfs();
+            let ino = text_leaf(&nfs).await;
+            assert_eq!(read_all(&nfs, ino).await, b"hello");
+            nfs.write(ino, 0, b"world").await.unwrap();
+            assert!(matches!(
+                nfs.commit(ino, 0, 0).await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+            assert!(retired(&nfs, ino).await);
+            let fresh = text_leaf(&nfs).await;
+            assert_ne!(fresh, ino, "a LOOKUP gives a new handle");
+            assert_eq!(read_all(&nfs, fresh).await, b"hello");
+            assert!(retired(&nfs, ino).await, "the old handle stays retired");
+        }
+
+        /// A LOOKUP that comes before any operation on the retired handle
+        /// gives the new handle too, and retires the old one.
+        #[tokio::test]
+        async fn a_lookup_after_a_refused_commit_gives_a_new_handle() {
+            let nfs = refusing_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.write(ino, 0, b"world").await.unwrap();
+            assert!(nfs.commit(ino, 0, 0).await.is_err());
+            let fresh = text_leaf(&nfs).await;
+            assert_ne!(fresh, ino);
+            assert!(retired(&nfs, ino).await);
+            assert_eq!(nfs.getattr(fresh).await.unwrap().size, 5);
+        }
+
+        /// A truncate the idle window commits, refused, retires the handle
+        /// the same way: no COMMIT is there to fail.
+        #[tokio::test]
+        async fn a_refused_idle_commit_retires_the_nodes_handle() {
+            let nfs = refusing_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            assert!(commit_now(&nfs));
+            assert!(retired(&nfs, ino).await);
+            assert_eq!(read_all(&nfs, text_leaf(&nfs).await).await, b"hello");
+        }
+
+        /// A staged edit refused by the commit before a structural operation
+        /// retires the handle the same way.
+        #[tokio::test]
+        async fn a_refused_structural_commit_retires_the_nodes_handle() {
+            let nfs = refusing_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.write(ino, 0, b"world").await.unwrap();
+            nfs.mkdir(ROOT_FILEID, &b"newdir".to_vec().into())
+                .await
+                .unwrap();
+            assert!(retired(&nfs, ino).await);
+        }
+
+        /// A WRITE that is a whole dirty range of its client — it starts at
+        /// 0 or off a page boundary and ends off one — and leaves the node's
+        /// file unparseable is refused `NFS3ERR_IO` at the WRITE (bead
+        /// `ley-line-open-bc5a6a`): a macOS client reports a refused WRITE
+        /// at fsync and close, and ignores a refused COMMIT. The edit and
+        /// the truncate before it are discarded, nothing reaches the write
+        /// path, and the handle is retired, so the client drops the refused
+        /// bytes it cached. Before, the WRITE was staged and only its
+        /// COMMIT refused, which the client ignored.
+        #[tokio::test]
+        async fn an_unparseable_whole_write_is_refused_at_the_write() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            assert!(matches!(
+                nfs.write(ino, 0, b"wor\0d").await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+            assert!(!commit_now(&nfs), "the truncate is discarded too");
+            assert!(recorder.writes.lock().is_empty());
+            assert!(retired(&nfs, ino).await);
+            assert_eq!(read_all(&nfs, text_leaf(&nfs).await).await, b"hello");
+        }
+
+        /// An append — a dirty range that starts off a page boundary — is a
+        /// whole range too, and is checked at its WRITE.
+        #[tokio::test]
+        async fn an_unparseable_append_is_refused_at_the_write() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            assert!(matches!(
+                nfs.write(ino, 5, b"\0").await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+            assert!(recorder.writes.lock().is_empty());
+            assert_eq!(read_all(&nfs, text_leaf(&nfs).await).await, b"hello");
+        }
+
+        /// A WRITE that may be one chunk of several — it ends on a page
+        /// boundary, or starts on one past 0 — is not checked: a client
+        /// splits a range at its buffer boundaries and sends the chunks in
+        /// any order, so the file is complete only at the COMMIT, which
+        /// refuses it.
+        #[tokio::test]
+        async fn a_write_that_may_be_one_chunk_of_several_waits_for_the_commit() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            nfs.write(ino, 4096, b"\0").await.unwrap();
+            nfs.write(ino, 0, &[b'a'; 4096]).await.unwrap();
+            assert!(recorder.writes.lock().is_empty());
+            assert!(matches!(
+                nfs.commit(ino, 0, 0).await,
+                Err(nfsstat3::NFS3ERR_IO)
+            ));
+            assert_eq!(recorder.writes.lock().len(), 1);
+        }
+
+        /// A parseable whole WRITE is staged and lands at its COMMIT.
+        #[tokio::test]
+        async fn a_parseable_whole_write_waits_for_the_commit() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.setattr(ino, size(0)).await.unwrap();
+            nfs.write(ino, 0, b"world").await.unwrap();
+            assert!(recorder.writes.lock().is_empty());
+            nfs.commit(ino, 0, 0).await.unwrap();
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+        }
+
+        /// A COMMIT that lands leaves the handle as it was.
+        #[tokio::test]
+        async fn a_landed_commit_keeps_the_handle() {
+            let (nfs, _recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            nfs.write(ino, 0, b"world").await.unwrap();
+            nfs.commit(ino, 0, 0).await.unwrap();
+            assert_eq!(text_leaf(&nfs).await, ino);
+            assert_eq!(read_all(&nfs, ino).await, b"world");
         }
 
         /// Another writer lands `text` over node `ino` — a socket proposal,
@@ -1106,9 +1386,11 @@ mod tests {
         }
 
         /// A refusal keeps the base: a client that retries from its cache,
-        /// with no READ in between, is refused again. A READ re-takes it,
-        /// and the edit made after that lands. Before, the refusal dropped
-        /// the base and the retry's WRITE took one from the moved file.
+        /// with no READ in between, is refused again — through the retired
+        /// handle and through the new one a LOOKUP gives. A READ re-takes
+        /// it, and the edit made after that lands. Before, the refusal
+        /// dropped the base and the retry's WRITE took one from the moved
+        /// file.
         #[tokio::test]
         async fn a_retry_without_a_read_after_a_stale_refusal_is_refused() {
             let (nfs, _recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
@@ -1121,6 +1403,8 @@ mod tests {
                 nfs.commit(x, 0, 0).await,
                 Err(nfsstat3::NFS3ERR_STALE)
             ));
+            assert!(is_stale(nfs.write(x, 0, b"world").await));
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
             for _ in 0..2 {
                 assert!(is_stale(nfs.write(x, 0, b"world").await));
             }
@@ -1179,6 +1463,7 @@ mod tests {
                 nfs.commit(x, 0, 0).await,
                 Err(nfsstat3::NFS3ERR_STALE)
             ));
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
             assert_eq!(read_all(&nfs, x).await, b"a");
             assert_eq!(read_all(&nfs, z).await, b"moved");
         }
@@ -1258,27 +1543,32 @@ mod tests {
             assert_eq!(*recorder.writes.lock(), vec![b"<p>he</p>\n".to_vec()]);
         }
 
-        /// A write past the end zero-fills the gap, as POSIX does.
+        /// A write past the end zero-fills the gap, as POSIX does. The
+        /// write starts on a page boundary, so it may be one chunk of
+        /// several and waits for the COMMIT.
         #[tokio::test]
         async fn a_write_past_the_end_zero_fills() {
             let (nfs, recorder) = html_nfs();
             let ino = text_leaf(&nfs).await;
-            nfs.write(ino, 7, b"x").await.unwrap();
-            assert_eq!(read_all(&nfs, ino).await, b"hello\0\0x");
+            nfs.write(ino, 4096, b"x").await.unwrap();
+            let mut filled = b"hello".to_vec();
+            filled.resize(4096, 0);
+            filled.push(b'x');
+            assert_eq!(read_all_of(&nfs, ino, 8192).await, filled);
             // The zero-filled file reaches the write path, which refuses
             // HTML with NULs in it; the COMMIT reports that refusal. The
             // refused edit is discarded from the mount, which never wrote it
-            // to the database, so nothing is written back: the leaf reads as
-            // it did before the write.
+            // to the database, so nothing is written back: the leaf, looked
+            // up again, reads as it did before the write.
             assert!(matches!(
                 nfs.commit(ino, 0, 0).await,
                 Err(nfsstat3::NFS3ERR_IO)
             ));
             assert_eq!(
                 *recorder.writes.lock(),
-                vec![b"<p>hello\0\0x</p>\n".to_vec()]
+                vec![[b"<p>".as_slice(), &filled, b"</p>\n"].concat()]
             );
-            assert_eq!(read_all(&nfs, ino).await, b"hello");
+            assert_eq!(read_all(&nfs, text_leaf(&nfs).await).await, b"hello");
         }
 
         /// An operation that changes the tree's shape commits staged writes

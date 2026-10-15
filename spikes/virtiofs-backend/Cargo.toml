@@ -1,0 +1,18 @@
+# ADR-0044 open question 1 spike (bead ley-line-open-bb8cc1).
+#
+# A standalone workspace outside rs/: not a member of rs/Cargo.toml, not seen by
+# tools/verify_release_version.sh, never built by `task ci`, never released.
+# It links a patched libkrun v1.19.4 from ./vendor/libkrun, which `run.sh`
+# clones and patches with libkrun-v1.19.4-custom-fs.patch.
+[workspace]
+
+[package]
+name = "llo-virtiofs-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+libkrun = { path = "vendor/libkrun/src/libkrun" }
+libc = "0.2"

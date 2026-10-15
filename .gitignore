@@ -41,6 +41,12 @@
 # ll-open crates (Tier 2: OSS projection engine)
 !rs/ll-open/**
 
+# Spikes: standalone cargo workspaces outside rs/ (so neither the workspace nor
+# the release-manifest sweep sees them), never built by CI or release. Their
+# vendor/ holds upstream checkouts that run.sh clones.
+!spikes/**
+spikes/**/vendor/
+
 # Workspace tools (compat-gen + future workspace-only binaries — not
 # published as crates; live under rs/tools/ and are wired into the
 # workspace via rs/Cargo.toml's `members = ["tools/*"]`).

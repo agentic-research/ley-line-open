@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Thu, 15 Oct 2026 10:44:42 -0600
+Subject: [PATCH] devices/fs: forward READDIRPLUS through DynFileSystem
+
+The server already dispatches READDIRPLUS to `FileSystem::readdirplus`
+(do_readdir with plus = true), and the kernel sends it once `init`
+returns FsOptions::DO_READDIRPLUS. `DynFs` did not forward it, so a
+`DynFileSystem` backend answered ENOSYS and the guest fell back to
+READDIR plus one LOOKUP per name.
+
+Add `DynFileSystem::readdirplus`, which hands each entry to
+`&mut dyn FnMut(DirEntry, Entry)` (object-safe, like `readdir`), with
+an ENOSYS default, and forward it from `DynFs`. Each `Entry` a backend
+returns counts as one lookup, which the kernel FORGETs.
+
+Measured on macOS (Hypervisor.framework, Linux 6.12 guest, 20,857-file
+tree, long entry/attribute timeouts): a cold `find` goes from 1,454 ms
+to 486 ms and its LOOKUPs from 24,385 to 1.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+Signed-off-by: jamestexas <18285880+jamestexas@users.noreply.github.com>
+---
+ src/devices/src/virtio/fs/dyn_fs.rs | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/devices/src/virtio/fs/dyn_fs.rs b/src/devices/src/virtio/fs/dyn_fs.rs
+index f45b27e..214ec8e 100644
+--- a/src/devices/src/virtio/fs/dyn_fs.rs
++++ b/src/devices/src/virtio/fs/dyn_fs.rs
+@@ -191,6 +191,20 @@ pub trait DynFileSystem: Send + Sync {
+     ) -> io::Result<()> {
+         enosys()
+     }
++    /// READDIRPLUS: each entry with its `Entry`, so the guest needs no LOOKUP
++    /// per name. Advertise `FsOptions::DO_READDIRPLUS` from `init` to receive
++    /// it. Each returned `Entry` counts as one lookup (the kernel FORGETs it).
++    fn readdirplus(
++        &self,
++        ctx: Context,
++        inode: u64,
++        handle: u64,
++        size: u32,
++        offset: u64,
++        add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
++    ) -> io::Result<()> {
++        enosys()
++    }
+     fn releasedir(&self, ctx: Context, inode: u64, flags: u32, handle: u64) -> io::Result<()> {
+         Ok(())
+     }
+@@ -493,6 +507,21 @@ impl FileSystem for DynFs {
+         self.0
+             .readdir(ctx, inode, handle, size, offset, &mut add_entry)
+     }
++    fn readdirplus<F>(
++        &self,
++        ctx: Context,
++        inode: u64,
++        handle: u64,
++        size: u32,
++        offset: u64,
++        mut add_entry: F,
++    ) -> io::Result<()>
++    where
++        F: FnMut(DirEntry, Entry) -> io::Result<usize>,
++    {
++        self.0
++            .readdirplus(ctx, inode, handle, size, offset, &mut add_entry)
++    }
+     fn releasedir(&self, ctx: Context, inode: u64, flags: u32, handle: u64) -> io::Result<()> {
+         self.0.releasedir(ctx, inode, flags, handle)
+     }
+-- 
+2.50.1 (Apple Git-155)
+

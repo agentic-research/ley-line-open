@@ -12,6 +12,24 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **storefs read freshness: READDIRPLUS, fresh-at-open page caching,
+  adaptive timeouts** (beads `ley-line-open-789e0f`, `e650d7`, decided in
+  `e6269a`; ADR-0044 V3 "Read freshness"). libkrun patch `0004` forwards
+  READDIRPLUS through `DynFileSystem` (object-safe:
+  `&mut dyn FnMut(DirEntry, Entry)`), and `StoreFs::readdirplus` answers
+  each entry with its attributes and timeout. `StoreFs::open` returns
+  `Opened { handle, keep_cache, direct_io }`: every OPEN reads the current
+  blob, a read-only open keeps the guest's pages only when the blob is the
+  one the previous (read-only) open of the inode served, and write opens
+  are `direct_io`; `StoreFs::opendir` applies the rule to a directory's
+  listing. Entry, attribute and negative-entry (`negative_ttl`) timeouts
+  are `Freshness::changed` (default 1 s) for a path, and its parent,
+  changed within `Freshness::window` (default 60 s) — by a proposal
+  storefs landed or a state change it observed — and
+  `Freshness::settled` (default 60 s) otherwise; the clock is injected
+  (`Clock`, `StoreFs::with_clock`). `docs/benchmarks/2026-10-15-vf3-virtiofs.md`
+  records the V-F3 measurements behind it.
+
 - **LLO builds the VMM it runs** (bead `ley-line-open-f1c46f`, ADR-0044
   phase A). `rs/third_party/libkrun` is libkrun v1.19.4 (commit
   `728df812`, Apache-2.0) with three patches from
@@ -81,6 +99,13 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking (`leyline-storefs`): `Options::ttl` is replaced by
+  `Options::freshness`, `open` returns `Opened`, and WRITE refuses a stale
+  base** (bead `ley-line-open-e650d7`). A WRITE on a handle whose blob base
+  is no longer the path's `_source.content_hash` (another writer changed
+  or deleted the file) answers `ESTALE` and stages nothing, so `write(2)`
+  reports the conflict before any bytes are staged; FLUSH and FSYNC keep
+  their checks for changes that land after the WRITE.
 - **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**
   (bead `ley-line-open-f1c46f`). `leyline-krun-worker`,
   `KrunWorkerConfig` and `leyline execution-daemon --backend micro-vm`

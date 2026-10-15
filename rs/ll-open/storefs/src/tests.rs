@@ -23,12 +23,41 @@ const B: &str = "package pkg\n\nfunc B() string { return \"b\" }\n";
 const C: &str = "package sub\n\nfunc C() {}\n";
 const D: &str = "package secret\n\nfunc D() {}\n";
 
+/// The timeout of a path no change was recorded for within [`WINDOW`].
 const TTL: Duration = Duration::from_secs(7);
+/// The timeout of a path changed within [`WINDOW`].
+const SHORT: Duration = Duration::from_millis(250);
+const WINDOW: Duration = Duration::from_secs(30);
+
+fn freshness() -> Freshness {
+    Freshness {
+        settled: TTL,
+        changed: SHORT,
+        window: WINDOW,
+    }
+}
+
+/// A clock the test moves: no test sleeps.
+#[derive(Default)]
+struct TestClock(parking_lot::Mutex<Duration>);
+
+impl TestClock {
+    fn advance(&self, by: Duration) {
+        *self.0.lock() += by;
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> Duration {
+        *self.0.lock()
+    }
+}
 
 struct Fixture {
     _db_dir: TempDir,
     src: TempDir,
     fs: StoreFs<Arc<LiveDb>>,
+    clock: Arc<TestClock>,
 }
 
 fn whole() -> Scope {
@@ -65,16 +94,18 @@ fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
     })
     .unwrap();
     let options = Options {
-        ttl: TTL,
+        freshness: freshness(),
         checkout: checkout.then(|| Checkout {
             dir: src.path().to_path_buf(),
             lang_filter: None,
         }),
     };
+    let clock = Arc::new(TestClock::default());
     Fixture {
         _db_dir: db_dir,
         src,
-        fs: StoreFs::new(live, scope, options),
+        fs: StoreFs::with_clock(live, scope, options, clock.clone()),
+        clock,
     }
 }
 
@@ -174,7 +205,7 @@ fn ino(f: &Fixture, path: &str) -> u64 {
 
 /// Open `path` with `flags`, replace its bytes with `text`, and return the handle.
 fn edit(f: &Fixture, path: &str, text: &str) -> u64 {
-    let h = f.fs.open(ino(f, path), O_RDWR | O_TRUNC).unwrap();
+    let h = f.fs.open(ino(f, path), O_RDWR | O_TRUNC).unwrap().handle;
     assert_eq!(f.fs.write(h, 0, text.as_bytes()), Ok(text.len()));
     h
 }
@@ -193,7 +224,7 @@ fn a_read_serves_the_blob_the_store_holds_for_the_path() {
 
     let entry = f.fs.lookup(ROOT_INODE, b"a.go").unwrap();
     assert_eq!(entry.attr.size, A.len() as u64);
-    let h = f.fs.open(entry.attr.inode, O_RDONLY).unwrap();
+    let h = f.fs.open(entry.attr.inode, O_RDONLY).unwrap().handle;
     assert_eq!(read_all(&f, h), stored);
     assert_eq!(f.fs.read(h, 2, 3).unwrap(), &A.as_bytes()[2..5]);
     assert_eq!(
@@ -206,10 +237,10 @@ fn a_read_serves_the_blob_the_store_holds_for_the_path() {
 #[test]
 fn an_open_reads_its_blob_once_and_keeps_serving_it() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap();
+    let h = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle;
     other_writer(&f, "a.go", A_OTHER);
     assert_eq!(read_all(&f, h), A.as_bytes());
-    let fresh = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap();
+    let fresh = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle;
     assert_eq!(read_all(&f, fresh), A_OTHER.as_bytes());
 }
 
@@ -324,7 +355,7 @@ fn an_accepted_flush_lands_in_the_store_and_advances_the_handles_base() {
     assert_ne!(after, hash);
     f.fs.release(h);
 
-    let reopened = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap();
+    let reopened = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle;
     assert_eq!(read_all(&f, reopened), A_OTHER.as_bytes());
 }
 
@@ -365,9 +396,9 @@ fn without_a_checkout_an_accepted_flush_writes_no_file() {
 #[test]
 fn a_flush_against_a_moved_file_is_estale_and_lands_nothing() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap();
-    other_writer(&f, "a.go", A_OTHER);
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
     assert_eq!(f.fs.write(h, 0, A_EDIT.as_bytes()), Ok(A_EDIT.len()));
+    other_writer(&f, "a.go", A_OTHER);
     assert_eq!(f.fs.flush(h), Err(Errno::ESTALE));
     assert_eq!(read_source(&f, "a.go").0, A_OTHER.as_bytes());
     // The staged bytes stay: the close after a refused fsync answers the same.
@@ -378,11 +409,44 @@ fn a_flush_against_a_moved_file_is_estale_and_lands_nothing() {
 #[test]
 fn an_fsync_against_a_moved_file_is_estale_and_lands_nothing() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_WRONLY).unwrap();
-    other_writer(&f, "a.go", A_OTHER);
+    let h = f.fs.open(ino(&f, "a.go"), O_WRONLY).unwrap().handle;
     assert_eq!(f.fs.write(h, 0, A_EDIT.as_bytes()), Ok(A_EDIT.len()));
+    other_writer(&f, "a.go", A_OTHER);
     assert_eq!(f.fs.fsync(h), Err(Errno::ESTALE));
     assert_eq!(read_source(&f, "a.go").0, A_OTHER.as_bytes());
+}
+
+/// The spike's D1: open, *foreign change*, write. The WRITE itself is
+/// refused, so `write(2)` answers `ESTALE` and nothing is staged: the
+/// `fsync` and `close` after it have nothing to propose.
+#[test]
+fn a_write_against_a_moved_file_is_estale_and_stages_nothing() {
+    let f = fixture(whole());
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
+    other_writer(&f, "a.go", A_OTHER);
+    assert_eq!(f.fs.write(h, 0, A_EDIT.as_bytes()), Err(Errno::ESTALE));
+    assert_eq!(read_all(&f, h), A.as_bytes(), "nothing was staged");
+    assert_eq!(f.fs.fsync(h), Ok(()));
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(read_source(&f, "a.go").0, A_OTHER.as_bytes());
+
+    // A file another writer deleted is as stale.
+    let b = f.fs.open(ino(&f, "pkg/b.go"), O_WRONLY).unwrap().handle;
+    f.fs.store()
+        .with_write(|conn| {
+            source_write::propose(
+                conn,
+                &Grant::Whole,
+                vec![Proposed::delete("pkg/b.go", Base::Any)],
+            )
+        })
+        .unwrap();
+    assert_eq!(f.fs.write(b, 0, B.as_bytes()), Err(Errno::ESTALE));
+
+    // A handle whose own flush advanced its base keeps writing.
+    let h = edit(&f, "a.go", A_EDIT);
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(f.fs.write(h, 0, A_TAILED.as_bytes()), Ok(A_TAILED.len()));
 }
 
 #[test]
@@ -397,8 +461,8 @@ fn a_flush_of_bytes_that_do_not_parse_is_eio_and_lands_nothing() {
 #[test]
 fn of_two_handles_on_one_file_the_second_to_flush_is_stale() {
     let f = fixture(whole());
-    let first = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap();
-    let second = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap();
+    let first = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
+    let second = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
     assert_eq!(f.fs.write(first, 0, A_EDIT.as_bytes()), Ok(A_EDIT.len()));
     assert_eq!(f.fs.write(second, 0, A_OTHER.as_bytes()), Ok(A_OTHER.len()));
     assert_eq!(f.fs.flush(first), Ok(()));
@@ -446,7 +510,7 @@ fn a_flush_with_nothing_staged_proposes_nothing() {
         see: Grant::Whole,
         propose: paths(&["a.go"]),
     });
-    let h = f.fs.open(ino(&f, "pkg/b.go"), O_RDONLY).unwrap();
+    let h = f.fs.open(ino(&f, "pkg/b.go"), O_RDONLY).unwrap().handle;
     assert_eq!(f.fs.flush(h), Ok(()));
     assert_eq!(f.fs.fsync(h), Ok(()));
 
@@ -462,7 +526,7 @@ fn a_flush_with_nothing_staged_proposes_nothing() {
 #[test]
 fn writes_stage_on_the_handle_at_their_offsets() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap();
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
     assert_eq!(f.fs.write(h, 0, b"PACK"), Ok(4));
     let mut expect = A.as_bytes().to_vec();
     expect[..4].copy_from_slice(b"PACK");
@@ -486,7 +550,7 @@ fn writes_stage_on_the_handle_at_their_offsets() {
 #[test]
 fn a_handle_that_was_not_opened_for_writing_refuses_writes_and_released_handles_are_gone() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap();
+    let h = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle;
     assert_eq!(f.fs.write(h, 0, b"x"), Err(Errno::EBADF));
     assert_eq!(
         f.fs.setattr(
@@ -519,7 +583,10 @@ fn an_unflushed_edit_is_discarded_at_release() {
 #[test]
 fn open_with_o_trunc_then_a_shorter_write_lands_exactly_those_bytes() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_WRONLY | O_TRUNC).unwrap();
+    let h =
+        f.fs.open(ino(&f, "a.go"), O_WRONLY | O_TRUNC)
+            .unwrap()
+            .handle;
     assert_eq!(read_all(&f, h), b"");
     assert_eq!(f.fs.write(h, 0, A_SHORT.as_bytes()), Ok(A_SHORT.len()));
     assert_eq!(f.fs.flush(h), Ok(()));
@@ -529,14 +596,20 @@ fn open_with_o_trunc_then_a_shorter_write_lands_exactly_those_bytes() {
 #[test]
 fn o_trunc_on_a_read_only_open_truncates_nothing() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_RDONLY | O_TRUNC).unwrap();
+    let h =
+        f.fs.open(ino(&f, "a.go"), O_RDONLY | O_TRUNC)
+            .unwrap()
+            .handle;
     assert_eq!(read_all(&f, h), A.as_bytes());
 }
 
 #[test]
 fn an_o_trunc_open_with_no_write_lands_an_empty_file_at_flush() {
     let f = fixture(whole());
-    let h = f.fs.open(ino(&f, "a.go"), O_WRONLY | O_TRUNC).unwrap();
+    let h =
+        f.fs.open(ino(&f, "a.go"), O_WRONLY | O_TRUNC)
+            .unwrap()
+            .handle;
     assert_eq!(f.fs.flush(h), Ok(()));
     assert_eq!(read_source(&f, "a.go").0, b"");
 }
@@ -545,7 +618,7 @@ fn an_o_trunc_open_with_no_write_lands_an_empty_file_at_flush() {
 fn ftruncate_stages_on_the_handle_and_lands_at_flush() {
     let f = fixture(whole());
     let a = ino(&f, "a.go");
-    let h = f.fs.open(a, O_RDWR).unwrap();
+    let h = f.fs.open(a, O_RDWR).unwrap().handle;
     let (attr, ttl) =
         f.fs.setattr(
             a,
@@ -715,7 +788,7 @@ fn a_write_outside_the_proposal_scope_is_eacces() {
         ),
         Err(Errno::EACCES)
     );
-    let h = f.fs.open(b, O_RDONLY).unwrap();
+    let h = f.fs.open(b, O_RDONLY).unwrap().handle;
     assert_eq!(read_all(&f, h), B.as_bytes());
     assert_eq!(read_source(&f, "pkg/b.go").0, B.as_bytes());
     // The file the scope may propose is writable.
@@ -914,7 +987,7 @@ fn a_file_the_store_cannot_hold_lives_in_the_session() {
     assert!(!stored(&f, "notes.txt"));
     let notes = ino(&f, "notes.txt");
     assert_eq!(f.fs.getattr(notes, None).unwrap().0.size, 6);
-    let r = f.fs.open(notes, O_RDONLY).unwrap();
+    let r = f.fs.open(notes, O_RDONLY).unwrap().handle;
     assert_eq!(read_all(&f, r), b"hello\n");
     assert!(names(&f, ROOT_INODE).contains(&"notes.txt".to_string()));
     assert_eq!(f.fs.unlink(ROOT_INODE, b"notes.txt"), Ok(()));
@@ -1019,7 +1092,7 @@ fn write_temp_then_rename_over_the_original_is_one_proposal() {
 fn rename_moves_a_stored_file_in_one_proposal_and_its_handle_follows() {
     let f = fixture_with(whole(), true, A);
     let a = ino(&f, "a.go");
-    let h = f.fs.open(a, O_RDWR).unwrap();
+    let h = f.fs.open(a, O_RDWR).unwrap().handle;
     count_passes(&f);
     let pkg = ino(&f, "pkg");
     assert_eq!(
@@ -1053,7 +1126,7 @@ fn rename_over_an_existing_file_replaces_it() {
     let pkg = ino(&f, "pkg");
     count_passes(&f);
     let replaced = format!("{B}// replaced\n");
-    let h = f.fs.open(ino(&f, "b-new.go"), O_RDWR).unwrap();
+    let h = f.fs.open(ino(&f, "b-new.go"), O_RDWR).unwrap().handle;
     assert_eq!(f.fs.write(h, 0, replaced.as_bytes()), Ok(replaced.len()));
     assert_eq!(f.fs.flush(h), Ok(()));
     assert_eq!(
@@ -1194,7 +1267,7 @@ fn a_create_outside_the_checkouts_language_stays_in_the_session() {
         f.fs.store().clone(),
         whole(),
         Options {
-            ttl: TTL,
+            freshness: freshness(),
             checkout: Some(Checkout {
                 dir: f.src.path().to_path_buf(),
                 lang_filter: Some("go".to_string()),
@@ -1276,7 +1349,7 @@ fn a_session_file_renames_within_the_scope() {
         f.fs.rename(ROOT_INODE, b"notes.txt", ROOT_INODE, b"kept.txt", 0),
         Ok(())
     );
-    let r = f.fs.open(ino(&f, "kept.txt"), O_RDONLY).unwrap();
+    let r = f.fs.open(ino(&f, "kept.txt"), O_RDONLY).unwrap().handle;
     assert_eq!(read_all(&f, r), b"hello\n");
     assert_eq!(f.fs.lookup(ROOT_INODE, b"notes.txt"), Err(Errno::ENOENT));
 }
@@ -1324,4 +1397,279 @@ fn structural_requests_naming_what_the_guest_cannot_see_are_enoent() {
         f.fs.rename(ROOT_INODE, b"a.go", 999, b"x", 0),
         Err(Errno::ENOENT)
     );
+}
+
+// ── read freshness (ADR-0044 V3 "Read freshness") ─────────────────────────
+
+const C_EDIT: &str = "package sub\n\nfunc C() {}\n\nfunc C2() {}\n";
+
+/// The entry timeout LOOKUP answers for `path`.
+fn ttl_of(f: &Fixture, path: &str) -> Duration {
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let parent = if parent.is_empty() {
+        ROOT_INODE
+    } else {
+        ino(f, parent)
+    };
+    f.fs.lookup(parent, name.as_bytes()).unwrap().ttl
+}
+
+/// Another writer deletes `path`.
+fn other_deleter(f: &Fixture, path: &str) {
+    f.fs.store()
+        .with_write(|conn| {
+            source_write::propose(conn, &Grant::Whole, vec![Proposed::delete(path, Base::Any)])
+        })
+        .unwrap();
+}
+
+/// Another writer creates `path`.
+fn other_creator(f: &Fixture, path: &str, text: &str) {
+    f.fs.store()
+        .with_write(|conn| {
+            source_write::propose(
+                conn,
+                &Grant::Whole,
+                vec![Proposed::create(path, text.as_bytes().to_vec())],
+            )
+        })
+        .unwrap();
+}
+
+/// A read-only open and its release: what the guest's page cache is told.
+fn read_open(f: &Fixture, inode: u64) -> Opened {
+    let opened = f.fs.open(inode, O_RDONLY).unwrap();
+    f.fs.release(opened.handle);
+    opened
+}
+
+#[test]
+fn readdirplus_answers_each_entry_with_its_attributes_and_timeout() {
+    let f = fixture(whole());
+    let pkg = ino(&f, "pkg");
+    let plus = f.fs.readdirplus(pkg, 0).unwrap();
+    let listed: Vec<DirEntry> = plus.iter().map(|(d, _)| d.clone()).collect();
+    assert_eq!(listed, f.fs.readdir(pkg, 0).unwrap());
+    assert_eq!(
+        plus.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(),
+        vec![
+            f.fs.lookup(pkg, b"b.go").unwrap(),
+            f.fs.lookup(pkg, b"sub").unwrap()
+        ]
+    );
+    let (b, b_entry) = &plus[0];
+    assert_eq!(b_entry.attr.inode, b.inode);
+    assert_eq!(
+        (b_entry.attr.kind, b_entry.attr.size, b_entry.attr.mode()),
+        (Kind::File, B.len() as u64, 0o100644)
+    );
+    assert_eq!(b_entry.ttl, TTL);
+    assert_eq!(plus[1].1.attr.mode(), 0o040755);
+    assert_eq!(f.fs.readdirplus(pkg, 1).unwrap(), plus[1..].to_vec());
+    assert_eq!(f.fs.readdirplus(pkg, 2).unwrap(), vec![]);
+    assert_eq!(f.fs.readdirplus(ino(&f, "a.go"), 0), Err(Errno::ENOTDIR));
+    assert_eq!(f.fs.readdirplus(999, 0), Err(Errno::ENOENT));
+
+    // A file only the session holds carries its bytes' size.
+    let (_, flushed) = create_file(&f, ROOT_INODE, "notes.txt", "hi\n");
+    assert_eq!(flushed, Ok(()));
+    let root = f.fs.readdirplus(ROOT_INODE, 0).unwrap();
+    let notes = root.iter().find(|(d, _)| d.name == "notes.txt").unwrap();
+    assert_eq!((notes.1.attr.kind, notes.1.attr.size), (Kind::File, 3));
+}
+
+#[test]
+fn readdirplus_answers_the_modes_the_scope_allows() {
+    let f = fixture(Scope {
+        see: Grant::Whole,
+        propose: paths(&["a.go"]),
+    });
+    let modes: Vec<(String, u32)> =
+        f.fs.readdirplus(ROOT_INODE, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(d, e)| (d.name, e.attr.mode()))
+            .collect();
+    assert_eq!(
+        modes,
+        [
+            ("a.go".to_string(), 0o100644),
+            ("pkg".to_string(), 0o040555),
+            ("secret".to_string(), 0o040555),
+        ]
+    );
+    let b = f.fs.readdirplus(ino(&f, "pkg"), 0).unwrap();
+    assert_eq!(b[0].1.attr.mode(), 0o100444);
+}
+
+/// The guest keeps a file's pages across opens only while the file holds
+/// the blob the last open served: content addressing gives open-to-close
+/// consistency with no invalidation channel.
+#[test]
+fn a_read_only_open_keeps_the_guests_pages_only_while_the_blob_is_unchanged() {
+    let f = fixture(whole());
+    let a = ino(&f, "a.go");
+    let first = read_open(&f, a);
+    assert_eq!((first.keep_cache, first.direct_io), (false, false));
+    assert!(read_open(&f, a).keep_cache);
+    assert!(read_open(&f, a).keep_cache);
+    assert!(!read_open(&f, ino(&f, "pkg/b.go")).keep_cache, "per file");
+
+    other_writer(&f, "a.go", A_OTHER);
+    let after = read_open(&f, a);
+    assert_eq!((after.keep_cache, after.direct_io), (false, false));
+    assert!(read_open(&f, a).keep_cache);
+
+    // A write open bypasses the page cache, and the guest drops the
+    // file's pages at it.
+    let w = f.fs.open(a, O_RDWR).unwrap();
+    assert_eq!((w.keep_cache, w.direct_io), (false, true));
+    assert!(!read_open(&f, a).keep_cache);
+    assert!(read_open(&f, a).keep_cache);
+
+    // The session's own accepted flush moves the blob as well.
+    assert_eq!(f.fs.write(w.handle, 0, A_EDIT.as_bytes()), Ok(A_EDIT.len()));
+    assert_eq!(f.fs.flush(w.handle), Ok(()));
+    assert!(!read_open(&f, a).keep_cache);
+    assert!(read_open(&f, a).keep_cache);
+
+    // A file only the session holds has no blob to compare.
+    let (h, flushed) = create_file(&f, ROOT_INODE, "notes.txt", "hi\n");
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    let notes = ino(&f, "notes.txt");
+    assert!(!read_open(&f, notes).keep_cache);
+    assert!(!read_open(&f, notes).keep_cache);
+}
+
+#[test]
+fn opendir_keeps_the_guests_listing_only_while_it_is_unchanged() {
+    let f = fixture(whole());
+    let pkg = ino(&f, "pkg");
+    assert_eq!(f.fs.opendir(pkg), Ok(OpenedDir { keep_cache: false }));
+    assert_eq!(f.fs.opendir(pkg), Ok(OpenedDir { keep_cache: true }));
+    other_writer(&f, "pkg/b.go", "package pkg\n");
+    assert!(
+        f.fs.opendir(pkg).unwrap().keep_cache,
+        "same names, same kinds"
+    );
+    other_creator(&f, "pkg/new.go", "package pkg\n");
+    assert!(!f.fs.opendir(pkg).unwrap().keep_cache);
+    assert!(f.fs.opendir(pkg).unwrap().keep_cache);
+    f.fs.mkdir(pkg, b"d").unwrap();
+    assert!(!f.fs.opendir(pkg).unwrap().keep_cache);
+    assert!(!f.fs.opendir(ROOT_INODE).unwrap().keep_cache);
+    assert_eq!(f.fs.opendir(ino(&f, "a.go")), Err(Errno::ENOTDIR));
+    assert_eq!(f.fs.opendir(999), Err(Errno::ENOENT));
+}
+
+/// "Recent": a change recorded at `t0` keeps the path's (and its parent
+/// directory's) timeouts short while `now - t0 < window`.
+#[test]
+fn a_proposal_shortens_the_timeouts_of_its_path_and_parent_for_the_window() {
+    let f = fixture(whole());
+    let c = ino(&f, "pkg/sub/c.go");
+    let sub = ino(&f, "pkg/sub");
+    let timeouts = |f: &Fixture| {
+        [
+            ttl_of(f, "pkg/sub/c.go"),
+            f.fs.getattr(c, None).unwrap().1,
+            ttl_of(f, "pkg/sub"),
+            f.fs.getattr(sub, None).unwrap().1,
+            ttl_of(f, "pkg"),
+            ttl_of(f, "a.go"),
+        ]
+    };
+    assert_eq!(timeouts(&f), [TTL; 6]);
+
+    f.clock.advance(Duration::from_secs(100));
+    let h = f.fs.open(c, O_RDWR).unwrap().handle;
+    assert_eq!(f.fs.write(h, 0, C_EDIT.as_bytes()), Ok(C_EDIT.len()));
+    assert_eq!(timeouts(&f), [TTL; 6], "nothing changes until it lands");
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(timeouts(&f), [SHORT, SHORT, SHORT, SHORT, TTL, TTL]);
+
+    f.clock.advance(WINDOW - Duration::from_nanos(1));
+    assert_eq!(timeouts(&f), [SHORT, SHORT, SHORT, SHORT, TTL, TTL]);
+    f.clock.advance(Duration::from_nanos(1));
+    assert_eq!(timeouts(&f), [TTL; 6]);
+
+    // A delete shortens the negative entry of the name it removed.
+    f.fs.unlink(sub, b"c.go").unwrap();
+    assert_eq!(f.fs.negative_ttl(sub, b"c.go"), SHORT);
+    assert_eq!(ttl_of(&f, "pkg/sub"), SHORT);
+}
+
+/// No proposal notifies storefs of another writer's change: it records the
+/// change when it next serves the path in a state other than the one it
+/// last served.
+#[test]
+fn a_foreign_change_shortens_the_timeouts_from_when_storefs_next_serves_the_path() {
+    let f = fixture(whole());
+    assert_eq!(ttl_of(&f, "a.go"), TTL);
+    f.clock.advance(Duration::from_secs(100));
+    other_writer(&f, "a.go", A_OTHER);
+    assert_eq!(ttl_of(&f, "a.go"), SHORT);
+    assert_eq!(f.fs.getattr(ROOT_INODE, None).unwrap().1, SHORT);
+    assert_eq!(ttl_of(&f, "pkg"), TTL);
+    f.clock.advance(WINDOW);
+    assert_eq!(ttl_of(&f, "a.go"), TTL);
+    assert_eq!(f.fs.getattr(ROOT_INODE, None).unwrap().1, TTL);
+
+    // A foreign delete: the name's negative entry is short; a name never
+    // served is not.
+    let pkg = ino(&f, "pkg");
+    assert_eq!(ttl_of(&f, "pkg/b.go"), TTL);
+    other_deleter(&f, "pkg/b.go");
+    assert_eq!(f.fs.lookup(pkg, b"b.go"), Err(Errno::ENOENT));
+    assert_eq!(f.fs.negative_ttl(pkg, b"b.go"), SHORT);
+    assert_eq!(f.fs.negative_ttl(pkg, b"never.go"), TTL);
+    assert_eq!(f.fs.negative_ttl(999, b"x.go"), Duration::ZERO);
+    assert_eq!(f.fs.negative_ttl(ROOT_INODE, b""), Duration::ZERO);
+
+    // A foreign create after a negative lookup.
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"x.go"), Err(Errno::ENOENT));
+    other_creator(&f, "x.go", "package a\n");
+    assert_eq!(ttl_of(&f, "x.go"), SHORT);
+
+    // GETATTR, OPEN and READDIRPLUS observe as LOOKUP does.
+    f.clock.advance(WINDOW);
+    let c = ino(&f, "pkg/sub/c.go");
+    assert_eq!(f.fs.getattr(c, None).unwrap().1, TTL);
+    other_writer(&f, "pkg/sub/c.go", C_EDIT);
+    assert_eq!(f.fs.getattr(c, None).unwrap().1, SHORT);
+    f.clock.advance(WINDOW);
+    let plus = f.fs.readdirplus(ino(&f, "pkg/sub"), 0).unwrap();
+    assert_eq!(plus[0].1.ttl, TTL);
+    other_writer(&f, "pkg/sub/c.go", C);
+    let plus = f.fs.readdirplus(ino(&f, "pkg/sub"), 0).unwrap();
+    assert_eq!(plus[0].1.ttl, SHORT);
+    f.clock.advance(WINDOW);
+    assert_eq!(ttl_of(&f, "a.go"), TTL);
+    other_writer(&f, "a.go", A);
+    f.fs.release(f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle);
+    assert_eq!(ttl_of(&f, "a.go"), SHORT);
+}
+
+#[test]
+fn the_default_freshness_is_long_for_settled_paths_and_one_second_for_changed_ones() {
+    assert_eq!(
+        Freshness::default(),
+        Freshness {
+            settled: Duration::from_secs(60),
+            changed: Duration::from_secs(1),
+            window: Duration::from_secs(60),
+        }
+    );
+}
+
+#[test]
+fn the_monotonic_clock_counts_from_its_origin() {
+    let clock = MonotonicClock {
+        origin: std::time::Instant::now() - Duration::from_secs(5),
+    };
+    let first = clock.now();
+    assert!(first >= Duration::from_secs(5));
+    assert!(clock.now() >= first);
+    assert!(MonotonicClock::default().now() < Duration::from_secs(5));
 }

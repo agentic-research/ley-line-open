@@ -14,12 +14,14 @@ libkrun's `DynFileSystem` trait; see "Adapter" below.
 
 | Request | Answer |
 |---|---|
-| LOOKUP `(parent, name)` | the entry for `parent/name`, with the configured TTL as both entry and attribute timeout; `ENOENT` for a name the scope does not see, an empty name, a name containing `/`, or non-UTF-8; `ENOTDIR` when `parent` is a file |
-| GETATTR `(inode, handle?)` | the node's attributes; with a live handle, the size of the bytes that handle serves |
+| LOOKUP `(parent, name)` | the entry for `parent/name`, with its timeout (see "Read freshness") as both entry and attribute timeout; `ENOENT` for a name the scope does not see, an empty name, a name containing `/`, or non-UTF-8, and `negative_ttl(parent, name)` is the negative-entry timeout; `ENOTDIR` when `parent` is a file |
+| GETATTR `(inode, handle?)` | the node's attributes and attribute timeout; with a live handle, the size of the bytes that handle serves |
 | READDIR `(inode, offset)` | the visible children after `offset`, in name order, each with the offset that resumes after it; `.` and `..` are not listed; `ENOTDIR` on a file |
-| OPEN `(inode, flags)` | a handle that serves the blob the file held at open. Opened for writing (`O_WRONLY`/`O_RDWR`), that blob is the handle's **base**; `EACCES` when the scope may not propose the path; `O_TRUNC` stages an empty file; `EISDIR` on a directory |
+| READDIRPLUS `(inode, offset)` | READDIR's entries, each with the entry a LOOKUP of it answers (attributes and timeout) |
+| OPENDIR `(inode)` | `keep_cache` when the directory lists the names and kinds the previous OPENDIR of it served; `ENOTDIR` on a file |
+| OPEN `(inode, flags)` | a handle that serves the blob the file holds at open, read from the store at every OPEN, with `keep_cache` and `direct_io` (see "Read freshness"). Opened for writing (`O_WRONLY`/`O_RDWR`), that blob is the handle's **base**; `EACCES` when the scope may not propose the path; `O_TRUNC` stages an empty file; `EISDIR` on a directory |
 | READ `(handle, offset, size)` | bytes the handle serves: its base, or what it staged |
-| WRITE `(handle, offset, data)` | stages `data` on the handle (a gap reads as zeros); `EBADF` on a handle not opened for writing |
+| WRITE `(handle, offset, data)` | stages `data` on the handle (a gap reads as zeros); `ESTALE`, staging nothing, when the path's `_source.content_hash` is no longer the handle's blob base (another writer changed or deleted it; compared without reading the bytes); `EBADF` on a handle not opened for writing |
 | FLUSH / FSYNC `(handle)` | proposes the staged bytes against the base through `source_write::propose`, on the store's one writer. Accepted: the base advances to the blob written, and an attached checkout is brought up to it. Nothing staged: no proposal, `Ok` |
 | RELEASE `(handle)` | drops the handle and any bytes no FLUSH landed |
 | SETATTR `(inode, handle?, {size, mode, uid, gid})` | a size with a handle stages on it (`ftruncate`); a size without one is a proposal of its own against the file's current blob (`truncate`), `EACCES` outside the proposal scope; mode/uid/gid are `EPERM`; times are not carried; `EISDIR` for a directory's size |
@@ -95,6 +97,44 @@ ADR-0043 names today. Inode numbers are stable per path for the life of a
 `StoreFs`; a RENAME carries the inode to the new path. The crate adds no
 persisted state.
 
+### Read freshness
+
+ADR-0044 V3, "Read freshness" (beads `ley-line-open-e6269a`, `789e0f`,
+`e650d7`). The guest caches entries, attributes and file pages, and nothing
+can tell it that another writer changed a path: libkrun's virtio-fs device
+has no notification queue and Linux's virtio-fs client has none either
+(`docs/benchmarks/2026-10-15-vf3-virtiofs.md`, "Source check"). Long
+timeouts and the page cache are what make a guest tree walk fast (same
+document: `find` 82× APFS with no caching, 1.0× with it), so `StoreFs`
+caches what it can prove unchanged and keeps the rest short:
+
+- **Fresh at open.** Every OPEN reads the path's current blob from the
+  store. `Opened::keep_cache` is set on a read-only open of a stored file
+  only when that blob is the one the previous open of the inode served and
+  that open was read-only; otherwise the guest drops the file's pages at
+  this open and reads the current blob. A write open (and CREATE) is
+  `direct_io`, never `keep_cache`, so every WRITE reaches the base check.
+  A file only the session holds never sets `keep_cache`. OPENDIR applies
+  the same rule to a directory's names and kinds.
+- **Adaptive timeouts.** `Options::freshness` is `Freshness { settled,
+  changed, window }`, default 60 s, 1 s, 60 s. A path is *recently changed*
+  at time `now` when `StoreFs` recorded a change to it at `t0` with
+  `now - t0 < window`. It records a change to a path, and to the path's
+  parent directory, when a proposal it lands writes, creates or deletes the
+  path, or when it serves the path (LOOKUP, GETATTR, SETATTR, OPEN,
+  READDIRPLUS, a parent's directory check) in a state — absent, a
+  directory, or a file and its blob — other than the one it last served
+  (another writer's proposal, observed). The entry, attribute and
+  negative-entry timeouts of a recently changed path are `changed`; every
+  other path's are `settled`. Time comes from a `Clock`
+  (`MonotonicClock` by default; `StoreFs::with_clock` injects one).
+- **What stays stale.** A name the guest cached is not asked about until
+  its timeout expires, so another writer's change to a settled path is
+  visible after at most `settled` (a `stat` or a cached negative entry);
+  file contents are current at each open. Writes never depend on a
+  timeout: OPEN, WRITE, FLUSH and FSYNC always reach the store, and WRITE
+  refuses a stale base with `ESTALE`.
+
 ## Not supported
 
 - Renaming a directory that holds anything (`EXDEV`: `mv` copies), and
@@ -103,8 +143,11 @@ persisted state.
   a note or temp file never renamed onto a projected name is gone when the
   `StoreFs` is.
 - A handle open on a file another writer deleted, or that an UNLINK or a
-  RENAME over it removed, answers `ESTALE` at its next FLUSH of staged
-  bytes, where a disk would write to the orphaned inode.
+  RENAME over it removed, answers `ESTALE` at its next WRITE, or at its
+  next FLUSH of bytes already staged, where a disk would write to the
+  orphaned inode.
+- Invalidation: the guest learns of another writer's change at OPEN or when
+  a timeout expires, never by notification (see "Read freshness").
 - Mode, owner, and times; extended attributes; links; locks.
 - Files the store holds no blob for (`_source.content_hash` NULL) do not
   exist for the guest.
@@ -124,29 +167,36 @@ The adapter implements libkrun's `DynFileSystem` over `StoreFs`:
 - `Attr` → `stat64`: `st_ino`, `st_mode = attr.mode()` (Linux `S_IFREG` /
   `S_IFDIR` bits), `st_nlink = attr.nlink()`, `st_size`, `st_blocks`,
   `st_blksize`. `Entry` → `Entry { inode, generation: 0, attr, attr_timeout:
-  ttl, entry_timeout: ttl }`.
-- OPEN returns the handle with `OpenOptions::DIRECT_IO`, as the spike did;
-  the FUSE writeback cache stays off so every WRITE reaches the handle before
-  FLUSH.
+  ttl, entry_timeout: ttl }`; GETATTR and SETATTR reply with their returned
+  duration as the attribute timeout.
+- LOOKUP's `ENOENT` → `Ok(Entry { inode: 0, entry_timeout:
+  negative_ttl(parent, name), .. })`, a negative entry the guest caches for
+  that long; a zero `negative_ttl` → `ENOENT` as is.
+- INIT returns `FsOptions::DO_READDIRPLUS`. READDIRPLUS: each `(DirEntry,
+  Entry)` → `add_entry(DirEntry, Entry)` as READDIR and LOOKUP map them,
+  until it returns 0.
+- OPEN: `OpenOptions::KEEP_CACHE` when `Opened::keep_cache`,
+  `OpenOptions::DIRECT_IO` when `Opened::direct_io`. OPENDIR:
+  `OpenOptions::CACHE_DIR` always, plus `KEEP_CACHE` when
+  `OpenedDir::keep_cache`. The FUSE writeback cache stays off so every
+  WRITE reaches the handle before FLUSH.
 - READ writes the returned bytes to the `io::Write`; WRITE reads `size`
   bytes from the `io::Read` and passes them on.
 - SETATTR: `SetattrValid::SIZE` → `size`, `MODE`/`UID`/`GID` → `mode`/`uid`/
   `gid`, the handle when the request carries one.
 - CREATE: `(parent, name, args.flags)` → `create`; reply with the entry and
-  the handle, `OpenOptions::DIRECT_IO` as for OPEN. The request's mode and
+  the handle, `OpenOptions::DIRECT_IO` as for a write open, never
+  `KEEP_CACHE`. The request's mode and
   umask are not carried. MKDIR: `(parent, name)` → `mkdir`, mode not
   carried. UNLINK and RMDIR pass `(parent, name)`.
 - RENAME and RENAME2: `(olddir, oldname, newdir, newname, flags)` → `rename`
   (`flags` = 0 for RENAME; RENAME2's `RENAME_NOREPLACE` = 1,
   `RENAME_EXCHANGE` = 2 and `RENAME_WHITEOUT` = 4 pass through, and every
   flag but `RENAME_NOREPLACE` is `EINVAL`).
-- After UNLINK, RMDIR or RENAME the guest's dentry and attribute caches for
-  the names involved are stale until their TTL; a zero TTL (or an explicit
-  invalidation) keeps them current.
 - READDIR: `DirEntry { ino, offset, type_: DT_REG (8) / DT_DIR (4), name }`
   into `add_entry` until it returns 0.
-- INIT, FORGET, OPENDIR, RELEASEDIR, ACCESS, STATFS stay adapter-local.
-  `dax_host_addr` stays `ENOSYS`.
+- FORGET, RELEASEDIR, ACCESS, STATFS stay adapter-local. `dax_host_addr`
+  stays `ENOSYS`.
 
 Dependency direction: this crate depends on `leyline-cli-lib`, which
 depends on `leyline-runtime`. The runtime therefore cannot depend on this

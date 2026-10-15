@@ -2,16 +2,17 @@
 //! V2, bead `ley-line-open-f1ea99`).
 //!
 //! [`StoreFs`] answers the FUSE requests a guest's file syscalls become —
-//! LOOKUP, GETATTR, READDIR, OPEN, READ, WRITE, FLUSH, FSYNC, RELEASE,
-//! SETATTR, CREATE, UNLINK, RENAME, MKDIR and RMDIR — from the store, and
-//! lands changes as ADR-0042 proposals:
+//! LOOKUP, GETATTR, READDIR, READDIRPLUS, OPENDIR, OPEN, READ, WRITE,
+//! FLUSH, FSYNC, RELEASE, SETATTR, CREATE, UNLINK, RENAME, MKDIR and RMDIR —
+//! from the store, and lands changes as ADR-0042 proposals:
 //!
 //! - **Reads** resolve a path through the store's tree (`_source`, the one
 //!   checkout ADR-0043 names today) to its blob in `source_blobs`. An open
 //!   reads the blob once; every READ on that handle serves those bytes.
 //! - **OPEN for writing** records the blob it read as the handle's base;
 //!   **CREATE** opens a handle whose base is "no file". WRITE and a SETATTR
-//!   of the size stage bytes on the handle.
+//!   of the size stage bytes on the handle; a WRITE whose base the path no
+//!   longer holds is `ESTALE` and stages nothing.
 //! - **FLUSH and FSYNC** propose the staged bytes against the handle's base
 //!   through [`leyline_cli_lib::source_write::propose`], on the store's one
 //!   writer: a replace, or a create for a created file. An accepted
@@ -31,6 +32,12 @@
 //! store can hold, unlinked, or the session ends. MKDIR makes a directory
 //! for the session; a directory is otherwise implied by the files under it.
 //!
+//! **Read freshness** (ADR-0044 V3): nothing can tell the guest a path
+//! changed, so every OPEN reaches the store and reads the current blob, a
+//! read-only open lets the guest keep its cached pages only when the blob is
+//! the one the previous open served ([`Opened`]), and entry and attribute
+//! timeouts are short only for recently changed paths ([`Freshness`]).
+//!
 //! Errors are Linux errno values whatever the host is: the guest is Linux.
 //!
 //! The crate adds no persisted state; it reads the tables
@@ -40,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use leyline_cli_lib::daemon::db_pool::LiveDb;
 use leyline_cli_lib::source_write::{self, Accepted, Base, Grant, Proposed, Refusal};
@@ -113,16 +120,103 @@ pub struct Checkout {
     pub lang_filter: Option<String>,
 }
 
+/// How long the guest may cache what a reply tells it (ADR-0044 V3, "Read
+/// freshness"). Nothing can tell the guest that a path changed (libkrun's
+/// device has no notification queue, nor does Linux's virtio-fs client), so
+/// a cached entry or attribute is only as fresh as its timeout.
+///
+/// A path is **recently changed** at time `now` when this [`StoreFs`]
+/// recorded a change to it at `t0` with `now - t0 < window`. It records a
+/// change to a path, and to the path's parent directory, when
+///
+/// - a proposal it lands writes, creates or deletes the path (FLUSH, FSYNC,
+///   SETATTR of a size, UNLINK, RENAME), or
+/// - it serves the path (LOOKUP, GETATTR, SETATTR, OPEN, READDIRPLUS, and
+///   the directory checks of every request naming a parent) in a state —
+///   absent, a directory, or a file with its blob — other than the one it
+///   last served: another writer's proposal, observed.
+///
+/// Entry, attribute and negative-entry timeouts are `changed` for a
+/// recently changed path and `settled` for every other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Freshness {
+    /// The timeout of a path no change was recorded for within `window`.
+    pub settled: Duration,
+    /// The timeout of a recently changed path.
+    pub changed: Duration,
+    /// How long a recorded change keeps a path's timeouts at `changed`.
+    pub window: Duration,
+}
+
+impl Default for Freshness {
+    /// 60 s for settled paths, 1 s for a path changed in the last 60 s.
+    fn default() -> Self {
+        Freshness {
+            settled: Duration::from_secs(60),
+            changed: Duration::from_secs(1),
+            window: Duration::from_secs(60),
+        }
+    }
+}
+
 /// How a [`StoreFs`] answers.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Options {
-    /// The entry and attribute timeout every LOOKUP, GETATTR and SETATTR
-    /// reply carries. Zero makes the guest ask again on every access; a
-    /// tree no other writer moves may hold it longer.
-    pub ttl: Duration,
+    /// The entry, attribute and negative-entry timeouts replies carry.
+    pub freshness: Freshness,
     /// Where accepted proposals are materialized; `None` lands them in the
     /// store only.
     pub checkout: Option<Checkout>,
+}
+
+/// Time for [`Freshness`]: the time since a fixed origin, never decreasing.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Duration;
+}
+
+/// [`Clock`] over [`Instant`], counting from its creation.
+#[derive(Clone, Copy, Debug)]
+pub struct MonotonicClock {
+    origin: Instant,
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        MonotonicClock {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
+/// An OPEN reply: the handle and what the guest's page cache does with the
+/// file (FUSE `FOPEN_KEEP_CACHE`, `FOPEN_DIRECT_IO`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Opened {
+    pub handle: u64,
+    /// The guest may keep the pages it holds for the file: set on a
+    /// read-only open of a stored file whose blob is the one the previous
+    /// open of the inode served, that open read-only. Unset, the guest
+    /// drops the file's pages at this open.
+    pub keep_cache: bool,
+    /// Every READ and WRITE reaches the backend, bypassing the page cache:
+    /// set on every write open, so each WRITE meets the base check.
+    pub direct_io: bool,
+}
+
+/// An OPENDIR reply: whether the guest may keep the listing it cached for
+/// the directory (FUSE `FOPEN_KEEP_CACHE`; the adapter sets
+/// `FOPEN_CACHE_DIR` on every OPENDIR).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenedDir {
+    /// Set when the directory lists the same names, with the same kinds,
+    /// as when the previous OPENDIR of the inode served it.
+    pub keep_cache: bool,
 }
 
 /// The store's connections, serialized the way the daemon serializes them:
@@ -197,10 +291,12 @@ impl Attr {
     }
 }
 
-/// A LOOKUP reply: the node and how long the guest may cache it.
+/// A LOOKUP (or READDIRPLUS) reply: the node and how long the guest may
+/// cache it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry {
     pub attr: Attr,
+    /// The entry and the attribute timeout ([`Freshness`]).
     pub ttl: Duration,
 }
 
@@ -271,24 +367,75 @@ impl Inodes {
     }
 }
 
+/// What a path was when this filesystem last served it: absent, or a node
+/// of a kind and, for a stored file, its blob.
+type Seen = Option<(Kind, Option<Hash>)>;
+
+/// What this filesystem has told the guest, for [`Freshness`] and the
+/// page-cache flags.
+#[derive(Default)]
+struct Served {
+    /// Each path as it was last served.
+    seen: HashMap<String, Seen>,
+    /// When a change to each path was last recorded ([`Clock::now`]).
+    changed: HashMap<String, Duration>,
+    /// Per file inode, the blob the previous open served, when that open
+    /// was read-only: what the guest's page cache may hold for it.
+    pages: HashMap<u64, Hash>,
+    /// Per directory inode, the listing the previous OPENDIR served.
+    listings: HashMap<u64, BTreeMap<String, Kind>>,
+}
+
+impl Served {
+    /// A change to `path` at `now`: it and its parent directory are
+    /// recently changed until `now + window`.
+    fn record_change(&mut self, path: &str, now: Duration) {
+        self.changed.insert(path.to_string(), now);
+        if !path.is_empty() {
+            let parent = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+            self.changed.insert(parent.to_string(), now);
+        }
+    }
+}
+
+/// A node as the store and the session hold it.
+#[derive(Clone, Copy, Debug)]
+struct Stat {
+    kind: Kind,
+    size: u64,
+    /// The blob of a stored file; `None` for a directory and for a file
+    /// only the session holds.
+    blob: Option<Hash>,
+}
+
 /// The filesystem: see the crate documentation.
 pub struct StoreFs<S> {
     store: S,
     scope: Scope,
     options: Options,
+    clock: Arc<dyn Clock>,
     inodes: Mutex<Inodes>,
     handles: Mutex<HashMap<u64, Arc<Mutex<Handle>>>>,
     next_handle: AtomicU64,
     /// Never held across a store call.
     session: Mutex<Session>,
+    /// Never held across a store call.
+    served: Mutex<Served>,
 }
 
 impl<S: Store> StoreFs<S> {
     pub fn new(store: S, scope: Scope, options: Options) -> Self {
+        Self::with_clock(store, scope, options, Arc::new(MonotonicClock::default()))
+    }
+
+    /// A filesystem whose [`Freshness`] reads `clock`.
+    pub fn with_clock(store: S, scope: Scope, options: Options, clock: Arc<dyn Clock>) -> Self {
         StoreFs {
             store,
             scope,
             options,
+            clock,
+            served: Mutex::new(Served::default()),
             inodes: Mutex::new(Inodes {
                 by_path: HashMap::from([(String::new(), ROOT_INODE)]),
                 by_inode: HashMap::from([(ROOT_INODE, String::new())]),
@@ -313,11 +460,66 @@ impl<S: Store> StoreFs<S> {
 
     /// GETATTR. With a handle, the size is the bytes that handle serves.
     pub fn getattr(&self, inode: u64, handle: Option<u64>) -> Result<(Attr, Duration), Errno> {
-        let mut attr = self.attr(&self.path_of(inode)?)?;
+        let path = self.path_of(inode)?;
+        let mut attr = self.attr(&path)?;
         if let Some(open) = handle.and_then(|h| self.handle(h).ok()) {
             attr.size = open.lock().bytes.len() as u64;
         }
-        Ok((attr, self.options.ttl))
+        Ok((attr, self.timeout(&path)))
+    }
+
+    /// The negative-entry timeout for a LOOKUP of `name` in `parent` that
+    /// answered `ENOENT` ([`Freshness`]); zero when the request names no
+    /// path the guest could cache.
+    pub fn negative_ttl(&self, parent: u64, name: &[u8]) -> Duration {
+        match self.child(parent, name) {
+            Ok(path) => self.timeout(&path),
+            Err(_) => Duration::ZERO,
+        }
+    }
+
+    /// READDIRPLUS: [`StoreFs::readdir`]'s entries, each with the reply a
+    /// LOOKUP of it answers, so the guest needs no LOOKUP per name.
+    pub fn readdirplus(&self, inode: u64, offset: u64) -> Result<Vec<(DirEntry, Entry)>, Errno> {
+        let dir = self.directory(inode)?;
+        let children = self.query(|conn| self.children(conn, &dir))?;
+        let mut out = Vec::new();
+        for (i, (name, kind)) in children.into_iter().enumerate().skip(offset as usize) {
+            let path = join(&dir, &name);
+            // A directory's kind is all its attributes carry; asking the
+            // store again would scan for the files under it.
+            let size = match kind {
+                Kind::Directory => {
+                    self.observe(&path, Some((Kind::Directory, None)));
+                    0
+                }
+                Kind::File => match self.served(&path)? {
+                    Some(stat) => stat.size,
+                    None => continue,
+                },
+            };
+            let attr = self.attr_of(&path, kind, size);
+            let entry = DirEntry {
+                inode: attr.inode,
+                offset: i as u64 + 1,
+                kind,
+                name,
+            };
+            let ttl = self.timeout(&path);
+            out.push((entry, Entry { attr, ttl }));
+        }
+        Ok(out)
+    }
+
+    /// OPENDIR: the guest may keep the listing it cached for the directory
+    /// when the directory lists what the previous OPENDIR of it served.
+    pub fn opendir(&self, inode: u64) -> Result<OpenedDir, Errno> {
+        let dir = self.directory(inode)?;
+        let listing = self.query(|conn| self.children(conn, &dir))?;
+        let mut served = self.served.lock();
+        let keep_cache = served.listings.get(&inode) == Some(&listing);
+        served.listings.insert(inode, listing);
+        Ok(OpenedDir { keep_cache })
     }
 
     /// READDIR: the directory's entries after `offset`, in name order. `.`
@@ -342,7 +544,10 @@ impl<S: Store> StoreFs<S> {
     /// writing, proposes against. `O_TRUNC` on a write open stages an empty
     /// file. A file this session created and the store does not hold yet
     /// serves its last flushed bytes, and its handle proposes a create.
-    pub fn open(&self, inode: u64, flags: u32) -> Result<u64, Errno> {
+    ///
+    /// OPEN always reaches the store, so every open reads the current blob
+    /// (fresh at open). See [`Opened`] for the page-cache flags.
+    pub fn open(&self, inode: u64, flags: u32) -> Result<Opened, Errno> {
         let path = self.path_of(inode)?;
         if self.attr(&path)?.kind == Kind::Directory {
             return Err(Errno::EISDIR);
@@ -356,13 +561,28 @@ impl<S: Store> StoreFs<S> {
         if truncate {
             bytes.clear();
         }
-        Ok(self.new_handle(Handle {
+        let keep_cache = {
+            let mut served = self.served.lock();
+            match &base {
+                Base::Blob(blob) if !writable => served.pages.insert(inode, *blob) == Some(*blob),
+                _ => {
+                    served.pages.remove(&inode);
+                    false
+                }
+            }
+        };
+        let handle = self.new_handle(Handle {
             path,
             base,
             bytes,
             dirty: truncate,
             writable,
-        }))
+        });
+        Ok(Opened {
+            handle,
+            keep_cache,
+            direct_io: writable,
+        })
     }
 
     /// READ: up to `size` bytes from `offset` of what the handle serves.
@@ -377,11 +597,23 @@ impl<S: Store> StoreFs<S> {
 
     /// WRITE: stages `data` at `offset` on the handle; a gap past the end
     /// reads as zeros. Nothing reaches the store until FLUSH or FSYNC.
+    ///
+    /// `ESTALE`, staging nothing, when the handle's base is a blob the path
+    /// no longer holds (another writer changed or deleted the file): the
+    /// store's current `_source.content_hash` for the path is compared with
+    /// the base; no bytes are read or hashed. A created file's base ("no
+    /// file") is checked at FLUSH.
     pub fn write(&self, handle: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if !open.writable {
             return Err(Errno::EBADF);
+        }
+        if let Base::Blob(base) = open.base {
+            let current = self.query(|conn| content_hash(conn, &open.path))?;
+            if current != Some(base) {
+                return Err(Errno::ESTALE);
+            }
         }
         let start = offset as usize;
         let end = start + data.len();
@@ -455,7 +687,7 @@ impl<S: Store> StoreFs<S> {
     /// outside the proposal scope.
     pub fn create(&self, parent: u64, name: &[u8], flags: u32) -> Result<(Entry, u64), Errno> {
         let path = self.child(parent, name)?;
-        if self.stat(&path)?.is_some() {
+        if self.kind_of(&path)?.is_some() {
             return Err(Errno::EEXIST);
         }
         if !self.scope.propose.covers(&path) {
@@ -477,7 +709,7 @@ impl<S: Store> StoreFs<S> {
     /// `EACCES` when the scope may propose no path under it.
     pub fn mkdir(&self, parent: u64, name: &[u8]) -> Result<Entry, Errno> {
         let path = self.child(parent, name)?;
-        if self.stat(&path)?.is_some() {
+        if self.kind_of(&path)?.is_some() {
             return Err(Errno::EEXIST);
         }
         if !self.may_propose_under(&path) {
@@ -494,10 +726,10 @@ impl<S: Store> StoreFs<S> {
     pub fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), Errno> {
         let dir = self.directory(parent)?;
         let path = self.child(parent, name)?;
-        match self.stat(&path)? {
+        match self.kind_of(&path)? {
             None => return Err(Errno::ENOENT),
-            Some((Kind::Directory, _)) => return Err(Errno::EISDIR),
-            Some((Kind::File, _)) => {}
+            Some(Kind::Directory) => return Err(Errno::EISDIR),
+            Some(Kind::File) => {}
         }
         if !self.scope.propose.covers(&path) {
             return Err(Errno::EACCES);
@@ -519,10 +751,10 @@ impl<S: Store> StoreFs<S> {
     pub fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), Errno> {
         let dir = self.directory(parent)?;
         let path = self.child(parent, name)?;
-        match self.stat(&path)? {
+        match self.kind_of(&path)? {
             None => return Err(Errno::ENOENT),
-            Some((Kind::File, _)) => return Err(Errno::ENOTDIR),
-            Some((Kind::Directory, _)) => {}
+            Some(Kind::File) => return Err(Errno::ENOTDIR),
+            Some(Kind::Directory) => {}
         }
         if !self.query(|conn| self.children(conn, &path))?.is_empty() {
             return Err(Errno::ENOTEMPTY);
@@ -560,11 +792,11 @@ impl<S: Store> StoreFs<S> {
         let from_dir = self.directory(olddir)?;
         let from = self.child(olddir, oldname)?;
         let to = self.child(newdir, newname)?;
-        let (kind, _) = self.stat(&from)?.ok_or(Errno::ENOENT)?;
+        let kind = self.kind_of(&from)?.ok_or(Errno::ENOENT)?;
         if from == to {
             return Ok(());
         }
-        let target = self.stat(&to)?.map(|(kind, _)| kind);
+        let target = self.kind_of(&to)?;
         if flags & rename_flags::RENAME_NOREPLACE != 0 && target.is_some() {
             return Err(Errno::EEXIST);
         }
@@ -732,7 +964,51 @@ impl<S: Store> StoreFs<S> {
         if let Some(problem) = &accepted.post_commit_error {
             log::warn!("proposal to '{named}' landed; after it: {problem}");
         }
+        let now = self.clock.now();
+        let mut served = self.served.lock();
+        let written = accepted
+            .blobs
+            .iter()
+            .map(|(path, blob)| (path, Some((Kind::File, Some(*blob)))));
+        let removed = accepted.removed.iter().map(|path| (path, None));
+        for (path, seen) in written.chain(removed) {
+            served.seen.insert(path.clone(), seen);
+            served.record_change(path, now);
+        }
+        drop(served);
         Ok(accepted)
+    }
+
+    /// The entry and attribute timeout of `path` ([`Freshness`]).
+    fn timeout(&self, path: &str) -> Duration {
+        let fresh = &self.options.freshness;
+        let now = self.clock.now();
+        let recent = self
+            .served
+            .lock()
+            .changed
+            .get(path)
+            .is_some_and(|&at| now.saturating_sub(at) < fresh.window);
+        if recent { fresh.changed } else { fresh.settled }
+    }
+
+    /// Serve `path` as it is now, recording a change when it was last
+    /// served otherwise.
+    fn observe(&self, path: &str, seen: Seen) {
+        let now = self.clock.now();
+        let mut served = self.served.lock();
+        if let Some(before) = served.seen.insert(path.to_string(), seen)
+            && before != seen
+        {
+            served.record_change(path, now);
+        }
+    }
+
+    /// What `path` is now, as [`StoreFs::observe`] serves it.
+    fn served(&self, path: &str) -> Result<Option<Stat>, Errno> {
+        let stat = self.query(|conn| self.stat_path(conn, path))?;
+        self.observe(path, stat.map(|s| (s.kind, s.blob)));
+        Ok(stat)
     }
 
     fn new_handle(&self, handle: Handle) -> u64 {
@@ -767,9 +1043,10 @@ impl<S: Store> StoreFs<S> {
     }
 
     fn entry(&self, path: &str) -> Result<Entry, Errno> {
+        let attr = self.attr(path)?;
         Ok(Entry {
-            attr: self.attr(path)?,
-            ttl: self.options.ttl,
+            attr,
+            ttl: self.timeout(path),
         })
     }
 
@@ -791,8 +1068,10 @@ impl<S: Store> StoreFs<S> {
         }
     }
 
-    fn stat(&self, path: &str) -> Result<Option<(Kind, u64)>, Errno> {
-        self.query(|conn| self.stat_path(conn, path))
+    fn kind_of(&self, path: &str) -> Result<Option<Kind>, Errno> {
+        Ok(self
+            .query(|conn| self.stat_path(conn, path))?
+            .map(|s| s.kind))
     }
 
     fn handle(&self, handle: u64) -> Result<Arc<Mutex<Handle>>, Errno> {
@@ -833,53 +1112,71 @@ impl<S: Store> StoreFs<S> {
         }
     }
 
+    /// The attributes of `path`, as [`StoreFs::observe`] serves it.
     fn attr(&self, path: &str) -> Result<Attr, Errno> {
-        let (kind, size) = self
-            .query(|conn| self.stat_path(conn, path))?
-            .ok_or(Errno::ENOENT)?;
+        let stat = self.served(path)?.ok_or(Errno::ENOENT)?;
+        Ok(self.attr_of(path, stat.kind, stat.size))
+    }
+
+    fn attr_of(&self, path: &str, kind: Kind, size: u64) -> Attr {
         let perm = match kind {
             Kind::Directory if self.may_propose_under(path) => 0o755,
             Kind::Directory => 0o555,
             Kind::File if self.scope.propose.covers(path) => 0o644,
             Kind::File => 0o444,
         };
-        Ok(Attr {
+        Attr {
             inode: self.inode_of(path),
             kind,
             size,
             perm,
-        })
+        }
     }
 
     /// What `path` is for the guest: a file the store holds a blob for and
     /// the scope sees, a file this session created that the store does not
     /// hold, a directory some such file is under or this session made, or
     /// nothing. The root is always a directory.
-    fn stat_path(&self, conn: &Connection, path: &str) -> anyhow::Result<Option<(Kind, u64)>> {
+    fn stat_path(&self, conn: &Connection, path: &str) -> anyhow::Result<Option<Stat>> {
         if self.scope.see.covers(path) {
-            let size: Option<i64> = conn
+            let row: Option<(i64, Vec<u8>)> = conn
                 .query_row(
-                    "SELECT length(b.blob_bytes) FROM _source s \
+                    "SELECT length(b.blob_bytes), s.content_hash FROM _source s \
                        JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = ?1",
                     [path],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            if let Some(size) = size {
-                return Ok(Some((Kind::File, size as u64)));
+            if let Some((size, hash)) = row {
+                return Ok(Some(Stat {
+                    kind: Kind::File,
+                    size: size as u64,
+                    blob: Some(blob_hash(path, hash)?),
+                }));
             }
         }
+        let node = |kind, size| {
+            Some(Stat {
+                kind,
+                size,
+                blob: None,
+            })
+        };
         {
             let session = self.session.lock();
             if let Some(bytes) = session.pending.get(path) {
-                return Ok(Some((Kind::File, bytes.len() as u64)));
+                return Ok(node(Kind::File, bytes.len() as u64));
             }
             if session.dirs.contains(path) {
-                return Ok(Some((Kind::Directory, 0)));
+                return Ok(node(Kind::Directory, 0));
             }
         }
         let is_dir = path.is_empty() || !self.children(conn, path)?.is_empty();
-        Ok(is_dir.then_some((Kind::Directory, 0)))
+        Ok(if is_dir {
+            node(Kind::Directory, 0)
+        } else {
+            None
+        })
     }
 
     /// The names directly under the directory `dir`: the stored files the
@@ -941,12 +1238,27 @@ fn blob_of(conn: &Connection, path: &str) -> anyhow::Result<Option<(Hash, Vec<u8
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    row.map(|(hash, bytes)| {
-        let hash = <[u8; 32]>::try_from(hash)
-            .map_err(|h| anyhow::anyhow!("'{path}': a {}-byte blob hash", h.len()))?;
-        Ok((Hash::from_bytes(hash), bytes))
-    })
-    .transpose()
+    row.map(|(hash, bytes)| Ok((blob_hash(path, hash)?, bytes)))
+        .transpose()
+}
+
+/// The blob `_source.content_hash` names for `path`, without reading the
+/// blob: what a WRITE checks its handle's base against.
+fn content_hash(conn: &Connection, path: &str) -> anyhow::Result<Option<Hash>> {
+    let hash: Option<Option<Vec<u8>>> = conn
+        .query_row(
+            "SELECT content_hash FROM _source WHERE id = ?1",
+            [path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    hash.flatten().map(|h| blob_hash(path, h)).transpose()
+}
+
+fn blob_hash(path: &str, hash: Vec<u8>) -> anyhow::Result<Hash> {
+    let hash = <[u8; 32]>::try_from(hash)
+        .map_err(|h| anyhow::anyhow!("'{path}': a {}-byte blob hash", h.len()))?;
+    Ok(Hash::from_bytes(hash))
 }
 
 /// The base a later write to `path` is checked against: the blob an

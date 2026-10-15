@@ -55,6 +55,12 @@ Prepared as an upstream pull request; not yet submitted. Each is one
 3. `0003` — **libkrun: `krun_add_virtiofs_backend`.** The Rust entry point
    that attaches such a backend to a context, and re-exports of the request
    types (`krun::virtio_fs`).
+4. `0004` — **devices/fs: forward READDIRPLUS through `DynFileSystem`.**
+   `DynFileSystem::readdirplus` (object-safe: entries go to
+   `&mut dyn FnMut(DirEntry, Entry)`) and its forward from `DynFs`; without
+   it a backend answered `ENOSYS` and the guest sent one LOOKUP per name.
+   Measured in `docs/benchmarks/2026-10-15-vf3-virtiofs.md` (bead
+   `ley-line-open-789e0f`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

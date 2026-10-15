@@ -1,100 +1,110 @@
-# ADR-0044 — Agents use a userspace data plane; the mount is compatibility
+# ADR-0044 — Agents see a filesystem served from userspace: an LLO virtio-fs device in a microVM
 
 **Status:** Proposed (2026-10-15)
 **Bead:** see "Beads" below
 **Related:**
 
-- ADR-0041 (publication: the snapshot an mmap reader maps)
-- ADR-0042 (proposals: what a write is checked against)
-- ADR-0043 (one store: refs and checkouts)
+- ADR-0041 (publication), ADR-0042 (proposals), ADR-0043 (one store: refs and checkouts)
+- `rs/ll-open/runtime` (execution/v1; the libkrun worker backend, which attaches a root filesystem
+  with `krun_add_virtiofs3`)
 - `ley-line-open-bc5a6a` (macOS NFS does not report a refused COMMIT), PR #461 (closed, unmerged)
 
 ______________________________________________________________________
 
 ## Context
 
-Agents reach LLO today through a mount (NFS on macOS, FUSE on Linux) and through the daemon's
-socket and MCP ops. Every mount operation crosses the kernel twice: the agent's syscall enters the
-kernel's VFS, the kernel forwards it to LLO's server, and the answer travels back the same way.
+**Requirement (2026-10-15).** An agent works through a filesystem: its own file syscalls, with no
+LLO-specific tools. An agent on a host and an agent in a container must see the same thing. The
+filesystem must carry ADR-0042's guarantees: an edit is checked against what its author read, and
+every refusal reaches the agent.
 
-The end-to-end test of 2026-10-14 measured what that costs beyond latency:
+**What the kernel mounts cost.** Agents reach LLO today through NFS (macOS) or FUSE (Linux). Each
+operation crosses the host kernel's VFS to LLO's server and back. The end-to-end test of 2026-10-14
+showed the cost is correctness as well as latency:
 
-- The macOS NFS client holds writes until `fsync`, so the server cannot know what the agent read
-  (`6116c9`, fixed by taking the base at READ and refusing a stale WRITE).
-- The macOS NFS client ignores every error the server sends after a WRITE. A refused COMMIT, a
-  STALE or IO answer to the closing GETATTR, and a changed write verifier all leave `fsync` and
-  `close` returning success (`bc5a6a`, probed on a real mount). Refusals the server can only make
-  at COMMIT never reach the agent.
-- fuse-t implements FUSE over that same NFS client. FSKit removes the kernel extension but keeps
-  the VFS round trip.
+- The macOS NFS client holds writes until `fsync`, so the server cannot tell what the agent read.
+  `6116c9` was fixed by taking the base at READ and refusing a stale WRITE.
+- The macOS NFS client ignores every error the server sends after a WRITE: a refused COMMIT, a STALE
+  or IO answer to the closing GETATTR, and a changed write verifier. `fsync` and `close` succeed, so
+  a refusal only the COMMIT can make never reaches the agent (`bc5a6a`, probed on a real mount).
+  Carrying the guarantees through this client takes heuristics (#461), and the user rejected them.
+- fuse-t implements FUSE over that same NFS client. FSKit and macFUSE keep the VFS round trip.
 
-Making the mount carry ADR-0042's guarantees on macOS means heuristics in the NFS server (#461:
-one node per file at a time, syntax checks guessed from write offsets). The direction set on
-2026-10-15 is to stop routing agents through the kernel at all.
+**What LLO already has.** The execution runtime boots workloads in libkrun microVMs (Hypervisor.framework
+on macOS, KVM on Linux) and attaches their root filesystem as virtio-fs. libkrun serves virtio-fs
+from a host directory by passthrough, so every guest file operation becomes a host syscall on that
+directory.
 
 ## Decision
 
-### U1 — Reads are in-process over the published snapshot
+### V1 — The agent runs in a microVM; its working tree is virtio-fs served by LLO
 
-An agent's client maps the published snapshot (ADR-0041) and queries it directly: no syscall per
-read once mapped. The seqlock control block already gives a reader a consistent `(path, size,
-root)`; a reader that meets an abandoned publish keeps its last snapshot (#448). mache reads the
-arena this way today.
+The agent's process runs in a libkrun guest. Its working tree is a virtio-fs share whose device
+backend is LLO, not a host directory. A guest file syscall goes to the guest kernel's FUSE client,
+then over virtqueues in memory shared with the VMM, then to LLO's backend in the same userspace
+process. No host VFS and no NFS client sit on the path.
 
-### U2 — Writes are proposals through a shared-memory ring
+### V2 — The backend answers from the store and writes through proposals
 
-A client writes proposals (ADR-0042, with the bases it read) into a ring in a mapping it shares with
-the daemon, and the daemon's single writer drains it. Each reply (accepted with blob hashes and the
-new `treeRoot`, or a typed refusal as #455 defines it) comes back on a reply ring. The kernel is
-involved only to wake a sleeper: a futex-style wait when a ring is empty or full, never per byte or
-per proposal. Every refusal reaches the proposer, because the proposer reads the reply itself.
+LLO implements libkrun's virtio-fs `FileSystem` interface (the FUSE request set: LOOKUP, GETATTR,
+OPEN, READ, WRITE, FLUSH, FSYNC, RELEASE, CREATE, UNLINK, RENAME, SETATTR, READDIR) over the store:
 
-### U3 — The agent interface is a library and tools
+- **Reads** resolve a path through the checkout's ref (ADR-0043) to a blob in `source_blobs`.
+- **OPEN** records the bytes the file held as the open's base (per open, as FUSE handles do since
+  #453).
+- **FLUSH, FSYNC and RELEASE** propose the file's new bytes against that base (ADR-0042).
+- **Refusals** answer the request with an errno: `ESTALE` for a moved base, `EIO` for a syntax
+  refusal. The Linux FUSE client returns FLUSH and FSYNC errors to `close` and `fsync`, so every
+  refusal reaches the agent.
 
-A Rust library with a C ABI (extending `leyline_fs`) and a Go binding for mache carries U1 and U2.
-Model agents use it through MCP tools (`read_source`, `propose`, queries), not through file
-syscalls. A tool built into an agent harness that reads the operating system's files is outside
-this path.
+### V3 — Reads can be zero-copy
 
-### U4 — The mount is compatibility
+virtio-fs DAX maps host memory windows into the guest. A blob of the published snapshot can be
+mapped into a DAX window, so reading it costs no copy and no exit. Whether libkrun exposes DAX on
+macOS is measured, not assumed.
 
-The NFS and FUSE mounts remain for people and for tools that need a directory. They keep the
-guarantees they can carry (per-open bases on FUSE; READ-time bases and WRITE-time stale refusal on
-NFS) and document what they cannot. NFS-only heuristics are not added. #461 is closed unmerged; its
-probe results are recorded here.
+### V4 — The host mount is compatibility
 
-### U5 — The socket stays as the slow path
+The NFS and FUSE host mounts remain for people and for tools that need a directory on the host.
+They keep the guarantees they can carry (per-open bases on FUSE; READ-time bases and WRITE-time
+stale refusal on NFS) and document what they cannot. NFS-only heuristics are not added: #461 is
+closed unmerged, and its probe results are recorded above.
 
-The UDS and MCP ops remain for remote callers and clients that do not map the store. They carry the
-same proposal and refusal types as the ring.
+### V5 — The socket stays
+
+The UDS and MCP ops remain for remote callers and for mache. They carry the same proposal and refusal
+types the virtio-fs backend uses.
 
 ## Consequences
 
-- `bc5a6a` closes as superseded: agents do not depend on the macOS NFS client.
-- The ring is a new cross-process contract: framing, versioning and the reply correlation id need
-  the same discipline as Cap'n Proto messages (schema first, generated bindings, fixtures).
-- ADR-0043's refs (R2) travel on the ring as on the socket.
+- `bc5a6a` closes as superseded: agents no longer depend on the macOS NFS client.
+- The guest sees ordinary files, so an agent harness, a shell and an editor inside the VM need no
+  change.
+- LLO depends on libkrun accepting a custom virtio-fs backend. If its C API does not, LLO links the
+  devices crate directly or carries a fork, which is a supply-chain decision (open question 1).
 
 ## Open questions
 
-1. **Ring layout.** One ring per client (no cross-client contention; the daemon polls N rings) or
-   one shared multi-producer ring (one wait point; producers contend).
-2. **Wake primitive on macOS.** `os_sync_wait_on_address` (macOS 14.4+) or a kqueue user event
-   on a shared descriptor; Linux uses a futex.
-3. **Large proposals.** Inline in the ring up to a size, else bytes in a shared blob area
-   referenced by hash.
+1. **How the backend plugs in.** libkrun's C API attaches a host directory (`krun_add_virtiofs3`).
+   A custom backend needs a new API in libkrun, linking libkrun's `devices` crate from Rust with a
+   custom `FileSystem`, or a vhost-user-fs device (virtiofsd's protocol) if libkrun supports one on
+   macOS. Spike first: serve one file from memory through each viable route.
+2. **DAX on macOS.** Whether libkrun maps DAX windows under Hypervisor.framework.
+3. **Agents on the host.** A host agent outside any VM gets no virtio-fs. Either host agents run in
+   the VM too (the requirement treats host and container alike), or they use the compatibility
+   mount with its documented limits.
 
 ## Falsifiers
 
 | # | Claim | Test |
 |---|---|---|
-| X1 | a read takes no syscall once mapped | count syscalls (dtrace on macOS, strace on Linux) over N reads: zero file syscalls |
-| X2 | every refusal reaches the proposer | a stale, a syntax and a grant refusal each return their typed reason on the reply ring |
-| X3 | a proposal round trip is faster than the mount and the socket | the same edit through ring, socket, NFS and FUSE: p50 and p99 recorded |
-| X4 | a crashed client leaves the daemon consistent | kill a client mid-write to the ring: the daemon discards the partial entry and keeps serving |
-| X5 | the ring is versioned | a client built against another ring version is refused at attach |
+| V-F1 | every refusal reaches the agent | in the guest: a stale edit makes `fsync` or `close` fail with `ESTALE`; an unparseable edit fails with `EIO`; nothing lands |
+| V-F2 | no host VFS on the path | count host file syscalls (dtrace on macOS) while the guest reads and writes the share: none on the store's behalf |
+| V-F3 | faster than the host mounts | the same edit and read loop through virtio-fs, host NFS and host FUSE: p50 and p99 recorded |
+| V-F4 | per-open bases | two guest processes open one file; the second's stale flush is refused |
+| V-F5 | a guest crash leaves the store consistent | kill the VM mid-write: no partial proposal lands |
 
 ## Beads
 
-Filed when this ADR is accepted: ring contract (schema, bindings, fixtures), daemon drain, client
-library (Rust, C, Go), MCP tools over the library, measurements X1 and X3.
+Filed when this ADR is accepted: the spike (open question 1), the `FileSystem` backend over the
+store, the execution/v1 runtime wiring, measurements V-F2 and V-F3, and the agent-in-VM launch path.

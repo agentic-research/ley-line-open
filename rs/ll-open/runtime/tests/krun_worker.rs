@@ -5,11 +5,11 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use leyline_runtime::backends::libkrun::worker::{
     InheritedDescriptor, WORKSPACE_SHARE_FD_ARG, WorkerEvent, WorkerOptions, declared_descriptors,
+    inherit_only,
 };
 use leyline_runtime::{
     DigestRef, ErrorCode, ExecutionRequest, ResourceLimits, WorkerChannel, WorkspaceGrant,
@@ -77,7 +77,9 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     .expect("krunvm trap");
     fs::set_permissions(&krunvm, fs::Permissions::from_mode(0o755)).expect("trap mode");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
+    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let mut child = command
         .args([
             "--cas-root",
             cas.path().to_str().expect("CAS UTF-8"),
@@ -157,7 +159,8 @@ fn worker_failure(request: &ExecutionRequest, extra: &[&str]) -> leyline_runtime
 }
 
 /// [`worker_failure`], with each of `inherited` kept open across the
-/// worker's `exec` (every descriptor this process opens is close-on-exec).
+/// worker's `exec` and every other descriptor of this process (a test
+/// runner's own inherited ones included) withheld, as the backend spawns it.
 fn worker_failure_inheriting(
     request: &ExecutionRequest,
     extra: &[&str],
@@ -165,20 +168,7 @@ fn worker_failure_inheriting(
 ) -> leyline_runtime::ExecutionError {
     let run_root = TempDir::new().expect("run root");
     let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
-    let inherited = inherited.to_vec();
-    // SAFETY: runs in the forked child before exec and makes only fcntl
-    // calls, which are async-signal-safe.
-    unsafe {
-        command.pre_exec(move || {
-            for &fd in &inherited {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
+    inherit_only(&mut command, inherited).expect("list this process's descriptors");
     let mut child = command
         .args(["--cas-root", "/nonexistent-cas", "--run-root"])
         .arg(run_root.path())

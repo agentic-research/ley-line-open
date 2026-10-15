@@ -283,7 +283,9 @@ virtio-fs, but the worker process holds the share socket, and that descriptor is
 `confinement/v1` manifest: nono confines what the worker may open, not what it inherits open. The
 worker and the backend derive one declaration from the grant (`worker::declared_descriptors`: the
 share's descriptor, workspace and `graphRoot` for a run granted a workspace, nothing otherwise).
-Before it reads the rootfs, the worker lists its open descriptors and refuses to start holding any
+The backend spawns the worker with its standard streams and that declaration only
+(`worker::inherit_only` marks every other descriptor it holds close-on-exec in the child, so one
+the daemon inherited open from its own parent does not pass on). Before it reads the rootfs, the worker lists its open descriptors and refuses to start holding any
 beyond its standard streams and that declaration; its readiness event carries the declaration,
 and the backend refuses one that differs from what it handed the worker. The receipt's
 `backend.evidence` is the digest of the backend evidence document (execution/v1 README "Backend

@@ -25,6 +25,11 @@ context, scoping notes, and review history are recoverable.
     worker lists its open descriptors (`/dev/fd`) and refuses to start
     holding any it does not declare (`IdentityPolicyMismatch`, naming
     them; `refuse_undeclared_descriptors`).
+  - `worker::inherit_only(command, keep)`: the child marks every
+    descriptor its spawner holds above the standard streams close-on-exec,
+    except `keep`. `KrunWorkerBackend` spawns the worker through it with
+    the declared share, so a descriptor the daemon inherited open from its
+    own parent (a build tool's jobserver pipes) does not reach the worker.
   - `WorkerEvent::Ready` carries the declaration (`inherited`);
     `KrunWorkerBackend` refuses a readiness whose declaration differs from
     what it handed the worker, before the run is published.

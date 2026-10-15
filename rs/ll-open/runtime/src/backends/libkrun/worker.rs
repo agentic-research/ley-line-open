@@ -5,7 +5,9 @@ use std::io::{Read, Write};
 use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(feature = "vmm")]
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 #[cfg(feature = "vmm")]
 use std::sync::Arc;
 
@@ -248,6 +250,46 @@ pub fn refuse_undeclared_descriptors(
         "the worker holds undeclared inherited descriptor(s) {undeclared:?}: it declares \
          its standard streams and {declared:?}, and starts with nothing else"
     )))
+}
+
+/// Have `command`'s child inherit its standard streams and `keep`, and no
+/// other descriptor of this process.
+///
+/// Every descriptor Rust's standard library opens is close-on-exec, but a
+/// process can inherit others from its own parent (a build tool's jobserver
+/// pipes, a shell's redirections) or open them through C code, and each
+/// would pass on to the worker, which refuses to start holding them
+/// ([`refuse_undeclared_descriptors`]). So the spawner lists its open
+/// descriptors before the fork and the child marks each one above the
+/// standard streams close-on-exec, except `keep`, whose flag it clears. A
+/// descriptor opened without close-on-exec between the listing and the fork
+/// still reaches the worker, and the worker's refusal is what catches it.
+pub fn inherit_only(command: &mut Command, keep: &[i32]) -> Result<(), ExecutionError> {
+    let held: Vec<i32> = held_descriptors()?
+        .into_iter()
+        .filter(|fd| !STANDARD_STREAMS.contains(fd))
+        .collect();
+    let keep = keep.to_vec();
+    // SAFETY: the closure runs in the forked child before exec, allocates
+    // nothing, and makes only fcntl calls, which are async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+            for &fd in held.iter().filter(|fd| !keep.contains(fd)) {
+                let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
+                // Closed since the listing: nothing to inherit.
+                if let Ok(flags) = fcntl_getfd(fd) {
+                    fcntl_setfd(fd, flags | FdFlags::CLOEXEC)?;
+                }
+            }
+            for &fd in &keep {
+                let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
+                fcntl_setfd(fd, fcntl_getfd(fd)?.difference(FdFlags::CLOEXEC))?;
+            }
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

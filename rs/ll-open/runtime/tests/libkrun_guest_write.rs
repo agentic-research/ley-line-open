@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use leyline_runtime::backends::libkrun::worker::WorkerEvent;
+use leyline_runtime::backends::libkrun::worker::{WorkerEvent, inherit_only};
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
@@ -79,7 +79,11 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
             wall_time_ms: 10_000,
         },
     };
-    let mut child = Command::new(&signed_worker)
+    // The worker inherits its standard streams and nothing else, as the
+    // backend spawns it.
+    let mut command = Command::new(&signed_worker);
+    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let mut child = command
         .arg("--cas-root")
         .arg(&cas)
         .arg("--run-root")

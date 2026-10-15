@@ -869,6 +869,31 @@ fn a_worker_declaring_other_descriptors_than_it_was_handed_never_reaches_running
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
 
+/// A descriptor this process holds without close-on-exec (inherited from
+/// its own parent, as a build tool's jobserver pipes are) does not reach the
+/// worker: the backend hands it its standard streams and declared channels
+/// only, so the worker's own check finds nothing undeclared.
+#[test]
+fn a_descriptor_the_backend_holds_open_across_exec_does_not_reach_the_worker() {
+    use std::os::fd::AsRawFd;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let leaked = fs::File::open("/dev/null").expect("a descriptor");
+    let fd = leaked.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this test owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        assert!(flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) >= 0);
+    }
+    let script = format!(
+        "#!/bin/sh\nIFS= read -r _\n[ -e /dev/fd/{fd} ] && exit 9\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n"
+    );
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
+    let started = backend.start(&request());
+    drop(leaked);
+    started.expect("the worker did not inherit the backend's open descriptor");
+}
+
 #[test]
 fn a_run_without_workspaces_is_handed_no_share() {
     let _serial = common::serial();

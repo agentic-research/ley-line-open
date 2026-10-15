@@ -1957,6 +1957,16 @@ fn a_directorys_time_moves_when_an_entry_is_created_removed_or_renamed_in_it() {
     f.fs.unlink(ROOT_INODE, b"n.txt").unwrap();
     assert_eq!(mtime(&f, ""), at, "UNLINK of a file only the session holds");
 
+    // A file only the session holds, saved onto a name the store holds in
+    // another directory: the directory it left changes too.
+    let (h, flushed) = create_file(&f, pkg, "a.go.tmp", A_EDIT);
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    let at = tick(&f);
+    f.fs.rename(pkg, b"a.go.tmp", ROOT_INODE, b"a.go", 0)
+        .unwrap();
+    assert_eq!((mtime(&f, "pkg"), mtime(&f, "a.go")), (at, at));
+
     // A session directory renamed: both directories' entries change.
     f.fs.mkdir(pkg, b"e").unwrap();
     let at = tick(&f);

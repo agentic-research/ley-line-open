@@ -962,9 +962,15 @@ impl<S: Store> StoreFs<S> {
             }
             writes.push(Proposed::write(to, target_base, bytes));
             let accepted = self.propose(writes)?;
-            let mut session = self.session.lock();
-            session.pending.remove(from);
-            session.pending.remove(to);
+            {
+                let mut session = self.session.lock();
+                session.pending.remove(from);
+                session.pending.remove(to);
+            }
+            // The proposal names `from` only when the store held it.
+            if !stored {
+                self.touch(from);
+            }
             landed(&accepted, to)?
         } else {
             {

@@ -1,0 +1,22 @@
+INFO vf-dax-warm status porcelain_lines=0 first=[]
+INFO vf-dax-warm status porcelain_lines=0 first=[]
+RESULT vf-dax-warm status 0 wall_us=184786
+RESULT vf-dax-warm status 1 wall_us=142473
+RESULT vf-dax-warm status 2 wall_us=169319
+RESULT vf-dax-warm status 3 wall_us=168302
+RESULT vf-dax-warm status 4 wall_us=171112
+INFO vf-dax-warm rg matching_files=12
+INFO vf-dax-warm rg matching_files=12
+RESULT vf-dax-warm rg 0 wall_us=1194094
+RESULT vf-dax-warm rg 1 wall_us=1252978
+RESULT vf-dax-warm rg 2 wall_us=1261417
+RESULT vf-dax-warm rg 3 wall_us=1262293
+RESULT vf-dax-warm rg 4 wall_us=1274632
+INFO vf-dax-warm find files=20870
+INFO vf-dax-warm find files=20870
+RESULT vf-dax-warm find 0 wall_us=191312
+RESULT vf-dax-warm find 1 wall_us=171314
+RESULT vf-dax-warm find 2 wall_us=184321
+RESULT vf-dax-warm find 3 wall_us=186155
+RESULT vf-dax-warm find 4 wall_us=184114
+DONE vf-dax-warm

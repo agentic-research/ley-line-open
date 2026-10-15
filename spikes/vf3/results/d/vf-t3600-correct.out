@@ -1,0 +1,8 @@
+D vf-t3600-correct D1 open,read,FOREIGN,write,fsync,close: write=ESTALE(116) fsync=ok close=ok store=Ok("line one|changed by another writer|")
+D vf-t3600-correct D2 open,write,FOREIGN,fsync,close: write=ok fsync=ESTALE(116) close=ESTALE(116) store=Ok("line one|changed by another writer|")
+D vf-t3600-correct D3 open,write,FOREIGN,close: write=ok close=ESTALE(116) store=Ok("line one|changed by another writer|")
+D vf-t3600-correct D4 refused namespace ops: rename=ESTALE(116) (d4 exists=true, d4.renamed exists=false) unlink=ESTALE(116) (d4 exists=true)
+D vf-t3600-correct D5 foreign append to llo/docs/adr/0014-capnp-as-protocol.md: before stat=18156 statx=Ok(18156) read=Ok((18156, "alization-not-canonical/>|")) | after stat=18156 statx=Ok(18156) read=Ok((18182, "changed by another writer|"))
+D vf-t3600-correct D7 foreign create after a negative lookup: stat=ENOENT(2) listed_by_readdir=true
+D vf-t3600-correct D6 FOREIGN,open,write,fsync,close: write=ok fsync=ok close=ok store=Ok("guest edit|anged by another writer|")
+DONE vf-t3600-correct

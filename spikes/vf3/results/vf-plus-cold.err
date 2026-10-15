@@ -1,0 +1,90 @@
+vf3: loaded 20870 files, 431391498 bytes in 557.54525ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold status 0 create=1 flush=15 getattr=9 lookup=25697 open=14 opendir=3505 read=45 readdirplus=7265 release=15 unlink=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 622.403916ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold rg 0 flush=19904 getattr=1 lookup=16412 open=19904 opendir=3282 read=62039 readdirplus=6819 release=19904 write=1
+vf3: loaded 20870 files, 431391498 bytes in 547.230125ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold find 0 flush=1 getattr=1 lookup=1 open=1 opendir=3515 readdirplus=7282 release=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 551.617333ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold edit 0 flush=1001 getattr=1000 lookup=6 open=1001 read=2000 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 581.126334ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold create 0 create=1000 flush=1001 getattr=1001 lookup=1002 mkdir=1 open=1 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 547.512709ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold untar 0 create=1000 flush=1001 getattr=1216 lookup=5068 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+vf3: loaded 20870 files, 431391498 bytes in 548.643167ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold status 0 create=1 flush=15 getattr=9 lookup=25697 open=14 opendir=3505 read=45 readdirplus=7265 release=15 unlink=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 549.230083ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold rg 0 flush=19904 getattr=1 lookup=16412 open=19904 opendir=3282 read=61652 readdirplus=6819 release=19904 write=1
+vf3: loaded 20870 files, 431391498 bytes in 591.265292ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold find 0 flush=1 getattr=1 lookup=1 open=1 opendir=3515 readdirplus=7282 release=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 555.871375ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold edit 0 flush=1001 getattr=1000 lookup=6 open=1001 read=2000 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 549.705958ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold create 0 create=1000 flush=1001 getattr=1001 lookup=1002 mkdir=1 open=1 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 550.909ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold untar 0 create=1000 flush=1001 getattr=1216 lookup=5068 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+vf3: loaded 20870 files, 431391498 bytes in 553.34975ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold status 0 create=1 flush=15 getattr=9 lookup=25697 open=14 opendir=3505 read=45 readdirplus=7265 release=15 unlink=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 641.947333ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold rg 0 flush=19904 getattr=1 lookup=16412 open=19904 opendir=3282 read=61992 readdirplus=6819 release=19904 write=1
+vf3: loaded 20870 files, 431391498 bytes in 613.002542ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold find 0 flush=1 getattr=1 lookup=1 open=1 opendir=3515 readdirplus=7282 release=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 568.313625ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold edit 0 flush=1001 getattr=1000 lookup=6 open=1001 read=2000 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 554.867416ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold create 0 create=1000 flush=1001 getattr=1001 lookup=1002 mkdir=1 open=1 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 552.424583ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold untar 0 create=1000 flush=1001 getattr=1216 lookup=5068 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+vf3: loaded 20870 files, 431391498 bytes in 547.543875ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold status 0 create=1 flush=15 getattr=9 lookup=25697 open=14 opendir=3505 read=45 readdirplus=7265 release=15 unlink=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 547.45875ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold rg 0 flush=19904 getattr=1 lookup=16412 open=19904 opendir=3282 read=61793 readdirplus=6819 release=19904 write=1
+vf3: loaded 20870 files, 431391498 bytes in 559.851083ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold find 0 flush=1 getattr=1 lookup=1 open=1 opendir=3515 readdirplus=7282 release=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 547.803708ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold edit 0 flush=1001 getattr=1000 lookup=6 open=1001 read=2000 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 549.12375ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold create 0 create=1000 flush=1001 getattr=1001 lookup=1002 mkdir=1 open=1 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 551.702875ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold untar 0 create=1000 flush=1001 getattr=1216 lookup=5068 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+vf3: loaded 20870 files, 431391498 bytes in 578.901875ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold status 0 create=1 flush=15 getattr=9 lookup=25697 open=14 opendir=3505 read=45 readdirplus=7265 release=15 unlink=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 547.505667ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold rg 0 flush=19904 getattr=1 lookup=16412 open=19904 opendir=3282 read=61985 readdirplus=6819 release=19904 write=1
+vf3: loaded 20870 files, 431391498 bytes in 558.243458ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold find 0 flush=1 getattr=1 lookup=1 open=1 opendir=3515 readdirplus=7282 release=1 write=1
+vf3: loaded 20870 files, 431391498 bytes in 551.962042ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold edit 0 flush=1001 getattr=1000 lookup=6 open=1001 read=2000 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 564.420375ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold create 0 create=1000 flush=1001 getattr=1001 lookup=1002 mkdir=1 open=1 release=1001 write=1001
+vf3: loaded 20870 files, 431391498 bytes in 549.082958ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-plus-cold untar 0 create=1000 flush=1001 getattr=1216 lookup=5068 mkdir=215 open=1 release=1001 setattr=3000 write=1015

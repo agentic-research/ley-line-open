@@ -1,0 +1,17 @@
+vf3: loaded 20870 files, 431391498 bytes in 547.486208ms; variant Variant { ttl: 3600s, plus: true, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+vf3: control bump dtest/d1 -> inode 24388 v3
+vf3: write inode 24388 base v2 but store at vSome(3) -> ESTALE
+vf3: control bump dtest/d2 -> inode 24389 v3
+vf3: land inode 24389 base v2 but store at v3 -> ESTALE
+vf3: land inode 24389 base v2 but store at v3 -> ESTALE
+vf3: control bump dtest/d3 -> inode 24390 v3
+vf3: land inode 24390 base v2 but store at v3 -> ESTALE
+vf3: control refuse dtest/d4 -> inode 24391 v2
+vf3: rename inode 24391 refused -> ESTALE
+vf3: rename inode 24391 refused -> ESTALE
+vf3: unlink inode 24391 refused -> ESTALE
+vf3: unlink inode 24391 refused -> ESTALE
+vf3: control bump llo/docs/adr/0014-capnp-as-protocol.md -> inode 2478 v2
+vf3: control create dtest/new7 -> inode 24394
+vf3: control bump dtest/d6 -> inode 24393 v3

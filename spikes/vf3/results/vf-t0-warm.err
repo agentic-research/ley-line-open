@@ -1,0 +1,32 @@
+vf3: loaded 20870 files, 431391498 bytes in 593.734125ms; variant Variant { ttl: 0ns, plus: false, cache: false, dax: false }
+vf3: init variant=Variant { ttl: 0ns, plus: false, cache: false, dax: false } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-t0-warm status 0 create=1 flush=15 getattr=183474 lookup=155481 open=14 opendir=3505 read=45 readdir=7053 release=15 unlink=1 write=1
+VF3OPS vf-t0-warm status 1 create=1 flush=15 getattr=183474 lookup=155481 open=14 opendir=3505 read=45 readdir=7053 release=15 unlink=1 write=1
+VF3OPS vf-t0-warm status 2 create=1 flush=15 getattr=183474 lookup=155481 open=14 opendir=3505 read=45 readdir=7053 release=15 unlink=1 write=1
+VF3OPS vf-t0-warm status 3 create=1 flush=15 getattr=183474 lookup=155481 open=14 opendir=3505 read=45 readdir=7053 release=15 unlink=1 write=1
+VF3OPS vf-t0-warm status 4 create=1 flush=15 getattr=183474 lookup=155481 open=14 opendir=3505 read=45 readdir=7053 release=15 unlink=1 write=1
+VF3OPS vf-t0-warm rg 0 flush=19904 getattr=284056 lookup=237891 open=19904 opendir=3282 read=62128 readdir=6607 release=19904 write=1
+VF3OPS vf-t0-warm rg 1 flush=19904 getattr=284056 lookup=237891 open=19904 opendir=3282 read=61761 readdir=6607 release=19904 write=1
+VF3OPS vf-t0-warm rg 2 flush=19904 getattr=284056 lookup=237891 open=19904 opendir=3282 read=61770 readdir=6607 release=19904 write=1
+VF3OPS vf-t0-warm rg 3 flush=19904 getattr=284056 lookup=237891 open=19904 opendir=3282 read=62066 readdir=6607 release=19904 write=1
+VF3OPS vf-t0-warm rg 4 flush=19904 getattr=284056 lookup=237891 open=19904 opendir=3282 read=61731 readdir=6607 release=19904 write=1
+VF3OPS vf-t0-warm find 0 flush=1 getattr=204781 lookup=148979 open=1 opendir=3515 readdir=7070 release=1 write=1
+VF3OPS vf-t0-warm find 1 flush=1 getattr=204781 lookup=148979 open=1 opendir=3515 readdir=7070 release=1 write=1
+VF3OPS vf-t0-warm find 2 flush=1 getattr=204781 lookup=148979 open=1 opendir=3515 readdir=7070 release=1 write=1
+VF3OPS vf-t0-warm find 3 flush=1 getattr=204781 lookup=148979 open=1 opendir=3515 readdir=7070 release=1 write=1
+VF3OPS vf-t0-warm find 4 flush=1 getattr=204781 lookup=148979 open=1 opendir=3515 readdir=7070 release=1 write=1
+VF3OPS vf-t0-warm edit 0 flush=1001 getattr=7002 lookup=5001 open=1001 read=2000 release=1001 write=1001
+VF3OPS vf-t0-warm edit 1 flush=1001 getattr=7002 lookup=5001 open=1001 read=2000 release=1001 write=1001
+VF3OPS vf-t0-warm edit 2 flush=1001 getattr=7002 lookup=5001 open=1001 read=2000 release=1001 write=1001
+VF3OPS vf-t0-warm edit 3 flush=1001 getattr=7002 lookup=5001 open=1001 read=2000 release=1001 write=1001
+VF3OPS vf-t0-warm edit 4 flush=1001 getattr=7002 lookup=5001 open=1001 read=2000 release=1001 write=1001
+VF3OPS vf-t0-warm create 0 create=1000 flush=1001 getattr=4004 lookup=2002 mkdir=1 open=1 release=1001 write=1001
+VF3OPS vf-t0-warm create 1 create=1000 flush=1001 getattr=4004 lookup=2002 mkdir=1 open=1 release=1001 write=1001
+VF3OPS vf-t0-warm create 2 create=1000 flush=1001 getattr=4004 lookup=2002 mkdir=1 open=1 release=1001 write=1001
+VF3OPS vf-t0-warm create 3 create=1000 flush=1001 getattr=4004 lookup=2002 mkdir=1 open=1 release=1001 write=1001
+VF3OPS vf-t0-warm create 4 create=1000 flush=1001 getattr=4004 lookup=2002 mkdir=1 open=1 release=1001 write=1001
+VF3OPS vf-t0-warm untar 0 create=1000 flush=1001 getattr=38120 lookup=33050 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+VF3OPS vf-t0-warm untar 1 create=1000 flush=1001 getattr=38120 lookup=33050 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+VF3OPS vf-t0-warm untar 2 create=1000 flush=1001 getattr=38120 lookup=33050 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+VF3OPS vf-t0-warm untar 3 create=1000 flush=1001 getattr=38120 lookup=33050 mkdir=215 open=1 release=1001 setattr=3000 write=1015
+VF3OPS vf-t0-warm untar 4 create=1000 flush=1001 getattr=38120 lookup=33050 mkdir=215 open=1 release=1001 setattr=3000 write=1015

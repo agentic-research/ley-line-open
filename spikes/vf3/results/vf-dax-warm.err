@@ -1,0 +1,17 @@
+vf3: loaded 20870 files, 431391498 bytes in 618.944625ms; variant Variant { ttl: 3600s, plus: true, cache: true, dax: true }
+vf3: init variant=Variant { ttl: 3600s, plus: true, cache: true, dax: true } kernel_capable_plus=true capable_inode_dax=true
+VF3OPS vf-dax-warm status 0 create=1 flush=15 getattr=3514 lookup=2 open=14 opendir=3505 release=15 unlink=1 write=1
+VF3OPS vf-dax-warm status 1 create=1 flush=15 getattr=3 lookup=2 open=14 opendir=3505 release=15 unlink=1 write=1
+VF3OPS vf-dax-warm status 2 create=1 flush=15 getattr=3 lookup=2 open=14 opendir=3505 release=15 unlink=1 write=1
+VF3OPS vf-dax-warm status 3 create=1 flush=15 getattr=3 lookup=2 open=14 opendir=3505 release=15 unlink=1 write=1
+VF3OPS vf-dax-warm status 4 create=1 flush=15 getattr=3 lookup=2 open=14 opendir=3505 release=15 unlink=1 write=1
+VF3OPS vf-dax-warm rg 0 dax_map=19911 flush=19904 getattr=1 lookup=1 open=19904 opendir=3282 release=19904 write=1
+VF3OPS vf-dax-warm rg 1 dax_map=19911 flush=19904 getattr=1 lookup=1 open=19904 opendir=3282 release=19904 write=1
+VF3OPS vf-dax-warm rg 2 dax_map=19911 flush=19904 getattr=1 lookup=1 open=19904 opendir=3282 release=19904 write=1
+VF3OPS vf-dax-warm rg 3 dax_map=19911 flush=19904 getattr=1 lookup=1 open=19904 opendir=3282 release=19904 write=1
+VF3OPS vf-dax-warm rg 4 dax_map=19911 flush=19904 getattr=1 lookup=1 open=19904 opendir=3282 release=19904 write=1
+VF3OPS vf-dax-warm find 0 flush=1 getattr=11 lookup=1 open=1 opendir=3515 release=1 write=1
+VF3OPS vf-dax-warm find 1 flush=1 getattr=1 lookup=1 open=1 opendir=3515 release=1 write=1
+VF3OPS vf-dax-warm find 2 flush=1 getattr=1 lookup=1 open=1 opendir=3515 release=1 write=1
+VF3OPS vf-dax-warm find 3 flush=1 getattr=1 lookup=1 open=1 opendir=3515 release=1 write=1
+VF3OPS vf-dax-warm find 4 flush=1 getattr=1 lookup=1 open=1 opendir=3515 release=1 write=1

@@ -302,6 +302,32 @@ impl MemFs {
                 _ => {}
             }
             let (verb, path) = line.split_once(' ').ok_or(io::Error::from_raw_os_error(EINVAL))?;
+            if verb == "create" {
+                // Another writer adds a file the guest has not seen.
+                let (dir, name) = path.trim().rsplit_once('/').unwrap_or(("", path.trim()));
+                let parent = Self::resolve(&nodes, dir)?;
+                let ino = nodes.len() as u64;
+                let Some(Node {
+                    kind: Kind::Dir(children),
+                    ..
+                }) = nodes[parent as usize].as_mut()
+                else {
+                    return err(ENOTDIR);
+                };
+                children.insert(name.as_bytes().to_vec(), ino);
+                nodes.push(Some(Node {
+                    parent,
+                    name: name.as_bytes().to_vec(),
+                    kind: Kind::File(Arc::new(b"created by another writer\n".to_vec())),
+                    mode: S_IFREG | 0o644,
+                    mtime: now(),
+                    version: 1,
+                    corpus: false,
+                    refuse_ns: false,
+                }));
+                eprintln!("vf3: control create {path} -> inode {ino}");
+                continue;
+            }
             let ino = Self::resolve(&nodes, path.trim())?;
             let node = nodes[ino as usize].as_mut().unwrap();
             match verb {

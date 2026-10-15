@@ -307,15 +307,57 @@ fn correctness(ctx: &Ctx) {
         ctx.label, outcome(&r), after_rename.0, after_rename.1, outcome(&u), after_unlink
     );
 
-    // D5: does the guest see a foreign change without invalidation?
-    let before = fs::metadata(p("d5")).map(|m| m.len());
-    let _ = fs::read(p("d5"));
-    ctx.ctl(&format!("bump {}", rel("d5")));
-    let after = fs::metadata(p("d5")).map(|m| m.len());
-    let reread = fs::read(p("d5")).map(|b| b.len());
+    // D5: does the guest see a foreign change to a file it has looked at?
+    // A corpus file (its attributes come from LOOKUP/READDIRPLUS, not from a
+    // guest write), observed through stat(2) (busybox), statx (Rust std) and
+    // a fresh open+read, before and after another writer appends 26 bytes.
+    let mut adr: Vec<PathBuf> = fs::read_dir(ctx.root.join("llo/docs/adr"))
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    adr.sort();
+    if let Some(target) = adr.first() {
+        let shown = target.strip_prefix(&ctx.root).unwrap().to_string_lossy().into_owned();
+        let stat_sh = |path: &PathBuf| {
+            Command::new("stat")
+                .args(["-c", "%s"])
+                .arg(path)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_default()
+        };
+        let read_tail = |path: &PathBuf| {
+            fs::read(path).map(|b| {
+                let tail = String::from_utf8_lossy(&b[b.len().saturating_sub(26)..]).replace('\n', "|");
+                (b.len(), tail)
+            })
+        };
+        let before = (stat_sh(target), fs::metadata(target).map(|m| m.len()), read_tail(target));
+        // A read invalidates the cached atime, so the next stat(2) asks the
+        // backend; stat once more so the attributes are cached and valid.
+        let _ = stat_sh(target);
+        let _ = fs::metadata(target);
+        ctx.ctl(&format!("bump {shown}"));
+        let after = (stat_sh(target), fs::metadata(target).map(|m| m.len()), read_tail(target));
+        println!(
+            "D {} D5 foreign append to {shown}: before stat={} statx={:?} read={:?} | after stat={} statx={:?} read={:?}",
+            ctx.label, before.0, before.1, before.2, after.0, after.1, after.2
+        );
+    }
+
+    // D7: a file another writer creates after the guest looked the name up.
+    let _ = fs::metadata(p("new7"));
+    ctx.ctl(&format!("create {}", rel("new7")));
+    let stat_after = fs::metadata(p("new7")).map(|m| m.len());
+    let listed = fs::read_dir(&dir)
+        .map(|d| d.filter_map(|e| e.ok()).any(|e| e.file_name() == "new7"))
+        .unwrap_or(false);
     println!(
-        "D {} D5 foreign change visibility: size_before={:?} stat_size_after={:?} reread_len={:?} (store now 35 bytes)",
-        ctx.label, before, after, reread
+        "D {} D7 foreign create after a negative lookup: stat={} listed_by_readdir={listed}",
+        ctx.label,
+        match stat_after {
+            Ok(n) => format!("ok({n} bytes)"),
+            Err(e) => errno_name(&e),
+        }
     );
 
     // D6: a foreign change BEFORE open: the open takes the new base.

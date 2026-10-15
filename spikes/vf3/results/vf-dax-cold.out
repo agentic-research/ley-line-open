@@ -1,0 +1,45 @@
+INFO vf-dax-cold status porcelain_lines=0 first=[]
+RESULT vf-dax-cold status 0 wall_us=640149
+DONE vf-dax-cold
+INFO vf-dax-cold rg matching_files=12
+RESULT vf-dax-cold rg 0 wall_us=1398312
+DONE vf-dax-cold
+INFO vf-dax-cold find files=20870
+RESULT vf-dax-cold find 0 wall_us=494269
+DONE vf-dax-cold
+INFO vf-dax-cold status porcelain_lines=0 first=[]
+RESULT vf-dax-cold status 0 wall_us=647869
+DONE vf-dax-cold
+INFO vf-dax-cold rg matching_files=12
+RESULT vf-dax-cold rg 0 wall_us=1404633
+DONE vf-dax-cold
+INFO vf-dax-cold find files=20870
+RESULT vf-dax-cold find 0 wall_us=500853
+DONE vf-dax-cold
+INFO vf-dax-cold status porcelain_lines=0 first=[]
+RESULT vf-dax-cold status 0 wall_us=617953
+DONE vf-dax-cold
+INFO vf-dax-cold rg matching_files=12
+RESULT vf-dax-cold rg 0 wall_us=1408448
+DONE vf-dax-cold
+INFO vf-dax-cold find files=20870
+RESULT vf-dax-cold find 0 wall_us=484018
+DONE vf-dax-cold
+INFO vf-dax-cold status porcelain_lines=0 first=[]
+RESULT vf-dax-cold status 0 wall_us=617083
+DONE vf-dax-cold
+INFO vf-dax-cold rg matching_files=12
+RESULT vf-dax-cold rg 0 wall_us=1398155
+DONE vf-dax-cold
+INFO vf-dax-cold find files=20870
+RESULT vf-dax-cold find 0 wall_us=485448
+DONE vf-dax-cold
+INFO vf-dax-cold status porcelain_lines=0 first=[]
+RESULT vf-dax-cold status 0 wall_us=653110
+DONE vf-dax-cold
+INFO vf-dax-cold rg matching_files=12
+RESULT vf-dax-cold rg 0 wall_us=1409154
+DONE vf-dax-cold
+INFO vf-dax-cold find files=20870
+RESULT vf-dax-cold find 0 wall_us=486907
+DONE vf-dax-cold

@@ -159,11 +159,12 @@ pub struct Attr {
 }
 
 impl Attr {
-    /// The Linux `st_mode`: file-type bits and permission bits.
+    /// The Linux `st_mode`: file-type bits and permission bits. The two
+    /// fields occupy disjoint bits, so their sum is their union.
     pub fn mode(&self) -> u32 {
         match self.kind {
-            Kind::File => S_IFREG | self.perm,
-            Kind::Directory => S_IFDIR | self.perm,
+            Kind::File => S_IFREG + self.perm,
+            Kind::Directory => S_IFDIR + self.perm,
         }
     }
 

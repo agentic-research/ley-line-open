@@ -70,6 +70,10 @@ struct ServiceState {
     starting: HashMap<String, String>,
     events: HashMap<String, Vec<RunEventRecord>>,
     receipts: HashMap<String, ReceiptContext>,
+    /// The channels each run's worker held beyond its confinement manifest,
+    /// as its backend verified them at start; the receipt's backend
+    /// evidence names them.
+    channels: HashMap<String, Vec<crate::WorkerChannel>>,
     provisioned: bool,
     provisioned_backend: Option<String>,
 }
@@ -228,6 +232,9 @@ impl<B: Backend> ExecutionService<B> {
         state
             .replay
             .insert(request.replay_key, request.run_id.clone());
+        state
+            .channels
+            .insert(request.run_id.clone(), started.channels);
         state.runs.insert(request.run_id, record.clone());
         let run_id = record.run_id.clone();
         state.events.insert(
@@ -378,6 +385,12 @@ impl<B: Backend> ExecutionService<B> {
             terminal_state: record.state,
             event_log_root: format!("blake3-256:{}", event_bytes.hash()),
             backend_id: record.backend_id.clone(),
+            backend_evidence: crate::BackendEvidenceDocument {
+                backend_id: record.backend_id.clone(),
+                channels: state.channels.get(run_id).cloned().ok_or_else(|| {
+                    ExecutionError::internal("run has no recorded worker channels")
+                })?,
+            },
             enforced: self.backend.capabilities().enforced,
             context,
             started_at_unix_ms,

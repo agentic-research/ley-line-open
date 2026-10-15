@@ -21,7 +21,7 @@ use super::super::process::{
     finish_failed_start, read_readiness_line, supervise_worker,
 };
 use super::share::{FsService, WorkspaceShares, serve};
-use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent};
+use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors};
 
 /// Keep `worker_end` open across the worker's `exec` and name its descriptor
 /// on the command line. The descriptor is created close-on-exec, as every
@@ -273,6 +273,14 @@ impl Backend for KrunWorkerBackend {
             },
             None => None,
         };
+        // What the worker must declare at readiness: exactly the share it
+        // is handed, under the descriptor number it inherits.
+        let declared = declared_descriptors(
+            request,
+            share
+                .as_ref()
+                .map(|(_, _, worker_end)| worker_end.as_raw_fd()),
+        );
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -413,7 +421,23 @@ impl Backend for KrunWorkerBackend {
             WorkerEvent::Ready {
                 run_id,
                 confinement_digest,
+                inherited,
             } if run_id == request.run_id => {
+                // The worker refuses to start holding a descriptor it does
+                // not declare; this refuses a declaration other than what
+                // this process handed it, so the receipt names the channels
+                // the worker actually holds.
+                if inherited != declared {
+                    return Err(abort_failed_start(
+                        &mut child,
+                        rootfs,
+                        LABELS,
+                        ExecutionError::identity_mismatch(format!(
+                            "descriptor drift: the worker declares inherited \
+                             descriptors {inherited:?}, and was handed {declared:?}"
+                        )),
+                    ));
+                }
                 // Same check as the native tier: the worker attests the
                 // policy it applied, and a disagreement with the grant stops
                 // the run before it executes.
@@ -505,6 +529,10 @@ impl Backend for KrunWorkerBackend {
         });
         Ok(BackendRun {
             backend_id: "libkrun/1".into(),
+            channels: declared
+                .into_iter()
+                .map(|descriptor| descriptor.channel)
+                .collect(),
         })
     }
 

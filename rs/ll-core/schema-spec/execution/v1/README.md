@@ -67,6 +67,36 @@ substrate derives the run identity before it checks any evidence and hands it
 to every verifier, so a verifier that accepts unbound evidence is choosing to;
 it has what it needs to refuse.
 
+## Backend evidence
+
+`RunReceipt.backend.evidence` names its contract by media type. LLO's is
+`application/vnd.leyline.execution.backend-evidence+json`: the digest
+(`blake3-256`) of one JSON document naming the backend that ran the workload
+and every channel its worker held beyond the `confinement/v1` manifest. A
+confinement manifest describes what the confined process may open; a
+descriptor the process inherits already open is outside it and outside any
+sandbox profile compiled from it, so the backend declares it here, the
+worker refuses to start holding a descriptor it does not declare, and the
+receipt commits to the declaration.
+
+```json
+{"backendId":"libkrun/1","channels":[{"graphRoot":"blake3-256:<hex>","role":"workspaceShare","workspace":"repo"}],"schemaVersion":"leyline/execution-backend-evidence/v1"}
+```
+
+- `backendId` — the receipt's `backend.backendId`.
+- `channels` — one entry per channel, empty when the worker holds none. The
+  one role v1 defines is `workspaceShare`: the run's `WorkspaceGrant`
+  (`workspace` its `name`, `graphRoot` its `graphRoot`) served to the guest
+  over a connected UNIX socket whose peer, in the substrate, answers the
+  guest's filesystem requests (ADR-0044). A run without a workspace has
+  none.
+- `schemaVersion` — `leyline/execution-backend-evidence/v1`.
+
+Canonical bytes: UTF-8, compact (no insignificant whitespace), object keys in
+ASCII byte order at every level, no trailing newline. Every value is one an
+issuer knows from its own grant (no descriptor number or host path), so a
+verifier recomputes the document and compares digests.
+
 `capabilities`, `status`, and `inspect` are read-only. In particular, `status`
 must not create a volume or initialize a backend. `provision`, `start`,
 `cancel`, and `cleanup` are explicit idempotent mutations.

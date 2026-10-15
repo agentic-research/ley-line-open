@@ -2,14 +2,18 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use leyline_runtime::backends::libkrun::worker::{
-    WORKSPACE_SHARE_FD_ARG, WorkerEvent, WorkerOptions,
+    InheritedDescriptor, WORKSPACE_SHARE_FD_ARG, WorkerEvent, WorkerOptions, declared_descriptors,
 };
 use leyline_runtime::{
-    DigestRef, ErrorCode, ExecutionRequest, ResourceLimits, WorkspaceGrant, WorkspaceOperation,
+    DigestRef, ErrorCode, ExecutionRequest, ResourceLimits, WorkerChannel, WorkspaceGrant,
+    WorkspaceOperation,
 };
 use tempfile::TempDir;
 
@@ -149,8 +153,33 @@ fn worker_options_name_the_inherited_workspace_share() {
 /// Runs the worker binary on `request` with `extra` arguments and answers
 /// its structured failure.
 fn worker_failure(request: &ExecutionRequest, extra: &[&str]) -> leyline_runtime::ExecutionError {
+    worker_failure_inheriting(request, extra, &[])
+}
+
+/// [`worker_failure`], with each of `inherited` kept open across the
+/// worker's `exec` (every descriptor this process opens is close-on-exec).
+fn worker_failure_inheriting(
+    request: &ExecutionRequest,
+    extra: &[&str],
+    inherited: &[RawFd],
+) -> leyline_runtime::ExecutionError {
     let run_root = TempDir::new().expect("run root");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
+    let inherited = inherited.to_vec();
+    // SAFETY: runs in the forked child before exec and makes only fcntl
+    // calls, which are async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            for &fd in &inherited {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .args(["--cas-root", "/nonexistent-cas", "--run-root"])
         .arg(run_root.path())
         .args(extra)
@@ -226,6 +255,87 @@ fn a_worker_refuses_a_share_that_does_not_match_its_grant() {
     let error = worker_failure(&reserved, &[]);
     assert_eq!(error.code, ErrorCode::InvalidSpec);
     assert!(error.detail.contains("KRUN_VIRTIOFS_MOUNTS"), "{error:?}");
+}
+
+/// The worker holds exactly the descriptors its run declares: the standard
+/// streams, and the workspace share when the run is granted one. Any other
+/// inherited descriptor is authority no manifest names, and the worker
+/// refuses to start with it, before the rootfs is touched (the CAS root
+/// here does not exist, so any later failure would name it instead).
+#[test]
+fn a_worker_holding_an_undeclared_descriptor_refuses_to_start() {
+    let _serial = common::serial();
+    let cas = TempDir::new().expect("CAS");
+    let plain = request_fixture(&cas);
+    let granted = ExecutionRequest {
+        workspaces: vec![grant("repo")],
+        ..plain.clone()
+    };
+    let stray = fs::File::open("/dev/null").expect("a stray descriptor");
+    let stray_fd = stray.as_raw_fd();
+
+    // A run without a workspace declares no descriptor beyond the streams.
+    let error = worker_failure_inheriting(&plain, &[], &[stray_fd]);
+    assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch, "{error:?}");
+    assert!(
+        error
+            .detail
+            .contains(&format!("undeclared inherited descriptor(s) [{stray_fd}]")),
+        "{error:?}"
+    );
+
+    // A run with a workspace declares its share, and nothing else.
+    let (_daemon_end, worker_end) = UnixStream::pair().expect("share socket pair");
+    let share_fd = worker_end.as_raw_fd().to_string();
+    let error = worker_failure_inheriting(
+        &granted,
+        &[WORKSPACE_SHARE_FD_ARG, &share_fd],
+        &[worker_end.as_raw_fd(), stray_fd],
+    );
+    assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch, "{error:?}");
+    assert!(
+        error.detail.contains(&format!(
+            "undeclared inherited descriptor(s) [{stray_fd}]: it declares its standard \
+             streams and [{share_fd}]"
+        )),
+        "only the stray descriptor is undeclared: {error:?}"
+    );
+
+    // The declared share alone passes the check: the worker goes on to the
+    // rootfs and fails there, on the CAS root this test withholds.
+    let error = worker_failure_inheriting(
+        &granted,
+        &[WORKSPACE_SHARE_FD_ARG, &share_fd],
+        &[worker_end.as_raw_fd()],
+    );
+    assert!(!error.detail.contains("undeclared"), "{error:?}");
+    let error = worker_failure_inheriting(&plain, &[], &[]);
+    assert!(!error.detail.contains("undeclared"), "{error:?}");
+}
+
+/// What a worker declares: nothing for a run without a workspace, and the
+/// share (its descriptor, workspace and graph root) for a run granted one.
+#[test]
+fn a_run_declares_its_workspace_share_and_nothing_else() {
+    let _serial = common::serial();
+    let cas = TempDir::new().expect("CAS");
+    let plain = request_fixture(&cas);
+    assert_eq!(declared_descriptors(&plain, None), Vec::new());
+
+    let granted = ExecutionRequest {
+        workspaces: vec![grant("repo")],
+        ..plain
+    };
+    assert_eq!(
+        declared_descriptors(&granted, Some(9)),
+        vec![InheritedDescriptor {
+            descriptor: 9,
+            channel: WorkerChannel::WorkspaceShare {
+                workspace: "repo".into(),
+                graph_root: format!("blake3-256:{}", "e".repeat(64)),
+            },
+        }]
+    );
 }
 
 #[test]

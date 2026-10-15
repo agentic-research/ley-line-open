@@ -12,6 +12,34 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **The libkrun worker declares its workspace share, holds nothing else,
+  and the receipt names it** (bead `ley-line-open-b83347`, ADR-0044 phase
+  C). The share descriptor (`--workspace-share-fd`) is a channel the worker
+  inherits open, outside its `confinement/v1` manifest and any sandbox
+  profile.
+  - `leyline_runtime::backends::libkrun::worker::declared_descriptors`
+    derives the worker's declared descriptors beyond its standard streams
+    from the grant: the share (`InheritedDescriptor { descriptor, channel:
+    WorkerChannel::WorkspaceShare { workspace, graphRoot } }`) for a run
+    granted a workspace, none otherwise. Before it reads the rootfs the
+    worker lists its open descriptors (`/dev/fd`) and refuses to start
+    holding any it does not declare (`IdentityPolicyMismatch`, naming
+    them; `refuse_undeclared_descriptors`).
+  - `WorkerEvent::Ready` carries the declaration (`inherited`);
+    `KrunWorkerBackend` refuses a readiness whose declaration differs from
+    what it handed the worker, before the run is published.
+  - `BackendRun.channels`, `WorkerChannel`, `BackendEvidenceDocument`,
+    `RunReceiptData.backend_evidence`. The receipt's `backend.evidence` is
+    now the digest of the backend evidence document (media type
+    `application/vnd.leyline.execution.backend-evidence+json`, the one the
+    canonical vector names; canonical bytes in the execution/v1 README
+    "Backend evidence"): the backend id and every channel its worker held.
+    It was the event log root under `application/vnd.leyline.backend-evidence`,
+    a value the receipt already carries as `eventLogRoot`.
+  - `WorkspaceGrant.expectedGeneration` stays carried and unchecked,
+    now documented: it is ADR-0041 S1's commit `seq`, which no store
+    implements, and the share is pinned by its `graphRoot` check.
+
 - **Agents run in a libkrun guest whose `/work` is the daemon's store**
   (bead `ley-line-open-f210c2`, ADR-0044 phase C). An execution/v1 run
   whose RunGrant carries a `WorkspaceGrant` gets that workspace as a

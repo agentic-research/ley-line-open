@@ -13,8 +13,8 @@ use leyline_runtime::transport::{
 };
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
-    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits, WorkspaceGrant,
-    WorkspaceOperation,
+    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits, WorkerChannel,
+    WorkspaceGrant, WorkspaceOperation,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1126,6 +1126,7 @@ impl Backend for RecordingBackend {
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: format!("test/{}", request.run_id),
+            channels: Vec::new(),
         })
     }
 
@@ -1155,6 +1156,7 @@ impl Backend for CompletingBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -1281,6 +1283,131 @@ fn natural_backend_completion_can_collect_a_schema_receipt() {
         .expect("collect terminal receipt");
     assert_eq!(receipt.terminal_state, leyline_runtime::RunState::Succeeded);
     assert!(receipt.event_log_root.starts_with("blake3-256:"));
+}
+
+/// Completes at once, holding the workspace share of each granted
+/// workspace, as the libkrun backend reports it.
+struct SharingBackend;
+
+impl Backend for SharingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        CompletingBackend.capabilities()
+    }
+
+    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "sharing/1".into(),
+            channels: request
+                .workspaces
+                .iter()
+                .map(|grant| WorkerChannel::WorkspaceShare {
+                    workspace: grant.name.clone(),
+                    graph_root: grant.graph_root.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(Some(BackendRunStatus::Succeeded))
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(true)
+    }
+}
+
+/// The receipt's backend evidence names every channel the run's worker held
+/// beyond its confinement manifest: the workspace share for a run granted a
+/// workspace, none for a run without one. The receipt carries the evidence
+/// document's digest under the execution/v1 media type.
+#[test]
+fn the_receipt_names_the_workspace_share_the_run_held() {
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let confinement = "b".repeat(64);
+    let root = "a".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &root)]);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![(
+                "repo",
+                &root,
+                vec![execution_capnp::WorkspaceOperation::Read],
+            )],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    let plain_spec = spec_bytes();
+    let plain_grant = grant_bytes(&plain_spec, true, 2_000, 0);
+
+    let service = ExecutionService::new(SharingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-sharing")
+        .expect("provision backend");
+    let shared = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect("a run granted a workspace");
+    // Its own service: both grants carry one replay key, and a replayed
+    // start answers the first run.
+    let plain_service = ExecutionService::new(SharingBackend);
+    plain_service
+        .provision(BackendClass::MicroVm, "provision-plain")
+        .expect("provision backend");
+    let plain = plain_service
+        .start_authorized(&plain_spec, &plain_grant, &policy, &TestResolver)
+        .expect("a run without a workspace");
+
+    let receipt = service.collect(&shared.run_id).expect("collect");
+    assert_eq!(
+        receipt.backend_evidence.channels,
+        vec![WorkerChannel::WorkspaceShare {
+            workspace: "repo".into(),
+            graph_root: format!("blake3-256:{root}"),
+        }]
+    );
+    assert_eq!(receipt.backend_evidence.backend_id, "sharing/1");
+    let wire: serde_json::Value = serde_json::from_str(
+        &collect_json(&service, &json!({"runId": shared.run_id}).to_string())
+            .expect("collect JSON"),
+    )
+    .expect("receipt JSON");
+    let evidence = &wire["receipt"]["backend"]["evidence"];
+    assert_eq!(
+        evidence["mediaType"],
+        "application/vnd.leyline.execution.backend-evidence+json"
+    );
+    assert_eq!(
+        format!(
+            "{}:{}",
+            evidence["digest"]["algorithm"].as_str().unwrap(),
+            evidence["digest"]["value"].as_str().unwrap()
+        ),
+        receipt.backend_evidence.digest()
+    );
+    assert_eq!(
+        receipt.backend_evidence.digest(),
+        format!(
+            "blake3-256:{}",
+            blake3::hash(&receipt.backend_evidence.canonical_bytes()).to_hex()
+        )
+    );
+
+    assert_ne!(plain.run_id, shared.run_id);
+    let receipt = plain_service.collect(&plain.run_id).expect("collect");
+    assert_eq!(receipt.backend_evidence.channels, Vec::new());
 }
 
 fn spec_json(bytes: &[u8]) -> String {

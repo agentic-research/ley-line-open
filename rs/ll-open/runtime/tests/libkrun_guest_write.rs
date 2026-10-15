@@ -121,8 +121,12 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
         WorkerEvent::Ready {
             run_id,
             confinement_digest,
+            inherited,
         } => {
             assert_eq!(run_id, "live-guest-write", "worker stderr: {stderr}");
+            // No workspace, no share: the worker declares no descriptor
+            // beyond its standard streams.
+            assert_eq!(inherited, Vec::new(), "worker stderr: {stderr}");
             assert!(
                 confinement_digest.starts_with("blake3-256:"),
                 "a live worker must attest the policy it applied, got \

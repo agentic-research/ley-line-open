@@ -278,6 +278,25 @@ store's `treeRoot` (ADR-0040 D1, the tagged fold over `_source`) is the grant's 
 `Controller.current_root`, not `Head.rootHash`). The guest init mounts the share at `/work`
 (libkrun patch `0005`, `KRUN_VIRTIOFS_MOUNTS`) and starts the workload there.
 
+**The share in the confinement evidence** (bead `ley-line-open-b83347`). The guest sees only
+virtio-fs, but the worker process holds the share socket, and that descriptor is outside its
+`confinement/v1` manifest: nono confines what the worker may open, not what it inherits open. The
+worker and the backend derive one declaration from the grant (`worker::declared_descriptors`: the
+share's descriptor, workspace and `graphRoot` for a run granted a workspace, nothing otherwise).
+Before it reads the rootfs, the worker lists its open descriptors and refuses to start holding any
+beyond its standard streams and that declaration; its readiness event carries the declaration,
+and the backend refuses one that differs from what it handed the worker. The receipt's
+`backend.evidence` is the digest of the backend evidence document (execution/v1 README "Backend
+evidence"), which names each `workspaceShare` channel; a run without a workspace names none. The
+in-guest scenarios below run through this check: the daemon's worker holds exactly its streams and
+the share.
+
+**`expectedGeneration`.** The grant's `WorkspaceGrant.expectedGeneration` is carried to the
+backend and not checked. ADR-0041 S1 defines it as the commit `seq` within the grant's epoch, and
+no store implements `(epoch, seq)` yet (ADR-0041 is Proposed), so there is no value to compare it
+with. The share is pinned by the `graphRoot` check: it opens only when the store's `treeRoot` is
+the grant's `graphRoot`. Checking `expectedGeneration` lands with ADR-0041 S1.
+
 **The test.** `rs/ll-open/cli/tests/agent_in_guest.rs` runs the real `leyline execution-daemon
 --backend micro-vm --source <checkout>` and starts an execution/v1 run over the socket whose
 RunGrant carries a WorkspaceGrant. The workload is a static guest program using file syscalls,

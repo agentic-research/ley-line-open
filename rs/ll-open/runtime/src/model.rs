@@ -181,6 +181,38 @@ pub struct ExecutionRequest {
     /// still does.
     #[serde(default)]
     pub confinement_manifest: Option<String>,
+    /// The RunGrant's `workspaces`, carried from authorization: the Graph
+    /// authority the run holds. The microVM tier attaches the one it is
+    /// granted as the guest's `/work` (ADR-0044 V5); a resolver carries
+    /// them and never chooses them, and the service refuses one that does.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceGrant>,
+}
+
+/// One RunGrant `WorkspaceGrant` (`execution/v1`): resolved authority over one
+/// logical Graph workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGrant {
+    /// The `RunSpec.workspaceInputs` name this grant resolves.
+    pub name: String,
+    /// The authorized input Graph root, `blake3-256:<hex>`.
+    pub graph_root: String,
+    pub expected_generation: u64,
+    /// Exactly the operations permitted.
+    pub operations: Vec<WorkspaceOperation>,
+}
+
+/// An operation a [`WorkspaceGrant`] permits (`execution/v1`
+/// `WorkspaceOperation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceOperation {
+    Read,
+    List,
+    Query,
+    Mutate,
+    Commit,
 }
 
 impl ExecutionRequest {

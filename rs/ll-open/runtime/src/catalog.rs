@@ -181,6 +181,9 @@ impl ExecutionResolver for CatalogResolver {
             // `authorization.rs` and then dropped here, so no dimension it
             // declared could reach the tier that enforces it.
             confinement_manifest: authorized.confinement_manifest.clone(),
+            // Carried, never chosen, as the confinement digest is: the
+            // workspace authority the grant resolved.
+            workspaces: authorized.workspaces.clone(),
         };
         request.validate()?;
         Ok(request)
@@ -287,6 +290,7 @@ mod tests {
                     output_bytes: 0,
                 },
             },
+            workspaces: Vec::new(),
         };
         let request = resolver.resolve(&authorized).expect("resolve catalog");
         assert_eq!(request.executable, "bin/agent");

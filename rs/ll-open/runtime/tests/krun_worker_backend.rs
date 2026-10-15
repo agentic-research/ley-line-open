@@ -5,8 +5,10 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
+use leyline_runtime::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
 use leyline_runtime::{
-    Backend, BackendClass, BackendRunStatus, DigestRef, ExecutionRequest, ResourceLimits,
+    Backend, BackendClass, BackendRunStatus, DigestRef, ExecutionError, ExecutionRequest,
+    ResourceLimits, WorkspaceGrant, WorkspaceOperation,
 };
 use tempfile::TempDir;
 
@@ -32,6 +34,7 @@ fn request() -> ExecutionRequest {
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
         confinement_manifest: None,
+        workspaces: Vec::new(),
         limits: ResourceLimits {
             vcpus: 1,
             memory_mib: 512,
@@ -684,4 +687,184 @@ fn rejection_kills_the_workers_grandchildren_too() {
         );
         std::hint::spin_loop();
     }
+}
+
+// ── Workspace shares (ADR-0044 phase C, bead ley-line-open-f210c2) ──────
+
+/// Records each request the worker's end of the share sends.
+struct RecordingShare {
+    seen: std::sync::Mutex<std::sync::mpsc::Sender<Request>>,
+}
+
+impl FsService for RecordingShare {
+    fn call(&self, request: Request) -> Reply {
+        let _ = self.seen.lock().unwrap().send(request);
+        Reply::Done
+    }
+}
+
+/// Opens [`RecordingShare`]s, or refuses with `refusal`, and records what it
+/// was asked to open.
+struct Shares {
+    refusal: Option<ExecutionError>,
+    opened: std::sync::Mutex<Vec<(String, WorkspaceGrant)>>,
+    seen: std::sync::Mutex<std::sync::mpsc::Sender<Request>>,
+}
+
+impl Shares {
+    fn new(refusal: Option<ExecutionError>) -> (Arc<Self>, std::sync::mpsc::Receiver<Request>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                refusal,
+                opened: std::sync::Mutex::new(Vec::new()),
+                seen: std::sync::Mutex::new(tx),
+            }),
+            rx,
+        )
+    }
+}
+
+impl WorkspaceShares for Shares {
+    fn open(
+        &self,
+        run_id: &str,
+        grant: &WorkspaceGrant,
+    ) -> Result<Arc<dyn FsService>, ExecutionError> {
+        self.opened
+            .lock()
+            .unwrap()
+            .push((run_id.to_owned(), grant.clone()));
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
+        Ok(Arc::new(RecordingShare {
+            seen: std::sync::Mutex::new(self.seen.lock().unwrap().clone()),
+        }))
+    }
+}
+
+fn workspace(name: &str) -> WorkspaceGrant {
+    WorkspaceGrant {
+        name: name.into(),
+        graph_root: format!("blake3-256:{}", "e".repeat(64)),
+        expected_generation: 0,
+        operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+    }
+}
+
+fn request_with(workspaces: Vec<WorkspaceGrant>) -> ExecutionRequest {
+    ExecutionRequest {
+        workspaces,
+        ..request()
+    }
+}
+
+/// A fake worker that logs its arguments to `args_log`, then reports ready
+/// and sleeps.
+fn arg_logging_worker(args_log: &std::path::Path) -> String {
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+        args_log.display()
+    )
+}
+
+#[test]
+fn a_granted_workspace_is_served_to_the_worker_over_an_inherited_socket() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    // The worker finds the descriptor named by `--workspace-share-fd` and
+    // sends one framed INIT request down it: 13 header bytes
+    // (`{"op":"init"}`), no payload.
+    let script = r#"#!/bin/sh
+fd=
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--workspace-share-fd" ]; then fd="$arg"; fi
+  prev="$arg"
+done
+IFS= read -r _
+[ -n "$fd" ] || exit 3
+eval "printf '\015\000\000\000\000\000\000\000{\"op\":\"init\"}' >&$fd" || exit 4
+printf '%s\n' '{"type":"ready","run_id":"run-backend-01"}' >&2
+exec /usr/bin/tail -f /dev/null
+"#;
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, script);
+    let (shares, seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares.clone());
+
+    backend
+        .start(&request_with(vec![workspace("repo")]))
+        .expect("a ready worker with its share");
+    assert_eq!(
+        seen.recv_timeout(READY_TIMEOUT)
+            .expect("the worker's request reached the share"),
+        Request::Init
+    );
+    assert_eq!(
+        *shares.opened.lock().unwrap(),
+        vec![("run-backend-01".to_owned(), workspace("repo"))],
+        "the provider opens the run's one granted workspace"
+    );
+}
+
+#[test]
+fn a_run_without_workspaces_is_handed_no_share() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let args_log = fixture.path().join("args.log");
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &arg_logging_worker(&args_log));
+    let (shares, _seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares.clone());
+
+    backend.start(&request()).expect("ready worker");
+    let args = fs::read_to_string(&args_log).expect("worker arguments");
+    assert!(
+        !args.contains("--workspace-share-fd"),
+        "no workspace, no share: {args}"
+    );
+    assert!(shares.opened.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_granted_workspace_is_refused_before_spawn_where_no_share_can_serve_it() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let args_log = fixture.path().join("args.log");
+
+    // No provider: the grant cannot be delivered, so the run does not start
+    // without it.
+    let (backend, ephemeral_root) = backend_with_worker(&fixture, &arg_logging_worker(&args_log));
+    let error = backend
+        .start(&request_with(vec![workspace("repo")]))
+        .expect_err("a workspace grant with nothing to serve it");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert!(error.detail.contains("repo"), "{error}");
+
+    // Two workspaces: the tier attaches one.
+    let (shares, _seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares.clone());
+    let error = backend
+        .start(&request_with(vec![workspace("repo"), workspace("docs")]))
+        .expect_err("two workspaces");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert!(shares.opened.lock().unwrap().is_empty());
+
+    // The provider refuses: its error is the run's.
+    let refusal = ExecutionError {
+        code: leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        retryable: false,
+        detail: "the store no longer holds the granted root".into(),
+    };
+    let (shares, _seen) = Shares::new(Some(refusal.clone()));
+    let backend = backend.with_workspace_shares(shares);
+    assert_eq!(
+        backend
+            .start(&request_with(vec![workspace("repo")]))
+            .expect_err("the provider refused"),
+        refusal
+    );
+
+    assert!(!args_log.exists(), "no worker was spawned");
+    assert_eq!(run_root_count(&ephemeral_root), 0);
 }

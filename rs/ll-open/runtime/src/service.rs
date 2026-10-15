@@ -317,6 +317,14 @@ impl<B: Backend> ExecutionService<B> {
                 "resolver changed the grant's confinement digest",
             ));
         }
+        // The fifth: a resolver that dropped a workspace grant would run the
+        // workload without the share it was granted, and one that widened
+        // its operations would let it propose where it may only read.
+        if request.workspaces != authorized.workspaces {
+            return Err(ExecutionError::identity_mismatch(
+                "resolver changed the grant's workspaces",
+            ));
+        }
         let record = self.start(request)?;
         self.state.write().receipts.insert(
             record.run_id.clone(),

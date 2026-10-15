@@ -23,6 +23,7 @@ fn request() -> ExecutionRequest {
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
         confinement_manifest: None,
+        workspaces: Vec::new(),
         limits: ResourceLimits {
             vcpus: 1,
             memory_mib: 64,

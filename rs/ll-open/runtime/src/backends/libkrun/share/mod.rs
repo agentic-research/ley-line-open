@@ -223,6 +223,19 @@ pub trait FsService: Send + Sync {
     fn call(&self, request: Request) -> Reply;
 }
 
+/// Where a run's workspace is served from: the embedder that holds the store
+/// (the daemon). The libkrun backend asks it before it spawns the worker;
+/// an error refuses the run.
+pub trait WorkspaceShares: Send + Sync {
+    /// The service answering the guest's share of `grant`'s workspace for
+    /// run `run_id`, scoped by the grant's operations.
+    fn open(
+        &self,
+        run_id: &str,
+        grant: &crate::WorkspaceGrant,
+    ) -> Result<std::sync::Arc<dyn FsService>, crate::ExecutionError>;
+}
+
 fn write_frame(writer: &mut impl Write, header: &[u8], payload: &[u8]) -> io::Result<()> {
     let header_len = frame_len(header.len())?;
     let payload_len = frame_len(payload.len())?;

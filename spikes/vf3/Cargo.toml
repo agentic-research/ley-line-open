@@ -1,0 +1,17 @@
+# ADR-0044 falsifier V-F3 benchmark spike. A standalone workspace outside
+# rs/: CI, release and `task ci` never build it. See
+# docs/benchmarks/2026-10-15-vf3-virtiofs.md.
+[package]
+name = "vf3-vmm"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+leyline-runtime = { path = "../../rs/ll-open/runtime" }
+libc = "0.2"
+
+[profile.release]
+debug = false

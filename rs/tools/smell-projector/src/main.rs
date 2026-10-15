@@ -1942,7 +1942,10 @@ mod tests {
         let gated = is_file_cfg_test_gated(&root.join("parent/gated.rs"));
         let real = is_file_cfg_test_gated(&root.join("parent/real.rs"));
         let _ = fs::remove_dir_all(&root);
-        assert!(gated, "a #[cfg(test)] mod in <dir>.rs gates <dir>/<name>.rs");
+        assert!(
+            gated,
+            "a #[cfg(test)] mod in <dir>.rs gates <dir>/<name>.rs"
+        );
         assert!(!real, "an ungated mod stays production code");
     }
 

@@ -1018,9 +1018,8 @@ impl<S: Store> StoreFs<S> {
             }
             _ => {}
         }
-        if !self.may_propose_under(from) || !self.may_propose_under(to) {
-            return Err(Errno::EACCES);
-        }
+        // The proposal's grant check answers `EACCES` for a path outside
+        // the proposal scope at either end.
         let writes = self
             .store
             .with_read(|conn| source_write::rename_dir(conn, from, to))
@@ -1064,9 +1063,8 @@ impl<S: Store> StoreFs<S> {
         }
         let (base, bytes) = self.held(from)?.ok_or(Errno::ENOENT)?;
         let stored = matches!(base, Base::Blob(_));
-        if !self.scope.propose.covers(from) || !self.scope.propose.covers(to) {
-            return Err(Errno::EACCES);
-        }
+        // The proposal's grant check answers `EACCES` for a path outside
+        // the proposal scope at either end.
         let mode = match self.served(from)?.and_then(|s| s.mode) {
             Some(mode) => mode,
             None => self
@@ -1394,18 +1392,15 @@ impl<S: Store> StoreFs<S> {
             Kind::Directory if self.may_propose_under(path) => 0o755,
             Kind::Directory => 0o555,
             Kind::Symlink => 0o777,
-            Kind::File => {
-                let read_write = if self.scope.propose.covers(path) {
-                    0o644
-                } else {
-                    0o444
-                };
-                if mode == Some(Mode::Executable) {
-                    read_write | ((read_write & 0o444) >> 2)
-                } else {
-                    read_write
-                }
-            }
+            Kind::File => match (
+                self.scope.propose.covers(path),
+                mode == Some(Mode::Executable),
+            ) {
+                (true, true) => 0o755,
+                (true, false) => 0o644,
+                (false, true) => 0o555,
+                (false, false) => 0o444,
+            },
         };
         Attr {
             inode: self.inode_of(path),

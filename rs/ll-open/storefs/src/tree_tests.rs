@@ -223,6 +223,12 @@ fn mkdir_and_rmdir_are_proposals() {
     let f = fixture_with(whole(), true, A);
     let made = f.fs.mkdir(ROOT_INODE, b"empty").unwrap();
     assert_eq!(made.attr.kind, Kind::Directory);
+    let listed = f.fs.readdir(ROOT_INODE, 0).unwrap();
+    assert_eq!(
+        listed.iter().find(|d| d.name == "empty").map(|d| d.kind),
+        Some(Kind::Directory),
+        "an empty directory lists as a directory"
+    );
     assert_eq!(entry(&f, "empty"), Some(StoreEntry::Dir));
     assert!(f.src.path().join("empty").is_dir());
     assert_eq!(

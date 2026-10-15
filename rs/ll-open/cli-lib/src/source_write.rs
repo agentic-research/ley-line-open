@@ -879,24 +879,27 @@ impl leyline_fs::graph::SourceWriter for MountWriter {
                 Ok(())
             }
             Err(err) => match err.downcast::<Refusal>() {
-                // A one-file replace: its one moved file. A file deleted
-                // since the mount read it has no current blob, and the
-                // refusal is passed on as it is.
-                Ok(Refusal::Stale(moved)) => match moved.as_slice() {
-                    [
-                        Stale {
-                            path,
-                            expected: Some(expected),
-                            current: Some(current),
-                        },
-                    ] => Err(leyline_fs::graph::StaleWrite {
-                        source_id: path.clone(),
-                        expected: *expected,
-                        current: *current,
+                // A one-file replace: its one moved file, whether it could
+                // not merge or its merge conflicted (ADR-0045 T5). A file
+                // deleted since the mount read it has no current blob, and
+                // the refusal is passed on as it is.
+                Ok(refusal @ (Refusal::Stale(_) | Refusal::Conflict { .. })) => {
+                    match refusal.moved() {
+                        [
+                            Stale {
+                                path,
+                                expected: Some(expected),
+                                current: Some(current),
+                            },
+                        ] => Err(leyline_fs::graph::StaleWrite {
+                            source_id: path.clone(),
+                            expected: *expected,
+                            current: *current,
+                        }
+                        .into()),
+                        _ => Err(refusal.into()),
                     }
-                    .into()),
-                    _ => Err(Refusal::Stale(moved).into()),
-                },
+                }
                 Ok(other) => Err(other.into()),
                 Err(other) => Err(other),
             },

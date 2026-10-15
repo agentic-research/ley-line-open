@@ -102,6 +102,10 @@ fn file_entry() -> Entry {
     }
 }
 
+// `stat` field widths differ by platform (macOS `st_mode` is u16 and
+// `st_nlink` u16; Linux x86_64 has u32 and u64), so each cast is needed on
+// one platform and redundant on another.
+#[allow(clippy::unnecessary_cast)]
 fn assert_stat(st: &Stat, attr: &Attr) {
     assert_eq!(st.st_ino as u64, attr.inode);
     assert_eq!(st.st_mode as u32, attr.mode);

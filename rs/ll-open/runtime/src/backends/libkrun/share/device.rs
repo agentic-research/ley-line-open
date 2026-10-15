@@ -142,6 +142,10 @@ impl<F: FsService> DynFileSystem for ShareFs<F> {
         self.attr(Request::Getattr { inode, handle })
     }
 
+    // `st_mode` is u16 on macOS and u32 on Linux: the cast widens on one and
+    // is the identity on the other, which `u32::from` would make a
+    // useless-conversion lint on Linux instead.
+    #[allow(clippy::unnecessary_cast)]
     fn setattr(
         &self,
         _ctx: Context,

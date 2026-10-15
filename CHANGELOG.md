@@ -37,6 +37,63 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A daemon restart keeps accepted proposals** (bead
+  `ley-line-open-60f39f`). `leyline daemon --source <dir>` stored an
+  accepted proposal (the `propose` op, or a mount edit) and never wrote
+  `<dir>`, and the warm-start reparse then saw the file's disk bytes
+  differ from the store and re-ingested them over the proposal; the git
+  watcher and `reparse` did the same. The daemon now checks `<dir>` out:
+  `_checkout_index` (in `live.db`, LLO-private) records per path the
+  blob last written into the directory or read from it. An accepted
+  proposal commits, is written into the directory (temp file, `fsync`,
+  `rename`), and only then advances the index. Startup, the watcher and
+  `reparse` over the checkout compare the directory and the store each
+  against the index: the store's moves are written out, the directory's
+  edits are ingested, and a path both changed to different bytes is a
+  conflict that overwrites neither side, is logged, and is recorded in
+  `_checkout_conflict` (readable through the `query` op). A crash
+  between the commit and the file write is written out at the next
+  start. A materialization that fails rides in `post_commit_error`.
+  A daemon without `--source` writes no file. In Rust,
+  `source_write::MountWriter` gains `checkout: Option<PathBuf>`.
+
+- **`leyline inspect --query` prints every value** (bead
+  `ley-line-open-12c0fa`). It read each column as text and printed
+  integers, reals, NULLs and blobs as empty strings, so `SELECT count(*)`
+  answered nothing. Numbers print as numbers, NULL as `NULL`, and blobs as
+  SQL hex literals (`x'00ff'`).
+
+- **An NFS mount edit made before another writer moved the file is
+  refused** (bead `ley-line-open-6116c9`). The mount handle's base was
+  taken at the file's first uncommitted WRITE. A macOS client holds
+  UNSTABLE writes until `fsync` or close, so after an agent read a node,
+  wrote and flushed its buffer, and a socket proposal then moved the
+  file, the server first saw the WRITE after the proposal, took the
+  base from the moved file, and the `fsync` landed the edit over the
+  proposal. Now every NFS READ of a node of a parsed file, while the
+  mount has no edit to that file staged, re-takes the file's base
+  before the bytes are served (new `Graph::note_read`, forwarded by
+  `HotSwapGraph`); a landed COMMIT sets the base to the bytes it wrote;
+  a refused edit keeps it, so a retry with no READ in between is
+  refused again. A WRITE or truncate to a file that no longer holds the
+  base is refused `NFS3ERR_STALE` before it is staged: a macOS client
+  reports a failed WRITE as `ESTALE` at `fsync`, and ignores a failed
+  COMMIT (measured: `fsync` and `close` returned success on a COMMIT
+  answered `NFS3ERR_STALE` or `NFS3ERR_IO`). Checked: an edit is staged
+  and lands only if the file holds the bytes of the client's last
+  server READ of it (with nothing staged) or of the mount's last landed
+  edit to it, whichever is later. Not checked: an edit from a cache
+  filled with no READ to this server process and no landed edit through
+  it (a previous mount or server process), whose base is still taken at
+  its WRITE; and, the base being per file, an edit to one node from a
+  cache older than the client's latest READ of another node of the same
+  file. A refusal only the COMMIT can make (the file moved between the
+  WRITE and the COMMIT, or the edit does not parse) discards the edit
+  but is not reported by a macOS client. The mount holds one base per
+  file it has served, replaced in place. Behaviour change: after a
+  refused edit, the client must READ the file before an edit through
+  the mount lands.
+
 - **An applied proposal is reported as applied** (bead
   `ley-line-open-5db28e`). When the head write, an index build or the
   publish failed after `COMMIT`, the daemon answered `{ok: false}` and
@@ -93,6 +150,49 @@ context, scoping notes, and review history are recoverable.
   without it, and the daemon ran headless when asked to mount, so the
   caller got no mount and no failure. It now refuses at startup and names
   the feature.
+
+- **A mount edit is checked against the bytes its own writer read, so a
+  second writer's edit is refused with `ESTALE`, never landed unchecked or
+  lost** (bead `ley-line-open-5da276`). The base of an edit (ADR-0042 P2)
+  and its pending bytes were kept per file per mount. When two FUSE opens
+  edited one file, the second inherited the first's base, took the file
+  after the first's flush as its base once that flush dropped it, and
+  shared one overlay with the first. Its edit landed over bytes it never
+  read, interleaved with the first's bytes, or was carried away by the
+  first flush while its own `close` and `fsync` reported success. Each
+  FUSE open is now its own handle with its own base, taken at the open,
+  and its own pending bytes: a read through the handle sees its edit,
+  every other read sees the stored file, and a node is sized as its
+  largest edit in progress. After a handle's flush lands, its base is the
+  file it wrote, held until `release`. A handle whose base no longer
+  matches the file gets `ESTALE` at `flush` and `fsync`, and every later
+  edit through it gets the same until the file is opened again. The mount
+  asks the kernel for `FUSE_ATOMIC_O_TRUNC`, so `open(O_TRUNC)` truncates
+  the new handle's own edit. A kernel without it sends the truncate as a
+  SETATTR naming no handle, which goes to the handles open for writing on
+  the file. With none open (`truncate(2)` by path), the truncate lands
+  through the write path before it returns and leaves no edit behind.
+  NFSv3 has no
+  opens and names no client on a WRITE, so an NFS edit is the mount
+  handle's: its base is taken when the file's first uncommitted write or
+  truncate arrives and held until the COMMIT of the file's last staged
+  node lands. A COMMIT whose file moved since then (another mount, a batch
+  splice, or the COMMIT of another node of the same file) is refused with
+  `NFS3ERR_STALE`, which the client reports as `ESTALE`; before, the first
+  COMMIT dropped the base and the second landed unchecked. Two NFS clients
+  writing the same node still share its staged bytes, since nothing on the
+  wire tells them apart. A batch splice no longer drops edits in progress
+  to the nodes it rewrites; their flushes refuse them as stale. `Graph`
+  gains `note_base_as`, `write_content_as`, `read_content_as`,
+  `truncate_as`, `flush_node_as` and `release`, defaulting to the methods
+  that name no handle.
+
+- **An edit that empties a node lands at its flush** (bead
+  `ley-line-open-8a26d8`). Its flush returned success without landing,
+  and the empty edit stayed pending: the node read and sized as empty
+  through the mount while the stored file kept its text, and `: > f`
+  over NFS never committed. It now reaches the write path like any other
+  edit, which refuses it when the file it makes does not parse.
 ## [0.20.5] — 2026-10-13
 
 Publication safety. A publisher that dies mid-publish no longer wedges

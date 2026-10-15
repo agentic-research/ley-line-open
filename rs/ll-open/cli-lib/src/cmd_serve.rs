@@ -155,6 +155,7 @@ pub async fn cmd_serve(
     let graph = HotSwapGraph::new(ctrl_path)?.with_source_writer(Arc::new(
         crate::source_write::MountWriter {
             grant: crate::source_write::Grant::Whole,
+            checkout: None,
         },
     ))?;
 

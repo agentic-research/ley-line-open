@@ -7,6 +7,7 @@
 
 # Root files
 !.gitignore
+!.gitattributes
 !LICENSE
 # Apache-2.0 covers the schema/interface layer — see README "Licensing".
 !LICENSE-APACHE
@@ -111,6 +112,12 @@
 # files; the regen-diff CI gate (.github/workflows/leyline-schema-go.yml)
 # requires them to be tracked, not gitignored.
 !clients/**
+
+# Third-party source LLO builds (ley-line-open-f1c46f): libkrun, vendored as
+# the pinned upstream commit plus the patches beside it, so the VMM builds
+# without the network. `tools/vendor_libkrun.sh check` proves the tree; see
+# rs/third_party/README.md.
+!rs/third_party/**
 
 # Re-deny build artifacts
 **/target/

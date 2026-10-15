@@ -319,6 +319,21 @@ tasks:
       - python3 -m pip install --break-system-packages ziglang
       - rustup target add "{{.RUST_TARGET}}"
 
+  # --------------------------------------------------------------------------
+  # Vendored VMM (rs/third_party/libkrun, ADR-0044, bead ley-line-open-f1c46f).
+  # Both fetch upstream from GitHub, so neither is part of `ci`; the build
+  # reads only the committed tree. See rs/third_party/README.md.
+  # --------------------------------------------------------------------------
+  vmm:vendor:check:
+    desc: Prove rs/third_party/libkrun is the pinned upstream commit plus rs/third_party/libkrun-patches (network)
+    cmds:
+      - tools/vendor_libkrun.sh check
+
+  vmm:vendor:sync:
+    desc: Rewrite rs/third_party/libkrun from the pinned upstream commit and the patches (network)
+    cmds:
+      - tools/vendor_libkrun.sh sync
+
   deps:cargo-mutants:
     desc: |
       cargo-mutants from source with --locked — installed from source rather

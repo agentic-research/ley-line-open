@@ -29,7 +29,6 @@ pub struct KrunWorkerConfig {
     pub worker: PathBuf,
     pub cas_root: PathBuf,
     pub ephemeral_root: PathBuf,
-    pub libkrun: PathBuf,
     pub runtime_files: Vec<PathBuf>,
     pub devices: Vec<PathBuf>,
     pub ready_timeout: Duration,
@@ -79,7 +78,6 @@ impl KrunWorkerBackend {
         self.config.worker.is_file()
             && self.config.cas_root.is_dir()
             && self.config.ephemeral_root.is_dir()
-            && self.config.libkrun.is_file()
             && self.config.runtime_files.iter().all(|path| path.is_file())
             && self.config.devices.iter().all(|path| path.exists())
     }
@@ -172,8 +170,6 @@ impl Backend for KrunWorkerBackend {
         command
             .arg("--cas-root")
             .arg(&self.config.cas_root)
-            .arg("--libkrun")
-            .arg(&self.config.libkrun)
             .arg("--run-root")
             .arg(rootfs.path())
             .stdin(Stdio::piped())
@@ -455,7 +451,6 @@ mod tests {
             worker: PathBuf::new(),
             cas_root: PathBuf::new(),
             ephemeral_root: PathBuf::new(),
-            libkrun: PathBuf::new(),
             runtime_files: Vec::new(),
             devices: Vec::new(),
             ready_timeout: Duration::from_secs(1),

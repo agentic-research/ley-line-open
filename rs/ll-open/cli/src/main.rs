@@ -44,7 +44,8 @@ enum Cmd {
         #[arg(long)]
         run_root: PathBuf,
 
-        /// First-party leyline-native-worker executable.
+        /// First-party worker executable: leyline-native-worker, or for
+        /// `--backend micro-vm` leyline-krun-worker, which links libkrun.
         #[arg(long)]
         worker: PathBuf,
 
@@ -55,10 +56,6 @@ enum Cmd {
         /// Backend to supervise: native nono or embedded libkrun microVM.
         #[arg(long, value_enum, default_value_t = ExecutionBackendKind::Native)]
         backend: ExecutionBackendKind,
-
-        /// Embedded libkrun shared library (required for `--backend micro-vm`).
-        #[arg(long)]
-        libkrun: Option<PathBuf>,
 
         /// Device paths explicitly granted to the libkrun worker.
         #[arg(long = "device")]
@@ -293,7 +290,6 @@ async fn main() -> Result<()> {
             worker,
             catalog,
             backend: backend_kind,
-            libkrun,
             devices,
             runtime_files,
             ready_timeout_ms,
@@ -352,8 +348,8 @@ async fn main() -> Result<()> {
             };
             match backend_kind {
                 ExecutionBackendKind::Native => {
-                    if libkrun.is_some() || !devices.is_empty() {
-                        bail!("--libkrun and --device require --backend micro-vm");
+                    if !devices.is_empty() {
+                        bail!("--device requires --backend micro-vm");
                     }
                     let backend =
                         leyline_runtime::backends::native_backend::NativeWorkerBackend::new(
@@ -387,12 +383,6 @@ async fn main() -> Result<()> {
                     .await
                 }
                 ExecutionBackendKind::MicroVm => {
-                    let Some(libkrun) = libkrun else {
-                        bail!("--libkrun is required with --backend micro-vm");
-                    };
-                    if !libkrun.is_file() {
-                        bail!("libkrun is not an existing file: {}", libkrun.display());
-                    }
                     if devices.iter().any(|path| !path.exists()) {
                         bail!("all --device paths must exist");
                     }
@@ -402,7 +392,6 @@ async fn main() -> Result<()> {
                                 worker,
                                 cas_root,
                                 ephemeral_root: run_root,
-                                libkrun,
                                 runtime_files,
                                 devices,
                                 ready_timeout: Duration::from_millis(ready_timeout_ms),
@@ -651,21 +640,15 @@ mod tests {
             "/worker",
             "--catalog",
             "/catalog.json",
-            "--libkrun",
-            "/lib/libkrun.dylib",
             "--device",
             "/dev/null",
         ])
         .unwrap();
         match cli.command {
             Cmd::ExecutionDaemon {
-                backend,
-                libkrun,
-                devices,
-                ..
+                backend, devices, ..
             } => {
                 assert_eq!(backend, ExecutionBackendKind::MicroVm);
-                assert_eq!(libkrun, Some(PathBuf::from("/lib/libkrun.dylib")));
                 assert_eq!(devices, vec![PathBuf::from("/dev/null")]);
             }
             _ => panic!("expected execution-daemon command"),

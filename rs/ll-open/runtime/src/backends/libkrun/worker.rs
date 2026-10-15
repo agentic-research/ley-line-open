@@ -1,23 +1,30 @@
 use std::ffi::OsString;
+#[cfg(feature = "vmm")]
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use crate::ExecutionError;
+#[cfg(feature = "vmm")]
+use crate::ExecutionRequest;
+#[cfg(feature = "vmm")]
 use crate::confinement::ConfinementManifest;
-use crate::{ExecutionError, ExecutionRequest};
 use serde::{Deserialize, Serialize};
 
-use super::api::{DynamicKrunApi, KRUN_TSI_HIJACK_INET, PreparedVm, prepare_vm};
+#[cfg(feature = "vmm")]
+use super::api::{KRUN_TSI_HIJACK_INET, LinkedKrunApi, PreparedVm, prepare_vm};
+#[cfg(feature = "vmm")]
 use super::confinement::{
     VmmHostResources, apply_manifest, confinement_manifest, vsock_unix_mappings,
 };
+#[cfg(feature = "vmm")]
 use super::plan::{DirectoryRootfsResolver, compile_plan};
+#[cfg(feature = "vmm")]
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerOptions {
     pub cas_root: PathBuf,
     pub run_root: PathBuf,
-    pub libkrun: PathBuf,
     pub runtime_files: Vec<PathBuf>,
     pub devices: Vec<PathBuf>,
     /// Carry the guest's `AF_INET` sockets over vsock (`KRUN_TSI_HIJACK_INET`).
@@ -55,7 +62,6 @@ impl WorkerOptions {
         let mut arguments = arguments.into_iter();
         let mut cas_root = None;
         let mut run_root = None;
-        let mut libkrun = None;
         let mut runtime_files = Vec::new();
         let mut devices = Vec::new();
 
@@ -76,7 +82,6 @@ impl WorkerOptions {
             })?;
             match argument.to_str() {
                 Some("--cas-root") if cas_root.is_none() => cas_root = Some(value.into()),
-                Some("--libkrun") if libkrun.is_none() => libkrun = Some(value.into()),
                 Some("--run-root") if run_root.is_none() => run_root = Some(value.into()),
                 Some("--runtime-file") => runtime_files.push(value.into()),
                 Some("--device") => devices.push(value.into()),
@@ -94,7 +99,6 @@ impl WorkerOptions {
                 .ok_or_else(|| ExecutionError::invalid("missing --cas-root option"))?,
             run_root: run_root
                 .ok_or_else(|| ExecutionError::invalid("missing --run-root option"))?,
-            libkrun: libkrun.ok_or_else(|| ExecutionError::invalid("missing --libkrun option"))?,
             runtime_files,
             devices,
             tsi_hijack_inet,
@@ -102,6 +106,7 @@ impl WorkerOptions {
     }
 }
 
+#[cfg(feature = "vmm")]
 pub fn execute_from_reader_with_events(
     options: WorkerOptions,
     reader: impl Read,
@@ -123,10 +128,12 @@ pub fn execute_from_reader_with_events(
     })
 }
 
+#[cfg(feature = "vmm")]
 pub fn execute(options: WorkerOptions, request: &ExecutionRequest) -> Result<(), ExecutionError> {
     execute_with_ready(options, request, |_| Ok(()))
 }
 
+#[cfg(feature = "vmm")]
 pub fn execute_with_ready(
     options: WorkerOptions,
     request: &ExecutionRequest,
@@ -142,15 +149,13 @@ pub fn execute_with_ready(
     }
     config.rootfs = materialize_ephemeral_rootfs(&config.rootfs, &options.run_root)?;
 
-    // Loading occurs before nono is applied because the platform dynamic
-    // loader may need to resolve libkrun's transitive libraries. All actual VM
+    // libkrun is linked into this binary; the only library it loads is
+    // libkrunfw, at `krun_create_ctx` inside `prepare_vm` — after nono is
+    // applied — so libkrunfw must be among the `--runtime-file` grants. All VM
     // configuration and execution happen after ambient authority is dropped.
-    let api = DynamicKrunApi::load(&options.libkrun)?;
     verify_ephemeral_rootfs(&config.rootfs)?;
-    let mut runtime_files = options.runtime_files;
-    runtime_files.push(options.libkrun);
     let resources = VmmHostResources {
-        runtime_files,
+        runtime_files: options.runtime_files,
         devices: options.devices,
     };
     // ONE manifest, applied and attested. The previous version built a manifest
@@ -253,7 +258,7 @@ pub fn execute_with_ready(
 
     apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
-    let vm: PreparedVm<'_> = prepare_vm(&api, &config)?;
+    let vm: PreparedVm<'_> = prepare_vm(&LinkedKrunApi, &config)?;
     on_ready(&WorkerEvent::Ready {
         run_id: config.run_id.clone(),
         confinement_digest: manifest.confinement_digest()?,

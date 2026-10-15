@@ -1,18 +1,37 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
+#[cfg(feature = "vmm")]
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+#[cfg(feature = "vmm")]
+use std::sync::Arc;
 
 use crate::ExecutionError;
-use libloading::Library;
 
 use super::plan::KrunConfig;
 
-/// Safe, narrow projection of the libkrun C API used by Leyline.
+/// The virtio-fs request types a custom share implements: `DynFileSystem` and
+/// the FUSE argument and reply types its methods take (`filesystem::Context`,
+/// `Entry`, `FsOptions`, ...). Re-exported from the linked libkrun so a
+/// backend names them through this crate and cannot drift from the VMM that
+/// dispatches to it.
+#[cfg(feature = "vmm")]
+pub use krun::virtio_fs;
+#[cfg(feature = "vmm")]
+pub use krun::virtio_fs::dyn_fs::DynFileSystem;
+
+/// The virtio-fs tag libkrun gives the guest's root filesystem.
+const ROOT_TAG: &CStr = c"/dev/root";
+
+/// Bytes in the virtio-fs device configuration's `tag` field (virtio spec
+/// 5.11.4). libkrun copies the tag into it unchecked and panics inside
+/// `krun_start_enter` on a longer one, so the length is checked here instead.
+pub const VIRTIOFS_TAG_MAX: usize = 36;
+
+/// Safe, narrow projection of the libkrun API used by Leyline.
 ///
-/// The dynamic implementation owns the unsafe ABI boundary. Tests can replace
-/// it at this seam without loading firmware or entering a VMM.
+/// [`LinkedKrunApi`] owns the unsafe ABI boundary. Tests replace it at this
+/// seam without loading firmware or entering a VMM.
 pub trait KrunApi: Send + Sync {
     fn create_context(&self) -> Result<u32, ExecutionError>;
     fn free_context(&self, context: u32);
@@ -22,6 +41,21 @@ pub trait KrunApi: Send + Sync {
         context: u32,
         rootfs: &CStr,
         read_only: bool,
+    ) -> Result<(), ExecutionError>;
+    /// Attach a virtio-fs device whose FUSE requests `backend` answers, in
+    /// this process, instead of a host directory (ADR-0044 V1).
+    ///
+    /// `dax_window` is the guest DAX window in bytes; `0` attaches the device
+    /// without one. The guest mounts it with `mount -t virtiofs <tag> <dir>`.
+    /// Replies carry Linux errno values whatever the host is: the guest is
+    /// Linux.
+    #[cfg(feature = "vmm")]
+    fn add_virtiofs_backend(
+        &self,
+        context: u32,
+        tag: &str,
+        dax_window: u64,
+        backend: Arc<dyn DynFileSystem>,
     ) -> Result<(), ExecutionError>;
     fn disable_implicit_vsock(&self, context: u32) -> Result<(), ExecutionError>;
     /// Add the one vsock device, with an explicit TSI feature mask.
@@ -81,14 +115,6 @@ pub trait KrunApi: Send + Sync {
     fn start_enter(&self, context: u32) -> Result<(), ExecutionError>;
 }
 
-type CreateContextFn = unsafe extern "C" fn() -> i32;
-type FreeContextFn = unsafe extern "C" fn(u32) -> i32;
-type SetVmConfigFn = unsafe extern "C" fn(u32, u8, u32) -> i32;
-type AddVirtiofs3Fn = unsafe extern "C" fn(u32, *const c_char, *const c_char, u64, bool) -> i32;
-type ContextOnlyFn = unsafe extern "C" fn(u32) -> i32;
-type StringOptionFn = unsafe extern "C" fn(u32, *const c_char) -> i32;
-type SetExecFn =
-    unsafe extern "C" fn(u32, *const c_char, *const *const c_char, *const *const c_char) -> i32;
 /// `KRUN_TSI_HIJACK_INET` from `libkrun.h` — carry the guest's `AF_INET`
 /// sockets over vsock instead of leaving them unreachable.
 ///
@@ -96,81 +122,18 @@ type SetExecFn =
 /// place that weakens the boundary says what it is doing.
 pub const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 
-type AddVsockFn = unsafe extern "C" fn(u32, u32) -> i32;
-type AddVsockPort2Fn = unsafe extern "C" fn(u32, u32, *const c_char, bool) -> i32;
-type SetPortMapFn = unsafe extern "C" fn(u32, *const *const c_char) -> i32;
+/// libkrun linked into this binary, built from `rs/third_party/libkrun`: upstream
+/// v1.19.4 plus LLO's patches (ADR-0044). LLO builds the VMM it runs; nothing
+/// is loaded from an installed libkrun. The guest kernel is still the
+/// installed libkrunfw, which libkrun dlopens at `krun_create_ctx`.
+#[cfg(feature = "vmm")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LinkedKrunApi;
 
-/// Dynamically loaded libkrun ABI. Loading at runtime keeps the rest of the
-/// first-party CLI usable on hosts where the optional microVM backend is not
-/// installed.
-pub struct DynamicKrunApi {
-    _library: Library,
-    create_context: CreateContextFn,
-    free_context: FreeContextFn,
-    set_vm_config: SetVmConfigFn,
-    add_virtiofs3: AddVirtiofs3Fn,
-    disable_implicit_vsock: ContextOnlyFn,
-    add_vsock: AddVsockFn,
-    add_vsock_port2: AddVsockPort2Fn,
-    set_port_map: SetPortMapFn,
-    set_workdir: StringOptionFn,
-    set_exec: SetExecFn,
-    start_enter: ContextOnlyFn,
-}
-
-impl fmt::Debug for DynamicKrunApi {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DynamicKrunApi")
-            .finish_non_exhaustive()
-    }
-}
-
-impl DynamicKrunApi {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, ExecutionError> {
-        let path = path.as_ref();
-        // SAFETY: the library stays owned by the returned object for at least
-        // as long as every copied function pointer. Each symbol is loaded with
-        // the signature declared by the corresponding libkrun C header.
-        let library = unsafe { Library::new(path) }.map_err(|error| {
-            ExecutionError::backend(format!(
-                "load libkrun shared library {}: {error}",
-                path.display()
-            ))
-        })?;
-        let create_context = load_symbol(&library, b"krun_create_ctx\0")?;
-        let free_context = load_symbol(&library, b"krun_free_ctx\0")?;
-        let set_vm_config = load_symbol(&library, b"krun_set_vm_config\0")?;
-        let add_virtiofs3 = load_symbol(&library, b"krun_add_virtiofs3\0")?;
-        let disable_implicit_vsock = load_symbol(&library, b"krun_disable_implicit_vsock\0")?;
-        let add_vsock = load_symbol(&library, b"krun_add_vsock\0")?;
-        let add_vsock_port2 = load_symbol(&library, b"krun_add_vsock_port2\0")?;
-        let set_port_map = load_symbol(&library, b"krun_set_port_map\0")?;
-        let set_workdir = load_symbol(&library, b"krun_set_workdir\0")?;
-        let set_exec = load_symbol(&library, b"krun_set_exec\0")?;
-        let start_enter = load_symbol(&library, b"krun_start_enter\0")?;
-
-        Ok(Self {
-            _library: library,
-            create_context,
-            free_context,
-            set_vm_config,
-            add_virtiofs3,
-            disable_implicit_vsock,
-            add_vsock,
-            add_vsock_port2,
-            set_port_map,
-            set_workdir,
-            set_exec,
-            start_enter,
-        })
-    }
-}
-
-impl KrunApi for DynamicKrunApi {
+#[cfg(feature = "vmm")]
+impl KrunApi for LinkedKrunApi {
     fn create_context(&self) -> Result<u32, ExecutionError> {
-        // SAFETY: symbol signature was checked when the library was loaded.
-        let result = unsafe { (self.create_context)() };
+        let result = krun::krun_create_ctx();
         if result < 0 {
             return Err(ffi_error("krun_create_ctx", result));
         }
@@ -178,16 +141,15 @@ impl KrunApi for DynamicKrunApi {
     }
 
     fn free_context(&self, context: u32) {
-        // SAFETY: context was returned by this libkrun instance. Drop cannot
-        // report cleanup failures, so the return code is intentionally ignored.
-        let _ = unsafe { (self.free_context)(context) };
+        // Drop cannot report cleanup failures, so the status is ignored.
+        let _ = krun::krun_free_ctx(context);
     }
 
     fn set_vm_config(&self, context: u32, vcpus: u8, ram_mib: u32) -> Result<(), ExecutionError> {
-        // SAFETY: scalar arguments match the loaded C signature.
-        check_ffi("krun_set_vm_config", unsafe {
-            (self.set_vm_config)(context, vcpus, ram_mib)
-        })
+        check_ffi(
+            "krun_set_vm_config",
+            krun::krun_set_vm_config(context, vcpus, ram_mib),
+        )
     }
 
     fn add_rootfs(
@@ -196,19 +158,31 @@ impl KrunApi for DynamicKrunApi {
         rootfs: &CStr,
         read_only: bool,
     ) -> Result<(), ExecutionError> {
-        const ROOT_TAG: &CStr = c"/dev/root";
         // SAFETY: both C strings live through the call; DAX is disabled and
         // the caller explicitly chooses the guest mount's write policy.
         check_ffi("krun_add_virtiofs3", unsafe {
-            (self.add_virtiofs3)(context, ROOT_TAG.as_ptr(), rootfs.as_ptr(), 0, read_only)
+            krun::krun_add_virtiofs3(context, ROOT_TAG.as_ptr(), rootfs.as_ptr(), 0, read_only)
         })
     }
 
+    fn add_virtiofs_backend(
+        &self,
+        context: u32,
+        tag: &str,
+        dax_window: u64,
+        backend: Arc<dyn DynFileSystem>,
+    ) -> Result<(), ExecutionError> {
+        check_ffi(
+            "krun_add_virtiofs_backend",
+            krun::krun_add_virtiofs_backend(context, tag, dax_window, backend),
+        )
+    }
+
     fn add_vsock(&self, context: u32, tsi_features: u32) -> Result<(), ExecutionError> {
-        // SAFETY: scalar arguments match the loaded C signature.
-        check_ffi("krun_add_vsock", unsafe {
-            (self.add_vsock)(context, tsi_features)
-        })
+        check_ffi(
+            "krun_add_vsock",
+            krun::krun_add_vsock(context, tsi_features),
+        )
     }
 
     fn add_vsock_port(
@@ -220,7 +194,7 @@ impl KrunApi for DynamicKrunApi {
     ) -> Result<(), ExecutionError> {
         // SAFETY: the path outlives the call; libkrun copies it.
         check_ffi("krun_add_vsock_port2", unsafe {
-            (self.add_vsock_port2)(context, port, host_path.as_ptr(), listen)
+            krun::krun_add_vsock_port2(context, port, host_path.as_ptr(), listen)
         })
     }
 
@@ -230,29 +204,25 @@ impl KrunApi for DynamicKrunApi {
         // port", and a pointer to an immediately-terminated array as "expose
         // none". An empty `entries` therefore builds `[NULL]` — one element,
         // the terminator — which is the closed default, not the open one.
-        let pointers: Vec<*const c_char> = entries
-            .iter()
-            .map(|entry| entry.as_ptr())
-            .chain(std::iter::once(std::ptr::null()))
-            .collect();
+        let pointers = null_terminated(entries);
         // SAFETY: `entries` owns the strings and `pointers` the array, both
         // alive across the call; libkrun copies what it needs.
         check_ffi("krun_set_port_map", unsafe {
-            (self.set_port_map)(context, pointers.as_ptr())
+            krun::krun_set_port_map(context, pointers.as_ptr())
         })
     }
 
     fn disable_implicit_vsock(&self, context: u32) -> Result<(), ExecutionError> {
-        // SAFETY: scalar argument matches the loaded C signature.
-        check_ffi("krun_disable_implicit_vsock", unsafe {
-            (self.disable_implicit_vsock)(context)
-        })
+        check_ffi(
+            "krun_disable_implicit_vsock",
+            krun::krun_disable_implicit_vsock(context),
+        )
     }
 
     fn set_workdir(&self, context: u32, workdir: &CStr) -> Result<(), ExecutionError> {
         // SAFETY: the C string lives through the call.
         check_ffi("krun_set_workdir", unsafe {
-            (self.set_workdir)(context, workdir.as_ptr())
+            krun::krun_set_workdir(context, workdir.as_ptr())
         })
     }
 
@@ -268,7 +238,7 @@ impl KrunApi for DynamicKrunApi {
         // SAFETY: all strings and both NULL-terminated pointer arrays live
         // through the call.
         check_ffi("krun_set_exec", unsafe {
-            (self.set_exec)(
+            krun::krun_set_exec(
                 context,
                 executable.as_ptr(),
                 arguments.as_ptr(),
@@ -278,44 +248,13 @@ impl KrunApi for DynamicKrunApi {
     }
 
     fn start_enter(&self, context: u32) -> Result<(), ExecutionError> {
-        // SAFETY: context is consumed by libkrun. On success this call exits
-        // the worker process and therefore does not return.
-        check_ffi("krun_start_enter", unsafe { (self.start_enter)(context) })
+        // On success libkrun runs the guest and exits this process with the
+        // guest's status, so this returns only for a pre-entry error.
+        check_ffi("krun_start_enter", krun::krun_start_enter(context))
     }
 }
 
-fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, ExecutionError> {
-    // SAFETY: callers provide the exact function-pointer type from libkrun.h;
-    // the copied pointer cannot outlive `library` because it is stored beside
-    // the owning Library in DynamicKrunApi.
-    let symbol = unsafe { library.get::<T>(name) }.map_err(|error| {
-        let name = String::from_utf8_lossy(name)
-            .trim_end_matches('\0')
-            .to_owned();
-        // A missing symbol here is almost always a libkrun older than this
-        // build expects, and the raw dlopen error does not say so. Naming the
-        // cause is the difference between "upgrade libkrun" and an afternoon
-        // spent on a linker message.
-        //
-        // `krun_add_vsock` is the newest of the three the vsock listener work
-        // added (`ley-line-open-17536d`) and is therefore the usual one to
-        // fail. Tested against libkrun 1.19.4; the true floor is whichever
-        // release first exported it, which we have not measured.
-        let hint = match name.as_str() {
-            "krun_add_vsock" | "krun_add_vsock_port2" | "krun_set_port_map" => {
-                " — this build needs a libkrun exporting the explicit vsock and \
-                 port-map API (tested against 1.19.4). An older libkrun cannot \
-                 be used: without krun_set_port_map the guest's listening ports \
-                 would be exposed to the host by default, so the backend refuses \
-                 rather than running with a weaker boundary than it reports."
-            }
-            _ => "",
-        };
-        ExecutionError::backend(format!("load libkrun symbol {name}: {error}{hint}"))
-    })?;
-    Ok(*symbol)
-}
-
+#[cfg(feature = "vmm")]
 fn null_terminated(values: &[CString]) -> Vec<*const c_char> {
     values
         .iter()
@@ -324,6 +263,24 @@ fn null_terminated(values: &[CString]) -> Vec<*const c_char> {
         .collect()
 }
 
+/// A virtio-fs tag the guest can mount and libkrun can attach: 1 to
+/// [`VIRTIOFS_TAG_MAX`] bytes, no NUL, and not the root filesystem's tag, which
+/// would put a second device under the name the guest boots from.
+pub fn check_virtiofs_tag(tag: &str) -> Result<(), ExecutionError> {
+    if tag.is_empty() || tag.len() > VIRTIOFS_TAG_MAX || tag.contains('\0') {
+        return Err(ExecutionError::invalid(format!(
+            "virtio-fs tag {tag:?} must be 1 to {VIRTIOFS_TAG_MAX} bytes with no NUL"
+        )));
+    }
+    if tag.as_bytes() == ROOT_TAG.to_bytes() {
+        return Err(ExecutionError::invalid(format!(
+            "virtio-fs tag {tag:?} is the guest root filesystem's"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vmm")]
 fn check_ffi(operation: &str, result: i32) -> Result<(), ExecutionError> {
     if result == 0 {
         Ok(())
@@ -332,6 +289,7 @@ fn check_ffi(operation: &str, result: i32) -> Result<(), ExecutionError> {
     }
 }
 
+#[cfg(feature = "vmm")]
 fn ffi_error(operation: &str, result: i32) -> ExecutionError {
     ExecutionError::backend(format!("{operation} failed with libkrun status {result}"))
 }
@@ -353,6 +311,21 @@ impl fmt::Debug for PreparedVm<'_> {
 impl PreparedVm<'_> {
     pub fn context_id(&self) -> u32 {
         self.context.expect("prepared VM always owns a context")
+    }
+
+    /// Give the guest a virtio-fs share served by `backend` from this process
+    /// (ADR-0044 V1). Called between [`prepare_vm`] and [`PreparedVm::enter`];
+    /// the backend lives as long as the VMM, which is the rest of the process.
+    #[cfg(feature = "vmm")]
+    pub fn add_virtiofs_backend(
+        &self,
+        tag: &str,
+        dax_window: u64,
+        backend: Arc<dyn DynFileSystem>,
+    ) -> Result<(), ExecutionError> {
+        check_virtiofs_tag(tag)?;
+        self.api
+            .add_virtiofs_backend(self.context_id(), tag, dax_window, backend)
     }
 
     /// Enter the VMM. A successful libkrun invocation takes over and exits the

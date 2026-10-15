@@ -66,13 +66,19 @@ fn a_cold_parse_stores_every_file_with_its_mode() {
     let result = parse_into_conn(&conn, root, None, None).unwrap();
 
     let expected = BTreeMap::from([
-        ("Makefile.local".to_string(), file(Mode::Regular, b"all:\n\ttrue\n")),
+        (
+            "Makefile.local".to_string(),
+            file(Mode::Regular, b"all:\n\ttrue\n"),
+        ),
         ("README.md".to_string(), file(Mode::Regular, b"# notes\n")),
         ("a.go".to_string(), file(Mode::Regular, GO.as_bytes())),
         ("empty".to_string(), Entry::Dir),
         ("empty/inner".to_string(), Entry::Dir),
         ("link".to_string(), file(Mode::Symlink, b"README.md")),
-        ("run.sh".to_string(), file(Mode::Executable, b"#!/bin/sh\necho hi\n")),
+        (
+            "run.sh".to_string(),
+            file(Mode::Executable, b"#!/bin/sh\necho hi\n"),
+        ),
         ("sub".to_string(), Entry::Dir),
         ("sub/b.go".to_string(), file(Mode::Regular, GO.as_bytes())),
     ]);
@@ -83,7 +89,10 @@ fn a_cold_parse_stores_every_file_with_its_mode() {
     // `README.md` (markdown) and `run.sh` (bash) are projected;
     // `Makefile.local` names no grammar and is stored only, and the symlink
     // is never followed.
-    assert_eq!(projected(&conn), ["README.md", "a.go", "run.sh", "sub/b.go"]);
+    assert_eq!(
+        projected(&conn),
+        ["README.md", "a.go", "run.sh", "sub/b.go"]
+    );
     let parser_id = crate::tree_root::ParserInputs::current(
         &leyline_ts::query_engine::resolve_query_set(&conn, &Default::default())
             .unwrap()
@@ -150,7 +159,10 @@ fn a_syntax_error_is_projected_with_a_diagnostic_that_a_fix_clears() {
     assert!(d.projected);
     assert_eq!(d.blob, broken.hash());
     let (start, end, row, _col) = d.span.expect("a projected diagnostic has a span");
-    assert!(start <= end && end as usize <= broken.len(), "{start}..{end}");
+    assert!(
+        start <= end && end as usize <= broken.len(),
+        "{start}..{end}"
+    );
     assert_eq!(row, 2, "the error is on the third line");
     assert!(d.message.contains("syntax error"), "{}", d.message);
 

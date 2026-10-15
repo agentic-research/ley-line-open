@@ -736,9 +736,8 @@ fn truncate_by_path_is_a_proposal_of_its_own() {
 
     // Truncating to bytes that do not parse lands them, with a diagnostic
     // (ADR-0045 T3).
-    let (attr, _) = f
-        .fs
-        .setattr(
+    let (attr, _) =
+        f.fs.setattr(
             a,
             None,
             SetAttr {

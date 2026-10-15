@@ -842,7 +842,9 @@ mod tests {
     }
 
     fn stored(c: &Checkout, path: &str) -> Option<Hash> {
-        crate::tree::entry(&c.conn, path).unwrap().and_then(Entry::blob)
+        crate::tree::entry(&c.conn, path)
+            .unwrap()
+            .and_then(Entry::blob)
     }
 
     /// A regular file holding `text`, as the checkout compares entries.
@@ -940,7 +942,10 @@ mod tests {
         let r = reconcile(&c.conn, &c.src, None, Some(&scope(&["sub/c.go"]))).unwrap();
         assert_eq!(r.removed, ["sub/c.go"]);
         assert!(c.src.join("sub").is_dir());
-        assert_eq!(crate::tree::entry(&c.conn, "sub").unwrap(), Some(Entry::Dir));
+        assert_eq!(
+            crate::tree::entry(&c.conn, "sub").unwrap(),
+            Some(Entry::Dir)
+        );
 
         // Nothing is left to do.
         let quiet = reconcile(&c.conn, &c.src, None, None).unwrap();
@@ -1204,7 +1209,9 @@ mod tests {
         index.sort();
         assert_eq!(index, ["a.go", "x.py"]);
         let projected: i64 = conn
-            .query_row("SELECT count(*) FROM _source WHERE id = 'x.py'", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM _source WHERE id = 'x.py'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(projected, 0);
     }
@@ -1227,7 +1234,10 @@ mod tests {
         std::fs::write(c.src.join("big.go"), &big).unwrap();
         let scope = ["d.go".to_string(), "big.go".to_string()];
         reconcile(&c.conn, &c.src, None, Some(&scope)).unwrap();
-        assert_eq!(crate::tree::entry(&c.conn, "d.go").unwrap(), Some(Entry::Dir));
+        assert_eq!(
+            crate::tree::entry(&c.conn, "d.go").unwrap(),
+            Some(Entry::Dir)
+        );
         assert_eq!(stored(&c, "big.go"), Some(h(&big)));
         assert_eq!(indexed(&c, "big.go"), Some(h(&big)));
         let d = crate::tree::diagnostic(&c.conn, "big.go").unwrap().unwrap();
@@ -1252,19 +1262,41 @@ mod tests {
         let r = reconcile(&c.conn, &c.src, None, Some(&paths)).unwrap();
         assert_eq!(r.problems(), None);
         let mode_of = |rel: &str| {
-            std::fs::symlink_metadata(c.src.join(rel)).unwrap().permissions().mode() & 0o777
+            std::fs::symlink_metadata(c.src.join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
         };
         assert_eq!(mode_of("a.go") & 0o111, 0o111, "a.go is executable");
-        assert_eq!(std::fs::read_link(c.src.join("link")).unwrap(), Path::new("a.go"));
+        assert_eq!(
+            std::fs::read_link(c.src.join("link")).unwrap(),
+            Path::new("a.go")
+        );
         assert!(c.src.join("empty/inner").is_dir());
         assert_eq!(disk(&c, "notes.txt").as_deref(), Some("n\n"));
         let index = index_entries(&c.conn).unwrap();
-        assert_eq!(index["a.go"], Entry::File { mode: Mode::Executable, blob: h(A) });
-        assert_eq!(index["link"], Entry::File { mode: Mode::Symlink, blob: h("a.go") });
+        assert_eq!(
+            index["a.go"],
+            Entry::File {
+                mode: Mode::Executable,
+                blob: h(A)
+            }
+        );
+        assert_eq!(
+            index["link"],
+            Entry::File {
+                mode: Mode::Symlink,
+                blob: h("a.go")
+            }
+        );
         assert_eq!(index["empty/inner"], Entry::Dir);
         // Nothing left to do, and a whole pass reads nothing back.
         let quiet = reconcile(&c.conn, &c.src, None, None).unwrap();
-        assert!(quiet.materialized.is_empty() && quiet.conflicts.is_empty(), "{quiet:?}");
+        assert!(
+            quiet.materialized.is_empty() && quiet.conflicts.is_empty(),
+            "{quiet:?}"
+        );
 
         // The store removes the directory and the link, and clears the bit.
         tree(vec![
@@ -1286,13 +1318,22 @@ mod tests {
         reconcile(&c.conn, &c.src, None, None).unwrap();
         assert_eq!(
             crate::tree::entry(&c.conn, "b.go").unwrap(),
-            Some(Entry::File { mode: Mode::Executable, blob: h(B) })
+            Some(Entry::File {
+                mode: Mode::Executable,
+                blob: h(B)
+            })
         );
         assert_eq!(
             crate::tree::entry(&c.conn, "l2").unwrap(),
-            Some(Entry::File { mode: Mode::Symlink, blob: h("b.go") })
+            Some(Entry::File {
+                mode: Mode::Symlink,
+                blob: h("b.go")
+            })
         );
-        assert_eq!(crate::tree::entry(&c.conn, "made").unwrap(), Some(Entry::Dir));
+        assert_eq!(
+            crate::tree::entry(&c.conn, "made").unwrap(),
+            Some(Entry::Dir)
+        );
     }
 
     #[test]

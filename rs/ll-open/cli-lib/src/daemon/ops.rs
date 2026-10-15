@@ -4539,9 +4539,15 @@ mod tests {
             ]}),
         );
         assert_eq!(r["ok"], true, "{r}");
-        let run = call(&ctx, serde_json::json!({"op": "read_source", "path": "bin/run"}));
+        let run = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "bin/run"}),
+        );
         assert_eq!(run["mode"], "100755", "{run}");
-        let dir = call(&ctx, serde_json::json!({"op": "read_source", "path": "empty"}));
+        let dir = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "empty"}),
+        );
         assert_eq!(dir["ok"], false, "{dir}");
         let removed = call(
             &ctx,
@@ -4555,7 +4561,10 @@ mod tests {
             ]}),
         );
         assert_eq!(bad["ok"], false, "{bad}");
-        assert!(bad.get("refusal").is_none(), "a malformed request, not a refusal: {bad}");
+        assert!(
+            bad.get("refusal").is_none(),
+            "a malformed request, not a refusal: {bad}"
+        );
         assert!(bad["error"].as_str().unwrap().contains("mode"), "{bad}");
     }
 
@@ -4689,7 +4698,10 @@ mod tests {
                 "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
                 rusqlite::params![key, PROPOSE_A.as_bytes()],
             )?;
-            conn.execute("UPDATE _tree SET blob_hash = ?1 WHERE path = 'a.go'", [&key])?;
+            conn.execute(
+                "UPDATE _tree SET blob_hash = ?1 WHERE path = 'a.go'",
+                [&key],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -4798,15 +4810,19 @@ mod tests {
         );
         ctx.with_write(|conn| {
             crate::checkout::reconcile(conn, dir.path(), Some("go"), None)?;
-            let projected: i64 =
-                conn.query_row("SELECT count(*) FROM _source WHERE id = 'tool.py'", [], |r| {
-                    r.get(0)
-                })?;
+            let projected: i64 = conn.query_row(
+                "SELECT count(*) FROM _source WHERE id = 'tool.py'",
+                [],
+                |r| r.get(0),
+            )?;
             assert_eq!(projected, 0);
             Ok(())
         })
         .unwrap();
-        let read = call(&ctx, serde_json::json!({"op": "read_source", "path": "tool.py"}));
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "tool.py"}),
+        );
         assert_eq!(read["content"], "x = 1\n", "{read}");
         let go = call(
             &ctx,

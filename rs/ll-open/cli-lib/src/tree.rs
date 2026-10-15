@@ -284,7 +284,11 @@ pub struct Diagnostic {
 }
 
 /// Replace `path`'s diagnostic with `diagnostic` (`None` clears it).
-pub fn set_diagnostic(conn: &Connection, path: &str, diagnostic: Option<&Diagnostic>) -> Result<()> {
+pub fn set_diagnostic(
+    conn: &Connection,
+    path: &str,
+    diagnostic: Option<&Diagnostic>,
+) -> Result<()> {
     conn.prepare_cached("DELETE FROM _parse_diagnostics WHERE path = ?1")?
         .execute([path])?;
     if let Some(d) = diagnostic {
@@ -327,10 +331,9 @@ pub fn diagnostic(conn: &Connection, path: &str) -> Result<Option<Diagnostic>> {
     })
     .optional()?
     .map(|(blob, projected, span, message)| {
-        let blob: [u8; 32] = blob
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("_parse_diagnostics {path:?} blob_hash is not 32 bytes"))?;
+        let blob: [u8; 32] = blob.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!("_parse_diagnostics {path:?} blob_hash is not 32 bytes")
+        })?;
         Ok(Diagnostic {
             path: path.to_string(),
             blob: Hash::from_bytes(blob),
@@ -361,7 +364,11 @@ mod tests {
             assert_eq!(Mode::from_octal(&m.octal()), Some(m));
             assert_eq!(Mode::from_git(m.git()), Some(m));
         }
-        assert_eq!(Mode::from_octal("040000"), None, "a directory is not a file mode");
+        assert_eq!(
+            Mode::from_octal("040000"),
+            None,
+            "a directory is not a file mode"
+        );
         assert_eq!(Mode::from_octal("100600"), None);
         assert_eq!(Mode::from_octal("x"), None);
         assert_eq!(Entry::Dir.git_mode(), 0o040000);
@@ -391,7 +398,10 @@ mod tests {
         remove(&c, "a/b/c.go").unwrap();
         assert_eq!(entry(&c, "a/b").unwrap(), Some(Entry::Dir));
         assert_eq!(entry(&c, "a/b/c.go").unwrap(), None);
-        assert_eq!(under(&c, "a").unwrap(), vec![("a/b".to_string(), Entry::Dir)]);
+        assert_eq!(
+            under(&c, "a").unwrap(),
+            vec![("a/b".to_string(), Entry::Dir)]
+        );
     }
 
     #[test]
@@ -408,10 +418,8 @@ mod tests {
     #[test]
     fn an_entry_git_does_not_store_fails_closed() {
         let c = conn();
-        c.execute_batch(
-            "INSERT INTO _tree (path, mode, blob_hash) VALUES ('x', 33188, NULL);",
-        )
-        .unwrap();
+        c.execute_batch("INSERT INTO _tree (path, mode, blob_hash) VALUES ('x', 33188, NULL);")
+            .unwrap();
         let err = entries(&c).unwrap_err().to_string();
         assert!(err.contains("no blob_hash"), "{err}");
         c.execute_batch("UPDATE _tree SET mode = 33152, blob_hash = zeroblob(32);")

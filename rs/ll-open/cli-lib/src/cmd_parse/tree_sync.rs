@@ -21,7 +21,10 @@ use crate::tree::{self, Diagnostic, Entry, Mode};
 /// What the pass decided per path.
 enum Seen<'a> {
     /// A file or symlink on disk.
-    Disk { abs: PathBuf, symlink: bool },
+    Disk {
+        abs: PathBuf,
+        symlink: bool,
+    },
     /// File bytes read from memory.
     Memory(&'a [u8]),
     Dir,
@@ -92,8 +95,10 @@ pub(crate) fn link_bytes(abs: &Path) -> Result<Vec<u8>> {
 /// Store `bytes` in `source_blobs` (once per hash) and return their hash.
 pub(crate) fn store_blob(conn: &Connection, bytes: &[u8]) -> Result<Hash> {
     let hash = bytes.hash();
-    conn.prepare_cached("INSERT OR IGNORE INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)")?
-        .execute(rusqlite::params![hash.as_bytes().as_slice(), bytes])?;
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+    )?
+    .execute(rusqlite::params![hash.as_bytes().as_slice(), bytes])?;
     Ok(hash)
 }
 
@@ -149,7 +154,13 @@ pub(super) fn sync(
                         seen.insert(rel.clone(), Seen::Dir);
                     }
                     Ok(m) if m.is_file() => {
-                        seen.insert(rel.clone(), Seen::Disk { abs, symlink: false });
+                        seen.insert(
+                            rel.clone(),
+                            Seen::Disk {
+                                abs,
+                                symlink: false,
+                            },
+                        );
                     }
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -209,7 +220,10 @@ pub(super) fn sync(
         }
         tree::remove(conn, rel)?;
         // A directory gone from disk takes what the store held under it.
-        if was == Some(Entry::Dir) && !whole && !memory.is_some_and(|m| m.edits().rmdirs.contains(rel)) {
+        if was == Some(Entry::Dir)
+            && !whole
+            && !memory.is_some_and(|m| m.edits().rmdirs.contains(rel))
+        {
             for (under, _) in tree::under(conn, rel)? {
                 tree::remove(conn, &under)?;
             }
@@ -253,8 +267,10 @@ pub(super) fn sync(
                 {
                     continue; // unchanged since the walk last stored it
                 }
+                // A symlink's blob is its target; a projected file's blob
+                // is already stored; any other file is read.
                 let bytes = if *symlink {
-                    None
+                    Some(link_bytes(abs)?)
                 } else if outcomes.projected.contains_key(rel.as_str()) {
                     None
                 } else {
@@ -266,7 +282,6 @@ pub(super) fn sync(
                         }
                     }
                 };
-                let bytes = if *symlink { Some(link_bytes(abs)?) } else { bytes };
                 (mode, Some(stat), bytes)
             }
         };

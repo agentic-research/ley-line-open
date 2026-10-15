@@ -35,7 +35,11 @@ fn lay_out(root: &Path, tree: &[(&str, Node)]) {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let bits = if *mode == Mode::Executable { 0o755 } else { 0o644 };
+                    let bits = if *mode == Mode::Executable {
+                        0o755
+                    } else {
+                        0o644
+                    };
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(bits)).unwrap();
                 }
             }
@@ -98,7 +102,11 @@ fn stored_text(s: &Store, path: &str) -> Option<String> {
 
 fn projected(s: &Store, path: &str) -> bool {
     s.conn
-        .query_row("SELECT EXISTS(SELECT 1 FROM _source WHERE id = ?1)", [path], |r| r.get(0))
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM _source WHERE id = ?1)",
+            [path],
+            |r| r.get(0),
+        )
         .unwrap()
 }
 
@@ -112,10 +120,14 @@ fn image(s: &Store) -> Vec<u8> {
 fn a_create_of_any_bytes_lands_in_the_store() {
     let s = store(&[("a.go", Node::File(A, Mode::Regular))]);
     let notes = "remember the milk\n";
-    let accepted = tree_propose(&s, vec![Proposed::create("docs/notes.txt", notes.into())]).unwrap();
+    let accepted =
+        tree_propose(&s, vec![Proposed::create("docs/notes.txt", notes.into())]).unwrap();
     assert_eq!(accepted.blobs["docs/notes.txt"], h(notes));
     assert_eq!(stored_text(&s, "docs/notes.txt").as_deref(), Some(notes));
-    assert_eq!(crate::tree::entry(&s.conn, "docs").unwrap(), Some(Entry::Dir));
+    assert_eq!(
+        crate::tree::entry(&s.conn, "docs").unwrap(),
+        Some(Entry::Dir)
+    );
     assert!(!projected(&s, "docs/notes.txt"));
     assert_eq!(
         accepted.tree_root,
@@ -132,12 +144,19 @@ fn a_create_of_any_bytes_lands_in_the_store() {
 fn an_unparseable_write_lands_with_a_diagnostic() {
     let s = store(&[("a.go", Node::File(A, Mode::Regular))]);
     let half = "package a\n\nfunc A() int { return\n";
-    let accepted = tree_propose(&s, vec![Proposed::write("a.go", Base::Blob(h(A)), half.into())]).unwrap();
+    let accepted = tree_propose(
+        &s,
+        vec![Proposed::write("a.go", Base::Blob(h(A)), half.into())],
+    )
+    .unwrap();
     assert_eq!(stored_text(&s, "a.go").as_deref(), Some(half));
     assert!(projected(&s, "a.go"));
     let d = crate::tree::diagnostic(&s.conn, "a.go").unwrap().unwrap();
     assert!(d.projected && d.blob == h(half), "{d:?}");
-    assert_eq!(accepted.tree_root, cold_root(&[("a.go", Node::File(half, Mode::Regular))]));
+    assert_eq!(
+        accepted.tree_root,
+        cold_root(&[("a.go", Node::File(half, Mode::Regular))])
+    );
 }
 
 /// T5: another writer moved the file; this writer's edit touches other
@@ -146,23 +165,51 @@ fn an_unparseable_write_lands_with_a_diagnostic() {
 fn a_moved_base_with_disjoint_edits_lands_the_merge() {
     let s = store(&[("a.go", Node::File(A, Mode::Regular))]);
     let theirs = A.replace("return 3", "return 30");
-    tree_propose(&s, vec![Proposed::write("a.go", Base::Blob(h(A)), theirs.clone().into())]).unwrap();
+    tree_propose(
+        &s,
+        vec![Proposed::write(
+            "a.go",
+            Base::Blob(h(A)),
+            theirs.clone().into(),
+        )],
+    )
+    .unwrap();
     let ours = A.replace("return 1", "return 10");
-    let accepted = tree_propose(&s, vec![Proposed::write("a.go", Base::Blob(h(A)), ours.into())]).unwrap();
-    let both = A.replace("return 1", "return 10").replace("return 3", "return 30");
+    let accepted = tree_propose(
+        &s,
+        vec![Proposed::write("a.go", Base::Blob(h(A)), ours.into())],
+    )
+    .unwrap();
+    let both = A
+        .replace("return 1", "return 10")
+        .replace("return 3", "return 30");
     assert_eq!(accepted.merged, BTreeSet::from(["a.go".to_string()]));
     assert_eq!(accepted.blobs["a.go"], h(&both));
     assert_eq!(stored_text(&s, "a.go").as_deref(), Some(both.as_str()));
-    assert_eq!(accepted.tree_root, cold_root(&[("a.go", Node::File(&*both.leak(), Mode::Regular))]));
+    assert_eq!(
+        accepted.tree_root,
+        cold_root(&[("a.go", Node::File(&*both.leak(), Mode::Regular))])
+    );
 }
 
 /// T5: overlapping hunks refuse; the refusal names the moved path and the
 /// base lines both sides changed, and nothing lands.
 #[test]
 fn overlapping_edits_refuse_stale_with_conflict_ranges() {
-    let s = store(&[("a.go", Node::File(A, Mode::Regular)), ("b.txt", Node::File("b\n", Mode::Regular))]);
+    let s = store(&[
+        ("a.go", Node::File(A, Mode::Regular)),
+        ("b.txt", Node::File("b\n", Mode::Regular)),
+    ]);
     let theirs = A.replace("return 2", "return 20");
-    tree_propose(&s, vec![Proposed::write("a.go", Base::Blob(h(A)), theirs.clone().into())]).unwrap();
+    tree_propose(
+        &s,
+        vec![Proposed::write(
+            "a.go",
+            Base::Blob(h(A)),
+            theirs.clone().into(),
+        )],
+    )
+    .unwrap();
     let before = image(&s);
     let ours = A.replace("return 2", "return 200");
     let err = tree_propose(
@@ -200,9 +247,19 @@ fn binary_files_never_merge() {
         b.push(tail);
         b
     };
-    let base = tree_propose(&s, vec![Proposed::create("img.bin", bin(1))]).unwrap().blobs["img.bin"];
-    tree_propose(&s, vec![Proposed::write("img.bin", Base::Blob(base), bin(2))]).unwrap();
-    let err = tree_propose(&s, vec![Proposed::write("img.bin", Base::Blob(base), bin(3))]).unwrap_err();
+    let base = tree_propose(&s, vec![Proposed::create("img.bin", bin(1))])
+        .unwrap()
+        .blobs["img.bin"];
+    tree_propose(
+        &s,
+        vec![Proposed::write("img.bin", Base::Blob(base), bin(2))],
+    )
+    .unwrap();
+    let err = tree_propose(
+        &s,
+        vec![Proposed::write("img.bin", Base::Blob(base), bin(3))],
+    )
+    .unwrap_err();
     assert!(matches!(refused(err), Refusal::Stale(m) if m.len() == 1 && m[0].path == "img.bin"));
 }
 
@@ -212,11 +269,22 @@ fn binary_files_never_merge() {
 fn deletes_and_creates_against_a_moved_path() {
     let s = store(&[("a.go", Node::File(A, Mode::Regular))]);
     let moved = A.replace("return 1", "return 9");
-    tree_propose(&s, vec![Proposed::write("a.go", Base::Blob(h(A)), moved.clone().into())]).unwrap();
+    tree_propose(
+        &s,
+        vec![Proposed::write(
+            "a.go",
+            Base::Blob(h(A)),
+            moved.clone().into(),
+        )],
+    )
+    .unwrap();
     let err = tree_propose(&s, vec![Proposed::delete("a.go", Base::Blob(h(A)))]).unwrap_err();
     assert!(matches!(refused(err), Refusal::Stale(_)));
 
-    let root = crate::tree_root::DerivedFrom::read(&s.conn).unwrap().unwrap().tree_root;
+    let root = crate::tree_root::DerivedFrom::read(&s.conn)
+        .unwrap()
+        .unwrap()
+        .tree_root;
     let same = tree_propose(&s, vec![Proposed::create("a.go", moved.clone().into())]).unwrap();
     assert_eq!(same.tree_root, root, "an identical create changes nothing");
     let err = tree_propose(&s, vec![Proposed::create("a.go", A.into())]).unwrap_err();
@@ -234,22 +302,36 @@ fn deletes_and_creates_against_a_moved_path() {
 /// symlink is a write whose bytes are its target, and is never projected.
 #[test]
 fn modes_and_symlinks_are_proposals() {
-    let s = store(&[("a.go", Node::File(A, Mode::Regular)), ("run.sh", Node::File("echo\n", Mode::Regular))]);
+    let s = store(&[
+        ("a.go", Node::File(A, Mode::Regular)),
+        ("run.sh", Node::File("echo\n", Mode::Regular)),
+    ]);
     let accepted = tree_propose(
         &s,
         vec![
-            Proposed::write_mode("run.sh", Base::Blob(h("echo\n")), "echo\n".into(), Mode::Executable),
+            Proposed::write_mode(
+                "run.sh",
+                Base::Blob(h("echo\n")),
+                "echo\n".into(),
+                Mode::Executable,
+            ),
             Proposed::write_mode("link.go", Base::Absent, "a.go".into(), Mode::Symlink),
         ],
     )
     .unwrap();
     assert_eq!(
         crate::tree::entry(&s.conn, "run.sh").unwrap(),
-        Some(Entry::File { mode: Mode::Executable, blob: h("echo\n") })
+        Some(Entry::File {
+            mode: Mode::Executable,
+            blob: h("echo\n")
+        })
     );
     assert_eq!(
         crate::tree::entry(&s.conn, "link.go").unwrap(),
-        Some(Entry::File { mode: Mode::Symlink, blob: h("a.go") })
+        Some(Entry::File {
+            mode: Mode::Symlink,
+            blob: h("a.go")
+        })
     );
     assert!(!projected(&s, "link.go"), "a symlink is never projected");
     assert_eq!(
@@ -261,15 +343,31 @@ fn modes_and_symlinks_are_proposals() {
         ])
     );
     // A write naming no mode keeps the entry's mode.
-    tree_propose(&s, vec![Proposed::write("run.sh", Base::Blob(h("echo\n")), "echo 2\n".into())]).unwrap();
+    tree_propose(
+        &s,
+        vec![Proposed::write(
+            "run.sh",
+            Base::Blob(h("echo\n")),
+            "echo 2\n".into(),
+        )],
+    )
+    .unwrap();
     assert_eq!(
         crate::tree::entry(&s.conn, "run.sh").unwrap(),
-        Some(Entry::File { mode: Mode::Executable, blob: h("echo 2\n") })
+        Some(Entry::File {
+            mode: Mode::Executable,
+            blob: h("echo 2\n")
+        })
     );
     // A symlink does not merge: a moved symlink refuses.
     let err = tree_propose(
         &s,
-        vec![Proposed::write_mode("link.go", Base::Blob(h("b.go")), "c.go".into(), Mode::Symlink)],
+        vec![Proposed::write_mode(
+            "link.go",
+            Base::Blob(h("b.go")),
+            "c.go".into(),
+            Mode::Symlink,
+        )],
     )
     .unwrap_err();
     assert!(matches!(refused(err), Refusal::Stale(_)));
@@ -278,11 +376,20 @@ fn modes_and_symlinks_are_proposals() {
 /// T4: directories are entries a proposal makes and removes.
 #[test]
 fn mkdir_and_rmdir_are_proposals() {
-    let s = store(&[("a.go", Node::File(A, Mode::Regular)), ("sub/b.txt", Node::File("b\n", Mode::Regular))]);
+    let s = store(&[
+        ("a.go", Node::File(A, Mode::Regular)),
+        ("sub/b.txt", Node::File("b\n", Mode::Regular)),
+    ]);
     let accepted = tree_propose(&s, vec![Proposed::mkdir("empty/inner")]).unwrap();
     assert_eq!(accepted.mkdirs, BTreeSet::from(["empty/inner".to_string()]));
-    assert_eq!(crate::tree::entry(&s.conn, "empty").unwrap(), Some(Entry::Dir));
-    assert_eq!(crate::tree::entry(&s.conn, "empty/inner").unwrap(), Some(Entry::Dir));
+    assert_eq!(
+        crate::tree::entry(&s.conn, "empty").unwrap(),
+        Some(Entry::Dir)
+    );
+    assert_eq!(
+        crate::tree::entry(&s.conn, "empty/inner").unwrap(),
+        Some(Entry::Dir)
+    );
     assert_eq!(
         accepted.tree_root,
         cold_root(&[
@@ -294,11 +401,32 @@ fn mkdir_and_rmdir_are_proposals() {
 
     let before = image(&s);
     let refusal = |w: Proposed| refused(tree_propose(&s, vec![w]).unwrap_err());
-    assert_eq!(refusal(Proposed::mkdir("sub")), Refusal::Exists { path: "sub".into() });
-    assert_eq!(refusal(Proposed::mkdir("a.go")), Refusal::Exists { path: "a.go".into() });
-    assert_eq!(refusal(Proposed::rmdir("sub")), Refusal::NotEmpty { path: "sub".into() });
-    assert_eq!(refusal(Proposed::rmdir("a.go")), Refusal::NotADirectory { path: "a.go".into() });
-    assert_eq!(refusal(Proposed::rmdir("nope")), Refusal::NoSuchFile { path: "nope".into() });
+    assert_eq!(
+        refusal(Proposed::mkdir("sub")),
+        Refusal::Exists { path: "sub".into() }
+    );
+    assert_eq!(
+        refusal(Proposed::mkdir("a.go")),
+        Refusal::Exists {
+            path: "a.go".into()
+        }
+    );
+    assert_eq!(
+        refusal(Proposed::rmdir("sub")),
+        Refusal::NotEmpty { path: "sub".into() }
+    );
+    assert_eq!(
+        refusal(Proposed::rmdir("a.go")),
+        Refusal::NotADirectory {
+            path: "a.go".into()
+        }
+    );
+    assert_eq!(
+        refusal(Proposed::rmdir("nope")),
+        Refusal::NoSuchFile {
+            path: "nope".into()
+        }
+    );
     assert_eq!(
         refusal(Proposed::write("sub", Base::Any, "x".into())),
         Refusal::IsADirectory { path: "sub".into() }
@@ -307,27 +435,57 @@ fn mkdir_and_rmdir_are_proposals() {
         refusal(Proposed::delete("sub", Base::Any)),
         Refusal::IsADirectory { path: "sub".into() }
     );
-    assert_eq!(refusal(Proposed::create("sub", "x".into())), Refusal::Exists { path: "sub".into() });
     assert_eq!(
-        refusal(Proposed::create("a.go/x", "x".into())),
-        Refusal::PathConflict { path: "a.go/x".into(), other: "a.go".into() }
+        refusal(Proposed::create("sub", "x".into())),
+        Refusal::Exists { path: "sub".into() }
     );
     assert_eq!(
-        refusal(Proposed { path: "d".into(), base: Base::Any, change: Change::Mkdir }),
+        refusal(Proposed::create("a.go/x", "x".into())),
+        Refusal::PathConflict {
+            path: "a.go/x".into(),
+            other: "a.go".into()
+        }
+    );
+    assert_eq!(
+        refusal(Proposed {
+            path: "d".into(),
+            base: Base::Any,
+            change: Change::Mkdir
+        }),
         Refusal::MalformedBase { path: "d".into() }
     );
     assert_eq!(
-        refusal(Proposed { path: "sub".into(), base: Base::Absent, change: Change::Rmdir }),
+        refusal(Proposed {
+            path: "sub".into(),
+            base: Base::Absent,
+            change: Change::Rmdir
+        }),
         Refusal::MalformedBase { path: "sub".into() }
     );
-    assert_eq!(refusal(Proposed::mkdir("../up")), Refusal::MalformedPath { path: "../up".into() });
+    assert_eq!(
+        refusal(Proposed::mkdir("../up")),
+        Refusal::MalformedPath {
+            path: "../up".into()
+        }
+    );
     assert_eq!(image(&s), before, "every refusal changes nothing");
 
     // The last file leaves; its directory stays, empty, until an rmdir in
     // the same proposal or a later one removes it.
-    tree_propose(&s, vec![Proposed::delete("sub/b.txt", Base::Blob(h("b\n")))]).unwrap();
-    assert_eq!(crate::tree::entry(&s.conn, "sub").unwrap(), Some(Entry::Dir));
-    let accepted = tree_propose(&s, vec![Proposed::rmdir("sub"), Proposed::rmdir("empty/inner")]).unwrap();
+    tree_propose(
+        &s,
+        vec![Proposed::delete("sub/b.txt", Base::Blob(h("b\n")))],
+    )
+    .unwrap();
+    assert_eq!(
+        crate::tree::entry(&s.conn, "sub").unwrap(),
+        Some(Entry::Dir)
+    );
+    let accepted = tree_propose(
+        &s,
+        vec![Proposed::rmdir("sub"), Proposed::rmdir("empty/inner")],
+    )
+    .unwrap();
     assert_eq!(crate::tree::entry(&s.conn, "sub").unwrap(), None);
     assert_eq!(
         accepted.tree_root,
@@ -352,7 +510,15 @@ fn a_directory_rename_is_one_proposal() {
     let paths: Vec<String> = crate::tree::entries(&s.conn).unwrap().into_keys().collect();
     assert_eq!(
         paths,
-        ["a.go", "lib", "lib/b.go", "lib/deep", "lib/deep/c.txt", "lib/empty", "lib/tool"]
+        [
+            "a.go",
+            "lib",
+            "lib/b.go",
+            "lib/deep",
+            "lib/deep/c.txt",
+            "lib/empty",
+            "lib/tool"
+        ]
     );
     assert!(projected(&s, "lib/b.go") && !projected(&s, "pkg/b.go"));
     assert_eq!(
@@ -367,9 +533,20 @@ fn a_directory_rename_is_one_proposal() {
     );
     // A rename whose source moved since it was planned refuses whole.
     let writes = rename_dir(&s.conn, "lib", "src").unwrap();
-    tree_propose(&s, vec![Proposed::write("lib/deep/c.txt", Base::Any, "moved\n".into())]).unwrap();
+    tree_propose(
+        &s,
+        vec![Proposed::write(
+            "lib/deep/c.txt",
+            Base::Any,
+            "moved\n".into(),
+        )],
+    )
+    .unwrap();
     let before = image(&s);
-    assert!(matches!(refused(tree_propose(&s, writes).unwrap_err()), Refusal::Stale(_)));
+    assert!(matches!(
+        refused(tree_propose(&s, writes).unwrap_err()),
+        Refusal::Stale(_)
+    ));
     assert_eq!(image(&s), before);
     // Onto an existing directory with entries: refused, nothing moves.
     let err = rename_dir(&s.conn, "lib/deep", "lib").unwrap_err();

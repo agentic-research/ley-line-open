@@ -28,12 +28,11 @@ fn stored_text(f: &Fixture, path: &str) -> Option<String> {
     let Some(StoreEntry::File { blob, .. }) = entry(f, path) else {
         return None;
     };
-    let bytes = f
-        .fs
-        .store()
-        .with_read(|conn| store_tree::blob_bytes(conn, blob))
-        .unwrap()
-        .unwrap();
+    let bytes =
+        f.fs.store()
+            .with_read(|conn| store_tree::blob_bytes(conn, blob))
+            .unwrap()
+            .unwrap();
     Some(String::from_utf8(bytes).unwrap())
 }
 
@@ -85,7 +84,10 @@ fn a_write_against_a_moved_file_stages_and_the_flush_lands_the_merge() {
     assert_eq!(f.fs.flush(h), Ok(()));
     let opened = f.fs.open(a, O_RDONLY).unwrap();
     assert!(!opened.keep_cache, "the guest's pages predate the merge");
-    assert_eq!(f.fs.read(opened.handle, 0, u32::MAX).unwrap(), A_MERGED.as_bytes());
+    assert_eq!(
+        f.fs.read(opened.handle, 0, u32::MAX).unwrap(),
+        A_MERGED.as_bytes()
+    );
 }
 
 /// T5 through the mount: overlapping edits refuse at FLUSH and FSYNC with
@@ -110,12 +112,11 @@ fn a_half_written_file_lands_with_a_diagnostic() {
     assert_eq!(f.fs.write(h, 0, A_BROKEN.as_bytes()), Ok(A_BROKEN.len()));
     assert_eq!(f.fs.flush(h), Ok(()));
     assert_eq!(stored_text(&f, "a.go").as_deref(), Some(A_BROKEN));
-    let d = f
-        .fs
-        .store()
-        .with_read(|conn| store_tree::diagnostic(conn, "a.go"))
-        .unwrap()
-        .unwrap();
+    let d =
+        f.fs.store()
+            .with_read(|conn| store_tree::diagnostic(conn, "a.go"))
+            .unwrap()
+            .unwrap();
     assert!(d.projected, "{d:?}");
 }
 
@@ -162,7 +163,10 @@ fn a_mode_change_is_a_proposal_of_the_mode() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let bits = std::fs::metadata(f.src.path().join("a.go")).unwrap().permissions().mode();
+        let bits = std::fs::metadata(f.src.path().join("a.go"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(bits & 0o111, 0o111);
     }
     let (attr, _) = f.fs.setattr(a, None, set(0o644)).unwrap();
@@ -221,7 +225,10 @@ fn mkdir_and_rmdir_are_proposals() {
     assert_eq!(made.attr.kind, Kind::Directory);
     assert_eq!(entry(&f, "empty"), Some(StoreEntry::Dir));
     assert!(f.src.path().join("empty").is_dir());
-    assert_eq!(lookup_in(&next_session(&f), "empty").unwrap().attr.kind, Kind::Directory);
+    assert_eq!(
+        lookup_in(&next_session(&f), "empty").unwrap().attr.kind,
+        Kind::Directory
+    );
     assert_eq!(f.fs.mkdir(ROOT_INODE, b"empty"), Err(Errno::EEXIST));
     assert_eq!(f.fs.rmdir(ROOT_INODE, b"pkg"), Err(Errno::ENOTEMPTY));
     assert_eq!(f.fs.rmdir(ROOT_INODE, b"a.go"), Err(Errno::ENOTDIR));
@@ -232,7 +239,10 @@ fn mkdir_and_rmdir_are_proposals() {
     let sub = ino(&f, "pkg/sub");
     assert_eq!(f.fs.unlink(sub, b"c.go"), Ok(()));
     assert_eq!(entry(&f, "pkg/sub"), Some(StoreEntry::Dir));
-    assert_eq!(lookup_in(&next_session(&f), "pkg/sub").unwrap().attr.kind, Kind::Directory);
+    assert_eq!(
+        lookup_in(&next_session(&f), "pkg/sub").unwrap().attr.kind,
+        Kind::Directory
+    );
 }
 
 /// T4: a directory RENAME is one proposal over every path under it.
@@ -241,15 +251,25 @@ fn a_directory_rename_is_one_proposal() {
     let f = fixture_with(whole(), true, A);
     let pkg = ino(&f, "pkg");
     let b = ino(&f, "pkg/b.go");
-    assert_eq!(f.fs.rename(ROOT_INODE, b"pkg", ROOT_INODE, b"lib", 0), Ok(()));
-    let paths: Vec<String> = f
-        .fs
-        .store()
-        .with_read(|conn| Ok(store_tree::entries(conn)?.into_keys().collect()))
-        .unwrap();
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"pkg", ROOT_INODE, b"lib", 0),
+        Ok(())
+    );
+    let paths: Vec<String> =
+        f.fs.store()
+            .with_read(|conn| Ok(store_tree::entries(conn)?.into_keys().collect()))
+            .unwrap();
     assert_eq!(
         paths,
-        ["a.go", "lib", "lib/b.go", "lib/sub", "lib/sub/c.go", "secret", "secret/d.go"]
+        [
+            "a.go",
+            "lib",
+            "lib/b.go",
+            "lib/sub",
+            "lib/sub/c.go",
+            "secret",
+            "secret/d.go"
+        ]
     );
     assert_eq!(ino(&f, "lib"), pkg, "the directory's inode follows it");
     assert_eq!(ino(&f, "lib/b.go"), b, "and its files' inodes");
@@ -268,9 +288,18 @@ fn each_new_refusal_answers_its_linux_errno() {
     let h = Hash::from_bytes([1; 32]);
     let path = || "p".to_string();
     assert_eq!(refused(Refusal::Exists { path: path() }), Errno::EEXIST);
-    assert_eq!(refused(Refusal::NotEmpty { path: path() }), Errno::ENOTEMPTY);
-    assert_eq!(refused(Refusal::NotADirectory { path: path() }), Errno::ENOTDIR);
-    assert_eq!(refused(Refusal::IsADirectory { path: path() }), Errno::EISDIR);
+    assert_eq!(
+        refused(Refusal::NotEmpty { path: path() }),
+        Errno::ENOTEMPTY
+    );
+    assert_eq!(
+        refused(Refusal::NotADirectory { path: path() }),
+        Errno::ENOTDIR
+    );
+    assert_eq!(
+        refused(Refusal::IsADirectory { path: path() }),
+        Errno::EISDIR
+    );
     assert_eq!(
         refused(Refusal::PathConflict {
             path: path(),

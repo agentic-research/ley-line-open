@@ -287,9 +287,15 @@ impl Host {
         results.check(
             scenario,
             script["mode"] == "100755" && executable == Some(0o111),
-            format!("run.sh is 100755 in the store ({}) and executable on disk ({executable:?})", script["mode"]),
+            format!(
+                "run.sh is 100755 in the store ({}) and executable on disk ({executable:?})",
+                script["mode"]
+            ),
         );
-        let link = call(&daemon.sock, json!({"op": "read_source", "path": "link.go"}));
+        let link = call(
+            &daemon.sock,
+            json!({"op": "read_source", "path": "link.go"}),
+        );
         let on_disk = fs::read_link(self.checkout.join("link.go")).ok();
         results.check(
             scenario,

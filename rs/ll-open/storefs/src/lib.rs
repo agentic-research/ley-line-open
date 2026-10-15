@@ -1184,7 +1184,11 @@ impl<S: Store> StoreFs<S> {
         // A created path's new parent directories are checked out too.
         let parents: BTreeSet<String> = paths
             .iter()
-            .flat_map(|p| store_tree::parents(p).map(str::to_string).collect::<Vec<_>>())
+            .flat_map(|p| {
+                store_tree::parents(p)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
             .collect();
         paths.extend(parents);
         let named = paths.join("', '");
@@ -1494,7 +1498,9 @@ impl<S: Store> StoreFs<S> {
         )?;
         let whole = self.scope.see == Grant::Whole;
         let mut out = BTreeMap::new();
-        for row in stmt.query_map([&prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))? {
+        for row in stmt.query_map([&prefix], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+        })? {
             let (path, git_mode) = row?;
             let is_dir = git_mode == store_tree::DIRECTORY_MODE;
             let rest = &path[prefix.len()..];

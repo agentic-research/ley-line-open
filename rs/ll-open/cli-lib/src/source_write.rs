@@ -35,8 +35,8 @@ use anyhow::{Context, Result, bail};
 use leyline_core::Hash;
 use rusqlite::{Connection, OptionalExtension};
 
-pub use crate::tree::Mode;
 use crate::tree::Entry;
+pub use crate::tree::Mode;
 
 /// The paths a writer may change: ADR-0029's sub-manifest of paths, the
 /// ring-2 slice grant. `Whole` is the grant the arena's owner holds — the
@@ -477,11 +477,13 @@ fn decide_one(conn: &Connection, w: Proposed) -> Result<Decided> {
         },
         conflicts: None,
     };
-    let plan = |change: Change| Decided::Plan(Plan {
-        path: path.clone(),
-        current,
-        change,
-    });
+    let plan = |change: Change| {
+        Decided::Plan(Plan {
+            path: path.clone(),
+            current,
+            change,
+        })
+    };
     match (&w.change, w.base, current) {
         // Shapes: a create names `Absent`, a delete does not; a mkdir names
         // `Absent` and an rmdir `Any`.
@@ -512,8 +514,7 @@ fn decide_one(conn: &Connection, w: Proposed) -> Result<Decided> {
             use leyline_core::ContentAddressed;
             // A create of exactly what the path holds changes nothing and
             // is accepted (ADR-0045 T5).
-            let identical =
-                bytes.as_slice().hash() == blob && mode.is_none_or(|m| m == held);
+            let identical = bytes.as_slice().hash() == blob && mode.is_none_or(|m| m == held);
             if identical {
                 Ok(plan(w.change))
             } else {
@@ -533,11 +534,11 @@ fn decide_one(conn: &Connection, w: Proposed) -> Result<Decided> {
         (Change::Write { .. } | Change::Delete, Base::Any, Some(Entry::File { .. })) => {
             Ok(plan(w.change))
         }
-        (Change::Write { .. } | Change::Delete, Base::Blob(expected), Some(Entry::File { blob, .. }))
-            if blob == expected =>
-        {
-            Ok(plan(w.change))
-        }
+        (
+            Change::Write { .. } | Change::Delete,
+            Base::Blob(expected),
+            Some(Entry::File { blob, .. }),
+        ) if blob == expected => Ok(plan(w.change)),
         (Change::Delete, Base::Blob(expected), Some(Entry::File { blob, .. })) => {
             Ok(stale(Some(expected), Some(blob), &path))
         }
@@ -772,7 +773,9 @@ pub fn rename_dir(conn: &Connection, from: &str, to: &str) -> Result<Vec<Propose
     match crate::tree::entry(conn, to)? {
         None => writes.push(Proposed::mkdir(to)),
         Some(Entry::Dir) if crate::tree::under(conn, to)?.is_empty() => {}
-        Some(_) => bail!("rename of '{from}' to '{to}': '{to}' exists and is not an empty directory"),
+        Some(_) => {
+            bail!("rename of '{from}' to '{to}': '{to}' exists and is not an empty directory")
+        }
     }
     writes.push(Proposed::rmdir(from));
     for (path, entry) in crate::tree::under(conn, from)? {
@@ -783,8 +786,9 @@ pub fn rename_dir(conn: &Connection, from: &str, to: &str) -> Result<Vec<Propose
                 writes.push(Proposed::mkdir(moved_to));
             }
             Entry::File { mode, blob } => {
-                let bytes = crate::tree::blob_bytes(conn, blob)?
-                    .with_context(|| format!("rename of '{path}': the store holds no blob {blob}"))?;
+                let bytes = crate::tree::blob_bytes(conn, blob)?.with_context(|| {
+                    format!("rename of '{path}': the store holds no blob {blob}")
+                })?;
                 writes.push(Proposed::delete(path, Base::Blob(blob)));
                 writes.push(Proposed::write_mode(moved_to, Base::Absent, bytes, mode));
             }
@@ -1457,7 +1461,10 @@ mod tests {
         let err = propose(
             &a.conn,
             &Grant::Whole,
-            vec![proposed("a.go", blob(A), &a_ours), proposed("b.go", blob(B), &b_ours)],
+            vec![
+                proposed("a.go", blob(A), &a_ours),
+                proposed("b.go", blob(B), &b_ours),
+            ],
         )
         .unwrap_err();
         let refusal = err.downcast_ref::<Refusal>().expect("typed");
@@ -1568,7 +1575,8 @@ mod tests {
             .unwrap();
         let before = whole_image(&a.conn);
         for base in [Base::Blob(Hash::ZERO), Base::Any] {
-            let err = propose(&a.conn, &Grant::Whole, vec![proposed("a.go", base, A2)]).unwrap_err();
+            let err =
+                propose(&a.conn, &Grant::Whole, vec![proposed("a.go", base, A2)]).unwrap_err();
             assert!(err.downcast_ref::<Refusal>().is_none(), "{err:#}");
             assert!(format!("{err:#}").contains("no blob_hash"), "{err:#}");
         }

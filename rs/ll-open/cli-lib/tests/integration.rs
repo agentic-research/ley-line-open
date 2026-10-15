@@ -3548,13 +3548,20 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     )
     .await;
     assert_eq!(merged["ok"], true, "{merged}");
-    assert_eq!(merged["merged"], serde_json::json!(["src/main.rs"]), "{merged}");
+    assert_eq!(
+        merged["merged"],
+        serde_json::json!(["src/main.rs"]),
+        "{merged}"
+    );
     let after = uds_round_trip(
         &sock_path,
         r#"{"op": "read_source", "path": "src/main.rs"}"#,
     )
     .await;
-    assert_eq!(after["content"], "fn main() { let _ = 1; }\n\nfn ours() {}\n");
+    assert_eq!(
+        after["content"],
+        "fn main() { let _ = 1; }\n\nfn ours() {}\n"
+    );
     check("propose_merged", &merged);
 
     // Any bytes at any path, modes, symlinks and directories (T4).
@@ -3574,7 +3581,10 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     let script = uds_round_trip(&sock_path, r#"{"op": "read_source", "path": "run.sh"}"#).await;
     assert_eq!(script["mode"], "100755", "{script}");
     let link = uds_round_trip(&sock_path, r#"{"op": "read_source", "path": "main.link"}"#).await;
-    assert_eq!((&link["mode"], &link["content"]), (&"120000".into(), &"src/main.rs".into()));
+    assert_eq!(
+        (&link["mode"], &link["content"]),
+        (&"120000".into(), &"src/main.rs".into())
+    );
 
     let refused = uds_round_trip(
         &sock_path,

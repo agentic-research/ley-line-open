@@ -1209,9 +1209,9 @@ fn parse_into_conn_with(
     // pass, which names none, projects under the one recorded, so the
     // projection is the same whichever path wrote a file (ADR-0045 T3).
     let recorded_filter = match (&memory, lang_filter) {
-        (Some(InMemory::Written { .. }), None) => get_meta(conn, PROJECTION_LANGUAGE_KEY)
-            .ok()
-            .flatten(),
+        (Some(InMemory::Written { .. }), None) => {
+            get_meta(conn, PROJECTION_LANGUAGE_KEY).ok().flatten()
+        }
         _ => None,
     };
     let filter_name = lang_filter.map(str::to_string).or(recorded_filter);
@@ -1848,7 +1848,8 @@ fn parse_into_conn_with(
         for (result, (chunk_rel, ..)) in parsed_files.into_iter().zip(chunk) {
             match result {
                 Ok(pf) => {
-                    projected_now.insert(pf.rel.clone(), (pf.content_hash, pf.syntax_error.clone()));
+                    projected_now
+                        .insert(pf.rel.clone(), (pf.content_hash, pf.syntax_error.clone()));
                     // ── projection-v5 minting (bead `ley-line-open-17c271`) ──
                     //
                     // The file's identity: `ensure_file_id` interns the rel
@@ -2397,7 +2398,10 @@ fn parse_into_conn_with(
         match &filter_name {
             Some(name) => set_meta(conn, PROJECTION_LANGUAGE_KEY, name)?,
             None => {
-                conn.execute("DELETE FROM _meta WHERE key = ?1", [PROJECTION_LANGUAGE_KEY])?;
+                conn.execute(
+                    "DELETE FROM _meta WHERE key = ?1",
+                    [PROJECTION_LANGUAGE_KEY],
+                )?;
             }
         }
     }

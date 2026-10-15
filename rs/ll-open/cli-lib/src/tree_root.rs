@@ -180,7 +180,9 @@ pub fn tree_root_of(leaves: &[TreeLeaf], parser_id: Hash) -> Hash {
 
 /// The fold's leaves of a manifest: every file entry, and every directory
 /// with no entry beneath it.
-pub fn leaves_of(entries: &std::collections::BTreeMap<String, crate::tree::Entry>) -> Vec<TreeLeaf> {
+pub fn leaves_of(
+    entries: &std::collections::BTreeMap<String, crate::tree::Entry>,
+) -> Vec<TreeLeaf> {
     use crate::tree::Entry as E;
     let mut leaves = Vec::with_capacity(entries.len());
     for (path, entry) in entries {
@@ -571,8 +573,10 @@ mod tests {
     fn tree_leaves_fail_closed_on_an_entry_without_a_hash() {
         let conn = Connection::open_in_memory().unwrap();
         crate::tree::ensure_tables(&conn).unwrap();
-        conn.execute_batch("INSERT INTO _tree (path, mode, blob_hash) VALUES ('a.go', 33188, NULL);")
-            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO _tree (path, mode, blob_hash) VALUES ('a.go', 33188, NULL);",
+        )
+        .unwrap();
         let err = format!("{:#}", tree_leaves(&conn).unwrap_err());
         assert!(err.contains("no blob_hash"), "{err}");
         conn.execute_batch("UPDATE _tree SET blob_hash = X'0102' WHERE path = 'a.go';")
@@ -635,9 +639,21 @@ mod tests {
         let h = |b: u8| Hash::from_bytes([b; 32]);
         let manifest = std::collections::BTreeMap::from([
             ("a".to_string(), E::Dir),
-            ("a/b.go".to_string(), E::File { mode: Mode::Regular, blob: h(1) }),
+            (
+                "a/b.go".to_string(),
+                E::File {
+                    mode: Mode::Regular,
+                    blob: h(1),
+                },
+            ),
             ("a-c".to_string(), E::Dir),
-            ("c.go".to_string(), E::File { mode: Mode::Regular, blob: h(2) }),
+            (
+                "c.go".to_string(),
+                E::File {
+                    mode: Mode::Regular,
+                    blob: h(2),
+                },
+            ),
         ]);
         let p = inputs().parser_id();
         let leaves = leaves_of(&manifest);
@@ -658,7 +674,10 @@ mod tests {
         assert_eq!(
             tree_root_of(&leaves_of(&without_empty), p),
             tree_root_of(
-                &[TreeLeaf::regular("a/b.go", h(1)), TreeLeaf::regular("c.go", h(2))],
+                &[
+                    TreeLeaf::regular("a/b.go", h(1)),
+                    TreeLeaf::regular("c.go", h(2))
+                ],
                 p
             ),
             "directories with files beneath them are not leaves"

@@ -161,7 +161,8 @@ mod tests {
         };
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            BASE.replace("return 1", "return 10").replace("return 3", "return 30")
+            BASE.replace("return 1", "return 10")
+                .replace("return 3", "return 30")
         );
     }
 

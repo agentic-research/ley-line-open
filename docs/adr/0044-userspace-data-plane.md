@@ -1,6 +1,6 @@
 # ADR-0044 — Agents see a filesystem served from userspace: an LLO virtio-fs device in a microVM
 
-**Status:** Proposed (2026-10-15)
+**Status:** Accepted (2026-10-15); LLO carries the libkrun patch until upstream takes it
 **Bead:** see "Beads" below
 **Related:**
 
@@ -210,6 +210,14 @@ upper filesystem (xattrs, whiteouts, rename) are unmeasured.
 | V-F3 | faster than the host mounts | the same edit and read loop through virtio-fs, host NFS and host FUSE: p50 and p99 recorded |
 | V-F4 | per-open bases | two guest processes open one file; the second's stale flush is refused |
 | V-F5 | a guest crash leaves the store consistent | kill the VM mid-write: no partial proposal lands |
+
+## Phases
+
+| Phase | Scope | Bead |
+|---|---|---|
+| A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib | `f1c46f` |
+| B | the store-backed `DynFileSystem`: reads from the checkout's ref, writes as proposals, refusals as Linux errno | `f1ea99` |
+| C | agents run in a guest whose working tree is that share; the end-to-end scenarios run inside the guest; V-F2 and V-F3 measured | `f210c2` |
 
 ## Beads
 

@@ -312,6 +312,43 @@ fn main() {
         ),
     );
 
+    // (m) git decides whether to rehash a file from its stat (size, mtime,
+    // ctime, inode): each of two successive same-size edits is reported by
+    // the git status after it, the index holding the stat of the previous
+    // state each time.
+    let git = |args: &[&str]| {
+        let mut all = vec!["-c", "safe.directory=*", "--git-dir=/repo.git", "--work-tree=/work"];
+        all.extend_from_slice(args);
+        run("/usr/bin/git", &all)
+    };
+    let mtime = || fs::metadata("m.go").and_then(|m| m.modified()).map_err(|e| errno_of(&e));
+    let m_status = |r: &mut Report, after: &str, want: &str| {
+        let (ok, status) = git(&["status", "--porcelain", "--", "m.go"]);
+        let status = status.trim_end().to_owned();
+        r.check(
+            "m",
+            ok && status == want,
+            format!(
+                "git status --porcelain -- m.go {after}: {status:?}, want {want:?}; \
+                 stat mtime {:?}",
+                mtime()
+            ),
+        );
+    };
+    // The index takes m.go's stat here.
+    m_status(&mut r, "before any edit", "");
+    match save("m.go", seed::M_ONE) {
+        Ok(()) => m_status(&mut r, "after the first same-size edit", " M m.go"),
+        Err(error) => r.fail("m", error),
+    }
+    let (ok, added) = git(&["add", "m.go"]);
+    r.check("m", ok, format!("git add m.go: exit ok={ok} {added:?}"));
+    m_status(&mut r, "after git add (the index takes the edit's stat)", "M  m.go");
+    match save("m.go", seed::M_TWO) {
+        Ok(()) => m_status(&mut r, "after the second same-size edit", "MM m.go"),
+        Err(error) => r.fail("m", error),
+    }
+
     let text = format!("{}\n", r.0.join("\n"));
     if let Err(error) = save(seed::REPORT, &text) {
         println!("FAIL report: {error}");

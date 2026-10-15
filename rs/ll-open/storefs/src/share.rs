@@ -223,6 +223,9 @@ fn wire_attr(attr: &Attr) -> WireAttr {
         size: attr.size,
         blocks: attr.size.div_ceil(512),
         blksize: BLKSIZE,
+        atime: attr.mtime,
+        mtime: attr.mtime,
+        ctime: attr.mtime,
     }
 }
 

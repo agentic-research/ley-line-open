@@ -38,6 +38,11 @@
 //! the one the previous open served ([`Opened`]), and entry and attribute
 //! timeouts are short only for recently changed paths ([`Freshness`]).
 //!
+//! **File times** (bead `ley-line-open-b8100d`): a node's [`Attr::mtime`]
+//! is the time of the latest change this filesystem recorded to its path,
+//! strictly increasing per path, or the [`Clock`]'s origin when it recorded
+//! none; git's stat check sees every change, same-size edits included.
+//!
 //! Errors are Linux errno values whatever the host is: the guest is Linux.
 //!
 //! The crate adds no persisted state; it reads the tables
@@ -47,7 +52,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use leyline_cli_lib::daemon::db_pool::LiveDb;
 use leyline_cli_lib::source_write::{self, Accepted, Base, Grant, Proposed, Refusal};
@@ -178,21 +183,30 @@ pub struct Options {
     pub checkout: Option<Checkout>,
 }
 
-/// Time for [`Freshness`]: the time since a fixed origin, never decreasing.
+/// Time for [`Freshness`] and file times: the time since a fixed origin,
+/// never decreasing, and the wall-clock time of that origin.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Duration;
+    /// The wall-clock time of the origin [`Clock::now`] counts from, since
+    /// the Unix epoch.
+    fn origin(&self) -> Duration;
 }
 
-/// [`Clock`] over [`Instant`], counting from its creation.
+/// [`Clock`] over [`Instant`], counting from its creation; its origin is
+/// the [`SystemTime`] read at its creation.
 #[derive(Clone, Copy, Debug)]
 pub struct MonotonicClock {
     origin: Instant,
+    wall: Duration,
 }
 
 impl Default for MonotonicClock {
     fn default() -> Self {
         MonotonicClock {
             origin: Instant::now(),
+            wall: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
         }
     }
 }
@@ -200,6 +214,10 @@ impl Default for MonotonicClock {
 impl Clock for MonotonicClock {
     fn now(&self) -> Duration {
         self.origin.elapsed()
+    }
+
+    fn origin(&self) -> Duration {
+        self.wall
     }
 }
 
@@ -291,6 +309,11 @@ pub struct Attr {
     /// for one it may only see; `0o755` for a directory the scope may
     /// propose a path under, `0o555` for one it may not.
     pub perm: u32,
+    /// The node's modification time, since the Unix epoch: the time of the
+    /// last change this filesystem recorded for the path, or the clock's
+    /// origin when it recorded none (see "File times" in the README). The
+    /// reply reports it as the change and access time too.
+    pub mtime: Duration,
 }
 
 impl Attr {
@@ -409,18 +432,39 @@ struct Served {
     /// (LOOKUP, GETATTR, SETATTR, READDIRPLUS, CREATE) told the guest: what
     /// the guest bounds a cached read by.
     told: HashMap<u64, u64>,
+    /// Per path, the time ([`Clock::now`]) of the last change recorded for
+    /// its file times: strictly increasing per path, and never zero, so
+    /// every change reports a time no earlier reply carried.
+    times: HashMap<String, Duration>,
 }
 
 impl Served {
     /// A change to `path` at `now`: it and its parent directory are
-    /// recently changed until `now + window`.
+    /// recently changed until `now + window`, and their times move
+    /// ([`Served::touch`]).
     fn record_change(&mut self, path: &str, now: Duration) {
-        self.changed.insert(path.to_string(), now);
-        if !path.is_empty() {
-            let parent = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-            self.changed.insert(parent.to_string(), now);
+        for changed in with_parent(path) {
+            self.changed.insert(changed.to_string(), now);
+        }
+        self.touch(path, now);
+    }
+
+    /// A change to `path` at `now` that moves only its and its parent
+    /// directory's times: each takes `now`, or the nanosecond after its
+    /// previous time when that is later.
+    fn touch(&mut self, path: &str, now: Duration) {
+        for changed in with_parent(path) {
+            let previous = self.times.get(changed).copied().unwrap_or_default();
+            let after = previous + Duration::from_nanos(1);
+            self.times.insert(changed.to_string(), now.max(after));
         }
     }
+}
+
+/// `path`, then its parent directory unless `path` is the root.
+fn with_parent(path: &str) -> impl Iterator<Item = &str> {
+    let parent = (!path.is_empty()).then(|| path.rsplit_once('/').map_or("", |(dir, _)| dir));
+    std::iter::once(path).chain(parent)
 }
 
 /// A node as the store and the session hold it.
@@ -552,9 +596,13 @@ impl<S: Store> StoreFs<S> {
     pub fn opendir(&self, inode: u64) -> Result<OpenedDir, Errno> {
         let dir = self.directory(inode)?;
         let listing = self.query(|conn| self.children(conn, &dir))?;
+        let now = self.clock.now();
         let mut served = self.served.lock();
         let keep_cache = served.listings.get(&inode) == Some(&listing);
-        served.listings.insert(inode, listing);
+        // A listing other than the previous one: entries changed in it.
+        if served.listings.insert(inode, listing).is_some() && !keep_cache {
+            served.touch(&dir, now);
+        }
         Ok(OpenedDir { keep_cache })
     }
 
@@ -738,6 +786,7 @@ impl<S: Store> StoreFs<S> {
             return Err(Errno::EACCES);
         }
         self.session.lock().pending.insert(path.clone(), Vec::new());
+        self.touch(&path);
         let handle = self.new_handle(Handle {
             path: path.clone(),
             base: Base::Absent,
@@ -762,6 +811,7 @@ impl<S: Store> StoreFs<S> {
             return Err(Errno::EACCES);
         }
         self.session.lock().dirs.insert(path.clone());
+        self.touch(&path);
         self.entry(&path)
     }
 
@@ -786,6 +836,7 @@ impl<S: Store> StoreFs<S> {
             }
             _ => {
                 self.session.lock().pending.remove(&path);
+                self.touch(&path);
             }
         }
         self.keep_dir(&dir);
@@ -806,6 +857,7 @@ impl<S: Store> StoreFs<S> {
             return Err(Errno::ENOTEMPTY);
         }
         self.session.lock().dirs.remove(&path);
+        self.touch(&path);
         self.keep_dir(&dir);
         Ok(())
     }
@@ -875,9 +927,13 @@ impl<S: Store> StoreFs<S> {
         if !self.may_propose_under(to) {
             return Err(Errno::EACCES);
         }
-        let mut session = self.session.lock();
-        session.dirs.remove(from);
-        session.dirs.insert(to.to_string());
+        {
+            let mut session = self.session.lock();
+            session.dirs.remove(from);
+            session.dirs.insert(to.to_string());
+        }
+        self.touch(from);
+        self.touch(to);
         Ok(())
     }
 
@@ -911,9 +967,13 @@ impl<S: Store> StoreFs<S> {
             session.pending.remove(to);
             landed(&accepted, to)?
         } else {
-            let mut session = self.session.lock();
-            session.pending.remove(from);
-            session.pending.insert(to.to_string(), bytes);
+            {
+                let mut session = self.session.lock();
+                session.pending.remove(from);
+                session.pending.insert(to.to_string(), bytes);
+            }
+            self.touch(from);
+            self.touch(to);
             Base::Absent
         };
         for open in self.handles.lock().values() {
@@ -952,6 +1012,8 @@ impl<S: Store> StoreFs<S> {
             };
             held.clone_from(&bytes);
             if !self.can_hold(path) {
+                drop(session);
+                self.touch(path);
                 return Ok(Base::Absent);
             }
         }
@@ -1179,7 +1241,23 @@ impl<S: Store> StoreFs<S> {
             kind,
             size,
             perm,
+            mtime: self.mtime(path),
         }
+    }
+
+    /// The time of the last change recorded for `path`, since the Unix
+    /// epoch; the clock's origin when none was recorded.
+    fn mtime(&self, path: &str) -> Duration {
+        let since_origin = self.served.lock().times.get(path).copied();
+        self.clock.origin() + since_origin.unwrap_or_default()
+    }
+
+    /// A change to `path` that only this session holds (a directory, or a
+    /// file the store does not hold): its and its parent directory's times
+    /// move ([`Served::touch`]); the guest made it, so its timeouts stay.
+    fn touch(&self, path: &str) {
+        let now = self.clock.now();
+        self.served.lock().touch(path, now);
     }
 
     /// What `path` is for the guest: a file the store holds a blob for and

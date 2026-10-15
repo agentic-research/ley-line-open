@@ -26,6 +26,10 @@
 //!   from `tools/guest_tools.sh`) over `/work`;
 //! - (g) after a host proposal the guest reads the new bytes at its next
 //!   open, and a cached `stat` turns over within the settled timeout;
+//! - (m) two successive same-size edits of `m.go` are each reported by the
+//!   `git status --porcelain` after it (` M`, then `MM` after `git add`):
+//!   the share's file times move with each edit (bead
+//!   `ley-line-open-b8100d`);
 //! - (h) the daemon is killed with SIGKILL and restarted: the accepted
 //!   guest edits persist in the store and the checkout.
 //!
@@ -679,6 +683,7 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
         ("n.go", Some(seed::N)),
         ("g.go", Some(seed::G_HOST)),
         ("t.go", Some(seed::T_HOST)),
+        ("m.go", Some(seed::M_TWO)),
     ]);
     for (path, text) in &expected {
         results.check(
@@ -696,7 +701,7 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
     let mut lines: Vec<String> = report.lines().map(str::to_owned).collect();
     lines.extend(results.0);
     eprintln!("agent-in-guest results:\n{}", lines.join("\n"));
-    let scenarios = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let scenarios = ["a", "b", "c", "d", "e", "f", "g", "m", "h"];
     for scenario in scenarios {
         assert!(
             lines

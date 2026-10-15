@@ -86,6 +86,12 @@ fn stat(attr: &Attr) -> Stat {
     st.st_size = attr.size as _;
     st.st_blocks = attr.blocks as _;
     st.st_blksize = attr.blksize as _;
+    st.st_atime = attr.atime.as_secs() as _;
+    st.st_atime_nsec = attr.atime.subsec_nanos() as _;
+    st.st_mtime = attr.mtime.as_secs() as _;
+    st.st_mtime_nsec = attr.mtime.subsec_nanos() as _;
+    st.st_ctime = attr.ctime.as_secs() as _;
+    st.st_ctime_nsec = attr.ctime.subsec_nanos() as _;
     st
 }
 

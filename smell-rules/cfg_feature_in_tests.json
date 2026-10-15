@@ -5,5 +5,5 @@
     "cfg_feature_test_sites"
   ],
   "ScopeColumn": "c.source_id",
-  "Query": "SELECT c.source_id, c.node_id, c.start_row, c.start_col, c.end_row, c.end_col, 1 AS metric FROM cfg_feature_test_sites c WHERE c.source_id NOT LIKE '%/tests/common/mod.rs' %s ORDER BY c.source_id, c.start_row"
+  "Query": "SELECT c.source_id, c.node_id, c.start_row, c.start_col, c.end_row, c.end_col, 1 AS metric FROM cfg_feature_test_sites c WHERE c.source_id NOT LIKE '%/tests/common/mod.rs' AND c.source_id NOT LIKE 'rs/third_party/%' %s ORDER BY c.source_id, c.start_row"
 }

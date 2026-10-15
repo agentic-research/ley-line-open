@@ -11,61 +11,12 @@ use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
 mod common;
-
-/// Resolve the hypervisor this test needs, or report that it did not run.
-///
-/// Previously the test carried a bare `#[ignore]`, which meant it ran NOWHERE —
-/// not in CI, which lacks libkrun, and not on a developer machine that has it,
-/// because running it required remembering `-- --ignored`. A gate that no
-/// environment satisfies produces no signal anywhere, and this is the tier
-/// whose confinement drift check turned out to be entirely untested
-/// (`ley-line-open-17536d`) precisely because everything here was skipped by
-/// construction.
-///
-/// So the gate is now the actual precondition rather than a blanket opt-out: it
-/// runs wherever `LEYLINE_LIBKRUN_PATH` and `LEYLINE_LIBKRUNFW_PATH` are set,
-/// and says so loudly when they are not. The message is deliberately worded as
-/// NOT a pass — the same stance `mutants_diff.sh` takes about a skipped gate,
-/// for the same reason: a green tick that tested nothing is worse than a red
-/// one, because nobody investigates it.
-fn hypervisor_or_skip() -> Option<(std::ffi::OsString, std::path::PathBuf)> {
-    let (Some(libkrun), Some(libkrunfw)) = (
-        std::env::var_os("LEYLINE_LIBKRUN_PATH"),
-        std::env::var_os("LEYLINE_LIBKRUNFW_PATH"),
-    ) else {
-        // A soft skip is still a green tick, and `cargo test` captures this
-        // message unless someone passes `--nocapture` — so on its own it is a
-        // quieter version of the same false green the bare `#[ignore]` was.
-        // `LEYLINE_REQUIRE_HYPERVISOR` is the escape: any environment that
-        // believes it can run this asserts so, and absence becomes a hard
-        // failure there instead of a silent pass. A runner that gains libkrun
-        // and forgets to set it degrades to "skipped", not to "wrong".
-        assert!(
-            std::env::var_os("LEYLINE_REQUIRE_HYPERVISOR").is_none(),
-            "LEYLINE_REQUIRE_HYPERVISOR is set, so this environment claims a \
-             hypervisor, but LEYLINE_LIBKRUN_PATH / LEYLINE_LIBKRUNFW_PATH are \
-             not both set. Refusing to report a pass for a microVM test that \
-             did not boot a microVM."
-        );
-        eprintln!(
-            "SKIPPED (NOT a pass): no hypervisor. This test exercises a real \
-             libkrun guest and needs LEYLINE_LIBKRUN_PATH + \
-             LEYLINE_LIBKRUNFW_PATH, plus the aarch64-unknown-linux-musl \
-             target. Nothing about the microVM backend was verified by this \
-             run. Set LEYLINE_REQUIRE_HYPERVISOR to make this absence fail."
-        );
-        return None;
-    };
-    let libkrunfw = std::path::PathBuf::from(libkrunfw)
-        .canonicalize()
-        .expect("canonical LEYLINE_LIBKRUNFW_PATH");
-    Some((libkrun, libkrunfw))
-}
+mod hypervisor;
 
 #[test]
 fn guest_writes_the_ephemeral_root_without_mutating_cas() {
     let _serial = common::serial();
-    let Some((libkrun, libkrunfw)) = hypervisor_or_skip() else {
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
         return;
     };
     let fixture = TempDir::new().expect("fixture");
@@ -81,23 +32,7 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
     )
     .expect("guest source");
     let guest_binary = staging_bin.join("guest-write");
-    let compile = Command::new("rustc")
-        .args([
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "-C",
-            "target-feature=+crt-static",
-            "-C",
-            "linker=rust-lld",
-            "-C",
-            "strip=symbols",
-            "-o",
-        ])
-        .arg(&guest_binary)
-        .arg(&guest_source)
-        .status()
-        .expect("compile static Linux guest");
-    assert!(compile.success(), "guest compilation failed: {compile}");
+    hypervisor::compile_guest(&guest_source, &guest_binary);
     fs::set_permissions(&guest_binary, fs::Permissions::from_mode(0o755)).expect("guest mode");
 
     let guest_bytes = fs::read(&guest_binary).expect("guest bytes");
@@ -119,26 +54,10 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
     let run_root = fixture.path().join("run-root");
     fs::create_dir(&run_root).expect("run root");
     let signed_worker = fixture.path().join("leyline-krun-worker");
-    fs::copy(env!("CARGO_BIN_EXE_leyline-krun-worker"), &signed_worker)
-        .expect("copy worker for ad-hoc signing");
-    let entitlements = fixture.path().join("libkrun-worker-entitlements.plist");
-    fs::write(
-        &entitlements,
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>com.apple.security.hypervisor</key><true/>
-</dict></plist>
-"#,
-    )
-    .expect("write test entitlements");
-    let sign = Command::new("codesign")
-        .args(["--force", "--sign", "-", "--entitlements"])
-        .arg(&entitlements)
-        .arg(&signed_worker)
-        .status()
-        .expect("ad-hoc sign libkrun worker");
-    assert!(sign.success(), "worker codesign failed: {sign}");
+    hypervisor::entitled_copy(
+        std::path::Path::new(env!("CARGO_BIN_EXE_leyline-krun-worker")),
+        &signed_worker,
+    );
 
     let request = ExecutionRequest {
         run_id: "live-guest-write".into(),
@@ -162,17 +81,13 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
     let mut child = Command::new(&signed_worker)
         .arg("--cas-root")
         .arg(&cas)
-        .arg("--libkrun")
-        .arg(&libkrun)
         .arg("--run-root")
         .arg(&run_root)
         .arg("--runtime-file")
         .arg(&libkrunfw)
         .env(
-            "DYLD_LIBRARY_PATH",
-            std::path::Path::new(&libkrunfw)
-                .parent()
-                .expect("libkrunfw parent"),
+            hypervisor::library_path_env(&libkrunfw).0,
+            hypervisor::library_path_env(&libkrunfw).1,
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

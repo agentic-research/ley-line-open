@@ -1,11 +1,15 @@
 use std::ffi::{CStr, CString};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use leyline_runtime::backends::libkrun::api::{DynamicKrunApi, KrunApi, prepare_vm};
+use leyline_runtime::backends::libkrun::api::{
+    DynFileSystem, KrunApi, LinkedKrunApi, VIRTIOFS_TAG_MAX, check_virtiofs_tag, prepare_vm,
+};
 use leyline_runtime::backends::libkrun::confinement::{VSOCK_UNIX_BASE_PORT, VsockUnixMapping};
 use leyline_runtime::backends::libkrun::plan::{KrunConfig, ResolvedRootfs};
 use leyline_runtime::{DigestRef, ErrorCode, ExecutionError};
 use tempfile::TempDir;
+
+mod memfs;
 
 #[derive(Default)]
 struct RecordingApi {
@@ -59,6 +63,16 @@ impl KrunApi for RecordingApi {
             "root:{context}:{read_only}:{}",
             rootfs.to_string_lossy()
         ))
+    }
+
+    fn add_virtiofs_backend(
+        &self,
+        context: u32,
+        tag: &str,
+        dax_window: u64,
+        _backend: Arc<dyn DynFileSystem>,
+    ) -> Result<(), ExecutionError> {
+        self.record(format!("virtiofs:{context}:{tag}:{dax_window}"))
     }
 
     fn disable_implicit_vsock(&self, context: u32) -> Result<(), ExecutionError> {
@@ -197,30 +211,138 @@ fn frees_the_libkrun_context_when_configuration_fails() {
     assert_eq!(api.calls().last().expect("final call"), "free:42");
 }
 
-#[test]
-fn missing_shared_library_is_a_first_party_backend_error() {
-    // Catches regressions back to a wrapper that recommends an internal task
-    // or shells out to the krunvm development CLI.
-    let error = DynamicKrunApi::load("/definitely/missing/libkrun")
-        .expect_err("missing shared library must fail");
+fn memfs() -> Arc<dyn DynFileSystem> {
+    Arc::new(memfs::MemFs::new([(
+        "hello.txt".to_owned(),
+        b"hi\n".to_vec(),
+    )]))
+}
 
+/// The linked library answers without a hypervisor: a context is configuration
+/// state, and libkrunfw is loaded but not required until `krun_start_enter`.
+/// So this exercises the real libkrun on every host, CI included.
+#[test]
+fn the_linked_libkrun_attaches_a_custom_share_to_a_live_context() {
+    let api = LinkedKrunApi;
+    let context = api.create_context().expect("create libkrun context");
+
+    api.add_virtiofs_backend(context, "llo", 0, memfs())
+        .expect("attach a backend to a live context");
+    api.add_virtiofs_backend(context, "llodax", 1 << 26, memfs())
+        .expect("attach a backend with a DAX window");
+
+    api.free_context(context);
+    let error = api
+        .add_virtiofs_backend(context, "llo", 0, memfs())
+        .expect_err("a freed context has nothing to attach to");
     assert_eq!(error.code, ErrorCode::BackendFailed);
     assert!(
-        error.detail.contains("load libkrun shared library"),
-        "{error}"
+        error.detail.contains("krun_add_virtiofs_backend"),
+        "the failing call must be named: {error}"
     );
-    assert!(!error.detail.contains("krunvm"), "{error}");
-    assert!(!error.detail.contains("task "), "{error}");
+}
+
+/// Each linked call reaches libkrun with its own arguments. On contexts libkrun
+/// knows, creation hands out distinct ids and the whole `prepare_vm` sequence
+/// succeeds; on one it has freed, every call fails and names itself. No
+/// hypervisor is involved, so this observes each `LinkedKrunApi` method on
+/// every host — the guest-boot tests that exercise the same calls end to end
+/// run only where libkrunfw is installed.
+#[test]
+fn every_linked_call_reaches_libkrun() {
+    let api = LinkedKrunApi;
+    let first = api.create_context().expect("first context");
+    let second = api.create_context().expect("second context");
+    assert_ne!(first, second, "libkrun hands out one id per context");
+    api.free_context(first);
+    api.free_context(second);
+
+    let rootfs = TempDir::new().expect("rootfs");
+    let vm = prepare_vm(&api, &config(&rootfs)).expect("libkrun accepts the prepared VM");
+    let freed = vm.context_id();
+    drop(vm);
+
+    let results = [
+        ("krun_set_vm_config", api.set_vm_config(freed, 1, 256)),
+        ("krun_add_virtiofs3", api.add_rootfs(freed, c"/", false)),
+        (
+            "krun_add_virtiofs_backend",
+            api.add_virtiofs_backend(freed, "llo", 0, memfs()),
+        ),
+        (
+            "krun_disable_implicit_vsock",
+            api.disable_implicit_vsock(freed),
+        ),
+        ("krun_add_vsock", api.add_vsock(freed, 0)),
+        (
+            "krun_add_vsock_port2",
+            api.add_vsock_port(freed, VSOCK_UNIX_BASE_PORT, c"/run/llo.sock", false),
+        ),
+        ("krun_set_port_map", api.set_port_map(freed, &[])),
+        ("krun_set_workdir", api.set_workdir(freed, c"/")),
+        ("krun_set_exec", api.set_exec(freed, c"/bin/true", &[], &[])),
+        ("krun_start_enter", api.start_enter(freed)),
+    ];
+    for (call, result) in results {
+        let error = result.expect_err(call);
+        assert_eq!(error.code, ErrorCode::BackendFailed, "{call}: {error}");
+        assert!(error.detail.contains(call), "{call} must be named: {error}");
+    }
+}
+
+/// The share is attached to the context `prepare_vm` built, after the root
+/// filesystem and with the window the caller chose — and a tag libkrun would
+/// panic on, or one that shadows the root, never reaches libkrun.
+#[test]
+fn a_prepared_vm_attaches_a_custom_share_to_its_own_context() {
+    let rootfs = TempDir::new().expect("rootfs");
+    let api = RecordingApi::default();
+    let vm = prepare_vm(&api, &config(&rootfs)).expect("prepared VM");
+
+    vm.add_virtiofs_backend("llo", 1 << 21, memfs())
+        .expect("valid tag");
+    let longest = "t".repeat(VIRTIOFS_TAG_MAX);
+    vm.add_virtiofs_backend(&longest, 0, memfs())
+        .expect("a tag that fills the config field");
+    for refused in [
+        "",
+        "/dev/root",
+        "nul\0tag",
+        &"t".repeat(VIRTIOFS_TAG_MAX + 1),
+    ] {
+        let error = vm
+            .add_virtiofs_backend(refused, 0, memfs())
+            .expect_err("tag must be refused");
+        assert_eq!(error.code, ErrorCode::InvalidSpec, "{refused:?}: {error}");
+    }
+    drop(vm);
+
+    let calls = api.calls();
+    let shares: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with("virtiofs:"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        shares,
+        vec![
+            "virtiofs:42:llo:2097152".to_owned(),
+            format!("virtiofs:42:{longest}:0")
+        ],
+        "only the valid tags reach libkrun, on the prepared context: {calls:?}"
+    );
+    assert_eq!(calls.last().expect("final call"), "free:42");
 }
 
 #[test]
-#[ignore = "requires LEYLINE_LIBKRUN_PATH to point at an installed libkrun"]
-fn installed_libkrun_exports_the_embedded_api() {
-    let path = std::env::var_os("LEYLINE_LIBKRUN_PATH").expect("LEYLINE_LIBKRUN_PATH");
-    let api = DynamicKrunApi::load(path).expect("load installed libkrun");
-
-    let context = api.create_context().expect("create libkrun context");
-    api.free_context(context);
+fn virtiofs_tags_are_checked_against_the_device_config_field() {
+    assert!(check_virtiofs_tag("a").is_ok());
+    assert!(check_virtiofs_tag(&"a".repeat(VIRTIOFS_TAG_MAX)).is_ok());
+    assert!(check_virtiofs_tag(&"a".repeat(VIRTIOFS_TAG_MAX + 1)).is_err());
+    assert!(check_virtiofs_tag("").is_err());
+    assert!(check_virtiofs_tag("/dev/root").is_err());
+    assert!(check_virtiofs_tag("/dev/root2").is_ok());
+    assert!(check_virtiofs_tag("a\0").is_err());
 }
 
 /// §6's vsock mappings reach libkrun, in order, between the vsock device and

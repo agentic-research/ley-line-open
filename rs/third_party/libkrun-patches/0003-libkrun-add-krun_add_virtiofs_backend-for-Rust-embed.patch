@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Wed, 14 Oct 2026 21:25:21 -0600
+Subject: [PATCH] libkrun: add krun_add_virtiofs_backend for Rust embedders
+
+Expose the DynFileSystem backend through the library: a Rust program
+that links the `libkrun` crate (crate-type "lib") can attach a virtio-fs
+device whose FUSE requests are answered by an object in its own
+process.
+
+    pub fn krun_add_virtiofs_backend(
+        ctx_id: u32,
+        tag: &str,
+        shm_size: u64,
+        backend: Arc<dyn DynFileSystem>,
+    ) -> i32
+
+`shm_size` is the DAX window size in bytes; 0 attaches the device
+without one. It returns KRUN_SUCCESS or -ENOENT for an unknown context,
+like krun_add_virtiofs*.
+
+FsDeviceConfig gains `custom_backend`; when it is set, the builder hands
+the backend to the device and `shared_dir` is unused. Every existing
+constructor sets it to None, so the C API is unchanged.
+
+The crate re-exports `devices::virtio::fs` as `virtio_fs` and
+`linux_error` so an embedder can name the trait and its request types
+without depending on krun-devices directly.
+
+This is a Rust-only entry point: a trait object does not cross the C
+ABI. A C embedder would need a callback table; that is left for a
+follow-up if there is demand.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+Signed-off-by: jamestexas <18285880+jamestexas@users.noreply.github.com>
+---
+ src/libkrun/src/lib.rs       | 39 ++++++++++++++++++++++++++++++++++++
+ src/vmm/src/builder.rs       |  4 ++++
+ src/vmm/src/vmm_config/fs.rs |  3 +++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 13f5c705..a886e1fe 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -634,6 +634,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char)
+                     }
+                     v
+                 },
++                custom_backend: None,
+             });
+         }
+         Entry::Vacant(_) => return -libc::ENOENT,
+@@ -738,6 +739,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
+                 shm_size: shm,
+                 read_only,
+                 virtual_entries,
++                custom_backend: None,
+             });
+         }
+         Entry::Vacant(_) => return -libc::ENOENT,
+@@ -746,6 +748,42 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
+     KRUN_SUCCESS
+ }
+ 
++/// Re-export of the virtio-fs request types an embedder needs to implement a backend.
++#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
++pub use devices::virtio::fs as virtio_fs;
++#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
++pub use devices::virtio::linux_errno::linux_error;
++
++/// Rust-only API: add a virtio-fs device whose FUSE requests are answered by
++/// `backend`, running in this process, instead of by a host directory.
++#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
++pub fn krun_add_virtiofs_backend(
++    ctx_id: u32,
++    tag: &str,
++    shm_size: u64,
++    backend: std::sync::Arc<dyn devices::virtio::fs::dyn_fs::DynFileSystem>,
++) -> i32 {
++    match CTX_MAP.lock().unwrap().entry(ctx_id) {
++        Entry::Occupied(mut ctx_cfg) => {
++            ctx_cfg.get_mut().vmr.add_fs_device(FsDeviceConfig {
++                fs_id: tag.to_string(),
++                shared_dir: None,
++                semantics: PermissionSemantics::LinuxComplete,
++                shm_size: if shm_size > 0 {
++                    Some(shm_size as usize)
++                } else {
++                    None
++                },
++                read_only: false,
++                virtual_entries: Vec::new(),
++                custom_backend: Some(devices::virtio::fs::dyn_fs::CustomFsBackend(backend)),
++            });
++        }
++        Entry::Vacant(_) => return -libc::ENOENT,
++    }
++    KRUN_SUCCESS
++}
++
+ #[allow(clippy::missing_safety_doc)]
+ #[no_mangle]
+ #[cfg(not(feature = "tee"))]
+@@ -2413,6 +2451,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
+                 shm_size: Some(1 << 29),
+                 read_only: false,
+                 virtual_entries,
++                custom_backend: None,
+             });
+ 
+             ctx_cfg.set_block_root(device, fstype, options);
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index 17143905..7932133e 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -1907,6 +1907,10 @@ fn attach_fs_devices(
+             .unwrap(),
+         ));
+ 
++        if let Some(backend) = config.custom_backend.clone() {
++            fs.lock().unwrap().set_custom_backend(backend);
++        }
++
+         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
+ 
+         if let Some(shm_region) = shm_manager.fs_region(i) {
+diff --git a/src/vmm/src/vmm_config/fs.rs b/src/vmm/src/vmm_config/fs.rs
+index 9f298958..cdd15f5c 100644
+--- a/src/vmm/src/vmm_config/fs.rs
++++ b/src/vmm/src/vmm_config/fs.rs
+@@ -14,4 +14,7 @@ pub struct FsDeviceConfig {
+     pub read_only: bool,
+     #[cfg(not(feature = "aws-nitro"))]
+     pub virtual_entries: Vec<VirtualDirEntry>,
++    /// Embedder-supplied backend. When set, `shared_dir` is ignored.
++    #[cfg(not(feature = "aws-nitro"))]
++    pub custom_backend: Option<devices::virtio::fs::dyn_fs::CustomFsBackend>,
+ }

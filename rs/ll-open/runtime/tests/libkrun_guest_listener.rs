@@ -38,32 +38,11 @@ use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 
 mod common;
+mod hypervisor;
 
 /// The port the guest binds. Above 1024 so `confinement/v1` §4 would permit
 /// declaring it, and not a port anything else here uses.
 const GUEST_PORT: u16 = 17536;
-
-fn hypervisor_or_skip() -> Option<(std::ffi::OsString, std::path::PathBuf)> {
-    let (Some(libkrun), Some(libkrunfw)) = (
-        std::env::var_os("LEYLINE_LIBKRUN_PATH"),
-        std::env::var_os("LEYLINE_LIBKRUNFW_PATH"),
-    ) else {
-        assert!(
-            std::env::var_os("LEYLINE_REQUIRE_HYPERVISOR").is_none(),
-            "LEYLINE_REQUIRE_HYPERVISOR is set but the libkrun paths are not; \
-             refusing to report a pass for a microVM test that did not boot one."
-        );
-        eprintln!(
-            "SKIPPED (NOT a pass): no hypervisor, so guest-listener exposure was \
-             not measured. Set LEYLINE_LIBKRUN_PATH + LEYLINE_LIBKRUNFW_PATH."
-        );
-        return None;
-    };
-    let libkrunfw = std::path::PathBuf::from(libkrunfw)
-        .canonicalize()
-        .expect("canonical LEYLINE_LIBKRUNFW_PATH");
-    Some((libkrun, libkrunfw))
-}
 
 #[test]
 fn a_guest_listener_nothing_declared_is_not_reachable_from_the_host() {
@@ -90,7 +69,7 @@ fn hijacked_guest_sockets_are_still_not_published_without_a_port_map() {
 }
 
 fn probe_listener_exposure(hijack_inet: bool) {
-    let Some((libkrun, libkrunfw)) = hypervisor_or_skip() else {
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
         return;
     };
     let fixture = TempDir::new().expect("fixture");
@@ -132,23 +111,7 @@ fn main() {{
     let staging_bin = fixture.path().join("staging/bin");
     fs::create_dir_all(&staging_bin).expect("staging bin");
     let guest_binary = staging_bin.join("guest-listen");
-    let compile = Command::new("rustc")
-        .args([
-            "--target",
-            "aarch64-unknown-linux-musl",
-            "-C",
-            "target-feature=+crt-static",
-            "-C",
-            "linker=rust-lld",
-            "-C",
-            "strip=symbols",
-            "-o",
-        ])
-        .arg(&guest_binary)
-        .arg(&guest_source)
-        .status()
-        .expect("compile static Linux guest");
-    assert!(compile.success(), "guest compilation failed: {compile}");
+    hypervisor::compile_guest(&guest_source, &guest_binary);
     fs::set_permissions(&guest_binary, fs::Permissions::from_mode(0o755)).expect("guest mode");
 
     let guest_digest = blake3::hash(&fs::read(&guest_binary).expect("guest bytes"))
@@ -173,25 +136,10 @@ fn main() {{
     fs::create_dir(&run_root).expect("run root");
 
     let signed_worker = fixture.path().join("leyline-krun-worker");
-    fs::copy(env!("CARGO_BIN_EXE_leyline-krun-worker"), &signed_worker).expect("copy worker");
-    let entitlements = fixture.path().join("entitlements.plist");
-    fs::write(
-        &entitlements,
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>com.apple.security.hypervisor</key><true/>
-</dict></plist>
-"#,
-    )
-    .expect("entitlements");
-    let sign = Command::new("codesign")
-        .args(["--force", "--sign", "-", "--entitlements"])
-        .arg(&entitlements)
-        .arg(&signed_worker)
-        .status()
-        .expect("ad-hoc sign worker");
-    assert!(sign.success(), "worker codesign failed: {sign}");
+    hypervisor::entitled_copy(
+        std::path::Path::new(env!("CARGO_BIN_EXE_leyline-krun-worker")),
+        &signed_worker,
+    );
 
     let request = ExecutionRequest {
         run_id: format!("listener-probe-hijack-{hijack_inet}"),
@@ -220,15 +168,13 @@ fn main() {{
     let mut child = worker
         .arg("--cas-root")
         .arg(&cas)
-        .arg("--libkrun")
-        .arg(&libkrun)
         .arg("--run-root")
         .arg(&run_root)
         .arg("--runtime-file")
         .arg(&libkrunfw)
         .env(
-            "DYLD_LIBRARY_PATH",
-            libkrunfw.parent().expect("libkrunfw parent"),
+            hypervisor::library_path_env(&libkrunfw).0,
+            hypervisor::library_path_env(&libkrunfw).1,
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

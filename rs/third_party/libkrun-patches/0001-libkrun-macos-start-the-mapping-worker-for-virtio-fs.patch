@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Wed, 14 Oct 2026 21:24:54 -0600
+Subject: [PATCH] libkrun/macos: start the mapping worker for virtio-fs DAX
+ windows
+
+On macOS, a virtio-fs DAX SETUPMAPPING is serviced by sending
+WorkerMessage::GpuAddMapping to the VMM worker thread, which calls
+hv_vm_map and replies. krun_start_enter starts that worker only when a
+virgl GPU is configured. With a virtio-fs device that has a shared
+memory window (krun_add_virtiofs2/3/4 with a non-zero shm_size) and no
+GPU, nothing receives the message: the fs worker blocks forever on the
+reply, and the guest's first read of a DAX-mapped file hangs.
+
+Start the worker when any configured virtio-fs device has a DAX window,
+as well as when a virgl GPU is configured.
+
+Reproduce: macOS arm64, krun_add_virtiofs2(ctx, tag, dir, 1 << 26), no
+GPU; in the guest, mount -t virtiofs -o dax=always <tag> /mnt and read
+a file. Before: the read hangs and the log shows setupmapping with no
+add_mapping. After: the read completes and statx reports
+STATX_ATTR_DAX.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+Signed-off-by: jamestexas <18285880+jamestexas@users.noreply.github.com>
+---
+ src/libkrun/src/lib.rs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index ef89a6d1..13f5c705 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -3019,8 +3019,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+         }
+     };
+ 
++    // virtio-fs DAX windows are mapped by this worker too (GpuAddMapping);
++    // without it the fs worker blocks forever on the first DAX fault.
+     #[cfg(target_os = "macos")]
+-    if ctx_cfg.gpu_virgl_flags.is_some() {
++    if ctx_cfg.gpu_virgl_flags.is_some() || ctx_cfg.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
+         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
+     }
+ 

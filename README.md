@@ -85,12 +85,21 @@ outside the guest's writable boundary. Embedders select a backend explicitly
 when constructing `run_execution_daemon`; the ordinary daemon remains backend-
 free for compatibility.
 
-The portable runtime tests use a fake worker and do not require libkrun or
-Hypervisor.framework. The real Apple Silicon guest-write proof is ignored by
-default because it requires a locally installed libkrun/libkrunfw toolchain and
-the Hypervisor.framework entitlement; see
-[`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs) and
-bead `ley-line-open-16a994` for the CI/release gate.
+LLO builds the VMM it runs: the libkrun worker links libkrun from
+[`rs/third_party/libkrun`](rs/third_party/README.md) (upstream v1.19.4 plus LLO's
+patches, ADR-0044) instead of loading an installed libkrun. The guest kernel,
+libkrunfw, is still an installed library. Building the worker compiles
+libkrun's guest init for Linux; on macOS that needs `zig`
+(`brew install zig`; see `tools/krun_init_cc.sh`).
+
+The portable runtime tests use a fake worker or the linked library without a
+hypervisor. The tests that boot a real guest run where
+`LEYLINE_LIBKRUNFW_PATH` names libkrunfw and report a skip otherwise (set
+`LEYLINE_REQUIRE_HYPERVISOR` to make that skip fail); on macOS they ad-hoc
+sign the VMM with the Hypervisor.framework entitlement. See
+[`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs),
+[`libkrun_virtiofs_backend.rs`](rs/ll-open/runtime/tests/libkrun_virtiofs_backend.rs)
+and bead `ley-line-open-16a994` for the CI/release gate.
 
 The execution/v1 API is exposed through the runtime crate, the explicit
 `run_execution_daemon` UDS entry point, first-party CLI client, and MCP
@@ -143,9 +152,9 @@ It requires the APAS Handoff/v1 predicate as well as the in-toto envelope
 type. Cloister may use that adapter or supply its own verifier for Interlace
 certificate/lease evidence; key distribution and rotation remain outside LLO.
 
-To select the embedded VM path, use `--backend micro-vm --libkrun
-/path/to/libkrun` and repeat `--device` only for explicitly granted device
-paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
+To select the embedded VM path, use `--backend micro-vm --worker
+/path/to/leyline-krun-worker`, grant libkrunfw with `--runtime-file`, and
+repeat `--device` only for explicitly granted device paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
 `krunvm` CLI.
 
 Mutation testing is invoked through the repository Taskfile. Run

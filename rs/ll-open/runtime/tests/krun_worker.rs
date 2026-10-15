@@ -51,6 +51,10 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     let _serial = common::serial();
     // Catches a regression to Cloister's old shell-wrapper architecture. A
     // PATH trap makes this behavioral rather than a source-text assertion.
+    //
+    // The worker must fail before it reaches the VMM, on any host: a relative
+    // `--runtime-file` is refused when the confinement manifest is built,
+    // after the rootfs is materialized and before `krun_create_ctx`.
     let cas = TempDir::new().expect("CAS");
     let request = request_fixture(&cas);
     let run_root = TempDir::new().expect("run root");
@@ -68,10 +72,10 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
         .args([
             "--cas-root",
             cas.path().to_str().expect("CAS UTF-8"),
-            "--libkrun",
-            "/definitely/missing/libkrun",
             "--run-root",
             run_root.path().to_str().expect("run root UTF-8"),
+            "--runtime-file",
+            "relative/libkrunfw",
         ])
         .env("PATH", trap.path())
         .stdin(Stdio::piped())
@@ -90,8 +94,11 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     let WorkerEvent::Failed { error } = event else {
         panic!("expected failed worker event, got {event:?}");
     };
-    assert_eq!(error.code, ErrorCode::BackendFailed);
-    assert!(error.detail.contains("load libkrun shared library"));
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    assert!(
+        error.detail.contains("relative/libkrunfw"),
+        "the refusal must name the path: {error:?}"
+    );
     assert!(!marker.exists(), "worker invoked the krunvm PATH trap");
     assert_eq!(
         fs::read(run_root.path().join("rootfs/usr/bin/probe")).expect("ephemeral executable"),
@@ -107,23 +114,56 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
 #[test]
 fn worker_options_require_an_explicit_run_root() {
     let _serial = common::serial();
-    let error = WorkerOptions::parse([
-        OsString::from("--cas-root"),
-        OsString::from("/cas"),
-        OsString::from("--libkrun"),
-        OsString::from("/libkrun"),
-    ])
-    .expect_err("run root is required");
+    let error = WorkerOptions::parse([OsString::from("--cas-root"), OsString::from("/cas")])
+        .expect_err("run root is required");
     assert!(error.detail.contains("missing --run-root option"));
 
     let options = WorkerOptions::parse([
         OsString::from("--cas-root"),
         OsString::from("/cas"),
-        OsString::from("--libkrun"),
-        OsString::from("/libkrun"),
         OsString::from("--run-root"),
         OsString::from("/run-root"),
     ])
     .expect("explicit run root");
     assert_eq!(options.run_root, std::path::PathBuf::from("/run-root"));
+}
+
+/// libkrun is linked into the worker: there is no library path to pass, and
+/// the option that used to carry one is refused rather than ignored.
+#[test]
+fn worker_options_refuse_a_libkrun_path() {
+    let _serial = common::serial();
+    let error = WorkerOptions::parse([
+        OsString::from("--cas-root"),
+        OsString::from("/cas"),
+        OsString::from("--run-root"),
+        OsString::from("/run-root"),
+        OsString::from("--libkrun"),
+        OsString::from("/libkrun"),
+    ])
+    .expect_err("--libkrun is not a worker option");
+    assert!(error.detail.contains("--libkrun"), "{error:?}");
+}
+
+/// Each path option names one path: a second `--cas-root` or `--run-root` is
+/// refused rather than silently replacing the first.
+#[test]
+fn worker_options_refuse_a_repeated_path_option() {
+    let _serial = common::serial();
+    for repeated in ["--cas-root", "--run-root"] {
+        let error = WorkerOptions::parse([
+            OsString::from("--cas-root"),
+            OsString::from("/cas"),
+            OsString::from("--run-root"),
+            OsString::from("/run-root"),
+            OsString::from(repeated),
+            OsString::from("/again"),
+        ])
+        .expect_err("a repeated path option is refused");
+        assert!(
+            error.detail.contains("unknown or duplicate worker option")
+                && error.detail.contains(repeated),
+            "{repeated}: {error:?}"
+        );
+    }
 }

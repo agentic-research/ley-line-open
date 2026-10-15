@@ -1,0 +1,6 @@
+# Vendored upstream bytes and the patches against them are kept exactly as
+# upstream wrote them, trailing whitespace and CRLF included:
+# tools/vendor_libkrun.sh check diffs them byte for byte. (ley-line-open-f1c46f)
+rs/third_party/libkrun/** -whitespace -text
+rs/third_party/libkrun-patches/** -whitespace -text
+rs/third_party/libkrun/** linguist-vendored

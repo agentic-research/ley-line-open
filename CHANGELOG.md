@@ -12,6 +12,25 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **LLO builds the VMM it runs** (bead `ley-line-open-f1c46f`, ADR-0044
+  phase A). `rs/third_party/libkrun` is libkrun v1.19.4 (commit
+  `728df812`, Apache-2.0) with three patches from
+  `rs/third_party/libkrun-patches/`: the macOS DAX mapping-worker fix,
+  `DynFileSystem` (an object-safe virtio-fs backend supplied by the
+  embedding process), and `krun_add_virtiofs_backend`.
+  `tools/vendor_libkrun.sh check` (`task vmm:vendor:check`) proves the
+  tree is the pinned commit plus the patches; provenance and license
+  are in `rs/third_party/README.md`. The guest init is compiled from the
+  vendored `init.c` (`tools/krun_init_cc.sh`: host `cc` on Linux,
+  `zig cc` elsewhere); nothing is read from an installed libkrun.
+- **A guest can mount a share the VMM serves from memory.**
+  `PreparedVm::add_virtiofs_backend(tag, dax_window, backend)` attaches
+  a virtio-fs device whose FUSE requests a `DynFileSystem` in the worker
+  process answers; `leyline_runtime::backends::libkrun::api` re-exports
+  `DynFileSystem` and `virtio_fs`. Tags are checked against the 36-byte
+  virtio-fs config field and the root tag. `libkrun_virtiofs_backend.rs`
+  boots a guest that reads a file an in-memory backend serves.
+
 - **`leyline-storefs`: the store-backed filesystem core for the virtio-fs
   device** (bead `ley-line-open-f1ea99`, ADR-0044 V2). A new crate,
   `rs/ll-open/storefs`, whose `StoreFs` answers LOOKUP, GETATTR, READDIR,
@@ -61,6 +80,20 @@ context, scoping notes, and review history are recoverable.
   answer them.
 
 ### Changed
+
+- **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**
+  (bead `ley-line-open-f1c46f`). `leyline-krun-worker`,
+  `KrunWorkerConfig` and `leyline execution-daemon --backend micro-vm`
+  no longer take a libkrun library path, and the worker refuses
+  `--libkrun`. libkrunfw is still loaded at run time: grant it with
+  `--runtime-file`. `DynamicKrunApi` is replaced by `LinkedKrunApi`.
+  `leyline-runtime` gains a default `vmm` feature that links the VMM and
+  builds the worker; `leyline-cli-lib` and `leyline-cli` turn it off and
+  do not compile libkrun. Consumers that keep default features compile
+  libkrun and need `CC_LINUX` (or `zig` on macOS through this
+  repository's `.cargo/config.toml`). The libkrun guest tests gate on
+  `LEYLINE_LIBKRUNFW_PATH` alone. The unused `libloading` workspace
+  dependency is removed.
 
 - **Breaking: `propose` requires `base`, and `any` is the explicit "no
   check"** (bead `ley-line-open-5dc3a5`). `ProposedWrite.base` was

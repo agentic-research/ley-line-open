@@ -146,7 +146,10 @@ for entry in $not_shipping; do
     fi
 done
 
-for manifest in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' | sort); do
+# third_party/ holds vendored upstream crates (libkrun): excluded from the
+# workspace, built only as path dependencies, and their features are upstream's
+# to declare. The features LLO turns on are its own crates' (runtime/vmm).
+for manifest in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' -not -path './third_party/*' | sort); do
     dir=$(cd "$(dirname "$manifest")" && pwd -P)
     for feature in $(sed -n '/^\[features\]/,/^\[/p' "$manifest" \
                      | grep -E '^[a-z][a-z0-9_-]* *=' | cut -d= -f1 | tr -d ' '); do

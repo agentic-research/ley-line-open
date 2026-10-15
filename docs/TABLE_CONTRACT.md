@@ -198,7 +198,7 @@ carries them.
 | Table | Purpose |
 |-------|---------|
 | `_checkout_index` | `path TEXT PRIMARY KEY` → `blob_hash BLOB`: the blob last written into the source directory or read from it — git's index. Startup, the watcher, `reparse` and every accepted proposal compare the directory and `_source.content_hash` each against it. |
-| `_checkout_conflict` | Paths whose directory bytes and stored bytes both moved, to different bytes, since the index: `disk_hash` (NULL when deleted on disk), `stored_hash`, `index_hash`. Neither side is overwritten; the row leaves when the two agree. |
+| `_checkout_conflict` | Paths whose directory bytes and stored bytes both moved, to different bytes, since the index: `disk_hash` (NULL when deleted on disk), `stored_hash` (NULL when a proposal deleted the file), `index_hash`. Neither side is overwritten; the row leaves when the two agree. |
 
 **Analysis substrate** (added v0.7.2 per `docs/decades/analysis-substrate.md`) — a *derived analysis facility*, not an identity domain; the word "substrate" here is the decade's name, not a claim about content addressing:
 

@@ -6,7 +6,7 @@
 //! - **Parallel**: tree-sitter parsing runs on all cores via rayon.
 //! - **Batched**: all inserts happen in a single SQLite transaction.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -804,10 +804,15 @@ impl Committed {
 
 /// Bytes a pass reads from memory instead of from disk.
 enum InMemory<'a> {
-    /// ADR-0040 D3: the files one proposal writes, keyed by `_source.id`;
-    /// the rest of the tree is untouched. Built only by
-    /// [`crate::source_write::propose`].
-    Written(&'a BTreeMap<String, Vec<u8>>),
+    /// ADR-0040 D3: the files one proposal writes, keyed by `_source.id`,
+    /// and the files it removes (bead `ley-line-open-47fb03`): a removed
+    /// file is out of the tree whether or not the directory holds it. The
+    /// rest of the tree is untouched. Built by
+    /// [`crate::source_write::propose`] and by a checkout's reconcile.
+    Written {
+        files: &'a BTreeMap<String, Vec<u8>>,
+        removed: &'a BTreeSet<String>,
+    },
     /// ADR-0040 D6: the whole tree, keyed by `_source.id`, read from
     /// `source_blobs` by `leyline rebuild`. No file is read from disk.
     Tree(&'a BTreeMap<String, Vec<u8>>),
@@ -816,7 +821,14 @@ enum InMemory<'a> {
 impl InMemory<'_> {
     fn bytes(&self, rel: &str) -> Option<&Vec<u8>> {
         match self {
-            InMemory::Written(files) | InMemory::Tree(files) => files.get(rel),
+            InMemory::Written { files, .. } | InMemory::Tree(files) => files.get(rel),
+        }
+    }
+
+    fn removes(&self, rel: &str) -> bool {
+        match self {
+            InMemory::Written { removed, .. } => removed.contains(rel),
+            InMemory::Tree(_) => false,
         }
     }
 }
@@ -988,43 +1000,56 @@ pub fn parse_into_conn(
 }
 
 /// Project written files through the cold parse (ADR-0040 D3), in one pass
-/// and one transaction. The pass is scoped to `written`'s paths and reads
-/// their bytes from it, never from disk; any written file that fails to
-/// parse rolls the whole pass back. `Ok` means the transaction committed;
-/// a failure after `COMMIT` rides in [`Committed::post_commit`].
+/// and one transaction, and remove the `removed` files' rows in the same
+/// transaction (bead `ley-line-open-47fb03`). The pass is scoped to those
+/// paths and reads the written bytes from `written`, never from disk; a
+/// removed file is removed whether or not the directory holds it. Any
+/// written file that fails to parse rolls the whole pass back. `Ok` means
+/// the transaction committed; a failure after `COMMIT` rides in
+/// [`Committed::post_commit`].
 pub(crate) fn parse_written_files(
     conn: &Connection,
     source: &Path,
     written: &BTreeMap<String, Vec<u8>>,
+    removed: &BTreeSet<String>,
 ) -> Result<Committed> {
-    let scope: Vec<String> = written.keys().cloned().collect();
+    let scope: Vec<String> = written.keys().chain(removed).cloned().collect();
     parse_into_conn_with(
         conn,
         source,
         None,
         Some(&scope),
-        Some(InMemory::Written(written)),
+        Some(InMemory::Written {
+            files: written,
+            removed,
+        }),
     )
 }
 
 /// Parse a daemon's checkout from disk, except the files in `kept`, whose
-/// bytes come from `kept` whether or not the directory holds them (bead
-/// `ley-line-open-60f39f`). `kept` carries the stored bytes of each
-/// checkout conflict, so a pass over the directory cannot replace them with
-/// the directory's bytes or delete them for being absent there.
+/// bytes come from `kept` whether or not the directory holds them, and the
+/// files in `removed`, which stay out of the store whether or not it does
+/// (beads `ley-line-open-60f39f`, `ley-line-open-47fb03`). `kept` carries
+/// the stored bytes of each checkout conflict and `removed` each path the
+/// store deleted that the directory still holds, so a pass over the
+/// directory overrides neither side.
 pub(crate) fn parse_checkout(
     conn: &Connection,
     source: &Path,
     lang_filter: Option<&str>,
     scope: Option<&[String]>,
     kept: &BTreeMap<String, Vec<u8>>,
+    removed: &BTreeSet<String>,
 ) -> Result<ParseResult> {
     parse_into_conn_with(
         conn,
         source,
         lang_filter,
         scope,
-        Some(InMemory::Written(kept)),
+        Some(InMemory::Written {
+            files: kept,
+            removed,
+        }),
     )?
     .into_result()
 }
@@ -1070,6 +1095,8 @@ fn parse_into_conn_with(
 ) -> Result<Committed> {
     // The bytes of `rel`, when this pass reads it from memory.
     let written_bytes = |rel: &str| -> Option<&Vec<u8>> { memory.as_ref()?.bytes(rel) };
+    // Whether this pass takes `rel` out of the tree, whatever the disk holds.
+    let removed = |rel: &str| memory.as_ref().is_some_and(|m| m.removes(rel));
     let tree_in_memory = match &memory {
         Some(InMemory::Tree(files)) => Some(*files),
         _ => None,
@@ -1090,7 +1117,7 @@ fn parse_into_conn_with(
         let mut v: Vec<PathBuf> = Vec::with_capacity(scope.len());
         for rel in scope {
             let abs = source.join(rel);
-            if abs.exists() || written_bytes(rel).is_some() {
+            if !removed(rel) && (abs.exists() || written_bytes(rel).is_some()) {
                 v.push(abs);
             }
         }
@@ -1108,10 +1135,17 @@ fn parse_into_conn_with(
         // A file read from memory is in the tree whether or not the
         // directory holds it (a checkout conflict whose directory side
         // was deleted, `parse_checkout`).
-        if let Some(InMemory::Written(written)) = &memory {
+        // A removed file is out of the tree whether or not the directory
+        // holds it (a path the store deleted whose directory side could
+        // not be removed, or changed since).
+        if let Some(InMemory::Written { files, removed }) = &memory {
+            v.retain(|abs| {
+                let rel = abs.strip_prefix(source).unwrap_or(abs);
+                !removed.contains(rel.to_string_lossy().as_ref())
+            });
             let walked: HashSet<PathBuf> = v.iter().cloned().collect();
             v.extend(
-                written
+                files
                     .keys()
                     .map(|rel| source.join(rel))
                     .filter(|abs| !walked.contains(abs)),

@@ -1,13 +1,14 @@
 //! ADR-0040 D3 — the one write path (bead `ley-line-open-f2ffbd`), and the
 //! proposal it is the one-file case of (ADR-0042 P1-P2).
 //!
-//! `propose(grant, writes)` is the only way a file's bytes change in an
-//! arena; `write(grant, path, bytes)` is its one-file, unchecked case. A
-//! proposal is refused whole before anything is touched when a path is
-//! outside the grant, a file moved since its author read it (its
-//! [`Base`]), or a file does not parse; otherwise every file is handed to
-//! the cold parse in one pass and one transaction, so the proposal lands
-//! exactly what a cold parse of the same bytes lands:
+//! `propose(grant, writes)` is the only way a file's bytes change, a file
+//! is created, or a file is deleted in an arena; `write(grant, path,
+//! bytes)` is its one-file, unchecked replace. A proposal is refused whole
+//! before anything is touched when a path is outside the grant, a path
+//! moved since its author read it (its [`Base`]), or a file does not parse;
+//! otherwise every written file is handed to the cold parse, and every
+//! deleted file's rows are swept, in one pass and one transaction, so the
+//! proposal lands exactly what a cold parse of the resulting tree lands:
 //!
 //! - the bytes in `source_blobs` under their hash, and `_source.content_hash`
 //!   naming that row (bead `0d3b72`);
@@ -66,44 +67,96 @@ pub struct Written {
     pub post_commit_error: Option<String>,
 }
 
-/// What a proposal's author read of a file, checked before the proposal is
+/// What a proposal's author read at a path, checked before the proposal is
 /// applied (ADR-0042 P2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Base {
-    /// No check: the write replaces whatever the file holds. What a writer
-    /// that read nothing first (a splice of known bytes) uses.
+    /// No check: the write replaces, or the delete removes, whatever the
+    /// file holds. What a writer that read nothing first (a splice of known
+    /// bytes) uses.
     Any,
     /// The `source_blobs` hash of the file's bytes when the author read
     /// them. The proposal is refused unless the file still holds them.
     Blob(Hash),
+    /// The author read no file at the path: the write creates it. The
+    /// proposal is refused unless the path still holds no file.
+    Absent,
 }
 
-/// One file a proposal writes: its `_source.id`, the base its author read,
-/// and its new bytes.
+/// What a proposal does at one path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Change {
+    /// The file's new bytes: a replace, or a create when the base is
+    /// [`Base::Absent`].
+    Write(Vec<u8>),
+    /// The file leaves the store, with every row its parse produced.
+    Delete,
+}
+
+/// One path a proposal changes: its `_source.id`, the base its author read,
+/// and the change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposed {
     pub path: String,
     pub base: Base,
-    pub bytes: Vec<u8>,
+    pub change: Change,
 }
 
-/// A file that moved since its author read it: one entry of
-/// [`Refusal::Stale`].
+impl Proposed {
+    /// The file at `path` holds `bytes`: a replace against `base`, or a
+    /// create when `base` is [`Base::Absent`].
+    pub fn write(path: impl Into<String>, base: Base, bytes: Vec<u8>) -> Self {
+        Proposed {
+            path: path.into(),
+            base,
+            change: Change::Write(bytes),
+        }
+    }
+
+    /// A new file at `path` holding `bytes`.
+    pub fn create(path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Proposed::write(path, Base::Absent, bytes)
+    }
+
+    /// The file at `path` leaves the store, if it still holds `base`.
+    pub fn delete(path: impl Into<String>, base: Base) -> Self {
+        Proposed {
+            path: path.into(),
+            base,
+            change: Change::Delete,
+        }
+    }
+}
+
+/// A path that moved since its author read it: one entry of
+/// [`Refusal::Stale`]. `None` is "no file": a create's base, or a file
+/// deleted since its author read it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stale {
     pub path: String,
-    /// The blob the author read.
-    pub expected: Hash,
-    /// The blob the file holds now.
-    pub current: Hash,
+    /// The blob the author read; `None` when the author read no file.
+    pub expected: Option<Hash>,
+    /// The blob the path holds now; `None` when it holds no file.
+    pub current: Option<Hash>,
+}
+
+impl Stale {
+    /// The wire spelling of a side: the blob hash, or [`BASE_ABSENT`].
+    pub fn spell(side: Option<Hash>) -> String {
+        side.map_or_else(|| BASE_ABSENT.to_string(), |h| h.to_string())
+    }
 }
 
 impl std::fmt::Display for Stale {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let side =
+            |s: Option<Hash>| s.map_or_else(|| "no file".to_string(), |h| format!("blob {h}"));
         write!(
             f,
-            "'{}' moved since it was read (read blob {}, now {})",
-            self.path, self.expected, self.current
+            "'{}' moved since it was read (read {}, now {})",
+            self.path,
+            side(self.expected),
+            side(self.current)
         )
     }
 }
@@ -136,8 +189,18 @@ pub enum Refusal {
     /// The arena stores no blob for a file (its `content_hash` is NULL), so
     /// no blob base can match it.
     NoStoredBlob { path: String },
-    /// Files moved since their author read them: every one that moved.
+    /// Paths moved since their author read them: every one that moved. A
+    /// create whose path now holds a file is stale with no expected blob.
     Stale(Vec<Stale>),
+    /// A created path names no language the parse projects, so the store
+    /// cannot hold it.
+    NoLanguage { path: String },
+    /// A created path is not a plain relative path: empty, absolute, or
+    /// with an empty, `.` or `..` component.
+    MalformedPath { path: String },
+    /// A created path is under a file, or is a directory of other files,
+    /// once the proposal's deletes are applied: `other` names that file.
+    PathConflict { path: String, other: String },
 }
 
 impl Refusal {
@@ -153,7 +216,10 @@ impl Refusal {
             | Refusal::DifferentRoots { path, .. }
             | Refusal::Syntax { path, .. }
             | Refusal::MalformedBase { path }
-            | Refusal::NoStoredBlob { path } => Some(path),
+            | Refusal::NoStoredBlob { path }
+            | Refusal::NoLanguage { path }
+            | Refusal::MalformedPath { path }
+            | Refusal::PathConflict { path, .. } => Some(path),
         }
     }
 }
@@ -177,7 +243,20 @@ impl std::fmt::Display for Refusal {
             Refusal::Syntax { path, detail } => write!(f, "'{path}': {detail}"),
             Refusal::MalformedBase { path } => write!(
                 f,
-                "the base for '{path}' is neither a 64-hex-char blob hash nor \"{BASE_ANY}\""
+                "the base for '{path}' does not fit its change: a replace or delete names a \
+                 64-hex-char blob hash or \"{BASE_ANY}\", a create names \"{BASE_ABSENT}\""
+            ),
+            Refusal::NoLanguage { path } => write!(
+                f,
+                "'{path}' names no language the parse projects, so the store cannot hold it"
+            ),
+            Refusal::MalformedPath { path } => {
+                write!(f, "'{path}' is not a plain relative path")
+            }
+            Refusal::PathConflict { path, other } => write!(
+                f,
+                "'{path}' cannot be created: the store holds '{other}', and one is the \
+                 other's directory"
             ),
             Refusal::NoStoredBlob { path } => write!(
                 f,
@@ -197,11 +276,17 @@ impl std::error::Error for Refusal {}
 /// applied whatever the file holds (bead `ley-line-open-5dc3a5`).
 pub const BASE_ANY: &str = "any";
 
+/// The wire spelling of [`Base::Absent`], and of "no file" in a stale
+/// refusal: a create names it as its base.
+pub const BASE_ABSENT: &str = "absent";
+
 /// What an accepted proposal produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Accepted {
     /// Each written path's new `source_blobs` key, now its `_source.content_hash`.
     pub blobs: std::collections::BTreeMap<String, Hash>,
+    /// The paths the proposal deleted.
+    pub removed: BTreeSet<String>,
     /// The arena's `treeRoot` after the proposal.
     pub tree_root: Hash,
     /// A step after `COMMIT` that failed (moving the sidecars into place,
@@ -212,15 +297,20 @@ pub struct Accepted {
     pub post_commit_error: Option<String>,
 }
 
-/// Apply `writes` as one change: every file lands, in one transaction, or
-/// none does (ADR-0042 P1).
+/// Apply `writes` as one change: every replace, create and delete lands, in
+/// one transaction, or none does (ADR-0042 P1, P1a). A rename is a delete
+/// and a create in one proposal.
 ///
 /// Refused with a [`Refusal`], and no change to the arena, when it writes
-/// nothing; when any path is outside `grant`, names no file, or appears
-/// twice; when any base no longer matches its file (every moved file is
-/// named) or names a blob the arena does not store; when the arena does not
-/// record where a file's tree is rooted, or the files are under different
-/// roots; or when any file's bytes do not parse cleanly in its language.
+/// nothing; when any path is outside `grant`, appears twice, or (with a
+/// [`Base::Any`] replace or delete) names no file; when any base no longer
+/// matches its path (every moved path is named: a create over a file, a
+/// change to a file that moved or was deleted) or names a blob the arena
+/// does not store; when a created path is not plain and relative, names no
+/// language the parse projects, or is under a file or the directory of one;
+/// when the arena does not record where a file's tree is rooted, or the
+/// files are under different roots; or when any written file's bytes do not
+/// parse cleanly in its language.
 /// Any failure inside the projection rolls the whole proposal back and is
 /// an untyped error. `Ok` means the proposal committed, even when a step
 /// after `COMMIT` failed ([`Accepted::post_commit_error`]).
@@ -241,14 +331,17 @@ pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Resul
         .into());
     }
 
-    // Every file's row, and every base checked, before anything else: a
-    // stale refusal names every file that moved.
+    // Every path's row, and every base checked, before anything else: a
+    // stale refusal names every path that moved.
     let mut seen = BTreeSet::new();
     let mut moved = Vec::new();
-    let mut rows = Vec::with_capacity(writes.len());
+    let mut plans = Vec::with_capacity(writes.len());
     for w in writes {
         if !seen.insert(w.path.clone()) {
             return Err(Refusal::DuplicatePath { path: w.path }.into());
+        }
+        if w.base == Base::Absent && w.change == Change::Delete {
+            return Err(Refusal::MalformedBase { path: w.path }.into());
         }
         let row: Option<(String, Option<String>, Option<Vec<u8>>)> = conn
             .query_row(
@@ -258,37 +351,74 @@ pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Resul
             )
             .optional()?;
         let Some((language, abs_path, held)) = row else {
-            return Err(Refusal::NoSuchFile { path: w.path }.into());
-        };
-        if let Base::Blob(expected) = w.base {
-            let Some(current) = held
-                .and_then(|h| <[u8; 32]>::try_from(h).ok())
-                .map(Hash::from_bytes)
-            else {
-                return Err(Refusal::NoStoredBlob { path: w.path }.into());
-            };
-            if current != expected {
-                moved.push(Stale {
+            match w.base {
+                Base::Any => return Err(Refusal::NoSuchFile { path: w.path }.into()),
+                Base::Blob(expected) => moved.push(Stale {
                     path: w.path.clone(),
-                    expected,
-                    current,
-                });
+                    expected: Some(expected),
+                    current: None,
+                }),
+                Base::Absent => {
+                    if !plain_relative(&w.path) {
+                        return Err(Refusal::MalformedPath { path: w.path }.into());
+                    }
+                    let Some(lang) = crate::cmd_parse::file_language(Path::new(&w.path), None)
+                    else {
+                        return Err(Refusal::NoLanguage { path: w.path }.into());
+                    };
+                    plans.push(Plan {
+                        path: w.path,
+                        stored: None,
+                        language: lang,
+                        change: w.change,
+                    });
+                }
             }
+            continue;
+        };
+        let held = held
+            .and_then(|h| <[u8; 32]>::try_from(h).ok())
+            .map(Hash::from_bytes);
+        match (w.base, held) {
+            (Base::Any, _) => {}
+            (Base::Blob(_) | Base::Absent, None) => {
+                return Err(Refusal::NoStoredBlob { path: w.path }.into());
+            }
+            (Base::Blob(expected), Some(current)) if current == expected => {}
+            (base, Some(current)) => moved.push(Stale {
+                path: w.path.clone(),
+                expected: match base {
+                    Base::Blob(expected) => Some(expected),
+                    _ => None,
+                },
+                current: Some(current),
+            }),
         }
-        rows.push((w.path, language, abs_path, w.bytes));
+        plans.push(Plan {
+            path: w.path,
+            stored: Some(Stored { abs_path }),
+            language: leyline_ts::languages::TsLanguage::from_name(&language)?,
+            change: w.change,
+        });
     }
     if !moved.is_empty() {
         return Err(Refusal::Stale(moved).into());
     }
 
+    // One proposal projects one tree: every stored file's recorded root,
+    // or the root the store's last parse recorded when it names none.
     let mut root: Option<PathBuf> = None;
-    let mut files = std::collections::BTreeMap::new();
-    let mut blobs = std::collections::BTreeMap::new();
-    for (path, language, abs_path, bytes) in rows {
-        let Some(abs_path) = abs_path else {
-            return Err(Refusal::NoTreeRoot { path }.into());
+    for plan in &plans {
+        let Some(stored) = &plan.stored else {
+            continue;
         };
-        let file_root = tree_root_dir(Path::new(&abs_path), &path)?;
+        let Some(abs_path) = &stored.abs_path else {
+            return Err(Refusal::NoTreeRoot {
+                path: plan.path.clone(),
+            }
+            .into());
+        };
+        let file_root = tree_root_dir(Path::new(abs_path), &plan.path)?;
         match &root {
             None => root = Some(file_root),
             Some(r) if *r != file_root => {
@@ -298,45 +428,151 @@ pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Resul
                         file_root.display(),
                         r.display()
                     ),
-                    path,
+                    path: plan.path.clone(),
                 }
                 .into());
             }
             Some(_) => {}
         }
-        let lang = leyline_ts::languages::TsLanguage::from_name(&language)?;
-        if let Err(e) = leyline_ts::splice::check_syntax(&bytes, lang.ts_language()) {
+    }
+    let root = match root {
+        Some(root) => root,
+        None => recorded_root(conn)?.ok_or_else(|| Refusal::NoTreeRoot {
+            path: plans[0].path.clone(),
+        })?,
+    };
+
+    let removed: BTreeSet<String> = plans
+        .iter()
+        .filter(|p| p.change == Change::Delete)
+        .map(|p| p.path.clone())
+        .collect();
+    let created: Vec<&str> = plans
+        .iter()
+        .filter(|p| p.stored.is_none())
+        .map(|p| p.path.as_str())
+        .collect();
+    if let Some(conflict) = path_conflict(conn, &created, &removed)? {
+        return Err(conflict.into());
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut blobs = std::collections::BTreeMap::new();
+    for plan in plans {
+        let Change::Write(bytes) = plan.change else {
+            continue;
+        };
+        if let Err(e) = leyline_ts::splice::check_syntax(&bytes, plan.language.ts_language()) {
             return Err(Refusal::Syntax {
-                path,
+                path: plan.path,
                 detail: format!("{e:#}"),
             }
             .into());
         }
-        blobs.insert(path.clone(), bytes.as_slice().hash());
-        files.insert(path, bytes);
+        blobs.insert(plan.path.clone(), bytes.as_slice().hash());
+        files.insert(plan.path, bytes);
     }
 
-    let root = root.expect("a non-empty proposal names a root");
-    let committed = crate::cmd_parse::parse_written_files(conn, &root, &files)?;
+    let committed = crate::cmd_parse::parse_written_files(conn, &root, &files, &removed)?;
     Ok(Accepted {
         blobs,
+        removed,
         tree_root: committed.result.tree_root,
         post_commit_error: committed.post_commit.map(|e| format!("{e:#}")),
     })
 }
 
+/// One path of a proposal once its base has been checked: `stored` is
+/// `None` for a create.
+struct Plan {
+    path: String,
+    stored: Option<Stored>,
+    language: leyline_ts::languages::TsLanguage,
+    change: Change,
+}
+
+/// What the store records of a file a proposal replaces or deletes.
+struct Stored {
+    /// `_source.path`, from which the file's tree root is derived.
+    abs_path: Option<String>,
+}
+
+/// Whether the store can hold a file at `path`: a plain relative path in a
+/// language the parse projects, so a create of it is not refused for its
+/// name ([`Refusal::MalformedPath`], [`Refusal::NoLanguage`]). With
+/// `lang_filter` (a checkout's `--language`), only that language: a file
+/// in another one is never written into the checkout, and the checkout's
+/// next whole-directory parse would drop it from the store.
+pub fn can_hold(path: &str, lang_filter: Option<&str>) -> bool {
+    let filter = lang_filter.and_then(|l| leyline_ts::languages::TsLanguage::from_name(l).ok());
+    plain_relative(path) && crate::cmd_parse::file_language(Path::new(path), filter).is_some()
+}
+
+/// Whether `path` is a plain relative path: one or more `/`-separated
+/// components, none empty, `.` or `..`.
+fn plain_relative(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// The tree root the store's last parse recorded (`_meta.source_root`).
+fn recorded_root(conn: &Connection) -> Result<Option<PathBuf>> {
+    let root: Option<String> = conn
+        .query_row(
+            "SELECT value FROM _meta WHERE key = 'source_root'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(root.map(PathBuf::from))
+}
+
+/// The first created path that is under a file, or is the directory of
+/// another file, once `removed` leaves the store: the store holds files,
+/// and a path cannot be both.
+fn path_conflict(
+    conn: &Connection,
+    created: &[&str],
+    removed: &BTreeSet<String>,
+) -> Result<Option<Refusal>> {
+    let mut under = conn.prepare_cached(
+        "SELECT id FROM _source WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id",
+    )?;
+    let mut exact = conn.prepare_cached("SELECT 1 FROM _source WHERE id = ?1")?;
+    for &path in created {
+        let conflict = |other: &str| Refusal::PathConflict {
+            path: path.to_string(),
+            other: other.to_string(),
+        };
+        // A file at one of the path's directories.
+        for (i, _) in path.match_indices('/') {
+            let dir = &path[..i];
+            let held = !removed.contains(dir) && exact.exists([dir])?;
+            if held || created.contains(&dir) {
+                return Ok(Some(conflict(dir)));
+            }
+        }
+        // A file under the path, as if it were a directory.
+        let prefix = format!("{path}/");
+        let stored = under
+            .query_map([&prefix], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if let Some(other) = stored.iter().find(|id| !removed.contains(*id)) {
+            return Ok(Some(conflict(other)));
+        }
+        if let Some(other) = created.iter().find(|c| c.starts_with(&prefix)) {
+            return Ok(Some(conflict(other)));
+        }
+    }
+    Ok(None)
+}
+
 /// Write `bytes` as the content of the file `path` names, whatever it holds:
 /// a one-file [`propose`] with [`Base::Any`].
 pub fn write(conn: &Connection, grant: &Grant, path: &str, bytes: Vec<u8>) -> Result<Written> {
-    let accepted = propose(
-        conn,
-        grant,
-        vec![Proposed {
-            path: path.to_string(),
-            base: Base::Any,
-            bytes,
-        }],
-    )?;
+    let accepted = propose(conn, grant, vec![Proposed::write(path, Base::Any, bytes)])?;
     Ok(Written {
         source_blob_hash: accepted.blobs[path],
         tree_root: accepted.tree_root,
@@ -368,11 +604,7 @@ impl leyline_fs::graph::SourceWriter for MountWriter {
         bytes: Vec<u8>,
         base: Option<Hash>,
     ) -> Result<()> {
-        let proposed = Proposed {
-            path: source_id.to_string(),
-            base: base.map_or(Base::Any, Base::Blob),
-            bytes,
-        };
+        let proposed = Proposed::write(source_id, base.map_or(Base::Any, Base::Blob), bytes);
         match propose(conn, &self.grant, vec![proposed]) {
             // The edit committed: the mount must not run its refusal path
             // over it. A failure after `COMMIT` is logged; the next write
@@ -398,19 +630,24 @@ impl leyline_fs::graph::SourceWriter for MountWriter {
                 Ok(())
             }
             Err(err) => match err.downcast::<Refusal>() {
-                Ok(Refusal::Stale(moved)) => {
-                    // A one-file proposal: its one moved file.
-                    let stale = moved
-                        .into_iter()
-                        .next()
-                        .expect("a stale refusal names a moved file");
-                    Err(leyline_fs::graph::StaleWrite {
-                        source_id: stale.path,
-                        expected: stale.expected,
-                        current: stale.current,
+                // A one-file replace: its one moved file. A file deleted
+                // since the mount read it has no current blob, and the
+                // refusal is passed on as it is.
+                Ok(Refusal::Stale(moved)) => match moved.as_slice() {
+                    [
+                        Stale {
+                            path,
+                            expected: Some(expected),
+                            current: Some(current),
+                        },
+                    ] => Err(leyline_fs::graph::StaleWrite {
+                        source_id: path.clone(),
+                        expected: *expected,
+                        current: *current,
                     }
-                    .into())
-                }
+                    .into()),
+                    _ => Err(Refusal::Stale(moved).into()),
+                },
                 Ok(other) => Err(other.into()),
                 Err(other) => Err(other),
             },
@@ -728,6 +965,7 @@ mod tests {
                 "a.go".to_string(),
                 b"package a\n\n// \0\n".to_vec(),
             )]),
+            &BTreeSet::new(),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("binary file"), "{err:#}");
@@ -875,11 +1113,7 @@ mod tests {
     const B2: &str = "package a\n\nfunc C() string { return \"see\" }\n";
 
     fn proposed(path: &str, base: Base, text: &str) -> Proposed {
-        Proposed {
-            path: path.to_string(),
-            base,
-            bytes: text.as_bytes().to_vec(),
-        }
+        Proposed::write(path, base, text.as_bytes().to_vec())
     }
 
     fn blob(text: &str) -> Base {
@@ -954,8 +1188,8 @@ mod tests {
             err.downcast_ref::<Refusal>(),
             Some(&Refusal::Stale(vec![Stale {
                 path: "a.go".to_string(),
-                expected: A.as_bytes().hash(),
-                current: A2.as_bytes().hash(),
+                expected: Some(A.as_bytes().hash()),
+                current: Some(A2.as_bytes().hash()),
             }])),
             "a typed stale refusal: {err:#}"
         );
@@ -990,13 +1224,13 @@ mod tests {
             Some(&Refusal::Stale(vec![
                 Stale {
                     path: "a.go".to_string(),
-                    expected: A.as_bytes().hash(),
-                    current: A2.as_bytes().hash(),
+                    expected: Some(A.as_bytes().hash()),
+                    current: Some(A2.as_bytes().hash()),
                 },
                 Stale {
                     path: "b.go".to_string(),
-                    expected: B.as_bytes().hash(),
-                    current: B2.as_bytes().hash(),
+                    expected: Some(B.as_bytes().hash()),
+                    current: Some(B2.as_bytes().hash()),
                 },
             ])),
             "{err:#}"
@@ -1359,6 +1593,382 @@ mod tests {
             })
             .unwrap();
         assert_eq!(record, "a", "the image holds no trace of the refused edit");
+    }
+
+    // ── structural proposals: create, delete, rename (bead 47fb03) ──────
+
+    const C: &str = "package a\n\nfunc D() int { return 4 }\n";
+
+    /// The `treeRoot` a verified head names.
+    fn verified_root(db: &Path) -> Hash {
+        match crate::tree_root::verify(db).unwrap() {
+            crate::tree_root::Verification::Valid { tree_root, .. } => tree_root,
+            other => panic!("the head does not verify: {other:?}"),
+        }
+    }
+
+    fn source_ids(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT id FROM _source ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Rows a file's `file_id` still owns anywhere in the projection.
+    fn rows_of_file_id(conn: &Connection, fid: i64) -> i64 {
+        let (lo, hi) = leyline_schema::file_nid_range(fid);
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [lo, hi], |r| r.get(0)).unwrap() };
+        count("SELECT count(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2")
+            + count("SELECT count(*) FROM node_defs WHERE nid BETWEEN ?1 AND ?2")
+            + count("SELECT count(*) FROM node_refs WHERE nid BETWEEN ?1 AND ?2")
+            + conn
+                .query_row(
+                    "SELECT count(*) FROM _ast_blob WHERE file_id = ?1",
+                    [fid],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+    }
+
+    fn refusal_of(err: &anyhow::Error) -> Refusal {
+        err.downcast_ref::<Refusal>()
+            .unwrap_or_else(|| panic!("an untyped refusal: {err:#}"))
+            .clone()
+    }
+
+    /// A create lands the new file exactly as a cold parse of the tree that
+    /// holds it, under a `file_id` of its own, and moves the head's root to
+    /// the cold parse's.
+    #[test]
+    fn a_create_lands_the_new_file_as_a_cold_parse_of_the_tree_holding_it() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let accepted = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::create("sub/c.go", C.as_bytes().to_vec())],
+        )
+        .unwrap();
+        assert_eq!(accepted.blobs["sub/c.go"], C.as_bytes().hash());
+        assert!(accepted.removed.is_empty());
+        let cold = arena(&[("a.go", A), ("b.go", B), ("sub/c.go", C)]);
+        assert_eq!(image(&a.conn, "sub/c.go"), image(&cold.conn, "sub/c.go"));
+        assert_eq!(image(&a.conn, "a.go"), image(&cold.conn, "a.go"));
+        let ids: BTreeSet<i64> = ["a.go", "b.go", "sub/c.go"]
+            .iter()
+            .map(|p| file_id(&a.conn, p))
+            .collect();
+        assert_eq!(ids.len(), 3, "the created file has a file_id of its own");
+        assert_eq!(
+            leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "sub/c.go")).unwrap(),
+            C.as_bytes()
+        );
+        assert_eq!(accepted.tree_root, verified_root(&a.db));
+        assert_eq!(accepted.tree_root, verified_root(&cold.db));
+        assert!(
+            !a._src.path().join("sub/c.go").exists(),
+            "a proposal writes no file"
+        );
+    }
+
+    /// A delete removes every row the file's parse produced, in the
+    /// proposal's transaction, and the head's root is the cold parse's of
+    /// the tree without it.
+    #[test]
+    fn a_delete_removes_the_files_rows_as_a_cold_parse_of_the_rest() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let fid = file_id(&a.conn, "b.go");
+        assert!(rows_of_file_id(&a.conn, fid) > 0);
+        let accepted = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::delete("b.go", blob(B))],
+        )
+        .unwrap();
+        assert_eq!(accepted.removed, BTreeSet::from(["b.go".to_string()]));
+        assert!(accepted.blobs.is_empty());
+        assert_eq!(source_ids(&a.conn), ["a.go"]);
+        assert_eq!(rows_of_file_id(&a.conn, fid), 0, "no row of b.go is left");
+        let defs: i64 = a
+            .conn
+            .query_row(
+                "SELECT count(*) FROM node_defs WHERE token = 'C'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(defs, 0, "b.go's definition left with it");
+        let cold = arena(&[("a.go", A)]);
+        assert_eq!(image(&a.conn, "a.go"), image(&cold.conn, "a.go"));
+        assert_eq!(accepted.tree_root, verified_root(&a.db));
+        assert_eq!(accepted.tree_root, verified_root(&cold.db));
+        assert!(
+            a._src.path().join("b.go").exists(),
+            "a proposal removes no file from disk"
+        );
+    }
+
+    /// A create is refused when the path holds a file: stale, read as no
+    /// file, now that file's blob. A delete or replace against a file that
+    /// was deleted since is stale with no current blob.
+    #[test]
+    fn a_create_over_a_file_and_a_change_to_a_deleted_file_are_stale() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&a.conn);
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::create("b.go", C.as_bytes().to_vec())],
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal_of(&err),
+            Refusal::Stale(vec![Stale {
+                path: "b.go".into(),
+                expected: None,
+                current: Some(B.as_bytes().hash()),
+            }])
+        );
+        assert!(err.to_string().contains("read no file"), "{err}");
+        assert!(whole_image(&a.conn) == before);
+
+        propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::delete("b.go", Base::Any)],
+        )
+        .unwrap();
+        let before = whole_image(&a.conn);
+        for change in [
+            Proposed::delete("b.go", blob(B)),
+            proposed("b.go", blob(B), B2),
+        ] {
+            let err = propose(&a.conn, &Grant::Whole, vec![change]).unwrap_err();
+            assert_eq!(
+                refusal_of(&err),
+                Refusal::Stale(vec![Stale {
+                    path: "b.go".into(),
+                    expected: Some(B.as_bytes().hash()),
+                    current: None,
+                }])
+            );
+        }
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::delete("b.go", Base::Any)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal_of(&err),
+            Refusal::NoSuchFile {
+                path: "b.go".into()
+            }
+        );
+        assert!(whole_image(&a.conn) == before);
+    }
+
+    /// A delete against a file that moved since it was read is stale.
+    #[test]
+    fn a_delete_against_a_moved_file_is_stale_and_changes_nothing() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        write(&a.conn, &Grant::Whole, "b.go", B2.as_bytes().to_vec()).unwrap();
+        let before = whole_image(&a.conn);
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::delete("b.go", blob(B))],
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal_of(&err),
+            Refusal::Stale(vec![Stale {
+                path: "b.go".into(),
+                expected: Some(B.as_bytes().hash()),
+                current: Some(B2.as_bytes().hash()),
+            }])
+        );
+        assert!(whole_image(&a.conn) == before);
+    }
+
+    /// A rename is one proposal: the source deleted against the blob it
+    /// held, the target created with its bytes. It lands as a cold parse of
+    /// the renamed tree.
+    #[test]
+    fn a_rename_is_one_proposal_that_lands_as_a_cold_parse_of_the_renamed_tree() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let accepted = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![
+                Proposed::delete("a.go", blob(A)),
+                Proposed::create("moved/a.go", A.as_bytes().to_vec()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(source_ids(&a.conn), ["b.go", "moved/a.go"]);
+        let cold = arena(&[("b.go", B), ("moved/a.go", A)]);
+        assert_eq!(
+            image(&a.conn, "moved/a.go"),
+            image(&cold.conn, "moved/a.go")
+        );
+        assert_eq!(accepted.tree_root, verified_root(&cold.db));
+    }
+
+    /// A rename over an existing file replaces it against the blob the
+    /// renamer read.
+    #[test]
+    fn a_rename_over_an_existing_file_replaces_it() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![
+                Proposed::delete("a.go", blob(A)),
+                proposed("b.go", blob(B), A),
+            ],
+        )
+        .unwrap();
+        assert_eq!(source_ids(&a.conn), ["b.go"]);
+        assert_eq!(
+            leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "b.go")).unwrap(),
+            A.as_bytes()
+        );
+    }
+
+    /// A rename whose create is refused leaves its source in place: the
+    /// delete is not applied alone.
+    #[test]
+    fn a_rename_whose_create_is_refused_leaves_the_source_in_place() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&a.conn);
+        for target in [
+            Proposed::create("b.go", A.as_bytes().to_vec()),
+            Proposed::create("c.go", b"package a\nfunc (".to_vec()),
+            Proposed::create("c.txt", A.as_bytes().to_vec()),
+        ] {
+            let err = propose(
+                &a.conn,
+                &Grant::Whole,
+                vec![Proposed::delete("a.go", blob(A)), target.clone()],
+            )
+            .unwrap_err();
+            assert!(
+                err.downcast_ref::<Refusal>().is_some(),
+                "{target:?}: {err:#}"
+            );
+            assert!(
+                whole_image(&a.conn) == before,
+                "{target:?} changed the arena"
+            );
+        }
+        assert_eq!(source_ids(&a.conn), ["a.go", "b.go"]);
+    }
+
+    /// A create the store cannot hold is refused before anything changes:
+    /// a path no language claims, a path that is not plain and relative,
+    /// a path under a file, a path that is the directory of a file.
+    #[test]
+    fn a_create_the_store_cannot_hold_is_refused() {
+        let a = arena(&[("a.go", A), ("lib.go/b.go", B)]);
+        let before = whole_image(&a.conn);
+        let refused = |writes: Vec<Proposed>| {
+            refusal_of(&propose(&a.conn, &Grant::Whole, writes).unwrap_err())
+        };
+        let create = |path: &str| Proposed::create(path, C.as_bytes().to_vec());
+
+        assert_eq!(
+            refused(vec![create("notes.txt")]),
+            Refusal::NoLanguage {
+                path: "notes.txt".into()
+            }
+        );
+        for path in [
+            "",
+            "/abs.go",
+            "../up.go",
+            "./c.go",
+            "x//c.go",
+            "x/../c.go",
+            "x/",
+        ] {
+            assert_eq!(
+                refused(vec![create(path)]),
+                Refusal::MalformedPath { path: path.into() },
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            refused(vec![create("a.go/c.go")]),
+            Refusal::PathConflict {
+                path: "a.go/c.go".into(),
+                other: "a.go".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![create("lib.go")]),
+            Refusal::PathConflict {
+                path: "lib.go".into(),
+                other: "lib.go/b.go".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![create("n/c.go"), create("n/c.go/d.go")]),
+            Refusal::PathConflict {
+                path: "n/c.go".into(),
+                other: "n/c.go/d.go".into()
+            }
+        );
+        assert_eq!(
+            refused(vec![Proposed::delete("a.go", Base::Absent)]),
+            Refusal::MalformedBase {
+                path: "a.go".into()
+            }
+        );
+        let only_a = Grant::Paths(BTreeSet::from(["a.go".to_string()]));
+        let err = propose(&a.conn, &only_a, vec![create("c.go")]).unwrap_err();
+        assert_eq!(
+            refusal_of(&err),
+            Refusal::OutsideGrant {
+                path: "c.go".into()
+            }
+        );
+        assert!(whole_image(&a.conn) == before);
+
+        // The proposal's own delete frees the path: a file becomes a
+        // directory in one change.
+        propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::delete("a.go", blob(A)), create("a.go/c.go")],
+        )
+        .unwrap();
+        assert_eq!(source_ids(&a.conn), ["a.go/c.go", "lib.go/b.go"]);
+    }
+
+    /// A store that holds no file yet takes its first create under the
+    /// root its parse recorded.
+    #[test]
+    fn the_first_create_in_an_empty_store_lands_under_the_recorded_root() {
+        let a = arena(&[]);
+        propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![Proposed::create("c.go", C.as_bytes().to_vec())],
+        )
+        .unwrap();
+        let cold = arena(&[("c.go", C)]);
+        assert_eq!(image(&a.conn, "c.go"), image(&cold.conn, "c.go"));
+        let recorded: String = a
+            .conn
+            .query_row("SELECT path FROM _source WHERE id = 'c.go'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            Path::new(&recorded),
+            a._src.path().canonicalize().unwrap().join("c.go")
+        );
     }
 
     #[test]

@@ -2,8 +2,9 @@
 
 The store-backed filesystem core behind LLO's virtio-fs device (ADR-0044 V2,
 bead `ley-line-open-f1ea99`). `StoreFs` answers the FUSE requests a Linux
-guest's file syscalls become, from the store, and lands writes as ADR-0042
-proposals. Every answer is data or a **Linux** errno: the guest is Linux
+guest's file syscalls become, from the store, and lands writes, creates,
+deletes and renames as ADR-0042 proposals (bead `ley-line-open-47fb03`,
+ADR-0042 P1a). Every answer is data or a **Linux** errno: the guest is Linux
 whatever the host is (macOS `ESTALE` is 70; the guest needs 116).
 
 This crate holds no libkrun code. Phase C adapts `StoreFs` onto the patched
@@ -22,10 +23,36 @@ libkrun's `DynFileSystem` trait; see "Adapter" below.
 | FLUSH / FSYNC `(handle)` | proposes the staged bytes against the base through `source_write::propose`, on the store's one writer. Accepted: the base advances to the blob written, and an attached checkout is brought up to it. Nothing staged: no proposal, `Ok` |
 | RELEASE `(handle)` | drops the handle and any bytes no FLUSH landed |
 | SETATTR `(inode, handle?, {size, mode, uid, gid})` | a size with a handle stages on it (`ftruncate`); a size without one is a proposal of its own against the file's current blob (`truncate`), `EACCES` outside the proposal scope; mode/uid/gid are `EPERM`; times are not carried; `EISDIR` for a directory's size |
-| CREATE, MKDIR | `EPERM` (`ENOENT`/`ENOTDIR` when the parent is not a visible directory) |
-| UNLINK, RMDIR, RENAME | `EPERM` (`ENOENT` when the named entry or target directory is not visible) |
+| CREATE `(parent, name, flags)` | the new file's entry and a handle whose base is "no file"; the file exists for the guest at once, and its first FLUSH proposes a **create** (bead `ley-line-open-47fb03`, ADR-0042 P1a). `EEXIST` when the name exists, `EACCES` outside the proposal scope |
+| UNLINK `(parent, name)` | a **delete** proposal against the blob the file holds; the directory it was in stays for the session, as on a disk. `EISDIR` on a directory, `ENOENT` when the name is not visible, `EACCES` outside the proposal scope |
+| RENAME `(olddir, oldname, newdir, newname, flags)` | a file moves by **one** proposal: delete the old path against its blob, create the new path (or replace the file there against its blob) with the same bytes; refused whole, so a refused rename leaves the old path. Handles open on the old path follow the file, and its inode moves with it. `EXDEV` for a stored file renamed to a name the store cannot hold, and for a directory that holds anything (the caller copies); `EISDIR`, `ENOTDIR`, `ENOTEMPTY` as `rename(2)`; `EEXIST` with `RENAME_NOREPLACE` over an existing name; `EINVAL` for `RENAME_EXCHANGE` and unknown flags; `EACCES` outside the proposal scope at either end |
+| MKDIR `(parent, name)` | a directory for the session, visible until RMDIR; nothing is proposed. `EEXIST` when the name exists, `EACCES` when the scope may propose no path under it |
+| RMDIR `(parent, name)` | removes a directory that holds nothing; `ENOTEMPTY` when a file or directory is under it, `ENOTDIR` on a file |
 
-Unknown inodes are `ENOENT`; unknown handles are `EBADF`.
+Unknown inodes are `ENOENT`; unknown handles are `EBADF`. Structural
+requests whose parent is not a visible directory are `ENOENT` or `ENOTDIR`.
+
+### Files and directories the store does not hold
+
+The store holds files in languages the parse projects; a directory is the
+prefix of the files under it. The session holds the rest, in memory, for
+the life of the `StoreFs`:
+
+- A **created file the store cannot hold** (its name names no projected
+  language: an editor's or harness's temp file such as
+  `a.go.tmp.4242.1700000000`, a note; or a language the attached
+  checkout's `lang_filter` excludes) keeps its bytes in the session at
+  each FLUSH and is never proposed. Renamed onto a name the store can
+  hold, it is proposed there as a create or replace: a write-temp-then-
+  rename save is one proposal. A stored file renamed to such a name is
+  `EXDEV`, so `mv` copies and unlinks instead.
+- A **created file the store can hold** is in the session from CREATE
+  until a FLUSH lands it. A FLUSH the store refuses (a syntax error) keeps
+  the written bytes in the session, so a later open or rename carries them;
+  an UNLINK before any FLUSH lands nothing.
+- A **directory** made by MKDIR, or emptied by UNLINK, RMDIR or RENAME,
+  stays until RMDIR. Directories are not persisted: a new `StoreFs` over
+  the same store sees the directories its files imply.
 
 ### Proposal errno map
 
@@ -33,8 +60,10 @@ Unknown inodes are `ENOENT`; unknown handles are `EBADF`.
 
 | `source_write::Refusal` | errno |
 |---|---|
-| `Stale` (the base moved) | `ESTALE` (116) |
+| `Stale` naming only creates whose path holds a file | `EEXIST` (17) |
+| any other `Stale` (a base moved, or its file was deleted) | `ESTALE` (116) |
 | `OutsideGrant` | `EACCES` (13) |
+| `NoSuchFile` | `ENOENT` (2) |
 | `Syntax`, every other refusal, every internal failure | `EIO` (5) |
 
 A refused FLUSH keeps the staged bytes and the base, so the `close` after a
@@ -47,9 +76,10 @@ the commit point (spike `ley-line-open-bb8cc1`).
 `Scope { see, propose }` is a run's `WorkspaceGrant` (`execution/v1`)
 resolved to paths: `read`/`list` operations become `see`, `mutate`/`commit`
 become `propose`. A path outside `see` does not exist for the guest. A
-directory exists when some visible file is under it; the root always exists.
-A file the scope may propose has mode `0644`, one it may only see `0444`;
-directories are `0555`.
+directory exists when some visible file is under it or the session made it;
+the root always exists. A file the scope may propose has mode `0644`, one it
+may only see `0444`; a directory the scope may propose a path under is
+`0755`, any other `0555`.
 
 ### Store and concurrency
 
@@ -62,14 +92,19 @@ to flush lands and the second is `ESTALE`.
 
 Reads resolve `_source.content_hash` to `source_blobs`: the one checkout
 ADR-0043 names today. Inode numbers are stable per path for the life of a
-`StoreFs`. The crate adds no persisted state.
+`StoreFs`; a RENAME carries the inode to the new path. The crate adds no
+persisted state.
 
 ## Not supported
 
-- Creating, deleting, renaming files or directories: the store has no
-  create, delete or move proposal. Editors that save by writing a temporary
-  file and renaming it over the original fail at CREATE; editors that write
-  in place work.
+- Renaming a directory that holds anything (`EXDEV`: `mv` copies), and
+  `RENAME_EXCHANGE`.
+- Files the store cannot hold persist only for the session (see above):
+  a note or temp file never renamed onto a projected name is gone when the
+  `StoreFs` is.
+- A handle open on a file another writer deleted, or that an UNLINK or a
+  RENAME over it removed, answers `ESTALE` at its next FLUSH of staged
+  bytes, where a disk would write to the orphaned inode.
 - Mode, owner, and times; extended attributes; links; locks.
 - Files the store holds no blob for (`_source.content_hash` NULL) do not
   exist for the guest.
@@ -97,6 +132,17 @@ The adapter implements libkrun's `DynFileSystem` over `StoreFs`:
   bytes from the `io::Read` and passes them on.
 - SETATTR: `SetattrValid::SIZE` → `size`, `MODE`/`UID`/`GID` → `mode`/`uid`/
   `gid`, the handle when the request carries one.
+- CREATE: `(parent, name, args.flags)` → `create`; reply with the entry and
+  the handle, `OpenOptions::DIRECT_IO` as for OPEN. The request's mode and
+  umask are not carried. MKDIR: `(parent, name)` → `mkdir`, mode not
+  carried. UNLINK and RMDIR pass `(parent, name)`.
+- RENAME and RENAME2: `(olddir, oldname, newdir, newname, flags)` → `rename`
+  (`flags` = 0 for RENAME; RENAME2's `RENAME_NOREPLACE` = 1,
+  `RENAME_EXCHANGE` = 2 and `RENAME_WHITEOUT` = 4 pass through, and every
+  flag but `RENAME_NOREPLACE` is `EINVAL`).
+- After UNLINK, RMDIR or RENAME the guest's dentry and attribute caches for
+  the names involved are stale until their TTL; a zero TTL (or an explicit
+  invalidation) keeps them current.
 - READDIR: `DirEntry { ino, offset, type_: DT_REG (8) / DT_DIR (4), name }`
   into `add_entry` until it returns 0.
 - INIT, FORGET, OPENDIR, RELEASEDIR, ACCESS, STATFS stay adapter-local.

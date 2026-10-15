@@ -13,28 +13,32 @@
 //!   directory or ingested from it — git's index.
 //!
 //! Comparing the directory and the store each against the index tells which
-//! side moved, path by path:
+//! side moved, path by path. "No file" is a value on every side: a file
+//! created on one side moved from no file, and a file deleted on one side
+//! moved to no file (bead `ley-line-open-47fb03`).
 //!
 //! | directory vs index | store vs index | action |
 //! |---|---|---|
 //! | same | same | nothing |
-//! | same | moved | materialize the stored bytes into the directory |
-//! | changed | same | ingest the directory's bytes |
-//! | changed | moved | converged when both hold the same bytes; otherwise a conflict |
+//! | same | moved | materialize the stored bytes into the directory, or remove the file the store deleted |
+//! | changed | same | ingest the directory's bytes, or its deletion |
+//! | changed | moved | converged when both hold the same bytes or both lost the file; otherwise a conflict |
 //!
-//! A conflict overwrites neither side: the store keeps its bytes, the file
-//! keeps its own, and the path is recorded in `_checkout_conflict` until a
-//! proposal or an edit makes the two agree. The store has no delete, so a
-//! path the store does not hold is never removed from the directory: a file
-//! there is ingested.
+//! A conflict overwrites neither side: the store keeps its bytes (or its
+//! deletion), the directory keeps its file (or its deletion), and the path
+//! is recorded in `_checkout_conflict` until a proposal or an edit makes
+//! the two agree. A path neither the store nor the index holds is a file
+//! new in the directory: it is ingested.
 //!
 //! **Ordering.** A proposal commits to the store and leaves the index alone;
-//! then each file is materialized (a temp file in the same directory,
-//! `fsync`, `rename`, `fsync` of the directory); then its index entry
-//! advances. A crash after the commit leaves directory == index while the
-//! store moved, which the next [`reconcile`] materializes. A crash after the
-//! rename leaves directory == store while the index lags, which converges.
-//! No ordering of crashes loses an accepted proposal or a person's edit.
+//! then each deleted file is removed (unlink, then `fsync` of its
+//! directory) and each written file materialized (a temp file in the same
+//! directory, `fsync`, `rename`, `fsync` of the directory); then its index
+//! entry advances. A crash after the commit leaves directory == index while
+//! the store moved, which the next [`reconcile`] carries out. A crash after
+//! the rename or the unlink leaves directory == store while the index lags,
+//! which converges. No ordering of crashes loses an accepted proposal or a
+//! person's edit.
 //!
 //! Startup, the watcher, `reparse` over the checkout and every accepted
 //! proposal run [`reconcile`]. A daemon without a source directory has no
@@ -64,6 +68,8 @@ pub enum Action {
     Converge,
     /// Both moved, to different bytes: reported, nothing overwritten.
     Conflict,
+    /// The store deleted the file: remove it from the directory.
+    Remove,
 }
 
 /// The action for a path the store holds as `stored`. `disk` is the hash of
@@ -81,15 +87,18 @@ pub fn classify(disk: Option<Hash>, stored: Hash, index: Option<Hash>) -> Action
     }
 }
 
-/// The action for a path the store does not hold. The store has no
-/// delete, so its not holding a file is never carried to the directory: a
-/// file there is ingested, and an index entry with no file on either side is
-/// dropped.
-pub fn classify_unstored(on_disk: bool, indexed: bool) -> Action {
-    match (on_disk, indexed) {
-        (true, _) => Action::Ingest,
-        (false, true) => Action::Converge,
-        (false, false) => Action::Nothing,
+/// The action for a path the store does not hold: [`classify`] with the
+/// store's side "no file". An index entry means the two once agreed on a
+/// file, so the store deleted it: removed from an unchanged directory, a
+/// conflict with a changed one. No index entry and a file on disk is a file
+/// new to the directory, ingested.
+pub fn classify_unstored(disk: Option<Hash>, index: Option<Hash>) -> Action {
+    match (disk, index) {
+        (None, None) => Action::Nothing,
+        (Some(_), None) => Action::Ingest,
+        (None, Some(_)) => Action::Converge,
+        (Some(d), Some(i)) if d == i => Action::Remove,
+        (Some(_), Some(_)) => Action::Conflict,
     }
 }
 
@@ -99,22 +108,24 @@ pub struct Conflict {
     pub path: String,
     /// The directory's bytes; `None` when the file was deleted there.
     pub disk: Option<Hash>,
-    /// The store's bytes, which the store keeps.
-    pub stored: Hash,
+    /// The store's bytes, which the store keeps; `None` when a proposal
+    /// deleted the file.
+    pub stored: Option<Hash>,
     /// Where the two last agreed.
     pub index: Option<Hash>,
 }
 
 impl std::fmt::Display for Conflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let disk = self
-            .disk
-            .map_or_else(|| "deleted".to_string(), |h| format!("blob {h}"));
+        let side =
+            |h: Option<Hash>| h.map_or_else(|| "deleted".to_string(), |h| format!("blob {h}"));
         write!(
             f,
-            "'{}' changed in the source directory ({disk}) and in the store (blob {}) \
+            "'{}' changed in the source directory ({}) and in the store ({}) \
              since they last agreed; neither was overwritten",
-            self.path, self.stored
+            self.path,
+            side(self.disk),
+            side(self.stored)
         )
     }
 }
@@ -127,8 +138,11 @@ pub struct Reconciled {
     pub parse: Option<ParseResult>,
     /// Paths whose stored bytes were written into the directory.
     pub materialized: Vec<String>,
-    /// Paths whose stored bytes could not be written, with the reason. The
-    /// store holds them, and the next reconcile tries again.
+    /// Paths the store deleted that were removed from the directory.
+    pub removed: Vec<String>,
+    /// Paths the directory could not be brought up to the store for: a
+    /// write or a removal that failed, with the reason. The store keeps its
+    /// side, and the next reconcile tries again.
     pub unmaterialized: Vec<(String, String)>,
     /// Paths both sides changed.
     pub conflicts: Vec<Conflict>,
@@ -144,7 +158,9 @@ impl Reconciled {
         let mut all: Vec<String> = self
             .unmaterialized
             .iter()
-            .map(|(path, why)| format!("'{path}' was not written to the source directory: {why}"))
+            .map(|(path, why)| {
+                format!("'{path}' was not brought up to the store in the source directory: {why}")
+            })
             .collect();
         all.extend(self.conflicts.iter().map(Conflict::to_string));
         (!all.is_empty()).then(|| all.join("; "))
@@ -177,7 +193,7 @@ pub fn ensure_tables(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS _checkout_conflict (
              path TEXT PRIMARY KEY,
              disk_hash BLOB,
-             stored_hash BLOB NOT NULL,
+             stored_hash BLOB,
              index_hash BLOB
          ) WITHOUT ROWID;",
     )?;
@@ -197,9 +213,11 @@ pub fn ensure_tables(conn: &Connection) -> Result<()> {
 /// the module documentation. `lang_filter` is the daemon's `--language`;
 /// a path the parse would skip is not part of the checkout.
 ///
-/// Materializing a file can fail without failing the reconcile: the path
-/// is reported in [`Reconciled::unmaterialized`]. Conflicts are recorded in
-/// `_checkout_conflict` and reported in [`Reconciled::conflicts`].
+/// Materializing or removing a file can fail without failing the
+/// reconcile: the path is reported in [`Reconciled::unmaterialized`], and a
+/// file the store deleted is kept out of the store whether or not it could
+/// be removed. Conflicts are recorded in `_checkout_conflict` and reported
+/// in [`Reconciled::conflicts`].
 pub fn reconcile(
     conn: &Connection,
     dir: &Path,
@@ -245,6 +263,7 @@ pub fn reconcile(
     let mut ingest = Vec::new();
     let mut converge: Vec<(String, Option<Hash>)> = Vec::new();
     let mut materialize: Vec<(String, Hash)> = Vec::new();
+    let mut remove: Vec<String> = Vec::new();
     let mut conflicts = Vec::new();
     let mut hashed = 0usize;
     for rel in &paths {
@@ -255,27 +274,25 @@ pub fn reconcile(
         // A symlink, a directory, or a file the parse skips for its size
         // is not part of the checkout.
         let meta = std::fs::symlink_metadata(&abs).ok();
-        let on_disk = match &meta {
-            None => false,
-            Some(m) if m.is_file() && (m.len() as i64) <= crate::cmd_parse::MAX_PARSE_FILE_SIZE => {
-                true
-            }
-            Some(_) => continue,
-        };
-        let indexed = index.get(rel).copied();
-        let Some(&held) = stored.get(rel) else {
-            match classify_unstored(on_disk, indexed.is_some()) {
-                Action::Ingest => ingest.push(rel.clone()),
-                Action::Converge => converge.push((rel.clone(), None)),
-                _ => {}
-            }
+        if let Some(m) = &meta
+            && !(m.is_file() && (m.len() as i64) <= crate::cmd_parse::MAX_PARSE_FILE_SIZE)
+        {
             continue;
-        };
+        }
+        let indexed = index.get(rel).copied();
+        let held = stored.get(rel).copied();
         // `meta` is `Some` exactly when the file is on disk: anything else
-        // there left the loop above.
-        let disk = match &meta {
-            Some(m) if stats.get(rel) == Some(&stat_pair(m)) => Some(held),
-            Some(_) => {
+        // there left the loop above. A file whose stat matches the store's
+        // record of it holds the stored bytes; a file new to both the store
+        // and the index is ingested unread.
+        let disk = match (&meta, held, indexed) {
+            (None, _, _) => None,
+            (Some(m), Some(held), _) if stats.get(rel) == Some(&stat_pair(m)) => Some(held),
+            (Some(_), None, None) => {
+                ingest.push(rel.clone());
+                continue;
+            }
+            (Some(_), _, _) => {
                 hashed += 1;
                 match std::fs::read(&abs) {
                     Ok(bytes) => Some(bytes.hash()),
@@ -285,13 +302,17 @@ pub fn reconcile(
                     }
                 }
             }
-            None => None,
         };
-        match classify(disk, held, indexed) {
+        let action = match held {
+            Some(held) => classify(disk, held, indexed),
+            None => classify_unstored(disk, indexed),
+        };
+        match action {
             Action::Nothing => {}
-            Action::Materialize => materialize.push((rel.clone(), held)),
+            Action::Materialize => materialize.extend(held.map(|h| (rel.clone(), h))),
+            Action::Remove => remove.push(rel.clone()),
             Action::Ingest => ingest.push(rel.clone()),
-            Action::Converge => converge.push((rel.clone(), Some(held))),
+            Action::Converge => converge.push((rel.clone(), held)),
             Action::Conflict => conflicts.push(Conflict {
                 path: rel.clone(),
                 disk,
@@ -302,9 +323,27 @@ pub fn reconcile(
     }
 
     // The directory is brought up to the store before anything is parsed
-    // from it, so the parse reads the bytes it just received.
+    // from it, so the parse reads the bytes it just received. Removals go
+    // first, so a proposal that turns a file into a directory of files
+    // lands in the directory too. A path the store deleted is kept out of
+    // the parse whether or not its file could be removed.
     let mut materialized = Vec::new();
+    let mut removed = Vec::new();
     let mut unmaterialized = Vec::new();
+    let mut kept_out = BTreeSet::new();
+    for rel in remove {
+        match remove_from(dir, &rel) {
+            Ok(()) => {
+                set_index(conn, &rel, None)?;
+                removed.push(rel);
+            }
+            Err(e) => {
+                log::warn!("checkout: '{rel}' was not removed from the source directory: {e:#}");
+                kept_out.insert(rel.clone());
+                unmaterialized.push((rel, format!("{e:#}")));
+            }
+        }
+    }
     for (rel, held) in materialize {
         match blob(conn, held).and_then(|bytes| write_into(dir, &rel, &bytes)) {
             Ok(()) => {
@@ -318,11 +357,19 @@ pub fn reconcile(
         }
     }
 
-    // A conflict keeps its stored bytes through the parse.
+    // A conflict keeps the store's side through the parse: its bytes, or
+    // its deletion.
     let mut kept = BTreeMap::new();
     for c in &conflicts {
         log::warn!("checkout conflict: {c}");
-        kept.insert(c.path.clone(), blob(conn, c.stored)?);
+        match c.stored {
+            Some(stored) => {
+                kept.insert(c.path.clone(), blob(conn, stored)?);
+            }
+            None => {
+                kept_out.insert(c.path.clone());
+            }
+        }
     }
     let parse = match scope {
         None => Some(crate::cmd_parse::parse_checkout(
@@ -331,6 +378,7 @@ pub fn reconcile(
             lang_filter,
             None,
             &kept,
+            &kept_out,
         )?),
         Some(_) if !ingest.is_empty() => Some(crate::cmd_parse::parse_checkout(
             conn,
@@ -338,6 +386,7 @@ pub fn reconcile(
             lang_filter,
             Some(&ingest),
             &kept,
+            &kept_out,
         )?),
         Some(_) => None,
     };
@@ -375,7 +424,7 @@ pub fn reconcile(
             rusqlite::params![
                 c.path,
                 c.disk.map(|h| h.as_bytes().to_vec()),
-                c.stored.as_bytes().to_vec(),
+                c.stored.map(|h| h.as_bytes().to_vec()),
                 c.index.map(|h| h.as_bytes().to_vec()),
             ],
         )?;
@@ -385,6 +434,7 @@ pub fn reconcile(
     Ok(Reconciled {
         parse,
         materialized,
+        removed,
         unmaterialized,
         conflicts,
         hashed,
@@ -449,6 +499,44 @@ pub fn write_into(dir: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&staging);
     }
     written.with_context(|| format!("write '{rel}' into {}", dir.display()))
+}
+
+/// Remove the file `rel` names under `dir`, then each directory above it
+/// that the removal left empty, up to `dir` itself, and sync the nearest
+/// directory left standing, so the removal survives a crash. Refused when
+/// `rel` is not a plain relative path or its directory resolves outside
+/// `dir` (a symlink out of the tree).
+pub fn remove_from(dir: &Path, rel: &str) -> Result<()> {
+    if !inside(rel) {
+        bail!("refusing to remove '{rel}': not a path inside the source directory");
+    }
+    let target = dir.join(rel);
+    let parent = target
+        .parent()
+        .with_context(|| format!("refusing to remove '{rel}': it names no directory"))?;
+    let root = dir
+        .canonicalize()
+        .with_context(|| format!("resolve the source directory {}", dir.display()))?;
+    let resolved = parent
+        .canonicalize()
+        .with_context(|| format!("resolve the directory of '{rel}'"))?;
+    if !resolved.starts_with(&root) {
+        bail!(
+            "refusing to remove '{rel}': {} is outside the source directory {}",
+            resolved.display(),
+            root.display()
+        );
+    }
+    let removed = (|| -> Result<()> {
+        std::fs::remove_file(&target)?;
+        let mut standing = parent;
+        while standing != dir && std::fs::remove_dir(standing).is_ok() {
+            standing = standing.parent().unwrap_or(dir);
+        }
+        std::fs::File::open(standing)?.sync_all()?;
+        Ok(())
+    })();
+    removed.with_context(|| format!("remove '{rel}' from {}", dir.display()))
 }
 
 /// Whether `rel` is a plain relative path: one or more normal components,
@@ -551,7 +639,9 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         for (rel, text) in files {
-            std::fs::write(src.join(rel), text).unwrap();
+            let path = src.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
         }
         let conn = Connection::open(dir.path().join("live.db")).unwrap();
         let cold = reconcile(&conn, &src, None, None).unwrap();
@@ -569,11 +659,7 @@ mod tests {
         propose(
             &c.conn,
             &Grant::Whole,
-            vec![Proposed {
-                path: path.to_string(),
-                base: Base::Any,
-                bytes: text.as_bytes().to_vec(),
-            }],
+            vec![Proposed::write(path, Base::Any, text.as_bytes().to_vec())],
         )
         .unwrap();
     }
@@ -627,12 +713,172 @@ mod tests {
         assert_eq!(classify(Some(z), y, None), Action::Conflict);
     }
 
+    /// A path the store does not hold: the same table with the store's side
+    /// absent. The store deleted it when the index still names it.
     #[test]
-    fn a_path_the_store_does_not_hold_is_never_removed_from_the_directory() {
-        assert_eq!(classify_unstored(true, false), Action::Ingest);
-        assert_eq!(classify_unstored(true, true), Action::Ingest);
-        assert_eq!(classify_unstored(false, true), Action::Converge);
-        assert_eq!(classify_unstored(false, false), Action::Nothing);
+    fn classify_unstored_follows_the_table_with_the_store_absent() {
+        let (x, y) = (h(A), h(A2));
+        assert_eq!(classify_unstored(None, None), Action::Nothing);
+        assert_eq!(classify_unstored(Some(x), None), Action::Ingest);
+        assert_eq!(classify_unstored(None, Some(x)), Action::Converge);
+        assert_eq!(classify_unstored(Some(x), Some(x)), Action::Remove);
+        assert_eq!(classify_unstored(Some(y), Some(x)), Action::Conflict);
+    }
+
+    fn commit(c: &Checkout, writes: Vec<Proposed>) {
+        propose(&c.conn, &Grant::Whole, writes).unwrap();
+    }
+
+    fn scope(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// Bead `ley-line-open-47fb03`: a create is written into the directory
+    /// (its directories made) and a delete removes the file, and the index
+    /// follows each.
+    #[test]
+    fn a_proposed_create_is_materialized_and_a_proposed_delete_removes_the_file() {
+        let c = checkout(&[("a.go", A), ("b.go", B)]);
+        commit(
+            &c,
+            vec![
+                Proposed::create("sub/c.go", A3.as_bytes().to_vec()),
+                Proposed::delete("b.go", Base::Blob(h(B))),
+            ],
+        );
+        let r = reconcile(&c.conn, &c.src, None, Some(&scope(&["sub/c.go", "b.go"]))).unwrap();
+        assert_eq!(r.materialized, ["sub/c.go"]);
+        assert_eq!(r.removed, ["b.go"]);
+        assert_eq!(r.problems(), None);
+        assert!(r.parse.is_none(), "nothing was ingested");
+        assert_eq!(disk(&c, "sub/c.go").as_deref(), Some(A3));
+        assert_eq!(disk(&c, "b.go"), None);
+        assert_eq!(indexed(&c, "sub/c.go"), Some(h(A3)));
+        assert_eq!(indexed(&c, "b.go"), None);
+        assert_eq!(stored(&c, "b.go"), None);
+
+        // The last file of a directory takes the emptied directory with it.
+        commit(&c, vec![Proposed::delete("sub/c.go", Base::Blob(h(A3)))]);
+        let r = reconcile(&c.conn, &c.src, None, Some(&scope(&["sub/c.go"]))).unwrap();
+        assert_eq!(r.removed, ["sub/c.go"]);
+        assert!(!c.src.join("sub").exists());
+        assert!(c.src.exists(), "the checkout's own directory stays");
+
+        // Nothing is left to do.
+        let quiet = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert!(quiet.removed.is_empty() && quiet.materialized.is_empty());
+        assert_eq!(stored(&c, "b.go"), None);
+    }
+
+    /// A create and a delete committed before a crash are carried out by
+    /// the whole-directory reconcile a restart runs: the deleted file is
+    /// removed from the directory, not ingested back into the store.
+    #[test]
+    fn a_create_and_delete_committed_before_a_crash_are_carried_out_at_restart() {
+        let c = checkout(&[("a.go", A), ("b.go", B)]);
+        commit(
+            &c,
+            vec![
+                Proposed::delete("a.go", Base::Blob(h(A))),
+                Proposed::create("c.go", A.as_bytes().to_vec()),
+            ],
+        );
+        // The restart: a new connection to the same database.
+        let db = c.src.parent().unwrap().join("live.db");
+        let restarted = Connection::open(&db).unwrap();
+        let r = reconcile(&restarted, &c.src, None, None).unwrap();
+        assert_eq!(r.removed, ["a.go"]);
+        assert_eq!(r.materialized, ["c.go"]);
+        assert_eq!(r.problems(), None);
+        let c = Checkout {
+            conn: restarted,
+            ..c
+        };
+        assert_eq!(disk(&c, "a.go"), None);
+        assert_eq!(stored(&c, "a.go"), None, "the delete is not undone");
+        assert_eq!(disk(&c, "c.go").as_deref(), Some(A));
+        assert_eq!(stored(&c, "c.go"), Some(h(A)));
+        assert_eq!(indexed(&c, "a.go"), None);
+        assert_eq!(indexed(&c, "c.go"), Some(h(A)));
+    }
+
+    /// The store deleted a file the directory changed: a conflict. Neither
+    /// side is overwritten — the store does not take the file back, the
+    /// directory keeps it — until the two agree.
+    #[test]
+    fn a_store_delete_against_a_directory_edit_is_a_conflict_that_keeps_both() {
+        let c = checkout(&[("a.go", A), ("b.go", B)]);
+        commit(&c, vec![Proposed::delete("b.go", Base::Blob(h(B)))]);
+        std::fs::write(c.src.join("b.go"), B2).unwrap();
+
+        let r = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert_eq!(
+            r.conflicts,
+            [Conflict {
+                path: "b.go".to_string(),
+                disk: Some(h(B2)),
+                stored: None,
+                index: Some(h(B)),
+            }]
+        );
+        assert!(r.removed.is_empty());
+        assert_eq!(stored(&c, "b.go"), None, "the store keeps the delete");
+        assert_eq!(disk(&c, "b.go").as_deref(), Some(B2), "the edit is kept");
+        assert_eq!(conflict_paths(&c), ["b.go"]);
+        let problems = r.problems().unwrap();
+        assert!(problems.contains("in the store (deleted)"), "{problems}");
+
+        // The person deletes it too: the two agree.
+        std::fs::remove_file(c.src.join("b.go")).unwrap();
+        let settled = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert!(settled.conflicts.is_empty());
+        assert!(conflict_paths(&c).is_empty());
+        assert_eq!(indexed(&c, "b.go"), None);
+    }
+
+    /// A delete the directory refuses (a read-only directory) is reported,
+    /// and a whole-directory pass does not ingest the file back.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_the_directory_refuses_keeps_the_store_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+        let c = checkout(&[("a.go", A), ("ro/b.go", B)]);
+        commit(&c, vec![Proposed::delete("ro/b.go", Base::Blob(h(B)))]);
+        let ro = c.src.join("ro");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = reconcile(&c.conn, &c.src, None, None);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = r.unwrap();
+        assert!(r.removed.is_empty());
+        assert_eq!(r.unmaterialized.len(), 1, "{:?}", r.unmaterialized);
+        assert_eq!(r.unmaterialized[0].0, "ro/b.go");
+        assert!(r.problems().unwrap().contains("ro/b.go"));
+        assert_eq!(stored(&c, "ro/b.go"), None, "not ingested back");
+        assert_eq!(indexed(&c, "ro/b.go"), Some(h(B)), "tried again next time");
+
+        let retried = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert_eq!(retried.removed, ["ro/b.go"]);
+        assert_eq!(disk(&c, "ro/b.go"), None);
+    }
+
+    #[test]
+    fn remove_from_refuses_a_path_outside_the_directory() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(dir.path().join("outside.go"), A).unwrap();
+        for rel in ["../outside.go", "/etc/hosts", "", "./a.go"] {
+            let err = remove_from(&src, rel).unwrap_err();
+            assert!(format!("{err:#}").contains("refusing"), "{rel}: {err:#}");
+        }
+        assert!(dir.path().join("outside.go").exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path(), src.join("link")).unwrap();
+            let err = remove_from(&src, "link/outside.go").unwrap_err();
+            assert!(format!("{err:#}").contains("outside"), "{err:#}");
+            assert!(dir.path().join("outside.go").exists());
+        }
     }
 
     #[test]
@@ -682,7 +928,7 @@ mod tests {
             [Conflict {
                 path: "a.go".to_string(),
                 disk: None,
-                stored: h(A2),
+                stored: Some(h(A2)),
                 index: Some(h(A)),
             }]
         );

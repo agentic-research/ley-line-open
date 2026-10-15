@@ -20,6 +20,7 @@ rs/ll-open/runtime/Cargo.toml
 rs/ll-open/schema-bridge/Cargo.toml
 rs/ll-open/sheaf/Cargo.toml
 rs/ll-open/sign/Cargo.toml
+rs/ll-open/storefs/Cargo.toml
 rs/ll-open/text-search/Cargo.toml
 rs/ll-open/ts/Cargo.toml
 rs/ll-open/vcs/Cargo.toml

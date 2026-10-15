@@ -191,6 +191,20 @@ pub trait DynFileSystem: Send + Sync {
     ) -> io::Result<()> {
         enosys()
     }
+    /// READDIRPLUS: each entry with its `Entry`, so the guest needs no LOOKUP
+    /// per name. Advertise `FsOptions::DO_READDIRPLUS` from `init` to receive
+    /// it. Each returned `Entry` counts as one lookup (the kernel FORGETs it).
+    fn readdirplus(
+        &self,
+        ctx: Context,
+        inode: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        enosys()
+    }
     fn releasedir(&self, ctx: Context, inode: u64, flags: u32, handle: u64) -> io::Result<()> {
         Ok(())
     }
@@ -492,6 +506,21 @@ impl FileSystem for DynFs {
     {
         self.0
             .readdir(ctx, inode, handle, size, offset, &mut add_entry)
+    }
+    fn readdirplus<F>(
+        &self,
+        ctx: Context,
+        inode: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        mut add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+    {
+        self.0
+            .readdirplus(ctx, inode, handle, size, offset, &mut add_entry)
     }
     fn releasedir(&self, ctx: Context, inode: u64, flags: u32, handle: u64) -> io::Result<()> {
         self.0.releasedir(ctx, inode, flags, handle)

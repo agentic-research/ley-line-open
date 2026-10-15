@@ -67,11 +67,11 @@ pub fn cmd_inspect(
     let conn = open_arena_db(arena, control_path)?;
 
     if let Some(sql) = query {
-        run_sql(&conn, sql)
+        print!("{}", sql_table(&conn, sql)?);
     } else {
         println!("{}", lookup_node(&conn, id)?);
-        Ok(())
     }
+    Ok(())
 }
 
 /// Look up a node by ID and render its columns as the report `leyline
@@ -125,12 +125,6 @@ fn lookup_node(conn: &Connection, id: &str) -> Result<String> {
     }
 }
 
-/// Run arbitrary SQL and print tab-separated results with column headers.
-fn run_sql(conn: &Connection, sql: &str) -> Result<()> {
-    print!("{}", sql_table(conn, sql)?);
-    Ok(())
-}
-
 /// One SQLite value as `inspect` prints it: numbers and text as they are,
 /// `NULL`, and a blob as an SQL hex literal.
 fn render(value: rusqlite::types::ValueRef<'_>) -> String {
@@ -148,7 +142,7 @@ fn render(value: rusqlite::types::ValueRef<'_>) -> String {
 }
 
 /// The result of `sql` as tab-separated lines: the column names, then one
-/// line per row.
+/// line per row. Returned, not printed, for the reason `lookup_node` gives.
 fn sql_table(conn: &Connection, sql: &str) -> Result<String> {
     let mut stmt = conn.prepare(sql)?;
     let col_count = stmt.column_count();

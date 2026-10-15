@@ -8,6 +8,11 @@
 - `rs/ll-open/runtime` (execution/v1; the libkrun worker backend, which attaches a root filesystem
   with `krun_add_virtiofs3`)
 - `ley-line-open-bc5a6a` (macOS NFS does not report a refused COMMIT), PR #461 (closed, unmerged)
+- cloister ADR-0044 (libkrun as the compute-isolation substrate; the guest's only filesystem is
+  libkrun's in-process virtio-fs server, `fuse-backend-rs`), ADR-0049 (amended: LLO owns the
+  execution runtime and its libkrun backend; cloister keeps policy, authorization and audit), ADR-0050
+  (Proposed: content-addressed read-only rootfs plus CoW overlay with validate-on-commit; per-op
+  mediation deferred), ADR-0063 (execution/v1 is LLO-owned)
 
 ______________________________________________________________________
 
@@ -57,11 +62,16 @@ OPEN, READ, WRITE, FLUSH, FSYNC, RELEASE, CREATE, UNLINK, RENAME, SETATTR, READD
   refusal. The Linux FUSE client returns FLUSH and FSYNC errors to `close` and `fsync`, so every
   refusal reaches the agent.
 
-### V3 — Reads can be zero-copy
+### V3 — Reads come from immutable blobs; only the write path is served per operation
 
-virtio-fs DAX maps host memory windows into the guest. A blob of the published snapshot can be
-mapped into a DAX window, so reading it costs no copy and no exit. Whether libkrun exposes DAX on
-macOS is measured, not assumed.
+Content-addressed blobs never change, so a read needs no round trip to LLO once the blob is in the
+guest. Reads are served from immutable blobs mapped into the guest: a virtio-fs DAX window over the
+published snapshot's blobs, or a read-only image of them, shared through the page cache. This is
+cloister ADR-0050's fast path. Only the operations that carry ADR-0042's guarantees reach LLO per
+operation: OPEN for writing (the base), WRITE (staged bytes), and FLUSH, FSYNC and RELEASE (the
+proposal and its errno). ADR-0050's "validate-on-commit" becomes "propose on flush": the commit point
+is the agent's own `fsync` or `close`, and its outcome is that call's return value. Whether libkrun
+maps DAX windows on macOS is measured, not assumed.
 
 ### V4 — The host mount is compatibility
 
@@ -70,7 +80,14 @@ They keep the guarantees they can carry (per-open bases on FUSE; READ-time bases
 stale refusal on NFS) and document what they cannot. NFS-only heuristics are not added: #461 is
 closed unmerged, and its probe results are recorded above.
 
-### V5 — The socket stays
+### V5 — Mechanism in LLO, policy in cloister
+
+LLO provides the virtio-fs backend and the libkrun runtime behind `execution/v1` (cloister ADR-0049
+amendment, ADR-0063). cloister provides the policy that scopes a run (which refs and paths the guest
+sees, who may propose, audit and receipts) through the RunGrant. The backend enforces the grant;
+it does not define it.
+
+### V6 — The socket stays
 
 The UDS and MCP ops remain for remote callers and for mache. They carry the same proposal and refusal
 types the virtio-fs backend uses.
@@ -80,6 +97,10 @@ types the virtio-fs backend uses.
 - `bc5a6a` closes as superseded: agents no longer depend on the macOS NFS client.
 - The guest sees ordinary files, so an agent harness, a shell and an editor inside the VM need no
   change.
+- cloister ADR-0050 defers per-op mediation as slow and unnecessary for isolation. It predates
+  proposals: its validate-on-commit has no base an edit was made against and no refusal that reaches
+  the agent. V3 keeps its read path and serves only the write path per operation; ADR-0050 needs an
+  amendment on the cloister side to say so.
 - LLO depends on libkrun accepting a custom virtio-fs backend. If its C API does not, LLO links the
   devices crate directly or carries a fork, which is a supply-chain decision (open question 1).
 

@@ -17,14 +17,14 @@ pub const COMMIT_IDLE: Duration = Duration::from_millis(200);
 /// How often the server checks for a standing truncate.
 const COMMIT_TICK: Duration = Duration::from_millis(50);
 
-/// The status a refused COMMIT answers: `NFS3ERR_STALE` when the file moved
-/// since the edit's base was taken (ADR-0042 P2), `NFS3ERR_IO` for any other
+/// The status a refused edit answers: `NFS3ERR_STALE` when the file moved
+/// since the edit's base was taken (ADR-0042 P2), `other` for any other
 /// refusal.
-fn commit_status(err: &anyhow::Error) -> nfsstat3 {
+fn refusal_status(err: &anyhow::Error, other: nfsstat3) -> nfsstat3 {
     if err.downcast_ref::<crate::graph::StaleWrite>().is_some() {
         nfsstat3::NFS3ERR_STALE
     } else {
-        nfsstat3::NFS3ERR_IO
+        other
     }
 }
 
@@ -44,13 +44,37 @@ fn commit_status(err: &anyhow::Error) -> nfsstat3 {
 ///
 /// NFSv3 has no opens and names no client on a WRITE, so every change is
 /// the graph's [`MOUNT_HANDLE`](crate::graph::MOUNT_HANDLE) edit (bead
-/// `ley-line-open-5da276`). Its base is the file's bytes when the first
-/// uncommitted write or truncate to the file arrives, and it is held until
-/// the COMMIT of the file's last staged node lands. A COMMIT whose file
-/// moved since that base — through another mount, a batch splice, or the
-/// COMMIT of another node of the same file — is refused `NFS3ERR_STALE`
-/// and its change discarded. Two clients editing one node share its staged
-/// bytes, since nothing on the wire tells them apart.
+/// `ley-line-open-5da276`), checked against one base per file: the hash of
+/// the file's stored bytes the client last had from the server (bead
+/// `ley-line-open-6116c9`). A client holds UNSTABLE writes until fsync or
+/// close, so the server can first see a WRITE after another writer moved
+/// the file; the base is taken no later than the READ:
+///
+/// - a READ of a node of the file, with no edit to the file staged,
+///   re-takes the base ([`Graph::note_read`]) before the bytes are served;
+/// - a READ while an edit to the file is staged leaves the base the edit
+///   was made against;
+/// - a landed COMMIT sets the base to the bytes it wrote, and a refused
+///   one keeps it, so a retry from the client's cache with no READ in
+///   between is refused again;
+/// - a WRITE or truncate with no base yet takes one, from the stored bytes.
+///
+/// A WRITE or truncate to a file that moved since that base — through a
+/// socket proposal, another mount, a batch splice, or the COMMIT of another
+/// node of the same file — is refused `NFS3ERR_STALE` before it is staged,
+/// and a COMMIT whose file moved after its WRITEs is refused the same way
+/// and its change discarded. The WRITE refusal is the one a macOS client
+/// reports (`ESTALE` at fsync or close); it ignores a failed COMMIT, so a
+/// refusal that only the COMMIT can make — the file moved between the
+/// WRITE and the COMMIT, or the edit does not parse — is not reported to
+/// it, though nothing of the edit lands. Not
+/// refused: an edit from a cache the client filled with no READ to this
+/// server and no landed edit through it (a previous mount or server
+/// process), whose base is taken at its WRITE; and, the base being per
+/// file, an edit to one node from a cache older than the client's latest
+/// READ of another node of the file. The mount holds one base per file it
+/// has served, replaced in place. Two clients editing one node share its
+/// staged bytes, since nothing on the wire tells them apart.
 pub struct Staged {
     graph: Arc<dyn Graph>,
     nodes: Mutex<HashMap<String, Stage>>,
@@ -352,11 +376,11 @@ impl NFSFileSystem for LeylineNfs {
             kept[n..].fill(0);
             self.graph
                 .truncate(&node_id)
-                .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
+                .map_err(|e| refusal_status(&e, nfsstat3::NFS3ERR_ROFS))?;
             if keep > 0 {
                 self.graph
                     .write_content(&node_id, &kept, 0)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|e| refusal_status(&e, nfsstat3::NFS3ERR_IO))?;
             }
             self.staged.stage_truncate(&node_id, Instant::now());
         }
@@ -377,6 +401,15 @@ impl NFSFileSystem for LeylineNfs {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let node_id = self.resolve_id(id)?;
+        // The base is taken before the bytes are read: a change landing in
+        // between leaves it older than what the client gets, so the edit is
+        // refused rather than landed over a change it did not read. A base
+        // that cannot be taken fails the READ: serving bytes no base covers
+        // would let the client's edit of them land unchecked.
+        self.graph.note_read(&node_id).map_err(|e| {
+            log::warn!("NFS read of {node_id}: base not taken: {e:#}");
+            nfsstat3::NFS3ERR_IO
+        })?;
         let mut buf = vec![0u8; count as usize];
         let n = self
             .graph
@@ -394,7 +427,10 @@ impl NFSFileSystem for LeylineNfs {
 
     /// Stage the chunk. An UNSTABLE write is answered UNSTABLE and waits for
     /// the client's COMMIT; a FILE_SYNC or DATA_SYNC write is committed
-    /// before it is answered. A refused commit fails the write.
+    /// before it is answered. A refused commit fails the write. A write to
+    /// a file that moved since the mount's base is refused `NFS3ERR_STALE`
+    /// before it is staged: macOS reports a failed WRITE at fsync, and
+    /// ignores a failed COMMIT (bead `ley-line-open-6116c9`).
     async fn write_stable(
         &self,
         id: fileid3,
@@ -405,7 +441,10 @@ impl NFSFileSystem for LeylineNfs {
         let node_id = self.resolve_id(id)?;
         self.graph
             .write_content(&node_id, data, offset)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|e| {
+                log::debug!("NFS write to {node_id} refused: {e:#}");
+                refusal_status(&e, nfsstat3::NFS3ERR_IO)
+            })?;
         self.staged.stage_write(&node_id);
         if stable {
             self.commit(id, 0, 0).await?;
@@ -429,7 +468,7 @@ impl NFSFileSystem for LeylineNfs {
         let node_id = self.resolve_id(id)?;
         self.staged.commit_node(&node_id).map_err(|e| {
             log::warn!("NFS commit of {node_id} refused: {e:#}");
-            commit_status(&e)
+            refusal_status(&e, nfsstat3::NFS3ERR_IO)
         })
     }
 
@@ -1007,6 +1046,161 @@ mod tests {
             );
             assert_eq!(read_all(&nfs, x).await, b"hello");
             assert_eq!(read_all(&nfs, y).await, b"again");
+        }
+
+        /// Another writer lands `text` over node `ino` — a socket proposal,
+        /// as far as the mount can tell: it reaches the write path without
+        /// passing through the NFS server.
+        fn land_elsewhere(nfs: &LeylineNfs, ino: fileid3, text: &str) {
+            let id = nfs.resolve_id(ino).unwrap();
+            nfs.graph
+                .batch_splice(&[(id, Some(text.to_string()))])
+                .unwrap();
+        }
+
+        /// Whether a WRITE was refused as stale.
+        fn is_stale<T>(r: Result<T, nfsstat3>) -> bool {
+            matches!(r, Err(nfsstat3::NFS3ERR_STALE))
+        }
+
+        /// The edit a macOS client makes: it READs the node, holds its
+        /// change as UNSTABLE writes until fsync, and the server first sees
+        /// the WRITE after another writer moved the file. The WRITE is
+        /// refused `NFS3ERR_STALE`, nothing is staged, and nothing of the
+        /// edit lands (bead `ley-line-open-6116c9`). The WRITE, not the
+        /// COMMIT, carries the refusal: macOS reports a failed WRITE at
+        /// fsync and ignores a failed COMMIT. Before, the base was taken at
+        /// the WRITE, from the moved file, and the edit landed over the
+        /// change its client never read.
+        #[tokio::test]
+        async fn an_edit_read_before_the_file_moved_is_refused_stale() {
+            let (nfs, recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            land_elsewhere(&nfs, y, "moved");
+            assert!(is_stale(nfs.write(x, 0, b"world").await));
+            nfs.commit(x, 0, 0).await.unwrap();
+            assert_eq!(read_all(&nfs, x).await, b"hello", "nothing landed");
+            assert_eq!(read_all(&nfs, y).await, b"moved");
+            assert_eq!(
+                recorder.writes.lock().len(),
+                1,
+                "only the move reached the write path"
+            );
+        }
+
+        /// A truncate from a client that read the file before it moved is
+        /// refused the same way, before anything is staged.
+        #[tokio::test]
+        async fn a_truncate_read_before_the_file_moved_is_refused_stale() {
+            let (nfs, recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            land_elsewhere(&nfs, y, "moved");
+            assert!(is_stale(nfs.setattr(x, size(0)).await));
+            assert!(!commit_now(&nfs), "nothing staged");
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            assert_eq!(recorder.writes.lock().len(), 1);
+        }
+
+        /// A refusal keeps the base: a client that retries from its cache,
+        /// with no READ in between, is refused again. A READ re-takes it,
+        /// and the edit made after that lands. Before, the refusal dropped
+        /// the base and the retry's WRITE took one from the moved file.
+        #[tokio::test]
+        async fn a_retry_without_a_read_after_a_stale_refusal_is_refused() {
+            let (nfs, _recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            nfs.write(x, 0, b"early").await.unwrap();
+            land_elsewhere(&nfs, y, "moved");
+            assert!(matches!(
+                nfs.commit(x, 0, 0).await,
+                Err(nfsstat3::NFS3ERR_STALE)
+            ));
+            for _ in 0..2 {
+                assert!(is_stale(nfs.write(x, 0, b"world").await));
+            }
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            nfs.write(x, 0, b"world").await.unwrap();
+            nfs.commit(x, 0, 0).await.unwrap();
+            assert_eq!(read_all(&nfs, x).await, b"world");
+            assert_eq!(read_all(&nfs, y).await, b"moved");
+        }
+
+        /// A READ with no change after it: the edit lands.
+        #[tokio::test]
+        async fn an_edit_read_from_the_current_file_lands() {
+            let (nfs, recorder) = html_nfs();
+            let ino = text_leaf(&nfs).await;
+            assert_eq!(read_all(&nfs, ino).await, b"hello");
+            nfs.write(ino, 0, b"world").await.unwrap();
+            nfs.commit(ino, 0, 0).await.unwrap();
+            assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+        }
+
+        /// A READ after the file moved, with nothing staged, re-takes the
+        /// base: the client has read the moved file, and its edit lands.
+        #[tokio::test]
+        async fn a_read_after_the_file_moved_refreshes_the_base() {
+            let (nfs, _recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            land_elsewhere(&nfs, y, "moved");
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            nfs.write(x, 0, b"world").await.unwrap();
+            nfs.commit(x, 0, 0).await.unwrap();
+            assert_eq!(read_all(&nfs, x).await, b"world");
+            assert_eq!(read_all(&nfs, y).await, b"moved");
+        }
+
+        /// A READ of another node of the file while an edit to it is staged
+        /// leaves the base alone: the staged edit was made against the
+        /// bytes read before it, and the file moved since.
+        #[tokio::test]
+        async fn a_read_while_an_edit_is_staged_keeps_its_base() {
+            let (nfs, _recorder) = nfs_over(b"<p>a</p>\n<p>b</p>\n<p>c</p>\n");
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            let z = walk(&nfs, &["test.html", "element_2", "text"]).await;
+            assert_eq!(read_all(&nfs, x).await, b"a");
+            nfs.write(x, 0, b"A").await.unwrap();
+            land_elsewhere(&nfs, z, "moved");
+            assert_eq!(read_all(&nfs, y).await, b"b");
+            assert!(
+                is_stale(nfs.write(x, 1, b"!").await),
+                "a further WRITE to the stale edit is refused"
+            );
+            assert!(matches!(
+                nfs.commit(x, 0, 0).await,
+                Err(nfsstat3::NFS3ERR_STALE)
+            ));
+            assert_eq!(read_all(&nfs, x).await, b"a");
+            assert_eq!(read_all(&nfs, z).await, b"moved");
+        }
+
+        /// After the mount's own edit lands, its base is the file it wrote:
+        /// the client's cache holds those bytes and it need not READ again.
+        /// Another writer then moves the file, and an edit the client makes
+        /// from its cache is refused `NFS3ERR_STALE` at its WRITE. Before, the landed
+        /// edit dropped the base and the next WRITE took one from the moved
+        /// file.
+        #[tokio::test]
+        async fn an_edit_after_the_mounts_own_landed_edit_is_checked() {
+            let (nfs, _recorder) = nfs_over(b"<p>hello</p>\n<p>there</p>\n");
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            nfs.write(x, 0, b"world").await.unwrap();
+            nfs.commit(x, 0, 0).await.unwrap();
+            land_elsewhere(&nfs, y, "moved");
+            assert!(is_stale(nfs.write(x, 0, b"again").await));
+            assert_eq!(read_all(&nfs, x).await, b"world");
+            assert_eq!(read_all(&nfs, y).await, b"moved");
         }
 
         /// A truncate with no write after it — `: > f` sends SETATTR alone,

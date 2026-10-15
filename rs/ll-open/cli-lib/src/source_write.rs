@@ -1334,8 +1334,13 @@ mod tests {
         graph
             .batch_splice(&[(body.to_string(), Some("{ return 7 }".to_string()))])
             .unwrap();
-        graph.write_content(leaf, b"b", 0).unwrap();
-        let err = graph.flush_node(leaf).unwrap_err();
+        // The mount handle refuses a stale edit at the write since 6116c9
+        // (the macOS NFS client ignores a refused COMMIT); a refusal at the
+        // flush is the same outcome.
+        let err = match graph.write_content(leaf, b"b", 0) {
+            Err(refused) => refused,
+            Ok(_) => graph.flush_node(leaf).unwrap_err(),
+        };
         assert!(err.downcast_ref::<StaleWrite>().is_some(), "{err:#}");
 
         let mut buf = [0u8; 8];

@@ -57,6 +57,43 @@ context, scoping notes, and review history are recoverable.
   A daemon without `--source` writes no file. In Rust,
   `source_write::MountWriter` gains `checkout: Option<PathBuf>`.
 
+- **`leyline inspect --query` prints every value** (bead
+  `ley-line-open-12c0fa`). It read each column as text and printed
+  integers, reals, NULLs and blobs as empty strings, so `SELECT count(*)`
+  answered nothing. Numbers print as numbers, NULL as `NULL`, and blobs as
+  SQL hex literals (`x'00ff'`).
+
+- **An NFS mount edit made before another writer moved the file is
+  refused** (bead `ley-line-open-6116c9`). The mount handle's base was
+  taken at the file's first uncommitted WRITE. A macOS client holds
+  UNSTABLE writes until `fsync` or close, so after an agent read a node,
+  wrote and flushed its buffer, and a socket proposal then moved the
+  file, the server first saw the WRITE after the proposal, took the
+  base from the moved file, and the `fsync` landed the edit over the
+  proposal. Now every NFS READ of a node of a parsed file, while the
+  mount has no edit to that file staged, re-takes the file's base
+  before the bytes are served (new `Graph::note_read`, forwarded by
+  `HotSwapGraph`); a landed COMMIT sets the base to the bytes it wrote;
+  a refused edit keeps it, so a retry with no READ in between is
+  refused again. A WRITE or truncate to a file that no longer holds the
+  base is refused `NFS3ERR_STALE` before it is staged: a macOS client
+  reports a failed WRITE as `ESTALE` at `fsync`, and ignores a failed
+  COMMIT (measured: `fsync` and `close` returned success on a COMMIT
+  answered `NFS3ERR_STALE` or `NFS3ERR_IO`). Checked: an edit is staged
+  and lands only if the file holds the bytes of the client's last
+  server READ of it (with nothing staged) or of the mount's last landed
+  edit to it, whichever is later. Not checked: an edit from a cache
+  filled with no READ to this server process and no landed edit through
+  it (a previous mount or server process), whose base is still taken at
+  its WRITE; and, the base being per file, an edit to one node from a
+  cache older than the client's latest READ of another node of the same
+  file. A refusal only the COMMIT can make (the file moved between the
+  WRITE and the COMMIT, or the edit does not parse) discards the edit
+  but is not reported by a macOS client. The mount holds one base per
+  file it has served, replaced in place. Behaviour change: after a
+  refused edit, the client must READ the file before an edit through
+  the mount lands.
+
 - **An applied proposal is reported as applied** (bead
   `ley-line-open-5db28e`). When the head write, an index build or the
   publish failed after `COMMIT`, the daemon answered `{ok: false}` and

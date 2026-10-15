@@ -8,9 +8,12 @@ tasks:
   test:
     desc: >-
       Run embedded execution runtime tests (fake-worker contracts and the
-      linked libkrun without a hypervisor). Set LEYLINE_LIBKRUNFW_PATH to
-      libkrunfw to also boot real guests; LEYLINE_REQUIRE_HYPERVISOR makes
-      their absence fail instead of skip.
+      linked libkrun without a hypervisor), then the agent-in-guest
+      end-to-end test (leyline-cli, tests/agent_in_guest.rs). Set
+      LEYLINE_LIBKRUNFW_PATH to libkrunfw to also boot real guests, and
+      LEYLINE_GUEST_TOOLS to the rootfs tools/guest_tools.sh writes for the
+      end-to-end test; LEYLINE_REQUIRE_HYPERVISOR makes their absence fail
+      instead of skip.
     dir: '{{.TASKFILE_DIR}}/../..'
     env:
       # Local developer toolchains commonly configure sccache globally. The
@@ -19,3 +22,5 @@ tasks:
       RUSTC_WRAPPER: ''
     cmds:
       - cargo test -p leyline-runtime
+      # Builds on the worker binary the line above built.
+      - cargo test -p leyline-cli --test agent_in_guest

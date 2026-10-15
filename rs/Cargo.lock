@@ -4616,13 +4616,19 @@ name = "leyline-cli"
 version = "0.20.5"
 dependencies = [
  "anyhow",
+ "blake3",
+ "capnp",
+ "capnp-json",
  "clap",
  "dirs",
  "env_logger",
  "leyline-cli-lib",
+ "leyline-public-schema",
  "leyline-runtime",
  "leyline-storefs",
  "libc",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

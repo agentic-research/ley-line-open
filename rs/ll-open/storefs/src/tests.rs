@@ -1584,6 +1584,7 @@ fn a_read_only_open_keeps_the_guests_pages_only_while_the_blob_is_unchanged() {
     assert!(read_open(&f, a).keep_cache);
     assert!(!read_open(&f, ino(&f, "pkg/b.go")).keep_cache, "per file");
 
+    // Same size: the guest's cached size still describes the new blob.
     other_writer(&f, "a.go", A_OTHER);
     let after = read_open(&f, a);
     assert_eq!((after.keep_cache, after.direct_io), (false, false));
@@ -1609,6 +1610,64 @@ fn a_read_only_open_keeps_the_guests_pages_only_while_the_blob_is_unchanged() {
     let notes = ino(&f, "notes.txt");
     assert!(!read_open(&f, notes).keep_cache);
     assert!(!read_open(&f, notes).keep_cache);
+}
+
+/// The guest bounds a cached read by the size its cached attributes hold;
+/// an OPEN reply carries no attributes. A read-only open serving a blob of
+/// another size than the last attributes the guest was told is therefore
+/// direct I/O, so its reads reach the whole current blob. Found by the
+/// in-guest end-to-end test (bead `ley-line-open-f210c2`): after another
+/// writer grew a file, the guest's next open read back the new blob cut to
+/// the old size.
+#[test]
+fn an_open_serving_another_size_than_the_guest_was_told_is_direct_io() {
+    let f = fixture(whole());
+    let a = ino(&f, "a.go"); // LOOKUP: the guest is told A's size
+    other_writer(&f, "a.go", A_TAILED);
+    let grown = f.fs.open(a, O_RDONLY).unwrap();
+    assert_eq!((grown.keep_cache, grown.direct_io), (false, true));
+    assert_eq!(read_all(&f, grown.handle), A_TAILED.as_bytes());
+    f.fs.release(grown.handle);
+    // The open told the guest no size: the next one is direct I/O too.
+    assert!(read_open(&f, a).direct_io);
+
+    // A GETATTR tells it the new size; opens are cached again.
+    let (attr, _) = f.fs.getattr(a, None).unwrap();
+    assert_eq!(attr.size, A_TAILED.len() as u64);
+    assert!(!read_open(&f, a).direct_io);
+
+    // A LOOKUP, READDIRPLUS, or a SETATTR's reply tells it too.
+    other_writer(&f, "a.go", A_SHORT);
+    assert!(read_open(&f, a).direct_io);
+    f.fs.lookup(ROOT_INODE, b"a.go").unwrap();
+    assert!(!read_open(&f, a).direct_io);
+    other_writer(&f, "a.go", A);
+    assert!(read_open(&f, a).direct_io);
+    f.fs.readdirplus(ROOT_INODE, 0).unwrap();
+    assert!(!read_open(&f, a).direct_io);
+    other_writer(&f, "a.go", A_TAILED);
+    let w = f.fs.open(a, O_RDWR).unwrap();
+    f.fs.setattr(
+        a,
+        Some(w.handle),
+        SetAttr {
+            size: Some(A_SHORT.len() as u64),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    f.fs.release(w.handle);
+    assert!(
+        read_open(&f, a).direct_io,
+        "the SETATTR reply told the staged size, not the stored one"
+    );
+    f.fs.getattr(a, None).unwrap();
+    assert!(!read_open(&f, a).direct_io);
+
+    // A created file's entry tells its (empty) size.
+    let (entry, h) = f.fs.create(ROOT_INODE, b"n.go", O_RDWR).unwrap();
+    f.fs.release(h);
+    assert!(!read_open(&f, entry.attr.inode).direct_io);
 }
 
 #[test]

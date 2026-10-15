@@ -1,0 +1,56 @@
+// The agent-in-guest end-to-end test's source tree and the edits made to
+// it. Compiled into the host test and, prepended as `mod seed`, into the
+// guest program: both sides name the same bytes.
+#![allow(dead_code)]
+
+pub const A: &str = "package a\n\nfunc A() int { return 1 }\n";
+/// (b): the guest's edit through open/write/close.
+pub const A_EDIT: &str = "package a\n\nfunc A() int { return 2 }\n";
+/// (e): the guest's save through a temp file and rename(2).
+pub const A_RENAMED: &str =
+    "package a\n\n// saved through a temp file and rename(2)\nfunc A() int { return 3 }\n";
+pub const A_TEMP: &str = "a.go.tmp.4242";
+pub const B: &str = "package a\n\nfunc B() int { return 1 }\n";
+/// (c): the socket proposal that moves the file the guest holds open.
+pub const B_HOST: &str = "package a\n\n// proposed over the socket\nfunc B() int { return 2 }\n";
+/// (c): what the guest tries to write over it.
+pub const B_GUEST: &str = "package a\n\nfunc B() int { return 9 }\n";
+pub const C: &str = "package a\n\nfunc C() int { return 1 }\n";
+/// (d): an edit the store cannot parse.
+pub const C_BROKEN: &str = "package a\n\nfunc C( {\n";
+/// (e): deleted by the guest.
+pub const D: &str = "package a\n\nfunc D() int { return 1 }\n";
+/// (e): created by the guest.
+pub const N: &str = "package a\n\nfunc N() int { return 7 }\n";
+pub const G: &str = "package a\n\nfunc G() int { return 1 }\n";
+/// (g): a host proposal the guest sees at its next open; longer than `G`.
+pub const G_HOST: &str =
+    "package a\n\n// a host proposal the guest sees at its next open\nfunc G() int { return 2 }\n";
+/// (g): a file the guest only stats; the host grows it.
+pub const T: &str = "package a\n\nfunc T() int { return 1 }\n";
+pub const T_HOST: &str = "package a\n\n// grown by a host proposal\nfunc T() int { return 2 }\n";
+pub const README: &str = "# agent in guest\n";
+
+/// The host's go-ahead file and the guest's step file: equal-length tokens,
+/// so a cached size never truncates a token.
+pub const HOST_SYNC: &str = "sync/host.md";
+pub const GUEST_SYNC: &str = "sync/guest.md";
+pub const REPORT: &str = "report.md";
+
+/// The share's settled entry and attribute timeout for this test
+/// (`--workspace-ttl-ms`), and the bound (g) checks.
+pub const SETTLED_MS: u64 = 3_000;
+pub const CHANGED_MS: u64 = 500;
+
+/// The files of the tree, as the daemon parses it.
+pub const TREE: [(&str, &str); 9] = [
+    ("a.go", A),
+    ("b.go", B),
+    ("c.go", C),
+    ("d.go", D),
+    ("g.go", G),
+    ("t.go", T),
+    ("README.md", README),
+    (HOST_SYNC, "go-0\n"),
+    (GUEST_SYNC, "st-0\n"),
+];

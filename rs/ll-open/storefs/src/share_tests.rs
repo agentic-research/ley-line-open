@@ -15,7 +15,7 @@ use super::StoreShare;
 use crate::open_flags::{O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use crate::rename_flags::{RENAME_EXCHANGE, RENAME_NOREPLACE};
 use crate::tests::{
-    A, A_BROKEN, A_EDIT, A_OTHER, B, Fixture, SHORT, TTL, fixture, fixture_with, freshness,
+    A, A_BROKEN, A_EDIT, A_OTHER, B, Fixture, ORIGIN, SHORT, TTL, fixture, fixture_with, freshness,
     on_disk, other_writer, read_source, whole,
 };
 use crate::{Freshness, Options, ROOT_INODE, Scope, StoreFs};
@@ -62,7 +62,15 @@ fn opened(reply: Reply) -> (u64, u32) {
     }
 }
 
+/// A file's attributes as the guest is told them, no change recorded: its
+/// times are the clock's origin.
 fn file_attr(inode: u64, size: u64, perm: u32) -> WireAttr {
+    file_attr_at(inode, size, perm, ORIGIN)
+}
+
+/// A file's attributes, with `time` as its access, modification and change
+/// time.
+fn file_attr_at(inode: u64, size: u64, perm: u32, time: Duration) -> WireAttr {
     WireAttr {
         inode,
         mode: 0o100000 | perm,
@@ -70,6 +78,9 @@ fn file_attr(inode: u64, size: u64, perm: u32) -> WireAttr {
         size,
         blocks: size.div_ceil(512),
         blksize: 4096,
+        atime: time,
+        mtime: time,
+        ctime: time,
     }
 }
 
@@ -112,6 +123,9 @@ fn lookup_answers_linux_attributes_and_the_freshness_timeout_twice() {
             size: 0,
             blocks: 0,
             blksize: 4096,
+            atime: ORIGIN,
+            mtime: ORIGIN,
+            ctime: ORIGIN,
         }
     );
 }
@@ -317,6 +331,50 @@ fn a_write_open_is_direct_io_and_never_keeps_the_cache() {
     );
 }
 
+/// git's stat check (bead `ley-line-open-b8100d`): a same-size edit moves
+/// the access, modification and change time the guest is told; nothing
+/// else does.
+#[test]
+fn a_same_size_edit_moves_all_three_times_the_guest_is_told() {
+    let f = fixture(whole());
+    let s = share(&f);
+    let a = entry_of(lookup(&s, ROOT_INODE, "a.go")).inode;
+    let getattr = || {
+        s.call(Request::Getattr {
+            inode: a,
+            handle: None,
+        })
+    };
+    f.clock.advance(Duration::from_secs(7));
+    assert_eq!(
+        getattr(),
+        Reply::Attr {
+            attr: file_attr(a, A.len() as u64, 0o644),
+            ttl: TTL
+        }
+    );
+    let (h, _) = opened(s.call(Request::Open {
+        inode: a,
+        flags: O_RDWR | O_TRUNC,
+    }));
+    s.call(Request::Write {
+        handle: h,
+        offset: 0,
+        data: A_EDIT.as_bytes().to_vec(),
+    });
+    assert_eq!(s.call(Request::Flush { handle: h }), Reply::Done);
+    let edited = file_attr_at(a, A.len() as u64, 0o644, ORIGIN + Duration::from_secs(7));
+    assert_eq!(
+        getattr(),
+        Reply::Attr {
+            attr: edited,
+            ttl: SHORT
+        }
+    );
+    f.clock.advance(Duration::from_secs(7));
+    assert_eq!(entry_of(lookup(&s, ROOT_INODE, "a.go")).attr, edited);
+}
+
 #[test]
 fn an_edit_lands_through_write_and_flush_and_a_stale_or_broken_one_does_not() {
     let f = fixture_with(whole(), true, A);
@@ -416,7 +474,11 @@ fn create_answers_its_entry_and_a_direct_io_handle() {
         panic!("expected a create, got {reply:?}");
     };
     assert_eq!(flags, FOPEN_DIRECT_IO);
-    assert_eq!(entry.attr, file_attr(entry.inode, 0, 0o644));
+    assert_eq!(
+        entry.attr,
+        file_attr_at(entry.inode, 0, 0o644, ORIGIN + Duration::from_nanos(1)),
+        "a CREATE is a change, later than the clock's origin"
+    );
     assert_eq!(entry.entry_ttl, entry.attr_ttl);
     assert_eq!(
         entry.entry_ttl, TTL,

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
@@ -21,27 +20,11 @@ use super::super::process::{
     finish_failed_start, read_readiness_line, supervise_worker,
 };
 use super::share::{FsService, WorkspaceShares, serve};
-use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent};
-
-/// Keep `worker_end` open across the worker's `exec` and name its descriptor
-/// on the command line. The descriptor is created close-on-exec, as every
-/// descriptor here is, so a process another thread spawns concurrently does
-/// not inherit it; only this child clears the flag, after its fork.
-fn inherit_share(command: &mut Command, worker_end: &UnixStream) {
-    let fd = worker_end.as_raw_fd();
-    command.arg(WORKSPACE_SHARE_FD_ARG).arg(fd.to_string());
-    // SAFETY: the closure runs in the forked child before exec and makes
-    // only fcntl calls, which are async-signal-safe; `fd` is open in the
-    // child because the parent holds `worker_end` until after spawn returns.
-    unsafe {
-        command.pre_exec(move || {
-            let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
-            let flags = rustix::io::fcntl_getfd(fd)?;
-            rustix::io::fcntl_setfd(fd, flags.difference(rustix::io::FdFlags::CLOEXEC))?;
-            Ok(())
-        });
-    }
-}
+// The share's `worker_end` is created close-on-exec, as every descriptor
+// here is, so a process another thread spawns concurrently does not inherit
+// it; only the worker's child clears the flag, after its fork
+// (`inherit_only`), and the parent holds `worker_end` until spawn returns.
+use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors, inherit_only};
 
 const LABELS: SupervisionLabels = SupervisionLabels {
     worker: "libkrun worker",
@@ -260,7 +243,9 @@ impl Backend for KrunWorkerBackend {
         let share = match share {
             Some(service) => match UnixStream::pair() {
                 Ok((daemon_end, worker_end)) => {
-                    inherit_share(&mut command, &worker_end);
+                    command
+                        .arg(WORKSPACE_SHARE_FD_ARG)
+                        .arg(worker_end.as_raw_fd().to_string());
                     Some((service, daemon_end, worker_end))
                 }
                 Err(error) => {
@@ -273,6 +258,20 @@ impl Backend for KrunWorkerBackend {
             },
             None => None,
         };
+        // What the worker must declare at readiness: exactly the share it
+        // is handed, under the descriptor number it inherits.
+        let declared = declared_descriptors(
+            request,
+            share
+                .as_ref()
+                .map(|(_, _, worker_end)| worker_end.as_raw_fd()),
+        );
+        // The worker inherits its standard streams and the declared share,
+        // and nothing else this process holds.
+        let keep: Vec<i32> = declared.iter().map(|d| d.descriptor).collect();
+        if let Err(error) = inherit_only(&mut command, &keep) {
+            return Err(finish_failed_start(rootfs, LABELS, error));
+        }
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -413,7 +412,23 @@ impl Backend for KrunWorkerBackend {
             WorkerEvent::Ready {
                 run_id,
                 confinement_digest,
+                inherited,
             } if run_id == request.run_id => {
+                // The worker refuses to start holding a descriptor it does
+                // not declare; this refuses a declaration other than what
+                // this process handed it, so the receipt names the channels
+                // the worker actually holds.
+                if inherited != declared {
+                    return Err(abort_failed_start(
+                        &mut child,
+                        rootfs,
+                        LABELS,
+                        ExecutionError::identity_mismatch(format!(
+                            "descriptor drift: the worker declares inherited \
+                             descriptors {inherited:?}, and was handed {declared:?}"
+                        )),
+                    ));
+                }
                 // Same check as the native tier: the worker attests the
                 // policy it applied, and a disagreement with the grant stops
                 // the run before it executes.
@@ -505,6 +520,10 @@ impl Backend for KrunWorkerBackend {
         });
         Ok(BackendRun {
             backend_id: "libkrun/1".into(),
+            channels: declared
+                .into_iter()
+                .map(|descriptor| descriptor.channel)
+                .collect(),
         })
     }
 

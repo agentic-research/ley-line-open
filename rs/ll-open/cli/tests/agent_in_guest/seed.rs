@@ -29,6 +29,11 @@ pub const G_HOST: &str =
 /// (g): a file the guest only stats; the host grows it.
 pub const T: &str = "package a\n\nfunc T() int { return 1 }\n";
 pub const T_HOST: &str = "package a\n\n// grown by a host proposal\nfunc T() int { return 2 }\n";
+/// (m): two successive same-size edits git status must each report
+/// (bead `ley-line-open-b8100d`).
+pub const M: &str = "package a\n\nfunc M() int { return 1 }\n";
+pub const M_ONE: &str = "package a\n\nfunc M() int { return 2 }\n";
+pub const M_TWO: &str = "package a\n\nfunc M() int { return 3 }\n";
 pub const README: &str = "# agent in guest\n";
 
 /// The host's go-ahead file and the guest's step file: equal-length tokens,
@@ -43,13 +48,14 @@ pub const SETTLED_MS: u64 = 3_000;
 pub const CHANGED_MS: u64 = 500;
 
 /// The files of the tree, as the daemon parses it.
-pub const TREE: [(&str, &str); 9] = [
+pub const TREE: [(&str, &str); 10] = [
     ("a.go", A),
     ("b.go", B),
     ("c.go", C),
     ("d.go", D),
     ("g.go", G),
     ("t.go", T),
+    ("m.go", M),
     ("README.md", README),
     (HOST_SYNC, "go-0\n"),
     (GUEST_SYNC, "st-0\n"),

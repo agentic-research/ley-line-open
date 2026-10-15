@@ -8,7 +8,7 @@ use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerC
 use leyline_runtime::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
 use leyline_runtime::{
     Backend, BackendClass, BackendRunStatus, DigestRef, ExecutionError, ExecutionRequest,
-    ResourceLimits, WorkspaceGrant, WorkspaceOperation,
+    ResourceLimits, WorkerChannel, WorkspaceGrant, WorkspaceOperation,
 };
 use tempfile::TempDir;
 
@@ -769,14 +769,12 @@ fn arg_logging_worker(args_log: &std::path::Path) -> String {
     )
 }
 
-#[test]
-fn a_granted_workspace_is_served_to_the_worker_over_an_inherited_socket() {
-    let _serial = common::serial();
-    let fixture = TempDir::new().expect("fixture");
-    // The worker finds the descriptor named by `--workspace-share-fd` and
-    // sends one framed INIT request down it: 13 header bytes
-    // (`{"op":"init"}`), no payload.
-    let script = r#"#!/bin/sh
+/// A fake worker that finds the descriptor named by `--workspace-share-fd`
+/// and reports ready with `inherited` (shell text, `$fd` expanded) as its
+/// declared descriptors, after running `before_ready`.
+fn share_worker(before_ready: &str, inherited: &str) -> String {
+    format!(
+        r#"#!/bin/sh
 fd=
 prev=
 for arg in "$@"; do
@@ -784,16 +782,33 @@ for arg in "$@"; do
   prev="$arg"
 done
 IFS= read -r _
-[ -n "$fd" ] || exit 3
-eval "printf '\015\000\000\000\000\000\000\000{\"op\":\"init\"}' >&$fd" || exit 4
-printf '%s\n' '{"type":"ready","run_id":"run-backend-01"}' >&2
+{before_ready}
+printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"inherited\":[{inherited}]}}" >&2
 exec /usr/bin/tail -f /dev/null
-"#;
-    let (backend, _ephemeral_root) = backend_with_worker(&fixture, script);
+"#
+    )
+}
+
+/// The worker's declaration of the share it was handed, as JSON with the
+/// descriptor left to the shell (`$fd`).
+const DECLARED_SHARE: &str = r#"{\"descriptor\":$fd,\"channel\":{\"role\":\"workspaceShare\",\"workspace\":\"repo\",\"graphRoot\":\"blake3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"#;
+
+#[test]
+fn a_granted_workspace_is_served_to_the_worker_over_an_inherited_socket() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    // The worker sends one framed INIT request down its share: 13 header
+    // bytes (`{"op":"init"}`), no payload.
+    let script = share_worker(
+        r#"[ -n "$fd" ] || exit 3
+eval "printf '\015\000\000\000\000\000\000\000{\"op\":\"init\"}' >&$fd" || exit 4"#,
+        DECLARED_SHARE,
+    );
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
     let (shares, seen) = Shares::new(None);
     let backend = backend.with_workspace_shares(shares.clone());
 
-    backend
+    let started = backend
         .start(&request_with(vec![workspace("repo")]))
         .expect("a ready worker with its share");
     assert_eq!(
@@ -806,6 +821,77 @@ exec /usr/bin/tail -f /dev/null
         vec![("run-backend-01".to_owned(), workspace("repo"))],
         "the provider opens the run's one granted workspace"
     );
+    // The run names the share it holds, for the receipt.
+    assert_eq!(
+        started.channels,
+        vec![WorkerChannel::WorkspaceShare {
+            workspace: "repo".into(),
+            graph_root: format!("blake3-256:{}", "e".repeat(64)),
+        }]
+    );
+}
+
+/// The worker's declared descriptors must be exactly what the backend handed
+/// it: a worker that does not declare its share, or declares one it was not
+/// handed, never reaches running.
+#[test]
+fn a_worker_declaring_other_descriptors_than_it_was_handed_never_reaches_running() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+
+    // Handed a share, declares none.
+    let (backend, ephemeral_root) = backend_with_worker(&fixture, &share_worker(":", ""));
+    let (shares, _seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares);
+    let error = backend
+        .start(&request_with(vec![workspace("repo")]))
+        .expect_err("an undeclared share");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("descriptor"), "{error:?}");
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+
+    // Handed nothing, declares a share.
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) =
+        backend_with_worker(&fixture, &share_worker("fd=7", DECLARED_SHARE));
+    let error = backend
+        .start(&request())
+        .expect_err("a declared share nothing handed");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        "{error:?}"
+    );
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// A descriptor this process holds without close-on-exec (inherited from
+/// its own parent, as a build tool's jobserver pipes are) does not reach the
+/// worker: the backend hands it its standard streams and declared channels
+/// only, so the worker's own check finds nothing undeclared.
+#[test]
+fn a_descriptor_the_backend_holds_open_across_exec_does_not_reach_the_worker() {
+    use std::os::fd::AsRawFd;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let leaked = fs::File::open("/dev/null").expect("a descriptor");
+    let fd = leaked.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this test owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        assert!(flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) >= 0);
+    }
+    let script = format!(
+        "#!/bin/sh\nIFS= read -r _\n[ -e /dev/fd/{fd} ] && exit 9\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n"
+    );
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
+    let started = backend.start(&request());
+    drop(leaked);
+    started.expect("the worker did not inherit the backend's open descriptor");
 }
 
 #[test]
@@ -817,12 +903,13 @@ fn a_run_without_workspaces_is_handed_no_share() {
     let (shares, _seen) = Shares::new(None);
     let backend = backend.with_workspace_shares(shares.clone());
 
-    backend.start(&request()).expect("ready worker");
+    let started = backend.start(&request()).expect("ready worker");
     let args = fs::read_to_string(&args_log).expect("worker arguments");
     assert!(
         !args.contains("--workspace-share-fd"),
         "no workspace, no share: {args}"
     );
+    assert_eq!(started.channels, Vec::new(), "no workspace, no channel");
     assert!(shares.opened.lock().unwrap().is_empty());
 }
 

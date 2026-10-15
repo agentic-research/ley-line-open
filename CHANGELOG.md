@@ -58,6 +58,39 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **The libkrun worker declares its workspace share, holds nothing else,
+  and the receipt names it** (bead `ley-line-open-b83347`, ADR-0044 phase
+  C). The share descriptor (`--workspace-share-fd`) is a channel the worker
+  inherits open, outside its `confinement/v1` manifest and any sandbox
+  profile.
+  - `leyline_runtime::backends::libkrun::worker::declared_descriptors`
+    derives the worker's declared descriptors beyond its standard streams
+    from the grant: the share (`InheritedDescriptor { descriptor, channel:
+    WorkerChannel::WorkspaceShare { workspace, graphRoot } }`) for a run
+    granted a workspace, none otherwise. Before it reads the rootfs the
+    worker lists its open descriptors (`/dev/fd`) and refuses to start
+    holding any it does not declare (`IdentityPolicyMismatch`, naming
+    them; `refuse_undeclared_descriptors`).
+  - `worker::inherit_only(command, keep)`: the child marks every
+    descriptor its spawner holds above the standard streams close-on-exec,
+    except `keep`. `KrunWorkerBackend` spawns the worker through it with
+    the declared share, so a descriptor the daemon inherited open from its
+    own parent (a build tool's jobserver pipes) does not reach the worker.
+  - `WorkerEvent::Ready` carries the declaration (`inherited`);
+    `KrunWorkerBackend` refuses a readiness whose declaration differs from
+    what it handed the worker, before the run is published.
+  - `BackendRun.channels`, `WorkerChannel`, `BackendEvidenceDocument`,
+    `RunReceiptData.backend_evidence`. The receipt's `backend.evidence` is
+    now the digest of the backend evidence document (media type
+    `application/vnd.leyline.execution.backend-evidence+json`, the one the
+    canonical vector names; canonical bytes in the execution/v1 README
+    "Backend evidence"): the backend id and every channel its worker held.
+    It was the event log root under `application/vnd.leyline.backend-evidence`,
+    a value the receipt already carries as `eventLogRoot`.
+  - `WorkspaceGrant.expectedGeneration` stays carried and unchecked,
+    now documented: it is ADR-0041 S1's commit `seq`, which no store
+    implements, and the share is pinned by its `graphRoot` check.
+
 - **Agents run in a libkrun guest whose `/work` is the daemon's store**
   (bead `ley-line-open-f210c2`, ADR-0044 phase C). An execution/v1 run
   whose RunGrant carries a `WorkspaceGrant` gets that workspace as a
@@ -235,6 +268,25 @@ context, scoping notes, and review history are recoverable.
   release.
 
 ### Fixed
+
+- **`git status` in a guest missed a same-size edit** (bead
+  `ley-line-open-b8100d`). The virtio-fs share reported every file time as
+  zero, and git decides whether to rehash a file from its stat (size,
+  mtime, ctime, inode): after its first run, an edit that kept the file's
+  size was invisible to `git status`. Every attribute reply now carries an
+  access, modification and change time (one value, since the Unix epoch):
+  the clock's origin (the wall-clock time `StoreFs` was created) for a
+  path no change was recorded for, then the time of the latest change
+  `StoreFs` recorded to it — a proposal it landed, another writer's
+  proposal observed when it next serves the path, a change to a file or
+  directory only the session holds — strictly increasing per path. A
+  directory's time moves when an entry is created, removed or renamed in
+  it, or an OPENDIR lists other names than the previous one. No state is
+  persisted: a new `StoreFs` reports its own origin, so git rehashes each
+  file once per session. The share wire's `Attr` gains `atime`, `mtime`
+  and `ctime`, which `ShareFs` transcribes into `stat`. The in-guest
+  end-to-end test gains scenario (m): two successive same-size edits are
+  each reported by `git status --porcelain`.
 
 - **A guest read a grown file cut to its old size** (bead
   `ley-line-open-f210c2`, found by the in-guest end-to-end test). An OPEN

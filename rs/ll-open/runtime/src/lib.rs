@@ -21,8 +21,9 @@ pub use authorization::{
 pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
-    BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, CeilingMechanism, DigestRef,
-    EnforcedCeilings, ExecutionRequest, ReceiptContext, ResourceLimits, RunEventRecord,
-    RunInspection, RunReceiptData, RunRecord, RunState, WorkspaceGrant, WorkspaceOperation,
+    BackendCapabilities, BackendClass, BackendEvidenceDocument, BackendRun, BackendRunStatus,
+    CeilingMechanism, DigestRef, EnforcedCeilings, ExecutionRequest, ReceiptContext,
+    ResourceLimits, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
+    WorkerChannel, WorkspaceGrant, WorkspaceOperation,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

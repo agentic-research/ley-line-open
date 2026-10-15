@@ -47,9 +47,17 @@ impl TestClock {
     }
 }
 
+/// The wall-clock time of a [`TestClock`]'s origin: a path no change was
+/// recorded for reports it as its times.
+pub(crate) const ORIGIN: Duration = Duration::new(1_760_000_000, 500);
+
 impl Clock for TestClock {
     fn now(&self) -> Duration {
         *self.0.lock()
+    }
+
+    fn origin(&self) -> Duration {
+        ORIGIN
     }
 }
 
@@ -1795,9 +1803,205 @@ fn the_default_freshness_is_long_for_settled_paths_and_one_second_for_changed_on
 fn the_monotonic_clock_counts_from_its_origin() {
     let clock = MonotonicClock {
         origin: std::time::Instant::now() - Duration::from_secs(5),
+        wall: ORIGIN,
     };
     let first = clock.now();
     assert!(first >= Duration::from_secs(5));
     assert!(clock.now() >= first);
+    assert_eq!(clock.origin(), ORIGIN);
     assert!(MonotonicClock::default().now() < Duration::from_secs(5));
+}
+
+#[test]
+fn the_monotonic_clocks_origin_is_the_wall_clock_at_its_creation() {
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+    };
+    let before = wall();
+    let origin = MonotonicClock::default().origin();
+    let after = wall();
+    assert!(
+        before <= origin && origin <= after,
+        "{before:?} {origin:?} {after:?}"
+    );
+}
+
+// ── file times (bead `ley-line-open-b8100d`) ──────────────────────────────
+//
+// git decides whether to rehash a file from its stat (size, mtime, ctime,
+// inode). A path's time is the clock's origin until this filesystem records
+// a change to it, then the time of the latest change, strictly increasing
+// per path.
+
+/// The modification time GETATTR answers for `path` ("" is the root).
+fn mtime(f: &Fixture, path: &str) -> Duration {
+    let inode = if path.is_empty() {
+        ROOT_INODE
+    } else {
+        ino(f, path)
+    };
+    f.fs.getattr(inode, None).unwrap().0.mtime
+}
+
+/// Advance the clock one second; answers the time a change recorded now
+/// reports.
+fn tick(f: &Fixture) -> Duration {
+    f.clock.advance(Duration::from_secs(1));
+    ORIGIN + f.clock.now()
+}
+
+#[test]
+fn a_path_no_change_was_recorded_for_reports_the_clocks_origin() {
+    let f = fixture(whole());
+    f.clock.advance(Duration::from_secs(40));
+    for path in ["", "a.go", "pkg", "pkg/b.go", "pkg/sub", "pkg/sub/c.go"] {
+        assert_eq!(mtime(&f, path), ORIGIN, "{path:?}");
+    }
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.mtime, ORIGIN);
+    let plus = f.fs.readdirplus(ino(&f, "pkg"), 0).unwrap();
+    assert!(plus.iter().all(|(_, entry)| entry.attr.mtime == ORIGIN));
+}
+
+#[test]
+fn a_same_size_edit_moves_the_files_time_and_an_unchanged_file_keeps_its_own() {
+    let f = fixture(whole());
+    assert_eq!(A.len(), A_EDIT.len());
+    assert_eq!(A.len(), A_OTHER.len());
+    let a = ino(&f, "a.go");
+    assert_eq!(mtime(&f, "a.go"), ORIGIN);
+
+    let at = tick(&f);
+    let h = edit(&f, "a.go", A_EDIT);
+    assert_eq!(mtime(&f, "a.go"), ORIGIN, "nothing changes until it lands");
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(mtime(&f, "a.go"), at);
+    assert_eq!(f.fs.getattr(a, Some(h)).unwrap().0.mtime, at);
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.mtime, at);
+    f.fs.release(h);
+
+    // A second same-size edit at the same clock reading still moves it.
+    let h = edit(&f, "a.go", A_OTHER);
+    assert_eq!(f.fs.flush(h), Ok(()));
+    let second = mtime(&f, "a.go");
+    assert_eq!(second, at + Duration::from_nanos(1));
+    f.fs.release(h);
+
+    // Unchanged since: stable, however long the clock runs.
+    f.clock.advance(Duration::from_secs(600));
+    assert_eq!(mtime(&f, "a.go"), second);
+    for path in ["pkg", "pkg/b.go", "pkg/sub/c.go"] {
+        assert_eq!(mtime(&f, path), ORIGIN, "{path:?} did not change");
+    }
+}
+
+#[test]
+fn a_foreign_proposal_moves_the_time_from_when_storefs_next_serves_the_path() {
+    let f = fixture(whole());
+    assert_eq!(mtime(&f, "a.go"), ORIGIN);
+    tick(&f);
+    other_writer(&f, "a.go", A_OTHER);
+    let served = tick(&f);
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.mtime, served);
+    tick(&f);
+    assert_eq!(mtime(&f, "a.go"), served);
+    assert_eq!(mtime(&f, ""), served, "the directory it is in");
+
+    // The same bytes again: the same blob, no change.
+    other_writer(&f, "a.go", A_OTHER);
+    tick(&f);
+    assert_eq!(mtime(&f, "a.go"), served);
+
+    // READDIRPLUS observes as LOOKUP does. (A path never served has told
+    // the guest no time to compare against.)
+    assert_eq!(mtime(&f, "pkg/b.go"), ORIGIN);
+    other_writer(&f, "pkg/b.go", "package pkg\n");
+    let listed = tick(&f);
+    let plus = f.fs.readdirplus(ino(&f, "pkg"), 0).unwrap();
+    assert_eq!(plus[0].0.name, "b.go");
+    assert_eq!(plus[0].1.attr.mtime, listed);
+}
+
+#[test]
+fn a_directorys_time_moves_when_an_entry_is_created_removed_or_renamed_in_it() {
+    let f = fixture(whole());
+    let pkg = ino(&f, "pkg");
+
+    let at = tick(&f);
+    let (_, h) = f.fs.create(pkg, b"n.go", O_RDWR).unwrap();
+    f.fs.release(h);
+    assert_eq!(mtime(&f, "pkg"), at, "CREATE");
+    assert_eq!(mtime(&f, "pkg/n.go"), at);
+    assert_eq!(mtime(&f, ""), ORIGIN, "only the directory the entry is in");
+
+    let at = tick(&f);
+    f.fs.unlink(pkg, b"b.go").unwrap();
+    assert_eq!(mtime(&f, "pkg"), at, "UNLINK of a stored file");
+
+    let at = tick(&f);
+    f.fs.mkdir(pkg, b"d").unwrap();
+    assert_eq!(mtime(&f, "pkg"), at, "MKDIR");
+    assert_eq!(mtime(&f, "pkg/d"), at);
+
+    let at = tick(&f);
+    f.fs.rmdir(pkg, b"d").unwrap();
+    assert_eq!(mtime(&f, "pkg"), at, "RMDIR");
+
+    let at = tick(&f);
+    f.fs.rename(pkg, b"n.go", ROOT_INODE, b"n.txt", 0).unwrap();
+    assert_eq!((mtime(&f, "pkg"), mtime(&f, "")), (at, at), "RENAME");
+    assert_eq!(mtime(&f, "n.txt"), at);
+
+    let at = tick(&f);
+    f.fs.unlink(ROOT_INODE, b"n.txt").unwrap();
+    assert_eq!(mtime(&f, ""), at, "UNLINK of a file only the session holds");
+
+    // A file only the session holds, saved onto a name the store holds in
+    // another directory: the directory it left changes too.
+    let (h, flushed) = create_file(&f, pkg, "a.go.tmp", A_EDIT);
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    let at = tick(&f);
+    f.fs.rename(pkg, b"a.go.tmp", ROOT_INODE, b"a.go", 0)
+        .unwrap();
+    assert_eq!((mtime(&f, "pkg"), mtime(&f, "a.go")), (at, at));
+
+    // A session directory renamed: both directories' entries change.
+    f.fs.mkdir(pkg, b"e").unwrap();
+    let at = tick(&f);
+    f.fs.rename(pkg, b"e", ROOT_INODE, b"e", 0).unwrap();
+    assert_eq!((mtime(&f, "pkg"), mtime(&f, "")), (at, at));
+}
+
+#[test]
+fn a_foreign_create_moves_its_directorys_time_when_storefs_next_lists_it() {
+    let f = fixture(whole());
+    let sub = ino(&f, "pkg/sub");
+    f.fs.opendir(sub).unwrap();
+    tick(&f);
+    f.fs.opendir(sub).unwrap();
+    assert_eq!(mtime(&f, "pkg/sub"), ORIGIN, "the same listing");
+    other_creator(&f, "pkg/sub/x.go", "package sub\n");
+    let listed = tick(&f);
+    f.fs.opendir(sub).unwrap();
+    assert_eq!(mtime(&f, "pkg/sub"), listed);
+    tick(&f);
+    f.fs.opendir(sub).unwrap();
+    assert_eq!(mtime(&f, "pkg/sub"), listed);
+}
+
+#[test]
+fn a_file_only_the_session_holds_moves_its_time_at_each_flush() {
+    let f = fixture(whole());
+    let (h, flushed) = create_file(&f, ROOT_INODE, "notes.txt", "hi\n");
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    let at = tick(&f);
+    let h = edit(&f, "notes.txt", "ho\n");
+    assert_eq!(f.fs.flush(h), Ok(()));
+    f.fs.release(h);
+    assert_eq!(mtime(&f, "notes.txt"), at);
+    tick(&f);
+    assert_eq!(mtime(&f, "notes.txt"), at);
 }

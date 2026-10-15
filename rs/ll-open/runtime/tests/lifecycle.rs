@@ -77,6 +77,7 @@ impl Backend for CompletingBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -102,6 +103,7 @@ impl Backend for FailingBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "failing/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -144,6 +146,7 @@ impl Backend for BlockingBackend {
         }
         Ok(BackendRun {
             backend_id: "blocking/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -175,6 +178,7 @@ impl Backend for RecordingBackend {
             .push("start");
         Ok(BackendRun {
             backend_id: "recording/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -474,6 +478,7 @@ impl Backend for JustFinishedBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "just-finished/1".into(),
+            channels: Vec::new(),
         })
     }
 

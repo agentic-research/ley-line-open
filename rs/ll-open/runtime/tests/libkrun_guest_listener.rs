@@ -163,6 +163,9 @@ fn main() {{
     };
 
     let mut worker = Command::new(&signed_worker);
+    // Its standard streams and nothing else, as the backend spawns it.
+    leyline_runtime::backends::libkrun::worker::inherit_only(&mut worker, &[])
+        .expect("list this process's descriptors");
     if hijack_inet {
         worker.arg("--tsi-hijack-inet");
     }

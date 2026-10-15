@@ -198,6 +198,10 @@ pub struct WorkspaceGrant {
     pub name: String,
     /// The authorized input Graph root, `blake3-256:<hex>`.
     pub graph_root: String,
+    /// Carried and not checked. ADR-0041 S1 defines it as the commit `seq`
+    /// within the grant's epoch, which no store implements yet; a share is
+    /// pinned by `graph_root` instead (it opens only when the store's
+    /// `treeRoot` is the grant's `graphRoot`, ADR-0044 phase C).
     pub expected_generation: u64,
     /// Exactly the operations permitted.
     pub operations: Vec<WorkspaceOperation>,
@@ -257,6 +261,87 @@ fn validate_guest_path(value: &str) -> Result<(), ExecutionError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendRun {
     pub backend_id: String,
+    /// Every channel the run's worker holds beyond its standard streams,
+    /// verified against what the worker declared at readiness. The receipt's
+    /// backend evidence names them ([`BackendEvidenceDocument`]).
+    pub channels: Vec<WorkerChannel>,
+}
+
+/// A channel a backend's worker holds outside its confinement manifest.
+///
+/// `confinement/v1` describes what the confined process may open: paths,
+/// hosts, a listener, UNIX socket paths. A descriptor the process inherits
+/// already open is none of those, and no sandbox profile governs it, so it
+/// is declared here instead: the worker declares each one at readiness, the
+/// backend checks the declaration against what it handed the worker, and the
+/// receipt's backend evidence names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "camelCase")]
+pub enum WorkerChannel {
+    /// The run's workspace share (ADR-0044 phase C): one end of a connected
+    /// UNIX socket pair whose peer, in the daemon, answers the guest's FUSE
+    /// requests for `/work` from the store, scoped by the grant.
+    WorkspaceShare {
+        /// The granted workspace's name.
+        workspace: String,
+        /// The granted workspace's `graphRoot`, `blake3-256:<hex>`.
+        #[serde(rename = "graphRoot")]
+        graph_root: String,
+    },
+}
+
+/// The document a receipt's `backend.evidence` digests: which backend ran
+/// the workload and the channels its worker held beyond the confinement
+/// manifest (execution/v1 README, "Backend evidence").
+///
+/// Every field is a value an issuer knows from its own grant, so a verifier
+/// recomputes the document and compares digests; it names no descriptor
+/// number or host path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendEvidenceDocument {
+    pub backend_id: String,
+    pub channels: Vec<WorkerChannel>,
+}
+
+impl BackendEvidenceDocument {
+    /// The media type of the receipt's `backend.evidence`.
+    pub const MEDIA_TYPE: &'static str = "application/vnd.leyline.execution.backend-evidence+json";
+    /// The contract identifier the document carries.
+    pub const SCHEMA_VERSION: &'static str = "leyline/execution-backend-evidence/v1";
+
+    /// The canonical bytes: compact JSON, object keys in ASCII byte order at
+    /// every level, no trailing newline, with `schemaVersion` added.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut value = serde_json::to_value(self).expect("the document serializes");
+        value["schemaVersion"] = Self::SCHEMA_VERSION.into();
+        serde_json::to_vec(&sorted(value)).expect("a JSON value serializes")
+    }
+
+    /// `blake3-256:<hex>` over [`Self::canonical_bytes`].
+    pub fn digest(&self) -> String {
+        use leyline_core::ContentAddressed;
+        format!("blake3-256:{}", self.canonical_bytes().hash())
+    }
+}
+
+/// `value` with every object's keys in ASCII byte order. `serde_json` keeps
+/// insertion order in this workspace (`preserve_order`), so the order is
+/// rebuilt from a `BTreeMap` at each level.
+fn sorted(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, sorted(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted).collect())
+        }
+        other => other,
+    }
 }
 
 /// Terminal result observed by a backend supervisor.  The service projects
@@ -320,6 +405,9 @@ pub struct RunReceiptData {
     pub event_log_root: String,
     pub context: ReceiptContext,
     pub backend_id: String,
+    /// The document `backend.evidence` digests: the backend and every
+    /// channel its worker held beyond the confinement manifest.
+    pub backend_evidence: BackendEvidenceDocument,
     /// What the backend actually applied, per ceiling (ADR-0035 §3). The
     /// receipt records the mechanism because the number alone does not carry
     /// its own meaning across tiers.
@@ -335,4 +423,48 @@ pub struct RunRecord {
     pub replay_key: String,
     pub state: RunState,
     pub backend_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendEvidenceDocument, WorkerChannel};
+
+    /// The canonical bytes the execution/v1 README's "Backend evidence"
+    /// section specifies, pinned: keys in ASCII order at every level
+    /// (`role`, the serde tag, sorts between `graphRoot` and `workspace`),
+    /// compact, no trailing newline.
+    #[test]
+    fn backend_evidence_canonical_bytes_are_pinned() {
+        let document = BackendEvidenceDocument {
+            backend_id: "libkrun/1".into(),
+            channels: vec![WorkerChannel::WorkspaceShare {
+                workspace: "repo".into(),
+                graph_root: format!("blake3-256:{}", "e".repeat(64)),
+            }],
+        };
+        let expected = format!(
+            "{{\"backendId\":\"libkrun/1\",\"channels\":[{{\"graphRoot\":\"blake3-256:{}\",\
+             \"role\":\"workspaceShare\",\"workspace\":\"repo\"}}],\
+             \"schemaVersion\":\"leyline/execution-backend-evidence/v1\"}}",
+            "e".repeat(64)
+        );
+        assert_eq!(
+            String::from_utf8(document.canonical_bytes()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            document.digest(),
+            format!("blake3-256:{}", blake3::hash(expected.as_bytes()).to_hex())
+        );
+
+        let none = BackendEvidenceDocument {
+            backend_id: "libkrun/1".into(),
+            channels: Vec::new(),
+        };
+        assert_eq!(
+            String::from_utf8(none.canonical_bytes()).unwrap(),
+            "{\"backendId\":\"libkrun/1\",\"channels\":[],\
+             \"schemaVersion\":\"leyline/execution-backend-evidence/v1\"}"
+        );
+    }
 }

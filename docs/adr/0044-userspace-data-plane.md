@@ -80,12 +80,21 @@ They keep the guarantees they can carry (per-open bases on FUSE; READ-time bases
 stale refusal on NFS) and document what they cannot. NFS-only heuristics are not added: #461 is
 closed unmerged, and its probe results are recorded above.
 
-### V5 — Mechanism in LLO, policy in cloister
+### V5 — LLO owns the filesystem; cloister owns policy; they meet at execution/v1
 
-LLO provides the virtio-fs backend and the libkrun runtime behind `execution/v1` (cloister ADR-0049
-amendment, ADR-0063). cloister provides the policy that scopes a run (which refs and paths the guest
-sees, who may propose, audit and receipts) through the RunGrant. The backend enforces the grant;
-it does not define it.
+Everything on disk and in the guest's view of files is LLO's: the content-addressed base, the
+overlay and write path, the virtio-fs backend, how blobs are mapped into the guest, and the libkrun
+runtime that attaches it (cloister ADR-0049 amendment, ADR-0063). cloister does not decide the
+filesystem substrate; cloister ADR-0050's substrate decision moves here.
+
+cloister owns policy: which refs and paths a run sees, whether it may propose, credentials, audit.
+The two meet at contracts LLO already owns:
+
+- **cloister → LLO:** the RunGrant's `WorkspaceGrant {graphRoot, expectedGeneration, operations}`
+  (`execution/v1`) scopes the guest's filesystem. The backend serves only what it grants and refuses
+  proposals it does not allow, with an errno the agent sees.
+- **LLO → cloister:** the run receipt carries, per proposal, `appliedTo`, `resultRoot` and
+  `proposalDigest` (ADR-0041 S3), which cloister links into its receipt chain.
 
 ### V6 — The socket stays
 
@@ -99,8 +108,8 @@ types the virtio-fs backend uses.
   change.
 - cloister ADR-0050 defers per-op mediation as slow and unnecessary for isolation. It predates
   proposals: its validate-on-commit has no base an edit was made against and no refusal that reaches
-  the agent. V3 keeps its read path and serves only the write path per operation; ADR-0050 needs an
-  amendment on the cloister side to say so.
+  the agent. V3 keeps its read path and serves only the write path per operation. ADR-0050 needs an
+  amendment on the cloister side deferring the filesystem substrate to this ADR (V5).
 - LLO depends on libkrun accepting a custom virtio-fs backend. If its C API does not, LLO links the
   devices crate directly or carries a fork, which is a supply-chain decision (open question 1).
 

@@ -37,6 +37,12 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **`leyline inspect --query` prints every value** (bead
+  `ley-line-open-12c0fa`). It read each column as text and printed
+  integers, reals, NULLs and blobs as empty strings, so `SELECT count(*)`
+  answered nothing. Numbers print as numbers, NULL as `NULL`, and blobs as
+  SQL hex literals (`x'00ff'`).
+
 - **An applied proposal is reported as applied** (bead
   `ley-line-open-5db28e`). When the head write, an index build or the
   publish failed after `COMMIT`, the daemon answered `{ok: false}` and

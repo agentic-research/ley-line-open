@@ -127,30 +127,65 @@ fn lookup_node(conn: &Connection, id: &str) -> Result<String> {
 
 /// Run arbitrary SQL and print tab-separated results with column headers.
 fn run_sql(conn: &Connection, sql: &str) -> Result<()> {
+    print!("{}", sql_table(conn, sql)?);
+    Ok(())
+}
+
+/// One SQLite value as `inspect` prints it: numbers and text as they are,
+/// `NULL`, and a blob as an SQL hex literal.
+fn render(value: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => "NULL".to_string(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(r) => r.to_string(),
+        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+        ValueRef::Blob(b) => {
+            let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("x'{hex}'")
+        }
+    }
+}
+
+/// The result of `sql` as tab-separated lines: the column names, then one
+/// line per row.
+fn sql_table(conn: &Connection, sql: &str) -> Result<String> {
     let mut stmt = conn.prepare(sql)?;
     let col_count = stmt.column_count();
-
-    // Print header row.
     let headers: Vec<&str> = (0..col_count)
         .map(|i| stmt.column_name(i).unwrap_or("?"))
         .collect();
-    println!("{}", headers.join("\t"));
+    let mut out = headers.join("\t");
+    out.push('\n');
 
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let vals: Vec<String> = (0..col_count)
-            .map(|i| row.get::<_, String>(i).unwrap_or_default())
-            .collect();
-        println!("{}", vals.join("\t"));
+        let vals = (0..col_count)
+            .map(|i| row.get_ref(i).map(render))
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        out.push_str(&vals.join("\t"));
+        out.push('\n');
     }
-
-    Ok(())
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use leyline_schema::{create_schema, insert_node};
+
+    /// `inspect --query` printed every non-text value as an empty string,
+    /// so `SELECT count(*)` answered nothing. Every SQLite type renders.
+    #[test]
+    fn a_query_renders_every_value_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        let table = sql_table(
+            &conn,
+            "SELECT 2 AS n, 1.5 AS r, 'x' AS t, NULL AS z, x'00ff' AS b",
+        )
+        .unwrap();
+        assert_eq!(table, "n\tr\tt\tz\tb\n2\t1.5\tx\tNULL\tx'00ff'\n");
+    }
 
     #[test]
     fn cmd_inspect_fails_loudly_when_the_arena_cannot_be_opened() {

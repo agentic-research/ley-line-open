@@ -55,6 +55,9 @@ use leyline_core::Hash;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 
+pub mod share;
+pub use share::StoreShare;
+
 #[cfg(test)]
 mod tests;
 

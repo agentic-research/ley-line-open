@@ -15,6 +15,10 @@ publish = false
 # is built by whoever links both — see README.md.
 leyline-cli-lib = { path = "../cli-lib" }
 leyline-core = { path = "../../ll-core/core" }
+# The share wire (`backends::libkrun::share`): the request and reply types the
+# adapter answers, and the workspace-share seam the libkrun backend calls.
+# Without `vmm`: the daemon serves shares; it never links the VMM.
+leyline-runtime = { path = "../runtime", default-features = false }
 anyhow = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }

@@ -13,23 +13,23 @@ use tempfile::TempDir;
 use super::open_flags::{O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use super::*;
 
-const A: &str = "package a\n\nfunc A() int { return 1 }\n";
-const A_EDIT: &str = "package a\n\nfunc A() int { return 2 }\n";
-const A_OTHER: &str = "package a\n\nfunc A() int { return 3 }\n";
+pub(crate) const A: &str = "package a\n\nfunc A() int { return 1 }\n";
+pub(crate) const A_EDIT: &str = "package a\n\nfunc A() int { return 2 }\n";
+pub(crate) const A_OTHER: &str = "package a\n\nfunc A() int { return 3 }\n";
 const A_SHORT: &str = "package a\n";
 const A_TAILED: &str = "package a\n\nfunc A() int { return 1 }\n// tail\n";
-const A_BROKEN: &str = "package a\n\nfunc A( {\n";
-const B: &str = "package pkg\n\nfunc B() string { return \"b\" }\n";
+pub(crate) const A_BROKEN: &str = "package a\n\nfunc A( {\n";
+pub(crate) const B: &str = "package pkg\n\nfunc B() string { return \"b\" }\n";
 const C: &str = "package sub\n\nfunc C() {}\n";
 const D: &str = "package secret\n\nfunc D() {}\n";
 
 /// The timeout of a path no change was recorded for within [`WINDOW`].
-const TTL: Duration = Duration::from_secs(7);
+pub(crate) const TTL: Duration = Duration::from_secs(7);
 /// The timeout of a path changed within [`WINDOW`].
-const SHORT: Duration = Duration::from_millis(250);
+pub(crate) const SHORT: Duration = Duration::from_millis(250);
 const WINDOW: Duration = Duration::from_secs(30);
 
-fn freshness() -> Freshness {
+pub(crate) fn freshness() -> Freshness {
     Freshness {
         settled: TTL,
         changed: SHORT,
@@ -39,10 +39,10 @@ fn freshness() -> Freshness {
 
 /// A clock the test moves: no test sleeps.
 #[derive(Default)]
-struct TestClock(parking_lot::Mutex<Duration>);
+pub(crate) struct TestClock(parking_lot::Mutex<Duration>);
 
 impl TestClock {
-    fn advance(&self, by: Duration) {
+    pub(crate) fn advance(&self, by: Duration) {
         *self.0.lock() += by;
     }
 }
@@ -53,14 +53,14 @@ impl Clock for TestClock {
     }
 }
 
-struct Fixture {
-    _db_dir: TempDir,
-    src: TempDir,
-    fs: StoreFs<Arc<LiveDb>>,
-    clock: Arc<TestClock>,
+pub(crate) struct Fixture {
+    pub(crate) _db_dir: TempDir,
+    pub(crate) src: TempDir,
+    pub(crate) fs: StoreFs<Arc<LiveDb>>,
+    pub(crate) clock: Arc<TestClock>,
 }
 
-fn whole() -> Scope {
+pub(crate) fn whole() -> Scope {
     Scope {
         see: Grant::Whole,
         propose: Grant::Whole,
@@ -74,7 +74,7 @@ fn paths(list: &[&str]) -> Grant {
 /// A store cold-parsed from a source tree holding `a.go` (`a_text`),
 /// `pkg/b.go`, `pkg/sub/c.go` and `secret/d.go`; with `checkout`, the source
 /// tree is attached as the checkout accepted proposals are written into.
-fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
+pub(crate) fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
     let src = tempfile::tempdir().unwrap();
     for (rel, text) in [
         ("a.go", a_text),
@@ -109,13 +109,13 @@ fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
     }
 }
 
-fn fixture(scope: Scope) -> Fixture {
+pub(crate) fn fixture(scope: Scope) -> Fixture {
     fixture_with(scope, false, A)
 }
 
 /// What the daemon's `read_source` answers for `path`: the bytes of the
 /// blob `_source.content_hash` names, and that hash.
-fn read_source(f: &Fixture, path: &str) -> (Vec<u8>, Hash) {
+pub(crate) fn read_source(f: &Fixture, path: &str) -> (Vec<u8>, Hash) {
     f.fs.store()
         .with_read(|conn| {
             let (bytes, hash): (Vec<u8>, Vec<u8>) = conn.query_row(
@@ -130,7 +130,7 @@ fn read_source(f: &Fixture, path: &str) -> (Vec<u8>, Hash) {
 }
 
 /// Another writer (a socket `propose`, another agent) lands `text` at `path`.
-fn other_writer(f: &Fixture, path: &str, text: &str) {
+pub(crate) fn other_writer(f: &Fixture, path: &str, text: &str) {
     f.fs.store()
         .with_write(|conn| {
             source_write::propose(
@@ -176,7 +176,7 @@ fn passes(f: &Fixture) -> i64 {
         .unwrap()
 }
 
-fn on_disk(f: &Fixture, path: &str) -> Option<String> {
+pub(crate) fn on_disk(f: &Fixture, path: &str) -> Option<String> {
     std::fs::read_to_string(f.src.path().join(path)).ok()
 }
 
@@ -197,7 +197,7 @@ fn create_file(f: &Fixture, parent: u64, name: &str, text: &str) -> (u64, Result
 }
 
 /// The inode of `path`, found by LOOKUP from the root.
-fn ino(f: &Fixture, path: &str) -> u64 {
+pub(crate) fn ino(f: &Fixture, path: &str) -> u64 {
     path.split('/').fold(ROOT_INODE, |parent, name| {
         f.fs.lookup(parent, name.as_bytes()).unwrap().attr.inode
     })

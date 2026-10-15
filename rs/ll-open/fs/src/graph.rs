@@ -111,6 +111,20 @@ pub trait Graph: Send + Sync {
         Ok(())
     }
 
+    /// The [`MOUNT_HANDLE`] is about to serve node `id`'s bytes to a client
+    /// (an NFS READ): its base for `id`'s file becomes the hash of the
+    /// file's bytes now, unless it has an edit to that file in progress,
+    /// which keeps the base it was made against (bead
+    /// `ley-line-open-6116c9`). NFSv3 has no open to take a base at, and a
+    /// client holds its writes until fsync, so the read is the last point
+    /// the server knows which bytes the client has. Called before the
+    /// bytes are read, so a change landing in between leaves the base
+    /// older than what the client got: the edit is refused, never landed
+    /// over a change the client did not read. Default no-op.
+    fn note_read(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Flush pending splice for a node (called on FUSE flush/NFS write completion).
     /// Default no-op; implementations with splice support override.
     fn flush_node(&self, _id: &str) -> Result<()> {
@@ -343,14 +357,18 @@ pub struct SqliteGraphAdapter {
     pending: Mutex<HashMap<String, HashMap<Handle, Vec<u8>>>>,
     /// The base of each edit, keyed by handle and `_source.id`: the hash of
     /// the file's bytes the handle read (ADR-0042 P2). Taken by
-    /// `note_base_as` (a FUSE open for writing) or the handle's first write,
-    /// and handed to the source writer on flush, which refuses the edit
-    /// when the file holds other bytes. After a flush lands, a FUSE handle's
-    /// base is the file it wrote, held until `release`; the mount handle's
-    /// is dropped, since NFS has no close to drop it at. Either is kept
-    /// while the handle has another edit to the file in progress, which was
-    /// made against the old bytes. A refused edit leaves a FUSE handle's
-    /// base in place and drops the mount handle's.
+    /// `note_base_as` (a FUSE open for writing), by `note_read` (an NFS
+    /// READ, for the mount handle, re-taken by each READ while the handle
+    /// has no edit to the file in progress) or by the handle's first write
+    /// when it has none, and handed to the source writer on flush, which
+    /// refuses the edit when the file holds other bytes. After a flush
+    /// lands, the handle's base is the file it wrote; it is kept while the
+    /// handle has another edit to the file in progress, which was made
+    /// against the old bytes. A refused edit leaves the base in place. A
+    /// FUSE handle's bases go at `release`. The mount handle has no
+    /// release: it holds at most one base per file, replaced in place, so
+    /// its entries are bounded by the files it has served (bead
+    /// `ley-line-open-6116c9`).
     #[cfg(feature = "splice")]
     bases: Mutex<HashMap<(Handle, String), leyline_core::Hash>>,
     /// Where an edit to a parsed file goes. Without one, such an edit is
@@ -529,13 +547,13 @@ impl SqliteGraphAdapter {
     /// Discard `handle`'s refused edit to `file_id`: drop its edits in
     /// progress to that file, so its nodes read as the stored file again,
     /// and record `refused` in `_errors` for `node_id`. Other handles' edits
-    /// stay for their own flushes, which check their own bases. A FUSE
-    /// handle keeps its base, the bytes it read, so every later edit through
-    /// it is checked against them until it is released; the mount handle
-    /// drops it, and its next edit takes a base at its first write. Nothing
-    /// in the database needs restoring, because a pending edit never
-    /// reached it. Recording the reason is best effort: the refusal is what
-    /// the caller must see.
+    /// stay for their own flushes, which check their own bases. The handle
+    /// keeps its base, the bytes it read, so every later edit through it is
+    /// checked against them: a FUSE handle's until it is released, the
+    /// mount handle's until a READ of the file re-takes it (bead
+    /// `ley-line-open-6116c9`). Nothing in the database needs restoring,
+    /// because a pending edit never reached it. Recording the reason is
+    /// best effort: the refusal is what the caller must see.
     #[cfg(feature = "splice")]
     fn discard_file(
         &self,
@@ -543,12 +561,8 @@ impl SqliteGraphAdapter {
         handle: Handle,
         node_id: &str,
         file_id: i64,
-        source_id: &str,
         refused: &anyhow::Error,
     ) {
-        if handle == MOUNT_HANDLE {
-            self.bases.lock().remove(&(handle, source_id.to_string()));
-        }
         self.pending.lock().retain(|id, edits| {
             if Self::in_file(conn, id, file_id) {
                 edits.remove(&handle);
@@ -626,6 +640,41 @@ impl SqliteGraphAdapter {
                     .or_insert(stored.as_slice().hash());
             }
             Err(e) => log::debug!("no base for '{}': {e:#}", key.1),
+        }
+        Ok(())
+    }
+
+    /// Refuse a [`MOUNT_HANDLE`] write or truncate to `nid`'s file when the
+    /// file moved since the handle's base: the edit is stale before it is
+    /// staged (bead `ley-line-open-6116c9`). The flush would refuse it too,
+    /// but an NFS client reports only the WRITE's failure — macOS ignores a
+    /// failed COMMIT — so the refusal must come at the WRITE. A FUSE handle
+    /// is left to its flush, which FUSE reports, and is not hashed per
+    /// write.
+    #[cfg(feature = "splice")]
+    fn refuse_moved(&self, conn: &Connection, handle: Handle, nid: i64) -> Result<()> {
+        if handle != MOUNT_HANDLE {
+            return Ok(());
+        }
+        let Some((file_id, source_id)) = Self::source_of(conn, nid)? else {
+            return Ok(());
+        };
+        let Some(expected) = self.bases.lock().get(&(handle, source_id.clone())).copied() else {
+            return Ok(());
+        };
+        // A file whose bytes cannot be read is left to the write path, as
+        // `take_base` leaves it.
+        let Ok(stored) = leyline_ts::splice::source_bytes(conn, file_id) else {
+            return Ok(());
+        };
+        let current = stored.as_slice().hash();
+        if current != expected {
+            return Err(StaleWrite {
+                source_id,
+                expected,
+                current,
+            }
+            .into());
         }
         Ok(())
     }
@@ -902,9 +951,14 @@ impl SqliteGraphAdapter {
             let nid = leyline_schema::resolve_path(guard.conn(), id)?
                 .with_context(|| format!("write to unknown node '{id}'"))?;
 
-            // The edit's base is the file before the handle's first write.
+            // The edit's base is the file before the handle's first write,
+            // or the one an NFS READ took; a mount write to a file that
+            // moved since that base is refused before it is staged.
             #[cfg(feature = "splice")]
-            self.take_base(guard.conn(), handle, nid)?;
+            {
+                self.refuse_moved(guard.conn(), handle, nid)?;
+                self.take_base(guard.conn(), handle, nid)?;
+            }
 
             // An edit to a node of a parsed file accumulates in `pending`
             // and reaches the database only through its flush.
@@ -1474,6 +1528,7 @@ impl Graph for SqliteGraphAdapter {
 
             #[cfg(feature = "splice")]
             if Self::is_spliced(conn, nid) {
+                self.refuse_moved(conn, handle, nid)?;
                 self.take_base(conn, handle, nid)?;
                 self.pending
                     .lock()
@@ -1528,6 +1583,40 @@ impl Graph for SqliteGraphAdapter {
             }
         }
         let _ = (handle, id);
+        Ok(())
+    }
+
+    fn note_read(&self, id: &str) -> Result<()> {
+        #[cfg(feature = "splice")]
+        {
+            let guard = self.writer_guard();
+            let conn = guard.conn();
+            let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
+                return Ok(());
+            };
+            let Some((file_id, source_id)) = Self::source_of(conn, nid)? else {
+                return Ok(());
+            };
+            // A staged edit keeps the base it was made against. The writer
+            // guard is held, so no write stages between this check and the
+            // insert.
+            if self.edits_file(conn, MOUNT_HANDLE, file_id) {
+                return Ok(());
+            }
+            // The entry for the file is replaced, never added beside: the
+            // mount handle holds one base per file. A file whose bytes
+            // cannot be read keeps the base it had, as `take_base` takes
+            // none for it.
+            match leyline_ts::splice::source_bytes(conn, file_id) {
+                Ok(stored) => {
+                    self.bases
+                        .lock()
+                        .insert((MOUNT_HANDLE, source_id), stored.as_slice().hash());
+                }
+                Err(e) => log::debug!("no base for '{source_id}': {e:#}"),
+            }
+        }
+        let _ = id;
         Ok(())
     }
 
@@ -1590,7 +1679,7 @@ impl Graph for SqliteGraphAdapter {
                 // handle's edits to that file are dropped, so its nodes read
                 // as the stored file again, and the reason is recorded for
                 // the node.
-                self.discard_file(guard.conn(), handle, id, file_id, source_id, &refused);
+                self.discard_file(guard.conn(), handle, id, file_id, &refused);
                 drop(guard);
                 self.refresh_readers()?;
                 return Err(refused);
@@ -1598,13 +1687,13 @@ impl Graph for SqliteGraphAdapter {
             self.drop_edit(handle, id);
             if !self.edits_file(guard.conn(), handle, file_id) {
                 // The handle's next edit to the file is made against the
-                // bytes it just wrote. A FUSE handle holds that base until
-                // it is released, so an edit another handle lands in
-                // between is caught. The mount handle has no release: its
-                // next edit takes its base at its first write.
-                let landed = (handle != MOUNT_HANDLE)
-                    .then(|| leyline_ts::splice::source_bytes(guard.conn(), file_id).ok())
-                    .flatten();
+                // bytes it just wrote, so an edit another writer lands in
+                // between is caught. A FUSE handle holds that base until it
+                // is released. The mount handle holds it until a READ of
+                // the file re-takes it (`note_read`): its client's cache
+                // holds the bytes it wrote, and it need not READ them again
+                // before its next edit (bead `ley-line-open-6116c9`).
+                let landed = leyline_ts::splice::source_bytes(guard.conn(), file_id).ok();
                 let mut bases = self.bases.lock();
                 match landed {
                     Some(stored) => {
@@ -2341,6 +2430,10 @@ impl Graph for HotSwapGraph {
 
     fn note_base(&self, id: &str) -> Result<()> {
         self.maybe_swap()?.note_base(id)
+    }
+
+    fn note_read(&self, id: &str) -> Result<()> {
+        self.maybe_swap()?.note_read(id)
     }
 
     fn flush_node(&self, id: &str) -> Result<()> {
@@ -3755,24 +3848,32 @@ mod tests {
         Ok(())
     }
 
-    /// Opening for writing takes the base (`note_base`): a change that lands
-    /// after the open and before the first write is caught at flush, because
-    /// the flush names the file as it was at the open, not at the write. The
-    /// change here is a batch splice, which writes with no base of its own.
+    /// Opening for writing takes the base (`note_base_as`): a change that
+    /// lands after the open and before the first write is caught at flush,
+    /// because the flush names the file as it was at the open, not at the
+    /// write. The change here is a batch splice, which writes with no base
+    /// of its own. The mount handle's write after such a change is refused
+    /// before it is staged (bead `ley-line-open-6116c9`).
     #[test]
     #[cfg(feature = "splice")]
     fn opening_for_writing_takes_the_base() -> Result<()> {
         fn check(graph: &dyn Graph, writer: &BaseCheckingWriter) -> Result<()> {
             let node_id = "test.html/element/text";
-            graph.note_base(node_id)?;
+            graph.note_base_as(A, node_id)?;
             graph.batch_splice(&[(node_id.to_string(), Some("other".to_string()))])?;
-            graph.write_content(node_id, b"world", 0)?;
-            graph.flush_node(node_id)?;
+            graph.write_content_as(A, node_id, b"world", 0)?;
+            graph.flush_node_as(A, node_id)?;
             assert_eq!(
                 writer.bases.lock().last(),
                 Some(&Some(hash_of(b"<p>hello</p>"))),
                 "the flush names the file as it was when it was opened",
             );
+
+            graph.note_base(node_id)?;
+            graph.batch_splice(&[(node_id.to_string(), Some("again".to_string()))])?;
+            assert!(is_stale(
+                graph.write_content(node_id, b"world", 0).map(drop)
+            ));
             Ok(())
         }
 
@@ -4118,10 +4219,37 @@ mod tests {
         assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"hello");
         assert_eq!(read_as(&adapter, MOUNT_HANDLE, y)?, b"again");
 
-        // With nothing pending, the next edit takes a fresh base.
+        // The refusal keeps the base: an edit made with no read of the
+        // moved file is refused too, at its write (bead
+        // `ley-line-open-6116c9`). A read with nothing pending re-takes it,
+        // and the edit after it lands.
+        assert!(is_stale(adapter.write_content(x, b"later", 0).map(drop)));
+        adapter.note_read(x)?;
         adapter.write_content(x, b"later", 0)?;
         adapter.flush_node(x)?;
         assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"later");
+        Ok(())
+    }
+
+    /// The mount handle holds one base per file however many of its nodes
+    /// are read, and a read replaces it rather than adding one: bases taken
+    /// by reads do not grow with the reads (bead `ley-line-open-6116c9`).
+    #[test]
+    #[cfg(feature = "splice")]
+    fn reads_hold_one_mount_base_per_file() -> Result<()> {
+        let adapter = checked_adapter(b"<p>hello</p>\n<p>there</p>\n")?;
+        let x = "test.html/element_0/text";
+        let y = "test.html/element_1/text";
+        adapter.note_read(x)?;
+        let first = adapter.bases.lock().clone();
+        adapter.batch_splice(&[(y.to_string(), Some("moved".to_string()))])?;
+        for _ in 0..3 {
+            adapter.note_read(x)?;
+            adapter.note_read(y)?;
+        }
+        let bases = adapter.bases.lock().clone();
+        assert_eq!(bases.len(), 1, "one base for the one file: {bases:?}");
+        assert_ne!(bases, first, "the read after the move re-took the base");
         Ok(())
     }
 
@@ -4193,6 +4321,12 @@ mod tests {
         graph.write_content_as(A, TEXT, b"xx", 0)?;
         graph.release(A)?;
         assert_eq!(read_as(&graph, A, TEXT)?, b"hi");
+
+        // An NFS READ's base reaches the adapter too: the file moves after
+        // it, and the mount's write is refused.
+        graph.note_read(TEXT)?;
+        graph.batch_splice(&[(TEXT.to_string(), Some("moved".to_string()))])?;
+        assert!(is_stale(graph.write_content(TEXT, b"late", 0).map(drop)));
         Ok(())
     }
 

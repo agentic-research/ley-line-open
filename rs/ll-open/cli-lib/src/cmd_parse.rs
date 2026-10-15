@@ -166,6 +166,65 @@ pub(crate) struct ParsedFile {
     /// own content-addressed subtree. Merged into `hash_by_id` in the
     /// insert loop, next to the `_ast`-derived entries.
     injected_hashes: Vec<(String, [u8; 32])>,
+    /// ADR-0045 T3: the first `ERROR` or `MISSING` node tree-sitter
+    /// produced, when the file did not parse cleanly. The file is projected
+    /// either way; this becomes its `_parse_diagnostics` row.
+    syntax_error: Option<SyntaxError>,
+}
+
+/// Where a projected file first fails to parse cleanly (ADR-0045 T3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyntaxError {
+    pub start_byte: i64,
+    pub end_byte: i64,
+    pub start_row: i64,
+    pub start_col: i64,
+    pub message: String,
+}
+
+/// The first `ERROR` or `MISSING` node under `root` in pre-order, or `None`
+/// when the tree has no error.
+fn first_syntax_error(root: tree_sitter::Node<'_>) -> Option<SyntaxError> {
+    if !root.has_error() {
+        return None;
+    }
+    let mut cursor = root.walk();
+    let mut found = root;
+    'walk: loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            found = node;
+            break 'walk;
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    let at = found.start_position();
+    let what = if found.is_missing() {
+        format!("missing {}", found.kind())
+    } else {
+        "unexpected input".to_string()
+    };
+    Some(SyntaxError {
+        start_byte: found.start_byte() as i64,
+        end_byte: found.end_byte() as i64,
+        start_row: at.row as i64,
+        start_col: at.column as i64,
+        message: format!(
+            "syntax error: {what} at line {}, column {}",
+            at.row + 1,
+            at.column + 1
+        ),
+    })
 }
 
 /// Per-parse extraction context threaded through the fold (bead
@@ -812,23 +871,44 @@ enum InMemory<'a> {
     Written {
         files: &'a BTreeMap<String, Vec<u8>>,
         removed: &'a BTreeSet<String>,
+        edits: &'a TreeEdits,
     },
-    /// ADR-0040 D6: the whole tree, keyed by `_source.id`, read from
-    /// `source_blobs` by `leyline rebuild`. No file is read from disk.
-    Tree(&'a BTreeMap<String, Vec<u8>>),
+    /// ADR-0040 D6: the whole tree, keyed by `_tree` path, read from
+    /// `source_blobs` by `leyline rebuild`, with its modes and directories
+    /// in `edits`. No file is read from disk.
+    Tree {
+        files: &'a BTreeMap<String, Vec<u8>>,
+        edits: &'a TreeEdits,
+    },
+}
+
+/// What a pass read from memory changes in the manifest beyond file bytes
+/// (ADR-0045 T1): a written file's mode (absent: the entry's current mode,
+/// or regular for a new file), and directories made and removed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TreeEdits {
+    pub modes: BTreeMap<String, crate::tree::Mode>,
+    pub mkdirs: BTreeSet<String>,
+    pub rmdirs: BTreeSet<String>,
 }
 
 impl InMemory<'_> {
     fn bytes(&self, rel: &str) -> Option<&Vec<u8>> {
         match self {
-            InMemory::Written { files, .. } | InMemory::Tree(files) => files.get(rel),
+            InMemory::Written { files, .. } | InMemory::Tree { files, .. } => files.get(rel),
         }
     }
 
     fn removes(&self, rel: &str) -> bool {
         match self {
             InMemory::Written { removed, .. } => removed.contains(rel),
-            InMemory::Tree(_) => false,
+            InMemory::Tree { .. } => false,
+        }
+    }
+
+    fn edits(&self) -> &TreeEdits {
+        match self {
+            InMemory::Written { edits, .. } | InMemory::Tree { edits, .. } => edits,
         }
     }
 }
@@ -1003,15 +1083,17 @@ pub fn parse_into_conn(
 /// and one transaction, and remove the `removed` files' rows in the same
 /// transaction (bead `ley-line-open-47fb03`). The pass is scoped to those
 /// paths and reads the written bytes from `written`, never from disk; a
-/// removed file is removed whether or not the directory holds it. Any
-/// written file that fails to parse rolls the whole pass back. `Ok` means
-/// the transaction committed; a failure after `COMMIT` rides in
+/// removed file is removed whether or not the directory holds it, and
+/// `edits` sets modes and makes and removes directories (ADR-0045 T1). A
+/// written file that does not parse is stored with a diagnostic (T3). `Ok`
+/// means the transaction committed; a failure after `COMMIT` rides in
 /// [`Committed::post_commit`].
 pub(crate) fn parse_written_files(
     conn: &Connection,
     source: &Path,
     written: &BTreeMap<String, Vec<u8>>,
     removed: &BTreeSet<String>,
+    edits: &TreeEdits,
 ) -> Result<Committed> {
     let scope: Vec<String> = written.keys().chain(removed).cloned().collect();
     parse_into_conn_with(
@@ -1022,6 +1104,7 @@ pub(crate) fn parse_written_files(
         Some(InMemory::Written {
             files: written,
             removed,
+            edits,
         }),
     )
 }
@@ -1049,6 +1132,7 @@ pub(crate) fn parse_checkout(
         Some(InMemory::Written {
             files: kept,
             removed,
+            edits: &TreeEdits::default(),
         }),
     )?
     .into_result()
@@ -1073,17 +1157,25 @@ pub(crate) fn file_language(path: &Path, lang_filter: Option<TsLanguage>) -> Opt
     }
 }
 
-/// Project a whole tree whose bytes are `files` (`_source.id` → bytes)
-/// through the cold parse, as if `source` held exactly those files
-/// (ADR-0040 D6). Nothing is read from disk and `source` need not exist; it
-/// only names the root the `_source.path` column is rendered under. Any
-/// file that fails to parse fails the pass.
+/// Project a whole tree whose file bytes are `files` (`_tree` path →
+/// bytes), with the modes and directories `edits` names, through the cold
+/// parse, as if `source` held exactly that tree (ADR-0040 D6, ADR-0045).
+/// Nothing is read from disk and `source` need not exist; it only names
+/// the root the `_source.path` column is rendered under.
 pub(crate) fn parse_tree_from_memory(
     conn: &Connection,
     source: &Path,
     files: &BTreeMap<String, Vec<u8>>,
+    edits: &TreeEdits,
 ) -> Result<ParseResult> {
-    parse_into_conn_with(conn, source, None, None, Some(InMemory::Tree(files)))?.into_result()
+    parse_into_conn_with(
+        conn,
+        source,
+        None,
+        None,
+        Some(InMemory::Tree { files, edits }),
+    )?
+    .into_result()
 }
 
 fn parse_into_conn_with(
@@ -1098,9 +1190,13 @@ fn parse_into_conn_with(
     // Whether this pass takes `rel` out of the tree, whatever the disk holds.
     let removed = |rel: &str| memory.as_ref().is_some_and(|m| m.removes(rel));
     let tree_in_memory = match &memory {
-        Some(InMemory::Tree(files)) => Some(*files),
+        Some(InMemory::Tree { files, .. }) => Some(*files),
         _ => None,
     };
+    // A whole-directory pass walks the tree once: its files are what the
+    // parse may project, and its files, symlinks and directories are what
+    // the store holds (ADR-0045 T3).
+    let mut walked: Option<crate::walk::Walked> = None;
     if tree_in_memory.is_none() && !source.is_dir() {
         bail!("{} is not a directory", source.display());
     }
@@ -1130,15 +1226,16 @@ fn parse_into_conn_with(
         // front (no cheap way without a pre-pass), so the inner Vec
         // resizes during traversal. Acceptable trade-off: registry-scale
         // walks dominated by stat/readdir cost, not Vec resizing.
-        let mut v = Vec::new();
-        collect_files(source, &mut v)?;
+        let walk = crate::walk::walk_tree(source)?;
+        let mut v = walk.files.clone();
+        walked = Some(walk);
         // A file read from memory is in the tree whether or not the
         // directory holds it (a checkout conflict whose directory side
         // was deleted, `parse_checkout`).
         // A removed file is out of the tree whether or not the directory
         // holds it (a path the store deleted whose directory side could
         // not be removed, or changed since).
-        if let Some(InMemory::Written { files, removed }) = &memory {
+        if let Some(InMemory::Written { files, removed, .. }) = &memory {
             v.retain(|abs| {
                 let rel = abs.strip_prefix(source).unwrap_or(abs);
                 !removed.contains(rel.to_string_lossy().as_ref())
@@ -1188,6 +1285,8 @@ fn parse_into_conn_with(
     // and so the FK check at COMMIT finds both tables present.
     create_query_blob_tables(conn)?;
     create_index_schema(conn)?;
+    // ADR-0045 T1, T3: the store's manifest and the parse's diagnostics.
+    crate::tree::ensure_tables(conn)?;
 
     let mtime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1295,6 +1394,11 @@ fn parse_into_conn_with(
     let mut to_parse: Vec<FileToParse> = Vec::with_capacity(files.len());
     let mut unchanged = 0u64;
     let mut oversized = 0u64;
+    // ADR-0045 T3: files the parse took up and could not project (oversized,
+    // binary), with why — stored with a diagnostic — and the files it
+    // projected, with their blob and their first syntax error if any.
+    let mut unprojected: BTreeMap<String, String> = BTreeMap::new();
+    let mut projected_now: HashMap<String, ([u8; 32], Option<SyntaxError>)> = HashMap::new();
 
     for path in &files {
         let Some(lang) = file_language(path, lang_filter) else {
@@ -1372,16 +1476,18 @@ fn parse_into_conn_with(
         // dump, vendored package-lock, minified bundle) would either OOM
         // the worker or take many minutes producing nodes that have no
         // semantic value anyway.
+        // The store holds it; the projection does not (ADR-0045 T3).
         if file_size > MAX_PARSE_FILE_SIZE {
-            if written_here.is_some() {
-                bail!(
-                    "written file {rel_str}: size {file_size} bytes exceeds \
-                     MAX_PARSE_FILE_SIZE ({MAX_PARSE_FILE_SIZE} bytes)"
-                );
-            }
             log::warn!(
                 "skip {rel_str}: size {file_size} bytes exceeds MAX_PARSE_FILE_SIZE \
                  ({MAX_PARSE_FILE_SIZE} bytes)",
+            );
+            unprojected.insert(
+                rel_str,
+                format!(
+                    "not projected: {file_size} bytes exceeds MAX_PARSE_FILE_SIZE \
+                     ({MAX_PARSE_FILE_SIZE} bytes)"
+                ),
             );
             oversized += 1;
             continue;
@@ -1476,6 +1582,13 @@ fn parse_into_conn_with(
             delete_file_rows(conn, rel)?;
         }
     }
+    // A file that grew past the parse's size limit leaves the projection.
+    for rel in unprojected.keys() {
+        if old_index.contains_key(rel) {
+            delete_file_rows(conn, rel)?;
+            deleted += 1;
+        }
+    }
 
     // ---- Parallel parse (CPU-bound tree-sitter on all cores) ----
 
@@ -1532,11 +1645,10 @@ fn parse_into_conn_with(
 
                 // Skip binary files (null byte in first 8KB — same heuristic as git).
                 let check_len = content.len().min(8192);
+                // The message names the relative path: it becomes the
+                // file's diagnostic, a function of the tree (ADR-0045 T3).
                 if content[..check_len].contains(&0) {
-                    bail!(
-                        "binary file (null byte in first 8KB): {}",
-                        abs_path.display()
-                    );
+                    bail!("binary file (null byte in first 8KB): {rel}");
                 }
 
                 // Canonicalize so `_source.path` matches the LSP-derived
@@ -1689,9 +1801,10 @@ fn parse_into_conn_with(
 
         let chunk_buffer_start = std::time::Instant::now();
 
-        for result in parsed_files {
+        for (result, (chunk_rel, ..)) in parsed_files.into_iter().zip(chunk) {
             match result {
                 Ok(pf) => {
+                    projected_now.insert(pf.rel.clone(), (pf.content_hash, pf.syntax_error.clone()));
                     // ── projection-v5 minting (bead `ley-line-open-17c271`) ──
                     //
                     // The file's identity: `ensure_file_id` interns the rel
@@ -2040,12 +2153,12 @@ fn parse_into_conn_with(
                     changed_files.push(pf.rel);
                     parsed += 1;
                 }
-                // A file read from memory that does not parse is the write
-                // or the rebuild failing, not a file left out of the tree:
-                // the rollback guard restores the arena.
-                Err(e) if memory.is_some() => return Err(e),
+                // A file the parse cannot project is still stored, with a
+                // diagnostic, whether it came from disk or from a proposal
+                // (ADR-0045 T3).
                 Err(e) => {
                     eprintln!("warn: {e:#}");
+                    unprojected.insert(chunk_rel.clone(), format!("not projected: {e:#}"));
                     errors += 1;
                 }
             }
@@ -2178,6 +2291,24 @@ fn parse_into_conn_with(
     // `_source` inside the transaction — the whole corpus, not this run's
     // delta — on the main thread where the connection is. The head writer
     // stays pure filesystem work and just stamps them, after COMMIT.
+    // ADR-0045 T1, T3: the manifest follows what this pass saw — every file
+    // (projected or not), symlink and directory — and the diagnostics
+    // follow what the parse made of the files it took up.
+    let reach = match (&walked, scope) {
+        (Some(w), _) => tree_sync::Reach::Walked(w),
+        (None, Some(paths)) => tree_sync::Reach::Paths(paths),
+        (None, None) => tree_sync::Reach::Tree,
+    };
+    tree_sync::sync(
+        conn,
+        source,
+        reach,
+        memory.as_ref(),
+        &tree_sync::Outcomes {
+            projected: &projected_now,
+            unprojected: &unprojected,
+        },
+    )?;
     let parser_id = crate::tree_root::ParserInputs::current(&query_set).parser_id();
     let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
 
@@ -3300,6 +3431,7 @@ pub(crate) fn parse_file_pure(
     let content_hash: [u8; 32] = *content.hash().as_bytes();
 
     let root = tree.root_node();
+    let syntax_error = first_syntax_error(root);
     let lang_name = language.name();
 
     let mut nodes = Vec::new();
@@ -3456,6 +3588,7 @@ pub(crate) fn parse_file_pure(
         pointer_blob_hash,
         source_blob_bytes,
         injected_hashes,
+        syntax_error,
     })
 }
 
@@ -4151,10 +4284,17 @@ pub(crate) fn is_bloat_dir(name: &str) -> bool {
 /// `ignore` crate — see `crate::walk`) AND directories matched by
 /// `is_bloat_dir`. See `tests::collect_files_skips_known_bloat_dirs`
 /// for the skip-list pin and `tests::collect_files_respects_gitignore`
-/// for the gitignore pin.
+/// for the gitignore pin. The pass itself walks with
+/// [`crate::walk::walk_tree`], which applies the same excludes.
+#[cfg(test)]
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     crate::walk::walk_into(dir, out)
 }
+
+mod tree_sync;
+
+#[cfg(test)]
+mod tree_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5092,7 +5232,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v6",
+            "projection-v7",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5105,7 +5245,7 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v6"),
+            Some("projection-v7"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
@@ -5124,7 +5264,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v6"),
+            msg.contains("projection-v4") && msg.contains("projection-v7"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(
@@ -5687,15 +5827,25 @@ mod tests {
         assert_eq!(parser_7, parser_1, "the derivation did not change");
 
         // The verifier agrees with the head it just wrote, and disagrees once
-        // the source set changes under it.
+        // the manifest changes under it (ADR-0045 T2: `treeRoot` names
+        // `_tree`), whether a blob or only a mode moves.
         assert!(matches!(
             crate::tree_root::verify(&db_a).unwrap(),
             crate::tree_root::Verification::Valid { .. }
         ));
         {
             let conn = Connection::open(&db_a).unwrap();
+            conn.execute("UPDATE _tree SET mode = 33261 WHERE path = 'a.go'", [])
+                .unwrap();
+        }
+        assert!(matches!(
+            crate::tree_root::verify(&db_a).unwrap(),
+            crate::tree_root::Verification::TreeRootMismatch { .. }
+        ));
+        {
+            let conn = Connection::open(&db_a).unwrap();
             conn.execute(
-                "UPDATE _source SET content_hash = zeroblob(32) WHERE id = 'a.go'",
+                "UPDATE _tree SET mode = 33188, blob_hash = zeroblob(32) WHERE path = 'a.go'",
                 [],
             )
             .unwrap();

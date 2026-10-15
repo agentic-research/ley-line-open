@@ -1,7 +1,8 @@
 //! ADR-0040 D6 — `leyline rebuild` (bead `ley-line-open-f31efd`).
 //!
 //! The projection is derived state. Ring 0 is `source_blobs` plus the
-//! manifest (`_source`: relative path → content hash); every other table is
+//! manifest (`_tree`: relative path → mode and blob hash, and the
+//! directories; ADR-0045 T1); every other table is
 //! a function of ring 0 under one `parserId`, and `_meta.derived_from`
 //! names which. `rebuild` reads ring 0 out of one arena and projects it into
 //! a fresh one through the cold parse, reading nothing from disk.
@@ -10,15 +11,15 @@
 //!
 //! - an arena with no `derived_from` (parsed before D6) has no stated
 //!   derivation to reproduce;
-//! - an arena whose `_source` set no longer folds to its stamped `treeRoot`
-//!   is not the tree the stamp names;
+//! - an arena whose `_tree` manifest no longer folds to its stamped
+//!   `treeRoot` is not the tree the stamp names;
 //! - a stamped `parserId` other than this binary's (against the arena's own
 //!   query overrides) is a different derivation. Rebuilding under it would
 //!   produce an arena that is not a reproduction, so it is refused; reparse
 //!   the source tree with this binary instead;
 //! - a file whose bytes are missing from `source_blobs`, or do not hash to
-//!   `_source.content_hash`, fails the whole rebuild (`source_bytes` fails
-//!   closed), as does a file that no longer parses.
+//!   its `_tree.blob_hash`, fails the whole rebuild. A file that does not
+//!   parse is rebuilt as the parse stores it: with a diagnostic.
 //!
 //! A whole-arena rebuild must land the stamped `treeRoot`; a rebuild of a
 //! sub-manifest (`--path`, ADR-0040 F5) lands the `treeRoot` of that subset.
@@ -62,37 +63,46 @@ pub fn rebuild(from: &Connection, into: &Connection, grant: &Grant) -> Result<Re
     let recomputed = crate::tree_root::tree_root(from, stamp.parser_id)?;
     if recomputed != stamp.tree_root {
         bail!(
-            "refusing to rebuild: the arena's _source set folds to treeRoot {recomputed}, \
+            "refusing to rebuild: the arena's _tree manifest folds to treeRoot {recomputed}, \
              but derived_from names {}",
             stamp.tree_root
         );
     }
     let source_root = leyline_ts::schema::get_meta(from, "source_root")?
         .context("refusing to rebuild: the arena records no source_root")?;
+    // Ring 0 is the manifest (ADR-0045 T1): every file entry with its mode,
+    // and, for the whole arena, every directory.
+    let manifest = crate::tree::entries(from)?;
     if let Grant::Paths(paths) = grant {
         for path in paths {
-            let known: bool = from.query_row(
-                "SELECT EXISTS(SELECT 1 FROM _source WHERE id = ?1)",
-                [path],
-                |r| r.get(0),
-            )?;
-            if !known {
+            if !matches!(manifest.get(path), Some(crate::tree::Entry::File { .. })) {
                 bail!("refusing to rebuild: no file '{path}' in the arena");
             }
         }
     }
 
     let mut files = BTreeMap::new();
-    {
-        let mut stmt = from.prepare("SELECT id, file_id FROM _source ORDER BY id")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        for row in rows {
-            let (id, file_id) = row?;
-            if grant.covers(&id) {
-                let bytes = leyline_ts::splice::source_bytes(from, file_id)
-                    .with_context(|| format!("refusing to rebuild '{id}'"))?;
-                files.insert(id, bytes);
+    let mut edits = crate::cmd_parse::TreeEdits::default();
+    for (path, entry) in &manifest {
+        match entry {
+            crate::tree::Entry::File { mode, blob } if grant.covers(path) => {
+                use leyline_core::ContentAddressed;
+                let bytes = crate::tree::blob_bytes(from, *blob)?.with_context(|| {
+                    format!("refusing to rebuild '{path}': the store holds no such blob {blob}")
+                })?;
+                let actual = bytes.hash();
+                if actual != *blob {
+                    bail!(
+                        "refusing to rebuild '{path}': its stored bytes hash to {actual}, not {blob}"
+                    );
+                }
+                files.insert(path.clone(), bytes);
+                edits.modes.insert(path.clone(), *mode);
             }
+            crate::tree::Entry::Dir if *grant == Grant::Whole => {
+                edits.mkdirs.insert(path.clone());
+            }
+            _ => {}
         }
     }
 
@@ -106,7 +116,7 @@ pub fn rebuild(from: &Connection, into: &Connection, grant: &Grant) -> Result<Re
     }
     copy_query_overrides(from, into)?;
 
-    crate::cmd_parse::parse_tree_from_memory(into, Path::new(&source_root), &files)?;
+    crate::cmd_parse::parse_tree_from_memory(into, Path::new(&source_root), &files, &edits)?;
     let derived_from = DerivedFrom::read(into)?
         .context("the rebuilt arena records no derived_from; the parse did not stamp it")?;
     if *grant == Grant::Whole && derived_from.tree_root != stamp.tree_root {
@@ -222,8 +232,9 @@ mod tests {
 
     /// The rows of an arena, canonicalised as ADR-0040 D6 declares: interned
     /// ids (`file_id`, nids, `name_id`, `kind_id`) rendered as what they name;
-    /// `nodes.mtime`, `_meta.parse_time`, `_meta.source_root` and the
-    /// absolute `_source.path` dropped; `_lsp*` excluded; content-addressed
+    /// `nodes.mtime`, `_tree.mtime`/`size`, `_meta.parse_time`,
+    /// `_meta.source_root` and the absolute `_source.path` dropped; `_lsp*`
+    /// excluded; content-addressed
     /// stores restricted to what the projection reaches, since a write
     /// leaves the replaced bytes and subtrees behind without changing what
     /// the arena projects.
@@ -333,7 +344,12 @@ mod tests {
                             _ => false,
                         };
                         match (table.as_str(), col.as_str()) {
-                            ("nodes", "mtime") | ("_source", "path") => continue,
+                            // `_tree.mtime`/`size` are the walk's stat
+                            // cache, not identity (ADR-0045 T1).
+                            ("nodes", "mtime")
+                            | ("_source", "path")
+                            | ("_tree", "mtime")
+                            | ("_tree", "size") => continue,
                             // Not functions of `node_hash`: neither is in its
                             // preimage, so `INSERT OR IGNORE` keeps whichever
                             // file's node landed first, and a write leaves the

@@ -120,32 +120,53 @@ impl ParserInputs {
     }
 }
 
-/// One `_source` row as the fold sees it.
+/// One leaf of the store's manifest as the fold sees it (ADR-0045 T2): a
+/// file entry, or an empty directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceLeaf {
-    /// `_source.id`: the path relative to the parse root.
-    pub relative_path: String,
-    /// `_source.content_hash`: BLAKE3 of the file bytes.
-    pub content_hash: Hash,
+pub struct TreeLeaf {
+    /// The path relative to the tree root.
+    pub path: String,
+    /// The entry's git mode (`0o100644`, `0o100755`, `0o120000`, or
+    /// `0o040000` for an empty directory).
+    pub mode: u32,
+    /// The file's blob hash; BLAKE3 of no bytes for an empty directory.
+    pub content: Hash,
+}
+
+impl TreeLeaf {
+    /// A regular (`0o100644`) file: the only leaf a pre-ADR-0045 tree held.
+    pub fn regular(path: impl Into<String>, content: Hash) -> Self {
+        TreeLeaf {
+            path: path.into(),
+            mode: 0o100644,
+            content,
+        }
+    }
+}
+
+/// `b` of a leaf's content entry: `0` for a regular file, so every tree a
+/// pre-ADR-0045 producer folded keeps its root, and the git mode otherwise.
+fn mode_tag(mode: u32) -> u64 {
+    if mode == 0o100644 { 0 } else { u64::from(mode) }
 }
 
 /// `treeRoot` over an explicit leaf set. Pure, so a receiver holding only a
 /// manifest (ADR-0029) recomputes it without an arena.
-pub fn tree_root_of(leaves: &[SourceLeaf], parser_id: Hash) -> Hash {
-    let mut sorted: Vec<&SourceLeaf> = leaves.iter().collect();
-    sorted.sort_by(|x, y| x.relative_path.as_bytes().cmp(y.relative_path.as_bytes()));
+pub fn tree_root_of(leaves: &[TreeLeaf], parser_id: Hash) -> Hash {
+    let mut sorted: Vec<&TreeLeaf> = leaves.iter().collect();
+    sorted.sort_by(|x, y| x.path.as_bytes().cmp(y.path.as_bytes()));
     let mut entries = Vec::with_capacity(sorted.len() * 2);
     for (i, leaf) in sorted.iter().enumerate() {
         let i = i as u64;
         entries.push(Entry {
-            addr: leaf.relative_path.as_bytes().hash(),
+            addr: leaf.path.as_bytes().hash(),
             a: 2 * i,
-            b: leaf.relative_path.len() as u64,
+            b: leaf.path.len() as u64,
         });
         entries.push(Entry {
-            addr: leaf.content_hash,
+            addr: leaf.content,
             a: 2 * i + 1,
-            b: 0,
+            b: mode_tag(leaf.mode),
         });
     }
     PartitionSpec {
@@ -157,38 +178,48 @@ pub fn tree_root_of(leaves: &[SourceLeaf], parser_id: Hash) -> Hash {
     .address(&entries)
 }
 
-/// Read every `_source` leaf from an arena. Fails closed on a row without a
-/// 32-byte content hash: a tree root over an unknown file is not a tree root.
-pub fn source_leaves(conn: &Connection) -> Result<Vec<SourceLeaf>> {
-    let mut stmt = conn
-        .prepare("SELECT id, content_hash FROM _source ORDER BY id")
-        .context("prepare _source scan for treeRoot")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
-    })?;
-    let mut leaves = Vec::new();
-    for row in rows {
-        let (id, hash) = row?;
-        let Some(bytes) = hash else {
-            bail!("treeRoot: _source row {id:?} has no content_hash");
-        };
-        let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "treeRoot: _source row {id:?} content_hash is {} bytes, expected 32",
-                bytes.len()
-            )
-        })?;
-        leaves.push(SourceLeaf {
-            relative_path: id,
-            content_hash: Hash::from_bytes(bytes),
-        });
+/// The fold's leaves of a manifest: every file entry, and every directory
+/// with no entry beneath it.
+pub fn leaves_of(entries: &std::collections::BTreeMap<String, crate::tree::Entry>) -> Vec<TreeLeaf> {
+    use crate::tree::Entry as E;
+    let mut leaves = Vec::with_capacity(entries.len());
+    for (path, entry) in entries {
+        match entry {
+            E::File { mode, blob } => leaves.push(TreeLeaf {
+                path: path.clone(),
+                mode: mode.git(),
+                content: *blob,
+            }),
+            E::Dir => {
+                let prefix = format!("{path}/");
+                let empty = !entries
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(k, _)| k.starts_with(&prefix));
+                if empty {
+                    leaves.push(TreeLeaf {
+                        path: path.clone(),
+                        mode: crate::tree::DIRECTORY_MODE,
+                        content: b"".hash(),
+                    });
+                }
+            }
+        }
     }
-    Ok(leaves)
+    leaves
+}
+
+/// Read every leaf of the arena's manifest (`_tree`). Fails closed on an
+/// entry git does not store or a file without a 32-byte blob hash: a tree
+/// root over an unknown file is not a tree root.
+pub fn tree_leaves(conn: &Connection) -> Result<Vec<TreeLeaf>> {
+    let entries = crate::tree::entries(conn).context("read _tree for treeRoot")?;
+    Ok(leaves_of(&entries))
 }
 
 /// `treeRoot` of an arena under `parser_id`.
 pub fn tree_root(conn: &Connection, parser_id: Hash) -> Result<Hash> {
-    Ok(tree_root_of(&source_leaves(conn)?, parser_id))
+    Ok(tree_root_of(&tree_leaves(conn)?, parser_id))
 }
 
 /// The `_meta` key [`DerivedFrom`] is stored under.
@@ -357,11 +388,8 @@ pub fn cmd_verify_head(db: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn leaf(path: &str, byte: u8) -> SourceLeaf {
-        SourceLeaf {
-            relative_path: path.to_string(),
-            content_hash: Hash::from_bytes([byte; 32]),
-        }
+    fn leaf(path: &str, byte: u8) -> TreeLeaf {
+        TreeLeaf::regular(path, Hash::from_bytes([byte; 32]))
     }
 
     fn inputs() -> ParserInputs {
@@ -540,18 +568,100 @@ mod tests {
     }
 
     #[test]
-    fn source_leaves_fail_closed_on_a_row_without_a_hash() {
+    fn tree_leaves_fail_closed_on_an_entry_without_a_hash() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE _source (id TEXT PRIMARY KEY, content_hash BLOB);
-             INSERT INTO _source VALUES ('a.go', NULL);",
-        )
-        .unwrap();
-        let err = source_leaves(&conn).unwrap_err().to_string();
-        assert!(err.contains("no content_hash"), "{err}");
-        conn.execute_batch("UPDATE _source SET content_hash = X'0102' WHERE id = 'a.go';")
+        crate::tree::ensure_tables(&conn).unwrap();
+        conn.execute_batch("INSERT INTO _tree (path, mode, blob_hash) VALUES ('a.go', 33188, NULL);")
             .unwrap();
-        let err = source_leaves(&conn).unwrap_err().to_string();
+        let err = format!("{:#}", tree_leaves(&conn).unwrap_err());
+        assert!(err.contains("no blob_hash"), "{err}");
+        conn.execute_batch("UPDATE _tree SET blob_hash = X'0102' WHERE path = 'a.go';")
+            .unwrap();
+        let err = format!("{:#}", tree_leaves(&conn).unwrap_err());
         assert!(err.contains("expected 32"), "{err}");
+    }
+
+    /// ADR-0045 T2: a leaf's content entry carries its git mode in `b`,
+    /// except a regular file, which carries the `0` every pre-ADR leaf
+    /// carried; an empty directory's content is BLAKE3 of no bytes.
+    #[test]
+    fn modes_and_empty_dirs_move_the_tree_root() {
+        let p = inputs().parser_id();
+        let leaves = [
+            TreeLeaf {
+                path: "run.sh".into(),
+                mode: 0o100755,
+                content: Hash::from_bytes([1; 32]),
+            },
+            TreeLeaf {
+                path: "link".into(),
+                mode: 0o120000,
+                content: b"run.sh".hash(),
+            },
+            TreeLeaf {
+                path: "empty".into(),
+                mode: 0o040000,
+                content: b"".hash(),
+            },
+        ];
+        let entry = |addr: Hash, a: u64, b: u64| Entry { addr, a, b };
+        let expected = PartitionSpec {
+            domain: Domain::RowSet,
+            scheme: "leyline/tree-root/v1".to_string(),
+            params: p.as_bytes().to_vec(),
+            canon_version: 1,
+        }
+        .address(&[
+            entry(b"empty".hash(), 0, 5),
+            entry(b"".hash(), 1, 16384),
+            entry(b"link".hash(), 2, 4),
+            entry(b"run.sh".hash(), 3, 40960),
+            entry(b"run.sh".hash(), 4, 6),
+            entry(Hash::from_bytes([1; 32]), 5, 33261),
+        ]);
+        assert_eq!(tree_root_of(&leaves, p), expected);
+        // The same bytes as a regular file fold differently.
+        let regular = TreeLeaf::regular("run.sh", Hash::from_bytes([1; 32]));
+        let executable = leaves[0].clone();
+        assert_ne!(tree_root_of(&[regular], p), tree_root_of(&[executable], p));
+    }
+
+    /// The leaves of a manifest are its files and its empty directories; a
+    /// directory with an entry beneath it is implied, and a tree of regular
+    /// files with no empty directory folds exactly as `_source` folded.
+    #[test]
+    fn a_default_tree_folds_as_before_modes_and_dirs() {
+        use crate::tree::{Entry as E, Mode};
+        let h = |b: u8| Hash::from_bytes([b; 32]);
+        let manifest = std::collections::BTreeMap::from([
+            ("a".to_string(), E::Dir),
+            ("a/b.go".to_string(), E::File { mode: Mode::Regular, blob: h(1) }),
+            ("a-c".to_string(), E::Dir),
+            ("c.go".to_string(), E::File { mode: Mode::Regular, blob: h(2) }),
+        ]);
+        let p = inputs().parser_id();
+        let leaves = leaves_of(&manifest);
+        assert_eq!(
+            leaves,
+            vec![
+                TreeLeaf {
+                    path: "a-c".into(),
+                    mode: 0o040000,
+                    content: b"".hash(),
+                },
+                TreeLeaf::regular("a/b.go", h(1)),
+                TreeLeaf::regular("c.go", h(2)),
+            ]
+        );
+        let mut without_empty = manifest.clone();
+        without_empty.remove("a-c");
+        assert_eq!(
+            tree_root_of(&leaves_of(&without_empty), p),
+            tree_root_of(
+                &[TreeLeaf::regular("a/b.go", h(1)), TreeLeaf::regular("c.go", h(2))],
+                p
+            ),
+            "directories with files beneath them are not leaves"
+        );
     }
 }

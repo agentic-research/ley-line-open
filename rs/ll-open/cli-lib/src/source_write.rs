@@ -473,7 +473,13 @@ pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Resul
         files.insert(plan.path, bytes);
     }
 
-    let committed = crate::cmd_parse::parse_written_files(conn, &root, &files, &removed)?;
+    let committed = crate::cmd_parse::parse_written_files(
+        conn,
+        &root,
+        &files,
+        &removed,
+        &crate::cmd_parse::TreeEdits::default(),
+    )?;
     Ok(Accepted {
         blobs,
         removed,
@@ -949,31 +955,32 @@ mod tests {
         assert_eq!(whole_image(&a.conn), before);
     }
 
-    /// A written file the cold parse refuses fails the pass, and the
-    /// transaction that already swept the file's rows rolls back: the file
-    /// is not left out of the arena. `write` checks syntax first, and every
-    /// grammar refuses the NUL byte the parse's binary-file rule rejects, so
-    /// the pass is driven directly.
+    /// ADR-0045 T3 (reverses the rollback this test used to pin): a written
+    /// file the parse cannot project (the NUL byte the binary-file rule
+    /// rejects) is stored, leaves the projection, and carries a diagnostic.
     #[test]
-    fn a_written_file_the_cold_parse_refuses_rolls_back_and_keeps_the_file() {
+    fn a_written_file_the_parse_cannot_project_is_stored_with_a_diagnostic() {
         let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = image(&a.conn, "a.go");
-        let err = crate::cmd_parse::parse_written_files(
+        let bytes = b"package a\n\n// \0\n".to_vec();
+        crate::cmd_parse::parse_written_files(
             &a.conn,
             a._src.path(),
-            &std::collections::BTreeMap::from([(
-                "a.go".to_string(),
-                b"package a\n\n// \0\n".to_vec(),
-            )]),
+            &std::collections::BTreeMap::from([("a.go".to_string(), bytes.clone())]),
             &BTreeSet::new(),
+            &crate::cmd_parse::TreeEdits::default(),
         )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("binary file"), "{err:#}");
-        assert_eq!(image(&a.conn, "a.go"), before);
+        .unwrap();
+        assert_eq!(source_ids(&a.conn), ["b.go"], "a.go left the projection");
         assert_eq!(
-            leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
-            A.as_bytes(),
+            crate::tree::entry(&a.conn, "a.go").unwrap(),
+            Some(crate::tree::Entry::File {
+                mode: crate::tree::Mode::Regular,
+                blob: bytes.as_slice().hash()
+            })
         );
+        let d = crate::tree::diagnostic(&a.conn, "a.go").unwrap().unwrap();
+        assert!(!d.projected);
+        assert!(d.message.contains("binary file"), "{}", d.message);
     }
 
     /// A write is one transaction: its rows, the sweep and the `_meta`

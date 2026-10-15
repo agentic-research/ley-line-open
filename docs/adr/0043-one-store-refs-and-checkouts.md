@@ -1,6 +1,6 @@
 # ADR-0043 — One store: branches are refs, worktrees are checkouts, git is read natively
 
-**Status:** Proposed (2026-10-14)
+**Status:** Accepted (2026-10-14), built in four phases (below); R3 for a single checkout is #459
 **Bead:** `ley-line-open-60f39f` (a daemon restart with `--source` reverts accepted proposals)
 **Related:**
 
@@ -98,15 +98,29 @@ their ref is the open question below.
 - `leyline-vcs` versions arena generations through `jj` today; under R2 it versions refs, and its
   sidecar becomes an export of refs to git.
 
-## Open questions
+## Decided
 
-1. **Projection keying.** Either one projection per checked-out ref (simple, and a duplicate
-   per branch), or rows keyed by `(treeRoot, path)` and shared across refs (one copy, and every
-   query names its ref). This decides R5's cost and is measured before it is chosen.
-2. **jj or gix.** `jj-lib` brings a working-copy model and operation log close to R2 and R3; `gix`
-   alone is smaller. Either keeps git out of process.
-3. **Refs on the wire.** `read_source` and `propose` gain a ref, defaulting to the daemon's
-   checkout, as a minor schema change.
+- **gix, not jj-lib.** R2 and R3 are LLO's ref and checkout model; jj-lib's working copy and
+  operation log would be a second one. git interop uses `gix` directly. `jj-lib` stays only in the
+  `leyline-vcs` sidecar.
+- **Refs on the wire are optional.** `read_source` and `propose` take a ref that defaults to the
+  daemon's checkout, a minor schema change; existing clients keep their behaviour.
+
+## Open question
+
+**Projection keying.** Either one projection per checked-out ref (simple, and a duplicate per
+branch), or rows keyed by `(treeRoot, path)` and shared across refs (one copy, and every query
+names its ref). It decides R5's cost and is measured in phase 4 before it is chosen.
+
+## Phases
+
+| Phase | Scope | Bead |
+|---|---|---|
+| 0 | R3 for the daemon's single checkout (index, write-through, three-way reconcile) | `60f39f`, #459 |
+| 1 | R4: `gix` replaces the daemon's git subprocesses | `e91e15` |
+| 2 | R2: refs; `read_source` and `propose` take an optional ref | `e94645` |
+| 3 | R3 across refs: several checkouts, each with its own index | `e96c76` |
+| 4 | R1 and R5: measure projection keying, then one store with several projections | `e993aa` |
 
 ## Falsifiers
 

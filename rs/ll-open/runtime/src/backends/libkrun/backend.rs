@@ -30,15 +30,14 @@ use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent};
 fn inherit_share(command: &mut Command, worker_end: &UnixStream) {
     let fd = worker_end.as_raw_fd();
     command.arg(WORKSPACE_SHARE_FD_ARG).arg(fd.to_string());
-    // SAFETY: the closure runs in the forked child before exec and calls
-    // only fcntl, which is async-signal-safe; `fd` is open in the child
-    // because the parent holds `worker_end` until after spawn returns.
+    // SAFETY: the closure runs in the forked child before exec and makes
+    // only fcntl calls, which are async-signal-safe; `fd` is open in the
+    // child because the parent holds `worker_end` until after spawn returns.
     unsafe {
         command.pre_exec(move || {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
+            let flags = rustix::io::fcntl_getfd(fd)?;
+            rustix::io::fcntl_setfd(fd, flags.difference(rustix::io::FdFlags::CLOEXEC))?;
             Ok(())
         });
     }

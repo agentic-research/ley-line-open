@@ -120,16 +120,12 @@ impl<S: Store> StoreShare<S> {
             }
             Request::Open { inode, flags } => {
                 let opened = self.fs.open(inode, flags)?;
-                let mut bits = 0;
-                if opened.keep_cache {
-                    bits |= FOPEN_KEEP_CACHE;
-                }
-                if opened.direct_io {
-                    bits |= FOPEN_DIRECT_IO;
-                }
                 Reply::Opened {
                     handle: opened.handle,
-                    flags: bits,
+                    flags: fopen_bits(&[
+                        (opened.keep_cache, FOPEN_KEEP_CACHE),
+                        (opened.direct_io, FOPEN_DIRECT_IO),
+                    ]),
                 }
             }
             // A created file's handle is a write handle: direct I/O, never
@@ -210,6 +206,14 @@ impl<S: Store> FsService for StoreShare<S> {
         self.answer(request)
             .unwrap_or_else(|Errno(errno)| Reply::Error { errno })
     }
+}
+
+/// The `FOPEN_*` bits whose condition holds; each bit is distinct.
+pub(crate) fn fopen_bits(bits: &[(bool, u32)]) -> u32 {
+    bits.iter()
+        .filter(|(set, _)| *set)
+        .map(|(_, bit)| bit)
+        .sum()
 }
 
 fn wire_attr(attr: &Attr) -> WireAttr {

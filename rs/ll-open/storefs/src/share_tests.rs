@@ -601,6 +601,22 @@ fn structural_requests_land_as_proposals_and_answer_done() {
 }
 
 #[test]
+fn open_flags_are_the_bits_whose_condition_holds() {
+    use crate::share::fopen_bits;
+    for (keep, direct, expected) in [
+        (false, false, 0),
+        (true, false, FOPEN_KEEP_CACHE),
+        (false, true, FOPEN_DIRECT_IO),
+        (true, true, FOPEN_KEEP_CACHE | FOPEN_DIRECT_IO),
+    ] {
+        assert_eq!(
+            fopen_bits(&[(keep, FOPEN_KEEP_CACHE), (direct, FOPEN_DIRECT_IO)]),
+            expected
+        );
+    }
+}
+
+#[test]
 fn the_wrapped_filesystem_is_reachable() {
     let f = fixture(whole());
     let s = share(&f);

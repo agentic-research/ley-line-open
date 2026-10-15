@@ -243,6 +243,19 @@ fn a_length_above_the_frame_limit_is_refused_before_allocating() {
 }
 
 #[test]
+fn a_reader_error_other_than_an_interrupt_is_returned() {
+    /// Fails every read the same way.
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::ConnectionReset.into())
+        }
+    }
+    let error = read_request(&mut Broken).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+}
+
+#[test]
 fn a_reader_interrupted_mid_lengths_resumes() {
     /// Yields one byte per read and reports `Interrupted` between them.
     struct Trickle {
@@ -322,6 +335,10 @@ fn serve_answers_each_request_in_order_until_the_peer_closes() {
 #[test]
 fn a_remote_service_answers_across_a_socket_as_the_served_one_does() {
     let (near, far) = UnixStream::pair().unwrap();
+    // A broken exchange fails the test instead of hanging it.
+    for end in [&near, &far] {
+        end.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    }
     let echo = Arc::new(Echo::default());
     let served = Arc::clone(&echo);
     let server = std::thread::spawn(move || {

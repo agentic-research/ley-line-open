@@ -36,7 +36,7 @@ pub const FUSE_DO_READDIRPLUS: u64 = 1 << 13;
 /// every WRITE must reach the service.
 pub const FUSE_WRITEBACK_CACHE: u64 = 1 << 16;
 /// `FOPEN_DIRECT_IO`: reads and writes bypass the guest's page cache.
-pub const FOPEN_DIRECT_IO: u32 = 1 << 0;
+pub const FOPEN_DIRECT_IO: u32 = 1;
 /// `FOPEN_KEEP_CACHE`: the guest keeps the pages it holds for the file.
 pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 /// `FOPEN_CACHE_DIR`: the guest may cache the directory's listing.
@@ -378,5 +378,5 @@ impl FsService for RemoteFs {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "vmm"))]
+#[cfg(test)]
 mod device_tests;

@@ -1,5 +1,6 @@
 //! `ShareFs`: each FUSE request transcribed onto the wire, each reply into
 //! libkrun's types.
+#![cfg(feature = "vmm")]
 
 use std::collections::VecDeque;
 use std::ffi::CString;

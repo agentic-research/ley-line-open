@@ -291,13 +291,30 @@ struct ReadSourceResponse {
   error    @4 :Text;
 }
 
-# One file of a proposal: its path, the base its author read, and its new
-# content. `base` is required: the `blob_hash` from `read_source` (64 hex
-# chars), or `any` to write whatever the file holds.
+# What one write of a proposal does at its path (ADR-0042 P1).
+enum WriteKind {
+  # The file's content becomes `content`. `base` is the `blob_hash` the
+  # author read, or `any`.
+  replace @0;
+  # A new file holding `content`. `base` is `absent`: refused `stale` when
+  # the path holds a file.
+  create  @1;
+  # The file leaves the store. `base` is the `blob_hash` the author read,
+  # or `any`; `content` is ignored.
+  delete  @2;
+}
+
+# One file of a proposal: its path, the base its author read, its new
+# content, and what the write does. `base` is required: the `blob_hash`
+# from `read_source` (64 hex chars), `any` to write whatever the file
+# holds, or `absent` for a create. `kind` defaults to `replace`, the only
+# kind before it existed. A rename is one proposal: a `delete` of the old
+# path and a `create` (or `replace`) of the new one with its content.
 struct ProposedWrite {
   path    @0 :Text;
   base    @1 :Text;
   content @2 :Text;
+  kind    @3 :WriteKind;
 }
 
 # Several files written as one change, applied whole or refused whole
@@ -311,19 +328,22 @@ struct PathHash {
   blobHash @1 :Text  $Json.name("blob_hash");
 }
 
-# A file that moved since its author read it.
+# A path that moved since its author read it. Either side is `absent` when
+# it is no file: a create's `expected`, or the `current` of a file deleted
+# since it was read.
 struct StaleRefusal {
   path     @0 :Text;
-  # The blob the author read.
+  # The blob the author read, or `absent`.
   expected @1 :Text;
-  # The blob the file holds now.
+  # The blob the path holds now, or `absent`.
   current  @2 :Text;
 }
 
 # Why a proposal was refused (ADR-0042 P1, P2). Every refusal is decided
 # before anything is written and changes nothing.
 enum RefusalReason {
-  # Files moved since their author read them; `moved` names every one.
+  # Paths moved since their author read them; `moved` names every one. A
+  # create whose path holds a file is stale with `expected` `absent`.
   stale          @0;
   # A path is outside the writer's grant.
   outsideGrant   @1 $Json.name("outside_grant");
@@ -337,12 +357,19 @@ enum RefusalReason {
   noTreeRoot     @5 $Json.name("no_tree_root");
   # A file's content does not parse cleanly in its language.
   syntax         @6;
-  # A base is neither a 64-hex-char blob hash nor `any`.
+  # A base does not fit its write's kind: a replace or delete names a
+  # 64-hex-char blob hash or `any`, a create names `absent`.
   malformedBase  @7 $Json.name("malformed_base");
   # The arena stores no blob for a file, so no blob base matches it.
   noStoredBlob   @8 $Json.name("no_stored_blob");
   # The proposal writes no file.
   empty          @9;
+  # A created path names no language the parse projects.
+  noLanguage     @10 $Json.name("no_language");
+  # A created path is not a plain relative path.
+  malformedPath  @11 $Json.name("malformed_path");
+  # A created path is under a file, or is the directory of another file.
+  pathConflict   @12 $Json.name("path_conflict");
 }
 
 struct ProposalRefusal {

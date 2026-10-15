@@ -198,14 +198,18 @@ pub fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "propose",
-            description: "Write several source files as one change: applied whole, or refused \
-                          whole. Every write needs a `base`: the `blob_hash` you read from \
-                          `read_source`, or `any` to write without a check. A refused proposal \
-                          writes nothing and carries `refusal {reason, path, moved}`; when files \
+            description: "Write, create and delete source files as one change: applied whole, \
+                          or refused whole. Each write has a `kind`: `replace` (the default), \
+                          `create` or `delete`; a rename is a `delete` of the old path and a \
+                          `create` of the new one in one proposal. Every write needs a `base`: \
+                          the `blob_hash` you read from `read_source`, `any` to replace or \
+                          delete without a check, or `absent` for a create. A refused proposal \
+                          writes nothing and carries `refusal {reason, path, moved}`; when paths \
                           moved since you read them, `reason` is `stale` and `moved` names each \
-                          with its current blob hash, so you can re-read and retry. An applied \
-                          proposal answers `ok` with each file's new `blob_hash`, and \
-                          `post_commit_error` when a step after the commit failed.",
+                          with its current blob hash (`absent` for no file), so you can re-read \
+                          and retry. An applied proposal answers `ok` with each written file's \
+                          new `blob_hash`, and `post_commit_error` when a step after the commit \
+                          failed.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -218,11 +222,19 @@ pub fn tool_registry() -> Vec<McpTool> {
                                 "path": {"type": "string"},
                                 "base": {
                                     "type": "string",
-                                    "description": "The `blob_hash` from `read_source`, or `any` for no check."
+                                    "description": "The `blob_hash` from `read_source`, `any` for no check, or `absent` for a create."
                                 },
-                                "content": {"type": "string"}
+                                "content": {
+                                    "type": "string",
+                                    "description": "The file's new content; required by `replace` and `create`, ignored by `delete`."
+                                },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["replace", "create", "delete"],
+                                    "default": "replace"
+                                }
                             },
-                            "required": ["path", "base", "content"]
+                            "required": ["path", "base"]
                         }
                     }
                 },

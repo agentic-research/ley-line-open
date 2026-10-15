@@ -105,14 +105,64 @@ fn other_writer(f: &Fixture, path: &str, text: &str) {
             source_write::propose(
                 conn,
                 &Grant::Whole,
-                vec![Proposed {
-                    path: path.to_string(),
-                    base: Base::Any,
-                    bytes: text.as_bytes().to_vec(),
-                }],
+                vec![Proposed::write(path, Base::Any, text.as_bytes().to_vec())],
             )
         })
         .unwrap();
+}
+
+/// Whether the store holds a file at `path`.
+fn stored(f: &Fixture, path: &str) -> bool {
+    f.fs.store()
+        .with_read(|conn| {
+            Ok(conn
+                .query_row("SELECT 1 FROM _source WHERE id = ?1", [path], |_| Ok(()))
+                .is_ok())
+        })
+        .unwrap()
+}
+
+/// Count the projection passes (one per landed proposal) from here on: a
+/// temp trigger on the writer's connection counts each `derived_from`
+/// stamp, which every pass writes once.
+fn count_passes(f: &Fixture) {
+    f.fs.store()
+        .with_write(|conn| {
+            conn.execute_batch(
+                "CREATE TEMP TABLE passes (n INTEGER);
+                 CREATE TEMP TRIGGER count_pass AFTER INSERT ON main._meta
+                   WHEN NEW.key = 'derived_from'
+                 BEGIN INSERT INTO passes VALUES (1); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn passes(f: &Fixture) -> i64 {
+    f.fs.store()
+        .with_write(|conn| Ok(conn.query_row("SELECT count(*) FROM passes", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+fn on_disk(f: &Fixture, path: &str) -> Option<String> {
+    std::fs::read_to_string(f.src.path().join(path)).ok()
+}
+
+fn names(f: &Fixture, inode: u64) -> Vec<String> {
+    f.fs.readdir(inode, 0)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect()
+}
+
+/// CREATE `name` in `parent`, write `text`, and flush: what `echo > name`
+/// does. Answers the handle and the flush's result.
+fn create_file(f: &Fixture, parent: u64, name: &str, text: &str) -> (u64, Result<(), Errno>) {
+    let (_, h) = f.fs.create(parent, name.as_bytes(), O_RDWR).unwrap();
+    assert_eq!(f.fs.write(h, 0, text.as_bytes()), Ok(text.len()));
+    (h, f.fs.flush(h))
 }
 
 /// The inode of `path`, found by LOOKUP from the root.
@@ -170,14 +220,14 @@ fn nodes_carry_linux_modes_sizes_and_the_configured_timeout() {
     assert_eq!(ttl, TTL);
     assert_eq!(root.inode, ROOT_INODE);
     assert_eq!(root.kind, Kind::Directory);
-    assert_eq!(root.mode(), 0o040555);
+    assert_eq!(root.mode(), 0o040755);
     assert_eq!(root.nlink(), 2);
     assert_eq!(root.size, 0);
 
     let pkg = f.fs.lookup(ROOT_INODE, b"pkg").unwrap();
     assert_eq!(pkg.ttl, TTL);
     assert_eq!(pkg.attr.kind, Kind::Directory);
-    assert_eq!(pkg.attr.mode(), 0o040555);
+    assert_eq!(pkg.attr.mode(), 0o040755);
 
     let b = f.fs.lookup(pkg.attr.inode, b"b.go").unwrap();
     assert_eq!(b.attr.kind, Kind::File);
@@ -646,6 +696,12 @@ fn a_write_outside_the_proposal_scope_is_eacces() {
     });
     let b = ino(&f, "pkg/b.go");
     assert_eq!(f.fs.getattr(b, None).unwrap().0.mode(), 0o100444);
+    // A directory is writable when the scope may propose a path under it.
+    assert_eq!(f.fs.getattr(ROOT_INODE, None).unwrap().0.mode(), 0o040755);
+    assert_eq!(
+        f.fs.getattr(ino(&f, "pkg"), None).unwrap().0.mode(),
+        0o040555
+    );
     assert_eq!(f.fs.open(b, O_RDWR), Err(Errno::EACCES));
     assert_eq!(f.fs.open(b, O_WRONLY), Err(Errno::EACCES));
     assert_eq!(
@@ -674,12 +730,55 @@ fn each_refusal_answers_its_linux_errno() {
     assert_eq!(
         refused(Refusal::Stale(vec![Stale {
             path: "a.go".into(),
-            expected: h,
-            current: h,
+            expected: Some(h),
+            current: Some(h),
         }])),
         Errno::ESTALE
     );
     assert_eq!(Errno::ESTALE, Errno(116));
+    // A file deleted since it was read is stale.
+    assert_eq!(
+        refused(Refusal::Stale(vec![Stale {
+            path: "a.go".into(),
+            expected: Some(h),
+            current: None,
+        }])),
+        Errno::ESTALE
+    );
+    // A create whose path now holds a file: the file exists.
+    assert_eq!(
+        refused(Refusal::Stale(vec![Stale {
+            path: "a.go".into(),
+            expected: None,
+            current: Some(h),
+        }])),
+        Errno::EEXIST
+    );
+    assert_eq!(Errno::EEXIST, Errno(17));
+    // A rename whose create met a file and whose delete met a moved file
+    // is stale: the moved file decides.
+    assert_eq!(
+        refused(Refusal::Stale(vec![
+            Stale {
+                path: "a.go".into(),
+                expected: Some(h),
+                current: Some(Hash::from_bytes([2; 32])),
+            },
+            Stale {
+                path: "b.go".into(),
+                expected: None,
+                current: Some(h),
+            },
+        ])),
+        Errno::ESTALE
+    );
+    assert_eq!(
+        refused(Refusal::NoSuchFile {
+            path: "a.go".into()
+        }),
+        Errno::ENOENT
+    );
+    assert_eq!(Errno::ENOENT, Errno(2));
     assert_eq!(
         refused(Refusal::OutsideGrant {
             path: "a.go".into()
@@ -696,36 +795,507 @@ fn each_refusal_answers_its_linux_errno() {
     );
     assert_eq!(Errno::EIO, Errno(5));
     assert_eq!(
-        refused(Refusal::NoSuchFile {
-            path: "a.go".into()
+        refused(Refusal::NoLanguage {
+            path: "a.txt".into()
         }),
         Errno::EIO
     );
     assert_eq!(errno_for(&anyhow::anyhow!("disk on fire")), Errno::EIO);
 }
 
-// ── what the store has no proposal for ───────────────────────────────────
+// ── structural requests: CREATE, UNLINK, RENAME, MKDIR, RMDIR (47fb03) ───
+
+const N: &str = "package a\n\nfunc N() int { return 7 }\n";
+
+/// `echo > new.go`: CREATE, WRITE, FLUSH. The file exists for the guest
+/// from CREATE on; the flush lands it in the store and the checkout.
+#[test]
+fn create_write_and_flush_lands_a_new_file_in_the_store_and_the_checkout() {
+    let f = fixture_with(whole(), true, A);
+    let (entry, h) = f.fs.create(ROOT_INODE, b"new.go", O_RDWR).unwrap();
+    assert_eq!(entry.attr.kind, Kind::File);
+    assert_eq!(entry.attr.mode(), 0o100644);
+    assert_eq!(entry.attr.size, 0);
+    assert_eq!(entry.ttl, TTL);
+    assert_eq!(ino(&f, "new.go"), entry.attr.inode);
+    assert!(names(&f, ROOT_INODE).contains(&"new.go".to_string()));
+    assert!(!stored(&f, "new.go"), "nothing lands before the flush");
+
+    assert_eq!(f.fs.write(h, 0, N.as_bytes()), Ok(N.len()));
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(read_source(&f, "new.go").0, N.as_bytes());
+    assert_eq!(on_disk(&f, "new.go").as_deref(), Some(N));
+    assert_eq!(
+        f.fs.getattr(entry.attr.inode, None).unwrap().0.size,
+        N.len() as u64
+    );
+
+    // The handle's base is now the blob it created: a second edit on it is
+    // a replace, checked against that blob.
+    assert_eq!(f.fs.write(h, 0, A_EDIT.as_bytes()), Ok(A_EDIT.len()));
+    assert_eq!(f.fs.fsync(h), Ok(()));
+    assert_eq!(read_source(&f, "new.go").0, A_EDIT.as_bytes());
+    f.fs.release(h);
+}
+
+/// `touch new.go`: a created file with nothing written lands empty.
+#[test]
+fn a_create_with_nothing_written_lands_an_empty_file() {
+    let f = fixture(whole());
+    let (_, h) = f.fs.create(ROOT_INODE, b"empty.go", O_WRONLY).unwrap();
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(read_source(&f, "empty.go").0, b"");
+}
+
+/// CREATE of a name that exists is `EEXIST`; a create another writer beat
+/// to the path is `EEXIST` at the flush and lands nothing.
+#[test]
+fn a_create_over_an_existing_name_is_eexist() {
+    let f = fixture(whole());
+    assert_eq!(
+        f.fs.create(ROOT_INODE, b"a.go", O_RDWR).map(|_| ()),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        f.fs.create(ROOT_INODE, b"pkg", O_RDWR).map(|_| ()),
+        Err(Errno::EEXIST)
+    );
+    let (_, h) = f.fs.create(ROOT_INODE, b"race.go", O_RDWR).unwrap();
+    f.fs.store()
+        .with_write(|conn| {
+            source_write::propose(
+                conn,
+                &Grant::Whole,
+                vec![Proposed::create("race.go", A_OTHER.as_bytes().to_vec())],
+            )
+        })
+        .unwrap();
+    assert_eq!(f.fs.write(h, 0, N.as_bytes()), Ok(N.len()));
+    assert_eq!(f.fs.flush(h), Err(Errno::EEXIST));
+    assert_eq!(read_source(&f, "race.go").0, A_OTHER.as_bytes());
+}
+
+/// A created file whose bytes do not parse is `EIO` at the flush and
+/// lands nothing; it stays in the session for the guest to fix.
+#[test]
+fn a_created_file_that_does_not_parse_is_eio_and_stays_in_the_session() {
+    let f = fixture(whole());
+    let (h, flushed) = create_file(&f, ROOT_INODE, "broken.go", A_BROKEN);
+    assert_eq!(flushed, Err(Errno::EIO));
+    assert!(!stored(&f, "broken.go"));
+    assert!(f.fs.lookup(ROOT_INODE, b"broken.go").is_ok());
+    assert_eq!(f.fs.write(h, 0, N.as_bytes()), Ok(N.len()));
+    assert_eq!(
+        f.fs.setattr(
+            ino(&f, "broken.go"),
+            Some(h),
+            SetAttr {
+                size: Some(N.len() as u64),
+                ..SetAttr::default()
+            }
+        )
+        .map(|_| ()),
+        Ok(())
+    );
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(read_source(&f, "broken.go").0, N.as_bytes());
+}
+
+/// A file the store cannot hold (no language: an editor's temp file, a
+/// note) lives in the session: readable, listable, never proposed.
+#[test]
+fn a_file_the_store_cannot_hold_lives_in_the_session() {
+    let f = fixture(whole());
+    count_passes(&f);
+    let (h, flushed) = create_file(&f, ROOT_INODE, "notes.txt", "hello\n");
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    assert_eq!(passes(&f), 0, "nothing was proposed");
+    assert!(!stored(&f, "notes.txt"));
+    let notes = ino(&f, "notes.txt");
+    assert_eq!(f.fs.getattr(notes, None).unwrap().0.size, 6);
+    let r = f.fs.open(notes, O_RDONLY).unwrap();
+    assert_eq!(read_all(&f, r), b"hello\n");
+    assert!(names(&f, ROOT_INODE).contains(&"notes.txt".to_string()));
+    assert_eq!(f.fs.unlink(ROOT_INODE, b"notes.txt"), Ok(()));
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"notes.txt"), Err(Errno::ENOENT));
+}
+
+/// UNLINK is a delete proposal: the file leaves the store and the
+/// checkout. A directory it empties stays until RMDIR, as on a disk.
+#[test]
+fn unlink_deletes_the_file_from_the_store_and_the_checkout() {
+    let f = fixture_with(whole(), true, A);
+    assert_eq!(f.fs.unlink(ROOT_INODE, b"a.go"), Ok(()));
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"a.go"), Err(Errno::ENOENT));
+    assert!(!stored(&f, "a.go"));
+    assert_eq!(on_disk(&f, "a.go"), None);
+
+    let sub = ino(&f, "pkg/sub");
+    assert_eq!(f.fs.unlink(sub, b"c.go"), Ok(()));
+    assert!(!stored(&f, "pkg/sub/c.go"));
+    assert_eq!(names(&f, ino(&f, "pkg")), ["b.go", "sub"]);
+    assert_eq!(names(&f, sub), Vec::<String>::new());
+    assert_eq!(f.fs.rmdir(ino(&f, "pkg"), b"sub"), Ok(()));
+    assert_eq!(names(&f, ino(&f, "pkg")), ["b.go"]);
+}
+
+/// A created file unlinked before its flush is never proposed: the flush
+/// of its open handle lands nothing.
+#[test]
+fn a_created_file_unlinked_before_its_flush_lands_nothing() {
+    let f = fixture(whole());
+    let (_, h) = f.fs.create(ROOT_INODE, b"gone.go", O_RDWR).unwrap();
+    assert_eq!(f.fs.write(h, 0, N.as_bytes()), Ok(N.len()));
+    assert_eq!(f.fs.unlink(ROOT_INODE, b"gone.go"), Ok(()));
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert!(!stored(&f, "gone.go"));
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"gone.go"), Err(Errno::ENOENT));
+}
 
 #[test]
-fn create_mkdir_unlink_rmdir_and_rename_are_eperm_and_change_nothing() {
-    let f = fixture(whole());
+fn unlink_answers_its_errnos() {
+    let f = fixture(Scope {
+        see: paths(&["a.go", "pkg/b.go"]),
+        propose: paths(&["a.go"]),
+    });
+    assert_eq!(f.fs.unlink(ROOT_INODE, b"pkg"), Err(Errno::EISDIR));
+    assert_eq!(f.fs.unlink(ROOT_INODE, b"nope.go"), Err(Errno::ENOENT));
+    assert_eq!(f.fs.unlink(ino(&f, "pkg"), b"b.go"), Err(Errno::EACCES));
+    assert!(stored(&f, "pkg/b.go"));
+    // Deleted by another writer since the guest looked it up: gone.
+    let a = ino(&f, "a.go");
+    f.fs.store()
+        .with_write(|conn| {
+            source_write::propose(
+                conn,
+                &Grant::Whole,
+                vec![Proposed::delete("a.go", Base::Any)],
+            )
+        })
+        .unwrap();
+    assert_eq!(f.fs.getattr(a, None), Err(Errno::ENOENT));
+    assert_eq!(f.fs.unlink(ROOT_INODE, b"a.go"), Err(Errno::ENOENT));
+}
+
+/// The save an editor or agent harness makes: write a temp file, then
+/// rename it over the original. The temp file (a name the store cannot
+/// hold) stays in the session, and the rename is the one proposal: the
+/// original's new bytes, checked against the blob it held.
+#[test]
+fn write_temp_then_rename_over_the_original_is_one_proposal() {
+    let f = fixture_with(whole(), true, A);
+    let a = ino(&f, "a.go");
+    count_passes(&f);
+    let (h, flushed) = create_file(&f, ROOT_INODE, "a.go.tmp.4242.1700000000", A_EDIT);
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    assert_eq!(passes(&f), 0);
+    assert_eq!(
+        f.fs.rename(
+            ROOT_INODE,
+            b"a.go.tmp.4242.1700000000",
+            ROOT_INODE,
+            b"a.go",
+            0
+        ),
+        Ok(())
+    );
+    assert_eq!(passes(&f), 1, "the rename is one proposal");
+    assert_eq!(read_source(&f, "a.go").0, A_EDIT.as_bytes());
+    assert_eq!(on_disk(&f, "a.go").as_deref(), Some(A_EDIT));
+    assert_eq!(
+        f.fs.lookup(ROOT_INODE, b"a.go.tmp.4242.1700000000"),
+        Err(Errno::ENOENT)
+    );
+    assert!(!f.src.path().join("a.go.tmp.4242.1700000000").exists());
+    assert_ne!(ino(&f, "a.go"), a, "the name now names the renamed inode");
+}
+
+/// A rename of a stored file is one proposal: the source deleted against
+/// the blob it held and the target created with its bytes. A handle open
+/// on the source follows it.
+#[test]
+fn rename_moves_a_stored_file_in_one_proposal_and_its_handle_follows() {
+    let f = fixture_with(whole(), true, A);
+    let a = ino(&f, "a.go");
+    let h = f.fs.open(a, O_RDWR).unwrap();
+    count_passes(&f);
     let pkg = ino(&f, "pkg");
     assert_eq!(
-        f.fs.create(ROOT_INODE, b"new.go", O_RDWR).map(|_| ()),
-        Err(Errno::EPERM)
+        f.fs.rename(ROOT_INODE, b"a.go", pkg, b"moved.go", 0),
+        Ok(())
+    );
+    assert_eq!(passes(&f), 1);
+    assert!(!stored(&f, "a.go"));
+    assert_eq!(read_source(&f, "pkg/moved.go").0, A.as_bytes());
+    assert_eq!(on_disk(&f, "a.go"), None);
+    assert_eq!(on_disk(&f, "pkg/moved.go").as_deref(), Some(A));
+    assert_eq!(ino(&f, "pkg/moved.go"), a, "the inode moved with the name");
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"a.go"), Err(Errno::ENOENT));
+
+    assert_eq!(f.fs.write(h, 0, A_EDIT.as_bytes()), Ok(A_EDIT.len()));
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(read_source(&f, "pkg/moved.go").0, A_EDIT.as_bytes());
+    assert!(!stored(&f, "a.go"));
+}
+
+/// A rename over an existing file replaces it in the same proposal that
+/// removes the source; a stored temp file (a name the store can hold)
+/// lands at its flush and leaves at the rename.
+#[test]
+fn rename_over_an_existing_file_replaces_it() {
+    let f = fixture_with(whole(), true, A);
+    let (h, flushed) = create_file(&f, ROOT_INODE, "b-new.go", B);
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    assert!(stored(&f, "b-new.go"));
+    let pkg = ino(&f, "pkg");
+    count_passes(&f);
+    let replaced = format!("{B}// replaced\n");
+    let h = f.fs.open(ino(&f, "b-new.go"), O_RDWR).unwrap();
+    assert_eq!(f.fs.write(h, 0, replaced.as_bytes()), Ok(replaced.len()));
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"b-new.go", pkg, b"b.go", 0),
+        Ok(())
+    );
+    assert_eq!(passes(&f), 2, "the flush and the rename");
+    assert!(!stored(&f, "b-new.go"));
+    assert_eq!(read_source(&f, "pkg/b.go").0, replaced.as_bytes());
+    assert_eq!(on_disk(&f, "pkg/b.go").as_deref(), Some(replaced.as_str()));
+    assert_eq!(on_disk(&f, "b-new.go"), None);
+}
+
+#[test]
+fn rename_answers_its_errnos_and_changes_nothing() {
+    let f = fixture(Scope {
+        see: Grant::Whole,
+        propose: paths(&["a.go", "pkg/b.go", "pkg/x.go"]),
+    });
+    use rename_flags::{RENAME_EXCHANGE, RENAME_NOREPLACE};
+    let pkg = ino(&f, "pkg");
+    // A stored file to a name the store cannot hold: the caller copies.
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"a.go", ROOT_INODE, b"a.go.bak", 0),
+        Err(Errno::EXDEV)
+    );
+    // A directory that holds files: the caller copies.
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"pkg", ROOT_INODE, b"pkg2", 0),
+        Err(Errno::EXDEV)
     );
     assert_eq!(
-        f.fs.mkdir(ROOT_INODE, b"newdir").map(|_| ()),
-        Err(Errno::EPERM)
+        f.fs.rename(ROOT_INODE, b"a.go", ROOT_INODE, b"pkg", 0),
+        Err(Errno::EISDIR)
     );
-    assert_eq!(f.fs.unlink(ROOT_INODE, b"a.go"), Err(Errno::EPERM));
-    assert_eq!(f.fs.rmdir(ROOT_INODE, b"pkg"), Err(Errno::EPERM));
     assert_eq!(
-        f.fs.rename(ROOT_INODE, b"a.go", pkg, b"a.go"),
-        Err(Errno::EPERM)
+        f.fs.rename(ROOT_INODE, b"nope.go", ROOT_INODE, b"x.go", 0),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"a.go", pkg, b"b.go", RENAME_NOREPLACE),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"a.go", pkg, b"b.go", RENAME_EXCHANGE),
+        Err(Errno::EINVAL)
+    );
+    // Outside the proposal scope, at either end.
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"a.go", ROOT_INODE, b"z.go", 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        f.fs.rename(ino(&f, "pkg/sub"), b"c.go", pkg, b"x.go", 0),
+        Err(Errno::EACCES)
+    );
+    // The same name: nothing to do.
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"a.go", ROOT_INODE, b"a.go", 0),
+        Ok(())
     );
     assert_eq!(read_source(&f, "a.go").0, A.as_bytes());
-    assert_eq!(f.fs.lookup(ROOT_INODE, b"new.go"), Err(Errno::ENOENT));
+    assert_eq!(read_source(&f, "pkg/b.go").0, B.as_bytes());
+    assert!(stored(&f, "pkg/sub/c.go"));
+}
+
+/// A rename the store refuses (the renamed bytes do not parse) is refused
+/// whole: the target keeps its bytes and the source stays.
+#[test]
+fn a_rename_refused_by_the_store_leaves_the_source_in_place() {
+    let f = fixture(whole());
+    let (h, flushed) = create_file(&f, ROOT_INODE, "bad.go", A_BROKEN);
+    assert_eq!(flushed, Err(Errno::EIO));
+    f.fs.release(h);
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"bad.go", ROOT_INODE, b"a.go", 0),
+        Err(Errno::EIO)
+    );
+    assert_eq!(read_source(&f, "a.go").0, A.as_bytes());
+    assert!(f.fs.lookup(ROOT_INODE, b"bad.go").is_ok());
+}
+
+/// MKDIR makes a directory for the session: visible, empty, and gone at
+/// RMDIR. A directory holding files is `ENOTEMPTY`.
+#[test]
+fn mkdir_and_rmdir_manage_session_directories() {
+    let f = fixture_with(whole(), true, A);
+    let d = f.fs.mkdir(ROOT_INODE, b"newdir").unwrap();
+    assert_eq!(d.attr.kind, Kind::Directory);
+    assert_eq!(d.attr.mode(), 0o040755);
+    assert_eq!(ino(&f, "newdir"), d.attr.inode);
+    assert!(names(&f, ROOT_INODE).contains(&"newdir".to_string()));
+    assert_eq!(names(&f, d.attr.inode), Vec::<String>::new());
+    assert_eq!(
+        f.fs.mkdir(ROOT_INODE, b"newdir").map(|_| ()),
+        Err(Errno::EEXIST)
+    );
+    assert_eq!(
+        f.fs.mkdir(ROOT_INODE, b"a.go").map(|_| ()),
+        Err(Errno::EEXIST)
+    );
+    let e = f.fs.mkdir(d.attr.inode, b"e").unwrap();
+    assert_eq!(f.fs.rmdir(ROOT_INODE, b"newdir"), Err(Errno::ENOTEMPTY));
+    assert_eq!(f.fs.rmdir(d.attr.inode, b"e"), Ok(()));
+    assert_eq!(f.fs.lookup(d.attr.inode, b"e"), Err(Errno::ENOENT));
+    assert_eq!(
+        f.fs.getattr(e.attr.inode, None).map(|_| ()),
+        Err(Errno::ENOENT)
+    );
+
+    // A file created in it lands under it, in the store and the checkout.
+    let (_, flushed) = create_file(&f, d.attr.inode, "x.go", N);
+    assert_eq!(flushed, Ok(()));
+    assert_eq!(read_source(&f, "newdir/x.go").0, N.as_bytes());
+    assert_eq!(on_disk(&f, "newdir/x.go").as_deref(), Some(N));
+    assert_eq!(f.fs.rmdir(ROOT_INODE, b"newdir"), Err(Errno::ENOTEMPTY));
+
+    assert_eq!(f.fs.rmdir(ROOT_INODE, b"pkg"), Err(Errno::ENOTEMPTY));
+    assert_eq!(f.fs.rmdir(ROOT_INODE, b"a.go"), Err(Errno::ENOTDIR));
+    assert_eq!(f.fs.rmdir(ROOT_INODE, b"nope"), Err(Errno::ENOENT));
+
+    // Session directories are not persisted: a new filesystem over the
+    // same store sees only directories its files imply.
+    let empty = f.fs.mkdir(ROOT_INODE, b"empty").unwrap();
+    assert_eq!(empty.attr.kind, Kind::Directory);
+    let again = StoreFs::new(f.fs.store().clone(), whole(), Options::default());
+    assert_eq!(again.lookup(ROOT_INODE, b"empty"), Err(Errno::ENOENT));
+    assert!(again.lookup(ROOT_INODE, b"newdir").is_ok());
+}
+
+/// A checkout whose `--language` filter excludes a created file's
+/// language would never write it out, and its next whole-directory parse
+/// would drop it from the store: such a file stays in the session.
+#[test]
+fn a_create_outside_the_checkouts_language_stays_in_the_session() {
+    let f = fixture_with(whole(), true, A);
+    let filtered = StoreFs::new(
+        f.fs.store().clone(),
+        whole(),
+        Options {
+            ttl: TTL,
+            checkout: Some(Checkout {
+                dir: f.src.path().to_path_buf(),
+                lang_filter: Some("go".to_string()),
+            }),
+        },
+    );
+    let (_, h) = filtered.create(ROOT_INODE, b"tool.py", O_RDWR).unwrap();
+    assert_eq!(filtered.write(h, 0, b"x = 1\n"), Ok(6));
+    assert_eq!(filtered.flush(h), Ok(()));
+    assert!(!stored(&f, "tool.py"));
+    assert!(filtered.lookup(ROOT_INODE, b"tool.py").is_ok());
+
+    // Without the filter the store holds it.
+    let (_, flushed) = create_file(&f, ROOT_INODE, "tool.py", "x = 1\n");
+    assert_eq!(flushed, Ok(()));
+    assert!(stored(&f, "tool.py"));
+}
+
+/// A file created read-only (`open(O_CREAT|O_RDONLY)`) exists and lands
+/// empty at its flush; its handle takes no writes.
+#[test]
+fn a_read_only_create_lands_an_empty_file_and_refuses_writes() {
+    let f = fixture(whole());
+    let (_, h) = f.fs.create(ROOT_INODE, b"ro.go", O_RDONLY).unwrap();
+    assert_eq!(f.fs.write(h, 0, N.as_bytes()), Err(Errno::EBADF));
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(read_source(&f, "ro.go").0, b"");
+}
+
+/// A session directory renames within the session: onto a free name or an
+/// empty directory; onto a file `ENOTDIR`, onto a directory holding
+/// anything `ENOTEMPTY`, into itself `EINVAL`, outside the proposal scope
+/// `EACCES`.
+#[test]
+fn an_empty_session_directory_renames_as_rename_2_does() {
+    let f = fixture(Scope {
+        see: Grant::Whole,
+        propose: paths(&["a.go", "d/x.go", "e/x.go", "pkg/x.go"]),
+    });
+    let d = f.fs.mkdir(ROOT_INODE, b"d").unwrap().attr.inode;
+    f.fs.mkdir(ROOT_INODE, b"e").unwrap();
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"d", ROOT_INODE, b"a.go", 0),
+        Err(Errno::ENOTDIR)
+    );
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"d", ROOT_INODE, b"pkg", 0),
+        Err(Errno::ENOTEMPTY)
+    );
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"d", d, b"inner", 0),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"d", ROOT_INODE, b"elsewhere", 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(f.fs.rename(ROOT_INODE, b"d", ROOT_INODE, b"e", 0), Ok(()));
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"d"), Err(Errno::ENOENT));
+    assert_eq!(ino(&f, "e"), d, "the inode moved with the name");
+}
+
+/// A file the store cannot hold moves within the session, and only inside
+/// the proposal scope at both ends.
+#[test]
+fn a_session_file_renames_within_the_scope() {
+    let f = fixture(Scope {
+        see: Grant::Whole,
+        propose: paths(&["a.go", "notes.txt", "kept.txt"]),
+    });
+    let (h, flushed) = create_file(&f, ROOT_INODE, "notes.txt", "hello\n");
+    assert_eq!(flushed, Ok(()));
+    f.fs.release(h);
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"notes.txt", ROOT_INODE, b"other.txt", 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"notes.txt", ROOT_INODE, b"kept.txt", 0),
+        Ok(())
+    );
+    let r = f.fs.open(ino(&f, "kept.txt"), O_RDONLY).unwrap();
+    assert_eq!(read_all(&f, r), b"hello\n");
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"notes.txt"), Err(Errno::ENOENT));
+}
+
+#[test]
+fn mkdir_outside_the_proposal_scope_is_eacces() {
+    let f = fixture(Scope {
+        see: Grant::Whole,
+        propose: paths(&["a.go", "tools/x.go"]),
+    });
+    assert_eq!(
+        f.fs.mkdir(ROOT_INODE, b"other").map(|_| ()),
+        Err(Errno::EACCES)
+    );
+    assert!(f.fs.mkdir(ROOT_INODE, b"tools").is_ok());
+    assert_eq!(
+        f.fs.create(ROOT_INODE, b"other.go", O_RDWR).map(|_| ()),
+        Err(Errno::EACCES)
+    );
 }
 
 #[test]
@@ -747,11 +1317,11 @@ fn structural_requests_naming_what_the_guest_cannot_see_are_enoent() {
     assert_eq!(f.fs.unlink(ROOT_INODE, b"secret"), Err(Errno::ENOENT));
     assert_eq!(f.fs.rmdir(ROOT_INODE, b"secret"), Err(Errno::ENOENT));
     assert_eq!(
-        f.fs.rename(ROOT_INODE, b"pkg", ROOT_INODE, b"x"),
+        f.fs.rename(ROOT_INODE, b"pkg", ROOT_INODE, b"x", 0),
         Err(Errno::ENOENT)
     );
     assert_eq!(
-        f.fs.rename(ROOT_INODE, b"a.go", 999, b"x"),
+        f.fs.rename(ROOT_INODE, b"a.go", 999, b"x", 0),
         Err(Errno::ENOENT)
     );
 }

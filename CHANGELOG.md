@@ -43,10 +43,42 @@ context, scoping notes, and review history are recoverable.
   `ESTALE` (116), a path outside the grant `EACCES` (13), a syntax refusal
   and every other failure `EIO` (5). `Scope { see, propose }` carries a
   run's `WorkspaceGrant` resolved to paths: unseen paths are `ENOENT`.
-  CREATE, MKDIR, UNLINK, RMDIR and RENAME are `EPERM`: the store has no
-  create, delete or move. The crate adds no persisted state and no libkrun
-  code; phase C adapts it onto libkrun's `DynFileSystem`. The contract is in
+  The crate adds no persisted state and no libkrun code; phase C adapts it
+  onto libkrun's `DynFileSystem`. The contract is in
   `rs/ll-open/storefs/README.md`.
+
+- **A proposal creates, deletes and renames files** (bead
+  `ley-line-open-47fb03`, ADR-0042 P1a, ADR-0044 phase B2). A write is a
+  replace, a create (base `absent`: refused `stale` when the path holds a
+  file) or a delete (refused `stale` when the file moved or is gone); a
+  rename is one proposal deleting the old path and creating or replacing
+  the new one. Deleted files' rows leave in the proposal's transaction and
+  `treeRoot` covers creates and deletes. A create is refused when its path
+  is not plain and relative (`malformed_path`), names no projected
+  language (`no_language`, which also covers a language the daemon's
+  `--language` excludes), or is under a file or the directory of one
+  (`path_conflict`). A replace against a blob base whose file was deleted
+  is now `stale` with `current` `absent` (it was `no_such_file`; a `base:
+  any` write to a missing file still is). In Rust, `source_write::Proposed` carries a `Change`
+  (`Write` or `Delete`), `Base` gains `Absent`, and a `Stale` entry's
+  `expected` and `current` are `Option`s. The daemon checkout removes a
+  file the store deleted (unlink, `fsync` of its directory), keeps a
+  directory edit to one as a conflict, and carries out a delete committed
+  before a crash at the next reconcile; `_checkout_conflict.stored_hash` is
+  NULL for a deleted file. `daemon.capnp`'s `ProposedWrite` gains `kind
+  :WriteKind` (`replace`, `create`, `delete`; omitted reads as `replace`,
+  so existing clients behave as before), `base` accepts `absent`,
+  `content` is optional for a delete, a stale refusal spells "no file"
+  `absent`, and `RefusalReason` gains `no_language`, `malformed_path` and
+  `path_conflict`; the Go bindings are regenerated and the MCP `propose`
+  tool takes `kind`. `leyline-storefs` answers CREATE (a create at the first
+  FLUSH), UNLINK (a delete), RENAME (one proposal; a write-temp-then-rename
+  save included), MKDIR and RMDIR (session directories) instead of `EPERM`;
+  a created file the store cannot hold (an editor's temp file) lives in the
+  session, and errno values are `EEXIST` for a create beaten to its path,
+  `ENOENT`, `EXDEV`, `ENOTEMPTY` and `EINVAL` as `rename(2)` and `rmdir(2)`
+  answer them.
+
 ### Changed
 
 - **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**

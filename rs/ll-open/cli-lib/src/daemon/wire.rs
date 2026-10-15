@@ -617,12 +617,29 @@ pub struct ProposedWriteInput {
     /// The file's `_source.id`.
     pub path: String,
     /// Required: the blob hash (64 hex chars) the author read, from
-    /// `read_source`, or [`crate::source_write::BASE_ANY`] to write without
-    /// a check. A write that omits it is refused rather than silently
-    /// overwriting (bead `ley-line-open-5dc3a5`).
+    /// `read_source`, [`crate::source_write::BASE_ANY`] to write without
+    /// a check, or [`crate::source_write::BASE_ABSENT`] for a create. A
+    /// write that omits it is refused rather than silently overwriting
+    /// (bead `ley-line-open-5dc3a5`).
     pub base: String,
-    /// The file's new content.
-    pub content: String,
+    /// The file's new content: required by a replace and a create, ignored
+    /// by a delete.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// What the write does (`daemon.capnp` `WriteKind`); `replace` when
+    /// omitted, the only kind before it existed (bead `ley-line-open-47fb03`).
+    #[serde(default)]
+    pub kind: WriteKind,
+}
+
+/// `daemon.capnp` `WriteKind` in its wire spelling.
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteKind {
+    #[default]
+    Replace,
+    Create,
+    Delete,
 }
 
 // ---------------------------------------------------------------------------

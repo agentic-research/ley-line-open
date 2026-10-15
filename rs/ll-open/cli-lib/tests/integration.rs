@@ -3490,6 +3490,7 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     let src = dir.path().join("tree");
     std::fs::create_dir_all(src.join("src")).unwrap();
     std::fs::write(src.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(src.join("src/old.rs"), "fn old() {}\n").unwrap();
     {
         let guard = ctx.live_db.writer.lock();
         leyline_cli_lib::cmd_parse::parse_into_conn(&guard, &src, None, None).unwrap();
@@ -3537,6 +3538,30 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     .await;
     assert_eq!(refused["refusal"]["reason"], "syntax", "{refused}");
     check("propose_refused", &refused);
+
+    // Bead `ley-line-open-47fb03`: a create over a file is stale with an
+    // `absent` base; a create and a delete land as one proposal.
+    let create_stale = uds_round_trip(
+        &sock_path,
+        r#"{"op": "propose", "writes": [{"path": "src/main.rs", "kind": "create", "base": "absent", "content": "fn main() {}\n"}]}"#,
+    )
+    .await;
+    assert_eq!(
+        create_stale["refusal"]["moved"][0]["expected"], "absent",
+        "{create_stale}"
+    );
+    check("propose_create_stale", &create_stale);
+    let structural = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "src/lib.rs", "kind": "create", "base": "absent", "content": "pub fn lib() {}\n"},
+            {"path": "src/old.rs", "kind": "delete", "base": "any"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(structural["ok"], true, "{structural}");
+    check("propose_structural", &structural);
 
     // A head the chain refuses: the proposal commits and its head write
     // fails after the commit.

@@ -12,6 +12,38 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: the FUSE/NFS host mount writes by the store's rules** (bead
+  `ley-line-open-53d701`, ADR-0045 T8). Every mount operation on a store is
+  a proposal decided as storefs's is.
+  - A leaf edit is the edit applied to the bytes its handle read (the node's
+    range is taken with the base), proposed against that base at FLUSH,
+    FSYNC or COMMIT: a change landed since merges three ways, overlapping
+    edits answer `ESTALE`/`NFS3ERR_STALE`, and a file left unparseable lands
+    with its `_parse_diagnostics` row. Before, a flush spliced the edit into
+    whatever the file held (another writer's change could move the node's
+    path onto another node) and every NFS WRITE against a moved base was
+    refused.
+  - The NFS WRITE (and SETATTR size) runs the COMMIT's own decision,
+    `source_write::check`, on the edit it stages and refuses exactly what it
+    refuses; only a conflicting change landed between the last WRITE and the
+    COMMIT is refused at a COMMIT macOS does not report (recorded in
+    `_errors`).
+  - Removing a leaf writes its file without the node; removing a source
+    file's entry deletes the file; removing a directory is an rmdir;
+    renaming a source file's entry or a directory moves it in `_tree`
+    (`source_write::rename`). Before, each touched `nodes` rows only.
+    Create, mkdir, a syntax node's rename, a rename into a syntax node and a
+    mode change other than the presented one answer `EPERM`/`NFS3ERR_PERM`;
+    before, a created file lived in `nodes` only and a mode change was
+    accepted and dropped. Refusals map to storefs's errno classes.
+  - Removed: `leyline_fs::graph::StaleWrite` (now `Refused` with a
+    `RefusalKind`), `SourceWriter::write` (now `propose`/`check` over
+    `Proposal`), the mount's syntax validation and shadow copies,
+    `SqliteGraphAdapter::set_default_language`,
+    `HotSwapGraph::with_validation`, `leyline serve --language`,
+    `leyline_ts::splice::check_syntax`, and `batch_splice`'s syntax-error
+    attribution and its record writes to nodes of no parsed file.
+
 - **Breaking: the store is a git-shaped tree; parsing is a projection over
   it; a proposal whose base moved merges three ways** (bead
   `ley-line-open-bb8aa6`, ADR-0045).

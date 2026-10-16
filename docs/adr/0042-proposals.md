@@ -191,6 +191,12 @@ accepted with persisted, scheme-tagged keys, and claims per key family only what
   checked against B's read and not refused; (3) a refusal only the COMMIT can make — the file moved
   between the WRITE and the COMMIT (another node of the same file committed first), or the edit
   does not parse — discards the edit, but a macOS client does not report it.
+
+  **Amended by ADR-0045 T8** (bead `53d701`): a moved base merges, so the WRITE no longer refuses
+  every moved base. It runs the COMMIT's own decision on the edit it stages and refuses exactly what
+  that decision refuses; an unparseable edit lands with a diagnostic. Residual (3) narrows to a
+  conflicting change landed between the client's last WRITE and its COMMIT. The bases above, taken
+  at READ, still name what the client read, and each edit is now applied to those bytes.
 - **Explicit, through the mount** (not implemented) — `.staging/` (in `leyline-vcs`, unmounted
   today) served by the mount; writes under it record bases at first read; `.commit` proposes them.
 - **Lifecycle points** (not implemented) — a jj or git commit, the end of a confined run (cloister's

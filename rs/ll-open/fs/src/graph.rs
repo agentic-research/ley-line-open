@@ -3710,11 +3710,13 @@ mod tests {
     #[derive(Default)]
     struct RecordingWriter {
         writes: Mutex<Vec<(String, Vec<u8>)>>,
+        proposals: Mutex<Vec<Proposal>>,
     }
 
     #[cfg(feature = "splice")]
     impl SourceWriter for RecordingWriter {
         fn propose(&self, _conn: &Connection, proposal: Proposal) -> Result<()> {
+            self.proposals.lock().push(proposal.clone());
             if let Proposal::Write { path, bytes, .. } = proposal {
                 self.writes.lock().push((path, bytes));
             }
@@ -3724,6 +3726,161 @@ mod tests {
         fn check(&self, _conn: &Connection, _proposal: &Proposal) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// ADR-0045 T8: a store's structure changes through the mount as
+    /// proposals. Removing a directory is its rmdir, a source file's entry
+    /// its delete, a syntax node a write of its file without the node's
+    /// bytes; a directory or a source file's entry renames into a
+    /// directory. A syntax node keeps its name, nothing moves into a syntax
+    /// node, and nothing is created.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn structure_changes_through_the_mount_are_proposals() -> Result<()> {
+        let html = b"<p>hello</p>";
+        let db = leyline_ts::parse_with_source(
+            html,
+            leyline_ts::languages::TsLanguage::Html,
+            "web/test.html",
+        )?;
+        let mut adapter = SqliteGraphAdapter::new_writable(&db)?;
+        let writer = Arc::new(RecordingWriter::default());
+        adapter.set_source_writer(writer.clone());
+        let base = html.as_slice().hash();
+        let not_in_projection =
+            |r: Result<()>| refusal_kind(&r.unwrap_err()) == Some(RefusalKind::NotInProjection);
+
+        adapter.rename_node("web", "", "www")?;
+        adapter.rename_node("web/test.html", "web", "x.html")?;
+        assert!(not_in_projection(adapter.rename_node(
+            "web/test.html/element",
+            "web/test.html",
+            "x"
+        )));
+        assert!(not_in_projection(adapter.rename_node(
+            "web/test.html",
+            "web/test.html/element",
+            "x.html"
+        )));
+        assert!(not_in_projection(
+            adapter.create_node("web", "new.html", false).map(drop)
+        ));
+        adapter.remove_node("web/test.html/element/text")?;
+        adapter.remove_node("web/test.html")?;
+        adapter.remove_node("web")?;
+        assert_eq!(
+            *writer.proposals.lock(),
+            [
+                Proposal::Rename {
+                    from: "web".into(),
+                    to: "www".into()
+                },
+                Proposal::Rename {
+                    from: "web/test.html".into(),
+                    to: "web/x.html".into()
+                },
+                Proposal::Write {
+                    path: "web/test.html".into(),
+                    base: Some(base),
+                    bytes: b"<p></p>".to_vec()
+                },
+                Proposal::Delete {
+                    path: "web/test.html".into(),
+                    base
+                },
+                Proposal::Rmdir { path: "web".into() },
+            ]
+        );
+        Ok(())
+    }
+
+    /// Removing a node forgets the edits and node ranges at it and beneath
+    /// it, and keeps every other.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_removal_forgets_only_what_was_beneath_it() -> Result<()> {
+        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
+        let text = "test.html/element/text";
+        let tag = "test.html/element/start_tag";
+        adapter.note_base_as(A, text)?;
+        adapter.note_base_as(A, tag)?;
+        adapter.remove_node(tag)?;
+        let spans = adapter.spans.lock();
+        assert!(spans.contains_key(&(A, text.to_string())));
+        assert!(!spans.contains_key(&(A, tag.to_string())));
+        Ok(())
+    }
+
+    /// A batch splice skips a node id that does not resolve and lands the
+    /// rest.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_batch_splice_skips_an_unknown_node() -> Result<()> {
+        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
+        adapter.batch_splice(&[
+            ("test.html/nope".to_string(), Some("x".to_string())),
+            (TEXT.to_string(), Some("world".to_string())),
+        ])?;
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"world");
+        Ok(())
+    }
+
+    /// An NFS READ of another node re-takes the mount handle's base and
+    /// drops the node ranges taken in the old one: the next WRITE takes the
+    /// node's range in the new base, and its edit lands at the node, not at
+    /// the old range in other bytes.
+    #[test]
+    #[cfg(feature = "splice")]
+    fn a_read_that_retakes_the_base_drops_the_old_ranges() -> Result<()> {
+        let adapter = checked_adapter(b"<p>a</p>\n<p>b</p>\n<p>c</p>\n")?;
+        let x = "test.html/element_0/text";
+        let y = "test.html/element_1/text";
+        let z = "test.html/element_2/text";
+        adapter.note_read(z)?;
+        adapter.batch_splice(&[(x.to_string(), Some("moved".to_string()))])?;
+        adapter.note_read(y)?;
+        adapter.write_content(z, b"C", 0)?;
+        adapter.flush_node(z)?;
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"moved");
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, z)?, b"C");
+        Ok(())
+    }
+
+    /// A flush drops the chunk manifests of every node of the file it
+    /// re-projects: a manifest left behind would serve the bytes before the
+    /// edit.
+    #[test]
+    #[cfg(all(feature = "splice", feature = "cdc"))]
+    fn a_flush_drops_the_files_chunk_manifests() -> Result<()> {
+        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
+        {
+            let guard = adapter.writer_guard();
+            crate::chunked::create_chunked_content_schema(guard.conn())?;
+            crate::chunked::store_content_chunked(
+                guard.conn(),
+                nid_of(guard.conn(), TEXT),
+                b"hello",
+            )?;
+        }
+        adapter.refresh_readers()?;
+        adapter.write_content(TEXT, b"world", 0)?;
+        adapter.flush_node(TEXT)?;
+        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"world");
+        Ok(())
+    }
+
+    /// The permissions a node is presented with.
+    #[test]
+    fn a_directory_is_presented_0755_and_a_file_0644() {
+        let node = |is_dir| Node {
+            id: String::new(),
+            name: String::new(),
+            is_dir,
+            size: 0,
+            mtime_nanos: 0,
+        };
+        assert_eq!(node(true).perm(), 0o755);
+        assert_eq!(node(false).perm(), 0o644);
     }
 
     /// ADR-0040 D3: the mount computes the whole file's new bytes and hands

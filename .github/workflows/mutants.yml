@@ -186,7 +186,7 @@ jobs:
   # single slice ever approaches this, the next move is splitting THAT slice,
   # not lifting the number: a slice too slow to fit is a slice doing too much.
   diff:
-    name: cargo mutants (${{ matrix.scope }} ${{ matrix.shard }}/2)
+    name: cargo mutants (${{ matrix.scope }} ${{ matrix.shard }}/4)
     needs: plan
     if: needs.plan.outputs.any == 'true'
     runs-on: ubuntu-latest
@@ -195,10 +195,11 @@ jobs:
       fail-fast: false
       matrix:
         scope: ${{ fromJSON(needs.plan.outputs.scopes) }}
-        # Each slice runs as two shards (MUTANTS_SHARD=k/2) on separate
+        # Each slice runs as four shards (MUTANTS_SHARD=k/4) on separate
         # runners: a 290-mutant cli-lib diff (ADR-0045, #470) overran the 60
-        # minute limit as one job. Splitting the slice, not lifting the limit.
-        shard: [0, 1]
+        # minute limit as one job and again as two shards (~25 s a mutant on a
+        # hosted runner). Splitting the slice, not lifting the limit.
+        shard: [0, 1, 2, 3]
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -240,9 +241,9 @@ jobs:
           git diff --relative=rs "$BASE_SHA...$HEAD_SHA" -- rs/ > /tmp/pr.diff
           wc -l < /tmp/pr.diff
 
-      - name: task mutants:diff (${{ matrix.scope }} ${{ matrix.shard }}/2)
+      - name: task mutants:diff (${{ matrix.scope }} ${{ matrix.shard }}/4)
         env:
-          MUTANTS_SHARD: ${{ matrix.shard }}/2
+          MUTANTS_SHARD: ${{ matrix.shard }}/4
         run: task mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=${{ matrix.scope }}
 
       - name: Upload mutants report

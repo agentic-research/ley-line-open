@@ -2124,7 +2124,7 @@ impl SqliteGraphAdapter {
         {
             let now = now_nanos();
             let new_name_id = leyline_schema::intern_name(conn, new_name)?;
-            let new_parent_dir_id = leyline_schema::ensure_dir_nodes(conn, &new_id, now)?;
+            let new_parent_dir_id = leyline_schema::ensure_dir_nodes(conn, new_id, now)?;
             let new_parent_nid = leyline_schema::dir_nid(new_parent_dir_id);
 
             if let Some(dir_id) = leyline_schema::nid_dir_id(old_nid) {

@@ -114,6 +114,21 @@ if [ "$SCOPE_IS_VALID" != yes ]; then
     exit 1
 fi
 
+# A shard is `k/n` with 0 <= k < n, as cargo-mutants numbers them. A typo
+# here would otherwise run a slice of nothing and pass.
+if [ -n "${MUTANTS_SHARD:-}" ]; then
+    shard_k=${MUTANTS_SHARD%/*}
+    shard_n=${MUTANTS_SHARD#*/}
+    case "$shard_k$shard_n" in
+        *[!0-9]*|'') shard_ok=no ;;
+        *) if [ "$shard_k" -lt "$shard_n" ]; then shard_ok=yes; else shard_ok=no; fi ;;
+    esac
+    if [ "$shard_ok" != yes ] || [ "$MUTANTS_SHARD" != "$shard_k/$shard_n" ]; then
+        echo "MUTANTS_SHARD must be k/n with 0 <= k < n, got '$MUTANTS_SHARD'" >&2
+        exit 1
+    fi
+fi
+
 # `list-scopes` prints the scopes that have work for this diff, one per line,
 # and exits. It runs no cargo and takes milliseconds.
 #
@@ -378,6 +393,12 @@ run_slice() {
     # Clearing it first makes the check able to see only THIS slice's result,
     # which is the difference between a gate and a rumour.
     rm -f mutants.out/missed.txt
+    # MUTANTS_SHARD=k/n runs one of n shards of the slice. CI splits a slow
+    # slice across runners this way instead of lifting a job's time limit; a
+    # slice too slow to fit is a slice doing too much (mutants.yml).
+    if [ -n "${MUTANTS_SHARD:-}" ]; then
+        set -- "$@" --shard "$MUTANTS_SHARD"
+    fi
     set +e
     if [ "$mode" = lib ]; then
         cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"

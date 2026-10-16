@@ -141,7 +141,6 @@ pub async fn cmd_serve(
     mount: &Path,
     backend: &str,
     nfs_port: u16,
-    language: Option<&str>,
     timeout: Option<&str>,
 ) -> Result<()> {
     // Calculate arena size from MiB.
@@ -152,21 +151,12 @@ pub async fn cmd_serve(
 
     // Build the HotSwapGraph. An edit to a parsed file goes through the one
     // write path (ADR-0040 D3); `serve` owns its arena, so the whole grant.
-    let graph = HotSwapGraph::new(ctrl_path)?.with_source_writer(Arc::new(
-        crate::source_write::MountWriter {
+    let graph = HotSwapGraph::new(ctrl_path)?
+        .with_source_writer(Arc::new(crate::source_write::MountWriter {
             grant: crate::source_write::Grant::Whole,
             checkout: None,
-        },
-    ))?;
-
-    // Optionally enable validation with the requested language.
-    let graph = if let Some(lang_ext) = language {
-        let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
-            .with_context(|| format!("unsupported language: {lang_ext}"))?;
-        graph.with_validation(Some(ts_lang))
-    } else {
-        graph.with_writable()
-    };
+        }))?
+        .with_writable();
 
     let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
 
@@ -355,7 +345,6 @@ mod tests {
             &mount,
             "carrier-pigeon",
             0,
-            None,
             None,
         )
         .await

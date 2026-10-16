@@ -286,10 +286,6 @@ pub enum Commands {
         #[arg(long, default_value_t = 0)]
         nfs_port: u16,
 
-        /// Default language for validation of extensionless files (e.g. "go", "py").
-        #[arg(long)]
-        language: Option<String>,
-
         /// Timeout before automatic shutdown (e.g. "30s", "5m", "2h").
         #[arg(long)]
         timeout: Option<String>,
@@ -504,7 +500,6 @@ pub async fn run(cmd: Commands) -> Result<()> {
             mount,
             backend,
             nfs_port,
-            language,
             timeout,
         } => {
             #[cfg(feature = "mount")]
@@ -516,7 +511,6 @@ pub async fn run(cmd: Commands) -> Result<()> {
                     &mount,
                     &backend,
                     nfs_port,
-                    language.as_deref(),
                     timeout.as_deref(),
                 )
                 .await
@@ -530,7 +524,6 @@ pub async fn run(cmd: Commands) -> Result<()> {
                     mount,
                     backend,
                     nfs_port,
-                    language,
                     timeout,
                 );
                 anyhow::bail!("serve requires the 'mount' feature (compile with --features mount)")

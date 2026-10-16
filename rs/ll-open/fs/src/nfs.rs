@@ -1,4 +1,4 @@
-use crate::graph::{Graph, Node};
+use crate::graph::{Graph, Node, RefusalKind};
 use async_trait::async_trait;
 use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -17,14 +17,21 @@ pub const COMMIT_IDLE: Duration = Duration::from_millis(200);
 /// How often the server checks for a standing truncate.
 const COMMIT_TICK: Duration = Duration::from_millis(50);
 
-/// The status a refused edit answers: `NFS3ERR_STALE` when the file moved
-/// since the edit's base was taken (ADR-0042 P2), `other` for any other
-/// refusal.
+/// The status a refused mount operation answers (ADR-0045 T8): its
+/// [`RefusalKind`]'s, as storefs answers the same refusal, or `other` for
+/// any other failure.
 fn refusal_status(err: &anyhow::Error, other: nfsstat3) -> nfsstat3 {
-    if err.downcast_ref::<crate::graph::StaleWrite>().is_some() {
-        nfsstat3::NFS3ERR_STALE
-    } else {
-        other
+    match crate::graph::refusal_kind(err) {
+        Some(RefusalKind::Stale) => nfsstat3::NFS3ERR_STALE,
+        Some(RefusalKind::Exists) => nfsstat3::NFS3ERR_EXIST,
+        Some(RefusalKind::NotEmpty) => nfsstat3::NFS3ERR_NOTEMPTY,
+        Some(RefusalKind::NotADirectory) => nfsstat3::NFS3ERR_NOTDIR,
+        Some(RefusalKind::IsADirectory) => nfsstat3::NFS3ERR_ISDIR,
+        Some(RefusalKind::NotFound) => nfsstat3::NFS3ERR_NOENT,
+        Some(RefusalKind::OutsideGrant) => nfsstat3::NFS3ERR_ACCES,
+        Some(RefusalKind::Invalid) => nfsstat3::NFS3ERR_INVAL,
+        Some(RefusalKind::NotInProjection) => nfsstat3::NFS3ERR_PERM,
+        None => other,
     }
 }
 
@@ -59,15 +66,20 @@ fn refusal_status(err: &anyhow::Error, other: nfsstat3) -> nfsstat3 {
 ///   between is refused again;
 /// - a WRITE or truncate with no base yet takes one, from the stored bytes.
 ///
-/// A WRITE or truncate to a file that moved since that base — through a
-/// socket proposal, another mount, a batch splice, or the COMMIT of another
-/// node of the same file — is refused `NFS3ERR_STALE` before it is staged,
-/// and a COMMIT whose file moved after its WRITEs is refused the same way
-/// and its change discarded. The WRITE refusal is the one a macOS client
-/// reports (`ESTALE` at fsync or close); it ignores a failed COMMIT, so a
-/// refusal that only the COMMIT can make — the file moved between the
-/// WRITE and the COMMIT, or the edit does not parse — is not reported to
-/// it, though nothing of the edit lands. Not
+/// A COMMIT proposes the edit made against that base, which the store
+/// merges with whatever landed since — a socket proposal, another mount, a
+/// batch splice, the COMMIT of another node of the same file — as storefs's
+/// FLUSH is merged (ADR-0045 T5, T8). A WRITE or truncate stages only an
+/// edit that, merged with what the store holds at that WRITE, lands: one
+/// that overlaps a change landed since its base, or whose node's place in
+/// the bytes the client read is not known (the file moved before the
+/// client touched the node), is refused `NFS3ERR_STALE` before it is
+/// staged. That refusal is the one a macOS client reports (`ESTALE` at
+/// fsync or close); it ignores a failed COMMIT. A COMMIT refuses only what
+/// changed between its last WRITE and itself: an overlapping change landed
+/// in that window. Its edit is discarded and the reason recorded in
+/// `_errors` for the node, and the client's next READ serves the store's
+/// bytes; that window is what a macOS client is not told of at `close`. Not
 /// refused: an edit from a cache the client filled with no READ to this
 /// server and no landed edit through it (a previous mount or server
 /// process), whose base is taken at its WRITE; and, the base being per
@@ -214,10 +226,11 @@ impl LeylineNfs {
     }
 
     fn node_to_fattr3(&self, ino: fileid3, node: &Node) -> fattr3 {
-        let (ftype, mode, size) = if node.is_dir {
-            (ftype3::NF3DIR, 0o755, 4096u64)
+        let mode = u32::from(node.perm());
+        let (ftype, size) = if node.is_dir {
+            (ftype3::NF3DIR, 4096u64)
         } else {
-            (ftype3::NF3REG, 0o644, node.size)
+            (ftype3::NF3REG, node.size)
         };
 
         // An NFSv3 client reuses a cached listing while the directory's mtime
@@ -356,11 +369,23 @@ impl NFSFileSystem for LeylineNfs {
     }
 
     /// A size change truncates to that size and is staged like a write (it
-    /// is the first RPC of a truncating write). Mode, owner and times are
-    /// derived from the projection, not stored, so changes to them are
-    /// accepted and have no effect.
+    /// is the first RPC of a truncating write). The projection stores no
+    /// mode: the mode a node is presented with is accepted, and any other
+    /// is `NFS3ERR_PERM` (ADR-0045 T8). Owner and times are derived from the
+    /// projection, not stored, so changes to them have no effect.
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let node_id = self.resolve_id(id)?;
+
+        if let set_mode3::mode(bits) = setattr.mode {
+            let node = self
+                .graph
+                .get_node(&node_id)
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            if bits & 0o7777 != u32::from(node.perm()) {
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+        }
 
         if let set_size3::size(size) = setattr.size {
             let keep = usize::try_from(size).map_err(|_| nfsstat3::NFS3ERR_FBIG)?;
@@ -427,10 +452,11 @@ impl NFSFileSystem for LeylineNfs {
 
     /// Stage the chunk. An UNSTABLE write is answered UNSTABLE and waits for
     /// the client's COMMIT; a FILE_SYNC or DATA_SYNC write is committed
-    /// before it is answered. A refused commit fails the write. A write to
-    /// a file that moved since the mount's base is refused `NFS3ERR_STALE`
-    /// before it is staged: macOS reports a failed WRITE at fsync, and
-    /// ignores a failed COMMIT (bead `ley-line-open-6116c9`).
+    /// before it is answered. A refused commit fails the write. A write
+    /// that, merged with what the store holds now, does not land is
+    /// refused `NFS3ERR_STALE` before it is staged: macOS reports a failed
+    /// WRITE at fsync, and ignores a failed COMMIT (bead
+    /// `ley-line-open-6116c9`, ADR-0045 T8).
     async fn write_stable(
         &self,
         id: fileid3,
@@ -485,7 +511,7 @@ impl NFSFileSystem for LeylineNfs {
         let new_id = self
             .graph
             .create_node(&parent_id, name, false)
-            .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
+            .map_err(|e| refusal_status(&e, nfsstat3::NFS3ERR_ROFS))?;
         let ino = self.ensure_ino(&new_id);
         Ok((ino, self.now_fattr3(ino, false)))
     }
@@ -507,7 +533,7 @@ impl NFSFileSystem for LeylineNfs {
         let new_id = self
             .graph
             .create_node(&parent_id, name, false)
-            .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
+            .map_err(|e| refusal_status(&e, nfsstat3::NFS3ERR_ROFS))?;
         Ok(self.ensure_ino(&new_id))
     }
 
@@ -523,7 +549,7 @@ impl NFSFileSystem for LeylineNfs {
         let new_id = self
             .graph
             .create_node(&parent_id, name, true)
-            .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
+            .map_err(|e| refusal_status(&e, nfsstat3::NFS3ERR_ROFS))?;
         let ino = self.ensure_ino(&new_id);
         Ok((ino, self.now_fattr3(ino, true)))
     }
@@ -541,7 +567,7 @@ impl NFSFileSystem for LeylineNfs {
 
         self.graph
             .remove_node(&node.id)
-            .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
+            .map_err(|e| refusal_status(&e, nfsstat3::NFS3ERR_ROFS))?;
 
         // Clean up inode maps
         let mut id_map = self.id_to_ino.lock();
@@ -573,7 +599,7 @@ impl NFSFileSystem for LeylineNfs {
         let old_id = node.id.clone();
         self.graph
             .rename_node(&old_id, &to_parent, to_name)
-            .map_err(|_| nfsstat3::NFS3ERR_ROFS)?;
+            .map_err(|e| refusal_status(&e, nfsstat3::NFS3ERR_ROFS))?;
 
         // Update inode maps
         let new_id = if to_parent.is_empty() {
@@ -872,9 +898,9 @@ mod tests {
     #[cfg(feature = "splice")]
     mod write_sequences {
         use super::*;
-        use crate::graph::SourceWriter;
         use crate::graph::SqliteGraphAdapter;
         use crate::graph::fixtures::CheckingWriter;
+        use crate::graph::{Proposal, SourceWriter};
         use rusqlite::Connection;
 
         /// Records every file the commit hands the write path, then checks
@@ -885,15 +911,15 @@ mod tests {
         }
 
         impl SourceWriter for Recorder {
-            fn write(
-                &self,
-                conn: &Connection,
-                source_id: &str,
-                bytes: Vec<u8>,
-                base: Option<leyline_core::Hash>,
-            ) -> anyhow::Result<()> {
-                self.writes.lock().push(bytes.clone());
-                CheckingWriter.write(conn, source_id, bytes, base)
+            fn propose(&self, conn: &Connection, proposal: Proposal) -> anyhow::Result<()> {
+                if let Proposal::Write { bytes, .. } = &proposal {
+                    self.writes.lock().push(bytes.clone());
+                }
+                CheckingWriter.propose(conn, proposal)
+            }
+
+            fn check(&self, conn: &Connection, proposal: &Proposal) -> anyhow::Result<()> {
+                CheckingWriter.check(conn, proposal)
             }
         }
 
@@ -1258,41 +1284,86 @@ mod tests {
             assert_eq!(*recorder.writes.lock(), vec![b"<p>he</p>\n".to_vec()]);
         }
 
-        /// A write past the end zero-fills the gap, as POSIX does.
+        /// A write past the end zero-fills the gap, as POSIX does, and the
+        /// zero-filled file lands: the mount refuses nothing on what the
+        /// bytes parse as (ADR-0045 T3, T8).
         #[tokio::test]
         async fn a_write_past_the_end_zero_fills() {
             let (nfs, recorder) = html_nfs();
             let ino = text_leaf(&nfs).await;
             nfs.write(ino, 7, b"x").await.unwrap();
             assert_eq!(read_all(&nfs, ino).await, b"hello\0\0x");
-            // The zero-filled file reaches the write path, which refuses
-            // HTML with NULs in it; the COMMIT reports that refusal. The
-            // refused edit is discarded from the mount, which never wrote it
-            // to the database, so nothing is written back: the leaf reads as
-            // it did before the write.
-            assert!(matches!(
-                nfs.commit(ino, 0, 0).await,
-                Err(nfsstat3::NFS3ERR_IO)
-            ));
+            nfs.commit(ino, 0, 0).await.unwrap();
             assert_eq!(
                 *recorder.writes.lock(),
                 vec![b"<p>hello\0\0x</p>\n".to_vec()]
             );
-            assert_eq!(read_all(&nfs, ino).await, b"hello");
         }
 
         /// An operation that changes the tree's shape commits staged writes
-        /// first, so it never runs against a half-applied file.
+        /// first, so it never runs against a half-applied file, even one
+        /// the projection then refuses: a new directory is nothing a
+        /// store's projection presents (ADR-0045 T8), so it is
+        /// `NFS3ERR_PERM`, and so are a new file and a mode change.
         #[tokio::test]
         async fn a_structural_operation_commits_staged_writes_first() {
             let (nfs, recorder) = html_nfs();
             let ino = text_leaf(&nfs).await;
             nfs.setattr(ino, size(0)).await.unwrap();
             nfs.write(ino, 0, b"world").await.unwrap();
-            nfs.mkdir(ROOT_FILEID, &b"newdir".to_vec().into())
-                .await
-                .unwrap();
+            assert!(matches!(
+                nfs.mkdir(ROOT_FILEID, &b"newdir".to_vec().into()).await,
+                Err(nfsstat3::NFS3ERR_PERM)
+            ));
             assert_eq!(*recorder.writes.lock(), vec![b"<p>world</p>\n".to_vec()]);
+            let name = b"new.html".to_vec().into();
+            assert!(matches!(
+                nfs.create(ROOT_FILEID, &name, sattr3::default()).await,
+                Err(nfsstat3::NFS3ERR_PERM)
+            ));
+            assert!(matches!(
+                nfs.create_exclusive(ROOT_FILEID, &name).await,
+                Err(nfsstat3::NFS3ERR_PERM)
+            ));
+            let ino = text_leaf(&nfs).await;
+            let mode = |bits| sattr3 {
+                mode: set_mode3::mode(bits),
+                ..sattr3::default()
+            };
+            assert!(matches!(
+                nfs.setattr(ino, mode(0o755)).await,
+                Err(nfsstat3::NFS3ERR_PERM)
+            ));
+            nfs.setattr(ino, mode(0o644)).await.unwrap();
+        }
+
+        /// A WRITE whose edit merges with a change landed since the
+        /// client's READ is staged, and its COMMIT lands the merge; one that
+        /// overlaps the change is refused `NFS3ERR_STALE` at the WRITE
+        /// (ADR-0045 T8).
+        #[tokio::test]
+        async fn a_write_that_merges_is_staged_and_an_overlapping_one_refused() {
+            let db = leyline_ts::parse_with_source(
+                b"<p>hello</p>\n<p>there</p>\n",
+                leyline_ts::languages::TsLanguage::Html,
+                "test.html",
+            )
+            .unwrap();
+            let mut adapter = SqliteGraphAdapter::new_writable(&db).unwrap();
+            adapter.set_source_writer(Arc::new(crate::graph::fixtures::MergingWriter));
+            let nfs = LeylineNfs::new(Arc::new(adapter));
+            let x = walk(&nfs, &["test.html", "element_0", "text"]).await;
+            let y = walk(&nfs, &["test.html", "element_1", "text"]).await;
+            assert_eq!(read_all(&nfs, x).await, b"hello");
+            land_elsewhere(&nfs, y, "moved");
+            nfs.write(x, 0, b"HELLO").await.unwrap();
+            nfs.commit(x, 0, 0).await.unwrap();
+            assert_eq!(read_all(&nfs, y).await, b"moved");
+            assert_eq!(read_all(&nfs, x).await, b"HELLO");
+
+            land_elsewhere(&nfs, x, "other");
+            assert!(is_stale(nfs.write(x, 0, b"mine!").await));
+            assert_eq!(read_all(&nfs, x).await, b"other");
         }
 
         /// Dropping the server commits what is staged; a shutdown inside the

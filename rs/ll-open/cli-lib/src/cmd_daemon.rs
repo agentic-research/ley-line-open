@@ -716,11 +716,6 @@ pub async fn run_daemon_with_options(
             grant: crate::source_write::Grant::Whole,
             checkout: ctx.source_dir.clone(),
         }));
-        if let Some(lang_ext) = language {
-            let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
-                .with_context(|| format!("unsupported language: {lang_ext}"))?;
-            graph.set_default_language(ts_lang);
-        }
         let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
 
         Some(cmd_serve::mount_backend(graph, mount_path, backend, nfs_port).await?)

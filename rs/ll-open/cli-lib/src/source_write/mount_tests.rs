@@ -167,10 +167,6 @@ fn storefs(conn: &Connection, writes: Vec<Proposed>) {
     propose(conn, &Grant::Whole, writes).unwrap();
 }
 
-fn assert_refused(err: &anyhow::Error, kind: RefusalKind) {
-    assert_eq!(refusal_kind(err), Some(kind), "{err:#}");
-}
-
 /// The bytes of `A` once its `return 1` reads `to`.
 fn a_returning(to: &str) -> String {
     A.replacen("return 1", &format!("return {to}"), 1)
@@ -295,7 +291,7 @@ fn an_overlapping_edit_through_the_mount_is_refused_stale() {
                 graph.flush_node_as(handle, &one).unwrap_err()
             }
         };
-        assert_refused(&err, RefusalKind::Stale);
+        assert_eq!(refusal_kind(&err), Some(RefusalKind::Stale), "{err:#}");
         assert_eq!(mounted_text(&img, &graph, "a.go"), theirs);
     }
 }
@@ -345,7 +341,11 @@ fn the_mount_refuses_what_its_projection_cannot_present() {
         ),
     ] {
         let err = result.expect_err(what);
-        assert_refused(&err, RefusalKind::NotInProjection);
+        assert_eq!(
+            refusal_kind(&err),
+            Some(RefusalKind::NotInProjection),
+            "{what}: {err:#}"
+        );
     }
     assert_eq!(img.mounted(&graph), before);
 }
@@ -379,7 +379,7 @@ fn removals_through_the_mount_are_proposals() {
     let img = image();
     let graph = img.mount();
     let err = graph.remove_node("pkg").unwrap_err();
-    assert_refused(&err, RefusalKind::NotEmpty);
+    assert_eq!(refusal_kind(&err), Some(RefusalKind::NotEmpty), "{err:#}");
 }
 
 /// T8: renaming a source file's entry moves the file, and renaming a

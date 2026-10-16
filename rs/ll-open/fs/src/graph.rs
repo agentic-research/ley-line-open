@@ -3758,6 +3758,11 @@ mod tests {
             "x"
         )));
         assert!(not_in_projection(adapter.rename_node(
+            "web/test.html/element",
+            "web",
+            "x"
+        )));
+        assert!(not_in_projection(adapter.rename_node(
             "web/test.html",
             "web/test.html/element",
             "x.html"
@@ -3866,6 +3871,15 @@ mod tests {
         adapter.write_content(TEXT, b"world", 0)?;
         adapter.flush_node(TEXT)?;
         assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"world");
+        // The freshness witness alone keeps a stale manifest from being
+        // served; the flush drops the manifest rows themselves.
+        let guard = adapter.writer_guard();
+        let left: i64 = guard.conn().query_row(
+            "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
+            [nid_of(guard.conn(), TEXT)],
+            |r| r.get(0),
+        )?;
+        assert_eq!(left, 0, "the flush left the node's manifest rows");
         Ok(())
     }
 

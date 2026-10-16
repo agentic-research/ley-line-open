@@ -182,7 +182,9 @@ type readSourceResponse struct {
 	Content  *string `json:"content,omitempty"`
 	BlobHash *string `json:"blob_hash,omitempty"`
 	TreeRoot *string `json:"tree_root,omitempty"`
-	Error    *string `json:"error,omitempty"`
+	// The entry's git mode, six octal digits (ADR-0045).
+	Mode  *string `json:"mode,omitempty"`
+	Error *string `json:"error,omitempty"`
 }
 
 type pathHash struct {
@@ -190,10 +192,17 @@ type pathHash struct {
 	BlobHash string `json:"blob_hash"`
 }
 
+// lineRange mirrors LineRange: base lines, 0-based, half-open.
+type lineRange struct {
+	Start uint32 `json:"start"`
+	End   uint32 `json:"end"`
+}
+
 type staleRefusal struct {
-	Path     string `json:"path"`
-	Expected string `json:"expected"`
-	Current  string `json:"current"`
+	Path      string      `json:"path"`
+	Expected  string      `json:"expected"`
+	Current   string      `json:"current"`
+	Conflicts []lineRange `json:"conflicts,omitempty"`
 }
 
 // proposalRefusal mirrors ProposalRefusal. `reason` is a RefusalReason
@@ -208,6 +217,7 @@ type proposeResponse struct {
 	OK              *bool            `json:"ok"`
 	TreeRoot        *string          `json:"tree_root,omitempty"`
 	Blobs           []pathHash       `json:"blobs,omitempty"`
+	Merged          []string         `json:"merged,omitempty"`
 	Refusal         *proposalRefusal `json:"refusal,omitempty"`
 	Error           *string          `json:"error,omitempty"`
 	PostCommitError *string          `json:"post_commit_error,omitempty"`

@@ -3,9 +3,13 @@
 The store-backed filesystem core behind LLO's virtio-fs device (ADR-0044 V2,
 bead `ley-line-open-f1ea99`). `StoreFs` answers the FUSE requests a Linux
 guest's file syscalls become, from the store, and lands writes, creates,
-deletes and renames as ADR-0042 proposals (bead `ley-line-open-47fb03`,
-ADR-0042 P1a). Every answer is data or a **Linux** errno: the guest is Linux
-whatever the host is (macOS `ESTALE` is 70; the guest needs 116).
+deletes, renames, directories, modes and symlinks as proposals (ADR-0042,
+ADR-0045). The store holds every file the guest makes, in any language, with
+its git mode; a write against a file another writer moved since it was read
+is merged three ways at FLUSH, and only overlapping edits are refused
+(bead `ley-line-open-bb8aa6`). Every answer is data or a **Linux** errno: the
+guest is Linux whatever the host is (macOS `ESTALE` is 70; the guest needs
+116).
 
 This crate holds no libkrun code. `StoreShare` answers a guest's virtio-fs
 requests from `StoreFs`, and `DaemonShares` serves an execution/v1 run's
@@ -23,40 +27,35 @@ granted workspace from the daemon's own store (ADR-0044 phase C, bead
 | OPENDIR `(inode)` | `keep_cache` when the directory lists the names and kinds the previous OPENDIR of it served; `ENOTDIR` on a file |
 | OPEN `(inode, flags)` | a handle that serves the blob the file holds at open, read from the store at every OPEN, with `keep_cache` and `direct_io` (see "Read freshness"). Opened for writing (`O_WRONLY`/`O_RDWR`), that blob is the handle's **base**; `EACCES` when the scope may not propose the path; `O_TRUNC` stages an empty file; `EISDIR` on a directory |
 | READ `(handle, offset, size)` | bytes the handle serves: its base, or what it staged |
-| WRITE `(handle, offset, data)` | stages `data` on the handle (a gap reads as zeros); `ESTALE`, staging nothing, when the path's `_source.content_hash` is no longer the handle's blob base (another writer changed or deleted it; compared without reading the bytes); `EBADF` on a handle not opened for writing |
-| FLUSH / FSYNC `(handle)` | proposes the staged bytes against the base through `source_write::propose`, on the store's one writer. Accepted: the base advances to the blob written, and an attached checkout is brought up to it. Nothing staged: no proposal, `Ok` |
+| WRITE `(handle, offset, data)` | stages `data` on the handle (a gap reads as zeros), whatever the store holds now: another writer's change is decided at FLUSH (ADR-0045 T6, reversing the WRITE-time `ESTALE` of bead `e650d7`); `EBADF` on a handle not opened for writing |
+| FLUSH / FSYNC `(handle)` | proposes the staged bytes (and a staged mode) against the base through `source_write::propose`, on the store's one writer. When the file moved since the base, the store merges the two three ways: a clean merge lands, the handle serves the merged bytes from then on, and the next read-only open drops the guest's pages; overlapping edits are `ESTALE`. A file that does not parse lands with a diagnostic. Accepted: the base advances to the blob written, and an attached checkout is brought up to it. Nothing staged: no proposal, `Ok` |
 | RELEASE `(handle)` | drops the handle and any bytes no FLUSH landed |
-| SETATTR `(inode, handle?, {size, mode, uid, gid})` | a size with a handle stages on it (`ftruncate`); a size without one is a proposal of its own against the file's current blob (`truncate`), `EACCES` outside the proposal scope; mode/uid/gid are `EPERM`; times are not carried; `EISDIR` for a directory's size |
+| SETATTR `(inode, handle?, {size, mode, uid, gid})` | a size with a handle stages on it (`ftruncate`); a size without one is a proposal of its own against the file's current blob (`truncate`), `EACCES` outside the proposal scope. A mode with a write handle stages on it (`fchmod`); without one it is a proposal of the file's git mode against its current blob (`chmod`: executable when any execute bit is set, regular otherwise); a directory's or symlink's mode changes nothing. uid/gid are `EPERM`; times are not carried; `EISDIR` for a directory's size |
 | CREATE `(parent, name, flags)` | the new file's entry and a handle whose base is "no file"; the file exists for the guest at once, and its first FLUSH proposes a **create** (bead `ley-line-open-47fb03`, ADR-0042 P1a). `EEXIST` when the name exists, `EACCES` outside the proposal scope |
-| UNLINK `(parent, name)` | a **delete** proposal against the blob the file holds; the directory it was in stays for the session, as on a disk. `EISDIR` on a directory, `ENOENT` when the name is not visible, `EACCES` outside the proposal scope |
-| RENAME `(olddir, oldname, newdir, newname, flags)` | a file moves by **one** proposal: delete the old path against its blob, create the new path (or replace the file there against its blob) with the same bytes; refused whole, so a refused rename leaves the old path. Handles open on the old path follow the file, and its inode moves with it. `EXDEV` for a stored file renamed to a name the store cannot hold, and for a directory that holds anything (the caller copies); `EISDIR`, `ENOTDIR`, `ENOTEMPTY` as `rename(2)`; `EEXIST` with `RENAME_NOREPLACE` over an existing name; `EINVAL` for `RENAME_EXCHANGE` and unknown flags; `EACCES` outside the proposal scope at either end |
-| MKDIR `(parent, name)` | a directory for the session, visible until RMDIR; nothing is proposed. `EEXIST` when the name exists, `EACCES` when the scope may propose no path under it |
-| RMDIR `(parent, name)` | removes a directory that holds nothing; `ENOTEMPTY` when a file or directory is under it, `ENOTDIR` on a file |
+| SYMLINK `(parent, name, target)` | a **create** proposal of `target`'s bytes with git mode `120000` (ADR-0045 T4); the link's entry. `EEXIST` when the name exists, `EACCES` outside the proposal scope |
+| READLINK `(inode)` | a symlink's stored target; `EINVAL` for anything else |
+| UNLINK `(parent, name)` | a **delete** proposal against the blob the file or symlink holds; the directory it was in stays, in the store too (ADR-0045 T1). `EISDIR` on a directory, `ENOENT` when the name is not visible, `EACCES` outside the proposal scope |
+| RENAME `(olddir, oldname, newdir, newname, flags)` | a file moves by **one** proposal: delete the old path against its blob, create the new path (or replace the file there against its blob) with the same bytes and mode; a directory moves by **one** proposal over every path under it (`source_write::rename_dir`), replacing an empty directory at the target. Refused whole, so a refused rename leaves the old paths. Handles open on the old paths follow the files, and inodes move with them. `EISDIR`, `ENOTDIR`, `ENOTEMPTY` as `rename(2)`; `EEXIST` with `RENAME_NOREPLACE` over an existing name; `EINVAL` for `RENAME_EXCHANGE`, unknown flags and a directory moved under itself; `EACCES` outside the proposal scope at either end |
+| MKDIR `(parent, name)` | an **mkdir** proposal. `EEXIST` when the name exists, `EACCES` when the scope may propose no path under it |
+| RMDIR `(parent, name)` | an **rmdir** proposal for a directory that holds nothing; `ENOTEMPTY` when a file or directory is under it, `ENOTDIR` on a file |
 
 Unknown inodes are `ENOENT`; unknown handles are `EBADF`. Structural
 requests whose parent is not a visible directory are `ENOENT` or `ENOTDIR`.
 
-### Files and directories the store does not hold
+### What the store holds, and what the session holds
 
-The store holds files in languages the parse projects; a directory is the
-prefix of the files under it. The session holds the rest, in memory, for
-the life of the `StoreFs`:
+The store holds every file the guest makes (ADR-0045 T1): any name, any
+bytes, with its git mode (`100644`, `100755`, `120000` for a symlink whose
+blob is its target), and every directory, empty ones included. Parsing is a
+projection over the files the parse knows; a file that does not parse lands
+with a `_parse_diagnostics` row. A checkout's `lang_filter` narrows the
+projection, not what is stored.
 
-- A **created file the store cannot hold** (its name names no projected
-  language: an editor's or harness's temp file such as
-  `a.go.tmp.4242.1700000000`, a note; or a language the attached
-  checkout's `lang_filter` excludes) keeps its bytes in the session at
-  each FLUSH and is never proposed. Renamed onto a name the store can
-  hold, it is proposed there as a create or replace: a write-temp-then-
-  rename save is one proposal. A stored file renamed to such a name is
-  `EXDEV`, so `mv` copies and unlinks instead.
-- A **created file the store can hold** is in the session from CREATE
-  until a FLUSH lands it. A FLUSH the store refuses (a syntax error) keeps
-  the written bytes in the session, so a later open or rename carries them;
-  an UNLINK before any FLUSH lands nothing.
-- A **directory** made by MKDIR, or emptied by UNLINK, RMDIR or RENAME,
-  stays until RMDIR. Directories are not persisted: a new `StoreFs` over
-  the same store sees the directories its files imply.
+The session holds only a **created file not landed yet**: from CREATE until
+its first FLUSH lands it. A FLUSH the store refuses keeps the written bytes
+in the session, so a later open or rename carries them; an UNLINK before any
+FLUSH lands nothing; a RENAME of it lands it under the new name. A `chmod`
+of such a file lands with it.
 
 ### Proposal errno map
 
@@ -64,11 +63,15 @@ the life of the `StoreFs`:
 
 | `source_write::Refusal` | errno |
 |---|---|
-| `Stale` naming only creates whose path holds a file | `EEXIST` (17) |
-| any other `Stale` (a base moved, or its file was deleted) | `ESTALE` (116) |
+| `Stale` naming only creates whose path holds other bytes | `EEXIST` (17) |
+| any other `Stale` (a base moved and could not merge, or its file was deleted), and `Conflict` (overlapping edits) | `ESTALE` (116) |
 | `OutsideGrant` | `EACCES` (13) |
 | `NoSuchFile` | `ENOENT` (2) |
-| `Syntax`, every other refusal, every internal failure | `EIO` (5) |
+| `Exists` | `EEXIST` (17) |
+| `NotEmpty` | `ENOTEMPTY` (39) |
+| `NotADirectory`, `PathConflict` (a path under a file) | `ENOTDIR` (20) |
+| `IsADirectory` | `EISDIR` (21) |
+| every other refusal, every internal failure | `EIO` (5) |
 
 A refused FLUSH keeps the staged bytes and the base, so the `close` after a
 refused `fsync` answers the same errno. The Linux FUSE client returns FLUSH
@@ -80,10 +83,12 @@ the commit point (spike `ley-line-open-bb8cc1`).
 `Scope { see, propose }` is a run's `WorkspaceGrant` (`execution/v1`)
 resolved to paths: `read`/`list` operations become `see`, `mutate`/`commit`
 become `propose`. A path outside `see` does not exist for the guest. A
-directory exists when some visible file is under it or the session made it;
-the root always exists. A file the scope may propose has mode `0644`, one it
-may only see `0444`; a directory the scope may propose a path under is
-`0755`, any other `0555`.
+stored directory exists for the guest when `see` is the whole tree, or when
+some visible file is under it; the root always exists. A file the scope may
+propose has mode `0644`, one it may only see `0444`, each with the execute
+bits where the read bits are for an executable file (`0755`, `0555`); a
+directory the scope may propose a path under is `0755`, any other `0555`; a
+symlink is `0777`.
 
 ### Store and concurrency
 
@@ -96,9 +101,10 @@ database into its arena, as the `propose` op does after its commit) and
 writer for the propose and the checkout reconcile, as the daemon's `propose`
 op does, then publishes; a failed publish is logged and does not refuse the
 committed proposal. Of two handles that read the same blob, the first to
-flush lands and the second is `ESTALE`.
+flush lands and the second merges with it: it lands when the two changed
+different lines, and is `ESTALE` when they overlap.
 
-Reads resolve `_source.content_hash` to `source_blobs`: the one checkout
+Reads resolve the manifest `_tree` to `source_blobs`: the one checkout
 ADR-0043 names today. Inode numbers are stable per path for the life of a
 `StoreFs`; a RENAME carries the inode to the new path. The crate adds no
 persisted state.
@@ -119,8 +125,9 @@ caches what it can prove unchanged and keeps the rest short:
   only when that blob is the one the previous open of the inode served and
   that open was read-only; otherwise the guest drops the file's pages at
   this open and reads the current blob. A write open (and CREATE) is
-  `direct_io`, never `keep_cache`, so every WRITE reaches the base check.
-  A file only the session holds never sets `keep_cache`. OPENDIR applies
+  `direct_io`, never `keep_cache`, so every WRITE reaches the handle. A
+  file not landed yet never sets `keep_cache`, and a FLUSH that landed a
+  merge clears the inode's `keep_cache` record. OPENDIR applies
   the same rule to a directory's names and kinds. An OPEN reply carries no
   attributes, and the guest bounds a cached read by the size its cached
   attributes hold: a read-only open serving a blob of another size than
@@ -144,8 +151,8 @@ caches what it can prove unchanged and keeps the rest short:
   its timeout expires, so another writer's change to a settled path is
   visible after at most `settled` (a `stat` or a cached negative entry);
   file contents are current at each open. Writes never depend on a
-  timeout: OPEN, WRITE, FLUSH and FSYNC always reach the store, and WRITE
-  refuses a stale base with `ESTALE`.
+  timeout: OPEN, WRITE, FLUSH and FSYNC always reach the store, and FLUSH
+  merges against, or refuses, a moved base.
 
 ### File times
 
@@ -155,8 +162,9 @@ the guest is told, and an unchanged file must keep them. Every `Attr`
 carries `mtime`, since the Unix epoch; the adapter reports it as `st_atime`,
 `st_mtime` and `st_ctime`.
 
-- **Source.** The store records no time per file (`_source` holds content
-  and its hash; `_checkout_index` holds blobs), and the crate adds no
+- **Source.** The store records no time per file (`_tree` holds modes and
+  blob hashes, and its `mtime` is the host walk's stat cache, not a time a
+  guest change made; `_checkout_index` holds entries), and the crate adds no
   persisted state, so times come from the change tracking `StoreFs`
   already does for "Read freshness". A path's time is the `Clock`'s origin
   (`Clock::origin`: the wall-clock time `MonotonicClock` read at its
@@ -166,9 +174,8 @@ carries `mtime`, since the Unix epoch; the adapter reports it as `st_atime`,
   directory's: a proposal `StoreFs` lands (FLUSH, FSYNC, SETATTR of a size,
   UNLINK, RENAME), another writer's proposal observed when `StoreFs` next
   serves the path in another state (the rule "Read freshness" records
-  changes by), and a change only the session holds (CREATE, MKDIR, RMDIR,
-  UNLINK or RENAME of a session file or directory, a FLUSH of a file the
-  store cannot hold). An OPENDIR that lists other names or kinds than the
+  changes by), and a change only the session holds (CREATE, and UNLINK of a
+  file not landed yet). An OPENDIR that lists other names or kinds than the
   previous OPENDIR of the directory moves the directory's time: another
   writer created or removed an entry in it. Session changes leave the
   timeouts alone; the guest made them.
@@ -185,28 +192,24 @@ carries `mtime`, since the Unix epoch; the adapter reports it as `st_atime`,
 
 ## Not supported
 
-- Renaming a directory that holds anything (`EXDEV`: `mv` copies), and
-  `RENAME_EXCHANGE`.
-- Files the store cannot hold persist only for the session (see above):
-  a note or temp file never renamed onto a projected name is gone when the
-  `StoreFs` is.
+- `RENAME_EXCHANGE`.
 - A handle open on a file another writer deleted, or that an UNLINK or a
-  RENAME over it removed, answers `ESTALE` at its next WRITE, or at its
-  next FLUSH of bytes already staged, where a disk would write to the
-  orphaned inode.
+  RENAME over it removed, answers `ESTALE` at its next FLUSH of staged
+  bytes, where a disk would write to the orphaned inode.
+- Merging binary files (bytes that are not UTF-8) and symlinks: a moved
+  base refuses them `ESTALE`.
 - Invalidation: the guest learns of another writer's change at OPEN or when
   a timeout expires, never by notification (see "Read freshness").
-- Mode and owner, and setting times (SETATTR carries none; see "File
-  times" for the times reported); extended attributes; links; locks.
-- Files the store holds no blob for (`_source.content_hash` NULL) do not
-  exist for the guest.
+- Owner, modes other than the execute bit, and setting times (SETATTR
+  carries none; see "File times" for the times reported); extended
+  attributes; hard links; locks.
 - DAX (ADR-0044 V3): the core serves reads per request.
 - Publication beyond `Store::publish`: an accepted proposal is committed to
   the living database and visible to its readers at once, and the store's
   `publish` runs after it (a `DaemonContext` snapshots to its arena; a bare
   `LiveDb` publishes nothing).
-- A directory's LOOKUP or GETATTR scans `_source` for a visible file under
-  it.
+- Under a path grant, a directory's LOOKUP or GETATTR scans `_tree` for a
+  visible file under it.
 
 ## Adapter (phase C)
 
@@ -232,15 +235,16 @@ landed share proposal reaches the checkout and the arena as a socket
 proposal does), when the store's `treeRoot` (ADR-0040 D1) is the grant's
 `graphRoot`, scoped by `scope_for(operations)`: `read`/`list` see the whole
 tree, `mutate`/`commit` propose anywhere in it, `query` neither.
-`expectedGeneration` is carried and not consulted: the `graphRoot` check
-pins the tree.
+`expectedGeneration` is carried and not consulted: it names ADR-0041's S1
+commit sequence `(epoch, seq)`, which is not implemented; the `graphRoot`
+check pins the share's tree.
 
 The mapping:
 
 - `Errno(n)` → `io::Error::from_raw_os_error(n)`, untranslated (the values
   are already Linux).
 - `Attr` → `stat64`: `st_ino`, `st_mode = attr.mode()` (Linux `S_IFREG` /
-  `S_IFDIR` bits), `st_nlink = attr.nlink()`, `st_size`, `st_blocks`,
+  `S_IFDIR` / `S_IFLNK` bits), `st_nlink = attr.nlink()`, `st_size`, `st_blocks`,
   `st_blksize`. `Entry` → `Entry { inode, generation: 0, attr, attr_timeout:
   ttl, entry_timeout: ttl }`; GETATTR and SETATTR reply with their returned
   duration as the attribute timeout.
@@ -263,12 +267,16 @@ The mapping:
   the handle, `OpenOptions::DIRECT_IO` as for a write open, never
   `KEEP_CACHE`. The request's mode and
   umask are not carried. MKDIR: `(parent, name)` → `mkdir`, mode not
-  carried. UNLINK and RMDIR pass `(parent, name)`.
+  carried. UNLINK and RMDIR pass `(parent, name)`. SYMLINK: `(linkname,
+  parent, name)` → `symlink(parent, name, target)`, reply with the entry;
+  READLINK: `inode` → `readlink`, the target as `Reply::Data` (libkrun
+  patch `0006` forwards both through `DynFileSystem`).
 - RENAME and RENAME2: `(olddir, oldname, newdir, newname, flags)` → `rename`
   (`flags` = 0 for RENAME; RENAME2's `RENAME_NOREPLACE` = 1,
   `RENAME_EXCHANGE` = 2 and `RENAME_WHITEOUT` = 4 pass through, and every
   flag but `RENAME_NOREPLACE` is `EINVAL`).
-- READDIR: `DirEntry { ino, offset, type_: DT_REG (8) / DT_DIR (4), name }`
+- READDIR: `DirEntry { ino, offset, type_: DT_REG (8) / DT_DIR (4) / DT_LNK
+  (10), name }`
   into `add_entry` until it returns 0.
 - FORGET, RELEASEDIR, ACCESS, STATFS stay local to `ShareFs`.
   `dax_host_addr` stays `ENOSYS`.

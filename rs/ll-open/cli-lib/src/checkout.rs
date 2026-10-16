@@ -3,19 +3,21 @@
 //! checkout a daemon has).
 //!
 //! A daemon started with `--source <dir>` checks `<dir>` out. Three things
-//! hold a file's bytes, each by blob hash (σ over the bytes, the hash
-//! `_source.content_hash` and `source_blobs` use):
+//! hold each path's entry (ADR-0045 T7: a file's git mode and blob hash —
+//! σ over the bytes, a symlink's over its target — or a directory):
 //!
-//! - the **store**: `_source.content_hash`, which every accepted proposal
-//!   advances (ADR-0040 D3, ADR-0042);
-//! - the **directory**: the file under `<dir>`, which a person edits;
-//! - the **index**: `_checkout_index`, the hash last materialized into the
-//!   directory or ingested from it — git's index.
+//! - the **store**: the `_tree` manifest, which every accepted proposal
+//!   advances (ADR-0040 D3, ADR-0042, ADR-0045 T1);
+//! - the **directory**: the file, symlink or directory under `<dir>`, which
+//!   a person edits;
+//! - the **index**: `_checkout_index`, the entry last materialized into the
+//!   directory or ingested from it — git's index, with the mode.
 //!
 //! Comparing the directory and the store each against the index tells which
-//! side moved, path by path. "No file" is a value on every side: a file
-//! created on one side moved from no file, and a file deleted on one side
-//! moved to no file (bead `ley-line-open-47fb03`).
+//! side moved, path by path. "No entry" is a value on every side: a path
+//! created on one side moved from no entry, and a path deleted on one side
+//! moved to no entry (bead `ley-line-open-47fb03`). A mode change alone is a
+//! move.
 //!
 //! | directory vs index | store vs index | action |
 //! |---|---|---|
@@ -31,10 +33,12 @@
 //! new in the directory: it is ingested.
 //!
 //! **Ordering.** A proposal commits to the store and leaves the index alone;
-//! then each deleted file is removed (unlink, then `fsync` of its
-//! directory) and each written file materialized (a temp file in the same
-//! directory, `fsync`, `rename`, `fsync` of the directory); then its index
-//! entry advances. A crash after the commit leaves directory == index while
+//! then each deleted file or symlink is removed (unlink, then `fsync` of
+//! its directory) and each removed directory (`rmdir`, deepest first; its
+//! directories above stay, ADR-0045 T1), then each directory made and each
+//! written file materialized (a temp file in the same directory with the
+//! entry's permissions, or a staged symlink, then `rename` and `fsync` of
+//! the directory); then its index entry advances. A crash after the commit leaves directory == index while
 //! the store moved, which the next [`reconcile`] carries out. A crash after
 //! the rename or the unlink leaves directory == store while the index lags,
 //! which converges. No ordering of crashes loses an accepted proposal or a
@@ -53,6 +57,7 @@ use leyline_core::{ContentAddressed, Hash};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::cmd_parse::ParseResult;
+use crate::tree::{Entry, Mode};
 
 /// What reconciling one path does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,10 +77,11 @@ pub enum Action {
     Remove,
 }
 
-/// The action for a path the store holds as `stored`. `disk` is the hash of
-/// the directory's file (`None` when the directory has no such file) and
-/// `index` the index entry (`None` when there is none).
-pub fn classify(disk: Option<Hash>, stored: Hash, index: Option<Hash>) -> Action {
+/// The action for a path the store holds as `stored`. `disk` is the
+/// directory's side (`None` when the directory has nothing there) and
+/// `index` the index entry (`None` when there is none). Each side is a
+/// blob hash or, as the checkout compares them, a whole [`Entry`].
+pub fn classify<T: Copy + Eq>(disk: Option<T>, stored: T, index: Option<T>) -> Action {
     let disk_moved = disk != index;
     let store_moved = Some(stored) != index;
     match (disk_moved, store_moved) {
@@ -92,7 +98,7 @@ pub fn classify(disk: Option<Hash>, stored: Hash, index: Option<Hash>) -> Action
 /// file, so the store deleted it: removed from an unchanged directory, a
 /// conflict with a changed one. No index entry and a file on disk is a file
 /// new to the directory, ingested.
-pub fn classify_unstored(disk: Option<Hash>, index: Option<Hash>) -> Action {
+pub fn classify_unstored<T: Copy + Eq>(disk: Option<T>, index: Option<T>) -> Action {
     match (disk, index) {
         (None, None) => Action::Nothing,
         (Some(_), None) => Action::Ingest,
@@ -102,23 +108,30 @@ pub fn classify_unstored(disk: Option<Hash>, index: Option<Hash>) -> Action {
     }
 }
 
-/// A path both sides changed, to different bytes, since they last agreed.
+/// A path both sides changed, to different entries, since they last agreed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Conflict {
     pub path: String,
-    /// The directory's bytes; `None` when the file was deleted there.
-    pub disk: Option<Hash>,
-    /// The store's bytes, which the store keeps; `None` when a proposal
-    /// deleted the file.
-    pub stored: Option<Hash>,
+    /// The directory's entry; `None` when the path was deleted there.
+    pub disk: Option<Entry>,
+    /// The store's entry, which the store keeps; `None` when a proposal
+    /// deleted the path.
+    pub stored: Option<Entry>,
     /// Where the two last agreed.
-    pub index: Option<Hash>,
+    pub index: Option<Entry>,
 }
 
 impl std::fmt::Display for Conflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let side =
-            |h: Option<Hash>| h.map_or_else(|| "deleted".to_string(), |h| format!("blob {h}"));
+        let side = |e: Option<Entry>| match e {
+            None => "deleted".to_string(),
+            Some(Entry::Dir) => "a directory".to_string(),
+            Some(Entry::File {
+                mode: Mode::Regular,
+                blob,
+            }) => format!("blob {blob}"),
+            Some(Entry::File { mode, blob }) => format!("blob {blob}, mode {}", mode.octal()),
+        };
         write!(
             f,
             "'{}' changed in the source directory ({}) and in the store ({}) \
@@ -179,16 +192,18 @@ pub fn staging_path(target: &Path) -> PathBuf {
 }
 
 /// Create the checkout's tables. An index created over a store that already
-/// holds files starts as the store: the agreement every parse before the
+/// holds entries starts as the store: the agreement every parse before the
 /// index existed left behind, so an edit made while an upgraded daemon was
-/// down is ingested, as it was before.
+/// down is ingested, as it was before. The index records each entry's git
+/// mode (ADR-0045 T7); a directory's `blob_hash` is empty.
 pub fn ensure_tables(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     let had_index = table_exists(conn, "_checkout_index")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _checkout_index (
              path TEXT PRIMARY KEY,
-             blob_hash BLOB NOT NULL
+             blob_hash BLOB NOT NULL,
+             mode INTEGER NOT NULL DEFAULT 33188
          ) WITHOUT ROWID;
          CREATE TABLE IF NOT EXISTS _checkout_conflict (
              path TEXT PRIMARY KEY,
@@ -197,10 +212,20 @@ pub fn ensure_tables(conn: &Connection) -> Result<()> {
              index_hash BLOB
          ) WITHOUT ROWID;",
     )?;
-    if !had_index && table_exists(conn, "_source")? {
+    let has_mode: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('_checkout_index') WHERE name = 'mode')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_mode {
+        conn.execute_batch(
+            "ALTER TABLE _checkout_index ADD COLUMN mode INTEGER NOT NULL DEFAULT 33188",
+        )?;
+    }
+    if !had_index && crate::tree::exists(conn) {
         conn.execute(
-            "INSERT INTO _checkout_index (path, blob_hash) \
-             SELECT id, content_hash FROM _source WHERE content_hash IS NOT NULL",
+            "INSERT INTO _checkout_index (path, blob_hash, mode) \
+             SELECT path, COALESCE(blob_hash, X''), mode FROM _tree",
             [],
         )?;
     }
@@ -225,33 +250,30 @@ pub fn reconcile(
     scope: Option<&[String]>,
 ) -> Result<Reconciled> {
     ensure_tables(conn)?;
-    let lang = lang_filter
-        .map(leyline_ts::languages::TsLanguage::from_name)
-        .transpose()
-        .context("invalid --lang")?;
-    let has_source = table_exists(conn, "_source")?;
-    let stored: HashMap<String, Hash> = if has_source {
-        hashes(
-            conn,
-            "SELECT id, content_hash FROM _source WHERE content_hash IS NOT NULL",
-        )?
+    let has_tree = crate::tree::exists(conn);
+    let stored: BTreeMap<String, Entry> = if has_tree {
+        crate::tree::entries(conn)?
+    } else {
+        BTreeMap::new()
+    };
+    let stats = if has_tree {
+        crate::tree::stats(conn)?
     } else {
         HashMap::new()
     };
-    let stats = if has_source {
-        leyline_ts::schema::read_file_stats(conn)?
-    } else {
-        HashMap::new()
-    };
-    let index = hashes(conn, "SELECT path, blob_hash FROM _checkout_index")?;
+    let index = index_entries(conn)?;
 
+    // Every path the store holds is the checkout's: `--language` narrows the
+    // projection, not the checkout (ADR-0045 T3).
     let paths: BTreeSet<String> = match scope {
         Some(paths) => paths.iter().cloned().collect(),
         None => {
-            let mut walked = Vec::new();
-            crate::walk::walk_into(dir, &mut walked)?;
+            let walked = crate::walk::walk_tree(dir)?;
             walked
+                .files
                 .iter()
+                .chain(&walked.symlinks)
+                .chain(&walked.dirs)
                 .filter_map(|abs| abs.strip_prefix(dir).ok())
                 .map(|rel| rel.to_string_lossy().into_owned())
                 .chain(stored.keys().cloned())
@@ -261,43 +283,56 @@ pub fn reconcile(
     };
 
     let mut ingest = Vec::new();
-    let mut converge: Vec<(String, Option<Hash>)> = Vec::new();
-    let mut materialize: Vec<(String, Hash)> = Vec::new();
+    let mut converge: Vec<(String, Option<Entry>)> = Vec::new();
+    let mut materialize: Vec<(String, Entry)> = Vec::new();
     let mut remove: Vec<String> = Vec::new();
     let mut conflicts = Vec::new();
     let mut hashed = 0usize;
     for rel in &paths {
-        let abs = dir.join(rel);
-        if !inside(rel) || crate::cmd_parse::file_language(&abs, lang).is_none() {
+        if !inside(rel) {
             continue;
         }
-        // A symlink, a directory, or a file the parse skips for its size
-        // is not part of the checkout.
+        let abs = dir.join(rel);
         let meta = std::fs::symlink_metadata(&abs).ok();
+        // A socket, a fifo or a device is not part of the checkout.
         if let Some(m) = &meta
-            && !(m.is_file() && (m.len() as i64) <= crate::cmd_parse::MAX_PARSE_FILE_SIZE)
+            && !(m.is_file() || m.is_dir() || m.file_type().is_symlink())
         {
             continue;
         }
         let indexed = index.get(rel).copied();
         let held = stored.get(rel).copied();
-        // `meta` is `Some` exactly when the file is on disk: anything else
-        // there left the loop above. A file whose stat matches the store's
-        // record of it holds the stored bytes; a file new to both the store
-        // and the index is ingested unread.
+        // A file whose mode and stat match the store's record of it holds
+        // the stored entry; an entry new to both the store and the index is
+        // ingested unread.
         let disk = match (&meta, held, indexed) {
             (None, _, _) => None,
-            (Some(m), Some(held), _) if stats.get(rel) == Some(&stat_pair(m)) => Some(held),
             (Some(_), None, None) => {
                 ingest.push(rel.clone());
                 continue;
             }
-            (Some(_), _, _) => {
+            (Some(m), _, _) if m.is_dir() => Some(Entry::Dir),
+            (Some(m), Some(held @ Entry::File { mode, .. }), _)
+                if crate::cmd_parse::disk_mode(m) == mode
+                    && stats.get(rel) == Some(&stat_pair(m)) =>
+            {
+                Some(held)
+            }
+            (Some(m), _, _) => {
                 hashed += 1;
-                match std::fs::read(&abs) {
-                    Ok(bytes) => Some(bytes.hash()),
+                let mode = crate::cmd_parse::disk_mode(m);
+                let bytes = if mode == Mode::Symlink {
+                    crate::cmd_parse::link_bytes(&abs)
+                } else {
+                    std::fs::read(&abs).map_err(anyhow::Error::from)
+                };
+                match bytes {
+                    Ok(bytes) => Some(Entry::File {
+                        mode,
+                        blob: bytes.hash(),
+                    }),
                     Err(e) => {
-                        log::warn!("checkout: skip '{rel}': cannot read it: {e}");
+                        log::warn!("checkout: skip '{rel}': cannot read it: {e:#}");
                         continue;
                     }
                 }
@@ -324,14 +359,16 @@ pub fn reconcile(
 
     // The directory is brought up to the store before anything is parsed
     // from it, so the parse reads the bytes it just received. Removals go
-    // first, so a proposal that turns a file into a directory of files
-    // lands in the directory too. A path the store deleted is kept out of
-    // the parse whether or not its file could be removed.
+    // first, deepest first so a directory's entries leave before it does,
+    // and so a proposal that turns a file into a directory of files lands
+    // in the directory too. A path the store deleted is kept out of the
+    // parse whether or not it could be removed.
     let mut materialized = Vec::new();
     let mut removed = Vec::new();
     let mut unmaterialized = Vec::new();
     let mut kept_out = BTreeSet::new();
-    for rel in remove {
+    remove.sort();
+    for rel in remove.into_iter().rev() {
         match remove_from(dir, &rel) {
             Ok(()) => {
                 set_index(conn, &rel, None)?;
@@ -344,8 +381,9 @@ pub fn reconcile(
             }
         }
     }
+    removed.reverse();
     for (rel, held) in materialize {
-        match blob(conn, held).and_then(|bytes| write_into(dir, &rel, &bytes)) {
+        match materialize_entry(conn, dir, &rel, held) {
             Ok(()) => {
                 set_index(conn, &rel, Some(held))?;
                 materialized.push(rel);
@@ -357,15 +395,17 @@ pub fn reconcile(
         }
     }
 
-    // A conflict keeps the store's side through the parse: its bytes, or
-    // its deletion.
+    // A conflict keeps the store's side through the parse: a file's bytes
+    // (its mode stays the store's), or its deletion. A directory the store
+    // holds stays in the store while the directory side is reported.
     let mut kept = BTreeMap::new();
     for c in &conflicts {
         log::warn!("checkout conflict: {c}");
         match c.stored {
-            Some(stored) => {
+            Some(Entry::File { blob: stored, .. }) => {
                 kept.insert(c.path.clone(), blob(conn, stored)?);
             }
+            Some(Entry::Dir) => {}
             None => {
                 kept_out.insert(c.path.clone());
             }
@@ -394,15 +434,12 @@ pub fn reconcile(
     let tx = conn.unchecked_transaction()?;
     // An ingested path's index is what the parse stored from the directory.
     for rel in &ingest {
-        let now: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT content_hash FROM _source WHERE id = ?1",
-                [rel],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        set_index(conn, rel, now.and_then(to_hash))?;
+        let now = if crate::tree::exists(conn) {
+            crate::tree::entry(conn, rel)?
+        } else {
+            None
+        };
+        set_index(conn, rel, now)?;
     }
     for (rel, held) in &converge {
         set_index(conn, rel, *held)?;
@@ -423,9 +460,9 @@ pub fn reconcile(
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
                 c.path,
-                c.disk.map(|h| h.as_bytes().to_vec()),
-                c.stored.map(|h| h.as_bytes().to_vec()),
-                c.index.map(|h| h.as_bytes().to_vec()),
+                c.disk.map(index_blob),
+                c.stored.map(index_blob),
+                c.index.map(index_blob),
             ],
         )?;
     }
@@ -447,51 +484,45 @@ pub fn reconcile(
 /// `rel` is not a plain relative path or its directory resolves outside
 /// `dir` (a symlink out of the tree).
 pub fn write_into(dir: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
-    if !inside(rel) {
-        bail!("refusing to write '{rel}': not a path inside the source directory");
-    }
-    let target = dir.join(rel);
-    let parent = target
-        .parent()
-        .with_context(|| format!("refusing to write '{rel}': it names no directory"))?;
-    let root = dir
-        .canonicalize()
-        .with_context(|| format!("resolve the source directory {}", dir.display()))?;
+    write_file(dir, rel, bytes, None)
+}
+
+/// [`write_into`] that also sets the file's mode (ADR-0045 T7): execute
+/// bits where the file is readable for `Executable`, none for `Regular`.
+/// `None` keeps the file's permissions.
+fn write_file(dir: &Path, rel: &str, bytes: &[u8], mode: Option<Mode>) -> Result<()> {
+    let target = checked_target(dir, rel, "write")?;
     // The nearest directory that exists is checked before anything is
     // created, and the file's own directory after.
-    let existing = parent
-        .ancestors()
-        .find(|a| a.exists())
-        .unwrap_or(dir)
-        .canonicalize()?;
-    if !existing.starts_with(&root) {
-        bail!(
-            "refusing to write '{rel}': {} is outside the source directory {}",
-            existing.display(),
-            root.display()
-        );
-    }
-    std::fs::create_dir_all(parent)?;
-    let resolved = parent.canonicalize()?;
-    if !resolved.starts_with(&root) {
-        bail!(
-            "refusing to write '{rel}': {} is outside the source directory {}",
-            resolved.display(),
-            root.display()
-        );
-    }
+    let parent = existing_parent(dir, rel, &target, "write")?;
     let staging = staging_path(&target);
     let written = (|| -> Result<()> {
+        let _ = std::fs::remove_file(&staging);
         let mut file = std::fs::File::create(&staging)
             .with_context(|| format!("stage {}", staging.display()))?;
         file.write_all(bytes)?;
-        if let Ok(meta) = std::fs::metadata(&target) {
-            file.set_permissions(meta.permissions())?;
+        // The file it replaces keeps its permissions; a new file has the
+        // staged file's. A mode sets the execute bits where the read bits
+        // are (git's rule), or clears them.
+        let mut permissions = match std::fs::symlink_metadata(&target) {
+            Ok(m) if m.is_file() => m.permissions(),
+            _ => file.metadata()?.permissions(),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bits = permissions.mode() & !0o111;
+            match mode {
+                Some(Mode::Executable) => permissions.set_mode(bits + ((bits & 0o444) >> 2)),
+                Some(_) => permissions.set_mode(bits),
+                None => {}
+            }
         }
+        file.set_permissions(permissions)?;
         file.sync_all()?;
         std::fs::rename(&staging, &target)
             .with_context(|| format!("rename {} over {}", staging.display(), target.display()))?;
-        std::fs::File::open(parent)?.sync_all()?;
+        std::fs::File::open(&parent)?.sync_all()?;
         Ok(())
     })();
     if written.is_err() {
@@ -501,11 +532,116 @@ pub fn write_into(dir: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
     written.with_context(|| format!("write '{rel}' into {}", dir.display()))
 }
 
-/// Remove the file `rel` names under `dir`, then each directory above it
-/// that the removal left empty, up to `dir` itself, and sync the nearest
-/// directory left standing, so the removal survives a crash. Refused when
-/// `rel` is not a plain relative path or its directory resolves outside
-/// `dir` (a symlink out of the tree).
+/// Write the store's `entry` at `rel` under `dir` (ADR-0045 T7): a file
+/// with its bytes and permissions, a symlink to its target, or a directory.
+fn materialize_entry(conn: &Connection, dir: &Path, rel: &str, entry: Entry) -> Result<()> {
+    match entry {
+        Entry::Dir => make_dir(dir, rel),
+        Entry::File {
+            mode: Mode::Symlink,
+            blob: target,
+        } => link_into(dir, rel, &blob(conn, target)?),
+        Entry::File { mode, blob: held } => write_file(dir, rel, &blob(conn, held)?, Some(mode)),
+    }
+}
+
+/// Make the directory `rel` names under `dir`, and its parents.
+pub fn make_dir(dir: &Path, rel: &str) -> Result<()> {
+    let target = checked_target(dir, rel, "make")?;
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("make the directory '{rel}' in {}", dir.display()))?;
+    let resolved = target.canonicalize()?;
+    let root = dir.canonicalize()?;
+    if !resolved.starts_with(&root) {
+        bail!(
+            "refusing to make '{rel}': {} is outside the source directory {}",
+            resolved.display(),
+            root.display()
+        );
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Make `rel` under `dir` a symlink whose target is `target` (git's
+/// bytes): staged beside it and renamed over it, so a crash leaves the old
+/// entry or the new one.
+pub fn link_into(dir: &Path, rel: &str, target: &[u8]) -> Result<()> {
+    let path = checked_target(dir, rel, "link")?;
+    let parent = existing_parent(dir, rel, &path, "link")?;
+    let staging = staging_path(&path);
+    let linked = (|| -> Result<()> {
+        let _ = std::fs::remove_file(&staging);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), &staging)
+                .with_context(|| format!("stage the link {}", staging.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            bail!("symlinks are materialized on unix only");
+        }
+        std::fs::rename(&staging, &path)
+            .with_context(|| format!("rename {} over {}", staging.display(), path.display()))?;
+        std::fs::File::open(&parent)?.sync_all()?;
+        Ok(())
+    })();
+    if linked.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    linked.with_context(|| format!("link '{rel}' in {}", dir.display()))
+}
+
+/// `dir.join(rel)`, refused when `rel` is not a plain relative path.
+fn checked_target(dir: &Path, rel: &str, verb: &str) -> Result<PathBuf> {
+    if !inside(rel) {
+        bail!("refusing to {verb} '{rel}': not a path inside the source directory");
+    }
+    Ok(dir.join(rel))
+}
+
+/// The directory `path` is in, made if missing, refused when it resolves
+/// outside `dir` (a symlink out of the tree) before or after it is made.
+fn existing_parent(dir: &Path, rel: &str, path: &Path, verb: &str) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("refusing to {verb} '{rel}': it names no directory"))?;
+    let root = dir
+        .canonicalize()
+        .with_context(|| format!("resolve the source directory {}", dir.display()))?;
+    let existing = parent
+        .ancestors()
+        .find(|a| a.exists())
+        .unwrap_or(dir)
+        .canonicalize()?;
+    if !existing.starts_with(&root) {
+        bail!(
+            "refusing to {verb} '{rel}': {} is outside the source directory {}",
+            existing.display(),
+            root.display()
+        );
+    }
+    std::fs::create_dir_all(parent)?;
+    let resolved = parent.canonicalize()?;
+    if !resolved.starts_with(&root) {
+        bail!(
+            "refusing to {verb} '{rel}': {} is outside the source directory {}",
+            resolved.display(),
+            root.display()
+        );
+    }
+    Ok(parent.to_path_buf())
+}
+
+/// Remove the entry `rel` names under `dir` — a file, a symlink, or an
+/// empty directory — and sync its directory, so the removal survives a
+/// crash. The directories above it stay (ADR-0045 T1). Refused when `rel`
+/// is not a plain relative path or its directory resolves outside `dir` (a
+/// symlink out of the tree).
 pub fn remove_from(dir: &Path, rel: &str) -> Result<()> {
     if !inside(rel) {
         bail!("refusing to remove '{rel}': not a path inside the source directory");
@@ -528,12 +664,13 @@ pub fn remove_from(dir: &Path, rel: &str) -> Result<()> {
         );
     }
     let removed = (|| -> Result<()> {
-        std::fs::remove_file(&target)?;
-        let mut standing = parent;
-        while standing != dir && std::fs::remove_dir(standing).is_ok() {
-            standing = standing.parent().unwrap_or(dir);
+        let is_dir = std::fs::symlink_metadata(&target)?.is_dir();
+        if is_dir {
+            std::fs::remove_dir(&target)?;
+        } else {
+            std::fs::remove_file(&target)?;
         }
-        std::fs::File::open(standing)?.sync_all()?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     removed.with_context(|| format!("remove '{rel}' from {}", dir.display()))
@@ -575,6 +712,7 @@ fn to_hash(bytes: Vec<u8>) -> Option<Hash> {
 
 /// `path → hash` rows of a two-column query; rows whose hash is not 32
 /// bytes are not hashes and are left out.
+#[cfg(test)]
 fn hashes(conn: &Connection, sql: &str) -> Result<HashMap<String, Hash>> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |r| {
@@ -600,11 +738,46 @@ fn blob(conn: &Connection, hash: Hash) -> Result<Vec<u8>> {
     .with_context(|| format!("the store holds no bytes for blob {hash}"))
 }
 
-fn set_index(conn: &Connection, rel: &str, hash: Option<Hash>) -> Result<()> {
-    match hash {
-        Some(h) => conn.execute(
-            "INSERT OR REPLACE INTO _checkout_index (path, blob_hash) VALUES (?1, ?2)",
-            rusqlite::params![rel, h.as_bytes().as_slice()],
+/// How the index and the conflict table spell an entry's blob: the hash,
+/// or no bytes for a directory.
+fn index_blob(entry: Entry) -> Vec<u8> {
+    entry
+        .blob()
+        .map_or_else(Vec::new, |h| h.as_bytes().to_vec())
+}
+
+/// Every index entry, by path; rows that are not a git entry are left out.
+fn index_entries(conn: &Connection) -> Result<HashMap<String, Entry>> {
+    let mut stmt = conn.prepare("SELECT path, blob_hash, mode FROM _checkout_index")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Vec<u8>>(1)?,
+            r.get::<_, u32>(2)?,
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (path, blob, mode) = row?;
+        let entry = if mode == crate::tree::DIRECTORY_MODE {
+            Some(Entry::Dir)
+        } else {
+            Mode::from_git(mode)
+                .zip(to_hash(blob))
+                .map(|(mode, blob)| Entry::File { mode, blob })
+        };
+        if let Some(entry) = entry {
+            out.insert(path, entry);
+        }
+    }
+    Ok(out)
+}
+
+fn set_index(conn: &Connection, rel: &str, entry: Option<Entry>) -> Result<()> {
+    match entry {
+        Some(e) => conn.execute(
+            "INSERT OR REPLACE INTO _checkout_index (path, blob_hash, mode) VALUES (?1, ?2, ?3)",
+            rusqlite::params![rel, index_blob(e), e.git_mode()],
         )?,
         None => conn.execute("DELETE FROM _checkout_index WHERE path = ?1", [rel])?,
     };
@@ -665,15 +838,17 @@ mod tests {
     }
 
     fn stored(c: &Checkout, path: &str) -> Option<Hash> {
-        c.conn
-            .query_row(
-                "SELECT content_hash FROM _source WHERE id = ?1",
-                [path],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .optional()
+        crate::tree::entry(&c.conn, path)
             .unwrap()
-            .and_then(to_hash)
+            .and_then(Entry::blob)
+    }
+
+    /// A regular file holding `text`, as the checkout compares entries.
+    fn file(text: &str) -> Entry {
+        Entry::File {
+            mode: Mode::Regular,
+            blob: h(text),
+        }
     }
 
     fn indexed(c: &Checkout, path: &str) -> Option<Hash> {
@@ -718,7 +893,7 @@ mod tests {
     #[test]
     fn classify_unstored_follows_the_table_with_the_store_absent() {
         let (x, y) = (h(A), h(A2));
-        assert_eq!(classify_unstored(None, None), Action::Nothing);
+        assert_eq!(classify_unstored::<Hash>(None, None), Action::Nothing);
         assert_eq!(classify_unstored(Some(x), None), Action::Ingest);
         assert_eq!(classify_unstored(None, Some(x)), Action::Converge);
         assert_eq!(classify_unstored(Some(x), Some(x)), Action::Remove);
@@ -757,12 +932,16 @@ mod tests {
         assert_eq!(indexed(&c, "b.go"), None);
         assert_eq!(stored(&c, "b.go"), None);
 
-        // The last file of a directory takes the emptied directory with it.
+        // The last file of a directory leaves the directory, as an empty
+        // entry, in the store and on disk (ADR-0045 T1).
         commit(&c, vec![Proposed::delete("sub/c.go", Base::Blob(h(A3)))]);
         let r = reconcile(&c.conn, &c.src, None, Some(&scope(&["sub/c.go"]))).unwrap();
         assert_eq!(r.removed, ["sub/c.go"]);
-        assert!(!c.src.join("sub").exists());
-        assert!(c.src.exists(), "the checkout's own directory stays");
+        assert!(c.src.join("sub").is_dir());
+        assert_eq!(
+            crate::tree::entry(&c.conn, "sub").unwrap(),
+            Some(Entry::Dir)
+        );
 
         // Nothing is left to do.
         let quiet = reconcile(&c.conn, &c.src, None, None).unwrap();
@@ -816,9 +995,9 @@ mod tests {
             r.conflicts,
             [Conflict {
                 path: "b.go".to_string(),
-                disk: Some(h(B2)),
+                disk: Some(file(B2)),
                 stored: None,
-                index: Some(h(B)),
+                index: Some(file(B)),
             }]
         );
         assert!(r.removed.is_empty());
@@ -928,8 +1107,8 @@ mod tests {
             [Conflict {
                 path: "a.go".to_string(),
                 disk: None,
-                stored: Some(h(A2)),
-                index: Some(h(A)),
+                stored: Some(file(A2)),
+                index: Some(file(A)),
             }]
         );
         assert_eq!(
@@ -979,7 +1158,7 @@ mod tests {
     #[test]
     fn an_index_entry_with_no_file_on_either_side_is_dropped() {
         let c = checkout(&[("a.go", A)]);
-        set_index(&c.conn, "gone.go", Some(h(B))).unwrap();
+        set_index(&c.conn, "gone.go", Some(file(B))).unwrap();
         reconcile(&c.conn, &c.src, None, None).unwrap();
         assert_eq!(indexed(&c, "gone.go"), None);
         assert_eq!(indexed(&c, "a.go"), Some(h(A)));
@@ -1008,8 +1187,10 @@ mod tests {
         assert_eq!(indexed(&c, "a.go"), Some(h(A3)));
     }
 
+    /// ADR-0045 T3: `--language` narrows the projection, not the checkout:
+    /// every file is stored and indexed, the other language unprojected.
     #[test]
-    fn a_file_the_language_filter_skips_is_not_checked_out() {
+    fn a_file_the_language_filter_skips_is_checked_out_and_not_projected() {
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1017,32 +1198,165 @@ mod tests {
         std::fs::write(src.join("x.py"), "x = 1\n").unwrap();
         let conn = Connection::open(dir.path().join("live.db")).unwrap();
         reconcile(&conn, &src, Some("go"), None).unwrap();
-        let index = hashes(&conn, "SELECT path, blob_hash FROM _checkout_index").unwrap();
-        assert_eq!(index.keys().collect::<Vec<_>>(), ["a.go"]);
+        let mut index: Vec<String> = hashes(&conn, "SELECT path, blob_hash FROM _checkout_index")
+            .unwrap()
+            .into_keys()
+            .collect();
+        index.sort();
+        assert_eq!(index, ["a.go", "x.py"]);
+        let projected: i64 = conn
+            .query_row("SELECT count(*) FROM _source WHERE id = 'x.py'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(projected, 0);
     }
 
-    /// A path out of the tree, a directory, and a file over the parse size
-    /// limit are not checkout files: a reconcile scoped to them reads,
-    /// parses and indexes nothing.
+    /// A path out of the tree is not a checkout path: a reconcile scoped to
+    /// it reads, parses and indexes nothing. A directory and a file over the
+    /// parse size limit are entries like any other (ADR-0045 T1, T3).
     #[test]
-    fn a_path_that_is_not_a_checkout_file_is_left_alone() {
+    fn a_path_outside_the_checkout_is_left_alone_and_directories_are_entries() {
         let c = checkout(&[("a.go", A)]);
         let outside = c.src.parent().unwrap().join("escape.go");
         std::fs::write(&outside, A).unwrap();
-        std::fs::create_dir_all(c.src.join("d.go")).unwrap();
-        let limit = crate::cmd_parse::MAX_PARSE_FILE_SIZE as usize;
-        std::fs::write(c.src.join("big.go"), "x".repeat(limit + 1)).unwrap();
-
-        let scope = [
-            "../escape.go".to_string(),
-            "d.go".to_string(),
-            "big.go".to_string(),
-        ];
-        let r = reconcile(&c.conn, &c.src, None, Some(&scope)).unwrap();
+        let r = reconcile(&c.conn, &c.src, None, Some(&["../escape.go".to_string()])).unwrap();
         assert!(r.parse.is_none(), "{:?}", r.parse);
         assert_eq!(r.hashed, 0);
-        let index = hashes(&c.conn, "SELECT path, blob_hash FROM _checkout_index").unwrap();
-        assert_eq!(index.keys().collect::<Vec<_>>(), ["a.go"]);
+
+        std::fs::create_dir_all(c.src.join("d.go")).unwrap();
+        let limit = crate::cmd_parse::MAX_PARSE_FILE_SIZE as usize;
+        let big = "x".repeat(limit + 1);
+        std::fs::write(c.src.join("big.go"), &big).unwrap();
+        let scope = ["d.go".to_string(), "big.go".to_string()];
+        reconcile(&c.conn, &c.src, None, Some(&scope)).unwrap();
+        assert_eq!(
+            crate::tree::entry(&c.conn, "d.go").unwrap(),
+            Some(Entry::Dir)
+        );
+        assert_eq!(stored(&c, "big.go"), Some(h(&big)));
+        assert_eq!(indexed(&c, "big.go"), Some(h(&big)));
+        let d = crate::tree::diagnostic(&c.conn, "big.go").unwrap().unwrap();
+        assert!(!d.projected, "{d:?}");
+    }
+
+    /// ADR-0045 T7: the checkout carries modes, symlinks and directories in
+    /// both directions, and its index records them.
+    #[cfg(unix)]
+    #[test]
+    fn checkout_materializes_modes_symlinks_and_empty_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let c = checkout(&[("a.go", A), ("b.go", B)]);
+        let tree = |writes: Vec<Proposed>| propose(&c.conn, &Grant::Whole, writes).unwrap();
+        tree(vec![
+            Proposed::write_mode("a.go", Base::Blob(h(A)), A.into(), Mode::Executable),
+            Proposed::write_mode("link", Base::Absent, "a.go".into(), Mode::Symlink),
+            Proposed::mkdir("empty/inner"),
+            Proposed::create("notes.txt", "n\n".into()),
+        ]);
+        let paths = scope(&["a.go", "link", "empty", "empty/inner", "notes.txt"]);
+        let r = reconcile(&c.conn, &c.src, None, Some(&paths)).unwrap();
+        assert_eq!(r.problems(), None);
+        let mode_of = |rel: &str| {
+            std::fs::symlink_metadata(c.src.join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode_of("a.go") & 0o111, 0o111, "a.go is executable");
+        assert_eq!(
+            std::fs::read_link(c.src.join("link")).unwrap(),
+            Path::new("a.go")
+        );
+        assert!(c.src.join("empty/inner").is_dir());
+        assert_eq!(disk(&c, "notes.txt").as_deref(), Some("n\n"));
+        let index = index_entries(&c.conn).unwrap();
+        assert_eq!(
+            index["a.go"],
+            Entry::File {
+                mode: Mode::Executable,
+                blob: h(A)
+            }
+        );
+        assert_eq!(
+            index["link"],
+            Entry::File {
+                mode: Mode::Symlink,
+                blob: h("a.go")
+            }
+        );
+        assert_eq!(index["empty/inner"], Entry::Dir);
+        // Nothing left to do, and a whole pass reads nothing back.
+        let quiet = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert!(
+            quiet.materialized.is_empty() && quiet.conflicts.is_empty(),
+            "{quiet:?}"
+        );
+
+        // The store removes the directory and the link, and clears the bit.
+        tree(vec![
+            Proposed::rmdir("empty/inner"),
+            Proposed::delete("link", Base::Any),
+            Proposed::write_mode("a.go", Base::Any, A.into(), Mode::Regular),
+        ]);
+        let r = reconcile(&c.conn, &c.src, None, Some(&paths)).unwrap();
+        assert_eq!(r.problems(), None);
+        assert!(!c.src.join("empty/inner").exists() && c.src.join("empty").is_dir());
+        assert!(std::fs::symlink_metadata(c.src.join("link")).is_err());
+        assert_eq!(mode_of("a.go") & 0o111, 0);
+
+        // Execute bits follow the read bits (git's rule): a file only its
+        // owner reads becomes executable by its owner only; a new file
+        // created executable is executable.
+        std::fs::set_permissions(c.src.join("b.go"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        reconcile(&c.conn, &c.src, None, None).unwrap();
+        tree(vec![
+            Proposed::write_mode("b.go", Base::Any, B.into(), Mode::Executable),
+            Proposed::write_mode(
+                "new.sh",
+                Base::Absent,
+                "#!/bin/sh\n".into(),
+                Mode::Executable,
+            ),
+        ]);
+        reconcile(&c.conn, &c.src, None, Some(&scope(&["b.go", "new.sh"]))).unwrap();
+        assert_eq!(mode_of("b.go"), 0o700);
+        assert_eq!(mode_of("new.sh") & 0o111, 0o111);
+        tree(vec![Proposed::write_mode(
+            "b.go",
+            Base::Any,
+            B.into(),
+            Mode::Regular,
+        )]);
+        reconcile(&c.conn, &c.src, None, Some(&scope(&["b.go"]))).unwrap();
+        assert_eq!(mode_of("b.go"), 0o600);
+
+        // The directory side: a mode, a link and a directory are ingested.
+        std::fs::set_permissions(c.src.join("b.go"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::os::unix::fs::symlink("b.go", c.src.join("l2")).unwrap();
+        std::fs::create_dir_all(c.src.join("made")).unwrap();
+        reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert_eq!(
+            crate::tree::entry(&c.conn, "b.go").unwrap(),
+            Some(Entry::File {
+                mode: Mode::Executable,
+                blob: h(B)
+            })
+        );
+        assert_eq!(
+            crate::tree::entry(&c.conn, "l2").unwrap(),
+            Some(Entry::File {
+                mode: Mode::Symlink,
+                blob: h("b.go")
+            })
+        );
+        assert_eq!(
+            crate::tree::entry(&c.conn, "made").unwrap(),
+            Some(Entry::Dir)
+        );
     }
 
     #[test]
@@ -1096,6 +1410,17 @@ mod tests {
             write_into(&src, "run.sh", b"#!/bin/sh\necho\n").unwrap();
             let mode = std::fs::metadata(&script).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755);
+
+            // A file written over a symlink is a new regular file: it does
+            // not take the link's permissions (`lrwxr-xr-x`).
+            std::fs::write(src.join("plain"), "p\n").unwrap();
+            std::fs::set_permissions(src.join("plain"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            std::os::unix::fs::symlink("plain", src.join("over")).unwrap();
+            write_into(&src, "over", b"x\n").unwrap();
+            let over = std::fs::symlink_metadata(src.join("over")).unwrap();
+            assert!(over.is_file());
+            assert_eq!(over.permissions().mode() & 0o111, 0, "not executable");
         }
     }
 

@@ -1075,32 +1075,31 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
 
 /// A whole source file by its `_source.id`, with its blob hash and the
 /// arena's `treeRoot`, read in one transaction so the three agree. The blob
-/// hash is the file's `_source.content_hash` — the column a later `propose`
-/// compares its base against (ADR-0042 P2), not a hash recomputed here, so
-/// the two agree by construction.
+/// hash is the file's manifest entry's `blob_hash` (ADR-0045 T1) — the
+/// value a later `propose` compares its base against (ADR-0042 P2), not a
+/// hash recomputed here, so the two agree by construction.
 fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String> {
-    use rusqlite::OptionalExtension;
     let path = req.path.as_str();
     ctx.with_read(|conn| {
         conn.execute_batch("BEGIN")?;
-        let read = (|| -> Result<(String, String, Option<leyline_core::Hash>)> {
-            let (bytes, blob_hash): (Vec<u8>, Vec<u8>) = conn
-                .query_row(
-                    "SELECT b.blob_bytes, s.content_hash FROM _source s \
-                       JOIN source_blobs b ON b.blob_hash = s.content_hash \
-                      WHERE s.id = ?1",
-                    [path],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?
+        let read = (|| -> Result<(String, String, String, Option<leyline_core::Hash>)> {
+            // The manifest entry (ADR-0045 T1) is what `propose` checks a
+            // base against, so the hash is read from the same row.
+            let entry = crate::tree::entry(conn, path)?
                 .with_context(|| format!("read_source: no stored source for '{path}'"))?;
+            let crate::tree::Entry::File { blob, mode } = entry else {
+                anyhow::bail!("read_source: '{path}' is a directory");
+            };
+            let bytes = crate::tree::blob_bytes(conn, blob)?.with_context(|| {
+                format!("read_source: the store holds no blob {blob} for '{path}'")
+            })?;
             let tree_root = crate::tree_root::DerivedFrom::read(conn)?.map(|d| d.tree_root);
             let content = String::from_utf8(bytes)
                 .with_context(|| format!("read_source: '{path}' is not UTF-8"))?;
-            Ok((content, hex::encode(blob_hash), tree_root))
+            Ok((content, blob.to_string(), mode.octal(), tree_root))
         })();
         conn.execute_batch("COMMIT")?;
-        let (content, blob_hash, tree_root) = read?;
+        let (content, blob_hash, mode, tree_root) = read?;
 
         let mut builder = capnp::message::Builder::new_default();
         let mut root: leyline_public_schema::daemon_capnp::read_source_response::Builder =
@@ -1108,6 +1107,7 @@ fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String
         root.set_ok(true);
         root.set_content(&content);
         root.set_blob_hash(blob_hash);
+        root.set_mode(mode);
         if let Some(t) = tree_root {
             root.set_tree_root(t.to_string());
         }
@@ -1140,55 +1140,73 @@ fn parse_base(
         })
 }
 
-/// One wire write as a [`crate::source_write::Proposed`]. A create names
-/// the `absent` base and a replace or delete does not, else the write is
-/// refused `malformed_base`; a replace or create without `content` is a
+/// One wire write as a [`crate::source_write::Proposed`]. A create or mkdir
+/// names the `absent` base, an rmdir `any`, and a replace or delete a blob
+/// or `any`, else the write is refused `malformed_base`; a replace or
+/// create without `content`, or with a `mode` git does not store, is a
 /// malformed request.
 fn parse_write(w: ProposedWriteInput) -> Result<crate::source_write::Proposed> {
-    use crate::source_write::{Base, Proposed, Refusal};
+    use crate::source_write::{Base, Change, Mode, Proposed, Refusal};
     let base = parse_base(&w.path, &w.base)?;
-    if (w.kind == WriteKind::Create) != (base == Base::Absent) {
+    let fits = match w.kind {
+        WriteKind::Create | WriteKind::Mkdir => base == Base::Absent,
+        WriteKind::Rmdir => base == Base::Any,
+        WriteKind::Replace | WriteKind::Delete => base != Base::Absent,
+    };
+    if !fits {
         return Err(Refusal::MalformedBase { path: w.path }.into());
     }
-    if w.kind == WriteKind::Delete {
-        return Ok(Proposed::delete(w.path, base));
-    }
-    let content = w.content.with_context(|| {
-        format!(
-            "propose: the write to '{}' has no `content`; a replace or create needs it",
-            w.path
-        )
-    })?;
-    Ok(Proposed::write(w.path, base, content.into_bytes()))
+    let change = match w.kind {
+        WriteKind::Delete => Change::Delete,
+        WriteKind::Mkdir => Change::Mkdir,
+        WriteKind::Rmdir => Change::Rmdir,
+        WriteKind::Replace | WriteKind::Create => {
+            let mode = w
+                .mode
+                .as_deref()
+                .map(|m| {
+                    Mode::from_octal(m).with_context(|| {
+                        format!(
+                            "propose: the write to '{}' names mode {m:?}; a mode is 100644, \
+                             100755 or 120000",
+                            w.path
+                        )
+                    })
+                })
+                .transpose()?;
+            let content = w.content.with_context(|| {
+                format!(
+                    "propose: the write to '{}' has no `content`; a replace or create needs it",
+                    w.path
+                )
+            })?;
+            Change::Write {
+                bytes: content.into_bytes(),
+                mode,
+            }
+        }
+    };
+    Ok(Proposed {
+        path: w.path,
+        base,
+        change,
+    })
 }
 
-/// Several files written as one change through the daemon's single writer
-/// (ADR-0042 P1): applied whole, or refused whole. A refusal carries its
-/// typed reason (`refusal`); a stale one names every file that moved. An
-/// applied proposal is published so out-of-process readers see it, and is
-/// reported applied even when a step after its commit (the head write, an
-/// index build, the publish) fails: that failure rides in
-/// `post_commit_error` (beads `ley-line-open-5db28e`, `ley-line-open-5dc3a5`).
+/// Several paths changed as one change through the daemon's single writer
+/// (ADR-0042 P1, ADR-0045): applied whole, or refused whole. Any file at
+/// any plain path, modes and directories are proposals; a write that does
+/// not parse lands with a diagnostic; a write whose base moved is merged
+/// three ways, and the merged paths are named (`merged`). A refusal carries
+/// its typed reason (`refusal`); a stale one names every path that moved,
+/// with the lines a conflicting merge overlapped. An applied proposal is
+/// published so out-of-process readers see it, and is reported applied
+/// even when a step after its commit (the head write, an index build, the
+/// publish) fails: that failure rides in `post_commit_error` (beads
+/// `ley-line-open-5db28e`, `ley-line-open-5dc3a5`).
 fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
-    use crate::source_write::{Base, Grant, Refusal};
+    use crate::source_write::{Grant, Refusal};
     let writes: Result<Vec<_>> = req.writes.into_iter().map(parse_write).collect();
-    // A create in a language the daemon's `--language` filter excludes is
-    // refused: the checkout would never write it out, and the next
-    // whole-directory parse would drop it from the store. Every other
-    // reason a create is refused is `propose`'s own.
-    let writes = writes.and_then(|writes| {
-        match writes.iter().find(|w| {
-            w.base == Base::Absent
-                && crate::source_write::can_hold(&w.path, None)
-                && !crate::source_write::can_hold(&w.path, ctx.lang_filter.as_deref())
-        }) {
-            Some(w) => Err(Refusal::NoLanguage {
-                path: w.path.clone(),
-            }
-            .into()),
-            None => Ok(writes),
-        }
-    });
     // A daemon with a source directory materializes the accepted files into
     // it, and removes the deleted ones, under the same writer lock, after
     // the commit (bead `ley-line-open-60f39f`): a crash in between leaves
@@ -1201,6 +1219,8 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
                     .blobs
                     .keys()
                     .chain(&accepted.removed)
+                    .chain(&accepted.mkdirs)
+                    .chain(&accepted.rmdirs)
                     .cloned()
                     .collect();
                 crate::checkout::reconcile(conn, dir, ctx.lang_filter.as_deref(), Some(&paths))
@@ -1239,6 +1259,12 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
             if !post_commit.is_empty() {
                 root.set_post_commit_error(post_commit.join("; "));
             }
+            if !accepted.merged.is_empty() {
+                let mut merged = root.reborrow().init_merged(accepted.merged.len() as u32);
+                for (i, path) in accepted.merged.iter().enumerate() {
+                    merged.set(i as u32, path.as_str());
+                }
+            }
         }
         Err(err) => {
             let Some(refusal) = err.downcast_ref::<Refusal>() else {
@@ -1262,31 +1288,45 @@ fn set_refusal(
     use crate::source_write::Refusal;
     use leyline_public_schema::daemon_capnp::RefusalReason as R;
     out.set_reason(match refusal {
-        Refusal::Stale(_) => R::Stale,
+        Refusal::Stale(_) | Refusal::Conflict { .. } => R::Stale,
         Refusal::OutsideGrant { .. } => R::OutsideGrant,
         Refusal::NoSuchFile { .. } => R::NoSuchFile,
         Refusal::DuplicatePath { .. } => R::DuplicatePath,
         Refusal::DifferentRoots { .. } => R::DifferentRoots,
         Refusal::NoTreeRoot { .. } => R::NoTreeRoot,
-        Refusal::Syntax { .. } => R::Syntax,
         Refusal::MalformedBase { .. } => R::MalformedBase,
-        Refusal::NoStoredBlob { .. } => R::NoStoredBlob,
         Refusal::Empty => R::Empty,
-        Refusal::NoLanguage { .. } => R::NoLanguage,
         Refusal::MalformedPath { .. } => R::MalformedPath,
         Refusal::PathConflict { .. } => R::PathConflict,
+        Refusal::Exists { .. } => R::Exists,
+        Refusal::NotEmpty { .. } => R::NotEmpty,
+        Refusal::NotADirectory { .. } => R::NotADirectory,
+        Refusal::IsADirectory { .. } => R::IsADirectory,
     });
     if let Some(path) = refusal.path() {
         out.set_path(path);
     }
-    if let Refusal::Stale(moved) = refusal {
+    let moved = refusal.moved();
+    if !moved.is_empty() {
         use crate::source_write::Stale;
+        let conflicts = match refusal {
+            Refusal::Conflict { conflicts, .. } => Some(conflicts),
+            _ => None,
+        };
         let mut list = out.init_moved(moved.len() as u32);
         for (i, m) in moved.iter().enumerate() {
             let mut s = list.reborrow().get(i as u32);
             s.set_path(&m.path);
             s.set_expected(Stale::spell(m.expected));
             s.set_current(Stale::spell(m.current));
+            if let Some(ranges) = conflicts.and_then(|c| c.get(&m.path)) {
+                let mut out = s.init_conflicts(ranges.len() as u32);
+                for (j, r) in ranges.iter().enumerate() {
+                    let mut range = out.reborrow().get(j as u32);
+                    range.set_start(r.start);
+                    range.set_end(r.end);
+                }
+            }
         }
     }
 }
@@ -4330,7 +4370,9 @@ mod tests {
             blobs.contains(&serde_json::json!({"path": "b.go", "blob_hash": hex_hash(PROPOSE_B2)}))
         );
 
-        // A second author still holding the first read is refused.
+        // A second author still holding the first read changed the same
+        // line: the merge conflicts there and the proposal is refused
+        // (ADR-0045 T5).
         let stale = call(
             &ctx,
             serde_json::json!({"op": "propose", "writes": [
@@ -4346,6 +4388,7 @@ mod tests {
                     "path": "a.go",
                     "expected": hex_hash(PROPOSE_A),
                     "current": hex_hash(PROPOSE_A2),
+                    "conflicts": [{"start": 2, "end": 3}],
                 }],
             })
         );
@@ -4437,8 +4480,20 @@ mod tests {
         let (_dir, ctx) = setup_parsed();
         let cases = [
             (
-                serde_json::json!([{"path": "a.go", "base": "any", "content": "package a\nfunc ("}]),
-                serde_json::json!({"reason": "syntax", "path": "a.go"}),
+                serde_json::json!([{"path": "a.go", "kind": "rmdir", "base": "any"}]),
+                serde_json::json!({"reason": "not_a_directory", "path": "a.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "a.go", "kind": "mkdir", "base": "absent"}]),
+                serde_json::json!({"reason": "exists", "path": "a.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "a.go/x", "kind": "mkdir", "base": "absent"}]),
+                serde_json::json!({"reason": "path_conflict", "path": "a.go/x"}),
+            ),
+            (
+                serde_json::json!([{"path": "d", "kind": "mkdir", "base": "any"}]),
+                serde_json::json!({"reason": "malformed_base", "path": "d"}),
             ),
             (
                 serde_json::json!([{"path": "z.go", "base": "any", "content": PROPOSE_A2}]),
@@ -4465,6 +4520,56 @@ mod tests {
                 "{r}"
             );
         }
+    }
+
+    /// ADR-0045 over the socket: a file no grammar claims, a mode and a
+    /// directory land; a `--language` daemon stores another language too;
+    /// a write that does not parse lands; a malformed mode is a malformed
+    /// request, not a guess.
+    #[tokio::test]
+    async fn propose_carries_any_file_modes_and_directories() {
+        let (_dir, ctx) = setup_parsed();
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "notes.txt", "kind": "create", "base": "absent", "content": "n\n"},
+                {"path": "lib.py", "kind": "create", "base": "absent", "content": "def f(:\n"},
+                {"path": "bin/run", "kind": "create", "base": "absent", "content": "#!/bin/sh\n", "mode": "100755"},
+                {"path": "empty", "kind": "mkdir", "base": "absent"},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(
+            r.get("merged").is_none(),
+            "nothing merged, no `merged`: {r}"
+        );
+        let run = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "bin/run"}),
+        );
+        assert_eq!(run["mode"], "100755", "{run}");
+        let dir = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "empty"}),
+        );
+        assert_eq!(dir["ok"], false, "{dir}");
+        let removed = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [{"path": "empty", "kind": "rmdir", "base": "any"}]}),
+        );
+        assert_eq!(removed["ok"], true, "{removed}");
+        let bad = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "x", "kind": "create", "base": "absent", "content": "", "mode": "777"}
+            ]}),
+        );
+        assert_eq!(bad["ok"], false, "{bad}");
+        assert!(
+            bad.get("refusal").is_none(),
+            "a malformed request, not a refusal: {bad}"
+        );
+        assert!(bad["error"].as_str().unwrap().contains("mode"), "{bad}");
     }
 
     /// Bead `ley-line-open-5db28e`: a step after `COMMIT` that fails does
@@ -4584,9 +4689,10 @@ mod tests {
     }
 
     /// Bead `ley-line-open-5dc3a5`: `read_source` returns the hash
-    /// `propose` compares — the file's `_source.content_hash` — so a read
-    /// followed by a propose against it agrees by construction, even when
-    /// the stored key is not the hash of the bytes it names.
+    /// `propose` compares — the file's manifest entry's `blob_hash`
+    /// (ADR-0045 T1) — so a read followed by a propose against it agrees by
+    /// construction, even when the stored key is not the hash of the bytes
+    /// it names.
     #[tokio::test]
     async fn read_source_returns_the_hash_propose_compares() {
         let (_dir, ctx) = setup_parsed();
@@ -4597,7 +4703,7 @@ mod tests {
                 rusqlite::params![key, PROPOSE_A.as_bytes()],
             )?;
             conn.execute(
-                "UPDATE _source SET content_hash = ?1 WHERE id = 'a.go'",
+                "UPDATE _tree SET blob_hash = ?1 WHERE path = 'a.go'",
                 [&key],
             )?;
             Ok(())
@@ -4683,27 +4789,45 @@ mod tests {
         );
     }
 
-    /// A daemon whose `--language` filter excludes a created file's
-    /// language refuses the create: its checkout would never write the file
-    /// out, and its next whole-directory parse would drop it.
+    /// ADR-0045 T3: a daemon whose `--language` filter excludes a created
+    /// file's language stores it, writes it into its checkout, and keeps it
+    /// through a whole-directory parse; only the projection skips it.
     #[tokio::test]
-    async fn a_create_outside_the_daemons_language_is_refused() {
+    async fn a_create_outside_the_daemons_language_is_stored_and_not_projected() {
         let (dir, ctx) = setup_checkout();
         let mut ctx = std::sync::Arc::into_inner(ctx).expect("one owner");
         ctx.lang_filter = Some("go".to_string());
         let ctx = std::sync::Arc::new(ctx);
+        // The startup pass of a `--language go` daemon records its filter.
+        ctx.with_write(|conn| crate::checkout::reconcile(conn, dir.path(), Some("go"), None))
+            .unwrap();
         let r = call(
             &ctx,
             serde_json::json!({"op": "propose", "writes": [
                 {"path": "tool.py", "kind": "create", "base": "absent", "content": "x = 1\n"},
             ]}),
         );
+        assert_eq!(r["ok"], true, "{r}");
         assert_eq!(
-            r["refusal"],
-            serde_json::json!({"reason": "no_language", "path": "tool.py"}),
-            "{r}"
+            std::fs::read_to_string(dir.path().join("tool.py")).unwrap(),
+            "x = 1\n"
         );
-        assert!(!dir.path().join("tool.py").exists());
+        ctx.with_write(|conn| {
+            crate::checkout::reconcile(conn, dir.path(), Some("go"), None)?;
+            let projected: i64 = conn.query_row(
+                "SELECT count(*) FROM _source WHERE id = 'tool.py'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(projected, 0);
+            Ok(())
+        })
+        .unwrap();
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "tool.py"}),
+        );
+        assert_eq!(read["content"], "x = 1\n", "{read}");
         let go = call(
             &ctx,
             serde_json::json!({"op": "propose", "writes": [
@@ -4715,8 +4839,8 @@ mod tests {
 
     /// A create over a file and a change to a deleted file are stale, with
     /// `absent` on the side that holds no file; a base that does not fit
-    /// its kind is `malformed_base`; a created path the store cannot hold
-    /// says why.
+    /// its kind is `malformed_base`; a created path that is not plain, or is
+    /// under a file, says why.
     #[tokio::test]
     async fn structural_proposals_are_refused_typed() {
         let (_dir, ctx) = setup_checkout();
@@ -4750,10 +4874,6 @@ mod tests {
             (
                 serde_json::json!([{"path": "a.go", "base": "absent", "content": PROPOSE_A2}]),
                 serde_json::json!({"reason": "malformed_base", "path": "a.go"}),
-            ),
-            (
-                serde_json::json!([{"path": "notes.txt", "kind": "create", "base": "absent", "content": "x"}]),
-                serde_json::json!({"reason": "no_language", "path": "notes.txt"}),
             ),
             (
                 serde_json::json!([{"path": "../up.go", "kind": "create", "base": "absent", "content": PROPOSE_A}]),

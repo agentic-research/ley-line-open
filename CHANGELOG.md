@@ -10,6 +10,72 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: the store is a git-shaped tree; parsing is a projection over
+  it; a proposal whose base moved merges three ways** (bead
+  `ley-line-open-bb8aa6`, ADR-0045).
+  - The store's manifest is the new table `_tree (path, mode, blob_hash,
+    mtime, size)`: every walked file of any language with its git mode
+    (`100644`, `100755`, `120000` for a symlink whose blob is its target),
+    and every directory, empty ones included. `_source` keeps only the
+    files the parse projects. `--language` narrows the projection, not the
+    store or the checkout.
+  - `treeRoot` folds `_tree`: a tree of regular files, all projected, with
+    no empty directory, keeps its root; an executable, a symlink, an empty
+    directory or an unprojected file moves it (ADR-0045 T2).
+  - A file that does not parse cleanly is stored and diagnosed in the new
+    table `_parse_diagnostics`: syntax errors are projected with their
+    error nodes; a binary or oversized file is stored with no projection
+    rows. `projection-v7`; a v6 arena is refused at parse open and rebuilt
+    cold. `leyline splice` follows the same write path: a syntax-breaking
+    splice is stored with its diagnostic instead of refused
+    (`tools/cli_smoke.sh` asserts the new behavior).
+  - `source_write::propose_with(.., Rules::Tree)` takes any bytes at any
+    plain path, `Change::Write { bytes, mode }`, `Mkdir`, `Rmdir`, and
+    `rename_dir`; a write against a moved base is merged with `gix-merge`
+    0.17.0's text driver (new dependency, MIT OR Apache-2.0, sharing gix
+    0.84's `gix-*` set) and lands as the write (`Accepted::merged`);
+    overlapping hunks refuse with `Refusal::Conflict` naming the base line
+    ranges. New refusals `Exists`, `NotEmpty`, `NotADirectory`,
+    `IsADirectory`; removed: `Refusal::Syntax`, `Refusal::NoLanguage`,
+    `Refusal::NoStoredBlob` (every manifest entry names its blob) and
+    `source_write::can_hold`. `Grant::covers_dir` admits a directory
+    change under a granted path.
+  - **storefs (ADR-0045 phase 4):** every file the guest makes lands in the
+    store (no session-only files); MKDIR, RMDIR, a directory RENAME (one
+    proposal over every path under it; no more `EXDEV`), SETATTR of the mode
+    (`chmod`, `fchmod`) and SYMLINK are proposals, READLINK answers a
+    symlink's target, and `Kind::Symlink` is served as `S_IFLNK`/`DT_LNK`.
+    WRITE no longer answers `ESTALE` for a moved base (reverses bead
+    `e650d7`): it stages, and FLUSH/FSYNC merge; a clean merge lands, the
+    handle serves the merged bytes, and the next read-only open drops the
+    guest's pages; overlapping edits are `ESTALE`. A half-written file lands
+    with a diagnostic. `errno_for` maps the directory refusals to `EEXIST`,
+    `ENOTEMPTY`, `ENOTDIR`, `EISDIR`. The share wire gains `Request::Symlink`
+    and `Request::Readlink` and `DT_LNK`; libkrun patch `0006` forwards
+    READLINK and SYMLINK through `DynFileSystem`. The compatibility mount's
+    `MountWriter` proposes under the same rules.
+  - `tests/agent_in_guest.rs` adds scenarios (c) merge, (C) conflict, (d)
+    half-written file with a diagnostic, and (p) README, a file in no
+    projected language, `chmod +x`, a symlink, an empty directory and a
+    directory rename, each checked again after the restart (h).
+  - A file deleted from the store leaves its directories; the checkout no
+    longer removes emptied directories. The checkout materializes modes,
+    symlinks and directories, ingests them from the directory, and its
+    index records each entry's mode.
+  - Daemon wire (`daemon.capnp`, schema 0.20.5 unreleased): `read_source`
+    reads any stored file and answers its `mode`; `ProposedWrite` gains
+    `mode` and `WriteKind` gains `mkdir` and `rmdir`; `StaleRefusal` gains
+    `conflicts` (`LineRange {start, end}`, base lines, 0-based half-open);
+    `ProposeResponse` gains `merged`; `RefusalReason` gains `exists`,
+    `not_empty`, `not_a_directory`, `is_a_directory`, and retires `syntax`,
+    `no_language` and `no_stored_blob` (ordinals kept, renamed
+    `retired_*`, never sent). The socket's `propose` no longer refuses a
+    file that does not parse or a file in no projected language, and
+    merges a moved base. Go bindings regenerated. Move clients of
+    `propose` with this release.
+
 ### Added
 
 - **The libkrun worker declares its workspace share, holds nothing else,

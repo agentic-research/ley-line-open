@@ -6,31 +6,35 @@
 //! FLUSH, FSYNC, RELEASE, SETATTR, CREATE, UNLINK, RENAME, MKDIR and RMDIR —
 //! from the store, and lands changes as ADR-0042 proposals:
 //!
-//! - **Reads** resolve a path through the store's tree (`_source`, the one
-//!   checkout ADR-0043 names today) to its blob in `source_blobs`. An open
-//!   reads the blob once; every READ on that handle serves those bytes.
+//! - **Reads** resolve a path through the store's manifest (`_tree`,
+//!   ADR-0045 T1: every file of any language with its git mode, every
+//!   symlink, every directory) to its blob in `source_blobs`. An open reads
+//!   the blob once; every READ on that handle serves those bytes.
 //! - **OPEN for writing** records the blob it read as the handle's base;
 //!   **CREATE** opens a handle whose base is "no file". WRITE and a SETATTR
-//!   of the size stage bytes on the handle; a WRITE whose base the path no
-//!   longer holds is `ESTALE` and stages nothing.
+//!   of the size stage bytes on the handle, whatever the store holds now.
 //! - **FLUSH and FSYNC** propose the staged bytes against the handle's base
 //!   through [`leyline_cli_lib::source_write::propose`], on the store's one
-//!   writer: a replace, or a create for a created file. An accepted
-//!   proposal advances the handle's base to the blob it wrote and, when a
-//!   checkout is attached, is materialized into it. A refusal is the
-//!   request's [`Errno`] ([`errno_for`]). The staged bytes stay, so the
-//!   next FLUSH answers the same.
+//!   writer: a replace, or a create for a created file. When another writer
+//!   moved the file since the base, the store merges the two three ways
+//!   (ADR-0045 T5): a clean merge lands, and the handle then serves the
+//!   merged bytes; overlapping edits are `ESTALE`. An accepted proposal
+//!   advances the handle's base to the blob it wrote and, when a checkout is
+//!   attached, is materialized into it. A refusal is the request's [`Errno`]
+//!   ([`errno_for`]). The staged bytes stay, so the next FLUSH answers the
+//!   same.
 //! - **UNLINK** proposes a delete; **RENAME** of a file proposes the delete
 //!   of the old path and the create (or replace) of the new one as one
-//!   proposal, so a write-temp-then-rename save is one change.
+//!   proposal, so a write-temp-then-rename save is one change; RENAME of a
+//!   directory is one proposal over every path under it.
+//! - **MKDIR**, **RMDIR**, **SYMLINK** and a SETATTR of the mode are
+//!   proposals; **READLINK** answers a symlink's stored target.
 //! - **RELEASE** drops the handle. The Linux FUSE client does not return a
 //!   RELEASE error to `close`, so FLUSH is the commit point.
 //!
-//! The store holds files. A created file the store cannot hold (its name
-//! names no language the parse projects: an editor's temp file, a note)
-//! lives in this filesystem's session until it is renamed onto a name the
-//! store can hold, unlinked, or the session ends. MKDIR makes a directory
-//! for the session; a directory is otherwise implied by the files under it.
+//! A created file lives in this filesystem's session from CREATE until its
+//! first FLUSH lands it (or UNLINK drops it); every name a guest can make is
+//! a name the store holds.
 //!
 //! **Read freshness** (ADR-0044 V3): nothing can tell the guest a path
 //! changed, so every OPEN reaches the store and reads the current blob, a
@@ -55,7 +59,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use leyline_cli_lib::daemon::db_pool::LiveDb;
-use leyline_cli_lib::source_write::{self, Accepted, Base, Grant, Proposed, Refusal};
+use leyline_cli_lib::source_write::{self, Accepted, Base, Grant, Mode, Proposed, Refusal};
+use leyline_cli_lib::tree::{self as store_tree, Entry as StoreEntry};
 use leyline_core::Hash;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
@@ -71,6 +76,8 @@ mod daemon_tests;
 mod share_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tree_tests;
 
 /// A Linux errno value: what a refused request answers the guest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +117,7 @@ pub mod open_flags {
 /// Linux `st_mode` file-type bits (`<linux/stat.h>`).
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFLNK: u32 = 0o120000;
 
 /// The inode of the tree's root directory.
 pub const ROOT_INODE: u64 = 1;
@@ -290,12 +298,13 @@ impl<S: Store> Store for Arc<S> {
     }
 }
 
-/// A file or a directory. The store holds files; a directory is a path
-/// prefix some visible file is under, or one this session made.
+/// A file, a directory or a symbolic link: the store's entries (ADR-0045
+/// T1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     File,
     Directory,
+    Symlink,
 }
 
 /// A node's attributes.
@@ -303,11 +312,13 @@ pub enum Kind {
 pub struct Attr {
     pub inode: u64,
     pub kind: Kind,
-    /// Bytes; zero for a directory.
+    /// Bytes (a symlink's: its target's); zero for a directory.
     pub size: u64,
     /// Permission bits: `0o644` for a file the scope may propose, `0o444`
-    /// for one it may only see; `0o755` for a directory the scope may
-    /// propose a path under, `0o555` for one it may not.
+    /// for one it may only see, each with the execute bits where the
+    /// readable ones are for an executable file (`0o755`, `0o555`); `0o755`
+    /// for a directory the scope may propose a path under, `0o555` for one
+    /// it may not; `0o777` for a symlink.
     pub perm: u32,
     /// The node's modification time, since the Unix epoch: the time of the
     /// last change this filesystem recorded for the path, or the clock's
@@ -323,13 +334,14 @@ impl Attr {
         match self.kind {
             Kind::File => S_IFREG + self.perm,
             Kind::Directory => S_IFDIR + self.perm,
+            Kind::Symlink => S_IFLNK + self.perm,
         }
     }
 
-    /// The link count: 1 for a file, 2 for a directory.
+    /// The link count: 2 for a directory, 1 for anything else.
     pub fn nlink(&self) -> u32 {
         match self.kind {
-            Kind::File => 1,
+            Kind::File | Kind::Symlink => 1,
             Kind::Directory => 2,
         }
     }
@@ -353,9 +365,10 @@ pub struct DirEntry {
     pub name: String,
 }
 
-/// The attributes a SETATTR changes. The store holds bytes only: a size is
-/// staged or proposed, a mode or owner is `EPERM`, and times are not
-/// carried.
+/// The attributes a SETATTR changes. A size is staged or proposed; a mode
+/// is a proposal of the file's git mode (executable when any execute bit
+/// is set, regular otherwise; a directory's or symlink's is accepted and
+/// changes nothing); an owner is `EPERM`; times are not carried.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SetAttr {
     pub size: Option<u64>,
@@ -371,22 +384,22 @@ struct Handle {
     path: String,
     base: Base,
     bytes: Vec<u8>,
+    /// A mode an `fchmod` staged on this write handle, proposed with its
+    /// bytes at FLUSH.
+    mode: Option<Mode>,
     dirty: bool,
     writable: bool,
 }
 
-/// What this session holds that the store does not.
+/// What this session holds that the store does not yet.
 #[derive(Default)]
 struct Session {
-    /// Files created here that the store does not hold, with their bytes
-    /// as of the last FLUSH (empty from CREATE). A name the store can hold
-    /// leaves when a proposal lands it; one it cannot hold stays until
-    /// UNLINK, a RENAME onto a name the store can hold, or the end of the
-    /// session.
+    /// Files created here and not landed yet, with their bytes (empty from
+    /// CREATE). A file leaves when its first FLUSH lands it, when UNLINK
+    /// drops it, or when RENAME lands it under its new name.
     pending: BTreeMap<String, Vec<u8>>,
-    /// Directories made by MKDIR, or emptied by UNLINK, RMDIR or RENAME,
-    /// visible until RMDIR.
-    dirs: BTreeSet<String>,
+    /// A mode a `chmod` by path gave a pending file, landed with it.
+    pending_modes: BTreeMap<String, Mode>,
 }
 
 /// Inode numbers, stable per path for the life of the [`StoreFs`]; a
@@ -398,6 +411,22 @@ struct Inodes {
 }
 
 impl Inodes {
+    /// [`Inodes::rename`] of `from` and of every path under it.
+    fn rename_tree(&mut self, from: &str, to: &str) {
+        let prefix = format!("{from}/");
+        let under: Vec<String> = self
+            .by_path
+            .keys()
+            .filter(|p| p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        self.rename(from, to);
+        for path in under {
+            let moved = format!("{to}{}", &path[from.len()..]);
+            self.rename(&path, &moved);
+        }
+    }
+
     /// The inode of `from` now names `to`; the inode `to` named, if any,
     /// names nothing.
     fn rename(&mut self, from: &str, to: &str) {
@@ -472,9 +501,11 @@ fn with_parent(path: &str) -> impl Iterator<Item = &str> {
 struct Stat {
     kind: Kind,
     size: u64,
-    /// The blob of a stored file; `None` for a directory and for a file
-    /// only the session holds.
+    /// The blob of a stored file or symlink; `None` for a directory and for
+    /// a file only the session holds.
     blob: Option<Hash>,
+    /// A file's git mode; `None` for a directory.
+    mode: Option<Mode>,
 }
 
 /// The filesystem: see the crate documentation.
@@ -567,17 +598,17 @@ impl<S: Store> StoreFs<S> {
             let path = join(&dir, &name);
             // A directory's kind is all its attributes carry; asking the
             // store again would scan for the files under it.
-            let size = match kind {
+            let (size, mode) = match kind {
                 Kind::Directory => {
                     self.observe(&path, Some((Kind::Directory, None)));
-                    0
+                    (0, None)
                 }
-                Kind::File => match self.served(&path)? {
-                    Some(stat) => stat.size,
+                Kind::File | Kind::Symlink => match self.served(&path)? {
+                    Some(stat) => (stat.size, stat.mode),
                     None => continue,
                 },
             };
-            let attr = self.attr_of(&path, kind, size);
+            let attr = self.attr_of(&path, kind, size, mode);
             self.tell(&attr);
             let entry = DirEntry {
                 inode: attr.inode,
@@ -664,6 +695,7 @@ impl<S: Store> StoreFs<S> {
             path,
             base,
             bytes,
+            mode: None,
             dirty: truncate,
             writable,
         });
@@ -688,24 +720,14 @@ impl<S: Store> StoreFs<S> {
     }
 
     /// WRITE: stages `data` at `offset` on the handle; a gap past the end
-    /// reads as zeros. Nothing reaches the store until FLUSH or FSYNC.
-    ///
-    /// `ESTALE`, staging nothing, when the handle's base is a blob the path
-    /// no longer holds (another writer changed or deleted the file): the
-    /// store's current `_source.content_hash` for the path is compared with
-    /// the base; no bytes are read or hashed. A created file's base ("no
-    /// file") is checked at FLUSH.
+    /// reads as zeros. Nothing reaches the store until FLUSH or FSYNC, and
+    /// a WRITE never asks it: another writer's change since the handle's
+    /// base is decided at FLUSH, where the two merge (ADR-0045 T6).
     pub fn write(&self, handle: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if !open.writable {
             return Err(Errno::EBADF);
-        }
-        if let Base::Blob(base) = open.base {
-            let current = self.query(|conn| content_hash(conn, &open.path))?;
-            if current != Some(base) {
-                return Err(Errno::ESTALE);
-            }
         }
         let start = offset as usize;
         let end = start + data.len();
@@ -733,8 +755,11 @@ impl<S: Store> StoreFs<S> {
 
     /// SETATTR. A size with a handle (`ftruncate`) stages on it; a size
     /// without one (`truncate`) is a proposal of its own against the
-    /// file's current blob. A mode or owner is `EPERM`; times are not
-    /// carried.
+    /// file's current blob. A mode with a write handle (`fchmod`) stages on
+    /// it; without one (`chmod`) it is a proposal of the file's git mode
+    /// against its current blob, or, for a file not landed yet, lands with
+    /// it. A directory's or symlink's mode changes nothing. An owner is
+    /// `EPERM`; times are not carried.
     pub fn setattr(
         &self,
         inode: u64,
@@ -742,8 +767,11 @@ impl<S: Store> StoreFs<S> {
         set: SetAttr,
     ) -> Result<(Attr, Duration), Errno> {
         let path = self.path_of(inode)?;
-        if set.mode.is_some() || set.uid.is_some() || set.gid.is_some() {
+        if set.uid.is_some() || set.gid.is_some() {
             return Err(Errno::EPERM);
+        }
+        if let Some(bits) = set.mode {
+            self.set_mode(&path, handle, bits)?;
         }
         if let Some(size) = set.size {
             if self.attr(&path)?.kind == Kind::Directory {
@@ -765,11 +793,83 @@ impl<S: Store> StoreFs<S> {
                     }
                     let (base, mut bytes) = self.held(&path)?.ok_or(Errno::ENOENT)?;
                     bytes.resize(size as usize, 0);
-                    self.land(&path, base, bytes)?;
+                    self.land(&path, base, bytes, None)?;
                 }
             }
         }
         self.getattr(inode, handle)
+    }
+
+    /// A SETATTR of the mode `bits` (ADR-0045 T4): see [`StoreFs::setattr`].
+    fn set_mode(&self, path: &str, handle: Option<u64>, bits: u32) -> Result<(), Errno> {
+        let mode = if bits & 0o111 != 0 {
+            Mode::Executable
+        } else {
+            Mode::Regular
+        };
+        let stat = self.served(path)?.ok_or(Errno::ENOENT)?;
+        if stat.kind != Kind::File {
+            return Ok(());
+        }
+        if !self.scope.propose.covers(path) {
+            return Err(Errno::EACCES);
+        }
+        if let Some(open) = handle.and_then(|h| self.handle(h).ok()) {
+            let mut open = open.lock();
+            if open.writable {
+                open.mode = Some(mode);
+                open.dirty = true;
+                return Ok(());
+            }
+        }
+        if stat.mode == Some(mode) {
+            return Ok(());
+        }
+        match self.held(path)?.ok_or(Errno::ENOENT)? {
+            (base @ Base::Blob(_), bytes) => {
+                self.propose(vec![Proposed::write_mode(path, base, bytes, mode)])?;
+            }
+            _ => {
+                self.session
+                    .lock()
+                    .pending_modes
+                    .insert(path.to_string(), mode);
+                self.touch(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// SYMLINK: a symbolic link `name` in `parent` whose target is
+    /// `target`, proposed as a create of the target's bytes with the
+    /// symlink mode (ADR-0045 T4). `EEXIST` when the name exists, `EACCES`
+    /// outside the proposal scope.
+    pub fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<Entry, Errno> {
+        let path = self.child(parent, name)?;
+        if self.kind_of(&path)?.is_some() {
+            return Err(Errno::EEXIST);
+        }
+        if !self.scope.propose.covers(&path) {
+            return Err(Errno::EACCES);
+        }
+        self.propose(vec![Proposed::write_mode(
+            path.as_str(),
+            Base::Absent,
+            target.to_vec(),
+            Mode::Symlink,
+        )])?;
+        let entry = self.entry(&path)?;
+        Ok(entry)
+    }
+
+    /// READLINK: a symbolic link's target. `EINVAL` for anything else.
+    pub fn readlink(&self, inode: u64) -> Result<Vec<u8>, Errno> {
+        let path = self.path_of(inode)?;
+        if self.attr(&path)?.kind != Kind::Symlink {
+            return Err(Errno::EINVAL);
+        }
+        let (_, bytes) = self.held(&path)?.ok_or(Errno::ENOENT)?;
+        Ok(bytes)
     }
 
     /// CREATE: a new file `name` in `parent`, and a handle on it whose base
@@ -791,6 +891,7 @@ impl<S: Store> StoreFs<S> {
             path: path.clone(),
             base: Base::Absent,
             bytes: Vec::new(),
+            mode: None,
             dirty: true,
             writable: flags & open_flags::O_ACCMODE != open_flags::O_RDONLY,
         });
@@ -799,9 +900,8 @@ impl<S: Store> StoreFs<S> {
         Ok((entry, handle))
     }
 
-    /// MKDIR: a directory for this session, visible until RMDIR; nothing is
-    /// proposed (the store holds files). `EEXIST` when the name exists,
-    /// `EACCES` when the scope may propose no path under it.
+    /// MKDIR: a directory, proposed (ADR-0045 T4). `EEXIST` when the name
+    /// exists, `EACCES` when the scope may propose no path under it.
     pub fn mkdir(&self, parent: u64, name: &[u8]) -> Result<Entry, Errno> {
         let path = self.child(parent, name)?;
         if self.kind_of(&path)?.is_some() {
@@ -810,22 +910,20 @@ impl<S: Store> StoreFs<S> {
         if !self.may_propose_under(&path) {
             return Err(Errno::EACCES);
         }
-        self.session.lock().dirs.insert(path.clone());
-        self.touch(&path);
+        self.propose(vec![Proposed::mkdir(path.as_str())])?;
         self.entry(&path)
     }
 
     /// UNLINK: a delete proposal against the blob the file holds; a file
-    /// the store does not hold leaves the session. The directory it was in
-    /// stays, as on a disk, until RMDIR. `EISDIR` on a directory, `EACCES`
-    /// outside the proposal scope.
+    /// not landed yet leaves the session. The directory it was in stays,
+    /// in the store too (ADR-0045 T1), until RMDIR. `EISDIR` on a
+    /// directory, `EACCES` outside the proposal scope.
     pub fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), Errno> {
-        let dir = self.directory(parent)?;
         let path = self.child(parent, name)?;
         match self.kind_of(&path)? {
             None => return Err(Errno::ENOENT),
             Some(Kind::Directory) => return Err(Errno::EISDIR),
-            Some(Kind::File) => {}
+            Some(Kind::File | Kind::Symlink) => {}
         }
         if !self.scope.propose.covers(&path) {
             return Err(Errno::EACCES);
@@ -835,47 +933,48 @@ impl<S: Store> StoreFs<S> {
                 self.propose(vec![Proposed::delete(path.as_str(), base)])?;
             }
             _ => {
-                self.session.lock().pending.remove(&path);
+                let mut session = self.session.lock();
+                session.pending.remove(&path);
+                session.pending_modes.remove(&path);
+                drop(session);
                 self.touch(&path);
             }
         }
-        self.keep_dir(&dir);
         Ok(())
     }
 
-    /// RMDIR: removes a directory that holds nothing. `ENOTEMPTY` when a
-    /// file or directory is under it, `ENOTDIR` on a file.
+    /// RMDIR: an rmdir proposal for a directory that holds nothing.
+    /// `ENOTEMPTY` when a file or directory is under it, `ENOTDIR` on a
+    /// file, `EACCES` when the scope may propose no path under it.
     pub fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), Errno> {
-        let dir = self.directory(parent)?;
         let path = self.child(parent, name)?;
         match self.kind_of(&path)? {
             None => return Err(Errno::ENOENT),
-            Some(Kind::File) => return Err(Errno::ENOTDIR),
+            Some(Kind::File | Kind::Symlink) => return Err(Errno::ENOTDIR),
             Some(Kind::Directory) => {}
         }
         if !self.query(|conn| self.children(conn, &path))?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
-        self.session.lock().dirs.remove(&path);
-        self.touch(&path);
-        self.keep_dir(&dir);
+        if !self.may_propose_under(&path) {
+            return Err(Errno::EACCES);
+        }
+        self.propose(vec![Proposed::rmdir(path.as_str())])?;
         Ok(())
     }
 
     /// RENAME. A file is moved by one proposal: the delete of the old path
     /// against the blob it holds and the create of the new one with its
-    /// bytes, or the replace of the file already there against that file's
-    /// blob. Refused whole, so a refused rename leaves the old path in
-    /// place. A file the store does not hold moves within the session, or,
-    /// renamed onto a name the store can hold, is proposed there as a create
-    /// or replace: a write-temp-then-rename save is one proposal. Handles
-    /// open on the old path follow the file.
+    /// bytes and mode, or the replace of the file already there against
+    /// that file's blob. Refused whole, so a refused rename leaves the old
+    /// path in place. A file not landed yet is proposed at its new name as
+    /// a create or replace: a write-temp-then-rename save is one proposal.
+    /// A directory is moved by one proposal over every path under it
+    /// (ADR-0045 T4). Handles open on the old paths follow the files.
     ///
-    /// `EXDEV` for a stored file renamed to a name the store cannot hold
-    /// and for a directory that holds anything (the caller copies);
     /// `EISDIR`, `ENOTDIR`, `ENOTEMPTY` and `EEXIST` (`RENAME_NOREPLACE`)
-    /// as `rename(2)`; `EINVAL` for `RENAME_EXCHANGE`; `EACCES` outside the
-    /// proposal scope.
+    /// as `rename(2)`; `EINVAL` for `RENAME_EXCHANGE` and for a directory
+    /// moved under itself; `EACCES` outside the proposal scope.
     pub fn rename(
         &self,
         olddir: u64,
@@ -887,7 +986,6 @@ impl<S: Store> StoreFs<S> {
         if flags & !rename_flags::RENAME_NOREPLACE != 0 {
             return Err(Errno::EINVAL);
         }
-        let from_dir = self.directory(olddir)?;
         let from = self.child(olddir, oldname)?;
         let to = self.child(newdir, newname)?;
         let kind = self.kind_of(&from)?.ok_or(Errno::ENOENT)?;
@@ -900,40 +998,61 @@ impl<S: Store> StoreFs<S> {
         }
         match kind {
             Kind::Directory => self.rename_directory(&from, &to, target)?,
-            Kind::File => self.rename_file(&from, &to, target)?,
+            Kind::File | Kind::Symlink => self.rename_file(&from, &to, target)?,
         }
-        self.keep_dir(&from_dir);
-        self.inodes.lock().rename(&from, &to);
+        self.inodes.lock().rename_tree(&from, &to);
         Ok(())
     }
 
-    /// RENAME of a directory: one this session made and that holds
-    /// nothing moves within the session; one that holds anything is
-    /// `EXDEV`.
+    /// RENAME of a directory: one proposal over every path under it
+    /// ([`source_write::rename_dir`]); an empty directory at `to` is
+    /// replaced.
     fn rename_directory(&self, from: &str, to: &str, target: Option<Kind>) -> Result<(), Errno> {
         if to.starts_with(&join(from, "")) {
             return Err(Errno::EINVAL);
         }
         match target {
-            Some(Kind::File) => return Err(Errno::ENOTDIR),
+            Some(Kind::File | Kind::Symlink) => return Err(Errno::ENOTDIR),
             Some(Kind::Directory) if !self.query(|c| self.children(c, to))?.is_empty() => {
                 return Err(Errno::ENOTEMPTY);
             }
             _ => {}
         }
-        if !self.query(|conn| self.children(conn, from))?.is_empty() {
-            return Err(Errno::EXDEV);
-        }
-        if !self.may_propose_under(to) {
-            return Err(Errno::EACCES);
-        }
+        // The proposal's grant check answers `EACCES` for a path outside
+        // the proposal scope at either end.
+        let writes = self
+            .store
+            .with_read(|conn| source_write::rename_dir(conn, from, to))
+            .map_err(|e| {
+                log::info!("rename of '{from}' to '{to}' not planned: {e:#}");
+                Errno::EIO
+            })?;
+        self.propose(writes)?;
+        let prefix = join(from, "");
         {
             let mut session = self.session.lock();
-            session.dirs.remove(from);
-            session.dirs.insert(to.to_string());
+            let pending: Vec<String> = session
+                .pending
+                .keys()
+                .filter(|p| p.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for path in pending {
+                let moved = format!("{to}{}", &path[from.len()..]);
+                if let Some(bytes) = session.pending.remove(&path) {
+                    session.pending.insert(moved.clone(), bytes);
+                }
+                if let Some(mode) = session.pending_modes.remove(&path) {
+                    session.pending_modes.insert(moved, mode);
+                }
+            }
         }
-        self.touch(from);
-        self.touch(to);
+        for open in self.handles.lock().values() {
+            let mut open = open.lock();
+            if open.path.starts_with(&prefix) {
+                open.path = format!("{to}{}", &open.path[from.len()..]);
+            }
+        }
         Ok(())
     }
 
@@ -943,45 +1062,41 @@ impl<S: Store> StoreFs<S> {
             return Err(Errno::EISDIR);
         }
         let (base, bytes) = self.held(from)?.ok_or(Errno::ENOENT)?;
-        let holdable = self.can_hold(to);
         let stored = matches!(base, Base::Blob(_));
-        if stored && !holdable {
-            return Err(Errno::EXDEV);
-        }
-        if !self.scope.propose.covers(from) || !self.scope.propose.covers(to) {
-            return Err(Errno::EACCES);
-        }
-        let moved = if holdable {
-            let target_base = match self.held(to)? {
-                Some((blob @ Base::Blob(_), _)) => blob,
-                _ => Base::Absent,
-            };
-            let mut writes = Vec::with_capacity(2);
-            if stored {
-                writes.push(Proposed::delete(from, base));
-            }
-            writes.push(Proposed::write(to, target_base, bytes));
-            let accepted = self.propose(writes)?;
-            {
-                let mut session = self.session.lock();
-                session.pending.remove(from);
-                session.pending.remove(to);
-            }
-            // The proposal names `from` only when the store held it.
-            if !stored {
-                self.touch(from);
-            }
-            landed(&accepted, to)?
-        } else {
-            {
-                let mut session = self.session.lock();
-                session.pending.remove(from);
-                session.pending.insert(to.to_string(), bytes);
-            }
-            self.touch(from);
-            self.touch(to);
-            Base::Absent
+        // The proposal's grant check answers `EACCES` for a path outside
+        // the proposal scope at either end.
+        let mode = match self.served(from)?.and_then(|s| s.mode) {
+            Some(mode) => mode,
+            None => self
+                .session
+                .lock()
+                .pending_modes
+                .get(from)
+                .copied()
+                .unwrap_or(Mode::Regular),
         };
+        let target_base = match self.held(to)? {
+            Some((blob @ Base::Blob(_), _)) => blob,
+            _ => Base::Absent,
+        };
+        let mut writes = Vec::with_capacity(2);
+        if stored {
+            writes.push(Proposed::delete(from, base));
+        }
+        writes.push(Proposed::write_mode(to, target_base, bytes, mode));
+        let accepted = self.propose(writes)?;
+        {
+            let mut session = self.session.lock();
+            for path in [from, to] {
+                session.pending.remove(path);
+                session.pending_modes.remove(path);
+            }
+        }
+        // The proposal names `from` only when the store held it.
+        if !stored {
+            self.touch(from);
+        }
+        let moved = landed(&accepted, to)?;
         for open in self.handles.lock().values() {
             let mut open = open.lock();
             if open.path == from {
@@ -992,60 +1107,88 @@ impl<S: Store> StoreFs<S> {
         Ok(())
     }
 
-    /// FLUSH and FSYNC: propose the handle's staged bytes against its base.
+    /// FLUSH and FSYNC: propose the handle's staged bytes (and staged mode)
+    /// against its base. When the store merged them with another writer's
+    /// change, the handle serves the merged bytes from then on.
     fn commit(&self, handle: u64) -> Result<(), Errno> {
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if !open.dirty {
             return Ok(());
         }
-        open.base = self.land(&open.path, open.base.clone(), open.bytes.clone())?;
+        let (base, merged) =
+            self.land(&open.path, open.base.clone(), open.bytes.clone(), open.mode)?;
+        if let Some(merged) = merged {
+            open.bytes = merged;
+        }
+        open.base = base;
+        open.mode = None;
         open.dirty = false;
         Ok(())
     }
 
-    /// Land `bytes` at `path` against `base`, answering the base a later
-    /// write is checked against. A blob base is a replace. A file the store
-    /// does not hold yet ([`Base::Absent`]) takes the bytes in the session
-    /// (what a later open or rename of it carries, landed or not), and is
-    /// proposed as a create when the store can hold its name; one unlinked
-    /// since it was created lands nothing.
-    fn land(&self, path: &str, base: Base, bytes: Vec<u8>) -> Result<Base, Errno> {
+    /// Land `bytes` (with `mode`, when set) at `path` against `base`,
+    /// answering the base a later write is checked against and, when the
+    /// store merged them with another writer's change, the merged bytes. A
+    /// blob base is a replace. A file not landed yet ([`Base::Absent`])
+    /// takes the bytes in the session (what a later open or rename of it
+    /// carries) and is proposed as a create; one unlinked since it was
+    /// created lands nothing.
+    fn land(
+        &self,
+        path: &str,
+        base: Base,
+        bytes: Vec<u8>,
+        mode: Option<Mode>,
+    ) -> Result<(Base, Option<Vec<u8>>), Errno> {
+        let mut mode = mode;
         if base == Base::Absent {
             let mut session = self.session.lock();
             let Some(held) = session.pending.get_mut(path) else {
-                return Ok(Base::Absent);
+                return Ok((Base::Absent, None));
             };
             held.clone_from(&bytes);
-            if !self.can_hold(path) {
-                drop(session);
-                self.touch(path);
-                return Ok(Base::Absent);
-            }
+            mode = mode.or_else(|| session.pending_modes.get(path).copied());
         }
-        let accepted = self.propose(vec![Proposed::write(path, base, bytes)])?;
-        self.session.lock().pending.remove(path);
-        landed(&accepted, path)
-    }
-
-    /// Whether the store can hold a created file at `path`
-    /// ([`source_write::can_hold`]), within the attached checkout's
-    /// `--language` filter: a file the checkout would never write out, and
-    /// whose next whole-directory parse would drop it, stays in the session.
-    fn can_hold(&self, path: &str) -> bool {
-        let filter = self
-            .options
-            .checkout
-            .as_ref()
-            .and_then(|c| c.lang_filter.as_deref());
-        source_write::can_hold(path, filter)
+        let write = match mode {
+            Some(mode) => Proposed::write_mode(path, base, bytes, mode),
+            None => Proposed::write(path, base, bytes),
+        };
+        let accepted = self.propose(vec![write])?;
+        {
+            let mut session = self.session.lock();
+            session.pending.remove(path);
+            session.pending_modes.remove(path);
+        }
+        let landed = landed(&accepted, path)?;
+        let merged = match (&landed, accepted.merged.contains(path)) {
+            (Base::Blob(blob), true) => {
+                let blob = *blob;
+                Some(
+                    self.query(|conn| store_tree::blob_bytes(conn, blob))?
+                        .ok_or(Errno::EIO)?,
+                )
+            }
+            _ => None,
+        };
+        Ok((landed, merged))
     }
 
     /// A proposal through the store's writer (ADR-0042), then materialized
     /// into the checkout under the same writer, as the daemon's `propose`
     /// op does.
     fn propose(&self, writes: Vec<Proposed>) -> Result<Accepted, Errno> {
-        let paths: Vec<String> = writes.iter().map(|w| w.path.clone()).collect();
+        let mut paths: Vec<String> = writes.iter().map(|w| w.path.clone()).collect();
+        // A created path's new parent directories are checked out too.
+        let parents: BTreeSet<String> = paths
+            .iter()
+            .flat_map(|p| {
+                store_tree::parents(p)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        paths.extend(parents);
         let named = paths.join("', '");
         let accepted = self
             .store
@@ -1082,15 +1225,31 @@ impl<S: Store> StoreFs<S> {
             log::warn!("proposal to '{named}' landed; publishing it failed: {e:#}");
         }
         let now = self.clock.now();
+        // What each landed path is now, as the guest will be served it.
+        let mut landed: Vec<(String, Seen)> = Vec::new();
+        for path in accepted.blobs.keys() {
+            let stat = self.query(|conn| self.stat_path(conn, path))?;
+            landed.push((path.clone(), stat.map(|s| (s.kind, s.blob))));
+        }
+        landed.extend(accepted.removed.iter().map(|p| (p.clone(), None)));
+        landed.extend(accepted.rmdirs.iter().map(|p| (p.clone(), None)));
+        landed.extend(
+            accepted
+                .mkdirs
+                .iter()
+                .map(|p| (p.clone(), Some((Kind::Directory, None)))),
+        );
+        let merged: Vec<u64> = accepted.merged.iter().map(|p| self.inode_of(p)).collect();
         let mut served = self.served.lock();
-        let written = accepted
-            .blobs
-            .iter()
-            .map(|(path, blob)| (path, Some((Kind::File, Some(*blob)))));
-        let removed = accepted.removed.iter().map(|path| (path, None));
-        for (path, seen) in written.chain(removed) {
+        for (path, seen) in landed {
             served.seen.insert(path.clone(), seen);
-            served.record_change(path, now);
+            served.record_change(&path, now);
+        }
+        // A merged file holds bytes no guest page holds: its next open
+        // drops the guest's pages and, serving another size than the guest
+        // was told, reads directly (ADR-0045 T6).
+        for inode in merged {
+            served.pages.remove(&inode);
         }
         drop(served);
         Ok(accepted)
@@ -1167,13 +1326,6 @@ impl<S: Store> StoreFs<S> {
         })
     }
 
-    /// A directory a file left stays for the session, as on a disk.
-    fn keep_dir(&self, dir: &str) {
-        if !dir.is_empty() {
-            self.session.lock().dirs.insert(dir.to_string());
-        }
-    }
-
     /// Whether the scope may propose some path under the directory `dir`.
     fn may_propose_under(&self, dir: &str) -> bool {
         match &self.scope.propose {
@@ -1225,22 +1377,30 @@ impl<S: Store> StoreFs<S> {
         let path = self.path_of(inode)?;
         match self.attr(&path)?.kind {
             Kind::Directory => Ok(path),
-            Kind::File => Err(Errno::ENOTDIR),
+            Kind::File | Kind::Symlink => Err(Errno::ENOTDIR),
         }
     }
 
     /// The attributes of `path`, as [`StoreFs::observe`] serves it.
     fn attr(&self, path: &str) -> Result<Attr, Errno> {
         let stat = self.served(path)?.ok_or(Errno::ENOENT)?;
-        Ok(self.attr_of(path, stat.kind, stat.size))
+        Ok(self.attr_of(path, stat.kind, stat.size, stat.mode))
     }
 
-    fn attr_of(&self, path: &str, kind: Kind, size: u64) -> Attr {
+    fn attr_of(&self, path: &str, kind: Kind, size: u64, mode: Option<Mode>) -> Attr {
         let perm = match kind {
             Kind::Directory if self.may_propose_under(path) => 0o755,
             Kind::Directory => 0o555,
-            Kind::File if self.scope.propose.covers(path) => 0o644,
-            Kind::File => 0o444,
+            Kind::Symlink => 0o777,
+            Kind::File => match (
+                self.scope.propose.covers(path),
+                mode == Some(Mode::Executable),
+            ) {
+                (true, true) => 0o755,
+                (true, false) => 0o644,
+                (false, true) => 0o555,
+                (false, false) => 0o444,
+            },
         };
         Attr {
             inode: self.inode_of(path),
@@ -1266,80 +1426,112 @@ impl<S: Store> StoreFs<S> {
         self.served.lock().touch(path, now);
     }
 
-    /// What `path` is for the guest: a file the store holds a blob for and
-    /// the scope sees, a file this session created that the store does not
-    /// hold, a directory some such file is under or this session made, or
-    /// nothing. The root is always a directory.
+    /// What `path` is for the guest: an entry of the store's manifest the
+    /// scope sees (a file or symlink the scope's `see` covers; a directory
+    /// with the whole tree in sight, or with a visible file under it), a
+    /// file this session created and has not landed, or nothing. The root
+    /// is always a directory.
     fn stat_path(&self, conn: &Connection, path: &str) -> anyhow::Result<Option<Stat>> {
-        if self.scope.see.covers(path) {
-            let row: Option<(i64, Vec<u8>)> = conn
-                .query_row(
-                    "SELECT length(b.blob_bytes), s.content_hash FROM _source s \
-                       JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = ?1",
-                    [path],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if let Some((size, hash)) = row {
+        let dir = Some(Stat {
+            kind: Kind::Directory,
+            size: 0,
+            blob: None,
+            mode: None,
+        });
+        if path.is_empty() {
+            return Ok(dir);
+        }
+        let row: Option<(u32, Option<Vec<u8>>, Option<i64>)> = conn
+            .prepare_cached(
+                "SELECT t.mode, t.blob_hash, length(b.blob_bytes) FROM _tree t \
+                   LEFT JOIN source_blobs b ON b.blob_hash = t.blob_hash WHERE t.path = ?1",
+            )?
+            .query_row([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        match row {
+            Some((store_tree::DIRECTORY_MODE, _, _)) => {
+                if self.scope.see == Grant::Whole || !self.children(conn, path)?.is_empty() {
+                    return Ok(dir);
+                }
+            }
+            Some((git_mode, Some(hash), Some(size))) if self.scope.see.covers(path) => {
+                let mode = Mode::from_git(git_mode).unwrap_or(Mode::Regular);
                 return Ok(Some(Stat {
-                    kind: Kind::File,
+                    kind: if mode == Mode::Symlink {
+                        Kind::Symlink
+                    } else {
+                        Kind::File
+                    },
                     size: size as u64,
                     blob: Some(blob_hash(path, hash)?),
+                    mode: Some(mode),
                 }));
             }
+            _ => {}
         }
-        let node = |kind, size| {
-            Some(Stat {
-                kind,
-                size,
-                blob: None,
-            })
-        };
-        {
-            let session = self.session.lock();
-            if let Some(bytes) = session.pending.get(path) {
-                return Ok(node(Kind::File, bytes.len() as u64));
-            }
-            if session.dirs.contains(path) {
-                return Ok(node(Kind::Directory, 0));
-            }
-        }
-        let is_dir = path.is_empty() || !self.children(conn, path)?.is_empty();
-        Ok(if is_dir {
-            node(Kind::Directory, 0)
-        } else {
-            None
-        })
+        let session = self.session.lock();
+        Ok(session.pending.get(path).map(|bytes| Stat {
+            kind: Kind::File,
+            size: bytes.len() as u64,
+            blob: None,
+            mode: Some(
+                session
+                    .pending_modes
+                    .get(path)
+                    .copied()
+                    .unwrap_or(Mode::Regular),
+            ),
+        }))
     }
 
-    /// The names directly under the directory `dir`: the stored files the
-    /// scope sees, and this session's files and directories.
+    /// The names directly under the directory `dir`: the store's entries
+    /// the scope sees, and this session's files not landed yet.
     fn children(&self, conn: &Connection, dir: &str) -> anyhow::Result<BTreeMap<String, Kind>> {
         let prefix = join(dir, "");
         let mut stmt = conn.prepare_cached(
-            "SELECT s.id FROM _source s JOIN source_blobs b ON b.blob_hash = s.content_hash \
-              WHERE substr(s.id, 1, length(?1)) = ?1",
+            "SELECT path, mode FROM _tree WHERE substr(path, 1, length(?1)) = ?1",
         )?;
+        let whole = self.scope.see == Grant::Whole;
         let mut out = BTreeMap::new();
-        let mut add = |rest: &str, leaf: Kind| match rest.split_once('/') {
-            Some((name, _)) => out.insert(name.to_string(), Kind::Directory),
-            None => out.insert(rest.to_string(), leaf),
-        };
-        for id in stmt.query_map([&prefix], |r| r.get::<_, String>(0))? {
-            let id = id?;
-            if self.scope.see.covers(&id) {
-                add(&id[prefix.len()..], Kind::File);
+        for row in stmt.query_map([&prefix], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+        })? {
+            let (path, git_mode) = row?;
+            let is_dir = git_mode == store_tree::DIRECTORY_MODE;
+            let rest = &path[prefix.len()..];
+            match rest.split_once('/') {
+                // A directory is listed with the whole tree in sight, or
+                // when a file the scope sees is under it.
+                Some((name, _)) => {
+                    if whole || (!is_dir && self.scope.see.covers(&path)) {
+                        out.insert(name.to_string(), Kind::Directory);
+                    }
+                }
+                None if is_dir => {
+                    if whole {
+                        out.insert(rest.to_string(), Kind::Directory);
+                    }
+                }
+                None => {
+                    if self.scope.see.covers(&path) {
+                        let kind = if Mode::from_git(git_mode) == Some(Mode::Symlink) {
+                            Kind::Symlink
+                        } else {
+                            Kind::File
+                        };
+                        out.insert(rest.to_string(), kind);
+                    }
+                }
             }
         }
         let session = self.session.lock();
         // The session's paths are never empty and never end in `/`, so a
         // path under `prefix` is longer than it.
-        let under = |p: &&String| p.starts_with(&prefix);
-        for path in session.pending.keys().filter(under) {
-            add(&path[prefix.len()..], Kind::File);
-        }
-        for path in session.dirs.iter().filter(under) {
-            add(&path[prefix.len()..], Kind::Directory);
+        for path in session.pending.keys().filter(|p| p.starts_with(&prefix)) {
+            match path[prefix.len()..].split_once('/') {
+                Some((name, _)) => out.insert(name.to_string(), Kind::Directory),
+                None => out.insert(path[prefix.len()..].to_string(), Kind::File),
+            };
         }
         Ok(out)
     }
@@ -1361,31 +1553,13 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-/// The blob `path` holds and its bytes, or `None` when the store holds none.
+/// The blob the file or symlink at `path` holds and its bytes, or `None`
+/// when the store holds none there.
 fn blob_of(conn: &Connection, path: &str) -> anyhow::Result<Option<(Hash, Vec<u8>)>> {
-    let row: Option<(Vec<u8>, Vec<u8>)> = conn
-        .query_row(
-            "SELECT s.content_hash, b.blob_bytes FROM _source s \
-               JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = ?1",
-            [path],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    row.map(|(hash, bytes)| Ok((blob_hash(path, hash)?, bytes)))
-        .transpose()
-}
-
-/// The blob `_source.content_hash` names for `path`, without reading the
-/// blob: what a WRITE checks its handle's base against.
-fn content_hash(conn: &Connection, path: &str) -> anyhow::Result<Option<Hash>> {
-    let hash: Option<Option<Vec<u8>>> = conn
-        .query_row(
-            "SELECT content_hash FROM _source WHERE id = ?1",
-            [path],
-            |r| r.get(0),
-        )
-        .optional()?;
-    hash.flatten().map(|h| blob_hash(path, h)).transpose()
+    let Some(StoreEntry::File { blob, .. }) = store_tree::entry(conn, path)? else {
+        return Ok(None);
+    };
+    Ok(store_tree::blob_bytes(conn, blob)?.map(|bytes| (blob, bytes)))
 }
 
 fn blob_hash(path: &str, hash: Vec<u8>) -> anyhow::Result<Hash> {
@@ -1407,15 +1581,21 @@ fn landed(accepted: &Accepted, path: &str) -> Result<Base, Errno> {
 
 /// The errno a proposal that was not applied answers: a create whose path
 /// another writer filled first is `EEXIST`; any other stale base (a file
-/// that moved, or was deleted) `ESTALE`; a path outside the grant
-/// `EACCES`; a file no longer there `ENOENT`; and a syntax refusal, every
-/// other refusal and every internal failure `EIO`.
+/// that moved, or was deleted, and did not merge) `ESTALE`; a path outside
+/// the grant `EACCES`; a path no longer there `ENOENT`; a directory change
+/// that does not fit the path `EEXIST`, `ENOTEMPTY`, `ENOTDIR` or `EISDIR`
+/// as `mkdir(2)`, `rmdir(2)` and `open(2)` answer; a path under a file
+/// `ENOTDIR`; every other refusal and every internal failure `EIO`.
 pub fn errno_for(err: &anyhow::Error) -> Errno {
     match err.downcast_ref::<Refusal>() {
         Some(Refusal::Stale(moved)) if moved.iter().all(|m| m.expected.is_none()) => Errno::EEXIST,
-        Some(Refusal::Stale(_)) => Errno::ESTALE,
+        Some(Refusal::Stale(_) | Refusal::Conflict { .. }) => Errno::ESTALE,
         Some(Refusal::OutsideGrant { .. }) => Errno::EACCES,
         Some(Refusal::NoSuchFile { .. }) => Errno::ENOENT,
+        Some(Refusal::Exists { .. }) => Errno::EEXIST,
+        Some(Refusal::NotEmpty { .. }) => Errno::ENOTEMPTY,
+        Some(Refusal::NotADirectory { .. } | Refusal::PathConflict { .. }) => Errno::ENOTDIR,
+        Some(Refusal::IsADirectory { .. }) => Errno::EISDIR,
         _ => Errno::EIO,
     }
 }

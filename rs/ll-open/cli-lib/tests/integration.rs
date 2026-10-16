@@ -3510,10 +3510,12 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     )
     .await;
     assert_eq!(read["ok"], true, "{read}");
+    assert_eq!(read["mode"], "100644", "{read}");
     check("read_source", &read);
     let base = read["blob_hash"].as_str().unwrap().to_string();
 
-    // Another writer moves the file; the first author's base is stale.
+    // Another writer moves the file; the first author's edit overlaps it,
+    // so the merge conflicts on the one line both changed (ADR-0045 T5).
     let moved = uds_round_trip(
         &sock_path,
         r#"{"op": "propose", "writes": [{"path": "src/main.rs", "base": "any", "content": "fn main() { let _ = 1; }\n"}]}"#,
@@ -3529,15 +3531,76 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     )
     .await;
     assert_eq!(stale["refusal"]["reason"], "stale", "{stale}");
+    assert_eq!(
+        stale["refusal"]["moved"][0]["conflicts"],
+        serde_json::json!([{"start": 0, "end": 1}]),
+        "{stale}"
+    );
     check("propose", &stale);
+
+    // An edit that touches other lines against the same moved base merges.
+    let merged = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "src/main.rs", "base": base, "content": "fn main() {}\n\nfn ours() {}\n"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(merged["ok"], true, "{merged}");
+    assert_eq!(
+        merged["merged"],
+        serde_json::json!(["src/main.rs"]),
+        "{merged}"
+    );
+    let after = uds_round_trip(
+        &sock_path,
+        r#"{"op": "read_source", "path": "src/main.rs"}"#,
+    )
+    .await;
+    assert_eq!(
+        after["content"],
+        "fn main() { let _ = 1; }\n\nfn ours() {}\n"
+    );
+    check("propose_merged", &merged);
+
+    // Any bytes at any path, modes, symlinks and directories (T4).
+    let tree = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "docs/empty", "kind": "mkdir", "base": "absent"},
+            {"path": "README.md", "kind": "create", "base": "absent", "content": "# tree\n"},
+            {"path": "run.sh", "kind": "create", "base": "absent", "content": "#!/bin/sh\n", "mode": "100755"},
+            {"path": "main.link", "kind": "create", "base": "absent", "content": "src/main.rs", "mode": "120000"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(tree["ok"], true, "{tree}");
+    check("propose_tree", &tree);
+    let script = uds_round_trip(&sock_path, r#"{"op": "read_source", "path": "run.sh"}"#).await;
+    assert_eq!(script["mode"], "100755", "{script}");
+    let link = uds_round_trip(&sock_path, r#"{"op": "read_source", "path": "main.link"}"#).await;
+    assert_eq!(
+        (&link["mode"], &link["content"]),
+        (&"120000".into(), &"src/main.rs".into())
+    );
 
     let refused = uds_round_trip(
         &sock_path,
-        r#"{"op": "propose", "writes": [{"path": "src/main.rs", "base": "any", "content": "fn main() {\n"}]}"#,
+        r#"{"op": "propose", "writes": [{"path": "src", "kind": "rmdir", "base": "any"}]}"#,
     )
     .await;
-    assert_eq!(refused["refusal"]["reason"], "syntax", "{refused}");
+    assert_eq!(refused["refusal"]["reason"], "not_empty", "{refused}");
     check("propose_refused", &refused);
+
+    // A half-written file lands; it no longer refuses as `syntax`.
+    let half = uds_round_trip(
+        &sock_path,
+        r#"{"op": "propose", "writes": [{"path": "src/old.rs", "base": "any", "content": "fn old( {\n"}]}"#,
+    )
+    .await;
+    assert_eq!(half["ok"], true, "{half}");
 
     // Bead `ley-line-open-47fb03`: a create over a file is stale with an
     // `absent` base; a create and a delete land as one proposal.

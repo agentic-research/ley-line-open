@@ -386,4 +386,25 @@ impl<F: FsService> DynFileSystem for ShareFs<F> {
     fn access(&self, _ctx: Context, _inode: u64, _mask: u32) -> io::Result<()> {
         Ok(())
     }
+
+    fn readlink(&self, _ctx: Context, inode: u64) -> io::Result<Vec<u8>> {
+        match self.call(Request::Readlink { inode })? {
+            Reply::Data { data } => Ok(data),
+            _ => Err(unexpected()),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _ctx: Context,
+        linkname: &CStr,
+        parent: u64,
+        name: &CStr,
+    ) -> io::Result<KrunEntry> {
+        self.entry(Request::Symlink {
+            parent,
+            name: bytes(name),
+            target: bytes(linkname),
+        })
+    }
 }

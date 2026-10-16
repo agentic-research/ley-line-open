@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Thu, 15 Oct 2026 18:00:00 -0600
+Subject: [PATCH] devices/fs: forward READLINK and SYMLINK through DynFileSystem
+
+The server dispatches READLINK and SYMLINK to `FileSystem::readlink` and
+`FileSystem::symlink`; `DynFs` did not forward them, so a
+`DynFileSystem` backend answered ENOSYS and a guest could neither read
+nor make a symbolic link on the share.
+
+Add `DynFileSystem::readlink` and `DynFileSystem::symlink` with ENOSYS
+defaults and forward both from `DynFs`. The symlink's `Entry` counts as
+one lookup, which the kernel FORGETs.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+---
+ src/devices/src/virtio/fs/dyn_fs.rs | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/src/devices/src/virtio/fs/dyn_fs.rs b/src/devices/src/virtio/fs/dyn_fs.rs
+index 214ec8e6..a5d980f8 100644
+--- a/src/devices/src/virtio/fs/dyn_fs.rs
++++ b/src/devices/src/virtio/fs/dyn_fs.rs
+@@ -211,6 +211,21 @@ pub trait DynFileSystem: Send + Sync {
+     fn access(&self, ctx: Context, inode: u64, mask: u32) -> io::Result<()> {
+         enosys()
+     }
++    /// READLINK: the target of the symbolic link `inode`.
++    fn readlink(&self, ctx: Context, inode: u64) -> io::Result<Vec<u8>> {
++        enosys()
++    }
++    /// SYMLINK: a symbolic link `name` in `parent` whose target is
++    /// `linkname`. The returned `Entry` counts as one lookup.
++    fn symlink(
++        &self,
++        ctx: Context,
++        linkname: &CStr,
++        parent: u64,
++        name: &CStr,
++    ) -> io::Result<Entry> {
++        enosys()
++    }
+ 
+     /// DAX: return the host address of `len` bytes holding the file's contents
+     /// from `foffset`. The memory must be host-page aligned and stay valid
+@@ -528,4 +543,17 @@ impl FileSystem for DynFs {
+     fn access(&self, ctx: Context, inode: u64, mask: u32) -> io::Result<()> {
+         self.0.access(ctx, inode, mask)
+     }
++    fn readlink(&self, ctx: Context, inode: u64) -> io::Result<Vec<u8>> {
++        self.0.readlink(ctx, inode)
++    }
++    fn symlink(
++        &self,
++        ctx: Context,
++        linkname: &CStr,
++        parent: u64,
++        name: &CStr,
++        _extensions: Extensions,
++    ) -> io::Result<Entry> {
++        self.0.symlink(ctx, linkname, parent, name)
++    }
+ }
+-- 
+2.50.1
+

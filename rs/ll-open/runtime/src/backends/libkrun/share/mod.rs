@@ -45,6 +45,8 @@ pub const FOPEN_CACHE_DIR: u32 = 1 << 3;
 pub const DT_DIR: u32 = 4;
 /// `DT_REG` (`<dirent.h>`).
 pub const DT_REG: u32 = 8;
+/// `DT_LNK` (`<dirent.h>`).
+pub const DT_LNK: u32 = 10;
 /// Linux `EIO`: what the device answers when the service cannot be reached.
 pub const LINUX_EIO: i32 = 5;
 
@@ -87,7 +89,7 @@ pub struct Entry {
 pub struct DirEntry {
     pub inode: u64,
     pub offset: u64,
-    /// `DT_REG` or `DT_DIR`.
+    /// `DT_REG`, `DT_DIR` or `DT_LNK`.
     pub kind: u32,
     pub name: Vec<u8>,
 }
@@ -175,6 +177,16 @@ pub enum Request {
     Readdirplus {
         inode: u64,
         offset: u64,
+    },
+    /// SYMLINK: a link `name` in `parent` whose target is `target`.
+    Symlink {
+        parent: u64,
+        name: Vec<u8>,
+        target: Vec<u8>,
+    },
+    /// READLINK: answered with [`Reply::Data`], the link's target.
+    Readlink {
+        inode: u64,
     },
 }
 

@@ -28,7 +28,9 @@ context, scoping notes, and review history are recoverable.
     table `_parse_diagnostics`: syntax errors are projected with their
     error nodes; a binary or oversized file is stored with no projection
     rows. `projection-v7`; a v6 arena is refused at parse open and rebuilt
-    cold.
+    cold. `leyline splice` follows the same write path: a syntax-breaking
+    splice is stored with its diagnostic instead of refused
+    (`tools/cli_smoke.sh` asserts the new behavior).
   - `source_write::propose_with(.., Rules::Tree)` takes any bytes at any
     plain path, `Change::Write { bytes, mode }`, `Mkdir`, `Rmdir`, and
     `rename_dir`; a write against a moved base is merged with `gix-merge`

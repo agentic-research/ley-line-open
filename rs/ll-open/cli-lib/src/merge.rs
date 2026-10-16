@@ -96,12 +96,16 @@ fn conflict_ranges(base: &[u8], ours: &[u8], theirs: &[u8]) -> Vec<LineRange> {
     let mut all = hunks(base, ours, Side::Ours);
     all.extend(hunks(base, theirs, Side::Theirs));
     all.sort_by_key(|h| h.before.start);
+    // Each pass that continues consumes at least one hunk, so the passes are
+    // bounded by the hunk count. The bound also keeps a broken stop condition
+    // from spinning (a mutant of it times out instead of failing).
+    let passes = all.len();
     let mut iter = all.into_iter().peekable();
     let mut out: Vec<LineRange> = Vec::new();
     while let Some(first) = iter.next() {
         let mut taken = vec![first];
         let mut intersecting: Vec<Hunk> = Vec::new();
-        loop {
+        for _ in 0..passes {
             let last = taken.last().expect("one pushed").clone();
             while let Some(h) = iter.next_if(|h| overlaps(h, &last)) {
                 intersecting.push(h);
@@ -171,6 +175,31 @@ mod tests {
         assert_eq!(
             merge(BASE.as_bytes(), BASE.as_bytes(), ours.as_bytes()),
             Merged::Clean(ours.into_bytes())
+        );
+    }
+
+    /// A chain of alternating overlaps (ours 2..4, theirs 3..6, ours 5..8,
+    /// theirs 7..10, ours 9..11) is one conflict: clustering continues past
+    /// its first pass until no hunk of either side overlaps it.
+    #[test]
+    fn a_chain_of_alternating_overlaps_is_one_conflict() {
+        let base: String = (0..14).map(|i| format!("l{i}\n")).collect();
+        let change = |lines: &[usize], tag: &str| -> String {
+            (0..14)
+                .map(|i| {
+                    if lines.contains(&i) {
+                        format!("{tag}{i}\n")
+                    } else {
+                        format!("l{i}\n")
+                    }
+                })
+                .collect()
+        };
+        let ours = change(&[2, 3, 5, 6, 7, 9, 10], "o");
+        let theirs = change(&[3, 4, 5, 7, 8, 9], "t");
+        assert_eq!(
+            merge(base.as_bytes(), ours.as_bytes(), theirs.as_bytes()),
+            Merged::Conflict(vec![LineRange { start: 2, end: 11 }])
         );
     }
 

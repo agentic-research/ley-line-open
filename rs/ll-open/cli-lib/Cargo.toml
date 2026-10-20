@@ -9,8 +9,8 @@ default = ["lsp", "validate", "hdc", "cdc"]
 lsp = ["dep:leyline-lsp"]
 # Tree-sitter syntactic validation surface exposed as a daemon op for
 # mache's writeback path (ley-line-open-fa8638). Pulls leyline-fs's
-# `validate` feature only; does not pull `fuse`/`nfs`. Default-on so
-# the op is always available; turn off for ultra-slim builds.
+# `validate` feature. Default-on so the op is always available; turn off
+# for ultra-slim builds.
 validate = ["leyline-fs/validate"]
 vec = ["dep:sqlite-vec", "dep:fastembed"]
 # HDC structural-equivalence surface exposed as daemon ops

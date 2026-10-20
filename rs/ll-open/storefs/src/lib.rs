@@ -1,5 +1,6 @@
 //! The store-backed filesystem core behind LLO's virtio-fs device (ADR-0044
-//! V2, bead `ley-line-open-f1ea99`).
+//! V2, bead `ley-line-open-f1ea99`) and, with the `mount` feature, behind
+//! the host's FUSE and NFS clients ([`host`], ADR-0045 T8).
 //!
 //! [`StoreFs`] answers the FUSE requests a guest's file syscalls become —
 //! LOOKUP, GETATTR, READDIR, READDIRPLUS, OPENDIR, OPEN, READ, WRITE,

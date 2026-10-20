@@ -16,6 +16,34 @@ requests from `StoreFs`, and `DaemonShares` serves an execution/v1 run's
 granted workspace from the daemon's own store (ADR-0044 phase C, bead
 `ley-line-open-f210c2`); see "Adapter" below.
 
+## The host mount (`mount` feature)
+
+The same `StoreFs` serves `leyline daemon --mount` (ADR-0045 T8, bead
+`ley-line-open-3e73dc`): `host::fuse::HostFuse` behind the host's FUSE client
+(Linux; macOS with macFUSE or fuse-t) and `host::nfs::HostNfs`, a loopback
+NFSv3 server on `nessie-nfsserve`, behind the host's NFS client (the macOS
+default). A host process sees what a guest sees and writes by the same
+rules; the `leyline` binary injects the mount into the daemon as
+`host::DaemonHostMount`.
+
+- **FUSE** translates the host's `open(2)` and `renamex_np(2)` flags into
+  Linux's and the Linux errno values that differ (`ESTALE`, `ENOTEMPTY`,
+  `ENOSYS`) into the host's.
+- **NFS** has no OPEN or CLOSE: the server keeps one write handle per file
+  id. A READ with nothing staged rereads it, so the bytes the client takes
+  are its base. A WRITE is checked against the store at once and refused
+  `NFS3ERR_STALE` exactly when its COMMIT would be, because the macOS client
+  reports a refused WRITE and ignores a refused COMMIT. A SETATTR of the size
+  stages unchecked (a save truncates before it writes); a truncate with no
+  WRITE after it lands once it has stood idle. CREATE lands the empty file
+  at once. A refused WRITE or COMMIT discards what the handle staged and
+  keeps its base, so a retry sent without a READ is refused too.
+- **macOS gate.** `host::mount_nfs` refuses Tahoe before 26.7 and Sequoia
+  before 15.8: their NFS client corrupts kernel memory on server replies
+  (CVE-2026-43686, CVE-2026-84549; bead `ley-line-open-2d49ce`).
+- The NFS client's attribute cache is one second (`actimeo=1`); every open
+  revalidates (close-to-open).
+
 ## Contract
 
 | Request | Answer |

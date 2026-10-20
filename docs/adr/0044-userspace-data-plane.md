@@ -132,9 +132,12 @@ READDIRPLUS reaches the backend through the vendored libkrun's `DynFileSystem` (
 The NFS and FUSE host mounts remain for people and for tools that need a directory on the host.
 They keep the guarantees they can carry (per-open bases on FUSE; READ-time bases and WRITE-time
 stale refusal on NFS) and document what they cannot. NFS-only heuristics are not added: #461 is
-closed unmerged, and its probe results are recorded above. Their writes follow the store's rules,
-not rules of their own: ADR-0045 T8 makes each mount operation a proposal decided as storefs's
-is, and the NFS WRITE-time refusal the decision the COMMIT would make.
+closed unmerged, and its probe results are recorded above. ADR-0045 T8 makes the host mount
+storefs itself, behind FUSE and NFS adapters: a host process sees the tree a guest sees and its
+writes are the proposals a guest's are, with the NFS WRITE-time refusal the decision the COMMIT
+would make. On macOS the NFS mount is refused before Tahoe 26.7 / Sequoia 15.8, whose NFS client
+corrupts kernel memory on server replies (`ley-line-open-2d49ce`). The agent path stays the
+virtio-fs share: the host mounts pay a kernel round trip per request.
 
 ### V5 — LLO owns the filesystem; cloister owns policy; they meet at execution/v1
 

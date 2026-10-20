@@ -267,7 +267,8 @@ os.mkdir(os.path.join(sys.argv[1], "empty"))
     want_hex=$(printf 'notes\n' | od -An -tx1 | tr -d ' \n')
     got_hex=$(stored_hex NOTES.txt)
     [ "$got_hex" = "$want_hex" ] || fail "NOTES.txt is not stored as written: $got_hex"
-    expect_eq "$(op "{\"op\":\"query\",\"sql\":\"SELECT mode FROM _tree WHERE path = 'empty'\"}" | field rows 0 mode)" 16384 "the empty directory's entry"
+    empty_mode=$(op '{"op":"query","sql":"SELECT mode FROM _tree WHERE path = '"'"'empty'"'"'"}' | field rows 0 mode)
+    expect_eq "$empty_mode" 16384 "the empty directory's entry"
     stop_daemon
     wait_for "the mount to detach" sh -c "! mount | grep -qF '$W/mnt'"
     step "mount: a save, a new file and an empty directory land in the store, and the mount detaches on SIGTERM"

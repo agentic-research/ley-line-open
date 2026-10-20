@@ -12,37 +12,57 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
-- **Breaking: the FUSE/NFS host mount writes by the store's rules** (bead
-  `ley-line-open-53d701`, ADR-0045 T8). Every mount operation on a store is
-  a proposal decided as storefs's is.
-  - A leaf edit is the edit applied to the bytes its handle read (the node's
-    range is taken with the base), proposed against that base at FLUSH,
-    FSYNC or COMMIT: a change landed since merges three ways, overlapping
-    edits answer `ESTALE`/`NFS3ERR_STALE`, and a file left unparseable lands
-    with its `_parse_diagnostics` row. Before, a flush spliced the edit into
-    whatever the file held (another writer's change could move the node's
-    path onto another node) and every NFS WRITE against a moved base was
-    refused.
-  - The NFS WRITE (and SETATTR size) runs the COMMIT's own decision,
-    `source_write::check`, on the edit it stages and refuses exactly what it
-    refuses; only a conflicting change landed between the last WRITE and the
-    COMMIT is refused at a COMMIT macOS does not report (recorded in
-    `_errors`).
-  - Removing a leaf writes its file without the node; removing a source
-    file's entry deletes the file; removing a directory is an rmdir;
-    renaming a source file's entry or a directory moves it in `_tree`
-    (`source_write::rename`). Before, each touched `nodes` rows only.
-    Create, mkdir, a syntax node's rename, a rename into a syntax node and a
-    mode change other than the presented one answer `EPERM`/`NFS3ERR_PERM`;
-    before, a created file lived in `nodes` only and a mode change was
-    accepted and dropped. Refusals map to storefs's errno classes.
-  - Removed: `leyline_fs::graph::StaleWrite` (now `Refused` with a
-    `RefusalKind`), `SourceWriter::write` (now `propose`/`check` over
-    `Proposal`), the mount's syntax validation and shadow copies,
+- **Breaking: the host mount is storefs — `daemon --mount` presents the
+  store's files and writes them by the store's rules** (beads
+  `ley-line-open-53d701`, `ley-line-open-3e73dc`, ADR-0045 T8).
+  - The FUSE and NFS host mounts serve `leyline_storefs::StoreFs`, the core
+    a guest's virtio-fs share serves, behind `storefs::host::fuse::HostFuse`
+    and `storefs::host::nfs::HostNfs` (new `leyline-storefs` feature
+    `mount`; the CLI's `mount` feature now enables it). A host process sees
+    the tree a guest sees — every file of any kind, mode, symlink and
+    directory in `_tree` — and each save, create, mkdir, rmdir, rename,
+    symlink and `chmod` is the proposal a guest's is: a moved base merges
+    three ways, overlapping edits answer `ESTALE`/`NFS3ERR_STALE`, an
+    unparseable save lands with its `_parse_diagnostics` row, and every
+    landed proposal is written into the daemon's checkout and published.
+  - Before, the host mount presented the projection: a parsed file as a
+    directory of its syntax nodes, a file of no language not at all, and
+    create, mkdir and mode changes refused `EPERM`. Paths under a mount
+    change: `util.go` is a file, not `util.go/package_clause/...`.
+  - NFS: each WRITE runs the COMMIT's own decision (`source_write::check`)
+    and refuses exactly what it refuses, because the macOS client ignores a
+    refused COMMIT; a SETATTR of the size stages unchecked (a save truncates
+    before it writes); a refused WRITE or COMMIT discards the staged bytes
+    and keeps the handle's base, so a retry sent without a READ is refused
+    too. CREATE lands the empty file at once.
+  - macOS: the NFS mount refuses Tahoe before 26.7 and Sequoia before 15.8,
+    whose NFS client corrupts kernel memory on server replies
+    (CVE-2026-43686, CVE-2026-84549; bead `ley-line-open-2d49ce`). The
+    client's attribute cache is `actimeo=1`.
+  - Embedders: `run_daemon_with_options` mounts only through a provider in
+    the new `DaemonOptions::host_mount` (`cmd_daemon::HostMount`;
+    `leyline_storefs::host::DaemonHostMount` is LLO's). A daemon asked to
+    `--mount` with none is refused before it starts. `DaemonOptions` is no
+    longer `Copy`.
+  - `leyline-fs` writes no store: every write, create, removal, truncate
+    and rename of a store's nodes is refused.
+  - Removed: `leyline serve` (use `leyline daemon --mount`);
+    `leyline_cli_lib::cmd_serve` (its arena, duration and shutdown helpers
+    are `leyline_cli_lib::lifecycle`); `source_write::MountWriter`;
+    `daemon::live_graph`; cli-lib's `mount` feature; `leyline-fs`'s `fuse`,
+    `nfs` and `splice` features with `leyline_fs::fuse`, `leyline_fs::nfs`,
+    `graph::{SourceWriter, Proposal, Refused, RefusalKind, refusal_kind,
+    LiveSource, Handle, MOUNT_HANDLE}`, `SqliteGraphAdapter::live` and
+    `set_source_writer`, `HotSwapGraph::with_source_writer`, the `Graph`
+    methods `note_base`, `note_read`, `flush_node`, `mtime_tracks_entries`,
+    `release` and the `*_as` handle variants, `Node::perm`, and the
+    `_errors` table; the mount's syntax validation and shadow copies,
     `SqliteGraphAdapter::set_default_language`,
-    `HotSwapGraph::with_validation`, `leyline serve --language`,
-    `leyline_ts::splice::check_syntax`, and `batch_splice`'s syntax-error
-    attribution and its record writes to nodes of no parsed file.
+    `HotSwapGraph::with_validation`, `leyline serve --language` and
+    `leyline_ts::splice::check_syntax`; the `deps:fuse` and
+    `fs:build:nfs-isolated` tasks (leyline-fs links no libfuse).
+  - ADR-0045's conflict ranges are documented as `daemon.capnp` defines
+    them: 0-based, half-open `[start, end)`.
 
 - **Breaking: the store is a git-shaped tree; parsing is a projection over
   it; a proposal whose base moved merges three ways** (bead

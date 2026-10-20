@@ -1,6 +1,6 @@
 //! Thin binary wrapper for ley-line (open edition).
 //!
-//! Shared commands (parse, splice, serve, load, inspect, lsp) live in
+//! Shared commands (parse, splice, load, inspect, lsp) live in
 //! `leyline_cli_lib::Commands`. The `Daemon` variant is defined here so
 //! ley-line (private) can define its own extended Daemon without conflict.
 

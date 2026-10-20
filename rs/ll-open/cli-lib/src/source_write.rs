@@ -17,9 +17,9 @@
 //! - `treeRoot` recomputed from the committed `_source` set and stamped into
 //!   the sibling head when the arena is file-backed (D1).
 //!
-//! Publication stays with the caller: the daemon's mount publishes on
-//! `fsync`, `leyline serve` flushes its image to the arena, and `leyline
-//! splice` writes a file-backed database in place.
+//! Publication stays with the caller: the daemon (its socket's `propose`, a
+//! guest's share and the host mount alike) snapshots to the arena after the
+//! commit, and `leyline splice` writes a file-backed database in place.
 //!
 //! The bytes land in the arena only; this module never writes a file. A
 //! daemon with a source directory materializes accepted writes into it
@@ -40,8 +40,8 @@ pub use crate::tree::Mode;
 
 /// The paths a writer may change: ADR-0029's sub-manifest of paths, the
 /// ring-2 slice grant. `Whole` is the grant the arena's owner holds — the
-/// daemon over its own source tree, `leyline serve` over its own arena, and
-/// `leyline splice` over a database the caller names.
+/// daemon over its own source tree and `leyline splice` over a database the
+/// caller names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Grant {
     Whole,

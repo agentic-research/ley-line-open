@@ -208,7 +208,8 @@ A refused proposal is never reported as success. Through the mount, the refused 
 (owner decision, 2026-10-12): the stored file is re-projected so the node reads as it, the file's
 pending edits are dropped, and the reason is recorded in `_errors` for the node. FUSE `fsync`
 returns the refusal instead of reporting success. mache's draft-on-invalid behaviour remains mache's
-choice as a client.
+choice as a client. (Amended by ADR-0045 T8: the host mount is storefs, which keeps a refused
+FLUSH's bytes on its handle and answers the refusal at `close`/`fsync`; `_errors` is removed.)
 
 ______________________________________________________________________
 

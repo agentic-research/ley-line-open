@@ -801,6 +801,36 @@ async fn a_read_reports_eof_at_the_end_of_the_file() {
     assert!(eof);
     let (_, eof) = h.nfs.read(id, 2, 1).await.unwrap();
     assert!(!eof, "offset 2 + 1 byte is not the end");
+    let (data, eof) = h.nfs.read(id, 1, u32::MAX).await.unwrap();
+    assert_eq!(data.len(), A.len() - 1);
+    assert!(eof, "offset 1 + the rest is the end");
+}
+
+/// A file removed through the mount and made again by another writer is a
+/// new file to the mount: a WRITE through its id is an edit of the new
+/// file's bytes, not of the bytes the removed file's handle read.
+#[tokio::test]
+async fn a_removed_files_handle_does_not_outlive_it() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.nfs.remove(ROOT_INODE, &name("a.go")).await.unwrap();
+    h.fs.store()
+        .with_write(|conn| {
+            source_write::propose(
+                conn,
+                &Grant::Whole,
+                vec![Proposed::write("a.go", Base::Absent, A_OTHER.as_bytes().to_vec())],
+            )
+        })
+        .unwrap();
+    let id = h.id("a.go").await;
+    // The same line A_OTHER changed: against the removed file's bytes (A)
+    // this overlaps; against the new file's it is a plain edit.
+    let edit = A.replace("return 1", "return 9");
+    h.nfs.write(id, 0, edit.as_bytes()).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(edit.as_str()));
 }
 
 /// A WRITE after a truncate waits with it for the client's COMMIT: the

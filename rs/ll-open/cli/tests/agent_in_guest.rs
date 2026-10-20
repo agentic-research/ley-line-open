@@ -55,337 +55,80 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Instant;
 
-use capnp::message::{Builder, ReaderOptions};
-use leyline_public_schema::execution_capnp;
-use leyline_runtime::authorization::{
-    EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION, canonical_digest,
-};
-use serde_json::{Value, json};
-use tempfile::TempDir;
+use serde_json::json;
 
+mod guest_harness;
 #[path = "../../runtime/tests/hypervisor/mod.rs"]
 mod hypervisor;
 #[path = "agent_in_guest/seed.rs"]
 mod seed;
 
+use guest_harness::{Daemon, Host, STEP, call, git_dir_of, propose, stored};
+
 const GUEST: &str = include_str!("agent_in_guest/guest.rs");
 const SEED: &str = include_str!("agent_in_guest/seed.rs");
-const MEDIA_TYPE: &str = "application/vnd.leyline.executable";
-const STEP: Duration = Duration::from_secs(150);
 
-/// The worker binary cargo built beside this test's target directory.
-fn worker_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("LEYLINE_KRUN_WORKER") {
-        return PathBuf::from(path);
-    }
-    let exe = std::env::current_exe().expect("test binary");
-    let path = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("target directory")
-        .join("leyline-krun-worker");
-    assert!(
-        path.is_file(),
-        "{} is missing: build it with `cargo build -p leyline-runtime --bin \
-         leyline-krun-worker`, or set LEYLINE_KRUN_WORKER",
-        path.display()
+/// The daemon's diagnostic for `path` (ADR-0045 T3), read from its living
+/// database: whether the file is projected, and the message.
+fn diagnostic(host: &Host, path: &str) -> Option<(bool, String)> {
+    let live = host.path("daemon.ctrl").with_extension("live.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(&live, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row(
+        "SELECT projected, message FROM _parse_diagnostics WHERE path = ?1",
+        [path],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
+}
+
+/// (p) and (h): the mode, the symlink and the directories the guest made,
+/// over the socket and in the checkout.
+fn check_tree(host: &Host, daemon: &Daemon, results: &mut Results, scenario: &str) {
+    let script = call(&daemon.sock, json!({"op": "read_source", "path": "run.sh"}));
+    let executable = fs::metadata(host.checkout.join("run.sh"))
+        .map(|m| m.permissions().mode() & 0o111)
+        .ok();
+    results.check(
+        scenario,
+        script["mode"] == "100755" && executable == Some(0o111),
+        format!(
+            "run.sh is 100755 in the store ({}) and executable on disk ({executable:?})",
+            script["mode"]
+        ),
     );
-    path
-}
-
-/// The guest tools rootfs fragment, or `None` (a skip, not a pass).
-fn guest_tools() -> Option<PathBuf> {
-    match std::env::var_os("LEYLINE_GUEST_TOOLS") {
-        Some(dir) => Some(PathBuf::from(dir)),
-        None => {
-            assert!(
-                std::env::var_os("LEYLINE_REQUIRE_HYPERVISOR").is_none(),
-                "LEYLINE_REQUIRE_HYPERVISOR is set and LEYLINE_GUEST_TOOLS is not: run \
-                 tools/guest_tools.sh <dir> and point it at <dir>/rootfs"
-            );
-            eprintln!(
-                "SKIPPED (NOT a pass): LEYLINE_GUEST_TOOLS is not set; run \
-                 tools/guest_tools.sh <dir> and point it at <dir>/rootfs"
-            );
-            None
-        }
-    }
-}
-
-/// One JSON request over the daemon's socket, one JSON reply.
-fn call(sock: &Path, request: Value) -> Value {
-    let mut stream = UnixStream::connect(sock)
-        .unwrap_or_else(|error| panic!("connect {}: {error}", sock.display()));
-    stream
-        .write_all(format!("{request}\n").as_bytes())
-        .expect("send request");
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .expect("end request");
-    let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .expect("read reply");
-    serde_json::from_str(&line).unwrap_or_else(|error| panic!("reply {line:?}: {error}"))
-}
-
-/// `read_source`: the stored text and the store's tree root, or `None`
-/// when the store holds no such file.
-fn read_source(sock: &Path, path: &str) -> Option<(String, String)> {
-    let reply = call(sock, json!({"op": "read_source", "path": path}));
-    (reply["ok"] == true).then(|| {
-        (
-            reply["content"].as_str().unwrap_or_default().to_owned(),
-            reply["tree_root"].as_str().unwrap_or_default().to_owned(),
-        )
-    })
-}
-
-fn stored(sock: &Path, path: &str) -> Option<String> {
-    read_source(sock, path).map(|(text, _)| text)
-}
-
-fn propose(sock: &Path, path: &str, content: &str) {
-    let reply = call(
-        sock,
-        json!({"op": "propose", "writes": [{"path": path, "base": "any", "content": content}]}),
+    let link = call(
+        &daemon.sock,
+        json!({"op": "read_source", "path": "link.go"}),
     );
-    assert_eq!(reply["ok"], true, "propose {path}: {reply}");
-}
-
-struct Daemon {
-    child: Child,
-    sock: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-struct Host {
-    dir: TempDir,
-    leyline: PathBuf,
-    worker: PathBuf,
-    libkrunfw: PathBuf,
-    checkout: PathBuf,
-}
-
-impl Host {
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
-    }
-
-    /// Start the execution daemon over the checkout, and wait until its
-    /// socket answers `status` with phase `ready`.
-    fn daemon(&self, lifetime: &str) -> Daemon {
-        let control = self.path("daemon.ctrl");
-        let (library_var, library_dir) = hypervisor::library_path_env(&self.libkrunfw);
-        let log = fs::File::create(self.path(&format!("daemon-{lifetime}.log"))).expect("log");
-        let child = Command::new(&self.leyline)
-            .arg("execution-daemon")
-            .arg("--backend")
-            .arg("micro-vm")
-            .arg("--arena")
-            .arg(self.path("daemon.arena"))
-            .arg("--control")
-            .arg(&control)
-            .arg("--cas-root")
-            .arg(self.path("cas"))
-            .arg("--run-root")
-            .arg(self.path("runs"))
-            .arg("--worker")
-            .arg(&self.worker)
-            .arg("--catalog")
-            .arg(self.path("catalog.json"))
-            .arg("--runtime-file")
-            .arg(&self.libkrunfw)
-            .arg("--ready-timeout-ms")
-            .arg("30000")
-            .arg("--allow-unverified-evidence")
-            .arg("--source")
-            .arg(&self.checkout)
-            .arg("--workspace-ttl-ms")
-            .arg(seed::SETTLED_MS.to_string())
-            .arg("--workspace-changed-ttl-ms")
-            .arg(seed::CHANGED_MS.to_string())
-            .arg("--workspace-change-window-ms")
-            .arg("30000")
-            // The daemon publishes a discovery link under $HOME/.mache.
-            .env("HOME", self.path("home"))
-            .env(library_var, library_dir)
-            .env("RUST_LOG", "info")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().expect("log"))
-            .stderr(log)
-            .spawn()
-            .expect("spawn leyline execution-daemon");
-        let daemon = Daemon {
-            child,
-            sock: control.with_extension("sock"),
-        };
-        let deadline = Instant::now() + STEP;
-        loop {
-            if daemon.sock.exists()
-                && let Ok(stream) = UnixStream::connect(&daemon.sock)
-            {
-                drop(stream);
-                if call(&daemon.sock, json!({"op": "status"}))["phase"] == "ready" {
-                    return daemon;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the daemon did not become ready; log:\n{}",
-                self.log(lifetime)
-            );
-            std::hint::spin_loop();
-        }
-    }
-
-    fn log(&self, lifetime: &str) -> String {
-        fs::read_to_string(self.path(&format!("daemon-{lifetime}.log"))).unwrap_or_default()
-    }
-
-    fn on_disk(&self, path: &str) -> Option<String> {
-        fs::read_to_string(self.checkout.join(path)).ok()
-    }
-
-    /// The daemon's diagnostic for `path` (ADR-0045 T3), read from its
-    /// living database: whether the file is projected, and the message.
-    fn diagnostic(&self, path: &str) -> Option<(bool, String)> {
-        let live = self.path("daemon.ctrl").with_extension("live.db");
-        let conn = rusqlite::Connection::open_with_flags(
-            &live,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .ok()?;
-        conn.query_row(
-            "SELECT projected, message FROM _parse_diagnostics WHERE path = ?1",
-            [path],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok()
-    }
-
-    /// (p) and (h): the mode, the symlink and the directories the guest
-    /// made, over the socket and in the checkout.
-    fn check_tree(&self, daemon: &Daemon, results: &mut Results, scenario: &str) {
-        let script = call(&daemon.sock, json!({"op": "read_source", "path": "run.sh"}));
-        let executable = fs::metadata(self.checkout.join("run.sh"))
-            .map(|m| m.permissions().mode() & 0o111)
-            .ok();
-        results.check(
-            scenario,
-            script["mode"] == "100755" && executable == Some(0o111),
-            format!(
-                "run.sh is 100755 in the store ({}) and executable on disk ({executable:?})",
-                script["mode"]
-            ),
-        );
-        let link = call(
-            &daemon.sock,
-            json!({"op": "read_source", "path": "link.go"}),
-        );
-        let on_disk = fs::read_link(self.checkout.join("link.go")).ok();
-        results.check(
-            scenario,
-            link["mode"] == "120000"
-                && link["content"] == "a.go"
-                && on_disk.as_deref() == Some(Path::new("a.go")),
-            format!("link.go is a symlink to a.go in the store ({link}) and on disk ({on_disk:?})"),
-        );
-        results.check(
-            scenario,
-            self.checkout.join("empty").is_dir()
-                && self.checkout.join("lib").is_dir()
-                && !self.checkout.join("pkg").exists(),
-            "the empty directory and the renamed one are in the checkout; pkg is gone".into(),
-        );
-    }
-}
-
-/// Copy `from` into `to`, regular files and directories only.
-fn copy_tree(from: &Path, to: &Path) {
-    fs::create_dir_all(to).expect("directory");
-    for entry in fs::read_dir(from).expect("read directory") {
-        let entry = entry.expect("entry");
-        let target = to.join(entry.file_name());
-        let kind = entry.file_type().expect("file type");
-        assert!(!kind.is_symlink(), "{}: no links", entry.path().display());
-        if kind.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), &target).expect("copy file");
-        }
-    }
-}
-
-/// Every regular file under `root`, relative, with its mode and BLAKE3.
-fn manifest_files(root: &Path, dir: &Path, out: &mut Vec<Value>) {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .expect("read directory")
-        .map(|e| e.expect("entry"))
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path).expect("metadata");
-        if meta.is_dir() {
-            manifest_files(root, &path, out);
-        } else {
-            let bytes = fs::read(&path).expect("file bytes");
-            out.push(json!({
-                "path": path.strip_prefix(root).unwrap().to_str().unwrap(),
-                "mode": meta.permissions().mode() & 0o7777,
-                "blake3": blake3::hash(&bytes).to_hex().to_string(),
-            }));
-        }
-    }
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(dir)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "agent")
-        .env("GIT_AUTHOR_EMAIL", "agent@example.invalid")
-        .env("GIT_COMMITTER_NAME", "agent")
-        .env("GIT_COMMITTER_EMAIL", "agent@example.invalid")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?}");
+    let on_disk = fs::read_link(host.checkout.join("link.go")).ok();
+    results.check(
+        scenario,
+        link["mode"] == "120000"
+            && link["content"] == "a.go"
+            && on_disk.as_deref() == Some(Path::new("a.go")),
+        format!("link.go is a symlink to a.go in the store ({link}) and on disk ({on_disk:?})"),
+    );
+    results.check(
+        scenario,
+        host.checkout.join("empty").is_dir()
+            && host.checkout.join("lib").is_dir()
+            && !host.checkout.join("pkg").exists(),
+        "the empty directory and the renamed one are in the checkout; pkg is gone".into(),
+    );
 }
 
 /// The guest rootfs: the guest program, the tools fragment, and a git
-/// repository of the seed tree at `/repo.git`. Returns its content digest.
-fn guest_rootfs(host: &Host, tools: &Path) -> String {
-    let staging = host.path("rootfs");
-    copy_tree(tools, &staging);
-    fs::create_dir_all(staging.join("bin")).expect("bin");
-    fs::create_dir_all(staging.join("tmp")).expect("tmp");
-    let source = host.path("agent.rs");
-    fs::write(&source, format!("mod seed {{\n{SEED}\n}}\n{GUEST}")).expect("guest source");
-    let agent = staging.join("bin/agent");
-    hypervisor::compile_guest(&source, &agent);
-    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).expect("agent mode");
-
+/// repository of the seed tree at `/repo.git`. Returns its content digest
+/// and the agent binary's.
+fn guest_rootfs(host: &Host, tools: &Path) -> (String, String) {
+    let (staging, agent_digest) =
+        guest_harness::stage_rootfs(host, tools, &format!("mod seed {{\n{SEED}\n}}\n{GUEST}"));
     // The repository `git status` in the guest compares /work against.
     let seed_tree = host.path("seed-tree");
     for (path, text) in seed::TREE {
@@ -393,120 +136,8 @@ fn guest_rootfs(host: &Host, tools: &Path) -> String {
         fs::create_dir_all(file.parent().unwrap()).expect("seed directory");
         fs::write(file, text).expect("seed file");
     }
-    let empty_template = host.path("git-template");
-    fs::create_dir_all(&empty_template).expect("template");
-    git(
-        &seed_tree,
-        &[
-            "init",
-            "-q",
-            "-b",
-            "main",
-            &format!("--template={}", empty_template.display()),
-        ],
-    );
-    git(&seed_tree, &["add", "-A"]);
-    git(&seed_tree, &["commit", "-q", "-m", "seed"]);
-    git(&seed_tree, &["gc", "-q"]);
-    copy_tree(&seed_tree.join(".git"), &staging.join("repo.git"));
-
-    let mut files = Vec::new();
-    manifest_files(&staging, &staging, &mut files);
-    let manifest = serde_json::to_vec(&json!({"version": 1, "files": files})).unwrap();
-    let digest = blake3::hash(&manifest).to_hex().to_string();
-    fs::write(staging.join("rootfs.manifest.json"), &manifest).expect("manifest");
-    fs::create_dir_all(host.path("cas")).expect("cas");
-    fs::rename(&staging, host.path("cas").join(&digest)).expect("publish rootfs");
-    digest
-}
-
-fn set_digest(mut digest: execution_capnp::digest_ref::Builder<'_>, value: &str) {
-    digest.set_algorithm("blake3-256");
-    digest.set_value(value);
-}
-
-fn evidence(mut evidence: execution_capnp::evidence_ref::Builder<'_>) {
-    evidence.set_media_type("application/vnd.leyline.test-evidence");
-    set_digest(evidence.init_digest(), &"a".repeat(64));
-}
-
-const LIMITS: (u64, u64, u64) = (300_000, 512 << 20, 2_000);
-
-fn set_limits(mut limits: execution_capnp::resource_limits::Builder<'_>) {
-    limits.set_wall_time_ms(LIMITS.0);
-    limits.set_memory_bytes(LIMITS.1);
-    limits.set_cpu_millis(LIMITS.2);
-}
-
-fn spec_json(bytes: &[u8]) -> Value {
-    let mut input = bytes;
-    let message = capnp::serialize::read_message(&mut input, ReaderOptions::new()).unwrap();
-    let root = message
-        .get_root::<execution_capnp::run_spec::Reader<'_>>()
-        .unwrap();
-    serde_json::from_str(&capnp_json::to_json(root).unwrap()).unwrap()
-}
-
-fn grant_json(bytes: &[u8]) -> Value {
-    let mut input = bytes;
-    let message = capnp::serialize::read_message(&mut input, ReaderOptions::new()).unwrap();
-    let root = message
-        .get_root::<execution_capnp::run_grant::Reader<'_>>()
-        .unwrap();
-    serde_json::from_str(&capnp_json::to_json(root).unwrap()).unwrap()
-}
-
-/// The RunSpec and RunGrant of the agent's run: workspace `repo` at
-/// `graph_root`, read and mutate.
-fn spec_and_grant(agent_digest: &str, graph_root: &str, confinement: &str) -> (Value, Value) {
-    let mut message = Builder::new_default();
-    let mut spec = message.init_root::<execution_capnp::run_spec::Builder<'_>>();
-    spec.set_schema_version(EXECUTION_SCHEMA_VERSION);
-    let mut executable = spec.reborrow().init_executable();
-    executable.set_media_type(MEDIA_TYPE);
-    set_digest(executable.init_digest(), agent_digest);
-    let mut workspace = spec.reborrow().init_workspace_inputs(1).get(0);
-    workspace.set_name("repo");
-    set_digest(workspace.init_graph_root(), graph_root);
-    set_limits(spec.init_requested_limits());
-    let mut spec_bytes = Vec::new();
-    capnp::serialize::write_message(&mut spec_bytes, &message).unwrap();
-
-    let spec_digest = canonical_digest(&spec_bytes).unwrap();
-    let mut message = Builder::new_default();
-    let mut grant = message.init_root::<execution_capnp::run_grant::Builder<'_>>();
-    grant.set_grant_id("grant-agent-in-guest");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    grant.set_expires_at_unix_ms(now + 3_600_000);
-    grant.set_replay_key(&format!("agent-in-guest-{now}"));
-    set_digest(
-        grant.reborrow().init_run_spec_digest(),
-        spec_digest.strip_prefix("blake3-256:").unwrap(),
-    );
-    evidence(grant.reborrow().init_issuer_evidence());
-    evidence(grant.reborrow().init_workload_identity_evidence());
-    evidence(grant.reborrow().init_actor_provenance_evidence());
-    set_digest(
-        grant.reborrow().init_confinement_digest(),
-        confinement.strip_prefix("blake3-256:").unwrap(),
-    );
-    grant.set_backend_class(execution_capnp::BackendClass::MicroVm);
-    set_limits(grant.reborrow().init_limits());
-    let mut capability = grant.reborrow().init_capabilities(1).get(0);
-    capability.set_grant(EXECUTION_CAPABILITY);
-    capability.set_interface(EXECUTION_SCHEMA_VERSION);
-    let mut workspace = grant.init_workspaces(1).get(0);
-    workspace.set_name("repo");
-    set_digest(workspace.reborrow().init_graph_root(), graph_root);
-    let mut operations = workspace.init_operations(2);
-    operations.set(0, execution_capnp::WorkspaceOperation::Read);
-    operations.set(1, execution_capnp::WorkspaceOperation::Mutate);
-    let mut grant_bytes = Vec::new();
-    capnp::serialize::write_message(&mut grant_bytes, &message).unwrap();
-    (spec_json(&spec_bytes), grant_json(&grant_bytes))
+    git_dir_of(host, &seed_tree, &staging.join("repo.git"));
+    (host.publish_rootfs(&staging), agent_digest)
 }
 
 /// Waits for the guest's `st-<step>` in the store, failing fast when the
@@ -555,92 +186,47 @@ impl Results {
 
 #[test]
 fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
-    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+    let Some(tools) = guest_harness::guest_tools_if_hypervisor() else {
         return;
     };
-    let Some(tools) = guest_tools() else {
-        return;
-    };
-    let dir = TempDir::new().expect("fixture");
-    let checkout = dir.path().join("checkout");
-    for (path, text) in seed::TREE {
-        let file = checkout.join(path);
-        fs::create_dir_all(file.parent().unwrap()).expect("checkout directory");
-        fs::write(file, text).expect("checkout file");
-    }
-    let worker = dir.path().join("leyline-krun-worker");
-    hypervisor::entitled_copy(&worker_binary(), &worker);
-    fs::create_dir_all(dir.path().join("runs")).expect("run root");
-    fs::create_dir_all(dir.path().join("home")).expect("home");
-    let host = Host {
-        leyline: PathBuf::from(env!("CARGO_BIN_EXE_leyline")),
-        worker,
-        libkrunfw,
-        checkout,
-        dir,
-    };
-    let rootfs = guest_rootfs(&host, &tools);
-    let agent_digest =
-        blake3::hash(&fs::read(host.path("cas").join(&rootfs).join("bin/agent")).expect("agent"))
-            .to_hex()
-            .to_string();
+    let host = guest_harness::host(
+        |dir| {
+            let checkout = dir.join("checkout");
+            for (path, text) in seed::TREE {
+                let file = checkout.join(path);
+                fs::create_dir_all(file.parent().unwrap()).expect("checkout directory");
+                fs::write(file, text).expect("checkout file");
+            }
+            checkout
+        },
+        seed::SETTLED_MS,
+        seed::CHANGED_MS,
+    )
+    .expect("libkrunfw was found a moment ago");
+    let (rootfs, agent_digest) = guest_rootfs(&host, &tools);
 
     // Lifetime 1: learn the tree root the grant authorizes, with an empty
     // catalog.
-    fs::write(host.path("catalog.json"), r#"{"entries":[]}"#).expect("catalog");
-    let graph_root = {
-        let daemon = host.daemon("seed");
-        let (_, tree_root) = read_source(&daemon.sock, "a.go").expect("a.go is stored");
-        format!("blake3-256:{tree_root}")
-    };
-    let catalog = json!({"entries": [{
-        "artifactDigest": format!("blake3-256:{agent_digest}"),
-        "mediaType": MEDIA_TYPE,
-        "rootfs": {"algorithm": "blake3-256", "value": rootfs},
-        "executable": "bin/agent",
-        "workspaceInputs": [{"name": "repo", "graphRoot": graph_root}],
-    }]});
-    fs::write(host.path("catalog.json"), catalog.to_string()).expect("catalog");
-    let confinement = leyline_runtime::backends::libkrun::confinement::confinement_manifest(
-        std::slice::from_ref(&host.libkrunfw),
-        &[],
-        None,
-    )
-    .and_then(|manifest| manifest.confinement_digest())
-    .expect("the worker's confinement digest");
+    let graph_root = host.graph_root("a.go");
+    host.write_catalog(&rootfs, &agent_digest, &graph_root);
 
     // Lifetime 2: the run.
     let mut results = Results::default();
     let daemon = host.daemon("run");
-    let (_, root_now) = read_source(&daemon.sock, "a.go").expect("a.go");
+    let (_, root_now) = guest_harness::read_source(&daemon.sock, "a.go").expect("a.go");
     assert_eq!(
         format!("blake3-256:{root_now}"),
         graph_root,
         "a restart keeps the tree root"
     );
-    let provision = call(
-        &daemon.sock,
-        json!({"op": "llo_execution_provision", "backendClass": "microVm", "idempotencyKey": "agent-in-guest"}),
-    );
-    assert_eq!(provision["provisioned"], true, "{provision}");
-    let (spec, grant) = spec_and_grant(
+    let run_id = host.start_run(
+        &daemon,
+        "run",
+        "agent-in-guest",
         &agent_digest,
-        graph_root.strip_prefix("blake3-256:").unwrap(),
-        &confinement,
+        &graph_root,
+        guest_harness::LIMITS,
     );
-    let started = call(
-        &daemon.sock,
-        json!({"op": "llo_execution_start", "spec": spec, "grant": grant}),
-    );
-    let run_id = started["runId"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "the run did not start: {started}\nlog:\n{}",
-                host.log("run")
-            )
-        })
-        .to_owned();
 
     // (b) the guest's edit is in the store and the checkout.
     await_guest(&host, &daemon, &run_id, 'b');
@@ -683,7 +269,7 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
 
     // (d) the half-written edit landed, with a diagnostic.
     await_guest(&host, &daemon, &run_id, 'd');
-    let diagnostic = host.diagnostic("c.go");
+    let diagnostic = diagnostic(&host, "c.go");
     results.check(
         "d",
         stored(&daemon.sock, "c.go").as_deref() == Some(seed::C_BROKEN)
@@ -740,22 +326,11 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
             format!("{path} is in the store and the checkout"),
         );
     }
-    host.check_tree(&daemon, &mut results, "p");
+    check_tree(&host, &daemon, &mut results, "p");
     go(&daemon, 'p');
 
     await_guest(&host, &daemon, &run_id, 'z');
-    let deadline = Instant::now() + STEP;
-    let terminal = loop {
-        let status = call(
-            &daemon.sock,
-            json!({"op": "llo_execution_status", "runId": run_id}),
-        );
-        if status.to_string().contains("succeeded") || status.to_string().contains("failed") {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "the run did not end: {status}");
-        std::hint::spin_loop();
-    };
+    let terminal = host.await_end(&daemon, &run_id, STEP);
     results.check(
         "run",
         terminal.to_string().contains("succeeded"),
@@ -795,7 +370,7 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
             ),
         );
     }
-    host.check_tree(&daemon, &mut results, "h");
+    check_tree(&host, &daemon, &mut results, "h");
     drop(daemon);
 
     let mut lines: Vec<String> = report.lines().map(str::to_owned).collect();

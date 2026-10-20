@@ -30,3 +30,6 @@ rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 tempfile = { workspace = true }
 # A daemon context's event router spawns its dispatch loop on a runtime.
 tokio = { workspace = true, features = ["rt", "macros"] }
+# The share tests build a DaemonContext as the shipped daemon does, and the
+# shipped daemon carries the sheaf state (cli-lib's default `sheaf` feature).
+leyline-cli-lib = { path = "../cli-lib", default-features = false, features = ["sheaf"] }

@@ -23,6 +23,7 @@ pub mod cmd_splice;
 pub mod daemon;
 pub mod merge;
 pub mod source_write;
+#[cfg(feature = "sheaf")]
 pub mod topology_pass;
 pub mod tree;
 pub mod tree_root;

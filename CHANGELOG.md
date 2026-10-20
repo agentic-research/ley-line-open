@@ -12,6 +12,16 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **The sheaf surface is a cargo feature** (bead `ley-line-open-39e239`).
+  `leyline-cli-lib` and `leyline-cli` gain a default-on `sheaf` feature
+  that owns the `leyline-sheaf` dependency, the `sheaf_*` and `agreement`
+  daemon ops, `ComplexBuildPass`, the granularity router, the topology
+  pass and the watcher's `daemon.sheaf.invalidate` emit. Default, `all`
+  and `full` builds are unchanged. A build of `leyline-cli-lib` with
+  `--no-default-features` no longer links `leyline-sheaf`, and its daemon
+  does not dispatch those ops (as with `hdc` and `vec`).
+  `task check:all-features` asserts it.
+
 - **Breaking: the store is a git-shaped tree; parsing is a projection over
   it; a proposal whose base moved merges three ways** (bead
   `ley-line-open-bb8aa6`, ADR-0045).

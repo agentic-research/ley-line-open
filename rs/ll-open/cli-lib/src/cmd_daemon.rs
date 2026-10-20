@@ -519,6 +519,7 @@ pub async fn run_daemon_with_options(
     // of run. Closes bead `ley-line-open-3af437` (sheaf gap 2):
     // previously the pass dropped the derived complex on return,
     // forcing every `op_sheaf_*` consumer query to trigger a rebuild.
+    #[cfg(feature = "sheaf")]
     let sheaf = {
         let s = Arc::new(crate::daemon::sheaf_ops::SheafState::new());
         // Wire the event bus so `sheaf_set_topology` / `sheaf_invalidate`
@@ -555,6 +556,7 @@ pub async fn run_daemon_with_options(
             // (written by SessionObservationPass) and builds a CellComplex
             // + drives CoChangeTracker. Installs the built complex +
             // tracker into `sheaf.cache` at end of run (bead `3af437`).
+            #[cfg(feature = "sheaf")]
             passes.push(Box::new(
                 crate::daemon::complex_build_pass::ComplexBuildPass::new(sheaf.clone()),
             ));
@@ -579,6 +581,7 @@ pub async fn run_daemon_with_options(
         embed_queue: embed_queue.clone(),
         #[cfg(feature = "text-search")]
         text_search,
+        #[cfg(feature = "sheaf")]
         sheaf,
     });
     // Before the socket: whatever the extension serves from the context
@@ -1838,6 +1841,7 @@ pub fn run_watcher_enrichment(
             // production path), otherwise `scope: "all-known"` — see
             // `emit_watcher_sheaf_invalidate` docs for the full
             // fallback contract.
+            #[cfg(feature = "sheaf")]
             emit_watcher_sheaf_invalidate(ctx, changed_files, emitter);
         }
         Err(e) => {
@@ -1937,6 +1941,7 @@ pub fn run_watcher_enrichment(
 ///
 /// Exposed to integration tests so the wire has a direct entry point
 /// that doesn't require spinning up the full git-poll loop.
+#[cfg(feature = "sheaf")]
 pub fn emit_watcher_sheaf_invalidate(
     ctx: &Arc<crate::daemon::DaemonContext>,
     changed_files: &[String],

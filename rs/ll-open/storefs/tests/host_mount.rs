@@ -10,7 +10,7 @@
 //! `src/host/tests.rs`; this file proves the kernel's clients reach it.
 //!
 //! One skip path, named: a macOS whose NFS client corrupts kernel memory is
-//! refused by the mount itself (`host::nfs_client_refusal`), and the test
+//! refused by the mount itself (`host::unpatched_nfs_client`), and the test
 //! prints that refusal and returns. Any other runner that cannot mount
 //! fails. No functional workload here loads the NFS client beyond a handful
 //! of operations.
@@ -270,9 +270,8 @@ fn save(path: PathBuf, text: &'static str) -> std::io::Result<()> {
 /// proposal storefs makes for a guest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_process_edits_the_store_through_the_mount() {
-    if let Some(refusal) = host::nfs_client_refusal().unwrap()
-        && leyline_cli_lib::lifecycle::default_backend() == "nfs"
-    {
+    #[cfg(target_os = "macos")]
+    if let Some(refusal) = host::unpatched_nfs_client(&host::macos_product_version().unwrap()) {
         eprintln!("host_mount: SKIPPED on this host: {refusal}");
         return;
     }

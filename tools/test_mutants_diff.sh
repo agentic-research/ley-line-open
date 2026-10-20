@@ -249,10 +249,10 @@ if MUTANTS_GENERIC_EXCLUDES='ll-open/orphan' \
     exit 1
 fi
 
-# The fs slice is the ONLY one that passes `--no-default-features`, so it owes
-# an exclusion for every gated module its flags compile out: cargo-mutants
-# parses with syn, never evaluates cfg, and would report each mutant inside
-# `verified.rs` (the not-shipping `verify` feature) as a phantom MISSED.
+# The fs slice is the ONLY one that passes `--no-default-features`, so it must
+# enable every gated module it mutates: cargo-mutants parses with syn, never
+# evaluates cfg, and would report each mutant inside a compiled-out
+# `verified.rs` as a phantom MISSED.
 : > "$log"
 cat > "$fixture_dir/fs-verify.diff" <<'DIFF'
 diff --git a/ll-open/fs/src/verified.rs b/ll-open/fs/src/verified.rs
@@ -264,8 +264,8 @@ diff --git a/ll-open/fs/src/verified.rs b/ll-open/fs/src/verified.rs
 DIFF
 PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/fs-verify.diff"
-assert_call 'mutants .*--package leyline-fs .*--features cdc,validate .*--exclude ll-open/fs/src/verified\.rs' \
-    'fs slice excludes the verify module its feature set compiles out'
+assert_call 'mutants .*--package leyline-fs .*--features cdc,validate,verify' \
+    'fs slice enables the verify module it mutates'
 
 # storefs's host mount is gated on its `mount` feature; storefs's own slice
 # names it, so its adapter mutants compile and their lib tests run, and the
@@ -389,4 +389,4 @@ fi
 
 echo 'diff mutation fixture proved package-specific integration-test routing'
 echo 'diff mutation fixture proved excluded packages must be claimed by a slice'
-echo 'diff mutation fixture proved the fs slice excludes what it compiles out'
+echo 'diff mutation fixture proved the fs and storefs slices enable what they mutate'

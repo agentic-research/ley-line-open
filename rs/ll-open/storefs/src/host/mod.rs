@@ -9,6 +9,7 @@
 //! xetdata's `nfsserve`), since FUSE there needs macFUSE. Linux mounts FUSE.
 
 pub mod fuse;
+pub mod fuse_abi;
 pub mod nfs;
 
 use std::path::{Path, PathBuf};
@@ -125,23 +126,10 @@ pub fn unpatched_nfs_client(product_version: &str) -> Option<String> {
     })
 }
 
-/// Why this host's NFS client must not mount a loopback server, or `None`
-/// when it may: the refusal [`unpatched_nfs_client`] gives this Mac's
-/// release. Every other host answers `None`.
-pub fn nfs_client_refusal() -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(unpatched_nfs_client(&macos_product_version()?))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(None)
-    }
-}
-
-/// This Mac's product version (`kern.osproductversion`).
+/// This Mac's product version (`kern.osproductversion`): what
+/// [`unpatched_nfs_client`] decides on.
 #[cfg(target_os = "macos")]
-fn macos_product_version() -> Result<String> {
+pub fn macos_product_version() -> Result<String> {
     let name = c"kern.osproductversion";
     let mut buf = [0u8; 64];
     let mut len = buf.len();
@@ -206,7 +194,8 @@ pub fn mount_nfs<S: Store + 'static>(
     server: NfsServer<S>,
     mountpoint: &Path,
 ) -> Result<NfsMount<S>> {
-    if let Some(refusal) = nfs_client_refusal()? {
+    #[cfg(target_os = "macos")]
+    if let Some(refusal) = unpatched_nfs_client(&macos_product_version()?) {
         anyhow::bail!(refusal);
     }
     let port = server.port();
@@ -215,28 +204,39 @@ pub fn mount_nfs<S: Store + 'static>(
     let mount_path = mountpoint
         .canonicalize()
         .unwrap_or_else(|_| mountpoint.to_path_buf());
-    let nfs_opts = format!(
-        "nolocks,vers=3,tcp,rsize=131072,wsize=131072,actimeo={NFS_ATTR_CACHE_SECS},\
-         port={port},mountport={port}"
-    );
     let mount_cmd = if cfg!(target_os = "macos") {
         "mount_nfs"
     } else {
         "mount.nfs"
     };
-    let status = std::process::Command::new(mount_cmd)
-        .args(["-o", &nfs_opts, "127.0.0.1:/"])
-        .arg(&mount_path)
-        .status()
-        .with_context(|| format!("spawn {mount_cmd}"))?;
-    if !status.success() {
-        anyhow::bail!("NFS mount failed with exit code {:?}", status.code());
-    }
+    run_mount(mount_cmd, &nfs_mount_options(port), &mount_path)?;
     Ok(NfsMount {
         path: mount_path,
         unmount: unmount_nfs,
         _server: server,
     })
+}
+
+/// The NFS client's mount options for a loopback server on `port`.
+pub fn nfs_mount_options(port: u16) -> String {
+    format!(
+        "nolocks,vers=3,tcp,rsize=131072,wsize=131072,actimeo={NFS_ATTR_CACHE_SECS},\
+         port={port},mountport={port}"
+    )
+}
+
+/// Run `mount_cmd -o options 127.0.0.1:/ path`; a mount command that exits
+/// non-zero is an error naming its exit code.
+pub fn run_mount(mount_cmd: &str, options: &str, path: &Path) -> Result<()> {
+    let status = std::process::Command::new(mount_cmd)
+        .args(["-o", options, "127.0.0.1:/"])
+        .arg(path)
+        .status()
+        .with_context(|| format!("spawn {mount_cmd}"))?;
+    if !status.success() {
+        anyhow::bail!("NFS mount failed with exit code {:?}", status.code());
+    }
+    Ok(())
 }
 
 /// A FUSE session; dropping it unmounts.

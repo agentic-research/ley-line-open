@@ -135,14 +135,6 @@ fn an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts() {
 }
 
 /// This Mac's product version reads as `major.minor[.patch]`.
-#[cfg(target_os = "macos")]
-#[test]
-fn this_macs_product_version_reads_as_a_release_number() {
-    let version = macos_product_version().unwrap();
-    let major: u32 = version.split('.').next().unwrap().parse().unwrap();
-    assert!(major >= 11, "{version}");
-}
-
 // ── mount plumbing ───────────────────────────────────────────────────────
 
 /// The NFS export is unauthenticated and writable, and the mount reaches it
@@ -575,7 +567,7 @@ fn each_errno_reaches_the_client_as_its_nfs_status() {
 /// rest pass through.
 #[test]
 fn linux_errnos_reach_the_host_in_its_values() {
-    use super::fuse::host_errno;
+    use super::fuse_abi::host_errno;
     use crate::Errno;
     assert_eq!(host_errno(Errno::ESTALE), libc::ESTALE);
     assert_eq!(host_errno(Errno::ENOTEMPTY), libc::ENOTEMPTY);
@@ -589,7 +581,7 @@ fn linux_errnos_reach_the_host_in_its_values() {
 /// Linux's values; other flags are not carried.
 #[test]
 fn host_open_flags_reach_the_filesystem_in_linux_values() {
-    use super::fuse::linux_open_flags;
+    use super::fuse_abi::linux_open_flags;
     use crate::open_flags;
     assert_eq!(linux_open_flags(libc::O_RDONLY), open_flags::O_RDONLY);
     assert_eq!(linux_open_flags(libc::O_WRONLY), open_flags::O_WRONLY);
@@ -606,10 +598,341 @@ fn host_open_flags_reach_the_filesystem_in_linux_values() {
 #[cfg(target_os = "macos")]
 #[test]
 fn host_rename_flags_reach_the_filesystem_in_linux_values() {
-    use super::fuse::linux_rename_flags;
+    use super::fuse_abi::{UNKNOWN_RENAME_FLAG, linux_rename_flags};
     use crate::rename_flags;
     assert_eq!(linux_rename_flags(0), 0);
     assert_eq!(linux_rename_flags(0x4), rename_flags::RENAME_NOREPLACE);
     assert_eq!(linux_rename_flags(0x2), rename_flags::RENAME_EXCHANGE);
-    assert_eq!(linux_rename_flags(0x10), 0x10);
+    assert_eq!(
+        linux_rename_flags(0x6),
+        rename_flags::RENAME_NOREPLACE | rename_flags::RENAME_EXCHANGE
+    );
+    // RENAME_SECLUDE (0x1) is no RENAME_NOREPLACE, though Linux spells
+    // NOREPLACE with that bit.
+    assert_eq!(linux_rename_flags(0x1), UNKNOWN_RENAME_FLAG);
+    assert_eq!(linux_rename_flags(0x10), UNKNOWN_RENAME_FLAG);
+    assert_eq!(
+        linux_rename_flags(0x5),
+        UNKNOWN_RENAME_FLAG | rename_flags::RENAME_NOREPLACE
+    );
+}
+
+/// A rename whose host flag has no Linux spelling is refused, not misread.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_rename_with_an_unknown_host_flag_is_refused() {
+    use super::fuse_abi::linux_rename_flags;
+    let f = fixture(crate::tests::whole());
+    let refused = f
+        .fs
+        .rename(ROOT_INODE, b"a.go", ROOT_INODE, b"b.go", linux_rename_flags(0x1));
+    assert_eq!(refused, Err(crate::Errno::EINVAL));
+    assert!(f.fs.lookup(ROOT_INODE, b"a.go").is_ok());
+}
+
+/// A node's FUSE attributes carry its inode, size, blocks, kind,
+/// permissions, link count and time, and the owner they are given.
+#[test]
+fn a_nodes_fuse_attributes_carry_what_storefs_answers() {
+    use super::fuse_abi::{BLKSIZE, file_attr};
+    use crate::{Attr, Kind};
+    use std::time::{Duration, UNIX_EPOCH};
+    let attr = Attr {
+        inode: 7,
+        kind: Kind::File,
+        size: 1025,
+        perm: 0o755,
+        mtime: Duration::new(1_760_000_000, 42),
+    };
+    let fa = file_attr(&attr, (501, 20));
+    assert_eq!(fa.ino, 7);
+    assert_eq!(fa.size, 1025);
+    assert_eq!(fa.blocks, 3);
+    assert_eq!(fa.mtime, UNIX_EPOCH + Duration::new(1_760_000_000, 42));
+    assert_eq!(fa.atime, fa.mtime);
+    assert_eq!(fa.ctime, fa.mtime);
+    assert_eq!(fa.crtime, fa.mtime);
+    assert_eq!(fa.kind, fuser::FileType::RegularFile);
+    assert_eq!(fa.perm, 0o755);
+    assert_eq!(fa.nlink, attr.nlink());
+    assert_eq!((fa.uid, fa.gid), (501, 20));
+    assert_eq!(fa.blksize, BLKSIZE);
+}
+
+/// Each node kind has its FUSE file type.
+#[test]
+fn each_kind_has_its_fuse_file_type() {
+    use super::fuse_abi::file_type;
+    use crate::Kind;
+    assert_eq!(file_type(Kind::File), fuser::FileType::RegularFile);
+    assert_eq!(file_type(Kind::Directory), fuser::FileType::Directory);
+    assert_eq!(file_type(Kind::Symlink), fuser::FileType::Symlink);
+}
+
+/// A SETATTR naming the owner every node is presented with changes
+/// nothing; any other owner is passed on, to be refused.
+#[test]
+fn only_another_owner_is_an_owner_change() {
+    use super::fuse_abi::owner_change;
+    let owner = (501, 20);
+    assert_eq!(owner_change(None, None, owner), (None, None));
+    assert_eq!(owner_change(Some(501), Some(20), owner), (None, None));
+    assert_eq!(owner_change(Some(0), None, owner), (Some(0), None));
+    assert_eq!(owner_change(None, Some(0), owner), (None, Some(0)));
+    assert_eq!(owner_change(Some(502), Some(21), owner), (Some(502), Some(21)));
+}
+
+/// A CREATE whose mode grants execute stages that mode; any other lands
+/// regular.
+#[test]
+fn a_create_that_grants_execute_stages_its_mode() {
+    use super::fuse_abi::create_mode;
+    assert_eq!(create_mode(0o755), Some(0o755));
+    assert_eq!(create_mode(0o100), Some(0o100));
+    assert_eq!(create_mode(0o001), Some(0o001));
+    assert_eq!(create_mode(0o644), None);
+    assert_eq!(create_mode(0o600), None);
+}
+
+/// Nodes are presented as owned by this process's user.
+#[test]
+fn nodes_are_owned_by_this_process() {
+    use super::fuse_abi::process_owner;
+    // SAFETY: `getuid(2)` and `getgid(2)` cannot fail and touch no memory.
+    let want = unsafe { (libc::getuid(), libc::getgid()) };
+    assert_eq!(process_owner(), want);
+}
+
+// ── the NFS adapter's attributes and owners ─────────────────────────────
+
+/// A node's NFS attributes carry its type, permissions, size, file id and
+/// time, owned by this process's user.
+#[test]
+fn a_nodes_nfs_attributes_carry_what_storefs_answers() {
+    use crate::{Attr, Kind};
+    use std::time::Duration;
+    let attr = Attr {
+        inode: 9,
+        kind: Kind::Directory,
+        size: 0,
+        perm: 0o755,
+        mtime: Duration::new(1_760_000_123, 456),
+    };
+    let fa = super::nfs::fattr(&attr);
+    assert!(matches!(fa.ftype, ftype3::NF3DIR));
+    assert_eq!(fa.mode, 0o755);
+    assert_eq!(fa.fileid, 9);
+    assert_eq!(fa.nlink, attr.nlink());
+    assert_eq!((fa.mtime.seconds, fa.mtime.nseconds), (1_760_000_123, 456));
+    assert_eq!((fa.atime.seconds, fa.ctime.nseconds), (1_760_000_123, 456));
+    // SAFETY: `getuid(2)` and `getgid(2)` cannot fail and touch no memory.
+    let owner = unsafe { (libc::getuid(), libc::getgid()) };
+    assert_eq!((fa.uid, fa.gid), owner);
+    let link = Attr {
+        kind: Kind::Symlink,
+        size: 4,
+        ..attr
+    };
+    let fa = super::nfs::fattr(&link);
+    assert!(matches!(fa.ftype, ftype3::NF3LNK));
+    assert_eq!((fa.size, fa.used), (4, 4));
+}
+
+/// An NFS SETATTR naming the presented owner changes nothing; another
+/// owner, user or group, is passed on to be refused.
+#[test]
+fn only_another_owner_is_an_nfs_owner_change() {
+    use super::nfs::owner_change;
+    use nfsserve::nfs::{set_gid3, set_uid3};
+    // SAFETY: `getuid(2)` and `getgid(2)` cannot fail and touch no memory.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let (other_uid, other_gid) = (uid.wrapping_add(1), gid.wrapping_add(1));
+    assert_eq!(owner_change(&set_uid3::Void, &set_gid3::Void), (None, None));
+    assert_eq!(
+        owner_change(&set_uid3::uid(uid), &set_gid3::gid(gid)),
+        (None, None)
+    );
+    assert_eq!(
+        owner_change(&set_uid3::uid(other_uid), &set_gid3::Void),
+        (Some(other_uid), None)
+    );
+    assert_eq!(
+        owner_change(&set_uid3::Void, &set_gid3::gid(other_gid)),
+        (None, Some(other_gid))
+    );
+}
+
+// ── the NFS adapter's remaining requests ─────────────────────────────────
+
+/// The export's root is the store's root inode.
+#[test]
+fn the_exports_root_is_the_root_inode() {
+    let h = host();
+    assert_eq!(h.nfs.root_dir(), ROOT_INODE);
+}
+
+/// GETATTR answers the file's type and size; with nothing staged it
+/// opens no handle and a COMMIT has nothing to land.
+#[tokio::test]
+async fn getattr_answers_the_store_and_a_clean_commit_lands_nothing() {
+    let h = host();
+    let id = h.id("a.go").await;
+    let attr = h.nfs.getattr(id).await.unwrap();
+    assert!(matches!(attr.ftype, ftype3::NF3REG));
+    assert_eq!(attr.size, A.len() as u64);
+    assert_eq!(attr.fileid, id);
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
+    let pkg = h.id("pkg").await;
+    let attr = h.nfs.getattr(pkg).await.unwrap();
+    assert!(matches!(attr.ftype, ftype3::NF3DIR));
+}
+
+/// A READ reports EOF exactly when it reaches the end of the file.
+#[tokio::test]
+async fn a_read_reports_eof_at_the_end_of_the_file() {
+    let h = host();
+    let id = h.id("a.go").await;
+    let (data, eof) = h.nfs.read(id, 0, 4).await.unwrap();
+    assert_eq!(data, b"pack");
+    assert!(!eof, "a read of the first bytes is not the end");
+    let (data, eof) = h.nfs.read(id, 4, u32::MAX).await.unwrap();
+    assert_eq!(data, &A.as_bytes()[4..]);
+    assert!(eof);
+    let (_, eof) = h.nfs.read(id, 2, 1).await.unwrap();
+    assert!(!eof, "offset 2 + 1 byte is not the end");
+}
+
+/// A WRITE after a truncate waits with it for the client's COMMIT: the
+/// idle window lands nothing, the COMMIT lands both.
+#[tokio::test]
+async fn a_truncate_then_a_write_waits_for_the_commit() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.save(id, A_TAILED).await.unwrap();
+    h.nfs
+        .setattr(
+            id,
+            sattr3 {
+                size: set_size3::size(A_TAILED.len() as u64),
+                ..sattr3::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !h.nfs.commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE),
+        "a written handle waits for its COMMIT, whatever was truncated after"
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_TAILED));
+}
+
+/// CREATE with a mode that grants execute lands an executable file.
+#[tokio::test]
+async fn a_create_with_execute_lands_executable() {
+    let h = host();
+    let (_, attr) = h
+        .nfs
+        .create(
+            ROOT_INODE,
+            &name("run.sh"),
+            sattr3 {
+                mode: set_mode3::mode(0o755),
+                ..sattr3::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(attr.mode & 0o111, 0o111, "{:o}", attr.mode);
+    assert!(matches!(
+        h.entry("run.sh"),
+        Some(StoreEntry::File {
+            mode: Mode::Executable,
+            ..
+        })
+    ));
+}
+
+/// CREATE_EXCLUSIVE lands a new file, and answers the existing one for a
+/// name the store holds.
+#[tokio::test]
+async fn create_exclusive_lands_a_file_or_answers_the_one_held() {
+    let h = host();
+    let id = h.nfs.create_exclusive(ROOT_INODE, &name("lock")).await.unwrap();
+    assert_eq!(id, h.id("lock").await);
+    assert_eq!(h.stored("lock"), Some(Vec::new()));
+    let held = h.nfs.create_exclusive(ROOT_INODE, &name("a.go")).await.unwrap();
+    assert_eq!(held, h.id("a.go").await);
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
+}
+
+/// A file removed and made again under its name is a new file: the old
+/// handle, and the base it read, go with the removal.
+#[tokio::test]
+async fn a_file_made_again_under_a_removed_name_is_a_new_file() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.nfs.remove(ROOT_INODE, &name("a.go")).await.unwrap();
+    let (id, _) = h
+        .nfs
+        .create(ROOT_INODE, &name("a.go"), sattr3::default())
+        .await
+        .unwrap();
+    h.nfs.write(id, 0, A_OTHER.as_bytes()).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
+    assert_eq!(h.read_all(id).await, A_OTHER.as_bytes());
+}
+
+// ── mount plumbing below the kernel ─────────────────────────────────────
+
+/// The NFS server answers on the port it reports.
+#[tokio::test]
+async fn the_nfs_server_listens_on_the_port_it_reports() {
+    let h = host();
+    let server = serve_nfs(Arc::clone(&h.fs), &nfs_listen_addr(0)).await.unwrap();
+    let port = server.port();
+    assert!(port > 1024, "an ephemeral port: {port}");
+    tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap_or_else(|e| panic!("connect to the reported port {port}: {e}"));
+}
+
+/// The NFS mount options: NFSv3 over TCP without locks, 128 KiB transfers,
+/// the one-second attribute cache, and the server's port for both the
+/// mount and the NFS service.
+#[test]
+fn the_nfs_mount_options_name_the_servers_port() {
+    assert_eq!(
+        nfs_mount_options(4049),
+        "nolocks,vers=3,tcp,rsize=131072,wsize=131072,actimeo=1,port=4049,mountport=4049"
+    );
+}
+
+/// A mount command that exits non-zero is an error naming its exit code; one
+/// that exits zero mounted.
+#[test]
+fn a_failed_mount_command_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = run_mount("false", "ro", dir.path()).unwrap_err();
+    assert!(format!("{err:#}").contains("exit code Some(1)"), "{err:#}");
+    run_mount("true", "ro", dir.path()).unwrap();
+    let err = run_mount("/nonexistent/mount_nfs", "ro", dir.path()).unwrap_err();
+    assert!(format!("{err:#}").contains("spawn /nonexistent/mount_nfs"), "{err:#}");
+}
+
+/// The product version the gate decides on is the one `sw_vers` reports.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_gate_reads_this_macs_product_version() {
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .unwrap();
+    let want = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(macos_product_version().unwrap(), want.trim());
 }

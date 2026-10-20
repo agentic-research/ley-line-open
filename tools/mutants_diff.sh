@@ -627,26 +627,35 @@ if { [ "$SCOPE" = all ] || [ "$SCOPE" = storefs ]; } && package_changed_in_diff 
     # tests only (`run_slice lib`): they drive the adapters below the kernel.
     # `tests/host_mount.rs` mounts through the kernel's NFS or FUSE client,
     # and a mutation run must never mount.
-    run_slice lib --package leyline-storefs --test-workspace=false --features mount
+    #
+    # `host/fuse.rs` is excluded: it is the `fuser::Filesystem` glue, whose
+    # requests and replies only a `/dev/fuse` session can build (fuser keeps
+    # `Request::new` and `ReplySender` private), so lib tests cannot reach it
+    # and every mutant there would report MISSED. Every decision it makes
+    # lives in `host/fuse_abi.rs`, which this slice mutates; the glue is
+    # exercised through the kernel by `tests/host_mount.rs` and
+    # `tools/cli_smoke.sh --mount`. The gap is `ley-line-open-5241ee`.
+    run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+        --exclude 'll-open/storefs/src/host/fuse.rs'
 fi
 
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = fs ]; } && package_changed_in_diff ll-open/fs; then
     claim_package ll-open/fs
     # This is the ONLY slice that passes `--no-default-features`, so it names
     # every feature whose code it mutates: `cdc` (the chunked read path and
-    # GC) and `validate`. `verified.rs` is compiled out by these flags while
-    # cargo-mutants, which parses with syn and never evaluates cfg, enumerates
-    # every mutant inside it anyway; each would build in 0s, pass every test,
-    # and be reported MISSED — a phantom survivor on healthy code (bead
-    # `ley-line-open-b23c41`). `verify` does not ship (`ley-line-open-b6a4dd`),
-    # so the file is excluded rather than enabled.
+    # GC), `validate`, and `verify` (verify-on-fault serving: `verified.rs`
+    # and the `#[cfg(feature = "verify")]` loaders in `graph.rs`). A gated
+    # module the flags compiled out would still have every mutant enumerated —
+    # cargo-mutants parses with syn and never evaluates cfg — and each would
+    # build in 0s, pass every test, and be reported MISSED: a phantom survivor
+    # on healthy code (bead `ley-line-open-b23c41`). `verify` does not ship
+    # (`ley-line-open-b6a4dd`), but `fs:test:cdc` runs the crate's tests with
+    # it, so its mutants are killable and the slice enables it.
     #
     # Kept in step by tools/check_mutants_cfg_coverage.sh, which fails if a
-    # cfg-gated module is neither enabled by its slice nor excluded here. That
-    # guard is load-bearing: enumerating this list BY HAND missed `verified.rs`.
+    # cfg-gated module is neither enabled by its slice nor excluded here.
     run_slice lib --package leyline-fs --test-workspace=false \
-        --no-default-features --features cdc,validate \
-        --exclude 'll-open/fs/src/verified.rs'
+        --no-default-features --features cdc,validate,verify
 fi
 
 # `ll-open/cli` is the thin clap binary: its only mutant is `replace main`,

@@ -271,6 +271,11 @@ fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
     }
 }
 
+/// The arena's size in bytes for `--arena-size-mib`.
+fn arena_bytes(arena_size_mib: u64) -> u64 {
+    arena_size_mib * 1024 * 1024
+}
+
 /// Refuse a mount nothing can provide. A daemon asked to mount that ran
 /// headless instead gave its caller no mount and no failure (bead
 /// `ley-line-open-2be4a7`). `provided` says whether the caller passed a
@@ -376,8 +381,7 @@ pub async fn run_daemon_with_options(
         .context("arena admission control (owner sentinel)")?;
 
     // 1. Arena setup.
-    let arena_bytes = arena_size_mib * 1024 * 1024;
-    let ctrl_path = lifecycle::setup_arena(arena, arena_bytes, control)?;
+    let ctrl_path = lifecycle::setup_arena(arena, arena_bytes(arena_size_mib), control)?;
 
     // Lifecycle state — starts as Initializing, transitions through Parsing /
     // Enriching / Ready / Error. Shared with op_status and background tasks.
@@ -2714,6 +2718,38 @@ mod tests {
         let err = refuse_unavailable_mount(at, false).unwrap_err().to_string();
         assert!(err.contains("`mount` feature"), "{err}");
         assert!(err.contains("/mnt/x"), "{err}");
+    }
+
+    /// `--arena-size-mib` is mebibytes.
+    #[test]
+    fn the_arena_size_is_mebibytes() {
+        assert_eq!(arena_bytes(1), 1_048_576);
+        assert_eq!(arena_bytes(64), 67_108_864);
+    }
+
+    /// Two [`HostMountRef`]s are equal when they hold the same provider, and
+    /// a provider prints by name, so `DaemonOptions` stays `Debug` and `Eq`.
+    #[test]
+    fn host_mount_refs_compare_by_provider() {
+        struct Never;
+        impl HostMount for Never {
+            fn mount<'a>(
+                &'a self,
+                _ctx: Arc<crate::daemon::DaemonContext>,
+                _at: &'a Path,
+                _backend: &'a str,
+                _nfs_port: u16,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MountGuard>> + Send + 'a>>
+            {
+                Box::pin(async { anyhow::bail!("never mounts") })
+            }
+        }
+        let one = HostMountRef(Arc::new(Never));
+        let same = one.clone();
+        let other = HostMountRef(Arc::new(Never));
+        assert_eq!(one, same);
+        assert_ne!(one, other);
+        assert_eq!(format!("{one:?}"), "HostMountRef");
     }
 
     #[test]

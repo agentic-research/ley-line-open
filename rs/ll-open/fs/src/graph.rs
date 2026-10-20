@@ -1863,8 +1863,10 @@ mod tests {
         adapter.write_content("docs/readme", b"modified", 0)?;
         adapter.create_node("docs", "new.txt", false)?;
 
-        // Serialize and re-open
-        let bytes = adapter.serialize()?;
+        // Serialize through the `Graph` trait (what `HotSwapGraph` publishes)
+        // and re-open.
+        let bytes = Graph::serialize(&adapter)?;
+        assert_eq!(bytes, adapter.serialize()?, "the trait serializes the writer");
         let adapter2 = SqliteGraphAdapter::new_writable(&bytes)?;
 
         // Verify writes survived
@@ -2119,7 +2121,7 @@ mod tests {
     #[cfg(feature = "cdc")]
     fn recreating_a_removed_path_does_not_leak_the_old_content() -> Result<()> {
         let adapter = chunked_adapter()?;
-        adapter.write_content("docs/readme", b"secret-old-bytes", 0)?;
+        adapter.write_content("docs/readme", &cdc_body(13, 300_000), 0)?;
         adapter.remove_node("docs/readme")?;
 
         let fresh = adapter.create_node("docs", "readme", false)?;
@@ -2142,19 +2144,44 @@ mod tests {
     #[cfg(feature = "cdc")]
     fn removing_a_directory_invalidates_descendant_manifests() -> Result<()> {
         let adapter = chunked_adapter()?;
-        adapter.write_content("docs/readme", b"child-secret", 0)?;
+        // Past CDC's chunking floor, so the write leaves a manifest to drop.
+        adapter.write_content("docs/readme", &cdc_body(7, 300_000), 0)?;
+        {
+            let guard = adapter.writer_guard();
+            assert!(
+                crate::chunked::has_chunked_content(
+                    guard.conn(),
+                    nid_of(guard.conn(), "docs/readme")
+                )?,
+                "precondition: the write left a manifest"
+            );
+        }
 
+        let nid = {
+            let guard = adapter.writer_guard();
+            nid_of(guard.conn(), "docs/readme")
+        };
         adapter.remove_node("docs")?;
 
         let guard = adapter.writer_guard();
         assert!(
-            !crate::chunked::has_chunked_content(
-                guard.conn(),
-                nid_of(guard.conn(), "docs/readme")
-            )?,
+            !crate::chunked::has_chunked_content(guard.conn(), nid)?,
             "descendant manifest survived removal of its parent directory"
         );
+        // The freshness witness alone keeps a stale manifest from being
+        // served; the removal drops the manifest rows themselves.
+        assert_eq!(manifest_rows(guard.conn(), nid)?, 0, "orphaned manifest rows");
         Ok(())
+    }
+
+    /// The `content_manifest` rows keyed to `nid`.
+    #[cfg(feature = "cdc")]
+    fn manifest_rows(conn: &Connection, nid: i64) -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
+            [nid],
+            |r| r.get(0),
+        )?)
     }
 
     /// `rename_node` moves the `nodes` row but the manifest is keyed by the old
@@ -2163,24 +2190,34 @@ mod tests {
     #[cfg(feature = "cdc")]
     fn rename_does_not_orphan_a_manifest_on_the_vacated_path() -> Result<()> {
         let adapter = chunked_adapter()?;
-        adapter.write_content("docs/readme", b"pre-rename-bytes", 0)?;
+        let body = cdc_body(11, 300_000);
+        adapter.write_content("docs/readme", &body, 0)?;
+        {
+            let guard = adapter.writer_guard();
+            assert!(
+                crate::chunked::has_chunked_content(
+                    guard.conn(),
+                    nid_of(guard.conn(), "docs/readme")
+                )?,
+                "precondition: the write left a manifest"
+            );
+        }
         adapter.rename_node("docs/readme", "docs", "moved")?;
 
         let guard = adapter.writer_guard();
+        let vacated = nid_of(guard.conn(), "docs/readme");
         assert!(
-            !crate::chunked::has_chunked_content(
-                guard.conn(),
-                nid_of(guard.conn(), "docs/readme")
-            )?,
+            !crate::chunked::has_chunked_content(guard.conn(), vacated)?,
             "manifest orphaned on the vacated path — a new file there would \
              read the pre-rename content"
         );
+        assert_eq!(manifest_rows(guard.conn(), vacated)?, 0, "orphaned manifest rows");
         drop(guard);
 
         // And the renamed node still reads correctly (via the record path).
-        let mut buf = [0u8; 64];
-        let n = adapter.read_content("docs/moved", &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"pre-rename-bytes");
+        let mut buf = vec![0u8; 64];
+        let n = adapter.read_content("docs/moved", &mut buf, 1000)?;
+        assert_eq!(&buf[..n], &body[1000..1064]);
         Ok(())
     }
 

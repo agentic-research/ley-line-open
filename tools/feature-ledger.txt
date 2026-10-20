@@ -70,8 +70,9 @@ ll-core/schema-capnp  regen-fixtures     not-shipping    skip    -
 # (flush_node fell back to a bare Ok(())), so it was a defect being recorded,
 # not a knob; it ships as of 918a75 and left the list. The flag here flips
 # into a shipping config in a later bead; move this row to ships-optin then.
-# mutants=skip: leyline-fs runs its own slice (cdc,validate), which
-# does not carry verify — a hole bounded by claim 3's compile check.
+# mutants=skip: leyline-fs runs its own slice (cdc,validate,verify), which
+# carries verify itself; this column routes features into the generic slice
+# only.
 ll-open/fs            verify             not-shipping    skip    ley-line-open-b6a4dd
 
 # Declared test-only in its own manifest comment: an atomic reach counter for

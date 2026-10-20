@@ -141,7 +141,7 @@ pub fn fattr(attr: &Attr) -> fattr3 {
 
 /// The owner a SETATTR names, unless it is the owner every node is
 /// presented with: setting that one changes nothing.
-fn owner_change(uid: &set_uid3, gid: &set_gid3) -> (Option<u32>, Option<u32>) {
+pub(super) fn owner_change(uid: &set_uid3, gid: &set_gid3) -> (Option<u32>, Option<u32>) {
     let (own_uid, own_gid) = owner();
     let uid = match uid {
         set_uid3::uid(uid) if *uid != own_uid => Some(*uid),

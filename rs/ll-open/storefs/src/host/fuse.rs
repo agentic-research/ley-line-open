@@ -2,27 +2,31 @@
 //! mount, and the macOS one where macFUSE or fuse-t is installed.
 //!
 //! Each request is the [`StoreFs`] call of the same name, as the libkrun
-//! share answers a guest's (`crate::share`); this adapter translates the
-//! host's `open(2)` and `rename(2)` flags into the Linux values [`StoreFs`]
-//! reads and the Linux errno values it answers into the host's.
+//! share answers a guest's (`crate::share`), with its flags, attributes and
+//! errno translated by [`super::fuse_abi`]. This file is only that glue:
+//! fuser's requests and replies come from a `/dev/fuse` session and cannot be
+//! built in a unit test, so it is exercised through the kernel
+//! (`tests/host_mount.rs`, `tools/cli_smoke.sh --mount`) and every decision it
+//! makes lives in `fuse_abi.rs`, which is.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use fuser::consts::{FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE};
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 
+use super::fuse_abi::{
+    create_mode, file_attr, file_type, host_errno, linux_open_flags, linux_rename_flags,
+    owner_change, process_owner,
+};
 use crate::share::fopen_bits;
-use crate::{Attr, Entry, Errno, Kind, SetAttr, Store, StoreFs, open_flags, rename_flags};
-
-/// `st_blksize`: the I/O size the host is told to prefer.
-const BLKSIZE: u32 = 4096;
+use crate::{Attr, Entry, Errno, SetAttr, Store, StoreFs};
 
 /// [`StoreFs`] as a [`fuser::Filesystem`]. A FUSE inode is the [`StoreFs`]
 /// inode; the root is inode 1 in both.
@@ -36,94 +40,9 @@ impl<S: Store> HostFuse<S> {
     }
 }
 
-/// The host's errno for a Linux one. `ENOSYS`, `ENOTEMPTY` and `ESTALE` are
-/// the values [`StoreFs`] answers that differ between Linux and macOS.
-pub fn host_errno(errno: Errno) -> i32 {
-    match errno {
-        Errno::ENOSYS => libc::ENOSYS,
-        Errno::ENOTEMPTY => libc::ENOTEMPTY,
-        Errno::ESTALE => libc::ESTALE,
-        Errno(other) => other,
-    }
-}
-
-/// The Linux `open(2)` flags [`StoreFs::open`] reads, from the host's: the
-/// access mode (the same bits on Linux and macOS) and `O_TRUNC` (which is
-/// not).
-pub fn linux_open_flags(host: i32) -> u32 {
-    let access = (host & libc::O_ACCMODE) as u32;
-    if host & libc::O_TRUNC != 0 {
-        access | open_flags::O_TRUNC
-    } else {
-        access
-    }
-}
-
-/// The Linux `renameat2(2)` flags [`StoreFs::rename`] reads, from the
-/// host's: macOS's `renamex_np(2)` spells `RENAME_NOREPLACE` as
-/// `RENAME_EXCL` and `RENAME_EXCHANGE` as `RENAME_SWAP`.
-pub fn linux_rename_flags(host: u32) -> u32 {
-    #[cfg(target_os = "macos")]
-    {
-        const RENAME_SWAP: u32 = 0x2;
-        const RENAME_EXCL: u32 = 0x4;
-        let mut linux = 0;
-        if host & RENAME_EXCL != 0 {
-            linux |= rename_flags::RENAME_NOREPLACE;
-        }
-        if host & RENAME_SWAP != 0 {
-            linux |= rename_flags::RENAME_EXCHANGE;
-        }
-        // Any other bit is one StoreFs does not know: pass it on, so it is
-        // refused as unknown rather than dropped.
-        linux | (host & !(RENAME_SWAP | RENAME_EXCL))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = rename_flags::RENAME_NOREPLACE;
-        host
-    }
-}
-
-/// A node's FUSE attributes, owned by this process's user.
-pub fn file_attr(attr: &Attr) -> FileAttr {
-    let mtime = UNIX_EPOCH + attr.mtime;
-    // SAFETY: `getuid(2)` and `getgid(2)` cannot fail and touch no memory.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    FileAttr {
-        ino: attr.inode,
-        size: attr.size,
-        blocks: attr.size.div_ceil(512),
-        atime: mtime,
-        mtime,
-        ctime: mtime,
-        crtime: mtime,
-        kind: match attr.kind {
-            Kind::File => FileType::RegularFile,
-            Kind::Directory => FileType::Directory,
-            Kind::Symlink => FileType::Symlink,
-        },
-        perm: attr.perm as u16,
-        nlink: attr.nlink(),
-        uid,
-        gid,
-        rdev: 0,
-        blksize: BLKSIZE,
-        flags: 0,
-    }
-}
-
-/// The owner a SETATTR names, unless it is the one every node is presented
-/// with: setting that one changes nothing.
-fn owner_change(uid: Option<u32>, gid: Option<u32>) -> (Option<u32>, Option<u32>) {
-    // SAFETY: as in `file_attr`.
-    let (own_uid, own_gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    (uid.filter(|&u| u != own_uid), gid.filter(|&g| g != own_gid))
-}
-
 fn reply_entry(reply: ReplyEntry, entry: Result<Entry, Errno>) {
     match entry {
-        Ok(entry) => reply.entry(&entry.ttl, &file_attr(&entry.attr), 0),
+        Ok(entry) => reply.entry(&entry.ttl, &file_attr(&entry.attr, process_owner()), 0),
         Err(errno) => reply.error(host_errno(errno)),
     }
 }
@@ -137,7 +56,7 @@ fn reply_empty(reply: ReplyEmpty, done: Result<(), Errno>) {
 
 fn reply_attr(reply: ReplyAttr, attr: Result<(Attr, Duration), Errno>) {
     match attr {
-        Ok((attr, ttl)) => reply.attr(&ttl, &file_attr(&attr)),
+        Ok((attr, ttl)) => reply.attr(&ttl, &file_attr(&attr, process_owner())),
         Err(errno) => reply.error(host_errno(errno)),
     }
 }
@@ -180,7 +99,7 @@ impl<S: Store + 'static> Filesystem for HostFuse<S> {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let (uid, gid) = owner_change(uid, gid);
+        let (uid, gid) = owner_change(uid, gid, process_owner());
         let set = SetAttr {
             size,
             mode,
@@ -339,11 +258,7 @@ impl<S: Store + 'static> Filesystem for HostFuse<S> {
         match self.fs.readdir(ino, offset.max(0) as u64) {
             Ok(entries) => {
                 for dirent in entries {
-                    let kind = match dirent.kind {
-                        Kind::File => FileType::RegularFile,
-                        Kind::Directory => FileType::Directory,
-                        Kind::Symlink => FileType::Symlink,
-                    };
+                    let kind = file_type(dirent.kind);
                     if reply.add(dirent.inode, dirent.offset as i64, kind, &dirent.name) {
                         break;
                     }
@@ -355,7 +270,8 @@ impl<S: Store + 'static> Filesystem for HostFuse<S> {
     }
 
     /// CREATE: the file exists at once and lands at its handle's first
-    /// FLUSH, which `close` sends.
+    /// FLUSH, which `close` sends; a mode that grants execute is staged with
+    /// it.
     fn create(
         &mut self,
         _req: &Request<'_>,
@@ -370,7 +286,7 @@ impl<S: Store + 'static> Filesystem for HostFuse<S> {
             .fs
             .create(parent, name.as_bytes(), linux_open_flags(flags))
             .and_then(|(entry, handle)| {
-                if mode & 0o111 != 0 {
+                if let Some(mode) = create_mode(mode) {
                     let exec = SetAttr {
                         mode: Some(mode),
                         ..SetAttr::default()
@@ -385,7 +301,7 @@ impl<S: Store + 'static> Filesystem for HostFuse<S> {
         match created {
             Ok((entry, handle)) => reply.created(
                 &entry.ttl,
-                &file_attr(&entry.attr),
+                &file_attr(&entry.attr, process_owner()),
                 0,
                 handle,
                 FOPEN_DIRECT_IO,

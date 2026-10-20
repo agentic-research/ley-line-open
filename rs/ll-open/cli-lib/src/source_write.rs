@@ -1628,6 +1628,35 @@ mod tests {
         assert_eq!(whole_image(&a.conn), before);
     }
 
+    /// `check` decides as `propose` would, landing nothing: an overlapping
+    /// edit against a moved base is refused with `propose`'s refusal, one
+    /// outside the grant is refused, and an edit that merges is accepted.
+    #[test]
+    fn check_decides_as_propose_and_lands_nothing() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
+        let before = whole_image(&a.conn);
+
+        let overlapping = vec![proposed("a.go", blob(A), "package a\n\nfunc A() int { return 3 }\n")];
+        let err = check(&a.conn, &Grant::Whole, overlapping.clone()).unwrap_err();
+        let want = propose(&a.conn, &Grant::Whole, overlapping).unwrap_err();
+        assert_eq!(err.downcast_ref::<Refusal>(), want.downcast_ref::<Refusal>());
+        assert!(matches!(
+            err.downcast_ref::<Refusal>(),
+            Some(Refusal::Conflict { .. })
+        ));
+
+        let narrow = Grant::Paths(BTreeSet::from(["b.go".to_string()]));
+        let err = check(&a.conn, &narrow, vec![proposed("a.go", Base::Any, A)]).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<Refusal>(),
+            Some(Refusal::OutsideGrant { .. })
+        ));
+
+        check(&a.conn, &Grant::Whole, vec![proposed("b.go", blob(B), B2)]).unwrap();
+        assert!(whole_image(&a.conn) == before, "a check lands nothing");
+    }
+
     /// The written bytes, not the disk's, are what the arena holds: the
     /// cold parse is handed the write and never reads the file.
     #[test]

@@ -56,28 +56,28 @@ expect_fail "cfg(feature = \"ghost\") module added to fs without an exclude"
 # The same module, honestly ENABLED by the slice: not a phantom, must pass.
 reset_fixture
 printf '#[cfg(feature = "ghost")]\npub mod ghost;\n' >> "$fs_lib"
-sed 's/--features cdc,validate/--features cdc,validate,ghost/' "$gate" > "$tmp_dir/m" \
+sed 's/--features cdc,validate,verify/--features cdc,validate,verify,ghost/' "$gate" > "$tmp_dir/m" \
     && mv "$tmp_dir/m" "$gate"
-grep -q 'validate,ghost' "$gate" || { echo "fixture: the enable mutation did not apply" >&2; exit 1; }
+grep -q 'verify,ghost' "$gate" || { echo "fixture: the enable mutation did not apply" >&2; exit 1; }
 expect_pass "ghost module enabled by the slice's --features"
 
 # The same module, honestly EXCLUDED by the slice: a recorded debt, must pass.
 reset_fixture
 printf '#[cfg(feature = "ghost")]\npub mod ghost;\n' >> "$fs_lib"
-sed "s|--exclude 'll-open/fs/src/verified.rs'|--exclude 'll-open/fs/src/verified.rs' --exclude 'll-open/fs/src/ghost.rs'|" "$gate" > "$tmp_dir/m" \
+sed "s|--features cdc,validate,verify|--features cdc,validate,verify --exclude 'll-open/fs/src/ghost.rs'|" "$gate" > "$tmp_dir/m" \
     && mv "$tmp_dir/m" "$gate"
 grep -q 'ghost.rs' "$gate" || { echo "fixture: the exclude mutation did not apply" >&2; exit 1; }
 expect_pass "ghost module excluded by the slice"
 
-# The drift the guard was written for: an existing exclusion deleted from the
-# slice while the module stays gated off. The first version of the guard
-# passed this silently.
+# The drift the guard was written for: a gated module's feature dropped from
+# the slice while the module stays gated off and nothing excludes it. The
+# first version of the guard passed this silently.
 reset_fixture
-grep -v -- "--exclude 'll-open/fs/src/verified.rs'" "$gate" > "$tmp_dir/m" \
+sed 's/--features cdc,validate,verify/--features cdc,validate/' "$gate" > "$tmp_dir/m" \
     && mv "$tmp_dir/m" "$gate"
-grep -q -- "--exclude 'll-open/fs/src/verified.rs'" "$gate" \
-    && { echo "fixture: the exclude removal did not apply" >&2; exit 1; }
-expect_fail "--exclude of verified.rs deleted from the fs slice"
+grep -q -- '--features cdc,validate,verify' "$gate" \
+    && { echo "fixture: the feature removal did not apply" >&2; exit 1; }
+expect_fail "verify dropped from the fs slice while verified.rs stays gated"
 
 # A `--no-default-features` slice whose invocation the lint cannot find is a
 # broken parse, not a clean bill: the lint must fail closed, not report

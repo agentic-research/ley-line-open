@@ -175,7 +175,34 @@ fn every_reply() -> Vec<Reply> {
             entries: vec![dirent.clone()],
         },
         Reply::DirPlus {
-            entries: vec![(dirent, entry)],
+            entries: vec![(dirent.clone(), entry)],
+        },
+        // Listings of more than one entry, and none: every entry survives.
+        Reply::Dir {
+            entries: (0..3)
+                .map(|i| DirEntry {
+                    inode: 10 + i,
+                    offset: i + 1,
+                    kind: DT_REG,
+                    name: format!("f{i}.go").into_bytes(),
+                })
+                .collect(),
+        },
+        Reply::DirPlus {
+            entries: vec![
+                (dirent.clone(), entry),
+                (
+                    DirEntry {
+                        name: b"lib".to_vec(),
+                        offset: 2,
+                        ..dirent
+                    },
+                    entry,
+                ),
+            ],
+        },
+        Reply::Dir {
+            entries: Vec::new(),
         },
     ]
 }

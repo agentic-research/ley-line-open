@@ -121,15 +121,22 @@ impl Host {
 /// and the fixed releases; those releases and every later major mount.
 #[test]
 fn an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts() {
-    for refused in ["26.6.2", "26.0", "15.7.9", "15.0", "14.7.1", "16.0", "", "next"] {
+    for refused in [
+        "26.6.2", "26.0", "15.7.9", "15.0", "14.7.1", "16.0", "", "next",
+    ] {
         let refusal = unpatched_nfs_client(refused)
             .unwrap_or_else(|| panic!("macOS {refused:?} must be refused"));
         assert!(refusal.contains("CVE-2026-43686"), "{refusal}");
         assert!(refusal.contains("CVE-2026-84549"), "{refusal}");
-        assert!(refusal.contains("26.7") && refusal.contains("15.8"), "{refusal}");
+        assert!(
+            refusal.contains("26.7") && refusal.contains("15.8"),
+            "{refusal}"
+        );
         assert!(refusal.contains(refused.trim()), "{refusal}");
     }
-    for patched in ["26.7", "26.7.1", "26.10", "15.8", "15.8.1", "27.0.1", "28.0", " 27.0 "] {
+    for patched in [
+        "26.7", "26.7.1", "26.10", "15.8", "15.8.1", "27.0.1", "28.0", " 27.0 ",
+    ] {
         assert_eq!(unpatched_nfs_client(patched), None, "macOS {patched:?}");
     }
 }
@@ -170,7 +177,9 @@ async fn dropping_an_nfs_mount_unmounts_its_path_and_lands_what_is_staged() {
         Ok(())
     }
     let h = host();
-    let server = serve_nfs(Arc::clone(&h.fs), &nfs_listen_addr(0)).await.unwrap();
+    let server = serve_nfs(Arc::clone(&h.fs), &nfs_listen_addr(0))
+        .await
+        .unwrap();
     assert_ne!(server.port(), 0, "port 0 picks one");
     let id = h.id("a.go").await;
     server.fs.read(id, 0, u32::MAX).await.unwrap();
@@ -199,7 +208,10 @@ async fn an_unknown_backend_is_refused_by_name() {
         format!("{err:#}").contains("unknown backend: carrier-pigeon"),
         "{err:#}"
     );
-    assert!(at.is_dir(), "the mountpoint is made before the backend is chosen");
+    assert!(
+        at.is_dir(),
+        "the mountpoint is made before the backend is chosen"
+    );
 }
 
 // ── the NFS adapter: what storefs lands, a host client lands ─────────────
@@ -230,7 +242,10 @@ async fn creating_a_held_name_is_exist() {
         .nfs
         .create(ROOT_INODE, &name("a.go"), sattr3::default())
         .await;
-    assert!(matches!(refused, Err(nfsstat3::NFS3ERR_EXIST)), "{refused:?}");
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_EXIST)),
+        "{refused:?}"
+    );
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
 }
 
@@ -245,7 +260,10 @@ async fn mkdir_and_rmdir_are_directory_entries() {
     h.nfs.remove(ROOT_INODE, &name("empty")).await.unwrap();
     assert_eq!(h.entry("empty"), None);
     let refused = h.nfs.remove(ROOT_INODE, &name("pkg")).await;
-    assert!(matches!(refused, Err(nfsstat3::NFS3ERR_NOTEMPTY)), "{refused:?}");
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_NOTEMPTY)),
+        "{refused:?}"
+    );
 }
 
 /// `chmod +x` lands the executable mode; the bytes stay.
@@ -312,7 +330,11 @@ async fn a_save_over_a_disjoint_landed_change_merges_at_commit() {
     h.save(id, A_TAILED).await.unwrap();
     h.nfs.commit(id, 0, 0).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_MERGED));
-    assert_eq!(h.read_all(id).await, A_MERGED.as_bytes(), "a READ serves the merge");
+    assert_eq!(
+        h.read_all(id).await,
+        A_MERGED.as_bytes(),
+        "a READ serves the merge"
+    );
 }
 
 /// A save that overlaps a landed change is `NFS3ERR_STALE` at the WRITE,
@@ -325,10 +347,16 @@ async fn a_save_over_an_overlapping_landed_change_is_stale_at_the_write() {
     h.read_all(id).await;
     h.other_writer("a.go", A_OTHER);
     let refused = h.save(id, &A.replace("return 1", "return 2")).await;
-    assert!(matches!(refused, Err(nfsstat3::NFS3ERR_STALE)), "{refused:?}");
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
     // The save's truncate went with its WRITE: nothing is left to land.
-    assert!(!h.nfs.commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE));
+    assert!(
+        !h.nfs
+            .commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE)
+    );
     h.nfs.commit(id, 0, 0).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
     // The client has not read A_OTHER: a retried WRITE is checked against
@@ -336,7 +364,10 @@ async fn a_save_over_an_overlapping_landed_change_is_stale_at_the_write() {
     // landing as an edit of bytes the client never saw.
     let retry = A.replace("return 1", "return 9");
     let retried = h.nfs.write(id, 0, retry.as_bytes()).await;
-    assert!(matches!(retried, Err(nfsstat3::NFS3ERR_STALE)), "{retried:?}");
+    assert!(
+        matches!(retried, Err(nfsstat3::NFS3ERR_STALE)),
+        "{retried:?}"
+    );
     h.nfs.commit(id, 0, 0).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
     // Once it READs the store's bytes, its edit of them lands.
@@ -354,15 +385,23 @@ async fn a_refused_commit_drops_the_edit_and_the_next_read_serves_the_store() {
     let h = host();
     let id = h.id("a.go").await;
     h.read_all(id).await;
-    h.save(id, &A.replace("return 1", "return 2")).await.unwrap();
+    h.save(id, &A.replace("return 1", "return 2"))
+        .await
+        .unwrap();
     h.other_writer("a.go", A_OTHER);
     let refused = h.nfs.commit(id, 0, 0).await;
-    assert!(matches!(refused, Err(nfsstat3::NFS3ERR_STALE)), "{refused:?}");
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
     // A retried overlapping WRITE before any READ is refused: the base stays
     // what the client read.
     let retry = A.replace("return 1", "return 9");
     let retried = h.nfs.write(id, 0, retry.as_bytes()).await;
-    assert!(matches!(retried, Err(nfsstat3::NFS3ERR_STALE)), "{retried:?}");
+    assert!(
+        matches!(retried, Err(nfsstat3::NFS3ERR_STALE)),
+        "{retried:?}"
+    );
     assert_eq!(h.read_all(id).await, A_OTHER.as_bytes());
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
 }
@@ -380,10 +419,9 @@ fn discard_drops_the_staged_bytes_and_keeps_the_base() {
     assert_eq!(h.fs.flush(handle), Ok(()), "nothing staged to propose");
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
 
-    let (_, created) = h
-        .fs
-        .create(ROOT_INODE, b"new.txt", crate::open_flags::O_RDWR)
-        .unwrap();
+    let (_, created) =
+        h.fs.create(ROOT_INODE, b"new.txt", crate::open_flags::O_RDWR)
+            .unwrap();
     h.fs.write(created, 0, b"x").unwrap();
     h.fs.discard(created).unwrap();
     assert_eq!(h.fs.read(created, 0, u32::MAX).unwrap(), b"");
@@ -404,17 +442,16 @@ async fn an_unparseable_save_lands_with_its_diagnostic() {
     h.save(id, A_BROKEN).await.unwrap();
     h.nfs.commit(id, 0, 0).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_BROKEN));
-    let diagnosed: i64 = h
-        .fs
-        .store()
-        .with_read(|conn| {
-            Ok(conn.query_row(
-                "SELECT count(*) FROM _parse_diagnostics WHERE path = 'a.go'",
-                [],
-                |r| r.get(0),
-            )?)
-        })
-        .unwrap();
+    let diagnosed: i64 =
+        h.fs.store()
+            .with_read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM _parse_diagnostics WHERE path = 'a.go'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
     assert_eq!(diagnosed, 1);
 }
 
@@ -436,7 +473,10 @@ async fn a_lone_truncate_lands_once_it_has_stood_idle() {
         .await
         .unwrap();
     let now = Instant::now();
-    assert!(!h.nfs.commit_if_idle(now, COMMIT_IDLE * 1000), "not yet idle");
+    assert!(
+        !h.nfs.commit_if_idle(now, COMMIT_IDLE * 1000),
+        "not yet idle"
+    );
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
     assert!(h.nfs.commit_if_idle(now + COMMIT_IDLE, COMMIT_IDLE));
     assert_eq!(h.stored("a.go"), Some(Vec::new()));
@@ -511,7 +551,10 @@ async fn dot_and_dotdot_resolve() {
     let h = host();
     let sub = h.id("pkg/sub").await;
     assert_eq!(h.nfs.lookup(sub, &name(".")).await.unwrap(), sub);
-    assert_eq!(h.nfs.lookup(sub, &name("..")).await.unwrap(), h.id("pkg").await);
+    assert_eq!(
+        h.nfs.lookup(sub, &name("..")).await.unwrap(),
+        h.id("pkg").await
+    );
 }
 
 /// An owner other than the one presented is `NFS3ERR_PERM`.
@@ -531,7 +574,10 @@ async fn an_owner_change_is_perm() {
             },
         )
         .await;
-    assert!(matches!(refused, Err(nfsstat3::NFS3ERR_PERM)), "{refused:?}");
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_PERM)),
+        "{refused:?}"
+    );
 }
 
 /// Each errno the filesystem answers reaches the client as its NFS status.
@@ -572,7 +618,13 @@ fn linux_errnos_reach_the_host_in_its_values() {
     assert_eq!(host_errno(Errno::ESTALE), libc::ESTALE);
     assert_eq!(host_errno(Errno::ENOTEMPTY), libc::ENOTEMPTY);
     assert_eq!(host_errno(Errno::ENOSYS), libc::ENOSYS);
-    for same in [Errno::EPERM, Errno::ENOENT, Errno::EACCES, Errno::EEXIST, Errno::EISDIR] {
+    for same in [
+        Errno::EPERM,
+        Errno::ENOENT,
+        Errno::EACCES,
+        Errno::EEXIST,
+        Errno::EISDIR,
+    ] {
         assert_eq!(host_errno(same), same.0);
     }
 }
@@ -590,7 +642,10 @@ fn host_open_flags_reach_the_filesystem_in_linux_values() {
         linux_open_flags(libc::O_RDWR | libc::O_TRUNC),
         open_flags::O_RDWR | open_flags::O_TRUNC
     );
-    assert_eq!(linux_open_flags(libc::O_WRONLY | libc::O_APPEND), open_flags::O_WRONLY);
+    assert_eq!(
+        linux_open_flags(libc::O_WRONLY | libc::O_APPEND),
+        open_flags::O_WRONLY
+    );
 }
 
 /// macOS's `renamex_np(2)` flags reach the filesystem as Linux's
@@ -623,9 +678,13 @@ fn host_rename_flags_reach_the_filesystem_in_linux_values() {
 fn a_rename_with_an_unknown_host_flag_is_refused() {
     use super::fuse_abi::linux_rename_flags;
     let f = fixture(crate::tests::whole());
-    let refused = f
-        .fs
-        .rename(ROOT_INODE, b"a.go", ROOT_INODE, b"b.go", linux_rename_flags(0x1));
+    let refused = f.fs.rename(
+        ROOT_INODE,
+        b"a.go",
+        ROOT_INODE,
+        b"b.go",
+        linux_rename_flags(0x1),
+    );
     assert_eq!(refused, Err(crate::Errno::EINVAL));
     assert!(f.fs.lookup(ROOT_INODE, b"a.go").is_ok());
 }
@@ -679,7 +738,10 @@ fn only_another_owner_is_an_owner_change() {
     assert_eq!(owner_change(Some(501), Some(20), owner), (None, None));
     assert_eq!(owner_change(Some(0), None, owner), (Some(0), None));
     assert_eq!(owner_change(None, Some(0), owner), (None, Some(0)));
-    assert_eq!(owner_change(Some(502), Some(21), owner), (Some(502), Some(21)));
+    assert_eq!(
+        owner_change(Some(502), Some(21), owner),
+        (Some(502), Some(21))
+    );
 }
 
 /// A CREATE whose mode grants execute stages that mode; any other lands
@@ -820,7 +882,11 @@ async fn a_removed_files_handle_does_not_outlive_it() {
             source_write::propose(
                 conn,
                 &Grant::Whole,
-                vec![Proposed::write("a.go", Base::Absent, A_OTHER.as_bytes().to_vec())],
+                vec![Proposed::write(
+                    "a.go",
+                    Base::Absent,
+                    A_OTHER.as_bytes().to_vec(),
+                )],
             )
         })
         .unwrap();
@@ -852,7 +918,8 @@ async fn a_truncate_then_a_write_waits_for_the_commit() {
         .await
         .unwrap();
     assert!(
-        !h.nfs.commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE),
+        !h.nfs
+            .commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE),
         "a written handle waits for its COMMIT, whatever was truncated after"
     );
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
@@ -891,10 +958,18 @@ async fn a_create_with_execute_lands_executable() {
 #[tokio::test]
 async fn create_exclusive_lands_a_file_or_answers_the_one_held() {
     let h = host();
-    let id = h.nfs.create_exclusive(ROOT_INODE, &name("lock")).await.unwrap();
+    let id = h
+        .nfs
+        .create_exclusive(ROOT_INODE, &name("lock"))
+        .await
+        .unwrap();
     assert_eq!(id, h.id("lock").await);
     assert_eq!(h.stored("lock"), Some(Vec::new()));
-    let held = h.nfs.create_exclusive(ROOT_INODE, &name("a.go")).await.unwrap();
+    let held = h
+        .nfs
+        .create_exclusive(ROOT_INODE, &name("a.go"))
+        .await
+        .unwrap();
     assert_eq!(held, h.id("a.go").await);
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
 }
@@ -924,7 +999,9 @@ async fn a_file_made_again_under_a_removed_name_is_a_new_file() {
 #[tokio::test]
 async fn the_nfs_server_listens_on_the_port_it_reports() {
     let h = host();
-    let server = serve_nfs(Arc::clone(&h.fs), &nfs_listen_addr(0)).await.unwrap();
+    let server = serve_nfs(Arc::clone(&h.fs), &nfs_listen_addr(0))
+        .await
+        .unwrap();
     let port = server.port();
     assert!(port > 1024, "an ephemeral port: {port}");
     tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -952,7 +1029,10 @@ fn a_failed_mount_command_is_an_error() {
     assert!(format!("{err:#}").contains("exit code Some(1)"), "{err:#}");
     run_mount("true", "ro", dir.path()).unwrap();
     let err = run_mount("/nonexistent/mount_nfs", "ro", dir.path()).unwrap_err();
-    assert!(format!("{err:#}").contains("spawn /nonexistent/mount_nfs"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("spawn /nonexistent/mount_nfs"),
+        "{err:#}"
+    );
 }
 
 /// The product version the gate decides on is the one `sw_vers` reports.

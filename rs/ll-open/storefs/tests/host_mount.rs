@@ -247,7 +247,10 @@ impl TestMount {
 impl Drop for TestMount {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!("host_mount: cleaned up after a failure: {}", force_unmount(&self.path));
+            eprintln!(
+                "host_mount: cleaned up after a failure: {}",
+                force_unmount(&self.path)
+            );
         }
         self.unmount();
     }
@@ -299,25 +302,32 @@ async fn a_host_process_edits_the_store_through_the_mount() {
     let refused = with_kernel_deadline("overlapping save", &m.path, move || {
         save(b, "package mine\n")
     });
-    assert!(refused.is_err(), "an overlapping save must fail at fsync or close");
+    assert!(
+        refused.is_err(),
+        "an overlapping save must fail at fsync or close"
+    );
     assert_eq!(f.stored("pkg/b.go").as_deref(), Some("package other\n"));
 
     // New entries of every kind.
     let root = m.path.clone();
-    with_kernel_deadline("create, mkdir, chmod, symlink, rename", &m.path, move || {
-        let mut notes = fs::File::create(root.join("NOTES.txt")).unwrap();
-        notes.write_all(b"notes\n").unwrap();
-        notes.sync_all().unwrap();
-        drop(notes);
-        fs::create_dir(root.join("empty")).unwrap();
-        let mut run = fs::File::create(root.join("run.sh")).unwrap();
-        run.write_all(b"#!/bin/sh\n").unwrap();
-        run.sync_all().unwrap();
-        drop(run);
-        fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink("a.go", root.join("main.link")).unwrap();
-        fs::rename(root.join("NOTES.txt"), root.join("pkg/NOTES.txt")).unwrap();
-    });
+    with_kernel_deadline(
+        "create, mkdir, chmod, symlink, rename",
+        &m.path,
+        move || {
+            let mut notes = fs::File::create(root.join("NOTES.txt")).unwrap();
+            notes.write_all(b"notes\n").unwrap();
+            notes.sync_all().unwrap();
+            drop(notes);
+            fs::create_dir(root.join("empty")).unwrap();
+            let mut run = fs::File::create(root.join("run.sh")).unwrap();
+            run.write_all(b"#!/bin/sh\n").unwrap();
+            run.sync_all().unwrap();
+            drop(run);
+            fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("a.go", root.join("main.link")).unwrap();
+            fs::rename(root.join("NOTES.txt"), root.join("pkg/NOTES.txt")).unwrap();
+        },
+    );
     m.unmount();
 
     assert_eq!(f.stored("pkg/NOTES.txt").as_deref(), Some("notes\n"));

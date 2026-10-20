@@ -756,7 +756,9 @@ impl<S: Store> StoreFs<S> {
             return Ok(data.len());
         }
         let write = match open.mode {
-            Some(mode) => Proposed::write_mode(open.path.as_str(), open.base.clone(), bytes.clone(), mode),
+            Some(mode) => {
+                Proposed::write_mode(open.path.as_str(), open.base.clone(), bytes.clone(), mode)
+            }
             None => Proposed::write(open.path.as_str(), open.base.clone(), bytes.clone()),
         };
         self.store

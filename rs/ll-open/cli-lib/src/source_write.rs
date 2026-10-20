@@ -1637,10 +1637,17 @@ mod tests {
         write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
         let before = whole_image(&a.conn);
 
-        let overlapping = vec![proposed("a.go", blob(A), "package a\n\nfunc A() int { return 3 }\n")];
+        let overlapping = vec![proposed(
+            "a.go",
+            blob(A),
+            "package a\n\nfunc A() int { return 3 }\n",
+        )];
         let err = check(&a.conn, &Grant::Whole, overlapping.clone()).unwrap_err();
         let want = propose(&a.conn, &Grant::Whole, overlapping).unwrap_err();
-        assert_eq!(err.downcast_ref::<Refusal>(), want.downcast_ref::<Refusal>());
+        assert_eq!(
+            err.downcast_ref::<Refusal>(),
+            want.downcast_ref::<Refusal>()
+        );
         assert!(matches!(
             err.downcast_ref::<Refusal>(),
             Some(Refusal::Conflict { .. })

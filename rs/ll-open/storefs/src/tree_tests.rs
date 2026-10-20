@@ -333,7 +333,11 @@ fn a_checked_write_of_the_bytes_held_stages_nothing() {
     let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
     assert_eq!(f.fs.write_checked(h, 0, &A.as_bytes()[..4]), Ok(4));
     assert_eq!(f.fs.flush(h), Ok(()));
-    assert_eq!(super::tests::passes(&f), 0, "an unchanged file lands nothing");
+    assert_eq!(
+        super::tests::passes(&f),
+        0,
+        "an unchanged file lands nothing"
+    );
 }
 
 /// A checked WRITE on a read-only handle is `EBADF`.
@@ -370,7 +374,11 @@ fn reread_of_a_deleted_file_is_enoent() {
     let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
     f.fs.store()
         .with_write(|conn| {
-            source_write::propose(conn, &Grant::Whole, vec![Proposed::delete("a.go", Base::Any)])
+            source_write::propose(
+                conn,
+                &Grant::Whole,
+                vec![Proposed::delete("a.go", Base::Any)],
+            )
         })
         .unwrap();
     assert_eq!(f.fs.reread(h), Err(Errno::ENOENT));

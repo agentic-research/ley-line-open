@@ -1043,7 +1043,9 @@ impl HotSwapGraph {
             return Ok(Arc::new(adapter));
         }
         if self.writable {
-            Ok(Arc::new(SqliteGraphAdapter::from_arena_writable(control_path)?))
+            Ok(Arc::new(SqliteGraphAdapter::from_arena_writable(
+                control_path,
+            )?))
         } else {
             Ok(Arc::new(SqliteGraphAdapter::from_arena(control_path)?))
         }
@@ -1866,7 +1868,11 @@ mod tests {
         // Serialize through the `Graph` trait (what `HotSwapGraph` publishes)
         // and re-open.
         let bytes = Graph::serialize(&adapter)?;
-        assert_eq!(bytes, adapter.serialize()?, "the trait serializes the writer");
+        assert_eq!(
+            bytes,
+            adapter.serialize()?,
+            "the trait serializes the writer"
+        );
         let adapter2 = SqliteGraphAdapter::new_writable(&bytes)?;
 
         // Verify writes survived
@@ -2170,7 +2176,11 @@ mod tests {
         );
         // The freshness witness alone keeps a stale manifest from being
         // served; the removal drops the manifest rows themselves.
-        assert_eq!(manifest_rows(guard.conn(), nid)?, 0, "orphaned manifest rows");
+        assert_eq!(
+            manifest_rows(guard.conn(), nid)?,
+            0,
+            "orphaned manifest rows"
+        );
         Ok(())
     }
 
@@ -2211,7 +2221,11 @@ mod tests {
             "manifest orphaned on the vacated path — a new file there would \
              read the pre-rename content"
         );
-        assert_eq!(manifest_rows(guard.conn(), vacated)?, 0, "orphaned manifest rows");
+        assert_eq!(
+            manifest_rows(guard.conn(), vacated)?,
+            0,
+            "orphaned manifest rows"
+        );
         drop(guard);
 
         // And the renamed node still reads correctly (via the record path).

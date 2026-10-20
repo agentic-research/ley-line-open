@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
-    set_gid3, set_mode3, set_size3, set_uid3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_gid3,
+    set_mode3, set_size3, set_uid3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use parking_lot::Mutex;
@@ -542,4 +542,3 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
         Ok(nfsstring(status(self.fs.readlink(id))?))
     }
 }
-

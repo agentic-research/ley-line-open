@@ -11,11 +11,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use leyline_core::ContentAddressed;
 
-use crate::lifecycle;
 use crate::daemon::{
     DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
     execution::{ExecutionDaemonExt, ExecutionHandler},
 };
+use crate::lifecycle;
 
 // ---------------------------------------------------------------------------
 // Tuning constants — extracted from the daemon orchestration so each magic

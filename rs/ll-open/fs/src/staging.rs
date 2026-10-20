@@ -507,7 +507,6 @@ impl Graph for StagingGraph {
         )?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]

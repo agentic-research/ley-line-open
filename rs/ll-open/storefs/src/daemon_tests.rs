@@ -172,7 +172,9 @@ async fn a_share_whose_grant_claims_a_generation_the_store_cannot_verify_is_refu
         assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch);
         assert!(!error.retryable, "{error:?}");
         assert!(
-            error.detail.contains(&format!("expectedGeneration {generation}")),
+            error
+                .detail
+                .contains(&format!("expectedGeneration {generation}")),
             "{error:?}"
         );
     }

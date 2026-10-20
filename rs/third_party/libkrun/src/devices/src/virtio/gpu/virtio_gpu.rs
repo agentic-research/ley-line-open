@@ -3,6 +3,7 @@ use std::env;
 use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +32,7 @@ use rutabaga_gfx::{
     RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D, RUTABAGA_CHANNEL_TYPE_WAYLAND,
     RUTABAGA_MAP_CACHE_MASK,
 };
+use rutabaga_gfx::{RutabagaDescriptor, RutabagaFromRawDescriptor};
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
@@ -221,6 +223,7 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
+        render_server_fd: Option<RawFd>,
         export_table: Option<ExportTable>,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
@@ -278,7 +281,17 @@ impl VirtioGpu {
 
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-        builder.clone().build(fence.clone(), None).ok()
+        builder
+            .clone()
+            .build(
+                fence.clone(),
+                render_server_fd.map(|fd| {
+                    // SAFETY: The caller guarantees the fd is valid and open for the
+                    // lifetime of the GPU device. Ownership is transferred to Rutabaga.
+                    unsafe { RutabagaDescriptor::from_raw_descriptor(fd) }
+                }),
+            )
+            .ok()
     }
 
     pub fn create_fallback_rutabaga(
@@ -305,6 +318,7 @@ impl VirtioGpu {
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         virgl_flags: u32,
+        render_server_fd: Option<RawFd>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -318,6 +332,7 @@ impl VirtioGpu {
             interrupt.clone(),
             fence_state.clone(),
             virgl_flags,
+            render_server_fd,
             export_table.clone(),
         ) {
             Some(rutabaga) => rutabaga,
@@ -774,13 +789,16 @@ impl VirtioGpu {
                     RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
                     RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
                     RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-                    _ => panic!("unexpected prot mode for mapping"),
+                    _ => return Err(ErrUnspec),
                 };
 
-                if offset + resource.size > shm_region.size as u64 {
-                    error!("mapping DOES NOT FIT");
-                }
-                let addr = shm_region.host_addr + offset;
+                let addr = checked_blob_map_addr(
+                    shm_region.host_addr,
+                    offset,
+                    resource.size,
+                    shm_region.size as u64,
+                )
+                .ok_or(ErrUnspec)?;
                 debug!(
                     "mapping: host_addr={:x}, addr={:x}, size={}",
                     shm_region.host_addr, addr, resource.size
@@ -829,14 +847,16 @@ impl VirtioGpu {
             RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
             RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
             RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-            _ => panic!("unexpected prot mode for mapping"),
+            _ => return Err(ErrUnspec),
         };
 
-        if offset + resource.size > shm_region.size as u64 {
-            error!("resource map doesn't fit in shm region");
-            return Err(ErrUnspec);
-        }
-        let addr = shm_region.host_addr + offset;
+        let addr = checked_blob_map_addr(
+            shm_region.host_addr,
+            offset,
+            resource.size,
+            shm_region.size as u64,
+        )
+        .ok_or(ErrUnspec)?;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             // SHM and DMABUF are both regular host fds whose pages can be exposed
@@ -904,12 +924,13 @@ impl VirtioGpu {
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
-                if offset + resource.size > shm_region.size as u64 {
-                    error!("mapping DOES NOT FIT");
-                    return Err(ErrUnspec);
-                }
-
-                let guest_addr = shm_region.guest_addr + offset;
+                let guest_addr = checked_blob_map_addr(
+                    shm_region.guest_addr,
+                    offset,
+                    resource.size,
+                    shm_region.size as u64,
+                )
+                .ok_or(ErrUnspec)?;
                 debug!(
                     "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
                     map_ptr, guest_addr, resource.size
@@ -968,7 +989,8 @@ impl VirtioGpu {
             )
         };
         if ret == libc::MAP_FAILED {
-            panic!("UNMAP failed");
+            error!("failed to unmap blob resource");
+            return Err(ErrUnspec);
         }
 
         resource.shmem_offset = None;
@@ -1012,9 +1034,41 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 }
+
+// A guest-controlled `offset` that wraps `offset + size` or `base + offset` would
+// otherwise pass the size guard and place the mmap(MAP_FIXED) out of bounds.
+fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Option<u64> {
+    if offset.checked_add(size)? > shm_size {
+        return None;
+    }
+    base.checked_add(offset)
+}
+
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    #[test]
+    fn checked_blob_map_addr_rejects_out_of_range_and_wrapping_offsets() {
+        use super::checked_blob_map_addr;
+
+        let base = 0x1_0000_u64;
+        let shm = 0x1_0000_u64;
+
+        assert_eq!(
+            checked_blob_map_addr(base, 0x1000, 0x2000, shm),
+            Some(base + 0x1000)
+        );
+        assert_eq!(checked_blob_map_addr(base, 0, shm, shm), Some(base));
+        assert!(checked_blob_map_addr(base, shm, 1, shm).is_none());
+
+        let size = 0x1000_u64;
+        let wrapping_offset = u64::MAX - size + 1;
+        assert!(wrapping_offset.wrapping_add(size) <= shm);
+        assert!(checked_blob_map_addr(base, wrapping_offset, size, shm).is_none());
+
+        assert!(checked_blob_map_addr(u64::MAX - 5, 10, 0, u64::MAX).is_none());
+    }
 
     #[test]
     fn test_virtio_gpu_associated_scanouts() {

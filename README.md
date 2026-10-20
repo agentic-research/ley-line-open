@@ -86,7 +86,7 @@ when constructing `run_execution_daemon`; the ordinary daemon remains backend-
 free for compatibility.
 
 LLO builds the VMM it runs: the libkrun worker links libkrun from
-[`rs/third_party/libkrun`](rs/third_party/README.md) (upstream v1.19.4 plus LLO's
+[`rs/third_party/libkrun`](rs/third_party/README.md) (upstream v1.19.6 plus LLO's
 patches, ADR-0044) instead of loading an installed libkrun. The guest kernel,
 libkrunfw, is still an installed library. Building the worker compiles
 libkrun's guest init for Linux; on macOS that needs `zig`

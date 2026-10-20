@@ -4975,10 +4975,14 @@ name = "leyline-storefs"
 version = "0.20.5"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "fuser",
  "leyline-cli-lib",
  "leyline-core",
  "leyline-runtime",
+ "libc",
  "log",
+ "nessie-nfsserve",
  "parking_lot",
  "rusqlite",
  "tempfile",

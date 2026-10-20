@@ -324,30 +324,24 @@ fn a_checked_write_that_merges_is_staged_and_its_flush_lands_the_merge() {
     assert_eq!(stored_text(&f, "a.go").as_deref(), Some(A_MERGED));
 }
 
-/// A checked truncate stages the size; one to the size the handle holds
-/// stages nothing, so its FLUSH proposes nothing.
+/// A checked WRITE that changes nothing the handle holds stages nothing, so
+/// its FLUSH proposes nothing.
 #[test]
-fn a_checked_truncate_stages_the_size_and_one_to_the_size_held_stages_nothing() {
+fn a_checked_write_of_the_bytes_held_stages_nothing() {
     let f = fixture(whole());
     super::tests::count_passes(&f);
     let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
-    assert_eq!(f.fs.truncate_checked(h, A.len() as u64), Ok(()));
+    assert_eq!(f.fs.write_checked(h, 0, &A.as_bytes()[..4]), Ok(4));
     assert_eq!(f.fs.flush(h), Ok(()));
-    assert_eq!(super::tests::passes(&f), 0, "an unchanged size lands nothing");
-    assert_eq!(f.fs.truncate_checked(h, 10), Ok(()));
-    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), &A.as_bytes()[..10]);
-    assert_eq!(f.fs.flush(h), Ok(()));
-    assert_eq!(super::tests::passes(&f), 1);
-    assert_eq!(stored_text(&f, "a.go").as_deref(), Some(&A[..10]));
+    assert_eq!(super::tests::passes(&f), 0, "an unchanged file lands nothing");
 }
 
-/// A checked change on a read-only handle is `EBADF`.
+/// A checked WRITE on a read-only handle is `EBADF`.
 #[test]
-fn a_checked_change_needs_a_write_handle() {
+fn a_checked_write_needs_a_write_handle() {
     let f = fixture(whole());
     let h = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle;
     assert_eq!(f.fs.write_checked(h, 0, b"x"), Err(Errno::EBADF));
-    assert_eq!(f.fs.truncate_checked(h, 0), Err(Errno::EBADF));
 }
 
 /// REREAD brings a handle with nothing staged to the blob the store holds

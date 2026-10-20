@@ -66,6 +66,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 
 pub mod daemon;
+#[cfg(feature = "mount")]
+pub mod host;
 pub mod share;
 pub use daemon::{DaemonShares, scope_for};
 pub use share::StoreShare;
@@ -742,31 +744,15 @@ impl<S: Store> StoreFs<S> {
     /// ignores a refused COMMIT, so the WRITE is where it learns of a
     /// conflict.
     pub fn write_checked(&self, handle: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
-        self.stage_checked(handle, |bytes| splice(bytes, offset, data))?;
-        Ok(data.len())
-    }
-
-    /// A SETATTR of the size on a write handle, checked as
-    /// [`StoreFs::write_checked`] is. A size the handle already holds
-    /// stages nothing.
-    pub fn truncate_checked(&self, handle: u64, size: u64) -> Result<(), Errno> {
-        let size = usize::try_from(size).map_err(|_| Errno::EINVAL)?;
-        self.stage_checked(handle, |bytes| bytes.resize(size, 0))
-    }
-
-    /// Stage `change` on the write handle `handle` when the proposal of the
-    /// changed bytes against the handle's base lands against what the store
-    /// holds now.
-    fn stage_checked(&self, handle: u64, change: impl FnOnce(&mut Vec<u8>)) -> Result<(), Errno> {
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if !open.writable {
             return Err(Errno::EBADF);
         }
         let mut bytes = open.bytes.clone();
-        change(&mut bytes);
+        splice(&mut bytes, offset, data);
         if bytes == open.bytes {
-            return Ok(());
+            return Ok(data.len());
         }
         let write = match open.mode {
             Some(mode) => Proposed::write_mode(open.path.as_str(), open.base.clone(), bytes.clone(), mode),
@@ -780,7 +766,7 @@ impl<S: Store> StoreFs<S> {
             })?;
         open.bytes = bytes;
         open.dirty = true;
-        Ok(())
+        Ok(data.len())
     }
 
     /// REREAD: a handle with nothing staged takes the blob the store holds

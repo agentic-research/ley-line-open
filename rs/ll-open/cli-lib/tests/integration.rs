@@ -558,9 +558,9 @@ fn test_serve_creates_arena() {
     let arena_size_mib: u64 = 2;
     let arena_bytes = arena_size_mib * 1024 * 1024;
 
-    // Run setup_arena — the reusable core of cmd_serve.
+    // Run setup_arena — the arena and controller every daemon starts from.
     let returned_ctrl =
-        leyline_cli_lib::cmd_serve::setup_arena(&arena_path, arena_bytes, Some(&ctrl_path))
+        leyline_cli_lib::lifecycle::setup_arena(&arena_path, arena_bytes, Some(&ctrl_path))
             .expect("setup_arena should succeed");
 
     // Verify the arena file was created with the expected size.
@@ -605,7 +605,7 @@ fn test_serve_derives_control_path() {
     let dir = TempDir::new().expect("create temp dir");
     let arena_path = dir.path().join("my.arena");
 
-    let ctrl_path = leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, None)
+    let ctrl_path = leyline_cli_lib::lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, None)
         .expect("setup_arena should succeed");
 
     // Should derive .ctrl extension from .arena

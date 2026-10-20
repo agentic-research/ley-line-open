@@ -7,10 +7,12 @@
 //! - a READ rereads the handle when nothing is staged on it
 //!   ([`StoreFs::reread`]), so the base an edit is checked against is no
 //!   older than the bytes the client read;
-//! - a WRITE and a SETATTR of the size stage on that handle, checked
-//!   against what the store holds now ([`StoreFs::write_checked`]): an edit
-//!   the store would refuse is refused `NFS3ERR_STALE` at the WRITE, which
-//!   the macOS client reports at `fsync` and `close`;
+//! - a WRITE stages on that handle, checked against what the store holds
+//!   now ([`StoreFs::write_checked`]): an edit the store would refuse is
+//!   refused `NFS3ERR_STALE` at the WRITE, which the macOS client reports at
+//!   `fsync` and `close`. A SETATTR of the size stages unchecked: a save
+//!   truncates before it writes, and the WRITE is checked with what it
+//!   makes;
 //! - a COMMIT (`fsync`, `close`) is the handle's FLUSH: a moved base merges,
 //!   overlapping edits refuse. A COMMIT is refused only for a change landed
 //!   between the client's last WRITE and the COMMIT; the macOS client does
@@ -306,10 +308,15 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
         self.attr(id)
     }
 
-    /// A size stages a truncate on the file id's handle, checked; a mode is
-    /// a proposal of the file's git mode, staged with what the handle
-    /// stages; an owner other than the one presented is `NFS3ERR_PERM`;
-    /// times are not carried.
+    /// A size stages a truncate on the file id's handle; a mode is a
+    /// proposal of the file's git mode, staged with what the handle stages;
+    /// an owner other than the one presented is `NFS3ERR_PERM`; times are
+    /// not carried.
+    ///
+    /// The truncate is not checked: a save truncates and then writes, and
+    /// the empty file between the two is no edit the client means. The WRITE
+    /// after it is checked with the bytes the save makes; a truncate with no
+    /// WRITE after it is decided when it lands.
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let (uid, gid) = owner_change(&setattr.uid, &setattr.gid);
         if uid.is_some() || gid.is_some() {
@@ -317,7 +324,11 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
         }
         if let set_size3::size(size) = setattr.size {
             let handle = self.handle(id)?;
-            status(self.fs.truncate_checked(handle, size))?;
+            let truncate = SetAttr {
+                size: Some(size),
+                ..SetAttr::default()
+            };
+            status(self.fs.setattr(id, Some(handle), truncate))?;
             self.stage(id, Stage::Truncated(Instant::now()));
         }
         if let set_mode3::mode(bits) = setattr.mode {
@@ -350,7 +361,9 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
 
     /// Stage the chunk, checked. An UNSTABLE write waits for the client's
     /// COMMIT; a FILE_SYNC or DATA_SYNC write is committed before it is
-    /// answered, and a refused commit fails it.
+    /// answered, and a refused commit fails it. A refused WRITE drops what
+    /// the handle staged before it (the save's truncate), so nothing of the
+    /// refused save lands.
     async fn write_stable(
         &self,
         id: fileid3,
@@ -359,7 +372,10 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
         stable: bool,
     ) -> Result<(fattr3, bool), nfsstat3> {
         let handle = self.handle(id)?;
-        status(self.fs.write_checked(handle, offset, data))?;
+        if let Err(errno) = self.fs.write_checked(handle, offset, data) {
+            self.forget(id);
+            return Err(nfs_status(errno));
+        }
         self.stage(id, Stage::Written);
         if stable {
             status(self.commit_id(id))?;

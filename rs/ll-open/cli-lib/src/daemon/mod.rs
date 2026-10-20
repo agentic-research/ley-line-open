@@ -18,7 +18,6 @@ pub mod granularity_router;
 pub mod hdc_enrich;
 #[cfg(feature = "hdc")]
 pub mod hdc_pass;
-pub mod live_graph;
 #[cfg(feature = "lsp")]
 pub mod lsp_pass;
 pub mod mcp;

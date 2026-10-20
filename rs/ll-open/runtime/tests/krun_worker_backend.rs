@@ -797,11 +797,12 @@ const DECLARED_SHARE: &str = r#"{\"descriptor\":$fd,\"channel\":{\"role\":\"work
 fn a_granted_workspace_is_served_to_the_worker_over_an_inherited_socket() {
     let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
-    // The worker sends one framed INIT request down its share: 13 header
-    // bytes (`{"op":"init"}`), no payload.
+    // The worker sends one framed INIT request down its share: a 32-byte
+    // header (one Cap'n Proto segment of three words: the root pointer, a
+    // data word whose union tag 0 is INIT, a null pointer), no payload.
     let script = share_worker(
         r#"[ -n "$fd" ] || exit 3
-eval "printf '\015\000\000\000\000\000\000\000{\"op\":\"init\"}' >&$fd" || exit 4"#,
+eval "printf '\040\000\000\000\000\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000\001\000\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000' >&$fd" || exit 4"#,
         DECLARED_SHARE,
     );
     let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);

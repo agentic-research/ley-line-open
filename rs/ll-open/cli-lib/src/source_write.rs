@@ -424,6 +424,22 @@ pub struct Accepted {
 /// arena has one writer: the daemon's writer lock, or the one process that
 /// owns a file-backed database.
 pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Result<Accepted> {
+    granted(grant, &writes)?;
+    propose_checked(conn, writes)
+}
+
+/// Whether [`propose`] accepts `writes` now: the same grant check, bases,
+/// merges and structure checks, refused with the same [`Refusal`], and
+/// nothing written. What the host mount's NFS WRITE asks of the edit it
+/// stages (ADR-0045 T8).
+pub fn check(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Result<()> {
+    granted(grant, &writes)?;
+    let (plans, _) = decide(conn, writes)?;
+    check_structure(conn, &plans)
+}
+
+/// Refuse a proposal that writes nothing, or names a path outside `grant`.
+fn granted(grant: &Grant, writes: &[Proposed]) -> Result<()> {
     if writes.is_empty() {
         return Err(Refusal::Empty.into());
     }
@@ -439,8 +455,7 @@ pub fn propose(conn: &Connection, grant: &Grant, writes: Vec<Proposed>) -> Resul
         }
         .into());
     }
-
-    propose_checked(conn, writes)
+    Ok(())
 }
 
 /// One path of a proposal once its base has been checked (and, for a
@@ -580,8 +595,52 @@ fn decide_one(conn: &Connection, w: Proposed) -> Result<Decided> {
 
 fn propose_checked(conn: &Connection, writes: Vec<Proposed>) -> Result<Accepted> {
     use leyline_core::ContentAddressed;
-    // Every path's entry, and every base checked (and merged), before
-    // anything else: a stale refusal names every path that moved.
+    let (plans, merged) = decide(conn, writes)?;
+    let root = proposal_root(conn, &plans)?;
+    check_structure(conn, &plans)?;
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut blobs = std::collections::BTreeMap::new();
+    let mut removed = BTreeSet::new();
+    let mut edits = crate::cmd_parse::TreeEdits::default();
+    for plan in plans {
+        match plan.change {
+            Change::Write { bytes, mode } => {
+                if let Some(mode) = mode {
+                    edits.modes.insert(plan.path.clone(), mode);
+                }
+                blobs.insert(plan.path.clone(), bytes.as_slice().hash());
+                files.insert(plan.path, bytes);
+            }
+            Change::Delete => {
+                removed.insert(plan.path);
+            }
+            Change::Mkdir => {
+                edits.mkdirs.insert(plan.path);
+            }
+            Change::Rmdir => {
+                edits.rmdirs.insert(plan.path);
+            }
+        }
+    }
+
+    let committed = crate::cmd_parse::parse_written_files(conn, &root, &files, &removed, &edits)?;
+    Ok(Accepted {
+        blobs,
+        removed,
+        merged,
+        mkdirs: edits.mkdirs,
+        rmdirs: edits.rmdirs,
+        tree_root: committed.result.tree_root,
+        post_commit_error: committed.post_commit.map(|e| format!("{e:#}")),
+    })
+}
+
+/// Every path's entry, and every base checked (and merged), before
+/// anything else: a stale refusal names every path that moved. Returns the
+/// plans and the paths whose bytes are a merge.
+fn decide(conn: &Connection, writes: Vec<Proposed>) -> Result<(Vec<Plan>, BTreeSet<String>)> {
+    use leyline_core::ContentAddressed;
     let mut seen = BTreeSet::new();
     let mut moved = Vec::new();
     let mut conflicts = std::collections::BTreeMap::new();
@@ -621,45 +680,7 @@ fn propose_checked(conn: &Connection, writes: Vec<Proposed>) -> Result<Accepted>
     if !moved.is_empty() {
         return Err(Refusal::Stale(moved).into());
     }
-
-    let root = proposal_root(conn, &plans)?;
-    check_structure(conn, &plans)?;
-
-    let mut files = std::collections::BTreeMap::new();
-    let mut blobs = std::collections::BTreeMap::new();
-    let mut removed = BTreeSet::new();
-    let mut edits = crate::cmd_parse::TreeEdits::default();
-    for plan in plans {
-        match plan.change {
-            Change::Write { bytes, mode } => {
-                if let Some(mode) = mode {
-                    edits.modes.insert(plan.path.clone(), mode);
-                }
-                blobs.insert(plan.path.clone(), bytes.as_slice().hash());
-                files.insert(plan.path, bytes);
-            }
-            Change::Delete => {
-                removed.insert(plan.path);
-            }
-            Change::Mkdir => {
-                edits.mkdirs.insert(plan.path);
-            }
-            Change::Rmdir => {
-                edits.rmdirs.insert(plan.path);
-            }
-        }
-    }
-
-    let committed = crate::cmd_parse::parse_written_files(conn, &root, &files, &removed, &edits)?;
-    Ok(Accepted {
-        blobs,
-        removed,
-        merged,
-        mkdirs: edits.mkdirs,
-        rmdirs: edits.rmdirs,
-        tree_root: committed.result.tree_root,
-        post_commit_error: committed.post_commit.map(|e| format!("{e:#}")),
-    })
+    Ok((plans, merged))
 }
 
 /// The directory the proposal's tree is rooted at: every projected file's
@@ -799,6 +820,47 @@ pub fn rename_dir(conn: &Connection, from: &str, to: &str) -> Result<Vec<Propose
     Ok(writes)
 }
 
+/// A rename of what the store holds at `from` as one proposal, as
+/// storefs's RENAME makes it: a file is deleted against its blob and
+/// written at `to` with its bytes and mode, replacing a file there against
+/// that file's blob; a directory is [`rename_dir`]. Refused with a typed
+/// [`Refusal`] before anything is planned: `NoSuchFile` when `from` holds
+/// nothing, `IsADirectory` for a file renamed over a directory,
+/// `NotADirectory` for a directory renamed over a file, `NotEmpty` over a
+/// directory with entries under it, and `MalformedPath` for a directory
+/// renamed under itself.
+pub fn rename(conn: &Connection, from: &str, to: &str) -> Result<Vec<Proposed>> {
+    let target = crate::tree::entry(conn, to)?;
+    match crate::tree::entry(conn, from)? {
+        None => Err(Refusal::NoSuchFile { path: from.into() }.into()),
+        Some(Entry::File { mode, blob }) => {
+            let replaced = match target {
+                Some(Entry::Dir) => return Err(Refusal::IsADirectory { path: to.into() }.into()),
+                Some(Entry::File { blob, .. }) => Base::Blob(blob),
+                None => Base::Absent,
+            };
+            let bytes = crate::tree::blob_bytes(conn, blob)?
+                .with_context(|| format!("rename of '{from}': the store holds no blob {blob}"))?;
+            Ok(vec![
+                Proposed::delete(from, Base::Blob(blob)),
+                Proposed::write_mode(to, replaced, bytes, mode),
+            ])
+        }
+        Some(Entry::Dir) => {
+            if to.starts_with(&format!("{from}/")) {
+                return Err(Refusal::MalformedPath { path: to.into() }.into());
+            }
+            match target {
+                Some(Entry::File { .. }) => Err(Refusal::NotADirectory { path: to.into() }.into()),
+                Some(Entry::Dir) if !crate::tree::under(conn, to)?.is_empty() => {
+                    Err(Refusal::NotEmpty { path: to.into() }.into())
+                }
+                _ => rename_dir(conn, from, to),
+            }
+        }
+    }
+}
+
 /// Whether `path` is a plain relative path: one or more `/`-separated
 /// components, none empty, `.` or `..`.
 fn plain_relative(path: &str) -> bool {
@@ -831,9 +893,9 @@ pub fn write(conn: &Connection, grant: &Grant, path: &str, bytes: Vec<u8>) -> Re
     })
 }
 
-/// A mount's handle on [`write`]: the FUSE/NFS mount computes an edited
-/// file's bytes and hands them here, under the grant the mount was built
-/// with.
+/// A mount's handle on [`propose`]: the FUSE/NFS mount computes what each
+/// of its operations proposes and hands it here, under the grant the mount
+/// was built with (ADR-0045 T8).
 #[cfg(feature = "mount")]
 pub struct MountWriter {
     pub grant: Grant,
@@ -843,69 +905,102 @@ pub struct MountWriter {
     pub checkout: Option<PathBuf>,
 }
 
+/// The changes a mount operation proposes, as storefs proposes the same
+/// operation (ADR-0045 T8).
+#[cfg(feature = "mount")]
+fn mount_writes(
+    conn: &Connection,
+    proposal: &leyline_fs::graph::Proposal,
+) -> Result<Vec<Proposed>> {
+    use leyline_fs::graph::Proposal as P;
+    Ok(match proposal {
+        P::Write { path, base, bytes } => vec![Proposed::write(
+            path.as_str(),
+            base.map_or(Base::Any, Base::Blob),
+            bytes.clone(),
+        )],
+        P::Delete { path, base } => vec![Proposed::delete(path.as_str(), Base::Blob(*base))],
+        P::Rmdir { path } => vec![Proposed::rmdir(path.as_str())],
+        P::Rename { from, to } => rename(conn, from, to)?,
+    })
+}
+
+/// `err` as the mount answers it: a [`Refusal`] becomes the mount's
+/// [`leyline_fs::graph::Refused`] of the class storefs's `errno_for` gives
+/// the same refusal; any other failure is passed on as it is.
+#[cfg(feature = "mount")]
+fn mount_refusal(err: anyhow::Error) -> anyhow::Error {
+    use leyline_fs::graph::RefusalKind as Kind;
+    let Some(refusal) = err.downcast_ref::<Refusal>() else {
+        return err;
+    };
+    let kind = match refusal {
+        Refusal::Stale(moved) if moved.iter().all(|m| m.expected.is_none()) => Kind::Exists,
+        Refusal::Stale(_) | Refusal::Conflict { .. } => Kind::Stale,
+        Refusal::OutsideGrant { .. } => Kind::OutsideGrant,
+        Refusal::NoSuchFile { .. } => Kind::NotFound,
+        Refusal::Exists { .. } => Kind::Exists,
+        Refusal::NotEmpty { .. } => Kind::NotEmpty,
+        Refusal::NotADirectory { .. } | Refusal::PathConflict { .. } => Kind::NotADirectory,
+        Refusal::IsADirectory { .. } => Kind::IsADirectory,
+        Refusal::MalformedPath { .. } => Kind::Invalid,
+        _ => return err,
+    };
+    let path = refusal
+        .path()
+        .or_else(|| refusal.moved().first().map(|m| m.path.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    leyline_fs::graph::Refused {
+        kind,
+        path,
+        reason: refusal.to_string(),
+    }
+    .into()
+}
+
 #[cfg(feature = "mount")]
 impl leyline_fs::graph::SourceWriter for MountWriter {
-    /// A one-file [`propose`] against the base the mount took when the edit
-    /// began; a file that moved since is refused with the mount's
-    /// [`leyline_fs::graph::StaleWrite`].
-    fn write(
-        &self,
-        conn: &Connection,
-        source_id: &str,
-        bytes: Vec<u8>,
-        base: Option<Hash>,
-    ) -> Result<()> {
-        let proposed = Proposed::write(source_id, base.map_or(Base::Any, Base::Blob), bytes);
-        match propose(conn, &self.grant, vec![proposed]) {
-            // The edit committed: the mount must not run its refusal path
-            // over it. A failure after `COMMIT` is logged; the next write
-            // or reparse advances the head and sidecars again.
-            Ok(accepted) => {
-                if let Some(problem) = accepted.post_commit_error {
-                    log::warn!("mount write to '{source_id}' landed; after it: {problem}");
-                }
-                if let Some(dir) = &self.checkout {
-                    let paths = [source_id.to_string()];
-                    match crate::checkout::reconcile(conn, dir, None, Some(&paths)) {
-                        Ok(reconciled) => {
-                            if let Some(problem) = reconciled.problems() {
-                                log::warn!("mount write to '{source_id}' landed; {problem}");
-                            }
-                        }
-                        Err(e) => log::warn!(
-                            "mount write to '{source_id}' landed; the source directory was \
-                             not brought up to it: {e:#}"
-                        ),
-                    }
-                }
-                Ok(())
-            }
-            Err(err) => match err.downcast::<Refusal>() {
-                // A one-file replace: its one moved file, whether it could
-                // not merge or its merge conflicted (ADR-0045 T5). A file
-                // deleted since the mount read it has no current blob, and
-                // the refusal is passed on as it is.
-                Ok(refusal @ (Refusal::Stale(_) | Refusal::Conflict { .. })) => {
-                    match refusal.moved() {
-                        [
-                            Stale {
-                                path,
-                                expected: Some(expected),
-                                current: Some(current),
-                            },
-                        ] => Err(leyline_fs::graph::StaleWrite {
-                            source_id: path.clone(),
-                            expected: *expected,
-                            current: *current,
-                        }
-                        .into()),
-                        _ => Err(refusal.into()),
-                    }
-                }
-                Ok(other) => Err(other.into()),
-                Err(other) => Err(other),
-            },
+    /// The mount operation's [`propose`], under the mount's grant, decided
+    /// as storefs's is: a moved base merges, overlapping edits refuse, a
+    /// file that does not parse lands with a diagnostic. An accepted
+    /// proposal is materialized into the checkout.
+    fn propose(&self, conn: &Connection, proposal: leyline_fs::graph::Proposal) -> Result<()> {
+        let writes = mount_writes(conn, &proposal).map_err(mount_refusal)?;
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        for w in &writes {
+            paths.insert(w.path.clone());
+            paths.extend(crate::tree::parents(&w.path).map(str::to_string));
         }
+        let named = paths.iter().cloned().collect::<Vec<_>>().join("', '");
+        // The proposal committed: the mount must not run its refusal path
+        // over it. A failure after `COMMIT` is logged; the next write or
+        // reparse advances the head and sidecars again.
+        let accepted = propose(conn, &self.grant, writes).map_err(mount_refusal)?;
+        if let Some(problem) = accepted.post_commit_error {
+            log::warn!("mount proposal to '{named}' landed; after it: {problem}");
+        }
+        if let Some(dir) = &self.checkout {
+            let paths: Vec<String> = paths.into_iter().collect();
+            match crate::checkout::reconcile(conn, dir, None, Some(&paths)) {
+                Ok(reconciled) => {
+                    if let Some(problem) = reconciled.problems() {
+                        log::warn!("mount proposal to '{named}' landed; {problem}");
+                    }
+                }
+                Err(e) => log::warn!(
+                    "mount proposal to '{named}' landed; the source directory was not \
+                     brought up to it: {e:#}"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// [`check`] of the proposal under the mount's grant.
+    fn check(&self, conn: &Connection, proposal: &leyline_fs::graph::Proposal) -> Result<()> {
+        let writes = mount_writes(conn, proposal).map_err(mount_refusal)?;
+        check(conn, &self.grant, writes).map_err(mount_refusal)
     }
 }
 
@@ -932,6 +1027,9 @@ fn tree_root_dir(abs: &Path, rel: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tree_tests;
+
+#[cfg(all(test, feature = "mount"))]
+mod mount_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1660,28 +1758,47 @@ mod tests {
         );
     }
 
-    /// The mount's writer is `write` under the grant it was built with.
+    /// A mount's write of `bytes` to `path` against `base`.
+    #[cfg(feature = "mount")]
+    fn mount_write(
+        writer: &MountWriter,
+        conn: &Connection,
+        path: &str,
+        bytes: &str,
+        base: Option<Hash>,
+    ) -> Result<()> {
+        use leyline_fs::graph::{Proposal, SourceWriter};
+        writer.propose(
+            conn,
+            Proposal::Write {
+                path: path.to_string(),
+                base,
+                bytes: bytes.as_bytes().to_vec(),
+            },
+        )
+    }
+
+    /// The mount's writer proposes under the grant it was built with.
     #[cfg(feature = "mount")]
     #[test]
     fn the_mount_writer_writes_under_its_grant() {
-        use leyline_fs::graph::SourceWriter;
         let a = arena(&[("a.go", A), ("b.go", B)]);
         let narrow = MountWriter {
             grant: Grant::Paths(BTreeSet::from(["b.go".to_string()])),
             checkout: None,
         };
-        let err = narrow
-            .write(&a.conn, "a.go", A2.as_bytes().to_vec(), None)
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("outside the grant"), "{err:#}");
+        let err = mount_write(&narrow, &a.conn, "a.go", A2, None).unwrap_err();
+        assert_eq!(
+            leyline_fs::graph::refusal_kind(&err),
+            Some(leyline_fs::graph::RefusalKind::OutsideGrant),
+            "{err:#}"
+        );
 
         let whole = MountWriter {
             grant: Grant::Whole,
             checkout: None,
         };
-        whole
-            .write(&a.conn, "a.go", A2.as_bytes().to_vec(), None)
-            .unwrap();
+        mount_write(&whole, &a.conn, "a.go", A2, None).unwrap();
         assert_eq!(
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
             A2.as_bytes(),
@@ -1698,61 +1815,128 @@ mod tests {
     #[cfg(feature = "mount")]
     #[test]
     fn the_mount_writer_materializes_into_its_checkout() {
-        use leyline_fs::graph::SourceWriter;
         let a = arena(&[("a.go", A), ("b.go", B)]);
         let src = a._src.path().to_path_buf();
         crate::checkout::ensure_tables(&a.conn).unwrap();
-        MountWriter {
+        let writer = MountWriter {
             grant: Grant::Whole,
             checkout: Some(src.clone()),
-        }
-        .write(
-            &a.conn,
-            "a.go",
-            A2.as_bytes().to_vec(),
-            Some(A.as_bytes().hash()),
-        )
-        .unwrap();
+        };
+        mount_write(&writer, &a.conn, "a.go", A2, Some(A.as_bytes().hash())).unwrap();
         assert_eq!(std::fs::read_to_string(src.join("a.go")).unwrap(), A2);
         assert_eq!(std::fs::read_to_string(src.join("b.go")).unwrap(), B);
     }
 
-    /// The mount's writer checks the base the mount hands it, and answers a
-    /// file that moved with the mount's own stale refusal, so the mount can
-    /// reply `ESTALE`.
+    /// The mount's writer proposes against the base the mount hands it:
+    /// an edit overlapping a change landed since is refused with the
+    /// mount's `Stale`, so the mount can reply `ESTALE`, and the store's
+    /// refusals reach the mount in storefs's classes.
     #[cfg(feature = "mount")]
     #[test]
-    fn the_mount_writer_refuses_a_moved_file_as_stale() {
-        use leyline_fs::graph::{SourceWriter, StaleWrite};
+    fn the_mount_writer_refuses_an_overlapping_edit_as_stale() {
+        use leyline_fs::graph::{Proposal, RefusalKind, SourceWriter, refusal_kind};
         let a = arena(&[("a.go", A), ("b.go", B)]);
         let writer = MountWriter {
             grant: Grant::Whole,
             checkout: None,
         };
-        writer
-            .write(
-                &a.conn,
-                "a.go",
-                A2.as_bytes().to_vec(),
-                Some(A.as_bytes().hash()),
-            )
-            .unwrap();
-        let err = writer
-            .write(
-                &a.conn,
-                "a.go",
-                b"package a\n\nfunc A() int { return 9 }\n".to_vec(),
-                Some(A.as_bytes().hash()),
-            )
-            .unwrap_err();
+        let base = Some(A.as_bytes().hash());
+        mount_write(&writer, &a.conn, "a.go", A2, base).unwrap();
+        let nine = "package a\n\nfunc A() int { return 9 }\n";
+        let refused = |r: Result<()>| refusal_kind(&r.unwrap_err());
+        let edit = Proposal::Write {
+            path: "a.go".into(),
+            base,
+            bytes: nine.as_bytes().to_vec(),
+        };
         assert_eq!(
-            err.downcast_ref::<StaleWrite>(),
-            Some(&StaleWrite {
-                source_id: "a.go".to_string(),
-                expected: A.as_bytes().hash(),
-                current: A2.as_bytes().hash(),
-            })
+            refused(writer.check(&a.conn, &edit)),
+            Some(RefusalKind::Stale)
         );
+        assert_eq!(
+            refused(writer.propose(&a.conn, edit)),
+            Some(RefusalKind::Stale)
+        );
+        for (proposal, kind) in [
+            (
+                Proposal::Delete {
+                    path: "a.go".into(),
+                    base: A.as_bytes().hash(),
+                },
+                RefusalKind::Stale,
+            ),
+            (
+                Proposal::Rename {
+                    from: "z.go".into(),
+                    to: "y.go".into(),
+                },
+                RefusalKind::NotFound,
+            ),
+            (
+                Proposal::Rmdir {
+                    path: "a.go".into(),
+                },
+                RefusalKind::NotADirectory,
+            ),
+        ] {
+            assert_eq!(refused(writer.propose(&a.conn, proposal)), Some(kind));
+        }
+        assert_eq!(
+            leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
+            A2.as_bytes(),
+        );
+    }
+
+    /// `mount_refusal` gives each refusal storefs's class; a failure that
+    /// is no refusal passes through untyped.
+    #[cfg(feature = "mount")]
+    #[test]
+    fn each_store_refusal_reaches_the_mount_in_storefs_class() {
+        use leyline_fs::graph::{RefusalKind as K, refusal_kind};
+        let stale = |expected: Option<Hash>| Stale {
+            path: "a.go".into(),
+            expected,
+            current: None,
+        };
+        let path = || "p".to_string();
+        for (refusal, kind) in [
+            (Refusal::Stale(vec![stale(None)]), K::Exists),
+            (
+                Refusal::Stale(vec![stale(None), stale(Some(Hash::ZERO))]),
+                K::Stale,
+            ),
+            (
+                Refusal::Conflict {
+                    moved: vec![stale(Some(Hash::ZERO))],
+                    conflicts: Default::default(),
+                },
+                K::Stale,
+            ),
+            (Refusal::OutsideGrant { path: path() }, K::OutsideGrant),
+            (Refusal::NoSuchFile { path: path() }, K::NotFound),
+            (Refusal::Exists { path: path() }, K::Exists),
+            (Refusal::NotEmpty { path: path() }, K::NotEmpty),
+            (Refusal::NotADirectory { path: path() }, K::NotADirectory),
+            (
+                Refusal::PathConflict {
+                    path: path(),
+                    other: path(),
+                },
+                K::NotADirectory,
+            ),
+            (Refusal::IsADirectory { path: path() }, K::IsADirectory),
+            (Refusal::MalformedPath { path: path() }, K::Invalid),
+        ] {
+            let err = mount_refusal(refusal.clone().into());
+            assert_eq!(refusal_kind(&err), Some(kind), "{refusal:?}");
+            let refused = err.downcast_ref::<leyline_fs::graph::Refused>().unwrap();
+            let named = refusal.path().unwrap_or("a.go");
+            assert_eq!(refused.path, named);
+        }
+        let err = mount_refusal(Refusal::Empty.into());
+        assert_eq!(refusal_kind(&err), None);
+        assert_eq!(err.downcast_ref::<Refusal>(), Some(&Refusal::Empty));
+        assert_eq!(refusal_kind(&mount_refusal(anyhow::anyhow!("disk"))), None);
     }
 
     /// Bead `ley-line-open-5db28e`: the mount's writer answers `Ok` once the
@@ -1761,35 +1945,30 @@ mod tests {
     #[cfg(feature = "mount")]
     #[test]
     fn the_mount_writer_answers_ok_when_the_edit_landed() {
-        use leyline_fs::graph::SourceWriter;
         let a = arena(&[("a.go", A)]);
         corrupt_head(&a);
-        MountWriter {
+        let writer = MountWriter {
             grant: Grant::Whole,
             checkout: None,
-        }
-        .write(
-            &a.conn,
-            "a.go",
-            A2.as_bytes().to_vec(),
-            Some(A.as_bytes().hash()),
-        )
-        .expect("the edit landed");
+        };
+        mount_write(&writer, &a.conn, "a.go", A2, Some(A.as_bytes().hash()))
+            .expect("the edit landed");
         assert_eq!(
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
             A2.as_bytes(),
         );
     }
 
-    /// Through the mount and the real writer, an edit refused because its
-    /// file moved leaves nothing behind: the edited node reads, and the
-    /// published image stores, what the file projects to. The refused text
-    /// never reached the database, so there is nothing for an "unchanged"
-    /// re-parse to leave in place (bead `ley-line-open-5d925d`).
+    /// Through the mount and the real writer, an edit refused because it
+    /// overlaps a change landed since its base leaves nothing behind: the
+    /// edited node reads, and the published image stores, what the file
+    /// projects to. The refused text never reached the database, so there
+    /// is nothing for an "unchanged" re-parse to leave in place (bead
+    /// `ley-line-open-5d925d`).
     #[cfg(feature = "mount")]
     #[test]
     fn a_refused_mount_edit_leaves_nothing_in_the_image() {
-        use leyline_fs::graph::{Graph, SqliteGraphAdapter, StaleWrite};
+        use leyline_fs::graph::{Graph, RefusalKind, SqliteGraphAdapter, refusal_kind};
         let a = arena(&[("a.go", A)]);
         let image = a.conn.serialize("main").unwrap();
         let mut graph = SqliteGraphAdapter::new_writable(image.as_ref()).unwrap();
@@ -1798,25 +1977,21 @@ mod tests {
             checkout: None,
         }));
         let leaf = "a.go/package_clause/package_identifier";
-        let body = "a.go/function_declaration/block";
 
-        graph.note_base(leaf).unwrap();
-        // The file moves after the edit began: another construct changes.
+        graph.note_read(leaf).unwrap();
+        // The file moves after the client read it: another writer changes
+        // the same line.
         graph
-            .batch_splice(&[(body.to_string(), Some("{ return 7 }".to_string()))])
+            .batch_splice(&[(leaf.to_string(), Some("z".to_string()))])
             .unwrap();
-        // The mount handle refuses a stale edit at the write since 6116c9
-        // (the macOS NFS client ignores a refused COMMIT); a refusal at the
-        // flush is the same outcome.
-        let err = match graph.write_content(leaf, b"b", 0) {
-            Err(refused) => refused,
-            Ok(_) => graph.flush_node(leaf).unwrap_err(),
-        };
-        assert!(err.downcast_ref::<StaleWrite>().is_some(), "{err:#}");
+        // The mount handle refuses, at the WRITE, an edit that does not
+        // merge (the macOS NFS client ignores a refused COMMIT).
+        let err = graph.write_content(leaf, b"b", 0).unwrap_err();
+        assert_eq!(refusal_kind(&err), Some(RefusalKind::Stale), "{err:#}");
 
         let mut buf = [0u8; 8];
         let n = graph.read_content(leaf, &mut buf, 0).unwrap();
-        assert_eq!(&buf[..n], b"a", "the node reads as the stored file");
+        assert_eq!(&buf[..n], b"z", "the node reads as the stored file");
         let out = tempfile::tempdir().unwrap();
         let path = out.path().join("published.db");
         std::fs::write(&path, graph.serialize().unwrap()).unwrap();
@@ -1829,7 +2004,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(record, "a", "the image holds no trace of the refused edit");
+        assert_eq!(record, "z", "the image holds no trace of the refused edit");
     }
 
     // ── structural proposals: create, delete, rename (bead 47fb03) ──────

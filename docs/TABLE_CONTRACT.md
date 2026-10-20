@@ -240,7 +240,7 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `_lsp*` | LSP layer |
 | `_vec*` | embedding layer |
 | `_sheaf*` | sheaf cache (ley-line private) |
-| `_errors` | validation layer (leyline-fs write path) |
+| `_errors` | why the store refused a host-mount edit the mount discarded, by node (leyline-fs; ADR-0045 T8) |
 | `_cfg*` | analysis-substrate CFG layer (leyline-ts; T1 of `analysis-substrate` decade) |
 | `_dfg*` | analysis-substrate DFG layer (T2 of `analysis-substrate` decade; not yet shipped) |
 | `_taint*` | analysis-substrate taint fixpoint (T3 of `analysis-substrate` decade; not yet shipped) |

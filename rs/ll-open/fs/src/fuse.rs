@@ -1,4 +1,4 @@
-use crate::graph::{Graph, MOUNT_HANDLE, Node};
+use crate::graph::{Graph, MOUNT_HANDLE, Node, RefusalKind};
 use fuser::{
     FUSE_ROOT_ID, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyOpen, ReplyWrite, Request,
@@ -67,7 +67,7 @@ impl LeylineFuse {
         {
             log::warn!("open({id}): truncating failed: {e:#}");
             self.release_handle(ino, fh);
-            return Err(libc::EROFS);
+            return Err(errno_of(&e, libc::EROFS));
         }
         self.writers.entry(ino).or_default().push(fh);
         Ok(fh)
@@ -92,14 +92,16 @@ impl LeylineFuse {
         };
         if !open.is_empty() {
             for &fh in open {
-                self.graph.truncate_as(fh, id).map_err(|_| libc::EROFS)?;
+                self.graph
+                    .truncate_as(fh, id)
+                    .map_err(|e| errno_of(&e, libc::EROFS))?;
             }
             return Ok(());
         }
         let landed = self
             .graph
             .truncate_as(MOUNT_HANDLE, id)
-            .map_err(|_| libc::EROFS)
+            .map_err(|e| errno_of(&e, libc::EROFS))
             .and_then(|()| {
                 self.graph.flush_node_as(MOUNT_HANDLE, id).map_err(|e| {
                     log::warn!("truncate of {id} failed: {e:#}");
@@ -112,6 +114,18 @@ impl LeylineFuse {
             log::warn!("dropping the truncate of {id} failed: {e:#}");
         }
         landed
+    }
+
+    /// A SETATTR of the mode `bits` on node `id`: the projection stores no
+    /// mode, so the mode it presents is accepted and any other is `EPERM`
+    /// (ADR-0045 T8), never accepted and dropped.
+    fn check_mode(&self, id: &str, bits: u32) -> Result<(), i32> {
+        match self.graph.get_node(id) {
+            Ok(Some(node)) if bits & 0o7777 == u32::from(node.perm()) => Ok(()),
+            Ok(Some(_)) => Err(libc::EPERM),
+            Ok(None) => Err(libc::ENOENT),
+            Err(_) => Err(libc::EIO),
+        }
     }
 
     /// The open `fh` of `ino` is closed: drop its edit and base.
@@ -150,10 +164,11 @@ impl LeylineFuse {
     }
 
     fn node_to_attr(&self, ino: u64, node: &Node) -> FileAttr {
-        let (ftype, perm, size) = if node.is_dir {
-            (FileType::Directory, 0o755, 4096)
+        let perm = node.perm();
+        let (ftype, size) = if node.is_dir {
+            (FileType::Directory, 4096)
         } else {
-            (FileType::RegularFile, 0o644, node.size)
+            (FileType::RegularFile, node.size)
         };
 
         let mtime = if node.mtime_nanos >= 0 {
@@ -370,7 +385,7 @@ impl Filesystem for LeylineFuse {
 
         match self.graph.write_content_as(fh, &id, data, offset as u64) {
             Ok(n) => reply.written(n as u32),
-            Err(_) => reply.error(libc::EROFS),
+            Err(e) => reply.error(errno_of(&e, libc::EROFS)),
         }
     }
 
@@ -418,7 +433,7 @@ impl Filesystem for LeylineFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -436,6 +451,13 @@ impl Filesystem for LeylineFuse {
             reply.error(libc::ENOENT);
             return;
         };
+
+        if let Some(bits) = mode
+            && let Err(errno) = self.check_mode(&id, bits)
+        {
+            reply.error(errno);
+            return;
+        }
 
         if let Some(0) = size
             && let Err(errno) = self.truncate_handle(ino, fh)
@@ -497,7 +519,7 @@ impl Filesystem for LeylineFuse {
                     Err(errno) => reply.error(errno),
                 }
             }
-            Err(_) => reply.error(libc::EROFS),
+            Err(e) => reply.error(errno_of(&e, libc::EROFS)),
         }
     }
 
@@ -539,7 +561,7 @@ impl Filesystem for LeylineFuse {
                 let attr = self.node_to_attr(ino, &node);
                 reply.entry(&TTL, &attr, 0);
             }
-            Err(_) => reply.error(libc::EROFS),
+            Err(e) => reply.error(errno_of(&e, libc::EROFS)),
         }
     }
 
@@ -578,7 +600,7 @@ impl Filesystem for LeylineFuse {
                 }
                 reply.ok();
             }
-            Err(_) => reply.error(libc::EROFS),
+            Err(e) => reply.error(errno_of(&e, libc::EROFS)),
         }
     }
 
@@ -638,7 +660,7 @@ impl Filesystem for LeylineFuse {
                 }
                 reply.ok();
             }
-            Err(_) => reply.error(libc::EROFS),
+            Err(e) => reply.error(errno_of(&e, libc::EROFS)),
         }
     }
 }
@@ -670,14 +692,28 @@ fn opens_for_writing(flags: i32) -> bool {
     flags & libc::O_ACCMODE != libc::O_RDONLY
 }
 
-/// The errno a refused flush answers: `ESTALE` when the file moved since
-/// the edit began (ADR-0042 P2), `EIO` for any other refusal.
-fn flush_errno(err: &anyhow::Error) -> i32 {
-    if err.downcast_ref::<crate::graph::StaleWrite>().is_some() {
-        libc::ESTALE
-    } else {
-        libc::EIO
+/// The errno a refused mount operation answers (ADR-0045 T8): its
+/// [`RefusalKind`]'s, as storefs answers the same refusal, or `other` for
+/// any other failure.
+fn errno_of(err: &anyhow::Error, other: i32) -> i32 {
+    match crate::graph::refusal_kind(err) {
+        Some(RefusalKind::Stale) => libc::ESTALE,
+        Some(RefusalKind::Exists) => libc::EEXIST,
+        Some(RefusalKind::NotEmpty) => libc::ENOTEMPTY,
+        Some(RefusalKind::NotADirectory) => libc::ENOTDIR,
+        Some(RefusalKind::IsADirectory) => libc::EISDIR,
+        Some(RefusalKind::NotFound) => libc::ENOENT,
+        Some(RefusalKind::OutsideGrant) => libc::EACCES,
+        Some(RefusalKind::Invalid) => libc::EINVAL,
+        Some(RefusalKind::NotInProjection) => libc::EPERM,
+        None => other,
     }
+}
+
+/// The errno a refused flush answers: `ESTALE` when the edit does not merge
+/// with what the file holds now, `EIO` for a failure that is no refusal.
+fn flush_errno(err: &anyhow::Error) -> i32 {
+    errno_of(err, libc::EIO)
 }
 
 #[cfg(test)]
@@ -694,21 +730,47 @@ mod tests {
         assert!(!opens_for_writing(libc::O_RDONLY | libc::O_NONBLOCK));
     }
 
-    /// A stale refusal reaches the client as `ESTALE`, wrapped in context or
-    /// not; every other refusal as `EIO`.
+    /// Each refusal reaches the client as its errno, wrapped in context or
+    /// not; every other failure as the operation's own errno.
     #[test]
-    fn a_stale_refusal_answers_estale_and_others_eio() {
-        let stale = || crate::graph::StaleWrite {
-            source_id: "a.go".to_string(),
-            expected: leyline_core::Hash::ZERO,
-            current: leyline_core::Hash::ZERO,
+    fn each_refusal_answers_its_errno_and_others_the_operations() {
+        let refused = |kind| {
+            anyhow::Error::new(crate::graph::Refused {
+                kind,
+                path: "a.go".to_string(),
+                reason: "test".to_string(),
+            })
         };
-        assert_eq!(flush_errno(&anyhow::Error::new(stale())), libc::ESTALE);
+        for (kind, errno) in [
+            (RefusalKind::Stale, libc::ESTALE),
+            (RefusalKind::Exists, libc::EEXIST),
+            (RefusalKind::NotEmpty, libc::ENOTEMPTY),
+            (RefusalKind::NotADirectory, libc::ENOTDIR),
+            (RefusalKind::IsADirectory, libc::EISDIR),
+            (RefusalKind::NotFound, libc::ENOENT),
+            (RefusalKind::OutsideGrant, libc::EACCES),
+            (RefusalKind::Invalid, libc::EINVAL),
+            (RefusalKind::NotInProjection, libc::EPERM),
+        ] {
+            assert_eq!(errno_of(&refused(kind), libc::EROFS), errno, "{kind:?}");
+        }
         assert_eq!(
-            flush_errno(&anyhow::Error::new(stale()).context("flush")),
+            flush_errno(&refused(RefusalKind::Stale).context("flush")),
             libc::ESTALE
         );
-        assert_eq!(flush_errno(&anyhow::anyhow!("syntax errors")), libc::EIO);
+        assert_eq!(flush_errno(&anyhow::anyhow!("disk full")), libc::EIO);
+    }
+
+    /// A mode change is refused `EPERM`: the projection stores none. The
+    /// mode a node is presented with is accepted.
+    #[test]
+    fn a_mode_other_than_the_presented_one_is_refused() {
+        let fs = LeylineFuse::new(test_graph());
+        assert_eq!(fs.check_mode("readme", 0o100644), Ok(()));
+        assert_eq!(fs.check_mode("readme", 0o100755), Err(libc::EPERM));
+        assert_eq!(fs.check_mode("docs", 0o040755), Ok(()));
+        assert_eq!(fs.check_mode("docs", 0o040700), Err(libc::EPERM));
+        assert_eq!(fs.check_mode("nope", 0o644), Err(libc::ENOENT));
     }
 
     /// Each open is its own handle and edits against its own base (bead

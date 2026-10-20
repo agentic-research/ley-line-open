@@ -67,6 +67,11 @@ Prepared as an upstream pull request; not yet submitted. Each is one
    not mount. The libkrun worker lists a run's workspace share (`work:/work`,
    bead `ley-line-open-f210c2`), so an unmodified workload starts in its
    working tree without calling `mount(2)`.
+6. `0006` — **devices/fs: forward READLINK and SYMLINK through
+   `DynFileSystem`.** `DynFileSystem::readlink` and `DynFileSystem::symlink`
+   with `ENOSYS` defaults, forwarded from `DynFs`; without them a guest could
+   neither read nor make a symbolic link on the share (ADR-0045 T4, bead
+   `ley-line-open-bb8aa6`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

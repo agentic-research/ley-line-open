@@ -183,14 +183,19 @@ head2=$("$BIN" verify-head "$DB") || fail "verify-head after splice: $head2"
 [ "$head2" != "$head1" ] || fail "the splice did not move treeRoot"
 step "splice: bytes stored, file re-hashed, head restamped"
 
-# --- splice: a bad edit changes nothing -------------------------------------
-before=$(cksum <"$DB")
-if "$BIN" splice --db "$DB" --node "$LEAF" --text '((' >/dev/null 2>"$W/bad.err"; then
-    fail "a splice that breaks the syntax succeeded"
-fi
-grep -q 'syntax errors' "$W/bad.err" || fail "the refused splice did not name the syntax error: $(cat "$W/bad.err")"
-expect_eq "$(cksum <"$DB")" "$before" "the database after a refused splice"
-step "splice: a syntax-breaking edit is refused and the database is unchanged"
+# --- splice: a syntax-breaking edit is stored with its diagnostic -----------
+# ADR-0045 M3: the store holds the bytes it was given; a file that does not
+# parse cleanly is projected as tree-sitter parsed it, with the first error
+# in _parse_diagnostics.
+expect_eq "$(sql "$DB" 'SELECT count(*) FROM _parse_diagnostics')" 0 "diagnostics before a syntax-breaking splice"
+"$BIN" splice --db "$DB" --node "$LEAF" --text '((' >/dev/null 2>"$W/bad.err" ||
+    fail "a syntax-breaking splice was refused: $(cat "$W/bad.err")"
+expect_eq "$(sql "$DB" "SELECT b.blob_bytes FROM _source s JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = 'util.go'" | head -1)" \
+    "package ((" "util.go's stored bytes after the syntax-breaking splice"
+expect_eq "$(sql "$DB" "SELECT path, projected FROM _parse_diagnostics")" "util.go|1" "the syntax-breaking splice's diagnostic"
+head3=$("$BIN" verify-head "$DB") || fail "verify-head after the syntax-breaking splice: $head3"
+[ "$head3" != "$head2" ] || fail "the syntax-breaking splice did not move treeRoot"
+step "splice: a syntax-breaking edit is stored, projected, and diagnosed"
 
 # --- daemon: an over-long socket path is an error, not a panic --------------
 long=$W/$(printf '%0120d' 0)

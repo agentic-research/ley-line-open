@@ -120,6 +120,14 @@ tempfile = { workspace = true }
 # `node_modules`/`target`/`vendor`/etc still get skipped even
 # without a matching gitignore entry.
 ignore = "0.4"
+# ADR-0045 T5: the three-way merge a proposal against a moved base gets —
+# gitoxide's builtin text driver, in process. Exact pins: 0.17.0 is the
+# gix-merge release built on the same gix-* set as the gix 0.84 jj-lib
+# already brings (gix-diff 0.64, gix-object 0.61, gix-hash 0.25), so no
+# second copy of gitoxide lands. MIT OR Apache-2.0, as is gix-imara-diff,
+# which computes the conflict ranges with gix-merge's own overlap rule.
+gix-merge = { version = "=0.17.0", default-features = false, features = ["sha1"] }
+imara-diff = { package = "gix-imara-diff", version = "=0.2.3" }
 
 # Unix-only: flock(2) for daemon arena admission control
 # (bead ley-line-open-0cba88). Kept as a direct dep so the fcntl call

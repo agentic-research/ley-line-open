@@ -560,6 +560,43 @@ fn a_listing_error_reaches_the_guest_and_adds_nothing() {
     assert_eq!(errno(error), Some(20));
 }
 
+/// ADR-0045 T4: SYMLINK carries its name and target and answers the entry;
+/// READLINK answers the target the service sends as data.
+#[test]
+fn symlink_and_readlink_reach_the_service() {
+    let link = Entry {
+        attr: Attr {
+            mode: 0o120777,
+            size: 4,
+            ..FILE_ATTR
+        },
+        ..file_entry()
+    };
+    let fs = Script::answering([
+        Reply::Entry { entry: link },
+        Reply::Data {
+            data: b"a.go".to_vec(),
+        },
+        Reply::Error { errno: 22 },
+    ]);
+    let made = fs.symlink(ctx(), &name("a.go"), 1, &name("link")).unwrap();
+    assert_entry(&made, &link);
+    assert_eq!(fs.readlink(ctx(), 7).unwrap(), b"a.go");
+    assert_eq!(errno(failed(fs.readlink(ctx(), 8))), Some(22));
+    assert_eq!(
+        requests(&fs),
+        [
+            Request::Symlink {
+                parent: 1,
+                name: b"link".to_vec(),
+                target: b"a.go".to_vec(),
+            },
+            Request::Readlink { inode: 7 },
+            Request::Readlink { inode: 8 },
+        ]
+    );
+}
+
 #[test]
 fn local_requests_answer_without_the_service() {
     let fs = Script::answering([]);

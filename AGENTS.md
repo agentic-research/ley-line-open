@@ -35,7 +35,7 @@ Do not use “root,” “hash,” or “identity” without naming the domain a
 | --- | --- | --- | --- |
 | `Controller.current_root` | One exact serialized SQLite arena snapshot | BLAKE3 over the complete serialized byte image | Shipped |
 | `Head.rootHash` | The Cap'n Proto segments produced by one parse run (a run receipt: truncated per run, carries absolute paths and mtimes) | Tagged fold over canonical segment addresses | Shipped |
-| `Head.treeRoot` | The source tree: every `_source` row as (relative path, content hash), under one `parserId` | Tagged fold `leyline/tree-root/v1` over the committed `_source` table, `parserId` as params; recomputed by `leyline verify-head` | Shipped (ADR-0040 D1) |
+| `Head.treeRoot` | The store's manifest: every `_tree` file entry as (relative path, git mode, blob hash) and every empty directory, under one `parserId` | Tagged fold `leyline/tree-root/v1` over the committed `_tree` table (mode `0o100644` folds as before; other modes and empty directories are framed by their git mode), `parserId` as params; recomputed by `leyline verify-head` | Shipped (ADR-0040 D1; modes and directories ADR-0045 T2) |
 | `Head.parserId` | The derivation `treeRoot` was computed under | Tagged fold `leyline/parser-id/v1` over IR and projection schema versions, extraction/injection/query-set epochs, and every compiled grammar's digest | Shipped (ADR-0040 D1) |
 | Blob hash | One content-addressed blob or CDC payload | BLAKE3 over that payload | Shipped |
 | SQL projection ABI | Consumer-visible relational shape and behavior | Tables, columns, constraints, semantics, fixtures | Shipped; not an identity domain |

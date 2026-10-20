@@ -34,6 +34,23 @@ pub fn walk_source_tree(root: &Path) -> Result<Vec<PathBuf>> {
 /// Same walk as `walk_source_tree`, but appends to an existing buffer
 /// (matches the `cmd_parse::collect_files(dir, &mut out)` shape).
 pub fn walk_into(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    out.extend(walk_tree(root)?.files);
+    Ok(())
+}
+
+/// Everything one walk of a source tree finds (ADR-0045 T3): regular
+/// files, symlinks (never followed), and directories below the root, each
+/// sorted. A directory is listed whether or not anything is walked under it.
+#[derive(Debug, Default)]
+pub struct Walked {
+    pub files: Vec<PathBuf>,
+    pub symlinks: Vec<PathBuf>,
+    pub dirs: Vec<PathBuf>,
+}
+
+/// Walk `root` with the excludes of [`walk_source_tree`], keeping symlinks
+/// and directories as well as files.
+pub fn walk_tree(root: &Path) -> Result<Walked> {
     let walker = ignore::WalkBuilder::new(root)
         .require_git(false)
         .filter_entry(|entry| {
@@ -44,11 +61,53 @@ pub fn walk_into(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                 .unwrap_or(true)
         })
         .build();
+    let mut walked = Walked::default();
     for entry in walker {
         let entry = entry.with_context(|| format!("walk under {}", root.display()))?;
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            out.push(entry.into_path());
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            walked.symlinks.push(entry.into_path());
+        } else if kind.is_dir() {
+            walked.dirs.push(entry.into_path());
+        } else if kind.is_file() {
+            walked.files.push(entry.into_path());
         }
     }
-    Ok(())
+    walked.files.sort();
+    walked.symlinks.sort();
+    walked.dirs.sort();
+    Ok(walked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_tree_keeps_symlinks_and_directories_and_skips_excludes() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/x")).unwrap();
+        std::fs::write(root.join("sub/a.go"), "package a\n").unwrap();
+        std::fs::write(root.join("README.md"), "hi\n").unwrap();
+        std::fs::write(root.join("node_modules/x/y.js"), "x\n").unwrap();
+        std::os::unix::fs::symlink("README.md", root.join("link")).unwrap();
+        let w = walk_tree(root).unwrap();
+        let rel = |v: &[PathBuf]| -> Vec<String> {
+            v.iter()
+                .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(rel(&w.files), ["README.md", "sub/a.go"]);
+        assert_eq!(rel(&w.symlinks), ["link"]);
+        assert_eq!(rel(&w.dirs), ["empty", "sub", "sub/deeper"]);
+    }
 }

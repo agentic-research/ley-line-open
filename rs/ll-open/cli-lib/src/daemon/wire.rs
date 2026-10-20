@@ -603,7 +603,7 @@ pub struct AgreementRequest {
 
 #[derive(Deserialize, Debug)]
 pub struct ReadSourceRequest {
-    /// The file's `_source.id`: its path relative to the tree root.
+    /// The file's `_tree` path: its path relative to the tree root.
     pub path: String,
 }
 
@@ -614,7 +614,7 @@ pub struct ProposeRequest {
 
 #[derive(Deserialize, Debug)]
 pub struct ProposedWriteInput {
-    /// The file's `_source.id`.
+    /// The path's `_tree` path.
     pub path: String,
     /// Required: the blob hash (64 hex chars) the author read, from
     /// `read_source`, [`crate::source_write::BASE_ANY`] to write without
@@ -630,6 +630,10 @@ pub struct ProposedWriteInput {
     /// omitted, the only kind before it existed (bead `ley-line-open-47fb03`).
     #[serde(default)]
     pub kind: WriteKind,
+    /// A replace's or create's git mode, six octal digits (ADR-0045 T4);
+    /// unset keeps the file's mode.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// `daemon.capnp` `WriteKind` in its wire spelling.
@@ -640,6 +644,8 @@ pub enum WriteKind {
     Replace,
     Create,
     Delete,
+    Mkdir,
+    Rmdir,
 }
 
 // ---------------------------------------------------------------------------

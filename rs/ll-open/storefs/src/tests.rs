@@ -122,13 +122,13 @@ pub(crate) fn fixture(scope: Scope) -> Fixture {
 }
 
 /// What the daemon's `read_source` answers for `path`: the bytes of the
-/// blob `_source.content_hash` names, and that hash.
+/// blob the store's manifest (`_tree`) names, and that hash.
 pub(crate) fn read_source(f: &Fixture, path: &str) -> (Vec<u8>, Hash) {
     f.fs.store()
         .with_read(|conn| {
             let (bytes, hash): (Vec<u8>, Vec<u8>) = conn.query_row(
-                "SELECT b.blob_bytes, s.content_hash FROM _source s \
-                   JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = ?1",
+                "SELECT b.blob_bytes, t.blob_hash FROM _tree t \
+                   JOIN source_blobs b ON b.blob_hash = t.blob_hash WHERE t.path = ?1",
                 [path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
@@ -155,7 +155,11 @@ fn stored(f: &Fixture, path: &str) -> bool {
     f.fs.store()
         .with_read(|conn| {
             Ok(conn
-                .query_row("SELECT 1 FROM _source WHERE id = ?1", [path], |_| Ok(()))
+                .query_row(
+                    "SELECT 1 FROM _tree WHERE path = ?1 AND blob_hash IS NOT NULL",
+                    [path],
+                    |_| Ok(()),
+                )
                 .is_ok())
         })
         .unwrap()
@@ -406,20 +410,15 @@ fn each_landed_proposal_is_published_and_a_refused_one_is_not() {
         let a = fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.inode;
         let published = || store.published.load(std::sync::atomic::Ordering::SeqCst);
 
-        let h = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
-        fs.write(h, 0, A_BROKEN.as_bytes()).unwrap();
-        assert_eq!(fs.flush(h), Err(Errno::EIO));
+        // Another writer changed the same line: the flush is refused.
+        let stale = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
+        other_writer(&f, "a.go", A_OTHER);
+        fs.write(stale, 0, A_EDIT.as_bytes()).unwrap();
+        assert_eq!(fs.flush(stale), Err(Errno::ESTALE));
         assert_eq!(published(), 0, "a refused proposal publishes nothing");
+        fs.release(stale);
 
-        fs.setattr(
-            a,
-            Some(h),
-            SetAttr {
-                size: Some(0),
-                ..SetAttr::default()
-            },
-        )
-        .unwrap();
+        let h = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
         fs.write(h, 0, A_EDIT.as_bytes()).unwrap();
         // A failed publish does not refuse what the store committed: the
         // daemon reports it after the commit, and the next publish repairs it.
@@ -493,21 +492,19 @@ fn an_fsync_against_a_moved_file_is_estale_and_lands_nothing() {
     assert_eq!(read_source(&f, "a.go").0, A_OTHER.as_bytes());
 }
 
-/// The spike's D1: open, *foreign change*, write. The WRITE itself is
-/// refused, so `write(2)` answers `ESTALE` and nothing is staged: the
-/// `fsync` and `close` after it have nothing to propose.
+/// The spike's D1 under ADR-0045 T6: open, *foreign change*, write. The
+/// WRITE stages; the FLUSH decides. A file another writer deleted is
+/// stale at the flush (a moved base with nothing to merge into).
 #[test]
-fn a_write_against_a_moved_file_is_estale_and_stages_nothing() {
+fn a_write_against_a_moved_file_stages_and_the_flush_decides() {
     let f = fixture(whole());
     let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
     other_writer(&f, "a.go", A_OTHER);
-    assert_eq!(f.fs.write(h, 0, A_EDIT.as_bytes()), Err(Errno::ESTALE));
-    assert_eq!(read_all(&f, h), A.as_bytes(), "nothing was staged");
-    assert_eq!(f.fs.fsync(h), Ok(()));
-    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(f.fs.write(h, 0, A_EDIT.as_bytes()), Ok(A_EDIT.len()));
+    assert_eq!(read_all(&f, h), A_EDIT.as_bytes(), "staged");
+    assert_eq!(f.fs.fsync(h), Err(Errno::ESTALE), "the same line moved");
     assert_eq!(read_source(&f, "a.go").0, A_OTHER.as_bytes());
 
-    // A file another writer deleted is as stale.
     let b = f.fs.open(ino(&f, "pkg/b.go"), O_WRONLY).unwrap().handle;
     f.fs.store()
         .with_write(|conn| {
@@ -518,21 +515,14 @@ fn a_write_against_a_moved_file_is_estale_and_stages_nothing() {
             )
         })
         .unwrap();
-    assert_eq!(f.fs.write(b, 0, B.as_bytes()), Err(Errno::ESTALE));
+    assert_eq!(f.fs.write(b, 0, B.as_bytes()), Ok(B.len()));
+    assert_eq!(f.fs.flush(b), Err(Errno::ESTALE));
 
     // A handle whose own flush advanced its base keeps writing.
     let h = edit(&f, "a.go", A_EDIT);
     assert_eq!(f.fs.flush(h), Ok(()));
     assert_eq!(f.fs.write(h, 0, A_TAILED.as_bytes()), Ok(A_TAILED.len()));
-}
-
-#[test]
-fn a_flush_of_bytes_that_do_not_parse_is_eio_and_lands_nothing() {
-    let f = fixture(whole());
-    let h = edit(&f, "a.go", A_BROKEN);
-    assert_eq!(f.fs.flush(h), Err(Errno::EIO));
-    assert_eq!(f.fs.fsync(h), Err(Errno::EIO));
-    assert_eq!(read_source(&f, "a.go").0, A.as_bytes());
+    assert_eq!(f.fs.flush(h), Ok(()));
 }
 
 #[test]
@@ -744,19 +734,20 @@ fn truncate_by_path_is_a_proposal_of_its_own() {
     assert_eq!(attr.size, A.len() as u64);
     assert_eq!(read_source(&f, "a.go").0, A.as_bytes());
 
-    // Truncating to bytes that do not parse is refused, and lands nothing.
-    assert_eq!(
+    // Truncating to bytes that do not parse lands them, with a diagnostic
+    // (ADR-0045 T3).
+    let (attr, _) =
         f.fs.setattr(
             a,
             None,
             SetAttr {
                 size: Some(12),
                 ..SetAttr::default()
-            }
-        ),
-        Err(Errno::EIO)
-    );
-    assert_eq!(read_source(&f, "a.go").0, A.as_bytes());
+            },
+        )
+        .unwrap();
+    assert_eq!(attr.size, 12);
+    assert_eq!(read_source(&f, "a.go").0, &A.as_bytes()[..12]);
 }
 
 #[test]
@@ -764,10 +755,6 @@ fn setattr_refuses_what_the_store_does_not_hold() {
     let f = fixture(whole());
     let a = ino(&f, "a.go");
     for set in [
-        SetAttr {
-            mode: Some(0o600),
-            ..SetAttr::default()
-        },
         SetAttr {
             uid: Some(0),
             ..SetAttr::default()
@@ -937,19 +924,12 @@ fn each_refusal_answers_its_linux_errno() {
     );
     assert_eq!(Errno::EACCES, Errno(13));
     assert_eq!(
-        refused(Refusal::Syntax {
-            path: "a.go".into(),
-            detail: "x".into()
+        refused(Refusal::DuplicatePath {
+            path: "a.go".into()
         }),
         Errno::EIO
     );
     assert_eq!(Errno::EIO, Errno(5));
-    assert_eq!(
-        refused(Refusal::NoLanguage {
-            path: "a.txt".into()
-        }),
-        Errno::EIO
-    );
     assert_eq!(errno_for(&anyhow::anyhow!("disk on fire")), Errno::EIO);
 }
 
@@ -1025,15 +1005,14 @@ fn a_create_over_an_existing_name_is_eexist() {
     assert_eq!(read_source(&f, "race.go").0, A_OTHER.as_bytes());
 }
 
-/// A created file whose bytes do not parse is `EIO` at the flush and
-/// lands nothing; it stays in the session for the guest to fix.
+/// A created file whose bytes do not parse lands at its flush, with a
+/// diagnostic (ADR-0045 T3); the guest's fix lands over it.
 #[test]
-fn a_created_file_that_does_not_parse_is_eio_and_stays_in_the_session() {
+fn a_created_file_that_does_not_parse_lands_and_its_fix_lands_over_it() {
     let f = fixture(whole());
     let (h, flushed) = create_file(&f, ROOT_INODE, "broken.go", A_BROKEN);
-    assert_eq!(flushed, Err(Errno::EIO));
-    assert!(!stored(&f, "broken.go"));
-    assert!(f.fs.lookup(ROOT_INODE, b"broken.go").is_ok());
+    assert_eq!(flushed, Ok(()));
+    assert_eq!(read_source(&f, "broken.go").0, A_BROKEN.as_bytes());
     assert_eq!(f.fs.write(h, 0, N.as_bytes()), Ok(N.len()));
     assert_eq!(
         f.fs.setattr(
@@ -1051,17 +1030,18 @@ fn a_created_file_that_does_not_parse_is_eio_and_stays_in_the_session() {
     assert_eq!(read_source(&f, "broken.go").0, N.as_bytes());
 }
 
-/// A file the store cannot hold (no language: an editor's temp file, a
-/// note) lives in the session: readable, listable, never proposed.
+/// A file in no projected language (an editor's temp file, a note) is a
+/// file like any other (ADR-0045 T1): proposed at its flush, stored,
+/// readable, listable, and unlinked by a proposal.
 #[test]
-fn a_file_the_store_cannot_hold_lives_in_the_session() {
+fn a_file_in_no_projected_language_lands_in_the_store() {
     let f = fixture(whole());
     count_passes(&f);
     let (h, flushed) = create_file(&f, ROOT_INODE, "notes.txt", "hello\n");
     assert_eq!(flushed, Ok(()));
     f.fs.release(h);
-    assert_eq!(passes(&f), 0, "nothing was proposed");
-    assert!(!stored(&f, "notes.txt"));
+    assert_eq!(passes(&f), 1, "the flush was one proposal");
+    assert!(stored(&f, "notes.txt"));
     let notes = ino(&f, "notes.txt");
     assert_eq!(f.fs.getattr(notes, None).unwrap().0.size, 6);
     let r = f.fs.open(notes, O_RDONLY).unwrap().handle;
@@ -1129,9 +1109,9 @@ fn unlink_answers_its_errnos() {
 }
 
 /// The save an editor or agent harness makes: write a temp file, then
-/// rename it over the original. The temp file (a name the store cannot
-/// hold) stays in the session, and the rename is the one proposal: the
-/// original's new bytes, checked against the blob it held.
+/// rename it over the original. The temp file lands in the store at its
+/// flush (ADR-0045 T1), and the rename is one proposal: the temp file
+/// deleted and the original's new bytes, checked against the blob it held.
 #[test]
 fn write_temp_then_rename_over_the_original_is_one_proposal() {
     let f = fixture_with(whole(), true, A);
@@ -1140,7 +1120,7 @@ fn write_temp_then_rename_over_the_original_is_one_proposal() {
     let (h, flushed) = create_file(&f, ROOT_INODE, "a.go.tmp.4242.1700000000", A_EDIT);
     assert_eq!(flushed, Ok(()));
     f.fs.release(h);
-    assert_eq!(passes(&f), 0);
+    assert_eq!(passes(&f), 1, "the temp file's flush");
     assert_eq!(
         f.fs.rename(
             ROOT_INODE,
@@ -1151,7 +1131,7 @@ fn write_temp_then_rename_over_the_original_is_one_proposal() {
         ),
         Ok(())
     );
-    assert_eq!(passes(&f), 1, "the rename is one proposal");
+    assert_eq!(passes(&f), 2, "the rename is one proposal");
     assert_eq!(read_source(&f, "a.go").0, A_EDIT.as_bytes());
     assert_eq!(on_disk(&f, "a.go").as_deref(), Some(A_EDIT));
     assert_eq!(
@@ -1225,15 +1205,15 @@ fn rename_answers_its_errnos_and_changes_nothing() {
     });
     use rename_flags::{RENAME_EXCHANGE, RENAME_NOREPLACE};
     let pkg = ino(&f, "pkg");
-    // A stored file to a name the store cannot hold: the caller copies.
-    assert_eq!(
-        f.fs.rename(ROOT_INODE, b"a.go", ROOT_INODE, b"a.go.bak", 0),
-        Err(Errno::EXDEV)
-    );
-    // A directory that holds files: the caller copies.
+    // A directory whose new place the scope may propose nothing under.
     assert_eq!(
         f.fs.rename(ROOT_INODE, b"pkg", ROOT_INODE, b"pkg2", 0),
-        Err(Errno::EXDEV)
+        Err(Errno::EACCES)
+    );
+    // A directory into itself.
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"pkg", pkg, b"inner", 0),
+        Err(Errno::EINVAL)
     );
     assert_eq!(
         f.fs.rename(ROOT_INODE, b"a.go", ROOT_INODE, b"pkg", 0),
@@ -1270,26 +1250,10 @@ fn rename_answers_its_errnos_and_changes_nothing() {
     assert!(stored(&f, "pkg/sub/c.go"));
 }
 
-/// A rename the store refuses (the renamed bytes do not parse) is refused
-/// whole: the target keeps its bytes and the source stays.
-#[test]
-fn a_rename_refused_by_the_store_leaves_the_source_in_place() {
-    let f = fixture(whole());
-    let (h, flushed) = create_file(&f, ROOT_INODE, "bad.go", A_BROKEN);
-    assert_eq!(flushed, Err(Errno::EIO));
-    f.fs.release(h);
-    assert_eq!(
-        f.fs.rename(ROOT_INODE, b"bad.go", ROOT_INODE, b"a.go", 0),
-        Err(Errno::EIO)
-    );
-    assert_eq!(read_source(&f, "a.go").0, A.as_bytes());
-    assert!(f.fs.lookup(ROOT_INODE, b"bad.go").is_ok());
-}
-
-/// MKDIR makes a directory for the session: visible, empty, and gone at
+/// MKDIR makes a directory in the store: visible, empty, and gone at
 /// RMDIR. A directory holding files is `ENOTEMPTY`.
 #[test]
-fn mkdir_and_rmdir_manage_session_directories() {
+fn mkdir_and_rmdir_manage_stored_directories() {
     let f = fixture_with(whole(), true, A);
     let d = f.fs.mkdir(ROOT_INODE, b"newdir").unwrap();
     assert_eq!(d.attr.kind, Kind::Directory);
@@ -1325,20 +1289,19 @@ fn mkdir_and_rmdir_manage_session_directories() {
     assert_eq!(f.fs.rmdir(ROOT_INODE, b"a.go"), Err(Errno::ENOTDIR));
     assert_eq!(f.fs.rmdir(ROOT_INODE, b"nope"), Err(Errno::ENOENT));
 
-    // Session directories are not persisted: a new filesystem over the
-    // same store sees only directories its files imply.
+    // Directories are stored (ADR-0045 T1): a new filesystem over the
+    // same store sees the empty one too.
     let empty = f.fs.mkdir(ROOT_INODE, b"empty").unwrap();
     assert_eq!(empty.attr.kind, Kind::Directory);
     let again = StoreFs::new(f.fs.store().clone(), whole(), Options::default());
-    assert_eq!(again.lookup(ROOT_INODE, b"empty"), Err(Errno::ENOENT));
+    assert!(again.lookup(ROOT_INODE, b"empty").is_ok());
     assert!(again.lookup(ROOT_INODE, b"newdir").is_ok());
 }
 
-/// A checkout whose `--language` filter excludes a created file's
-/// language would never write it out, and its next whole-directory parse
-/// would drop it from the store: such a file stays in the session.
+/// A checkout's `--language` filter narrows its projection, not what it
+/// holds (ADR-0045 T3): a file in another language lands in the store.
 #[test]
-fn a_create_outside_the_checkouts_language_stays_in_the_session() {
+fn a_create_outside_the_checkouts_language_lands_in_the_store() {
     let f = fixture_with(whole(), true, A);
     let filtered = StoreFs::new(
         f.fs.store().clone(),
@@ -1354,13 +1317,9 @@ fn a_create_outside_the_checkouts_language_stays_in_the_session() {
     let (_, h) = filtered.create(ROOT_INODE, b"tool.py", O_RDWR).unwrap();
     assert_eq!(filtered.write(h, 0, b"x = 1\n"), Ok(6));
     assert_eq!(filtered.flush(h), Ok(()));
-    assert!(!stored(&f, "tool.py"));
-    assert!(filtered.lookup(ROOT_INODE, b"tool.py").is_ok());
-
-    // Without the filter the store holds it.
-    let (_, flushed) = create_file(&f, ROOT_INODE, "tool.py", "x = 1\n");
-    assert_eq!(flushed, Ok(()));
     assert!(stored(&f, "tool.py"));
+    assert_eq!(on_disk(&f, "tool.py").as_deref(), Some("x = 1\n"));
+    assert!(f.fs.lookup(ROOT_INODE, b"tool.py").is_ok());
 }
 
 /// A file created read-only (`open(O_CREAT|O_RDONLY)`) exists and lands
@@ -1611,13 +1570,13 @@ fn a_read_only_open_keeps_the_guests_pages_only_while_the_blob_is_unchanged() {
     assert!(!read_open(&f, a).keep_cache);
     assert!(read_open(&f, a).keep_cache);
 
-    // A file only the session holds has no blob to compare.
+    // A file of any name is stored (ADR-0045 T1): the same rule holds.
     let (h, flushed) = create_file(&f, ROOT_INODE, "notes.txt", "hi\n");
     assert_eq!(flushed, Ok(()));
     f.fs.release(h);
     let notes = ino(&f, "notes.txt");
     assert!(!read_open(&f, notes).keep_cache);
-    assert!(!read_open(&f, notes).keep_cache);
+    assert!(read_open(&f, notes).keep_cache);
 }
 
 /// The guest bounds a cached read by the size its cached attributes hold;

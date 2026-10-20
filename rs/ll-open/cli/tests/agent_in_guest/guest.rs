@@ -12,8 +12,9 @@
 // end. `mod seed` is prepended by the host.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::IntoRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,6 @@ extern "C" {
 }
 
 const ESTALE: i32 = 116;
-const EIO: i32 = 5;
 
 #[derive(Default)]
 struct Report(Vec<String>);
@@ -75,6 +75,14 @@ fn save(path: &str, text: &str) -> Result<(), String> {
     file.write_all(text.as_bytes())
         .map_err(|e| format!("write {path}: errno={}", errno_of(&e)))?;
     close_file(file).map_err(|errno| format!("close {path}: errno={errno}"))
+}
+
+/// Replace an open file's bytes with `text`: seek to the start, truncate,
+/// write (what an editor holding the file open does on save).
+fn rewrite(file: &mut File, text: &str) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(text.as_bytes())
 }
 
 fn read(path: &str) -> Result<String, String> {
@@ -151,30 +159,66 @@ fn main() {
     signal('b');
     wait('b');
 
-    // (c) A socket proposal moves a file the guest holds open: the guest's
-    // write(2) is ESTALE and nothing of it lands.
+    // (c) A socket proposal moves b.go under the guest's open handle,
+    // changing other lines than the guest's edit: write(2) stages and
+    // close(2) lands the three-way merge, which the next open reads
+    // (ADR-0045 T5, T6).
     match OpenOptions::new().read(true).write(true).open("b.go") {
         Ok(mut file) => {
             let mut held = String::new();
             let _ = file.read_to_string(&mut held);
             signal('c');
             wait('c');
-            match file.write(seed::B_GUEST.as_bytes()) {
-                Err(e) if errno_of(&e) == ESTALE => r.pass(
-                    "c",
-                    format!("write(2) b.go after the host's proposal: -1 errno={ESTALE} (ESTALE)"),
+            let wrote = rewrite(&mut file, seed::B_GUEST_TOP);
+            let closed = close_file(file);
+            let after = read("b.go");
+            r.check(
+                "c",
+                wrote.is_ok() && closed.is_ok() && after.as_deref() == Ok(seed::B_MERGED),
+                format!(
+                    "b.go moved under the open handle, other lines: write ok={}, close(2) = {}; \
+                     the next read is the merge: {}",
+                    wrote.is_ok(),
+                    show(closed),
+                    after.as_deref() == Ok(seed::B_MERGED)
                 ),
-                Err(e) => r.fail("c", format!("write(2) b.go: errno={}, not ESTALE", errno_of(&e))),
-                Ok(n) => r.fail("c", format!("write(2) b.go wrote {n} bytes over a moved base")),
-            }
-            r.line(format!("NOTE (c) close(2) b.go = {}", show(close_file(file))));
+            );
         }
         Err(e) => r.fail("c", format!("open b.go: errno={}", errno_of(&e))),
     }
     signal('C');
     wait('C');
 
-    // (d) An edit the store cannot parse: fsync(2) and close(2) are EIO.
+    // (C) The host and the guest change the same line: write(2) stages,
+    // fsync(2) and close(2) are ESTALE, and the host's bytes stay.
+    match OpenOptions::new().read(true).write(true).open("b.go") {
+        Ok(mut file) => {
+            let mut held = String::new();
+            let _ = file.read_to_string(&mut held);
+            signal('x');
+            wait('x');
+            let wrote = rewrite(&mut file, seed::B_GUEST_SAME);
+            let fsync = file.sync_all().map_err(|e| errno_of(&e));
+            let closed = close_file(file);
+            r.check(
+                "C",
+                wrote.is_ok() && fsync == Err(ESTALE) && closed == Err(ESTALE),
+                format!(
+                    "b.go, the same line as the host's proposal: write ok={}, fsync(2) = {}, \
+                     close(2) = {} (ESTALE={ESTALE})",
+                    wrote.is_ok(),
+                    show(fsync),
+                    show(closed)
+                ),
+            );
+        }
+        Err(e) => r.fail("C", format!("open b.go: errno={}", errno_of(&e))),
+    }
+    signal('X');
+    wait('X');
+
+    // (d) A half-written edit lands: fsync(2) and close(2) are 0, and the
+    // store records a diagnostic for it (ADR-0045 T3).
     match OpenOptions::new().write(true).truncate(true).open("c.go") {
         Ok(mut file) => {
             let wrote = file.write_all(seed::C_BROKEN.as_bytes());
@@ -182,9 +226,9 @@ fn main() {
             let closed = close_file(file);
             r.check(
                 "d",
-                wrote.is_ok() && fsync == Err(EIO) && closed == Err(EIO),
+                wrote.is_ok() && fsync.is_ok() && closed.is_ok(),
                 format!(
-                    "unparseable c.go: write ok={}, fsync(2) = {}, close(2) = {} (EIO={EIO})",
+                    "half-written c.go: write ok={}, fsync(2) = {}, close(2) = {}",
                     wrote.is_ok(),
                     show(fsync),
                     show(closed)
@@ -348,6 +392,57 @@ fn main() {
         Ok(()) => m_status(&mut r, "after the second same-size edit", "MM m.go"),
         Err(error) => r.fail("m", error),
     }
+
+    // (p) Every file the agent makes is the store's (ADR-0045 T1, T4): a
+    // README edit, a file in no projected language, chmod +x, a symlink, an
+    // empty directory, and a directory renamed with a file in it.
+    let made = save("README.md", seed::README_EDIT)
+        .and_then(|()| save("notes", seed::NOTES))
+        .and_then(|()| save("run.sh", seed::RUN_SH))
+        .and_then(|()| {
+            fs::set_permissions("run.sh", fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod(2) run.sh: errno={}", errno_of(&e)))
+        })
+        .and_then(|()| {
+            std::os::unix::fs::symlink("a.go", "link.go")
+                .map_err(|e| format!("symlink(2) link.go: errno={}", errno_of(&e)))
+        })
+        .and_then(|()| {
+            fs::create_dir("empty").map_err(|e| format!("mkdir(2) empty: errno={}", errno_of(&e)))
+        })
+        .and_then(|()| {
+            fs::create_dir("pkg").map_err(|e| format!("mkdir(2) pkg: errno={}", errno_of(&e)))
+        })
+        .and_then(|()| save("pkg/x.go", seed::LIB_X))
+        .and_then(|()| {
+            fs::rename("pkg", "lib").map_err(|e| format!("rename(2) pkg -> lib: errno={}", errno_of(&e)))
+        });
+    match made {
+        Ok(()) => {
+            let executable = fs::metadata("run.sh").map(|m| m.permissions().mode() & 0o111);
+            let link = fs::read_link("link.go").map(|p| p.display().to_string());
+            let empty = fs::metadata("empty").map(|m| m.is_dir());
+            let moved = read("lib/x.go");
+            let gone = fs::metadata("pkg").is_err();
+            r.check(
+                "p",
+                executable.as_ref().ok() == Some(&0o111)
+                    && link.as_deref().ok() == Some("a.go")
+                    && empty.as_ref().ok() == Some(&true)
+                    && moved.as_deref() == Ok(seed::LIB_X)
+                    && gone,
+                format!(
+                    "README.md, notes, chmod +x run.sh ({executable:?}), symlink link.go \
+                     ({link:?}), mkdir empty ({empty:?}), rename pkg -> lib ({:?}, pkg gone: \
+                     {gone}): all 0",
+                    moved.as_deref() == Ok(seed::LIB_X)
+                ),
+            );
+        }
+        Err(error) => r.fail("p", error),
+    }
+    signal('p');
+    wait('p');
 
     let text = format!("{}\n", r.0.join("\n"));
     if let Err(error) = save(seed::REPORT, &text) {

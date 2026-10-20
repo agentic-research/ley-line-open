@@ -211,6 +211,21 @@ pub trait DynFileSystem: Send + Sync {
     fn access(&self, ctx: Context, inode: u64, mask: u32) -> io::Result<()> {
         enosys()
     }
+    /// READLINK: the target of the symbolic link `inode`.
+    fn readlink(&self, ctx: Context, inode: u64) -> io::Result<Vec<u8>> {
+        enosys()
+    }
+    /// SYMLINK: a symbolic link `name` in `parent` whose target is
+    /// `linkname`. The returned `Entry` counts as one lookup.
+    fn symlink(
+        &self,
+        ctx: Context,
+        linkname: &CStr,
+        parent: u64,
+        name: &CStr,
+    ) -> io::Result<Entry> {
+        enosys()
+    }
 
     /// DAX: return the host address of `len` bytes holding the file's contents
     /// from `foffset`. The memory must be host-page aligned and stay valid
@@ -527,5 +542,18 @@ impl FileSystem for DynFs {
     }
     fn access(&self, ctx: Context, inode: u64, mask: u32) -> io::Result<()> {
         self.0.access(ctx, inode, mask)
+    }
+    fn readlink(&self, ctx: Context, inode: u64) -> io::Result<Vec<u8>> {
+        self.0.readlink(ctx, inode)
+    }
+    fn symlink(
+        &self,
+        ctx: Context,
+        linkname: &CStr,
+        parent: u64,
+        name: &CStr,
+        _extensions: Extensions,
+    ) -> io::Result<Entry> {
+        self.0.symlink(ctx, linkname, parent, name)
     }
 }

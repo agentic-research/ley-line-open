@@ -93,6 +93,21 @@ if grep -E -- '--package leyline-cli-lib| -C --lib ' "$log" >/dev/null; then
     exit 1
 fi
 
+# MUTANTS_SHARD splits a slice across CI runners: it reaches cargo-mutants as
+# --shard, and a malformed one is refused before anything runs.
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" MUTANTS_SHARD=1/2 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/pr.diff" runtime
+assert_call 'mutants .*--package leyline-runtime .*--shard 1/2' \
+    'a sharded slice passes its shard to cargo-mutants'
+for bad in 2/2 x/2 1/ /2 12; do
+    if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" MUTANTS_SHARD=$bad \
+        "$repo_root/tools/mutants_diff.sh" "$fixture_dir/pr.diff" runtime 2>/dev/null; then
+        echo "MUTANTS_SHARD=$bad was accepted" >&2
+        exit 1
+    fi
+done
+
 cat > "$fixture_dir/cli-only.diff" <<'DIFF'
 diff --git a/ll-open/cli-lib/src/daemon/client.rs b/ll-open/cli-lib/src/daemon/client.rs
 --- a/ll-open/cli-lib/src/daemon/client.rs

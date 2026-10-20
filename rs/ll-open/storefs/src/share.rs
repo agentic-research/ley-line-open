@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use leyline_runtime::backends::libkrun::share::{
-    Attr as WireAttr, DT_DIR, DT_REG, DirEntry as WireDirEntry, Entry as WireEntry,
+    Attr as WireAttr, DT_DIR, DT_LNK, DT_REG, DirEntry as WireDirEntry, Entry as WireEntry,
     FOPEN_CACHE_DIR, FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE, FUSE_DO_READDIRPLUS, FsService, Reply,
     Request,
 };
@@ -186,6 +186,14 @@ impl<S: Store> StoreShare<S> {
                     .map(wire_dirent)
                     .collect(),
             },
+            Request::Symlink {
+                parent,
+                name,
+                target,
+            } => entry_reply(&self.fs.symlink(parent, &name, &target)?),
+            Request::Readlink { inode } => Reply::Data {
+                data: self.fs.readlink(inode)?,
+            },
             Request::Readdirplus { inode, offset } => Reply::DirPlus {
                 entries: self
                     .fs
@@ -252,6 +260,7 @@ fn wire_dirent(dirent: &DirEntry) -> WireDirEntry {
         kind: match dirent.kind {
             Kind::File => DT_REG,
             Kind::Directory => DT_DIR,
+            Kind::Symlink => DT_LNK,
         },
         name: dirent.name.as_bytes().to_vec(),
     }

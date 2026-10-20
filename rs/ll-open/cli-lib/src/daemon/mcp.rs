@@ -187,9 +187,11 @@ pub fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "read_source",
-            description: "Read a whole source file by its path relative to the tree root. \
-                          Returns its content, `blob_hash` (pass it as the `base` of a later \
-                          `propose`) and the arena's `tree_root`.",
+            description: "Read a whole file by its path relative to the tree root (any file \
+                          the store holds, parsed or not). Returns its content (a symlink's \
+                          target), `blob_hash` (pass it as the `base` of a later `propose`), \
+                          its git `mode` (`100644`, `100755` or `120000`) and the arena's \
+                          `tree_root`.",
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -198,18 +200,25 @@ pub fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "propose",
-            description: "Write, create and delete source files as one change: applied whole, \
-                          or refused whole. Each write has a `kind`: `replace` (the default), \
-                          `create` or `delete`; a rename is a `delete` of the old path and a \
-                          `create` of the new one in one proposal. Every write needs a `base`: \
-                          the `blob_hash` you read from `read_source`, `any` to replace or \
-                          delete without a check, or `absent` for a create. A refused proposal \
-                          writes nothing and carries `refusal {reason, path, moved}`; when paths \
-                          moved since you read them, `reason` is `stale` and `moved` names each \
-                          with its current blob hash (`absent` for no file), so you can re-read \
-                          and retry. An applied proposal answers `ok` with each written file's \
-                          new `blob_hash`, and `post_commit_error` when a step after the commit \
-                          failed.",
+            description: "Write, create and delete files and directories as one change: \
+                          applied whole, or refused whole. Any file at any plain relative path \
+                          is held, whether or not it parses. Each write has a `kind`: \
+                          `replace` (the default), `create`, `delete`, `mkdir` or `rmdir`; a \
+                          rename is a `delete` of the old path and a `create` of the new one in \
+                          one proposal. A replace or create may name a git `mode` (`100644`, \
+                          `100755`, or `120000` for a symlink whose content is its target). \
+                          Every write needs a `base`: the `blob_hash` you read from \
+                          `read_source`, `any` to replace or delete without a check, `absent` \
+                          for a create or mkdir, `any` for an rmdir. When the file changed since \
+                          you read it, your edit is merged three ways with the current content: \
+                          a clean merge lands and the path is listed in `merged`; edits that \
+                          overlap are refused. A refused proposal writes nothing and carries \
+                          `refusal {reason, path, moved}`; when paths moved, `reason` is `stale` \
+                          and `moved` names each with its current blob hash (`absent` for no \
+                          file) and, for a conflicting merge, the base `conflicts` line ranges, \
+                          so you can re-read and retry. An applied proposal answers `ok` with \
+                          each written file's new `blob_hash`, and `post_commit_error` when a \
+                          step after the commit failed.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -222,16 +231,21 @@ pub fn tool_registry() -> Vec<McpTool> {
                                 "path": {"type": "string"},
                                 "base": {
                                     "type": "string",
-                                    "description": "The `blob_hash` from `read_source`, `any` for no check, or `absent` for a create."
+                                    "description": "The `blob_hash` from `read_source`, `any` for no check (and for an rmdir), or `absent` for a create or mkdir."
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "The file's new content; required by `replace` and `create`, ignored by `delete`."
+                                    "description": "The file's new content (a symlink's target); required by `replace` and `create`, ignored by `delete`, `mkdir` and `rmdir`."
                                 },
                                 "kind": {
                                     "type": "string",
-                                    "enum": ["replace", "create", "delete"],
+                                    "enum": ["replace", "create", "delete", "mkdir", "rmdir"],
                                     "default": "replace"
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "enum": ["100644", "100755", "120000"],
+                                    "description": "The file's git mode; unset keeps it (a create is 100644)."
                                 }
                             },
                             "required": ["path", "base"]

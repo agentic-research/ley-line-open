@@ -168,7 +168,7 @@ fn stored(f: &Fixture, path: &str) -> bool {
 /// Count the projection passes (one per landed proposal) from here on: a
 /// temp trigger on the writer's connection counts each `derived_from`
 /// stamp, which every pass writes once.
-fn count_passes(f: &Fixture) {
+pub(crate) fn count_passes(f: &Fixture) {
     f.fs.store()
         .with_write(|conn| {
             conn.execute_batch(
@@ -182,7 +182,7 @@ fn count_passes(f: &Fixture) {
         .unwrap();
 }
 
-fn passes(f: &Fixture) -> i64 {
+pub(crate) fn passes(f: &Fixture) -> i64 {
     f.fs.store()
         .with_write(|conn| Ok(conn.query_row("SELECT count(*) FROM passes", [], |r| r.get(0))?))
         .unwrap()

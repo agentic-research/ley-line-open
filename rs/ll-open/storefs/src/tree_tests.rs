@@ -288,6 +288,110 @@ fn a_directory_rename_is_one_proposal() {
     );
 }
 
+// ── the host NFS mount's handle (ADR-0045 T8) ───────────────────────────
+
+/// A checked WRITE is decided as its FLUSH would be, against what the store
+/// holds now: an edit that overlaps a change landed since the handle's
+/// base is `ESTALE` at the WRITE and leaves nothing staged.
+#[test]
+fn a_checked_write_that_overlaps_a_landed_change_is_refused_and_not_staged() {
+    let f = fixture(whole());
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
+    other_writer(&f, "a.go", A_OTHER);
+    let edit = A.replace("return 1", "return 2");
+    assert_eq!(
+        f.fs.write_checked(h, 0, edit.as_bytes()),
+        Err(Errno::ESTALE)
+    );
+    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), A.as_bytes());
+    assert_eq!(f.fs.flush(h), Ok(()), "nothing is staged to propose");
+    assert_eq!(stored_text(&f, "a.go").as_deref(), Some(A_OTHER));
+}
+
+/// A checked WRITE that merges with the landed change is staged; its FLUSH
+/// lands the merge.
+#[test]
+fn a_checked_write_that_merges_is_staged_and_its_flush_lands_the_merge() {
+    let f = fixture(whole());
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR | O_TRUNC).unwrap().handle;
+    other_writer(&f, "a.go", A_OTHER);
+    assert_eq!(
+        f.fs.write_checked(h, 0, A_TAILED.as_bytes()),
+        Ok(A_TAILED.len())
+    );
+    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), A_TAILED.as_bytes());
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(stored_text(&f, "a.go").as_deref(), Some(A_MERGED));
+}
+
+/// A checked truncate stages the size; one to the size the handle holds
+/// stages nothing, so its FLUSH proposes nothing.
+#[test]
+fn a_checked_truncate_stages_the_size_and_one_to_the_size_held_stages_nothing() {
+    let f = fixture(whole());
+    super::tests::count_passes(&f);
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
+    assert_eq!(f.fs.truncate_checked(h, A.len() as u64), Ok(()));
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(super::tests::passes(&f), 0, "an unchanged size lands nothing");
+    assert_eq!(f.fs.truncate_checked(h, 10), Ok(()));
+    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), &A.as_bytes()[..10]);
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(super::tests::passes(&f), 1);
+    assert_eq!(stored_text(&f, "a.go").as_deref(), Some(&A[..10]));
+}
+
+/// A checked change on a read-only handle is `EBADF`.
+#[test]
+fn a_checked_change_needs_a_write_handle() {
+    let f = fixture(whole());
+    let h = f.fs.open(ino(&f, "a.go"), O_RDONLY).unwrap().handle;
+    assert_eq!(f.fs.write_checked(h, 0, b"x"), Err(Errno::EBADF));
+    assert_eq!(f.fs.truncate_checked(h, 0), Err(Errno::EBADF));
+}
+
+/// REREAD brings a handle with nothing staged to the blob the store holds
+/// now, its base with it; a handle with a staged edit keeps the bytes and
+/// the base the edit was made against.
+#[test]
+fn reread_brings_a_clean_handle_to_the_store_and_leaves_a_dirty_one() {
+    let f = fixture(whole());
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
+    other_writer(&f, "a.go", A_OTHER);
+    assert_eq!(f.fs.reread(h), Ok(()));
+    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), A_OTHER.as_bytes());
+    // The base moved with the bytes: an edit of them lands unmerged.
+    let edit = A_OTHER.replace("return 3", "return 4");
+    assert_eq!(f.fs.write_checked(h, 0, edit.as_bytes()), Ok(edit.len()));
+    other_writer(&f, "a.go", A);
+    assert_eq!(f.fs.reread(h), Ok(()));
+    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), edit.as_bytes());
+    assert_eq!(f.fs.flush(h), Err(Errno::ESTALE), "against A_OTHER, not A");
+}
+
+/// REREAD of a file the store no longer holds is `ENOENT`.
+#[test]
+fn reread_of_a_deleted_file_is_enoent() {
+    let f = fixture(whole());
+    let h = f.fs.open(ino(&f, "a.go"), O_RDWR).unwrap().handle;
+    f.fs.store()
+        .with_write(|conn| {
+            source_write::propose(conn, &Grant::Whole, vec![Proposed::delete("a.go", Base::Any)])
+        })
+        .unwrap();
+    assert_eq!(f.fs.reread(h), Err(Errno::ENOENT));
+}
+
+/// PARENT names the directory an inode is in; the root is its own parent.
+#[test]
+fn parent_names_the_directory_above_an_inode() {
+    let f = fixture(whole());
+    assert_eq!(f.fs.parent(ino(&f, "pkg/sub/c.go")), Ok(ino(&f, "pkg/sub")));
+    assert_eq!(f.fs.parent(ino(&f, "pkg")), Ok(ROOT_INODE));
+    assert_eq!(f.fs.parent(ROOT_INODE), Ok(ROOT_INODE));
+    assert_eq!(f.fs.parent(9_999), Err(Errno::ENOENT));
+}
+
 #[test]
 fn each_new_refusal_answers_its_linux_errno() {
     let refused = |r: Refusal| errno_for(&anyhow::Error::from(r));

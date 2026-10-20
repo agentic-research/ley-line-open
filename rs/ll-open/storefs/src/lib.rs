@@ -729,13 +729,88 @@ impl<S: Store> StoreFs<S> {
         if !open.writable {
             return Err(Errno::EBADF);
         }
-        let start = offset as usize;
-        let end = start + data.len();
-        let len = open.bytes.len().max(end);
-        open.bytes.resize(len, 0);
-        open.bytes[start..end].copy_from_slice(data);
+        splice(&mut open.bytes, offset, data);
         open.dirty = true;
         Ok(data.len())
+    }
+
+    /// WRITE as the host NFS mount makes it (ADR-0045 T8): staged only when
+    /// the proposal its FLUSH would make lands against what the store holds
+    /// now ([`source_write::check`]: grant, base, merge, structure), and
+    /// refused with that proposal's errno otherwise, staging nothing. The
+    /// macOS NFS client reports a refused WRITE at `fsync` and `close` and
+    /// ignores a refused COMMIT, so the WRITE is where it learns of a
+    /// conflict.
+    pub fn write_checked(&self, handle: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
+        self.stage_checked(handle, |bytes| splice(bytes, offset, data))?;
+        Ok(data.len())
+    }
+
+    /// A SETATTR of the size on a write handle, checked as
+    /// [`StoreFs::write_checked`] is. A size the handle already holds
+    /// stages nothing.
+    pub fn truncate_checked(&self, handle: u64, size: u64) -> Result<(), Errno> {
+        let size = usize::try_from(size).map_err(|_| Errno::EINVAL)?;
+        self.stage_checked(handle, |bytes| bytes.resize(size, 0))
+    }
+
+    /// Stage `change` on the write handle `handle` when the proposal of the
+    /// changed bytes against the handle's base lands against what the store
+    /// holds now.
+    fn stage_checked(&self, handle: u64, change: impl FnOnce(&mut Vec<u8>)) -> Result<(), Errno> {
+        let open = self.handle(handle)?;
+        let mut open = open.lock();
+        if !open.writable {
+            return Err(Errno::EBADF);
+        }
+        let mut bytes = open.bytes.clone();
+        change(&mut bytes);
+        if bytes == open.bytes {
+            return Ok(());
+        }
+        let write = match open.mode {
+            Some(mode) => Proposed::write_mode(open.path.as_str(), open.base.clone(), bytes.clone(), mode),
+            None => Proposed::write(open.path.as_str(), open.base.clone(), bytes.clone()),
+        };
+        self.store
+            .with_read(|conn| source_write::check(conn, &self.scope.propose, vec![write]))
+            .map_err(|e| {
+                log::info!("write to '{}' refused: {e:#}", open.path);
+                errno_for(&e)
+            })?;
+        open.bytes = bytes;
+        open.dirty = true;
+        Ok(())
+    }
+
+    /// REREAD: a handle with nothing staged takes the blob the store holds
+    /// for its path now, as its base and as the bytes it serves; a handle
+    /// with a staged edit keeps both, since the edit was made against them.
+    /// The host NFS mount rereads before each READ it serves from a handle
+    /// (ADR-0045 T8): NFSv3 has no OPEN, so a READ is where a client takes
+    /// what it will later edit. `ENOENT` when the store holds no file there.
+    pub fn reread(&self, handle: u64) -> Result<(), Errno> {
+        let open = self.handle(handle)?;
+        let mut open = open.lock();
+        if open.dirty {
+            return Ok(());
+        }
+        let (base, bytes) = self.held(&open.path)?.ok_or(Errno::ENOENT)?;
+        if base != open.base {
+            open.base = base;
+            open.bytes = bytes;
+        }
+        Ok(())
+    }
+
+    /// PARENT: the inode of the directory `inode` is in; the root's is the
+    /// root. What an NFS LOOKUP of `..` answers.
+    pub fn parent(&self, inode: u64) -> Result<u64, Errno> {
+        let path = self.path_of(inode)?;
+        Ok(match path.rsplit_once('/') {
+            Some((dir, _)) => self.inode_of(dir),
+            None => ROOT_INODE,
+        })
     }
 
     /// FLUSH (each `close`): proposes the staged bytes. See [`errno_for`].
@@ -1542,6 +1617,16 @@ impl<S: Store> StoreFs<S> {
             Errno::EIO
         })
     }
+}
+
+/// `data` written into `bytes` at `offset`; a gap past the end reads as
+/// zeros.
+fn splice(bytes: &mut Vec<u8>, offset: u64, data: &[u8]) {
+    let start = offset as usize;
+    let end = start + data.len();
+    let len = bytes.len().max(end);
+    bytes.resize(len, 0);
+    bytes[start..end].copy_from_slice(data);
 }
 
 /// `name` under the directory `dir` (the root is `""`).

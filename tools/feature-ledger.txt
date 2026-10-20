@@ -111,12 +111,6 @@ ll-open/text-search   engine-witchcraft  not-shipping    exclude-file:ll-open/te
 # mutants=enable so its gated parser code compiles under mutation.
 ll-open/ts            hcl                ships-optin     enable  -
 
-# The host mount (bead ley-line-open-3e73dc): StoreFs behind the FUSE and NFS
-# adapters, reachable through the CLI's opt-in `mount`/`full` configs.
-# mutants=enable: `host/` is gated on it, and its adapter tests run below
-# the kernel, so the generic slice kills its mutants without mounting.
-ll-open/storefs       mount              ships-optin     enable  -
-
 # ley-line-open-988b93 — NOT a grammar: a 349-line dependency-graph
 # projection (pyproject.toml -> mountable /deps tree). Unwired too — nothing
 # calls project_pyproject. Dead in two ways. mutants=enable: it was the entry

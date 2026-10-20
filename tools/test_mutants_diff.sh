@@ -267,9 +267,9 @@ PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
 assert_call 'mutants .*--package leyline-fs .*--features cdc,validate .*--exclude ll-open/fs/src/verified\.rs' \
     'fs slice excludes the verify module its feature set compiles out'
 
-# storefs's host mount is gated on its `mount` feature; the ledger's enable
-# row routes the feature into the generic slice when a diff touches storefs,
-# so its adapter mutants compile and their tests run.
+# storefs's host mount is gated on its `mount` feature; storefs's own slice
+# names it, so its adapter mutants compile and their lib tests run, and the
+# generic slice leaves storefs alone.
 : > "$log"
 cat > "$fixture_dir/storefs-host.diff" <<'DIFF'
 diff --git a/ll-open/storefs/src/host/nfs.rs b/ll-open/storefs/src/host/nfs.rs
@@ -281,8 +281,12 @@ diff --git a/ll-open/storefs/src/host/nfs.rs b/ll-open/storefs/src/host/nfs.rs
 DIFF
 PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/storefs-host.diff"
-assert_call 'mutants .*--features mount' \
-    'a storefs diff routes the mount feature into the generic slice'
+assert_call 'mutants .*-C --lib .*--package leyline-storefs .*--features mount' \
+    'a storefs diff runs the storefs slice with the mount feature, lib tests only'
+if grep -q -- "--exclude ll-open/fs/\*\*.*--features" "$log"; then
+    echo 'the generic slice was handed storefs features' >&2
+    exit 1
+fi
 
 # --------------------------------------------------------------------------
 # `list-scopes`: the plan the CI matrix is built from. Runs no cargo.

@@ -44,7 +44,7 @@ test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
 # same drift class `ley-line-open-cb1e29` collapsed the feature ledger to fix.
 #
 # Format: `<scope>=<package>[,<package>...]`. Everything below derives from it.
-MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge'
+MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge storefs=ll-open/storefs'
 
 # Every package owned by SOME package slice — i.e. exactly what the generic
 # slice must exclude. Each MUST be claimed by a slice of its own below. A
@@ -531,7 +531,8 @@ LEDGER_ROWS
             --exclude 'll-open/runtime/**' \
             --exclude 'll-open/cli-lib/**' \
             --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**'
+            --exclude 'll-open/schema-bridge/**' \
+            --exclude 'll-open/storefs/**'
     else
         # shellcheck disable=SC2086
         run_slice lib \
@@ -540,7 +541,8 @@ LEDGER_ROWS
             --exclude 'll-open/runtime/**' \
             --exclude 'll-open/cli-lib/**' \
             --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**'
+            --exclude 'll-open/schema-bridge/**' \
+            --exclude 'll-open/storefs/**'
     fi
 fi
 
@@ -615,6 +617,17 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
         -C --test -C injection_extraction_test \
         --package leyline-cli-lib --test-workspace=false
   fi
+fi
+
+if { [ "$SCOPE" = all ] || [ "$SCOPE" = storefs ]; } && package_changed_in_diff ll-open/storefs; then
+    claim_package ll-open/storefs
+    # The host mount (`host/`, bead `ley-line-open-3e73dc`) is gated on
+    # storefs's non-default `mount` feature, so the slice names it: without it
+    # every adapter mutant compiles out and reports a phantom MISSED. Lib
+    # tests only (`run_slice lib`): they drive the adapters below the kernel.
+    # `tests/host_mount.rs` mounts through the kernel's NFS or FUSE client,
+    # and a mutation run must never mount.
+    run_slice lib --package leyline-storefs --test-workspace=false --features mount
 fi
 
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = fs ]; } && package_changed_in_diff ll-open/fs; then

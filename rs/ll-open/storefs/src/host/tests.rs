@@ -339,6 +339,20 @@ async fn a_save_over_an_overlapping_landed_change_is_stale_at_the_write() {
     assert!(!h.nfs.commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE));
     h.nfs.commit(id, 0, 0).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
+    // The client has not read A_OTHER: a retried WRITE is checked against
+    // what it read (A), so an overlapping retry is refused rather than
+    // landing as an edit of bytes the client never saw.
+    let retry = A.replace("return 1", "return 9");
+    let retried = h.nfs.write(id, 0, retry.as_bytes()).await;
+    assert!(matches!(retried, Err(nfsstat3::NFS3ERR_STALE)), "{retried:?}");
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
+    // Once it READs the store's bytes, its edit of them lands.
+    assert_eq!(h.read_all(id).await, A_OTHER.as_bytes());
+    let edit = A_OTHER.replace("return 3", "return 4");
+    h.save(id, &edit).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(edit.as_str()));
 }
 
 /// A COMMIT refused for a change landed after the client's last WRITE drops
@@ -352,7 +366,41 @@ async fn a_refused_commit_drops_the_edit_and_the_next_read_serves_the_store() {
     h.other_writer("a.go", A_OTHER);
     let refused = h.nfs.commit(id, 0, 0).await;
     assert!(matches!(refused, Err(nfsstat3::NFS3ERR_STALE)), "{refused:?}");
+    // A retried overlapping WRITE before any READ is refused: the base stays
+    // what the client read.
+    let retry = A.replace("return 1", "return 9");
+    let retried = h.nfs.write(id, 0, retry.as_bytes()).await;
+    assert!(matches!(retried, Err(nfsstat3::NFS3ERR_STALE)), "{retried:?}");
     assert_eq!(h.read_all(id).await, A_OTHER.as_bytes());
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
+}
+
+/// DISCARD drops a handle's staged bytes and serves its base again, and a
+/// created file's handle discards to empty.
+#[test]
+fn discard_drops_the_staged_bytes_and_keeps_the_base() {
+    let h = host();
+    let id = ino_of(&h, "a.go");
+    let handle = h.fs.open(id, crate::open_flags::O_RDWR).unwrap().handle;
+    h.fs.write(handle, 0, b"zzzz").unwrap();
+    h.fs.discard(handle).unwrap();
+    assert_eq!(h.fs.read(handle, 0, u32::MAX).unwrap(), A.as_bytes());
+    assert_eq!(h.fs.flush(handle), Ok(()), "nothing staged to propose");
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
+
+    let (_, created) = h
+        .fs
+        .create(ROOT_INODE, b"new.txt", crate::open_flags::O_RDWR)
+        .unwrap();
+    h.fs.write(created, 0, b"x").unwrap();
+    h.fs.discard(created).unwrap();
+    assert_eq!(h.fs.read(created, 0, u32::MAX).unwrap(), b"");
+}
+
+fn ino_of(h: &Host, path: &str) -> u64 {
+    path.split('/').fold(ROOT_INODE, |parent, name| {
+        h.fs.lookup(parent, name.as_bytes()).unwrap().attr.inode
+    })
 }
 
 /// A file left unparseable lands, with its diagnostic row.

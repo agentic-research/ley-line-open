@@ -10,8 +10,8 @@
 #
 # Usage: tools/cli_smoke.sh BIN [--mount]
 #   BIN      the leyline binary to exercise
-#   --mount  also mount the daemon's projection and write through it
-#            (BIN must be built with the `mount` feature; needs FUSE/fuse-t)
+#   --mount  also mount the daemon's store and write through it (BIN must
+#            be built with the `mount` feature; NFS on macOS, FUSE on Linux)
 # Env:
 #   EXPECT_VERSION  if set, `BIN --version` must report exactly this
 #   DEADLINE        seconds any one wait may take (default 30)
@@ -232,30 +232,45 @@ step "daemon: status, leyline_version and typed query answers; SIGTERM shuts it 
 if [ "$MODE" = --mount ]; then
     mkdir "$W/mnt"
     start_daemon --mount "$W/mnt"
-    wait_for "the mount to serve util.go" test -d "$W/mnt/util.go"
-    within_deadline "read through the mount" sh -c "test \"\$(cat '$W/mnt/$LEAF')\" = main"
-    # truncate + write + fsync: the fsync is what makes the mount publish.
+    # The mount presents the store's files as files (bead ley-line-open-3e73dc).
+    wait_for "the mount to serve util.go" test -f "$W/mnt/util.go"
+    within_deadline "read through the mount" sh -c "grep -q '^package main' '$W/mnt/util.go'"
+    # truncate + write + fsync: the fsync is what lands the save.
     within_deadline "write through the mount" python3 -I -c '
 import os, sys
 fd = os.open(sys.argv[1], os.O_WRONLY | os.O_TRUNC)
-os.write(fd, b"util")
+os.write(fd, b"package util\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n")
 os.fsync(fd)
 os.close(fd)
-' "$W/mnt/$LEAF"
-    # The fsync's COMMIT committed the write through the one write path
-    # before it returned, so the stored source is read at once, not waited for.
-    within_deadline "read back through the mount" sh -c "test \"\$(cat '$W/mnt/$LEAF')\" = util"
-    want_hex=$(printf 'package util\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n' | od -An -tx1 | tr -d ' \n')
+' "$W/mnt/util.go"
+    # A new file of no language and an empty directory are entries like any
+    # other.
+    within_deadline "create through the mount" python3 -I -c '
+import os, sys
+with open(os.path.join(sys.argv[1], "NOTES.txt"), "w") as f:
+    f.write("notes\n")
+    f.flush()
+    os.fsync(f.fileno())
+os.mkdir(os.path.join(sys.argv[1], "empty"))
+' "$W/mnt"
+    # The fsync landed the save through the one write path before it
+    # returned, so the stored bytes are read at once, not waited for.
+    within_deadline "read back through the mount" sh -c "grep -q '^package util' '$W/mnt/util.go'"
     stored_hex() {
-        op '{"op":"query","sql":"SELECT b.blob_bytes FROM _source s JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = '"'"'util.go'"'"'"}' |
+        op "{\"op\":\"query\",\"sql\":\"SELECT b.blob_bytes FROM _tree t JOIN source_blobs b ON b.blob_hash = t.blob_hash WHERE t.path = '$1'\"}" |
             field rows 0 blob_bytes
     }
-    got_hex=$(stored_hex)
+    want_hex=$(printf 'package util\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n' | od -An -tx1 | tr -d ' \n')
+    got_hex=$(stored_hex util.go)
     [ "$got_hex" = "$want_hex" ] ||
         fail "util.go's stored bytes are not the mount write once its fsync returned: $got_hex"
+    want_hex=$(printf 'notes\n' | od -An -tx1 | tr -d ' \n')
+    got_hex=$(stored_hex NOTES.txt)
+    [ "$got_hex" = "$want_hex" ] || fail "NOTES.txt is not stored as written: $got_hex"
+    expect_eq "$(op "{\"op\":\"query\",\"sql\":\"SELECT mode FROM _tree WHERE path = 'empty'\"}" | field rows 0 mode)" 16384 "the empty directory's entry"
     stop_daemon
     wait_for "the mount to detach" sh -c "! mount | grep -qF '$W/mnt'"
-    step "mount: a write through the mount is stored, served back, and the mount detaches on SIGTERM"
+    step "mount: a save, a new file and an empty directory land in the store, and the mount detaches on SIGTERM"
 fi
 
 step "PASS"

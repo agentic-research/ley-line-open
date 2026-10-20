@@ -789,6 +789,30 @@ impl<S: Store> StoreFs<S> {
         Ok(())
     }
 
+    /// DISCARD: drop what the handle staged and serve its base's bytes
+    /// again, keeping the base. The host NFS mount discards a refused edit
+    /// (ADR-0045 T8): its client has not read what the store holds now, so
+    /// every later WRITE through the handle is checked against the bytes
+    /// the client read, and refused, until a READ takes the store's bytes
+    /// ([`StoreFs::reread`]). Dropping the handle instead would let the
+    /// client's retry land as an edit of bytes it never saw.
+    pub fn discard(&self, handle: u64) -> Result<(), Errno> {
+        let open = self.handle(handle)?;
+        let mut open = open.lock();
+        let bytes = match &open.base {
+            Base::Blob(blob) => {
+                let blob = *blob;
+                self.query(|conn| store_tree::blob_bytes(conn, blob))?
+                    .ok_or(Errno::EIO)?
+            }
+            _ => Vec::new(),
+        };
+        open.bytes = bytes;
+        open.mode = None;
+        open.dirty = false;
+        Ok(())
+    }
+
     /// PARENT: the inode of the directory `inode` is in; the root's is the
     /// root. What an NFS LOOKUP of `..` answers.
     pub fn parent(&self, inode: u64) -> Result<u64, Errno> {

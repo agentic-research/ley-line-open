@@ -44,17 +44,6 @@ tasks:
     cmds:
       - cargo test -p leyline-cli-lib --features vec,text-search
 
-  test:mount:
-    desc: |
-      Tests for the `mount` feature (FUSE/NFS) — ships in install:full+mount.
-      Mounts a parsed projection the way the daemon does, on the platform's
-      default backend, and reads and writes it back (bead
-      ley-line-open-aed167): our NFS server under mount_nfs on macOS, FUSE on
-      Linux (libfuse from deps:ci at RUN time). There is no skip path.
-    dir: '{{.TASKFILE_DIR}}/../..'
-    cmds:
-      - cargo test -p leyline-cli-lib --features mount --test mount_round_trip
-
   # The binary, end to end: tools/cli_smoke.sh runs parse, verify-head,
   # splice, and the daemon's socket ops and SIGTERM shutdown on a fixture
   # tree. `smoke` builds what release.yml ships (default features);

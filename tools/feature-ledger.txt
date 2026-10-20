@@ -23,7 +23,7 @@
 # configuration, (b) shipping but exercised by no ci-invoked test, or (c)
 # non-default and gating covered code in a generic-slice package. What does
 # NOT live here: default-enabled features (cargo resolves them, mutants
-# compiles them), and per-slice test configs (leyline-fs's cdc,splice,validate
+# compiles them), and per-slice test configs (leyline-fs's cdc,validate
 # invocation in mutants_diff.sh mirrors the Taskfile's mutants:fs targets —
 # a separate fact with a separate owner).
 #
@@ -70,7 +70,7 @@ ll-core/schema-capnp  regen-fixtures     not-shipping    skip    -
 # (flush_node fell back to a bare Ok(())), so it was a defect being recorded,
 # not a knob; it ships as of 918a75 and left the list. The flag here flips
 # into a shipping config in a later bead; move this row to ships-optin then.
-# mutants=skip: leyline-fs runs its own slice (cdc,splice,validate), which
+# mutants=skip: leyline-fs runs its own slice (cdc,validate), which
 # does not carry verify — a hole bounded by claim 3's compile check.
 ll-open/fs            verify             not-shipping    skip    ley-line-open-b6a4dd
 
@@ -110,6 +110,12 @@ ll-open/text-search   engine-witchcraft  not-shipping    exclude-file:ll-open/te
 # Grammar for HCL, reachable via the opt-in shipping configs, not default.
 # mutants=enable so its gated parser code compiles under mutation.
 ll-open/ts            hcl                ships-optin     enable  -
+
+# The host mount (bead ley-line-open-3e73dc): StoreFs behind the FUSE and NFS
+# adapters, reachable through the CLI's opt-in `mount`/`full` configs.
+# mutants=enable: `host/` is gated on it, and its adapter tests run below
+# the kernel, so the generic slice kills its mutants without mounting.
+ll-open/storefs       mount              ships-optin     enable  -
 
 # ley-line-open-988b93 — NOT a grammar: a 349-line dependency-graph
 # projection (pyproject.toml -> mountable /deps tree). Unwired too — nothing

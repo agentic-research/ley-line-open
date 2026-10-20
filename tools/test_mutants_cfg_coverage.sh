@@ -56,7 +56,7 @@ expect_fail "cfg(feature = \"ghost\") module added to fs without an exclude"
 # The same module, honestly ENABLED by the slice: not a phantom, must pass.
 reset_fixture
 printf '#[cfg(feature = "ghost")]\npub mod ghost;\n' >> "$fs_lib"
-sed 's/--features cdc,splice,validate/--features cdc,splice,validate,ghost/' "$gate" > "$tmp_dir/m" \
+sed 's/--features cdc,validate/--features cdc,validate,ghost/' "$gate" > "$tmp_dir/m" \
     && mv "$tmp_dir/m" "$gate"
 grep -q 'validate,ghost' "$gate" || { echo "fixture: the enable mutation did not apply" >&2; exit 1; }
 expect_pass "ghost module enabled by the slice's --features"

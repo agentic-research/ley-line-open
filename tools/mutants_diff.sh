@@ -589,13 +589,6 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # it. The whole binary set below compiles with the feature and its deps are
     # already in Cargo.lock, so this costs a longer link, not a download.
     #
-    # `mount`, for the same reason: `cmd_serve` and the mount's source writer
-    # (`source_write::MountWriter`) are behind it, and the one-write-path PR
-    # (`ley-line-open-f2ffbd`) reported both as 0s-build MISSED under `vec`
-    # alone. It links libfuse (deps:ci installs libfuse-dev; the Taskfile's
-    # PKG_CONFIG_PATH finds fuse-t on macOS) and mounts nothing: the lib
-    # tests it adds stop before a mount.
-    #
     # lsp_enrich_pipeline: kills the whole-function replacement mutants on
     # `enrich_files_with_client` (four survived on the PR that added the
     # test — nothing observed that function's counts or writes before it).
@@ -611,7 +604,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # range entirely. Verified before routing: the mutation leaves the lib
     # suite green and fails five tests in this binary.
     run_slice integration \
-        --features vec,mount \
+        --features vec \
         -C --lib \
         -C --test -C execution_client \
         -C --test -C execution_transport \
@@ -626,32 +619,20 @@ fi
 
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = fs ]; } && package_changed_in_diff ll-open/fs; then
     claim_package ll-open/fs
-    # This is the ONLY slice that passes `--no-default-features`, which makes it
-    # the only place tools/feature-ledger.txt's standing exemption for
-    # default-enabled features ("cargo resolves them, mutants compiles them") is
-    # false. `fuse` and `nfs` ARE in leyline-fs's default set, so the ledger is
-    # right not to carry them — but these flags compile `fuse.rs`, `nfs.rs` and
-    # `verified.rs` out, while cargo-mutants parses with syn, never evaluates
-    # cfg, and enumerates every mutant inside them anyway. Each then builds in
-    # 0s, every test trivially passes, and it is reported MISSED: a phantom
-    # survivor on healthy code, indistinguishable in the log from a real missing
-    # assertion (bead `ley-line-open-b23c41`).
-    #
-    # A slice that opts out of default features owes an exclusion for what that
-    # choice removes — the exclusions below are not a policy about mount, they
-    # are this invocation being consistent with itself. Enabling the features
-    # instead would be worse: `ley-line-open-aed167` records that mount ships
-    # with no tests at any level, so the phantoms would become REAL survivors
-    # and redden every mount PR over a coverage debt this gate did not incur.
-    # `verified` is the same shape (`ley-line-open-b6a4dd`).
+    # This is the ONLY slice that passes `--no-default-features`, so it names
+    # every feature whose code it mutates: `cdc` (the chunked read path and
+    # GC) and `validate`. `verified.rs` is compiled out by these flags while
+    # cargo-mutants, which parses with syn and never evaluates cfg, enumerates
+    # every mutant inside it anyway; each would build in 0s, pass every test,
+    # and be reported MISSED — a phantom survivor on healthy code (bead
+    # `ley-line-open-b23c41`). `verify` does not ship (`ley-line-open-b6a4dd`),
+    # so the file is excluded rather than enabled.
     #
     # Kept in step by tools/check_mutants_cfg_coverage.sh, which fails if a
     # cfg-gated module is neither enabled by its slice nor excluded here. That
     # guard is load-bearing: enumerating this list BY HAND missed `verified.rs`.
     run_slice lib --package leyline-fs --test-workspace=false \
-        --no-default-features --features cdc,splice,validate \
-        --exclude 'll-open/fs/src/fuse.rs' \
-        --exclude 'll-open/fs/src/nfs.rs' \
+        --no-default-features --features cdc,validate \
         --exclude 'll-open/fs/src/verified.rs'
 fi
 

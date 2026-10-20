@@ -219,14 +219,29 @@ impl<S: Store> HostNfs<S> {
         }
     }
 
-    /// Drop `id`'s handle and anything staged on it.
+    /// Drop `id`'s handle and anything staged on it: the file left the
+    /// tree, or another file took its name.
     fn forget(&self, id: fileid3) {
         if let Some(open) = self.opens.lock().remove(&id) {
             self.fs.release(open.handle);
         }
     }
 
-    /// Land what is staged on `id`'s handle. A refusal drops the staged
+    /// Drop what `id`'s handle staged and keep its base
+    /// ([`StoreFs::discard`]): a refused edit's client has not read what
+    /// the store holds, so its next WRITE is refused too until it READs.
+    fn discard(&self, id: fileid3, handle: u64) {
+        if let Err(errno) = self.fs.discard(handle) {
+            log::warn!("discarding the refused edit of file {id} failed ({errno:?})");
+            self.forget(id);
+            return;
+        }
+        if let Some(open) = self.opens.lock().get_mut(&id) {
+            open.stage = Stage::Clean;
+        }
+    }
+
+    /// Land what is staged on `id`'s handle. A refusal discards the staged
     /// edit: the client's next READ serves the store's bytes.
     fn commit_id(&self, id: fileid3) -> Result<(), Errno> {
         let Some(handle) = self.staged(id) else {
@@ -241,7 +256,7 @@ impl<S: Store> HostNfs<S> {
             }
             Err(errno) => {
                 log::warn!("NFS commit of file {id} refused ({errno:?}); its edit is dropped");
-                self.forget(id);
+                self.discard(id, handle);
                 Err(errno)
             }
         }
@@ -361,9 +376,10 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
 
     /// Stage the chunk, checked. An UNSTABLE write waits for the client's
     /// COMMIT; a FILE_SYNC or DATA_SYNC write is committed before it is
-    /// answered, and a refused commit fails it. A refused WRITE drops what
-    /// the handle staged before it (the save's truncate), so nothing of the
-    /// refused save lands.
+    /// answered, and a refused commit fails it. A refused WRITE discards
+    /// what the handle staged before it (the save's truncate), so nothing of
+    /// the refused save lands, and keeps the handle's base, so the client's
+    /// retry is refused too until it READs.
     async fn write_stable(
         &self,
         id: fileid3,
@@ -373,7 +389,7 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
     ) -> Result<(fattr3, bool), nfsstat3> {
         let handle = self.handle(id)?;
         if let Err(errno) = self.fs.write_checked(handle, offset, data) {
-            self.forget(id);
+            self.discard(id, handle);
             return Err(nfs_status(errno));
         }
         self.stage(id, Stage::Written);

@@ -125,6 +125,20 @@ pub fn unpatched_nfs_client(product_version: &str) -> Option<String> {
     })
 }
 
+/// Why this host's NFS client must not mount a loopback server, or `None`
+/// when it may: the refusal [`unpatched_nfs_client`] gives this Mac's
+/// release. Every other host answers `None`.
+pub fn nfs_client_refusal() -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(unpatched_nfs_client(&macos_product_version()?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
 /// This Mac's product version (`kern.osproductversion`).
 #[cfg(target_os = "macos")]
 fn macos_product_version() -> Result<String> {
@@ -192,8 +206,7 @@ pub fn mount_nfs<S: Store + 'static>(
     server: NfsServer<S>,
     mountpoint: &Path,
 ) -> Result<NfsMount<S>> {
-    #[cfg(target_os = "macos")]
-    if let Some(refusal) = unpatched_nfs_client(&macos_product_version()?) {
+    if let Some(refusal) = nfs_client_refusal()? {
         anyhow::bail!(refusal);
     }
     let port = server.port();

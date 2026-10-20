@@ -34,6 +34,14 @@ context, scoping notes, and review history are recoverable.
     takes seconds on a 2,000-file store (bead `ley-line-open-8c8ded`).
   - The guest-run host harness moves from `tests/agent_in_guest.rs` to
     `tests/guest_harness/`, shared by both tests.
+- **The vendored libkrun moves from v1.19.4 to v1.19.6** (bead
+  `ley-line-open-397fa6`). Upstream's virtio-fs and vsock fixes and a GPU
+  bounds check; LLO's six patches apply unchanged. The guest kernel
+  (libkrunfw) is still an installed library.
+- **CI checks the vendored libkrun tree** (bead `ley-line-open-396d77`).
+  The new `vendor-libkrun` workflow runs `task vmm:vendor:check` on every
+  pull request touching `rs/third_party/` or `tools/vendor_libkrun.sh`, and
+  weekly: a hand edit to the vendored tree fails it.
 
 - **Breaking: the store is a git-shaped tree; parsing is a projection over
   it; a proposal whose base moved merges three ways** (bead

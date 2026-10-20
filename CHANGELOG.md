@@ -12,6 +12,15 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: a workspace grant that claims a generation is refused**
+  (bead `ley-line-open-39abfa`). `WorkspaceGrant.expectedGeneration` is
+  ADR-0041 S1's commit `seq`, which no store records yet, so the daemon's
+  workspace share now refuses a grant whose `expectedGeneration` is nonzero
+  with `identityPolicyMismatch` before the run starts. Before, the value
+  was carried to the backend and ignored. A grant pinned by `graphRoot`
+  alone carries `expectedGeneration` 0 (execution/v1 README "Workspace
+  generation").
+
 - **Breaking: the store is a git-shaped tree; parsing is a projection over
   it; a proposal whose base moved merges three ways** (bead
   `ley-line-open-bb8aa6`, ADR-0045).

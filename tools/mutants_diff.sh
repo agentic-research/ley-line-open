@@ -610,6 +610,11 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # collapses every injected nid to 0 and the fact rows leave the host's
     # range entirely. Verified before routing: the mutation leaves the lib
     # suite green and fails five tests in this binary.
+    # watcher_enrichment_gap1_test: the only tests that call
+    # `cmd_daemon::run_watcher_enrichment` and observe its phase change and
+    # `daemon.enrichment.*` emits. `replace run_watcher_enrichment with ()`
+    # survived on the sheaf-feature PR (bead 39e239); verified before
+    # routing: that mutation fails all three tests in this binary.
     run_slice integration \
         --features vec,mount \
         -C --lib \
@@ -620,6 +625,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
         -C --test -C lsp_enrich_pipeline \
         -C --test -C pointer_store_dual_write_test \
         -C --test -C injection_extraction_test \
+        -C --test -C watcher_enrichment_gap1_test \
         --package leyline-cli-lib --test-workspace=false
   fi
 fi

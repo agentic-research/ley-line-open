@@ -19,7 +19,10 @@ use std::time::{Duration, Instant};
 
 const LATENCY_FILE: &str = "bench/latency.txt";
 const LATENCY_OPS: u32 = 1000;
-const STORM_FILES: u32 = 200;
+// Each file closed on the share is one accepted proposal, and each accepted
+// proposal re-snapshots the whole store (bead ley-line-open-39d3a4's
+// finding), so the storm is kept short.
+const STORM_FILES: u32 = 20;
 const WARM_RUNS: u32 = 3;
 
 struct Tools {

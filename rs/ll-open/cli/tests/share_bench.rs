@@ -3,7 +3,7 @@
 //! travelling worker -> share socket -> daemon storefs, against the same
 //! workloads in a plain APFS directory.
 //!
-//! Ignored by default (it boots a VM over a ~10k-file corpus and takes
+//! Ignored by default (it boots a VM over a ~2k-file corpus and takes
 //! minutes); run it with
 //!
 //! ```text
@@ -19,7 +19,9 @@
 //!
 //! The corpus is this repository's tracked files plus crate sources from
 //! `$CARGO_HOME/registry/src` until `LEYLINE_BENCH_FILES` files (default
-//! 10000); symlinks, `.gitignore` files and files over 4 MiB are left out.
+//! 2000); symlinks, `.gitignore` files and files over 4 MiB are left out.
+//! Every accepted write re-snapshots the whole store, so the write
+//! workloads' cost grows with the corpus.
 //! `LEYLINE_BENCH_OUT` names a file to write the result table to.
 
 use std::fs;
@@ -155,7 +157,7 @@ fn the_shipped_share_path_against_apfs() {
     let want: usize = std::env::var("LEYLINE_BENCH_FILES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(2_000);
     let files = corpus(want);
     let mut host = guest_harness::host(
         |dir| {
@@ -218,7 +220,12 @@ fn the_shipped_share_path_against_apfs() {
         &graph_root,
         LIMITS,
     );
-    let terminal = host.await_end(&daemon, &run_id, Duration::from_millis(LIMITS.wall_time_ms));
+    let terminal = host.await_end(
+        &daemon,
+        "run",
+        &run_id,
+        Duration::from_millis(LIMITS.wall_time_ms),
+    );
     let guest_result = stored(&daemon.sock, RESULT).unwrap_or_default();
     assert!(
         terminal.to_string().contains("succeeded") && !guest_result.is_empty(),

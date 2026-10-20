@@ -330,7 +330,7 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
     go(&daemon, 'p');
 
     await_guest(&host, &daemon, &run_id, 'z');
-    let terminal = host.await_end(&daemon, &run_id, STEP);
+    let terminal = host.await_end(&daemon, "run", &run_id, STEP);
     results.check(
         "run",
         terminal.to_string().contains("succeeded"),

@@ -309,7 +309,15 @@ impl Host {
     }
 
     /// Poll the run's status until it ends; returns the terminal status.
-    pub fn await_end(&self, daemon: &Daemon, run_id: &str, within: Duration) -> Value {
+    /// `lifetime` names the daemon log reported when the run outlives
+    /// `within`.
+    pub fn await_end(
+        &self,
+        daemon: &Daemon,
+        lifetime: &str,
+        run_id: &str,
+        within: Duration,
+    ) -> Value {
         let deadline = Instant::now() + within;
         loop {
             let status = call(
@@ -319,7 +327,15 @@ impl Host {
             if status.to_string().contains("succeeded") || status.to_string().contains("failed") {
                 return status;
             }
-            assert!(Instant::now() < deadline, "the run did not end: {status}");
+            assert!(
+                Instant::now() < deadline,
+                "the run did not end: {status}\nevents: {}\nlog:\n{}",
+                call(
+                    &daemon.sock,
+                    json!({"op": "llo_execution_inspect", "runId": run_id, "afterSequence": 0}),
+                ),
+                self.log(lifetime)
+            );
             std::hint::spin_loop();
         }
     }

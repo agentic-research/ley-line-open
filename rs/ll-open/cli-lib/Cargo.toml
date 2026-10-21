@@ -5,7 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [features]
-default = ["lsp", "validate", "hdc", "cdc"]
+default = ["lsp", "validate", "hdc", "cdc", "sheaf"]
 lsp = ["dep:leyline-lsp"]
 # Tree-sitter syntactic validation surface exposed as a daemon op for
 # mache's writeback path (ley-line-open-fa8638). Pulls leyline-fs's
@@ -40,13 +40,19 @@ text-search = ["dep:leyline-text-search"]
 # Pure Rust and runtime opt-in, so the command is present in ordinary builds
 # without changing any database merely by opening it.
 cdc = ["leyline-fs/cdc"]
+# The sheaf surface (bead ley-line-open-39e239): the `sheaf_*` and
+# `agreement` daemon ops, the co-change complex pass, the granularity
+# router and the watcher's `daemon.sheaf.invalidate` emit, all over
+# `leyline-sheaf`. Default-on because mache's cascade calls those ops;
+# off, the ops are not dispatched and leyline-sheaf is not linked.
+sheaf = ["dep:leyline-sheaf"]
 
 [dependencies]
 parking_lot = { workspace = true }
 leyline-lsp = { path = "../lsp", optional = true }
 leyline-hdc = { path = "../hdc", optional = true }
 leyline-text-search = { path = "../text-search", optional = true }
-leyline-sheaf = { path = "../sheaf" }
+leyline-sheaf = { path = "../sheaf", optional = true }
 leyline-ts = { path = "../ts", features = [
     "html", "markdown", "json", "yaml", "go", "python", "elixir", "hcl",
     "rust", "proto", "javascript", "typescript",

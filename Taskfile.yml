@@ -539,9 +539,20 @@ tasks:
 
       `check` not `build`: this catches the type errors at a fraction of the
       link cost. `task release:full` still does the real build.
+
+      The other end of the lattice: cli-lib with no default features builds,
+      and links no leyline-sheaf (bead ley-line-open-39e239), so the sheaf
+      surface stays a feature rather than drifting back into a hard
+      dependency.
     dir: rs
     cmds:
       - cargo check -p leyline-cli --features all
+      - cargo check -p leyline-cli-lib --no-default-features
+      - |
+        if cargo tree -p leyline-cli-lib --no-default-features -e normal -i leyline-sheaf 2>/dev/null | grep -q leyline-sheaf; then
+          echo "leyline-cli-lib links leyline-sheaf with its default features off" >&2
+          exit 1
+        fi
 
   # --------------------------------------------------------------------------
   # Build

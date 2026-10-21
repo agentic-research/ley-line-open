@@ -111,6 +111,16 @@ fn every_request() -> Vec<Request> {
             inode: 1,
             offset: 2,
         },
+        Request::Symlink {
+            parent: 1,
+            name: b"link.go".to_vec(),
+            target: b"a.go".to_vec(),
+        },
+        Request::Readlink { inode: 7 },
+        Request::Getattr {
+            inode: 2,
+            handle: None,
+        },
     ]
 }
 
@@ -165,7 +175,34 @@ fn every_reply() -> Vec<Reply> {
             entries: vec![dirent.clone()],
         },
         Reply::DirPlus {
-            entries: vec![(dirent, entry)],
+            entries: vec![(dirent.clone(), entry)],
+        },
+        // Listings of more than one entry, and none: every entry survives.
+        Reply::Dir {
+            entries: (0..3)
+                .map(|i| DirEntry {
+                    inode: 10 + i,
+                    offset: i + 1,
+                    kind: DT_REG,
+                    name: format!("f{i}.go").into_bytes(),
+                })
+                .collect(),
+        },
+        Reply::DirPlus {
+            entries: vec![
+                (dirent.clone(), entry),
+                (
+                    DirEntry {
+                        name: b"lib".to_vec(),
+                        offset: 2,
+                        ..dirent
+                    },
+                    entry,
+                ),
+            ],
+        },
+        Reply::Dir {
+            entries: Vec::new(),
         },
     ]
 }
@@ -204,13 +241,181 @@ fn write_and_read_bytes_travel_as_the_payload_not_the_header() {
     let header_len = u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize;
     let payload_len = u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize;
     assert_eq!(payload_len, 1000);
-    assert!(header_len < 100, "the bytes stay out of the JSON header");
+    assert!(header_len < 100, "the bytes stay out of the header");
     assert_eq!(wire.len(), 8 + header_len + payload_len);
     assert_eq!(&wire[8 + header_len..], &[0xAB; 1000][..]);
 
     let mut wire = Vec::new();
     write_reply(&mut wire, &Reply::Data { data: vec![7; 64] }).unwrap();
     assert_eq!(u32::from_le_bytes(wire[4..8].try_into().unwrap()), 64);
+}
+
+/// The header and payload lengths of the one frame `wire` holds.
+fn lengths(wire: &[u8]) -> (usize, usize) {
+    (
+        u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize,
+        u32::from_le_bytes(wire[4..8].try_into().unwrap()) as usize,
+    )
+}
+
+/// One frame with `header` and `payload`, as the peer would write it.
+fn frame(header: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    wire.extend_from_slice(header);
+    wire.extend_from_slice(payload);
+    wire
+}
+
+#[test]
+fn the_header_is_one_capnp_share_message() {
+    let mut wire = Vec::new();
+    write_request(
+        &mut wire,
+        &Request::Lookup {
+            parent: 1,
+            name: b"a.go".to_vec(),
+        },
+    )
+    .unwrap();
+    let (header_len, _) = lengths(&wire);
+    let mut header = &wire[8..8 + header_len];
+    let message = capnp::serialize::read_message_from_flat_slice(
+        &mut header,
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("the header is a Cap'n Proto message");
+    assert!(header.is_empty(), "the message is the whole header");
+    let root = message
+        .get_root::<leyline_public_schema::share_capnp::request::Reader<'_>>()
+        .unwrap();
+    match root.which().unwrap() {
+        leyline_public_schema::share_capnp::request::Which::Lookup(lookup) => {
+            let lookup = lookup.unwrap();
+            assert_eq!(lookup.get_parent(), 1);
+            assert_eq!(lookup.get_name().unwrap(), b"a.go");
+        }
+        _ => panic!("the header names a lookup"),
+    }
+}
+
+#[test]
+fn a_header_that_is_not_a_share_message_is_refused() {
+    for header in [&b"{\"op\":\"init\"}"[..], b"", &[0xff; 16][..]] {
+        let error = read_request(&mut Cursor::new(frame(header, &[]))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{header:?}");
+        let error = read_reply(&mut Cursor::new(frame(header, &[]))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{header:?}");
+    }
+}
+
+#[test]
+fn bytes_after_the_header_message_are_refused() {
+    let mut wire = Vec::new();
+    write_request(&mut wire, &Request::Init).unwrap();
+    let (header_len, _) = lengths(&wire);
+    let mut header = wire[8..8 + header_len].to_vec();
+    header.extend_from_slice(&[0; 8]);
+    let error = read_request(&mut Cursor::new(frame(&header, &[]))).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+/// A one-segment message whose root struct has a one-word data section
+/// holding `tag` at bit `at` and one null pointer: what a peer whose schema
+/// has a union member this side lacks would send. `capnp compile -ocapnp
+/// share.capnp` places Request's tag at bits [0, 16) and Reply's at [32, 48).
+fn root_with_tag(tag: u16, at: u32) -> Vec<u8> {
+    let mut message = Vec::new();
+    message.extend_from_slice(&0u32.to_le_bytes()); // one segment
+    message.extend_from_slice(&3u32.to_le_bytes()); // of three words
+    let root: u64 = (1 << 32) | (1 << 48); // struct, offset 0, 1 data word, 1 pointer
+    message.extend_from_slice(&root.to_le_bytes());
+    message.extend_from_slice(&(u64::from(tag) << at).to_le_bytes());
+    message.extend_from_slice(&0u64.to_le_bytes());
+    message
+}
+
+const REQUEST_TAG_AT: u32 = 0;
+const REPLY_TAG_AT: u32 = 32;
+
+#[test]
+fn a_request_or_reply_kind_this_side_does_not_know_is_refused() {
+    let unknown = root_with_tag(999, REQUEST_TAG_AT);
+    let error = read_request(&mut Cursor::new(frame(&unknown, &[]))).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    let unknown = root_with_tag(999, REPLY_TAG_AT);
+    let error = read_reply(&mut Cursor::new(frame(&unknown, &[]))).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    // The same bytes with a known kind parse: the refusal is the unknown
+    // kind, not the hand-built message.
+    let init = root_with_tag(0, REQUEST_TAG_AT);
+    assert_eq!(
+        read_request(&mut Cursor::new(frame(&init, &[]))).unwrap(),
+        Some(Request::Init)
+    );
+    let done = root_with_tag(8, REPLY_TAG_AT);
+    assert_eq!(
+        read_reply(&mut Cursor::new(frame(&done, &[]))).unwrap(),
+        Reply::Done
+    );
+}
+
+#[test]
+fn a_payload_on_a_kind_that_carries_none_is_refused() {
+    let mut wire = Vec::new();
+    write_request(&mut wire, &Request::Flush { handle: 1 }).unwrap();
+    let (header_len, _) = lengths(&wire);
+    let header = wire[8..8 + header_len].to_vec();
+    let error = read_request(&mut Cursor::new(frame(&header, b"stray"))).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+    let mut wire = Vec::new();
+    write_reply(&mut wire, &Reply::Done).unwrap();
+    let (header_len, _) = lengths(&wire);
+    let header = wire[8..8 + header_len].to_vec();
+    let error = read_reply(&mut Cursor::new(frame(&header, b"stray"))).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_time_with_a_nanosecond_count_of_a_second_or_more_is_refused() {
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let root = message.init_root::<leyline_public_schema::share_capnp::reply::Builder<'_>>();
+        let mut attr = root.init_attr();
+        let mut ttl = attr.reborrow().init_ttl();
+        ttl.set_secs(1);
+        ttl.set_nanos(1_000_000_000);
+        attr.init_attr();
+    }
+    let mut header = Vec::new();
+    capnp::serialize::write_message(&mut header, &message).unwrap();
+    let error = read_reply(&mut Cursor::new(frame(&header, &[]))).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_remote_service_answering_a_malformed_reply_fails_eio_from_then_on() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let remote = RemoteFs::new(client);
+    let answer = std::thread::spawn(move || {
+        read_request(&mut server).unwrap().expect("a request");
+        server
+            .write_all(&frame(b"not a share message", &[]))
+            .unwrap();
+        server
+    });
+    assert_eq!(
+        remote.call(Request::Init),
+        Reply::Error { errno: LINUX_EIO }
+    );
+    let _server = answer.join().unwrap();
+    assert_eq!(
+        remote.call(Request::Init),
+        Reply::Error { errno: LINUX_EIO },
+        "a stream that returned a malformed reply stays failed"
+    );
 }
 
 #[test]

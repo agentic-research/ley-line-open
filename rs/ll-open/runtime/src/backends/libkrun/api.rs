@@ -123,7 +123,7 @@ pub trait KrunApi: Send + Sync {
 pub const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 
 /// libkrun linked into this binary, built from `rs/third_party/libkrun`: upstream
-/// v1.19.4 plus LLO's patches (ADR-0044). LLO builds the VMM it runs; nothing
+/// v1.19.6 plus LLO's patches (ADR-0044). LLO builds the VMM it runs; nothing
 /// is loaded from an installed libkrun. The guest kernel is still the
 /// installed libkrunfw, which libkrun dlopens at `krun_create_ctx`.
 #[cfg(feature = "vmm")]

@@ -10,8 +10,8 @@ from an installed library (ADR-0044, bead `ley-line-open-f1c46f`). The
 | | |
 |---|---|
 | Upstream | https://github.com/containers/libkrun |
-| Tag | `v1.19.4` (lightweight tag) |
-| Commit | `728df8125077d0db44265f6e997c72b81b65c015` — "Bump patch version to 1.19.4", Sergio Lopez, 2026-07-03 |
+| Tag | `v1.19.6` |
+| Commit | `227b2de6ed323fe180e02f871c5f325a90c13cc2` (2026-09-25); vendored at `v1.19.4` (`728df812`) until bead `ley-line-open-397fa6` |
 | License | Apache-2.0 (`libkrun/LICENSE`); see "License" below |
 | LLO patches | `rs/third_party/libkrun-patches/`, applied in file order |
 | Writer and verifier | `tools/vendor_libkrun.sh sync` / `check` (`task vmm:vendor:check`) |
@@ -38,16 +38,19 @@ testing do not reach them.
 `tools/vendor_libkrun.sh check` clones the tag, refuses it unless it resolves
 to the pinned commit, copies the same file set, applies the patches, and
 `diff -r`s the result against this tree. It needs the network, so `task ci`
-does not run it; the build reads only the committed tree.
+does not run it; the build reads only the committed tree. The
+`vendor-libkrun` workflow runs it on every pull request that touches this
+tree, the patches or the script, and weekly (bead `ley-line-open-396d77`).
 
 ### The patches
 
 Prepared as an upstream pull request; not yet submitted. Each is one
-`git format-patch` commit on top of `v1.19.4`:
+`git format-patch` commit, written on top of `v1.19.4`; all six apply
+unchanged to `v1.19.6`:
 
 1. `0001` — **libkrun/macos: start the mapping worker for virtio-fs DAX
    windows.** On macOS a virtio-fs DAX mapping is serviced by the VMM worker
-   thread (`GpuAddMapping` → `hv_vm_map`), which 1.19.4 starts only for a virgl
+   thread (`GpuAddMapping` → `hv_vm_map`), which upstream starts only for a virgl
    GPU. Without the fix a guest's first DAX read hangs.
 2. `0002` — **devices/fs: `DynFileSystem`.** An object-safe trait for a
    virtio-fs backend supplied by the embedding process, an adapter to the

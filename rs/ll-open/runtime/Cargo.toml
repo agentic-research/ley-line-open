@@ -9,7 +9,7 @@ license = "AGPL-3.0-or-later"
 [features]
 default = ["vmm"]
 # The linked VMM (ADR-0044, bead ley-line-open-f1c46f): libkrun built from
-# rs/third_party/libkrun, upstream v1.19.4 plus the patches beside it. The
+# rs/third_party/libkrun, upstream v1.19.6 plus the patches beside it. The
 # leyline-krun-worker binary runs guests through it. A crate that only
 # supervises the worker — leyline-cli-lib, leyline-cli — turns default
 # features off and does not compile libkrun.

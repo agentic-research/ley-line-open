@@ -66,7 +66,22 @@ context, scoping notes, and review history are recoverable.
     `fs:build:nfs-isolated` tasks (leyline-fs links no libfuse).
   - ADR-0045's conflict ranges are documented as `daemon.capnp` defines
     them: 0-based, half-open `[start, end)`.
-
+- **Breaking: a workspace grant that claims a generation is refused**
+  (bead `ley-line-open-39abfa`). `WorkspaceGrant.expectedGeneration` is
+  ADR-0041 S1's commit `seq`, which no store records yet, so the daemon's
+  workspace share now refuses a grant whose `expectedGeneration` is nonzero
+  with `identityPolicyMismatch` before the run starts. Before, the value
+  was carried to the backend and ignored. A grant pinned by `graphRoot`
+  alone carries `expectedGeneration` 0 (execution/v1 README "Workspace
+  generation").
+- **The vendored libkrun moves from v1.19.4 to v1.19.6** (bead
+  `ley-line-open-397fa6`). Upstream's virtio-fs and vsock fixes and a GPU
+  bounds check; LLO's six patches apply unchanged. The guest kernel
+  (libkrunfw) is still an installed library.
+- **CI checks the vendored libkrun tree** (bead `ley-line-open-396d77`).
+  The new `vendor-libkrun` workflow runs `task vmm:vendor:check` on every
+  pull request touching `rs/third_party/` or `tools/vendor_libkrun.sh`, and
+  weekly: a hand edit to the vendored tree fails it.
 - **Breaking: the store is a git-shaped tree; parsing is a projection over
   it; a proposal whose base moved merges three ways** (bead
   `ley-line-open-bb8aa6`, ADR-0045).

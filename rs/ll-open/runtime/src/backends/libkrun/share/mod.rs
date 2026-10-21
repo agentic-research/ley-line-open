@@ -13,17 +13,23 @@
 //! and timeouts. The service decides every reply; the device transcribes it
 //! into libkrun's types and adds nothing.
 //!
-//! Framing: two little-endian `u32` lengths (header, payload), a JSON header
-//! ([`Request`] or [`Reply`]), then the payload — the bytes a WRITE carries or
-//! a READ answers, which stay out of the JSON.
+//! Framing: two little-endian `u32` lengths (header, payload), the header
+//! ([`Request`] or [`Reply`]) as one Cap'n Proto message of
+//! `leyline-public-schema`'s `capnp/share.capnp`, then the payload — the
+//! bytes a WRITE carries or a READ or READLINK answers, which stay out of the
+//! header. The schema is internal to one LLO release: the daemon spawns the
+//! worker it ships with. A frame either side cannot read — a header that is
+//! not one share message, trailing bytes, a kind this side does not know, a
+//! payload on a kind that carries none — fails the stream, and the guest's
+//! request answers `EIO`.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
+mod codec;
 #[cfg(feature = "vmm")]
 mod device;
 #[cfg(feature = "vmm")]
@@ -56,7 +62,7 @@ pub const LINUX_EIO: i32 = 5;
 pub const MAX_FRAME: u32 = 64 << 20;
 
 /// A node's attributes, as `stat` reports them to the guest.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Attr {
     pub inode: u64,
     /// Linux `st_mode`: file-type and permission bits.
@@ -76,7 +82,7 @@ pub struct Attr {
 
 /// A LOOKUP reply. `inode` 0 is a negative entry: the name does not exist,
 /// and the guest may cache that for `entry_ttl`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Entry {
     pub inode: u64,
     pub attr: Attr,
@@ -85,7 +91,7 @@ pub struct Entry {
 }
 
 /// One directory entry; `offset` resumes after it.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DirEntry {
     pub inode: u64,
     pub offset: u64,
@@ -95,8 +101,7 @@ pub struct DirEntry {
 }
 
 /// A FUSE request the guest sent.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
     Init,
     Lookup {
@@ -155,7 +160,6 @@ pub enum Request {
         handle: u64,
         offset: u64,
         /// Carried as the frame's payload.
-        #[serde(skip)]
         data: Vec<u8>,
     },
     Flush {
@@ -191,8 +195,7 @@ pub enum Request {
 }
 
 /// The answer to a [`Request`].
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "reply", rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reply {
     /// A Linux errno value.
     Error {
@@ -219,9 +222,9 @@ pub enum Reply {
         handle: u64,
         flags: u32,
     },
+    /// READ and READLINK: the bytes.
     Data {
         /// Carried as the frame's payload.
-        #[serde(skip)]
         data: Vec<u8>,
     },
     Written {
@@ -302,12 +305,8 @@ fn read_frame(reader: &mut impl Read) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> 
     Ok(Some((header, payload)))
 }
 
-fn invalid(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 pub fn write_request(writer: &mut impl Write, request: &Request) -> io::Result<()> {
-    let header = serde_json::to_vec(request).map_err(invalid)?;
+    let header = codec::request_header(request);
     let payload = match request {
         Request::Write { data, .. } => data.as_slice(),
         _ => &[],
@@ -320,15 +319,11 @@ pub fn read_request(reader: &mut impl Read) -> io::Result<Option<Request>> {
     let Some((header, payload)) = read_frame(reader)? else {
         return Ok(None);
     };
-    let mut request: Request = serde_json::from_slice(&header).map_err(invalid)?;
-    if let Request::Write { data, .. } = &mut request {
-        *data = payload;
-    }
-    Ok(Some(request))
+    codec::request(&header, payload).map(Some)
 }
 
 pub fn write_reply(writer: &mut impl Write, reply: &Reply) -> io::Result<()> {
-    let header = serde_json::to_vec(reply).map_err(invalid)?;
+    let header = codec::reply_header(reply);
     let payload = match reply {
         Reply::Data { data } => data.as_slice(),
         _ => &[],
@@ -338,11 +333,7 @@ pub fn write_reply(writer: &mut impl Write, reply: &Reply) -> io::Result<()> {
 
 pub fn read_reply(reader: &mut impl Read) -> io::Result<Reply> {
     let (header, payload) = read_frame(reader)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-    let mut reply: Reply = serde_json::from_slice(&header).map_err(invalid)?;
-    if let Reply::Data { data } = &mut reply {
-        *data = payload;
-    }
-    Ok(reply)
+    codec::reply(&header, payload)
 }
 
 /// Answer requests from `reader` with `service`, replies to `writer`, until

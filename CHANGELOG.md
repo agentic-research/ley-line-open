@@ -72,6 +72,28 @@ context, scoping notes, and review history are recoverable.
     `fs:build:nfs-isolated` tasks (leyline-fs links no libfuse).
   - ADR-0045's conflict ranges are documented as `daemon.capnp` defines
     them: 0-based, half-open `[start, end)`.
+- **The workspace share's frame header is Cap'n Proto, and the shipped
+  share path is measured** (bead `ley-line-open-39d3a4`).
+  - Each FUSE request the `leyline-krun-worker` forwards to the daemon, and
+    each reply, carries its header as one message of the new internal
+    schema `rs/ll-core/public-schema/capnp/share.capnp` instead of JSON.
+    The framing (two little-endian `u32` lengths, then the header, then the
+    payload) is unchanged. The worker and the daemon ship in one release,
+    so the schema has no Go or TypeScript bindings and is not in
+    `compatibility.json`; a worker and a daemon from different releases do
+    not interoperate.
+  - Decoding fails closed: a header that is not exactly one share message,
+    a request or reply kind the reader does not know, a time whose
+    nanosecond count is a second or more, or a payload on a kind that
+    carries none fails the stream, and the guest's request answers `EIO`.
+  - `rs/ll-open/cli/tests/share_bench.rs` (ignored; run with `--ignored`)
+    measures the shipped path (guest -> worker -> share socket -> daemon
+    storefs) against APFS. Results and method:
+    `docs/benchmarks/2026-10-20-share-path.md`. It found that every
+    accepted write re-snapshots the whole store: one small-file create
+    takes seconds on a 2,000-file store (bead `ley-line-open-8c8ded`).
+  - The guest-run host harness moves from `tests/agent_in_guest.rs` to
+    `tests/guest_harness/`, shared by both tests.
 - **The sheaf surface is a cargo feature** (bead `ley-line-open-39e239`).
   `leyline-cli-lib` and `leyline-cli` gain a default-on `sheaf` feature
   that owns the `leyline-sheaf` dependency, the `sheaf_*` and `agreement`

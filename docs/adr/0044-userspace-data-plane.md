@@ -96,7 +96,10 @@ or page is therefore as fresh as its timeout or the next OPEN.
 **Caching is required for speed.** The V-F3 run (same document) measured a storefs-shaped backend
 with zero timeouts and `DIRECT_IO` at 29–82× APFS on tree walks (`find` issues 364k requests for
 20,857 files). Long timeouts, READDIRPLUS and page-cached read-only opens bring warm walks to
-1.0–2.3× APFS.
+1.0–2.3× APFS. Those numbers are the in-process prototype's. The shipped path (worker -> share
+socket -> daemon storefs, Cap'n Proto frame headers) is measured in
+`docs/benchmarks/2026-10-20-share-path.md`: reads cost a socket round trip per request on top,
+and every accepted write re-snapshots the whole store (bead `ley-line-open-8c8ded`).
 
 **The contract:**
 
@@ -137,9 +140,10 @@ storefs itself, behind FUSE and NFS adapters: a host process sees the tree a gue
 writes are the proposals a guest's are, with the NFS WRITE-time refusal the decision the COMMIT
 would make. The merge and `ESTALE` hold between separate writers (a guest's session, a FUSE
 handle, a socket proposal); two processes through one NFS mount share one NFS client, and the
-last save wins (`ley-line-open-5ec040`). On macOS the NFS mount is refused before Tahoe 26.7 / Sequoia 15.8, whose NFS client
-corrupts kernel memory on server replies (`ley-line-open-2d49ce`). The agent path stays the
-virtio-fs share: the host mounts pay a kernel round trip per request.
+last save wins (`ley-line-open-5ec040`). On macOS the NFS mount is refused before Tahoe 26.7 /
+Sequoia 15.8, whose NFS client corrupts kernel memory on server replies
+(`ley-line-open-2d49ce`). The agent path stays the virtio-fs share: the host mounts pay a kernel
+round trip per request.
 
 ### V5 — LLO owns the filesystem; cloister owns policy; they meet at execution/v1
 
@@ -270,7 +274,7 @@ upper filesystem (xattrs, whiteouts, rename) are unmeasured.
 |---|---|---|---|
 | A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib; re-pinned to v1.19.6 with the same patches (`397fa6`), and CI checks the vendored tree (`396d77`) | `f1c46f` | Done (#464) |
 | B | the store-backed `DynFileSystem`: reads from the checkout's ref, writes as proposals, refusals as Linux errno | `f1ea99` | Done (#463) |
-| C | agents run in a guest whose working tree is that share; the end-to-end scenarios run inside the guest; V-F2 and V-F3 measured | `f210c2` | Done on macOS/HVF: the in-guest scenarios pass (below). V-F3 was measured by the spike harness (`docs/benchmarks/2026-10-15-vf3-virtiofs.md`), not through the daemon's share; V-F2 (dtrace) is not measured; Linux/KVM not run |
+| C | agents run in a guest whose working tree is that share; the end-to-end scenarios run inside the guest; V-F2 and V-F3 measured | `f210c2` | Done on macOS/HVF: the in-guest scenarios pass (below). V-F3 was measured by the spike harness (`docs/benchmarks/2026-10-15-vf3-virtiofs.md`); the daemon's share is measured by `share_bench` (`docs/benchmarks/2026-10-20-share-path.md`, bead `39d3a4`); V-F2 (dtrace) is not measured; Linux/KVM not run |
 
 ## Phase C results (bead `ley-line-open-f210c2`, 2026-10-15)
 

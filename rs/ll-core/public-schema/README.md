@@ -7,6 +7,7 @@ cloister, and other clients.
 ## What's here
 
 - **`capnp/daemon.capnp`** — the schema. Source of truth for every base op's request and response shape. Field-level `$Json.name(...)` annotations map camelCase capnp names to snake_case JSON wire names per the capnp-json codec.
+- **`capnp/share.capnp`** — **internal, not a consumer contract.** The workspace share's frame header between the `leyline-krun-worker` and the daemon that spawned it (ADR-0044 phase C, bead `ley-line-open-39d3a4`). Both sides ship in one LLO release, so it has no Go or TypeScript bindings (`clients/go/leyline-schema/regen.sh` does not compile it) and is not in `compatibility.json`. It still follows the append-only rule below. Exposed as the `#[doc(hidden)]` module `share_capnp`.
 - **`capnp/capnp/compat/json.capnp`** — vendored from [capnp-json](https://crates.io/crates/capnp-json) (which vendors from upstream [capnproto/capnproto](https://github.com/capnproto/capnproto)). Provides the `$Json.name` / `$Json.flatten` / `$Json.discriminator` annotation IDs. **Don't edit** — kept byte-identical to upstream so regen is clean.
 - **`build.rs`** — invokes capnpc-rust with `crate_provides("capnp_json", ...)` so generated bindings resolve the json annotations to the capnp-json crate's types. Re-runs on any schema change.
 - **`leyline-schema-spec` build dependency** — owns the canonical

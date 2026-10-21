@@ -21,6 +21,17 @@ or backend implementation name appears in the portable contract. Workspaces
 are logical Graph roots with explicit operations. A `.db` can be an immutable
 artifact, but never live storage authority.
 
+## Workspace generation
+
+`WorkspaceGrant.expectedGeneration` is ADR-0041 S1's commit `seq` within the
+grant's epoch: the number of proposals the workspace had accepted when the
+grant was issued. Zero claims no generation; the grant's `graphRoot` alone
+pins the run. No LLO store records `(epoch, seq)` yet (ADR-0041 is
+Proposed), so a store refuses a grant whose `expectedGeneration` is nonzero
+with `identityPolicyMismatch` before the run starts, rather than running it
+against a generation nothing checked. When a store implements S1, it compares
+the claim with its `seq` instead.
+
 ## Issuer signature
 
 `RunGrant.signature` is the only signed surface in this capability.

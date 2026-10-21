@@ -261,7 +261,7 @@ upper filesystem (xattrs, whiteouts, rename) are unmeasured.
 
 | Phase | Scope | Bead | Status |
 |---|---|---|---|
-| A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib | `f1c46f` | Done (#464) |
+| A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib; re-pinned to v1.19.6 with the same patches (`397fa6`), and CI checks the vendored tree (`396d77`) | `f1c46f` | Done (#464) |
 | B | the store-backed `DynFileSystem`: reads from the checkout's ref, writes as proposals, refusals as Linux errno | `f1ea99` | Done (#463) |
 | C | agents run in a guest whose working tree is that share; the end-to-end scenarios run inside the guest; V-F2 and V-F3 measured | `f210c2` | Done on macOS/HVF: the in-guest scenarios pass (below). V-F3 was measured by the spike harness (`docs/benchmarks/2026-10-15-vf3-virtiofs.md`), not through the daemon's share; V-F2 (dtrace) is not measured; Linux/KVM not run |
 
@@ -296,11 +296,13 @@ evidence"), which names each `workspaceShare` channel; a run without a workspace
 in-guest scenarios below run through this check: the daemon's worker holds exactly its streams and
 the share.
 
-**`expectedGeneration`.** The grant's `WorkspaceGrant.expectedGeneration` is carried to the
-backend and not checked. ADR-0041 S1 defines it as the commit `seq` within the grant's epoch, and
-no store implements `(epoch, seq)` yet (ADR-0041 is Proposed), so there is no value to compare it
-with. The share is pinned by the `graphRoot` check: it opens only when the store's `treeRoot` is
-the grant's `graphRoot`. Checking `expectedGeneration` lands with ADR-0041 S1.
+**`expectedGeneration`.** ADR-0041 S1 defines the grant's `WorkspaceGrant.expectedGeneration` as
+the commit `seq` within the grant's epoch, and no store implements `(epoch, seq)` yet (ADR-0041 is
+Proposed), so there is no value to compare a claim with. The daemon's share refuses a grant whose
+`expectedGeneration` is nonzero (`identityPolicyMismatch`, before the worker starts; bead
+`ley-line-open-39abfa`): a claim nothing checks is not run. Zero claims no generation, and the
+share is pinned by the `graphRoot` check: it opens only when the store's `treeRoot` is the grant's
+`graphRoot`. Comparing a nonzero claim with the store's `seq` lands with ADR-0041 S1.
 
 **The test.** `rs/ll-open/cli/tests/agent_in_guest.rs` runs the real `leyline execution-daemon
 --backend micro-vm --source <checkout>` and starts an execution/v1 run over the socket whose

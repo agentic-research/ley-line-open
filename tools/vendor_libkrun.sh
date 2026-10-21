@@ -21,8 +21,8 @@
 set -eu
 
 URL=https://github.com/containers/libkrun.git
-TAG=v1.19.4
-SHA=728df8125077d0db44265f6e997c72b81b65c015
+TAG=v1.19.6
+SHA=227b2de6ed323fe180e02f871c5f325a90c13cc2
 
 # What cargo needs, plus the license and the C header the Rust API mirrors.
 # Not upstream's root Cargo.toml: it declares only upstream's own [workspace].

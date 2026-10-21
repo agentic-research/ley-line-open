@@ -149,6 +149,46 @@ async fn a_share_whose_granted_root_the_store_no_longer_holds_is_refused() {
     assert!(error.detail.contains(&tree_root(&ctx)), "{error:?}");
 }
 
+/// The store records no commit generation (ADR-0041 S1 is not implemented),
+/// so a grant that claims one is refused before the worker starts rather
+/// than run against a generation nothing checked. The granted root is the
+/// store's, so the generation alone refuses it.
+#[tokio::test]
+async fn a_share_whose_grant_claims_a_generation_the_store_cannot_verify_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let ctx = daemon(&dir);
+    let slot = ContextSlot::default();
+    slot.set(Arc::clone(&ctx)).ok().unwrap();
+    let shares = DaemonShares::new(slot, freshness());
+    for generation in [1, 7, u64::MAX] {
+        let claimed = WorkspaceGrant {
+            expected_generation: generation,
+            ..grant(tree_root(&ctx), vec![WorkspaceOperation::Read])
+        };
+        let error = match shares.open("run-1", &claimed) {
+            Ok(_) => panic!("generation {generation} cannot be verified"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch);
+        assert!(!error.retryable, "{error:?}");
+        assert!(
+            error
+                .detail
+                .contains(&format!("expectedGeneration {generation}")),
+            "{error:?}"
+        );
+    }
+    // Zero claims no generation: the granted root alone pins the run.
+    assert!(
+        shares
+            .open(
+                "run-1",
+                &grant(tree_root(&ctx), vec![WorkspaceOperation::Read])
+            )
+            .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn a_granted_share_serves_the_daemons_store_and_lands_as_its_proposals_do() {
     let dir = TempDir::new().unwrap();

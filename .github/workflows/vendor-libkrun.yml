@@ -1,0 +1,43 @@
+name: Vendored libkrun
+
+# rs/third_party/libkrun must be upstream libkrun at the commit
+# tools/vendor_libkrun.sh pins, plus rs/third_party/libkrun-patches, byte for
+# byte (ADR-0044, bead ley-line-open-396d77). `task vmm:vendor:check` proves it
+# against a fresh upstream clone. It needs the network, so `task ci` leaves it
+# out; this workflow runs it on every change that could break it, and weekly,
+# so a hand edit to the vendored tree or a moved upstream tag fails here.
+on:
+  pull_request:
+    paths:
+      - 'rs/third_party/**'
+      - 'tools/vendor_libkrun.sh'
+      - '.github/workflows/vendor-libkrun.yml'
+  schedule:
+    # Mondays 06:17 UTC.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vendor-libkrun-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: vmm:vendor:check
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      # SHA-pinned: arduino/setup-task@v2.0.0, the same go-task version as ci.yml.
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: task vmm:vendor:check

@@ -357,18 +357,36 @@ async fn a_save_over_an_overlapping_landed_change_is_stale_at_the_write() {
         !h.nfs
             .commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE)
     );
-    h.nfs.commit(id, 0, 0).await.unwrap();
-    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
-    // The client has not read A_OTHER: a retried WRITE is checked against
-    // what it read (A), so an overlapping retry is refused rather than
-    // landing as an edit of bytes the client never saw.
-    let retry = A.replace("return 1", "return 9");
-    let retried = h.nfs.write(id, 0, retry.as_bytes()).await;
+    // The client has not read A_OTHER, so the rest of its save is void:
+    // its COMMIT, a retried WRITE (even one that would merge) and the
+    // length it sets after the refused WRITE are refused, and nothing
+    // lands. Before, the length staged on the client's stale base and its
+    // COMMIT merged `A` plus a NUL byte over the other writer's change.
+    let commit = h.nfs.commit(id, 0, 0).await;
+    assert!(matches!(commit, Err(nfsstat3::NFS3ERR_STALE)), "{commit:?}");
+    let retried = h.nfs.write(id, 0, b"package b\n").await;
     assert!(
         matches!(retried, Err(nfsstat3::NFS3ERR_STALE)),
         "{retried:?}"
     );
-    h.nfs.commit(id, 0, 0).await.unwrap();
+    let length = h
+        .nfs
+        .setattr(
+            id,
+            sattr3 {
+                size: set_size3::size(A.len() as u64 + 1),
+                ..sattr3::default()
+            },
+        )
+        .await;
+    assert!(matches!(length, Err(nfsstat3::NFS3ERR_STALE)), "{length:?}");
+    assert!(
+        !h.nfs
+            .commit_if_idle(Instant::now() + COMMIT_IDLE, COMMIT_IDLE)
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
+    // A shape change commits what is staged: the void save stays void.
+    h.nfs.mkdir(ROOT_INODE, &name("later")).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
     // Once it READs the store's bytes, its edit of them lands.
     assert_eq!(h.read_all(id).await, A_OTHER.as_bytes());
@@ -394,10 +412,8 @@ async fn a_refused_commit_drops_the_edit_and_the_next_read_serves_the_store() {
         matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
         "{refused:?}"
     );
-    // A retried overlapping WRITE before any READ is refused: the base stays
-    // what the client read.
-    let retry = A.replace("return 1", "return 9");
-    let retried = h.nfs.write(id, 0, retry.as_bytes()).await;
+    // A retried WRITE before any READ is refused: the save is void.
+    let retried = h.nfs.write(id, 0, b"package b\n").await;
     assert!(
         matches!(retried, Err(nfsstat3::NFS3ERR_STALE)),
         "{retried:?}"
@@ -649,41 +665,54 @@ fn host_open_flags_reach_the_filesystem_in_linux_values() {
 }
 
 /// macOS's `renamex_np(2)` flags reach the filesystem as Linux's
-/// `renameat2(2)` flags; an unknown bit passes through to be refused.
-#[cfg(target_os = "macos")]
+/// `renameat2(2)` flags; a flag with no Linux spelling becomes one the
+/// filesystem refuses.
 #[test]
-fn host_rename_flags_reach_the_filesystem_in_linux_values() {
-    use super::fuse_abi::{UNKNOWN_RENAME_FLAG, linux_rename_flags};
+fn macos_rename_flags_reach_the_filesystem_in_linux_values() {
+    use super::fuse_abi::{UNKNOWN_RENAME_FLAG, macos_rename_flags};
     use crate::rename_flags;
-    assert_eq!(linux_rename_flags(0), 0);
-    assert_eq!(linux_rename_flags(0x4), rename_flags::RENAME_NOREPLACE);
-    assert_eq!(linux_rename_flags(0x2), rename_flags::RENAME_EXCHANGE);
+    assert_eq!(UNKNOWN_RENAME_FLAG, 0x8000_0000);
+    assert_eq!(macos_rename_flags(0), 0);
+    assert_eq!(macos_rename_flags(0x4), rename_flags::RENAME_NOREPLACE);
+    assert_eq!(macos_rename_flags(0x2), rename_flags::RENAME_EXCHANGE);
     assert_eq!(
-        linux_rename_flags(0x6),
+        macos_rename_flags(0x6),
         rename_flags::RENAME_NOREPLACE | rename_flags::RENAME_EXCHANGE
     );
     // RENAME_SECLUDE (0x1) is no RENAME_NOREPLACE, though Linux spells
     // NOREPLACE with that bit.
-    assert_eq!(linux_rename_flags(0x1), UNKNOWN_RENAME_FLAG);
-    assert_eq!(linux_rename_flags(0x10), UNKNOWN_RENAME_FLAG);
+    assert_eq!(macos_rename_flags(0x1), UNKNOWN_RENAME_FLAG);
+    assert_eq!(macos_rename_flags(0x10), UNKNOWN_RENAME_FLAG);
     assert_eq!(
-        linux_rename_flags(0x5),
+        macos_rename_flags(0x5),
         UNKNOWN_RENAME_FLAG | rename_flags::RENAME_NOREPLACE
     );
 }
 
+/// The host's rename flags: macOS's translated, Linux's as they are.
+#[test]
+fn host_rename_flags_are_the_platforms() {
+    use super::fuse_abi::linux_rename_flags;
+    use crate::rename_flags;
+    assert_eq!(linux_rename_flags(0), 0);
+    let noreplace = if cfg!(target_os = "macos") { 0x4 } else { 0x1 };
+    assert_eq!(
+        linux_rename_flags(noreplace),
+        rename_flags::RENAME_NOREPLACE
+    );
+}
+
 /// A rename whose host flag has no Linux spelling is refused, not misread.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_rename_with_an_unknown_host_flag_is_refused() {
-    use super::fuse_abi::linux_rename_flags;
+    use super::fuse_abi::macos_rename_flags;
     let f = fixture(crate::tests::whole());
     let refused = f.fs.rename(
         ROOT_INODE,
         b"a.go",
         ROOT_INODE,
         b"b.go",
-        linux_rename_flags(0x1),
+        macos_rename_flags(0x1),
     );
     assert_eq!(refused, Err(crate::Errno::EINVAL));
     assert!(f.fs.lookup(ROOT_INODE, b"a.go").is_ok());
@@ -1044,5 +1073,5 @@ fn the_gate_reads_this_macs_product_version() {
         .output()
         .unwrap();
     let want = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(macos_product_version().unwrap(), want.trim());
+    assert_eq!(super::macos::product_version().unwrap(), want.trim());
 }

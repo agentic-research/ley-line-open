@@ -635,8 +635,20 @@ if { [ "$SCOPE" = all ] || [ "$SCOPE" = storefs ]; } && package_changed_in_diff 
     # lives in `host/fuse_abi.rs`, which this slice mutates; the glue is
     # exercised through the kernel by `tests/host_mount.rs` and
     # `tools/cli_smoke.sh --mount`. The gap is `ley-line-open-5241ee`.
-    run_slice lib --package leyline-storefs --test-workspace=false --features mount \
-        --exclude 'll-open/storefs/src/host/fuse.rs'
+    #
+    # `host/macos.rs` is `#[cfg(target_os = "macos")]` (a `sysctlbyname(3)`
+    # read): a platform gate is a feature gate cargo-mutants cannot see either,
+    # so on any other runner every mutant in it builds in 0s and reports a
+    # phantom MISSED. It is excluded there and mutated on macOS, where its test
+    # checks it against `sw_vers`.
+    if [ "$(uname -s)" = Darwin ]; then
+        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+            --exclude 'll-open/storefs/src/host/fuse.rs'
+    else
+        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+            --exclude 'll-open/storefs/src/host/fuse.rs' \
+            --exclude 'll-open/storefs/src/host/macos.rs'
+    fi
 fi
 
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = fs ]; } && package_changed_in_diff ll-open/fs; then

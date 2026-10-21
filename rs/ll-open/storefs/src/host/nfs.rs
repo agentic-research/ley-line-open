@@ -18,6 +18,11 @@
 //!   between the client's last WRITE and the COMMIT; the macOS client does
 //!   not report that refusal, so the staged edit is dropped, the refusal is
 //!   logged, and the client's next READ serves the store's bytes;
+//! - after a refused WRITE or COMMIT the client's save is void: the handle
+//!   drops what it staged, keeps its base, and refuses every WRITE, SETATTR
+//!   of the size and COMMIT `NFS3ERR_STALE` until a READ takes the store's
+//!   bytes. A client that goes on with its save (macOS sets the length after
+//!   a refused WRITE) changes nothing;
 //! - a truncate with no WRITE after it has no COMMIT coming (`: > f` sends
 //!   SETATTR alone), so it is committed once it has stood for
 //!   [`COMMIT_IDLE`];
@@ -55,6 +60,10 @@ enum Stage {
     Written,
     /// A truncate at this instant with no WRITE since: the idle window.
     Truncated(Instant),
+    /// The handle's last edit was refused: its client has not read what the
+    /// store holds now, so its save is void. Every WRITE, SETATTR of the size
+    /// and COMMIT is refused until a READ takes the store's bytes.
+    Refused,
 }
 
 struct Open {
@@ -204,8 +213,17 @@ impl<S: Store> HostNfs<S> {
         self.opens
             .lock()
             .get(&id)
-            .filter(|open| open.stage != Stage::Clean)
+            .filter(|open| matches!(open.stage, Stage::Written | Stage::Truncated(_)))
             .map(|open| open.handle)
+    }
+
+    /// Whether `id`'s handle is refusing changes: its last edit was refused
+    /// and its client has not read since.
+    fn refused(&self, id: fileid3) -> bool {
+        self.opens
+            .lock()
+            .get(&id)
+            .is_some_and(|open| open.stage == Stage::Refused)
     }
 
     /// Record that `id`'s handle staged a change: a WRITE, or a truncate
@@ -237,13 +255,16 @@ impl<S: Store> HostNfs<S> {
             return;
         }
         if let Some(open) = self.opens.lock().get_mut(&id) {
-            open.stage = Stage::Clean;
+            open.stage = Stage::Refused;
         }
     }
 
     /// Land what is staged on `id`'s handle. A refusal discards the staged
     /// edit: the client's next READ serves the store's bytes.
     fn commit_id(&self, id: fileid3) -> Result<(), Errno> {
+        if self.refused(id) {
+            return Err(Errno::ESTALE);
+        }
         let Some(handle) = self.staged(id) else {
             return Ok(());
         };
@@ -268,7 +289,7 @@ impl<S: Store> HostNfs<S> {
             .opens
             .lock()
             .iter()
-            .filter(|(_, open)| open.stage != Stage::Clean)
+            .filter(|(_, open)| matches!(open.stage, Stage::Written | Stage::Truncated(_)))
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
@@ -338,6 +359,9 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
             return Err(nfsstat3::NFS3ERR_PERM);
         }
         if let set_size3::size(size) = setattr.size {
+            if self.refused(id) {
+                return Err(nfsstat3::NFS3ERR_STALE);
+            }
             let handle = self.handle(id)?;
             let truncate = SetAttr {
                 size: Some(size),
@@ -364,6 +388,13 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let handle = self.handle(id)?;
         status(self.fs.reread(handle))?;
+        // The client now holds the store's bytes: a refused save's handle
+        // takes edits again.
+        if let Some(open) = self.opens.lock().get_mut(&id)
+            && open.stage == Stage::Refused
+        {
+            open.stage = Stage::Clean;
+        }
         let data = status(self.fs.read(handle, offset, count))?;
         let (attr, _) = status(self.fs.getattr(id, Some(handle)))?;
         let eof = offset + data.len() as u64 >= attr.size;
@@ -387,6 +418,9 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
         data: &[u8],
         stable: bool,
     ) -> Result<(fattr3, bool), nfsstat3> {
+        if self.refused(id) {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
         let handle = self.handle(id)?;
         if let Err(errno) = self.fs.write_checked(handle, offset, data) {
             self.discard(id, handle);

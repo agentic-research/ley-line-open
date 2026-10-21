@@ -18,7 +18,7 @@
 #![cfg(feature = "mount")]
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -256,16 +256,29 @@ impl Drop for TestMount {
     }
 }
 
-/// Replace `path`'s bytes as an editor's save does — `open(O_TRUNC)`,
-/// write, `fsync`, `close` — and answer the first refusal.
-fn save(path: PathBuf, text: &'static str) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new()
+/// Open `path` for reading and writing and read it whole, as an editor
+/// loads a file it will save. The open's read is the edit's base on both
+/// clients: FUSE takes it at OPEN, NFS at the READ.
+fn open_and_read(path: PathBuf) -> (fs::File, String) {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .truncate(true)
-        .open(&path)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut text = String::new();
+    file.read_to_string(&mut text).unwrap();
+    (file, text)
+}
+
+/// Save `text` through the descriptor the file was read with — rewrite from
+/// the start, set the length, `fsync`, `close` — and answer the first
+/// refusal.
+fn save_through(mut file: fs::File, text: &'static str) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(text.as_bytes())?;
+    file.set_len(text.len() as u64)?;
+    file.sync_all()?;
+    drop(file);
     Ok(())
 }
 
@@ -274,33 +287,35 @@ fn save(path: PathBuf, text: &'static str) -> std::io::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_process_edits_the_store_through_the_mount() {
     #[cfg(target_os = "macos")]
-    if let Some(refusal) = host::unpatched_nfs_client(&host::macos_product_version().unwrap()) {
+    if let Some(refusal) = host::unpatched_nfs_client(&host::macos::product_version().unwrap()) {
         eprintln!("host_mount: SKIPPED on this host: {refusal}");
         return;
     }
     let f = fixture();
     let mut m = TestMount::new(Arc::clone(&f.fs)).await;
 
-    // Reads: the store's files, as files.
+    // Reads: the store's files, as files. An editor holds the file open
+    // from its read to its save; another writer lands in between.
     let a = m.at("a.go");
-    let read = with_kernel_deadline("read", &m.path, move || fs::read_to_string(a).unwrap());
+    let (file, read) = with_kernel_deadline("open and read", &m.path, move || open_and_read(a));
     assert_eq!(read, A);
 
     // A save over a disjoint change another writer landed merges.
     f.other_writer("a.go", A_OTHER);
-    let a = m.at("a.go");
-    with_kernel_deadline("disjoint save", &m.path, move || save(a, A_TAILED)).unwrap();
+    with_kernel_deadline("disjoint save", &m.path, move || {
+        save_through(file, A_TAILED)
+    })
+    .unwrap();
     assert_eq!(f.stored("a.go").as_deref(), Some(A_MERGED));
 
     // A save over an overlapping change is refused, and the store keeps the
     // other writer's bytes.
     let b = m.at("pkg/b.go");
-    let read = with_kernel_deadline("read", &m.path, move || fs::read_to_string(b).unwrap());
+    let (file, read) = with_kernel_deadline("open and read", &m.path, move || open_and_read(b));
     assert_eq!(read, "package pkg\n");
     f.other_writer("pkg/b.go", "package other\n");
-    let b = m.at("pkg/b.go");
     let refused = with_kernel_deadline("overlapping save", &m.path, move || {
-        save(b, "package mine\n")
+        save_through(file, "package mine\n")
     });
     assert!(
         refused.is_err(),

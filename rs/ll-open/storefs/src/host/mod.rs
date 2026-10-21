@@ -10,6 +10,8 @@
 
 pub mod fuse;
 pub mod fuse_abi;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod nfs;
 
 use std::path::{Path, PathBuf};
@@ -126,33 +128,6 @@ pub fn unpatched_nfs_client(product_version: &str) -> Option<String> {
     })
 }
 
-/// This Mac's product version (`kern.osproductversion`): what
-/// [`unpatched_nfs_client`] decides on.
-#[cfg(target_os = "macos")]
-pub fn macos_product_version() -> Result<String> {
-    let name = c"kern.osproductversion";
-    let mut buf = [0u8; 64];
-    let mut len = buf.len();
-    // SAFETY: `buf` is valid for `len` bytes and `sysctlbyname` writes at
-    // most `len` bytes into it, updating `len` to the count written; the
-    // name is NUL-terminated and no new value is set.
-    let status = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if status != 0 {
-        return Err(std::io::Error::last_os_error()).context("read kern.osproductversion");
-    }
-    let bytes = &buf[..len];
-    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
-    Ok(String::from_utf8_lossy(bytes).into_owned())
-}
-
 /// An NFS mount this process made and the server behind it. Dropping it
 /// unmounts (the kernel flushes the client's last writes to the server) and
 /// then drops the server, which lands them before the drop returns.
@@ -195,7 +170,7 @@ pub fn mount_nfs<S: Store + 'static>(
     mountpoint: &Path,
 ) -> Result<NfsMount<S>> {
     #[cfg(target_os = "macos")]
-    if let Some(refusal) = unpatched_nfs_client(&macos_product_version()?) {
+    if let Some(refusal) = unpatched_nfs_client(&macos::product_version()?) {
         anyhow::bail!(refusal);
     }
     let port = server.port();

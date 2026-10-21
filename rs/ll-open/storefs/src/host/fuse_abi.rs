@@ -45,32 +45,36 @@ pub fn linux_open_flags(host: i32) -> u32 {
 pub const UNKNOWN_RENAME_FLAG: u32 = 1 << 31;
 
 /// The Linux `renameat2(2)` flags [`StoreFs::rename`](crate::StoreFs::rename)
-/// reads, from the host's: macOS's `renamex_np(2)` spells `RENAME_NOREPLACE`
-/// as `RENAME_EXCL` and `RENAME_EXCHANGE` as `RENAME_SWAP`. Its other flags
-/// (`RENAME_SECLUDE` is `0x1`, Linux's `RENAME_NOREPLACE` bit) have no Linux
-/// spelling and become [`UNKNOWN_RENAME_FLAG`].
+/// reads, from the host's: [`macos_rename_flags`] on macOS; Linux's own
+/// elsewhere.
 pub fn linux_rename_flags(host: u32) -> u32 {
-    #[cfg(target_os = "macos")]
-    {
-        const RENAME_SWAP: u32 = 0x2;
-        const RENAME_EXCL: u32 = 0x4;
-        let mut linux = 0;
-        if host & RENAME_EXCL != 0 {
-            linux |= rename_flags::RENAME_NOREPLACE;
-        }
-        if host & RENAME_SWAP != 0 {
-            linux |= rename_flags::RENAME_EXCHANGE;
-        }
-        if host & !(RENAME_SWAP | RENAME_EXCL) != 0 {
-            linux |= UNKNOWN_RENAME_FLAG;
-        }
-        linux
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = rename_flags::RENAME_NOREPLACE;
+    if cfg!(target_os = "macos") {
+        macos_rename_flags(host)
+    } else {
         host
     }
+}
+
+/// macOS `renamex_np(2)` flags as Linux `renameat2(2)` flags: macOS spells
+/// `RENAME_NOREPLACE` as `RENAME_EXCL` and `RENAME_EXCHANGE` as
+/// `RENAME_SWAP`. Its other flags (`RENAME_SECLUDE` is `0x1`, Linux's
+/// `RENAME_NOREPLACE` bit) have no Linux spelling and become
+/// [`UNKNOWN_RENAME_FLAG`]. Compiled on every platform, so it is tested on
+/// every one.
+pub fn macos_rename_flags(host: u32) -> u32 {
+    const RENAME_SWAP: u32 = 0x2;
+    const RENAME_EXCL: u32 = 0x4;
+    let mut linux = 0;
+    if host & RENAME_EXCL != 0 {
+        linux |= rename_flags::RENAME_NOREPLACE;
+    }
+    if host & RENAME_SWAP != 0 {
+        linux |= rename_flags::RENAME_EXCHANGE;
+    }
+    if host & !(RENAME_SWAP | RENAME_EXCL) != 0 {
+        linux |= UNKNOWN_RENAME_FLAG;
+    }
+    linux
 }
 
 /// A node's FUSE attributes, owned by `owner` (this process's user).

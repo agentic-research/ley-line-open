@@ -253,9 +253,11 @@ COMMIT, so each WRITE runs the COMMIT's own decision (`source_write::check`: gra
 structure) on the bytes it stages and refuses `NFS3ERR_STALE` exactly when that decision does. A
 SETATTR of the size stages unchecked: a save truncates before it writes, and the empty file
 between the two is no edit the client means; a truncate with no WRITE after it (`: > f`) lands
-once it has stood idle. A refused WRITE or COMMIT discards the handle's staged bytes and keeps
-its base, so a retry the client sends without reading is still checked against what it read; a
-READ takes the store's bytes. What a WRITE cannot decide is a conflicting change landed after the
+once it has stood idle. A refused WRITE or COMMIT voids the client's save: the handle drops what
+it staged, keeps its base, and refuses every WRITE, SETATTR of the size and COMMIT until a READ
+takes the store's bytes. (macOS goes on with a refused save by setting the file's length; staged
+on the stale base, that length once landed the client's old bytes with a NUL appended, merged
+over the other writer's change.) What a WRITE cannot decide is a conflicting change landed after the
 client's last WRITE and before its COMMIT: that COMMIT is refused, macOS does not report it, and
 the edit is discarded. A FUSE handle, like a guest's, is decided at its FLUSH, which the kernel
 reports.

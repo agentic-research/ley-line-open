@@ -36,8 +36,10 @@ rules; the `leyline` binary injects the mount into the daemon as
   reports a refused WRITE and ignores a refused COMMIT. A SETATTR of the size
   stages unchecked (a save truncates before it writes); a truncate with no
   WRITE after it lands once it has stood idle. CREATE lands the empty file
-  at once. A refused WRITE or COMMIT discards what the handle staged and
-  keeps its base, so a retry sent without a READ is refused too.
+  at once. A refused WRITE or COMMIT voids the client's save: the handle
+  drops what it staged, keeps its base, and refuses every WRITE, SETATTR
+  of the size and COMMIT until a READ takes the store's bytes (macOS sets
+  the file's length after a refused WRITE; that changes nothing).
 - **macOS gate.** `host::mount_nfs` refuses Tahoe before 26.7 and Sequoia
   before 15.8: their NFS client corrupts kernel memory on server replies
   (CVE-2026-43686, CVE-2026-84549; bead `ley-line-open-2d49ce`).

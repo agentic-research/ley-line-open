@@ -32,9 +32,12 @@ context, scoping notes, and review history are recoverable.
   - NFS: each WRITE runs the COMMIT's own decision (`source_write::check`)
     and refuses exactly what it refuses, because the macOS client ignores a
     refused COMMIT; a SETATTR of the size stages unchecked (a save truncates
-    before it writes); a refused WRITE or COMMIT discards the staged bytes
-    and keeps the handle's base, so a retry sent without a READ is refused
-    too. CREATE lands the empty file at once.
+    before it writes); a refused WRITE or COMMIT voids the client's save —
+    the handle drops what it staged, keeps its base, and refuses every
+    WRITE, size SETATTR and COMMIT until a READ. CREATE lands the empty
+    file at once.
+  - Known: the macOS NFS client's AppleDouble `._*` files (its xattr
+    fallback) land in the store (`ley-line-open-8d6a8a`).
   - macOS: the NFS mount refuses Tahoe before 26.7 and Sequoia before 15.8,
     whose NFS client corrupts kernel memory on server replies
     (CVE-2026-43686, CVE-2026-84549; bead `ley-line-open-2d49ce`). The

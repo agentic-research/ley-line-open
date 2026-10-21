@@ -262,6 +262,17 @@ client's last WRITE and before its COMMIT: that COMMIT is refused, macOS does no
 the edit is discarded. A FUSE handle, like a guest's, is decided at its FLUSH, which the kernel
 reports.
 
+**Who is a writer.** The merge and the `ESTALE` refusal decide between writers that hold their
+own handles, each with its own base: a guest's virtio-fs session, a FUSE `open(2)` (each open is
+its own handle, its base taken at OPEN), the socket's `propose` op. Two processes writing through
+**one NFS mount** are not two writers. NFSv3 carries no open state, and both processes share the
+host's one NFS client and its page cache, so the server receives one client's READs and WRITEs
+against one handle per file and cannot know that one process's bytes rest on an older read than
+the other's. The last save to reach the server wins: a disjoint edit from the other process is
+lost, and an overlapping one is not refused. Separating writers on one mount needs a session per
+writer (`ley-line-open-5ec040`). macOS FUSE through fuse-t is itself an NFS server to the
+kernel's NFS client; whether it separates writers is not measured.
+
 **The macOS NFS client gate.** Before Tahoe 26.7 and Sequoia 15.8, Apple's NFS client corrupts
 kernel memory on server replies it mishandles (CVE-2026-43686, a use-after-free; CVE-2026-84549,
 an out-of-bounds read); a loopback NFS workload panicked a development Mac
@@ -277,7 +288,9 @@ revalidates every open.
   persist in the store, in the checkout and across a daemon restart.
 - Two agents editing different lines of one file both land; the second's flush lands the merge.
   Two agents editing the same lines: the second's `close` or `fsync` is `ESTALE`, and the
-  refusal names the conflicting lines.
+  refusal names the conflicting lines. This holds for agents that are separate writers (their
+  own virtio-fs sessions, FUSE handles or socket proposals); two processes through one host NFS
+  mount are one client, and the last save wins (T8, `ley-line-open-5ec040`).
 - A half-written Go file lands. Its projection carries error nodes and a diagnostic row; queries
   over it see what tree-sitter recovered.
 - `treeRoot` moves for trees holding non-projected files, executables, symlinks or empty

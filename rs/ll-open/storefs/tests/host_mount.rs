@@ -295,7 +295,10 @@ async fn a_host_process_edits_the_store_through_the_mount() {
     let mut m = TestMount::new(Arc::clone(&f.fs)).await;
 
     // Reads: the store's files, as files. An editor holds the file open
-    // from its read to its save; another writer lands in between.
+    // from its read to its save; another writer lands in between. That
+    // writer proposes to the store directly, as a guest or the socket does:
+    // a second process through this same NFS mount is the same client, and
+    // its save would simply be overwritten (bead `ley-line-open-5ec040`).
     let a = m.at("a.go");
     let (file, read) = with_kernel_deadline("open and read", &m.path, move || open_and_read(a));
     assert_eq!(read, A);

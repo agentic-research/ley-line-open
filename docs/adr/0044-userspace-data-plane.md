@@ -135,7 +135,9 @@ stale refusal on NFS) and document what they cannot. NFS-only heuristics are not
 closed unmerged, and its probe results are recorded above. ADR-0045 T8 makes the host mount
 storefs itself, behind FUSE and NFS adapters: a host process sees the tree a guest sees and its
 writes are the proposals a guest's are, with the NFS WRITE-time refusal the decision the COMMIT
-would make. On macOS the NFS mount is refused before Tahoe 26.7 / Sequoia 15.8, whose NFS client
+would make. The merge and `ESTALE` hold between separate writers (a guest's session, a FUSE
+handle, a socket proposal); two processes through one NFS mount share one NFS client, and the
+last save wins (`ley-line-open-5ec040`). On macOS the NFS mount is refused before Tahoe 26.7 / Sequoia 15.8, whose NFS client
 corrupts kernel memory on server replies (`ley-line-open-2d49ce`). The agent path stays the
 virtio-fs share: the host mounts pay a kernel round trip per request.
 

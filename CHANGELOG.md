@@ -36,6 +36,12 @@ context, scoping notes, and review history are recoverable.
     the handle drops what it staged, keeps its base, and refuses every
     WRITE, size SETATTR and COMMIT until a READ. CREATE lands the empty
     file at once.
+  - Writers: the merge and `ESTALE` hold between separate writers (a
+    guest's virtio-fs session, a FUSE handle, a socket proposal). Two
+    processes through one NFS mount share the host's NFS client and page
+    cache, which NFSv3 presents to the server as one client: the last save
+    wins, and the other's edit is lost whether or not the two overlap
+    (`ley-line-open-5ec040`).
   - Known: the macOS NFS client's AppleDouble `._*` files (its xattr
     fallback) land in the store (`ley-line-open-8d6a8a`).
   - macOS: the NFS mount refuses Tahoe before 26.7 and Sequoia before 15.8,

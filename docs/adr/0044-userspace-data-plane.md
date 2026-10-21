@@ -299,11 +299,13 @@ evidence"), which names each `workspaceShare` channel; a run without a workspace
 in-guest scenarios below run through this check: the daemon's worker holds exactly its streams and
 the share.
 
-**`expectedGeneration`.** The grant's `WorkspaceGrant.expectedGeneration` is carried to the
-backend and not checked. ADR-0041 S1 defines it as the commit `seq` within the grant's epoch, and
-no store implements `(epoch, seq)` yet (ADR-0041 is Proposed), so there is no value to compare it
-with. The share is pinned by the `graphRoot` check: it opens only when the store's `treeRoot` is
-the grant's `graphRoot`. Checking `expectedGeneration` lands with ADR-0041 S1.
+**`expectedGeneration`.** ADR-0041 S1 defines the grant's `WorkspaceGrant.expectedGeneration` as
+the commit `seq` within the grant's epoch, and no store implements `(epoch, seq)` yet (ADR-0041 is
+Proposed), so there is no value to compare a claim with. The daemon's share refuses a grant whose
+`expectedGeneration` is nonzero (`identityPolicyMismatch`, before the worker starts; bead
+`ley-line-open-39abfa`): a claim nothing checks is not run. Zero claims no generation, and the
+share is pinned by the `graphRoot` check: it opens only when the store's `treeRoot` is the grant's
+`graphRoot`. Comparing a nonzero claim with the store's `seq` lands with ADR-0041 S1.
 
 **The test.** `rs/ll-open/cli/tests/agent_in_guest.rs` runs the real `leyline execution-daemon
 --backend micro-vm --source <checkout>` and starts an execution/v1 run over the socket whose

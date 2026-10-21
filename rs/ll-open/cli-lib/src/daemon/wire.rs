@@ -90,13 +90,21 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "lsp_refs",
     "lsp_symbols",
     "lsp_diagnostics",
+    #[cfg(feature = "sheaf")]
     "sheaf_set_topology",
+    #[cfg(feature = "sheaf")]
     "sheaf_update_topology",
+    #[cfg(feature = "sheaf")]
     "sheaf_invalidate",
+    #[cfg(feature = "sheaf")]
     "sheaf_defect",
+    #[cfg(feature = "sheaf")]
     "sheaf_stalks",
+    #[cfg(feature = "sheaf")]
     "sheaf_status",
+    #[cfg(feature = "sheaf")]
     "sheaf_learned_weights",
+    #[cfg(feature = "sheaf")]
     "sheaf_reap",
     "leyline_version",
     #[cfg(feature = "vec")]
@@ -115,6 +123,7 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "at_position",
     "inspect_neighborhood",
     "search_symbols",
+    #[cfg(feature = "sheaf")]
     "agreement",
     "llo_execution_capabilities",
     "llo_execution_provision",
@@ -213,6 +222,7 @@ pub enum BaseRequest {
         #[serde(default = "default_text_search_k")]
         k: u32,
     },
+    #[cfg(feature = "sheaf")]
     SheafSetTopology {
         #[serde(default)]
         regions: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
@@ -221,22 +231,29 @@ pub enum BaseRequest {
         #[serde(default)]
         node_stalk_dim: u32,
     },
+    #[cfg(feature = "sheaf")]
     SheafUpdateTopology {
         #[serde(default)]
         delta: crate::daemon::sheaf_ops::TopologyDeltaInput,
         #[serde(default)]
         node_stalk_dim: u32,
     },
+    #[cfg(feature = "sheaf")]
     SheafInvalidate {
         #[serde(default)]
         regions: Vec<u32>,
         #[serde(default)]
         stalks: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
     },
+    #[cfg(feature = "sheaf")]
     SheafDefect,
+    #[cfg(feature = "sheaf")]
     SheafStalks,
+    #[cfg(feature = "sheaf")]
     SheafStatus,
+    #[cfg(feature = "sheaf")]
     SheafLearnedWeights,
+    #[cfg(feature = "sheaf")]
     SheafReap,
     /// Wire-compat handshake. Takes no args; returns the daemon's
     /// version + wire-format identity (bead ley-line-open-cb8960).
@@ -292,6 +309,7 @@ pub enum BaseRequest {
     /// `CellComplex` with identity restrictions, runs
     /// `detect_violations`, and returns `coherence_defect` + per-pair
     /// `defects`. Read-only.
+    #[cfg(feature = "sheaf")]
     Agreement(AgreementRequest),
     /// Generated execution/v1 capability discovery delegated to the shared
     /// LLO runtime handler.
@@ -591,6 +609,7 @@ fn default_search_limit() -> u32 {
 //   table has for this `(token, payload_kind)`.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "sheaf")]
 #[derive(Deserialize, Debug)]
 pub struct AgreementRequest {
     /// Observer-emitted stable token (per ADR-0020 §1). Looked up

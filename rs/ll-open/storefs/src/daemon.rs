@@ -99,11 +99,29 @@ impl WorkspaceShares for DaemonShares {
     /// tree it was authorized against. Once open, the share serves the live
     /// store: another writer's proposals are visible at the next open, and
     /// an edit against bytes another writer moved is refused (ADR-0044 V3).
+    ///
+    /// A grant's `expectedGeneration` is ADR-0041 S1's commit `seq` within
+    /// the grant's epoch. The store records no `(epoch, seq)`, so a grant
+    /// that claims a generation (any value but zero) names an authority
+    /// nothing here can check, and is refused rather than run unchecked.
+    /// Zero claims no generation; the `graphRoot` pins the run.
     fn open(
         &self,
         run_id: &str,
         grant: &WorkspaceGrant,
     ) -> Result<Arc<dyn FsService>, ExecutionError> {
+        if grant.expected_generation != 0 {
+            return Err(refused(
+                ErrorCode::IdentityPolicyMismatch,
+                false,
+                format!(
+                    "workspace {:?} is granted at expectedGeneration {}, and the store \
+                     records no commit generation to verify it against (ADR-0041 S1); \
+                     a grant pinned by graphRoot alone carries expectedGeneration 0",
+                    grant.name, grant.expected_generation
+                ),
+            ));
+        }
         let ctx = self.daemon.get().ok_or_else(|| {
             refused(
                 ErrorCode::NotProvisioned,

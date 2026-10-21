@@ -10,11 +10,13 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
+#[cfg(feature = "sheaf")]
+use super::wire::AgreementRequest;
 #[cfg(feature = "validate")]
 use super::wire::ValidateRequest;
 use super::wire::{
-    AgreementRequest, BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest,
-    LspFile, LspPosition, ProposeRequest, ProposedWriteInput, ReadSourceRequest, Ref as WireRef,
+    BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest, LspFile,
+    LspPosition, ProposeRequest, ProposedWriteInput, ReadSourceRequest, Ref as WireRef,
     SearchSymbolsRequest, TokenMapEntry, WriteKind,
 };
 #[cfg(feature = "hdc")]
@@ -153,6 +155,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::VecSearch { query, k } => op_vec_search(ctx, &query, k),
         #[cfg(feature = "text-search")]
         BaseRequest::TextSearch { query, k } => op_text_search(ctx, &query, k),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafSetTopology {
             regions,
             restrictions,
@@ -163,17 +166,24 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
             &restrictions,
             node_stalk_dim,
         ),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafUpdateTopology {
             delta,
             node_stalk_dim,
         } => super::sheaf_ops::op_sheaf_update_topology(&ctx.sheaf, &delta, node_stalk_dim),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafInvalidate { regions, stalks } => {
             super::sheaf_ops::op_sheaf_invalidate(&ctx.sheaf, &ctx.ctrl_path, &regions, &stalks)
         }
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafDefect => super::sheaf_ops::op_sheaf_defect(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafStalks => super::sheaf_ops::op_sheaf_stalks(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafStatus => super::sheaf_ops::op_sheaf_status(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafLearnedWeights => super::sheaf_ops::op_sheaf_learned_weights(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafReap => super::sheaf_ops::op_sheaf_reap(&ctx.sheaf),
         BaseRequest::LeylineVersion => op_leyline_version(),
         #[cfg(feature = "validate")]
@@ -188,6 +198,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::AtPosition(p) => op_at_position(ctx, &p),
         BaseRequest::InspectNeighborhood(r) => op_inspect_neighborhood(ctx, &r),
         BaseRequest::SearchSymbols(r) => op_search_symbols(ctx, &r),
+        #[cfg(feature = "sheaf")]
         BaseRequest::Agreement(r) => op_agreement(ctx, &r),
         BaseRequest::LloExecutionCapabilities => op_execution_capabilities(ctx),
         BaseRequest::LloExecutionProvision {
@@ -3502,6 +3513,7 @@ fn op_search_symbols(
 /// One observation row decoded for agreement scoring: the source name
 /// plus the decoded f32 stalk vector. Mirrors the per-source 0-cell
 /// the agreement op feeds into the degenerate `CellComplex`.
+#[cfg(feature = "sheaf")]
 #[derive(Debug, Clone)]
 struct AgreementRow {
     source: String,
@@ -3513,6 +3525,7 @@ struct AgreementRow {
 /// The token filter uses ADR-0020's `observation_by_mentions` index
 /// via `json_each` — same shape the future `agreement` Gate 4 property
 /// test will exercise.
+#[cfg(feature = "sheaf")]
 fn query_agreement_observations(
     conn: &Connection,
     token: &str,
@@ -3564,6 +3577,7 @@ fn query_agreement_observations(
 /// out instead of crashing the op). When the typed-payload registry
 /// (ley-line-open-503971) ships, this is the single point that learns
 /// to dispatch by `payload_kind`.
+#[cfg(feature = "sheaf")]
 fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
@@ -3598,8 +3612,10 @@ fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
 /// corrupted incidence is wire-indistinguishable from a valid answer);
 /// `build_agreement_complex` asserts it as a backstop. Bead
 /// `ley-line-open-4fece1`.
+#[cfg(feature = "sheaf")]
 const AGREEMENT_EDGE_BASE: u32 = 1_000;
 
+#[cfg(feature = "sheaf")]
 fn build_agreement_complex(
     rows: &[AgreementRow],
 ) -> Option<(leyline_sheaf::complex::CellComplex, Vec<String>)> {
@@ -3661,6 +3677,7 @@ fn build_agreement_complex(
 /// for, per math-friend bead `ley-line-open-659a39`. The op surfaces
 /// the mismatch as an explicit error envelope rather than coercing to
 /// an empty-defects success.
+#[cfg(feature = "sheaf")]
 fn classify_agreement_dims(
     rows: &[AgreementRow],
 ) -> std::result::Result<Option<usize>, (String, usize, String, usize)> {
@@ -3686,6 +3703,7 @@ fn classify_agreement_dims(
 /// provenance, certainty}`. Builds a degenerate CellComplex from the
 /// most-recent `payload_inline` per source and reports
 /// `detect_violations`. Read-only.
+#[cfg(feature = "sheaf")]
 fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> Result<String> {
     // Lazy schema install for edge-case callers (test fixtures / fresh
     // daemons) — production ensures the schema via

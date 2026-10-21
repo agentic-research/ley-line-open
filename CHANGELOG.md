@@ -66,6 +66,15 @@ context, scoping notes, and review history are recoverable.
     `fs:build:nfs-isolated` tasks (leyline-fs links no libfuse).
   - ADR-0045's conflict ranges are documented as `daemon.capnp` defines
     them: 0-based, half-open `[start, end)`.
+- **The sheaf surface is a cargo feature** (bead `ley-line-open-39e239`).
+  `leyline-cli-lib` and `leyline-cli` gain a default-on `sheaf` feature
+  that owns the `leyline-sheaf` dependency, the `sheaf_*` and `agreement`
+  daemon ops, `ComplexBuildPass`, the granularity router, the topology
+  pass and the watcher's `daemon.sheaf.invalidate` emit. Default, `all`
+  and `full` builds are unchanged. A build of `leyline-cli-lib` with
+  `--no-default-features` no longer links `leyline-sheaf`, and its daemon
+  does not dispatch those ops (as with `hdc` and `vec`).
+  `task check:all-features` asserts it.
 - **Breaking: a workspace grant that claims a generation is refused**
   (bead `ley-line-open-39abfa`). `WorkspaceGrant.expectedGeneration` is
   ADR-0041 S1's commit `seq`, which no store records yet, so the daemon's

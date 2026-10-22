@@ -1,23 +1,22 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
-#[cfg(feature = "vmm")]
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-#[cfg(feature = "vmm")]
 use std::sync::Arc;
 
-use crate::ExecutionError;
+use leyline_runtime::ExecutionError;
+use leyline_runtime::backends::libkrun::plan::KrunConfig;
 
-use super::plan::KrunConfig;
+/// `KRUN_TSI_HIJACK_INET`, defined beside [`KrunConfig::tsi_features`], which
+/// it sets.
+pub use leyline_runtime::backends::libkrun::plan::KRUN_TSI_HIJACK_INET;
 
 /// The virtio-fs request types a custom share implements: `DynFileSystem` and
 /// the FUSE argument and reply types its methods take (`filesystem::Context`,
 /// `Entry`, `FsOptions`, ...). Re-exported from the linked libkrun so a
 /// backend names them through this crate and cannot drift from the VMM that
 /// dispatches to it.
-#[cfg(feature = "vmm")]
 pub use krun::virtio_fs;
-#[cfg(feature = "vmm")]
 pub use krun::virtio_fs::dyn_fs::DynFileSystem;
 
 /// The virtio-fs tag libkrun gives the guest's root filesystem.
@@ -49,7 +48,6 @@ pub trait KrunApi: Send + Sync {
     /// without one. The guest mounts it with `mount -t virtiofs <tag> <dir>`.
     /// Replies carry Linux errno values whatever the host is: the guest is
     /// Linux.
-    #[cfg(feature = "vmm")]
     fn add_virtiofs_backend(
         &self,
         context: u32,
@@ -115,22 +113,13 @@ pub trait KrunApi: Send + Sync {
     fn start_enter(&self, context: u32) -> Result<(), ExecutionError>;
 }
 
-/// `KRUN_TSI_HIJACK_INET` from `libkrun.h` — carry the guest's `AF_INET`
-/// sockets over vsock instead of leaving them unreachable.
-///
-/// Named here rather than written as a bare `1` at the call site so the one
-/// place that weakens the boundary says what it is doing.
-pub const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
-
 /// libkrun linked into this binary, built from `rs/third_party/libkrun`: upstream
 /// v1.19.6 plus LLO's patches (ADR-0044). LLO builds the VMM it runs; nothing
 /// is loaded from an installed libkrun. The guest kernel is still the
 /// installed libkrunfw, which libkrun dlopens at `krun_create_ctx`.
-#[cfg(feature = "vmm")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinkedKrunApi;
 
-#[cfg(feature = "vmm")]
 impl KrunApi for LinkedKrunApi {
     fn create_context(&self) -> Result<u32, ExecutionError> {
         let result = krun::krun_create_ctx();
@@ -254,7 +243,6 @@ impl KrunApi for LinkedKrunApi {
     }
 }
 
-#[cfg(feature = "vmm")]
 fn null_terminated(values: &[CString]) -> Vec<*const c_char> {
     values
         .iter()
@@ -280,7 +268,6 @@ pub fn check_virtiofs_tag(tag: &str) -> Result<(), ExecutionError> {
     Ok(())
 }
 
-#[cfg(feature = "vmm")]
 fn check_ffi(operation: &str, result: i32) -> Result<(), ExecutionError> {
     if result == 0 {
         Ok(())
@@ -289,7 +276,6 @@ fn check_ffi(operation: &str, result: i32) -> Result<(), ExecutionError> {
     }
 }
 
-#[cfg(feature = "vmm")]
 fn ffi_error(operation: &str, result: i32) -> ExecutionError {
     ExecutionError::backend(format!("{operation} failed with libkrun status {result}"))
 }
@@ -316,7 +302,6 @@ impl PreparedVm<'_> {
     /// Give the guest a virtio-fs share served by `backend` from this process
     /// (ADR-0044 V1). Called between [`prepare_vm`] and [`PreparedVm::enter`];
     /// the backend lives as long as the VMM, which is the rest of the process.
-    #[cfg(feature = "vmm")]
     pub fn add_virtiofs_backend(
         &self,
         tag: &str,

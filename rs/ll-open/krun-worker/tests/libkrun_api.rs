@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
-use leyline_runtime::backends::libkrun::api::{
+use leyline_krun_worker::api::{
     DynFileSystem, KrunApi, LinkedKrunApi, VIRTIOFS_TAG_MAX, check_virtiofs_tag, prepare_vm,
 };
 use leyline_runtime::backends::libkrun::confinement::{VSOCK_UNIX_BASE_PORT, VsockUnixMapping};

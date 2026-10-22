@@ -1,9 +1,8 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use leyline_runtime::backends::libkrun::worker::{
-    WorkerEvent, WorkerOptions, execute_from_reader_with_events,
-};
+use leyline_krun_worker::worker::execute_from_reader_with_events;
+use leyline_runtime::backends::libkrun::worker::{WorkerEvent, WorkerOptions};
 
 fn main() -> ExitCode {
     let result = WorkerOptions::parse(std::env::args_os().skip(1)).and_then(|options| {

@@ -20,12 +20,13 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use leyline_krun_worker::api::{LinkedKrunApi, prepare_vm};
 use leyline_runtime::DigestRef;
-use leyline_runtime::backends::libkrun::api::{LinkedKrunApi, prepare_vm};
 use leyline_runtime::backends::libkrun::plan::{KrunConfig, ResolvedRootfs};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
+#[path = "../../runtime/tests/common/mod.rs"]
 mod common;
 mod hypervisor;
 mod memfs;

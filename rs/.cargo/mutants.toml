@@ -46,7 +46,9 @@ exclude_re = [
     # flag mask from `libkrun.h` rather than an arbitrary number. The shift is
     # the correct expression; the operator has no semantic target at
     # shift-distance zero.
-    'api\.rs.*replace << with >>',
+    # The constant lives in libkrun/plan.rs, beside `KrunConfig.tsi_features`
+    # (bead ley-line-open-395e43); it is plan.rs's only shift.
+    'plan\.rs.*replace << with >>',
 
     # `let chunk_rows = chunk_files * ROWS_PER_FILE_EST;` feeding
     # `Vec::with_capacity(chunk_rows)` for the per-chunk row buffers, mutated

@@ -31,7 +31,7 @@ changed 500 ms. Guest tools: Alpine aarch64 git and ripgrep from
 **Harness.** `rs/ll-open/cli/tests/share_bench.rs` (ignored by default):
 
 ```text
-cargo build -p leyline-runtime --bin leyline-krun-worker
+cargo build -p leyline-krun-worker   # leyline-runtime --bin leyline-krun-worker before bead 395e43
 LEYLINE_REQUIRE_HYPERVISOR=1 LEYLINE_LIBKRUNFW_PATH=/opt/homebrew/lib/libkrunfw.5.dylib \
 LEYLINE_GUEST_TOOLS=<dir>/rootfs LEYLINE_BENCH_OUT=<table> \
   cargo test -p leyline-cli --test share_bench -- --ignored --nocapture

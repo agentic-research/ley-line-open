@@ -6,39 +6,9 @@ description = "Capability-resolved execution lifecycle and isolation backends fo
 repository = "https://github.com/agentic-research/ley-line-open"
 license = "AGPL-3.0-or-later"
 
-[features]
-default = ["vmm"]
-# The linked VMM (ADR-0044, bead ley-line-open-f1c46f): libkrun built from
-# rs/third_party/libkrun, upstream v1.19.6 plus the patches beside it. The
-# leyline-krun-worker binary runs guests through it. A crate that only
-# supervises the worker — leyline-cli-lib, leyline-cli — turns default
-# features off and does not compile libkrun.
-vmm = ["dep:krun"]
-
-[[bin]]
-name = "leyline-krun-worker"
-required-features = ["vmm"]
-
-# Tests that link the VMM or run the worker binary.
-[[test]]
-name = "krun_worker"
-required-features = ["vmm"]
-
-[[test]]
-name = "libkrun_api"
-required-features = ["vmm"]
-
-[[test]]
-name = "libkrun_guest_listener"
-required-features = ["vmm"]
-
-[[test]]
-name = "libkrun_guest_write"
-required-features = ["vmm"]
-
-[[test]]
-name = "libkrun_virtiofs_backend"
-required-features = ["vmm"]
+# No VMM here: the libkrun backend supervises the leyline-krun-worker binary,
+# which the unpublished leyline-krun-worker crate builds and which links the
+# vendored libkrun (ADR-0044, bead ley-line-open-395e43).
 
 [dependencies]
 blake3 = { workspace = true }
@@ -55,9 +25,6 @@ serde_json = { workspace = true }
 rustix = { version = "1.1.4", features = ["fs"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-# `lib` name `krun`. libkrun dlopens libkrunfw (the guest kernel) at
-# `krun_create_ctx`; that library stays an installed runtime file.
-krun = { package = "libkrun", path = "../../third_party/libkrun/src/libkrun", optional = true }
 
 [dev-dependencies]
 hex = { workspace = true }

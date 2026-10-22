@@ -18,9 +18,9 @@ pub mod cmd_lsp;
 pub mod cmd_parse;
 pub mod cmd_rebuild;
 pub mod cmd_self;
-pub mod cmd_serve;
 pub mod cmd_splice;
 pub mod daemon;
+pub mod lifecycle;
 pub mod merge;
 pub mod source_write;
 #[cfg(feature = "sheaf")]
@@ -261,41 +261,6 @@ pub enum Commands {
         language_id: Option<String>,
     },
 
-    /// Create an arena, mount it via NFS or FUSE, and wait for shutdown.
-    Serve {
-        /// Path to the arena file.
-        #[arg(long, default_value = "./leyline.arena")]
-        arena: PathBuf,
-
-        /// Arena size in MiB.
-        #[arg(long, default_value_t = 64)]
-        arena_size_mib: u64,
-
-        /// Path to the controller (.ctrl) file. Defaults to arena path with .ctrl extension.
-        #[arg(long)]
-        control: Option<PathBuf>,
-
-        /// Directory to mount the filesystem at.
-        #[arg(long)]
-        mount: PathBuf,
-
-        /// Filesystem backend: "nfs" or "fuse".
-        #[arg(long, default_value_t = cmd_serve::default_backend())]
-        backend: String,
-
-        /// NFS listen port (0 = auto-assign).
-        #[arg(long, default_value_t = 0)]
-        nfs_port: u16,
-
-        /// Default language for validation of extensionless files (e.g. "go", "py").
-        #[arg(long)]
-        language: Option<String>,
-
-        /// Timeout before automatic shutdown (e.g. "30s", "5m", "2h").
-        #[arg(long)]
-        timeout: Option<String>,
-    },
-
     /// Manage this binary's own installation: install, update, where.
     //
     // Bead ley-line-open-321ded. Doc comment above is user-facing help
@@ -497,45 +462,6 @@ pub async fn run(cmd: Commands) -> Result<()> {
                 language_id.as_deref(),
             )
             .await
-        }
-        Commands::Serve {
-            arena,
-            arena_size_mib,
-            control,
-            mount,
-            backend,
-            nfs_port,
-            language,
-            timeout,
-        } => {
-            #[cfg(feature = "mount")]
-            {
-                cmd_serve::cmd_serve(
-                    &arena,
-                    arena_size_mib,
-                    control.as_deref(),
-                    &mount,
-                    &backend,
-                    nfs_port,
-                    language.as_deref(),
-                    timeout.as_deref(),
-                )
-                .await
-            }
-            #[cfg(not(feature = "mount"))]
-            {
-                let _ = (
-                    arena,
-                    arena_size_mib,
-                    control,
-                    mount,
-                    backend,
-                    nfs_port,
-                    language,
-                    timeout,
-                );
-                anyhow::bail!("serve requires the 'mount' feature (compile with --features mount)")
-            }
         }
         Commands::SelfManage { command } => {
             // Process env, current exe, and the release endpoints are

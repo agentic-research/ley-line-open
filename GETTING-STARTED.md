@@ -80,7 +80,7 @@ All three produce `~/.local/bin/leyline` (codesigned on macOS).
 
 Runtime deps:
 - **None** for the `leyline parse` + `leyline daemon` happy path (daemon default is UDS-only on the control socket; MCP HTTP is opt-in via `--mcp-port`).
-- **None** for the default mount path on macOS under `install:full+mount` — `leyline daemon --mount /path` uses the kernel's native NFS client (`leyline serve --backend nfs` is the macOS default; `--backend fuse` is opt-in and requires `fuse-t`).
+- **None** for the default mount path on macOS under `install:full+mount` — `leyline daemon --mount /path` uses the kernel's native NFS client (`--backend nfs` is the macOS default; `--backend fuse` is opt-in and requires `fuse-t`). The NFS mount refuses macOS Tahoe before 26.7 and Sequoia before 15.8, whose NFS client corrupts kernel memory (CVE-2026-43686, CVE-2026-84549): update macOS, or use `--backend fuse`.
 - **libfuse3** on Linux for `install:full+mount` builds — Linux's default backend is FUSE (`--backend fuse`); NFS is opt-in.
 - **A fastembed model cache** at `~/.cache/fastembed/` (~100 MB, downloaded on first `vec_search` use, only present under `install:full` and up). Skip if you don't use `vec_search`.
 

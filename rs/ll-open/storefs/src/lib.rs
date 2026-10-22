@@ -1,5 +1,6 @@
 //! The store-backed filesystem core behind LLO's virtio-fs device (ADR-0044
-//! V2, bead `ley-line-open-f1ea99`).
+//! V2, bead `ley-line-open-f1ea99`) and, with the `mount` feature, behind
+//! the host's FUSE and NFS clients ([`host`], ADR-0045 T8).
 //!
 //! [`StoreFs`] answers the FUSE requests a guest's file syscalls become —
 //! LOOKUP, GETATTR, READDIR, READDIRPLUS, OPENDIR, OPEN, READ, WRITE,
@@ -66,6 +67,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 
 pub mod daemon;
+#[cfg(feature = "mount")]
+pub mod host;
 pub mod share;
 pub use daemon::{DaemonShares, scope_for};
 pub use share::StoreShare;
@@ -729,13 +732,98 @@ impl<S: Store> StoreFs<S> {
         if !open.writable {
             return Err(Errno::EBADF);
         }
-        let start = offset as usize;
-        let end = start + data.len();
-        let len = open.bytes.len().max(end);
-        open.bytes.resize(len, 0);
-        open.bytes[start..end].copy_from_slice(data);
+        splice(&mut open.bytes, offset, data);
         open.dirty = true;
         Ok(data.len())
+    }
+
+    /// WRITE as the host NFS mount makes it (ADR-0045 T8): staged only when
+    /// the proposal its FLUSH would make lands against what the store holds
+    /// now ([`source_write::check`]: grant, base, merge, structure), and
+    /// refused with that proposal's errno otherwise, staging nothing. The
+    /// macOS NFS client reports a refused WRITE at `fsync` and `close` and
+    /// ignores a refused COMMIT, so the WRITE is where it learns of a
+    /// conflict.
+    pub fn write_checked(&self, handle: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
+        let open = self.handle(handle)?;
+        let mut open = open.lock();
+        if !open.writable {
+            return Err(Errno::EBADF);
+        }
+        let mut bytes = open.bytes.clone();
+        splice(&mut bytes, offset, data);
+        if bytes == open.bytes {
+            return Ok(data.len());
+        }
+        let write = match open.mode {
+            Some(mode) => {
+                Proposed::write_mode(open.path.as_str(), open.base.clone(), bytes.clone(), mode)
+            }
+            None => Proposed::write(open.path.as_str(), open.base.clone(), bytes.clone()),
+        };
+        self.store
+            .with_read(|conn| source_write::check(conn, &self.scope.propose, vec![write]))
+            .map_err(|e| {
+                log::info!("write to '{}' refused: {e:#}", open.path);
+                errno_for(&e)
+            })?;
+        open.bytes = bytes;
+        open.dirty = true;
+        Ok(data.len())
+    }
+
+    /// REREAD: a handle with nothing staged takes the blob the store holds
+    /// for its path now, as its base and as the bytes it serves; a handle
+    /// with a staged edit keeps both, since the edit was made against them.
+    /// The host NFS mount rereads before each READ it serves from a handle
+    /// (ADR-0045 T8): NFSv3 has no OPEN, so a READ is where a client takes
+    /// what it will later edit. `ENOENT` when the store holds no file there.
+    pub fn reread(&self, handle: u64) -> Result<(), Errno> {
+        let open = self.handle(handle)?;
+        let mut open = open.lock();
+        if open.dirty {
+            return Ok(());
+        }
+        let (base, bytes) = self.held(&open.path)?.ok_or(Errno::ENOENT)?;
+        if base != open.base {
+            open.base = base;
+            open.bytes = bytes;
+        }
+        Ok(())
+    }
+
+    /// DISCARD: drop what the handle staged and serve its base's bytes
+    /// again, keeping the base. The host NFS mount discards a refused edit
+    /// (ADR-0045 T8): its client has not read what the store holds now, so
+    /// every later WRITE through the handle is checked against the bytes
+    /// the client read, and refused, until a READ takes the store's bytes
+    /// ([`StoreFs::reread`]). Dropping the handle instead would let the
+    /// client's retry land as an edit of bytes it never saw.
+    pub fn discard(&self, handle: u64) -> Result<(), Errno> {
+        let open = self.handle(handle)?;
+        let mut open = open.lock();
+        let bytes = match &open.base {
+            Base::Blob(blob) => {
+                let blob = *blob;
+                self.query(|conn| store_tree::blob_bytes(conn, blob))?
+                    .ok_or(Errno::EIO)?
+            }
+            _ => Vec::new(),
+        };
+        open.bytes = bytes;
+        open.mode = None;
+        open.dirty = false;
+        Ok(())
+    }
+
+    /// PARENT: the inode of the directory `inode` is in; the root's is the
+    /// root. What an NFS LOOKUP of `..` answers.
+    pub fn parent(&self, inode: u64) -> Result<u64, Errno> {
+        let path = self.path_of(inode)?;
+        Ok(match path.rsplit_once('/') {
+            Some((dir, _)) => self.inode_of(dir),
+            None => ROOT_INODE,
+        })
     }
 
     /// FLUSH (each `close`): proposes the staged bytes. See [`errno_for`].
@@ -1542,6 +1630,16 @@ impl<S: Store> StoreFs<S> {
             Errno::EIO
         })
     }
+}
+
+/// `data` written into `bytes` at `offset`; a gap past the end reads as
+/// zeros.
+fn splice(bytes: &mut Vec<u8>, offset: u64, data: &[u8]) {
+    let start = offset as usize;
+    let end = start + data.len();
+    let len = bytes.len().max(end);
+    bytes.resize(len, 0);
+    bytes[start..end].copy_from_slice(data);
 }
 
 /// `name` under the directory `dir` (the root is `""`).

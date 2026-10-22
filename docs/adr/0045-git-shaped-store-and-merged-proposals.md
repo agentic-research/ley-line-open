@@ -1,9 +1,10 @@
 # ADR-0045 — The store is a git-shaped tree, parsing is a projection over it, and a moved base merges
 
-**Status:** Accepted (2026-10-15, owner direction); phases 1–4 built (below)
-**Bead:** `ley-line-open-bb8aa6`
+**Status:** Accepted (2026-10-15, owner direction); phases 1–6 built (below)
+**Bead:** `ley-line-open-bb8aa6`; T8 `ley-line-open-53d701`, `ley-line-open-3e73dc`
 **Amends:** ADR-0042 (P1a "what the store can hold", P2 "there is no merge", P4/P5 syntax
-refusals), ADR-0044 (V2 refusal errnos, V3 "Read freshness": WRITE-time `ESTALE`)
+refusals, the NFS mount bases of `6116c9`), ADR-0044 (V2 refusal errnos, V3 "Read freshness":
+WRITE-time `ESTALE`, V4 the host mount's write rules)
 **Related:**
 
 - ADR-0040 D1 (`treeRoot`, `parserId`), D3 (one write path), D6 (`derived_from`, `leyline rebuild`)
@@ -136,8 +137,7 @@ CREATE TABLE _parse_diagnostics (
 
 The row is a function of the bytes and the grammar, so a proposal and a cold parse of the same
 tree write the same rows. A file whose next version parses cleanly loses its row in the same
-transaction. `_errors` (the leyline-fs mount's validation table, keyed by display path, with a
-timestamp) is not reused: its rows are not a function of the tree.
+transaction.
 
 `projection-v7` adds `_tree` and `_parse_diagnostics`. A v6 arena is refused at parse open and
 rebuilt cold, as every earlier shape change was.
@@ -179,7 +179,7 @@ no longer refused outright:
 |---|---|
 | `Write` against a moved base, all three of base (`b`), ours (the proposal's bytes) and theirs (`c`) UTF-8, both entries non-symlink | three-way merge with `gix-merge`'s builtin text driver (`blob::builtin_driver::text`, Myers, line tokens), in process |
 | — clean merge | the merged bytes land as the proposal's write for that path; `Accepted::merged` names it |
-| — overlapping hunks | refused `stale`; the path's `moved` entry carries `conflicts`: the base line ranges (1-based, inclusive) where the two sides overlap |
+| — overlapping hunks | refused `stale`; the path's `moved` entry carries `conflicts`: the base line ranges where the two sides overlap, 0-based and half-open (`[start, end)`; two insertions at one line are the empty range `[line, line)`), as `daemon.capnp` `LineRange` and `merge::LineRange` define them |
 | any of the three not UTF-8 ("binary"), or either side a symlink, or the base blob no longer stored | refused `stale` (no merge) |
 | `Delete` against a moved base | refused `stale` |
 | create (`Absent`) where the path holds a file | refused `stale` (`expected: absent`), unless the file holds the same bytes and mode: then it is accepted and changes nothing |
@@ -204,9 +204,9 @@ from `write(2)` itself (bead `e650d7`, #466). Under T5 a moved base is not a ref
 staged bytes may still merge. A WRITE stages on its handle whatever the store holds; FLUSH and
 FSYNC propose against the handle's base, and their answer is the decision: a clean merge lands
 (and the next open of the file must read the merged bytes, so that FLUSH withholds
-`KEEP_CACHE`), a conflict is `ESTALE` from `close(2)` or `fsync(2)`. This is the virtio-fs
-path's contract only; the NFS compatibility mount keeps its WRITE-time refusal (ADR-0042 P4,
-`6116c9`), because the macOS NFS client never reports a refused COMMIT.
+`KEEP_CACHE`), a conflict is `ESTALE` from `close(2)` or `fsync(2)`. The host mount decides its
+writes by the same rule (T8); its NFS server also checks each WRITE, because the macOS NFS client
+never reports a refused COMMIT.
 
 ### T7 — The checkout carries modes, symlinks and directories
 
@@ -218,13 +218,79 @@ then renamed over the target), creates an empty directory, and removes a directo
 removed (when it is empty on disk; otherwise the path is reported, not forced). A file the
 store deleted is removed and its directory is left in place (T1).
 
+### T8 — The host mount is storefs
+
+Beads `ley-line-open-53d701`, `ley-line-open-3e73dc`. The host's FUSE and NFS mounts serve the
+same filesystem core a guest's virtio-fs share serves: `leyline_storefs::StoreFs`, behind
+`storefs::host::fuse::HostFuse` and `storefs::host::nfs::HostNfs`. A host process and a guest
+see one tree (`_tree`: every file of any kind, mode, symlink and directory) and write it by one
+set of rules (T4–T6): each save is a proposal on the daemon's one writer, a moved base merges, an
+overlap is `ESTALE`, an unparseable save lands with its diagnostic, and every landed proposal is
+written into the daemon's checkout and published to its arena. CREATE, MKDIR, RMDIR, RENAME,
+SYMLINK, READLINK and a SETATTR of the mode are the proposals T4 names.
+
+Before this the host mount was `leyline-fs`'s projection view: a parsed file presented as a
+directory of its syntax nodes, a file of no language not presented at all, and creates, empty
+directories and modes refused `EPERM` because that view had nothing to present them as. The
+syntax view of a tree is mache's to serve; the store's mount is a filesystem. `leyline-fs`
+keeps the nodes-table graph, its arena hot-swap and CDC reads, and refuses every write to a
+store's nodes: only a proposal changes a store. `leyline serve`, which mounted that view over a
+private arena with no daemon, is removed; `leyline daemon --mount` is the host mount.
+
+The `leyline` binary injects the mount (`cmd_daemon::HostMount`, `DaemonOptions::host_mount`):
+storefs depends on cli-lib, so cli-lib cannot construct it. A daemon asked to mount with no
+provider is refused before it starts.
+
+**Errno translation.** storefs answers Linux errno values (its guest is Linux). The FUSE adapter
+translates the three whose host values differ (`ESTALE`, `ENOTEMPTY`, `ENOSYS`), the host's
+`open(2)` and `renamex_np(2)` flags into Linux's, and the NFS adapter maps each errno to its
+`nfsstat3`.
+
+**The macOS COMMIT tension.** NFSv3 has no OPEN or CLOSE, so `HostNfs` keeps one storefs write
+handle per file id; a READ with nothing staged rereads it (the bytes the client takes become its
+base). The macOS NFS client reports a refused WRITE (at `fsync` or `close`) and ignores a refused
+COMMIT, so each WRITE runs the COMMIT's own decision (`source_write::check`: grant, bases, merge,
+structure) on the bytes it stages and refuses `NFS3ERR_STALE` exactly when that decision does. A
+SETATTR of the size stages unchecked: a save truncates before it writes, and the empty file
+between the two is no edit the client means; a truncate with no WRITE after it (`: > f`) lands
+once it has stood idle. A refused WRITE or COMMIT voids the client's save: the handle drops what
+it staged, keeps its base, and refuses every WRITE, SETATTR of the size and COMMIT until a READ
+takes the store's bytes. (macOS goes on with a refused save by setting the file's length; staged
+on the stale base, that length once landed the client's old bytes with a NUL appended, merged
+over the other writer's change.) What a WRITE cannot decide is a conflicting change landed after the
+client's last WRITE and before its COMMIT: that COMMIT is refused, macOS does not report it, and
+the edit is discarded. A FUSE handle, like a guest's, is decided at its FLUSH, which the kernel
+reports.
+
+**Who is a writer.** The merge and the `ESTALE` refusal decide between writers that hold their
+own handles, each with its own base: a guest's virtio-fs session, a FUSE `open(2)` (each open is
+its own handle, its base taken at OPEN), the socket's `propose` op. Two processes writing through
+**one NFS mount** are not two writers. NFSv3 carries no open state, and both processes share the
+host's one NFS client and its page cache, so the server receives one client's READs and WRITEs
+against one handle per file and cannot know that one process's bytes rest on an older read than
+the other's. The last save to reach the server wins: a disjoint edit from the other process is
+lost, and an overlapping one is not refused. Separating writers on one mount needs a session per
+writer (`ley-line-open-5ec040`). macOS FUSE through fuse-t is itself an NFS server to the
+kernel's NFS client; whether it separates writers is not measured.
+
+**The macOS NFS client gate.** Before Tahoe 26.7 and Sequoia 15.8, Apple's NFS client corrupts
+kernel memory on server replies it mishandles (CVE-2026-43686, a use-after-free; CVE-2026-84549,
+an out-of-bounds read); a loopback NFS workload panicked a development Mac
+(`ley-line-open-2d49ce`). `host::mount_nfs` refuses those releases, naming the CVEs and the fixed
+releases. Loopback NFSv3 on a patched kernel is the arrangement Hugging Face's `hf-mount` ships on
+xetdata's `nfsserve`, which this mount's `nessie-nfsserve` forks. The client's attribute cache is
+held to one second (`actimeo=1`, storefs's changed-path timeout); close-to-open consistency
+revalidates every open.
+
 ## Consequences
 
 - An agent's `README.md`, `notes.txt`, `Makefile`, `chmod +x`, symlink and empty directory
   persist in the store, in the checkout and across a daemon restart.
 - Two agents editing different lines of one file both land; the second's flush lands the merge.
   Two agents editing the same lines: the second's `close` or `fsync` is `ESTALE`, and the
-  refusal names the conflicting lines.
+  refusal names the conflicting lines. This holds for agents that are separate writers (their
+  own virtio-fs sessions, FUSE handles or socket proposals); two processes through one host NFS
+  mount are one client, and the last save wins (T8, `ley-line-open-5ec040`).
 - A half-written Go file lands. Its projection carries error nodes and a diagnostic row; queries
   over it see what tree-sitter recovered.
 - `treeRoot` moves for trees holding non-projected files, executables, symlinks or empty
@@ -242,6 +308,8 @@ store deleted is removed and its directory is left in place (T1).
 | 2 | `_tree`, `_parse_diagnostics`; the walk ingests every file; proposals with modes, symlinks, directories and merges; the checkout's modes, symlinks and directories | Done |
 | 3 | the daemon wire: `mode`, `mkdir`/`rmdir`, conflict ranges, retired `syntax`/`no_language` | Done |
 | 4 | storefs: every file to the store, MKDIR/RMDIR/directory RENAME/SETATTR mode/symlink as proposals, WRITE stages, FLUSH merges; libkrun patch `0006` (READLINK, SYMLINK through `DynFileSystem`); the in-guest end-to-end scenarios | Done |
+| 5 | T8: the host mount's writes as proposals; the NFS WRITE check; the mount's syntax validation, `serve --language` and `StaleWrite` removed (bead `53d701`) | Done |
+| 6 | T8: the host mount is storefs behind FUSE and NFS adapters; the macOS NFS-client gate; `leyline serve`, `leyline-fs`'s mount servers and its `fuse`, `nfs` and `splice` features removed (bead `3e73dc`) | Done |
 
 During phases 2 and 3 `source_write::propose` kept ADR-0042's rules for the virtio-fs core alone
 (a `Rules::ParsedFilesOnly` mode); phase 4 moved storefs and the compatibility mounts to these
@@ -259,3 +327,4 @@ rules and removed that mode, `Refusal::Syntax`, `Refusal::NoLanguage` and `can_h
 | M6 | the checkout carries modes, symlinks and directories | `checkout_materializes_modes_symlinks_and_empty_dirs` |
 | M7 | the wire carries it | `daemon_protocol_gate_proposals_produce_the_fixture_shapes` (fixtures for `mode`, `mkdir`, `conflicts`) |
 | M8 | in the guest | `agent_in_guest.rs` scenarios (c), (C), (d), (p), (h): two writers on different lines both land; same lines `ESTALE`; README, `chmod +x`, symlink, empty directory, directory rename and a half-written Go file persist across a daemon restart; storefs `tree_tests` |
+| M9 | the host mount is storefs: it lands new files, directories, modes and symlinks, merges, refuses overlap (and a retry made without a read), stores an unparseable save, and refuses an unpatched macOS NFS client | storefs `host::tests` (`a_new_file_lands_at_create_and_its_bytes_at_commit`, `mkdir_and_rmdir_are_directory_entries`, `a_mode_change_lands_the_executable_mode`, `a_symlink_lands_with_its_target`, `a_save_over_a_disjoint_landed_change_merges_at_commit`, `a_save_over_an_overlapping_landed_change_is_stale_at_the_write`, `a_refused_commit_drops_the_edit_and_the_next_read_serves_the_store`, `an_unparseable_save_lands_with_its_diagnostic`, `an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts`); through the kernel, storefs `tests/host_mount.rs` and `tools/cli_smoke.sh --mount`; fs `a_store_refuses_every_write` |

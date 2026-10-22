@@ -17,23 +17,14 @@ version: '3'
 
 tasks:
   test:cdc:
-    desc: leyline-fs CDC + verify-on-fault + NFS write-sequence tests + clippy (cdc,splice,validate,verify,nfs) — no default features
+    desc: leyline-fs CDC + verify-on-fault tests + clippy (cdc,validate,verify) — no default features
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
-      # `nfs` (pure Rust, no system dependency, unlike `fuse`) so the NFS
-      # write-sequence tests, which need `splice`'s source writer, run
-      # (bead ley-line-open-b6d217).
-      - cargo test -p leyline-fs --no-default-features --features cdc,splice,validate,verify,nfs
-      - cargo clippy -p leyline-fs --no-default-features --features cdc,splice,validate,verify,nfs --no-deps -- -D warnings
+      - cargo test -p leyline-fs --no-default-features --features cdc,validate,verify
+      - cargo clippy -p leyline-fs --no-default-features --features cdc,validate,verify --no-deps -- -D warnings
 
   build:static:
     desc: Build the leyline-fs staticlib with `cdc` — the FFI surface consumers link
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
       - cargo build -p leyline-fs --lib --features cdc
-
-  build:nfs-isolated:
-    desc: Build leyline-fs with ONLY `nfs` — proves the NFS path compiles without cdc/fuse
-    dir: '{{.TASKFILE_DIR}}/../..'
-    cmds:
-      - cargo build -p leyline-fs --no-default-features --features nfs

@@ -640,3 +640,77 @@ fn a_directory_rename_is_one_proposal() {
     assert_eq!(crate::tree::entry(&s.conn, "lib/empty").unwrap(), None);
     let _ = &s.src;
 }
+
+/// `rename` plans storefs's RENAME from the store and refuses, typed, what
+/// `rename(2)` refuses: a file renamed over a directory, a directory over
+/// a file or over a directory with entries under it, a directory under
+/// itself, and a path that holds nothing. A directory replaces an empty
+/// one; a file replaces a file against its blob.
+#[test]
+fn rename_plans_storefs_rename_and_refuses_typed() {
+    let s = store(&[
+        ("a.go", Node::File(A, Mode::Regular)),
+        ("b.go", Node::File("package a\n", Mode::Executable)),
+        ("pkg/c.txt", Node::File("c\n", Mode::Regular)),
+        ("full/d.txt", Node::File("d\n", Mode::Regular)),
+        ("empty", Node::Dir),
+    ]);
+    let refused = |from: &str, to: &str| {
+        rename(&s.conn, from, to)
+            .unwrap_err()
+            .downcast::<Refusal>()
+            .unwrap()
+    };
+    assert_eq!(
+        refused("a.go", "pkg"),
+        Refusal::IsADirectory { path: "pkg".into() }
+    );
+    assert_eq!(
+        refused("pkg", "a.go"),
+        Refusal::NotADirectory {
+            path: "a.go".into()
+        }
+    );
+    assert_eq!(
+        refused("pkg", "full"),
+        Refusal::NotEmpty {
+            path: "full".into()
+        }
+    );
+    assert_eq!(
+        refused("pkg", "pkg/in"),
+        Refusal::MalformedPath {
+            path: "pkg/in".into()
+        }
+    );
+    assert_eq!(
+        refused("nope", "x"),
+        Refusal::NoSuchFile {
+            path: "nope".into()
+        }
+    );
+
+    let b = "package a\n".as_bytes().hash();
+    assert_eq!(
+        rename(&s.conn, "b.go", "a.go").unwrap(),
+        [
+            Proposed::delete("b.go", Base::Blob(b)),
+            Proposed::write_mode(
+                "a.go",
+                Base::Blob(A.as_bytes().hash()),
+                b"package a\n".to_vec(),
+                Mode::Executable
+            ),
+        ]
+    );
+    let writes = rename(&s.conn, "pkg", "empty").unwrap();
+    assert_eq!(writes, rename_dir(&s.conn, "pkg", "empty").unwrap());
+    tree_propose(&s, writes).unwrap();
+    assert_eq!(
+        crate::tree::entry(&s.conn, "empty/c.txt")
+            .unwrap()
+            .and_then(Entry::blob),
+        Some("c\n".as_bytes().hash())
+    );
+    let _ = &s.src;
+}

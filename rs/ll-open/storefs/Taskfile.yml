@@ -1,0 +1,18 @@
+version: '3'
+
+# Crate-scoped tasks for `leyline-storefs`, included by the root Taskfile under
+# the `storefs:` namespace.
+
+tasks:
+  test:mount:
+    desc: |
+      Tests for the `mount` feature — the host mount (bead
+      ley-line-open-3e73dc): StoreFs behind the FUSE and NFS adapters below
+      the kernel, then mounted the way `daemon --mount` mounts it, on the
+      platform's default backend (our NFS server under mount_nfs on macOS,
+      FUSE on Linux with libfuse from deps:ci). A macOS whose NFS client is
+      unpatched is refused by the mount itself; the kernel tests report it
+      and skip by name. Nothing else skips.
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo test -p leyline-storefs --features mount

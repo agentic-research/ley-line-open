@@ -17,6 +17,7 @@ use leyline_runtime::{
 };
 use tempfile::TempDir;
 
+#[path = "../../runtime/tests/common/mod.rs"]
 mod common;
 
 fn request_fixture(cas: &TempDir) -> ExecutionRequest {

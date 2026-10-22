@@ -4798,6 +4798,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "leyline-krun-worker"
+version = "0.20.5"
+dependencies = [
+ "blake3",
+ "leyline-runtime",
+ "libc",
+ "libkrun",
+ "parking_lot",
+ "serde_json",
+ "tempfile",
+ "wait-timeout",
+]
+
+[[package]]
 name = "leyline-lsp"
 version = "0.20.5"
 dependencies = [
@@ -4859,7 +4873,6 @@ dependencies = [
  "leyline-envelope",
  "leyline-public-schema",
  "libc",
- "libkrun",
  "nono",
  "parking_lot",
  "rustix",

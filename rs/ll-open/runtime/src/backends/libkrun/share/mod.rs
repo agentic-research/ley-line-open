@@ -3,8 +3,8 @@
 //!
 //! The VMM runs in the `leyline-krun-worker` process; the store a run's
 //! workspace is served from lives in the daemon that started it, behind the
-//! daemon's one writer. The worker's virtio-fs device ([`ShareFs`], `vmm`
-//! feature) forwards each FUSE request over a connected UNIX socket the
+//! daemon's one writer. The worker's virtio-fs device (`ShareFs`, in the
+//! `leyline-krun-worker` crate) forwards each FUSE request over a connected UNIX socket the
 //! daemon handed it at spawn; the daemon answers with [`serve`] over an
 //! [`FsService`] (`leyline-storefs`'s store-backed one).
 //!
@@ -30,10 +30,6 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 mod codec;
-#[cfg(feature = "vmm")]
-mod device;
-#[cfg(feature = "vmm")]
-pub use device::ShareFs;
 
 /// `FUSE_DO_READDIRPLUS` (`<linux/fuse.h>`): the guest asks for entries with
 /// their attributes.
@@ -386,6 +382,3 @@ impl FsService for RemoteFs {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod device_tests;

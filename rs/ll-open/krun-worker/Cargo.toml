@@ -1,0 +1,30 @@
+[package]
+name = "leyline-krun-worker"
+version = "0.20.5"
+edition = "2024"
+description = "The microVM worker: links the vendored libkrun and runs one guest per process for leyline-runtime's libkrun backend"
+repository = "https://github.com/agentic-research/ley-line-open"
+license = "AGPL-3.0-or-later"
+# Links libkrun by path from rs/third_party/libkrun, which cargo cannot
+# package; leyline-runtime, which supervises this binary, stays publishable
+# (bead ley-line-open-395e43).
+publish = false
+
+[[bin]]
+name = "leyline-krun-worker"
+
+[dependencies]
+leyline-runtime = { path = "../runtime" }
+libc = { workspace = true }
+serde_json = { workspace = true }
+# `lib` name `krun`. libkrun dlopens libkrunfw (the guest kernel) at
+# `krun_create_ctx`; that library stays an installed runtime file. The VMM
+# is ADR-0044's (bead ley-line-open-f1c46f): libkrun built from
+# rs/third_party/libkrun, upstream v1.19.6 plus the patches beside it.
+krun = { package = "libkrun", path = "../../third_party/libkrun/src/libkrun" }
+
+[dev-dependencies]
+blake3 = { workspace = true }
+parking_lot = { workspace = true }
+tempfile = { workspace = true }
+wait-timeout = "0.2"

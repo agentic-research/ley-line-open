@@ -10,6 +10,7 @@ use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
+#[path = "../../runtime/tests/common/mod.rs"]
 mod common;
 mod hypervisor;
 

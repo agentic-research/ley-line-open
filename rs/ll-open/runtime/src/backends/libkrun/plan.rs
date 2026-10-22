@@ -59,6 +59,13 @@ impl RootfsResolver for DirectoryRootfsResolver {
     }
 }
 
+/// `KRUN_TSI_HIJACK_INET` from `libkrun.h` — carry the guest's `AF_INET`
+/// sockets over vsock instead of leaving them unreachable.
+///
+/// Named here rather than written as a bare `1` at the call site so the one
+/// place that weakens the boundary says what it is doing.
+pub const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
+
 #[derive(Debug)]
 pub struct KrunConfig {
     pub run_id: String,

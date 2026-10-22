@@ -1,35 +1,21 @@
 use std::ffi::OsString;
-#[cfg(feature = "vmm")]
-use std::io::{Read, Write};
-#[cfg(feature = "vmm")]
+use std::io::Read;
 use std::os::fd::{BorrowedFd, FromRawFd};
-#[cfg(feature = "vmm")]
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(feature = "vmm")]
-use std::sync::Arc;
 
-#[cfg(feature = "vmm")]
 use rustix::fs::FileType;
 
-#[cfg(feature = "vmm")]
 use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest, WorkerChannel};
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "vmm")]
-use super::api::{KRUN_TSI_HIJACK_INET, LinkedKrunApi, PreparedVm, prepare_vm};
-#[cfg(feature = "vmm")]
 use super::confinement::{
     VmmHostResources, apply_manifest, confinement_manifest, vsock_unix_mappings,
 };
-#[cfg(feature = "vmm")]
-use super::plan::{DirectoryRootfsResolver, compile_plan};
-#[cfg(feature = "vmm")]
-use super::share::{RemoteFs, ShareFs};
-#[cfg(feature = "vmm")]
+use super::plan::{DirectoryRootfsResolver, KRUN_TSI_HIJACK_INET, KrunConfig, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
 /// The worker option naming the inherited descriptor of the run's workspace
@@ -49,7 +35,6 @@ pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
 
 /// Refuse a workload environment that names the guest init's mount list:
 /// which shares the guest mounts, and where, is the worker's decision.
-#[cfg(feature = "vmm")]
 fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), ExecutionError> {
     if request.public_environment.contains_key(VIRTIOFS_MOUNTS_ENV) {
         return Err(ExecutionError::invalid(format!(
@@ -64,7 +49,6 @@ fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), Executi
 /// [`WORKSPACE_SHARE_FD_ARG`], when the run is granted a workspace. A share
 /// without a grant, a grant without a share, and a descriptor that is not a
 /// socket are refused; the tier attaches one workspace.
-#[cfg(feature = "vmm")]
 fn workspace_share(
     request: &ExecutionRequest,
     fd: Option<i32>,
@@ -107,8 +91,7 @@ fn workspace_share(
 /// start the workload there. The executable stays the rootfs's: the plan's
 /// guest-relative path is anchored at `/`, since init would otherwise
 /// resolve it against the share.
-#[cfg(feature = "vmm")]
-fn mount_workspace(config: &mut super::plan::KrunConfig) {
+fn mount_workspace(config: &mut KrunConfig) {
     config.environment.push(
         std::ffi::CString::new(format!(
             "{VIRTIOFS_MOUNTS_ENV}={WORKSPACE_TAG}:{WORKSPACE_DIR}"
@@ -376,39 +359,52 @@ impl WorkerOptions {
     }
 }
 
-#[cfg(feature = "vmm")]
-pub fn execute_from_reader_with_events(
-    options: WorkerOptions,
-    reader: impl Read,
-    mut writer: impl Write,
-) -> Result<(), ExecutionError> {
-    let request: ExecutionRequest =
-        crate::backends::process::read_request(reader).map_err(|error| {
-            ExecutionError::invalid(format!("invalid worker request JSON: {error}"))
-        })?;
-    execute_with_ready(options, &request, |event| {
-        serde_json::to_writer(&mut writer, event)
-            .map_err(|error| ExecutionError::backend(format!("write worker event: {error}")))?;
-        writer
-            .write_all(b"\n")
-            .map_err(|error| ExecutionError::backend(format!("write worker event: {error}")))?;
-        writer
-            .flush()
-            .map_err(|error| ExecutionError::backend(format!("flush worker event: {error}")))
-    })
+/// The worker's request, read from its standard input: one JSON
+/// [`ExecutionRequest`], complete as soon as its closing brace arrives.
+pub fn read_request(reader: impl Read) -> Result<ExecutionRequest, ExecutionError> {
+    crate::backends::process::read_request(reader)
+        .map_err(|error| ExecutionError::invalid(format!("invalid worker request JSON: {error}")))
 }
 
-#[cfg(feature = "vmm")]
-pub fn execute(options: WorkerOptions, request: &ExecutionRequest) -> Result<(), ExecutionError> {
-    execute_with_ready(options, request, |_| Ok(()))
+/// A run the worker checked, planned, materialized and confined, ready for
+/// the VMM: everything [`prepare`] does before libkrun is called. The
+/// `leyline-krun-worker` crate links libkrun, builds the VM from
+/// [`PreparedRun::config`], attaches [`PreparedRun::share`], reports
+/// [`PreparedRun::ready`] and enters the VM.
+#[derive(Debug)]
+pub struct PreparedRun {
+    /// The VM to build: the compiled plan with the workspace mount, the
+    /// operator's socket hijacking, the port map and the vsock mappings.
+    pub config: KrunConfig,
+    /// The run's workspace share, when the run is granted a workspace: the
+    /// socket the guest's `/work` device forwards its FUSE requests over.
+    pub share: Option<UnixStream>,
+    /// The digest of the confinement manifest this process applied.
+    pub confinement_digest: String,
+    /// The descriptors this process holds beyond its standard streams.
+    pub inherited: Vec<InheritedDescriptor>,
 }
 
-#[cfg(feature = "vmm")]
-pub fn execute_with_ready(
+impl PreparedRun {
+    /// The readiness event this run reports once its VM is built.
+    pub fn ready(&self) -> WorkerEvent {
+        WorkerEvent::Ready {
+            run_id: self.config.run_id.clone(),
+            confinement_digest: self.confinement_digest.clone(),
+            inherited: self.inherited.clone(),
+        }
+    }
+}
+
+/// Check, plan, materialize and confine a run, up to the VMM.
+///
+/// On return the process is confined by the manifest whose digest
+/// [`PreparedRun::confinement_digest`] names; everything after it — building
+/// the VM and entering it — happens under that confinement.
+pub fn prepare(
     options: WorkerOptions,
     request: &ExecutionRequest,
-    on_ready: impl FnOnce(&WorkerEvent) -> Result<(), ExecutionError>,
-) -> Result<(), ExecutionError> {
+) -> Result<PreparedRun, ExecutionError> {
     // Checked before anything is read or materialized: the share is the
     // run's granted workspace or nothing, and the guest init's mount list
     // is the worker's alone.
@@ -540,23 +536,15 @@ pub fn execute_with_ready(
 
     apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
-    let vm: PreparedVm<'_> = prepare_vm(&LinkedKrunApi, &config)?;
-    if let Some(stream) = share {
-        vm.add_virtiofs_backend(
-            WORKSPACE_TAG,
-            0,
-            Arc::new(ShareFs::new(RemoteFs::new(stream))),
-        )?;
-    }
-    on_ready(&WorkerEvent::Ready {
-        run_id: config.run_id.clone(),
+    Ok(PreparedRun {
         confinement_digest: manifest.confinement_digest()?,
+        config,
+        share,
         inherited,
-    })?;
-    vm.enter()
+    })
 }
 
-#[cfg(all(test, feature = "vmm"))]
+#[cfg(test)]
 mod tests {
     use std::ffi::CString;
     use std::path::PathBuf;

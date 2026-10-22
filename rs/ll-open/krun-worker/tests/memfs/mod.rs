@@ -11,8 +11,8 @@ use std::ffi::CStr;
 use std::io;
 use std::time::Duration;
 
-use leyline_runtime::backends::libkrun::api::DynFileSystem;
-use leyline_runtime::backends::libkrun::api::virtio_fs::filesystem::{Context, Entry, OpenOptions};
+use leyline_krun_worker::api::DynFileSystem;
+use leyline_krun_worker::api::virtio_fs::filesystem::{Context, Entry, OpenOptions};
 
 #[cfg(target_os = "macos")]
 type Stat = libc::stat;

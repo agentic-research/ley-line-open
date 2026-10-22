@@ -22,5 +22,8 @@ tasks:
       RUSTC_WRAPPER: ''
     cmds:
       - cargo test -p leyline-runtime
+      # The worker crate links the vendored libkrun and builds the
+      # leyline-krun-worker binary (bead ley-line-open-395e43).
+      - cargo test -p leyline-krun-worker
       # Builds on the worker binary the line above built.
       - cargo test -p leyline-cli --test agent_in_guest

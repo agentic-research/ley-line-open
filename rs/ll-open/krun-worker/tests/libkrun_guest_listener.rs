@@ -28,11 +28,12 @@
 //! is belt-and-braces — still worth adding, but not a security fix.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
@@ -44,6 +45,28 @@ mod hypervisor;
 /// The port the guest binds. Above 1024 so `confinement/v1` §4 would permit
 /// declaring it, and not a port anything else here uses.
 const GUEST_PORT: u16 = 17536;
+
+/// The prefix of the guest's one console line: `bound`, or `bind-failed: …`.
+const REPORT: &str = "listener-probe: ";
+
+/// How long the guest may take to boot and report. Only a bound on a failure:
+/// a guest that reports is probed at once, and one that does not fails here.
+const REPORT_BOUND: Duration = Duration::from_secs(60);
+
+/// Whether a TCP connection to `127.0.0.1:port` succeeds. A refusal is the
+/// answer "no"; anything else (a timeout, an unreachable route) means the probe
+/// learned nothing, which fails the test rather than reading as "no".
+fn probe(port: u16) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+        Ok(stream) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            true
+        }
+        Err(error) if error.kind() == ErrorKind::ConnectionRefused => false,
+        Err(error) => panic!("the probe of {address} was inconclusive: {error}"),
+    }
+}
 
 #[test]
 fn a_guest_listener_nothing_declared_is_not_reachable_from_the_host() {
@@ -75,35 +98,33 @@ fn probe_listener_exposure(hijack_inet: bool) {
     };
     let fixture = TempDir::new().expect("fixture");
 
-    // The guest records whether the bind itself succeeded, because "unreachable"
-    // has two very different causes: the port map refused to expose a live
-    // listener, or the guest had no network stack to bind on. Only the marker
-    // distinguishes them, and reporting the first when it was the second would
-    // be a false all-clear.
+    // The guest reports on its console whether the bind itself succeeded,
+    // because "unreachable" has two very different causes: the port map refused
+    // to expose a live listener, or the guest had no network stack to bind on.
+    // Only the report distinguishes them, and reporting the first when it was
+    // the second would be a false all-clear. The report is printed after
+    // `listen` returns, so it is also the event the host's probe waits for.
+    // The guest then holds the listener until the host ends the VM.
     let guest_source = fixture.path().join("guest-listen.rs");
     fs::write(
         &guest_source,
         format!(
             r#"use std::io::Write;
 fn main() {{
-    let outcome = match std::net::TcpListener::bind(("0.0.0.0", {GUEST_PORT})) {{
-        Ok(listener) => {{
-            // Hold it open across the host's probe window.
-            std::thread::spawn(move || {{
-                for stream in listener.incoming() {{
-                    if let Ok(mut stream) = stream {{
-                        let _ = stream.write_all(b"reached\n");
-                    }}
-                }}
-            }});
-            "bound".to_owned()
+    let listener = match std::net::TcpListener::bind(("0.0.0.0", {GUEST_PORT})) {{
+        Ok(listener) => listener,
+        Err(error) => {{
+            println!("{REPORT}bind-failed: {{error}}");
+            return;
         }}
-        Err(error) => format!("bind-failed: {{error}}"),
     }};
-    let mut marker = std::fs::File::create("/listener-probe").unwrap();
-    marker.write_all(outcome.as_bytes()).unwrap();
-    marker.sync_all().unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    println!("{REPORT}bound");
+    std::io::stdout().flush().unwrap();
+    for stream in listener.incoming() {{
+        if let Ok(mut stream) = stream {{
+            let _ = stream.write_all(b"reached\n");
+        }}
+    }}
 }}"#
         ),
     )
@@ -163,6 +184,23 @@ fn main() {{
         },
     };
 
+    // Controls before the VM exists. The probe must see a live host listener
+    // (otherwise "unreachable" below could be a broken probe), and GUEST_PORT
+    // must be free on the host (otherwise a host process, not the guest, would
+    // answer the probe).
+    let control = TcpListener::bind("127.0.0.1:0").expect("control listener");
+    let control_port = control.local_addr().expect("control address").port();
+    assert!(
+        probe(control_port),
+        "the probe did not reach a live host listener on port {control_port}"
+    );
+    drop(control);
+    assert!(
+        !probe(GUEST_PORT),
+        "port {GUEST_PORT} already answers on the host before the VM starts; \
+         free it, or this run cannot attribute a connection to the guest"
+    );
+
     let mut worker = Command::new(&signed_worker);
     // Its standard streams and nothing else, as the backend spawns it.
     leyline_runtime::backends::libkrun::worker::inherit_only(&mut worker, &[])
@@ -190,8 +228,8 @@ fn main() {{
     child.stdin.take().expect("close stdin").flush().ok();
 
     // Readiness is emitted after the policy is applied and the VM prepared, but
-    // before the guest runs — so it marks the start of the probe window, not a
-    // listening socket. Hence the retry loop below rather than a single attempt.
+    // before the guest runs, so it says nothing about a listening socket. The
+    // probe waits for the guest's own report instead.
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
     let mut readiness = String::new();
     stderr.read_line(&mut readiness).expect("read readiness");
@@ -199,37 +237,81 @@ fn main() {{
         readiness.contains("ready"),
         "worker did not report readiness: {readiness}"
     );
+    // Drain the rest of stderr so the worker never blocks on a full pipe, and
+    // keep it for the failure messages.
+    let stderr_rest = std::thread::spawn(move || {
+        let mut rest = String::new();
+        let _ = stderr.read_to_string(&mut rest);
+        rest
+    });
 
-    let address: SocketAddr = format!("127.0.0.1:{GUEST_PORT}")
-        .parse()
-        .expect("probe address");
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut reached = false;
-    while Instant::now() < deadline {
-        if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
-            let _ = stream.shutdown(Shutdown::Both);
-            reached = true;
-            break;
+    // The guest console is the worker's stdout. A reader thread forwards the
+    // guest's report the moment it is printed; the bound below only turns a
+    // guest that never reports into a failure.
+    let (report_tx, report_rx) = mpsc::channel();
+    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    std::thread::spawn(move || {
+        let mut console = Vec::new();
+        for line in stdout.lines() {
+            let Ok(line) = line else { break };
+            if let Some(report) = line
+                .find(REPORT)
+                .map(|at| line[at + REPORT.len()..].to_owned())
+            {
+                let _ = report_tx.send(Ok(report));
+                return;
+            }
+            console.push(line);
         }
-        std::thread::sleep(Duration::from_millis(150));
+        let _ = report_tx.send(Err(console.join("\n")));
+    });
+    let report = match report_rx.recv_timeout(REPORT_BOUND) {
+        Ok(Ok(report)) => report,
+        Ok(Err(console)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the guest console closed without a bind report.\nconsole:\n{console}\n\
+                 worker stderr:\n{}",
+                stderr_rest.join().unwrap_or_default()
+            );
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "FAILED: no bind report from the guest within {REPORT_BOUND:?}.\nworker stderr:\n{}",
+                stderr_rest.join().unwrap_or_default()
+            );
+        }
+    };
+    eprintln!("guest bind outcome: {report}");
+    if report != "bound" {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "the guest could not bind at all, so this run measured nothing about \
+             host exposure. Fix the guest or the VM config before trusting a \
+             negative result here. Guest said: {report}"
+        );
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-
-    // Read the guest's own record before judging. An unreachable port proves
-    // nothing about the port map if the guest never managed to bind.
-    let marker = fs::read_to_string(run_root.join("rootfs/listener-probe"))
-        .unwrap_or_else(|error| format!("marker unreadable: {error}"));
-
-    eprintln!("guest bind outcome: {marker}");
+    // The guest's listener is live and stays live: it serves until the VM is
+    // ended. One probe decides; on loopback a port nothing exposes refuses at
+    // once.
+    let reached = probe(GUEST_PORT);
     eprintln!("host reached guest listener: {reached}");
 
+    // The probe only means something if the guest still held its listener
+    // while it ran: a guest that had exited would make any refusal vacuous.
+    let still_running = child.try_wait().expect("poll worker").is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    let worker_stderr = stderr_rest.join().unwrap_or_default();
     assert!(
-        marker.starts_with("bound"),
-        "the guest could not bind at all, so this run measured nothing about \
-         host exposure. Fix the guest or the VM config before trusting a \
-         negative result here. Guest said: {marker}"
+        still_running,
+        "the worker exited before the host's probe finished, so the guest's \
+         listener was not held across it. worker stderr:\n{worker_stderr}"
     );
     assert!(
         !reached,

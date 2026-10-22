@@ -50,7 +50,7 @@
 //! elsewhere; `LEYLINE_REQUIRE_HYPERVISOR` turns the skip into a failure.
 //! It also needs `LEYLINE_GUEST_TOOLS` (the rootfs fragment
 //! `tools/guest_tools.sh` writes) and the worker binary
-//! (`cargo build -p leyline-runtime --bin leyline-krun-worker`, or
+//! (`cargo build -p leyline-krun-worker`, or
 //! `LEYLINE_KRUN_WORKER`).
 
 use std::collections::BTreeMap;
@@ -62,7 +62,7 @@ use std::time::Instant;
 use serde_json::json;
 
 mod guest_harness;
-#[path = "../../runtime/tests/hypervisor/mod.rs"]
+#[path = "../../krun-worker/tests/hypervisor/mod.rs"]
 mod hypervisor;
 #[path = "agent_in_guest/seed.rs"]
 mod seed;

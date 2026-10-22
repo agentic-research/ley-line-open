@@ -11,7 +11,7 @@
 //!   cargo test -p leyline-cli --test share_bench -- --ignored --nocapture
 //! ```
 //!
-//! after `cargo build -p leyline-runtime --bin leyline-krun-worker`. The
+//! after `cargo build -p leyline-krun-worker`. The
 //! workloads are `share_bench/bench.rs` (see its header). There is no host
 //! NFS, fuse-t, macFUSE or FSKit leg: those drive host kernel filesystem
 //! code, and a loopback NFS load kernel-panicked a development Mac (bead
@@ -30,7 +30,7 @@ use std::process::Command;
 use std::time::Duration;
 
 mod guest_harness;
-#[path = "../../runtime/tests/hypervisor/mod.rs"]
+#[path = "../../krun-worker/tests/hypervisor/mod.rs"]
 mod hypervisor;
 
 use guest_harness::{Limits, git_dir_of, stored};

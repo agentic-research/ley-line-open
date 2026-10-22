@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 
+#[path = "../../runtime/tests/common/mod.rs"]
 mod common;
 mod hypervisor;
 

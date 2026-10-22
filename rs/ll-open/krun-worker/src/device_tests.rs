@@ -1,24 +1,23 @@
 //! `ShareFs`: each FUSE request transcribed onto the wire, each reply into
 //! libkrun's types.
-#![cfg(feature = "vmm")]
 
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
 use std::time::Duration;
 
+use leyline_runtime::backends::libkrun::share::{
+    Attr, DT_DIR, DT_REG, DirEntry, Entry, FOPEN_CACHE_DIR, FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE,
+    FUSE_DO_READDIRPLUS, FUSE_WRITEBACK_CACHE, FsService, Reply, Request,
+};
 use parking_lot::Mutex;
 
-use super::device::{ShareFs, Stat};
-use super::{
-    Attr, DT_DIR, DT_REG, DirEntry, Entry, FOPEN_CACHE_DIR, FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE,
-    FUSE_DO_READDIRPLUS, FsService, Reply, Request,
-};
-use crate::backends::libkrun::api::DynFileSystem;
-use crate::backends::libkrun::api::virtio_fs::filesystem::{
+use crate::api::DynFileSystem;
+use crate::api::virtio_fs::filesystem::{
     Context, DirEntry as KrunDirEntry, Entry as KrunEntry, Extensions, FsOptions, OpenOptions,
     SetattrValid,
 };
+use crate::device::{ShareFs, Stat};
 
 /// Answers with scripted replies, in order, and records each request.
 #[derive(Default)]
@@ -613,10 +612,7 @@ fn the_wire_bits_are_libkruns_fuse_bits() {
         FsOptions::from_bits_truncate(FUSE_DO_READDIRPLUS),
         FsOptions::DO_READDIRPLUS
     );
-    assert_eq!(
-        FsOptions::WRITEBACK_CACHE.bits(),
-        super::FUSE_WRITEBACK_CACHE
-    );
+    assert_eq!(FsOptions::WRITEBACK_CACHE.bits(), FUSE_WRITEBACK_CACHE);
     assert_eq!(OpenOptions::DIRECT_IO.bits(), FOPEN_DIRECT_IO);
     assert_eq!(OpenOptions::KEEP_CACHE.bits(), FOPEN_KEEP_CACHE);
     assert_eq!(OpenOptions::CACHE_DIR.bits(), FOPEN_CACHE_DIR);

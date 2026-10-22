@@ -263,7 +263,7 @@ daemon's libkrun backend hands the worker):
   every FUSE-level decision below. Its replies are in FUSE's vocabulary:
   inode numbers, `st_mode` bits, Linux errno values, `FOPEN_*` and
   `FUSE_*` bits, `DT_*` types, timeouts.
-- `ShareFs` (`leyline-runtime`, `vmm` feature) is libkrun's `DynFileSystem`
+- `ShareFs` (`leyline-krun-worker`, the crate that links libkrun) is libkrun's `DynFileSystem`
   over any `FsService`: it transcribes each reply into libkrun's types and
   decides nothing. `ShareFs<StoreShare<S>>` is `DynFileSystem` over
   `StoreFs` in one process; the worker uses `ShareFs<RemoteFs>`.
@@ -324,7 +324,7 @@ The mapping:
   `EIO`; a broken share socket stays broken (every later request is `EIO`).
 
 Dependency direction: this crate depends on `leyline-cli-lib`, which
-depends on `leyline-runtime` without `vmm`. The wire and `ShareFs` live in
-the runtime; this crate implements the wire's `FsService` and
+depends on `leyline-runtime`; neither links libkrun. The wire lives in the
+runtime and `ShareFs` in `leyline-krun-worker`; this crate implements the wire's `FsService` and
 `WorkspaceShares`; `leyline-cli` wires `DaemonShares` into the libkrun
 backend (`leyline execution-daemon --backend micro-vm --source <dir>`).

@@ -148,7 +148,8 @@ done
 
 # third_party/ holds vendored upstream crates (libkrun): excluded from the
 # workspace, built only as path dependencies, and their features are upstream's
-# to declare. The features LLO turns on are its own crates' (runtime/vmm).
+# to declare. LLO links them without features of its own: the libkrun crate is
+# a plain dependency of leyline-krun-worker.
 for manifest in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' -not -path './third_party/*' | sort); do
     dir=$(cd "$(dirname "$manifest")" && pwd -P)
     for feature in $(sed -n '/^\[features\]/,/^\[/p' "$manifest" \

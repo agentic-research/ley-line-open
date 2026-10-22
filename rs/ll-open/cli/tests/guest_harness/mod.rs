@@ -47,8 +47,8 @@ pub fn worker_binary() -> PathBuf {
         .join("leyline-krun-worker");
     assert!(
         path.is_file(),
-        "{} is missing: build it with `cargo build -p leyline-runtime --bin \
-         leyline-krun-worker`, or set LEYLINE_KRUN_WORKER",
+        "{} is missing: build it with `cargo build -p leyline-krun-worker`, \
+         or set LEYLINE_KRUN_WORKER",
         path.display()
     );
     path

@@ -4,8 +4,9 @@
 
 `rs/third_party/libkrun/` is libkrun built by LLO from source instead of loaded
 from an installed library (ADR-0044, bead `ley-line-open-f1c46f`). The
-`leyline-krun-worker` binary links it through `leyline-runtime`'s default
-`vmm` feature.
+unpublished `leyline-krun-worker` crate (`rs/ll-open/krun-worker`) links it
+and builds the `leyline-krun-worker` binary; no other crate depends on it
+(bead `ley-line-open-395e43`).
 
 | | |
 |---|---|

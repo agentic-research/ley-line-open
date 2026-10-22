@@ -29,7 +29,8 @@ pub struct ExecutionError {
 }
 
 impl ExecutionError {
-    pub(crate) fn invalid(detail: impl Into<String>) -> Self {
+    /// A malformed or refused request ([`ErrorCode::InvalidSpec`]).
+    pub fn invalid(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::InvalidSpec,
             retryable: false,
@@ -61,7 +62,8 @@ impl ExecutionError {
         }
     }
 
-    pub(crate) fn backend(detail: impl Into<String>) -> Self {
+    /// A backend that failed while running ([`ErrorCode::BackendFailed`]).
+    pub fn backend(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::BackendFailed,
             retryable: false,

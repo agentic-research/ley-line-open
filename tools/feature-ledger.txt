@@ -128,13 +128,3 @@ ll-open/vcs           sqlite             not-shipping    skip    -
 # Compounds 918a75, where flush_node was a silent no-op so mount writes never
 # reprojected. Remove when a round-trip test lands. mutants=skip: cli-lib has
 # its own slice, which does not enable mount.
-
-# ley-line-open-f1c46f — the linked VMM (libkrun from rs/third_party/libkrun,
-# ADR-0044). DEFAULT-ON in leyline-runtime, so every runtime build, test,
-# clippy and mutation run compiles it; it is on this ledger only because the
-# CLI depends on leyline-runtime with default features off: the CLI
-# supervises leyline-krun-worker and never links libkrun, and the worker is
-# not a release artifact yet. Move to ships-optin when a release ships the
-# worker. mutants=skip is nominal: runtime has its own slice, which runs
-# default features and so compiles the gated code.
-ll-open/runtime       vmm                not-shipping    skip    ley-line-open-f1c46f

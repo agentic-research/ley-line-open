@@ -6,18 +6,21 @@ use std::ffi::CStr;
 use std::io;
 use std::time::Duration;
 
-use super::{Attr, DirEntry, Entry, FsService, LINUX_EIO, Reply, Request};
-use crate::backends::libkrun::api::DynFileSystem;
-use crate::backends::libkrun::api::virtio_fs::filesystem::{
+use leyline_runtime::backends::libkrun::share::{
+    Attr, DirEntry, Entry, FsService, LINUX_EIO, Reply, Request,
+};
+
+use crate::api::DynFileSystem;
+use crate::api::virtio_fs::filesystem::{
     Context, DirEntry as KrunDirEntry, Entry as KrunEntry, Extensions, FsOptions, OpenOptions,
     SetattrValid,
 };
 
 /// The `stat` libkrun's server reads attributes from.
 #[cfg(target_os = "macos")]
-pub(super) type Stat = libc::stat;
+pub(crate) type Stat = libc::stat;
 #[cfg(target_os = "linux")]
-pub(super) type Stat = libc::stat64;
+pub(crate) type Stat = libc::stat64;
 
 /// A virtio-fs device whose every request `service` answers.
 pub struct ShareFs<F> {

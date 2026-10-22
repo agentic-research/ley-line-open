@@ -132,14 +132,15 @@ symlink is `0777`.
 ### Store and concurrency
 
 `Store` is the daemon's connection discipline: `with_read` on a reader pool,
-`with_write` on its one writer, and `publish` after a proposal landed. It is
-implemented for `LiveDb` (the daemon's living database; `publish` does
-nothing), `DaemonContext` (a running daemon; `publish` snapshots the living
-database into its arena, as the `propose` op does after its commit) and
-`Arc<S>`. Any number of handles stage concurrently; each proposal holds the
-writer for the propose and the checkout reconcile, as the daemon's `propose`
-op does, then publishes; a failed publish is logged and does not refuse the
-committed proposal. Of two handles that read the same blob, the first to
+`with_write` on its one writer, and `request_publish` after a proposal
+landed. It is implemented for `LiveDb` (the daemon's living database;
+`request_publish` asks nothing), `DaemonContext` (a running daemon;
+`request_publish` wakes the daemon's publisher, as the `propose` op does
+after its commit, bead `ley-line-open-8c8ded`) and `Arc<S>`. Any number of
+handles stage concurrently; each proposal holds the writer for the propose
+and the checkout reconcile, as the daemon's `propose` op does, then requests
+a publish and returns: the publisher coalesces every proposal landed before
+it runs, off the writer. Of two handles that read the same blob, the first to
 flush lands and the second merges with it: it lands when the two changed
 different lines, and is `ESTALE` when they overlap.
 
@@ -243,10 +244,10 @@ carries `mtime`, since the Unix epoch; the adapter reports it as `st_atime`,
   carries none; see "File times" for the times reported); extended
   attributes; hard links; locks.
 - DAX (ADR-0044 V3): the core serves reads per request.
-- Publication beyond `Store::publish`: an accepted proposal is committed to
-  the living database and visible to its readers at once, and the store's
-  `publish` runs after it (a `DaemonContext` snapshots to its arena; a bare
-  `LiveDb` publishes nothing).
+- Publication beyond `Store::request_publish`: an accepted proposal is
+  committed to the living database and visible to its readers at once; the
+  arena image follows when the daemon's publisher runs (a bare `LiveDb`
+  requests nothing).
 - Under a path grant, a directory's LOOKUP or GETATTR scans `_tree` for a
   visible file under it.
 

@@ -441,8 +441,9 @@ struct ProposeResponse {
   refusal         @3 :ProposalRefusal;
   error           @4 :Text;
   # ok only: a step after the commit that failed (the head write, an index
-  # build, the publish). The proposal is applied; the head or the published
-  # snapshot may lag it until the next write or reparse advances them.
+  # build, the checkout). The proposal is applied; the head may lag it until
+  # the next write or reparse advances it. The arena image follows through
+  # the daemon's publisher, never in this reply.
   postCommitError @5 :Text  $Json.name("post_commit_error");
   # ok only: the written paths whose base had moved and whose content is
   # the three-way merge with what the path held (ADR-0045 T5); what landed

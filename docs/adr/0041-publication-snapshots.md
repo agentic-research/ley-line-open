@@ -43,6 +43,38 @@ before deserialising it (T2.3, `fs/src/lib.rs:69-119`).
 
 `VerifiedArena` and verify-on-fault (`fs/src/verified.rs`) have no production caller.
 
+### Amendment (2026-10-22) — shipped interim: one publisher, off the writer
+
+Bead `ley-line-open-8c8ded`. The share benchmark
+([2026-10-20](../benchmarks/2026-10-20-share-path.md)) measured ~15 s to create one small file in
+the guest on a 2,034-file store: every landed proposal published inline, on the `live.db` writer
+lock. A profile of `op_propose` on a 3,080-file store (1.3 GB `live.db`) put the time in that
+publish: 53% in `write_grown_arena` (a new 2.6 GB arena file, although the image had grown by a few
+KiB: the resize sized the buffer to the image, so any growth after a resize rewrote the arena) and
+36% in a single-threaded BLAKE3 of the image. This ships ahead of S1–S6; nothing below changes what
+`current_root` names (BLAKE3 over one exact serialized image), and the decisions below stay Proposed.
+
+- **A proposal requests a publish; it does not publish.** `propose` and storefs's FLUSH commit to
+  `live.db` and call `LiveDb::request_publish`. A proposal is durable once committed (WAL,
+  `synchronous=NORMAL`; warm start opens `live.db` first), so the reply waits for the commit only.
+  Out-of-process readers see it after the publisher's next publish; `snapshot` publishes on demand.
+- **One publisher, off the writer** (S5's daemon half; H5). Every daemon publish goes through
+  `publish_living_db`: it holds `LiveDb::publish_lock` from the serialize to the root advance and
+  reads the image through a pool connection, one read transaction, so the image is one committed
+  state and proposals commit while it is written. The daemon's publisher task wakes on a request
+  or the 500 ms tick and publishes once for every commit since its last publish
+  (`publish_if_dirty`). `op_load` writes the arena under the same lock. The ops whose reply
+  promises a published image (`reparse`, `enrich`, `snapshot`) and the watcher's reparse publish
+  before replying or emitting, as before.
+- **The arena grows with headroom.** `arena_size_for` keeps the arena while the image fits a buffer
+  and otherwise allocates buffers a quarter larger than the image, so a growing database resizes
+  O(log n) times.
+- **The image root hashes across cores.** `image_root` is `blake3::Hasher::update_rayon`, which
+  yields the bytes `ContentAddressed::hash` yields (tested across chunk sizes).
+
+A publish still costs one serialize, write and hash of the whole database; it no longer sits on any
+proposal's path. S2's immutable snapshot files remove that cost.
+
 ______________________________________________________________________
 
 ## Decision

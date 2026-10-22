@@ -886,6 +886,10 @@ enum InMemory<'a> {
 /// under; a proposal's pass projects under it (ADR-0045 T3).
 pub(crate) const PROJECTION_LANGUAGE_KEY: &str = "projection_language";
 
+/// `_meta` key of the unbound-reference count the head records, kept with
+/// the rows it counts (bead `ley-line-open-8c8ded`).
+pub const UNBOUND_FACTS_KEY: &str = "unbound_facts";
+
 /// What a pass read from memory changes in the manifest beyond file bytes
 /// (ADR-0045 T1): a written file's mode (absent: the entry's current mode,
 /// or regular for a new file), and directories made and removed.
@@ -2304,14 +2308,33 @@ fn parse_into_conn_with(
     // `create_post_load_indexes` runs — so no second connection contends for
     // the db lock. Whole-db
     // count, so it stays correct if a later run reparses only part of the tree.
-    let unbound_facts: u64 = conn
-        .query_row(
-            "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n as u64)
-        .unwrap_or(0);
+    //
+    // The count scans every reference: O(store). It is a function of
+    // node_refs and node_defs alone, and a pass changes those only when it
+    // parses or deletes a file; any other pass (a proposal of a file the
+    // parse does not project) reuses the count recorded with the rows, in
+    // this transaction's `_meta` (bead `ley-line-open-8c8ded`).
+    let facts_changed = !to_parse.is_empty() || deleted > 0;
+    let recorded = if facts_changed {
+        None
+    } else {
+        get_meta(conn, UNBOUND_FACTS_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let unbound_facts: u64 = match recorded {
+        Some(n) => n,
+        None => conn
+            .query_row(
+                "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .unwrap_or(0),
+    };
+    set_meta(conn, UNBOUND_FACTS_KEY, &unbound_facts.to_string())?;
 
     // Pre-grab the db_path so we can dispatch the head-write hash pass
     // (pure filesystem work, reads ast.capnp + source.capnp) on a worker

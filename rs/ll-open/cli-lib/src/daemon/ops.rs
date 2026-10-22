@@ -124,7 +124,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
     let result: Result<String> = match req {
         BaseRequest::Status => op_status(ctx),
         BaseRequest::Flush => op_flush(&ctx.ctrl_path),
-        BaseRequest::Load { db } => op_load(&ctx.ctrl_path, &db),
+        BaseRequest::Load { db } => op_load(ctx, &db),
         BaseRequest::Query { sql, limit } => op_query(ctx, &sql, limit),
         BaseRequest::Reparse {
             source,
@@ -598,12 +598,19 @@ fn op_flush(ctrl_path: &Path) -> Result<String> {
     Ok(capnp_json::to_json(reader)?)
 }
 
-fn op_load(ctrl_path: &Path, db_b64: &str) -> Result<String> {
+fn op_load(ctx: &DaemonContext, db_b64: &str) -> Result<String> {
     use base64::Engine;
+    let ctrl_path = ctx.ctrl_path.as_path();
     let db_bytes = base64::engine::general_purpose::STANDARD
         .decode(db_b64)
         .context("invalid base64 in \"db\" field")?;
-    crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
+    {
+        // The arena has one writer at a time: a load writes the inactive
+        // buffer the daemon's publisher also writes (bead
+        // `ley-line-open-8c8ded`).
+        let _publisher = ctx.live_db.publish_lock.lock();
+        crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
+    }
     let current_root = read_root_hex(ctrl_path)?;
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::load_response::Builder = builder.init_root();
@@ -4665,6 +4672,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, PROPOSE_A2.as_bytes());
+        // The proposal requested a publish and did not wait for one (bead
+        // `ley-line-open-8c8ded`); the publisher's next image carries it.
+        assert_eq!(
+            Controller::open_or_create(&ctx.ctrl_path)
+                .unwrap()
+                .current_root(),
+            root_before,
+            "the proposal did not publish inline"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.live_db.publish_requested.notified(),
+        )
+        .await
+        .expect("the applied proposal requested a publish");
+        let snap = call(&ctx, serde_json::json!({"op": "snapshot"}));
+        assert_eq!(snap["ok"], true, "{snap}");
         assert_ne!(
             Controller::open_or_create(&ctx.ctrl_path)
                 .unwrap()
@@ -4674,10 +4698,11 @@ mod tests {
         );
     }
 
-    /// Bead `ley-line-open-5db28e`: a publish that fails after the proposal
-    /// committed is reported beside it, not in place of it.
+    /// Beads `ley-line-open-5db28e`, `ley-line-open-8c8ded`: a publish that
+    /// fails after a proposal committed fails the publish, never the
+    /// proposal. The proposal stays applied and readable.
     #[tokio::test]
-    async fn propose_reports_an_applied_proposal_as_applied_when_its_publish_fails() {
+    async fn a_failed_publish_leaves_an_applied_proposal_applied() {
         let (dir, ctx) = setup_parsed();
         let nowhere = dir.path().join("missing-dir").join("x.arena");
         Controller::open_or_create(&ctx.ctrl_path)
@@ -4691,10 +4716,9 @@ mod tests {
             ]}),
         );
         assert_eq!(r["ok"], true, "{r}");
-        assert!(
-            r["post_commit_error"].as_str().unwrap().contains("publish"),
-            "{r}"
-        );
+        assert!(r.get("post_commit_error").is_none(), "{r}");
+        let snap = call(&ctx, serde_json::json!({"op": "snapshot"}));
+        assert_ne!(snap["ok"], true, "the publish into a missing arena fails: {snap}");
         let written = call(
             &ctx,
             serde_json::json!({"op": "read_source", "path": "a.go"}),

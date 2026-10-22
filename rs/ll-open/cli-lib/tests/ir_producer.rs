@@ -509,6 +509,98 @@ fn head_records_unbound_facts_parity() {
     );
 }
 
+/// The head's `unboundFacts` for the file-backed db at `db_path`.
+fn head_unbound_facts(db_path: &Path) -> u64 {
+    use leyline_schema_capnp::head_capnp::head;
+    let bytes = fs::read(db_path.with_extension("head.capnp")).expect("head.capnp");
+    let mut slice: &[u8] = &bytes;
+    let msg =
+        capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new()).unwrap();
+    let h: head::Reader = msg.get_root().unwrap();
+    h.get_unbound_facts()
+}
+
+fn recount_unbound(conn: &rusqlite::Connection) -> u64 {
+    conn.query_row(
+        "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap() as u64
+}
+
+/// Bead `ley-line-open-8c8ded`: a pass that changes no reference or
+/// definition reuses the recorded count instead of scanning every
+/// reference, and the head stays exact across passes that do change them.
+#[test]
+fn unbound_facts_stay_exact_across_passes_that_do_and_do_not_change_facts() {
+    let src = create_go_fixture();
+    let out = TempDir::new().unwrap();
+    let db_path = out.path().join("test.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let parse = |scope: &[&str]| {
+        let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+        leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), Some(&scope))
+            .unwrap();
+    };
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    assert_eq!(head_unbound_facts(&db_path), 1, "println has no def");
+
+    // A file the parse does not project: no fact changes.
+    fs::write(src.path().join("notes.txt"), "notes\n").unwrap();
+    parse(&["notes.txt"]);
+    assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+    assert_eq!(head_unbound_facts(&db_path), 1);
+
+    // A call to a function nothing defines: one more unbound reference.
+    fs::write(
+        src.path().join("extra.go"),
+        "package main\n\nfunc extra() { missing() }\n",
+    )
+    .unwrap();
+    parse(&["extra.go"]);
+    assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+    assert_eq!(head_unbound_facts(&db_path), 2);
+
+    // Defining it elsewhere binds the reference.
+    fs::write(src.path().join("defs.go"), "package main\n\nfunc missing() {}\n").unwrap();
+    parse(&["defs.go"]);
+    assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+    assert_eq!(head_unbound_facts(&db_path), 1);
+
+    // Deleting the definition unbinds it again.
+    fs::remove_file(src.path().join("defs.go")).unwrap();
+    parse(&["defs.go"]);
+    assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+    assert_eq!(head_unbound_facts(&db_path), 2);
+}
+
+/// The carried count is the one recorded with the rows, not a recount:
+/// with the record set to a marker, a pass that changes no fact reports the
+/// marker.
+#[test]
+fn a_pass_that_changes_no_facts_carries_the_recorded_unbound_count() {
+    let src = create_go_fixture();
+    let out = TempDir::new().unwrap();
+    let db_path = out.path().join("test.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+    conn.execute(
+        "UPDATE _meta SET value = '999' WHERE key = ?1",
+        [leyline_cli_lib::cmd_parse::UNBOUND_FACTS_KEY],
+    )
+    .unwrap();
+    fs::write(src.path().join("notes.txt"), "notes\n").unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(
+        &conn,
+        src.path(),
+        Some("go"),
+        Some(&["notes.txt".to_string()]),
+    )
+    .unwrap();
+    assert_eq!(head_unbound_facts(&db_path), 999);
+}
+
 #[test]
 fn retired_symbols_and_fact_edges_tables_are_gone() {
     // B3: the eager symbols/fact_edges tables are deleted. Neither may be

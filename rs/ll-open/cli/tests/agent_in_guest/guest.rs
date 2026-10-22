@@ -16,7 +16,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 extern "C" {
     fn close(fd: i32) -> i32;
@@ -379,16 +379,37 @@ fn main() {
             ),
         );
     };
+    // git's racy-clean check compares the index file's mtime (the guest's
+    // clock) with each entry's (the share's, the host's clock): a guest clock
+    // ahead of the host's hides a same-second edit (bead
+    // `ley-line-open-f8138d`). The time the guest reads before a save is
+    // never later than the time the share records for it.
+    let saved = |r: &mut Report, text: &str| {
+        let before = SystemTime::now();
+        let result = save("m.go", text);
+        if result.is_ok() {
+            let recorded = fs::metadata("m.go").and_then(|m| m.modified());
+            r.check(
+                "m",
+                recorded.as_ref().is_ok_and(|&at| before <= at),
+                format!(
+                    "the guest's clock before the save ({before:?}) is not later than the \
+                     share's mtime for it ({recorded:?})"
+                ),
+            );
+        }
+        result
+    };
     // The index takes m.go's stat here.
     m_status(&mut r, "before any edit", "");
-    match save("m.go", seed::M_ONE) {
+    match saved(&mut r, seed::M_ONE) {
         Ok(()) => m_status(&mut r, "after the first same-size edit", " M m.go"),
         Err(error) => r.fail("m", error),
     }
     let (ok, added) = git(&["add", "m.go"]);
     r.check("m", ok, format!("git add m.go: exit ok={ok} {added:?}"));
     m_status(&mut r, "after git add (the index takes the edit's stat)", "M  m.go");
-    match save("m.go", seed::M_TWO) {
+    match saved(&mut r, seed::M_TWO) {
         Ok(()) => m_status(&mut r, "after the second same-size edit", "MM m.go"),
         Err(error) => r.fail("m", error),
     }

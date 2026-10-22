@@ -2977,10 +2977,16 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
+    // The host's wall clock as the command line is built. The guest's RTC
+    // reads whole seconds, so a guest that took its time from it alone would
+    // start up to half a second off the host; init sets the clock from this
+    // value plus the guest's time since boot instead, which is never later
+    // than the host's time (see init.c, set_realtime_from_host).
+    let realtime_ns = utils::time::get_time(utils::time::ClockType::Real);
     let kernel_cmdline = KernelCmdlineConfig {
         prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
         krun_env: Some(format!(
-            " {} {} {} {} {}",
+            " {} {} {} {} KRUN_REALTIME_NS={realtime_ns} {}",
             ctx_cfg.get_exec_path(),
             ctx_cfg.get_workdir(),
             ctx_cfg.get_block_root(),

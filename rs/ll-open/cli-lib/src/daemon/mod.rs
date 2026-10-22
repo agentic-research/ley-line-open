@@ -158,8 +158,10 @@ pub struct DaemonContext {
     ///
     /// The downside is that long sync work blocks the tokio worker thread.
     /// Mitigations:
-    /// - Periodic snapshot timer uses `try_snapshot_or_log` (try_lock + skip)
-    ///   so it doesn't queue behind a long reparse.
+    /// - The publisher (`cmd_daemon::publish_living_db`) reads through the
+    ///   pool under its own lock, never the writer, and its dirty check
+    ///   (`publish_if_dirty`) try_locks the writer and skips while it is
+    ///   held, so it doesn't queue behind a long reparse.
     /// - Future op_reparse refactor: wrap the lock+work in
     ///   `tokio::task::spawn_blocking` to move the blocking work to the
     ///   blocking pool. Tracked as a follow-up under 5fea4e.

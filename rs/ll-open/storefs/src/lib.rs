@@ -263,13 +263,12 @@ pub trait Store: Send + Sync {
     fn with_read<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T>;
     fn with_write<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T>;
 
-    /// Publish the store after a proposal landed, as the daemon's
-    /// `propose` op does after its commit: out-of-process readers see the
-    /// change. A failure does not undo the proposal; the next publish
-    /// serializes the whole store. The default publishes nothing.
-    fn publish(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
+    /// Ask for the store to be published after a proposal landed, as the
+    /// daemon's `propose` op does after its commit: out-of-process readers
+    /// see the change once the publisher runs. Returns at once; the
+    /// publisher coalesces every proposal landed before it runs (bead
+    /// `ley-line-open-8c8ded`). The default asks nothing.
+    fn request_publish(&self) {}
 }
 
 /// The daemon's living database: its reader pool and its single writer.
@@ -296,8 +295,8 @@ impl<S: Store> Store for Arc<S> {
         S::with_write(self, f)
     }
 
-    fn publish(&self) -> anyhow::Result<()> {
-        S::publish(self)
+    fn request_publish(&self) {
+        S::request_publish(self)
     }
 }
 
@@ -1309,9 +1308,7 @@ impl<S: Store> StoreFs<S> {
         if let Some(problem) = &accepted.post_commit_error {
             log::warn!("proposal to '{named}' landed; after it: {problem}");
         }
-        if let Err(e) = self.store.publish() {
-            log::warn!("proposal to '{named}' landed; publishing it failed: {e:#}");
-        }
+        self.store.request_publish();
         let now = self.clock.now();
         // What each landed path is now, as the guest will be served it.
         let mut landed: Vec<(String, Seen)> = Vec::new();

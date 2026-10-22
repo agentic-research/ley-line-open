@@ -66,7 +66,10 @@ leyline-sign = { path = "../sign", features = ["root-signer"] }
 capnp = { workspace = true }
 # daemon wire codec (see daemon/wire.rs and ADR-0014 interim status).
 capnp-json = { workspace = true }
-blake3 = { workspace = true }
+# `rayon`: a published image's `current_root` is hashed across cores
+# (`cmd_daemon::image_root`, bead ley-line-open-8c8ded); same bytes as
+# `blake3::hash`.
+blake3 = { workspace = true, features = ["rayon"] }
 # MCP wire auth (ADR-0022 / bead ley-line-open-b885d1). Constant-time
 # token comparison + random token generation + hex encoding.
 subtle = "2"

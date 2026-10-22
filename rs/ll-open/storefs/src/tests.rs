@@ -371,11 +371,10 @@ fn an_accepted_flush_lands_in_the_store_and_advances_the_handles_base() {
     assert_eq!(read_all(&f, reopened), A_OTHER.as_bytes());
 }
 
-/// A store that counts [`Store::publish`] calls, and fails them when asked.
+/// A store that counts [`Store::request_publish`] calls.
 struct Publishing {
     inner: Arc<LiveDb>,
     published: std::sync::atomic::AtomicUsize,
-    fail: bool,
 }
 
 impl Store for Publishing {
@@ -387,52 +386,40 @@ impl Store for Publishing {
         self.inner.with_write(f)
     }
 
-    fn publish(&self) -> anyhow::Result<()> {
+    fn request_publish(&self) {
         self.published
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.fail {
-            anyhow::bail!("the arena is full");
-        }
-        Ok(())
     }
 }
 
 #[test]
-fn each_landed_proposal_is_published_and_a_refused_one_is_not() {
-    for fail in [false, true] {
-        let f = fixture(whole());
-        let store = Arc::new(Publishing {
-            inner: Arc::clone(f.fs.store()),
-            published: Default::default(),
-            fail,
-        });
-        let fs = StoreFs::new(Arc::clone(&store), whole(), Options::default());
-        let a = fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.inode;
-        let published = || store.published.load(std::sync::atomic::Ordering::SeqCst);
-
-        // Another writer changed the same line: the flush is refused.
-        let stale = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
-        other_writer(&f, "a.go", A_OTHER);
-        fs.write(stale, 0, A_EDIT.as_bytes()).unwrap();
-        assert_eq!(fs.flush(stale), Err(Errno::ESTALE));
-        assert_eq!(published(), 0, "a refused proposal publishes nothing");
-        fs.release(stale);
-
-        let h = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
-        fs.write(h, 0, A_EDIT.as_bytes()).unwrap();
-        // A failed publish does not refuse what the store committed: the
-        // daemon reports it after the commit, and the next publish repairs it.
-        assert_eq!(fs.flush(h), Ok(()), "fail={fail}");
-        assert_eq!(published(), 1);
-        assert_eq!(read_source(&f, "a.go").0, A_EDIT.as_bytes());
-        assert_eq!(fs.flush(h), Ok(()));
-        assert_eq!(published(), 1, "nothing staged: no proposal, no publish");
-        fs.unlink(ROOT_INODE, b"a.go").unwrap();
-        assert_eq!(published(), 2, "a delete is a landed proposal");
-    }
-    // The default publishes nothing and succeeds.
+fn each_landed_proposal_requests_a_publish_and_a_refused_one_does_not() {
     let f = fixture(whole());
-    assert!(f.fs.store().publish().is_ok());
+    let store = Arc::new(Publishing {
+        inner: Arc::clone(f.fs.store()),
+        published: Default::default(),
+    });
+    let fs = StoreFs::new(Arc::clone(&store), whole(), Options::default());
+    let a = fs.lookup(ROOT_INODE, b"a.go").unwrap().attr.inode;
+    let published = || store.published.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Another writer changed the same line: the flush is refused.
+    let stale = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
+    other_writer(&f, "a.go", A_OTHER);
+    fs.write(stale, 0, A_EDIT.as_bytes()).unwrap();
+    assert_eq!(fs.flush(stale), Err(Errno::ESTALE));
+    assert_eq!(published(), 0, "a refused proposal requests nothing");
+    fs.release(stale);
+
+    let h = fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
+    fs.write(h, 0, A_EDIT.as_bytes()).unwrap();
+    assert_eq!(fs.flush(h), Ok(()));
+    assert_eq!(published(), 1);
+    assert_eq!(read_source(&f, "a.go").0, A_EDIT.as_bytes());
+    assert_eq!(fs.flush(h), Ok(()));
+    assert_eq!(published(), 1, "nothing staged: no proposal, no request");
+    fs.unlink(ROOT_INODE, b"a.go").unwrap();
+    assert_eq!(published(), 2, "a delete is a landed proposal");
 }
 
 #[test]

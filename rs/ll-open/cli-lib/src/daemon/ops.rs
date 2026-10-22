@@ -495,26 +495,19 @@ pub(crate) fn read_root_hex(ctrl_path: &Path) -> Result<String> {
     Ok(s)
 }
 
-/// Acquire the living-db lock and snapshot to the arena. Used by every
-/// state-changing op (reparse, enrich, snapshot) to publish the latest
-/// db image to mache/remote consumers.
+/// Publish the living db to the arena before replying. Used by the ops
+/// whose reply promises a published image (reparse, enrich, snapshot);
+/// a proposal requests a publish instead and does not wait for it.
 ///
-/// **Lock window:** the write lock is held for the *full* duration of
-/// `snapshot_to_arena`, which serializes the entire SQLite database to
-/// the on-disk arena (a disk write proportional to db size). This is
-/// not a cheap window. Concurrent readers and writers block until the
-/// snapshot completes. Don't add work inside this function expecting
-/// the lock to be held briefly — it isn't. If we ever want concurrent
-/// reads during snapshot, the path is `serialize_with_flags(NO_COPY)`
-/// followed by an out-of-lock disk write, but that's a deliberate
-/// refactor, not something to assume here. Doc rewritten after iter-35
-/// adversarial review caught the previous false minimal-lock claim.
+/// **Lock window:** the publish costs one serialize, write and hash of
+/// the whole database. It holds the single-publisher lock, not the
+/// writer, and reads one committed state through a pool connection:
+/// readers and proposals proceed while it runs (bead
+/// `ley-line-open-8c8ded`). A second publish waits for this one.
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
-    // Snapshot classified as `with_write`: `conn.serialize("main")` needs
-    // exclusive access to the DB (SQLite serialize takes an internal
-    // schema-write lock). Bead `ley-line-open-ba8294` Phase 2 intent-
-    // marking; behavior identical under today's Mutex.
-    ctx.with_write(|conn| crate::cmd_daemon::snapshot_to_arena(conn, &ctx.ctrl_path))
+    // The daemon's one publish path: a pool read transaction under the
+    // single-publisher lock, off the writer (bead `ley-line-open-8c8ded`).
+    crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,10 +1204,13 @@ fn parse_write(w: ProposedWriteInput) -> Result<crate::source_write::Proposed> {
 /// three ways, and the merged paths are named (`merged`). A refusal carries
 /// its typed reason (`refusal`); a stale one names every path that moved,
 /// with the lines a conflicting merge overlapped. An applied proposal is
-/// published so out-of-process readers see it, and is reported applied
-/// even when a step after its commit (the head write, an index build, the
-/// publish) fails: that failure rides in `post_commit_error` (beads
-/// `ley-line-open-5db28e`, `ley-line-open-5dc3a5`).
+/// durable once committed to the living db; the daemon's publisher puts it
+/// in the arena for out-of-process readers with whatever else lands before
+/// that publish (bead `ley-line-open-8c8ded`), and `snapshot` publishes on
+/// demand. It is reported applied even when a step after its commit (the
+/// head write, an index build) fails: that failure rides in
+/// `post_commit_error` (beads `ley-line-open-5db28e`,
+/// `ley-line-open-5dc3a5`).
 fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
     use crate::source_write::{Grant, Refusal};
     let writes: Result<Vec<_>> = req.writes.into_iter().map(parse_write).collect();
@@ -1245,9 +1241,8 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
         builder.init_root();
     match outcome {
         Ok((accepted, checkout)) => {
-            // Publish whatever happened after the commit: the rows are
-            // committed, and a publish that fails here is repaired by the
-            // next one, which serializes the whole database.
+            // Report whatever happened after the commit: the rows are
+            // committed whatever the steps after it did.
             let mut post_commit: Vec<String> = accepted.post_commit_error.into_iter().collect();
             match checkout {
                 Some(Ok(reconciled)) => post_commit.extend(reconciled.problems()),
@@ -1256,9 +1251,10 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
                 )),
                 None => {}
             }
-            if let Err(e) = snapshot_living_db(ctx) {
-                post_commit.push(format!("publish after a committed proposal failed: {e:#}"));
-            }
+            // The arena image follows through the daemon's publisher, which
+            // coalesces every proposal landed since its last publish (bead
+            // `ley-line-open-8c8ded`); `snapshot` publishes on demand.
+            ctx.live_db.request_publish();
             root.set_ok(true);
             root.set_tree_root(accepted.tree_root.to_string());
             let mut blobs = root.reborrow().init_blobs(accepted.blobs.len() as u32);

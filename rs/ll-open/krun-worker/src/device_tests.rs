@@ -612,10 +612,7 @@ fn the_wire_bits_are_libkruns_fuse_bits() {
         FsOptions::from_bits_truncate(FUSE_DO_READDIRPLUS),
         FsOptions::DO_READDIRPLUS
     );
-    assert_eq!(
-        FsOptions::WRITEBACK_CACHE.bits(),
-        FUSE_WRITEBACK_CACHE
-    );
+    assert_eq!(FsOptions::WRITEBACK_CACHE.bits(), FUSE_WRITEBACK_CACHE);
     assert_eq!(OpenOptions::DIRECT_IO.bits(), FOPEN_DIRECT_IO);
     assert_eq!(OpenOptions::KEEP_CACHE.bits(), FOPEN_KEEP_CACHE);
     assert_eq!(OpenOptions::CACHE_DIR.bits(), FOPEN_CACHE_DIR);

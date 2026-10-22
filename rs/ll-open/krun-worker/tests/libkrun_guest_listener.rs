@@ -111,6 +111,10 @@ fn probe_listener_exposure(hijack_inet: bool) {
         format!(
             r#"use std::io::Write;
 fn main() {{
+    // Printed before the bind, so a run that stalls says whether the guest
+    // started at all.
+    println!("listener-probe-start");
+    std::io::stdout().flush().unwrap();
     let listener = match std::net::TcpListener::bind(("0.0.0.0", {GUEST_PORT})) {{
         Ok(listener) => listener,
         Err(error) => {{
@@ -277,10 +281,18 @@ fn main() {{
             );
         }
         Err(_) => {
+            // Ending the worker closes the console, so the reader hands back
+            // everything the guest printed before it stalled.
             let _ = child.kill();
             let _ = child.wait();
+            let console = match report_rx.recv() {
+                Ok(Err(console)) => console,
+                Ok(Ok(report)) => format!("(report arrived after the bound: {report})"),
+                Err(_) => "(console reader ended without output)".to_owned(),
+            };
             panic!(
-                "FAILED: no bind report from the guest within {REPORT_BOUND:?}.\nworker stderr:\n{}",
+                "FAILED: no bind report from the guest within {REPORT_BOUND:?}.\nconsole:\n{console}\n\
+                 worker stderr:\n{}",
                 stderr_rest.join().unwrap_or_default()
             );
         }

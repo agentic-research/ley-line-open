@@ -19,7 +19,7 @@ leyline-cli-lib = { path = "../cli-lib", default-features = false }
 leyline-core = { path = "../../ll-core/core" }
 # The share wire (`backends::libkrun::share`): the request and reply types the
 # adapter answers, and the workspace-share seam the libkrun backend calls.
-# The daemon serves shares; it never links the VMM (leyline-krun-worker does).
+# Without `vmm`: the daemon serves shares; it never links the VMM.
 leyline-runtime = { path = "../runtime", default-features = false }
 anyhow = { workspace = true }
 log = { workspace = true }

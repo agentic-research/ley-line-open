@@ -264,7 +264,7 @@ upper filesystem (xattrs, whiteouts, rename) are unmeasured.
 
 | Phase | Scope | Bead | Status |
 |---|---|---|---|
-| A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib; re-pinned to v1.19.6 with the same patches (`397fa6`), and CI checks the vendored tree (`396d77`) | `f1c46f` | Done (#464) |
+| A | LLO builds its own VMM from vendored libkrun v1.19.4 plus the custom-fs patch; the runtime links it instead of loading the Homebrew dylib; re-pinned to v1.19.6 with the same patches (`397fa6`), and CI checks the vendored tree (`396d77`); the worker is its own unpublished crate, `leyline-krun-worker`, so `leyline-runtime` has no libkrun dependency and no `vmm` feature (`395e43`) | `f1c46f` | Done (#464) |
 | B | the store-backed `DynFileSystem`: reads from the checkout's ref, writes as proposals, refusals as Linux errno | `f1ea99` | Done (#463) |
 | C | agents run in a guest whose working tree is that share; the end-to-end scenarios run inside the guest; V-F2 and V-F3 measured | `f210c2` | Done on macOS/HVF: the in-guest scenarios pass (below). V-F3 was measured by the spike harness (`docs/benchmarks/2026-10-15-vf3-virtiofs.md`); the daemon's share is measured by `share_bench` (`docs/benchmarks/2026-10-20-share-path.md`, bead `39d3a4`); V-F2 (dtrace) is not measured; Linux/KVM not run |
 

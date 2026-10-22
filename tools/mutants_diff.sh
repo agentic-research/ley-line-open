@@ -44,7 +44,7 @@ test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
 # same drift class `ley-line-open-cb1e29` collapsed the feature ledger to fix.
 #
 # Format: `<scope>=<package>[,<package>...]`. Everything below derives from it.
-MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge'
+MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime,ll-open/krun-worker cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge'
 
 # Every package owned by SOME package slice — i.e. exactly what the generic
 # slice must exclude. Each MUST be claimed by a slice of its own below. A
@@ -529,6 +529,7 @@ LEDGER_ROWS
             $exclude_file_args \
             --exclude 'll-open/fs/**' \
             --exclude 'll-open/runtime/**' \
+            --exclude 'll-open/krun-worker/**' \
             --exclude 'll-open/cli-lib/**' \
             --exclude 'll-open/cli/**' \
             --exclude 'll-open/schema-bridge/**'
@@ -538,6 +539,7 @@ LEDGER_ROWS
             $exclude_file_args \
             --exclude 'll-open/fs/**' \
             --exclude 'll-open/runtime/**' \
+            --exclude 'll-open/krun-worker/**' \
             --exclude 'll-open/cli-lib/**' \
             --exclude 'll-open/cli/**' \
             --exclude 'll-open/schema-bridge/**'
@@ -562,6 +564,13 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then
   if package_changed_in_diff ll-open/runtime; then
     claim_package ll-open/runtime
     run_slice integration --package leyline-runtime --test-workspace=false
+  fi
+  # The worker crate (bead ley-line-open-395e43) is the runtime's libkrun half:
+  # its api.rs and worker.rs are asserted by its own tests/, which the
+  # lib-only generic slice would never run.
+  if package_changed_in_diff ll-open/krun-worker; then
+    claim_package ll-open/krun-worker
+    run_slice integration --package leyline-krun-worker --test-workspace=false
   fi
 fi
 

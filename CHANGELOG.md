@@ -12,6 +12,22 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: the microVM worker is its own crate; `leyline-runtime` has no
+  libkrun and no `vmm` feature** (bead `ley-line-open-395e43`). The
+  `leyline-krun-worker` binary, the libkrun API (`api::LinkedKrunApi`,
+  `KrunApi`, `prepare_vm`, `PreparedVm`, `DynFileSystem`, `virtio_fs`), the
+  share device (`ShareFs`) and the VM half of the worker
+  (`execute_with_ready`) move to the unpublished `leyline-krun-worker` crate
+  (`rs/ll-open/krun-worker`), the only one that links the vendored libkrun.
+  `leyline-runtime` keeps the worker's options, descriptor checks, events and
+  a new `worker::prepare`, which does everything before the VMM and returns a
+  `PreparedRun`. The runtime's `vmm` feature is removed: `cargo package -p
+  leyline-runtime` no longer fails on libkrun's path-only dependency, and a
+  default-features build of the runtime no longer compiles libkrun or needs
+  `CC_LINUX`. Build the worker with `cargo build -p leyline-krun-worker`.
+  `KRUN_TSI_HIJACK_INET` moves to `backends::libkrun::plan` (re-exported by
+  the worker crate's `api`), and `ExecutionError::invalid` and
+  `ExecutionError::backend` are public.
 - **The workspace share's frame header is Cap'n Proto, and the shipped
   share path is measured** (bead `ley-line-open-39d3a4`).
   - Each FUSE request the `leyline-krun-worker` forwards to the daemon, and

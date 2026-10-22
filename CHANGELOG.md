@@ -27,7 +27,9 @@ context, scoping notes, and review history are recoverable.
   `CC_LINUX`. Build the worker with `cargo build -p leyline-krun-worker`.
   `KRUN_TSI_HIJACK_INET` moves to `backends::libkrun::plan` (re-exported by
   the worker crate's `api`), and `ExecutionError::invalid` and
-  `ExecutionError::backend` are public.
+  `ExecutionError::backend` are public. `worker::execute`, which nothing
+  called, is removed; `execute_with_ready` and
+  `execute_from_reader_with_events` remain.
 - **The workspace share's frame header is Cap'n Proto, and the shipped
   share path is measured** (bead `ley-line-open-39d3a4`).
   - Each FUSE request the `leyline-krun-worker` forwards to the daemon, and

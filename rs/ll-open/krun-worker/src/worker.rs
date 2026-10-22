@@ -33,10 +33,6 @@ pub fn execute_from_reader_with_events(
     })
 }
 
-pub fn execute(options: WorkerOptions, request: &ExecutionRequest) -> Result<(), ExecutionError> {
-    execute_with_ready(options, request, |_| Ok(()))
-}
-
 /// Prepare the run (checked, planned, confined), build its VM with the
 /// workspace share attached, report readiness through `on_ready`, and enter
 /// the VM. A successful entry does not return: libkrun exits the process

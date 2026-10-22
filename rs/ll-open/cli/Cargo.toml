@@ -15,7 +15,7 @@ path = "src/main.rs"
 # download at first use) stay opt-in to keep the default build portable.
 default = ["lsp", "validate", "hdc", "cdc", "sheaf"]
 lsp = ["leyline-cli-lib/lsp"]
-mount = ["leyline-cli-lib/mount"]
+mount = ["leyline-storefs/mount"]
 vec = ["leyline-cli-lib/vec"]
 validate = ["leyline-cli-lib/validate"]
 hdc = ["leyline-cli-lib/hdc"]

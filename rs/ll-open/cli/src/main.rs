@@ -1,6 +1,6 @@
 //! Thin binary wrapper for ley-line (open edition).
 //!
-//! Shared commands (parse, splice, serve, load, inspect, lsp) live in
+//! Shared commands (parse, splice, load, inspect, lsp) live in
 //! `leyline_cli_lib::Commands`. The `Daemon` variant is defined here so
 //! ley-line (private) can define its own extended Daemon without conflict.
 
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use leyline_cli_lib::cmd_serve;
+use leyline_cli_lib::lifecycle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ExecutionBackendKind {
@@ -42,6 +42,22 @@ impl WorkspaceFreshness {
             window: Duration::from_millis(self.workspace_change_window_ms),
         }
     }
+}
+
+/// What serves `daemon --mount`: the store's filesystem behind the host's
+/// FUSE or NFS client (bead `ley-line-open-3e73dc`), in a `mount` build.
+#[cfg(feature = "mount")]
+fn host_mount() -> Option<leyline_cli_lib::cmd_daemon::HostMountRef> {
+    Some(leyline_cli_lib::cmd_daemon::HostMountRef(Arc::new(
+        leyline_storefs::host::DaemonHostMount::new(leyline_storefs::Freshness::default()),
+    )))
+}
+
+/// A build without `mount` has nothing to serve `daemon --mount`; the daemon
+/// refuses the flag.
+#[cfg(not(feature = "mount"))]
+fn host_mount() -> Option<leyline_cli_lib::cmd_daemon::HostMountRef> {
+    None
 }
 
 #[derive(Subcommand)]
@@ -158,7 +174,7 @@ enum Cmd {
         mount: Option<PathBuf>,
 
         /// Filesystem backend: "nfs" or "fuse".
-        #[arg(long, default_value_t = cmd_serve::default_backend())]
+        #[arg(long, default_value_t = lifecycle::default_backend())]
         backend: String,
 
         /// NFS listen port (0 = auto-assign).
@@ -370,7 +386,7 @@ async fn main() -> Result<()> {
                 arena_size_mib: 64,
                 control,
                 mount: None,
-                backend: cmd_serve::default_backend(),
+                backend: lifecycle::default_backend(),
                 nfs_port: 0,
                 language,
                 timeout: None,
@@ -531,6 +547,7 @@ async fn main() -> Result<()> {
                 Arc::new(leyline_cli_lib::daemon::NoExt),
                 leyline_cli_lib::cmd_daemon::DaemonOptions {
                     cdc: cdc.then_some(cdc_target),
+                    host_mount: host_mount(),
                     ..Default::default()
                 },
             )

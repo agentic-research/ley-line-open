@@ -42,7 +42,7 @@ and `NID_ORDINAL_MASK`.
   keyed by a file and how (`FileKey::NidRange` with its extra nid columns,
   `FileKey::FileId`, or `FileKey::SourcePath`); `delete_file_rows`,
   `delete_file_rows_by_id`, `move_file_rows` and
-  `refresh_source_paths_under_dir` iterate it. A splice, a mount `rm` or
+  `refresh_source_paths_under_dir` iterate it. A splice, a graph `rm` or
   `mv`, and a scoped reparse all go through these; `table_exists` probes
   the optional sidecars.
 - **`SQLITE_MAX_BOUND_PARAMS`** — the one bound-parameter ceiling every

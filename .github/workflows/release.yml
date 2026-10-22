@@ -171,14 +171,10 @@ jobs:
       # ---- FFI staticlib (consumed by mache's release build) ----
       # mache links `libleyline_fs-<os>-<arch>.a` + `leyline_fs.h` to build
       # its NFS-backed binaries (mache-55d3e1 / ley-line-open-c33b9a). Built
-      # with leyline-fs defaults (validate, fuse, nfs) plus explicit `cdc`, so
-      # mache's cgo reads use the same materialize-on-read path validated by
-      # this release. Only the 3 platforms in mache's release matrix carry
-      # `lib_asset`; darwin-amd64 is skipped.
-      - name: Install FUSE deps (staticlib only)
-        if: matrix.lib_asset
-        run: task deps:fuse
-
+      # with leyline-fs defaults (validate) plus explicit `cdc`, so mache's
+      # cgo reads use the same materialize-on-read path validated by this
+      # release. leyline-fs links no libfuse. Only the 3 platforms in mache's
+      # release matrix carry `lib_asset`; darwin-amd64 is skipped.
       - name: Build leyline-fs staticlib
         if: matrix.lib_asset
         env:

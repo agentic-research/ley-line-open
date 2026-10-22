@@ -37,8 +37,8 @@ before deserialising it (T2.3, `fs/src/lib.rs:69-119`).
 | The header flips before `current_root` publishes; a fresh reader in the window is refused. Three LLO sites, plus mache's `ArenaFlusher` and ley-line's net receiver | `1eefe3` | `cmd_daemon.rs` snapshot; `fs/src/graph.rs` `flush_to_arena`; `cmd_load.rs`; mache `graph/arena_writer.go:229-252`; ley-line `crates/net/src/receiver.rs:347-377` |
 | Growing the arena in place while buffer B was active moved B under its readers | `5a0f07` | fixed by `write_grown_arena` (#436); the double buffer stays a hazard |
 | A publisher killed mid-publish leaves the seqlock odd; readers spin | `0a8c14` | `core/src/control.rs:128-186`, `:278-300`, `:408-419` |
-| Every FUSE fsync publishes a full image | — | `fs/src/fuse.rs` → `graph.rs` → `snapshot_to_arena` |
-| Two arena writers run outside the `live.db` writer lock | — | `op_load` (`cmd_load.rs`); `leyline serve` (`HotSwapGraph::flush_to_arena`) |
+| Every host-mount save publishes a full image | — | storefs `StoreFs::propose` → `Store::publish` → `snapshot_to_arena` (since ADR-0045 T8; before, `fs/src/fuse.rs` → `graph.rs`) |
+| An arena writer runs outside the `live.db` writer lock | — | `op_load` (`cmd_load.rs`); `leyline serve`'s `HotSwapGraph::flush_to_arena` was the second, removed with `serve` (ADR-0045 T8) |
 | The warm-start fallback hydrates `live.db` from the arena with no root check | — | `cmd_daemon.rs` `try_warm_start_from_arena` |
 
 `VerifiedArena` and verify-on-fault (`fs/src/verified.rs`) have no production caller.
@@ -154,7 +154,8 @@ on control block v3 in v0.20.5 (`0a8c14`, mache's reader mirrors it); v4 keeps i
 
 ### S5 — One producer
 
-Only the daemon's projection writer (or `leyline serve`, which runs the same writer) publishes.
+Only the daemon's projection writer publishes (`leyline serve`, which ran the same writer, is
+removed: ADR-0045 T8).
 `op_load` and `cmd_load.rs` are removed — loading a corpus is a proposal of its files. mache's
 writable control mode stops writing arena images and proposes through the daemon (`mache-0fed77`).
 ley-line's net receiver stops writing an arena and submits what it received as a proposal. The

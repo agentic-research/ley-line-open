@@ -16,6 +16,45 @@ requests from `StoreFs`, and `DaemonShares` serves an execution/v1 run's
 granted workspace from the daemon's own store (ADR-0044 phase C, bead
 `ley-line-open-f210c2`); see "Adapter" below.
 
+## The host mount (`mount` feature)
+
+The same `StoreFs` serves `leyline daemon --mount` (ADR-0045 T8, bead
+`ley-line-open-3e73dc`): `host::fuse::HostFuse` behind the host's FUSE client
+(Linux; macOS with macFUSE or fuse-t) and `host::nfs::HostNfs`, a loopback
+NFSv3 server on `nessie-nfsserve`, behind the host's NFS client (the macOS
+default). A host process sees what a guest sees and writes by the same
+rules; the `leyline` binary injects the mount into the daemon as
+`host::DaemonHostMount`.
+
+- **FUSE** translates the host's `open(2)` and `renamex_np(2)` flags into
+  Linux's and the Linux errno values that differ (`ESTALE`, `ENOTEMPTY`,
+  `ENOSYS`) into the host's.
+- **NFS** has no OPEN or CLOSE: the server keeps one write handle per file
+  id. A READ with nothing staged rereads it, so the bytes the client takes
+  are its base. A WRITE is checked against the store at once and refused
+  `NFS3ERR_STALE` exactly when its COMMIT would be, because the macOS client
+  reports a refused WRITE and ignores a refused COMMIT. A SETATTR of the size
+  stages unchecked (a save truncates before it writes); a truncate with no
+  WRITE after it lands once it has stood idle. CREATE lands the empty file
+  at once. A refused WRITE or COMMIT voids the client's save: the handle
+  drops what it staged, keeps its base, and refuses every WRITE, SETATTR
+  of the size and COMMIT until a READ takes the store's bytes (macOS sets
+  the file's length after a refused WRITE; that changes nothing).
+- **Writers.** The merge and `ESTALE` decide between writers with their
+  own handles: a guest's virtio-fs session, a FUSE open, a socket proposal.
+  Two processes through one NFS mount share the host's one NFS client and
+  its page cache; NFSv3 has no open state, so the server sees one client
+  and cannot tell that one process wrote over an older read. The last save
+  wins: the other process's edit is lost, overlapping or not (bead
+  `ley-line-open-5ec040`, a session per writer). macOS FUSE through fuse-t
+  is an NFS server to the kernel's client; its writer separation is not
+  measured.
+- **macOS gate.** `host::mount_nfs` refuses Tahoe before 26.7 and Sequoia
+  before 15.8: their NFS client corrupts kernel memory on server replies
+  (CVE-2026-43686, CVE-2026-84549; bead `ley-line-open-2d49ce`).
+- The NFS client's attribute cache is one second (`actimeo=1`); every open
+  revalidates (close-to-open).
+
 ## Contract
 
 | Request | Answer |

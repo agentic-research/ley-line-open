@@ -10,14 +10,10 @@ pub mod blob_chunked;
 /// chunks instead of re-materializing the whole file. Opt-in (`--features cdc`).
 #[cfg(feature = "cdc")]
 pub mod chunked;
-#[cfg(feature = "fuse")]
-pub mod fuse;
 /// Explicit reachability garbage collection for unreferenced CDC chunks.
 #[cfg(feature = "cdc")]
 pub mod gc;
 pub mod graph;
-#[cfg(feature = "nfs")]
-pub mod nfs;
 pub mod staging;
 pub mod validate;
 /// Verify-on-fault serving of the arena payload against the Σ root — the

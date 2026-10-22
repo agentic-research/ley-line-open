@@ -1,14 +1,12 @@
-//! Serve command — create arena, mount via NFS or FUSE, wait for shutdown.
+//! What a long-running command sets up and waits on: the arena and its
+//! controller, the mount backend a platform defaults to, and the signals
+//! and timeout that end it.
 
 use std::path::{Path, PathBuf};
-#[cfg(feature = "mount")]
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use leyline_core::{Controller, create_arena};
-#[cfg(feature = "mount")]
-use leyline_fs::graph::HotSwapGraph;
 
 /// Return the default filesystem backend for the current platform.
 ///
@@ -83,176 +81,6 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     }
 
     Ok(ctrl_path)
-}
-
-/// Where the NFS export listens: loopback, on `port` (0 picks one). The export
-/// is unauthenticated and writable, and [`mount_nfs_cmd`] reaches it at
-/// 127.0.0.1, so nothing off this host has a reason to reach it.
-pub fn nfs_listen_addr(port: u16) -> String {
-    format!("127.0.0.1:{port}")
-}
-
-/// Shell out to mount_nfs (macOS) or mount.nfs (Linux) to mount `server`'s
-/// export; the returned guard owns the server, and dropping it unmounts and
-/// then stops the server.
-#[cfg(feature = "mount")]
-pub fn mount_nfs_cmd(server: leyline_fs::nfs::NfsServer, mountpoint: &Path) -> Result<NfsMount> {
-    let port = server.port();
-    std::fs::create_dir_all(mountpoint)
-        .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
-
-    let mount_path = mountpoint
-        .canonicalize()
-        .unwrap_or_else(|_| mountpoint.to_path_buf());
-
-    let nfs_opts =
-        format!("nolocks,vers=3,tcp,rsize=131072,wsize=131072,port={port},mountport={port}");
-    let mount_str = mount_path.to_string_lossy();
-
-    let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("mount_nfs")
-            .args(["-o", &nfs_opts, "127.0.0.1:/", &mount_str])
-            .status()
-            .context("spawn mount_nfs")?
-    } else {
-        std::process::Command::new("mount.nfs")
-            .args(["-o", &nfs_opts, "127.0.0.1:/", &mount_str])
-            .status()
-            .context("spawn mount.nfs")?
-    };
-
-    if !status.success() {
-        anyhow::bail!("NFS mount failed with exit code {:?}", status.code());
-    }
-    Ok(NfsMount {
-        path: mount_path,
-        unmount: unmount_nfs,
-        _server: server,
-    })
-}
-
-#[cfg(feature = "mount")]
-/// Main serve entry point.
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_serve(
-    arena: &Path,
-    arena_size_mib: u64,
-    control: Option<&Path>,
-    mount: &Path,
-    backend: &str,
-    nfs_port: u16,
-    language: Option<&str>,
-    timeout: Option<&str>,
-) -> Result<()> {
-    // Calculate arena size from MiB.
-    let arena_bytes = arena_size_mib * 1024 * 1024;
-
-    // Set up arena and controller.
-    let ctrl_path = setup_arena(arena, arena_bytes, control)?;
-
-    // Build the HotSwapGraph. An edit to a parsed file goes through the one
-    // write path (ADR-0040 D3); `serve` owns its arena, so the whole grant.
-    let graph = HotSwapGraph::new(ctrl_path)?.with_source_writer(Arc::new(
-        crate::source_write::MountWriter {
-            grant: crate::source_write::Grant::Whole,
-            checkout: None,
-        },
-    ))?;
-
-    // Optionally enable validation with the requested language.
-    let graph = if let Some(lang_ext) = language {
-        let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
-            .with_context(|| format!("unsupported language: {lang_ext}"))?;
-        graph.with_validation(Some(ts_lang))
-    } else {
-        graph.with_writable()
-    };
-
-    let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
-
-    let mounted = mount_backend(graph, mount, backend, nfs_port).await?;
-    wait_for_shutdown(timeout).await?;
-    drop(mounted);
-
-    Ok(())
-}
-
-/// A mount this process holds while it serves. Dropping it unmounts: the
-/// FUSE session's own drop, or `umount` for an NFS mount. Held for the whole
-/// serve; before, the daemon dropped its FUSE session at the end of the arm
-/// that created it, and nothing ever unmounted NFS, so the daemon exited
-/// leaving the kernel holding a mount whose server was gone.
-#[cfg(feature = "mount")]
-pub enum Mounted {
-    Nfs(NfsMount),
-    Fuse(leyline_fs::fuse::FuseSession),
-}
-
-/// An NFS mount this process made and the server behind it. Dropping it
-/// unmounts — the kernel flushes the client's last writes to the server —
-/// and then drops the server, which commits them before the drop returns.
-/// So the daemon's final snapshot, taken after this drop, holds every write.
-#[cfg(feature = "mount")]
-pub struct NfsMount {
-    path: PathBuf,
-    /// [`unmount_nfs`] in every real mount; a test substitutes a recorder.
-    unmount: fn(&Path) -> Result<()>,
-    /// Dropped after `Drop::drop` has unmounted (fields drop after it).
-    _server: leyline_fs::nfs::NfsServer,
-}
-
-#[cfg(feature = "mount")]
-impl Drop for NfsMount {
-    fn drop(&mut self) {
-        if let Err(e) = (self.unmount)(&self.path) {
-            eprintln!("warn: {e:#}");
-        }
-    }
-}
-
-/// Unmount an NFS mount: `umount`, then `umount -f` if the first refuses.
-#[cfg(feature = "mount")]
-pub fn unmount_nfs(path: &Path) -> Result<()> {
-    for args in [&[][..], &["-f"][..]] {
-        let status = std::process::Command::new("umount")
-            .args(args)
-            .arg(path)
-            .status()
-            .context("spawn umount")?;
-        if status.success() {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("could not unmount {}", path.display())
-}
-
-/// Mount `graph` at `mount` on `backend` ("nfs" or "fuse") and return the
-/// guard that unmounts it.
-#[cfg(feature = "mount")]
-pub async fn mount_backend(
-    graph: Arc<dyn leyline_fs::graph::Graph>,
-    mount: &Path,
-    backend: &str,
-    nfs_port: u16,
-) -> Result<Mounted> {
-    std::fs::create_dir_all(mount)
-        .with_context(|| format!("create mountpoint {}", mount.display()))?;
-    match backend {
-        "nfs" => {
-            let listen_addr = nfs_listen_addr(nfs_port);
-            let server = leyline_fs::nfs::serve_nfs(graph, &listen_addr).await?;
-            eprintln!("NFS server listening on port {}", server.port());
-            let mounted = mount_nfs_cmd(server, mount)?;
-            eprintln!("mounted at {}", mount.display());
-            Ok(Mounted::Nfs(mounted))
-        }
-        "fuse" => {
-            let session = leyline_fs::fuse::mount_fuse(graph, mount)?;
-            eprintln!("FUSE mounted at {}", mount.display());
-            Ok(Mounted::Fuse(session))
-        }
-        other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
-    }
 }
 
 /// What ended a [`ShutdownSignals::wait`].
@@ -340,66 +168,10 @@ pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Everything `serve` does before it mounts — arena, control block,
-    /// graph with its source writer, mountpoint — runs, and an unknown
-    /// backend is then refused by name rather than served.
-    #[cfg(feature = "mount")]
-    #[tokio::test]
-    async fn serve_builds_its_graph_then_refuses_an_unknown_backend() {
-        let dir = tempfile::tempdir().unwrap();
-        let mount = dir.path().join("mnt");
-        let err = cmd_serve(
-            &dir.path().join("a.arena"),
-            1,
-            None,
-            &mount,
-            "carrier-pigeon",
-            0,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("unknown backend: carrier-pigeon"),
-            "{err:#}"
-        );
-        assert!(
-            mount.is_dir(),
-            "the mountpoint is created before the backend is chosen"
-        );
-    }
-
-    /// Unmounting a directory nothing is mounted on fails, naming it, after
-    /// both `umount` and `umount -f` refuse — it does not report success.
     /// Tests that install the process-wide signal handlers run one at a time:
     /// the SIGTERM test signals the whole process, which would end another
     /// test's wait early.
     static SIGNAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Dropping an NFS mount unmounts its own path — the daemon and `serve`
-    /// rely on the drop alone to leave no mount behind.
-    #[cfg(feature = "mount")]
-    #[tokio::test]
-    async fn dropping_an_nfs_mount_unmounts_its_path() {
-        use std::sync::Mutex;
-        static UNMOUNTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-        fn record(path: &Path) -> Result<()> {
-            UNMOUNTED.lock().unwrap().push(path.to_path_buf());
-            Ok(())
-        }
-        let graph = Arc::new(leyline_fs::graph::MemoryGraph::new());
-        let server = leyline_fs::nfs::serve_nfs(graph, &nfs_listen_addr(0))
-            .await
-            .unwrap();
-        let path = PathBuf::from("/nonexistent/leyline-test-mount");
-        drop(NfsMount {
-            path: path.clone(),
-            unmount: record,
-            _server: server,
-        });
-        assert_eq!(*UNMOUNTED.lock().unwrap(), vec![path]);
-    }
 
     /// A timeout that does not parse is refused before anything waits, and a
     /// valid one is waited out rather than returning at once.
@@ -410,28 +182,6 @@ mod tests {
         let started = std::time::Instant::now();
         wait_for_shutdown(Some("1")).await.unwrap();
         assert!(started.elapsed() >= Duration::from_secs(1));
-    }
-
-    #[cfg(feature = "mount")]
-    #[test]
-    fn unmounting_what_is_not_mounted_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = unmount_nfs(dir.path()).unwrap_err();
-        assert!(
-            format!("{err:#}").contains(&dir.path().display().to_string()),
-            "{err:#}"
-        );
-    }
-
-    /// The NFS export is unauthenticated and writable, and the mount reaches
-    /// it at 127.0.0.1, so it listens on loopback only. It listened on
-    /// 0.0.0.0, serving the arena — and since ADR-0040 D3 writes into it —
-    /// to every host that could reach the port.
-    #[test]
-    fn the_nfs_export_listens_on_loopback_only() {
-        let addr: std::net::SocketAddr = nfs_listen_addr(2049).parse().unwrap();
-        assert!(addr.ip().is_loopback(), "{addr}");
-        assert_eq!(addr.port(), 2049);
     }
 
     /// The timeout ends the wait, and SIGTERM — what `docker stop`, launchd
@@ -499,7 +249,7 @@ mod tests {
         assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
         assert_eq!(parse_duration("0").unwrap(), Duration::from_secs(0));
 
-        // Trim handles surrounding whitespace (line 30 `s.trim()`).
+        // Trim handles surrounding whitespace (`s.trim()`).
         assert_eq!(parse_duration("  5m  ").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("\t30s\n").unwrap(), Duration::from_secs(30));
 

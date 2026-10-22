@@ -149,4 +149,24 @@ exclude_re = [
     # would remove the mutants by removing the optimisation, and hoisting it
     # into a helper only relocates them.
     'root_signer\.rs.*(delete ! in verify_head|replace == with != in verify_head)',
+
+    # The host FUSE adapter's flag translations (storefs `host/fuse_abi.rs`,
+    # bead `ley-line-open-3e73dc`), each `|` (or `|=`) mutated to `^` (`^=`).
+    #
+    # The `observe_exit` case again: every operand pair is disjoint by
+    # construction. `linux_open_flags` ors the access mode — `host &
+    # O_ACCMODE`, bits 0o3 — with Linux `O_TRUNC`, 0o1000. In
+    # `macos_rename_flags`, `RENAME_SWAP | RENAME_EXCL` is 0x2 and 0x4, and
+    # `linux` starts at 0 and takes `RENAME_NOREPLACE` (0x1),
+    # `RENAME_EXCHANGE` (0x2) and `UNKNOWN_RENAME_FLAG` (1 << 31) at most once
+    # each. For operands with no bits in common `a | b` and `a ^ b` are the
+    # same integer, so the mutated function returns the same flags for every
+    # input; there is no difference to assert on.
+    #
+    # Writing them as `+` would trade a true statement for one that breaks the
+    # day two flags overlap; the bitwise-or is the correct expression. The
+    # sibling mutations (`| -> &`, `&= / |=` swaps, `!= -> ==`) change the
+    # result and are killed by `host_open_flags_reach_the_filesystem_in_linux_values`
+    # and `macos_rename_flags_reach_the_filesystem_in_linux_values`.
+    'fuse_abi\.rs.*replace (\| with \^|\|= with \^=) in (linux_open_flags|macos_rename_flags)',
 ]

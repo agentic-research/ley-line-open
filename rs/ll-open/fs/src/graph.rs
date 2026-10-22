@@ -9,10 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use leyline_core::mmap::{mmap_read, mmap_write};
 use leyline_core::{ArenaHeader, ContentAddressed, Controller};
-// Used by the splice path (an edit's base, `batch_splice`'s invalidation);
-// importing it unconditionally would warn on leaner builds.
-#[cfg(feature = "splice")]
-use rusqlite::OptionalExtension;
 
 use crate::SqliteGraph;
 use rusqlite::Connection;
@@ -27,19 +23,11 @@ pub struct Node {
     pub mtime_nanos: i64,
 }
 
-/// Whose edit a write belongs to. An edit is checked against the bytes its
-/// author read (ADR-0042 P2), so a graph that keeps edits in progress keeps
-/// one per handle: FUSE opens one per `open(2)`; NFSv3 has no opens and
-/// writes as [`MOUNT_HANDLE`].
-pub type Handle = u64;
-
-/// The handle the methods that name none act as: NFS, tests and every
-/// caller outside a FUSE open.
-pub const MOUNT_HANDLE: Handle = 0;
-
-/// Abstract graph interface for the FUSE layer.
+/// The nodes-table graph: the projection's tree, by display path.
 ///
-/// Read methods are required; write methods default to EROFS.
+/// Read methods are required; write methods default to EROFS. A store (a
+/// database with `_source`) is written only through
+/// `leyline_cli_lib::source_write`; its nodes refuse every write here.
 pub trait Graph: Send + Sync {
     fn get_node(&self, id: &str) -> Result<Option<Node>>;
     fn lookup_child(&self, parent_id: &str, name: &str) -> Result<Option<Node>>;
@@ -77,15 +65,6 @@ pub trait Graph: Send + Sync {
         Ok(out)
     }
 
-    /// Whether directory `id`'s mtime moves every time its entries change.
-    /// An NFSv3 client keeps a cached listing for as long as the directory's
-    /// mtime is unchanged, so a server may report a directory's stored mtime
-    /// only when this holds; otherwise it must report a moving one. Default:
-    /// no.
-    fn mtime_tracks_entries(&self, _id: &str) -> Result<bool> {
-        Ok(false)
-    }
-
     fn write_content(&self, _id: &str, _data: &[u8], _offset: u64) -> Result<usize> {
         anyhow::bail!("read-only filesystem")
     }
@@ -100,86 +79,6 @@ pub trait Graph: Send + Sync {
     }
     fn rename_node(&self, _id: &str, _new_parent_id: &str, _new_name: &str) -> Result<()> {
         anyhow::bail!("read-only filesystem")
-    }
-
-    /// Take the base the [`MOUNT_HANDLE`] edit to node `id` is made against:
-    /// the hash of its file's bytes now (ADR-0042 P2). A FUSE open for
-    /// writing takes its own handle's ([`Self::note_base_as`]), so a change
-    /// that lands while it is open is caught at flush; the first write takes
-    /// it otherwise. Default no-op.
-    fn note_base(&self, _id: &str) -> Result<()> {
-        Ok(())
-    }
-
-    /// The [`MOUNT_HANDLE`] is about to serve node `id`'s bytes to a client
-    /// (an NFS READ): its base for `id`'s file becomes the hash of the
-    /// file's bytes now, unless it has an edit to that file in progress,
-    /// which keeps the base it was made against (bead
-    /// `ley-line-open-6116c9`). NFSv3 has no open to take a base at, and a
-    /// client holds its writes until fsync, so the read is the last point
-    /// the server knows which bytes the client has. Called before the
-    /// bytes are read, so a change landing in between leaves the base
-    /// older than what the client got: the edit is refused, never landed
-    /// over a change the client did not read. Default no-op.
-    fn note_read(&self, _id: &str) -> Result<()> {
-        Ok(())
-    }
-
-    /// Flush pending splice for a node (called on FUSE flush/NFS write completion).
-    /// Default no-op; implementations with splice support override.
-    fn flush_node(&self, _id: &str) -> Result<()> {
-        Ok(())
-    }
-
-    /// [`Self::note_base`] for the edit made through `handle`: each open
-    /// handle edits against its own base (bead `ley-line-open-5da276`).
-    /// Default: the handle is ignored.
-    fn note_base_as(&self, _handle: Handle, id: &str) -> Result<()> {
-        self.note_base(id)
-    }
-
-    /// [`Self::write_content`] into the edit made through `handle`. Another
-    /// handle's edit to the same node is a separate edit. Default: the
-    /// handle is ignored.
-    fn write_content_as(
-        &self,
-        _handle: Handle,
-        id: &str,
-        data: &[u8],
-        offset: u64,
-    ) -> Result<usize> {
-        self.write_content(id, data, offset)
-    }
-
-    /// [`Self::read_content`] through `handle`: the handle's own edit in
-    /// progress, if it has one, and the stored node otherwise. Default: the
-    /// handle is ignored.
-    fn read_content_as(
-        &self,
-        _handle: Handle,
-        id: &str,
-        buf: &mut [u8],
-        offset: u64,
-    ) -> Result<usize> {
-        self.read_content(id, buf, offset)
-    }
-
-    /// [`Self::truncate`] as the edit made through `handle`. Default: the
-    /// handle is ignored.
-    fn truncate_as(&self, _handle: Handle, id: &str) -> Result<()> {
-        self.truncate(id)
-    }
-
-    /// [`Self::flush_node`] for the edit made through `handle`, checked
-    /// against that handle's base. Default: the handle is ignored.
-    fn flush_node_as(&self, _handle: Handle, id: &str) -> Result<()> {
-        self.flush_node(id)
-    }
-
-    /// The handle is closed: drop its edits in progress and its bases.
-    /// Default no-op.
-    fn release(&self, _handle: Handle) -> Result<()> {
-        Ok(())
     }
 
     /// Batch splice: apply multiple edits atomically (ADR-007 commit path).
@@ -229,165 +128,17 @@ pub trait Graph: Send + Sync {
 /// method therefore translates at the SQL layer: `resolve_path` on the way in,
 /// rendered names on the way out. Display names are NOT stored per AST row,
 /// so listings join `v_node_name`.
-/// Where an adapter's connections come from when it is NOT a private copy
-/// of an arena image: a live, file-backed WAL database owned by someone else
-/// (the daemon), which hands out pooled read connections and its single
-/// writer, and publishes on request.
 ///
-/// ADR-0040 D4 (bead `ley-line-open-f2ee9f`). The daemon's in-process mount
-/// used to deserialise its own copy of the arena and publish from that copy,
-/// so a mount write never reached `live.db` and was dropped on the next
-/// snapshot (bead `192018`), and every save cost four image-sized copies on
-/// the reader side (bead `af6c9d`). Through this trait the mount reads what
-/// the daemon's socket readers read, with zero copies, and writes through
-/// the one writer the daemon's own ops use, so SQLite's WAL is the only
-/// consistency mechanism and there is one writer per arena.
-///
-/// Object-safe on purpose: `leyline-fs` does not know the pool type.
-pub trait LiveSource: Send + Sync {
-    /// A read connection. Pooled; `query_only` is the implementor's business.
-    fn reader(&self) -> Result<Box<dyn std::ops::Deref<Target = Connection> + '_>>;
-    /// THE write connection, exclusively, for the guard's lifetime.
-    fn writer(&self) -> Box<dyn std::ops::DerefMut<Target = Connection> + '_>;
-    /// Publish the live database to out-of-process consumers (the arena and
-    /// its control block). Called from the mount's `fsync`.
-    fn publish(&self) -> Result<()>;
-}
-
-/// The one write path (ADR-0040 D3, bead `ley-line-open-f2ffbd`) that a
-/// mount hands an edited file's new bytes to. `leyline-fs` computes the
-/// bytes of a node edit and nothing else: storing them, re-projecting the
-/// file through the cold parse and recomputing `treeRoot` belong to the
-/// implementor (`leyline_cli_lib::source_write`), which owns the parse.
-/// The grant is the implementor's too.
-#[cfg(feature = "splice")]
-pub trait SourceWriter: Send + Sync {
-    /// Write `bytes` as the content of the file whose `_source.id` is
-    /// `source_id`, on `conn` — the adapter's writer connection. `base` is
-    /// the hash of the file's bytes the edit was made against (ADR-0042
-    /// P2); when it is set and the file no longer holds those bytes, the
-    /// write is refused with [`StaleWrite`]. `None` writes unconditionally.
-    fn write(
-        &self,
-        conn: &Connection,
-        source_id: &str,
-        bytes: Vec<u8>,
-        base: Option<leyline_core::Hash>,
-    ) -> Result<()>;
-}
-
-/// A mount edit refused because its file moved since the edit began: the
-/// file no longer holds the bytes the edit was made against. A mount answers
-/// it with `ESTALE` rather than a generic I/O error.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StaleWrite {
-    pub source_id: String,
-    /// The hash of the bytes the edit was made against.
-    pub expected: leyline_core::Hash,
-    /// The hash of the bytes the file holds now.
-    pub current: leyline_core::Hash,
-}
-
-impl std::fmt::Display for StaleWrite {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "edit to '{}' refused: the file moved since the edit began (edited {}, now {})",
-            self.source_id, self.expected, self.current
-        )
-    }
-}
-
-impl std::error::Error for StaleWrite {}
-
-/// A private in-memory copy of an arena image: one writer, a pool of
-/// deserialised readers refreshed from the writer's bytes after each write.
-/// What `leyline serve`, FFI and tests use.
-struct ImagePool {
+/// The adapter is a private in-memory copy of an arena image: one writer, a
+/// pool of deserialised readers refreshed from the writer's bytes after each
+/// write. What FFI, vcs and tests use.
+pub struct SqliteGraphAdapter {
     writer: Mutex<SqliteGraph>,
     readers: ArrayQueue<(SqliteGraph, u64)>,
     /// Cached serialized bytes for creating new readers on pool exhaustion.
     reader_bytes: Mutex<Vec<u8>>,
     /// Bumped on each write; readers stamped with stale generations are dropped.
     reader_gen: AtomicU64,
-}
-
-/// The adapter's connection backing.
-enum Backing {
-    /// See [`ImagePool`].
-    Image(Box<ImagePool>),
-    /// Somebody else's live database (see [`LiveSource`]).
-    Live(Arc<dyn LiveSource>),
-}
-
-/// Exclusive access to the writer connection, whichever backing holds it.
-pub(crate) enum WriterGuard<'a> {
-    Image(parking_lot::MutexGuard<'a, SqliteGraph>),
-    Live(Box<dyn std::ops::DerefMut<Target = Connection> + 'a>),
-}
-
-impl WriterGuard<'_> {
-    pub(crate) fn conn(&self) -> &Connection {
-        match self {
-            WriterGuard::Image(g) => g.conn(),
-            WriterGuard::Live(b) => b,
-        }
-    }
-}
-
-pub struct SqliteGraphAdapter {
-    backing: Backing,
-    /// Default tree-sitter language for extensionless files (e.g. `source`).
-    #[cfg(feature = "validate")]
-    default_language: Option<tree_sitter::Language>,
-    /// Shadow copy of content saved on truncate, restored on validation failure.
-    /// Key: node ID, Value: old content before truncate.
-    #[cfg(feature = "validate")]
-    shadow: Mutex<HashMap<String, String>>,
-    /// The bytes of each edit in progress to a node of a parsed file, keyed
-    /// by node id and then by the [`Handle`] making it: the node's record
-    /// with every write through that handle applied. They stay here, not in
-    /// `nodes.record`, until the flush hands the spliced file to the source
-    /// writer: the projection rows are a function of the stored source, and
-    /// anything that publishes the database before the flush lands must not
-    /// carry half an edit (bead `ley-line-open-5d8246`). A read through the
-    /// handle sees its edit; every other read sees the stored node. Two
-    /// handles' edits never share bytes (bead `ley-line-open-5da276`).
-    #[cfg(feature = "splice")]
-    pending: Mutex<HashMap<String, HashMap<Handle, Vec<u8>>>>,
-    /// The base of each edit, keyed by handle and `_source.id`: the hash of
-    /// the file's bytes the handle read (ADR-0042 P2). Taken by
-    /// `note_base_as` (a FUSE open for writing), by `note_read` (an NFS
-    /// READ, for the mount handle, re-taken by each READ while the handle
-    /// has no edit to the file in progress) or by the handle's first write
-    /// when it has none, and handed to the source writer on flush, which
-    /// refuses the edit when the file holds other bytes. After a flush
-    /// lands, the handle's base is the file it wrote; it is kept while the
-    /// handle has another edit to the file in progress, which was made
-    /// against the old bytes. A refused edit leaves the base in place. A
-    /// FUSE handle's bases go at `release`. The mount handle has no
-    /// release: it holds at most one base per file, replaced in place, so
-    /// its entries are bounded by the files it has served (bead
-    /// `ley-line-open-6116c9`).
-    #[cfg(feature = "splice")]
-    bases: Mutex<HashMap<(Handle, String), leyline_core::Hash>>,
-    /// Where an edit to a parsed file goes. Without one, such an edit is
-    /// refused rather than reported as done.
-    #[cfg(feature = "splice")]
-    source_writer: Option<Arc<dyn SourceWriter>>,
-}
-
-/// Write `data` into `content` at `offset`, extending it with zeros when the
-/// write starts or ends past its end.
-#[cfg(feature = "splice")]
-fn patch(content: &mut Vec<u8>, data: &[u8], offset: u64) -> Result<()> {
-    let off = usize::try_from(offset).context("write offset exceeds usize")?;
-    let end = off
-        .checked_add(data.len())
-        .context("write offset + length overflow")?;
-    content.resize(content.len().max(end), 0);
-    content[off..end].copy_from_slice(data);
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,21 +156,6 @@ pub(crate) enum WriteRefreshOutcome {
         rehashed: usize,
         bytes_scanned: usize,
     },
-}
-
-impl WriteRefreshOutcome {
-    /// The outcome of a write that touched no stored content.
-    #[cfg(feature = "splice")]
-    fn untouched() -> Self {
-        #[cfg(feature = "cdc")]
-        {
-            WriteRefreshOutcome::Skipped
-        }
-        #[cfg(not(feature = "cdc"))]
-        {
-            WriteRefreshOutcome::Disabled
-        }
-    }
 }
 
 impl SqliteGraphAdapter {
@@ -443,147 +179,21 @@ impl SqliteGraphAdapter {
                 let _ = readers.push((reader, 0));
             }
         }
-        Self::with_backing(Backing::Image(Box::new(ImagePool {
+        Self {
             writer: Mutex::new(graph),
             readers,
             reader_bytes: Mutex::new(bytes),
             reader_gen: AtomicU64::new(0),
-        })))
-    }
-
-    fn with_backing(backing: Backing) -> Self {
-        Self {
-            backing,
-            #[cfg(feature = "validate")]
-            default_language: None,
-            #[cfg(feature = "validate")]
-            shadow: Mutex::new(HashMap::new()),
-            #[cfg(feature = "splice")]
-            pending: Mutex::new(HashMap::new()),
-            #[cfg(feature = "splice")]
-            bases: Mutex::new(HashMap::new()),
-            #[cfg(feature = "splice")]
-            source_writer: None,
         }
     }
 
-    /// Route edits to parsed files through `writer` (ADR-0040 D3).
-    #[cfg(feature = "splice")]
-    pub fn set_source_writer(&mut self, writer: Arc<dyn SourceWriter>) {
-        self.source_writer = Some(writer);
-    }
-
-    /// Hand a file's new bytes to the source writer, or refuse.
-    #[cfg(feature = "splice")]
-    fn write_source(
-        &self,
-        conn: &Connection,
-        source_id: &str,
-        bytes: Vec<u8>,
-        base: Option<leyline_core::Hash>,
-    ) -> Result<()> {
-        let writer = self.source_writer.as_ref().with_context(|| {
-            format!("edit to '{source_id}' refused: this mount has no source writer")
-        })?;
-        writer.write(conn, source_id, bytes, base)
-    }
-
-    /// The `file_id` and `_source.id` of the parsed file `nid` belongs to, or
-    /// `None` for a node outside any parsed file.
-    #[cfg(feature = "splice")]
-    fn source_of(conn: &Connection, nid: i64) -> Result<Option<(i64, String)>> {
-        let Some(file_id) = leyline_schema::nid_file_id(nid) else {
-            return Ok(None);
-        };
-        let has_sources: bool = conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_source')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !has_sources {
-            return Ok(None);
-        }
-        let source_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM _source WHERE file_id = ?1",
-                [file_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(source_id.map(|s| (file_id, s)))
-    }
-
-    /// Whether node `id` belongs to the parsed file `file_id`.
-    #[cfg(feature = "splice")]
-    fn in_file(conn: &Connection, id: &str, file_id: i64) -> bool {
-        leyline_schema::resolve_path(conn, id)
-            .ok()
-            .flatten()
-            .and_then(leyline_schema::nid_file_id)
-            == Some(file_id)
-    }
-
-    /// Whether `handle` has an edit in progress to a node of `file_id`.
-    #[cfg(feature = "splice")]
-    fn edits_file(&self, conn: &Connection, handle: Handle, file_id: i64) -> bool {
-        self.pending
-            .lock()
-            .iter()
-            .any(|(id, edits)| edits.contains_key(&handle) && Self::in_file(conn, id, file_id))
-    }
-
-    /// Drop `handle`'s edit in progress to node `id`, if it has one.
-    #[cfg(feature = "splice")]
-    fn drop_edit(&self, handle: Handle, id: &str) {
-        let mut pending = self.pending.lock();
-        if let Some(edits) = pending.get_mut(id) {
-            edits.remove(&handle);
-            if edits.is_empty() {
-                pending.remove(id);
-            }
-        }
-    }
-
-    /// Discard `handle`'s refused edit to `file_id`: drop its edits in
-    /// progress to that file, so its nodes read as the stored file again,
-    /// and record `refused` in `_errors` for `node_id`. Other handles' edits
-    /// stay for their own flushes, which check their own bases. The handle
-    /// keeps its base, the bytes it read, so every later edit through it is
-    /// checked against them: a FUSE handle's until it is released, the
-    /// mount handle's until a READ of the file re-takes it (bead
-    /// `ley-line-open-6116c9`). Nothing in the database needs restoring,
-    /// because a pending edit never reached it. Recording the reason is
-    /// best effort: the refusal is what the caller must see.
-    #[cfg(feature = "splice")]
-    fn discard_file(
-        &self,
-        conn: &Connection,
-        handle: Handle,
-        node_id: &str,
-        file_id: i64,
-        refused: &anyhow::Error,
-    ) {
-        self.pending.lock().retain(|id, edits| {
-            if Self::in_file(conn, id, file_id) {
-                edits.remove(&handle);
-            }
-            !edits.is_empty()
-        });
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) \
-             VALUES (?1, 0, 0, ?2, ?3)",
-            rusqlite::params![node_id, format!("{refused:#}"), now_nanos()],
-        ) {
-            log::warn!("recording the refusal of '{node_id}' failed: {e:#}");
-        }
-    }
-
-    /// Whether an edit to `nid` is spliced into its file on flush: the node
-    /// has a syntax-tree row, so it belongs to a parsed file.
-    #[cfg(feature = "splice")]
-    fn is_spliced(conn: &Connection, nid: i64) -> bool {
-        conn.query_row("SELECT 1 FROM _ast WHERE nid = ?1", [nid], |_| Ok(()))
-            .is_ok()
+    /// Whether the database is a store's projection (it has `_source`). A
+    /// store is written through `leyline_cli_lib::source_write` alone (ADR-0045
+    /// T8): the projection rows are a function of the stored bytes, so this
+    /// graph refuses every change to a store. Any other database's nodes
+    /// are records written as they are.
+    fn is_store(conn: &Connection) -> Result<bool> {
+        Ok(leyline_schema::table_exists(conn, "_source")?)
     }
 
     /// `nid`'s stored record as bytes; empty when it has none.
@@ -597,105 +207,9 @@ impl SqliteGraphAdapter {
         .unwrap_or_default()
     }
 
-    /// `node` as the reader sees it: sized as the largest edit in progress
-    /// to it, if any. A kernel keeps one size per inode for every handle on
-    /// it, and grows it with each write; this is the size that shows the
-    /// writer its own edit.
-    fn with_pending(&self, node: Node) -> Node {
-        #[cfg(feature = "splice")]
-        if let Some(size) = self
-            .pending
-            .lock()
-            .get(&node.id)
-            .and_then(|edits| edits.values().map(Vec::len).max())
-        {
-            return Node {
-                size: size as u64,
-                ..node
-            };
-        }
-        node
-    }
-
-    /// Record the base of `handle`'s edit to `nid`'s file — the hash of its
-    /// stored bytes — if the handle has none for that file. Hashes the file
-    /// once per edit, not once per write.
-    #[cfg(feature = "splice")]
-    fn take_base(&self, conn: &Connection, handle: Handle, nid: i64) -> Result<()> {
-        let Some((file_id, source_id)) = Self::source_of(conn, nid)? else {
-            return Ok(());
-        };
-        let key = (handle, source_id);
-        if self.bases.lock().contains_key(&key) {
-            return Ok(());
-        }
-        // A file whose stored bytes cannot be read has no base to check:
-        // the edit goes ahead unchecked, as it did before bases, and the
-        // write path reports whatever is wrong with the file.
-        match leyline_ts::splice::source_bytes(conn, file_id) {
-            Ok(stored) => {
-                self.bases
-                    .lock()
-                    .entry(key)
-                    .or_insert(stored.as_slice().hash());
-            }
-            Err(e) => log::debug!("no base for '{}': {e:#}", key.1),
-        }
-        Ok(())
-    }
-
-    /// Refuse a [`MOUNT_HANDLE`] write or truncate to `nid`'s file when the
-    /// file moved since the handle's base: the edit is stale before it is
-    /// staged (bead `ley-line-open-6116c9`). The flush would refuse it too,
-    /// but an NFS client reports only the WRITE's failure — macOS ignores a
-    /// failed COMMIT — so the refusal must come at the WRITE. A FUSE handle
-    /// is left to its flush, which FUSE reports, and is not hashed per
-    /// write.
-    #[cfg(feature = "splice")]
-    fn refuse_moved(&self, conn: &Connection, handle: Handle, nid: i64) -> Result<()> {
-        if handle != MOUNT_HANDLE {
-            return Ok(());
-        }
-        let Some((file_id, source_id)) = Self::source_of(conn, nid)? else {
-            return Ok(());
-        };
-        let Some(expected) = self.bases.lock().get(&(handle, source_id.clone())).copied() else {
-            return Ok(());
-        };
-        // A file whose bytes cannot be read is left to the write path, as
-        // `take_base` leaves it.
-        let Ok(stored) = leyline_ts::splice::source_bytes(conn, file_id) else {
-            return Ok(());
-        };
-        let current = stored.as_slice().hash();
-        if current != expected {
-            return Err(StaleWrite {
-                source_id,
-                expected,
-                current,
-            }
-            .into());
-        }
-        Ok(())
-    }
-
-    /// An adapter over somebody else's live database (ADR-0040 D4): reads
-    /// come from `source.reader()`, writes go through `source.writer()`, and
-    /// `fsync` publishes through `source.publish()`. No bytes are copied
-    /// to build it, and no reader pool is refreshed after a write: SQLite's
-    /// WAL gives every later read the committed state.
-    pub fn live(source: Arc<dyn LiveSource>) -> Result<Self> {
-        let adapter = Self::with_backing(Backing::Live(source));
-        adapter.ensure_errors_table()?;
-        Ok(adapter)
-    }
-
     /// Exclusive access to the writer connection.
-    fn writer_guard(&self) -> WriterGuard<'_> {
-        match &self.backing {
-            Backing::Image(pool) => WriterGuard::Image(pool.writer.lock()),
-            Backing::Live(source) => WriterGuard::Live(source.writer()),
-        }
+    fn writer_guard(&self) -> parking_lot::MutexGuard<'_, SqliteGraph> {
+        self.writer.lock()
     }
 
     /// Compute reader pool size from DB size.
@@ -708,45 +222,10 @@ impl SqliteGraphAdapter {
         target.clamp(2, 8)
     }
 
-    /// Set the default tree-sitter language for validation of extensionless files.
-    #[cfg(feature = "validate")]
-    pub fn set_default_language(&mut self, lang: tree_sitter::Language) {
-        self.default_language = Some(lang);
-    }
-
-    /// The language a write to `id` (at `nid`) is validated against on its
-    /// own, if any. A node of a parsed file — its nid in the range of a file
-    /// with a `_source` row — has none: it is a fragment, and the write path
-    /// validates the whole spliced file when it lands (ADR-0040 D3). Parsing
-    /// the fragment alone as a file refused legitimate edits (a Go package
-    /// name is not a Go file).
-    #[cfg(feature = "validate")]
-    fn standalone_language(
-        &self,
-        conn: &Connection,
-        id: &str,
-        nid: i64,
-    ) -> Option<tree_sitter::Language> {
-        let in_parsed_file = leyline_schema::nid_file_id(nid).is_some_and(|file_id| {
-            conn.query_row(
-                "SELECT 1 FROM _source WHERE file_id = ?1",
-                [file_id],
-                |_| Ok(()),
-            )
-            .is_ok()
-        });
-        if in_parsed_file {
-            return None;
-        }
-        crate::validate::language_for_node(id, self.default_language.as_ref())
-    }
-
-    /// Create a writable adapter from raw bytes (for FUSE write-back).
+    /// Create a writable adapter from raw bytes.
     pub fn new_writable(data: &[u8]) -> Result<Self> {
         let graph = SqliteGraph::from_bytes_writable(data)?;
-        let adapter = Self::new(graph);
-        adapter.ensure_errors_table()?;
-        Ok(adapter)
+        Ok(Self::new(graph))
     }
 
     pub fn from_arena(control_path: &Path) -> Result<Self> {
@@ -775,9 +254,7 @@ impl SqliteGraphAdapter {
     pub fn from_arena_writable_verified(control_path: &Path) -> Result<Self> {
         let arena = crate::verified::VerifiedArena::open(control_path)?;
         let graph = SqliteGraph::from_bytes_writable(&arena.read_all()?)?;
-        let adapter = Self::new(graph);
-        adapter.ensure_errors_table()?;
-        Ok(adapter)
+        Ok(Self::new(graph))
     }
 
     /// Create a writable adapter from an arena (for daemon with write-back).
@@ -806,139 +283,61 @@ impl SqliteGraphAdapter {
         // exactly the verified slice (no padded-suffix asymmetry).
         let verified = crate::verify_arena_root(&controller, header, buf)?;
         let graph = SqliteGraph::from_bytes_writable(verified)?;
-        let adapter = Self::new(graph);
-        adapter.ensure_errors_table()?;
-        Ok(adapter)
+        Ok(Self::new(graph))
     }
 
-    /// Ensure the `_errors` table exists for storing validation errors.
-    ///
-    /// This table stays keyed by the DISPLAY PATH while the rest of the
-    /// projection moves to integer nids (projection-v5). It is not a
-    /// projection table — it is owned by this crate and read back by the
-    /// mount — and its rows must be able to name a path that has NO node:
-    /// `rename_node` records a validation failure against the DESTINATION
-    /// path precisely when it refuses to create it, so there is no nid to key
-    /// on. Re-keying would force either a fabricated nid or dropping that
-    /// diagnostic entirely.
-    fn ensure_errors_table(&self) -> Result<()> {
-        let guard = self.writer_guard();
-        guard.conn().execute_batch(
-            "CREATE TABLE IF NOT EXISTS _errors (
-                node_id   TEXT PRIMARY KEY,
-                line      INTEGER NOT NULL,
-                col       INTEGER NOT NULL,
-                message   TEXT NOT NULL,
-                timestamp INTEGER NOT NULL
-            )",
-        )?;
-        Ok(())
-    }
-
-    /// Serialize the current DB image for arena flush. For a live backing this
-    /// is one `sqlite3_serialize` of the live database under the writer lock:
-    /// the image publication path, not the read path.
+    /// Serialize the current DB image for arena flush.
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        match &self.backing {
-            Backing::Image(pool) => pool.writer.lock().serialize(),
-            Backing::Live(source) => {
-                let guard = source.writer();
-                let data = guard.serialize("main")?;
-                Ok(data.to_vec())
-            }
-        }
+        self.writer.lock().serialize()
     }
 
-    /// Run `f` against a read connection.
-    ///
-    /// Image backing: borrow a reader from the pool, or create one on the fly;
-    /// readers stamped with a stale generation are discarded on pop. Live
-    /// backing: a pooled connection to the live database; nothing to refresh,
-    /// the WAL serves the committed state.
+    /// Run `f` against a read connection: one borrowed from the pool, or
+    /// made on the fly; readers stamped with a stale generation are
+    /// discarded on pop.
     fn with_reader<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&Connection) -> Result<R>,
     {
-        match &self.backing {
-            Backing::Image(pool) => {
-                let ImagePool {
-                    readers,
-                    reader_bytes,
-                    reader_gen,
-                    ..
-                } = &**pool;
-                let current_gen = reader_gen.load(Ordering::Acquire);
-                let (reader, rgen) = loop {
-                    match readers.pop() {
-                        Some((r, g)) if g == current_gen => break (r, current_gen),
-                        Some(_) => continue, // discard stale reader
-                        None => {
-                            let bytes = reader_bytes.lock();
-                            break (SqliteGraph::from_bytes(&bytes)?, current_gen);
-                        }
-                    }
-                };
-                let result = f(reader.conn());
-                // Only return to pool if still current generation
-                if rgen == reader_gen.load(Ordering::Acquire) {
-                    let _ = readers.push((reader, rgen));
+        let current_gen = self.reader_gen.load(Ordering::Acquire);
+        let (reader, rgen) = loop {
+            match self.readers.pop() {
+                Some((r, g)) if g == current_gen => break (r, current_gen),
+                Some(_) => continue, // discard stale reader
+                None => {
+                    let bytes = self.reader_bytes.lock();
+                    break (SqliteGraph::from_bytes(&bytes)?, current_gen);
                 }
-                result
             }
-            Backing::Live(source) => {
-                let conn = source.reader()?;
-                f(&conn)
-            }
+        };
+        let result = f(reader.conn());
+        // Only return to pool if still current generation
+        if rgen == self.reader_gen.load(Ordering::Acquire) {
+            let _ = self.readers.push((reader, rgen));
         }
+        result
     }
 
-    /// After a write on the image backing, bump the generation and update the
-    /// cached bytes so new readers see the mutation; stale readers are
-    /// discarded lazily by `with_reader`. A no-op on the live backing: the
-    /// write is committed in the WAL and every later read sees it.
+    /// After a write, bump the generation and update the cached bytes so new
+    /// readers see the mutation; stale readers are discarded lazily by
+    /// `with_reader`.
     fn refresh_readers(&self) -> Result<()> {
-        match &self.backing {
-            Backing::Image(pool) => {
-                let ImagePool {
-                    writer,
-                    readers,
-                    reader_bytes,
-                    reader_gen,
-                } = &**pool;
-                let writer = writer.lock();
-                let bytes = writer.serialize()?;
-                reader_gen.fetch_add(1, Ordering::Release);
-                // Drain is best-effort; stale stragglers are caught by generation check
-                while readers.pop().is_some() {}
-                *reader_bytes.lock() = bytes;
-                Ok(())
-            }
-            Backing::Live(_) => Ok(()),
-        }
+        let writer = self.writer.lock();
+        let bytes = writer.serialize()?;
+        self.reader_gen.fetch_add(1, Ordering::Release);
+        // Drain is best-effort; stale stragglers are caught by generation check
+        while self.readers.pop().is_some() {}
+        *self.reader_bytes.lock() = bytes;
+        Ok(())
     }
 
-    #[cfg(all(test, feature = "cdc"))]
-    fn write_content_traced(
-        &self,
-        id: &str,
-        data: &[u8],
-        offset: u64,
-    ) -> Result<(usize, WriteRefreshOutcome)> {
-        self.write_traced(MOUNT_HANDLE, id, data, offset)
-    }
-
-    /// Write through `handle`. An edit to a node of a parsed file is the
-    /// handle's own; a write to any other node lands in the database at
-    /// once, whichever handle makes it.
+    /// Write `data` into node `id`'s record at `offset`. A store refuses
+    /// the write; any other database's record takes it at once.
     fn write_traced(
         &self,
-        handle: Handle,
         id: &str,
         data: &[u8],
         offset: u64,
     ) -> Result<(usize, WriteRefreshOutcome)> {
-        #[cfg(not(feature = "splice"))]
-        let _ = handle;
         let refresh = {
             let guard = self.writer_guard();
             let now = now_nanos();
@@ -951,27 +350,8 @@ impl SqliteGraphAdapter {
             let nid = leyline_schema::resolve_path(guard.conn(), id)?
                 .with_context(|| format!("write to unknown node '{id}'"))?;
 
-            // The edit's base is the file before the handle's first write,
-            // or the one an NFS READ took; a mount write to a file that
-            // moved since that base is refused before it is staged.
-            #[cfg(feature = "splice")]
-            {
-                self.refuse_moved(guard.conn(), handle, nid)?;
-                self.take_base(guard.conn(), handle, nid)?;
-            }
-
-            // An edit to a node of a parsed file accumulates in `pending`
-            // and reaches the database only through its flush.
-            #[cfg(feature = "splice")]
-            if Self::is_spliced(guard.conn(), nid) {
-                let mut pending = self.pending.lock();
-                let content = pending
-                    .entry(id.to_string())
-                    .or_default()
-                    .entry(handle)
-                    .or_insert_with(|| Self::record_bytes(guard.conn(), nid));
-                patch(content, data, offset)?;
-                return Ok((data.len(), WriteRefreshOutcome::untouched()));
+            if Self::is_store(guard.conn())? {
+                return Err(Self::unproposable(id));
             }
 
             // Read existing content, patch in the new data
@@ -995,56 +375,8 @@ impl SqliteGraphAdapter {
             }
             content[off..write_end].copy_from_slice(data);
 
-            // Validate via tree-sitter if a language is known for this node.
-            // Flash-clear pattern: always clear stale error first, then validate.
-            #[cfg(feature = "validate")]
-            {
-                let lang = self.standalone_language(guard.conn(), id, nid);
-                if let Some(lang) = lang {
-                    // Flash clear: remove any previous error for this node
-                    guard
-                        .conn()
-                        .execute(
-                            "DELETE FROM _errors WHERE node_id = ?1",
-                            rusqlite::params![id],
-                        )
-                        .ok();
-
-                    if !content.is_empty()
-                        && let Err(e) = crate::validate::validate(&content, &lang)
-                    {
-                        // Write structured error to SQLite
-                        guard.conn().execute(
-                            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            rusqlite::params![id, e.line, e.column, e.message, now],
-                        ).ok();
-
-                        // Restore shadow copy if truncate wiped content before this write
-                        if let Some(old) = self.shadow.lock().remove(id) {
-                            guard
-                                .conn()
-                                .execute(
-                                    "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE nid = ?4",
-                                    rusqlite::params![&old, old.len() as i64, now, nid],
-                                )
-                                .ok();
-                            log::info!("restored shadow copy for {id} after validation failure");
-                        }
-
-                        log::warn!("validation failed for {id}: {e}");
-                        // Drop writer lock and refresh readers so shadow
-                        // restore (if any) is visible to subsequent reads.
-                        drop(guard);
-                        self.refresh_readers()?;
-                        return Err(anyhow::anyhow!("{e}"));
-                    }
-
-                    // Validation passed — clear shadow (no longer needed)
-                    self.shadow.lock().remove(id);
-                }
-            }
-
-            // Validation passed (or skipped) — commit the write
+            // A record of a database that is no store is written as it is:
+            // no parse decides what it holds.
             let new_str = String::from_utf8_lossy(&content);
             guard.conn().execute(
                 "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE nid = ?4",
@@ -1228,25 +560,10 @@ impl Graph for SqliteGraphAdapter {
                 |row| Self::row_to_node(row, id.to_string()),
             );
             match result {
-                Ok(node) => Ok(Some(self.with_pending(node))),
+                Ok(node) => Ok(Some(node)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e.into()),
             }
-        })
-    }
-
-    /// A node of a parsed file (nid >= 0: the file row and its syntax
-    /// nodes) is rewritten, every row with a new mtime, whenever the file is
-    /// reparsed or written, and that is the only way its entries change. A
-    /// structural directory (negative nid) keeps the mtime of the parse that
-    /// created it while files come and go under it (`ensure_dir_nodes`), and
-    /// the root has none.
-    fn mtime_tracks_entries(&self, id: &str) -> Result<bool> {
-        if id.is_empty() {
-            return Ok(false);
-        }
-        self.with_reader(|conn| {
-            Ok(leyline_schema::resolve_path(conn, id)?.is_some_and(|nid| nid >= 0))
         })
     }
 
@@ -1269,7 +586,7 @@ impl Graph for SqliteGraphAdapter {
                 |row| Self::row_to_node(row, id.clone()),
             );
             match result {
-                Ok(node) => Ok(Some(self.with_pending(node))),
+                Ok(node) => Ok(Some(node)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e.into()),
             }
@@ -1294,7 +611,7 @@ impl Graph for SqliteGraphAdapter {
             })?;
             let mut children = Vec::new();
             for row in rows {
-                children.push(self.with_pending(row?));
+                children.push(row?);
             }
             Ok(children)
         })
@@ -1320,17 +637,6 @@ impl Graph for SqliteGraphAdapter {
             for row in rows {
                 out.push(row?);
             }
-            #[cfg(feature = "splice")]
-            for (id, record) in &mut out {
-                if let Some(content) = self
-                    .pending
-                    .lock()
-                    .get(id.as_str())
-                    .and_then(|edits| edits.get(&MOUNT_HANDLE))
-                {
-                    *record = String::from_utf8_lossy(content).into_owned();
-                }
-            }
             Ok(out)
         })
     }
@@ -1346,35 +652,6 @@ impl Graph for SqliteGraphAdapter {
     /// Both branches go through one accessor so the two storage generations
     /// cannot drift into different range semantics.
     fn read_content(&self, id: &str, buf: &mut [u8], offset: u64) -> Result<usize> {
-        self.read_content_as(MOUNT_HANDLE, id, buf, offset)
-    }
-
-    /// [`Self::read_content`], serving `handle`'s edit in progress to `id`
-    /// when it has one.
-    fn read_content_as(
-        &self,
-        handle: Handle,
-        id: &str,
-        buf: &mut [u8],
-        offset: u64,
-    ) -> Result<usize> {
-        #[cfg(not(feature = "splice"))]
-        let _ = handle;
-        #[cfg(feature = "splice")]
-        if let Some(content) = self
-            .pending
-            .lock()
-            .get(id)
-            .and_then(|edits| edits.get(&handle))
-        {
-            let off = usize::try_from(offset).unwrap_or(usize::MAX);
-            if off >= content.len() {
-                return Ok(0);
-            }
-            let n = buf.len().min(content.len() - off);
-            buf[..n].copy_from_slice(&content[off..off + n]);
-            return Ok(n);
-        }
         self.with_reader(|reader| {
             // An unresolvable id reads as empty, matching the pre-v5 miss on
             // `WHERE id = ?` — a read of a vanished node is not an error.
@@ -1409,31 +686,25 @@ impl Graph for SqliteGraphAdapter {
     }
 
     fn write_content(&self, id: &str, data: &[u8], offset: u64) -> Result<usize> {
-        self.write_content_as(MOUNT_HANDLE, id, data, offset)
-    }
-
-    fn write_content_as(
-        &self,
-        handle: Handle,
-        id: &str,
-        data: &[u8],
-        offset: u64,
-    ) -> Result<usize> {
-        self.write_traced(handle, id, data, offset)
+        self.write_traced(id, data, offset)
             .map(|(written, _)| written)
     }
 
-    /// Create a mount-visible node, interning it into the projection's
-    /// `dirs`/`files` tables so it has a nid to be addressed by.
+    /// Create a node, interning it into the projection's `dirs`/`files`
+    /// tables so it has a nid to be addressed by.
     ///
     /// Directories land in negative nid space (`-dir_id`); files take ordinal
     /// 0 of their `file_id` range, which is also where a later parse would put
     /// the file's AST root — so a created-then-parsed file keeps one identity.
+    /// A store refuses the create.
     fn create_node(&self, parent_id: &str, name: &str, is_dir: bool) -> Result<String> {
         let id = Self::join_id(parent_id, name);
         {
             let guard = self.writer_guard();
             let conn = guard.conn();
+            if Self::is_store(conn)? {
+                return Err(Self::unproposable(&id));
+            }
             let now = now_nanos();
             let name_id = leyline_schema::intern_name(conn, name)?;
 
@@ -1475,6 +746,8 @@ impl Graph for SqliteGraphAdapter {
         Ok(id)
     }
 
+    /// Delete the node's rows and every row beneath it. A store refuses the
+    /// removal.
     fn remove_node(&self, id: &str) -> Result<()> {
         {
             let guard = self.writer_guard();
@@ -1484,40 +757,29 @@ impl Graph for SqliteGraphAdapter {
             let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
                 return Ok(());
             };
-
-            // Invalidate BEFORE deleting. The manifest has no FK to `nodes`,
-            // so deleting the rows would leave it behind — and the subtree
-            // descent for an interior AST node walks `nodes.parent_nid`, which
-            // the delete would have already erased.
+            if Self::is_store(conn)? {
+                return Err(Self::unproposable(id));
+            }
+            // Invalidate BEFORE deleting. The manifest has no FK to
+            // `nodes`, so deleting the rows would leave it behind — and
+            // the subtree descent for an interior AST node walks
+            // `nodes.parent_nid`, which the delete would have already
+            // erased.
             //
-            // The orphan is not merely stale: `files` is append-only, so a
-            // file re-created at this path re-binds to the same `file_id` and
-            // therefore the same nids, and `has_chunked_content` would serve
-            // the DELETED file's bytes to a brand-new, never-written node.
-            #[cfg(feature = "cdc")]
-            crate::chunked::invalidate_chunked_content_subtree(conn, nid)?;
-
+            // The orphan is not merely stale: `files` is append-only, so
+            // a file re-created at this path re-binds to the same
+            // `file_id` and therefore the same nids, and
+            // `has_chunked_content` would serve the DELETED file's bytes
+            // to a brand-new, never-written node.
+            Self::invalidate_subtree(conn, nid)?;
             Self::delete_subtree(conn, nid)?;
         }
-        // An edit in progress to the removed node or beneath it has nowhere
-        // to land.
-        #[cfg(feature = "splice")]
-        self.pending
-            .lock()
-            .retain(|pending, _| pending != id && !pending.starts_with(&format!("{id}/")));
         self.refresh_readers()?;
         Ok(())
     }
 
+    /// Empty the node's record. A store refuses the truncate.
     fn truncate(&self, id: &str) -> Result<()> {
-        self.truncate_as(MOUNT_HANDLE, id)
-    }
-
-    /// [`Self::truncate`]: an edit to a node of a parsed file is `handle`'s
-    /// own; any other node is truncated in the database at once.
-    fn truncate_as(&self, handle: Handle, id: &str) -> Result<()> {
-        #[cfg(not(feature = "splice"))]
-        let _ = handle;
         {
             let guard = self.writer_guard();
             let conn = guard.conn();
@@ -1526,33 +788,8 @@ impl Graph for SqliteGraphAdapter {
                 return Ok(());
             };
 
-            #[cfg(feature = "splice")]
-            if Self::is_spliced(conn, nid) {
-                self.refuse_moved(conn, handle, nid)?;
-                self.take_base(conn, handle, nid)?;
-                self.pending
-                    .lock()
-                    .entry(id.to_string())
-                    .or_default()
-                    .insert(handle, Vec::new());
-                return Ok(());
-            }
-
-            // Save shadow copy before truncating (for validation rollback)
-            #[cfg(feature = "validate")]
-            {
-                let lang = self.standalone_language(conn, id, nid);
-                if lang.is_some() {
-                    let old_content: Option<String> = conn
-                        .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
-                            row.get(0)
-                        })
-                        .ok()
-                        .flatten();
-                    if let Some(content) = old_content {
-                        self.shadow.lock().insert(id.to_string(), content);
-                    }
-                }
+            if Self::is_store(conn)? {
+                return Err(Self::unproposable(id));
             }
 
             conn.execute(
@@ -1570,415 +807,12 @@ impl Graph for SqliteGraphAdapter {
         Ok(())
     }
 
-    fn note_base(&self, id: &str) -> Result<()> {
-        self.note_base_as(MOUNT_HANDLE, id)
-    }
-
-    fn note_base_as(&self, handle: Handle, id: &str) -> Result<()> {
-        #[cfg(feature = "splice")]
-        {
-            let guard = self.writer_guard();
-            if let Some(nid) = leyline_schema::resolve_path(guard.conn(), id)? {
-                self.take_base(guard.conn(), handle, nid)?;
-            }
-        }
-        let _ = (handle, id);
-        Ok(())
-    }
-
-    fn note_read(&self, id: &str) -> Result<()> {
-        #[cfg(feature = "splice")]
-        {
-            let guard = self.writer_guard();
-            let conn = guard.conn();
-            let Some(nid) = leyline_schema::resolve_path(conn, id)? else {
-                return Ok(());
-            };
-            let Some((file_id, source_id)) = Self::source_of(conn, nid)? else {
-                return Ok(());
-            };
-            // A staged edit keeps the base it was made against. The writer
-            // guard is held, so no write stages between this check and the
-            // insert.
-            if self.edits_file(conn, MOUNT_HANDLE, file_id) {
-                return Ok(());
-            }
-            // The entry for the file is replaced, never added beside: the
-            // mount handle holds one base per file. A file whose bytes
-            // cannot be read keeps the base it had, as `take_base` takes
-            // none for it.
-            match leyline_ts::splice::source_bytes(conn, file_id) {
-                Ok(stored) => {
-                    self.bases
-                        .lock()
-                        .insert((MOUNT_HANDLE, source_id), stored.as_slice().hash());
-                }
-                Err(e) => log::debug!("no base for '{source_id}': {e:#}"),
-            }
-        }
-        let _ = id;
-        Ok(())
-    }
-
-    fn flush_node(&self, id: &str) -> Result<()> {
-        self.flush_node_as(MOUNT_HANDLE, id)
-    }
-
-    fn release(&self, handle: Handle) -> Result<()> {
-        #[cfg(feature = "splice")]
-        {
-            self.bases.lock().retain(|(h, _), _| *h != handle);
-            self.pending.lock().retain(|_, edits| {
-                edits.remove(&handle);
-                !edits.is_empty()
-            });
-        }
-        let _ = handle;
-        Ok(())
-    }
-
-    /// Land `handle`'s edit to `id`, checked against the handle's base.
-    fn flush_node_as(&self, handle: Handle, id: &str) -> Result<()> {
-        #[cfg(feature = "splice")]
-        {
-            let Some(content) = self
-                .pending
-                .lock()
-                .get(id)
-                .and_then(|edits| edits.get(&handle))
-                .cloned()
-            else {
-                return Ok(());
-            };
-            let guard = self.writer_guard();
-            let Some(nid) = leyline_schema::resolve_path(guard.conn(), id)? else {
-                return Ok(());
-            };
-            // An edit that empties the node lands like any other (bead
-            // `ley-line-open-8a26d8`): the write path refuses it if the
-            // file it makes does not parse.
-            let text = String::from_utf8_lossy(&content);
-            let bytes = leyline_ts::splice::splice(guard.conn(), nid, &text)?;
-            let file_id = leyline_schema::nid_file_id(nid)
-                .context("spliced node must be a file-scoped nid")?;
-            let source_id: String = guard.conn().query_row(
-                "SELECT id FROM _source WHERE file_id = ?1",
-                [file_id],
-                |r| r.get(0),
-            )?;
-            let key = (handle, source_id);
-            let source_id = &key.1;
-            let base = self.bases.lock().get(&key).copied();
-            if self.source_writer.is_none() {
-                // Nothing could restore the file either: the edit stays
-                // pending and the refusal says why.
-                return self.write_source(guard.conn(), source_id, bytes, base);
-            }
-            if let Err(refused) = self.write_source(guard.conn(), source_id, bytes, base) {
-                // A refused edit is discarded, not left behind: the
-                // handle's edits to that file are dropped, so its nodes read
-                // as the stored file again, and the reason is recorded for
-                // the node.
-                self.discard_file(guard.conn(), handle, id, file_id, &refused);
-                drop(guard);
-                self.refresh_readers()?;
-                return Err(refused);
-            }
-            self.drop_edit(handle, id);
-            if !self.edits_file(guard.conn(), handle, file_id) {
-                // The handle's next edit to the file is made against the
-                // bytes it just wrote, so an edit another writer lands in
-                // between is caught. A FUSE handle holds that base until it
-                // is released. The mount handle holds it until a READ of
-                // the file re-takes it (`note_read`): its client's cache
-                // holds the bytes it wrote, and it need not READ them again
-                // before its next edit (bead `ley-line-open-6116c9`).
-                let landed = leyline_ts::splice::source_bytes(guard.conn(), file_id).ok();
-                let mut bases = self.bases.lock();
-                match landed {
-                    Some(stored) => {
-                        bases.insert(key, stored.as_slice().hash());
-                    }
-                    None => {
-                        bases.remove(&key);
-                    }
-                }
-            }
-
-            // The write re-projected the spliced node AND every other node
-            // of the same source, through the cold parse — which knows
-            // nothing about chunk tables. Any manifest still on those nodes
-            // now describes the PRE-splice bytes, and the chunked read path
-            // would serve them without complaint. Invalidate so those reads
-            // fall back to `record`: slower, but correct. Reads re-chunk
-            // lazily on the next write through this crate.
-            //
-            // projection-v5 makes "every node of this source" a nid RANGE —
-            // one delete over the file's `(file_id << 24) | ordinal` span.
-            // The range holds across the re-projection because `files` is
-            // append-only: the re-projected file re-binds to the same
-            // `file_id`.
-            #[cfg(feature = "cdc")]
-            crate::chunked::invalidate_chunked_content_subtree(
-                guard.conn(),
-                leyline_schema::file_nid(file_id, 0),
-            )?;
-
-            // Reproject replaced all nodes — shadows are stale
-            #[cfg(feature = "validate")]
-            self.shadow.lock().clear();
-            drop(guard);
-            self.refresh_readers()?;
-        }
-        let _ = (handle, id);
-        Ok(())
-    }
-
-    #[cfg(feature = "splice")]
-    fn batch_splice(&self, edits: &[(String, Option<String>)]) -> Result<()> {
-        if edits.is_empty() {
-            return Ok(());
-        }
-
-        let guard = self.writer_guard();
-        let conn = guard.conn();
-        let now = now_nanos();
-
-        // Classify edits into AST-tracked (have _ast entry) vs plain data nodes
-        struct AstEdit {
-            node_id: String,
-            text: Option<String>,
-            source_id: String,
-            start_byte: usize,
-            end_byte: usize,
-        }
-
-        let mut ast_edits: Vec<AstEdit> = Vec::new();
-
-        for (node_id, text) in edits {
-            // A node id that does not resolve has no `_ast` row by
-            // construction, so it takes the non-AST arm below — the same
-            // place the pre-v5 `QueryReturnedNoRows` sent it.
-            let nid = leyline_schema::resolve_path(conn, node_id)?;
-            // projection-v5: `_ast` lost its `source_id` column — a node's
-            // source IS its file, `nid >> 24`, joined to `_source.file_id`.
-            let ast_info = match nid {
-                Some(nid) => conn.query_row(
-                    "SELECT s.id, a.start_byte, a.end_byte \
-                       FROM _ast a JOIN _source s ON s.file_id = (a.nid >> 24) \
-                      WHERE a.nid = ?1",
-                    [nid],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, i64>(1)? as usize,
-                            r.get::<_, i64>(2)? as usize,
-                        ))
-                    },
-                ),
-                None => Err(rusqlite::Error::QueryReturnedNoRows),
-            };
-
-            match ast_info {
-                Ok((source_id, start, end)) => {
-                    ast_edits.push(AstEdit {
-                        node_id: node_id.clone(),
-                        text: text.clone(),
-                        source_id,
-                        start_byte: start,
-                        end_byte: end,
-                    });
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    // Non-AST node — direct record update or delete.
-                    //
-                    // These write `nodes` directly and are NOT covered by the
-                    // post-reproject invalidation below: that loop walks
-                    // `_ast`-derived node ids, and by definition these nodes
-                    // have no `_ast` row. Each arm must invalidate its own
-                    // manifest or the read path serves pre-splice bytes (update
-                    // arm) or a deleted node's bytes to whatever reuses the
-                    // path (delete arm).
-                    let Some(nid) = nid else {
-                        continue;
-                    };
-                    match text {
-                        Some(t) => {
-                            conn.execute(
-                                "UPDATE nodes SET record = ?1, size = ?2, mtime = ?3 WHERE nid = ?4",
-                                rusqlite::params![t, t.len() as i64, now, nid],
-                            )?;
-                            #[cfg(feature = "cdc")]
-                            crate::chunked::invalidate_chunked_content(conn, nid)?;
-                        }
-                        None => {
-                            // Invalidate first: the subtree descent for an
-                            // interior node reads `nodes.parent_nid`, which
-                            // the delete is about to erase.
-                            #[cfg(feature = "cdc")]
-                            crate::chunked::invalidate_chunked_content_subtree(conn, nid)?;
-                            Self::delete_subtree(conn, nid)?;
-                        }
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        if ast_edits.is_empty() {
-            drop(guard);
-            self.refresh_readers()?;
-            return Ok(());
-        }
-
-        // Group AST edits by source_id
-        let mut groups: HashMap<String, Vec<&AstEdit>> = HashMap::new();
-        for edit in &ast_edits {
-            groups.entry(edit.source_id.clone()).or_default().push(edit);
-        }
-
-        for (source_id, mut group) in groups {
-            // Check for byte-range overlaps (parent-child trap)
-            for i in 0..group.len() {
-                for j in (i + 1)..group.len() {
-                    let (si, ei) = (group[i].start_byte, group[i].end_byte);
-                    let (sj, ej) = (group[j].start_byte, group[j].end_byte);
-                    if (si <= sj && ej <= ei) || (sj <= si && ei <= ej) {
-                        anyhow::bail!(
-                            "overlapping edits: {} [{}, {}) and {} [{}, {})",
-                            group[i].node_id,
-                            si,
-                            ei,
-                            group[j].node_id,
-                            sj,
-                            ej
-                        );
-                    }
-                }
-            }
-
-            // Sort by start_byte DESC (bottom-up: splice later offsets first)
-            group.sort_by_key(|a| std::cmp::Reverse(a.start_byte));
-
-            // Read original source through the one reader that knows where
-            // this arena keeps a file's bytes — `_source.content` is NULL on
-            // every daemon-parsed arena, so reading it here failed on exactly
-            // the arenas a mount serves (bead `ley-line-open-af4539`).
-            let file_id = leyline_schema::lookup_file_id(conn, &source_id)?
-                .with_context(|| format!("source '{source_id}' not found"))?;
-            let source = leyline_ts::splice::source_bytes(conn, file_id)?;
-
-            // Apply splices bottom-up, tracking each edit's post-splice byte range
-            struct SpliceRange {
-                node_id: String,
-                start: usize,
-                end: usize,
-            }
-            let mut modified = source;
-            let mut ranges: Vec<SpliceRange> = Vec::new();
-            for edit in &group {
-                let replacement = edit.text.as_deref().unwrap_or("");
-                let mut result = Vec::with_capacity(
-                    edit.start_byte + replacement.len() + (modified.len() - edit.end_byte),
-                );
-                result.extend_from_slice(&modified[..edit.start_byte]);
-                result.extend_from_slice(replacement.as_bytes());
-                result.extend_from_slice(&modified[edit.end_byte..]);
-                ranges.push(SpliceRange {
-                    node_id: edit.node_id.clone(),
-                    start: edit.start_byte,
-                    end: edit.start_byte + replacement.len(),
-                });
-                modified = result;
-            }
-
-            // The one write path validates, stores and re-projects. A batch
-            // splice is applied against the file as it is now: the staging
-            // overlay records no base yet.
-            self.write_source(conn, &source_id, modified, None)
-                .map_err(|e| {
-                    // Attempt to attribute the error to a specific node
-                    let msg = format!("{e:#}");
-                    // Parse "error at byte N..M" from the syntax check
-                    if let Some(pos) = msg.find("error at byte ") {
-                        let rest = &msg[pos + 14..];
-                        if let Some(dot_pos) = rest.find("..")
-                            && let Ok(err_byte) = rest[..dot_pos].parse::<usize>()
-                        {
-                            // Find which edit's post-splice range contains the error byte
-                            for r in &ranges {
-                                if err_byte >= r.start && err_byte < r.end {
-                                    return anyhow::anyhow!(
-                                        "{e:#} (attributed to node '{}')",
-                                        r.node_id
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // No attribution possible — list all nodes in the group
-                    let node_ids: Vec<&str> = group.iter().map(|e| e.node_id.as_str()).collect();
-                    anyhow::anyhow!(
-                        "{e:#} (source '{}', edited nodes: {:?})",
-                        source_id,
-                        node_ids
-                    )
-                })?;
-
-            // The write rewrote `nodes.record` for EVERY node of this source
-            // through the cold parse. Unlike the `write_content` path, nothing
-            // here re-chunks, so any manifest on those nodes now describes
-            // pre-splice bytes and the chunked read path would serve them.
-            // Invalidate the whole source: reads fall back to `record` until
-            // the next write refreshes them.
-            //
-            // "The whole source" is now one nid range — `_source.file_id`
-            // names the file, and every node of it lives in that file's span.
-            #[cfg(feature = "cdc")]
-            {
-                let file_id: Option<i64> = conn
-                    .query_row(
-                        "SELECT file_id FROM _source WHERE id = ?1",
-                        [&source_id],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                if let Some(file_id) = file_id {
-                    crate::chunked::invalidate_chunked_content_subtree(
-                        conn,
-                        leyline_schema::file_nid(file_id, 0),
-                    )?;
-                }
-            }
-        }
-
-        // Edits in progress stay for their own flushes, which check them
-        // against the bytes they were made on: the batch moved the file, so
-        // an edit made before it is refused as stale, never dropped while
-        // its flush reports success (bead `ley-line-open-5da276`).
-        #[cfg(feature = "validate")]
-        self.shadow.lock().clear();
-
-        drop(guard);
-        self.refresh_readers()?;
-        Ok(())
-    }
-
     fn serialize(&self) -> Result<Vec<u8>> {
         self.serialize()
     }
 
-    /// Live backing: publish the live database through its owner (the
-    /// daemon's snapshot). Image backing: this adapter does not own an arena;
-    /// `HotSwapGraph::flush_to_arena` does that for image-backed mounts.
-    fn flush_to_arena(&self) -> Result<()> {
-        match &self.backing {
-            Backing::Live(source) => source.publish(),
-            Backing::Image(_) => anyhow::bail!("graph does not support arena flush"),
-        }
-    }
-
+    /// Move the node's rows, and every row beneath it, to the new path. A
+    /// store refuses the rename.
     fn rename_node(&self, id: &str, new_parent_id: &str, new_name: &str) -> Result<()> {
         {
             let guard = self.writer_guard();
@@ -1987,34 +821,8 @@ impl Graph for SqliteGraphAdapter {
             let old_nid = leyline_schema::resolve_path(conn, id)?
                 .with_context(|| format!("rename of unknown node '{id}'"))?;
 
-            // Validate content against destination language (catches sed -i pattern:
-            // write to temp file → rename over validated file)
-            #[cfg(feature = "validate")]
-            {
-                let dest_lang =
-                    crate::validate::language_for_node(&new_id, self.default_language.as_ref());
-                if let Some(lang) = dest_lang {
-                    let content: Option<String> = conn
-                        .query_row(
-                            "SELECT record FROM nodes WHERE nid = ?1",
-                            [old_nid],
-                            |row| row.get(0),
-                        )
-                        .ok()
-                        .flatten();
-                    if let Some(ref src) = content
-                        && !src.is_empty()
-                        && let Err(e) = crate::validate::validate(src.as_bytes(), &lang)
-                    {
-                        let now = now_nanos();
-                        conn.execute(
-                            "INSERT OR REPLACE INTO _errors (node_id, line, col, message, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            rusqlite::params![&new_id, e.line, e.column, e.message, now],
-                        ).ok();
-                        log::warn!("validation failed on rename to {new_id}: {e}");
-                        anyhow::bail!("{e}");
-                    }
-                }
+            if Self::is_store(conn)? {
+                return Err(Self::unproposable(id));
             }
 
             // Clear both sides BEFORE moving rows. The manifest has no FK to
@@ -2029,17 +837,31 @@ impl Graph for SqliteGraphAdapter {
             // but re-keying onto a nid that already has a manifest violates
             // the `(nid, seq)` primary key. Correctness first; re-keying with
             // conflict handling is an available optimization.
-            #[cfg(feature = "cdc")]
-            {
-                crate::chunked::invalidate_chunked_content_subtree(conn, old_nid)?;
-                if let Some(dest) = leyline_schema::resolve_path(conn, &new_id)? {
-                    crate::chunked::invalidate_chunked_content_subtree(conn, dest)?;
-                }
+            Self::invalidate_subtree(conn, old_nid)?;
+            if let Some(dest) = leyline_schema::resolve_path(conn, &new_id)? {
+                Self::invalidate_subtree(conn, dest)?;
             }
+            Self::move_rows(conn, id, old_nid, &new_id, new_name)?;
+        }
+        self.refresh_readers()?;
+        Ok(())
+    }
+}
 
+impl SqliteGraphAdapter {
+    /// Move node `id`'s rows (at `old_nid`) to `new_id`: what a rename is
+    /// in a database that is no store.
+    fn move_rows(
+        conn: &Connection,
+        id: &str,
+        old_nid: i64,
+        new_id: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        {
             let now = now_nanos();
             let new_name_id = leyline_schema::intern_name(conn, new_name)?;
-            let new_parent_dir_id = leyline_schema::ensure_dir_nodes(conn, &new_id, now)?;
+            let new_parent_dir_id = leyline_schema::ensure_dir_nodes(conn, new_id, now)?;
             let new_parent_nid = leyline_schema::dir_nid(new_parent_dir_id);
 
             if let Some(dir_id) = leyline_schema::nid_dir_id(old_nid) {
@@ -2076,7 +898,7 @@ impl Graph for SqliteGraphAdapter {
                 // `leyline_schema`. This used to move `nodes` alone and leave
                 // the rest pointing at the old range (bead
                 // `ley-line-open-af3817`).
-                let new_file_id = leyline_schema::move_file_rows(conn, id, &new_id)?;
+                let new_file_id = leyline_schema::move_file_rows(conn, id, new_id)?;
                 conn.execute(
                     "UPDATE nodes SET parent_nid = ?1, name_id = ?2 WHERE nid = ?3",
                     rusqlite::params![
@@ -2087,8 +909,26 @@ impl Graph for SqliteGraphAdapter {
                 )?;
             }
         }
-        self.refresh_readers()?;
         Ok(())
+    }
+
+    /// Drop a chunk manifest under `nid`, where `cdc` keeps them: the rows
+    /// under it are about to be deleted or rewritten, and a manifest left
+    /// behind would serve the old bytes.
+    fn invalidate_subtree(conn: &Connection, nid: i64) -> Result<()> {
+        #[cfg(feature = "cdc")]
+        crate::chunked::invalidate_chunked_content_subtree(conn, nid)?;
+        let _ = (conn, nid);
+        Ok(())
+    }
+
+    /// The refusal of a change to a store: a store's projection is a
+    /// function of its stored bytes, which only a proposal changes.
+    fn unproposable(id: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "'{id}' refused: the database is a store, written through a proposal \
+             (the daemon's propose op, storefs, or the checkout)"
+        )
     }
 }
 
@@ -2117,12 +957,6 @@ pub struct HotSwapGraph {
     /// handle is visible here.
     controller: Mutex<Controller>,
     writable: bool,
-    /// Handed to every writable adapter this graph builds (ADR-0040 D3).
-    #[cfg(feature = "splice")]
-    source_writer: Option<Arc<dyn SourceWriter>>,
-    /// Default tree-sitter language for extensionless files (e.g. `source`).
-    #[cfg(feature = "validate")]
-    default_language: Option<tree_sitter::Language>,
     /// Route every (re)load through the verify-on-fault gate and advance
     /// `current_root` incrementally on flush (bead `ley-line-open-b6a4dd`).
     /// Runtime opt-in via [`HotSwapGraph::with_verify_on_fault`], so the
@@ -2155,10 +989,6 @@ impl HotSwapGraph {
             last_root: Mutex::new(root),
             controller: Mutex::new(ctrl),
             writable: false,
-            #[cfg(feature = "splice")]
-            source_writer: None,
-            #[cfg(feature = "validate")]
-            default_language: None,
             #[cfg(feature = "verify")]
             verify_on_fault: false,
             #[cfg(feature = "verify")]
@@ -2188,22 +1018,7 @@ impl HotSwapGraph {
         Ok(self)
     }
 
-    /// Enable writable mode with optional validation language for extensionless files.
-    /// Re-opens the inner graph as writable if already loaded.
-    #[cfg(feature = "validate")]
-    pub fn with_validation(mut self, default_language: Option<tree_sitter::Language>) -> Self {
-        self.writable = true;
-        self.default_language = default_language;
-        let cached_root = *self.last_root.lock();
-        if cached_root != [0u8; 32]
-            && let Ok(new_graph) = self.build_adapter(&self.control_path)
-        {
-            *self.inner.write() = new_graph;
-        }
-        self
-    }
-
-    /// Enable writable mode (no validation).
+    /// Enable writable mode.
     /// Re-opens the inner graph as writable if already loaded.
     pub fn with_writable(mut self) -> Self {
         self.writable = true;
@@ -2216,54 +1031,23 @@ impl HotSwapGraph {
         self
     }
 
-    /// Route edits to parsed files through `writer` (ADR-0040 D3). Re-opens
-    /// the inner graph if it is already loaded writable, so the writer
-    /// reaches the adapter serving now.
-    #[cfg(feature = "splice")]
-    pub fn with_source_writer(mut self, writer: Arc<dyn SourceWriter>) -> Result<Self> {
-        self.source_writer = Some(writer);
-        if self.writable && *self.last_root.lock() != [0u8; 32] {
-            let new_graph = self.build_adapter(&self.control_path)?;
-            *self.inner.write() = new_graph;
-        }
-        Ok(self)
-    }
-
     /// Build an adapter for the current root.
     fn build_adapter(&self, control_path: &Path) -> Result<Arc<dyn Graph>> {
         #[cfg(feature = "verify")]
         if self.verify_on_fault {
-            #[allow(unused_mut)]
-            let mut adapter = if self.writable {
+            let adapter = if self.writable {
                 SqliteGraphAdapter::from_arena_writable_verified(control_path)?
             } else {
                 SqliteGraphAdapter::from_arena_verified(control_path)?
             };
-            if self.writable {
-                self.configure_writable(&mut adapter);
-            }
             return Ok(Arc::new(adapter));
         }
         if self.writable {
-            let mut adapter = SqliteGraphAdapter::from_arena_writable(control_path)?;
-            self.configure_writable(&mut adapter);
-            Ok(Arc::new(adapter))
+            Ok(Arc::new(SqliteGraphAdapter::from_arena_writable(
+                control_path,
+            )?))
         } else {
             Ok(Arc::new(SqliteGraphAdapter::from_arena(control_path)?))
-        }
-    }
-
-    /// What every writable adapter this graph builds carries: the default
-    /// validation language and the source writer.
-    #[allow(unused_variables)]
-    fn configure_writable(&self, adapter: &mut SqliteGraphAdapter) {
-        #[cfg(feature = "validate")]
-        if let Some(ref lang) = self.default_language {
-            adapter.set_default_language(lang.clone());
-        }
-        #[cfg(feature = "splice")]
-        if let Some(ref writer) = self.source_writer {
-            adapter.set_source_writer(writer.clone());
         }
     }
 
@@ -2404,10 +1188,6 @@ impl Graph for HotSwapGraph {
         self.maybe_swap()?.read_content(id, buf, offset)
     }
 
-    fn mtime_tracks_entries(&self, id: &str) -> Result<bool> {
-        self.maybe_swap()?.mtime_tracks_entries(id)
-    }
-
     fn write_content(&self, id: &str, data: &[u8], offset: u64) -> Result<usize> {
         self.maybe_swap()?.write_content(id, data, offset)
     }
@@ -2426,55 +1206,6 @@ impl Graph for HotSwapGraph {
 
     fn rename_node(&self, id: &str, new_parent_id: &str, new_name: &str) -> Result<()> {
         self.maybe_swap()?.rename_node(id, new_parent_id, new_name)
-    }
-
-    fn note_base(&self, id: &str) -> Result<()> {
-        self.maybe_swap()?.note_base(id)
-    }
-
-    fn note_read(&self, id: &str) -> Result<()> {
-        self.maybe_swap()?.note_read(id)
-    }
-
-    fn flush_node(&self, id: &str) -> Result<()> {
-        self.maybe_swap()?.flush_node(id)
-    }
-
-    fn note_base_as(&self, handle: Handle, id: &str) -> Result<()> {
-        self.maybe_swap()?.note_base_as(handle, id)
-    }
-
-    fn write_content_as(
-        &self,
-        handle: Handle,
-        id: &str,
-        data: &[u8],
-        offset: u64,
-    ) -> Result<usize> {
-        self.maybe_swap()?
-            .write_content_as(handle, id, data, offset)
-    }
-
-    fn read_content_as(
-        &self,
-        handle: Handle,
-        id: &str,
-        buf: &mut [u8],
-        offset: u64,
-    ) -> Result<usize> {
-        self.maybe_swap()?.read_content_as(handle, id, buf, offset)
-    }
-
-    fn truncate_as(&self, handle: Handle, id: &str) -> Result<()> {
-        self.maybe_swap()?.truncate_as(handle, id)
-    }
-
-    fn flush_node_as(&self, handle: Handle, id: &str) -> Result<()> {
-        self.maybe_swap()?.flush_node_as(handle, id)
-    }
-
-    fn release(&self, handle: Handle) -> Result<()> {
-        self.maybe_swap()?.release(handle)
     }
 
     fn batch_splice(&self, edits: &[(String, Option<String>)]) -> Result<()> {
@@ -2603,81 +1334,6 @@ pub(crate) mod fixtures {
 
     use super::*;
     use rusqlite::Connection;
-
-    /// Stands in for `leyline_cli_lib::source_write`, which owns the cold
-    /// parse and is out of this crate's reach: re-projects the written file
-    /// through the single-file projector these fixtures were built with.
-    /// What it lets a test observe is the adapter's half of an edit — the
-    /// bytes it computes, the source it names, the state it clears and the
-    /// manifests it invalidates. The write path itself is tested in
-    /// `leyline-cli-lib`.
-    #[cfg(feature = "splice")]
-    pub(crate) struct ProjectingWriter;
-
-    #[cfg(feature = "splice")]
-    impl SourceWriter for ProjectingWriter {
-        fn write(
-            &self,
-            conn: &Connection,
-            source_id: &str,
-            bytes: Vec<u8>,
-            _base: Option<leyline_core::Hash>,
-        ) -> Result<()> {
-            let language: String = conn.query_row(
-                "SELECT language FROM _source WHERE id = ?1",
-                [source_id],
-                |r| r.get(0),
-            )?;
-            let lang = leyline_ts::languages::TsLanguage::from_name(&language)?;
-            leyline_ts::splice::check_syntax(&bytes, lang.ts_language())?;
-            leyline_schema::delete_file_rows(conn, source_id)?;
-            leyline_ts::project::project_ast_with_source(
-                &bytes,
-                lang.ts_language(),
-                conn,
-                source_id,
-                &language,
-            )?;
-            Ok(())
-        }
-    }
-
-    /// [`ProjectingWriter`] behind the base check the write path makes
-    /// (ADR-0042 P2): a write that names a base the file no longer holds is
-    /// refused with [`StaleWrite`].
-    #[cfg(feature = "splice")]
-    pub(crate) struct CheckingWriter;
-
-    #[cfg(feature = "splice")]
-    impl SourceWriter for CheckingWriter {
-        fn write(
-            &self,
-            conn: &Connection,
-            source_id: &str,
-            bytes: Vec<u8>,
-            base: Option<leyline_core::Hash>,
-        ) -> Result<()> {
-            let file_id: i64 = conn.query_row(
-                "SELECT file_id FROM _source WHERE id = ?1",
-                [source_id],
-                |r| r.get(0),
-            )?;
-            let current = leyline_ts::splice::source_bytes(conn, file_id)?
-                .as_slice()
-                .hash();
-            if let Some(expected) = base
-                && expected != current
-            {
-                return Err(StaleWrite {
-                    source_id: source_id.to_string(),
-                    expected,
-                    current,
-                }
-                .into());
-            }
-            ProjectingWriter.write(conn, source_id, bytes, base)
-        }
-    }
 
     /// The nid a display path resolves to. Tests that reach past the [`Graph`]
     /// trait into the nid-keyed chunk layer translate here, exactly as the
@@ -2888,10 +1544,7 @@ mod tests {
     }
 
     fn pooled_readers(adapter: &SqliteGraphAdapter) -> usize {
-        match &adapter.backing {
-            Backing::Image(pool) => pool.readers.len(),
-            Backing::Live(_) => 0,
-        }
+        adapter.readers.len()
     }
 
     /// The image pool's generation discipline: a current reader goes back to
@@ -2919,12 +1572,9 @@ mod tests {
         // A reader checked out across a write can land back in the pool with
         // the old generation (the push races the refresh). Plant one: the
         // next read must discard it, not serve the pre-write bytes.
-        let Backing::Image(pool) = &adapter.backing else {
-            unreachable!("writable_adapter is image-backed")
-        };
-        while pool.readers.pop().is_some() {}
-        let stale_gen = pool.reader_gen.load(Ordering::Acquire) - 1;
-        let _ = pool
+        while adapter.readers.pop().is_some() {}
+        let stale_gen = adapter.reader_gen.load(Ordering::Acquire) - 1;
+        let _ = adapter
             .readers
             .push((SqliteGraph::from_bytes(&old_bytes)?, stale_gen));
         let n = adapter.read_content("docs/readme", &mut buf, 0)?;
@@ -2932,49 +1582,37 @@ mod tests {
         Ok(())
     }
 
-    /// A [`LiveSource`] over one in-memory connection that counts publishes.
-    struct CountingSource {
-        conn: Mutex<Connection>,
-        publishes: AtomicU64,
-    }
-
-    impl LiveSource for CountingSource {
-        fn reader(&self) -> Result<Box<dyn std::ops::Deref<Target = Connection> + '_>> {
-            Ok(Box::new(self.conn.lock()))
-        }
-        fn writer(&self) -> Box<dyn std::ops::DerefMut<Target = Connection> + '_> {
-            Box::new(self.conn.lock())
-        }
-        fn publish(&self) -> Result<()> {
-            self.publishes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    /// A live adapter reads and writes its source's connection and publishes
-    /// through it; an image adapter does not own an arena and refuses.
+    /// The adapter owns no arena: publishing is `HotSwapGraph`'s.
     #[test]
-    fn live_adapter_flush_publishes_through_its_source() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        create_schema(&conn)?;
-        put_dir(&conn, "docs", 1000)?;
-        put_file(&conn, "docs/readme", 2000, Some("hello"))?;
-        let source = Arc::new(CountingSource {
-            conn: Mutex::new(conn),
-            publishes: AtomicU64::new(0),
-        });
-        let adapter = SqliteGraphAdapter::live(source.clone())?;
+    fn an_adapter_does_not_flush_to_an_arena() -> Result<()> {
+        assert!(writable_adapter()?.flush_to_arena().is_err());
+        Ok(())
+    }
+
+    /// A store's nodes are written only through a proposal: every write,
+    /// create, removal, truncate and rename through this graph is refused,
+    /// and the rows are unchanged.
+    #[test]
+    fn a_store_refuses_every_write() -> Result<()> {
+        let source = Connection::open_in_memory()?;
+        create_schema(&source)?;
+        put_dir(&source, "docs", 1000)?;
+        put_file(&source, "docs/readme", 2000, Some("hello"))?;
+        source.execute_batch("CREATE TABLE _source (id TEXT PRIMARY KEY)")?;
+        let data = source.serialize("main")?;
+        let adapter = SqliteGraphAdapter::new_writable(data.as_ref())?;
+        let refused = |r: Result<()>| {
+            let err = r.expect_err("a store refuses the change");
+            assert!(format!("{err:#}").contains("is a store"), "{err:#}");
+        };
+        refused(adapter.write_content("docs/readme", b"HELLO", 0).map(drop));
+        refused(adapter.create_node("docs", "new", false).map(drop));
+        refused(adapter.remove_node("docs/readme"));
+        refused(adapter.truncate("docs/readme"));
+        refused(adapter.rename_node("docs/readme", "docs", "moved"));
         let mut buf = [0u8; 16];
         let n = adapter.read_content("docs/readme", &mut buf, 0)?;
         assert_eq!(&buf[..n], b"hello");
-        adapter.write_content("docs/readme", b"HELLO", 0)?;
-        let n = adapter.read_content("docs/readme", &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"HELLO");
-        assert_eq!(source.publishes.load(Ordering::SeqCst), 0);
-        adapter.flush_to_arena()?;
-        assert_eq!(source.publishes.load(Ordering::SeqCst), 1);
-
-        assert!(writable_adapter()?.flush_to_arena().is_err());
         Ok(())
     }
 
@@ -3152,47 +1790,6 @@ mod tests {
         Ok(())
     }
 
-    /// Whose mtime moves with its entries (`mtime_tracks_entries`, which
-    /// decides what mtime NFS may report): in the projection a parsed
-    /// file's nodes do; a structural directory, the synthetic root and a
-    /// path that names nothing do not, and neither does a graph that does
-    /// not say (the default). The hot-swapping graph answers for the
-    /// adapter it is serving.
-    #[test]
-    fn only_a_parsed_files_nodes_have_mtimes_that_track_their_entries() -> Result<()> {
-        let adapter = writable_adapter()?;
-        assert!(
-            adapter.mtime_tracks_entries("docs/readme")?,
-            "a file's node"
-        );
-        assert!(!adapter.mtime_tracks_entries("docs")?, "a structural dir");
-        assert!(!adapter.mtime_tracks_entries("")?, "the root");
-        assert!(!adapter.mtime_tracks_entries("nope")?, "nothing");
-        assert!(!MemoryGraph::new().mtime_tracks_entries("docs/readme")?);
-
-        let dir = tempfile::tempdir()?;
-        let ctrl_path = dir.path().join("test.ctrl");
-        let arena_path = dir.path().join("test.arena");
-        let arena_size: u64 = 4096 + 131_072 * 2;
-        let source = Connection::open_in_memory()?;
-        create_schema(&source)?;
-        put_dir(&source, "docs", 1000)?;
-        put_file(&source, "docs/readme", 2000, Some("hello"))?;
-        let db_bytes = source.serialize("main")?;
-        let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
-        leyline_core::layout::write_to_arena(&mut mmap, db_bytes.as_ref())?;
-        let root: [u8; 32] = blake3::hash(db_bytes.as_ref()).into();
-        Controller::open_or_create(&ctrl_path)?.set_arena_with_root(
-            arena_path.to_str().unwrap(),
-            arena_size,
-            root,
-        )?;
-        let graph = HotSwapGraph::new(ctrl_path)?;
-        assert!(graph.mtime_tracks_entries("docs/readme")?, "a file's node");
-        assert!(!graph.mtime_tracks_entries("docs")?, "a structural dir");
-        Ok(())
-    }
-
     #[test]
     fn extra_columns_safe() -> Result<()> {
         // Mache's nodes table has `record_id TEXT` and `source_file TEXT` columns.
@@ -3268,8 +1865,14 @@ mod tests {
         adapter.write_content("docs/readme", b"modified", 0)?;
         adapter.create_node("docs", "new.txt", false)?;
 
-        // Serialize and re-open
-        let bytes = adapter.serialize()?;
+        // Serialize through the `Graph` trait (what `HotSwapGraph` publishes)
+        // and re-open.
+        let bytes = Graph::serialize(&adapter)?;
+        assert_eq!(
+            bytes,
+            adapter.serialize()?,
+            "the trait serializes the writer"
+        );
         let adapter2 = SqliteGraphAdapter::new_writable(&bytes)?;
 
         // Verify writes survived
@@ -3280,1415 +1883,6 @@ mod tests {
         let node = adapter2.get_node("docs/new.txt")?.unwrap();
         assert_eq!(node.name, "new.txt");
 
-        Ok(())
-    }
-
-    /// Helper: create a writable adapter with Go source files for validation tests.
-    #[cfg(feature = "validate")]
-    fn writable_go_adapter() -> Result<SqliteGraphAdapter> {
-        let source = Connection::open_in_memory()?;
-        create_schema(&source)?;
-        let go_src = "package main\n\nfunc main() {\n}\n";
-        put_dir(&source, "functions", 1000)?;
-        put_dir(&source, "functions/main", 2000)?;
-        put_file(&source, "functions/main/source", 3000, Some(go_src))?;
-        put_dir(&source, "docs", 1000)?;
-        put_file(&source, "docs/readme.txt", 2000, Some("hello"))?;
-        put_dir(&source, "src", 1000)?;
-        put_file(&source, "src/main.go", 3000, Some(go_src))?;
-        let data = source.serialize("main")?;
-        let mut adapter = SqliteGraphAdapter::new_writable(data.as_ref())?;
-        let go_lang: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
-        adapter.set_default_language(go_lang);
-        Ok(adapter)
-    }
-
-    #[cfg(feature = "validate")]
-    #[test]
-    fn write_valid_code_clears_error() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // Write valid Go — should succeed and no error in _errors
-        let valid = b"package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n";
-        adapter.write_content("functions/main/source", valid, 0)?;
-
-        // Verify content updated
-        let mut buf = [0u8; 256];
-        let n = adapter.read_content("functions/main/source", &mut buf, 0)?;
-        assert_eq!(&buf[..n], valid.as_slice());
-
-        // Verify no error stored
-        let guard = adapter.writer_guard();
-        let count: i64 = guard.conn().query_row(
-            "SELECT COUNT(*) FROM _errors WHERE node_id = ?1",
-            ["functions/main/source"],
-            |row| row.get(0),
-        )?;
-        assert_eq!(count, 0, "no error should be stored for valid write");
-
-        Ok(())
-    }
-
-    #[cfg(feature = "validate")]
-    #[test]
-    fn write_invalid_code_stores_error() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // Write broken Go — should fail
-        let invalid = b"package main\n\nfunc {{{ bad\n";
-        let result = adapter.write_content("functions/main/source", invalid, 0);
-        assert!(result.is_err(), "write should fail for invalid Go");
-
-        // Verify content was NOT updated (old content preserved)
-        let mut buf = [0u8; 256];
-        let n = adapter.read_content("functions/main/source", &mut buf, 0)?;
-        let content = std::str::from_utf8(&buf[..n])?;
-        assert!(
-            content.contains("package main"),
-            "old content should be preserved"
-        );
-
-        // Verify structured error stored in _errors table
-        let guard = adapter.writer_guard();
-        let (line, _col, message): (i64, i64, String) = guard.conn().query_row(
-            "SELECT line, col, message FROM _errors WHERE node_id = ?1",
-            ["functions/main/source"],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert!(line >= 2, "error should be on line >= 2, got {line}");
-        assert_eq!(message, "syntax error");
-        drop(guard);
-
-        // Now write valid code — error should be cleared
-        let valid = b"package main\n\nfunc main() {\n}\n";
-        adapter.write_content("functions/main/source", valid, 0)?;
-
-        let guard = adapter.writer_guard();
-        let count: i64 = guard.conn().query_row(
-            "SELECT COUNT(*) FROM _errors WHERE node_id = ?1",
-            ["functions/main/source"],
-            |row| row.get(0),
-        )?;
-        assert_eq!(count, 0, "error should be cleared after valid write");
-
-        Ok(())
-    }
-
-    #[cfg(feature = "validate")]
-    #[test]
-    fn write_skips_validation_unknown_extension() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // .txt file — no tree-sitter language, should pass without validation
-        let garbage = b"this is not valid code in any language {{{!!!";
-        adapter.write_content("docs/readme.txt", garbage, 0)?;
-
-        // Verify content updated (no validation blocked it)
-        let mut buf = [0u8; 256];
-        let n = adapter.read_content("docs/readme.txt", &mut buf, 0)?;
-        assert_eq!(&buf[..n], garbage.as_slice());
-
-        Ok(())
-    }
-
-    #[cfg(feature = "validate")]
-    #[test]
-    fn write_uses_fallback_language_for_extensionless() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // "source" has no extension — should use default_language (Go)
-        let invalid = b"func {{{ totally broken";
-        let result = adapter.write_content("functions/main/source", invalid, 0);
-        assert!(
-            result.is_err(),
-            "extensionless file should be validated via fallback"
-        );
-
-        Ok(())
-    }
-
-    /// The first leaf under `id` whose content is `token`.
-    #[cfg(feature = "validate")]
-    fn leaf_holding(adapter: &SqliteGraphAdapter, id: &str, token: &[u8]) -> Option<String> {
-        for child in adapter.list_children(id).ok()? {
-            if child.is_dir {
-                if let Some(found) = leaf_holding(adapter, &child.id, token) {
-                    return Some(found);
-                }
-            } else {
-                let mut buf = vec![0u8; token.len() + 1];
-                if adapter.read_content(&child.id, &mut buf, 0).ok()? == token.len()
-                    && buf.starts_with(token)
-                {
-                    return Some(child.id);
-                }
-            }
-        }
-        None
-    }
-
-    /// A node of a parsed file is a fragment of that file, not a file: the
-    /// write path validates the whole spliced file (ADR-0040 D3), so the
-    /// fallback language does not validate the fragment alone. Before, with
-    /// a default language set (the daemon's `--language go`), a token write
-    /// was parsed as a whole Go file and refused — `util`, a Go package
-    /// name, is not a Go file. A JSON file stands in for the parsed file
-    /// (this crate's parser carries no Go grammar); its token `2` is no more
-    /// a Go file than `util` is. A standalone record
-    /// (`functions/main/source` above) still validates.
-    #[cfg(feature = "validate")]
-    #[test]
-    fn a_token_of_a_parsed_file_is_not_validated_alone() -> Result<()> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"{\"a\": 1}\n",
-            leyline_ts::languages::TsLanguage::Json,
-            "x.json",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        adapter.set_default_language(tree_sitter_go::LANGUAGE.into());
-        let leaf = leaf_holding(&adapter, "x.json", b"1").expect("the number's leaf");
-
-        adapter.write_content(&leaf, b"2", 0)?;
-        let mut buf = [0u8; 4];
-        let n = adapter.read_content(&leaf, &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"2");
-        Ok(())
-    }
-
-    #[cfg(feature = "validate")]
-    #[test]
-    fn write_validates_by_extension() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // main.go has .go extension — should validate as Go regardless of fallback
-        let invalid = b"func {{{ broken go";
-        let result = adapter.write_content("src/main.go", invalid, 0);
-        assert!(result.is_err(), ".go file should be validated as Go");
-
-        // Valid Go
-        let valid = b"package main\n\nfunc main() {}\n";
-        adapter.write_content("src/main.go", valid, 0)?;
-
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "validate")]
-    fn truncate_then_invalid_write_restores_shadow() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // Write valid Go to the extensionless "source" file (uses fallback language)
-        let valid = b"package main\n\nfunc main() { println(\"hello\") }\n";
-        adapter.write_content("functions/main/source", valid, 0)?;
-
-        // Verify content is there
-        let mut buf = [0u8; 256];
-        let n = adapter.read_content("functions/main/source", &mut buf, 0)?;
-        assert_eq!(&buf[..n], valid);
-
-        // Truncate (simulates first half of `echo 'x' > file`)
-        adapter.truncate("functions/main/source")?;
-
-        // Content is gone after truncate
-        let n = adapter.read_content("functions/main/source", &mut buf, 0)?;
-        assert_eq!(n, 0);
-
-        // Write INVALID Go (simulates second half of `echo 'x' > file`)
-        let invalid = b"func {{{ broken";
-        let result = adapter.write_content("functions/main/source", invalid, 0);
-        assert!(result.is_err(), "invalid write should be rejected");
-
-        // Shadow copy should have restored the old valid content
-        let n = adapter.read_content("functions/main/source", &mut buf, 0)?;
-        assert_eq!(
-            &buf[..n],
-            valid,
-            "old valid content should be restored after failed write"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "validate")]
-    fn rename_invalid_content_to_validated_path_rejected() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // Create a temp file with invalid Go content (simulates sed -i temp file)
-        // Use .tmp extension so write_content skips validation (unrecognized ext)
-        adapter.create_node("src", "main.go.tmp", false)?;
-        let invalid = b"func {{{ broken";
-        adapter.write_content("src/main.go.tmp", invalid, 0)?;
-
-        // Rename temp over main.go — destination has .go extension → validate
-        let result = adapter.rename_node("src/main.go.tmp", "src", "main.go");
-        assert!(
-            result.is_err(),
-            "renaming invalid content to .go path should fail"
-        );
-
-        // Temp file should still exist (rename was rejected)
-        let temp = adapter.get_node("src/main.go.tmp")?;
-        assert!(
-            temp.is_some(),
-            "temp file should still exist after rejected rename"
-        );
-
-        // Original main.go should still have its old content
-        let mut buf = [0u8; 256];
-        let n = adapter.read_content("src/main.go", &mut buf, 0)?;
-        assert!(n > 0, "original .go file should still exist with content");
-
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "validate")]
-    fn rename_valid_content_to_validated_path_succeeds() -> Result<()> {
-        let adapter = writable_go_adapter()?;
-
-        // Create temp file with valid Go
-        adapter.create_node("src", "main.go.tmp", false)?;
-        let valid = b"package main\n\nfunc main() { println(\"updated\") }\n";
-        adapter.write_content("src/main.go.tmp", valid, 0)?;
-
-        // sed -i removes the original before renaming temp over it
-        adapter.remove_node("src/main.go")?;
-
-        // Rename temp → main.go — valid content, should succeed
-        adapter.rename_node("src/main.go.tmp", "src", "main.go")?;
-
-        // main.go now has the new content
-        let mut buf = [0u8; 256];
-        let n = adapter.read_content("src/main.go", &mut buf, 0)?;
-        assert_eq!(&buf[..n], valid);
-
-        Ok(())
-    }
-
-    /// Two HTML files projected into one arena, as a writable adapter. The
-    /// mount's `rm`/`mv` used to touch `nodes` alone (bead
-    /// `ley-line-open-af3817`); these fixtures let the tests read every
-    /// other file-keyed table through the writer.
-    fn two_file_adapter() -> Result<SqliteGraphAdapter> {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        let html = leyline_ts::languages::TsLanguage::Html;
-        for (rel, src) in [
-            ("a.html", b"<p>alpha</p>".as_slice()),
-            ("b.html", b"<p>beta</p>".as_slice()),
-        ] {
-            leyline_ts::project::project_ast_with_source(
-                src,
-                html.ts_language(),
-                &conn,
-                rel,
-                "html",
-            )?;
-        }
-        let bytes = conn.serialize("main")?;
-        SqliteGraphAdapter::new_writable(bytes.as_ref())
-    }
-
-    fn rows_in_file_range(adapter: &SqliteGraphAdapter, table: &str, rel: &str) -> i64 {
-        let guard = adapter.writer_guard();
-        let conn = guard.conn();
-        let Some(file_id) = leyline_schema::lookup_file_id(conn, rel).unwrap() else {
-            return 0;
-        };
-        let (lo, hi) = leyline_schema::file_nid_range(file_id);
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM {table} WHERE nid BETWEEN ?1 AND ?2"),
-            rusqlite::params![lo, hi],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    fn source_rows(adapter: &SqliteGraphAdapter, rel: &str) -> i64 {
-        let guard = adapter.writer_guard();
-        guard
-            .conn()
-            .query_row("SELECT COUNT(*) FROM _source WHERE id = ?1", [rel], |r| {
-                r.get(0)
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn remove_node_clears_every_table_of_the_file_and_no_other() -> Result<()> {
-        let adapter = two_file_adapter()?;
-        let b_ast_before = rows_in_file_range(&adapter, "_ast", "b.html");
-        assert!(
-            b_ast_before > 0,
-            "fixture must project _ast rows for b.html"
-        );
-        assert!(rows_in_file_range(&adapter, "_ast", "a.html") > 0);
-
-        adapter.remove_node("a.html")?;
-
-        assert_eq!(rows_in_file_range(&adapter, "nodes", "a.html"), 0);
-        assert_eq!(
-            rows_in_file_range(&adapter, "_ast", "a.html"),
-            0,
-            "a removed file's _ast rows must go with its nodes rows"
-        );
-        assert_eq!(
-            source_rows(&adapter, "a.html"),
-            0,
-            "_source row must go too"
-        );
-        assert_eq!(rows_in_file_range(&adapter, "_ast", "b.html"), b_ast_before);
-        assert_eq!(source_rows(&adapter, "b.html"), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn rename_node_moves_every_table_of_the_file_into_the_new_range() -> Result<()> {
-        let adapter = two_file_adapter()?;
-        let a_ast_before = rows_in_file_range(&adapter, "_ast", "a.html");
-        let a_nodes_before = rows_in_file_range(&adapter, "nodes", "a.html");
-        let b_ast_before = rows_in_file_range(&adapter, "_ast", "b.html");
-        assert!(a_ast_before > 0);
-
-        adapter.rename_node("a.html", "", "c.html")?;
-
-        assert_eq!(
-            rows_in_file_range(&adapter, "_ast", "c.html"),
-            a_ast_before,
-            "_ast rows must follow the file into its new nid range"
-        );
-        assert_eq!(
-            rows_in_file_range(&adapter, "nodes", "c.html"),
-            a_nodes_before
-        );
-        assert_eq!(
-            rows_in_file_range(&adapter, "_ast", "a.html"),
-            0,
-            "nothing may stay behind in the old range"
-        );
-        assert_eq!(
-            source_rows(&adapter, "c.html"),
-            1,
-            "_source.id must be rewritten"
-        );
-        assert_eq!(source_rows(&adapter, "a.html"), 0);
-        assert_eq!(rows_in_file_range(&adapter, "_ast", "b.html"), b_ast_before);
-        // The renamed file still reads through the graph under its new path.
-        let mut buf = [0u8; 32];
-        let n = adapter.read_content("c.html/element/text", &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"alpha");
-        Ok(())
-    }
-
-    /// Helper: create a writable adapter from an HTML parse with source tracking.
-    #[cfg(feature = "splice")]
-    fn writable_ast_adapter(html: &[u8]) -> Result<SqliteGraphAdapter> {
-        let db_bytes = leyline_ts::parse_with_source(
-            html,
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        #[allow(unused_mut)]
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        #[cfg(feature = "splice")]
-        adapter.set_source_writer(Arc::new(super::fixtures::ProjectingWriter));
-        Ok(adapter)
-    }
-
-    /// Records what the adapter hands the write path, and writes nothing.
-    #[cfg(feature = "splice")]
-    #[derive(Default)]
-    struct RecordingWriter {
-        writes: Mutex<Vec<(String, Vec<u8>)>>,
-    }
-
-    #[cfg(feature = "splice")]
-    impl SourceWriter for RecordingWriter {
-        fn write(
-            &self,
-            _conn: &Connection,
-            source_id: &str,
-            bytes: Vec<u8>,
-            _base: Option<leyline_core::Hash>,
-        ) -> Result<()> {
-            self.writes.lock().push((source_id.to_string(), bytes));
-            Ok(())
-        }
-    }
-
-    /// ADR-0040 D3: the mount computes the whole file's new bytes and hands
-    /// them, with the file's `_source.id`, to the one write path — from a
-    /// flush and from a batch splice alike.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn an_edit_hands_the_whole_spliced_file_to_the_source_writer() -> Result<()> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>\n<!-- kept -->\n",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        let writer = Arc::new(RecordingWriter::default());
-        adapter.set_source_writer(writer.clone());
-        let node_id = "test.html/element/text";
-
-        adapter.write_content(node_id, b"world", 0)?;
-        adapter.flush_node(node_id)?;
-        assert_eq!(
-            writer.writes.lock().as_slice(),
-            [(
-                "test.html".to_string(),
-                b"<p>world</p>\n<!-- kept -->\n".to_vec()
-            )],
-        );
-        assert!(!adapter.pending.lock().contains_key(node_id));
-
-        writer.writes.lock().clear();
-        adapter.batch_splice(&[(node_id.to_string(), Some("hi".to_string()))])?;
-        assert_eq!(
-            writer.writes.lock().as_slice(),
-            [(
-                "test.html".to_string(),
-                b"<p>hi</p>\n<!-- kept -->\n".to_vec()
-            )],
-        );
-        Ok(())
-    }
-
-    /// With no source writer, an edit to a parsed file is refused rather
-    /// than reported as done, and the flush stays pending.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn an_edit_with_no_source_writer_is_refused_and_stays_pending() -> Result<()> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        let node_id = "test.html/element/text";
-
-        adapter.write_content(node_id, b"world", 0)?;
-        let err = adapter.flush_node(node_id).unwrap_err();
-        assert!(format!("{err:#}").contains("no source writer"), "{err:#}");
-        assert!(adapter.pending.lock().contains_key(node_id));
-
-        let err = adapter
-            .batch_splice(&[(node_id.to_string(), Some("x".to_string()))])
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("no source writer"), "{err:#}");
-        Ok(())
-    }
-
-    /// Records the base each write names; with `refuse`, refuses as stale
-    /// any write that names one, the way the write path refuses a file that
-    /// moved, and projects the rest.
-    #[cfg(feature = "splice")]
-    #[derive(Default)]
-    struct BaseCheckingWriter {
-        bases: Mutex<Vec<Option<leyline_core::Hash>>>,
-        refuse: bool,
-    }
-
-    #[cfg(feature = "splice")]
-    impl SourceWriter for BaseCheckingWriter {
-        fn write(
-            &self,
-            conn: &Connection,
-            source_id: &str,
-            bytes: Vec<u8>,
-            base: Option<leyline_core::Hash>,
-        ) -> Result<()> {
-            self.bases.lock().push(base);
-            if let (true, Some(expected)) = (self.refuse, base) {
-                return Err(StaleWrite {
-                    source_id: source_id.to_string(),
-                    expected,
-                    current: leyline_core::Hash::ZERO,
-                }
-                .into());
-            }
-            super::fixtures::ProjectingWriter.write(conn, source_id, bytes, base)
-        }
-    }
-
-    #[cfg(feature = "splice")]
-    fn hash_of(bytes: &[u8]) -> leyline_core::Hash {
-        bytes.hash()
-    }
-
-    /// ADR-0042 P2 through the mount: an edit hands the write path the hash
-    /// of the file as it was before the edit's first write, so a change
-    /// that lands in between is caught. After a flush the next edit takes a
-    /// fresh base.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn an_edit_names_the_file_it_was_made_against() -> Result<()> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        let writer = Arc::new(BaseCheckingWriter::default());
-        adapter.set_source_writer(writer.clone());
-        let node_id = "test.html/element/text";
-
-        adapter.write_content(node_id, b"world", 0)?;
-        adapter.flush_node(node_id)?;
-        adapter.write_content(node_id, b"again", 0)?;
-        adapter.flush_node(node_id)?;
-        assert_eq!(
-            writer.bases.lock().as_slice(),
-            [
-                Some(hash_of(b"<p>hello</p>")),
-                Some(hash_of(b"<p>world</p>"))
-            ],
-        );
-        Ok(())
-    }
-
-    /// Opening for writing takes the base (`note_base_as`): a change that
-    /// lands after the open and before the first write is caught at flush,
-    /// because the flush names the file as it was at the open, not at the
-    /// write. The change here is a batch splice, which writes with no base
-    /// of its own. The mount handle's write after such a change is refused
-    /// before it is staged (bead `ley-line-open-6116c9`).
-    #[test]
-    #[cfg(feature = "splice")]
-    fn opening_for_writing_takes_the_base() -> Result<()> {
-        fn check(graph: &dyn Graph, writer: &BaseCheckingWriter) -> Result<()> {
-            let node_id = "test.html/element/text";
-            graph.note_base_as(A, node_id)?;
-            graph.batch_splice(&[(node_id.to_string(), Some("other".to_string()))])?;
-            graph.write_content_as(A, node_id, b"world", 0)?;
-            graph.flush_node_as(A, node_id)?;
-            assert_eq!(
-                writer.bases.lock().last(),
-                Some(&Some(hash_of(b"<p>hello</p>"))),
-                "the flush names the file as it was when it was opened",
-            );
-
-            graph.note_base(node_id)?;
-            graph.batch_splice(&[(node_id.to_string(), Some("again".to_string()))])?;
-            assert!(is_stale(
-                graph.write_content(node_id, b"world", 0).map(drop)
-            ));
-            Ok(())
-        }
-
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        let writer = Arc::new(BaseCheckingWriter::default());
-        adapter.set_source_writer(writer.clone());
-        check(&adapter, &writer)?;
-
-        let dir = tempfile::tempdir()?;
-        let writer = Arc::new(BaseCheckingWriter::default());
-        let graph = HotSwapGraph::new(publish_html_arena(dir.path())?)?
-            .with_writable()
-            .with_source_writer(writer.clone())?;
-        check(&graph, &writer)
-    }
-
-    /// An edit to a node of a parsed file stays out of the database until
-    /// its flush lands: the projection rows are a function of the stored
-    /// source, and anything that publishes the database in between (another
-    /// file's flush, a reparse, a snapshot) must not carry half an edit. The
-    /// node still reads, and sizes, as the edit so far.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn an_unflushed_edit_stays_out_of_the_database() -> Result<()> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        adapter.set_source_writer(Arc::new(BaseCheckingWriter::default()));
-        let node_id = "test.html/element/text";
-        let stored = |adapter: &SqliteGraphAdapter| -> Result<String> {
-            let guard = adapter.writer_guard();
-            let nid = leyline_schema::resolve_path(guard.conn(), node_id)?.unwrap();
-            Ok(guard
-                .conn()
-                .query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
-                    r.get(0)
-                })?)
-        };
-
-        adapter.write_content(node_id, b"worlds", 0)?;
-        assert_eq!(
-            stored(&adapter)?,
-            "hello",
-            "the database holds no half edit"
-        );
-        let mut buf = [0u8; 16];
-        let n = adapter.read_content(node_id, &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"worlds", "the node reads as the edit so far");
-        let n = adapter.read_content(node_id, &mut buf, 2)?;
-        assert_eq!(&buf[..n], b"rlds", "a read at an offset");
-        assert_eq!(
-            adapter.read_content(node_id, &mut buf, 6)?,
-            0,
-            "past the end"
-        );
-        assert_eq!(adapter.get_node(node_id)?.unwrap().size, 6);
-        let listed = adapter.list_children("test.html/element")?;
-        let text = listed.iter().find(|n| n.id == node_id).unwrap();
-        assert_eq!(text.size, 6);
-
-        adapter.flush_node(node_id)?;
-        assert_eq!(stored(&adapter)?, "worlds", "the flush lands the edit");
-        Ok(())
-    }
-
-    /// Removing a node drops the edits in progress to it and to the nodes
-    /// beneath it, which have nowhere to land, and keeps every other.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn removing_a_node_drops_the_edits_beneath_it() -> Result<()> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        adapter.set_source_writer(Arc::new(BaseCheckingWriter::default()));
-        let tag = "test.html/element/start_tag";
-        let tag_name = "test.html/element/start_tag/tag_name";
-        let text = "test.html/element/text";
-        adapter.write_content(tag, b"<q>", 0)?;
-        adapter.write_content(tag_name, b"q", 0)?;
-        adapter.write_content(text, b"world", 0)?;
-
-        adapter.remove_node(tag)?;
-        let pending = adapter.pending.lock();
-        assert!(!pending.contains_key(tag), "the removed node's edit");
-        assert!(!pending.contains_key(tag_name), "an edit beneath it");
-        assert!(pending.contains_key(text), "an edit elsewhere stays");
-        Ok(())
-    }
-
-    /// A refused edit is discarded, not left behind: the node reads as the
-    /// stored file again, nothing stays pending, the refusal is typed as
-    /// stale for the mount to answer `ESTALE`, and its reason is recorded
-    /// in `_errors` for the node.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_refused_edit_restores_the_node_and_reports_stale() -> Result<()> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        adapter.set_source_writer(Arc::new(BaseCheckingWriter {
-            refuse: true,
-            ..Default::default()
-        }));
-        let node_id = "test.html/element/text";
-
-        adapter.write_content(node_id, b"world", 0)?;
-        let err = adapter.flush_node(node_id).unwrap_err();
-        assert!(err.downcast_ref::<StaleWrite>().is_some(), "{err:#}");
-
-        let mut buf = [0u8; 16];
-        let n = adapter.read_content(node_id, &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"hello", "the refused edit is discarded");
-        assert!(!adapter.pending.lock().contains_key(node_id));
-        let recorded: String = adapter.writer_guard().conn().query_row(
-            "SELECT message FROM _errors WHERE node_id = ?1",
-            [node_id],
-            |r| r.get(0),
-        )?;
-        assert!(recorded.contains("moved"), "{recorded}");
-        Ok(())
-    }
-
-    // ---- Edits per handle (bead ley-line-open-5da276) ----
-    //
-    // Two handles open one file; each edit is checked against the bytes its
-    // own handle read (ADR-0042 P2). Before, the base and the edit in
-    // progress were kept per file per mount: a second handle inherited the
-    // first's base, took a fresh one after the first flushed, and shared one
-    // overlay with it, so its edit landed unchecked, interleaved, or not at
-    // all while its flush reported success.
-
-    #[cfg(feature = "splice")]
-    const A: Handle = 1;
-    #[cfg(feature = "splice")]
-    const B: Handle = 2;
-    #[cfg(feature = "splice")]
-    const TEXT: &str = "test.html/element/text";
-
-    /// An adapter over `html` whose write path checks bases against the
-    /// stored file, as the real one does.
-    #[cfg(feature = "splice")]
-    fn checked_adapter(html: &[u8]) -> Result<SqliteGraphAdapter> {
-        let db_bytes = leyline_ts::parse_with_source(
-            html,
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-        adapter.set_source_writer(Arc::new(super::fixtures::CheckingWriter));
-        Ok(adapter)
-    }
-
-    #[cfg(feature = "splice")]
-    fn read_as(graph: &dyn Graph, handle: Handle, id: &str) -> Result<Vec<u8>> {
-        let mut buf = [0u8; 64];
-        let n = graph.read_content_as(handle, id, &mut buf, 0)?;
-        Ok(buf[..n].to_vec())
-    }
-
-    #[cfg(feature = "splice")]
-    fn is_stale(result: Result<()>) -> bool {
-        result.is_err_and(|e| e.downcast_ref::<StaleWrite>().is_some())
-    }
-
-    /// A opens, B opens, A's edit lands: B's edit was made against bytes the
-    /// file no longer holds, so B's flush is refused as stale and the file
-    /// keeps A's edit. Before, B's first write took the file after A's
-    /// flush as its base, which B never read, and B's flush landed.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_second_handle_whose_file_moved_is_refused_stale() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.note_base_as(A, TEXT)?;
-        adapter.note_base_as(B, TEXT)?;
-        adapter.write_content_as(A, TEXT, b"world", 0)?;
-        adapter.flush_node_as(A, TEXT)?;
-        adapter.write_content_as(B, TEXT, b"there", 0)?;
-        assert!(is_stale(adapter.flush_node_as(B, TEXT)));
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"world");
-
-        // B still has not read A's file: every later edit through B is
-        // refused too, until B is released and the file opened again.
-        adapter.write_content_as(B, TEXT, b"retry", 0)?;
-        assert!(is_stale(adapter.flush_node_as(B, TEXT)));
-        adapter.release(B)?;
-        adapter.note_base_as(B, TEXT)?;
-        adapter.write_content_as(B, TEXT, b"fresh", 0)?;
-        adapter.flush_node_as(B, TEXT)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"fresh");
-        Ok(())
-    }
-
-    /// Two handles' edits to one node do not interleave: the first flush
-    /// lands its own bytes alone, and the other edit, made against the file
-    /// before it, is refused rather than dropped. Before, both wrote one
-    /// overlay (`world` patched with `hi` landed `hirld`, where B's edit of
-    /// `hello` is `hillo`), and the first
-    /// flush took the overlay away, so the second reported success having
-    /// landed nothing.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn two_handles_edits_do_not_interleave_and_neither_is_lost() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.note_base_as(A, TEXT)?;
-        adapter.note_base_as(B, TEXT)?;
-        adapter.write_content_as(A, TEXT, b"world", 0)?;
-        adapter.write_content_as(B, TEXT, b"hi", 0)?;
-        adapter.flush_node_as(B, TEXT)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"hillo");
-        assert!(is_stale(adapter.flush_node_as(A, TEXT)));
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"hillo");
-        Ok(())
-    }
-
-    /// A handle opened after another's edit landed reads, and edits
-    /// against, the file as it is now: its flush lands.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_handle_opened_after_a_flush_lands_its_edit() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.note_base_as(A, TEXT)?;
-        adapter.write_content_as(A, TEXT, b"world", 0)?;
-        adapter.flush_node_as(A, TEXT)?;
-        adapter.release(A)?;
-        adapter.note_base_as(B, TEXT)?;
-        adapter.write_content_as(B, TEXT, b"there", 0)?;
-        adapter.flush_node_as(B, TEXT)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"there");
-        Ok(())
-    }
-
-    /// A handle reads its own edit in progress; another handle, and a read
-    /// that names no handle, read the stored node. The node is sized as the
-    /// largest edit in progress to it, which is the size the kernel's one
-    /// inode shows the writer.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_handle_reads_its_own_edit_and_others_read_the_stored_node() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.write_content_as(A, TEXT, b"worlds", 0)?;
-        assert_eq!(read_as(&adapter, A, TEXT)?, b"worlds");
-        assert_eq!(read_as(&adapter, B, TEXT)?, b"hello");
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"hello");
-        assert_eq!(adapter.get_node(TEXT)?.unwrap().size, 6);
-        adapter.write_content_as(B, TEXT, b"J", 0)?;
-        assert_eq!(read_as(&adapter, A, TEXT)?, b"worlds");
-        assert_eq!(read_as(&adapter, B, TEXT)?, b"Jello");
-        Ok(())
-    }
-
-    /// After its own flush a handle's base is the file it wrote: an edit
-    /// another handle lands next is not absorbed into its next edit.
-    /// Before, the flush dropped the base and the next write took the
-    /// other handle's file as its own.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_handle_after_its_own_flush_edits_against_what_it_wrote() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.note_base_as(A, TEXT)?;
-        adapter.write_content_as(A, TEXT, b"world", 0)?;
-        adapter.flush_node_as(A, TEXT)?;
-        adapter.note_base_as(B, TEXT)?;
-        adapter.write_content_as(B, TEXT, b"there", 0)?;
-        adapter.flush_node_as(B, TEXT)?;
-        adapter.write_content_as(A, TEXT, b"again", 0)?;
-        assert!(is_stale(adapter.flush_node_as(A, TEXT)));
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"there");
-
-        // With nothing landing in between, the handle edits on.
-        adapter.release(A)?;
-        adapter.note_base_as(A, TEXT)?;
-        adapter.write_content_as(A, TEXT, b"one", 0)?;
-        adapter.flush_node_as(A, TEXT)?;
-        adapter.truncate_as(A, TEXT)?;
-        adapter.write_content_as(A, TEXT, b"two", 0)?;
-        adapter.flush_node_as(A, TEXT)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"two");
-        Ok(())
-    }
-
-    /// Releasing a handle drops its edit in progress and its base, and
-    /// leaves every other handle's.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn releasing_a_handle_drops_its_edit() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.write_content_as(A, TEXT, b"world", 0)?;
-        adapter.write_content_as(B, TEXT, b"J", 0)?;
-        adapter.release(A)?;
-        assert_eq!(read_as(&adapter, A, TEXT)?, b"hello");
-        assert_eq!(read_as(&adapter, B, TEXT)?, b"Jello");
-        adapter.release(B)?;
-        assert_eq!(adapter.get_node(TEXT)?.unwrap().size, 5);
-        adapter.flush_node_as(A, TEXT)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"hello");
-        Ok(())
-    }
-
-    /// A batch splice that lands while a handle's edit to the same node is
-    /// in progress leaves that edit to its flush, which refuses it as stale.
-    /// Before, the batch dropped the edit and the flush reported success
-    /// having landed nothing.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_batch_splice_leaves_an_edit_in_progress_to_be_refused() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.write_content_as(A, TEXT, b"world", 0)?;
-        adapter.batch_splice(&[(TEXT.to_string(), Some("other".to_string()))])?;
-        assert!(is_stale(adapter.flush_node_as(A, TEXT)));
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, TEXT)?, b"other");
-        Ok(())
-    }
-
-    /// The mount handle (NFS) edits two nodes of one file, as two clients
-    /// with no opens to tell them apart do. Once one lands, the other was
-    /// made against bytes the file no longer holds and is refused as stale.
-    /// Before, the first flush dropped the file's base and the second
-    /// landed unchecked.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn the_mount_handle_keeps_a_base_while_an_edit_to_its_file_is_pending() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>\n<p>there</p>\n")?;
-        let x = "test.html/element_0/text";
-        let y = "test.html/element_1/text";
-        adapter.write_content(x, b"world", 0)?;
-        adapter.write_content(y, b"again", 0)?;
-        adapter.flush_node(y)?;
-        assert!(is_stale(adapter.flush_node(x)));
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"hello");
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, y)?, b"again");
-
-        // The refusal keeps the base: an edit made with no read of the
-        // moved file is refused too, at its write (bead
-        // `ley-line-open-6116c9`). A read with nothing pending re-takes it,
-        // and the edit after it lands.
-        assert!(is_stale(adapter.write_content(x, b"later", 0).map(drop)));
-        adapter.note_read(x)?;
-        adapter.write_content(x, b"later", 0)?;
-        adapter.flush_node(x)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, x)?, b"later");
-        Ok(())
-    }
-
-    /// The mount handle holds one base per file however many of its nodes
-    /// are read, and a read replaces it rather than adding one: bases taken
-    /// by reads do not grow with the reads (bead `ley-line-open-6116c9`).
-    #[test]
-    #[cfg(feature = "splice")]
-    fn reads_hold_one_mount_base_per_file() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>\n<p>there</p>\n")?;
-        let x = "test.html/element_0/text";
-        let y = "test.html/element_1/text";
-        adapter.note_read(x)?;
-        let first = adapter.bases.lock().clone();
-        adapter.batch_splice(&[(y.to_string(), Some("moved".to_string()))])?;
-        for _ in 0..3 {
-            adapter.note_read(x)?;
-            adapter.note_read(y)?;
-        }
-        let bases = adapter.bases.lock().clone();
-        assert_eq!(bases.len(), 1, "one base for the one file: {bases:?}");
-        assert_ne!(bases, first, "the read after the move re-took the base");
-        Ok(())
-    }
-
-    /// An edit that empties a node lands at its flush like any other, and
-    /// leaves nothing pending (bead `ley-line-open-8a26d8`). Before, an
-    /// empty edit's flush returned success without landing and the empty
-    /// edit stayed pending, so the node read and sized as empty through
-    /// the mount while the stored file still held its text.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn an_edit_that_empties_a_node_lands_at_its_flush() -> Result<()> {
-        let adapter = checked_adapter(b"<p>hello</p>")?;
-        adapter.truncate(TEXT)?;
-        adapter.flush_node(TEXT)?;
-        assert!(adapter.pending.lock().is_empty(), "nothing stays pending");
-        assert_eq!(read_as(&adapter, B, TEXT)?, b"", "the stored file moved");
-        Ok(())
-    }
-
-    /// A handle's edit in progress to another file neither holds this
-    /// file's base after its flush nor is dropped by a refusal here: the
-    /// mount handle's next edit to `a.html` takes a fresh base and lands,
-    /// and its refused edit to `a.html` leaves its edit to `b.html`.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn an_edit_to_another_file_is_not_this_files_edit() -> Result<()> {
-        let mut adapter = two_file_adapter()?;
-        adapter.set_source_writer(Arc::new(super::fixtures::CheckingWriter));
-        let a = "a.html/element/text";
-        let b = "b.html/element/text";
-        adapter.write_content(b, b"gamma", 0)?;
-        adapter.write_content(a, b"omega", 0)?;
-        adapter.flush_node(a)?;
-        adapter.write_content(a, b"sigma", 0)?;
-        adapter.flush_node(a)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, a)?, b"sigma");
-
-        adapter.write_content(a, b"three", 0)?;
-        adapter.batch_splice(&[(a.to_string(), Some("four".to_string()))])?;
-        assert!(is_stale(adapter.flush_node(a)));
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, b)?, b"gamma");
-        adapter.flush_node(b)?;
-        assert_eq!(read_as(&adapter, MOUNT_HANDLE, b)?, b"gamma");
-        Ok(())
-    }
-
-    /// The handle methods route through a hot-swapping graph to the adapter
-    /// it serves: each handle reads, truncates, writes, flushes and
-    /// releases its own edit.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_hot_swap_graph_keeps_edits_per_handle() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let graph = HotSwapGraph::new(publish_html_arena(dir.path())?)?
-            .with_writable()
-            .with_source_writer(Arc::new(super::fixtures::CheckingWriter))?;
-        graph.note_base_as(A, TEXT)?;
-        graph.note_base_as(B, TEXT)?;
-        assert_eq!(graph.write_content_as(A, TEXT, b"worlds", 0)?, 6);
-        assert_eq!(read_as(&graph, A, TEXT)?, b"worlds");
-        assert_eq!(read_as(&graph, B, TEXT)?, b"hello");
-        graph.truncate_as(A, TEXT)?;
-        graph.write_content_as(A, TEXT, b"hi", 0)?;
-        assert_eq!(read_as(&graph, A, TEXT)?, b"hi");
-        graph.flush_node_as(A, TEXT)?;
-        assert_eq!(read_as(&graph, MOUNT_HANDLE, TEXT)?, b"hi");
-        graph.write_content_as(B, TEXT, b"there", 0)?;
-        assert!(is_stale(graph.flush_node_as(B, TEXT)));
-        graph.write_content_as(A, TEXT, b"xx", 0)?;
-        graph.release(A)?;
-        assert_eq!(read_as(&graph, A, TEXT)?, b"hi");
-
-        // An NFS READ's base reaches the adapter too: the file moves after
-        // it, and the mount's write is refused.
-        graph.note_read(TEXT)?;
-        graph.batch_splice(&[(TEXT.to_string(), Some("moved".to_string()))])?;
-        assert!(is_stale(graph.write_content(TEXT, b"late", 0).map(drop)));
-        Ok(())
-    }
-
-    /// A graph that keeps no edits per handle serves every handle method
-    /// through the method that names none, and returns what it returns.
-    #[test]
-    fn the_handle_methods_default_to_the_methods_that_name_none() -> Result<()> {
-        #[derive(Default)]
-        struct Unhandled {
-            calls: Mutex<Vec<&'static str>>,
-        }
-        impl Graph for Unhandled {
-            fn get_node(&self, _id: &str) -> Result<Option<Node>> {
-                Ok(None)
-            }
-            fn lookup_child(&self, _parent_id: &str, _name: &str) -> Result<Option<Node>> {
-                Ok(None)
-            }
-            fn list_children(&self, _parent_id: &str) -> Result<Vec<Node>> {
-                Ok(Vec::new())
-            }
-            fn read_content(&self, _id: &str, _buf: &mut [u8], _offset: u64) -> Result<usize> {
-                self.calls.lock().push("read");
-                Ok(7)
-            }
-            fn write_content(&self, _id: &str, data: &[u8], _offset: u64) -> Result<usize> {
-                self.calls.lock().push("write");
-                Ok(data.len() + 10)
-            }
-            fn truncate(&self, _id: &str) -> Result<()> {
-                self.calls.lock().push("truncate");
-                Ok(())
-            }
-            fn note_base(&self, _id: &str) -> Result<()> {
-                self.calls.lock().push("note_base");
-                Ok(())
-            }
-            fn flush_node(&self, _id: &str) -> Result<()> {
-                self.calls.lock().push("flush");
-                Ok(())
-            }
-        }
-
-        let graph = Unhandled::default();
-        let mut buf = [0u8; 4];
-        graph.note_base_as(3, "f")?;
-        assert_eq!(graph.write_content_as(3, "f", b"ab", 0)?, 12);
-        assert_eq!(graph.read_content_as(3, "f", &mut buf, 0)?, 7);
-        graph.truncate_as(3, "f")?;
-        graph.flush_node_as(3, "f")?;
-        graph.release(3)?;
-        assert_eq!(
-            *graph.calls.lock(),
-            ["note_base", "write", "read", "truncate", "flush"]
-        );
-        Ok(())
-    }
-
-    /// Refuses every write with a syntax error at a fixed byte, the way the
-    /// write path reports one.
-    #[cfg(feature = "splice")]
-    struct SyntaxErrorAt(usize);
-
-    #[cfg(feature = "splice")]
-    impl SourceWriter for SyntaxErrorAt {
-        fn write(
-            &self,
-            _conn: &Connection,
-            _source_id: &str,
-            _bytes: Vec<u8>,
-            _base: Option<leyline_core::Hash>,
-        ) -> Result<()> {
-            anyhow::bail!(
-                "modified source has syntax errors (error at byte {}..{}, line 1)",
-                self.0,
-                self.0 + 1
-            )
-        }
-    }
-
-    /// A batch splice names the edited node whose post-splice byte range
-    /// holds the syntax error, and only that node: `hello` -> `world` at
-    /// byte 3 occupies `[3, 8)`.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_batch_splice_error_is_attributed_to_the_node_whose_range_holds_it() -> Result<()> {
-        let node_id = "test.html/element/text";
-        let attributed = |err_byte: usize| -> Result<bool> {
-            let db_bytes = leyline_ts::parse_with_source(
-                b"<p>hello</p>",
-                leyline_ts::languages::TsLanguage::Html,
-                "test.html",
-            )?;
-            let mut adapter = SqliteGraphAdapter::new_writable(&db_bytes)?;
-            adapter.set_source_writer(Arc::new(SyntaxErrorAt(err_byte)));
-            let err = adapter
-                .batch_splice(&[(node_id.to_string(), Some("world".to_string()))])
-                .unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(msg.contains("syntax errors"), "{msg}");
-            Ok(msg.contains(&format!("attributed to node '{node_id}'")))
-        };
-        assert!(attributed(3)?, "the range's first byte");
-        assert!(attributed(5)?, "inside the range");
-        assert!(!attributed(1)?, "before the range");
-        assert!(!attributed(8)?, "the range's end is exclusive");
-        Ok(())
-    }
-
-    /// Publish an HTML file's single-file projection as an arena, returning
-    /// the control path.
-    #[cfg(feature = "splice")]
-    fn publish_html_arena(dir: &Path) -> Result<PathBuf> {
-        let db_bytes = leyline_ts::parse_with_source(
-            b"<p>hello</p>",
-            leyline_ts::languages::TsLanguage::Html,
-            "test.html",
-        )?;
-        let arena_path = dir.join("splice.arena");
-        let ctrl_path = dir.join("splice.ctrl");
-        let arena_size = 4096 + 2 * 1024 * 1024;
-        let mut mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
-        leyline_core::layout::write_to_arena(&mut mmap, &db_bytes)?;
-        let root: [u8; 32] = blake3::hash(&db_bytes).into();
-        Controller::open_or_create(&ctrl_path)?.set_arena_with_root(
-            arena_path.to_str().unwrap(),
-            arena_size,
-            root,
-        )?;
-        Ok(ctrl_path)
-    }
-
-    /// `leyline serve`'s graph hands its source writer to the writable
-    /// adapter it is already serving, and to the ones it builds later.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_hot_swap_graph_routes_edits_to_its_source_writer() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let ctrl = publish_html_arena(dir.path())?;
-        let writer = Arc::new(RecordingWriter::default());
-        let graph = HotSwapGraph::new(ctrl)?
-            .with_writable()
-            .with_source_writer(writer.clone())?;
-        let node_id = "test.html/element/text";
-
-        graph.write_content(node_id, b"world", 0)?;
-        graph.flush_node(node_id)?;
-        assert_eq!(
-            writer.writes.lock().as_slice(),
-            [("test.html".to_string(), b"<p>world</p>".to_vec())],
-        );
-        Ok(())
-    }
-
-    /// Before anything is published there is no adapter to hand the writer
-    /// to: the graph keeps serving the empty tree rather than loading one.
-    #[test]
-    #[cfg(feature = "splice")]
-    fn a_source_writer_on_an_unpublished_arena_keeps_the_empty_tree() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let ctrl_path = dir.path().join("empty.ctrl");
-        let arena_path = dir.path().join("empty.arena");
-        let arena_size: u64 = 4096 + 131_072 * 2;
-        Controller::open_or_create(&ctrl_path)?
-            .set_arena(arena_path.to_str().unwrap(), arena_size)?;
-        let _mmap = leyline_core::layout::create_arena(&arena_path, arena_size)?;
-
-        let graph = HotSwapGraph::new(ctrl_path)?
-            .with_writable()
-            .with_source_writer(Arc::new(RecordingWriter::default()))?;
-        let root = graph.get_node("")?.expect("the empty tree has a root");
-        assert!(root.is_dir);
-        assert!(graph.list_children("")?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "splice")]
-    fn splice_write_and_flush_triggers_reproject() -> Result<()> {
-        let html = b"<p>hello</p>";
-        let adapter = writable_ast_adapter(html)?;
-
-        // The text leaf is at "test.html/element/text" in the projected
-        // tree: a node's path is rooted at its source FILE, which is the
-        // node the parse hangs the AST root on.
-        let node_id = "test.html/element/text";
-        let node = adapter.get_node(node_id)?;
-        assert!(
-            node.is_some(),
-            "test.html/element/text node should exist after HTML parse"
-        );
-
-        // Write new content to the node's record
-        adapter.write_content(node_id, b"world", 0)?;
-
-        // Verify pending splice was marked
-        assert!(
-            adapter.pending.lock().contains_key(node_id),
-            "node should be marked for pending splice"
-        );
-
-        // Flush splices and hands the file to the source writer
-        adapter.flush_node(node_id)?;
-
-        // Pending splice should be cleared
-        assert!(
-            !adapter.pending.lock().contains_key(node_id),
-            "pending splice should be cleared after successful flush"
-        );
-
-        // Source should be updated
-        let guard = adapter.writer_guard();
-        let source: Vec<u8> = guard.conn().query_row(
-            "SELECT content FROM _source WHERE id = 'test.html'",
-            [],
-            |r| r.get(0),
-        )?;
-        let source_str = String::from_utf8_lossy(&source);
-        assert!(
-            source_str.contains("world"),
-            "_source should contain spliced text, got: {source_str}"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "splice")]
-    fn splice_non_ast_node_ignored() -> Result<()> {
-        let html = b"<p>hello</p>";
-        let adapter = writable_ast_adapter(html)?;
-
-        // Create a plain node (no _ast entry)
-        adapter.create_node("", "plain.txt", false)?;
-        adapter.write_content("plain.txt", b"just text", 0)?;
-
-        // Should not be pending
-        assert!(
-            !adapter.pending.lock().contains_key("plain.txt"),
-            "non-AST node should not be marked for splice"
-        );
-
-        // Flush is a no-op
-        adapter.flush_node("plain.txt")?;
-
-        // Plain content unchanged
-        let mut buf = [0u8; 64];
-        let n = adapter.read_content("plain.txt", &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"just text");
-
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "splice")]
-    fn splice_partial_then_complete() -> Result<()> {
-        let html = b"<div>original</div>";
-        let adapter = writable_ast_adapter(html)?;
-
-        let node_id = "test.html/element/text";
-
-        // Write broken HTML that produces syntax errors when spliced into source
-        // <div>original</div> → <div><broken</div> → tree-sitter error
-        adapter.truncate(node_id)?;
-        adapter.write_content(node_id, b"<broken", 0)?;
-
-        // Flush should fail (syntax error) but not panic
-        let result = adapter.flush_node(node_id);
-        if result.is_err() {
-            // A refused edit is discarded: nothing stays pending and the
-            // node reads as the stored file again.
-            assert!(
-                !adapter.pending.lock().contains_key(node_id),
-                "a refused flush drops the edit"
-            );
-            let mut buf = [0u8; 64];
-            let n = adapter.read_content(node_id, &mut buf, 0)?;
-            assert_eq!(&buf[..n], b"original");
-        }
-        // Note: tree-sitter may be lenient with HTML — if it passes, that's OK too.
-
-        // Write valid replacement content
-        adapter.truncate(node_id)?;
-        adapter.write_content(node_id, b"replaced", 0)?;
-
-        // This flush should succeed
-        adapter.flush_node(node_id)?;
-
-        assert!(
-            !adapter.pending.lock().contains_key(node_id),
-            "successful flush should clear pending"
-        );
-
-        // Verify source updated
-        let guard = adapter.writer_guard();
-        let source: Vec<u8> = guard.conn().query_row(
-            "SELECT content FROM _source WHERE id = 'test.html'",
-            [],
-            |r| r.get(0),
-        )?;
-        let source_str = String::from_utf8_lossy(&source);
-        assert!(
-            source_str.contains("replaced"),
-            "_source should contain final text, got: {source_str}"
-        );
-
-        Ok(())
-    }
-
-    /// End-to-end for the write-then-flush path: write, splice, read back.
-    ///
-    /// NOTE on what this does and does not prove. It passes with or without
-    /// the manifest invalidation in `flush_node`, because `write_content`
-    /// re-chunks the node before the flush ever runs — so this node is never
-    /// stale by the time it is read. Verified by removing the invalidation:
-    /// still green. The genuine staleness case is
-    /// `batch_splice_does_not_leave_a_stale_chunk_manifest`, which reaches
-    /// the source writer without any `write_content` refresh in front of it.
-    /// Kept as a path-integration check, not as the staleness falsifier.
-    #[test]
-    #[cfg(all(feature = "splice", feature = "cdc"))]
-    fn write_then_flush_serves_post_splice_bytes() -> Result<()> {
-        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
-        let node_id = "test.html/element/text";
-
-        // Give the arena chunk storage, then populate this node's manifest so
-        // reads are genuinely being served from chunks before the splice.
-        {
-            let guard = adapter.writer_guard();
-            crate::chunked::create_chunked_content_schema(guard.conn())?;
-            crate::chunked::store_content_chunked(
-                guard.conn(),
-                nid_of(guard.conn(), node_id),
-                b"hello",
-            )?;
-            assert!(crate::chunked::has_chunked_content(
-                guard.conn(),
-                nid_of(guard.conn(), node_id)
-            )?);
-        }
-        adapter.refresh_readers()?;
-
-        let mut buf = vec![0u8; 32];
-        let n = adapter.read_content(node_id, &mut buf, 0)?;
-        assert_eq!(
-            &buf[..n],
-            b"hello",
-            "precondition: chunked read serves old text"
-        );
-
-        // Write + flush: leyline-ts reprojects and rewrites `record` directly.
-        adapter.write_content(node_id, b"world", 0)?;
-        adapter.flush_node(node_id)?;
-
-        // The read must NOT return the stale chunked bytes.
-        let mut buf = vec![0u8; 32];
-        let n = adapter.read_content(node_id, &mut buf, 0)?;
-        assert_eq!(
-            &buf[..n],
-            b"world",
-            "read served stale pre-splice bytes from an invalidated-but-kept manifest"
-        );
         Ok(())
     }
 
@@ -4717,50 +1911,6 @@ mod tests {
         let mut buf = vec![0u8; 100];
         let n = adapter.read_content("docs/readme", &mut buf, 150_000)?;
         assert_eq!(&buf[..n], &body.as_bytes()[150_000..150_100]);
-        Ok(())
-    }
-
-    /// `batch_splice` (the ADR-007 commit path) calls the source writer
-    /// DIRECTLY — it never goes through `write_content`, so nothing re-chunks.
-    /// A manifest populated before the splice therefore describes pre-splice
-    /// bytes, and the chunked read path would serve them: correct-looking
-    /// output that is silently the wrong content.
-    ///
-    /// This is the falsifying case for the invalidation in `batch_splice`.
-    /// Remove that invalidation and this test fails; every other test passes.
-    #[test]
-    #[cfg(all(feature = "splice", feature = "cdc"))]
-    fn batch_splice_does_not_leave_a_stale_chunk_manifest() -> Result<()> {
-        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
-        let node_id = "test.html/element/text";
-
-        {
-            let guard = adapter.writer_guard();
-            crate::chunked::create_chunked_content_schema(guard.conn())?;
-            // Manifest describes the CURRENT content, "hello".
-            crate::chunked::store_content_chunked(
-                guard.conn(),
-                nid_of(guard.conn(), node_id),
-                b"hello",
-            )?;
-        }
-        adapter.refresh_readers()?;
-
-        let mut buf = vec![0u8; 32];
-        let n = adapter.read_content(node_id, &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"hello", "precondition: served from chunks");
-
-        // Commit path: no write_content, so no re-chunk anywhere.
-        adapter.batch_splice(&[(node_id.to_string(), Some("world".to_string()))])?;
-        adapter.refresh_readers()?;
-
-        let mut buf = vec![0u8; 32];
-        let n = adapter.read_content(node_id, &mut buf, 0)?;
-        assert_eq!(
-            &buf[..n],
-            b"world",
-            "batch_splice left a stale manifest — the read served pre-splice bytes"
-        );
         Ok(())
     }
 
@@ -4858,7 +2008,7 @@ mod tests {
             }
             model[edit_offset..write_end].copy_from_slice(edit);
 
-            let (_, outcome) = adapter.write_content_traced(node_id, edit, edit_offset as u64)?;
+            let (_, outcome) = adapter.write_traced(node_id, edit, edit_offset as u64)?;
             assert_chunked_content_matches(&adapter, node_id, &model)
                 .with_context(|| format!("{name} diverged from full-chunk oracle"))?;
 
@@ -4907,7 +2057,7 @@ mod tests {
             }
 
             let edit = b"XY";
-            let (_, outcome) = adapter.write_content_traced(node_id, edit, 1)?;
+            let (_, outcome) = adapter.write_traced(node_id, edit, 1)?;
             assert_eq!(
                 outcome,
                 WriteRefreshOutcome::Full { bytes_scanned: 5 },
@@ -4926,7 +2076,7 @@ mod tests {
     #[cfg(feature = "cdc")]
     fn graph_write_does_not_add_chunk_schema_to_foreign_arena() -> Result<()> {
         let adapter = writable_adapter()?;
-        let (_, outcome) = adapter.write_content_traced("docs/readme", b"XY", 1)?;
+        let (_, outcome) = adapter.write_traced("docs/readme", b"XY", 1)?;
         assert_eq!(outcome, WriteRefreshOutcome::Skipped);
 
         let guard = adapter.writer_guard();
@@ -4977,7 +2127,7 @@ mod tests {
     #[cfg(feature = "cdc")]
     fn recreating_a_removed_path_does_not_leak_the_old_content() -> Result<()> {
         let adapter = chunked_adapter()?;
-        adapter.write_content("docs/readme", b"secret-old-bytes", 0)?;
+        adapter.write_content("docs/readme", &cdc_body(13, 300_000), 0)?;
         adapter.remove_node("docs/readme")?;
 
         let fresh = adapter.create_node("docs", "readme", false)?;
@@ -5000,59 +2150,48 @@ mod tests {
     #[cfg(feature = "cdc")]
     fn removing_a_directory_invalidates_descendant_manifests() -> Result<()> {
         let adapter = chunked_adapter()?;
-        adapter.write_content("docs/readme", b"child-secret", 0)?;
+        // Past CDC's chunking floor, so the write leaves a manifest to drop.
+        adapter.write_content("docs/readme", &cdc_body(7, 300_000), 0)?;
+        {
+            let guard = adapter.writer_guard();
+            assert!(
+                crate::chunked::has_chunked_content(
+                    guard.conn(),
+                    nid_of(guard.conn(), "docs/readme")
+                )?,
+                "precondition: the write left a manifest"
+            );
+        }
 
+        let nid = {
+            let guard = adapter.writer_guard();
+            nid_of(guard.conn(), "docs/readme")
+        };
         adapter.remove_node("docs")?;
 
         let guard = adapter.writer_guard();
         assert!(
-            !crate::chunked::has_chunked_content(
-                guard.conn(),
-                nid_of(guard.conn(), "docs/readme")
-            )?,
+            !crate::chunked::has_chunked_content(guard.conn(), nid)?,
             "descendant manifest survived removal of its parent directory"
+        );
+        // The freshness witness alone keeps a stale manifest from being
+        // served; the removal drops the manifest rows themselves.
+        assert_eq!(
+            manifest_rows(guard.conn(), nid)?,
+            0,
+            "orphaned manifest rows"
         );
         Ok(())
     }
 
-    /// `batch_splice`'s non-AST arm writes `nodes` directly. The post-reproject
-    /// invalidation walks `_ast`-derived ids, so by definition it never sees
-    /// these nodes — each arm must invalidate itself.
-    #[test]
-    #[cfg(all(feature = "splice", feature = "cdc"))]
-    fn batch_splice_plain_node_arm_invalidates() -> Result<()> {
-        let adapter = writable_ast_adapter(b"<p>hello</p>")?;
-        {
-            let guard = adapter.writer_guard();
-            crate::chunked::create_chunked_content_schema(guard.conn())?;
-        }
-        // A node with no `_ast` row.
-        let plain = adapter.create_node("", "plain.txt", false)?;
-        adapter.write_content(&plain, b"world", 0)?;
-        {
-            let guard = adapter.writer_guard();
-            let is_ast: bool = guard
-                .conn()
-                .query_row(
-                    "SELECT 1 FROM _ast WHERE nid = ?1",
-                    [nid_of(guard.conn(), &plain)],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            assert!(!is_ast, "fixture must be a NON-AST node");
-        }
-
-        adapter.batch_splice(&[(plain.clone(), Some("REPLACED".to_string()))])?;
-        adapter.refresh_readers()?;
-
-        let mut buf = [0u8; 64];
-        let n = adapter.read_content(&plain, &mut buf, 0)?;
-        assert_eq!(
-            &buf[..n],
-            b"REPLACED",
-            "plain-node splice served stale bytes from a live manifest"
-        );
-        Ok(())
+    /// The `content_manifest` rows keyed to `nid`.
+    #[cfg(feature = "cdc")]
+    fn manifest_rows(conn: &Connection, nid: i64) -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
+            [nid],
+            |r| r.get(0),
+        )?)
     }
 
     /// `rename_node` moves the `nodes` row but the manifest is keyed by the old
@@ -5061,24 +2200,38 @@ mod tests {
     #[cfg(feature = "cdc")]
     fn rename_does_not_orphan_a_manifest_on_the_vacated_path() -> Result<()> {
         let adapter = chunked_adapter()?;
-        adapter.write_content("docs/readme", b"pre-rename-bytes", 0)?;
+        let body = cdc_body(11, 300_000);
+        adapter.write_content("docs/readme", &body, 0)?;
+        {
+            let guard = adapter.writer_guard();
+            assert!(
+                crate::chunked::has_chunked_content(
+                    guard.conn(),
+                    nid_of(guard.conn(), "docs/readme")
+                )?,
+                "precondition: the write left a manifest"
+            );
+        }
         adapter.rename_node("docs/readme", "docs", "moved")?;
 
         let guard = adapter.writer_guard();
+        let vacated = nid_of(guard.conn(), "docs/readme");
         assert!(
-            !crate::chunked::has_chunked_content(
-                guard.conn(),
-                nid_of(guard.conn(), "docs/readme")
-            )?,
+            !crate::chunked::has_chunked_content(guard.conn(), vacated)?,
             "manifest orphaned on the vacated path — a new file there would \
              read the pre-rename content"
+        );
+        assert_eq!(
+            manifest_rows(guard.conn(), vacated)?,
+            0,
+            "orphaned manifest rows"
         );
         drop(guard);
 
         // And the renamed node still reads correctly (via the record path).
-        let mut buf = [0u8; 64];
-        let n = adapter.read_content("docs/moved", &mut buf, 0)?;
-        assert_eq!(&buf[..n], b"pre-rename-bytes");
+        let mut buf = vec![0u8; 64];
+        let n = adapter.read_content("docs/moved", &mut buf, 1000)?;
+        assert_eq!(&buf[..n], &body[1000..1064]);
         Ok(())
     }
 
@@ -5345,12 +2498,6 @@ mod tests {
     }
 
     /// Does a `nodes` row still exist for this nid?
-    ///
-    /// Counts rather than reaching for `OptionalExtension::optional`: that
-    /// trait is imported under `#[cfg(all(feature = "cdc", feature =
-    /// "splice"))]` for `batch_splice`, so a helper that called `.optional()`
-    /// unconditionally would not compile under leaner feature sets — which is
-    /// what `lint:feature-reachability` checks for `ll-open/fs/verify`.
     fn node_row_present(conn: &Connection, nid: i64) -> bool {
         conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE nid = ?1",

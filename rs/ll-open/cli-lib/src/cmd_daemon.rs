@@ -11,11 +11,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use leyline_core::ContentAddressed;
 
-use crate::cmd_serve;
 use crate::daemon::{
     DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
     execution::{ExecutionDaemonExt, ExecutionHandler},
 };
+use crate::lifecycle;
 
 // ---------------------------------------------------------------------------
 // Tuning constants — extracted from the daemon orchestration so each magic
@@ -136,7 +136,7 @@ pub struct DaemonConfig {
 /// Kept separate from [`DaemonConfig`] so downstream crates that construct the
 /// long-lived public config with struct literals do not break when an opt-in
 /// behavior is added.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonOptions {
     /// Activate/resume the private CDC index before the first arena snapshot,
     /// over the named target. `None` leaves CDC inactive.
@@ -149,7 +149,49 @@ pub struct DaemonOptions {
     /// points force their own name so an execution daemon cannot silently
     /// take over `~/.mache/default.sock` from a running substrate daemon.
     pub discovery: crate::daemon::socket::SocketDiscovery,
+    /// What serves `--mount` (bead `ley-line-open-3e73dc`): the store's
+    /// filesystem behind the host's FUSE or NFS client. `leyline-storefs`
+    /// provides it; cli-lib cannot, since storefs depends on cli-lib. A
+    /// daemon asked to mount with none is refused before it starts.
+    pub host_mount: Option<HostMountRef>,
 }
+
+/// The guard of a host mount: dropping it unmounts, and lands what the
+/// mount holds staged, before the daemon's final snapshot.
+pub type MountGuard = Box<dyn Send>;
+
+/// Mounts the daemon's store at a path (bead `ley-line-open-3e73dc`, ADR-0045
+/// T8): every file, mode, symlink and directory `_tree` holds, read and
+/// written as storefs reads and writes them for a guest, on the daemon's
+/// one writer.
+pub trait HostMount: Send + Sync {
+    fn mount<'a>(
+        &'a self,
+        ctx: Arc<crate::daemon::DaemonContext>,
+        at: &'a Path,
+        backend: &'a str,
+        nfs_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MountGuard>> + Send + 'a>>;
+}
+
+/// A [`HostMount`] held by [`DaemonOptions`]. Two are equal when they are the
+/// same provider.
+#[derive(Clone)]
+pub struct HostMountRef(pub Arc<dyn HostMount>);
+
+impl std::fmt::Debug for HostMountRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostMountRef")
+    }
+}
+
+impl PartialEq for HostMountRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HostMountRef {}
 
 pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
@@ -229,13 +271,18 @@ fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
     }
 }
 
-/// Refuse a mount this build cannot provide. A daemon asked to mount that
-/// ran headless instead gave its caller no mount and no failure (bead
-/// `ley-line-open-2be4a7`). `compiled` says whether this build has the
-/// `mount` feature; it is an argument so both answers are tested in any
-/// build.
-fn refuse_unavailable_mount(mount: Option<&Path>, compiled: bool) -> Result<()> {
-    if let (Some(path), false) = (mount, compiled) {
+/// The arena's size in bytes for `--arena-size-mib`.
+fn arena_bytes(arena_size_mib: u64) -> u64 {
+    arena_size_mib * 1024 * 1024
+}
+
+/// Refuse a mount nothing can provide. A daemon asked to mount that ran
+/// headless instead gave its caller no mount and no failure (bead
+/// `ley-line-open-2be4a7`). `provided` says whether the caller passed a
+/// [`HostMount`]: the `leyline` binary does when it is built with the
+/// `mount` feature.
+fn refuse_unavailable_mount(mount: Option<&Path>, provided: bool) -> Result<()> {
+    if let (Some(path), false) = (mount, provided) {
         anyhow::bail!(
             "cannot mount at {}: this leyline was built without the `mount` feature. \
              Build with `--features mount`, or omit --mount to run headless.",
@@ -271,7 +318,7 @@ pub async fn run_daemon_with_options(
     let arena = arena.as_path();
     let control = control.as_deref();
     let mount = mount.as_deref();
-    refuse_unavailable_mount(mount, cfg!(feature = "mount"))?;
+    refuse_unavailable_mount(mount, options.host_mount.is_some())?;
     let source = source.as_deref();
     let backend = backend.as_str();
     let language = language.as_deref();
@@ -334,8 +381,7 @@ pub async fn run_daemon_with_options(
         .context("arena admission control (owner sentinel)")?;
 
     // 1. Arena setup.
-    let arena_bytes = arena_size_mib * 1024 * 1024;
-    let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
+    let ctrl_path = lifecycle::setup_arena(arena, arena_bytes(arena_size_mib), control)?;
 
     // Lifecycle state — starts as Initializing, transitions through Parsing /
     // Enriching / Ready / Error. Shared with op_status and background tasks.
@@ -699,44 +745,25 @@ pub async fn run_daemon_with_options(
     // 7. Mount (optional — omit --mount for headless mode).
     // The guard lives until shutdown, which drops it — unmounting — before
     // the final snapshot.
-    #[cfg(feature = "mount")]
-    let mounted = if let Some(mount_path) = mount {
-        // ADR-0040 D4 (bead `ley-line-open-f2ee9f`): the in-process mount
-        // reads `live.db` through the daemon's reader pool and writes through
-        // its single writer. It is not a private copy of the arena, so a
-        // mount write is durable the moment it commits and a reparse of
-        // another file cannot drop it (bead `192018`), and no image is
-        // deserialised to serve it (bead `af6c9d`). The arena and
-        // `current_root` remain the publication for out-of-process consumers;
-        // the mount's `fsync` publishes through `snapshot_to_arena`.
-        let source = Arc::new(crate::daemon::live_graph::LiveDbSource::new(ctx.clone()));
-        let mut graph = leyline_fs::graph::SqliteGraphAdapter::live(source)?;
-        // ADR-0040 D3: an edit to a parsed file goes through the one write
-        // path. The daemon owns its tree, so the mount holds the whole grant,
-        // and an accepted edit is materialized into its checkout (bead
-        // `ley-line-open-60f39f`).
-        graph.set_source_writer(Arc::new(crate::source_write::MountWriter {
-            grant: crate::source_write::Grant::Whole,
-            checkout: ctx.source_dir.clone(),
-        }));
-        if let Some(lang_ext) = language {
-            let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
-                .with_context(|| format!("unsupported language: {lang_ext}"))?;
-            graph.set_default_language(ts_lang);
+    // The mount serves the store (bead `ley-line-open-3e73dc`): `live.db`
+    // through the daemon's reader pool and its one writer, each landed
+    // proposal written into the checkout and published to the arena, as a
+    // guest's share is served. `refuse_unavailable_mount` refused a mount
+    // path with no provider above.
+    let mounted = match (mount, options.host_mount.as_ref()) {
+        (Some(mount_path), Some(provider)) => {
+            let guard = provider
+                .0
+                .mount(ctx.clone(), mount_path, backend, nfs_port)
+                .await?;
+            eprintln!("mounted at {}", mount_path.display());
+            Some(guard)
         }
-        let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
-
-        Some(cmd_serve::mount_backend(graph, mount_path, backend, nfs_port).await?)
-    } else {
-        eprintln!("headless mode (no mount)");
-        None
+        _ => {
+            eprintln!("headless mode (no mount)");
+            None
+        }
     };
-    #[cfg(not(feature = "mount"))]
-    {
-        // `refuse_unavailable_mount` refused a mount path above.
-        let _ = (mount, backend, nfs_port);
-        eprintln!("headless mode (no mount)");
-    }
 
     // 7. Extension post-mount.
     ext.on_post_mount(&ctrl_path, &router);
@@ -819,10 +846,9 @@ pub async fn run_daemon_with_options(
     eprintln!("daemon ready — press Ctrl+C to stop");
 
     // 11. Wait for shutdown.
-    cmd_serve::wait_for_shutdown(timeout).await?;
+    lifecycle::wait_for_shutdown(timeout).await?;
 
     // 12. Graceful shutdown: unmount, final snapshot, cleanup.
-    #[cfg(feature = "mount")]
     drop(mounted);
     {
         let guard = ctx.live_db.writer.lock();
@@ -2699,6 +2725,38 @@ mod tests {
         assert!(err.contains("/mnt/x"), "{err}");
     }
 
+    /// `--arena-size-mib` is mebibytes.
+    #[test]
+    fn the_arena_size_is_mebibytes() {
+        assert_eq!(arena_bytes(1), 1_048_576);
+        assert_eq!(arena_bytes(64), 67_108_864);
+    }
+
+    /// Two [`HostMountRef`]s are equal when they hold the same provider, and
+    /// a provider prints by name, so `DaemonOptions` stays `Debug` and `Eq`.
+    #[test]
+    fn host_mount_refs_compare_by_provider() {
+        struct Never;
+        impl HostMount for Never {
+            fn mount<'a>(
+                &'a self,
+                _ctx: Arc<crate::daemon::DaemonContext>,
+                _at: &'a Path,
+                _backend: &'a str,
+                _nfs_port: u16,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MountGuard>> + Send + 'a>>
+            {
+                Box::pin(async { anyhow::bail!("never mounts") })
+            }
+        }
+        let one = HostMountRef(Arc::new(Never));
+        let same = one.clone();
+        let other = HostMountRef(Arc::new(Never));
+        assert_eq!(one, same);
+        assert_ne!(one, other);
+        assert_eq!(format!("{one:?}"), "HostMountRef");
+    }
+
     #[test]
     fn only_a_wal_stamped_sqlite_image_is_restamped() {
         let header = |w: u8, r: u8| {
@@ -2889,7 +2947,7 @@ mod tests {
     /// `ley-line-open-e37e03`, filed by mache: `--reset-arena` ALWAYS
     /// failed, including on a completely fresh arena with no prior
     /// state, because the reset zeroed the arena PATH along with the
-    /// root — but `cmd_serve::setup_arena` (this function's real
+    /// root — but `lifecycle::setup_arena` (this function's real
     /// caller, always run first) had already stamped the path, and
     /// nothing re-stamps it. The next `snapshot_to_arena` then opens
     /// an empty path and fails with "open arena file".
@@ -2909,7 +2967,7 @@ mod tests {
         // The real caller, not a hand-rolled mimic — the bug is specifically
         // about what THIS stamps and the reset then blanks.
         let ctrl_path_returned =
-            cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
+            lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
                 .expect("setup_arena on a completely fresh arena");
         assert_eq!(ctrl_path_returned, ctrl_path);
 
@@ -2963,7 +3021,7 @@ mod tests {
         // First daemon: cold start against repo A, snapshot it — this is
         // the prior state a shared arena (e.g. `~/.mache/default.arena`)
         // carries into the next run.
-        cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
+        lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
             .expect("setup_arena for repo A");
         let conn_a = init_living_db(
             &ctrl_path,
@@ -3199,7 +3257,7 @@ mod tests {
 
     /// One daemon lifetime over `src`, started the way `run_daemon` starts.
     fn boot(state: &Path, src: &Path) -> Arc<DaemonContext> {
-        let ctrl = cmd_serve::setup_arena(
+        let ctrl = lifecycle::setup_arena(
             &state.join("arena"),
             8 * 1024 * 1024,
             Some(&state.join("arena.ctrl")),
@@ -3777,6 +3835,7 @@ mod execution_discovery_tests {
         let caller = DaemonOptions {
             cdc: Some(crate::CdcTarget::SourceBlobs),
             discovery: SocketDiscovery::Substrate,
+            host_mount: None,
         };
         let effective = execution_daemon_options(caller);
         assert_eq!(

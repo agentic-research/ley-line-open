@@ -124,7 +124,7 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-text-search` | Unstructured-text semantic search backend abstraction. `NullEngine` default; `WitchcraftEngine` (XTR-WARP) behind feature flag | `TextSearchEngine` trait |
 | `leyline-chat-embed` | CLI binary: semantic search over Claude Code chat databases (mache's `claude-chats` ingest) via fastembed/MiniLM | `chat-embed` binary |
 | `leyline-cli-lib` | The daemon. Owns the living db + UDS control socket + MCP HTTP transport; hosts all enrichment passes | `cmd_daemon`, `daemon::ops` |
-| `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib` | `parse`, `daemon`, `serve`, `inspect` |
+| `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib`; injects the storefs host mount into `daemon --mount` | `parse`, `daemon`, `inspect` |
 
 **Contract:** The `nodes` + `_ast` + `_source` + `node_content` tables form the
 core **SQL projection ABI**; enrichment passes write derived sidecars (`_lsp*`,
@@ -378,7 +378,7 @@ Architectural decisions that shape LLO today:
 | [ADR-0042](adr/0042-proposals.md) | Proposals — a write names the bytes its author read and is applied whole or refused whole; file bases, daemon `read_source`/`propose`, mount `ESTALE`; node bases and the closure check open | Proposed — file bases, one-transaction writes, durable acknowledgement, daemon ops and mount bases implemented (#437-#440, `843e03`) |
 | [ADR-0043](adr/0043-one-store-refs-and-checkouts.md) | One store — branches are refs, worktrees are checkouts with an index, git is read and written natively (no subprocess); closes the restart that reverted proposals (`60f39f`) | Accepted — built in phases; phase 0 (single checkout) is #459 |
 | [ADR-0044](adr/0044-userspace-data-plane.md) | Agents see a filesystem served from userspace — the agent runs in a libkrun microVM and its working tree is a virtio-fs share whose backend is LLO (reads from the store, writes as proposals, refusals as errno); host NFS/FUSE mounts are compatibility | Accepted — LLO carries a libkrun patch; phases A–C |
-| [ADR-0045](adr/0045-git-shaped-store-and-merged-proposals.md) | The store is a git-shaped tree — every path holds any bytes with a git mode, directories are entries, `treeRoot` covers both; parsing is a projection and an unparseable file is stored with a diagnostic; a proposal whose base moved merges three ways (`gix-merge`) and overlapping hunks refuse with their ranges; amends ADR-0042 and ADR-0044 | Accepted — phases 1–4 (store, proposals, wire, storefs) |
+| [ADR-0045](adr/0045-git-shaped-store-and-merged-proposals.md) | The store is a git-shaped tree — every path holds any bytes with a git mode, directories are entries, `treeRoot` covers both; parsing is a projection and an unparseable file is stored with a diagnostic; a proposal whose base moved merges three ways (`gix-merge`) and overlapping hunks refuse with their ranges; amends ADR-0042 and ADR-0044; T8: the host mount is storefs | Accepted — phases 1–6 (store, proposals, wire, storefs, host mount) |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 

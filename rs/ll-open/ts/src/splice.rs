@@ -9,7 +9,6 @@
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension};
-use tree_sitter::{Language, Parser};
 
 /// Splice new text into a node's byte range, returning the modified source bytes.
 ///
@@ -134,50 +133,6 @@ fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Refuse `source` if it does not parse cleanly in `language`, naming the
-/// first error or missing node. A write through a mount lands one edit at a
-/// time; an edit that leaves the file unparseable is rejected rather than
-/// projected.
-pub fn check_syntax(source: &[u8], language: Language) -> Result<()> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language)
-        .context("failed to set tree-sitter language")?;
-    let tree = parser
-        .parse(source, None)
-        .context("tree-sitter parse returned None")?;
-    if !tree.root_node().has_error() {
-        return Ok(());
-    }
-    // Find the first ERROR node and report its byte range
-    let mut cursor = tree.walk();
-    let mut error_info = String::new();
-    'walk: loop {
-        if cursor.node().is_error() || cursor.node().is_missing() {
-            let node = cursor.node();
-            error_info = format!(
-                " (error at byte {}..{}, line {})",
-                node.start_byte(),
-                node.end_byte(),
-                node.start_position().row + 1,
-            );
-            break 'walk;
-        }
-        if cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                break 'walk;
-            }
-        }
-    }
-    bail!("modified source has syntax errors{error_info} — splice rejected")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,7 +143,7 @@ mod tests {
     #[cfg(feature = "html")]
     fn setup_html(src: &[u8]) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        let lang: Language = tree_sitter_html::LANGUAGE.into();
+        let lang: tree_sitter::Language = tree_sitter_html::LANGUAGE.into();
         project_ast_with_source(src, lang, &conn, "test.html", "html").unwrap();
         conn
     }
@@ -263,17 +218,6 @@ mod tests {
         // A nid far outside any interned file's populated range.
         let result = splice(&conn, 1 << 40, "text");
         assert!(result.is_err());
-    }
-
-    #[cfg(feature = "json")]
-    #[test]
-    fn check_syntax_accepts_clean_source_and_names_the_first_error() {
-        let json = crate::languages::TsLanguage::Json.ts_language();
-        check_syntax(br#"{"a": 1}"#, json.clone()).unwrap();
-        let err = check_syntax(b"{\"a\": 1,\n \"b\": }", json).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("syntax errors"), "{msg}");
-        assert!(msg.contains("line 2"), "the error names its line: {msg}");
     }
 
     /// A `_source` row in the cold parse's shape: no inline content, a

@@ -12,6 +12,66 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: the host mount is storefs — `daemon --mount` presents the
+  store's files and writes them by the store's rules** (beads
+  `ley-line-open-53d701`, `ley-line-open-3e73dc`, ADR-0045 T8).
+  - The FUSE and NFS host mounts serve `leyline_storefs::StoreFs`, the core
+    a guest's virtio-fs share serves, behind `storefs::host::fuse::HostFuse`
+    and `storefs::host::nfs::HostNfs` (new `leyline-storefs` feature
+    `mount`; the CLI's `mount` feature now enables it). A host process sees
+    the tree a guest sees — every file of any kind, mode, symlink and
+    directory in `_tree` — and each save, create, mkdir, rmdir, rename,
+    symlink and `chmod` is the proposal a guest's is: a moved base merges
+    three ways, overlapping edits answer `ESTALE`/`NFS3ERR_STALE`, an
+    unparseable save lands with its `_parse_diagnostics` row, and every
+    landed proposal is written into the daemon's checkout and published.
+  - Before, the host mount presented the projection: a parsed file as a
+    directory of its syntax nodes, a file of no language not at all, and
+    create, mkdir and mode changes refused `EPERM`. Paths under a mount
+    change: `util.go` is a file, not `util.go/package_clause/...`.
+  - NFS: each WRITE runs the COMMIT's own decision (`source_write::check`)
+    and refuses exactly what it refuses, because the macOS client ignores a
+    refused COMMIT; a SETATTR of the size stages unchecked (a save truncates
+    before it writes); a refused WRITE or COMMIT voids the client's save —
+    the handle drops what it staged, keeps its base, and refuses every
+    WRITE, size SETATTR and COMMIT until a READ. CREATE lands the empty
+    file at once.
+  - Writers: the merge and `ESTALE` hold between separate writers (a
+    guest's virtio-fs session, a FUSE handle, a socket proposal). Two
+    processes through one NFS mount share the host's NFS client and page
+    cache, which NFSv3 presents to the server as one client: the last save
+    wins, and the other's edit is lost whether or not the two overlap
+    (`ley-line-open-5ec040`).
+  - Known: the macOS NFS client's AppleDouble `._*` files (its xattr
+    fallback) land in the store (`ley-line-open-8d6a8a`).
+  - macOS: the NFS mount refuses Tahoe before 26.7 and Sequoia before 15.8,
+    whose NFS client corrupts kernel memory on server replies
+    (CVE-2026-43686, CVE-2026-84549; bead `ley-line-open-2d49ce`). The
+    client's attribute cache is `actimeo=1`.
+  - Embedders: `run_daemon_with_options` mounts only through a provider in
+    the new `DaemonOptions::host_mount` (`cmd_daemon::HostMount`;
+    `leyline_storefs::host::DaemonHostMount` is LLO's). A daemon asked to
+    `--mount` with none is refused before it starts. `DaemonOptions` is no
+    longer `Copy`.
+  - `leyline-fs` writes no store: every write, create, removal, truncate
+    and rename of a store's nodes is refused.
+  - Removed: `leyline serve` (use `leyline daemon --mount`);
+    `leyline_cli_lib::cmd_serve` (its arena, duration and shutdown helpers
+    are `leyline_cli_lib::lifecycle`); `source_write::MountWriter`;
+    `daemon::live_graph`; cli-lib's `mount` feature; `leyline-fs`'s `fuse`,
+    `nfs` and `splice` features with `leyline_fs::fuse`, `leyline_fs::nfs`,
+    `graph::{SourceWriter, Proposal, Refused, RefusalKind, refusal_kind,
+    LiveSource, Handle, MOUNT_HANDLE}`, `SqliteGraphAdapter::live` and
+    `set_source_writer`, `HotSwapGraph::with_source_writer`, the `Graph`
+    methods `note_base`, `note_read`, `flush_node`, `mtime_tracks_entries`,
+    `release` and the `*_as` handle variants, `Node::perm`, and the
+    `_errors` table; the mount's syntax validation and shadow copies,
+    `SqliteGraphAdapter::set_default_language`,
+    `HotSwapGraph::with_validation`, `leyline serve --language` and
+    `leyline_ts::splice::check_syntax`; the `deps:fuse` and
+    `fs:build:nfs-isolated` tasks (leyline-fs links no libfuse).
+  - ADR-0045's conflict ranges are documented as `daemon.capnp` defines
+    them: 0-based, half-open `[start, end)`.
 - **The workspace share's frame header is Cap'n Proto, and the shipped
   share path is measured** (bead `ley-line-open-39d3a4`).
   - Each FUSE request the `leyline-krun-worker` forwards to the daemon, and

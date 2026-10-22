@@ -44,8 +44,8 @@ workspace are invisible to them. Re-derive rather than trust when it matters.
 
 | Table | LLO readers | Notes |
 |-------|------------:|-------|
-| `nodes` | 41+ | Filesystem projection (`fs/src/graph.rs`), `ts/pyproject.rs`, `ll-core/schema`. Load-bearing for mount — NOT droppable. |
-| `_ast` | 34 | `fs/src/graph.rs`, `ts/src/splice.rs`, `lsp/src/project.rs`, `daemon/ops.rs`. `find_definition` stopped needing it at `projection-v3`, but the mount and splice paths still read it directly. |
+| `nodes` | 41+ | The nodes-table graph (`fs/src/graph.rs`: the FFI mache links, vcs), `ts/pyproject.rs`, `ll-core/schema`. NOT droppable. The host mount no longer reads it: since ADR-0045 T8 it serves `_tree` through storefs. |
+| `_ast` | 34 | `fs/src/graph.rs`, `ts/src/splice.rs`, `lsp/src/project.rs`, `daemon/ops.rs`. `find_definition` stopped needing it at `projection-v3`, but the graph and splice paths still read it directly. |
 | `node_defs` / `node_refs` | 32 | The symbol layer. Also the agent-facing one: `find_definition` returns `node_id` STRINGS straight through MCP, so these ids are user-visible output, not an internal key. |
 | `source_blobs` | 11 | |
 | `node_content` | **0** | No SELECT anywhere. Survives as the FK target of `node_defs`/`node_refs.node_hash`. |
@@ -148,7 +148,7 @@ the projection is derived-only, so no in-place migration exists.
 | `names` / `dirs` / `files` / `kinds` | Interning tables (`projection-v5`). Every path component, directory link, file, and tree-sitter kind stored ONCE; all four are append-only — rows are never deleted or renumbered, which is what makes `file_id` reuse impossible and a directory rename a ONE-row `UPDATE dirs SET name_id`. `dirs.dir_id = 1` is the root ("", parent NULL). |
 | `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
 | `_ast` | AST positions (nid → kind_id, byte/row/col ranges, node_hash). No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
-| `_source` | Source file metadata (id → language, abs path, `file_id` — the interned integer that keys every node row's high bits) |
+| `_source` | Source file metadata (id → language, abs path, `file_id` — the interned integer that keys every node row's high bits). As of `projection-v7` (ADR-0045 T1) one row per file the parse PROJECTED: a file of no grammar, a binary or an oversized file has a `_tree` entry and no `_source` row. `content_hash` equals the path's `_tree.blob_hash`. List every file from `_tree`, not from here. |
 | `node_refs` | Token references (token → nid, node_hash, container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. |
 | `node_defs` | Token definitions (token → nid, node_hash, container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). No `qualifier` column. |
 | `_imports` | Import statements (alias, path, source_id) |
@@ -173,6 +173,13 @@ the projection is derived-only, so no in-place migration exists.
 | Table | Purpose |
 |-------|---------|
 | `source_blobs` | Content-addressed byte store — `blob_hash BLOB PRIMARY KEY`, `blob_bytes BLOB`, `byte_len INTEGER` (stored generated column). F-git compat with `git cat-file blob`. |
+
+**The store's manifest and the parse's diagnostics** (added at `projection-v7` per ADR-0045 T1, T3; DDL in `rs/ll-open/cli-lib/src/tree.rs`). A `projection-v6` arena is refused at parse open and rebuilt cold.
+
+| Table | Purpose |
+|-------|---------|
+| `_tree` | One row per entry the store holds — `path TEXT PRIMARY KEY` (relative, `/`-separated, no `''`/`.`/`..`), `mode INTEGER NOT NULL` (git mode: `0o100644` regular, `0o100755` executable, `0o120000` symlink whose blob is its target, `0o040000` directory), `blob_hash BLOB` (the `source_blobs` key; NULL for a directory), `mtime INTEGER` and `size INTEGER` (the walk's stat cache; not identity). Every file of any kind is an entry, projected or not; directories are explicit, so an empty directory is an entry, and the set is closed under parents. `treeRoot` folds `(path, mode, blob)` over it. |
+| `_parse_diagnostics` | One row per file the parse projects that did not parse cleanly — `path TEXT PRIMARY KEY` (the `_tree` path), `blob_hash BLOB NOT NULL` (the bytes described), `projected INTEGER NOT NULL` (`1`: projected as tree-sitter parsed it, error nodes included; `0`: stored with no projection rows — a NUL byte in the first 8 KiB or larger than `MAX_PARSE_FILE_SIZE`), `start_byte`, `end_byte`, `start_row` (0-based), `start_col` (the first `ERROR`/`MISSING` node; NULL when not projected), `message TEXT NOT NULL`. A function of the bytes and the grammar: a proposal and a cold parse of one tree write the same rows, and a file whose next version parses cleanly loses its row in the same transaction. |
 
 **CDC derived chunk cache** (per `rs/ll-open/fs/src/chunked.rs:83-121`, activated by `daemon --cdc` / `leyline cdc`):
 
@@ -240,7 +247,6 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `_lsp*` | LSP layer |
 | `_vec*` | embedding layer |
 | `_sheaf*` | sheaf cache (ley-line private) |
-| `_errors` | validation layer (leyline-fs write path) |
 | `_cfg*` | analysis-substrate CFG layer (leyline-ts; T1 of `analysis-substrate` decade) |
 | `_dfg*` | analysis-substrate DFG layer (T2 of `analysis-substrate` decade; not yet shipped) |
 | `_taint*` | analysis-substrate taint fixpoint (T3 of `analysis-substrate` decade; not yet shipped) |

@@ -44,7 +44,7 @@ test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
 # same drift class `ley-line-open-cb1e29` collapsed the feature ledger to fix.
 #
 # Format: `<scope>=<package>[,<package>...]`. Everything below derives from it.
-MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge'
+MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge storefs=ll-open/storefs'
 
 # Every package owned by SOME package slice — i.e. exactly what the generic
 # slice must exclude. Each MUST be claimed by a slice of its own below. A
@@ -531,7 +531,8 @@ LEDGER_ROWS
             --exclude 'll-open/runtime/**' \
             --exclude 'll-open/cli-lib/**' \
             --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**'
+            --exclude 'll-open/schema-bridge/**' \
+            --exclude 'll-open/storefs/**'
     else
         # shellcheck disable=SC2086
         run_slice lib \
@@ -540,7 +541,8 @@ LEDGER_ROWS
             --exclude 'll-open/runtime/**' \
             --exclude 'll-open/cli-lib/**' \
             --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**'
+            --exclude 'll-open/schema-bridge/**' \
+            --exclude 'll-open/storefs/**'
     fi
 fi
 
@@ -589,13 +591,6 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # it. The whole binary set below compiles with the feature and its deps are
     # already in Cargo.lock, so this costs a longer link, not a download.
     #
-    # `mount`, for the same reason: `cmd_serve` and the mount's source writer
-    # (`source_write::MountWriter`) are behind it, and the one-write-path PR
-    # (`ley-line-open-f2ffbd`) reported both as 0s-build MISSED under `vec`
-    # alone. It links libfuse (deps:ci installs libfuse-dev; the Taskfile's
-    # PKG_CONFIG_PATH finds fuse-t on macOS) and mounts nothing: the lib
-    # tests it adds stop before a mount.
-    #
     # lsp_enrich_pipeline: kills the whole-function replacement mutants on
     # `enrich_files_with_client` (four survived on the PR that added the
     # test — nothing observed that function's counts or writes before it).
@@ -616,7 +611,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # survived on the sheaf-feature PR (bead 39e239); verified before
     # routing: that mutation fails all three tests in this binary.
     run_slice integration \
-        --features vec,mount \
+        --features vec \
         -C --lib \
         -C --test -C execution_client \
         -C --test -C execution_transport \
@@ -630,35 +625,55 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
   fi
 fi
 
+if { [ "$SCOPE" = all ] || [ "$SCOPE" = storefs ]; } && package_changed_in_diff ll-open/storefs; then
+    claim_package ll-open/storefs
+    # The host mount (`host/`, bead `ley-line-open-3e73dc`) is gated on
+    # storefs's non-default `mount` feature, so the slice names it: without it
+    # every adapter mutant compiles out and reports a phantom MISSED. Lib
+    # tests only (`run_slice lib`): they drive the adapters below the kernel.
+    # `tests/host_mount.rs` mounts through the kernel's NFS or FUSE client,
+    # and a mutation run must never mount.
+    #
+    # `host/fuse.rs` is excluded: it is the `fuser::Filesystem` glue, whose
+    # requests and replies only a `/dev/fuse` session can build (fuser keeps
+    # `Request::new` and `ReplySender` private), so lib tests cannot reach it
+    # and every mutant there would report MISSED. Every decision it makes
+    # lives in `host/fuse_abi.rs`, which this slice mutates; the glue is
+    # exercised through the kernel by `tests/host_mount.rs` and
+    # `tools/cli_smoke.sh --mount`. The gap is `ley-line-open-5241ee`.
+    #
+    # `host/macos.rs` is `#[cfg(target_os = "macos")]` (a `sysctlbyname(3)`
+    # read): a platform gate is a feature gate cargo-mutants cannot see either,
+    # so on any other runner every mutant in it builds in 0s and reports a
+    # phantom MISSED. It is excluded there and mutated on macOS, where its test
+    # checks it against `sw_vers`.
+    if [ "$(uname -s)" = Darwin ]; then
+        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+            --exclude 'll-open/storefs/src/host/fuse.rs'
+    else
+        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+            --exclude 'll-open/storefs/src/host/fuse.rs' \
+            --exclude 'll-open/storefs/src/host/macos.rs'
+    fi
+fi
+
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = fs ]; } && package_changed_in_diff ll-open/fs; then
     claim_package ll-open/fs
-    # This is the ONLY slice that passes `--no-default-features`, which makes it
-    # the only place tools/feature-ledger.txt's standing exemption for
-    # default-enabled features ("cargo resolves them, mutants compiles them") is
-    # false. `fuse` and `nfs` ARE in leyline-fs's default set, so the ledger is
-    # right not to carry them — but these flags compile `fuse.rs`, `nfs.rs` and
-    # `verified.rs` out, while cargo-mutants parses with syn, never evaluates
-    # cfg, and enumerates every mutant inside them anyway. Each then builds in
-    # 0s, every test trivially passes, and it is reported MISSED: a phantom
-    # survivor on healthy code, indistinguishable in the log from a real missing
-    # assertion (bead `ley-line-open-b23c41`).
-    #
-    # A slice that opts out of default features owes an exclusion for what that
-    # choice removes — the exclusions below are not a policy about mount, they
-    # are this invocation being consistent with itself. Enabling the features
-    # instead would be worse: `ley-line-open-aed167` records that mount ships
-    # with no tests at any level, so the phantoms would become REAL survivors
-    # and redden every mount PR over a coverage debt this gate did not incur.
-    # `verified` is the same shape (`ley-line-open-b6a4dd`).
+    # This is the ONLY slice that passes `--no-default-features`, so it names
+    # every feature whose code it mutates: `cdc` (the chunked read path and
+    # GC), `validate`, and `verify` (verify-on-fault serving: `verified.rs`
+    # and the `#[cfg(feature = "verify")]` loaders in `graph.rs`). A gated
+    # module the flags compiled out would still have every mutant enumerated —
+    # cargo-mutants parses with syn and never evaluates cfg — and each would
+    # build in 0s, pass every test, and be reported MISSED: a phantom survivor
+    # on healthy code (bead `ley-line-open-b23c41`). `verify` does not ship
+    # (`ley-line-open-b6a4dd`), but `fs:test:cdc` runs the crate's tests with
+    # it, so its mutants are killable and the slice enables it.
     #
     # Kept in step by tools/check_mutants_cfg_coverage.sh, which fails if a
-    # cfg-gated module is neither enabled by its slice nor excluded here. That
-    # guard is load-bearing: enumerating this list BY HAND missed `verified.rs`.
+    # cfg-gated module is neither enabled by its slice nor excluded here.
     run_slice lib --package leyline-fs --test-workspace=false \
-        --no-default-features --features cdc,splice,validate \
-        --exclude 'll-open/fs/src/fuse.rs' \
-        --exclude 'll-open/fs/src/nfs.rs' \
-        --exclude 'll-open/fs/src/verified.rs'
+        --no-default-features --features cdc,validate,verify
 fi
 
 # `ll-open/cli` is the thin clap binary: its only mutant is `replace main`,

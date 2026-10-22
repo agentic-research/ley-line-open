@@ -26,6 +26,8 @@ includes:
     taskfile: rs/ll-open/runtime/Taskfile.yml
   sign:
     taskfile: rs/ll-open/sign/Taskfile.yml
+  storefs:
+    taskfile: rs/ll-open/storefs/Taskfile.yml
 
 vars:
   SCCACHE_VERSION: 0.15.0
@@ -279,33 +281,12 @@ tasks:
   deps:ci:
     desc: |
       Everything `task ci` compiles against on a Linux runner: the capnp
-      toolchain plus libdbus-1-dev (keyring) and libfuse-dev (fuser).
+      toolchain plus libdbus-1-dev (keyring) and libfuse-dev (fuser, behind
+      storefs's `mount`).
       ci.yml calls this; the extras ride on deps:capnp's apt-get update.
     cmds:
       - task: deps:capnp
       - sudo apt-get install -y --no-install-recommends libdbus-1-dev libfuse-dev
-
-  deps:fuse:
-    desc: |
-      FUSE headers for the leyline-fs staticlib build (`fuse` feature links
-      libfuse3). release.yml's build job calls this only for matrix entries
-      that carry lib_asset.
-    cmds:
-      - |
-        set -eu
-        case "${RUNNER_OS:-$(uname -s)}" in
-          Linux)
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends libfuse3-dev
-            ;;
-          macOS|Darwin)
-            brew install --cask fuse-t
-            ;;
-          *)
-            echo "deps:fuse: unsupported OS '${RUNNER_OS:-$(uname -s)}'" >&2
-            exit 1
-            ;;
-        esac
 
   deps:zig:
     desc: |
@@ -1099,9 +1080,9 @@ tasks:
   #
   # Climb the ladder in tier order, because the tier boundary decides the cost.
   # `ll-core/*` compiles without `ll-open/*` (the tier-isolation gate), so those
-  # crates mutate with no feature incantation at all — note `mutants:fs` needs
-  # `--no-default-features --features cdc,splice,validate` purely because
-  # leyline-fs reaches libfuse. Ask "which tier is this in?" before "is this
+  # crates mutate with no feature incantation at all — note `mutants:fs` names
+  # `--no-default-features --features cdc,validate` to mutate the chunked
+  # read path, which is opt-in. Ask "which tier is this in?" before "is this
   # important?": a file in the wrong tier is expensive to mutate regardless.
   #
   # Next rungs, both already tier-clean: the schema-bridge emitters
@@ -1188,7 +1169,7 @@ tasks:
       # missed. Exit 2 (a mutant no test caught) still fails.
       - >-
         cargo mutants -p leyline-fs --test-workspace=false
-        --no-default-features --features cdc,splice,validate
+        --no-default-features --features cdc,validate
         -C --lib --file ll-open/fs/src/chunked.rs
         || [ $? -eq 3 ]
 
@@ -1199,7 +1180,7 @@ tasks:
       # Exit 3 tolerated for the same reason as mutants:fs/mutants:cdc.
       - >-
         cargo mutants -p leyline-fs --test-workspace=false
-        --no-default-features --features cdc,splice,validate
+        --no-default-features --features cdc,validate
         -C --lib --file ll-open/fs/src/gc.rs
         || [ $? -eq 3 ]
 
@@ -1617,11 +1598,10 @@ tasks:
       - task: clippy
       - task: smells
       - task: fs:build:static
-      - task: fs:build:nfs-isolated
       - task: fs:test:cdc
       - task: cli-lib:test:cdc-activation
       - task: cli-lib:test:search
-      - task: cli-lib:test:mount
+      - task: storefs:test:mount
       - task: cli-lib:smoke:dev
       - task: tier:isolation
       - task: check:all-features

@@ -349,8 +349,11 @@ fn a_checked_write_needs_a_write_handle() {
 }
 
 /// REREAD brings a handle with nothing staged to the blob the store holds
-/// now, its base with it; a handle with a staged edit keeps the bytes and
-/// the base the edit was made against.
+/// now, its base with it, and keeps the blob it replaces among the handle's
+/// earlier reads: an edit of the very line the other writer changed may
+/// have been made from either read, so it is refused until SETTLE; a handle
+/// with a staged edit keeps the bytes and the base the edit was made
+/// against.
 #[test]
 fn reread_brings_a_clean_handle_to_the_store_and_leaves_a_dirty_one() {
     let f = fixture(whole());
@@ -358,13 +361,33 @@ fn reread_brings_a_clean_handle_to_the_store_and_leaves_a_dirty_one() {
     other_writer(&f, "a.go", A_OTHER);
     assert_eq!(f.fs.reread(h), Ok(()));
     assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), A_OTHER.as_bytes());
-    // The base moved with the bytes: an edit of them lands unmerged.
     let edit = A_OTHER.replace("return 3", "return 4");
+    assert_eq!(
+        f.fs.write_checked(h, 0, edit.as_bytes()),
+        Err(Errno::ESTALE),
+        "made from A, the edit undoes A_OTHER's line"
+    );
+    // Settled, the base moved with the bytes: an edit of them lands unmerged.
+    assert_eq!(f.fs.settle(h), Ok(()));
     assert_eq!(f.fs.write_checked(h, 0, edit.as_bytes()), Ok(edit.len()));
     other_writer(&f, "a.go", A);
     assert_eq!(f.fs.reread(h), Ok(()));
     assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), edit.as_bytes());
     assert_eq!(f.fs.flush(h), Err(Errno::ESTALE), "against A_OTHER, not A");
+}
+
+/// A save that means different things against its handle's reads is
+/// `ESTALE`, and the refusal the log records names the path.
+#[test]
+fn an_ambiguous_save_is_stale_and_names_its_path() {
+    let err = anyhow::Error::new(crate::Ambiguous {
+        path: "pkg/b.go".into(),
+    });
+    assert_eq!(crate::errno_for(&err), Errno::ESTALE);
+    assert_eq!(
+        format!("{err}"),
+        "'pkg/b.go': the save means different things against the reads it may have been made from"
+    );
 }
 
 /// REREAD of a file the store no longer holds is `ENOENT`.

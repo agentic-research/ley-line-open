@@ -6,7 +6,12 @@
 //!
 //! - a READ rereads the handle when nothing is staged on it
 //!   ([`StoreFs::reread`]), so the base an edit is checked against is no
-//!   older than the bytes the client read;
+//!   older than the bytes the client read. The base it replaces stays among
+//!   the handle's earlier reads: the macOS client READs a page again before
+//!   a partial WRITE once it saw the file change, so the kernel can hold
+//!   new bytes while the editor holds old ones. An edit lands only when it
+//!   means the same against every read since the handle last landed
+//!   (`agree`), otherwise `NFS3ERR_STALE`;
 //! - a WRITE stages on that handle, checked against what the store holds
 //!   now ([`StoreFs::write_checked`]): an edit the store would refuse is
 //!   refused `NFS3ERR_STALE` at the WRITE, which the macOS client reports at
@@ -389,11 +394,13 @@ impl<S: Store + 'static> NFSFileSystem for HostNfs<S> {
         let handle = self.handle(id)?;
         status(self.fs.reread(handle))?;
         // The client now holds the store's bytes: a refused save's handle
-        // takes edits again.
-        if let Some(open) = self.opens.lock().get_mut(&id)
-            && open.stage == Stage::Refused
-        {
-            open.stage = Stage::Clean;
+        // takes edits again, made from what this READ served.
+        let refused = self.refused(id);
+        if refused {
+            status(self.fs.settle(handle))?;
+            if let Some(open) = self.opens.lock().get_mut(&id) {
+                open.stage = Stage::Clean;
+            }
         }
         let data = status(self.fs.read(handle, offset, count))?;
         let (attr, _) = status(self.fs.getattr(id, Some(handle)))?;

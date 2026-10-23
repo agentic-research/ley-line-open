@@ -248,7 +248,15 @@ translates the three whose host values differ (`ESTALE`, `ENOTEMPTY`, `ENOSYS`),
 
 **The macOS COMMIT tension.** NFSv3 has no OPEN or CLOSE, so `HostNfs` keeps one storefs write
 handle per file id; a READ with nothing staged rereads it (the bytes the client takes become its
-base). The macOS NFS client reports a refused WRITE (at `fsync` or `close`) and ignores a refused
+base). The base it replaces stays among the handle's earlier reads (bead `4a8953`): the macOS
+client READs a page again before a partial WRITE once its attribute cache saw the file change, so
+a READ can hand another writer's bytes to the kernel while the editor still holds the bytes it
+read first. The server cannot tell which read an edit was made from, so a save lands only when
+its three-way merge with what the store holds is clean against every read since the handle last
+landed and all of them give the same bytes (`StoreFs::agree`), decided at the WRITE and again at
+the COMMIT under the store's writer; otherwise it is `NFS3ERR_STALE`. An edit next to the other
+writer's change can be refused this way although the editor reloaded; the READ after the
+refusal settles the handle, and the retry lands. The macOS NFS client reports a refused WRITE (at `fsync` or `close`) and ignores a refused
 COMMIT, so each WRITE runs the COMMIT's own decision (`source_write::check`: grant, bases, merge,
 structure) on the bytes it stages and refuses `NFS3ERR_STALE` exactly when that decision does. A
 SETATTR of the size stages unchecked: a save truncates before it writes, and the empty file
@@ -327,4 +335,4 @@ rules and removed that mode, `Refusal::Syntax`, `Refusal::NoLanguage` and `can_h
 | M6 | the checkout carries modes, symlinks and directories | `checkout_materializes_modes_symlinks_and_empty_dirs` |
 | M7 | the wire carries it | `daemon_protocol_gate_proposals_produce_the_fixture_shapes` (fixtures for `mode`, `mkdir`, `conflicts`) |
 | M8 | in the guest | `agent_in_guest.rs` scenarios (c), (C), (d), (p), (h): two writers on different lines both land; same lines `ESTALE`; README, `chmod +x`, symlink, empty directory, directory rename and a half-written Go file persist across a daemon restart; storefs `tree_tests` |
-| M9 | the host mount is storefs: it lands new files, directories, modes and symlinks, merges, refuses overlap (and a retry made without a read), stores an unparseable save, and refuses an unpatched macOS NFS client | storefs `host::tests` (`a_new_file_lands_at_create_and_its_bytes_at_commit`, `mkdir_and_rmdir_are_directory_entries`, `a_mode_change_lands_the_executable_mode`, `a_symlink_lands_with_its_target`, `a_save_over_a_disjoint_landed_change_merges_at_commit`, `a_save_over_an_overlapping_landed_change_is_stale_at_the_write`, `a_refused_commit_drops_the_edit_and_the_next_read_serves_the_store`, `an_unparseable_save_lands_with_its_diagnostic`, `an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts`); through the kernel, storefs `tests/host_mount.rs` and `tools/cli_smoke.sh --mount`; fs `a_store_refuses_every_write` |
+| M9 | the host mount is storefs: it lands new files, directories, modes and symlinks, merges, refuses overlap (and a retry made without a read), stores an unparseable save, and refuses an unpatched macOS NFS client | storefs `host::tests` (`a_new_file_lands_at_create_and_its_bytes_at_commit`, `mkdir_and_rmdir_are_directory_entries`, `a_mode_change_lands_the_executable_mode`, `a_symlink_lands_with_its_target`, `a_save_over_a_disjoint_landed_change_merges_at_commit`, `a_save_over_an_overlapping_landed_change_is_stale_at_the_write`, `a_page_fill_read_does_not_hide_another_writers_change`, `a_page_fill_read_does_not_hide_an_overlapping_change`, `a_commit_refuses_a_save_whose_result_turned_ambiguous`, `a_read_after_a_refusal_settles_the_handle`, `a_refused_commit_drops_the_edit_and_the_next_read_serves_the_store`, `an_unparseable_save_lands_with_its_diagnostic`, `an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts`); through the kernel, storefs `tests/host_mount.rs` and `tools/cli_smoke.sh --mount`; fs `a_store_refuses_every_write` |

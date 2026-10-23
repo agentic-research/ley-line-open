@@ -31,7 +31,11 @@ rules; the `leyline` binary injects the mount into the daemon as
   `ENOSYS`) into the host's.
 - **NFS** has no OPEN or CLOSE: the server keeps one write handle per file
   id. A READ with nothing staged rereads it, so the bytes the client takes
-  are its base. A WRITE is checked against the store at once and refused
+  are its base; the base it replaces stays among the handle's earlier reads,
+  because the macOS client READs a page again before a partial WRITE once it
+  saw the file change. A save lands only when it means the same against
+  every read since the handle last landed (`StoreFs::agree`), and the READ
+  after a refusal settles the handle (bead `4a8953`). A WRITE is checked against the store at once and refused
   `NFS3ERR_STALE` exactly when its COMMIT would be, because the macOS client
   reports a refused WRITE and ignores a refused COMMIT. A SETATTR of the size
   stages unchecked (a save truncates before it writes); a truncate with no

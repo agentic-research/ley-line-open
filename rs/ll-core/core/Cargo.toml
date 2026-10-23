@@ -16,6 +16,11 @@ serde = { workspace = true, features = ["derive"] }
 # to BLAKE3 per Σ §3.4 (decade write-up 2026-merkle-cas-substrate.md).
 blake3 = { workspace = true }
 
+# statvfs: a grown arena is refused when the filesystem cannot hold it
+# (bead ley-line-open-8c8ded).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 default = []
 interrupt = []

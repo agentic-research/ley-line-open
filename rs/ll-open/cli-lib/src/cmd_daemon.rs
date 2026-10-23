@@ -2928,6 +2928,22 @@ mod tests {
             grown.arena_size() > small,
             "the second snapshot must grow the arena"
         );
+        // The grown arena is sized from the image it holds: two buffers of
+        // the image plus a quarter, and the file is exactly that long (bead
+        // `ley-line-open-8c8ded`: a sizing bug must fail here, not fill the
+        // disk).
+        let grown_file = std::fs::File::open(&arena_path).unwrap();
+        let mut grown_header = [0u8; std::mem::size_of::<leyline_core::ArenaHeader>()];
+        grown_file.read_exact_at(&mut grown_header, 0).unwrap();
+        let grown_header: leyline_core::ArenaHeader = *bytemuck::from_bytes(&grown_header);
+        let image_len = grown_header.data_size;
+        assert_eq!(
+            grown.arena_size(),
+            leyline_core::ArenaHeader::HEADER_SIZE
+                + 2 * std::cmp::max(image_len + image_len / 4, 1024 * 1024),
+            "the grown arena is the header and two buffers of the image plus a quarter"
+        );
+        assert_eq!(grown_file.metadata().unwrap().len(), grown.arena_size());
         assert_ne!(grown.current_root(), published_root);
 
         let mut image = vec![0u8; header.data_size as usize];

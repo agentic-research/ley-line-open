@@ -4725,6 +4725,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "bytemuck",
+ "libc",
  "memmap2",
  "parking_lot",
  "serde",

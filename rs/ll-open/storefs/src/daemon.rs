@@ -17,7 +17,7 @@ use leyline_cli_lib::tree_root::DerivedFrom;
 use leyline_runtime::backends::libkrun::share::{FsService, WorkspaceShares};
 use leyline_runtime::{ErrorCode, ExecutionError, WorkspaceGrant, WorkspaceOperation};
 
-use crate::{Checkout, Freshness, Options, Scope, Store, StoreFs, StoreShare};
+use crate::{Checkout, Derived, Freshness, Options, Scope, Store, StoreFs, StoreShare};
 
 /// The daemon's living database: the share reads on its reader pool and
 /// proposes on its one writer, the same connections the socket's `propose`
@@ -158,6 +158,9 @@ impl WorkspaceShares for DaemonShares {
                 dir,
                 lang_filter: ctx.lang_filter.clone(),
             }),
+            // This run's build output and tool state (ADR-0045 T9), removed
+            // with its share.
+            derived: Some(Derived::in_temp_dir()),
         };
         log::info!(
             "run {run_id}: serving workspace {:?} at {} ({:?})",

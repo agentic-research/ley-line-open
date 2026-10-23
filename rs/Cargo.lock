@@ -4987,6 +4987,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fuser",
+ "ignore",
  "leyline-cli-lib",
  "leyline-core",
  "leyline-runtime",

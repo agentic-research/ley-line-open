@@ -83,6 +83,17 @@ fn paths(list: &[&str]) -> Grant {
 /// `pkg/b.go`, `pkg/sub/c.go` and `secret/d.go`; with `checkout`, the source
 /// tree is attached as the checkout accepted proposals are written into.
 pub(crate) fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixture {
+    fixture_derived(scope, checkout, a_text, None)
+}
+
+/// [`fixture_with`], with `derived` as the filesystem's derived-path
+/// options (ADR-0045 T9).
+pub(crate) fn fixture_derived(
+    scope: Scope,
+    checkout: bool,
+    a_text: &str,
+    derived: Option<Derived>,
+) -> Fixture {
     let src = tempfile::tempdir().unwrap();
     for (rel, text) in [
         ("a.go", a_text),
@@ -107,6 +118,7 @@ pub(crate) fn fixture_with(scope: Scope, checkout: bool, a_text: &str) -> Fixtur
             dir: src.path().to_path_buf(),
             lang_filter: None,
         }),
+        derived,
     };
     let clock = Arc::new(TestClock::default());
     Fixture {
@@ -1299,6 +1311,7 @@ fn a_create_outside_the_checkouts_language_lands_in_the_store() {
                 dir: f.src.path().to_path_buf(),
                 lang_filter: Some("go".to_string()),
             }),
+            derived: None,
         },
     );
     let (_, h) = filtered.create(ROOT_INODE, b"tool.py", O_RDWR).unwrap();

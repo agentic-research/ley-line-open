@@ -290,6 +290,61 @@ xetdata's `nfsserve`, which this mount's `nessie-nfsserve` forks. The client's a
 held to one second (`actimeo=1`, storefs's changed-path timeout); close-to-open consistency
 revalidates every open.
 
+### T9 — Derived paths are never proposals
+
+Bead `ley-line-open-39998b`. A path is **authored** or **derived**. Authored paths are what T1–T8
+describe: every change is a proposal, merged, durable, in `_tree`, `treeRoot` and the checkout.
+Derived paths are build output and tool state: `cargo build`'s `target/`, `npm install`'s
+`node_modules/`, a virtualenv, `.git/`. They are regenerated, never merged, and written in volume
+(a build writes thousands of files; at T8's ~47 ms a proposal, ten thousand take eight minutes),
+so storefs never proposes them. There is no mode to enable: the class is decided per path, the
+same way for the guest share and the host mount.
+
+**Which paths are derived.** Decided in order, for each request:
+
+1. A path the store holds (or this session created and holds pending) is authored: tracked wins,
+   as in git. A tracked file under an ignored directory stays a proposal.
+2. A path this session's scratch holds is derived.
+3. A new path (CREATE, MKDIR, SYMLINK, the target of a RENAME) is derived when its parent is
+   derived, or when the rules match it:
+   - a component named `target`, `node_modules`, `__pycache__`, `__pypackages__`, `venv`,
+     `.venv` or `.git` (the directory names of the parse walk's `is_bloat_dir` that are always
+     generated; `vendor` and dot-names in general are not, since vendored and dot-prefixed files
+     are often authored);
+   - a file named `._*` or `.DS_Store` (macOS metadata; bead `8d6a8a`);
+   - a `.gitignore` rule: the `.gitignore` of each directory from the path's parent up to the root,
+     read from the store or, absent there, from the checkout, nearest first; an ignore match makes
+     it derived, a `!` whitelist match authored. A `.gitignore` this filesystem lands is reread at
+     its next match. `.git/info/exclude` and global excludes are not read.
+
+   Otherwise it is authored.
+
+A rule change does not move what exists: a scratch entry stays derived until it is removed, and a
+stored entry stays authored.
+
+**Where derived paths live.** In a scratch directory this `StoreFs` creates on its first derived
+write: one per guest run (each run's share is its own `StoreFs`) and one per host-mount session.
+It is a host directory served through the same share, so a derived request costs a share round
+trip and a host file operation, and no parse, merge, durable flush or publish. A guest-local overlay
+(virtio-blk or tmpfs inside the VM) would remove the round trip as well; it needs a guest-init
+change and is not part of this decision. The scratch directory is removed when the `StoreFs` is
+dropped, at the end of the run or unmount.
+
+- **Confinement.** Every scratch access resolves the path component by component with `openat`
+  and `O_NOFOLLOW` beneath the scratch root, so a symlink the guest made there is served to the
+  guest as a symlink and is never followed on the host. Derived writes are inside the run's scope
+  as authored ones are: `EACCES` where the scope may not propose.
+- **Size.** Scratch is limited (16 GiB by default). A write past the limit is `ENOSPC`, and so is
+  a full host disk. A derived write never falls back to the store.
+- **Durability.** None. FSYNC of a derived file does not sync, and a crash or restart loses the
+  scratch.
+
+**Crossing classes.** A RENAME of a file from a derived path to an authored one lands its bytes as
+a proposal create at the new path, then removes the scratch file; from authored to derived, it
+writes the bytes into scratch, then proposes the delete of the old path. A directory RENAME
+across classes is `EXDEV`, which `mv` answers by copying. A directory listing is the store's
+entries and the scratch entries under the same directory; a name both hold lists the stored one.
+
 ## Consequences
 
 - An agent's `README.md`, `notes.txt`, `Makefile`, `chmod +x`, symlink and empty directory

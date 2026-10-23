@@ -1285,6 +1285,49 @@ static int mount_virtiofs_list()
     unsetenv("KRUN_VIRTIOFS_MOUNTS");
     return 0;
 }
+
+/*
+ * Set the guest's wall clock from KRUN_REALTIME_NS, the host's wall clock
+ * when the VMM built the kernel command line, plus the guest's time since
+ * boot. The kernel took its first time from the RTC, which reads whole
+ * seconds, and set it to the middle of that second, so the guest started up
+ * to half a second ahead of or behind the host. A guest clock ahead of the
+ * host's breaks anything that compares a guest-local time with a file time
+ * a host-side filesystem served: git's racy-clean check compares the index
+ * file's mtime with each entry's, and two same-size edits within one second
+ * of a host-timed share then look unchanged. The stamp was taken before the
+ * guest booted, so the time set here is never later than the host's; it
+ * trails it by the VMM's setup time. A missing or malformed value leaves
+ * the RTC's time. The variable is removed from the workload's environment.
+ */
+static void set_realtime_from_host()
+{
+    char *value, *end;
+    unsigned long long host_ns;
+    struct timespec since_boot, now;
+
+    value = getenv("KRUN_REALTIME_NS");
+    if (value == NULL) {
+        return;
+    }
+    errno = 0;
+    host_ns = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        clock_gettime(CLOCK_BOOTTIME, &since_boot) < 0) {
+        printf("KRUN_REALTIME_NS: '%s' is not a time; keeping the RTC's\n",
+               value);
+        unsetenv("KRUN_REALTIME_NS");
+        return;
+    }
+    host_ns += (unsigned long long)since_boot.tv_sec * 1000000000ULL +
+               (unsigned long long)since_boot.tv_nsec;
+    now.tv_sec = host_ns / 1000000000ULL;
+    now.tv_nsec = host_ns % 1000000000ULL;
+    if (clock_settime(CLOCK_REALTIME, &now) < 0) {
+        perror("clock_settime(KRUN_REALTIME_NS)");
+    }
+    unsetenv("KRUN_REALTIME_NS");
+}
 #endif
 
 #if __linux__
@@ -1455,6 +1498,8 @@ int main(int argc, char **argv)
     }
 
 #if __linux__
+    set_realtime_from_host();
+
     krun_root = clone_str(getenv("KRUN_BLOCK_ROOT_DEVICE"));
     if (krun_root) {
         if (mkdir("/newroot", 0755) < 0 && errno != EEXIST) {

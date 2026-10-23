@@ -46,8 +46,8 @@ tree, the patches or the script, and weekly (bead `ley-line-open-396d77`).
 ### The patches
 
 Prepared as an upstream pull request; not yet submitted. Each is one
-`git format-patch` commit, written on top of `v1.19.4`; all six apply
-unchanged to `v1.19.6`:
+`git format-patch` commit. `0001`–`0006` were written on top of `v1.19.4`
+and apply unchanged to `v1.19.6`; `0007` was written on top of `v1.19.6`:
 
 1. `0001` — **libkrun/macos: start the mapping worker for virtio-fs DAX
    windows.** On macOS a virtio-fs DAX mapping is serviced by the VMM worker
@@ -76,6 +76,16 @@ unchanged to `v1.19.6`:
    with `ENOSYS` defaults, forwarded from `DynFs`; without them a guest could
    neither read nor make a symbolic link on the share (ADR-0045 T4, bead
    `ley-line-open-bb8aa6`).
+7. `0007` — **init: set the guest clock from the host's, not the RTC's whole
+   second.** The VMM passes `KRUN_REALTIME_NS` (the host's wall clock as the
+   kernel command line is built) and init sets `CLOCK_REALTIME` to it plus
+   `CLOCK_BOOTTIME`. The kernel's own first time, from the PL031 RTC's whole
+   seconds set to the middle of the second, started a guest up to half a
+   second ahead of or behind the host (+0.09, +0.14, +0.31, −0.24 s over four
+   boots); ahead, git's racy-clean check compared a guest-clock index mtime
+   with host-clock share mtimes and missed a same-second, same-size edit.
+   The guest now trails the host by the VMM's setup time (75–150 ms
+   measured) and is never ahead (bead `ley-line-open-f8138d`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

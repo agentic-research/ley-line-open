@@ -33,16 +33,19 @@
 //! new in the directory: it is ingested.
 //!
 //! **Ordering.** A proposal commits to the store and leaves the index alone;
-//! then each deleted file or symlink is removed (unlink, then `fsync` of
-//! its directory) and each removed directory (`rmdir`, deepest first; its
-//! directories above stay, ADR-0045 T1), then each directory made and each
-//! written file materialized (a temp file in the same directory with the
-//! entry's permissions, or a staged symlink, then `rename` and `fsync` of
-//! the directory); then its index entry advances. A crash after the commit leaves directory == index while
+//! then each deleted file or symlink is removed (unlink, then its directory
+//! ordered to the disk) and each removed directory (`rmdir`, deepest first;
+//! its directories above stay, ADR-0045 T1), then each directory made and
+//! each written file materialized (a temp file in the same directory with
+//! the entry's permissions, its bytes ordered to the disk, or a staged
+//! symlink, then `rename` and the directory ordered); then the index entries
+//! advance, in one transaction (`crate::durable`, ADR-0041 amendment
+//! 2026-10-23). A crash after the commit leaves directory == index while
 //! the store moved, which the next [`reconcile`] carries out. A crash after
 //! the rename or the unlink leaves directory == store while the index lags,
-//! which converges. No ordering of crashes loses an accepted proposal or a
-//! person's edit.
+//! which converges. The ordering keeps a power loss to those two states: an
+//! index row never reaches the disk ahead of the rename it records. No
+//! ordering of crashes loses an accepted proposal or a person's edit.
 //!
 //! Startup, the watcher, `reparse` over the checkout and every accepted
 //! proposal run [`reconcile`]. A daemon without a source directory has no
@@ -490,9 +493,10 @@ pub fn reconcile(
     })
 }
 
-/// Write `bytes` as the file `rel` names under `dir`: staged beside it,
-/// synced, renamed over it, and the directory synced, so a crash leaves the
-/// old file or the new one. The file keeps its permissions. Refused when
+/// Write `bytes` as the file `rel` names under `dir`: staged beside it, its
+/// bytes ordered to the disk, renamed over it, and the directory ordered
+/// (`crate::durable`), so a crash or a power loss leaves the old file or the
+/// whole new one. The file keeps its permissions. Refused when
 /// `rel` is not a plain relative path or its directory resolves outside
 /// `dir` (a symlink out of the tree).
 pub fn write_into(dir: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
@@ -652,8 +656,9 @@ fn existing_parent(dir: &Path, rel: &str, path: &Path, verb: &str) -> Result<Pat
 }
 
 /// Remove the entry `rel` names under `dir` — a file, a symlink, or an
-/// empty directory — and sync its directory, so the removal survives a
-/// crash. The directories above it stay (ADR-0045 T1). Refused when `rel`
+/// empty directory — and order its directory to the disk, so the removal
+/// lands before the index row that drops it (`crate::durable`). The
+/// directories above it stay (ADR-0045 T1). Refused when `rel`
 /// is not a plain relative path or its directory resolves outside `dir` (a
 /// symlink out of the tree).
 pub fn remove_from(dir: &Path, rel: &str) -> Result<()> {

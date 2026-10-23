@@ -2501,6 +2501,61 @@ mod tests {
         );
     }
 
+    /// Bead `ley-line-open-98d0c3`: the cost of one accepted proposal and
+    /// its write-through to the checkout, on the daemon's `live.db`
+    /// configuration, without a VM or a socket in the way. Prints the
+    /// median and mean over `LEYLINE_BENCH_PROPOSALS` (default 100) one-file
+    /// proposals into a `LEYLINE_BENCH_FILES` (default 2,000) file tree.
+    #[test]
+    #[ignore = "a benchmark: run with --ignored --nocapture"]
+    fn bench_one_proposal_and_its_checkout_write() {
+        use crate::source_write::{Base, Grant, Proposed, propose};
+        let files: usize = std::env::var("LEYLINE_BENCH_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
+        let proposals: usize = std::env::var("LEYLINE_BENCH_PROPOSALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        for i in 0..files {
+            let path = src.join(format!("d{}/f{i}.go", i % 50));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!("package d\n\nfunc F{i}() int {{ return {i} }}\n"),
+            )
+            .unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("bench.live.db")).unwrap();
+        configure_wal(&conn).unwrap();
+        crate::checkout::reconcile(&conn, &src, None, None).unwrap();
+        let mut took = Vec::with_capacity(proposals);
+        for n in 0..proposals {
+            let rel = format!("d{}/f{n}.go", n % 50);
+            let bytes = format!("package d\n\nfunc F{n}() int {{ return -{n} }}\n").into_bytes();
+            let start = std::time::Instant::now();
+            propose(
+                &conn,
+                &Grant::Whole,
+                vec![Proposed::write(&rel, Base::Any, bytes)],
+            )
+            .unwrap();
+            let r = crate::checkout::reconcile(&conn, &src, None, Some(&[rel])).unwrap();
+            took.push(start.elapsed());
+            assert_eq!(r.materialized.len(), 1);
+        }
+        took.sort();
+        let mean = took.iter().sum::<std::time::Duration>() / took.len() as u32;
+        println!(
+            "proposal+checkout over {files} files, {proposals} proposals: median {:.2} ms, mean {:.2} ms",
+            took[took.len() / 2].as_secs_f64() * 1e3,
+            mean.as_secs_f64() * 1e3
+        );
+    }
+
     #[test]
     fn configure_wal_activates_wal_on_file_backed_connection() {
         // The 15a load-bearing check: PRAGMA journal_mode=WAL must

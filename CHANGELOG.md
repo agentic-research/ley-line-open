@@ -12,6 +12,19 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **A proposal issues one full flush: its `live.db` commit** (bead
+  `ley-line-open-98d0c3`, ADR-0041 amendment 2026-10-23). The daemon's
+  `live.db` connection sets `fullfsync` and `checkpoint_fullfsync`, so on
+  macOS the commit that acknowledges a proposal reaches past the drive's
+  cache (it was plain `fsync(2)`, which stops at it). The checkout file,
+  its directory, the Σ head and its directory, each flushed with
+  `F_FULLFSYNC` before, are ordered with `F_BARRIERFSYNC`: a file's bytes
+  before its rename, the rename before the `_checkout_index` row that
+  records it. Reconcile advances the index in one transaction after every
+  write, committed without a sync of its own. A power loss can roll the
+  checkout or the head back to its predecessor; the next reconcile or
+  parse brings it forward from the durable rows.
+
 - **Breaking: a proposal is published by the daemon's publisher, not
   inline** (bead `ley-line-open-8c8ded`, ADR-0041 amendment 2026-10-22).
   `propose` and storefs's FLUSH reply once the proposal is committed to

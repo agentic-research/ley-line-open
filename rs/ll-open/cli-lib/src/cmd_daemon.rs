@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use leyline_core::ContentAddressed;
 
 use crate::daemon::{
     DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
@@ -1380,13 +1379,10 @@ pub fn arena_size_for(current: u64, image_len: u64) -> u64 {
 }
 
 /// `current_root` of a published image: BLAKE3 over its exact bytes, the
-/// substrate's `ContentAddressed` hash. Large images hash across cores;
-/// BLAKE3's tree mode gives the same bytes as the serial hash.
+/// substrate's `ContentAddressed` hash. The image hashes across cores;
+/// BLAKE3's tree mode gives the same bytes as the serial hash, and
+/// `update_rayon` hashes a small input on the calling thread.
 pub fn image_root(image: &[u8]) -> [u8; 32] {
-    const PARALLEL_FROM: usize = 1024 * 1024;
-    if image.len() < PARALLEL_FROM {
-        return *image.hash().as_bytes();
-    }
     *blake3::Hasher::new().update_rayon(image).finalize().as_bytes()
 }
 
@@ -3845,22 +3841,28 @@ mod tests {
         let grown = arena_size_for(64 * MIB, image);
         let buffer = leyline_core::ArenaHeader::buffer_size(grown);
         assert!(buffer >= image, "the image fits the new buffer");
-        assert!(
-            buffer >= image + image / 4,
-            "the new buffer leaves a quarter of the image free: {buffer} for {image}"
+        assert_eq!(
+            buffer,
+            image + image / 4,
+            "the new buffer leaves exactly a quarter of the image free, no more"
+        );
+        assert_eq!(
+            grown,
+            header + 2 * buffer,
+            "the arena is the header and two buffers"
         );
         // The case the share benchmark hit: a few KiB of growth after a
         // resize rewrote the whole 2.6 GB arena. It now stays in place.
         assert_eq!(arena_size_for(grown, image + 64 * 1024), grown);
         // A small image still gets a usable minimum.
         let small = arena_size_for(header, 10);
-        assert!(leyline_core::ArenaHeader::buffer_size(small) >= MIB);
+        assert_eq!(leyline_core::ArenaHeader::buffer_size(small), MIB);
     }
 
     #[test]
     fn the_image_root_is_the_substrate_hash_of_the_image() {
         use leyline_core::ContentAddressed;
-        // Sizes across BLAKE3's chunk (1 KiB) and the parallel threshold.
+        // Sizes across BLAKE3's chunk (1 KiB) and its multi-chunk tree.
         for len in [0usize, 1, 1023, 1024, 1025, 64 * 1024 + 3, 3 * 1024 * 1024 + 7] {
             let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
             let expected = *bytes.as_slice().hash().as_bytes();

@@ -386,6 +386,13 @@ pub struct SetAttr {
 struct Handle {
     path: String,
     base: Base,
+    /// The blobs this handle served before `base`, since it last landed or
+    /// its client last read after a refusal ([`StoreFs::reread`]). The host
+    /// NFS mount has no OPEN, so it cannot tell which of its reads the
+    /// client's edit was made from; a save lands only when it means the
+    /// same thing against each of them ([`agree`]). Empty for every handle
+    /// that is never reread.
+    earlier: Vec<Hash>,
     bytes: Vec<u8>,
     /// A mode an `fchmod` staged on this write handle, proposed with its
     /// bytes at FLUSH.
@@ -697,6 +704,7 @@ impl<S: Store> StoreFs<S> {
         let handle = self.new_handle(Handle {
             path,
             base,
+            earlier: Vec::new(),
             bytes,
             mode: None,
             dirty: truncate,
@@ -762,7 +770,10 @@ impl<S: Store> StoreFs<S> {
             None => Proposed::write(open.path.as_str(), open.base.clone(), bytes.clone()),
         };
         self.store
-            .with_read(|conn| source_write::check(conn, &self.scope.propose, vec![write]))
+            .with_read(|conn| {
+                source_write::check(conn, &self.scope.propose, vec![write])?;
+                agree(conn, &open.path, &open.base, &open.earlier, &bytes)
+            })
             .map_err(|e| {
                 log::info!("write to '{}' refused: {e:#}", open.path);
                 errno_for(&e)
@@ -778,6 +789,12 @@ impl<S: Store> StoreFs<S> {
     /// The host NFS mount rereads before each READ it serves from a handle
     /// (ADR-0045 T8): NFSv3 has no OPEN, so a READ is where a client takes
     /// what it will later edit. `ENOENT` when the store holds no file there.
+    ///
+    /// The base it replaces is kept among the handle's earlier reads: the
+    /// macOS client READs a page again before a partial WRITE once it saw
+    /// the file change, so a READ may hand new bytes to the kernel while the
+    /// editor still holds the old ones. A later edit must mean the same
+    /// against every read it may have been made from ([`agree`]).
     pub fn reread(&self, handle: u64) -> Result<(), Errno> {
         let open = self.handle(handle)?;
         let mut open = open.lock();
@@ -786,9 +803,24 @@ impl<S: Store> StoreFs<S> {
         }
         let (base, bytes) = self.held(&open.path)?.ok_or(Errno::ENOENT)?;
         if base != open.base {
+            if let Base::Blob(served) = open.base
+                && !open.earlier.contains(&served)
+            {
+                open.earlier.push(served);
+            }
             open.base = base;
             open.bytes = bytes;
         }
+        Ok(())
+    }
+
+    /// SETTLE: forget the handle's earlier reads, keeping its base. The
+    /// host NFS mount settles a handle when its client READs after a
+    /// refused save: the refusal told the client its bytes were stale, so
+    /// what it saves next is made from the bytes that READ served.
+    pub fn settle(&self, handle: u64) -> Result<(), Errno> {
+        let open = self.handle(handle)?;
+        open.lock().earlier.clear();
         Ok(())
     }
 
@@ -881,7 +913,7 @@ impl<S: Store> StoreFs<S> {
                     }
                     let (base, mut bytes) = self.held(&path)?.ok_or(Errno::ENOENT)?;
                     bytes.resize(size as usize, 0);
-                    self.land(&path, base, bytes, None)?;
+                    self.land(&path, base, &[], bytes, None)?;
                 }
             }
         }
@@ -978,6 +1010,7 @@ impl<S: Store> StoreFs<S> {
         let handle = self.new_handle(Handle {
             path: path.clone(),
             base: Base::Absent,
+            earlier: Vec::new(),
             bytes: Vec::new(),
             mode: None,
             dirty: true,
@@ -1204,12 +1237,19 @@ impl<S: Store> StoreFs<S> {
         if !open.dirty {
             return Ok(());
         }
-        let (base, merged) =
-            self.land(&open.path, open.base.clone(), open.bytes.clone(), open.mode)?;
+        let (base, merged) = self.land(
+            &open.path,
+            open.base.clone(),
+            &open.earlier,
+            open.bytes.clone(),
+            open.mode,
+        )?;
         if let Some(merged) = merged {
             open.bytes = merged;
         }
         open.base = base;
+        // What landed is what the client holds now.
+        open.earlier.clear();
         open.mode = None;
         open.dirty = false;
         Ok(())
@@ -1221,11 +1261,14 @@ impl<S: Store> StoreFs<S> {
     /// blob base is a replace. A file not landed yet ([`Base::Absent`])
     /// takes the bytes in the session (what a later open or rename of it
     /// carries) and is proposed as a create; one unlinked since it was
-    /// created lands nothing.
+    /// created lands nothing. `earlier` are the handle's earlier reads
+    /// ([`Handle::earlier`]): the bytes must mean the same against each of
+    /// them as against `base`, decided under the writer with the proposal.
     fn land(
         &self,
         path: &str,
         base: Base,
+        earlier: &[Hash],
         bytes: Vec<u8>,
         mode: Option<Mode>,
     ) -> Result<(Base, Option<Vec<u8>>), Errno> {
@@ -1238,11 +1281,12 @@ impl<S: Store> StoreFs<S> {
             held.clone_from(&bytes);
             mode = mode.or_else(|| session.pending_modes.get(path).copied());
         }
+        let precheck = |conn: &Connection| agree(conn, path, &base, earlier, &bytes);
         let write = match mode {
-            Some(mode) => Proposed::write_mode(path, base, bytes, mode),
-            None => Proposed::write(path, base, bytes),
+            Some(mode) => Proposed::write_mode(path, base.clone(), bytes.clone(), mode),
+            None => Proposed::write(path, base.clone(), bytes.clone()),
         };
-        let accepted = self.propose(vec![write])?;
+        let accepted = self.propose_after(vec![write], &precheck)?;
         {
             let mut session = self.session.lock();
             session.pending.remove(path);
@@ -1266,6 +1310,16 @@ impl<S: Store> StoreFs<S> {
     /// into the checkout under the same writer, as the daemon's `propose`
     /// op does.
     fn propose(&self, writes: Vec<Proposed>) -> Result<Accepted, Errno> {
+        self.propose_after(writes, &|_| Ok(()))
+    }
+
+    /// [`StoreFs::propose`], after `precheck` passes under the same writer:
+    /// nothing lands between the two.
+    fn propose_after(
+        &self,
+        writes: Vec<Proposed>,
+        precheck: &dyn Fn(&Connection) -> anyhow::Result<()>,
+    ) -> Result<Accepted, Errno> {
         let mut paths: Vec<String> = writes.iter().map(|w| w.path.clone()).collect();
         // A created path's new parent directories are checked out too.
         let parents: BTreeSet<String> = paths
@@ -1281,6 +1335,7 @@ impl<S: Store> StoreFs<S> {
         let accepted = self
             .store
             .with_write(|conn| {
+                precheck(conn)?;
                 let accepted = source_write::propose(conn, &self.scope.propose, writes)?;
                 if let Some(checkout) = &self.options.checkout {
                     match leyline_cli_lib::checkout::reconcile(
@@ -1653,6 +1708,73 @@ fn join(dir: &str, name: &str) -> String {
 
 /// The blob the file or symlink at `path` holds and its bytes, or `None`
 /// when the store holds none there.
+/// A save whose result depends on which of its handle's reads it was made
+/// from ([`Handle::earlier`]): refused `ESTALE`, as a conflicting merge is.
+#[derive(Debug)]
+pub struct Ambiguous {
+    pub path: String,
+}
+
+impl std::fmt::Display for Ambiguous {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}': the save means different things against the reads it may have been made from",
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for Ambiguous {}
+
+/// Whether `bytes`, saved at `path` by a handle whose base is `base` and
+/// which served `earlier` before it, mean the same edit whichever of those
+/// reads they were made from: the three-way merge with what the store holds
+/// now is clean against each, and every merge gives the same bytes. A
+/// handle with no earlier reads always agrees; so does a path the store no
+/// longer holds as a file, which the proposal itself decides.
+fn agree(
+    conn: &Connection,
+    path: &str,
+    base: &Base,
+    earlier: &[Hash],
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let Base::Blob(latest) = base else {
+        return Ok(());
+    };
+    if earlier.is_empty() {
+        return Ok(());
+    }
+    let Some((_, current)) = blob_of(conn, path)? else {
+        return Ok(());
+    };
+    let ambiguous = || {
+        anyhow::Error::new(Ambiguous {
+            path: path.to_string(),
+        })
+    };
+    let mut meant: Option<Vec<u8>> = None;
+    for read in std::iter::once(latest).chain(earlier) {
+        let read_bytes = store_tree::blob_bytes(conn, *read)?
+            .ok_or_else(|| anyhow::anyhow!("'{path}': a read blob is missing from the store"))?;
+        let result = if read_bytes == current {
+            bytes.to_vec()
+        } else {
+            match leyline_cli_lib::merge::merge(&read_bytes, bytes, &current) {
+                leyline_cli_lib::merge::Merged::Clean(merged) => merged,
+                _ => return Err(ambiguous()),
+            }
+        };
+        match &meant {
+            Some(first) if *first != result => return Err(ambiguous()),
+            Some(_) => {}
+            None => meant = Some(result),
+        }
+    }
+    Ok(())
+}
+
 fn blob_of(conn: &Connection, path: &str) -> anyhow::Result<Option<(Hash, Vec<u8>)>> {
     let Some(StoreEntry::File { blob, .. }) = store_tree::entry(conn, path)? else {
         return Ok(None);
@@ -1685,6 +1807,9 @@ fn landed(accepted: &Accepted, path: &str) -> Result<Base, Errno> {
 /// as `mkdir(2)`, `rmdir(2)` and `open(2)` answer; a path under a file
 /// `ENOTDIR`; every other refusal and every internal failure `EIO`.
 pub fn errno_for(err: &anyhow::Error) -> Errno {
+    if err.downcast_ref::<Ambiguous>().is_some() {
+        return Errno::ESTALE;
+    }
     match err.downcast_ref::<Refusal>() {
         Some(Refusal::Stale(moved)) if moved.iter().all(|m| m.expected.is_none()) => Errno::EEXIST,
         Some(Refusal::Stale(_) | Refusal::Conflict { .. }) => Errno::ESTALE,

@@ -396,6 +396,128 @@ async fn a_save_over_an_overlapping_landed_change_is_stale_at_the_write() {
     assert_eq!(h.stored_text("a.go").as_deref(), Some(edit.as_str()));
 }
 
+/// `A` with its package line changed: an edit of other lines than
+/// `A_OTHER`'s, made to `A`.
+const A_RENAMED: &str = "package z\n\nfunc A() int { return 1 }\n";
+/// The same edit made to `A_OTHER`: it carries the other writer's change.
+const A_OTHER_RENAMED: &str = "package z\n\nfunc A() int { return 3 }\n";
+
+/// The macOS client READs a page again before a partial WRITE once its
+/// attribute cache saw the file change, so a READ between the editor's read
+/// and its save serves the other writer's bytes to the kernel, not to the
+/// editor. An edit built on the first read must still be refused: it would
+/// otherwise land as an edit of the other writer's bytes and silently undo
+/// their change (the save keeps `return 1`).
+#[tokio::test]
+async fn a_page_fill_read_does_not_hide_another_writers_change() {
+    let h = host();
+    let id = h.id("a.go").await;
+    assert_eq!(h.read_all(id).await, A.as_bytes());
+    h.other_writer("a.go", A_OTHER);
+    assert_eq!(h.read_all(id).await, A_OTHER.as_bytes(), "the page fill");
+    let refused = h.save(id, A_RENAMED).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
+}
+
+/// The same for an edit of the very line the other writer changed: refused,
+/// never landed over their change.
+#[tokio::test]
+async fn a_page_fill_read_does_not_hide_an_overlapping_change() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.other_writer("a.go", A_OTHER);
+    h.read_all(id).await;
+    let refused = h.save(id, &A.replace("return 1", "return 2")).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
+}
+
+/// An editor that reloaded the other writer's bytes and edited other lines
+/// saves an edit that carries their change: every read it may have built on
+/// gives the same result, and it lands. (An edit next to the other writer's
+/// line can merge with a conflict against the earlier read and is refused
+/// once; the client's READ after the refusal settles it, and its retry
+/// lands.)
+#[tokio::test]
+async fn an_edit_of_reloaded_bytes_lands_whichever_read_it_built_on() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.other_writer("a.go", A_OTHER);
+    h.read_all(id).await;
+    h.save(id, A_OTHER_RENAMED).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER_RENAMED));
+}
+
+/// A landed save is what its client holds: the reads before it no longer
+/// bear on its next edit, which may undo anything, including the other
+/// writer's line.
+#[tokio::test]
+async fn a_landed_save_forgets_the_reads_before_it() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.other_writer("a.go", A_OTHER);
+    h.read_all(id).await;
+    h.save(id, A_OTHER_RENAMED).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    h.save(id, A_RENAMED).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_RENAMED));
+}
+
+/// A refused save's client READs the store's bytes before it saves again:
+/// that READ settles the handle, and the retry lands even where it is the
+/// very line the other writer changed.
+#[tokio::test]
+async fn a_read_after_a_refusal_settles_the_handle() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.other_writer("a.go", A_OTHER);
+    h.read_all(id).await;
+    let edit = A_OTHER.replace("return 3", "return 4");
+    let refused = h.save(id, &edit).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    assert_eq!(h.read_all(id).await, A_OTHER.as_bytes());
+    h.save(id, &edit).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(edit.as_str()));
+}
+
+/// The COMMIT decides again: a change landed after the WRITE that makes the
+/// save's result depend on which read it was built on refuses the COMMIT.
+/// Built on `A`, the save keeps `return 3` (`A_OTHER_RENAMED`); built on
+/// `A_OTHER`, it takes the revert (`A_RENAMED`).
+#[tokio::test]
+async fn a_commit_refuses_a_save_whose_result_turned_ambiguous() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.other_writer("a.go", A_OTHER);
+    h.read_all(id).await;
+    h.save(id, A_OTHER_RENAMED).await.unwrap();
+    h.other_writer("a.go", A);
+    let refused = h.nfs.commit(id, 0, 0).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A));
+}
+
 /// A COMMIT refused for a change landed after the client's last WRITE drops
 /// the staged edit: the client's next READ serves the store's bytes.
 #[tokio::test]

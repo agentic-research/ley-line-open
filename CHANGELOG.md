@@ -414,6 +414,17 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A host NFS save can no longer silently undo another writer's change**
+  (bead `ley-line-open-4a8953`). The macOS NFS client READs a page again
+  before a partial WRITE once it saw the file change, and that READ moved
+  the mount handle's base to the other writer's bytes, so a save made from
+  the editor's first read checked as a plain replace and landed over their
+  change. The handle now keeps the blobs it served since it last landed; a
+  save lands only when it means the same against each of them, checked at
+  the WRITE and again at the COMMIT, and is `ESTALE` otherwise. An edit next
+  to the other writer's line can be refused once although the editor
+  reloaded; the READ after the refusal settles it and the retry lands. The
+  intermittent `storefs` `host_mount` failure was this.
 - **A guest's clock no longer runs ahead of the host's** (bead
   `ley-line-open-f8138d`). The guest kernel took its first time from the
   RTC's whole seconds, set to the middle of the second, so a guest started

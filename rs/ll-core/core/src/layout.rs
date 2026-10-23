@@ -271,6 +271,8 @@ fn available_bytes(path: &std::path::Path) -> Option<u64> {
     {
         use std::os::unix::ffi::OsStrExt;
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `libc::statvfs` is a plain C struct of integers, for which
+        // all-zero bytes are a valid value.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: `path` is a valid NUL-terminated string and `stat` is a
         // writable statvfs; statvfs writes only into it.

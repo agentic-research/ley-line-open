@@ -11,7 +11,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use leyline_cli_lib::cmd_daemon::snapshot_to_arena;
 use leyline_cli_lib::daemon::{ContextSlot, DaemonContext};
 use leyline_cli_lib::source_write::Grant;
 use leyline_cli_lib::tree_root::DerivedFrom;
@@ -38,10 +37,11 @@ impl Store for DaemonContext {
         DaemonContext::with_write(self, f)
     }
 
-    /// Snapshot the living database into the arena, on the writer, as the
-    /// socket's `propose` op does after its commit.
-    fn publish(&self) -> anyhow::Result<()> {
-        DaemonContext::with_write(self, |conn| snapshot_to_arena(conn, &self.ctrl_path))
+    /// Ask the daemon's publisher to publish the living database, as the
+    /// socket's `propose` op does after its commit (bead
+    /// `ley-line-open-8c8ded`).
+    fn request_publish(&self) {
+        self.live_db.request_publish();
     }
 }
 

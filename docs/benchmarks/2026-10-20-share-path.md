@@ -103,3 +103,36 @@ The APFS column moves 2-10× between runs (`git_status_cold` 440-946 ms,
 alternation keeps the JSON/Cap'n Proto comparison fair; absolute numbers are
 an upper bound on an idle machine's. Re-run on an idle machine before quoting
 a single figure.
+
+## After bead `ley-line-open-8c8ded` (2026-10-23)
+
+The write cost is fixed by four changes (ADR-0041 amendment): a proposal
+requests a publish and the daemon's single publisher coalesces every proposal
+landed since its last publish, off the writer; the arena keeps its size while
+the image fits a buffer and grows with a quarter of headroom (the earlier
+sizing rewrote the whole arena on a few KiB of growth); `current_root` is
+hashed across cores (the same BLAKE3 bytes); and a parse pass that changes no
+reference or definition reuses the unbound-reference count recorded with the
+rows instead of scanning `node_refs`.
+
+Release build, `perf/8c8ded-proposal-cost` @ e55a79b6, macOS 27.0.1, Apple M3
+Max, one run, 2,044 files, a 200-file storm, APFS and the libkrun guest only:
+
+| measurement | guest (share) | APFS |
+|---|---:|---:|
+| `open_read_close` | 180.2 µs/op | 12.0 µs/op |
+| `lookup_miss` | 113.2 µs/op | 2.1 µs/op |
+| `git_status_cold` | 996.3 ms | 328.0 ms |
+| `git_status_warm_min` | 136.8 ms | 23.3 ms |
+| `rg_first` | 297.7 ms | 61.4 ms |
+| `rg_warm_min` | 242.7 ms | 60.8 ms |
+| `storm_total` | 9,417.2 ms | 27.6 ms |
+| `storm_per_file` | **47.1 ms** | 0.14 ms |
+
+A small-file create went from ~15 s to 47.1 ms (320×). An earlier tree of the
+same branch measured 59.0 ms in release, so the bead's 50 ms bound holds with
+little margin and run-to-run noise of that size. About a third of the
+remainder is four `F_FULLFSYNC` calls per accepted proposal (4.65 ms each on
+this disk against 0.03 ms for a plain `fsync`); they carry the proposal's
+power-loss durability, and replacing them with barriers and one flush is bead
+`ley-line-open-98d0c3`.

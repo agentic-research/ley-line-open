@@ -217,6 +217,77 @@ pub fn create_arena(path: &std::path::Path, arena_size: u64) -> Result<MmapMut> 
     Ok(mmap)
 }
 
+/// Free space a grown arena leaves on its filesystem (bead
+/// `ley-line-open-8c8ded`).
+pub const GROW_FREE_MARGIN: u64 = 1_073_741_824; // 1 GiB
+
+/// Why [`write_grown_arena`] refused a target size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowRefused {
+    /// The target exceeds [`max_grown_arena_size`] for the image.
+    BeyondImageBound { target: u64, bound: u64 },
+    /// The target exceeds the filesystem's free space less
+    /// [`GROW_FREE_MARGIN`].
+    BeyondFreeSpace { target: u64, available: u64 },
+}
+
+impl std::fmt::Display for GrowRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for GrowRefused {}
+
+/// The largest arena [`write_grown_arena`] builds for an image of
+/// `data_len` bytes: two buffers of twice the image plus 1 MiB. This bound
+/// is independent of the daemon's sizing policy, which stays well under
+/// it, so a sizing bug meets it instead of the disk.
+pub fn max_grown_arena_size(data_len: u64) -> u64 {
+    const MIN_BUFFER: u64 = 1_048_576; // 1 MiB
+    let buffer = data_len.saturating_mul(2).saturating_add(MIN_BUFFER);
+    ArenaHeader::HEADER_SIZE.saturating_add(buffer.saturating_mul(2))
+}
+
+/// Whether growing to `target` for an image of `data_len` bytes is refused,
+/// given `available` free bytes on the arena's filesystem (`None`: unknown).
+pub fn grow_refusal(target: u64, data_len: u64, available: Option<u64>) -> Option<GrowRefused> {
+    let bound = max_grown_arena_size(data_len);
+    if target > bound {
+        return Some(GrowRefused::BeyondImageBound { target, bound });
+    }
+    match available {
+        Some(available) if target.saturating_add(GROW_FREE_MARGIN) > available => {
+            Some(GrowRefused::BeyondFreeSpace { target, available })
+        }
+        _ => None,
+    }
+}
+
+/// Free bytes available to this process on the filesystem holding `path`
+/// (an existing file or directory); `None` when it cannot be read.
+fn available_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `libc::statvfs` is a plain C struct of integers, for which
+        // all-zero bytes are a valid value.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` is a valid NUL-terminated string and `stat` is a
+        // writable statvfs; statvfs writes only into it.
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Write `data` into a new arena of `arena_size` bytes and rename it over
 /// `path`, leaving the arena that was there untouched.
 ///
@@ -230,6 +301,14 @@ pub fn create_arena(path: &std::path::Path, arena_size: u64) -> Result<MmapMut> 
 pub fn write_grown_arena(path: &std::path::Path, arena_size: u64, data: &[u8]) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Read;
+    // A target the image does not justify, or the disk cannot hold, is
+    // refused before any file is created (bead `ley-line-open-8c8ded`).
+    // The free space is that of the filesystem holding the arena being
+    // replaced; with no arena there yet it is unknown, and only the image
+    // bound applies.
+    if let Some(refused) = grow_refusal(arena_size, data.len() as u64, available_bytes(path)) {
+        return Err(anyhow::Error::new(refused).context("refuse to grow the arena"));
+    }
     let mut header_bytes = [0u8; std::mem::size_of::<ArenaHeader>()];
     let sequence = match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut header_bytes))
     {
@@ -390,6 +469,124 @@ mod tests {
         assert_eq!(ArenaHeader::buffer_size(4096 + 4096 * 2), 4096);
         assert_eq!(ArenaHeader::buffer_size(4096 + 65536 * 2), 65536);
         assert_eq!(ArenaHeader::buffer_size(4096 + 1024 * 2), 1024);
+    }
+
+    // --- bead ley-line-open-8c8ded: a sizing bug fails closed, never fills the disk
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn the_free_space_margin_is_one_gib() {
+        assert_eq!(GROW_FREE_MARGIN, GIB);
+        assert_eq!(GIB, 1 << 30);
+    }
+
+    #[test]
+    fn available_bytes_reads_the_filesystem_holding_a_path() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let free = available_bytes(&file).expect("statvfs of an existing file");
+        assert!(
+            free > MIB,
+            "a test filesystem has more than 1 MiB free: {free}"
+        );
+        assert!(
+            available_bytes(dir.path()).is_some(),
+            "a directory works too"
+        );
+        assert_eq!(available_bytes(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn a_grow_within_the_image_bound_and_free_space_is_allowed() {
+        let data = 100 * MIB;
+        let bound = ArenaHeader::HEADER_SIZE + 2 * (2 * data + MIB);
+        assert_eq!(max_grown_arena_size(data), bound);
+        assert_eq!(
+            grow_refusal(bound, data, Some(bound + GROW_FREE_MARGIN)),
+            None
+        );
+        assert_eq!(
+            grow_refusal(bound, data, None),
+            None,
+            "no free-space figure"
+        );
+        // A tiny image still gets the minimum buffer.
+        assert_eq!(max_grown_arena_size(0), ArenaHeader::HEADER_SIZE + 2 * MIB);
+    }
+
+    #[test]
+    fn a_grow_past_the_image_bound_is_refused() {
+        let data = 3 * MIB;
+        let bound = max_grown_arena_size(data);
+        assert_eq!(
+            grow_refusal(bound + 1, data, None),
+            Some(GrowRefused::BeyondImageBound {
+                target: bound + 1,
+                bound
+            })
+        );
+        // The case a sizing mutant produced: len * len / 4 for a 3 MiB image.
+        let enormous = data * data / 4;
+        assert!(matches!(
+            grow_refusal(enormous, data, Some(u64::MAX)),
+            Some(GrowRefused::BeyondImageBound { .. })
+        ));
+    }
+
+    #[test]
+    fn a_grow_past_the_free_space_is_refused() {
+        let data = 100 * MIB;
+        let target = ArenaHeader::HEADER_SIZE + 2 * (data + data / 4);
+        let available = target + GROW_FREE_MARGIN - 1;
+        assert_eq!(
+            grow_refusal(target, data, Some(available)),
+            Some(GrowRefused::BeyondFreeSpace { target, available })
+        );
+        assert_eq!(
+            grow_refusal(target, data, Some(target + GROW_FREE_MARGIN)),
+            None
+        );
+    }
+
+    #[test]
+    fn write_grown_arena_refuses_a_target_past_the_image_bound_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("big.arena");
+        let small = 4096 + 4096 * 2;
+        let mut mmap = create_arena(&path, small).unwrap();
+        write_to_arena(&mut mmap, b"first").unwrap();
+        drop(mmap);
+        let before = std::fs::read(&path).unwrap();
+
+        // One page past the bound: refused, and small enough that a broken
+        // guard writes ~2 MiB here, not the disk.
+        let data = b"second";
+        let target = max_grown_arena_size(data.len() as u64) + 4096;
+        let err = write_grown_arena(&path, target, data).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<GrowRefused>(),
+                Some(GrowRefused::BeyondImageBound { .. })
+            ),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("BeyondImageBound"),
+            "the refusal names its reason: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the arena is unchanged"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no grown arena was created beside it"
+        );
     }
 
     #[test]

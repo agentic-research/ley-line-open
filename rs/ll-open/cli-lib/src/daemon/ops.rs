@@ -124,7 +124,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
     let result: Result<String> = match req {
         BaseRequest::Status => op_status(ctx),
         BaseRequest::Flush => op_flush(&ctx.ctrl_path),
-        BaseRequest::Load { db } => op_load(&ctx.ctrl_path, &db),
+        BaseRequest::Load { db } => op_load(ctx, &db),
         BaseRequest::Query { sql, limit } => op_query(ctx, &sql, limit),
         BaseRequest::Reparse {
             source,
@@ -495,26 +495,19 @@ pub(crate) fn read_root_hex(ctrl_path: &Path) -> Result<String> {
     Ok(s)
 }
 
-/// Acquire the living-db lock and snapshot to the arena. Used by every
-/// state-changing op (reparse, enrich, snapshot) to publish the latest
-/// db image to mache/remote consumers.
+/// Publish the living db to the arena before replying. Used by the ops
+/// whose reply promises a published image (reparse, enrich, snapshot);
+/// a proposal requests a publish instead and does not wait for it.
 ///
-/// **Lock window:** the write lock is held for the *full* duration of
-/// `snapshot_to_arena`, which serializes the entire SQLite database to
-/// the on-disk arena (a disk write proportional to db size). This is
-/// not a cheap window. Concurrent readers and writers block until the
-/// snapshot completes. Don't add work inside this function expecting
-/// the lock to be held briefly — it isn't. If we ever want concurrent
-/// reads during snapshot, the path is `serialize_with_flags(NO_COPY)`
-/// followed by an out-of-lock disk write, but that's a deliberate
-/// refactor, not something to assume here. Doc rewritten after iter-35
-/// adversarial review caught the previous false minimal-lock claim.
+/// **Lock window:** the publish costs one serialize, write and hash of
+/// the whole database. It holds the single-publisher lock, not the
+/// writer, and reads one committed state through a pool connection:
+/// readers and proposals proceed while it runs (bead
+/// `ley-line-open-8c8ded`). A second publish waits for this one.
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
-    // Snapshot classified as `with_write`: `conn.serialize("main")` needs
-    // exclusive access to the DB (SQLite serialize takes an internal
-    // schema-write lock). Bead `ley-line-open-ba8294` Phase 2 intent-
-    // marking; behavior identical under today's Mutex.
-    ctx.with_write(|conn| crate::cmd_daemon::snapshot_to_arena(conn, &ctx.ctrl_path))
+    // The daemon's one publish path: a pool read transaction under the
+    // single-publisher lock, off the writer (bead `ley-line-open-8c8ded`).
+    crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -605,12 +598,19 @@ fn op_flush(ctrl_path: &Path) -> Result<String> {
     Ok(capnp_json::to_json(reader)?)
 }
 
-fn op_load(ctrl_path: &Path, db_b64: &str) -> Result<String> {
+fn op_load(ctx: &DaemonContext, db_b64: &str) -> Result<String> {
     use base64::Engine;
+    let ctrl_path = ctx.ctrl_path.as_path();
     let db_bytes = base64::engine::general_purpose::STANDARD
         .decode(db_b64)
         .context("invalid base64 in \"db\" field")?;
-    crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
+    {
+        // The arena has one writer at a time: a load writes the inactive
+        // buffer the daemon's publisher also writes (bead
+        // `ley-line-open-8c8ded`).
+        let _publisher = ctx.live_db.publish_lock.lock();
+        crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
+    }
     let current_root = read_root_hex(ctrl_path)?;
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::load_response::Builder = builder.init_root();
@@ -1211,10 +1211,13 @@ fn parse_write(w: ProposedWriteInput) -> Result<crate::source_write::Proposed> {
 /// three ways, and the merged paths are named (`merged`). A refusal carries
 /// its typed reason (`refusal`); a stale one names every path that moved,
 /// with the lines a conflicting merge overlapped. An applied proposal is
-/// published so out-of-process readers see it, and is reported applied
-/// even when a step after its commit (the head write, an index build, the
-/// publish) fails: that failure rides in `post_commit_error` (beads
-/// `ley-line-open-5db28e`, `ley-line-open-5dc3a5`).
+/// durable once committed to the living db; the daemon's publisher puts it
+/// in the arena for out-of-process readers with whatever else lands before
+/// that publish (bead `ley-line-open-8c8ded`), and `snapshot` publishes on
+/// demand. It is reported applied even when a step after its commit (the
+/// head write, an index build) fails: that failure rides in
+/// `post_commit_error` (beads `ley-line-open-5db28e`,
+/// `ley-line-open-5dc3a5`).
 fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
     use crate::source_write::{Grant, Refusal};
     let writes: Result<Vec<_>> = req.writes.into_iter().map(parse_write).collect();
@@ -1245,9 +1248,8 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
         builder.init_root();
     match outcome {
         Ok((accepted, checkout)) => {
-            // Publish whatever happened after the commit: the rows are
-            // committed, and a publish that fails here is repaired by the
-            // next one, which serializes the whole database.
+            // Report whatever happened after the commit: the rows are
+            // committed whatever the steps after it did.
             let mut post_commit: Vec<String> = accepted.post_commit_error.into_iter().collect();
             match checkout {
                 Some(Ok(reconciled)) => post_commit.extend(reconciled.problems()),
@@ -1256,9 +1258,10 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
                 )),
                 None => {}
             }
-            if let Err(e) = snapshot_living_db(ctx) {
-                post_commit.push(format!("publish after a committed proposal failed: {e:#}"));
-            }
+            // The arena image follows through the daemon's publisher, which
+            // coalesces every proposal landed since its last publish (bead
+            // `ley-line-open-8c8ded`); `snapshot` publishes on demand.
+            ctx.live_db.request_publish();
             root.set_ok(true);
             root.set_tree_root(accepted.tree_root.to_string());
             let mut blobs = root.reborrow().init_blobs(accepted.blobs.len() as u32);
@@ -4669,6 +4672,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, PROPOSE_A2.as_bytes());
+        // The proposal requested a publish and did not wait for one (bead
+        // `ley-line-open-8c8ded`); the publisher's next image carries it.
+        assert_eq!(
+            Controller::open_or_create(&ctx.ctrl_path)
+                .unwrap()
+                .current_root(),
+            root_before,
+            "the proposal did not publish inline"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.live_db.publish_requested.notified(),
+        )
+        .await
+        .expect("the applied proposal requested a publish");
+        let snap = call(&ctx, serde_json::json!({"op": "snapshot"}));
+        assert_eq!(snap["ok"], true, "{snap}");
         assert_ne!(
             Controller::open_or_create(&ctx.ctrl_path)
                 .unwrap()
@@ -4678,10 +4698,11 @@ mod tests {
         );
     }
 
-    /// Bead `ley-line-open-5db28e`: a publish that fails after the proposal
-    /// committed is reported beside it, not in place of it.
+    /// Beads `ley-line-open-5db28e`, `ley-line-open-8c8ded`: a publish that
+    /// fails after a proposal committed fails the publish, never the
+    /// proposal. The proposal stays applied and readable.
     #[tokio::test]
-    async fn propose_reports_an_applied_proposal_as_applied_when_its_publish_fails() {
+    async fn a_failed_publish_leaves_an_applied_proposal_applied() {
         let (dir, ctx) = setup_parsed();
         let nowhere = dir.path().join("missing-dir").join("x.arena");
         Controller::open_or_create(&ctx.ctrl_path)
@@ -4695,9 +4716,11 @@ mod tests {
             ]}),
         );
         assert_eq!(r["ok"], true, "{r}");
-        assert!(
-            r["post_commit_error"].as_str().unwrap().contains("publish"),
-            "{r}"
+        assert!(r.get("post_commit_error").is_none(), "{r}");
+        let snap = call(&ctx, serde_json::json!({"op": "snapshot"}));
+        assert_ne!(
+            snap["ok"], true,
+            "the publish into a missing arena fails: {snap}"
         );
         let written = call(
             &ctx,

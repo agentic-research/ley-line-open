@@ -684,6 +684,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]
@@ -4724,6 +4725,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "bytemuck",
+ "libc",
  "memmap2",
  "parking_lot",
  "serde",

@@ -38,11 +38,9 @@ use rusqlite::Connection;
 /// `Mutex<Connection>` field on `DaemonContext`.
 ///
 /// Field access is `pub` so helper functions in `cmd_daemon.rs` that
-/// need the raw writer mutex (`snapshot_or_log`, `try_snapshot_or_log`,
-/// `read_total_changes`) can pass `&live_db.writer` without going
-/// through `with_read` / `with_write`. Those helpers pre-date the
-/// method API and their signatures were left as `&Mutex<Connection>`
-/// on purpose so the migration is a mechanical rename, not a rewrite.
+/// need the raw writer mutex (`read_total_changes`) or the publisher's
+/// lock and pool (`publish_living_db`) reach them without going through
+/// `with_read` / `with_write`.
 pub struct LiveDb {
     /// Shared read-only connection pool. `with_read` checks out one
     /// connection per closure invocation; connections return to the
@@ -57,6 +55,17 @@ pub struct LiveDb {
     /// concurrently through this API; a caller that tries will block
     /// on the mutex, matching what SQLite would do at the file lock.
     pub writer: Mutex<Connection>,
+    /// The single publisher (bead `ley-line-open-8c8ded`). Every daemon
+    /// publish of the living db into the arena holds it from the serialize
+    /// to the root advance, so two publishes never write the inactive
+    /// buffer at once and a later publish never carries an older image.
+    /// A publish reads through a pool connection and holds this lock, not
+    /// `writer`: proposals commit while an image is being written.
+    pub publish_lock: Mutex<()>,
+    /// Wakes the daemon's publisher. A landed proposal requests a publish
+    /// here instead of publishing inline; the publisher coalesces every
+    /// commit since its last publish into one image.
+    pub publish_requested: tokio::sync::Notify,
 }
 
 /// Compute the default reader pool size.
@@ -134,7 +143,15 @@ impl LiveDb {
         Ok(Self {
             reader_pool,
             writer: Mutex::new(writer),
+            publish_lock: Mutex::new(()),
+            publish_requested: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Ask the daemon's publisher to publish what has committed. Returns at
+    /// once; requests made while a publish runs are served by the next one.
+    pub fn request_publish(&self) {
+        self.publish_requested.notify_one();
     }
 
     /// Open a fresh file-backed WAL LiveDb at `path`. Convenience for

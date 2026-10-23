@@ -246,7 +246,22 @@ async fn a_granted_share_serves_the_daemons_store_and_lands_as_its_proposals_do(
         std::fs::read_to_string(ctx.source_dir.as_ref().unwrap().join("a.go")).unwrap(),
         A_EDIT
     );
-    // ...and published to its arena, as a socket proposal is.
+    // ...and handed to the daemon's publisher, as a socket proposal is: the
+    // flush asked for a publish and did not wait for one (bead
+    // `ley-line-open-8c8ded`)...
+    assert_eq!(
+        published_root(&ctx.ctrl_path),
+        before,
+        "the flush did not publish"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.live_db.publish_requested.notified(),
+    )
+    .await
+    .expect("the landed proposal requested a publish");
+    // ...and the publisher's next image carries it.
+    leyline_cli_lib::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path).unwrap();
     assert_ne!(published_root(&ctx.ctrl_path), before);
 }
 

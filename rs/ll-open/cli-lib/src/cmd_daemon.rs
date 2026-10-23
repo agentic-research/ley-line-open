@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use leyline_core::ContentAddressed;
 
 use crate::daemon::{
     DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
@@ -47,15 +46,16 @@ const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 /// won't be reparsed until the next one.
 const GIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// When the live db outgrows the arena, auto-resize to `db_bytes *
-/// ARENA_GROWTH_FACTOR + ARENA_HEADROOM_BYTES` so the next few
-/// snapshots don't trigger another resize. Factor must be ≥2 (each
-/// arena holds two buffers — one active, one inactive).
-const ARENA_GROWTH_FACTOR: u64 = 2;
+/// When an image outgrows the arena's buffer, the new buffer holds the
+/// image plus `1 / ARENA_HEADROOM_DIVISOR` of it (bead
+/// `ley-line-open-8c8ded`), so a growing db resizes O(log n) times. The
+/// arena is two such buffers (active and inactive) after its header.
+/// Sizing the buffer to the image alone, as before, rewrote the whole
+/// arena for every few KiB the db grew.
+const ARENA_HEADROOM_DIVISOR: u64 = 4;
 
-/// Slack added on top of `db_bytes * ARENA_GROWTH_FACTOR` during arena
-/// auto-resize, so a slowly growing db doesn't churn through resizes.
-const ARENA_HEADROOM_BYTES: u64 = 1024 * 1024; // 1 MiB
+/// The smallest buffer a resize allocates.
+const ARENA_MIN_BUFFER_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 // Compile-time invariants on the tuning constants. Each fails the build
 // if a future edit violates the documented constraint — cheaper than a
@@ -64,9 +64,8 @@ const ARENA_HEADROOM_BYTES: u64 = 1024 * 1024; // 1 MiB
 // (Clippy correctly notes that runtime assertions on these would be
 // constant-folded; const _ asserts are the idiomatic Rust answer.)
 const _: () = assert!(
-    ARENA_GROWTH_FACTOR >= 2,
-    "arena holds 2 buffers (active + inactive); growth factor < 2 \
-     can't fit both copies after a resize",
+    ARENA_HEADROOM_DIVISOR > 0,
+    "the headroom is a fraction of the image",
 );
 const _: () = assert!(
     SNAPSHOT_INTERVAL.as_millis() < GIT_POLL_INTERVAL.as_millis(),
@@ -87,7 +86,7 @@ const _: () = assert!(
 pub struct DaemonConfig {
     /// Path to the arena file (backing store for the substrate).
     pub arena: std::path::PathBuf,
-    /// Arena size hint in MiB. Grown auto per `ARENA_GROWTH_FACTOR`.
+    /// Arena size hint in MiB. Grown automatically by [`arena_size_for`].
     pub arena_size_mib: u64,
     /// Optional control socket path. Auto-derived from arena if `None`.
     pub control: Option<std::path::PathBuf>,
@@ -810,34 +809,34 @@ pub async fn run_daemon_with_options(
         let snap_ctx = ctx.clone();
         let snap_ctrl = ctrl_path.clone();
         let emitter = router.emitter();
+        // The daemon's publisher (bead `ley-line-open-8c8ded`): it wakes on
+        // a landed proposal's `request_publish` or on the tick, and
+        // publishes once for every commit since its last publish. The
+        // publish runs on the blocking pool, off the writer.
         tokio::spawn(async move {
             use tokio::time::interval;
             let mut tick = interval(SNAPSHOT_INTERVAL);
-            let mut last_snapshot_changes: u64 =
-                read_total_changes(&snap_ctx.live_db.writer).unwrap_or(0);
+            let mut last = read_total_changes(&snap_ctx.live_db.writer).unwrap_or(0);
             loop {
-                tick.tick().await;
-                // Cheap dirty-check: read `total_changes()` under a
-                // brief try_lock. If the counter hasn't advanced since
-                // the last successful snapshot, skip the whole
-                // serialize/msync path — nothing to persist.
-                let current_changes = match read_total_changes(&snap_ctx.live_db.writer) {
-                    Some(n) => n,
-                    None => continue, // contended; try again next tick
-                };
-                if current_changes == last_snapshot_changes {
-                    continue; // db is clean; no work to do
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = snap_ctx.live_db.publish_requested.notified() => {}
                 }
-                // Non-blocking: skip this tick if op_reparse / op_enrich
-                // is mid-flight rather than queuing snapshots behind it.
-                // 5fea4e — block-the-tokio-worker prevention.
-                if try_snapshot_or_log(
-                    &snap_ctx.live_db.writer,
-                    &snap_ctrl,
-                    "periodic snapshot failed",
-                ) {
-                    last_snapshot_changes = current_changes;
-                    emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
+                let ctx = Arc::clone(&snap_ctx);
+                let ctrl = snap_ctrl.clone();
+                let published = tokio::task::spawn_blocking(move || {
+                    let mut seen = last;
+                    publish_if_dirty(&ctx.live_db, &ctrl, &mut seen).map(|p| (p, seen))
+                })
+                .await;
+                match published {
+                    Ok(Ok((true, seen))) => {
+                        last = seen;
+                        emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
+                    }
+                    Ok(Ok((false, _))) => {}
+                    Ok(Err(e)) => log::error!("publish failed: {e:#}"),
+                    Err(e) => log::error!("publish task failed: {e}"),
                 }
             }
         });
@@ -850,13 +849,10 @@ pub async fn run_daemon_with_options(
 
     // 12. Graceful shutdown: unmount, final snapshot, cleanup.
     drop(mounted);
-    {
-        let guard = ctx.live_db.writer.lock();
-        if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {
-            eprintln!("warn: final snapshot failed: {e:#}");
-        } else {
-            eprintln!("final snapshot saved to arena");
-        }
+    if let Err(e) = publish_living_db(&ctx.live_db, &ctrl_path) {
+        eprintln!("warn: final snapshot failed: {e:#}");
+    } else {
+        eprintln!("final snapshot saved to arena");
     }
     if let Some(handle) = mcp_handle {
         handle.abort();
@@ -1305,34 +1301,45 @@ fn try_warm_start_from_arena(
     Ok(Some(conn))
 }
 
-/// Take the live-db lock, snapshot to arena, and log any failure under
-/// `label`. Used by the background timers (periodic snapshot, post-watch
-/// snapshot) where a snapshot failure is recoverable — the next tick
-/// retries — but should still surface in logs. The graceful-shutdown
-/// path uses `eprintln!` directly because it has a distinct success
-/// message; this helper is for the fire-and-forget periodic shape.
-pub fn snapshot_or_log(
-    live_db: &parking_lot::Mutex<rusqlite::Connection>,
-    ctrl_path: &Path,
-    label: &str,
-) {
-    let guard = live_db.lock();
-    if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
-        log::error!("{label}: {e:#}");
-    }
+/// Publish the living db into the arena: the daemon's one publish path
+/// (bead `ley-line-open-8c8ded`).
+///
+/// Holds [`LiveDb::publish_lock`](crate::daemon::db_pool::LiveDb) from the
+/// serialize to the root advance, so publishes are serialized against each
+/// other, and reads the image through a pool connection: one read
+/// transaction, so the image is one committed state, and the writer stays
+/// free. A proposal that commits during the publish is in the next one.
+pub fn publish_living_db(live_db: &crate::daemon::db_pool::LiveDb, ctrl_path: &Path) -> Result<()> {
+    let _publisher = live_db.publish_lock.lock();
+    let conn = live_db
+        .reader_pool
+        .get()
+        .map_err(|e| anyhow::anyhow!("reader pool checkout for a publish failed: {e}"))?;
+    snapshot_to_arena(&conn, ctrl_path)
 }
 
-/// Non-blocking variant of `snapshot_or_log` for the periodic snapshot
-/// timer (5fea4e). Uses `try_lock`: if the live_db lock is contended
-/// (e.g. `op_reparse` holds it across `parse_into_conn`), this tick is
-/// skipped with a debug log instead of blocking the tokio worker for
-/// the duration of the long-running operation.
-///
-/// Without this guard, a 500ms+ reparse would queue every subsequent
-/// snapshot tick behind it; on completion the queue drains in a burst,
-/// and any concurrent UDS query (which only borrows the db read-only)
-/// blocks behind the burst. `WouldBlock` and `Poisoned` are both
-/// recoverable — the next tick retries the lock.
+/// Publish when anything committed since the last publish this caller made
+/// (`last` is the writer's `total_changes()` then). Returns whether it
+/// published. A contended writer reads as "unknown": nothing is published
+/// and the caller's next wake retries.
+pub fn publish_if_dirty(
+    live_db: &crate::daemon::db_pool::LiveDb,
+    ctrl_path: &Path,
+    last: &mut u64,
+) -> Result<bool> {
+    let Some(changes) = read_total_changes(&live_db.writer) else {
+        return Ok(false);
+    };
+    if changes == *last {
+        return Ok(false);
+    }
+    // Every commit counted in `changes` is visible to the read transaction
+    // the publish opens after this point.
+    publish_living_db(live_db, ctrl_path)?;
+    *last = changes;
+    Ok(true)
+}
+
 /// Best-effort read of `sqlite3_total_changes()` under a brief try_lock.
 ///
 /// Returns `None` if the mutex is contended (some other task is holding
@@ -1357,23 +1364,29 @@ pub fn read_total_changes(live_db: &parking_lot::Mutex<rusqlite::Connection>) ->
     live_db.try_lock().map(|g| g.total_changes())
 }
 
-pub fn try_snapshot_or_log(
-    live_db: &parking_lot::Mutex<rusqlite::Connection>,
-    ctrl_path: &Path,
-    label: &str,
-) -> bool {
-    match live_db.try_lock() {
-        Some(guard) => {
-            if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
-                log::error!("{label}: {e:#}");
-            }
-            true
-        }
-        None => {
-            log::debug!("{label}: live_db contended, skipping this tick");
-            false
-        }
+/// The arena size an image of `image_len` bytes is written into, given the
+/// arena's current size: unchanged while the image fits a buffer, else two
+/// buffers with headroom (bead `ley-line-open-8c8ded`).
+pub fn arena_size_for(current: u64, image_len: u64) -> u64 {
+    if image_len <= leyline_core::ArenaHeader::buffer_size(current) {
+        return current;
     }
+    let buffer = std::cmp::max(
+        image_len + image_len / ARENA_HEADROOM_DIVISOR,
+        ARENA_MIN_BUFFER_BYTES,
+    );
+    leyline_core::ArenaHeader::HEADER_SIZE + 2 * buffer
+}
+
+/// `current_root` of a published image: BLAKE3 over its exact bytes, the
+/// substrate's `ContentAddressed` hash. The image hashes across cores;
+/// BLAKE3's tree mode gives the same bytes as the serial hash, and
+/// `update_rayon` hashes a small input on the calling thread.
+pub fn image_root(image: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new()
+        .update_rayon(image)
+        .finalize()
+        .as_bytes()
 }
 
 /// `image` as a standalone rollback-mode database, when it is a SQLite
@@ -1414,9 +1427,13 @@ pub(crate) fn rollback_image(mut image: Vec<u8>) -> Vec<u8> {
 /// 3. **`current_root` advance is the publish point (T2.4).** Polling
 ///    readers (HotSwapGraph) compare `current_root`; they don't refresh
 ///    until it changes. `set_arena_with_root` advances size and root
-///    together under the seqlock. Its error aborts the snapshot;
-///    callers (snapshot_or_log) move the daemon into Error phase so
-///    operators see it.
+///    together under the seqlock. Its error aborts the snapshot and
+///    reaches the caller ([`publish_living_db`]'s callers log it, and the
+///    next publish repairs it).
+///
+/// In the daemon every call goes through [`publish_living_db`], which
+/// holds the single-publisher lock: two concurrent calls would write the
+/// same inactive buffer.
 pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
     let db_bytes = rollback_image(
         conn.serialize("main")
@@ -1429,10 +1446,7 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     let arena_path = ctrl.arena_path();
     let arena_size = ctrl.arena_size();
 
-    let min_arena = leyline_core::ArenaHeader::HEADER_SIZE
-        + db_bytes.len() as u64 * ARENA_GROWTH_FACTOR
-        + ARENA_HEADROOM_BYTES;
-    let new_size = std::cmp::max(arena_size, min_arena);
+    let new_size = arena_size_for(arena_size, db_bytes.len() as u64);
 
     let buf_capacity = leyline_core::ArenaHeader::buffer_size(new_size) as usize;
     if db_bytes.len() > buf_capacity {
@@ -1473,14 +1487,9 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     // observe (new_size, new active_buffer, new current_root).
     // current_root = σ(serialized db bytes) via the substrate's
     // ContentAddressed impl; Σ §3.4 locks BLAKE3. Retrofitted from
-    // inline `blake3::hash` per bead `ley-line-open-32201a`.
-    //
-    // Explicit `&[u8]` annotation on `as_ref` — rusqlite's
-    // `SerializedData` has multiple `AsRef<T>` impls now that the
-    // walker dep tree pulled `ignore`/`regex` in (bead
-    // ley-line-open-25685d), so inference needs a hint.
-    let db_slice: &[u8] = db_bytes.as_ref();
-    let current_root: [u8; 32] = *db_slice.hash().as_bytes();
+    // inline `blake3::hash` per bead `ley-line-open-32201a`; `image_root`
+    // computes those bytes across cores (bead `ley-line-open-8c8ded`).
+    let current_root: [u8; 32] = image_root(&db_bytes);
     ctrl.set_arena_with_root(&arena_path, new_size, current_root)
         .context("publish current_root (snapshot advance)")?;
 
@@ -1692,8 +1701,11 @@ async fn git_watch_loop(
                     );
                     drop(guard);
 
-                    // 4. Snapshot to arena.
-                    snapshot_or_log(&ctx.live_db.writer, &ctx.ctrl_path, "watch snapshot failed");
+                    // 4. Publish before the events below: a consumer that
+                    // reads the arena on them sees the reparse.
+                    if let Err(e) = publish_living_db(&ctx.live_db, &ctx.ctrl_path) {
+                        log::error!("watch snapshot failed: {e:#}");
+                    }
 
                     // 5. Update state + emit events.
                     {
@@ -2186,36 +2198,22 @@ mod tests {
     // parking_lot doesn't poison, so `read_total_changes` returning
     // None specifically on poison is not expressible. The remaining
     // contract — `read_total_changes` returns None when the lock is
-    // contended (uncontended → Some(counter)) — is covered by the
-    // `try_snapshot_or_log_*` tests below.
+    // contended (uncontended → Some(counter)) — is covered by
+    // `the_publisher_skips_a_wake_while_the_writer_is_busy` below.
 
     #[test]
-    fn try_snapshot_or_log_skips_when_lock_contended() {
-        // 5fea4e contract: when the live_db mutex is contended (e.g.
-        // op_reparse holds it across parse_into_conn), the periodic
-        // snapshot timer must skip the tick — NOT block the tokio
-        // worker thread waiting for the lock to release. Pin so a
-        // refactor that swapped try_lock for blocking lock would
-        // surface here as a hung test.
+    fn the_publisher_skips_a_wake_while_the_writer_is_busy() {
+        // 5fea4e contract: while the writer is held (op_reparse across
+        // parse_into_conn, a proposal mid-commit), the publisher's dirty
+        // check cannot read the counter; it returns at once without
+        // publishing, and its next wake retries. A blocking lock here
+        // would hang this test, which holds the writer on its own thread.
         let dir = TempDir::new().unwrap();
-        let ctrl_path = dir.path().join("contended.ctrl");
-        // Need a real arena for snapshot_to_arena to find — it'll
-        // bail when called, but the lock-skip path returns BEFORE we
-        // get there, so we don't need a working snapshot.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let live_db = StdMutex::new(conn);
-
-        // Hold the lock from this thread.
-        let _held_guard = live_db.lock();
-
-        // Now invoke try_snapshot_or_log — it must observe WouldBlock
-        // and return false WITHOUT trying to take the lock again
-        // (which would deadlock since we hold it on the same thread).
-        let snapshotted = try_snapshot_or_log(&live_db, &ctrl_path, "contention test");
-        assert!(
-            !snapshotted,
-            "try_snapshot_or_log must return false when lock is held by another holder",
-        );
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        let _held_guard = live.writer.lock();
+        let mut last = 0;
+        assert!(!publish_if_dirty(&live, &ctrl_path, &mut last).unwrap());
+        assert_eq!(last, 0, "nothing recorded as published");
     }
 
     // The pre-parking_lot poison-recovery test lived here — deleted
@@ -2225,8 +2223,8 @@ mod tests {
     // returns `MutexGuard` directly, so a panic-during-lock leaves no
     // Err state to recover from — the next lock just proceeds. The
     // "acquire when uncontended, skip when contended" contract that
-    // matters is still pinned by `try_snapshot_or_log_returns_false_when_lock_held`
-    // above.
+    // matters is still pinned by
+    // `the_publisher_skips_a_wake_while_the_writer_is_busy` above.
 
     #[test]
     fn warm_start_returns_none_on_missing_ctrl() {
@@ -2930,6 +2928,22 @@ mod tests {
             grown.arena_size() > small,
             "the second snapshot must grow the arena"
         );
+        // The grown arena is sized from the image it holds: two buffers of
+        // the image plus a quarter, and the file is exactly that long (bead
+        // `ley-line-open-8c8ded`: a sizing bug must fail here, not fill the
+        // disk).
+        let grown_file = std::fs::File::open(&arena_path).unwrap();
+        let mut grown_header = [0u8; std::mem::size_of::<leyline_core::ArenaHeader>()];
+        grown_file.read_exact_at(&mut grown_header, 0).unwrap();
+        let grown_header: leyline_core::ArenaHeader = *bytemuck::from_bytes(&grown_header);
+        let image_len = grown_header.data_size;
+        assert_eq!(
+            grown.arena_size(),
+            leyline_core::ArenaHeader::HEADER_SIZE
+                + 2 * std::cmp::max(image_len + image_len / 4, 1024 * 1024),
+            "the grown arena is the header and two buffers of the image plus a quarter"
+        );
+        assert_eq!(grown_file.metadata().unwrap().len(), grown.arena_size());
         assert_ne!(grown.current_root(), published_root);
 
         let mut image = vec![0u8; header.data_size as usize];
@@ -3822,6 +3836,171 @@ mod tests {
                 "gate must NOT fire when mcp_port is None; got: {msg}"
             );
         }
+    }
+
+    // --- bead ley-line-open-8c8ded: a publish costs one image, off the writer
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_arena_keeps_its_size_while_the_image_fits_its_buffer() {
+        let header = leyline_core::ArenaHeader::HEADER_SIZE;
+        let arena = header + 2 * (100 * MIB);
+        // An image that fits the inactive buffer exactly, or with room to
+        // spare, is written in place: no new arena.
+        assert_eq!(arena_size_for(arena, 100 * MIB), arena);
+        assert_eq!(arena_size_for(arena, 1), arena);
+        assert_eq!(arena_size_for(arena, 0), arena);
+    }
+
+    #[test]
+    fn a_grown_arena_leaves_room_for_the_image_to_grow() {
+        let header = leyline_core::ArenaHeader::HEADER_SIZE;
+        let image = 1_312_063_488u64;
+        let grown = arena_size_for(64 * MIB, image);
+        let buffer = leyline_core::ArenaHeader::buffer_size(grown);
+        assert!(buffer >= image, "the image fits the new buffer");
+        assert_eq!(
+            buffer,
+            image + image / 4,
+            "the new buffer leaves exactly a quarter of the image free, no more"
+        );
+        assert_eq!(
+            grown,
+            header + 2 * buffer,
+            "the arena is the header and two buffers"
+        );
+        // The case the share benchmark hit: a few KiB of growth after a
+        // resize rewrote the whole 2.6 GB arena. It now stays in place.
+        assert_eq!(arena_size_for(grown, image + 64 * 1024), grown);
+        // A small image still gets a usable minimum.
+        let small = arena_size_for(header, 10);
+        assert_eq!(leyline_core::ArenaHeader::buffer_size(small), MIB);
+    }
+
+    #[test]
+    fn the_image_root_is_the_substrate_hash_of_the_image() {
+        use leyline_core::ContentAddressed;
+        // Sizes across BLAKE3's chunk (1 KiB) and its multi-chunk tree.
+        for len in [
+            0usize,
+            1,
+            1023,
+            1024,
+            1025,
+            64 * 1024 + 3,
+            3 * 1024 * 1024 + 7,
+        ] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let expected = *bytes.as_slice().hash().as_bytes();
+            assert_eq!(image_root(&bytes), expected, "len {len}");
+        }
+    }
+
+    /// A living db file-backed beside `ctrl_path`, wrapped as the daemon
+    /// wraps it, with a small arena registered.
+    fn publishing_live_db(dir: &TempDir) -> (crate::daemon::db_pool::LiveDb, std::path::PathBuf) {
+        let arena_path = dir.path().join("pub.arena");
+        let ctrl_path = dir.path().join("pub.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+        let _mmap = leyline_core::create_arena(&arena_path, 2 * MIB).unwrap();
+        leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .set_arena(&arena_path.to_string_lossy(), 2 * MIB)
+            .unwrap();
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        conn.execute_batch("CREATE TABLE landed (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let live = crate::daemon::db_pool::LiveDb::new(conn, &live_db_path, 2).unwrap();
+        (live, ctrl_path)
+    }
+
+    fn published_names(ctrl_path: &Path) -> Vec<String> {
+        let graph = leyline_fs::SqliteGraph::from_arena(ctrl_path).unwrap();
+        let mut stmt = graph
+            .conn()
+            .prepare("SELECT name FROM landed ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn every_commit_before_a_publish_is_in_the_image_it_publishes() {
+        let dir = TempDir::new().unwrap();
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        for name in ["a", "b", "c", "d"] {
+            live.writer
+                .lock()
+                .execute("INSERT INTO landed (name) VALUES (?1)", [name])
+                .unwrap();
+        }
+        publish_living_db(&live, &ctrl_path).unwrap();
+        assert_eq!(published_names(&ctrl_path), ["a", "b", "c", "d"]);
+        let root = leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .current_root();
+        assert_ne!(root, [0u8; 32], "the publish advanced current_root");
+    }
+
+    #[test]
+    fn a_publish_does_not_wait_for_the_writer() {
+        // The writer is held (a proposal mid-commit) for the whole publish:
+        // the publish reads a committed snapshot through the pool and
+        // finishes. Publishing on the writer deadlocked here.
+        let dir = TempDir::new().unwrap();
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        live.writer
+            .lock()
+            .execute("INSERT INTO landed (name) VALUES ('committed')", [])
+            .unwrap();
+        let live = Arc::new(live);
+        let held = live.writer.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let publisher = {
+            let live = Arc::clone(&live);
+            let ctrl_path = ctrl_path.clone();
+            std::thread::spawn(move || {
+                done_tx
+                    .send(publish_living_db(&live, &ctrl_path).is_ok())
+                    .unwrap();
+            })
+        };
+        let published = done_rx.recv_timeout(std::time::Duration::from_secs(60));
+        drop(held);
+        publisher.join().unwrap();
+        assert_eq!(
+            published,
+            Ok(true),
+            "the publish finished while the writer was held"
+        );
+        assert_eq!(published_names(&ctrl_path), ["committed"]);
+    }
+
+    #[test]
+    fn the_publisher_publishes_only_when_something_committed() {
+        let dir = TempDir::new().unwrap();
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        let mut last = read_total_changes(&live.writer).unwrap();
+        assert!(
+            !publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "clean: no publish"
+        );
+        live.writer
+            .lock()
+            .execute("INSERT INTO landed (name) VALUES ('x')", [])
+            .unwrap();
+        assert!(
+            publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "dirty: one publish"
+        );
+        assert_eq!(published_names(&ctrl_path), ["x"]);
+        assert!(
+            !publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "nothing since: no second publish of the same image"
+        );
     }
 }
 

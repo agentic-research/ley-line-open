@@ -12,6 +12,28 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: a proposal is published by the daemon's publisher, not
+  inline** (bead `ley-line-open-8c8ded`, ADR-0041 amendment 2026-10-22).
+  `propose` and storefs's FLUSH reply once the proposal is committed to
+  `live.db` and request a publish; the publisher coalesces every proposal
+  landed before it runs. Out-of-process arena readers see a proposal after
+  that publish; `snapshot` publishes on demand. A publish no longer holds
+  the writer: it reads one committed state through the reader pool under a
+  single-publisher lock, which `load` also takes. `propose` no longer
+  reports a publish failure in `post_commit_error`. storefs's
+  `Store::publish` is now `Store::request_publish` and cannot fail.
+- **The arena keeps its size while the image fits a buffer, and grows
+  with a quarter of headroom** (bead `ley-line-open-8c8ded`). Before, any
+  growth after a resize rewrote the whole arena; on a 1.3 GB store that
+  was a new 2.6 GB file per proposal.
+- **A grown arena the image does not justify, or the disk cannot hold, is
+  refused** (bead `ley-line-open-8c8ded`). `leyline_core::write_grown_arena`
+  returns a typed `GrowRefused` before creating any file when the target
+  exceeds `max_grown_arena_size` (two buffers of twice the image plus 1 MiB)
+  or the filesystem's free space less 1 GiB. A sizing mutant had made a grow
+  test write a 3.8 TB sparse arena (152 GB on disk).
+- **`current_root` hashes across cores** (bead `ley-line-open-8c8ded`):
+  `blake3::Hasher::update_rayon`, the same bytes as before.
 - **Breaking: the microVM worker is its own crate; `leyline-runtime` has no
   libkrun and no `vmm` feature** (bead `ley-line-open-395e43`). The
   `leyline-krun-worker` binary, the libkrun API (`api::LinkedKrunApi`,

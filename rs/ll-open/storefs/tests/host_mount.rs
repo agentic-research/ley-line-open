@@ -30,7 +30,7 @@ use leyline_cli_lib::daemon::db_pool::LiveDb;
 use leyline_cli_lib::source_write::{self, Base, Grant, Proposed};
 use leyline_cli_lib::tree::{self as store_tree, Entry, Mode};
 use leyline_storefs::host::{self, Mounted};
-use leyline_storefs::{Options, Scope, Store, StoreFs};
+use leyline_storefs::{Derived, Options, Scope, Store, StoreFs};
 use tempfile::TempDir;
 
 const A: &str = "package a\n\nfunc A() int { return 1 }\n";
@@ -150,6 +150,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(Options::default())
+}
+
+fn fixture_with(options: Options) -> Fixture {
     let src = tempfile::tempdir().unwrap();
     for (rel, text) in [("a.go", A), ("pkg/b.go", "package pkg\n")] {
         let p = src.path().join(rel);
@@ -170,7 +174,7 @@ fn fixture() -> Fixture {
     Fixture {
         _db_dir: db_dir,
         _src: src,
-        fs: Arc::new(StoreFs::new(live, scope, Options::default())),
+        fs: Arc::new(StoreFs::new(live, scope, options)),
     }
 }
 
@@ -366,4 +370,79 @@ async fn a_host_process_edits_the_store_through_the_mount() {
         })
     ));
     assert_eq!(f.stored("main.link").as_deref(), Some("a.go"));
+}
+
+/// Build output and the metadata a host writes through the mount stay out
+/// of the store (ADR-0045 T9): files under `target/`, and on macOS the
+/// AppleDouble `._` file the NFS client writes for an extended attribute
+/// (bead `ley-line-open-8d6a8a`), which reads back through the mount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_output_and_host_metadata_stay_out_of_the_store_through_the_mount() {
+    #[cfg(target_os = "macos")]
+    if let Some(refusal) = host::unpatched_nfs_client(&host::macos::product_version().unwrap()) {
+        eprintln!("host_mount: SKIPPED on this host: {refusal}");
+        return;
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let f = fixture_with(Options {
+        derived: Some(Derived {
+            parent: parent.path().to_path_buf(),
+            limit: 64 << 20,
+        }),
+        ..Options::default()
+    });
+    let mut m = TestMount::new(Arc::clone(&f.fs)).await;
+    let root = m.path.clone();
+    let built = with_kernel_deadline("build output", &m.path, move || {
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        for i in 0..20 {
+            fs::write(
+                root.join(format!("target/debug/obj-{i}.o")),
+                format!("o{i}\n"),
+            )
+            .unwrap();
+        }
+        fs::read_to_string(root.join("target/debug/obj-7.o")).unwrap()
+    });
+    assert_eq!(built, "o7\n");
+    #[cfg(target_os = "macos")]
+    {
+        let a = m.at("a.go");
+        let read = with_kernel_deadline("set and read an extended attribute", &m.path, move || {
+            let set = Command::new("xattr")
+                .args(["-w", "org.leyline.test", "kept"])
+                .arg(&a)
+                .status()
+                .unwrap();
+            assert!(set.success(), "xattr -w through the mount");
+            let out = Command::new("xattr")
+                .args(["-p", "org.leyline.test"])
+                .arg(&a)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        });
+        assert_eq!(
+            read.trim(),
+            "kept",
+            "the attribute reads back through the mount"
+        );
+    }
+    let scratch = f.fs.scratch_dir().expect("the mount made its scratch");
+    assert!(scratch.join("target/debug/obj-7.o").is_file());
+    #[cfg(target_os = "macos")]
+    assert!(
+        scratch.join("._a.go").is_file(),
+        "the NFS client's AppleDouble file is in scratch"
+    );
+    m.unmount();
+
+    assert_eq!(f.entry("target"), None);
+    assert_eq!(f.entry("target/debug/obj-7.o"), None);
+    assert_eq!(f.entry("._a.go"), None, "no AppleDouble file in the store");
+    assert_eq!(
+        f.stored("a.go").as_deref(),
+        Some(A),
+        "a.go itself is unchanged"
+    );
 }

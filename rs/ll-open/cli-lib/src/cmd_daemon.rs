@@ -893,9 +893,14 @@ pub fn live_db_path_for(ctrl_path: &Path) -> std::path::PathBuf {
 ///   run's write live (ADR-0040), and the mount acknowledges a write at
 ///   the client's fsync or NFS COMMIT; under `NORMAL` that write
 ///   survived a process crash but not a power loss or OS crash (bead
-///   `ley-line-open-0a9931`). The guarantee is `fsync(2)`'s: on macOS
-///   that reaches the drive, not past its cache (`F_FULLFSYNC`, SQLite's
-///   `fullfsync`, is not set).
+///   `ley-line-open-0a9931`).
+/// - `fullfsync = ON`, `checkpoint_fullfsync = ON` — on macOS the commit's
+///   sync is `F_FULLFSYNC`, which reaches past the drive's cache; plain
+///   `fsync(2)` there stops at the drive. This commit is a proposal's
+///   acknowledgement: its one full flush. The checkout and the Σ head it
+///   writes after are ordered with `F_BARRIERFSYNC`, not flushed
+///   (`crate::durable`, bead `ley-line-open-98d0c3`). Elsewhere SQLite
+///   ignores both.
 /// - `wal_autocheckpoint = 1000` — checkpoint every ~1000 pages
 ///   (~4 MiB at default 4KB page size). Keeps the WAL from
 ///   growing unbounded on a write-heavy daemon; ensures the
@@ -914,6 +919,10 @@ fn configure_wal(conn: &rusqlite::Connection) -> Result<()> {
     }
     conn.pragma_update(None, "synchronous", "FULL")
         .context("set PRAGMA synchronous=FULL")?;
+    conn.pragma_update(None, "fullfsync", true)
+        .context("set PRAGMA fullfsync=ON")?;
+    conn.pragma_update(None, "checkpoint_fullfsync", true)
+        .context("set PRAGMA checkpoint_fullfsync=ON")?;
     conn.pragma_update(None, "wal_autocheckpoint", 1000i64)
         .context("set PRAGMA wal_autocheckpoint=1000")?;
     Ok(())
@@ -2514,6 +2523,14 @@ mod tests {
         // at fsync or NFS COMMIT is on disk, not only in the page cache
         // (bead ley-line-open-0a9931).
         assert_eq!(synchronous, 2, "synchronous must be FULL (=2)");
+        // The commit is a proposal's acknowledgement and its one full
+        // flush: F_FULLFSYNC on macOS (bead ley-line-open-98d0c3).
+        for pragma in ["fullfsync", "checkpoint_fullfsync"] {
+            let on: i64 = conn
+                .query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(on, 1, "{pragma} must be ON");
+        }
         let autocheckpoint: i64 = conn
             .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
             .unwrap();

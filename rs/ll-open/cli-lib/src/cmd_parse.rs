@@ -3171,10 +3171,12 @@ fn temp_path_for(path: &Path) -> PathBuf {
 }
 
 /// Replace `path` with `bytes` atomically: the bytes go to a temp file
-/// beside it, are synced, and the temp file is renamed over `path`, and
-/// the directory is synced so the rename survives a crash. A reader sees
-/// the previous file or the new one, never a partial one; a write that
-/// fails leaves the previous file as it was (bead `ley-line-open-5db28e`).
+/// beside it, are ordered to the disk before the temp file is renamed over
+/// `path`, and the rename is ordered after them (`crate::durable`). A
+/// reader sees the previous file or the new one, never a partial one, a
+/// power loss included; a write that fails leaves the previous file as it
+/// was (bead `ley-line-open-5db28e`). The rename becomes durable at the
+/// next `F_FULLFSYNC` (bead `ley-line-open-98d0c3`).
 fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     let temp = temp_path_for(path);
@@ -3187,9 +3189,8 @@ fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("open {}", temp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("write {}", temp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("sync {}", temp.display()))?;
-        std::fs::rename(&temp, path)
+        crate::durable::order(&f, &temp).with_context(|| format!("sync {}", temp.display()))?;
+        crate::durable::rename(&temp, path)
             .with_context(|| format!("rename {} over {}", temp.display(), path.display()))
     })();
     if written.is_err() {
@@ -3198,8 +3199,7 @@ fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let path = std::path::absolute(path).with_context(|| format!("resolve {}", path.display()))?;
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
+        crate::durable::order_dir(dir)
             .with_context(|| format!("sync directory {}", dir.display()))?;
     }
     Ok(())

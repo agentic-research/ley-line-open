@@ -87,9 +87,10 @@ requests whose parent is not a visible directory are `ENOENT` or `ENOTDIR`.
 
 ### What the store holds, and what the session holds
 
-The store holds every file the guest makes (ADR-0045 T1): any name, any
-bytes, with its git mode (`100644`, `100755`, `120000` for a symlink whose
-blob is its target), and every directory, empty ones included. Parsing is a
+The store holds every authored file the guest makes (ADR-0045 T1): any
+name, any bytes, with its git mode (`100644`, `100755`, `120000` for a
+symlink whose blob is its target), and every directory, empty ones included.
+Derived paths (below) are never stored. Parsing is a
 projection over the files the parse knows; a file that does not parse lands
 with a `_parse_diagnostics` row. A checkout's `lang_filter` narrows the
 projection, not what is stored.
@@ -99,6 +100,38 @@ its first FLUSH lands it. A FLUSH the store refuses keeps the written bytes
 in the session, so a later open or rename carries them; an UNLINK before any
 FLUSH lands nothing; a RENAME of it lands it under the new name. A `chmod`
 of such a file lands with it.
+
+### Derived paths
+
+Build output and tool state are never proposals (ADR-0045 T9, bead
+`ley-line-open-39998b`). With `Options::derived` set (the daemon's run
+shares and its host mount set it), a path is derived when the store does
+not hold it and either scratch holds it, its parent is derived, or a rule
+matches it as it is made: a directory component named `target`,
+`node_modules`, `__pycache__`, `__pypackages__`, `venv`, `.venv` or `.git`;
+a file named `._*` or `.DS_Store`; or a `.gitignore` rule (the store's
+`.gitignore` of each directory up to the root, else the checkout's, nearest
+first, with `!` whitelists). A path the store holds stays authored (tracked
+wins).
+
+Derived paths live in a scratch directory this `StoreFs` makes under
+`Derived::parent` on its first derived write and removes when it is
+dropped: per guest run, per host-mount session. A derived request is a host
+file operation: no parse, merge, durable flush or publish, and no entry in
+`_tree`, the tree root or the checkout. Listings show the store's names and
+scratch's (a name both hold is the store's).
+
+- **Confinement:** every scratch access resolves the path with `openat` and
+  `O_NOFOLLOW` beneath the scratch root, so a symlink the guest made in
+  scratch is served as a symlink and never followed on the host. Derived
+  writes need the same scope as authored ones (`EACCES`).
+- **Limit:** `Derived::limit` bytes of file data (16 GiB by default); past
+  it a write is `ENOSPC` (28), as is a full host disk. A derived write never
+  falls back to the store.
+- **Durability:** none; FSYNC of a derived file does not sync.
+- **Crossing classes:** a file renamed from a derived path to an authored
+  one lands as a create at the new path; the reverse proposes the delete of
+  the old path. A directory renamed across classes is `EXDEV` (18).
 
 ### Proposal errno map
 

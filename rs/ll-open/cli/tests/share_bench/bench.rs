@@ -23,6 +23,8 @@ const LATENCY_OPS: u32 = 1000;
 // re-snapshotted the whole store (bead ley-line-open-39d3a4's finding); the
 // daemon's publisher now coalesces them (bead ley-line-open-8c8ded).
 const STORM_FILES: u32 = 200;
+// Build output written under target/: derived paths, never proposals.
+const DERIVED_FILES: u32 = 2000;
 const WARM_RUNS: u32 = 3;
 
 struct Tools {
@@ -167,6 +169,26 @@ fn main() {
     line(
         "storm_per_file",
         elapsed.as_secs_f64() * 1e3 / f64::from(STORM_FILES),
+        "ms",
+    );
+
+    // Build-output storm: the same create, write, close under target/. On
+    // the share these are derived paths (ADR-0045 T9, bead
+    // ley-line-open-39998b): scratch files, no proposal.
+    let output = format!("{}/target/bench-storm", t.tree);
+    fs::create_dir_all(&output).expect("build output directory");
+    let start = Instant::now();
+    for i in 0..DERIVED_FILES {
+        let mut file = File::create(format!("{output}/o{i}.o")).expect("create");
+        file.write_all(format!("object {i}\n").as_bytes())
+            .expect("write");
+        drop(file);
+    }
+    let elapsed = start.elapsed();
+    line("derived_storm_total", elapsed.as_secs_f64() * 1e3, "ms");
+    line(
+        "derived_storm_per_file",
+        elapsed.as_secs_f64() * 1e3 / f64::from(DERIVED_FILES),
         "ms",
     );
 

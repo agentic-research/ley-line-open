@@ -327,7 +327,9 @@ write: one per guest run (each run's share is its own `StoreFs`) and one per hos
 It is a host directory served through the same share, so a derived request costs a share round
 trip and a host file operation, and no parse, merge, durable flush or publish. A guest-local overlay
 (virtio-blk or tmpfs inside the VM) would remove the round trip as well; it needs a guest-init
-change and is not part of this decision. The scratch directory is removed when the `StoreFs` is
+change and is not part of this decision (bead `ley-line-open-2354c3`). Measured: 7.06 ms per
+derived file against 56.6 ms per authored one in the same guest run, 0.41 ms on APFS
+(`docs/benchmarks/2026-10-20-share-path.md`). The scratch directory is removed when the `StoreFs` is
 dropped, at the end of the run or unmount.
 
 - **Confinement.** Every scratch access resolves the path component by component with `openat`
@@ -354,6 +356,9 @@ entries and the scratch entries under the same directory; a name both hold lists
   refusal names the conflicting lines. This holds for agents that are separate writers (their
   own virtio-fs sessions, FUSE handles or socket proposals); two processes through one host NFS
   mount are one client, and the last save wins (T8, `ley-line-open-5ec040`).
+- A `cargo build`, `npm install` or `git` command in the guest or on the host mount writes its
+  output to scratch: nothing it writes under a derived path reaches the store, the tree root or
+  the checkout, and none of it outlives the run or the mount session (T9).
 - A half-written Go file lands. Its projection carries error nodes and a diagnostic row; queries
   over it see what tree-sitter recovered.
 - `treeRoot` moves for trees holding non-projected files, executables, symlinks or empty
@@ -373,6 +378,7 @@ entries and the scratch entries under the same directory; a name both hold lists
 | 4 | storefs: every file to the store, MKDIR/RMDIR/directory RENAME/SETATTR mode/symlink as proposals, WRITE stages, FLUSH merges; libkrun patch `0006` (READLINK, SYMLINK through `DynFileSystem`); the in-guest end-to-end scenarios | Done |
 | 5 | T8: the host mount's writes as proposals; the NFS WRITE check; the mount's syntax validation, `serve --language` and `StaleWrite` removed (bead `53d701`) | Done |
 | 6 | T8: the host mount is storefs behind FUSE and NFS adapters; the macOS NFS-client gate; `leyline serve`, `leyline-fs`'s mount servers and its `fuse`, `nfs` and `splice` features removed (bead `3e73dc`) | Done |
+| 7 | T9: derived paths in a per-run (per-mount-session) scratch directory; built-in, macOS-metadata and `.gitignore` rules; tracked wins; class-crossing renames (bead `39998b`) | Done |
 
 During phases 2 and 3 `source_write::propose` kept ADR-0042's rules for the virtio-fs core alone
 (a `Rules::ParsedFilesOnly` mode); phase 4 moved storefs and the compatibility mounts to these
@@ -391,3 +397,4 @@ rules and removed that mode, `Refusal::Syntax`, `Refusal::NoLanguage` and `can_h
 | M7 | the wire carries it | `daemon_protocol_gate_proposals_produce_the_fixture_shapes` (fixtures for `mode`, `mkdir`, `conflicts`) |
 | M8 | in the guest | `agent_in_guest.rs` scenarios (c), (C), (d), (p), (h): two writers on different lines both land; same lines `ESTALE`; README, `chmod +x`, symlink, empty directory, directory rename and a half-written Go file persist across a daemon restart; storefs `tree_tests` |
 | M9 | the host mount is storefs: it lands new files, directories, modes and symlinks, merges, refuses overlap (and a retry made without a read), stores an unparseable save, and refuses an unpatched macOS NFS client | storefs `host::tests` (`a_new_file_lands_at_create_and_its_bytes_at_commit`, `mkdir_and_rmdir_are_directory_entries`, `a_mode_change_lands_the_executable_mode`, `a_symlink_lands_with_its_target`, `a_save_over_a_disjoint_landed_change_merges_at_commit`, `a_save_over_an_overlapping_landed_change_is_stale_at_the_write`, `a_page_fill_read_does_not_hide_another_writers_change`, `a_page_fill_read_does_not_hide_an_overlapping_change`, `a_commit_refuses_a_save_whose_result_turned_ambiguous`, `a_read_after_a_refusal_settles_the_handle`, `a_refused_commit_drops_the_edit_and_the_next_read_serves_the_store`, `an_unparseable_save_lands_with_its_diagnostic`, `an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts`); through the kernel, storefs `tests/host_mount.rs` and `tools/cli_smoke.sh --mount`; fs `a_store_refuses_every_write` |
+| M10 | derived paths are never proposals, tracked wins, scratch is confined, limited and gone with its filesystem | storefs `derived_tests` (`build_output_under_target_and_node_modules_is_never_a_proposal`, `a_tracked_file_under_an_ignored_directory_stays_a_proposal`, `a_gitignore_rule_makes_a_new_path_derived_and_a_whitelist_keeps_one_authored`, `a_gitignore_in_the_checkout_only_is_read`, `macos_metadata_files_are_derived`, `a_rename_from_a_derived_path_to_an_authored_one_lands_a_create`, `a_rename_from_an_authored_path_to_a_derived_one_proposes_the_delete`, `a_directory_rename_across_classes_is_exdev`, `a_symlink_in_scratch_is_served_and_never_followed_on_the_host`, `a_write_past_the_scratch_limit_is_enospc_and_nothing_reaches_the_store`, `a_derived_write_outside_the_proposal_scope_is_eacces`, `the_scratch_is_gone_when_the_filesystem_drops`); in the guest, `agent_in_guest.rs` scenario (o); `share_bench` `derived_storm_per_file` |

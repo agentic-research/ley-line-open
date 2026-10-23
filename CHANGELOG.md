@@ -414,6 +414,17 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **A guest's clock no longer runs ahead of the host's** (bead
+  `ley-line-open-f8138d`). The guest kernel took its first time from the
+  RTC's whole seconds, set to the middle of the second, so a guest started
+  up to half a second ahead of or behind the host. Ahead, git's racy-clean
+  check (the index file's mtime on the guest's clock against each entry's
+  on the share's host clock) missed a same-size edit made in the same
+  second as `git add`, and `agent_in_guest` (m) failed intermittently.
+  Vendored libkrun patch `0007` passes the host's wall clock to init
+  (`KRUN_REALTIME_NS`), which sets the guest's clock to it plus the time
+  since boot: never later than the host's, trailing it by the VMM's setup
+  time.
 - **`git status` in a guest missed a same-size edit** (bead
   `ley-line-open-b8100d`). The virtio-fs share reported every file time as
   zero, and git decides whether to rehash a file from its stat (size,

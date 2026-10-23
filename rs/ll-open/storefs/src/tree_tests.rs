@@ -376,6 +376,20 @@ fn reread_brings_a_clean_handle_to_the_store_and_leaves_a_dirty_one() {
     assert_eq!(f.fs.flush(h), Err(Errno::ESTALE), "against A_OTHER, not A");
 }
 
+/// A save that means different things against its handle's reads is
+/// `ESTALE`, and the refusal the log records names the path.
+#[test]
+fn an_ambiguous_save_is_stale_and_names_its_path() {
+    let err = anyhow::Error::new(crate::Ambiguous {
+        path: "pkg/b.go".into(),
+    });
+    assert_eq!(crate::errno_for(&err), Errno::ESTALE);
+    assert_eq!(
+        format!("{err}"),
+        "'pkg/b.go': the save means different things against the reads it may have been made from"
+    );
+}
+
 /// REREAD of a file the store no longer holds is `ENOENT`.
 #[test]
 fn reread_of_a_deleted_file_is_enoent() {

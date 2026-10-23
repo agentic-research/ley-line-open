@@ -1383,7 +1383,10 @@ pub fn arena_size_for(current: u64, image_len: u64) -> u64 {
 /// BLAKE3's tree mode gives the same bytes as the serial hash, and
 /// `update_rayon` hashes a small input on the calling thread.
 pub fn image_root(image: &[u8]) -> [u8; 32] {
-    *blake3::Hasher::new().update_rayon(image).finalize().as_bytes()
+    *blake3::Hasher::new()
+        .update_rayon(image)
+        .finalize()
+        .as_bytes()
 }
 
 /// `image` as a standalone rollback-mode database, when it is a SQLite
@@ -3863,7 +3866,15 @@ mod tests {
     fn the_image_root_is_the_substrate_hash_of_the_image() {
         use leyline_core::ContentAddressed;
         // Sizes across BLAKE3's chunk (1 KiB) and its multi-chunk tree.
-        for len in [0usize, 1, 1023, 1024, 1025, 64 * 1024 + 3, 3 * 1024 * 1024 + 7] {
+        for len in [
+            0usize,
+            1,
+            1023,
+            1024,
+            1025,
+            64 * 1024 + 3,
+            3 * 1024 * 1024 + 7,
+        ] {
             let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
             let expected = *bytes.as_slice().hash().as_bytes();
             assert_eq!(image_root(&bytes), expected, "len {len}");
@@ -3936,13 +3947,19 @@ mod tests {
             let live = Arc::clone(&live);
             let ctrl_path = ctrl_path.clone();
             std::thread::spawn(move || {
-                done_tx.send(publish_living_db(&live, &ctrl_path).is_ok()).unwrap();
+                done_tx
+                    .send(publish_living_db(&live, &ctrl_path).is_ok())
+                    .unwrap();
             })
         };
         let published = done_rx.recv_timeout(std::time::Duration::from_secs(60));
         drop(held);
         publisher.join().unwrap();
-        assert_eq!(published, Ok(true), "the publish finished while the writer was held");
+        assert_eq!(
+            published,
+            Ok(true),
+            "the publish finished while the writer was held"
+        );
         assert_eq!(published_names(&ctrl_path), ["committed"]);
     }
 
@@ -3951,12 +3968,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (live, ctrl_path) = publishing_live_db(&dir);
         let mut last = read_total_changes(&live.writer).unwrap();
-        assert!(!publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(), "clean: no publish");
+        assert!(
+            !publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "clean: no publish"
+        );
         live.writer
             .lock()
             .execute("INSERT INTO landed (name) VALUES ('x')", [])
             .unwrap();
-        assert!(publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(), "dirty: one publish");
+        assert!(
+            publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "dirty: one publish"
+        );
         assert_eq!(published_names(&ctrl_path), ["x"]);
         assert!(
             !publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),

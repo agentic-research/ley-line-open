@@ -6394,7 +6394,11 @@ mod tests {
         assert_eq!(head_unbound_facts(&db_path), 2);
 
         // Defining it elsewhere binds the reference.
-        std::fs::write(src.path().join("defs.go"), "package main\n\nfunc missing() {}\n").unwrap();
+        std::fs::write(
+            src.path().join("defs.go"),
+            "package main\n\nfunc missing() {}\n",
+        )
+        .unwrap();
         parse(&["defs.go"]);
         assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
         assert_eq!(head_unbound_facts(&db_path), 1);

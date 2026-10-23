@@ -4718,7 +4718,10 @@ mod tests {
         assert_eq!(r["ok"], true, "{r}");
         assert!(r.get("post_commit_error").is_none(), "{r}");
         let snap = call(&ctx, serde_json::json!({"op": "snapshot"}));
-        assert_ne!(snap["ok"], true, "the publish into a missing arena fails: {snap}");
+        assert_ne!(
+            snap["ok"], true,
+            "the publish into a missing arena fails: {snap}"
+        );
         let written = call(
             &ctx,
             serde_json::json!({"op": "read_source", "path": "a.go"}),

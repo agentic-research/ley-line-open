@@ -159,6 +159,9 @@ impl Host {
         let control = self.path("daemon.ctrl");
         let (library_var, library_dir) = hypervisor::library_path_env(&self.libkrunfw);
         let log = fs::File::create(self.path(&format!("daemon-{lifetime}.log"))).expect("log");
+        // The daemon's temporary directory: where each run's scratch for
+        // derived paths is made (ADR-0045 T9), so a test can see it go.
+        fs::create_dir_all(self.path("tmp")).expect("daemon temp dir");
         let child = Command::new(&self.leyline)
             .arg("execution-daemon")
             .arg("--backend")
@@ -190,6 +193,7 @@ impl Host {
             .arg("30000")
             // The daemon publishes a discovery link under $HOME/.mache.
             .env("HOME", self.path("home"))
+            .env("TMPDIR", self.path("tmp"))
             .env(library_var, library_dir)
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())

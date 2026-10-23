@@ -33,7 +33,8 @@
 //! - (m) two successive same-size edits of `m.go` are each reported by the
 //!   `git status --porcelain` after it (` M`, then `MM` after `git add`):
 //!   the share's file times move with each edit (bead
-//!   `ley-line-open-b8100d`);
+//!   `ley-line-open-b8100d`), and the guest's clock is never ahead of the
+//!   share's, so git's racy-clean check holds (bead `ley-line-open-f8138d`);
 //! - (p) a README edit, a file in no projected language, `chmod +x`, a
 //!   symlink, an empty directory and a directory rename persist in the
 //!   store and the checkout (ADR-0045 T1, T4);

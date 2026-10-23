@@ -1,0 +1,121 @@
+From b61c8975904a62727fe94943a77b2252f510ae38 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Thu, 22 Oct 2026 15:54:22 -0600
+Subject: [PATCH] init: set the guest clock from the host's, not the RTC's
+ whole second
+
+The guest kernel takes its first wall-clock time from the PL031 RTC,
+which reads whole seconds, and sets it to the middle of that second
+(rtc_hctosys). A guest therefore starts up to half a second ahead of or
+behind the host, and keeps that offset: measured over four boots on
+macOS/HVF, +0.09 s, +0.14 s, +0.31 s and -0.24 s.
+
+A guest clock ahead of the host's breaks anything that compares a
+guest-local time with a time a host-side filesystem serves. git's
+racy-clean check compares the index file's mtime (guest rootfs, guest
+clock) with each entry's mtime (a virtio-fs share, host clock); with the
+guest ahead, an entry recorded in the same second as a later same-size
+edit looks clean, and git status misses the edit.
+
+The VMM now passes KRUN_REALTIME_NS, the host's wall clock as the kernel
+command line is built, and init sets CLOCK_REALTIME to it plus
+CLOCK_BOOTTIME. The stamp precedes the guest's boot, so the guest's
+clock is never later than the host's; it trails it by the VMM's setup
+time. A missing or malformed value leaves the RTC's time, and the
+variable is removed from the workload's environment.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+Signed-off-by: jamestexas <18285880+jamestexas@users.noreply.github.com>
+---
+ src/init_blob/init/init.c | 45 +++++++++++++++++++++++++++++++++++++++
+ src/libkrun/src/lib.rs    |  8 ++++++-
+ 2 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
+index 92c35fa..471ed65 100644
+--- a/src/init_blob/init/init.c
++++ b/src/init_blob/init/init.c
+@@ -1285,6 +1285,49 @@ static int mount_virtiofs_list()
+     unsetenv("KRUN_VIRTIOFS_MOUNTS");
+     return 0;
+ }
++
++/*
++ * Set the guest's wall clock from KRUN_REALTIME_NS, the host's wall clock
++ * when the VMM built the kernel command line, plus the guest's time since
++ * boot. The kernel took its first time from the RTC, which reads whole
++ * seconds, and set it to the middle of that second, so the guest started up
++ * to half a second ahead of or behind the host. A guest clock ahead of the
++ * host's breaks anything that compares a guest-local time with a file time
++ * a host-side filesystem served: git's racy-clean check compares the index
++ * file's mtime with each entry's, and two same-size edits within one second
++ * of a host-timed share then look unchanged. The stamp was taken before the
++ * guest booted, so the time set here is never later than the host's; it
++ * trails it by the VMM's setup time. A missing or malformed value leaves
++ * the RTC's time. The variable is removed from the workload's environment.
++ */
++static void set_realtime_from_host()
++{
++    char *value, *end;
++    unsigned long long host_ns;
++    struct timespec since_boot, now;
++
++    value = getenv("KRUN_REALTIME_NS");
++    if (value == NULL) {
++        return;
++    }
++    errno = 0;
++    host_ns = strtoull(value, &end, 10);
++    if (errno != 0 || end == value || *end != '\0' ||
++        clock_gettime(CLOCK_BOOTTIME, &since_boot) < 0) {
++        printf("KRUN_REALTIME_NS: '%s' is not a time; keeping the RTC's\n",
++               value);
++        unsetenv("KRUN_REALTIME_NS");
++        return;
++    }
++    host_ns += (unsigned long long)since_boot.tv_sec * 1000000000ULL +
++               (unsigned long long)since_boot.tv_nsec;
++    now.tv_sec = host_ns / 1000000000ULL;
++    now.tv_nsec = host_ns % 1000000000ULL;
++    if (clock_settime(CLOCK_REALTIME, &now) < 0) {
++        perror("clock_settime(KRUN_REALTIME_NS)");
++    }
++    unsetenv("KRUN_REALTIME_NS");
++}
+ #endif
+ 
+ #if __linux__
+@@ -1455,6 +1498,8 @@ int main(int argc, char **argv)
+     }
+ 
+ #if __linux__
++    set_realtime_from_host();
++
+     krun_root = clone_str(getenv("KRUN_BLOCK_ROOT_DEVICE"));
+     if (krun_root) {
+         if (mkdir("/newroot", 0755) < 0 && errno != EEXIST) {
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index 29ebe6a..f2ff270 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -2977,10 +2977,16 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+         return -libc::EINVAL;
+     }
+ 
++    // The host's wall clock as the command line is built. The guest's RTC
++    // reads whole seconds, so a guest that took its time from it alone would
++    // start up to half a second off the host; init sets the clock from this
++    // value plus the guest's time since boot instead, which is never later
++    // than the host's time (see init.c, set_realtime_from_host).
++    let realtime_ns = utils::time::get_time(utils::time::ClockType::Real);
+     let kernel_cmdline = KernelCmdlineConfig {
+         prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+         krun_env: Some(format!(
+-            " {} {} {} {} {}",
++            " {} {} {} {} KRUN_REALTIME_NS={realtime_ns} {}",
+             ctx_cfg.get_exec_path(),
+             ctx_cfg.get_workdir(),
+             ctx_cfg.get_block_root(),
+-- 
+2.50.1 (Apple Git-155)
+

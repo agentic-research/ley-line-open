@@ -1336,7 +1336,7 @@ impl<S: Store> StoreFs<S> {
         match (kind, from_derived, to_derived) {
             (Kind::Directory, false, false) => self.rename_directory(&from, &to, target)?,
             (Kind::File | Kind::Symlink, false, false) => self.rename_file(&from, &to, target)?,
-            (_, true, true) => self.rename_in_scratch(&from, &to, kind, target)?,
+            (_, true, true) => self.rename_in_scratch(&from, &to, kind)?,
             // A directory changes class only by copy: `mv` answers EXDEV so.
             (Kind::Directory, _, _) => return Err(Errno::EXDEV),
             (_, true, false) => self.rename_out_of_scratch(&from, &to, kind, target)?,
@@ -1347,30 +1347,18 @@ impl<S: Store> StoreFs<S> {
     }
 
     /// RENAME within scratch: a derived path to a derived path.
-    fn rename_in_scratch(
-        &self,
-        from: &str,
-        to: &str,
-        kind: Kind,
-        target: Option<Kind>,
-    ) -> Result<(), Errno> {
+    /// Both ends are scratch's (a path the store holds is never derived), so
+    /// `renameat` itself refuses a directory moved under itself (`EINVAL`),
+    /// a directory over a file (`ENOTDIR`) or over a non-empty directory
+    /// (`ENOTEMPTY`, or `EEXIST` on Linux), and a file over a directory
+    /// (`EISDIR`), as `rename(2)` does for the guest.
+    fn rename_in_scratch(&self, from: &str, to: &str, kind: Kind) -> Result<(), Errno> {
         let may = |path: &str| match kind {
             Kind::Directory => self.may_propose_under(path),
             Kind::File | Kind::Symlink => self.scope.propose.covers(path),
         };
         if !may(from) || !may(to) {
             return Err(Errno::EACCES);
-        }
-        match (kind, target) {
-            (Kind::Directory, _) if to.starts_with(&join(from, "")) => {
-                return Err(Errno::EINVAL);
-            }
-            (Kind::Directory, Some(Kind::File | Kind::Symlink)) => return Err(Errno::ENOTDIR),
-            (Kind::Directory, Some(Kind::Directory)) if !self.listing(to)?.is_empty() => {
-                return Err(Errno::ENOTEMPTY);
-            }
-            (Kind::File | Kind::Symlink, Some(Kind::Directory)) => return Err(Errno::EISDIR),
-            _ => {}
         }
         self.scratch()?.rename(from, to).map_err(|e| errno_of(&e))
     }

@@ -99,6 +99,10 @@ pub(crate) struct Scratch {
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// A directory opened for reading: `O_RDONLY` is the zero access mode, so
+/// the flags are `O_DIRECTORY` alone.
+const READ_DIR: i32 = libc::O_DIRECTORY;
+
 impl Scratch {
     /// A fresh scratch directory under `parent`, readable and writable by
     /// this process only.
@@ -111,7 +115,7 @@ impl Scratch {
             match std::fs::create_dir(&dir) {
                 Ok(()) => {
                     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-                    let root = open_path(&dir, libc::O_RDONLY | libc::O_DIRECTORY)?;
+                    let root = open_path(&dir, READ_DIR)?;
                     return Ok(Scratch {
                         dir,
                         root,
@@ -138,10 +142,10 @@ impl Scratch {
         let mut dir = Dir::Borrowed(self.root.as_raw_fd());
         for part in parts {
             let name = cname(part)?;
-            let next = match openat(dir.fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY) {
+            let next = match openat(dir.fd(), &name, READ_DIR) {
                 Err(e) if make && e.raw_os_error() == Some(libc::ENOENT) => {
                     mkdirat(dir.fd(), &name, 0o755)?;
-                    openat(dir.fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?
+                    openat(dir.fd(), &name, READ_DIR)?
                 }
                 other => other?,
             };
@@ -174,7 +178,7 @@ impl Scratch {
                 Err(e) if missing(&e) => return Ok(Vec::new()),
                 Err(e) => return Err(e),
             };
-            match openat(parent.fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY) {
+            match openat(parent.fd(), &name, READ_DIR) {
                 Ok(fd) => Dir::Owned(fd),
                 Err(e) if missing(&e) => return Ok(Vec::new()),
                 Err(e) => return Err(e),
@@ -221,10 +225,9 @@ impl Scratch {
         let n = unsafe {
             libc::readlinkat(dir.fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
         };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        buf.truncate(n as usize);
+        // -1 on failure; otherwise the target's length.
+        let n = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
+        buf.truncate(n);
         Ok(buf)
     }
 
@@ -362,47 +365,52 @@ fn missing(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
 }
 
+/// A syscall's `int` result: `-1` is failure, with `errno` set.
 fn check(rc: libc::c_int) -> io::Result<()> {
-    if rc < 0 {
+    if rc == -1 {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
     }
 }
 
+/// A descriptor a syscall just returned, owned from here; `-1` is failure.
+fn owned(fd: libc::c_int) -> io::Result<OwnedFd> {
+    check(fd)?;
+    // SAFETY: `fd` was just returned by the kernel to this process and is
+    // owned by no one else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open `path` with `flags`, close-on-exec. `flags` never carries
+/// `O_CLOEXEC` itself (debug-asserted).
 fn open_path(path: &Path, flags: i32) -> io::Result<OwnedFd> {
+    debug_assert_eq!(flags & libc::O_CLOEXEC, 0);
     let c = CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    // SAFETY: `c` is NUL-terminated; a non-negative result is a descriptor
-    // this process now owns.
-    let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just returned by `open` and is owned by no one else.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    // SAFETY: `c` is NUL-terminated.
+    owned(unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) })
 }
 
 fn openat(dir: RawFd, name: &CStr, flags: i32) -> io::Result<OwnedFd> {
     openat_mode(dir, name, flags, 0)
 }
 
+/// Open `name` in `dir` with `flags`, never following a symlink, and
+/// close-on-exec. `flags` never carries `O_NOFOLLOW` or `O_CLOEXEC` itself
+/// (debug-asserted).
 fn openat_mode(dir: RawFd, name: &CStr, flags: i32, mode: u32) -> io::Result<OwnedFd> {
+    debug_assert_eq!(flags & (libc::O_NOFOLLOW | libc::O_CLOEXEC), 0);
     // SAFETY: `name` is NUL-terminated and `dir` is an open directory
-    // descriptor; a non-negative result is a descriptor this process owns.
-    let fd = unsafe {
+    // descriptor.
+    owned(unsafe {
         libc::openat(
             dir,
             name.as_ptr(),
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             mode as libc::c_uint,
         )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just returned by `openat` and is owned by no one else.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    })
 }
 
 fn mkdirat(dir: RawFd, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
@@ -443,9 +451,7 @@ fn stat_of(mode: u32, size: u64, secs: i64, nanos: i64) -> ScratchStat {
 fn read_names(dir: RawFd) -> io::Result<Vec<String>> {
     // SAFETY: `dir` is an open descriptor; `dup` returns a new one or -1.
     let dup = unsafe { libc::dup(dir) };
-    if dup < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    check(dup)?;
     // SAFETY: `dup` is a fresh descriptor; `fdopendir` takes ownership of it
     // on success.
     let stream = unsafe { libc::fdopendir(dup) };
@@ -497,3 +503,7 @@ pub(crate) fn errno_of(e: &io::Error) -> Errno {
         _ => Errno::EIO,
     }
 }
+
+#[cfg(test)]
+#[path = "scratch_tests.rs"]
+mod tests;

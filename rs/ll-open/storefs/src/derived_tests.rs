@@ -3,10 +3,10 @@
 //! store, its tree root and the checkout, and are gone with the filesystem.
 
 use leyline_cli_lib::source_write::{Base, Grant, Proposed};
-use leyline_cli_lib::tree::{self as store_tree, Entry as StoreEntry};
+use leyline_cli_lib::tree::{self as store_tree, Entry as StoreEntry, Mode};
 use tempfile::TempDir;
 
-use super::open_flags::{O_RDONLY, O_RDWR};
+use super::open_flags::{O_RDONLY, O_RDWR, O_TRUNC};
 use super::tests::{A, Fixture, count_passes, fixture_derived, ino, on_disk, passes, whole};
 use super::*;
 
@@ -402,6 +402,217 @@ fn without_derived_options_build_output_is_a_proposal_as_before() {
         Some(StoreEntry::File { .. })
     ));
     assert_eq!(f.fs.scratch_dir(), None);
+}
+
+fn chmod(f: &Fixture, inode: u64, mode: u32) -> Attr {
+    f.fs.setattr(
+        inode,
+        None,
+        SetAttr {
+            mode: Some(mode),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap()
+    .0
+}
+
+fn stored_mode(f: &Fixture, path: &str) -> Option<Mode> {
+    match entry(f, path) {
+        Some(StoreEntry::File { mode, .. }) => Some(mode),
+        _ => None,
+    }
+}
+
+#[test]
+fn readdirplus_resumes_a_derived_listing_at_its_offsets() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let target = mkdir_p(&f, "target");
+    for name in ["a", "b", "c"] {
+        write_new(&f, target, name, name).unwrap();
+    }
+    let all = f.fs.readdirplus(target, 0).unwrap();
+    let listed: Vec<(String, u64)> = all
+        .iter()
+        .map(|(e, _)| (e.name.clone(), e.offset))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]
+    );
+    let rest: Vec<String> =
+        f.fs.readdirplus(target, 1)
+            .unwrap()
+            .into_iter()
+            .map(|(e, _)| e.name)
+            .collect();
+    assert_eq!(rest, vec!["b".to_string(), "c".to_string()]);
+    assert_eq!(all[0].1.attr.size, 1);
+}
+
+#[test]
+fn a_derived_read_starts_at_its_offset_and_stops_at_the_end() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let target = mkdir_p(&f, "target");
+    write_new(&f, target, "x", "12345").unwrap();
+    let h = f.fs.open(ino(&f, "target/x"), O_RDONLY).unwrap().handle;
+    assert_eq!(f.fs.read(h, 2, 100).unwrap(), b"345");
+    assert_eq!(f.fs.read(h, 1, 2).unwrap(), b"23");
+    assert_eq!(f.fs.read(h, 5, 10).unwrap(), b"");
+    assert_eq!(f.fs.read(h, 9, 10).unwrap(), b"");
+}
+
+#[test]
+fn a_read_only_derived_handle_neither_writes_nor_truncates() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let target = mkdir_p(&f, "target");
+    let x = write_new(&f, target, "x", "12345").unwrap();
+    let h = f.fs.open(x, O_RDONLY).unwrap().handle;
+    assert_eq!(f.fs.write(h, 0, b"z"), Err(Errno::EBADF));
+    assert_eq!(
+        f.fs.setattr(
+            x,
+            Some(h),
+            SetAttr {
+                size: Some(1),
+                ..SetAttr::default()
+            }
+        )
+        .map(|_| ()),
+        Err(Errno::EBADF)
+    );
+    assert_eq!(read_text(&f, "target/x"), "12345");
+}
+
+#[test]
+fn a_derived_open_truncates_only_with_o_trunc() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let target = mkdir_p(&f, "target");
+    let x = write_new(&f, target, "x", "12345").unwrap();
+    let h = f.fs.open(x, O_RDWR).unwrap().handle;
+    f.fs.write(h, 0, b"a").unwrap();
+    f.fs.release(h);
+    assert_eq!(read_text(&f, "target/x"), "a2345");
+    let h = f.fs.open(x, O_RDWR | O_TRUNC).unwrap().handle;
+    f.fs.release(h);
+    assert_eq!(read_text(&f, "target/x"), "");
+}
+
+#[test]
+fn a_derived_files_attributes_carry_its_permission_bits() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let target = mkdir_p(&f, "target");
+    let x = write_new(&f, target, "x", "x").unwrap();
+    assert_eq!(chmod(&f, x, 0o640).perm, 0o640);
+    assert_eq!(f.fs.lookup(target, b"x").unwrap().attr.perm, 0o640);
+    let link = f.fs.symlink(target, b"l", b"x").unwrap();
+    assert_eq!(link.attr.perm, 0o777);
+    assert_eq!(link.attr.kind, Kind::Symlink);
+}
+
+#[test]
+fn a_file_renamed_out_of_scratch_lands_with_its_mode_and_over_a_stored_file() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let target = mkdir_p(&f, "target");
+    let run = write_new(&f, target, "run", "#!/bin/sh\n").unwrap();
+    chmod(&f, run, 0o755);
+    write_new(&f, target, "plain", "plain\n").unwrap();
+    write_new(&f, target, "new_a", "package a\n").unwrap();
+    f.fs.rename(target, b"run", ROOT_INODE, b"run.sh", 0)
+        .unwrap();
+    f.fs.rename(target, b"plain", ROOT_INODE, b"plain.txt", 0)
+        .unwrap();
+    f.fs.rename(target, b"new_a", ROOT_INODE, b"a.go", 0)
+        .unwrap();
+    assert_eq!(stored_mode(&f, "run.sh"), Some(Mode::Executable));
+    assert_eq!(stored_mode(&f, "plain.txt"), Some(Mode::Regular));
+    assert_eq!(on_disk(&f, "a.go").as_deref(), Some("package a\n"));
+}
+
+#[test]
+fn a_file_named_like_a_generated_directory_is_authored() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let target = mkdir_p(&f, "target");
+    write_new(&f, target, "venv", "a file, not a directory\n").unwrap();
+    f.fs.rename(target, b"venv", ROOT_INODE, b"venv", 0)
+        .unwrap();
+    assert!(matches!(entry(&f, "venv"), Some(StoreEntry::File { .. })));
+}
+
+#[test]
+fn a_file_renamed_into_scratch_keeps_its_mode() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let tool = write_new(&f, ROOT_INODE, "tool.sh", "#!/bin/sh\n").unwrap();
+    chmod(&f, tool, 0o755);
+    assert_eq!(stored_mode(&f, "tool.sh"), Some(Mode::Executable));
+    let target = mkdir_p(&f, "target");
+    f.fs.rename(ROOT_INODE, b"tool.sh", target, b"tool.sh", 0)
+        .unwrap();
+    f.fs.rename(ROOT_INODE, b"a.go", target, b"a.go", 0)
+        .unwrap();
+    assert_eq!(f.fs.lookup(target, b"tool.sh").unwrap().attr.perm, 0o755);
+    assert_eq!(f.fs.lookup(target, b"a.go").unwrap().attr.perm, 0o644);
+}
+
+#[test]
+fn renames_touching_scratch_need_the_scope_at_both_ends() {
+    let scope = Scope {
+        see: Grant::Whole,
+        propose: Grant::Paths(["a.go", "target/a", "target/keep"].map(String::from).into()),
+    };
+    let (f, _parent) = derived_fixture_scoped(scope, 64 * MIB);
+    let target = mkdir_p(&f, "target");
+    write_new(&f, target, "a", "a").unwrap();
+    assert_eq!(
+        f.fs.rename(target, b"a", target, b"b", 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        f.fs.rename(ROOT_INODE, b"a.go", target, b"x", 0),
+        Err(Errno::EACCES)
+    );
+    assert!(matches!(entry(&f, "a.go"), Some(StoreEntry::File { .. })));
+}
+
+#[test]
+fn a_rename_within_scratch_is_refused_as_rename_2_refuses() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    mkdir_p(&f, "target/d/sub");
+    mkdir_p(&f, "target/full/child");
+    mkdir_p(&f, "target/empty");
+    let target = ino(&f, "target");
+    write_new(&f, target, "f", "f").unwrap();
+    let sub = ino(&f, "target/d/sub");
+    assert_eq!(
+        f.fs.rename(target, b"d", sub, b"inside", 0),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        f.fs.rename(target, b"d", target, b"f", 0),
+        Err(Errno::ENOTDIR)
+    );
+    assert_eq!(
+        f.fs.rename(target, b"f", target, b"d", 0),
+        Err(Errno::EISDIR)
+    );
+    let over_full = f.fs.rename(target, b"empty", target, b"full", 0);
+    assert!(
+        matches!(over_full, Err(Errno::ENOTEMPTY) | Err(Errno::EEXIST)),
+        "{over_full:?}"
+    );
+}
+
+#[test]
+fn a_nested_gitignore_applies_beneath_its_directory_only() {
+    let (f, _parent) = derived_fixture(64 * MIB);
+    let pkg = ino(&f, "pkg");
+    write_new(&f, pkg, ".gitignore", "gen/\n").unwrap();
+    let gen_dir = mkdir_p(&f, "pkg/gen");
+    write_new(&f, gen_dir, "out.go", "generated\n").unwrap();
+    assert_eq!(entry(&f, "pkg/gen"), None);
+    assert_eq!(read_text(&f, "pkg/gen/out.go"), "generated\n");
+    mkdir_p(&f, "gen");
+    assert_eq!(entry(&f, "gen"), Some(StoreEntry::Dir));
 }
 
 /// The rule matcher alone.

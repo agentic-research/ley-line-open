@@ -505,5 +505,4 @@ pub(crate) fn errno_of(e: &io::Error) -> Errno {
 }
 
 #[cfg(test)]
-#[path = "scratch_tests.rs"]
 mod tests;

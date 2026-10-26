@@ -5,7 +5,7 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-10-23, at integration `ac742873` (latest tag v0.20.5).
+Last updated: 2026-10-26, at integration `ac742873` (latest tag v0.20.5).
 
 ## v1.0: single host, portable
 
@@ -25,6 +25,7 @@ v1.0.0 tag is published with its crates on crates.io, and
 | Write path for real workloads | Build output stays out of the store; bursts of authored writes commit as one batch; a write is acknowledged after one durable append; a guest write stays under 50 ms | `39998b`, `18bfdd`, `98d0c3` |
 | Fail-closed authority | A run writes only inside its grant's write scope; a backend refuses a workspace it cannot serve | `483134`, `204a94` |
 | Installable | The crates publish to crates.io; a release is a tag, not a git revision | `c3e8c6`, `395e43` |
+| Git compatible at the boundary | Real `git` (status, diff, commit, log, blame, push, fetch) behaves in an agent's working tree as in a plain clone; git object ids are an export-only identity domain | `cf8fdb` |
 | Limits fixed or documented | Two writers on one NFS mount; `.git` in the mount | `5ec040`, `5ee38a` |
 
 Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
@@ -51,8 +52,20 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   starting without the workspace.
 - `16a994`, `5c2040` — VM tests in CI (a self-hosted Apple-silicon runner; Linux/KVM).
 
+**Measure, then cut operations**
+- `be495a` — count operations per workload (FUSE requests, guest exits, socket
+  round trips, flushes, bytes copied, parse passes) against the native minimum.
+  Counts are deterministic, so `b18099`'s regression gate asserts on them as
+  well as on timings, at two store sizes (per-write cost must not grow with the
+  store).
+- `b6c7ce` — parse after the reply: since ADR-0045 an unparseable file lands
+  with a diagnostic, so the parse no longer gates acceptance; the projection
+  follows like publication (~21 ms of the 47 ms write).
+- `bf80bd` — collapse the worker-to-daemon hop on the share's hot path.
+
 **Then**
 - `b70e44`, `10075e` — the contract freeze, after the ADR status decisions.
+- `cf8fdb` — the git conformance suite.
 - `c3e8c6` — publish the crates in dependency order (unblocks `395e43`).
 - `5ec040`, `5ee38a` — fix or document the host-mount limits.
 
@@ -85,6 +98,30 @@ quoting a single figure.
   `c4480a`.
 - The host NFS mount is refused on macOS Tahoe below 26.7 and Sequoia below 15.8
   (Apple NFS-client CVE-2026-43686 and CVE-2026-84549; `2d49ce`).
+
+## Design direction: one control plane, n data planes
+
+Native filesystems are among the most optimized code there is, and every cost
+LLO has paid sits where it deviates from them: no page cache, one flush per
+write instead of a group-committed journal, semantic work on the write path,
+O(volume) work on a write, build output through the store. The direction
+(`d4f424`) is a control plane (the store of record: `treeRoot`, proposals,
+merge, grants, projection) over several data planes that hold or serve the same
+bytes, each with its own identity domain and an adapter that turns its writes
+into proposals:
+
+| Data plane | Addresses bytes by | Bead |
+|---|---|---|
+| Store-backed share | blob hash (BLAKE3) | shipped |
+| Native copy-on-write checkout (APFS `clonefile`, Linux reflink or overlayfs), passthrough virtio-fs | path | `c739e3` |
+| Scratch for derived paths | path, never stored | `39998b` |
+| `.git` object database served from the store (gix ODB backend) | git object id | `cf8fdb` |
+| Object store (R2/S3), ordered by compare-and-swap | key | `a7b9d9` |
+
+Identities never cross planes by inference: a mapping such as "blob X is git
+object Y" is a row the control plane records and attests (ADR-0032). Git
+compatibility is a boundary contract: internals are free, and the end state is
+an ordinary repository to git, CI, review, editors and build tools.
 
 ## After v1
 

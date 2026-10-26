@@ -559,6 +559,25 @@ async fn one_writers_successive_saves_all_land() {
     }
 }
 
+/// The bound counts distinct reads: a file the other writer flips between
+/// two versions, read after every flip, is two reads however often it
+/// flips, and a save that keeps both versions' lines lands.
+#[tokio::test]
+async fn the_remembered_reads_are_distinct() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    for _ in 0..=crate::MAX_REMEMBERED_READS {
+        h.other_writer("a.go", A_OTHER);
+        h.read_all(id).await;
+        h.other_writer("a.go", A);
+        h.read_all(id).await;
+    }
+    h.save(id, A_TAILED).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_TAILED));
+}
+
 /// The reads a handle remembers are bounded. Once a save could have been
 /// made from a read the handle no longer remembers, it is refused rather
 /// than checked against an incomplete history; the client's READ settles

@@ -53,26 +53,17 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// One function with the platform split inside, so the body a mutation
-/// test replaces is the one this platform runs (a `cfg`-gated second
-/// function would be mutated without being compiled).
-fn barrier(file: &File) -> io::Result<()> {
-    #[cfg(target_vendor = "apple")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: `fcntl` with `F_BARRIERFSYNC` takes no pointer argument and
-        // reads only the descriptor, which `file` keeps open for the call.
-        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        file.sync_all()
-    }
-}
+// The barrier is the one platform-specific call, one file per platform, so
+// a mutation run excludes the file its platform does not build (a mutant in
+// code the compiler drops would pass every test: `tools/mutants_diff.sh`).
+#[cfg(target_vendor = "apple")]
+mod apple;
+#[cfg(target_vendor = "apple")]
+use apple::barrier;
+#[cfg(not(target_vendor = "apple"))]
+mod other;
+#[cfg(not(target_vendor = "apple"))]
+use other::barrier;
 
 /// Run `body` in one transaction whose commit does not sync the WAL
 /// (`synchronous = NORMAL`), restoring the connection's level after. For

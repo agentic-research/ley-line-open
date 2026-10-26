@@ -150,3 +150,4 @@ an ordinary repository to git, CI, review, editors and build tools.
 | #478 | A proposal costs one coalesced publish, not O(store); arena growth fails closed | `8c8ded` |
 | #479 | A host NFS save agrees with every read it may have been made from | `4a8953` |
 | #480 | The guest-listener probe is event-driven | `bbfa52` |
+| #482 | A proposal's one full flush is its `live.db` commit; the checkout and head writes are ordered | `98d0c3` |

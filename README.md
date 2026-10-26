@@ -8,7 +8,8 @@ Most people use it through [mache](https://github.com/agentic-research/mache):
 mache installs or starts `leyline` for you. Start with
 [GETTING-STARTED.md](GETTING-STARTED.md). This README is the short orientation;
 the implementation-level contract is in
-[docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md).
+[docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md). Where the project is
+headed, and in what order, is [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## The useful mental model
 

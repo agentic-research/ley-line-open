@@ -9,9 +9,18 @@ For non-trivial work:
 1. Use `rsry` to search for an existing bead before changing code. Create one when no suitable bead exists, record meaningful progress, and close it only when its acceptance criteria are verified. Beads, not GitHub issues or ad hoc investigation logs, are the work ledger.
 2. Use `mache.get_overview` before exploring unfamiliar code, then use its symbol and community tools to narrow the relevant seam. If mache is unavailable, record the tooling failure in its existing bead before falling back to targeted repository reads.
 3. Use `lectio` when available for repository history and observational context. Tooling absence must not be mistaken for evidence about the code.
-4. Read the governing material in this order: `README.md`, `docs/TECHNICAL_OVERVIEW.md`, `docs/ARCHITECTURE.md`, `docs/TABLE_CONTRACT.md`, then the relevant ADR, specification, crate README, and tests.
+4. Read the governing material in this order: `README.md`, `docs/ROADMAP.md`, `docs/TECHNICAL_OVERVIEW.md`, `docs/ARCHITECTURE.md`, `docs/TABLE_CONTRACT.md`, then the relevant ADR, specification, crate README, and tests.
 
 Treat a bead as a pointer, not as proof. Verify every claim against the current source, generated surfaces, and tests.
+
+## Direction
+
+`docs/ROADMAP.md` is the plan: v1.0 is **single host, portable** (one daemon owns one store on one machine, the same on macOS and Linux; epic `ley-line-open-b2e687`). Prefer work that closes a v1 blocker. Multi-host stores, blob-mapped reads and construct-aware merge come after v1 unless the roadmap says otherwise. A pull request that closes a roadmap bead or changes the plan updates `docs/ROADMAP.md` in the same pull request.
+
+Two design rules the roadmap depends on:
+
+- **A write's behavior follows its path's class, not a mode.** Authored paths are proposals (merged, durable, in `treeRoot`). Derived paths, the ones the tree's ignore rules match, are never proposals; they live in per-run scratch at native speed (`39998b`).
+- **Accepted means durable in `live.db`.** Publication of the arena is a derived, coalesced step (#478); a reply promises only what one durable append guarantees (`98d0c3`).
 
 ## Review Routing
 

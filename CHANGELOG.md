@@ -10,7 +10,53 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-26
+
+Many agents, one store. The store is a git-shaped tree that holds any bytes
+with git modes, symlinks and empty directories, and a save whose base moved
+merges three ways with what landed since it was read. Agents work through an
+ordinary filesystem: a libkrun microVM over the store-backed share, or the
+host mount, which now serves the same storefs core. A guest write costs one
+coalesced publish and one full flush (~17–22 ms, from ~15 s), and build
+output never enters the store. `SCHEMA_VERSION` moves to 0.21.0 with a
+matching `clients/go/leyline-schema/v0.21.0` tag. Crates are not published
+to crates.io for this release.
+
+Breaking changes downstream must absorb:
+
+- **Projection v7.** `_tree (path, mode, blob_hash, mtime, size)` lists every
+  entry the store holds, explicit directories included; `_source` lists only
+  the files the parse projects; `_parse_diagnostics` names each file that did
+  not parse cleanly. A v6 arena is refused at parse open and rebuilt cold.
+- **The `propose` wire.** `base` is required (a blob hash, `"any"` or
+  `"absent"`); `kind` is `replace`, `create`, `delete`, `mkdir` or `rmdir`;
+  `mode` is `100644`, `100755` or `120000`. A clean three-way merge answers
+  `merged`; overlapping edits refuse `stale` with `conflicts` as 0-based,
+  half-open line ranges. New refusal reasons `exists`, `not_empty`,
+  `not_a_directory`, `is_a_directory`; `syntax`, `no_language` and
+  `no_stored_blob` are never sent.
+- **The host mount** serves the store's plain files through storefs; the
+  syntax-node directory view and `leyline serve --language` are removed. The
+  macOS NFS mount is refused below Tahoe 26.7 and Sequoia 15.8 (Apple
+  NFS-client CVE-2026-43686 and CVE-2026-84549).
+- **`leyline-runtime`** has no `vmm` feature and links no libkrun; the
+  microVM worker is the unpublished `leyline-krun-worker` crate.
+- **execution/v1:** a workspace grant whose `expectedGeneration` is nonzero is
+  refused before the run starts.
+- **`treeRoot`** covers modes and empty directories, so a cloister grant whose
+  `graphRoot` predates ADR-0045 over such a tree no longer matches; re-derive
+  it from the daemon's `read_source` `tree_root`.
+- **Derived paths** (`target/`, `node_modules/`, `.venv/`, `.git/`, `._*`,
+  `.gitignore` matches) are never proposals; they live in per-run or
+  per-mount-session scratch.
+
 ### Changed
+
+- **Crates are published by hand, never by a tag** (bead
+  `ley-line-open-0fadab`). `.github/workflows/publish-crates.yml` runs on
+  `workflow_dispatch` with a release tag input instead of on every `v*` tag
+  push, so tagging v0.21.0 publishes binaries and the image only. Publishing
+  crates resumes as a deliberate run (bead `ley-line-open-c3e8c6`).
 
 - **Breaking: build output and tool state are never proposals** (bead
   `ley-line-open-39998b`, ADR-0045 T9). In a guest run's share and on the
@@ -253,6 +299,61 @@ context, scoping notes, and review history are recoverable.
     merges a moved base. Go bindings regenerated. Move clients of
     `propose` with this release.
 
+
+- **Breaking: execution/v1 carries workspace grants to the backend**
+  (bead `ley-line-open-f210c2`). `AuthorizedExecution.workspaces` and
+  `ExecutionRequest.workspaces` hold each RunGrant `WorkspaceGrant` (name,
+  graph root, expected generation, operations); the catalog resolver
+  carries them, and the service refuses a resolver that changes them
+  (`identity-policy-mismatch`). Both structs gained a field: struct
+  literals outside this repository need `workspaces`. A microVM run granted
+  a workspace is refused (`unsupported-backend`) when the backend has no
+  `WorkspaceShares`, and when it is granted more than one.
+
+- **Breaking (`leyline-storefs`): `Options::ttl` is replaced by
+  `Options::freshness`, `open` returns `Opened`, and WRITE refuses a stale
+  base** (bead `ley-line-open-e650d7`). A WRITE on a handle whose blob base
+  is no longer the path's `_source.content_hash` (another writer changed
+  or deleted the file) answers `ESTALE` and stages nothing, so `write(2)`
+  reports the conflict before any bytes are staged; FLUSH and FSYNC keep
+  their checks for changes that land after the WRITE.
+- **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**
+  (bead `ley-line-open-f1c46f`). `leyline-krun-worker`,
+  `KrunWorkerConfig` and `leyline execution-daemon --backend micro-vm`
+  no longer take a libkrun library path, and the worker refuses
+  `--libkrun`. libkrunfw is still loaded at run time: grant it with
+  `--runtime-file`. `DynamicKrunApi` is replaced by `LinkedKrunApi`.
+  `leyline-runtime` gains a default `vmm` feature that links the VMM and
+  builds the worker; `leyline-cli-lib` and `leyline-cli` turn it off and
+  do not compile libkrun. Consumers that keep default features compile
+  libkrun and need `CC_LINUX` (or `zig` on macOS through this
+  repository's `.cargo/config.toml`). The libkrun guest tests gate on
+  `LEYLINE_LIBKRUNFW_PATH` alone. The unused `libloading` workspace
+  dependency is removed.
+
+- **Breaking: `propose` requires `base`, and `any` is the explicit "no
+  check"** (bead `ley-line-open-5dc3a5`). `ProposedWrite.base` was
+  optional, and an agent that omitted it silently got last-writer-wins.
+  A write without `base` is now refused as a malformed request; an
+  empty or non-hex `base` is refused as `malformed_base`; `any` writes
+  whatever the file holds. The MCP `propose` schema lists `base` as
+  required.
+
+- **Breaking: every `propose` refusal is typed, and a stale one names
+  every file that moved** (bead `ley-line-open-5dc3a5`). The response's
+  `stale {path, expected, current}` is replaced by
+  `refusal {reason, path, moved}`. `reason` is one of `stale`,
+  `outside_grant`, `no_such_file`, `duplicate_path`, `different_roots`,
+  `no_tree_root`, `syntax`, `malformed_base`, `no_stored_blob` and
+  `empty`; `moved` lists `{path, expected, current}` for each moved
+  file, where `stale` named only the first. A response with `ok: false`
+  and no `refusal` is an internal error. In Rust,
+  `source_write::propose` returns a `Refusal` error for each case. The
+  daemon schema (`daemon.capnp`) gains `ProposalRefusal` and the
+  `RefusalReason` enum, the Go bindings are regenerated, and
+  `SCHEMA_VERSION` moves (0.21.0, with this release's Go client tag). Move
+  clients of `propose` with this release.
+
 ### Added
 
 - **The libkrun worker declares its workspace share, holds nothing else,
@@ -407,62 +508,6 @@ context, scoping notes, and review history are recoverable.
   session, and errno values are `EEXIST` for a create beaten to its path,
   `ENOENT`, `EXDEV`, `ENOTEMPTY` and `EINVAL` as `rename(2)` and `rmdir(2)`
   answer them.
-
-### Changed
-
-- **Breaking: execution/v1 carries workspace grants to the backend**
-  (bead `ley-line-open-f210c2`). `AuthorizedExecution.workspaces` and
-  `ExecutionRequest.workspaces` hold each RunGrant `WorkspaceGrant` (name,
-  graph root, expected generation, operations); the catalog resolver
-  carries them, and the service refuses a resolver that changes them
-  (`identity-policy-mismatch`). Both structs gained a field: struct
-  literals outside this repository need `workspaces`. A microVM run granted
-  a workspace is refused (`unsupported-backend`) when the backend has no
-  `WorkspaceShares`, and when it is granted more than one.
-
-- **Breaking (`leyline-storefs`): `Options::ttl` is replaced by
-  `Options::freshness`, `open` returns `Opened`, and WRITE refuses a stale
-  base** (bead `ley-line-open-e650d7`). A WRITE on a handle whose blob base
-  is no longer the path's `_source.content_hash` (another writer changed
-  or deleted the file) answers `ESTALE` and stages nothing, so `write(2)`
-  reports the conflict before any bytes are staged; FLUSH and FSYNC keep
-  their checks for changes that land after the WRITE.
-- **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**
-  (bead `ley-line-open-f1c46f`). `leyline-krun-worker`,
-  `KrunWorkerConfig` and `leyline execution-daemon --backend micro-vm`
-  no longer take a libkrun library path, and the worker refuses
-  `--libkrun`. libkrunfw is still loaded at run time: grant it with
-  `--runtime-file`. `DynamicKrunApi` is replaced by `LinkedKrunApi`.
-  `leyline-runtime` gains a default `vmm` feature that links the VMM and
-  builds the worker; `leyline-cli-lib` and `leyline-cli` turn it off and
-  do not compile libkrun. Consumers that keep default features compile
-  libkrun and need `CC_LINUX` (or `zig` on macOS through this
-  repository's `.cargo/config.toml`). The libkrun guest tests gate on
-  `LEYLINE_LIBKRUNFW_PATH` alone. The unused `libloading` workspace
-  dependency is removed.
-
-- **Breaking: `propose` requires `base`, and `any` is the explicit "no
-  check"** (bead `ley-line-open-5dc3a5`). `ProposedWrite.base` was
-  optional, and an agent that omitted it silently got last-writer-wins.
-  A write without `base` is now refused as a malformed request; an
-  empty or non-hex `base` is refused as `malformed_base`; `any` writes
-  whatever the file holds. The MCP `propose` schema lists `base` as
-  required.
-
-- **Breaking: every `propose` refusal is typed, and a stale one names
-  every file that moved** (bead `ley-line-open-5dc3a5`). The response's
-  `stale {path, expected, current}` is replaced by
-  `refusal {reason, path, moved}`. `reason` is one of `stale`,
-  `outside_grant`, `no_such_file`, `duplicate_path`, `different_roots`,
-  `no_tree_root`, `syntax`, `malformed_base`, `no_stored_blob` and
-  `empty`; `moved` lists `{path, expected, current}` for each moved
-  file, where `stale` named only the first. A response with `ok: false`
-  and no `refusal` is an internal error. In Rust,
-  `source_write::propose` returns a `Refusal` error for each case. The
-  daemon schema (`daemon.capnp`) gains `ProposalRefusal` and the
-  `RefusalReason` enum, the Go bindings are regenerated, and
-  `SCHEMA_VERSION` moves to 0.20.5. Move clients of `propose` with this
-  release.
 
 ### Fixed
 

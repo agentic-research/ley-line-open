@@ -1,6 +1,6 @@
 [package]
 name = "leyline-storefs"
-version = "0.20.5"
+version = "0.21.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "The store-backed filesystem core behind LLO's virtio-fs device (ADR-0044 V2): FUSE-shaped requests answered from the store, writes landed as ADR-0042 proposals, refusals returned as Linux errno values."

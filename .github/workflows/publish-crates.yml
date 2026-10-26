@@ -41,9 +41,16 @@ name: Publish crates
 # (leyline-mcp-protocol-schema is deliberately excluded — `publish = false`
 # in its own Cargo.toml.)
 
+# Publishing is a deliberate act, never a side effect of tagging (v0.21.0,
+# owner's decision): a `v*` tag publishes binaries and the image, not crates.
+# Run this workflow by hand with the release tag to publish the crates below.
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish crates from (e.g. v0.21.0)'
+        required: true
+        type: string
 
 permissions: {}
 
@@ -64,6 +71,7 @@ jobs:
       # SHA-pinned: actions/checkout@v6.0.2 (matches ci.yml/mutants.yml/release.yml).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
 
       # SHA-pinned: dtolnay/rust-toolchain, same nightly pin as ci.yml/mutants.yml
@@ -143,9 +151,11 @@ jobs:
       # loud, not to block on it.
       - name: Report crates.io drift (all intended crates, non-fatal)
         if: always()
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -u
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${RELEASE_TAG#v}"
           for crate in \
             leyline-chat-embed leyline-core leyline-ffi-helpers leyline-hdc \
             leyline-mcp-descriptor leyline-schema leyline-schema-bridge \

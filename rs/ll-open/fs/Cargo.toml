@@ -1,6 +1,6 @@
 [package]
 name = "leyline-fs"
-version = "0.20.5"
+version = "0.21.0"
 edition = "2024"
 description = "SQLite-backed content-addressed graph for ley-line — the nodes-table graph and its arena hot-swap, chunk-backed (CDC) range reads, and transactional GC"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -35,10 +35,10 @@ verify = []
 
 [dependencies]
 parking_lot = { workspace = true }
-leyline-core = { path = "../../ll-core/core", version = "0.20.5" }
+leyline-core = { path = "../../ll-core/core", version = "0.21.0" }
 # Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2).
-leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers", version = "0.20.5" }
-leyline-schema = { path = "../../ll-core/schema", version = "0.20.5" }
+leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers", version = "0.21.0" }
+leyline-schema = { path = "../../ll-core/schema", version = "0.21.0" }
 anyhow = { workspace = true }
 memmap2 = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
@@ -57,7 +57,7 @@ tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-elixir = { version = "0.3.5", optional = true }
-leyline-cdc = { path = "../cdc", version = "0.20.5", optional = true }
+leyline-cdc = { path = "../cdc", version = "0.21.0", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

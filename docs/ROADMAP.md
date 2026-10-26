@@ -147,4 +147,4 @@ an ordinary repository to git, CI, review, editors and build tools.
 | #478 | A proposal costs one coalesced publish, not O(store); arena growth fails closed | `8c8ded` |
 | #479 | A host NFS save agrees with every read it may have been made from | `4a8953` |
 | #480 | The guest-listener probe is event-driven | `bbfa52` |
-| this PR | Derived paths (build output, tool state, macOS metadata) live in per-run scratch, never in the store | `39998b`, `8d6a8a` |
+| #483 | Derived paths (build output, tool state, macOS metadata) live in per-run scratch, never in the store | `39998b`, `8d6a8a` |

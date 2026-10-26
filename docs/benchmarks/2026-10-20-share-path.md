@@ -136,3 +136,46 @@ remainder is four `F_FULLFSYNC` calls per accepted proposal (4.65 ms each on
 this disk against 0.03 ms for a plain `fsync`); they carry the proposal's
 power-loss durability, and replacing them with barriers and one flush is bead
 `ley-line-open-98d0c3`.
+
+## After bead `ley-line-open-98d0c3` (2026-10-26)
+
+A proposal's one full flush is its `live.db` commit (`fullfsync`); the
+checkout file, its directory, the Σ head and its directory are ordered with
+`F_BARRIERFSYNC` instead of flushed, and the checkout index commits once
+without a sync (ADR-0041 amendment 2026-10-23).
+
+**The primitives on this disk** (Python `fcntl`, 200 calls each, a 14-byte
+file, two passes): `fsync` 0.055-0.099 ms median, `F_BARRIERFSYNC`
+0.50-0.65 ms, `F_FULLFSYNC` 3.96-4.56 ms. Four full flushes and a plain
+commit (~18.8 ms) became one full flush and four barriers (~7 ms).
+
+**One proposal and its checkout write, in process** (no VM, no socket;
+`cmd_daemon` test `bench_one_proposal_and_its_checkout_write`, the daemon's
+`live.db` configuration, 2,000 files, 100 one-file proposals, release,
+integration @ ac742873 vs this branch, interleaved):
+
+| round | before (median) | after (median) |
+|---|---:|---:|
+| 1 | 41.71 ms | 21.48 ms |
+| 2 | 29.16 ms | 17.93 ms |
+
+**`storm_per_file` in the guest** (`share_bench`, release, 2,000 files, a
+200-file storm, APFS and the libkrun guest only, before and after
+interleaved; one-minute load average at the start of each run where
+recorded):
+
+| round | load (before / after) | before | after |
+|---|---|---:|---:|
+| 1 | — | 78.5 ms | 22.1 ms |
+| 2 | — | 42.0 ms | 170.5 ms |
+| 3 | 12.1 / 23.2 | 193.5 ms | 110.3 ms |
+| 4 | 8.9 / 6.0 | 33.1 ms | 17.1 ms |
+| 5 | 5.0 / 6.4 | 36.1 ms | 17.3 ms |
+
+Median of the five rounds: 42.0 ms before, 22.1 ms after. On the two rounds
+run with the machine otherwise quiet (4 and 5) the write halved, 33-36 ms to
+17 ms. Under load both trees vary by up to 10× between rounds (round 2's
+170.5 ms after and round 3's 193.5 ms before), because `F_FULLFSYNC` flushes
+the whole drive cache, including whatever else is writing; the coalesced
+publisher's whole-image write is one such writer. S2's immutable snapshot
+files, which shrink a publish to the changed pages, address that.

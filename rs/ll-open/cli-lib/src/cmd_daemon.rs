@@ -893,9 +893,14 @@ pub fn live_db_path_for(ctrl_path: &Path) -> std::path::PathBuf {
 ///   run's write live (ADR-0040), and the mount acknowledges a write at
 ///   the client's fsync or NFS COMMIT; under `NORMAL` that write
 ///   survived a process crash but not a power loss or OS crash (bead
-///   `ley-line-open-0a9931`). The guarantee is `fsync(2)`'s: on macOS
-///   that reaches the drive, not past its cache (`F_FULLFSYNC`, SQLite's
-///   `fullfsync`, is not set).
+///   `ley-line-open-0a9931`).
+/// - `fullfsync = ON`, `checkpoint_fullfsync = ON` — on macOS the commit's
+///   sync is `F_FULLFSYNC`, which reaches past the drive's cache; plain
+///   `fsync(2)` there stops at the drive. This commit is a proposal's
+///   acknowledgement: its one full flush. The checkout and the Σ head it
+///   writes after are ordered with `F_BARRIERFSYNC`, not flushed
+///   (`crate::durable`, bead `ley-line-open-98d0c3`). Elsewhere SQLite
+///   ignores both.
 /// - `wal_autocheckpoint = 1000` — checkpoint every ~1000 pages
 ///   (~4 MiB at default 4KB page size). Keeps the WAL from
 ///   growing unbounded on a write-heavy daemon; ensures the
@@ -914,6 +919,10 @@ fn configure_wal(conn: &rusqlite::Connection) -> Result<()> {
     }
     conn.pragma_update(None, "synchronous", "FULL")
         .context("set PRAGMA synchronous=FULL")?;
+    conn.pragma_update(None, "fullfsync", true)
+        .context("set PRAGMA fullfsync=ON")?;
+    conn.pragma_update(None, "checkpoint_fullfsync", true)
+        .context("set PRAGMA checkpoint_fullfsync=ON")?;
     conn.pragma_update(None, "wal_autocheckpoint", 1000i64)
         .context("set PRAGMA wal_autocheckpoint=1000")?;
     Ok(())
@@ -2492,6 +2501,61 @@ mod tests {
         );
     }
 
+    /// Bead `ley-line-open-98d0c3`: the cost of one accepted proposal and
+    /// its write-through to the checkout, on the daemon's `live.db`
+    /// configuration, without a VM or a socket in the way. Prints the
+    /// median and mean over `LEYLINE_BENCH_PROPOSALS` (default 100) one-file
+    /// proposals into a `LEYLINE_BENCH_FILES` (default 2,000) file tree.
+    #[test]
+    #[ignore = "a benchmark: run with --ignored --nocapture"]
+    fn bench_one_proposal_and_its_checkout_write() {
+        use crate::source_write::{Base, Grant, Proposed, propose};
+        let files: usize = std::env::var("LEYLINE_BENCH_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
+        let proposals: usize = std::env::var("LEYLINE_BENCH_PROPOSALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        for i in 0..files {
+            let path = src.join(format!("d{}/f{i}.go", i % 50));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!("package d\n\nfunc F{i}() int {{ return {i} }}\n"),
+            )
+            .unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("bench.live.db")).unwrap();
+        configure_wal(&conn).unwrap();
+        crate::checkout::reconcile(&conn, &src, None, None).unwrap();
+        let mut took = Vec::with_capacity(proposals);
+        for n in 0..proposals {
+            let rel = format!("d{}/f{n}.go", n % 50);
+            let bytes = format!("package d\n\nfunc F{n}() int {{ return -{n} }}\n").into_bytes();
+            let start = std::time::Instant::now();
+            propose(
+                &conn,
+                &Grant::Whole,
+                vec![Proposed::write(&rel, Base::Any, bytes)],
+            )
+            .unwrap();
+            let r = crate::checkout::reconcile(&conn, &src, None, Some(&[rel])).unwrap();
+            took.push(start.elapsed());
+            assert_eq!(r.materialized.len(), 1);
+        }
+        took.sort();
+        let mean = took.iter().sum::<std::time::Duration>() / took.len() as u32;
+        println!(
+            "proposal+checkout over {files} files, {proposals} proposals: median {:.2} ms, mean {:.2} ms",
+            took[took.len() / 2].as_secs_f64() * 1e3,
+            mean.as_secs_f64() * 1e3
+        );
+    }
+
     #[test]
     fn configure_wal_activates_wal_on_file_backed_connection() {
         // The 15a load-bearing check: PRAGMA journal_mode=WAL must
@@ -2514,6 +2578,14 @@ mod tests {
         // at fsync or NFS COMMIT is on disk, not only in the page cache
         // (bead ley-line-open-0a9931).
         assert_eq!(synchronous, 2, "synchronous must be FULL (=2)");
+        // The commit is a proposal's acknowledgement and its one full
+        // flush: F_FULLFSYNC on macOS (bead ley-line-open-98d0c3).
+        for pragma in ["fullfsync", "checkpoint_fullfsync"] {
+            let on: i64 = conn
+                .query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(on, 1, "{pragma} must be ON");
+        }
         let autocheckpoint: i64 = conn
             .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
             .unwrap();

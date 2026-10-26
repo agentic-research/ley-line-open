@@ -33,16 +33,19 @@
 //! new in the directory: it is ingested.
 //!
 //! **Ordering.** A proposal commits to the store and leaves the index alone;
-//! then each deleted file or symlink is removed (unlink, then `fsync` of
-//! its directory) and each removed directory (`rmdir`, deepest first; its
-//! directories above stay, ADR-0045 T1), then each directory made and each
-//! written file materialized (a temp file in the same directory with the
-//! entry's permissions, or a staged symlink, then `rename` and `fsync` of
-//! the directory); then its index entry advances. A crash after the commit leaves directory == index while
+//! then each deleted file or symlink is removed (unlink, then its directory
+//! ordered to the disk) and each removed directory (`rmdir`, deepest first;
+//! its directories above stay, ADR-0045 T1), then each directory made and
+//! each written file materialized (a temp file in the same directory with
+//! the entry's permissions, its bytes ordered to the disk, or a staged
+//! symlink, then `rename` and the directory ordered); then the index entries
+//! advance, in one transaction (`crate::durable`, ADR-0041 amendment
+//! 2026-10-23). A crash after the commit leaves directory == index while
 //! the store moved, which the next [`reconcile`] carries out. A crash after
 //! the rename or the unlink leaves directory == store while the index lags,
-//! which converges. No ordering of crashes loses an accepted proposal or a
-//! person's edit.
+//! which converges. The ordering keeps a power loss to those two states: an
+//! index row never reaches the disk ahead of the rename it records. No
+//! ordering of crashes loses an accepted proposal or a person's edit.
 //!
 //! Startup, the watcher, `reparse` over the checkout and every accepted
 //! proposal run [`reconcile`]. A daemon without a source directory has no
@@ -363,7 +366,11 @@ pub fn reconcile(
     // and so a proposal that turns a file into a directory of files lands
     // in the directory too. A path the store deleted is kept out of the
     // parse whether or not it could be removed.
+    //
+    // Each index entry advances after its file's rename or removal is
+    // ordered to the disk, in the one transaction below (`crate::durable`).
     let mut materialized = Vec::new();
+    let mut advanced: Vec<(String, Option<Entry>)> = Vec::new();
     let mut removed = Vec::new();
     let mut unmaterialized = Vec::new();
     let mut kept_out = BTreeSet::new();
@@ -371,7 +378,7 @@ pub fn reconcile(
     for rel in remove.into_iter().rev() {
         match remove_from(dir, &rel) {
             Ok(()) => {
-                set_index(conn, &rel, None)?;
+                advanced.push((rel.clone(), None));
                 removed.push(rel);
             }
             Err(e) => {
@@ -385,7 +392,7 @@ pub fn reconcile(
     for (rel, held) in materialize {
         match materialize_entry(conn, dir, &rel, held) {
             Ok(()) => {
-                set_index(conn, &rel, Some(held))?;
+                advanced.push((rel.clone(), Some(held)));
                 materialized.push(rel);
             }
             Err(e) => {
@@ -431,42 +438,50 @@ pub fn reconcile(
         Some(_) => None,
     };
 
-    let tx = conn.unchecked_transaction()?;
-    // An ingested path's index is what the parse stored from the directory.
-    for rel in &ingest {
-        let now = if crate::tree::exists(conn) {
-            crate::tree::entry(conn, rel)?
-        } else {
-            None
-        };
-        set_index(conn, rel, now)?;
-    }
-    for (rel, held) in &converge {
-        set_index(conn, rel, *held)?;
-    }
-    match scope {
-        None => {
-            conn.execute("DELETE FROM _checkout_conflict", [])?;
+    // The index and the conflict table record what the store's durable rows
+    // and the directory already hold: a lost commit here leaves the index
+    // behind, which the next reconcile converges. So this commit does not
+    // flush (`crate::durable::commit_unsynced`).
+    crate::durable::commit_unsynced(conn, || {
+        for (rel, entry) in &advanced {
+            set_index(conn, rel, *entry)?;
         }
-        Some(_) => {
-            for rel in &paths {
-                conn.execute("DELETE FROM _checkout_conflict WHERE path = ?1", [rel])?;
+        // An ingested path's index is what the parse stored from the directory.
+        for rel in &ingest {
+            let now = if crate::tree::exists(conn) {
+                crate::tree::entry(conn, rel)?
+            } else {
+                None
+            };
+            set_index(conn, rel, now)?;
+        }
+        for (rel, held) in &converge {
+            set_index(conn, rel, *held)?;
+        }
+        match scope {
+            None => {
+                conn.execute("DELETE FROM _checkout_conflict", [])?;
+            }
+            Some(_) => {
+                for rel in &paths {
+                    conn.execute("DELETE FROM _checkout_conflict WHERE path = ?1", [rel])?;
+                }
             }
         }
-    }
-    for c in &conflicts {
-        conn.execute(
-            "INSERT INTO _checkout_conflict (path, disk_hash, stored_hash, index_hash) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                c.path,
-                c.disk.map(index_blob),
-                c.stored.map(index_blob),
-                c.index.map(index_blob),
-            ],
-        )?;
-    }
-    tx.commit()?;
+        for c in &conflicts {
+            conn.execute(
+                "INSERT INTO _checkout_conflict (path, disk_hash, stored_hash, index_hash) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    c.path,
+                    c.disk.map(index_blob),
+                    c.stored.map(index_blob),
+                    c.index.map(index_blob),
+                ],
+            )?;
+        }
+        Ok(())
+    })?;
 
     Ok(Reconciled {
         parse,
@@ -478,9 +493,10 @@ pub fn reconcile(
     })
 }
 
-/// Write `bytes` as the file `rel` names under `dir`: staged beside it,
-/// synced, renamed over it, and the directory synced, so a crash leaves the
-/// old file or the new one. The file keeps its permissions. Refused when
+/// Write `bytes` as the file `rel` names under `dir`: staged beside it, its
+/// bytes ordered to the disk, renamed over it, and the directory ordered
+/// (`crate::durable`), so a crash or a power loss leaves the old file or the
+/// whole new one. The file keeps its permissions. Refused when
 /// `rel` is not a plain relative path or its directory resolves outside
 /// `dir` (a symlink out of the tree).
 pub fn write_into(dir: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
@@ -519,10 +535,12 @@ fn write_file(dir: &Path, rel: &str, bytes: &[u8], mode: Option<Mode>) -> Result
             }
         }
         file.set_permissions(permissions)?;
-        file.sync_all()?;
-        std::fs::rename(&staging, &target)
+        // The bytes before the rename, the rename before the index row
+        // (`crate::durable`).
+        crate::durable::order(&file, &staging)?;
+        crate::durable::rename(&staging, &target)
             .with_context(|| format!("rename {} over {}", staging.display(), target.display()))?;
-        std::fs::File::open(&parent)?.sync_all()?;
+        crate::durable::order_dir(&parent)?;
         Ok(())
     })();
     if written.is_err() {
@@ -560,7 +578,7 @@ pub fn make_dir(dir: &Path, rel: &str) -> Result<()> {
         );
     }
     if let Some(parent) = target.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
+        crate::durable::order_dir(parent)?;
     }
     Ok(())
 }
@@ -585,9 +603,9 @@ pub fn link_into(dir: &Path, rel: &str, target: &[u8]) -> Result<()> {
             let _ = target;
             bail!("symlinks are materialized on unix only");
         }
-        std::fs::rename(&staging, &path)
+        crate::durable::rename(&staging, &path)
             .with_context(|| format!("rename {} over {}", staging.display(), path.display()))?;
-        std::fs::File::open(&parent)?.sync_all()?;
+        crate::durable::order_dir(&parent)?;
         Ok(())
     })();
     if linked.is_err() {
@@ -638,8 +656,9 @@ fn existing_parent(dir: &Path, rel: &str, path: &Path, verb: &str) -> Result<Pat
 }
 
 /// Remove the entry `rel` names under `dir` — a file, a symlink, or an
-/// empty directory — and sync its directory, so the removal survives a
-/// crash. The directories above it stay (ADR-0045 T1). Refused when `rel`
+/// empty directory — and order its directory to the disk, so the removal
+/// lands before the index row that drops it (`crate::durable`). The
+/// directories above it stay (ADR-0045 T1). Refused when `rel`
 /// is not a plain relative path or its directory resolves outside `dir` (a
 /// symlink out of the tree).
 pub fn remove_from(dir: &Path, rel: &str) -> Result<()> {
@@ -670,7 +689,7 @@ pub fn remove_from(dir: &Path, rel: &str) -> Result<()> {
         } else {
             std::fs::remove_file(&target)?;
         }
-        std::fs::File::open(parent)?.sync_all()?;
+        crate::durable::order_dir(parent)?;
         Ok(())
     })();
     removed.with_context(|| format!("remove '{rel}' from {}", dir.display()))
@@ -1153,6 +1172,97 @@ mod tests {
         assert!(r.materialized.is_empty() && r.conflicts.is_empty());
         assert!(r.parse.is_none());
         assert_eq!(indexed(&c, "a.go"), Some(h(A2)));
+    }
+
+    /// Bead `ley-line-open-98d0c3`: a materialized file's bytes are ordered
+    /// before its rename, the rename before the index row that records it,
+    /// and the index commits once, after every file, without a flush of its
+    /// own. Nothing on this path flushes the drive: the proposal's commit
+    /// already did.
+    #[test]
+    fn a_materialized_file_is_ordered_before_its_rename_and_its_index_row() {
+        use crate::durable::{Event, take_events};
+        let c = checkout(&[("a.go", A), ("b.go", B)]);
+        commit_only(&c, "a.go", A2);
+        commit_only(&c, "b.go", B2);
+        take_events();
+        let r = reconcile(&c.conn, &c.src, None, Some(&scope(&["a.go", "b.go"]))).unwrap();
+        assert_eq!(r.materialized, ["a.go", "b.go"]);
+        let a = c.src.join("a.go");
+        let b = c.src.join("b.go");
+        assert_eq!(
+            take_events(),
+            [
+                Event::Order(staging_path(&a)),
+                Event::Rename(a),
+                Event::Order(c.src.clone()),
+                Event::Order(staging_path(&b)),
+                Event::Rename(b),
+                Event::Order(c.src.clone()),
+                Event::Commit,
+            ]
+        );
+        assert_eq!(indexed(&c, "a.go"), Some(h(A2)));
+        assert_eq!(indexed(&c, "b.go"), Some(h(B2)));
+        let level: i64 = c
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        let before: i64 = {
+            let fresh = Connection::open_in_memory().unwrap();
+            fresh
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(level, before, "the connection's level is restored");
+    }
+
+    /// A removal is ordered before the index row that drops it.
+    #[test]
+    fn a_removal_is_ordered_before_its_index_row() {
+        use crate::durable::{Event, take_events};
+        let c = checkout(&[("a.go", A), ("b.go", B)]);
+        propose(
+            &c.conn,
+            &Grant::Whole,
+            vec![Proposed::delete("b.go", Base::Any)],
+        )
+        .unwrap();
+        take_events();
+        let r = reconcile(&c.conn, &c.src, None, Some(&scope(&["b.go"]))).unwrap();
+        assert_eq!(r.removed, ["b.go"]);
+        assert_eq!(take_events(), [Event::Order(c.src.clone()), Event::Commit]);
+        assert_eq!(indexed(&c, "b.go"), None);
+    }
+
+    /// Why the index row must not be durable before the rename: an index
+    /// that names the store's bytes over a directory that lost them reads as
+    /// a person's edit, and reconcile ingests the old bytes, undoing the
+    /// proposal. The ordering in [`write_file`] makes this state unreachable
+    /// after a power loss; this test pins what it would cost.
+    #[test]
+    fn an_index_row_landed_ahead_of_its_rename_reads_as_an_edit() {
+        let c = checkout(&[("a.go", A)]);
+        commit_only(&c, "a.go", A2);
+        // The rename was lost; the index row was not.
+        set_index(&c.conn, "a.go", Some(file(A2))).unwrap();
+        assert_eq!(disk(&c, "a.go").as_deref(), Some(A));
+        reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert_eq!(stored(&c, "a.go"), Some(h(A)), "the proposal is undone");
+    }
+
+    /// A crash after the proposal's commit and before the file reached the
+    /// directory: the directory still matches the index, the store moved,
+    /// and the next reconcile writes the accepted bytes.
+    #[test]
+    fn a_crash_before_the_write_materializes_the_accepted_bytes_at_restart() {
+        let c = checkout(&[("a.go", A)]);
+        commit_only(&c, "a.go", A2);
+        let restarted = Connection::open(c.src.parent().unwrap().join("live.db")).unwrap();
+        let r = reconcile(&restarted, &c.src, None, None).unwrap();
+        assert_eq!(r.materialized, ["a.go"]);
+        assert_eq!(disk(&c, "a.go").as_deref(), Some(A2));
+        assert_eq!(stored(&c, "a.go"), Some(h(A2)));
     }
 
     #[test]

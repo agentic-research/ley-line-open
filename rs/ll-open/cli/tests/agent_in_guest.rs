@@ -38,6 +38,10 @@
 //! - (p) a README edit, a file in no projected language, `chmod +x`, a
 //!   symlink, an empty directory and a directory rename persist in the
 //!   store and the checkout (ADR-0045 T1, T4);
+//! - (o) build output (300 files under `target/debug/`, a rename there, a
+//!   `node_modules/` package) is written and read back in the run's
+//!   scratch, reaches neither the store nor the checkout, and the scratch is
+//!   gone when the run ends (ADR-0045 T9);
 //! - (h) the daemon is killed with SIGKILL and restarted: the accepted
 //!   guest edits persist in the store and the checkout.
 //!
@@ -68,7 +72,7 @@ mod hypervisor;
 #[path = "agent_in_guest/seed.rs"]
 mod seed;
 
-use guest_harness::{Daemon, Host, STEP, call, git_dir_of, propose, stored};
+use guest_harness::{Daemon, Host, STEP, call, git_dir_of, propose, read_source, stored};
 
 const GUEST: &str = include_str!("agent_in_guest/guest.rs");
 const SEED: &str = include_str!("agent_in_guest/seed.rs");
@@ -86,6 +90,22 @@ fn diagnostic(host: &Host, path: &str) -> Option<(bool, String)> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
     .ok()
+}
+
+/// (o): the scratch directories of the daemon's runs, under its `TMPDIR`.
+fn scratch_dirs(host: &Host) -> Vec<std::path::PathBuf> {
+    fs::read_dir(host.path("tmp"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("leyline-scratch-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// (p) and (h): the mode, the symlink and the directories the guest made,
@@ -330,12 +350,49 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
     check_tree(&host, &daemon, &mut results, "p");
     go(&daemon, 'p');
 
+    // (o) build output stayed in the run's scratch.
+    await_guest(&host, &daemon, &run_id, 'o');
+    for path in [
+        "target",
+        "target/debug/first.o",
+        "node_modules",
+        "node_modules/left-pad/index.js",
+    ] {
+        results.check(
+            "o",
+            read_source(&daemon.sock, path).is_none() && !host.checkout.join(path).exists(),
+            format!("{path} is in neither the store nor the checkout"),
+        );
+    }
+    let scratch: Vec<_> = scratch_dirs(&host);
+    results.check(
+        "o",
+        scratch.len() == 1 && scratch[0].join("target/debug/first.o").is_file(),
+        format!("the run's build output is in its scratch: {scratch:?}"),
+    );
+    go(&daemon, 'o');
+
     await_guest(&host, &daemon, &run_id, 'z');
     let terminal = host.await_end(&daemon, "run", &run_id, STEP);
     results.check(
         "run",
         terminal.to_string().contains("succeeded"),
         format!("the execution/v1 run ended: {terminal}"),
+    );
+    // The share's serving thread drops the run's filesystem, and with it
+    // the scratch, when it reads the worker's end of stream, which can
+    // follow the run's terminal state. Poll the condition; a daemon round
+    // trip paces the probe.
+    let deadline = Instant::now() + STEP;
+    let mut scratch = scratch_dirs(&host);
+    while !scratch.is_empty() && Instant::now() < deadline {
+        call(&daemon.sock, json!({"op": "status"}));
+        scratch = scratch_dirs(&host);
+    }
+    results.check(
+        "o",
+        scratch.is_empty(),
+        format!("the run's scratch is gone after it ends: {scratch:?}"),
     );
     let report = stored(&daemon.sock, seed::REPORT).unwrap_or_default();
     results.check(
@@ -377,7 +434,7 @@ fn an_agent_in_a_microvm_works_through_the_store_backed_filesystem() {
     let mut lines: Vec<String> = report.lines().map(str::to_owned).collect();
     lines.extend(results.0);
     eprintln!("agent-in-guest results:\n{}", lines.join("\n"));
-    let scenarios = ["a", "b", "c", "C", "d", "e", "f", "g", "m", "p", "h"];
+    let scenarios = ["a", "b", "c", "C", "d", "e", "f", "g", "m", "p", "o", "h"];
     for scenario in scenarios {
         assert!(
             lines

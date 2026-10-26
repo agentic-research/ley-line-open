@@ -12,6 +12,23 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: build output and tool state are never proposals** (bead
+  `ley-line-open-39998b`, ADR-0045 T9). In a guest run's share and on the
+  host mount, a path the store does not hold is derived when a directory
+  component is `target`, `node_modules`, `__pycache__`, `__pypackages__`,
+  `venv`, `.venv` or `.git`, when it is a macOS metadata file (`._*`,
+  `.DS_Store`, bead `8d6a8a`), when a `.gitignore` rule matches it, or when
+  its parent is derived. Derived paths live in a scratch directory per run
+  (per mount session) outside the store, its tree root and the checkout,
+  and are removed with it; a path the store holds stays a proposal. A
+  `cargo build` in the guest no longer lands its artifacts in the store:
+  300 build files took 3.9 ms each through the share, where an accepted
+  proposal takes ~47 ms. Scratch is limited (`ENOSPC` past 16 GiB),
+  confined (`openat` with `O_NOFOLLOW` beneath its root), and carries no
+  durability. A directory renamed between a derived and an authored path is
+  `EXDEV`. `storefs::Options` gains `derived`; `leyline-storefs` takes
+  `ignore` and an unconditional `libc` dependency.
+
 - **A proposal issues one full flush: its `live.db` commit** (bead
   `ley-line-open-98d0c3`, ADR-0041 amendment 2026-10-23). The daemon's
   `live.db` connection sets `fullfsync` and `checkpoint_fullfsync`, so on

@@ -25,6 +25,11 @@ anyhow = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
+# Derived paths (ADR-0045 T9): `.gitignore` rules, matched as the parse
+# walk's `ignore` crate matches them, and scratch access through `openat`
+# with `O_NOFOLLOW` beneath the scratch root.
+ignore = "0.4"
+libc = { workspace = true }
 # The host mount (`host`, bead `ley-line-open-3e73dc`): this filesystem
 # behind the host's FUSE client and a loopback NFSv3 server.
 #
@@ -39,12 +44,11 @@ fuser = { version = "0.16", optional = true, features = ["libfuse"] }
 # was read before it was taken; a new version gets the same reading.
 nfsserve = { package = "nessie-nfsserve", version = "=0.3.1", optional = true }
 async-trait = { version = "0.1", optional = true }
-libc = { workspace = true, optional = true }
 # `time` + `macros`: the NFS server's idle committer.
 tokio = { workspace = true, optional = true, features = ["net", "time", "macros", "rt"] }
 
 [features]
-mount = ["dep:fuser", "dep:nfsserve", "dep:async-trait", "dep:libc", "dep:tokio"]
+mount = ["dep:fuser", "dep:nfsserve", "dep:async-trait", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

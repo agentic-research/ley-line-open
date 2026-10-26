@@ -137,6 +137,37 @@ this disk against 0.03 ms for a plain `fsync`); they carry the proposal's
 power-loss durability, and replacing them with barriers and one flush is bead
 `ley-line-open-98d0c3`.
 
+## Derived paths (bead `ley-line-open-39998b`, 2026-10-23)
+
+ADR-0045 T9 keeps build output out of the store: a path under `target/`,
+`node_modules/` and the like is a scratch file, not a proposal. The benchmark
+gained `derived_storm`: 2,000 create, write, close under `target/bench-storm/`
+(on APFS, the same files in a plain directory). Release build, macOS 27.0.1,
+Apple M3 Max (Mac15,11), 2,001 files, one run, with other builds on the
+machine (load average ~33): `storm_per_file` measured 56.6 ms here against
+47.1 ms above, so every guest figure in this run is inflated by the load.
+
+| measurement | guest (share) | APFS |
+|---|---:|---:|
+| `open_read_close` | 246.9 µs/op | 47.4 µs/op |
+| `lookup_miss` | 130.4 µs/op | 12.0 µs/op |
+| `git_status_cold` | 2,216.8 ms | 654.3 ms |
+| `git_status_warm_min` | 195.2 ms | 75.4 ms |
+| `rg_first` | 394.6 ms | 115.2 ms |
+| `rg_warm_min` | 266.5 ms | 108.8 ms |
+| `storm_total` | 11,319.5 ms | 62.4 ms |
+| `storm_per_file` (authored: one proposal per file) | 56.6 ms | 0.31 ms |
+| `derived_storm_total` | 14,117.0 ms | 818.1 ms |
+| `derived_storm_per_file` (scratch, no proposal) | **7.06 ms** | 0.41 ms |
+
+A derived file costs an eighth of an authored one in the same run. In-process,
+the same create, write, flush and release on a `StoreFs` with derived paths
+(release build, 2,000 files, a lookup and a getattr per file) takes 0.9 ms, so
+most of the 7.06 ms is the share's round trips: each FUSE request crosses
+worker -> socket -> daemon (120-280 µs each). The agent-in-guest scenario (o)
+wrote 300 build files at 3.9 ms each. Reaching APFS speed takes scratch inside
+the guest (a guest-local overlay), which ADR-0045 T9 names and leaves out.
+
 ## After bead `ley-line-open-98d0c3` (2026-10-26)
 
 A proposal's one full flush is its `live.db` commit (`fullfsync`); the

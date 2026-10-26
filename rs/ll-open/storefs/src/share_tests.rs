@@ -28,6 +28,7 @@ fn share(f: &Fixture) -> StoreShare<Arc<LiveDb>> {
         Options {
             freshness: freshness(),
             checkout: None,
+            derived: None,
         },
     )
 }
@@ -181,6 +182,7 @@ fn a_zero_negative_timeout_answers_enoent_and_other_errors_pass_through() {
                 window: Duration::ZERO,
             },
             checkout: None,
+            derived: None,
         },
     );
     assert_eq!(
@@ -383,6 +385,7 @@ fn an_edit_lands_through_write_and_flush_and_a_stale_or_broken_one_does_not() {
                 dir: f.src.path().to_path_buf(),
                 lang_filter: None,
             }),
+            derived: None,
         },
     );
     let a = entry_of(lookup(&s, ROOT_INODE, "a.go")).inode;

@@ -171,4 +171,26 @@ exclude_re = [
     # result and are killed by `host_open_flags_reach_the_filesystem_in_linux_values`
     # and `macos_rename_flags_reach_the_filesystem_in_linux_values`.
     'fuse_abi\.rs.*replace (\| with \^|\|= with \^=) in (linux_open_flags|macos_rename_flags)',
+
+    # The scratch directory's open flags (storefs `derived.rs` and the
+    # scratch paths of `lib.rs`, bead `ley-line-open-39998b`), each `|`
+    # mutated to `^`.
+    #
+    # The `observe_exit` case again, with the disjointness stated in the
+    # code. `openat_mode` ors the caller's flags with `O_NOFOLLOW` and
+    # `O_CLOEXEC`, and `open_path` with `O_CLOEXEC`; each `debug_assert`s
+    # that the caller's flags carry neither, and no caller passes them.
+    # `rename_into_scratch` opens with `O_WRONLY | O_CREAT | O_EXCL` and
+    # `open_scratch` adds `O_CREAT | O_EXCL` to an access mode of `O_RDWR`
+    # or `O_RDONLY`: distinct single-bit flags (and a two-bit access mode)
+    # with no bit in common. For operands with no bits in common `a | b`
+    # and `a ^ b` are the same integer, so the mutated program passes the
+    # same flags to the same syscalls.
+    #
+    # The sibling `| -> &` mutations change the flags and are killed:
+    # `a_symlink_is_never_followed_at_the_last_component_or_on_the_way`
+    # (`O_NOFOLLOW`), `the_root_and_every_opened_file_are_close_on_exec`
+    # (`O_CLOEXEC`), and the create tests (`O_CREAT`).
+    'derived\.rs.*replace \| with \^ in (openat_mode|open_path)',
+    'storefs/src/lib\.rs.*replace \| with \^ in StoreFs<S>::(rename_into_scratch|open_scratch)',
 ]

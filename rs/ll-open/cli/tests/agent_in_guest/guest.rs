@@ -465,6 +465,56 @@ fn main() {
     signal('p');
     wait('p');
 
+    // (o) Build output is never a proposal (ADR-0045 T9): files under
+    // target/ and node_modules/ are written, renamed and read back in the
+    // run's scratch, and reach neither the store nor the checkout.
+    let started = std::time::Instant::now();
+    let built = fs::create_dir_all("target/debug")
+        .map_err(|e| format!("mkdir -p target/debug: errno={}", errno_of(&e)))
+        .and_then(|()| {
+            (0..seed::OUTPUT_FILES).try_for_each(|i| {
+                fs::write(format!("target/debug/obj-{i}.o"), seed::output(i))
+                    .map_err(|e| format!("write target/debug/obj-{i}.o: errno={}", errno_of(&e)))
+            })
+        })
+        .and_then(|()| {
+            fs::rename("target/debug/obj-0.o", "target/debug/first.o")
+                .map_err(|e| format!("rename(2) obj-0.o -> first.o: errno={}", errno_of(&e)))
+        })
+        .and_then(|()| {
+            fs::create_dir_all("node_modules/left-pad")
+                .map_err(|e| format!("mkdir -p node_modules/left-pad: errno={}", errno_of(&e)))
+        })
+        .and_then(|()| save("node_modules/left-pad/index.js", seed::LEFT_PAD));
+    let elapsed = started.elapsed();
+    match built {
+        Ok(()) => {
+            let listed = fs::read_dir("target/debug").map(|d| d.count());
+            let first = fs::read("target/debug/first.o");
+            let last = fs::read(format!("target/debug/obj-{}.o", seed::OUTPUT_FILES - 1));
+            let module = read("node_modules/left-pad/index.js");
+            r.check(
+                "o",
+                listed.as_ref().ok() == Some(&seed::OUTPUT_FILES)
+                    && first.as_deref().ok() == Some(seed::output(0).as_slice())
+                    && last.as_deref().ok()
+                        == Some(seed::output(seed::OUTPUT_FILES - 1).as_slice())
+                    && module.as_deref() == Ok(seed::LEFT_PAD),
+                format!(
+                    "{} files under target/debug ({listed:?} listed), a rename and \
+                     node_modules/left-pad/index.js read back; written in {:.1} ms \
+                     ({:.3} ms per file)",
+                    seed::OUTPUT_FILES,
+                    elapsed.as_secs_f64() * 1e3,
+                    elapsed.as_secs_f64() * 1e3 / seed::OUTPUT_FILES as f64
+                ),
+            );
+        }
+        Err(error) => r.fail("o", error),
+    }
+    signal('o');
+    wait('o');
+
     let text = format!("{}\n", r.0.join("\n"));
     if let Err(error) = save(seed::REPORT, &text) {
         println!("FAIL report: {error}");

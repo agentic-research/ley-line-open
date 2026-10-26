@@ -67,14 +67,20 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 
 pub mod daemon;
+mod derived;
 #[cfg(feature = "mount")]
 pub mod host;
 pub mod share;
 pub use daemon::{DaemonShares, scope_for};
+pub use derived::{DEFAULT_LIMIT as DEFAULT_SCRATCH_LIMIT, Derived};
 pub use share::StoreShare;
+
+use derived::{Scratch, ScratchHandle, ScratchStat, builtin_derived, errno_of};
 
 #[cfg(test)]
 mod daemon_tests;
+#[cfg(test)]
+mod derived_tests;
 #[cfg(test)]
 mod share_tests;
 #[cfg(test)]
@@ -97,8 +103,11 @@ impl Errno {
     pub const ENOTDIR: Errno = Errno(20);
     pub const EISDIR: Errno = Errno(21);
     pub const EINVAL: Errno = Errno(22);
+    pub const ENOSPC: Errno = Errno(28);
+    pub const ENAMETOOLONG: Errno = Errno(36);
     pub const ENOSYS: Errno = Errno(38);
     pub const ENOTEMPTY: Errno = Errno(39);
+    pub const ELOOP: Errno = Errno(40);
     pub const ESTALE: Errno = Errno(116);
 }
 
@@ -192,6 +201,9 @@ pub struct Options {
     /// Where accepted proposals are materialized; `None` lands them in the
     /// store only.
     pub checkout: Option<Checkout>,
+    /// Where derived paths live (ADR-0045 T9); `None` makes every path a
+    /// proposal.
+    pub derived: Option<Derived>,
 }
 
 /// Time for [`Freshness`] and file times: the time since a fixed origin,
@@ -530,6 +542,20 @@ pub struct StoreFs<S> {
     session: Mutex<Session>,
     /// Never held across a store call.
     served: Mutex<Served>,
+    /// The scratch directory derived paths live in (ADR-0045 T9), made on
+    /// the first derived write and removed with this filesystem.
+    scratch: Mutex<Option<Arc<Scratch>>>,
+    scratch_handles: Mutex<HashMap<u64, Arc<Mutex<ScratchHandle>>>>,
+    /// Per directory, its `.gitignore` rules, or `None` when it has none.
+    ignores: Mutex<HashMap<String, Option<Arc<ignore::gitignore::Gitignore>>>>,
+}
+
+/// Where a path is: the store (or this session's pending files), the
+/// scratch directory, or nowhere.
+enum Located {
+    Stored(Stat),
+    Scratch(ScratchStat),
+    Absent,
 }
 
 impl<S: Store> StoreFs<S> {
@@ -553,7 +579,15 @@ impl<S: Store> StoreFs<S> {
             handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             session: Mutex::new(Session::default()),
+            scratch: Mutex::new(None),
+            scratch_handles: Mutex::new(HashMap::new()),
+            ignores: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The scratch directory, once a derived write made it.
+    pub fn scratch_dir(&self) -> Option<PathBuf> {
+        self.scratch.lock().as_ref().map(|s| s.dir().to_path_buf())
     }
 
     /// The store this filesystem serves.
@@ -575,6 +609,9 @@ impl<S: Store> StoreFs<S> {
         let mut attr = self.attr(&path)?;
         if let Some(open) = handle.and_then(|h| self.handle(h).ok()) {
             attr.size = open.lock().bytes.len() as u64;
+        } else if let Some(open) = handle.and_then(|h| self.scratch_handle(h)) {
+            let stat = derived::stat_file(&open.lock().file).map_err(|e| errno_of(&e))?;
+            attr.size = stat.size;
         }
         self.tell(&attr);
         Ok((attr, self.timeout(&path)))
@@ -601,10 +638,28 @@ impl<S: Store> StoreFs<S> {
     /// LOOKUP of it answers, so the guest needs no LOOKUP per name.
     pub fn readdirplus(&self, inode: u64, offset: u64) -> Result<Vec<(DirEntry, Entry)>, Errno> {
         let dir = self.directory(inode)?;
-        let children = self.query(|conn| self.children(conn, &dir))?;
+        let children = self.listing(&dir)?;
         let mut out = Vec::new();
-        for (i, (name, kind)) in children.into_iter().enumerate().skip(offset as usize) {
+        for (i, (name, (kind, in_scratch))) in
+            children.into_iter().enumerate().skip(offset as usize)
+        {
             let path = join(&dir, &name);
+            if in_scratch {
+                let Some(stat) = self.scratch_stat(&path)? else {
+                    continue;
+                };
+                let attr = self.scratch_attr(&path, stat);
+                self.tell(&attr);
+                let entry = DirEntry {
+                    inode: attr.inode,
+                    offset: i as u64 + 1,
+                    kind: stat.kind,
+                    name,
+                };
+                let ttl = self.timeout(&path);
+                out.push((entry, Entry { attr, ttl }));
+                continue;
+            }
             // A directory's kind is all its attributes carry; asking the
             // store again would scan for the files under it.
             let (size, mode) = match kind {
@@ -635,7 +690,7 @@ impl<S: Store> StoreFs<S> {
     /// when the directory lists what the previous OPENDIR of it served.
     pub fn opendir(&self, inode: u64) -> Result<OpenedDir, Errno> {
         let dir = self.directory(inode)?;
-        let listing = self.query(|conn| self.children(conn, &dir))?;
+        let listing = self.names_under(&dir)?;
         let now = self.clock.now();
         let mut served = self.served.lock();
         let keep_cache = served.listings.get(&inode) == Some(&listing);
@@ -650,7 +705,7 @@ impl<S: Store> StoreFs<S> {
     /// and `..` are not listed.
     pub fn readdir(&self, inode: u64, offset: u64) -> Result<Vec<DirEntry>, Errno> {
         let dir = self.directory(inode)?;
-        let children = self.query(|conn| self.children(conn, &dir))?;
+        let children = self.names_under(&dir)?;
         Ok(children
             .into_iter()
             .enumerate()
@@ -679,6 +734,14 @@ impl<S: Store> StoreFs<S> {
         let writable = flags & open_flags::O_ACCMODE != open_flags::O_RDONLY;
         if writable && !self.scope.propose.covers(&path) {
             return Err(Errno::EACCES);
+        }
+        if let Located::Scratch(_) = self.whereis(&path)? {
+            let handle = self.open_scratch(&path, flags, false)?;
+            return Ok(Opened {
+                handle,
+                keep_cache: false,
+                direct_io: writable,
+            });
         }
         let (base, mut bytes) = self.held(&path)?.ok_or(Errno::ENOENT)?;
         let truncate = writable && flags & open_flags::O_TRUNC != 0;
@@ -721,6 +784,18 @@ impl<S: Store> StoreFs<S> {
 
     /// READ: up to `size` bytes from `offset` of what the handle serves.
     pub fn read(&self, handle: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
+        if let Some(open) = self.scratch_handle(handle) {
+            let open = open.lock();
+            let len = derived::stat_file(&open.file)
+                .map_err(|e| errno_of(&e))?
+                .size;
+            let start = offset.min(len);
+            let want = (size as u64).min(len - start) as usize;
+            let mut buf = vec![0u8; want];
+            std::os::unix::fs::FileExt::read_exact_at(&open.file, &mut buf, start)
+                .map_err(|e| errno_of(&e))?;
+            return Ok(buf);
+        }
         let open = self.handle(handle)?;
         let open = open.lock();
         let len = open.bytes.len();
@@ -734,6 +809,9 @@ impl<S: Store> StoreFs<S> {
     /// a WRITE never asks it: another writer's change since the handle's
     /// base is decided at FLUSH, where the two merge (ADR-0045 T6).
     pub fn write(&self, handle: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
+        if let Some(open) = self.scratch_handle(handle) {
+            return self.write_scratch(&open, offset, data);
+        }
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if !open.writable {
@@ -752,6 +830,9 @@ impl<S: Store> StoreFs<S> {
     /// ignores a refused COMMIT, so the WRITE is where it learns of a
     /// conflict.
     pub fn write_checked(&self, handle: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
+        if let Some(open) = self.scratch_handle(handle) {
+            return self.write_scratch(&open, offset, data);
+        }
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if !open.writable {
@@ -795,6 +876,9 @@ impl<S: Store> StoreFs<S> {
     /// editor still holds the old ones. A later edit must mean the same
     /// against every read it may have been made from ([`agree`]).
     pub fn reread(&self, handle: u64) -> Result<(), Errno> {
+        if self.scratch_handle(handle).is_some() {
+            return Ok(());
+        }
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if open.dirty {
@@ -818,6 +902,9 @@ impl<S: Store> StoreFs<S> {
     /// refused save: the refusal told the client its bytes were stale, so
     /// what it saves next is made from the bytes that READ served.
     pub fn settle(&self, handle: u64) -> Result<(), Errno> {
+        if self.scratch_handle(handle).is_some() {
+            return Ok(());
+        }
         let open = self.handle(handle)?;
         open.lock().earlier.clear();
         Ok(())
@@ -831,6 +918,9 @@ impl<S: Store> StoreFs<S> {
     /// ([`StoreFs::reread`]). Dropping the handle instead would let the
     /// client's retry land as an edit of bytes it never saw.
     pub fn discard(&self, handle: u64) -> Result<(), Errno> {
+        if self.scratch_handle(handle).is_some() {
+            return Ok(());
+        }
         let open = self.handle(handle)?;
         let mut open = open.lock();
         let bytes = match &open.base {
@@ -870,6 +960,24 @@ impl<S: Store> StoreFs<S> {
     /// RELEASE: drops the handle and any bytes no FLUSH landed.
     pub fn release(&self, handle: u64) {
         self.handles.lock().remove(&handle);
+        self.scratch_handles.lock().remove(&handle);
+    }
+
+    /// WRITE to a scratch file: written through, within scratch's limit.
+    fn write_scratch(
+        &self,
+        open: &Arc<Mutex<ScratchHandle>>,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, Errno> {
+        let open = open.lock();
+        if !open.writable {
+            return Err(Errno::EBADF);
+        }
+        self.scratch()?
+            .write(&open.file, offset, data)
+            .map_err(|e| errno_of(&e))?;
+        Ok(data.len())
     }
 
     /// SETATTR. A size with a handle (`ftruncate`) stages on it; a size
@@ -888,6 +996,10 @@ impl<S: Store> StoreFs<S> {
         let path = self.path_of(inode)?;
         if set.uid.is_some() || set.gid.is_some() {
             return Err(Errno::EPERM);
+        }
+        if let Located::Scratch(stat) = self.whereis(&path)? {
+            self.setattr_scratch(&path, stat, handle, &set)?;
+            return self.getattr(inode, handle);
         }
         if let Some(bits) = set.mode {
             self.set_mode(&path, handle, bits)?;
@@ -917,6 +1029,56 @@ impl<S: Store> StoreFs<S> {
             }
         }
         self.getattr(inode, handle)
+    }
+
+    /// A SETATTR of a derived path: its permission bits and size, set on the
+    /// scratch file (a symlink's mode changes nothing).
+    fn setattr_scratch(
+        &self,
+        path: &str,
+        stat: ScratchStat,
+        handle: Option<u64>,
+        set: &SetAttr,
+    ) -> Result<(), Errno> {
+        if set.mode.is_none() && set.size.is_none() {
+            return Ok(());
+        }
+        let may = match stat.kind {
+            Kind::Directory => self.may_propose_under(path),
+            Kind::File | Kind::Symlink => self.scope.propose.covers(path),
+        };
+        if !may {
+            return Err(Errno::EACCES);
+        }
+        let scratch = self.scratch()?;
+        if let Some(bits) = set.mode
+            && stat.kind != Kind::Symlink
+        {
+            scratch.chmod(path, bits).map_err(|e| errno_of(&e))?;
+        }
+        if let Some(size) = set.size {
+            if stat.kind == Kind::Directory {
+                return Err(Errno::EISDIR);
+            }
+            match handle.and_then(|h| self.scratch_handle(h)) {
+                Some(open) => {
+                    let open = open.lock();
+                    if !open.writable {
+                        return Err(Errno::EBADF);
+                    }
+                    scratch
+                        .set_len(&open.file, size)
+                        .map_err(|e| errno_of(&e))?;
+                }
+                None => {
+                    let file = scratch
+                        .open(path, libc::O_RDWR, 0)
+                        .map_err(|e| errno_of(&e))?;
+                    scratch.set_len(&file, size).map_err(|e| errno_of(&e))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A SETATTR of the mode `bits` (ADR-0045 T4): see [`StoreFs::setattr`].
@@ -965,11 +1127,17 @@ impl<S: Store> StoreFs<S> {
     /// outside the proposal scope.
     pub fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<Entry, Errno> {
         let path = self.child(parent, name)?;
-        if self.kind_of(&path)?.is_some() {
+        if !matches!(self.whereis(&path)?, Located::Absent) {
             return Err(Errno::EEXIST);
         }
         if !self.scope.propose.covers(&path) {
             return Err(Errno::EACCES);
+        }
+        if self.derived_new(&path, false)? {
+            self.scratch()?
+                .symlink(target, &path)
+                .map_err(|e| errno_of(&e))?;
+            return self.entry(&path);
         }
         self.propose(vec![Proposed::write_mode(
             path.as_str(),
@@ -987,6 +1155,9 @@ impl<S: Store> StoreFs<S> {
         if self.attr(&path)?.kind != Kind::Symlink {
             return Err(Errno::EINVAL);
         }
+        if let Located::Scratch(_) = self.whereis(&path)? {
+            return self.scratch()?.readlink(&path).map_err(|e| errno_of(&e));
+        }
         let (_, bytes) = self.held(&path)?.ok_or(Errno::ENOENT)?;
         Ok(bytes)
     }
@@ -998,11 +1169,17 @@ impl<S: Store> StoreFs<S> {
     /// outside the proposal scope.
     pub fn create(&self, parent: u64, name: &[u8], flags: u32) -> Result<(Entry, u64), Errno> {
         let path = self.child(parent, name)?;
-        if self.kind_of(&path)?.is_some() {
+        if !matches!(self.whereis(&path)?, Located::Absent) {
             return Err(Errno::EEXIST);
         }
         if !self.scope.propose.covers(&path) {
             return Err(Errno::EACCES);
+        }
+        if self.derived_new(&path, false)? {
+            let handle = self.open_scratch(&path, flags, true)?;
+            let entry = self.entry(&path)?;
+            self.tell(&entry.attr);
+            return Ok((entry, handle));
         }
         self.session.lock().pending.insert(path.clone(), Vec::new());
         self.touch(&path);
@@ -1024,11 +1201,15 @@ impl<S: Store> StoreFs<S> {
     /// exists, `EACCES` when the scope may propose no path under it.
     pub fn mkdir(&self, parent: u64, name: &[u8]) -> Result<Entry, Errno> {
         let path = self.child(parent, name)?;
-        if self.kind_of(&path)?.is_some() {
+        if !matches!(self.whereis(&path)?, Located::Absent) {
             return Err(Errno::EEXIST);
         }
         if !self.may_propose_under(&path) {
             return Err(Errno::EACCES);
+        }
+        if self.derived_new(&path, true)? {
+            self.scratch()?.mkdir(&path).map_err(|e| errno_of(&e))?;
+            return self.entry(&path);
         }
         self.propose(vec![Proposed::mkdir(path.as_str())])?;
         self.entry(&path)
@@ -1040,13 +1221,24 @@ impl<S: Store> StoreFs<S> {
     /// directory, `EACCES` outside the proposal scope.
     pub fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), Errno> {
         let path = self.child(parent, name)?;
-        match self.kind_of(&path)? {
-            None => return Err(Errno::ENOENT),
-            Some(Kind::Directory) => return Err(Errno::EISDIR),
-            Some(Kind::File | Kind::Symlink) => {}
-        }
+        let in_scratch = match self.whereis(&path)? {
+            Located::Absent => return Err(Errno::ENOENT),
+            Located::Stored(Stat {
+                kind: Kind::Directory,
+                ..
+            })
+            | Located::Scratch(ScratchStat {
+                kind: Kind::Directory,
+                ..
+            }) => return Err(Errno::EISDIR),
+            Located::Stored(_) => false,
+            Located::Scratch(_) => true,
+        };
         if !self.scope.propose.covers(&path) {
             return Err(Errno::EACCES);
+        }
+        if in_scratch {
+            return self.scratch()?.unlink(&path).map_err(|e| errno_of(&e));
         }
         match self.held(&path)? {
             Some((base @ Base::Blob(_), _)) => {
@@ -1068,18 +1260,35 @@ impl<S: Store> StoreFs<S> {
     /// file, `EACCES` when the scope may propose no path under it.
     pub fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), Errno> {
         let path = self.child(parent, name)?;
-        match self.kind_of(&path)? {
-            None => return Err(Errno::ENOENT),
-            Some(Kind::File | Kind::Symlink) => return Err(Errno::ENOTDIR),
-            Some(Kind::Directory) => {}
-        }
-        if !self.query(|conn| self.children(conn, &path))?.is_empty() {
+        let in_scratch = match self.whereis(&path)? {
+            Located::Absent => return Err(Errno::ENOENT),
+            Located::Stored(Stat {
+                kind: Kind::Directory,
+                ..
+            }) => false,
+            Located::Scratch(ScratchStat {
+                kind: Kind::Directory,
+                ..
+            }) => true,
+            Located::Stored(_) | Located::Scratch(_) => return Err(Errno::ENOTDIR),
+        };
+        if !self.listing(&path)?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
         if !self.may_propose_under(&path) {
             return Err(Errno::EACCES);
         }
+        if in_scratch {
+            return self.scratch()?.rmdir(&path).map_err(|e| errno_of(&e));
+        }
         self.propose(vec![Proposed::rmdir(path.as_str())])?;
+        // The empty directory scratch made beside it for derived names.
+        if let Some(scratch) = self.scratch_made()
+            && let Ok(Some(_)) = scratch.stat(&path)
+            && let Err(e) = scratch.rmdir(&path)
+        {
+            log::info!("scratch directory '{path}' left: {e}");
+        }
         Ok(())
     }
 
@@ -1108,19 +1317,157 @@ impl<S: Store> StoreFs<S> {
         }
         let from = self.child(olddir, oldname)?;
         let to = self.child(newdir, newname)?;
-        let kind = self.kind_of(&from)?.ok_or(Errno::ENOENT)?;
+        let (kind, from_derived) = match self.whereis(&from)? {
+            Located::Absent => return Err(Errno::ENOENT),
+            Located::Stored(stat) => (stat.kind, false),
+            Located::Scratch(stat) => (stat.kind, true),
+        };
         if from == to {
             return Ok(());
         }
-        let target = self.kind_of(&to)?;
+        let (target, to_derived) = match self.whereis(&to)? {
+            Located::Absent => (None, self.derived_new(&to, kind == Kind::Directory)?),
+            Located::Stored(stat) => (Some(stat.kind), false),
+            Located::Scratch(stat) => (Some(stat.kind), true),
+        };
         if flags & rename_flags::RENAME_NOREPLACE != 0 && target.is_some() {
             return Err(Errno::EEXIST);
         }
-        match kind {
-            Kind::Directory => self.rename_directory(&from, &to, target)?,
-            Kind::File | Kind::Symlink => self.rename_file(&from, &to, target)?,
+        match (kind, from_derived, to_derived) {
+            (Kind::Directory, false, false) => self.rename_directory(&from, &to, target)?,
+            (Kind::File | Kind::Symlink, false, false) => self.rename_file(&from, &to, target)?,
+            (_, true, true) => self.rename_in_scratch(&from, &to, kind)?,
+            // A directory changes class only by copy: `mv` answers EXDEV so.
+            (Kind::Directory, _, _) => return Err(Errno::EXDEV),
+            (_, true, false) => self.rename_out_of_scratch(&from, &to, kind, target)?,
+            (_, false, true) => self.rename_into_scratch(&from, &to, target)?,
         }
         self.inodes.lock().rename_tree(&from, &to);
+        Ok(())
+    }
+
+    /// RENAME within scratch: a derived path to a derived path.
+    /// Both ends are scratch's (a path the store holds is never derived), so
+    /// `renameat` itself refuses a directory moved under itself (`EINVAL`),
+    /// a directory over a file (`ENOTDIR`) or over a non-empty directory
+    /// (`ENOTEMPTY`, or `EEXIST` on Linux), and a file over a directory
+    /// (`EISDIR`), as `rename(2)` does for the guest.
+    fn rename_in_scratch(&self, from: &str, to: &str, kind: Kind) -> Result<(), Errno> {
+        let may = |path: &str| match kind {
+            Kind::Directory => self.may_propose_under(path),
+            Kind::File | Kind::Symlink => self.scope.propose.covers(path),
+        };
+        if !may(from) || !may(to) {
+            return Err(Errno::EACCES);
+        }
+        self.scratch()?.rename(from, to).map_err(|e| errno_of(&e))
+    }
+
+    /// RENAME of a derived file or symlink to an authored path: its bytes
+    /// land as a proposal at `to`, then the scratch file goes.
+    fn rename_out_of_scratch(
+        &self,
+        from: &str,
+        to: &str,
+        kind: Kind,
+        target: Option<Kind>,
+    ) -> Result<(), Errno> {
+        if target == Some(Kind::Directory) {
+            return Err(Errno::EISDIR);
+        }
+        if !self.scope.propose.covers(from) {
+            return Err(Errno::EACCES);
+        }
+        let scratch = self.scratch()?;
+        let (bytes, mode) = if kind == Kind::Symlink {
+            let target = scratch.readlink(from).map_err(|e| errno_of(&e))?;
+            (target, Mode::Symlink)
+        } else {
+            let file = scratch
+                .open(from, libc::O_RDONLY, 0)
+                .map_err(|e| errno_of(&e))?;
+            let stat = derived::stat_file(&file).map_err(|e| errno_of(&e))?;
+            let mut bytes = vec![0u8; stat.size as usize];
+            std::os::unix::fs::FileExt::read_exact_at(&file, &mut bytes, 0)
+                .map_err(|e| errno_of(&e))?;
+            let mode = if stat.perm & 0o111 != 0 {
+                Mode::Executable
+            } else {
+                Mode::Regular
+            };
+            (bytes, mode)
+        };
+        let target_base = match self.held(to)? {
+            Some((blob @ Base::Blob(_), _)) => blob,
+            _ => Base::Absent,
+        };
+        // The proposal's grant check answers `EACCES` outside the scope.
+        self.propose(vec![Proposed::write_mode(to, target_base, bytes, mode)])?;
+        {
+            let mut session = self.session.lock();
+            session.pending.remove(to);
+            session.pending_modes.remove(to);
+        }
+        scratch.unlink(from).map_err(|e| errno_of(&e))
+    }
+
+    /// RENAME of an authored file or symlink to a derived path: its bytes go
+    /// to scratch at `to`, then the delete of `from` is proposed. A refused
+    /// delete takes the scratch copy away again.
+    fn rename_into_scratch(&self, from: &str, to: &str, target: Option<Kind>) -> Result<(), Errno> {
+        if target == Some(Kind::Directory) {
+            return Err(Errno::EISDIR);
+        }
+        if !self.scope.propose.covers(from) || !self.scope.propose.covers(to) {
+            return Err(Errno::EACCES);
+        }
+        let (base, bytes) = self.held(from)?.ok_or(Errno::ENOENT)?;
+        let mode = match self.served(from)?.and_then(|s| s.mode) {
+            Some(mode) => mode,
+            None => self
+                .session
+                .lock()
+                .pending_modes
+                .get(from)
+                .copied()
+                .unwrap_or(Mode::Regular),
+        };
+        let scratch = self.scratch()?;
+        if target.is_some() {
+            scratch.unlink(to).map_err(|e| errno_of(&e))?;
+        }
+        if mode == Mode::Symlink {
+            scratch.symlink(&bytes, to).map_err(|e| errno_of(&e))?;
+        } else {
+            let perm = if mode == Mode::Executable {
+                0o755
+            } else {
+                0o644
+            };
+            let file = scratch
+                .open(to, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, perm)
+                .map_err(|e| errno_of(&e))?;
+            if let Err(e) = scratch.write(&file, 0, &bytes) {
+                drop(file);
+                let _ = scratch.unlink(to);
+                return Err(errno_of(&e));
+            }
+        }
+        match base {
+            Base::Blob(_) => {
+                if let Err(errno) = self.propose(vec![Proposed::delete(from, base)]) {
+                    let _ = scratch.unlink(to);
+                    return Err(errno);
+                }
+            }
+            _ => {
+                let mut session = self.session.lock();
+                session.pending.remove(from);
+                session.pending_modes.remove(from);
+                drop(session);
+                self.touch(from);
+            }
+        }
         Ok(())
     }
 
@@ -1133,7 +1480,7 @@ impl<S: Store> StoreFs<S> {
         }
         match target {
             Some(Kind::File | Kind::Symlink) => return Err(Errno::ENOTDIR),
-            Some(Kind::Directory) if !self.query(|c| self.children(c, to))?.is_empty() => {
+            Some(Kind::Directory) if !self.listing(to)?.is_empty() => {
                 return Err(Errno::ENOTEMPTY);
             }
             _ => {}
@@ -1148,6 +1495,13 @@ impl<S: Store> StoreFs<S> {
                 Errno::EIO
             })?;
         self.propose(writes)?;
+        // Derived names under the directory move with it.
+        if let Some(scratch) = self.scratch_made()
+            && let Ok(Some(_)) = scratch.stat(from)
+            && let Err(e) = scratch.rename(from, to)
+        {
+            log::warn!("derived names under '{from}' did not move to '{to}': {e}");
+        }
         let prefix = join(from, "");
         {
             let mut session = self.session.lock();
@@ -1231,6 +1585,10 @@ impl<S: Store> StoreFs<S> {
     /// against its base. When the store merged them with another writer's
     /// change, the handle serves the merged bytes from then on.
     fn commit(&self, handle: u64) -> Result<(), Errno> {
+        // A derived file is written through and carries no durability.
+        if self.scratch_handle(handle).is_some() {
+            return Ok(());
+        }
         let open = self.handle(handle)?;
         let mut open = open.lock();
         if !open.dirty {
@@ -1363,6 +1721,12 @@ impl<S: Store> StoreFs<S> {
         if let Some(problem) = &accepted.post_commit_error {
             log::warn!("proposal to '{named}' landed; after it: {problem}");
         }
+        // A `.gitignore` landed or went: derived-path rules are read again.
+        let is_ignore_file = |p: &String| p == ".gitignore" || p.ends_with("/.gitignore");
+        if accepted.blobs.keys().any(is_ignore_file) || accepted.removed.iter().any(is_ignore_file)
+        {
+            self.ignores.lock().clear();
+        }
         self.store.request_publish();
         let now = self.clock.now();
         // What each landed path is now, as the guest will be served it.
@@ -1477,12 +1841,6 @@ impl<S: Store> StoreFs<S> {
         }
     }
 
-    fn kind_of(&self, path: &str) -> Result<Option<Kind>, Errno> {
-        Ok(self
-            .query(|conn| self.stat_path(conn, path))?
-            .map(|s| s.kind))
-    }
-
     fn handle(&self, handle: u64) -> Result<Arc<Mutex<Handle>>, Errno> {
         self.handles
             .lock()
@@ -1521,10 +1879,14 @@ impl<S: Store> StoreFs<S> {
         }
     }
 
-    /// The attributes of `path`, as [`StoreFs::observe`] serves it.
+    /// The attributes of `path`, as [`StoreFs::observe`] serves it, or as
+    /// scratch holds it.
     fn attr(&self, path: &str) -> Result<Attr, Errno> {
-        let stat = self.served(path)?.ok_or(Errno::ENOENT)?;
-        Ok(self.attr_of(path, stat.kind, stat.size, stat.mode))
+        match self.locate(path)? {
+            Located::Stored(stat) => Ok(self.attr_of(path, stat.kind, stat.size, stat.mode)),
+            Located::Scratch(stat) => Ok(self.scratch_attr(path, stat)),
+            Located::Absent => Err(Errno::ENOENT),
+        }
     }
 
     fn attr_of(&self, path: &str, kind: Kind, size: u64, mode: Option<Mode>) -> Attr {
@@ -1681,6 +2043,221 @@ impl<S: Store> StoreFs<S> {
             log::warn!("store read failed: {e:#}");
             Errno::EIO
         })
+    }
+
+    // ── derived paths (ADR-0045 T9) ─────────────────────────────────────
+
+    /// The scratch directory, made now if no derived write made it yet.
+    /// `EIO` when derived paths are not enabled or it cannot be made: a
+    /// derived write never falls back to the store.
+    fn scratch(&self) -> Result<Arc<Scratch>, Errno> {
+        let Some(derived) = &self.options.derived else {
+            return Err(Errno::EIO);
+        };
+        let mut held = self.scratch.lock();
+        if let Some(scratch) = held.as_ref() {
+            return Ok(Arc::clone(scratch));
+        }
+        let made = Scratch::create(derived).map_err(|e| {
+            log::warn!("scratch under {} not made: {e}", derived.parent.display());
+            Errno::EIO
+        })?;
+        let made = Arc::new(made);
+        *held = Some(Arc::clone(&made));
+        Ok(made)
+    }
+
+    fn scratch_made(&self) -> Option<Arc<Scratch>> {
+        self.scratch.lock().clone()
+    }
+
+    fn scratch_stat(&self, path: &str) -> Result<Option<ScratchStat>, Errno> {
+        if path.is_empty() {
+            return Ok(None);
+        }
+        match self.scratch_made() {
+            None => Ok(None),
+            Some(scratch) => scratch.stat(path).map_err(|e| errno_of(&e)),
+        }
+    }
+
+    /// Where `path` is: a path the store or this session holds is stored
+    /// (tracked wins), else scratch's, else absent. Served as
+    /// [`StoreFs::observe`] serves it.
+    fn locate(&self, path: &str) -> Result<Located, Errno> {
+        let stored = self.served(path)?;
+        self.located(path, stored)
+    }
+
+    /// [`StoreFs::locate`] without serving: what a request checks before it
+    /// changes the path, as a reply never told the guest.
+    fn whereis(&self, path: &str) -> Result<Located, Errno> {
+        let stored = self.query(|conn| self.stat_path(conn, path))?;
+        self.located(path, stored)
+    }
+
+    fn located(&self, path: &str, stored: Option<Stat>) -> Result<Located, Errno> {
+        if let Some(stat) = stored {
+            return Ok(Located::Stored(stat));
+        }
+        Ok(match self.scratch_stat(path)? {
+            Some(stat) => Located::Scratch(stat),
+            None => Located::Absent,
+        })
+    }
+
+    /// Whether a path being made (a directory when `is_dir`) is derived: its
+    /// parent is scratch's, or a rule matches it (ADR-0045 T9).
+    fn derived_new(&self, path: &str, is_dir: bool) -> Result<bool, Errno> {
+        if self.options.derived.is_none() {
+            return Ok(false);
+        }
+        if let Some((parent, _)) = path.rsplit_once('/')
+            && matches!(self.whereis(parent)?, Located::Scratch(_))
+        {
+            return Ok(true);
+        }
+        if builtin_derived(path, is_dir) {
+            return Ok(true);
+        }
+        self.gitignored(path, is_dir)
+    }
+
+    /// Whether the `.gitignore` rules of `path`'s directories ignore it,
+    /// nearest directory first: an ignore match is `true`, a whitelist
+    /// match `false`, and no match defers to the next directory up.
+    fn gitignored(&self, path: &str, is_dir: bool) -> Result<bool, Errno> {
+        let mut dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        loop {
+            if let Some(rules) = self.ignore_rules(dir)? {
+                // `path` relative to `dir`, which is one of its ancestors.
+                let rel = path
+                    .strip_prefix(dir)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .unwrap_or(path);
+                let matched = rules.matched_path_or_any_parents(rel, is_dir);
+                if matched.is_ignore() {
+                    return Ok(true);
+                }
+                if matched.is_whitelist() {
+                    return Ok(false);
+                }
+            }
+            if dir.is_empty() {
+                return Ok(false);
+            }
+            dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+        }
+    }
+
+    /// The rules of `dir`'s `.gitignore`: the store's file, or the
+    /// checkout's when the store holds none. Read once; a `.gitignore`
+    /// this filesystem lands clears what was read ([`StoreFs::propose_after`]).
+    fn ignore_rules(&self, dir: &str) -> Result<Option<Arc<ignore::gitignore::Gitignore>>, Errno> {
+        if let Some(rules) = self.ignores.lock().get(dir) {
+            return Ok(rules.clone());
+        }
+        let file = join(dir, ".gitignore");
+        let bytes = match self.query(|conn| blob_of(conn, &file))? {
+            Some((_, bytes)) => Some(bytes),
+            None => self
+                .options
+                .checkout
+                .as_ref()
+                .and_then(|c| std::fs::read(c.dir.join(&file)).ok()),
+        };
+        let rules = bytes.and_then(|bytes| {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new("");
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                if let Err(e) = builder.add_line(None, line) {
+                    log::info!("'{file}': rule {line:?} skipped: {e}");
+                }
+            }
+            match builder.build() {
+                Ok(rules) => Some(Arc::new(rules)),
+                Err(e) => {
+                    log::warn!("'{file}' not read: {e}");
+                    None
+                }
+            }
+        });
+        self.ignores.lock().insert(dir.to_string(), rules.clone());
+        Ok(rules)
+    }
+
+    fn scratch_attr(&self, path: &str, stat: ScratchStat) -> Attr {
+        Attr {
+            inode: self.inode_of(path),
+            kind: stat.kind,
+            size: stat.size,
+            perm: if stat.kind == Kind::Symlink {
+                0o777
+            } else {
+                stat.perm
+            },
+            mtime: stat.mtime,
+        }
+    }
+
+    /// The names under the directory `dir`: the store's
+    /// ([`StoreFs::children`]) and scratch's, each marked `true` when it is
+    /// scratch's; a name both hold is the stored one.
+    fn listing(&self, dir: &str) -> Result<BTreeMap<String, (Kind, bool)>, Errno> {
+        let mut out: BTreeMap<String, (Kind, bool)> = self
+            .query(|conn| self.children(conn, dir))?
+            .into_iter()
+            .map(|(name, kind)| (name, (kind, false)))
+            .collect();
+        if let Some(scratch) = self.scratch_made() {
+            for (name, kind) in scratch.list(dir).map_err(|e| errno_of(&e))? {
+                out.entry(name).or_insert((kind, true));
+            }
+        }
+        Ok(out)
+    }
+
+    fn names_under(&self, dir: &str) -> Result<BTreeMap<String, Kind>, Errno> {
+        Ok(self
+            .listing(dir)?
+            .into_iter()
+            .map(|(name, (kind, _))| (name, kind))
+            .collect())
+    }
+
+    fn scratch_handle(&self, handle: u64) -> Option<Arc<Mutex<ScratchHandle>>> {
+        self.scratch_handles.lock().get(&handle).cloned()
+    }
+
+    fn new_scratch_handle(&self, handle: ScratchHandle) -> u64 {
+        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.scratch_handles
+            .lock()
+            .insert(id, Arc::new(Mutex::new(handle)));
+        id
+    }
+
+    /// Open the scratch file `path` (made with `create`) on a new handle.
+    fn open_scratch(&self, path: &str, flags: u32, create: bool) -> Result<u64, Errno> {
+        let writable = flags & open_flags::O_ACCMODE != open_flags::O_RDONLY;
+        let mut oflags = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        if create {
+            oflags |= libc::O_CREAT | libc::O_EXCL;
+        }
+        let scratch = self.scratch()?;
+        if writable && !create && flags & open_flags::O_TRUNC != 0 {
+            let file = scratch
+                .open(path, libc::O_RDWR, 0)
+                .map_err(|e| errno_of(&e))?;
+            scratch.set_len(&file, 0).map_err(|e| errno_of(&e))?;
+        }
+        let file = scratch
+            .open(path, oflags, 0o644)
+            .map_err(|e| errno_of(&e))?;
+        Ok(self.new_scratch_handle(ScratchHandle { file, writable }))
     }
 }
 

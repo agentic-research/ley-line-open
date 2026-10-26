@@ -24,7 +24,7 @@ use leyline_cli_lib::daemon::DaemonContext;
 use leyline_cli_lib::source_write::Grant;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
-use crate::{Checkout, Freshness, Options, Scope, Store, StoreFs};
+use crate::{Checkout, Derived, Freshness, Options, Scope, Store, StoreFs};
 
 /// How often the NFS server looks for a truncate that has stood for
 /// [`nfs::COMMIT_IDLE`].
@@ -287,6 +287,9 @@ impl HostMount for DaemonHostMount {
                     dir,
                     lang_filter: ctx.lang_filter.clone(),
                 }),
+                // This mount session's build output, tool state and macOS
+                // metadata (ADR-0045 T9), removed at unmount.
+                derived: Some(Derived::in_temp_dir()),
             };
             let scope = Scope {
                 see: Grant::Whole,

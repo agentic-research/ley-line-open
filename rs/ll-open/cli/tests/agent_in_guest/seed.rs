@@ -49,6 +49,15 @@ pub const M: &str = "package a\n\nfunc M() int { return 1 }\n";
 pub const M_ONE: &str = "package a\n\nfunc M() int { return 2 }\n";
 pub const M_TWO: &str = "package a\n\nfunc M() int { return 3 }\n";
 pub const README: &str = "# agent in guest\n";
+/// (o): build output the guest writes under target/ and node_modules/,
+/// which reaches neither the store nor the checkout (ADR-0045 T9).
+pub const OUTPUT_FILES: usize = 300;
+pub const LEFT_PAD: &str = "module.exports = (s, n) => s.padStart(n);\n";
+
+/// The bytes of (o)'s `i`th object file.
+pub fn output(i: usize) -> Vec<u8> {
+    format!("object {i}\n").repeat(16).into_bytes()
+}
 
 /// The host's go-ahead file and the guest's step file: equal-length tokens,
 /// so a cached size never truncates a token.

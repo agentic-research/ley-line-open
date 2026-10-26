@@ -34,9 +34,7 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- `39998b` — derived paths (the tree's ignore rules: `target/`, `node_modules/`,
-  `.venv/`, `dist/`) are never proposals; they live in per-run scratch at native
-  speed. A path's class decides its write behavior; there is no user-visible mode.
+- Nothing in flight: `39998b` and `98d0c3` shipped (below); the next items follow.
 
 **Next**
 - `0fadab` — cut v0.21.0 from integration and hand mache the upgrade note
@@ -76,6 +74,7 @@ guest only; `docs/benchmarks/2026-10-20-share-path.md`):
 | Operation | VM share | APFS | Target |
 |---|---|---|---|
 | Small-file write in the guest | 17 ms on a quiet machine, 22 ms median of five interleaved runs (47 ms after `8c8ded`, ~15 s before) | 0.07 ms | < 50 ms (v1); `18bfdd` batches bursts |
+| Build-output write in the guest (`target/`, derived, `39998b`) | 7.06 ms (loaded machine, before `98d0c3`; an authored write measured 56.6 ms in the same run) | 0.41 ms | near APFS after `2354c3` (scratch inside the guest) |
 | open, read, close | 200–280 µs | ~20 µs | within 2× of APFS after `e0893c` (post-v1) |
 | `git status`, warm | 163–182 ms | 32–90 ms | |
 | `rg`, warm | ~310 ms | ~60 ms | |
@@ -91,8 +90,6 @@ quoting a single figure.
   `5ec040`.
 - The store excludes `.git`, so git does not run inside the mount or the share —
   `5ee38a`.
-- macOS writes AppleDouble `._*` files through the host mount and they land in
-  the store — `8d6a8a`.
 - A guest in TSI-hijack mode intermittently stalls before its program runs —
   `c4480a`.
 - The host NFS mount is refused on macOS Tahoe below 26.7 and Sequoia below 15.8
@@ -113,7 +110,7 @@ into proposals:
 |---|---|---|
 | Store-backed share | blob hash (BLAKE3) | shipped |
 | Native copy-on-write checkout (APFS `clonefile`, Linux reflink or overlayfs), passthrough virtio-fs | path | `c739e3` |
-| Scratch for derived paths | path, never stored | `39998b` |
+| Scratch for derived paths | path, never stored | shipped (`39998b`); guest-local `2354c3` |
 | `.git` object database served from the store (gix ODB backend) | git object id | `cf8fdb` |
 | Object store (R2/S3), ordered by compare-and-swap | key | `a7b9d9` |
 
@@ -151,3 +148,4 @@ an ordinary repository to git, CI, review, editors and build tools.
 | #479 | A host NFS save agrees with every read it may have been made from | `4a8953` |
 | #480 | The guest-listener probe is event-driven | `bbfa52` |
 | #482 | A proposal's one full flush is its `live.db` commit; the checkout and head writes are ordered | `98d0c3` |
+| #483 | Derived paths (build output, tool state, macOS metadata) live in per-run scratch, never in the store | `39998b`, `8d6a8a` |

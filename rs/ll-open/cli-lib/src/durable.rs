@@ -53,21 +53,25 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
-#[cfg(target_vendor = "apple")]
+/// One function with the platform split inside, so the body a mutation
+/// test replaces is the one this platform runs (a `cfg`-gated second
+/// function would be mutated without being compiled).
 fn barrier(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `fcntl` with `F_BARRIERFSYNC` takes no pointer argument and
-    // reads only the descriptor, which `file` keeps open for the call.
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
-    if rc == -1 {
-        return Err(io::Error::last_os_error());
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fcntl` with `F_BARRIERFSYNC` takes no pointer argument and
+        // reads only the descriptor, which `file` keeps open for the call.
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
-    Ok(())
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn barrier(file: &File) -> io::Result<()> {
-    file.sync_all()
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_all()
+    }
 }
 
 /// Run `body` in one transaction whose commit does not sync the WAL
@@ -147,21 +151,16 @@ mod tests {
 
     #[test]
     fn order_reports_a_descriptor_it_cannot_sync() {
-        // A directory opened for reading is a valid descriptor; a closed
-        // one is not. `order` must surface the OS error, not swallow it.
-        let dir = TempDir::new().unwrap();
-        let file = File::open(dir.path()).unwrap();
-        use std::os::fd::{FromRawFd, IntoRawFd};
-        let fd = file.into_raw_fd();
-        // SAFETY: `fd` was just released by `into_raw_fd` and is owned here.
-        let owned = unsafe { File::from_raw_fd(fd) };
-        // SAFETY: closing the descriptor the `File` still names makes the
-        // next call on it fail with EBADF; the `File` is forgotten so it is
-        // not closed twice.
-        unsafe { libc::close(fd) };
-        let err = barrier(&owned).unwrap_err();
-        std::mem::forget(owned);
+        // A pipe has no data on a disk to order: the OS refuses the sync
+        // (EBADF for F_BARRIERFSYNC on macOS, EINVAL for fsync on Linux),
+        // and `order` must surface that error, not swallow it.
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let pipe = File::from(std::os::fd::OwnedFd::from(writer));
+        let err = order(&pipe, Path::new("pipe")).unwrap_err();
+        #[cfg(target_vendor = "apple")]
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        #[cfg(not(target_vendor = "apple"))]
+        assert!(err.raw_os_error().is_some(), "{err}");
     }
 
     #[test]

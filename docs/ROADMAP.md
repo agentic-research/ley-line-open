@@ -34,9 +34,6 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- `39998b` — derived paths (the tree's ignore rules: `target/`, `node_modules/`,
-  `.venv/`, `dist/`) are never proposals; they live in per-run scratch at native
-  speed. A path's class decides its write behavior; there is no user-visible mode.
 - `98d0c3` — acknowledge a proposal after one durable append (the `live.db` WAL
   commit); the checkout write, head write and publish follow the reply.
 
@@ -77,6 +74,7 @@ guest only; `docs/benchmarks/2026-10-20-share-path.md`):
 | Operation | VM share | APFS | Target |
 |---|---|---|---|
 | Small-file write in the guest | 47 ms (was ~15 s before `8c8ded`) | 0.14 ms | < 50 ms (v1); `98d0c3` and `18bfdd` widen the margin |
+| Build-output write in the guest (`target/`, derived) | 7.06 ms (loaded machine; authored 56.6 ms in the same run) | 0.41 ms | near APFS after `2354c3` (scratch inside the guest) |
 | open, read, close | 200–280 µs | ~20 µs | within 2× of APFS after `e0893c` (post-v1) |
 | `git status`, warm | 163–182 ms | 32–90 ms | |
 | `rg`, warm | ~310 ms | ~60 ms | |
@@ -92,8 +90,6 @@ quoting a single figure.
   `5ec040`.
 - The store excludes `.git`, so git does not run inside the mount or the share —
   `5ee38a`.
-- macOS writes AppleDouble `._*` files through the host mount and they land in
-  the store — `8d6a8a`.
 - A guest in TSI-hijack mode intermittently stalls before its program runs —
   `c4480a`.
 - The host NFS mount is refused on macOS Tahoe below 26.7 and Sequoia below 15.8
@@ -114,7 +110,7 @@ into proposals:
 |---|---|---|
 | Store-backed share | blob hash (BLAKE3) | shipped |
 | Native copy-on-write checkout (APFS `clonefile`, Linux reflink or overlayfs), passthrough virtio-fs | path | `c739e3` |
-| Scratch for derived paths | path, never stored | `39998b` |
+| Scratch for derived paths | path, never stored | shipped (`39998b`); guest-local `2354c3` |
 | `.git` object database served from the store (gix ODB backend) | git object id | `cf8fdb` |
 | Object store (R2/S3), ordered by compare-and-swap | key | `a7b9d9` |
 
@@ -151,3 +147,4 @@ an ordinary repository to git, CI, review, editors and build tools.
 | #478 | A proposal costs one coalesced publish, not O(store); arena growth fails closed | `8c8ded` |
 | #479 | A host NFS save agrees with every read it may have been made from | `4a8953` |
 | #480 | The guest-listener probe is event-driven | `bbfa52` |
+| this PR | Derived paths (build output, tool state, macOS metadata) live in per-run scratch, never in the store | `39998b`, `8d6a8a` |

@@ -419,6 +419,10 @@ fn mkdirat(dir: RawFd, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
     check(unsafe { libc::mkdirat(dir, name.as_ptr(), mode) })
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "st_mode is u16 on macOS and u32 on Linux"
+)]
 fn fstatat(dir: RawFd, name: &CStr) -> io::Result<ScratchStat> {
     // SAFETY: an all-zero `stat` is a valid value for the out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -433,6 +437,10 @@ fn fstatat(dir: RawFd, name: &CStr) -> io::Result<ScratchStat> {
     ))
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "S_IF* constants are u16 on macOS and u32 on Linux"
+)]
 fn stat_of(mode: u32, size: u64, secs: i64, nanos: i64) -> ScratchStat {
     let kind = match mode & libc::S_IFMT as u32 {
         m if m == libc::S_IFDIR as u32 => Kind::Directory,

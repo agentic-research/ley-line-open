@@ -60,6 +60,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use leyline_cli_lib::daemon::db_pool::LiveDb;
+use leyline_cli_lib::merge::{LineRange, changed_lines};
 use leyline_cli_lib::source_write::{self, Accepted, Base, Grant, Mode, Proposed, Refusal};
 use leyline_cli_lib::tree::{self as store_tree, Entry as StoreEntry};
 use leyline_core::Hash;
@@ -397,19 +398,90 @@ pub struct SetAttr {
 struct Handle {
     path: String,
     base: Base,
-    /// The blobs this handle served before `base`, since it last landed or
-    /// its client last read after a refusal ([`StoreFs::reread`]). The host
-    /// NFS mount has no OPEN, so it cannot tell which of its reads the
-    /// client's edit was made from; a save lands only when it means the
-    /// same thing against each of them ([`agree`]). Empty for every handle
-    /// that is never reread.
-    earlier: Vec<Hash>,
+    /// The blobs this handle served or landed before `base`, since its
+    /// client last read after a refusal ([`StoreFs::settle`]). The host NFS
+    /// mount has no OPEN and one client serves every process on the host,
+    /// so it cannot tell which of its reads a save was made from, nor which
+    /// process made it: a save lands only when it means the same thing
+    /// against each of them ([`agree`]). A landed save is kept too, since
+    /// another process may still hold what was read before it (bead
+    /// 5ec040). Empty for every handle that is never reread.
+    earlier: Reads,
     bytes: Vec<u8>,
     /// A mode an `fchmod` staged on this write handle, proposed with its
     /// bytes at FLUSH.
     mode: Option<Mode>,
     dirty: bool,
     writable: bool,
+}
+
+/// How many earlier reads a reread handle remembers ([`Reads`]). A save
+/// that may have been made from a read beyond these is refused, not
+/// checked against an incomplete history.
+pub(crate) const MAX_REMEMBERED_READS: usize = 32;
+
+/// A reread handle's earlier reads ([`Handle::earlier`]): distinct blob
+/// hashes, at most [`MAX_REMEMBERED_READS`]. `complete` is false once a
+/// read was dropped for the bound; [`agree`] then refuses every save until
+/// the handle settles. `reread` marks a handle the host NFS mount rereads
+/// ([`StoreFs::reread`]): only such a handle is shared by every process on
+/// its client, so only it keeps the base a landed save replaced. A guest or
+/// FUSE handle belongs to one open and never does.
+#[derive(Debug)]
+struct Reads {
+    blobs: Vec<Hash>,
+    complete: bool,
+    reread: bool,
+}
+
+impl Reads {
+    fn new() -> Self {
+        Reads {
+            blobs: Vec::new(),
+            complete: true,
+            reread: false,
+        }
+    }
+
+    /// After a save landed `landed` over `replaced`: a reread handle keeps
+    /// `replaced`, which another process may still hold.
+    fn landed(&mut self, replaced: &Base, landed: &Base) {
+        if !self.reread {
+            return;
+        }
+        if let Base::Blob(replaced) = replaced {
+            self.remember(*replaced, landed);
+        }
+        if let Base::Blob(landed) = landed {
+            self.blobs.retain(|blob| blob != landed);
+        }
+    }
+
+    /// Remember `blob`, unless it is remembered already or is `base` (which
+    /// [`agree`] checks first anyway). Beyond the bound the history is
+    /// incomplete.
+    fn remember(&mut self, blob: Hash, base: &Base) {
+        if self.blobs.contains(&blob) || *base == Base::Blob(blob) {
+            return;
+        }
+        if self.blobs.len() == MAX_REMEMBERED_READS {
+            self.complete = false;
+            return;
+        }
+        self.blobs.push(blob);
+    }
+
+    /// Forget every read: the client read what the handle serves now.
+    fn clear(&mut self) {
+        self.blobs.clear();
+        self.complete = true;
+    }
+
+    /// Whether nothing is remembered and nothing was dropped: the handle
+    /// was never reread, or settled since.
+    fn is_empty(&self) -> bool {
+        self.blobs.is_empty() && self.complete
+    }
 }
 
 /// What this session holds that the store does not yet.
@@ -766,7 +838,7 @@ impl<S: Store> StoreFs<S> {
         let handle = self.new_handle(Handle {
             path,
             base,
-            earlier: Vec::new(),
+            earlier: Reads::new(),
             bytes,
             mode: None,
             dirty: truncate,
@@ -884,12 +956,11 @@ impl<S: Store> StoreFs<S> {
         if open.dirty {
             return Ok(());
         }
+        open.earlier.reread = true;
         let (base, bytes) = self.held(&open.path)?.ok_or(Errno::ENOENT)?;
         if base != open.base {
-            if let Base::Blob(served) = open.base
-                && !open.earlier.contains(&served)
-            {
-                open.earlier.push(served);
+            if let Base::Blob(served) = open.base {
+                open.earlier.remember(served, &base);
             }
             open.base = base;
             open.bytes = bytes;
@@ -1024,7 +1095,7 @@ impl<S: Store> StoreFs<S> {
                     }
                     let (base, mut bytes) = self.held(&path)?.ok_or(Errno::ENOENT)?;
                     bytes.resize(size as usize, 0);
-                    self.land(&path, base, &[], bytes, None)?;
+                    self.land(&path, base, &Reads::new(), bytes, None)?;
                 }
             }
         }
@@ -1186,7 +1257,7 @@ impl<S: Store> StoreFs<S> {
         let handle = self.new_handle(Handle {
             path: path.clone(),
             base: Base::Absent,
-            earlier: Vec::new(),
+            earlier: Reads::new(),
             bytes: Vec::new(),
             mode: None,
             dirty: true,
@@ -1604,9 +1675,11 @@ impl<S: Store> StoreFs<S> {
         if let Some(merged) = merged {
             open.bytes = merged;
         }
-        open.base = base;
-        // What landed is what the client holds now.
-        open.earlier.clear();
+        // A reread handle keeps the base the save replaced: one NFS client
+        // serves every process on the host, and another may still hold it.
+        let replaced = std::mem::replace(&mut open.base, base);
+        let landed = open.base.clone();
+        open.earlier.landed(&replaced, &landed);
         open.mode = None;
         open.dirty = false;
         Ok(())
@@ -1625,7 +1698,7 @@ impl<S: Store> StoreFs<S> {
         &self,
         path: &str,
         base: Base,
-        earlier: &[Hash],
+        earlier: &Reads,
         bytes: Vec<u8>,
         mode: Option<Mode>,
     ) -> Result<(Base, Option<Vec<u8>>), Errno> {
@@ -2302,16 +2375,24 @@ impl std::fmt::Display for Ambiguous {
 impl std::error::Error for Ambiguous {}
 
 /// Whether `bytes`, saved at `path` by a handle whose base is `base` and
-/// which served `earlier` before it, mean the same edit whichever of those
-/// reads they were made from: the three-way merge with what the store holds
-/// now is clean against each, and every merge gives the same bytes. A
-/// handle with no earlier reads always agrees; so does a path the store no
-/// longer holds as a file, which the proposal itself decides.
+/// which served or landed `earlier` before it, keep every change the store
+/// took since each of those, so that landing them loses no one's edit
+/// whichever it was made from (bead 5ec040). For each read that differs
+/// from what the store holds now, the lines that changed since that read
+/// ([`changed_lines`] read → current, on current's side) must be untouched
+/// by the save's own edit (current → `bytes`, on current's side): a save
+/// that touches them may have been made from that read and would undo
+/// them. A handle with no earlier reads always agrees; so does a path the
+/// store no longer holds as a file, which the proposal itself decides. A
+/// handle whose history dropped a read for its bound never agrees: the
+/// save may have been made from the read it no longer remembers.
+///
+/// [`changed_lines`]: leyline_cli_lib::merge::changed_lines
 fn agree(
     conn: &Connection,
     path: &str,
     base: &Base,
-    earlier: &[Hash],
+    earlier: &Reads,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
     let Base::Blob(latest) = base else {
@@ -2328,25 +2409,44 @@ fn agree(
             path: path.to_string(),
         })
     };
-    let mut meant: Option<Vec<u8>> = None;
-    for read in std::iter::once(latest).chain(earlier) {
+    if !earlier.complete {
+        return Err(ambiguous());
+    }
+    let edit: Vec<LineRange> = changed_lines(&current, bytes)
+        .into_iter()
+        .map(|c| c.from)
+        .collect();
+    for read in std::iter::once(latest).chain(&earlier.blobs) {
         let read_bytes = store_tree::blob_bytes(conn, *read)?
             .ok_or_else(|| anyhow::anyhow!("'{path}': a read blob is missing from the store"))?;
-        let result = if read_bytes == current {
-            bytes.to_vec()
-        } else {
-            match leyline_cli_lib::merge::merge(&read_bytes, bytes, &current) {
-                leyline_cli_lib::merge::Merged::Clean(merged) => merged,
-                _ => return Err(ambiguous()),
-            }
-        };
-        match &meant {
-            Some(first) if *first != result => return Err(ambiguous()),
-            Some(_) => {}
-            None => meant = Some(result),
+        if read_bytes == current {
+            continue;
+        }
+        let since = changed_lines(&read_bytes, &current);
+        if since
+            .iter()
+            .any(|change| edit.iter().any(|e| touches(change.to, *e)))
+        {
+            return Err(ambiguous());
         }
     }
     Ok(())
+}
+
+/// Whether a save's edit `e` (lines of the current file it replaces) undoes
+/// or overwrites `since` (lines of the current file a change since a read
+/// produced). Two line ranges that share a line touch. An empty `since` is a
+/// deletion at that line: an edit that starts, ends or spans there may put
+/// the deleted lines back. An empty `e` is an insertion: it overwrites
+/// nothing, so it touches only when it falls strictly inside `since`.
+fn touches(since: LineRange, e: LineRange) -> bool {
+    if since.start == since.end {
+        return e.start <= since.start && since.start <= e.end;
+    }
+    if e.start == e.end {
+        return since.start < e.start && e.start < since.end;
+    }
+    since.start < e.end && e.start < since.end
 }
 
 fn blob_of(conn: &Connection, path: &str) -> anyhow::Result<Option<(Hash, Vec<u8>)>> {

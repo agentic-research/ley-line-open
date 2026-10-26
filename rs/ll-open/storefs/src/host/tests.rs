@@ -458,11 +458,13 @@ async fn an_edit_of_reloaded_bytes_lands_whichever_read_it_built_on() {
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER_RENAMED));
 }
 
-/// A landed save is what its client holds: the reads before it no longer
-/// bear on its next edit, which may undo anything, including the other
-/// writer's line.
+/// A landed save does not end what the mount's other processes hold: one
+/// NFS client serves every process on the host, so a process that read
+/// before the save may save next. An edit that reverts the other writer's
+/// line means different things against the reads it may have been made
+/// from, and is refused until the client READs again; the retry lands.
 #[tokio::test]
-async fn a_landed_save_forgets_the_reads_before_it() {
+async fn a_landed_save_keeps_the_reads_before_it() {
     let h = host();
     let id = h.id("a.go").await;
     h.read_all(id).await;
@@ -470,9 +472,121 @@ async fn a_landed_save_forgets_the_reads_before_it() {
     h.read_all(id).await;
     h.save(id, A_OTHER_RENAMED).await.unwrap();
     h.nfs.commit(id, 0, 0).await.unwrap();
+    let refused = h.save(id, A_RENAMED).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER_RENAMED));
+    assert_eq!(h.read_all(id).await, A_OTHER_RENAMED.as_bytes());
     h.save(id, A_RENAMED).await.unwrap();
     h.nfs.commit(id, 0, 0).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_RENAMED));
+}
+
+/// Two processes on one mount read `a.go`; B saves an edit of one line and
+/// it lands; A then saves its edit of another line, built on the bytes it
+/// read before B's save. The NFS server sees one client, so A's WRITE
+/// carries no sign of being stale. It must not land as a replace of B's
+/// bytes (which would silently drop B's line): A is refused, and B's edit
+/// stays (bead 5ec040).
+#[tokio::test]
+async fn a_second_process_on_one_mount_cannot_drop_a_landed_save() {
+    let h = host();
+    let id = h.id("a.go").await;
+    assert_eq!(h.read_all(id).await, A.as_bytes());
+    h.save(id, A_TAILED).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_TAILED));
+    let refused = h.save(id, A_RENAMED).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(A_TAILED));
+}
+
+/// The same for the very line B changed: A's edit of it, built on the read
+/// before B's save, is refused and B's line stays.
+#[tokio::test]
+async fn a_second_process_on_one_mount_cannot_overwrite_a_landed_line() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    let b = A.replace("return 1", "return 2");
+    h.save(id, &b).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    let refused = h.save(id, &A.replace("return 1", "return 3")).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(b.as_str()));
+}
+
+/// After that refusal the client READs B's bytes; A's edit made to them
+/// lands and carries both lines.
+#[tokio::test]
+async fn after_a_refused_second_process_reads_its_retry_keeps_both_edits() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    h.save(id, A_TAILED).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert!(h.save(id, A_RENAMED).await.is_err());
+    assert_eq!(h.read_all(id).await, A_TAILED.as_bytes());
+    let both = A_TAILED.replace("package a", "package z");
+    h.save(id, &both).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(both.as_str()));
+}
+
+/// One writer saving edit after edit, each built on its last save, lands
+/// every save: against every read it may have been made from, each save
+/// means the same thing.
+#[tokio::test]
+async fn one_writers_successive_saves_all_land() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    let s1 = A_TAILED.to_string();
+    let s2 = s1.replace("package a", "package z");
+    let s3 = s2.replace("return 1", "return 5");
+    for save in [&s1, &s2, &s3] {
+        h.save(id, save).await.unwrap();
+        h.nfs.commit(id, 0, 0).await.unwrap();
+        assert_eq!(h.stored_text("a.go").as_deref(), Some(save.as_str()));
+    }
+}
+
+/// The reads a handle remembers are bounded. Once a save could have been
+/// made from a read the handle no longer remembers, it is refused rather
+/// than checked against an incomplete history; the client's READ settles
+/// the handle and the retry lands.
+#[tokio::test]
+async fn a_save_beyond_the_remembered_reads_is_refused_until_a_read() {
+    let h = host();
+    let id = h.id("a.go").await;
+    h.read_all(id).await;
+    let mut text = A.to_string();
+    // Each landed save remembers the base it replaced: the save after the
+    // history is full drops one.
+    for n in 0..=crate::MAX_REMEMBERED_READS {
+        text.push_str(&format!("// line {n}\n"));
+        h.save(id, &text).await.unwrap();
+        h.nfs.commit(id, 0, 0).await.unwrap();
+    }
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(text.as_str()));
+    text.push_str("// one more\n");
+    let refused = h.save(id, &text).await;
+    assert!(
+        matches!(refused, Err(nfsstat3::NFS3ERR_STALE)),
+        "{refused:?}"
+    );
+    h.read_all(id).await;
+    h.save(id, &text).await.unwrap();
+    h.nfs.commit(id, 0, 0).await.unwrap();
+    assert_eq!(h.stored_text("a.go").as_deref(), Some(text.as_str()));
 }
 
 /// A refused save's client READs the store's bytes before it saves again:

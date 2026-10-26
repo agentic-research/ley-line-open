@@ -40,6 +40,9 @@ const A_TAILED: &str = "package a\n\nfunc A() int { return 1 }\n// tail\n";
 const A_OTHER: &str = "package a\n\nfunc A() int { return 3 }\n";
 /// `A_OTHER` and `A_TAILED`, merged.
 const A_MERGED: &str = "package a\n\nfunc A() int { return 3 }\n// tail\n";
+/// `A` with its package line changed: an edit of other lines than
+/// `A_TAILED`'s, made to `A`.
+const A_PACKAGED: &str = "package z\n\nfunc A() int { return 1 }\n";
 
 /// How long the mount may take to appear in the mount table.
 const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
@@ -300,9 +303,9 @@ async fn a_host_process_edits_the_store_through_the_mount() {
 
     // Reads: the store's files, as files. An editor holds the file open
     // from its read to its save; another writer lands in between. That
-    // writer proposes to the store directly, as a guest or the socket does:
-    // a second process through this same NFS mount is the same client, and
-    // its save would simply be overwritten (bead `ley-line-open-5ec040`).
+    // writer proposes to the store directly, as a guest or the socket does;
+    // a second process through this same mount is
+    // `a_second_process_on_one_mount_never_loses_an_edit`.
     let a = m.at("a.go");
     let (file, read) = with_kernel_deadline("open and read", &m.path, move || open_and_read(a));
     assert_eq!(read, A);
@@ -370,6 +373,48 @@ async fn a_host_process_edits_the_store_through_the_mount() {
         })
     ));
     assert_eq!(f.stored("main.link").as_deref(), Some("a.go"));
+}
+
+/// Two processes on one mount read `a.go`; B saves an edit of one line,
+/// then A saves its edit of another line, made from what it read before
+/// B's save. Both go through one NFS client, so the server cannot tell A's
+/// write is stale from the write itself. B's edit is never lost: A's save
+/// either lands carrying both edits or fails at `fsync` or `close` (bead
+/// `ley-line-open-5ec040`). Two descriptors in this process stand for the
+/// two processes: to the server they are the same client either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_process_on_one_mount_never_loses_an_edit() {
+    #[cfg(target_os = "macos")]
+    if let Some(refusal) = host::unpatched_nfs_client(&host::macos::product_version().unwrap()) {
+        eprintln!("host_mount: SKIPPED on this host: {refusal}");
+        return;
+    }
+    let f = fixture();
+    let mut m = TestMount::new(Arc::clone(&f.fs)).await;
+    let (a_path, b_path) = (m.at("a.go"), m.at("a.go"));
+    let (a_file, read) =
+        with_kernel_deadline("A opens and reads", &m.path, move || open_and_read(a_path));
+    assert_eq!(read, A);
+    let (b_file, read) =
+        with_kernel_deadline("B opens and reads", &m.path, move || open_and_read(b_path));
+    assert_eq!(read, A);
+    with_kernel_deadline("B saves", &m.path, move || save_through(b_file, A_TAILED)).unwrap();
+    assert_eq!(f.stored("a.go").as_deref(), Some(A_TAILED));
+    let a_saved = with_kernel_deadline("A saves from its earlier read", &m.path, move || {
+        save_through(a_file, A_PACKAGED)
+    });
+    m.unmount();
+    let stored = f.stored("a.go").unwrap();
+    assert!(
+        stored.contains("// tail"),
+        "B's edit was lost: A's save answered {a_saved:?} and the store holds {stored:?}"
+    );
+    if a_saved.is_ok() {
+        assert!(
+            stored.contains("package z"),
+            "A's save reported success but did not land: {stored:?}"
+        );
+    }
 }
 
 /// Build output and the metadata a host writes through the mount stay out

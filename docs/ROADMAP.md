@@ -85,9 +85,10 @@ quoting a single figure.
 
 ## Known limits (documented behavior today)
 
-- Two writers through one host NFS mount are one client to the server; the last
-  close wins. Per-writer merging holds across separate sessions (the VM path) —
-  `5ec040`.
+- Two writers through one host NFS mount are one client to the server. No edit
+  is lost: the second save made from an older read is refused `ESTALE` and
+  lands after a reload. Their disjoint edits do not merge; per-writer merging
+  holds across separate sessions (the VM path) — `5ec040`.
 - The store excludes `.git`, so git does not run inside the mount or the share —
   `5ee38a`.
 - A guest in TSI-hijack mode intermittently stalls before its program runs —

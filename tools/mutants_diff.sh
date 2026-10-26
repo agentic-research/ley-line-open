@@ -619,7 +619,19 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # `daemon.enrichment.*` emits. `replace run_watcher_enrichment with ()`
     # survived on the sheaf-feature PR (bead 39e239); verified before
     # routing: that mutation fails all three tests in this binary.
+    #
+    # `durable/apple.rs` (`F_BARRIERFSYNC`) and `durable/other.rs` (`fsync`)
+    # are platform gates (bead `ley-line-open-98d0c3`): the file a runner's
+    # platform does not build would report every mutant as a phantom MISSED,
+    # so it is excluded there and mutated where it compiles, where
+    # `durable::tests::order_reports_a_descriptor_it_cannot_sync` kills it.
+    if [ "$(uname -s)" = Darwin ]; then
+        durable_unbuilt='ll-open/cli-lib/src/durable/other.rs'
+    else
+        durable_unbuilt='ll-open/cli-lib/src/durable/apple.rs'
+    fi
     run_slice integration \
+        --exclude "$durable_unbuilt" \
         --features vec \
         -C --lib \
         -C --test -C execution_client \

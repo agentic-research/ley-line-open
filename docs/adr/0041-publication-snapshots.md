@@ -56,7 +56,8 @@ KiB: the resize sized the buffer to the image, so any growth after a resize rewr
 
 - **A proposal requests a publish; it does not publish.** `propose` and storefs's FLUSH commit to
   `live.db` and call `LiveDb::request_publish`. A proposal is durable once committed (WAL,
-  `synchronous=NORMAL`; warm start opens `live.db` first), so the reply waits for the commit only.
+  `synchronous=FULL`, and `fullfsync` since the 2026-10-23 amendment; warm start opens `live.db`
+  first), so the reply waits for the commit only.
   Out-of-process readers see it after the publisher's next publish; `snapshot` publishes on demand.
 - **One publisher, off the writer** (S5's daemon half; H5). Every daemon publish goes through
   `publish_living_db`: it holds `LiveDb::publish_lock` from the serialize to the root advance and
@@ -74,6 +75,41 @@ KiB: the resize sized the buffer to the image, so any growth after a resize rewr
 
 A publish still costs one serialize, write and hash of the whole database; it no longer sits on any
 proposal's path. S2's immutable snapshot files remove that cost.
+
+### Amendment (2026-10-23) — a proposal's one full flush is its commit
+
+Bead `ley-line-open-98d0c3`. After the amendment above, an accepted proposal on macOS issued four
+`F_FULLFSYNC` (4.65 ms each on the benchmark machine's disk, against 0.03 ms for `fsync(2)`): the
+checkout file and its directory, and the Σ head file and its directory. Its acknowledgement, the
+`live.db` commit, used plain `fsync(2)`, which on macOS stops at the drive's cache: the copies were
+flushed harder than the rows they copy.
+
+**Durability contract.** A proposal is *accepted* when its rows are durable in `live.db`: the WAL
+commit at `synchronous=FULL` with `fullfsync` and `checkpoint_fullfsync`, one `F_FULLFSYNC` on
+macOS. The reply promises that and nothing else. Everything a proposal writes after it is a copy
+of those rows that a later pass rebuilds, so it is *ordered*, not flushed
+(`leyline_cli_lib::durable::order`: `F_BARRIERFSYNC` on macOS, `fsync(2)` elsewhere):
+
+| write | ordering | after a power loss |
+|---|---|---|
+| checkout file | its bytes before its rename | the old file or the whole new one, never a rename landed ahead of its data |
+| checkout rename or removal | before the `_checkout_index` row that records it | the index never names a file the directory lost; reconcile converges or materializes |
+| `_checkout_index`, `_checkout_conflict` | one transaction after every rename, committed without a sync of its own | lost rows leave the index behind, which the next reconcile converges |
+| Σ head | its bytes before its rename, the rename ordered after | the previous head or the new one, never a torn one |
+
+Ordering the index row after the rename is load-bearing: an index row durable ahead of its rename
+names the store's bytes over a directory that lost them, which reconcile reads as a person's edit
+and ingests, undoing the proposal (`an_index_row_landed_ahead_of_its_rename_reads_as_an_edit`).
+
+The copies become durable at the next `F_FULLFSYNC`: the next proposal's commit or a checkpoint.
+Until then a power loss can roll the checkout or the head back to its predecessor; the checkout is
+brought forward by the next reconcile, and the head by the next parse over the durable rows.
+Sidecar segment files are renamed without a sync, as before; that is unchanged here.
+
+Falsifiers: `a_materialized_file_is_ordered_before_its_rename_and_its_index_row`,
+`a_removal_is_ordered_before_its_index_row`, `a_crash_before_the_write_materializes_the_accepted_bytes_at_restart`,
+`configure_wal_activates_wal_on_file_backed_connection` (`fullfsync`, `checkpoint_fullfsync`),
+and `durable`'s unit tests.
 
 ______________________________________________________________________
 

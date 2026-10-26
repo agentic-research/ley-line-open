@@ -34,8 +34,7 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- `98d0c3` — acknowledge a proposal after one durable append (the `live.db` WAL
-  commit); the checkout write, head write and publish follow the reply.
+- Nothing in flight: `39998b` and `98d0c3` shipped (below); the next items follow.
 
 **Next**
 - `0fadab` — cut v0.21.0 from integration and hand mache the upgrade note
@@ -57,7 +56,8 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   store).
 - `b6c7ce` — parse after the reply: since ADR-0045 an unparseable file lands
   with a diagnostic, so the parse no longer gates acceptance; the projection
-  follows like publication (~21 ms of the 47 ms write).
+  follows like publication (most of the ~17 ms write that remains after
+  `98d0c3`).
 - `bf80bd` — collapse the worker-to-daemon hop on the share's hot path.
 
 **Then**
@@ -73,8 +73,8 @@ guest only; `docs/benchmarks/2026-10-20-share-path.md`):
 
 | Operation | VM share | APFS | Target |
 |---|---|---|---|
-| Small-file write in the guest | 47 ms (was ~15 s before `8c8ded`) | 0.14 ms | < 50 ms (v1); `98d0c3` and `18bfdd` widen the margin |
-| Build-output write in the guest (`target/`, derived) | 7.06 ms (loaded machine; authored 56.6 ms in the same run) | 0.41 ms | near APFS after `2354c3` (scratch inside the guest) |
+| Small-file write in the guest | 17 ms on a quiet machine, 22 ms median of five interleaved runs (47 ms after `8c8ded`, ~15 s before) | 0.07 ms | < 50 ms (v1); `18bfdd` batches bursts |
+| Build-output write in the guest (`target/`, derived, `39998b`) | 7.06 ms (loaded machine, before `98d0c3`; an authored write measured 56.6 ms in the same run) | 0.41 ms | near APFS after `2354c3` (scratch inside the guest) |
 | open, read, close | 200–280 µs | ~20 µs | within 2× of APFS after `e0893c` (post-v1) |
 | `git status`, warm | 163–182 ms | 32–90 ms | |
 | `rg`, warm | ~310 ms | ~60 ms | |
@@ -147,4 +147,5 @@ an ordinary repository to git, CI, review, editors and build tools.
 | #478 | A proposal costs one coalesced publish, not O(store); arena growth fails closed | `8c8ded` |
 | #479 | A host NFS save agrees with every read it may have been made from | `4a8953` |
 | #480 | The guest-listener probe is event-driven | `bbfa52` |
+| #482 | A proposal's one full flush is its `live.db` commit; the checkout and head writes are ordered | `98d0c3` |
 | #483 | Derived paths (build output, tool state, macOS metadata) live in per-run scratch, never in the store | `39998b`, `8d6a8a` |

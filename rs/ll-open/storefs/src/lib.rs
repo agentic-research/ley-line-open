@@ -2130,11 +2130,11 @@ impl<S: Store> StoreFs<S> {
         let mut dir = path.rsplit_once('/').map_or("", |(d, _)| d);
         loop {
             if let Some(rules) = self.ignore_rules(dir)? {
-                let rel = if dir.is_empty() {
-                    path
-                } else {
-                    &path[dir.len() + 1..]
-                };
+                // `path` relative to `dir`, which is one of its ancestors.
+                let rel = path
+                    .strip_prefix(dir)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .unwrap_or(path);
                 let matched = rules.matched_path_or_any_parents(rel, is_dir);
                 if matched.is_ignore() {
                     return Ok(true);

@@ -606,11 +606,19 @@ fn a_rename_within_scratch_is_refused_as_rename_2_refuses() {
 fn a_nested_gitignore_applies_beneath_its_directory_only() {
     let (f, _parent) = derived_fixture(64 * MIB);
     let pkg = ino(&f, "pkg");
-    write_new(&f, pkg, ".gitignore", "gen/\n").unwrap();
+    // Anchored: the rule names `gen` directly in `pkg`, so it matches only
+    // the path relative to `pkg` exactly.
+    write_new(&f, pkg, ".gitignore", "/gen/\n").unwrap();
     let gen_dir = mkdir_p(&f, "pkg/gen");
     write_new(&f, gen_dir, "out.go", "generated\n").unwrap();
     assert_eq!(entry(&f, "pkg/gen"), None);
     assert_eq!(read_text(&f, "pkg/gen/out.go"), "generated\n");
+    mkdir_p(&f, "pkg/sub/gen");
+    assert_eq!(
+        entry(&f, "pkg/sub/gen"),
+        Some(StoreEntry::Dir),
+        "anchored to pkg"
+    );
     mkdir_p(&f, "gen");
     assert_eq!(entry(&f, "gen"), Some(StoreEntry::Dir));
 }

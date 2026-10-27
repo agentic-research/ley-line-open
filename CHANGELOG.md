@@ -321,6 +321,29 @@ context, scoping notes, and review history are recoverable.
   `tests/fixtures/notme`) and against cloister's committed Interlace
   vectors.
 
+- **`leyline execution-daemon` can install a real evidence verifier** (bead
+  `ley-line-open-410921`). `--evidence-store DIR` with one or more
+  `--trust-key FILE` installs `CasDsseEvidenceVerifier` over
+  `leyline_runtime::cas_evidence::CasEvidenceStore`, an `EvidenceStore` over
+  `leyline-core`'s `FsBlobStore` (BLAKE3-addressed, verified on read). It
+  checks the `RunGrant` issuer signature and each DSSE evidence envelope
+  against exactly the operator's Ed25519 keys; LLO ships none. A key file
+  holds 64 hex characters or a canonical RFC 8410 PEM `PUBLIC KEY`, and is
+  logged by its ADR-012 canonical kid (SHA-256 over SPKI DER); evidence is
+  addressed `blake3-256:<hex>` over the envelope bytes. Startup is refused
+  when only one of the two flags is given, when a key is unreadable,
+  malformed or repeated, when the store directory does not exist, or when
+  `--allow-unverified-evidence` is combined with either. No verifier flags
+  still refuses every start. `CasDsseEvidenceVerifier` now reports each
+  refusal as an `EvidenceRejection` (`grant-unsigned`, `untrusted-signer`,
+  `signature-invalid`, `evidence-missing`, `evidence-integrity`,
+  `no-trust-keys`, …): its `ExecutionError.detail` begins with the reason's
+  stable token, which `EvidenceRejection::of` recovers on the far side of the
+  daemon; the wire `ExecutionError` is unchanged. A trust set's empty-key case
+  now refuses the grant signature as `no-trust-keys` rather than as an
+  untrusted issuer. `leyline-runtime` takes `anyhow`, `base64` and
+  `leyline-sign` (`root-signer`).
+
 - **The release ships the macOS microVM worker, signed with the hypervisor
   entitlement** (beads `ley-line-open-984acf`, `ley-line-open-853c07`).
   `leyline-krun-worker-darwin-arm64` is a release asset, listed in

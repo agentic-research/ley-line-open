@@ -9,6 +9,13 @@
     <true/>
     <key>com.apple.security.network.server</key>
     <true/>
+    <!-- Hypervisor.framework: leyline-krun-worker links libkrun, which
+         creates the guest VM through Hypervisor.framework. A worker
+         without this key reaches krun_start_enter and fails VM creation
+         with EINVAL (bead ley-line-open-984acf). tools/sign_krun_worker.sh
+         applies this plist to the worker and asserts the key. -->
+    <key>com.apple.security.hypervisor</key>
+    <true/>
     <!-- File access: arena + control files written under user-chosen
          paths (often outside ~). Without this, macOS sandbox blocks
          the open() before SIGKILL. Granted via "no sandbox" mode

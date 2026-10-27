@@ -13,6 +13,19 @@ use leyline_runtime::{
 use tempfile::TempDir;
 
 mod common;
+// Signs a worker the way the build, install, and release paths do.
+#[allow(dead_code)]
+#[path = "../../krun-worker/tests/hypervisor/mod.rs"]
+mod hypervisor;
+
+/// A backend over a FAKE worker: a shell script that speaks the worker
+/// protocol and never enters a hypervisor. A script cannot carry the
+/// hypervisor entitlement, so these supervision-contract tests vouch for it;
+/// `a_worker_without_the_hypervisor_entitlement_is_unavailable` below is
+/// the test of the check they skip.
+fn fake_worker_backend(config: KrunWorkerConfig) -> KrunWorkerBackend {
+    KrunWorkerBackend::new(config).with_unverified_hypervisor_access()
+}
 
 fn run_root_count(path: &std::path::Path) -> usize {
     fs::read_dir(path).expect("enumerate run roots").count()
@@ -54,7 +67,7 @@ fn backend_with_worker(
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
@@ -93,7 +106,7 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     fs::create_dir(&cas).expect("CAS");
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root: cas,
         ephemeral_root: ephemeral_root.clone(),
@@ -133,7 +146,7 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
@@ -197,7 +210,7 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
@@ -230,7 +243,7 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
@@ -272,7 +285,7 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
@@ -323,7 +336,7 @@ printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":fal
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
@@ -354,7 +367,7 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
@@ -387,7 +400,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = Arc::new(KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = Arc::new(fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root,
@@ -455,7 +468,7 @@ fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
         fs::create_dir(&cas_root).expect("CAS");
         fs::create_dir(&ephemeral_root).expect("ephemeral root");
 
-        let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        let backend = fake_worker_backend(KrunWorkerConfig {
             worker,
             cas_root,
             ephemeral_root,
@@ -600,7 +613,7 @@ fn every_libkrun_resource_is_required_independently() {
     };
 
     assert!(
-        KrunWorkerBackend::new(complete()).capabilities().available,
+        fake_worker_backend(complete()).capabilities().available,
         "a fully provisioned host must report the backend available, or the \
          cases below would pass for the wrong reason"
     );
@@ -634,13 +647,23 @@ fn every_libkrun_resource_is_required_independently() {
         }),
     ];
     for (resource, configuration) in incomplete {
+        let capabilities = fake_worker_backend(configuration).capabilities();
         assert!(
-            !KrunWorkerBackend::new(configuration)
-                .capabilities()
-                .available,
+            !capabilities.available,
             "a missing {resource} must make the backend unavailable"
         );
+        let reason = capabilities.unavailable_reason.unwrap_or_default();
+        assert!(
+            reason.contains("not configured"),
+            "a missing {resource} must say why: {reason:?}"
+        );
     }
+    assert_eq!(
+        fake_worker_backend(complete())
+            .capabilities()
+            .unavailable_reason,
+        None
+    );
 }
 
 /// A rejection kill must reach the worker's DESCENDANTS, not just the
@@ -955,4 +978,125 @@ fn a_granted_workspace_is_refused_before_spawn_where_no_share_can_serve_it() {
 
     assert!(!args_log.exists(), "no worker was spawned");
     assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// Bead ley-line-open-831bf1, I1-I3: a microVM backend reports
+/// `available=true` only for a worker that can enter the hypervisor, and says
+/// why not BEFORE any run is accepted. On macOS that is the worker binary's
+/// `com.apple.security.hypervisor` entitlement, read from its signature.
+///
+/// The binaries are real Mach-O copies of this test executable: one with no
+/// signature at all, one with the linker's ad-hoc signature and no
+/// entitlements (what `cargo build` leaves), and one signed by
+/// `tools/sign_krun_worker.sh`, the path every build, install, and release
+/// takes. Nothing is executed, so the copies need not be workers.
+#[test]
+fn a_worker_without_the_hypervisor_entitlement_is_unavailable() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let this_binary = std::env::current_exe().expect("test binary");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("runs");
+    let backend_for = |worker: &std::path::Path| {
+        KrunWorkerBackend::new(KrunWorkerConfig {
+            worker: worker.to_path_buf(),
+            cas_root: cas_root.clone(),
+            ephemeral_root: ephemeral_root.clone(),
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            ready_timeout: READY_TIMEOUT,
+            tsi_hijack_inet: false,
+        })
+    };
+
+    let unsigned = fixture.path().join("unsigned-worker");
+    fs::copy(&this_binary, &unsigned).expect("copy");
+    let linker_signed = fixture.path().join("linker-signed-worker");
+    fs::copy(&this_binary, &linker_signed).expect("copy");
+    let signed = fixture.path().join("signed-worker");
+    fs::copy(&this_binary, &signed).expect("copy");
+    hypervisor::sign_krun_worker(&signed);
+
+    // Off macOS no entitlement exists to hold (KVM access is a device grant),
+    // so the host's rule admits every copy. The macOS rule is then applied
+    // explicitly: with no codesign to read a signature, it admits none.
+    let macos = cfg!(target_os = "macos");
+    if !macos {
+        for worker in [&unsigned, &linker_signed, &signed] {
+            let capabilities = backend_for(worker).capabilities();
+            assert!(capabilities.available, "{capabilities:?}");
+            assert_eq!(capabilities.unavailable_reason, None);
+        }
+    } else {
+        let status = std::process::Command::new("/usr/bin/codesign")
+            .arg("--remove-signature")
+            .arg(&unsigned)
+            .status()
+            .expect("codesign --remove-signature");
+        assert!(status.success(), "remove signature: {status}");
+
+        let entitled = backend_for(&signed).capabilities();
+        assert!(
+            entitled.available,
+            "a worker signed by tools/sign_krun_worker.sh must be available, or \
+             the cases below would pass for the wrong reason: {entitled:?}"
+        );
+        assert_eq!(entitled.unavailable_reason, None);
+    }
+
+    for (label, worker) in [("unsigned", &unsigned), ("linker-signed", &linker_signed)] {
+        let backend = backend_for(worker).with_entitlement_platform("macos");
+        let capabilities = backend.capabilities();
+        assert!(
+            !capabilities.available,
+            "an {label} worker cannot enter the hypervisor, so the backend \
+             must not report itself available"
+        );
+        let reason = capabilities
+            .unavailable_reason
+            .unwrap_or_else(|| panic!("an unavailable {label} worker must say why"));
+        assert!(
+            reason.contains("com.apple.security.hypervisor"),
+            "the {label} reason must name the entitlement: {reason}"
+        );
+
+        // A run is never accepted: neither by direct start, which would
+        // otherwise spawn the worker and die inside krun_start_enter, nor
+        // by capability negotiation through the service.
+        let error = backend.start(&request()).expect_err("unentitled start");
+        assert!(
+            error.detail.contains("com.apple.security.hypervisor"),
+            "{error}"
+        );
+        assert_eq!(run_root_count(&ephemeral_root), 0, "no run root was made");
+        let service = leyline_runtime::ExecutionService::new(backend);
+        let error = service
+            .provision(BackendClass::MicroVm, "provision-unentitled")
+            .expect_err("unentitled provision");
+        assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+        assert!(
+            error.detail.contains("com.apple.security.hypervisor"),
+            "{error}"
+        );
+    }
+
+    // A caller that vouches for its worker (a fake in a supervision test)
+    // skips the rule, even the macOS one; that is the only way around it.
+    let vouched = backend_for(&unsigned)
+        .with_entitlement_platform("macos")
+        .with_unverified_hypervisor_access()
+        .capabilities();
+    assert!(vouched.available, "{vouched:?}");
+    assert_eq!(vouched.unavailable_reason, None);
+
+    if macos {
+        // The verdict follows the binary: signing the same path makes it
+        // available without rebuilding the backend.
+        let backend = backend_for(&linker_signed);
+        assert!(!backend.capabilities().available);
+        hypervisor::sign_krun_worker(&linker_signed);
+        assert!(backend.capabilities().available);
+    }
 }

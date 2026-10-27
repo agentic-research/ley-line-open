@@ -15,7 +15,31 @@
 
 use leyline_sign::cert_chain::{
     CertProfile, ChainError, claims_to_json, verify_cert_chain, verify_cert_path,
+    verify_cert_path_expecting,
 };
+
+/// A caller that binds notme's anchor to the Signet profile accepts notme's
+/// path and refuses to read it as Interlace.
+#[test]
+fn notme_anchor_bound_to_signet_profile() {
+    let ok = verify_cert_path_expecting(
+        TASK_SIGNING,
+        &[ISSUING_CA],
+        ROOT_PUB,
+        Some(CertProfile::Signet),
+    )
+    .expect("notme path under its own profile");
+    assert_eq!(ok.epoch, Some(EPOCH));
+    assert!(matches!(
+        verify_cert_path_expecting(
+            TASK_SIGNING,
+            &[ISSUING_CA],
+            ROOT_PUB,
+            Some(CertProfile::Interlace)
+        ),
+        Err(ChainError::ConstraintViolation(_))
+    ));
+}
 
 const ROOT_PUB: &[u8] = include_bytes!("fixtures/notme/root.pub");
 const ISSUING_CA: &[u8] = include_bytes!("fixtures/notme/issuing-ca.der");

@@ -281,7 +281,13 @@ context, scoping notes, and review history are recoverable.
   `"pr":"signet"` for Signet-profile certificates only, so Interlace claims
   serialize to the same bytes as before. Under `"pr":"signet"` an absent
   `pf`/`sc` means "not read", never "unrestricted": consumers check `pr`
-  first. Breaking for Rust callers that build `CertClaims` literals or
+  first. A caller that knows which profile an anchor issues binds them:
+  `verify_cert_path_expecting(.., Some(profile))`, and the
+  `expected_profile` argument of `leyline_verify_cert_path` (`0` either,
+  `1` Interlace, `2` Signet, anything else fails). A notme anchor bound to
+  Signet then cannot present Interlace claims, and the reverse.
+  `leyline_verify_cert_chain` and `verify_cert_path` are unchanged and
+  accept either profile. Breaking for Rust callers that build `CertClaims` literals or
   match `ChainError` exhaustively (new `ConstraintViolation`). Tested
   against real notme certificates minted by notme's
   `cert-authority.ts` (`sign/tests/fixtures/notme`, provenance alongside)

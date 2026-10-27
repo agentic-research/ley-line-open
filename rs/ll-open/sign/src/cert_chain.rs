@@ -129,6 +129,27 @@ pub enum CertProfile {
 }
 
 impl CertProfile {
+    /// FFI code for "accept either profile" (`leyline_verify_cert_path`).
+    pub const FFI_ANY: u32 = 0;
+    /// FFI code for [`CertProfile::Interlace`].
+    pub const FFI_INTERLACE: u32 = 1;
+    /// FFI code for [`CertProfile::Signet`].
+    pub const FFI_SIGNET: u32 = 2;
+
+    /// Decode an FFI expected-profile code. `Ok(None)` is "either profile";
+    /// an unknown code is `Err`, so a caller cannot mistype its way into
+    /// accepting any profile.
+    pub fn from_ffi_code(code: u32) -> Result<Option<CertProfile>, ChainError> {
+        match code {
+            Self::FFI_ANY => Ok(None),
+            Self::FFI_INTERLACE => Ok(Some(CertProfile::Interlace)),
+            Self::FFI_SIGNET => Ok(Some(CertProfile::Signet)),
+            _ => Err(ChainError::ConstraintViolation(
+                "unknown expected-profile code",
+            )),
+        }
+    }
+
     /// Stable lowercase name used in the claims JSON (`"pr"`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -289,6 +310,29 @@ struct LinkClaims {
 /// the variant is for logs and tests.
 pub fn verify_cert_chain(cert_der: &[u8], master_pubkey: &[u8]) -> Result<CertClaims, ChainError> {
     verify_cert_path(cert_der, &[], master_pubkey)
+}
+
+/// [`verify_cert_path`], then require the path's profile to be `expected`.
+///
+/// The profile is read from bytes the issuer signed, so on its own it only
+/// says what the issuer chose to write. A caller that knows which profile an
+/// anchor issues binds the two here: an anchor trusted for notme (Signet)
+/// certificates then cannot be used to present Interlace claims, and the
+/// reverse. `None` accepts either profile and is [`verify_cert_path`].
+/// A mismatch is [`ChainError::ConstraintViolation`].
+pub fn verify_cert_path_expecting(
+    leaf_der: &[u8],
+    intermediates_der: &[&[u8]],
+    anchor_pubkey: &[u8],
+    expected: Option<CertProfile>,
+) -> Result<CertClaims, ChainError> {
+    let claims = verify_cert_path(leaf_der, intermediates_der, anchor_pubkey)?;
+    match expected {
+        Some(profile) if profile != claims.profile => Err(ChainError::ConstraintViolation(
+            "certificate profile is not the profile the caller bound to this anchor",
+        )),
+        _ => Ok(claims),
+    }
 }
 
 /// Verify `leaf_der` through `intermediates_der` up to the Ed25519 trust

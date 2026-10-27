@@ -9,7 +9,29 @@
 //! `signet-verify.test.ts` gates on the same bytes.
 
 use base64::Engine;
-use leyline_sign::cert_chain::{CertProfile, ChainError, claims_to_json, verify_cert_chain};
+use leyline_sign::cert_chain::{
+    CertProfile, ChainError, claims_to_json, verify_cert_chain, verify_cert_path_expecting,
+};
+
+/// The reverse binding: cloister's anchor bound to Interlace keeps its
+/// claims, and refuses to be read as a Signet-profile issuer.
+#[test]
+fn cloister_anchor_bound_to_interlace_profile() {
+    let cert = d(CERT_FULL_B64);
+    let anchor = d(MASTER_PUBKEY_B64);
+    let c = verify_cert_path_expecting(&cert, &[], &anchor, Some(CertProfile::Interlace))
+        .expect("Interlace cert under its own profile");
+    assert_eq!(c.peer_fp.as_deref(), Some("sha256:abc123def456"));
+    assert!(matches!(
+        verify_cert_path_expecting(&cert, &[], &anchor, Some(CertProfile::Signet)),
+        Err(ChainError::ConstraintViolation(_))
+    ));
+    // Unbound is the unchanged default.
+    assert_eq!(
+        claims_to_json(&verify_cert_path_expecting(&cert, &[], &anchor, None).unwrap()),
+        claims_to_json(&verify(CERT_FULL_B64).unwrap())
+    );
+}
 
 const MASTER_PUBKEY_B64: &str = "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ";
 const EPK_B64: &str = "zRSzf5VulTGU_3-3Oz2B3MVh1hp1OAlLfD4aZD7l86o";

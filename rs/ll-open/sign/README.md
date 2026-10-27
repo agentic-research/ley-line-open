@@ -40,6 +40,11 @@ The signing/verification wiring in the CLI is opt-in via `LEYLINE_HEAD_SIGNING_K
   and its `.1.5` / `.1.6` are never reported as `peer_fp` / `scope`.
   Everything else is the Interlace profile, whose claims are unchanged. See
   the `cert_chain` module documentation (bead `ley-line-open-9ac66d`).
+- **Binding an anchor to its profile.** The profile is read from bytes the
+  issuer signed. A caller that knows which profile an anchor issues passes
+  it (`verify_cert_path_expecting`, or `expected_profile` on
+  `leyline_verify_cert_path`: `0` either, `1` Interlace, `2` Signet), so a
+  trusted issuer cannot present the other profile's claims.
 
 ## CMS + jj commit signing
 

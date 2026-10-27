@@ -154,7 +154,10 @@ type. Cloister may use that adapter or supply its own verifier for Interlace
 certificate/lease evidence; key distribution and rotation remain outside LLO.
 
 To select the embedded VM path, use `--backend micro-vm --worker
-/path/to/leyline-krun-worker`, grant libkrunfw with `--runtime-file`, and
+/path/to/leyline-krun-worker` (the release's `leyline-krun-worker-darwin-arm64`,
+or `task krun-worker:install`; on macOS the worker must carry
+`com.apple.security.hypervisor`, and the backend reports itself unavailable
+when it does not), grant libkrunfw with `--runtime-file`, and
 repeat `--device` only for explicitly granted device paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
 `krunvm` CLI.
 

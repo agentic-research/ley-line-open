@@ -161,10 +161,9 @@ fn main() {{
     let run_root = fixture.path().join("run-root");
     fs::create_dir(&run_root).expect("run root");
 
-    let signed_worker = fixture.path().join("leyline-krun-worker");
-    hypervisor::entitled_copy(
+    let signed_worker = hypervisor::worker_under_test(
         std::path::Path::new(env!("CARGO_BIN_EXE_leyline-krun-worker")),
-        &signed_worker,
+        &fixture.path().join("leyline-krun-worker"),
     );
 
     let request = ExecutionRequest {

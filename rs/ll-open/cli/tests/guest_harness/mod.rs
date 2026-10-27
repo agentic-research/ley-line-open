@@ -35,10 +35,9 @@ pub const MEDIA_TYPE: &str = "application/vnd.leyline.executable";
 pub const STEP: Duration = Duration::from_secs(150);
 
 /// The worker binary cargo built beside this test's target directory.
+/// `LEYLINE_KRUN_WORKER` (an installed worker) is handled by
+/// `hypervisor::worker_under_test`, which checks and runs it as installed.
 pub fn worker_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("LEYLINE_KRUN_WORKER") {
-        return PathBuf::from(path);
-    }
     let exe = std::env::current_exe().expect("test binary");
     let path = exe
         .parent()
@@ -544,8 +543,10 @@ pub fn host(
     let libkrunfw = hypervisor::libkrunfw_or_skip()?;
     let dir = TempDir::new().expect("fixture");
     let checkout = checkout_of(dir.path());
-    let worker = dir.path().join("leyline-krun-worker");
-    hypervisor::entitled_copy(&worker_binary(), &worker);
+    // The installed worker when LEYLINE_KRUN_WORKER names one, checked for
+    // the entitlement and run as installed; else a signed cargo-built copy.
+    let worker =
+        hypervisor::worker_under_test(&worker_binary(), &dir.path().join("leyline-krun-worker"));
     fs::create_dir_all(dir.path().join("runs")).expect("run root");
     fs::create_dir_all(dir.path().join("home")).expect("home");
     Some(Host {

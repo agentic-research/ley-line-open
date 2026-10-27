@@ -466,6 +466,24 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **Share file times are the host's wall clock, so a host sleep cannot
+  hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).
+  storefs reported a path's time as the wall clock at the daemon's start
+  plus `Instant` elapsed; on macOS `Instant` reads `CLOCK_UPTIME_RAW`,
+  which stops while the host sleeps (a laptop on battery cycles through
+  maintenance sleeps), so share times fell behind the wall clock by every
+  sleep since the daemon started. The guest's rootfs is host APFS, which
+  stamps wall-clock times, so git's index carried a time seconds to a
+  minute later than the share's file times; git built without `USE_NSEC`
+  compares whole seconds, its racy-clean check trusted a stale
+  same-second stat, and a second same-size edit was invisible to `git
+  status` (agent_in_guest (m) failed 11 of 20 runs on a host that slept).
+  `Clock::wall` gives file times (strictly increasing per path, from the
+  clock's origin); freshness timeouts keep the monotonic `Clock::now`. The
+  host mount reports the same wall-clock times. The guest's own clock still
+  counts on the hypervisor's counter, which also stops while the host
+  sleeps, so after a sleep it trails the host: never ahead of a share
+  time, which is the direction git's check needs.
 - **Two processes on one host NFS mount never lose an edit** (bead
   `ley-line-open-5ec040`). One NFS client serves every process on the host,
   so a process that read a file before another process's save could save

@@ -466,10 +466,6 @@ tasks:
         (cd rs && cargo build --quiet -p leyline-schema-bridge --bin capnpc-schema-bridge-zod)
         tmp=$(mktemp -d "${TMPDIR:-/tmp}/leyline-execution-asset.XXXXXX")
         trap 'rm -rf "$tmp"' EXIT
-        # Run under a release asset name, as a consumer runs the download:
-        # the plugin must resolve its format through the platform suffix.
-        zod="$tmp/capnpc-schema-bridge-zod-linux-amd64"
-        cp rs/target/debug/capnpc-schema-bridge-zod "$zod"
         printf '#!/bin/sh\n' > "$tmp/leyline"
         # Staged by the release staging script itself, so the assets under
         # test are the bytes and names a release publishes.
@@ -477,7 +473,16 @@ tasks:
           ASSET_NAME=leyline-fixture \
           EXECUTION_SCHEMA_ROOT="$PWD/rs/ll-core/schema-spec" \
           tools/stage_release_artifacts.sh
-        tools/test_execution_schema_asset.sh "$tmp/staged" "$zod"
+        # Run the plugin under EVERY zod asset name the release publishes,
+        # as a consumer runs the download: it must resolve its format
+        # through each platform suffix (OutputFormat::RELEASE_PLATFORM_SUFFIXES).
+        zod_assets=$(grep '^capnpc-schema-bridge-zod-' tools/release-assets.txt)
+        test -n "$zod_assets"
+        for zod_asset in $zod_assets; do
+          zod="$tmp/$zod_asset"
+          cp rs/target/debug/capnpc-schema-bridge-zod "$zod"
+          tools/test_execution_schema_asset.sh "$tmp/staged" "$zod"
+        done
         # The compile is real: a traits asset without the annotations the
         # schema uses must fail it.
         printf '@0xd3b652fd6a4debe6;\n' > "$tmp/staged/traits.capnp"

@@ -513,9 +513,10 @@ context, scoping notes, and review history are recoverable.
   downloaded `capnpc-schema-bridge-zod-linux-amd64` failed with
   `unknown output format 'zod-linux-amd64'` unless the consumer renamed it.
   The plugin now strips a trailing release platform (`linux-amd64`,
-  `linux-arm64`, `darwin-amd64`, `darwin-arm64`; pinned to
-  `tools/release-assets.txt` by a test) before matching the format. Any
-  other tail is still an unknown format.
+  `linux-arm64`, `darwin-amd64`, `darwin-arm64`) before matching the
+  format. Any other tail is still an unknown format.
+  `task schema:execution-asset-consumer-test` runs the plugin under every
+  zod asset name `tools/release-assets.txt` lists.
 
 - **Share file times are the host's wall clock, so a host sleep cannot
   hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).

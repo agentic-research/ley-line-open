@@ -110,8 +110,11 @@ impl OutputFormat {
 
     // The `<os>-<arch>` tails a release appends to every plugin asset name
     // (tools/release-assets.txt; `GENERATOR_SUFFIX` in
-    // tools/stage_release_artifacts.sh). A test pins this list to the
-    // generator names release-assets.txt asserts.
+    // tools/stage_release_artifacts.sh). `task
+    // schema:execution-asset-consumer-test` runs the zod plugin under every
+    // `capnpc-schema-bridge-zod-<platform>` name release-assets.txt lists,
+    // so a platform added there and not here fails it. (A crate test cannot
+    // read tools/: cargo-mutants builds a copy of rs/ alone.)
     pub const RELEASE_PLATFORM_SUFFIXES: &'static [&'static str] =
         &["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64"];
 

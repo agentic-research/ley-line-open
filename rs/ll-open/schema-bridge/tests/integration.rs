@@ -1287,24 +1287,6 @@ fn output_format_from_binary_name_rejects_unknown_platform_suffix() {
 }
 
 #[test]
-fn release_platform_suffixes_match_published_generator_assets() {
-    // The stripped set must be exactly the platforms the release ships the
-    // plugins under, read from the asset contract itself.
-    let assets_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/release-assets.txt");
-    let assets = std::fs::read_to_string(&assets_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", assets_path.display()));
-    let mut published: Vec<&str> = assets
-        .lines()
-        .filter_map(|line| line.strip_prefix("capnpc-schema-bridge-zod-"))
-        .collect();
-    published.sort_unstable();
-    let mut stripped = OutputFormat::RELEASE_PLATFORM_SUFFIXES.to_vec();
-    stripped.sort_unstable();
-    assert_eq!(stripped, published);
-}
-
-#[test]
 fn emit_dispatches_zod_equivalently_to_outputs_zod() {
     // Sanity: the multiplexer's emit(&schema, Zod) must produce the
     // same source as the direct call. Any divergence means the

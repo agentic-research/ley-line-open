@@ -173,7 +173,7 @@ pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1";
 /// different declarations and digest differently. That is what the meet
 /// compares ([`ConfinementManifest::meet`]). Two grants for the same socket in
 /// one document are refused under either spelling — see
-/// [`Self::same_socket`].
+/// [`ConfinementManifest::with_port_bind`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortGrant {
     bind: u16,
@@ -196,15 +196,10 @@ impl PortGrant {
         self.address.as_deref().unwrap_or(DEFAULT_BIND_ADDRESS)
     }
 
-    /// True when both grants bind the same socket, whatever their spelling.
-    /// A document naming one socket twice is refused: one grant, one spelling.
-    pub fn same_socket(&self, other: &Self) -> bool {
-        self.bind == other.bind && self.effective_address() == other.effective_address()
-    }
-
     /// Canonical list order (README §7 rule 5): `bind`, then effective
-    /// address. Total over a document's grants, because a document cannot
-    /// carry two grants for the same socket.
+    /// address. The key is also socket identity, whatever the spelling, which
+    /// is how `with_port_bind` refuses a second grant for one socket — so the
+    /// order is total over any document's grants.
     fn canonical_order(&self) -> (u16, &str) {
         (self.bind, self.effective_address())
     }
@@ -451,20 +446,26 @@ impl ConfinementManifest {
             bind,
             address: address.map(str::to_owned),
         };
-        if let Some(existing) = self.ports.iter().find(|held| held.same_socket(&grant)) {
-            return Err(ExecutionError::invalid(format!(
+        // One search answers both questions. The canonical order key is
+        // (port, effective address), which is exactly socket identity, so an
+        // equal key IS the duplicate and the insertion point is where a new
+        // grant keeps the list canonical.
+        match self
+            .ports
+            .binary_search_by(|held| held.canonical_order().cmp(&grant.canonical_order()))
+        {
+            Ok(index) => Err(ExecutionError::invalid(format!(
                 "confinement/v1 §4 port grants {bind} on {} twice (declared as \
                  {:?} and {:?}); a document names each socket once",
                 grant.effective_address(),
-                existing.address(),
+                self.ports[index].address(),
                 grant.address(),
-            )));
+            ))),
+            Err(at) => {
+                self.ports.insert(at, grant);
+                Ok(self)
+            }
         }
-        let at = self
-            .ports
-            .partition_point(|held| held.canonical_order() < grant.canonical_order());
-        self.ports.insert(at, grant);
-        Ok(self)
     }
 
     pub fn fs_grants(&self) -> &[FsGrant] {

@@ -60,11 +60,10 @@ pub struct KrunWorkerBackend {
     /// Serves a run's granted workspace as the guest's `/work`. `None`: a
     /// run granted a workspace is refused, since nothing could deliver it.
     shares: Option<Arc<dyn WorkspaceShares>>,
-    /// Whether availability includes the worker's hypervisor entitlement.
-    hypervisor_access: HypervisorAccess,
-    /// The last entitlement verdict, keyed by the worker file's identity so a
-    /// re-signed or replaced binary is inspected again.
-    entitlement: Mutex<Option<(WorkerIdentity, Result<(), String>)>>,
+    /// Whose hypervisor-entitlement rule applies to the worker: a
+    /// [`std::env::consts::OS`] value, or `None` when the caller vouches for
+    /// the worker (see [`Self::with_unverified_hypervisor_access`]).
+    entitlement_platform: Option<&'static str>,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
@@ -77,43 +76,12 @@ struct WorkerControl {
     finished: mpsc::Receiver<Result<(), ExecutionError>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HypervisorAccess {
-    /// Inspect the worker's code signature (the default, and the daemon's).
-    Verified,
-    /// The caller vouches for it: a fake worker in a supervision test, which
-    /// never enters a hypervisor and could not carry the entitlement (a shell
-    /// script holds no entitlements).
-    AssumedByCaller,
-}
-
-/// Enough of a file's metadata to notice it was replaced or re-signed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkerIdentity {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-    inode: u64,
-}
-
-impl WorkerIdentity {
-    fn of(path: &std::path::Path) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::metadata(path).ok()?;
-        Some(Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            inode: metadata.ino(),
-        })
-    }
-}
-
 impl KrunWorkerBackend {
     pub fn new(config: KrunWorkerConfig) -> Self {
         Self {
             config,
             shares: None,
-            hypervisor_access: HypervisorAccess::Verified,
-            entitlement: Mutex::new(None),
+            entitlement_platform: Some(std::env::consts::OS),
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
@@ -161,7 +129,16 @@ impl KrunWorkerBackend {
     /// guest, so nothing but such a test calls it; the daemon never does.
     #[doc(hidden)]
     pub fn with_unverified_hypervisor_access(mut self) -> Self {
-        self.hypervisor_access = HypervisorAccess::AssumedByCaller;
+        self.entitlement_platform = None;
+        self
+    }
+
+    /// Apply `os`'s hypervisor-entitlement rule instead of the host's, so a
+    /// test can hold the macOS rule to account on any platform. Like the
+    /// opt-out above, only tests call it.
+    #[doc(hidden)]
+    pub fn with_entitlement_platform(mut self, os: &'static str) -> Self {
+        self.entitlement_platform = Some(os);
         self
     }
 
@@ -177,6 +154,10 @@ impl KrunWorkerBackend {
     /// can enter the hypervisor (bead ley-line-open-831bf1, I1-I3). The
     /// entitlement is checked here, at capability negotiation, so a worker
     /// that would die inside `krun_start_enter` is never handed a run.
+    ///
+    /// Not cached: the signature is read on every call (one `codesign`
+    /// spawn on macOS), so a worker re-signed or replaced in place is judged
+    /// as it is now, and a guest boot dwarfs the cost.
     fn availability(&self) -> Result<(), String> {
         if !self.configured() {
             return Err(
@@ -184,19 +165,10 @@ impl KrunWorkerBackend {
                     .into(),
             );
         }
-        if self.hypervisor_access == HypervisorAccess::AssumedByCaller {
-            return Ok(());
+        match self.entitlement_platform {
+            Some(os) => super::entitlement::hypervisor_entitlement(os, &self.config.worker),
+            None => Ok(()),
         }
-        let identity = WorkerIdentity::of(&self.config.worker);
-        let mut cached = self.entitlement.lock();
-        if let (Some(identity), Some((seen, verdict))) = (&identity, cached.as_ref())
-            && identity == seen
-        {
-            return verdict.clone();
-        }
-        let verdict = super::entitlement::hypervisor_entitlement(&self.config.worker);
-        *cached = identity.map(|identity| (identity, verdict.clone()));
-        verdict
     }
 
     /// Stop one backend run and release its parent-owned ephemeral rootfs.

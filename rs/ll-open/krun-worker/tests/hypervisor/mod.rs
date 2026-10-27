@@ -90,9 +90,24 @@ pub fn entitled_copy(binary: &Path, dest: &Path) {
 /// do: through `tools/sign_krun_worker.sh`, the single source of the
 /// entitlements plist and the codesign flags (bead ley-line-open-984acf). A
 /// no-op off macOS.
+///
+/// The script is found beside the checkout (every crate that includes this
+/// module sits at rs/ll-open/<crate>), or at `LEYLINE_SIGN_KRUN_WORKER`. The
+/// variable is for a copy of the workspace without the repository around it:
+/// cargo-mutants tests a copy of `rs/` alone, and tools/mutants_diff.sh points
+/// it at the real script.
 pub fn sign_krun_worker(binary: &Path) {
-    // Every crate that includes this module sits at rs/ll-open/<crate>.
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/sign_krun_worker.sh");
+    let script = std::env::var_os("LEYLINE_SIGN_KRUN_WORKER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/sign_krun_worker.sh")
+        });
+    assert!(
+        script.is_file(),
+        "the worker signing script {} does not exist; outside a full checkout, \
+         set LEYLINE_SIGN_KRUN_WORKER to tools/sign_krun_worker.sh",
+        script.display()
+    );
     let status = Command::new("/bin/sh")
         .arg(&script)
         .arg(binary)

@@ -647,11 +647,23 @@ fn every_libkrun_resource_is_required_independently() {
         }),
     ];
     for (resource, configuration) in incomplete {
+        let capabilities = fake_worker_backend(configuration).capabilities();
         assert!(
-            !fake_worker_backend(configuration).capabilities().available,
+            !capabilities.available,
             "a missing {resource} must make the backend unavailable"
         );
+        let reason = capabilities.unavailable_reason.unwrap_or_default();
+        assert!(
+            reason.contains("not configured"),
+            "a missing {resource} must say why: {reason:?}"
+        );
     }
+    assert_eq!(
+        fake_worker_backend(complete())
+            .capabilities()
+            .unavailable_reason,
+        None
+    );
 }
 
 /// A rejection kill must reach the worker's DESCENDANTS, not just the
@@ -1007,33 +1019,35 @@ fn a_worker_without_the_hypervisor_entitlement_is_unavailable() {
     fs::copy(&this_binary, &signed).expect("copy");
     hypervisor::sign_krun_worker(&signed);
 
-    if !cfg!(target_os = "macos") {
-        // No entitlement exists to hold: KVM access is a device grant.
+    // Off macOS no entitlement exists to hold (KVM access is a device grant),
+    // so the host's rule admits every copy. The macOS rule is then applied
+    // explicitly: with no codesign to read a signature, it admits none.
+    let macos = cfg!(target_os = "macos");
+    if !macos {
         for worker in [&unsigned, &linker_signed, &signed] {
             let capabilities = backend_for(worker).capabilities();
             assert!(capabilities.available, "{capabilities:?}");
             assert_eq!(capabilities.unavailable_reason, None);
         }
-        return;
+    } else {
+        let status = std::process::Command::new("/usr/bin/codesign")
+            .arg("--remove-signature")
+            .arg(&unsigned)
+            .status()
+            .expect("codesign --remove-signature");
+        assert!(status.success(), "remove signature: {status}");
+
+        let entitled = backend_for(&signed).capabilities();
+        assert!(
+            entitled.available,
+            "a worker signed by tools/sign_krun_worker.sh must be available, or \
+             the cases below would pass for the wrong reason: {entitled:?}"
+        );
+        assert_eq!(entitled.unavailable_reason, None);
     }
 
-    let status = std::process::Command::new("/usr/bin/codesign")
-        .arg("--remove-signature")
-        .arg(&unsigned)
-        .status()
-        .expect("codesign --remove-signature");
-    assert!(status.success(), "remove signature: {status}");
-
-    let entitled = backend_for(&signed).capabilities();
-    assert!(
-        entitled.available,
-        "a worker signed by tools/sign_krun_worker.sh must be available, or \
-         the cases below would pass for the wrong reason: {entitled:?}"
-    );
-    assert_eq!(entitled.unavailable_reason, None);
-
     for (label, worker) in [("unsigned", &unsigned), ("linker-signed", &linker_signed)] {
-        let backend = backend_for(worker);
+        let backend = backend_for(worker).with_entitlement_platform("macos");
         let capabilities = backend.capabilities();
         assert!(
             !capabilities.available,
@@ -1068,10 +1082,21 @@ fn a_worker_without_the_hypervisor_entitlement_is_unavailable() {
         );
     }
 
-    // The verdict follows the binary: signing the same path makes it
-    // available without rebuilding the backend.
-    let backend = backend_for(&linker_signed);
-    assert!(!backend.capabilities().available);
-    hypervisor::sign_krun_worker(&linker_signed);
-    assert!(backend.capabilities().available);
+    // A caller that vouches for its worker (a fake in a supervision test)
+    // skips the rule, even the macOS one; that is the only way around it.
+    let vouched = backend_for(&unsigned)
+        .with_entitlement_platform("macos")
+        .with_unverified_hypervisor_access()
+        .capabilities();
+    assert!(vouched.available, "{vouched:?}");
+    assert_eq!(vouched.unavailable_reason, None);
+
+    if macos {
+        // The verdict follows the binary: signing the same path makes it
+        // available without rebuilding the backend.
+        let backend = backend_for(&linker_signed);
+        assert!(!backend.capabilities().available);
+        hypervisor::sign_krun_worker(&linker_signed);
+        assert!(backend.capabilities().available);
+    }
 }

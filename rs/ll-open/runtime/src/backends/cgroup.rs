@@ -144,6 +144,7 @@ impl CgroupRoot {
             path,
             removed: false,
             stand_in: self.stand_in,
+            kill_timeout: KILL_TIMEOUT,
         };
         let ResourceLimits {
             wall_time_ms: _,
@@ -178,6 +179,9 @@ pub struct RunCgroup {
     path: PathBuf,
     removed: bool,
     stand_in: bool,
+    /// How long teardown waits for the cgroup to empty; [`KILL_TIMEOUT`]
+    /// except in the unit tests, which shorten it.
+    kill_timeout: Duration,
 }
 
 impl RunCgroup {
@@ -197,7 +201,7 @@ impl RunCgroup {
     /// Kill everything in the cgroup, wait until it is empty, and remove it.
     pub fn remove(mut self) -> Result<(), ExecutionError> {
         self.removed = true;
-        remove_run_cgroup(&self.path, self.stand_in)
+        remove_run_cgroup(&self.path, self.stand_in, self.kill_timeout)
     }
 
     fn write(&self, file: &str, value: &str) -> Result<(), ExecutionError> {
@@ -229,12 +233,16 @@ impl RunCgroup {
 impl Drop for RunCgroup {
     fn drop(&mut self) {
         if !self.removed {
-            let _ = remove_run_cgroup(&self.path, self.stand_in);
+            let _ = remove_run_cgroup(&self.path, self.stand_in, self.kill_timeout);
         }
     }
 }
 
-fn remove_run_cgroup(path: &Path, stand_in: bool) -> Result<(), ExecutionError> {
+fn remove_run_cgroup(
+    path: &Path,
+    stand_in: bool,
+    kill_timeout: Duration,
+) -> Result<(), ExecutionError> {
     if !path.exists() {
         return Ok(());
     }
@@ -249,7 +257,7 @@ fn remove_run_cgroup(path: &Path, stand_in: bool) -> Result<(), ExecutionError> 
     // A cgroup can be removed only once it holds no process. `cgroup.events`
     // reports `populated 0` when the kill has finished.
     let events = path.join("cgroup.events");
-    let deadline = Instant::now() + KILL_TIMEOUT;
+    let deadline = Instant::now() + kill_timeout;
     while events.exists() {
         let populated = fs::read_to_string(&events)
             .map(|text| text.lines().any(|line| line == "populated 1"))
@@ -333,6 +341,36 @@ mod tests {
     }
 
     #[test]
+    fn the_cgroup_quota_floor_is_inclusive() {
+        // cgroup v2 accepts exactly 1000 µs; one less is refused.
+        let at = CpuLimits {
+            quota: 1_000,
+            period: 100_000,
+        };
+        assert_eq!(
+            at.cgroup_max().expect("1000 is the minimum"),
+            Some("1000 100000".into())
+        );
+        let below = CpuLimits {
+            quota: 999,
+            period: 100_000,
+        };
+        assert!(below.cgroup_max().is_err());
+        // The period bounds are inclusive at both ends.
+        for period in [1_000, 1_000_000] {
+            assert!(
+                CpuLimits {
+                    quota: 1_000,
+                    period
+                }
+                .cgroup_max()
+                .is_ok(),
+                "{period}"
+            );
+        }
+    }
+
+    #[test]
     fn a_run_cgroup_carries_each_requested_ceiling_in_its_kernel_file() {
         let (_dir, root) = root("cpu memory pids\n");
         let limits = ResourceLimits {
@@ -397,6 +435,99 @@ mod tests {
                 "{run_id:?} must be refused"
             );
         }
+    }
+
+    /// A stand-in run cgroup the test lays out by hand, with a short kill
+    /// timeout so the waiting paths are observable in milliseconds.
+    fn stand_in_run(dir: &Path) -> RunCgroup {
+        fs::create_dir_all(dir).expect("run dir");
+        RunCgroup {
+            path: dir.to_path_buf(),
+            removed: false,
+            stand_in: true,
+            kill_timeout: Duration::from_millis(300),
+        }
+    }
+
+    #[test]
+    fn placing_a_process_writes_its_pid_to_cgroup_procs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
+        run.place(4242).expect("place");
+        assert_eq!(
+            fs::read_to_string(run.path().join("cgroup.procs")).expect("procs"),
+            "4242"
+        );
+    }
+
+    #[test]
+    fn an_optional_control_file_is_written_when_present_and_never_created() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
+        fs::write(run.path().join("memory.swap.max"), "max").expect("present file");
+        run.write_if_present("memory.swap.max", "0").expect("write");
+        assert_eq!(
+            fs::read_to_string(run.path().join("memory.swap.max")).expect("read"),
+            "0"
+        );
+        run.write_if_present("memory.oom.group", "1")
+            .expect("absent is fine");
+        assert!(!run.path().join("memory.oom.group").exists());
+    }
+
+    #[test]
+    fn teardown_kills_then_removes_a_cgroup_that_reports_empty() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
+        fs::write(run.path().join("cgroup.kill"), "").expect("kill file");
+        fs::write(run.path().join("cgroup.events"), "populated 0\nfrozen 0\n").expect("events");
+        let path = run.path().to_path_buf();
+        let started = Instant::now();
+        run.remove().expect("an empty cgroup is removed");
+        assert!(!path.exists());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "an already-empty cgroup is removed without waiting out the timeout"
+        );
+    }
+
+    #[test]
+    fn teardown_waits_for_the_kill_to_empty_the_cgroup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
+        let events = run.path().join("cgroup.events");
+        fs::write(&events, "populated 1\n").expect("events");
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            fs::write(&events, "populated 0\n").expect("flip");
+        });
+        let path = run.path().to_path_buf();
+        run.remove().expect("removed once the kill has emptied it");
+        flipper.join().expect("flipper");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn teardown_reports_a_cgroup_that_never_empties() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
+        fs::write(run.path().join("cgroup.events"), "populated 1\n").expect("events");
+        let error = run.remove().expect_err("still populated");
+        assert!(
+            error.detail.contains("still holds processes"),
+            "{}",
+            error.detail
+        );
+    }
+
+    #[test]
+    fn teardown_reports_a_kill_the_kernel_refused() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
+        // A directory where the control file should be: the write fails.
+        fs::create_dir(run.path().join("cgroup.kill")).expect("unwritable kill");
+        let error = run.remove().expect_err("the kill write failed");
+        assert!(error.detail.contains("cgroup.kill"), "{}", error.detail);
     }
 
     #[test]

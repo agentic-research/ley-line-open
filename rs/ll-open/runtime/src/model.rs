@@ -224,12 +224,13 @@ impl CpuLimits {
                 "grant limit cpu.quota is not a whole multiple of cpu.period, and the hypervisor sizes whole vCPUs",
             ));
         }
-        match u8::try_from(self.quota / period) {
-            Ok(vcpus) if vcpus != 0 => Ok(Some(vcpus)),
-            _ => Err(ExecutionError::unsupported(
+        // A non-zero quota that is a whole multiple of the period is at least
+        // one period, so the quotient is never zero here.
+        u8::try_from(self.quota / period).map(Some).map_err(|_| {
+            ExecutionError::unsupported(
                 "grant limit cpu.quota exceeds what the hypervisor can size",
-            )),
-        }
+            )
+        })
     }
 
     /// The cgroup v2 `cpu.max` line for this ceiling, `"$quota $period"`.

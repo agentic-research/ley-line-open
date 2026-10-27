@@ -196,6 +196,26 @@ fn prepares_a_writable_ephemeral_networkless_vm_without_entering_it() {
     assert_eq!(api.calls().last().expect("final call"), "free:42");
 }
 
+/// `compile_plan` writes zero for a ceiling the hypervisor cannot size
+/// (bead `ley-line-open-da36d2`). Either one unsized is refused before a
+/// context exists, so libkrun never sees a zero vCPU count or RAM size.
+#[test]
+fn an_unsized_vm_is_refused_before_libkrun_is_called() {
+    let rootfs = TempDir::new().expect("rootfs");
+    for (vcpus, ram_mib) in [(0, 1024), (2, 0), (0, 0)] {
+        let api = RecordingApi::default();
+        let mut sizing = config(&rootfs);
+        sizing.vcpus = vcpus;
+        sizing.ram_mib = ram_mib;
+        let error = match prepare_vm(&api, &sizing) {
+            Ok(_) => panic!("vcpus {vcpus}, ram {ram_mib} MiB must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::InvalidSpec, "{}", error.detail);
+        assert!(api.calls().is_empty(), "no libkrun call: {:?}", api.calls());
+    }
+}
+
 #[test]
 fn frees_the_libkrun_context_when_configuration_fails() {
     // Catches leaked libkrun contexts on any fallible setup call.

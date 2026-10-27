@@ -394,17 +394,7 @@ impl Backend for NativeWorkerBackend {
             // group kill missed (a process that called setsid), and the
             // directory goes. A teardown failure is reported, never dropped.
             let removed = run_cgroup.map_or(Ok(()), RunCgroup::remove);
-            let result = match (supervised, removed) {
-                (Ok(()), removed) => removed,
-                (Err(error), Ok(())) => Err(error),
-                (Err(error), Err(cleanup)) => Err(ExecutionError {
-                    detail: format!(
-                        "{}; cgroup cleanup also failed: {}",
-                        error.detail, cleanup.detail
-                    ),
-                    ..error
-                }),
-            };
+            let result = with_cgroup_cleanup(supervised, removed);
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }
@@ -436,6 +426,26 @@ impl Backend for NativeWorkerBackend {
     }
 }
 
+/// A run's result once its cgroup is torn down: the supervision outcome, with
+/// a cgroup teardown failure reported rather than dropped. When both failed,
+/// the supervision error keeps its code and the teardown failure is appended.
+fn with_cgroup_cleanup(
+    supervised: Result<(), ExecutionError>,
+    removed: Result<(), ExecutionError>,
+) -> Result<(), ExecutionError> {
+    match (supervised, removed) {
+        (Ok(()), removed) => removed,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(ExecutionError {
+            detail: format!(
+                "{}; cgroup cleanup also failed: {}",
+                error.detail, cleanup.detail
+            ),
+            ..error
+        }),
+    }
+}
+
 impl Drop for NativeWorkerBackend {
     fn drop(&mut self) {
         let controls: Vec<_> = self
@@ -459,6 +469,37 @@ mod tests {
     use crate::{Backend, BackendRunStatus};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn a_cgroup_teardown_failure_is_reported_alongside_a_run_failure() {
+        use crate::{ErrorCode, ExecutionError};
+        let run = ExecutionError {
+            code: ErrorCode::ResourceExhausted,
+            retryable: false,
+            detail: "execution exceeded wall-clock limit".into(),
+        };
+        let teardown = ExecutionError::backend("run cgroup still holds processes");
+        let both = super::with_cgroup_cleanup(Err(run.clone()), Err(teardown.clone()))
+            .expect_err("both failed");
+        assert_eq!(
+            both.code,
+            ErrorCode::ResourceExhausted,
+            "the run's code wins"
+        );
+        assert_eq!(
+            both.detail,
+            "execution exceeded wall-clock limit; cgroup cleanup also failed: run cgroup still holds processes"
+        );
+        assert_eq!(
+            super::with_cgroup_cleanup(Ok(()), Err(teardown.clone())).expect_err("teardown"),
+            teardown
+        );
+        assert_eq!(
+            super::with_cgroup_cleanup(Err(run.clone()), Ok(())).expect_err("run"),
+            run
+        );
+        assert!(super::with_cgroup_cleanup(Ok(()), Ok(())).is_ok());
+    }
 
     #[test]
     fn backend_trait_poll_returns_published_completion() {

@@ -959,13 +959,14 @@ fn refuse_unread_ceilings<'a>(
     field: &str,
 ) -> Result<(), ExecutionError> {
     let raw = reader.into_internal_struct_reader();
-    let words = (raw.get_data_section_size() / 64) as usize;
+    let data = raw.get_data_section_as_blob();
     // Only the top-level struct had a pre-OCI layout; the nested ones are new.
-    let pre_oci =
-        top_level && raw.get_pointer_section_size() == 0 && words > RESOURCE_LIMITS_DATA_WORDS;
+    let pre_oci = top_level
+        && raw.get_pointer_section_size() == 0
+        && data.len() > RESOURCE_LIMITS_DATA_WORDS * 8;
     let first_word = if pre_oci { 1 } else { known_words };
-    for word in first_word..words {
-        if raw.get_data_field::<u64>(word) == 0 {
+    for (word, bytes) in data.chunks_exact(8).enumerate().skip(first_word) {
+        if bytes.iter().all(|byte| *byte == 0) {
             continue;
         }
         return Err(match PRE_OCI_LIMIT_WORDS.get(word).filter(|_| pre_oci) {

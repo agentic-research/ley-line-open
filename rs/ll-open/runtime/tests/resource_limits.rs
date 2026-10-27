@@ -749,6 +749,50 @@ fn capabilities_advertise_the_resource_limits_revision() {
     }
 }
 
+/// Only a struct LONGER than the current data section is the pre-OCI layout.
+/// A pointer-less struct of exactly two words is a current struct whose
+/// `memory`, `cpu` and `pids` are unset (a producer may truncate trailing
+/// null pointers), so its word 1 is `outputBytes`, not `memoryBytes`, and it
+/// must be judged as that.
+#[test]
+fn a_two_word_struct_is_read_as_the_current_layout_not_the_old_one() {
+    use leyline_public_schema::execution_capnp::{resource_limits, run_spec};
+    let vector = vector();
+    let mut spec_message = capnp::message::Builder::new_default();
+    capnp_json::from_json(
+        &vector["spec"].to_string(),
+        spec_message.init_root::<run_spec::Builder<'_>>(),
+    )
+    .expect("spec");
+    let raw = raw_message::<2, 0>(&[60_000, 4_096]);
+    spec_message
+        .get_root::<run_spec::Builder<'_>>()
+        .unwrap()
+        .set_requested_limits(
+            raw.get_root_as_reader::<resource_limits::Reader<'_>>()
+                .unwrap(),
+        )
+        .unwrap();
+    let mut spec_bytes = Vec::new();
+    capnp::serialize::write_message(&mut spec_bytes, &spec_message).unwrap();
+    let digest = leyline_runtime::authorization::canonical_digest(&spec_bytes).unwrap();
+    let mut grant = vector["grant"].clone();
+    grant["runSpecDigest"]["value"] = json!(digest.strip_prefix("blake3-256:").unwrap());
+    // The grant restates the spec's one ceiling, so authorization passes and
+    // only the layout reading is under test.
+    grant["limits"] = json!({"wallTimeMs": 60_000, "outputBytes": 4_096});
+    let mut grant_message = capnp::message::Builder::new_default();
+    capnp_json::from_json(
+        &grant.to_string(),
+        grant_message.init_root::<leyline_public_schema::execution_capnp::run_grant::Builder<'_>>(),
+    )
+    .unwrap();
+    let mut grant_bytes = Vec::new();
+    capnp::serialize::write_message(&mut grant_bytes, &grant_message).unwrap();
+    authorize_microvm(&spec_bytes, &grant_bytes)
+        .expect("a two-word struct is the current layout with outputBytes set");
+}
+
 /// A pre-OCI struct that sets only the wall clock means the same thing in
 /// both layouts, so it is not refused for its shape.
 #[test]

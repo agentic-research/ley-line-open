@@ -18,8 +18,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
+#[repr(C)]
+struct TimeSpec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 extern "C" {
     fn close(fd: i32) -> i32;
+    fn clock_gettime(clock: i32, ts: *mut TimeSpec) -> i32;
 }
 
 const ESTALE: i32 = 116;
@@ -85,6 +92,87 @@ fn rewrite(file: &mut File, text: &str) -> std::io::Result<()> {
     file.write_all(text.as_bytes())
 }
 
+/// What git compares for m.go: the file's stat as the guest sees it, the
+/// index file's mtime, and the entry git recorded (bead
+/// `ley-line-open-2a7d66`).
+fn m_stat_note(when: &str, git: &dyn Fn(&[&str]) -> (bool, String)) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let file = fs::symlink_metadata("m.go").map(|m| {
+        format!(
+            "size {} mtime {}.{:09} ctime {}.{:09} ino {}",
+            m.size(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+            m.ino()
+        )
+    });
+    let index = fs::metadata("/repo.git/index")
+        .map(|m| format!("mtime {}.{:09}", m.mtime(), m.mtime_nsec()));
+    let (_, entry) = git(&["ls-files", "--debug", "--", "m.go"]);
+    let (_, build) = git(&["version", "--build-options"]);
+    let build: Vec<&str> = build.lines().filter(|l| l.contains("NSEC") || l.starts_with("git version")).collect();
+    format!(
+        "NOTE (m) {when}: m.go {file:?}; index {index:?}; entry {:?}; git {build:?}",
+        entry.replace('\n', " | ")
+    )
+}
+
+/// The guest clock against the host's: a file saved to the share takes the
+/// host's time at its flush; the guest reads its own clock before and after
+/// the save (bead `ley-line-open-2a7d66`).
+fn clock_note(when: &str) -> String {
+    let before = SystemTime::now();
+    let saved = save(".clock-probe", "probe\n");
+    let after = SystemTime::now();
+    let host = fs::metadata(".clock-probe").and_then(|m| m.modified());
+    let _ = fs::remove_file(".clock-probe");
+    let boot = fs::read_to_string("/proc/uptime").unwrap_or_default();
+    // The rootfs's own times: a file written there, its mtime as the guest
+    // reads it, against the guest's clock around the write.
+    let root_before = SystemTime::now();
+    let root_written = fs::write("/tmp/.clock-probe", "probe\n");
+    let root_after = SystemTime::now();
+    let root = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata("/tmp/.clock-probe")
+            .map(|m| format!("{}.{:09} (written between {root_before:?} and {root_after:?})", m.mtime(), m.mtime_nsec()))
+    };
+    // The kernel's own file timestamps on a filesystem with no host behind
+    // it, and the coarse clock those timestamps come from.
+    let _ = fs::create_dir_all("/dev/shm");
+    let shm = match fs::write("/dev/shm/.clock-probe", "probe\n") {
+        Ok(()) => {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata("/dev/shm/.clock-probe").map(|m| format!("{}.{:09}", m.mtime(), m.mtime_nsec()))
+        }
+        Err(e) => Err(e),
+    };
+    let coarse = {
+        let mut ts = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+        // CLOCK_REALTIME_COARSE = 5 on Linux.
+        let rc = unsafe { clock_gettime(5, &mut ts) };
+        format!("rc {rc} {}.{:09}", ts.tv_sec, ts.tv_nsec)
+    };
+    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let root_mount: Vec<&str> = mounts.lines().filter(|l| l.split(' ').nth(1) == Some("/")).collect();
+    let boot = format!(
+        "{} ; rootfs write {root_written:?} mtime {root:?} ; tmpfs mtime {shm:?} ; coarse {coarse} ; kernel {} ; mount {root_mount:?}",
+        boot.trim(),
+        kernel.trim()
+    );
+    let offset = host.as_ref().ok().map(|h| match after.duration_since(*h) {
+        Ok(ahead) => format!("guest ahead by at least {ahead:?}"),
+        Err(e) => format!("guest behind by up to {:?}", e.duration()),
+    });
+    format!(
+        "NOTE (clock) {when}: save {saved:?}; guest before {before:?} after {after:?}; host flush {host:?}; {offset:?}; uptime {}",
+        boot.trim()
+    )
+}
+
 fn read(path: &str) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("read {path}: errno={}", errno_of(&e)))
 }
@@ -140,6 +228,7 @@ fn main() {
         cwd.as_deref().ok() == Some("/work"),
         format!("the workload starts in {cwd:?}, mounted by init"),
     );
+    r.line(clock_note("at the workload's start"));
 
     // (a) A read is the stored bytes.
     match read("a.go") {
@@ -400,6 +489,7 @@ fn main() {
         }
         result
     };
+    r.line(clock_note("before (m)"));
     // The index takes m.go's stat here.
     m_status(&mut r, "before any edit", "");
     match saved(&mut r, seed::M_ONE) {
@@ -409,8 +499,12 @@ fn main() {
     let (ok, added) = git(&["add", "m.go"]);
     r.check("m", ok, format!("git add m.go: exit ok={ok} {added:?}"));
     m_status(&mut r, "after git add (the index takes the edit's stat)", "M  m.go");
+    r.line(m_stat_note("after git add", &git));
     match saved(&mut r, seed::M_TWO) {
-        Ok(()) => m_status(&mut r, "after the second same-size edit", "MM m.go"),
+        Ok(()) => {
+            r.line(m_stat_note("after the second same-size edit", &git));
+            m_status(&mut r, "after the second same-size edit", "MM m.go")
+        }
         Err(error) => r.fail("m", error),
     }
 

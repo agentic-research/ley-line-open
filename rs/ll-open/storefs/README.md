@@ -248,10 +248,18 @@ carries `mtime`, since the Unix epoch; the adapter reports it as `st_atime`,
   blob hashes, and its `mtime` is the host walk's stat cache, not a time a
   guest change made; `_checkout_index` holds entries), and the crate adds no
   persisted state, so times come from the change tracking `StoreFs`
-  already does for "Read freshness". A path's time is the `Clock`'s origin
-  (`Clock::origin`: the wall-clock time `MonotonicClock` read at its
-  creation) plus the `Clock::now` reading of the latest change recorded to
-  it, or the origin alone when none was recorded.
+  already does for "Read freshness". A path's time is the wall-clock time
+  (`Clock::wall`) of the latest change recorded to it, or the `Clock`'s
+  origin (`Clock::origin`: the wall-clock time `MonotonicClock` read at its
+  creation) when none was recorded.
+- **Wall clock, not a monotonic count.** Freshness timeouts count
+  `Clock::now`, a monotonic duration; file times do not. On macOS a
+  monotonic count (`CLOCK_UPTIME_RAW`, which Rust's `Instant` reads) stops
+  while the host sleeps, and the guest's rootfs is host APFS, which stamps
+  wall-clock times: git keeps its index there. Times counted from the
+  daemon's start fell behind the index's by every host sleep, git's
+  racy-clean check then trusted a stale same-second stat, and a same-size
+  edit was invisible to `git status` (bead `ley-line-open-2a7d66`).
 - **What moves it.** A change to a path moves its time and its parent
   directory's: a proposal `StoreFs` lands (FLUSH, FSYNC, SETATTR of a size,
   UNLINK, RENAME), another writer's proposal observed when `StoreFs` next
@@ -261,9 +269,11 @@ carries `mtime`, since the Unix epoch; the adapter reports it as `st_atime`,
   previous OPENDIR of the directory moves the directory's time: another
   writer created or removed an entry in it. Session changes leave the
   timeouts alone; the guest made them.
-- **Monotonic.** Each change takes `now`, or the nanosecond after the
-  path's previous time when that is later, so two changes in one clock
-  reading report two times, and no change reports the origin.
+- **Strictly increasing per path.** Each change takes the wall-clock time,
+  or the nanosecond after the time the path reported before (its last
+  change, or the origin) when that is later, so two changes in one clock
+  reading report two times, a wall clock set back never moves a time
+  backward, and no change reports the origin.
 - **Through the guest's cache.** A reply's times are cached with its
   attributes; a changed path's attribute timeout is `Freshness::changed`,
   so the next GETATTR or LOOKUP after it expires carries the new time. A

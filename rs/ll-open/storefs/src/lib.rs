@@ -207,13 +207,21 @@ pub struct Options {
     pub derived: Option<Derived>,
 }
 
-/// Time for [`Freshness`] and file times: the time since a fixed origin,
-/// never decreasing, and the wall-clock time of that origin.
+/// Time for [`Freshness`] and file times. Freshness counts durations, so
+/// [`Clock::now`] is monotonic. File times are compared with the times the
+/// host's own filesystems stamp (the guest's rootfs, where git keeps its
+/// index), so they are [`Clock::wall`]: a monotonic count stops while the
+/// host sleeps (macOS `CLOCK_UPTIME_RAW`, which Rust's `Instant` reads) and
+/// falls behind the wall clock by every sleep since the daemon started
+/// (bead `ley-line-open-2a7d66`).
 pub trait Clock: Send + Sync {
+    /// The time since a fixed origin, never decreasing.
     fn now(&self) -> Duration;
     /// The wall-clock time of the origin [`Clock::now`] counts from, since
-    /// the Unix epoch.
+    /// the Unix epoch: the time a path no change was recorded for reports.
     fn origin(&self) -> Duration;
+    /// The wall-clock time now, since the Unix epoch.
+    fn wall(&self) -> Duration;
 }
 
 /// [`Clock`] over [`Instant`], counting from its creation; its origin is
@@ -242,6 +250,12 @@ impl Clock for MonotonicClock {
 
     fn origin(&self) -> Duration {
         self.wall
+    }
+
+    fn wall(&self) -> Duration {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
     }
 }
 
@@ -554,31 +568,49 @@ struct Served {
     /// (LOOKUP, GETATTR, SETATTR, READDIRPLUS, CREATE) told the guest: what
     /// the guest bounds a cached read by.
     told: HashMap<u64, u64>,
-    /// Per path, the time ([`Clock::now`]) of the last change recorded for
-    /// its file times: strictly increasing per path, and never zero, so
-    /// every change reports a time no earlier reply carried.
+    /// Per path, the wall-clock time ([`Clock::wall`], since the Unix epoch)
+    /// of the last change recorded for its file times: strictly increasing
+    /// per path, so every change reports a time no earlier reply carried.
     times: HashMap<String, Duration>,
 }
 
 impl Served {
-    /// A change to `path` at `now`: it and its parent directory are
-    /// recently changed until `now + window`, and their times move
-    /// ([`Served::touch`]).
-    fn record_change(&mut self, path: &str, now: Duration) {
+    /// A change to `path` at monotonic `now` and at `time` ([`Times`]): it
+    /// and its parent directory are recently changed until `now + window`,
+    /// and their times move ([`Served::touch`]).
+    fn record_change(&mut self, path: &str, now: Duration, time: Times) {
         for changed in with_parent(path) {
             self.changed.insert(changed.to_string(), now);
         }
-        self.touch(path, now);
+        self.touch(path, time);
     }
 
-    /// A change to `path` at `now` that moves only its and its parent
-    /// directory's times: each takes `now`, or the nanosecond after its
-    /// previous time when that is later.
-    fn touch(&mut self, path: &str, now: Duration) {
+    /// A change to `path` that moves only its and its parent directory's
+    /// times: each takes the wall-clock time, or the nanosecond after the
+    /// time it reported before (its last change, or the clock's origin) when
+    /// that is later, as on the same instant or after a wall clock set back.
+    fn touch(&mut self, path: &str, time: Times) {
         for changed in with_parent(path) {
-            let previous = self.times.get(changed).copied().unwrap_or_default();
+            let previous = self.times.get(changed).copied().unwrap_or(time.origin);
             let after = previous + Duration::from_nanos(1);
-            self.times.insert(changed.to_string(), now.max(after));
+            self.times.insert(changed.to_string(), time.wall.max(after));
+        }
+    }
+}
+
+/// The wall-clock time of a change and of the clock's origin (the time a
+/// path with no recorded change reports), since the Unix epoch.
+#[derive(Clone, Copy, Debug)]
+struct Times {
+    wall: Duration,
+    origin: Duration,
+}
+
+impl Times {
+    fn of(clock: &dyn Clock) -> Times {
+        Times {
+            wall: clock.wall(),
+            origin: clock.origin(),
         }
     }
 }
@@ -763,12 +795,12 @@ impl<S: Store> StoreFs<S> {
     pub fn opendir(&self, inode: u64) -> Result<OpenedDir, Errno> {
         let dir = self.directory(inode)?;
         let listing = self.names_under(&dir)?;
-        let now = self.clock.now();
+        let time = Times::of(self.clock.as_ref());
         let mut served = self.served.lock();
         let keep_cache = served.listings.get(&inode) == Some(&listing);
         // A listing other than the previous one: entries changed in it.
         if served.listings.insert(inode, listing).is_some() && !keep_cache {
-            served.touch(&dir, now);
+            served.touch(&dir, time);
         }
         Ok(OpenedDir { keep_cache })
     }
@@ -1802,6 +1834,7 @@ impl<S: Store> StoreFs<S> {
         }
         self.store.request_publish();
         let now = self.clock.now();
+        let time = Times::of(self.clock.as_ref());
         // What each landed path is now, as the guest will be served it.
         let mut landed: Vec<(String, Seen)> = Vec::new();
         for path in accepted.blobs.keys() {
@@ -1820,7 +1853,7 @@ impl<S: Store> StoreFs<S> {
         let mut served = self.served.lock();
         for (path, seen) in landed {
             served.seen.insert(path.clone(), seen);
-            served.record_change(&path, now);
+            served.record_change(&path, now, time);
         }
         // A merged file holds bytes no guest page holds: its next open
         // drops the guest's pages and, serving another size than the guest
@@ -1849,11 +1882,12 @@ impl<S: Store> StoreFs<S> {
     /// served otherwise.
     fn observe(&self, path: &str, seen: Seen) {
         let now = self.clock.now();
+        let time = Times::of(self.clock.as_ref());
         let mut served = self.served.lock();
         if let Some(before) = served.seen.insert(path.to_string(), seen)
             && before != seen
         {
-            served.record_change(path, now);
+            served.record_change(path, now, time);
         }
     }
 
@@ -1989,16 +2023,16 @@ impl<S: Store> StoreFs<S> {
     /// The time of the last change recorded for `path`, since the Unix
     /// epoch; the clock's origin when none was recorded.
     fn mtime(&self, path: &str) -> Duration {
-        let since_origin = self.served.lock().times.get(path).copied();
-        self.clock.origin() + since_origin.unwrap_or_default()
+        let changed = self.served.lock().times.get(path).copied();
+        changed.unwrap_or_else(|| self.clock.origin())
     }
 
     /// A change to `path` that only this session holds (a directory, or a
     /// file the store does not hold): its and its parent directory's times
     /// move ([`Served::touch`]); the guest made it, so its timeouts stay.
     fn touch(&self, path: &str) {
-        let now = self.clock.now();
-        self.served.lock().touch(path, now);
+        let time = Times::of(self.clock.as_ref());
+        self.served.lock().touch(path, time);
     }
 
     /// What `path` is for the guest: an entry of the store's manifest the

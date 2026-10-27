@@ -3,3 +3,4 @@
 # See ../README.md §5-§8 for what these vectors document.
 
 899f4f1449aa970c7c20f4bc2ddd7eb6905f1ad2c3c4985d8aa1dcc495f8169e  test-vectors/manifest-canonical.json
+ca4597e76f59b104d6f897bb7037fffddc1a04631f222098eb8aaa7377396f9e  test-vectors/manifest-port-list.json

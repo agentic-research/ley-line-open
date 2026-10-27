@@ -31,7 +31,7 @@ Three load-bearing properties this v1 publishes:
    does not explicitly allow is rejected at the kernel boundary — no
    "implicit inherit-from-parent" fallback.
 2. **Declarative, not procedural.** The manifest names desired end
-   states (allowed paths, allowed hosts, bound port, credential
+   states (allowed paths, allowed hosts, bound ports, credential
    backend). It does NOT ship shell commands, seccomp DSL, or
    iptables rules — enforcement engines translate the manifest into
    their kernel's primitives.
@@ -86,6 +86,13 @@ This v1 **DEFINES** (new content not in either upstream spec):
   refusal §2–§6 states in prose is actually refused.
 - `test-vectors/manifest-canonical.json` — a canonical example
   manifest.
+- `test-vectors/manifest-port-list.json` — §4 `port` and §3
+  `connectLocal` as lists: canonicalization of 0, 1 and 2 grants, the
+  meet, and the refusals, each with its `confinementDigest` (§7 rule 5,
+  §7 "Meet"). Not itself a manifest, so its digests live inside it
+  rather than in `CONFINEMENT_DIGESTS.blake3`. Verified by
+  `verify_confinement_port_lists` (schema-spec crate) and, against an
+  implementation, by `confinement_port_list_vectors` (leyline-runtime).
 - `VECTORS.sha256` — **SHA-256 CONTENT-INTEGRITY pins** for the test
   vectors ("the bytes on disk haven't drifted"). Verified by
   `verify_vectors_sha256` (schema-spec crate). This is a
@@ -243,11 +250,29 @@ to §4.
   }
   ```
 
+- **`connectLocal`: loopback ports the bundle may dial.** One integer,
+  or a non-empty list of distinct integers, 1–65535. The bundle may
+  `connect(2)` to each named port on loopback and MUST NOT bind it.
+  No 1024 floor, unlike §4: binding a privileged port is a privileged
+  act, connecting to one is not. The grant names which port may be
+  dialled, not who is listening there — a loopback port is a shared
+  host namespace, so the channel needs its own authentication
+  (ADR-0037). A list's canonical form and meet are those of §4 below
+  (§7 rule 5, §7 "Meet").
+  ```json
+  "network": {"connectLocal": [8443, 9443]}
+  ```
+
 ## §4 port.bind
 
-Zero or one listener port the bundle may bind. v1 is deliberately
-single-port; multi-port bundles publish v2. If the manifest omits
-`port`, the bundle MUST NOT bind any listener.
+Zero or more listener grants the bundle may bind. If the manifest
+omits `port`, the bundle MUST NOT bind any listener.
+
+`port` is either one grant object or a non-empty list of them. The list
+form is an additive v1 extension (bead `ley-line-open-e2c33f`, for
+cloister ADR-0069's multi-listener bundles): the single-object form
+keeps its meaning and its digest (§7 rule 5), so every document valid
+before the extension is valid and digests identically after it.
 
 - **Port number.** Integer 1024–65535 (privileged ports out of scope
   in v1). Runners MAY reject 8080 or other well-known
@@ -257,6 +282,25 @@ single-port; multi-port bundles publish v2. If the manifest omits
   ```json
   "port": {"bind": 8443, "address": "0.0.0.0"}
   ```
+- **Several listeners.** A list of grants, each obeying the rules
+  above:
+  ```json
+  "port": [{"bind": 8443}, {"bind": 9090}]
+  ```
+- **An empty list is refused.** It declares nothing, and the omitted
+  block already means MUST NOT bind; accepting `[]` would give one
+  policy two spellings that digest differently.
+- **One grant per socket.** A list MUST NOT name the same
+  (port, effective address) twice, under any spelling: `{"bind": 8443}`
+  and `{"bind": 8443, "address": "127.0.0.1"}` are the same socket, and
+  a list carrying both is refused. The same port on two different
+  addresses is two grants. JSON Schema's `uniqueItems` catches only the
+  identical spelling; the rest is the runner's refusal.
+- **Every grant compiles, or the dimension is refused.** A runner that
+  can enforce some grants of a list and not others MUST refuse the list
+  (§9 condition 6) rather than grant the subset — a document committing
+  to N listeners and delivering fewer is the silently-dropped clause §1
+  forbids, one grant at a time.
 
 ## §5 credentialSource
 
@@ -379,6 +423,53 @@ by following these rules:
    the serialization is the closing `}` of the outermost object.
 4. **Two-space indentation.** Human-readable but deterministic. A
    `null`-valued field is omitted, not emitted as `"field": null`.
+5. **List clauses: one element is the scalar.** §4 `port` and §3
+   `network.connectLocal` accept one value or a list. The canonical
+   form emits a one-element list as its element — the grant object, or
+   the integer — and two or more as a list:
+   - `port` lists are sorted by `bind` ascending, then by effective
+     address (an omitted address sorts as `127.0.0.1`) in byte order.
+     Each grant keeps its own spelling of `address`: an omitted address
+     stays omitted, so `{"bind": 8443}` and
+     `{"bind": 8443, "address": "127.0.0.1"}` digest differently, as
+     they did before lists existed.
+   - `connectLocal` lists are sorted ascending.
+   - Duplicates are refused at parse (§4 "One grant per socket"), never
+     merged, so sorting never has to choose between two spellings.
+   - A clause with zero elements is omitted, and a `network` block left
+     with neither clause is omitted with it.
+
+   **Why the scalar, and not always a list.** Every document written
+   before the extension spells these clauses as scalars, and its
+   `confinementDigest` is committed to workload identities already.
+   Canonicalizing to the scalar is the only choice under which every
+   such digest is unchanged *and* a one-element list cannot digest
+   differently from the scalar it spells. `manifest-port-list.json`
+   pins the proof: the one-element list form of `manifest-canonical.json`
+   reaches the same `d9b5b727…` digest.
+
+### Meet
+
+The meet of two documents is the policy both permit. v1 defines it for
+the two list clauses only:
+
+- **`port` and `connectLocal` meet by set intersection.** A grant
+  survives when both operands carry it, compared as canonical grants —
+  so an omitted address and an explicit `"127.0.0.1"` do not meet; a
+  meet can only drop a grant, never add one. The result is in canonical
+  order (rule 5), and an empty intersection omits the clause, so a meet
+  with nothing in common is byte-identical to a document that never
+  declared the dimension. A union is not a meet: it would grant what
+  one side refused.
+- **Every other dimension must be equal.** v1 defines no meet for path
+  prefixes, host patterns, socket modes or vault backends. A runner
+  asked to meet two documents differing in any of them MUST refuse,
+  naming the dimension, rather than invent a rule.
+
+The meet is commutative and idempotent, and meeting the result with
+either operand again changes nothing. `manifest-port-list.json` pins
+meets with their digests, including the disjoint case that separates
+intersection from union.
 
 The reference example that conforming implementations MUST reach the
 same BLAKE3-256 digest on is `test-vectors/manifest-canonical.json`.
@@ -414,6 +505,10 @@ A second implementation is conformant when:
 2. Its canonical serialization of the parsed manifest reaches the
    BLAKE3-256 `confinementDigest` pinned in
    `CONFINEMENT_DIGESTS.blake3` for that vector.
+   For `manifest-port-list.json`, it reaches every `canonical` and
+   `confinementDigest` from each case's input, computes every pinned
+   meet in both operand orders, and refuses every `rejects` input and
+   every `meetRefusals` pair.
 3. Independently, its stored bytes match the SHA-256 content-integrity
    pin in `VECTORS.sha256` (a cross-cutting spec-tree convention;
    distinct concern from §8's identity digest).

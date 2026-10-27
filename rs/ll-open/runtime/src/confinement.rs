@@ -157,13 +157,94 @@ impl UnixSocketGrant {
     }
 }
 
-/// The `port` block (README §4). Deliberately not `Serialize` — canonical
-/// bytes are built through [`ConfinementManifest::canonical_value`], and a
-/// derive here would offer a second, subtly different way to emit it.
+/// The address §4 binds when a grant omits one.
+pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1";
+
+/// One §4 listener grant: a port the bundle may bind, and the address.
+///
+/// Deliberately not `Serialize` — canonical bytes are built through
+/// [`ConfinementManifest::canonical_value`], and a derive here would offer a
+/// second, subtly different way to emit it. Constructed only through
+/// [`ConfinementManifest::with_port_bind`], so every value carries the §4
+/// port floor.
+///
+/// Equality is exact, including the spelling of the address: an omitted
+/// address and an explicit `"127.0.0.1"` bind the same socket, but they are
+/// different declarations and digest differently. That is what the meet
+/// compares ([`ConfinementManifest::meet`]). Two grants for the same socket in
+/// one document are refused under either spelling — see
+/// [`ConfinementManifest::with_port_bind`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PortBlock {
+pub struct PortGrant {
     bind: u16,
     address: Option<String>,
+}
+
+impl PortGrant {
+    /// The port the bundle may bind.
+    pub fn bind(&self) -> u16 {
+        self.bind
+    }
+
+    /// The address as declared. `None` is §4's 127.0.0.1 default, not "any".
+    pub fn address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    /// The address this grant binds, with §4's default applied.
+    pub fn effective_address(&self) -> &str {
+        self.address.as_deref().unwrap_or(DEFAULT_BIND_ADDRESS)
+    }
+
+    /// Canonical list order (README §7 rule 5): `bind`, then effective
+    /// address. The key is also socket identity, whatever the spelling, which
+    /// is how `with_port_bind` refuses a second grant for one socket — so the
+    /// order is total over any document's grants.
+    fn canonical_order(&self) -> (u16, &str) {
+        (self.bind, self.effective_address())
+    }
+
+    fn canonical_value(&self) -> serde_json::Value {
+        let mut block: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        block.insert("bind".into(), serde_json::Value::from(self.bind));
+        if let Some(address) = &self.address {
+            block.insert("address".into(), serde_json::Value::String(address.clone()));
+        }
+        json_object(block)
+    }
+}
+
+/// A list clause in canonical form (README §7 rule 5): one element is emitted
+/// as the element itself, two or more as a list. The scalar spelling is what
+/// every document written before lists existed already uses, so collapsing a
+/// one-element list onto it is what keeps their digests where they were.
+fn scalar_or_list(mut values: Vec<serde_json::Value>) -> serde_json::Value {
+    if values.len() == 1 {
+        values.remove(0)
+    } else {
+        serde_json::Value::Array(values)
+    }
+}
+
+/// Read a clause that is either one `T` or a non-empty list of them.
+///
+/// An empty list is refused rather than read as "none": it would declare
+/// nothing while still differing, on the wire, from the omitted block that
+/// already means none — the `{"allow": []}` round-trip defect, not repeated.
+fn one_or_many<'v>(
+    value: &'v serde_json::Value,
+    clause: &str,
+) -> Result<Vec<&'v serde_json::Value>, ExecutionError> {
+    match value {
+        serde_json::Value::Array(items) if items.is_empty() => {
+            Err(ExecutionError::invalid(format!(
+                "confinement/v1 {clause} is an empty list, which declares nothing; \
+                 omit the clause instead — an omitted clause is already the refusal"
+            )))
+        }
+        serde_json::Value::Array(items) => Ok(items.iter().collect()),
+        single => Ok(vec![single]),
+    }
 }
 
 /// A `cloister/confinement/v1` manifest.
@@ -176,9 +257,12 @@ pub struct ConfinementManifest {
     credential_source: Option<String>,
     fs_allow: Vec<FsGrant>,
     allow_hosts: Vec<String>,
-    port: Option<PortBlock>,
+    /// Kept in canonical order (README §7 rule 5) by `with_port_bind`, so
+    /// structural equality is document equality.
+    ports: Vec<PortGrant>,
     unix_sockets: Vec<UnixSocketGrant>,
-    connect_local: Option<u16>,
+    /// Ascending and distinct, kept so by `with_connect_local`.
+    connect_local: Vec<u16>,
 }
 
 /// The five dimensions of `confinement/v1`, decomposed so a compiler must name
@@ -193,15 +277,20 @@ pub struct Dimensions<'a> {
     pub fs_allow: &'a [FsGrant],
     /// §3 — hosts egress is permitted to. Empty means none.
     pub allow_hosts: &'a [String],
-    /// §4 — the single listener, as `(port, address)`. `None` address means
-    /// §4's 127.0.0.1 default, not "any".
-    pub port: Option<(u16, Option<&'a str>)>,
+    /// §4 — every listener grant, in canonical order. Empty means the bundle
+    /// MUST NOT bind. A grant's `None` address means §4's 127.0.0.1 default,
+    /// not "any".
+    ///
+    /// A list, not an `Option`: a consumer that read only the first grant
+    /// would attest N listeners and deliver one, so the type no longer offers
+    /// "the" listener to read (`ley-line-open-e2c33f`).
+    pub ports: &'a [PortGrant],
     /// §5 — the vault backend this workload authenticates against.
     pub credential_source: Option<&'a str>,
     /// §6 — UNIX sockets this workload may reach. Empty means none.
     pub unix_sockets: &'a [UnixSocketGrant],
-    /// §3 `network.connectLocal` — the single loopback port this workload may
-    /// `connect(2)` to. `None` means none, which is the default.
+    /// §3 `network.connectLocal` — the loopback ports this workload may
+    /// `connect(2)` to, ascending. Empty means none, which is the default.
     ///
     /// A sixth dimension living under §3's `network` object rather than in a
     /// section of its own: the JSON already groups it there, and this document
@@ -214,7 +303,7 @@ pub struct Dimensions<'a> {
     /// host namespace; the grant says which port the workload may dial, not
     /// who is listening on it. §6 gets peer identity from the filesystem, this
     /// gets it from the protocol or not at all — see ADR-0037.
-    pub connect_local: Option<u16>,
+    pub connect_local: &'a [u16],
 }
 
 impl Default for ConfinementManifest {
@@ -231,9 +320,9 @@ impl ConfinementManifest {
             credential_source: None,
             fs_allow: Vec::new(),
             allow_hosts: Vec::new(),
-            port: None,
+            ports: Vec::new(),
             unix_sockets: Vec::new(),
-            connect_local: None,
+            connect_local: Vec::new(),
         }
     }
 
@@ -318,7 +407,15 @@ impl ConfinementManifest {
         Ok(self)
     }
 
-    /// Declare §4's single listener.
+    /// Declare a §4 listener. Each call adds one grant; the manifest keeps
+    /// them in canonical order, so the order of calls does not reach the
+    /// digest.
+    ///
+    /// A second grant for a socket already granted is refused — under either
+    /// spelling of the default address. Silently merging the two would leave
+    /// the document's bytes, the parsed value and the digest disagreeing about
+    /// how many grants there are, and picking one spelling would be a choice
+    /// the issuer did not make.
     ///
     /// Fallible because `confinement.schema.json` constrains `bind` to
     /// 1024–65535 and this type is named for that spec. Accepting a wider `u16`
@@ -345,11 +442,30 @@ impl ConfinementManifest {
                  is every port rather than one."
             )));
         }
-        self.port = Some(PortBlock {
+        let grant = PortGrant {
             bind,
             address: address.map(str::to_owned),
-        });
-        Ok(self)
+        };
+        // One search answers both questions. The canonical order key is
+        // (port, effective address), which is exactly socket identity, so an
+        // equal key IS the duplicate and the insertion point is where a new
+        // grant keeps the list canonical.
+        match self
+            .ports
+            .binary_search_by(|held| held.canonical_order().cmp(&grant.canonical_order()))
+        {
+            Ok(index) => Err(ExecutionError::invalid(format!(
+                "confinement/v1 §4 port grants {bind} on {} twice (declared as \
+                 {:?} and {:?}); a document names each socket once",
+                grant.effective_address(),
+                self.ports[index].address(),
+                grant.address(),
+            ))),
+            Err(at) => {
+                self.ports.insert(at, grant);
+                Ok(self)
+            }
+        }
     }
 
     pub fn fs_grants(&self) -> &[FsGrant] {
@@ -428,27 +544,30 @@ impl ConfinementManifest {
         Dimensions {
             fs_allow: &self.fs_allow,
             allow_hosts: &self.allow_hosts,
-            port: self.port_bind(),
+            ports: self.port_binds(),
             credential_source: self.credential_source(),
             unix_sockets: &self.unix_sockets,
-            connect_local: self.connect_local,
+            connect_local: self.connect_local(),
         }
     }
 
-    /// The single loopback port §3 `connectLocal` permits dialing.
-    pub fn connect_local(&self) -> Option<u16> {
-        self.connect_local
+    /// The loopback ports §3 `connectLocal` permits dialing, ascending.
+    pub fn connect_local(&self) -> &[u16] {
+        &self.connect_local
     }
 
-    /// Declare §3's `connectLocal` — one loopback port the workload may
-    /// `connect(2)` to.
+    /// Declare a §3 `connectLocal` port — a loopback port the workload may
+    /// `connect(2)` to. Each call adds one; the manifest keeps them ascending,
+    /// and refuses a port already declared.
     ///
-    /// Single-valued, matching §4's "deliberately single-port; multi-port
-    /// bundles publish v2" rather than fighting it. The constraint is also
-    /// mechanical: `nono::CapabilitySet::proxy_only` takes one port, and it is
-    /// the only builder that compiles to connect-WITHOUT-bind on both
-    /// platforms. Declaring a list we could not enforce would be the
-    /// declared-but-dead class §9 condition 6 exists to forbid.
+    /// A list since `ley-line-open-e2c33f` (cloister ADR-0069 broker
+    /// endpoints). An earlier version kept this single-valued on the grounds
+    /// that `nono::CapabilitySet::proxy_only` takes one port and is the only
+    /// builder compiling to connect-WITHOUT-bind on both platforms. That
+    /// remains true of the builder, not of the mechanisms: Landlock takes one
+    /// `ConnectTcp` rule per port, and Seatbelt's per-port outbound rule is
+    /// the very rule `proxy_only` emits, repeatable as a platform rule. The
+    /// compiler (`capabilities_from_manifest`) does exactly that.
     ///
     /// No 1024 floor, unlike §4. That floor exists because binding a
     /// privileged port is a privileged act; CONNECTING to one is not — a
@@ -462,20 +581,84 @@ impl ConfinementManifest {
                  mechanisms it compiles to a wildcard",
             ));
         }
-        self.connect_local = Some(port);
-        Ok(self)
+        match self.connect_local.binary_search(&port) {
+            Ok(_) => Err(ExecutionError::invalid(format!(
+                "confinement/v1 §3 network.connectLocal declares {port} twice; a \
+                 document names each port once"
+            ))),
+            Err(at) => {
+                self.connect_local.insert(at, port);
+                Ok(self)
+            }
+        }
     }
 
-    /// The single listener §4 permits, as `(port, address)`. `None` means the
+    /// Every listener §4 permits, in canonical order. Empty means the
     /// manifest declares no listener, which §4 defines as MUST NOT bind.
     ///
-    /// The address is returned unresolved — `None` here means "§4's default",
-    /// not "any address", and only the caller knows whether it can enforce the
+    /// Each grant's address is unresolved — `None` means "§4's default", not
+    /// "any address", and only the caller knows whether it can enforce the
     /// distinction.
-    pub fn port_bind(&self) -> Option<(u16, Option<&str>)> {
-        self.port
-            .as_ref()
-            .map(|port| (port.bind, port.address.as_deref()))
+    pub fn port_binds(&self) -> &[PortGrant] {
+        &self.ports
+    }
+
+    /// The meet of two documents: the policy both permit.
+    ///
+    /// Defined for the two list clauses — §4 `port` and §3 `connectLocal` —
+    /// as set intersection (README §7, "Meet"). A grant survives only when
+    /// both operands carry it, compared as canonical grants: an omitted
+    /// address and an explicit `"127.0.0.1"` are different declarations, so
+    /// they do not meet. That can only drop a grant, never add one, which is
+    /// the direction a meet must err in. An empty intersection omits the
+    /// clause, and a `network` block left with no clause is omitted with it,
+    /// so a meet with nothing in common is byte-identical to a document that
+    /// never declared the dimension.
+    ///
+    /// Every other dimension must be EQUAL on both sides, or the meet is
+    /// refused naming the dimensions that differ. v1 defines no meet for path
+    /// prefixes, host patterns, socket modes or vault backends, and inventing
+    /// one here would let this function decide policy no document stated.
+    ///
+    /// Commutative and idempotent, and the result is in canonical order
+    /// because both operands are.
+    pub fn meet(&self, other: &Self) -> Result<Self, ExecutionError> {
+        let Dimensions {
+            fs_allow,
+            allow_hosts,
+            ports: _,
+            credential_source,
+            unix_sockets,
+            connect_local: _,
+        } = self.dimensions();
+        let theirs = other.dimensions();
+        let mut differing = Vec::new();
+        if fs_allow != theirs.fs_allow {
+            differing.push("§2 fs.allow");
+        }
+        if allow_hosts != theirs.allow_hosts {
+            differing.push("§3 network.allowHosts");
+        }
+        if credential_source != theirs.credential_source {
+            differing.push("§5 credentialSource");
+        }
+        if unix_sockets != theirs.unix_sockets {
+            differing.push("§6 unixSocket.allow");
+        }
+        if !differing.is_empty() {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 meet is defined for §4 port and §3 \
+                 network.connectLocal only; the operands differ in {}, which v1 \
+                 gives no meet for",
+                differing.join(", ")
+            )));
+        }
+        let mut meet = self.clone();
+        meet.ports
+            .retain(|grant| other.ports.iter().any(|theirs| theirs == grant));
+        meet.connect_local
+            .retain(|port| other.connect_local.binary_search(port).is_ok());
+        Ok(meet)
     }
 
     /// Serialize to the canonical JSON the digest is computed over (§7).
@@ -525,7 +708,7 @@ impl ConfinementManifest {
         // declared. Emitted only when at least one is, so a manifest using
         // neither digests exactly as it did before `connectLocal` existed —
         // which is what keeps the pinned v1 vector still.
-        if !self.allow_hosts.is_empty() || self.connect_local.is_some() {
+        if !self.allow_hosts.is_empty() || !self.connect_local.is_empty() {
             let mut network: BTreeMap<String, serde_json::Value> = BTreeMap::new();
             if !self.allow_hosts.is_empty() {
                 let hosts: Vec<serde_json::Value> = self
@@ -536,8 +719,16 @@ impl ConfinementManifest {
                     .collect();
                 network.insert("allowHosts".into(), serde_json::Value::Array(hosts));
             }
-            if let Some(port) = self.connect_local {
-                network.insert("connectLocal".into(), serde_json::Value::from(port));
+            // §7 rule 5: one port is the bare integer — the only spelling that
+            // existed before lists, so every such document keeps its digest.
+            if !self.connect_local.is_empty() {
+                let ports = self
+                    .connect_local
+                    .iter()
+                    .copied()
+                    .map(serde_json::Value::from)
+                    .collect();
+                network.insert("connectLocal".into(), scalar_or_list(ports));
             }
             root.insert("network".into(), json_object(network));
         }
@@ -569,13 +760,12 @@ impl ConfinementManifest {
             block.insert("allow".into(), serde_json::Value::Array(allow));
             root.insert("unixSocket".into(), json_object(block));
         }
-        if let Some(port) = &self.port {
-            let mut block: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            block.insert("bind".into(), serde_json::Value::from(port.bind));
-            if let Some(address) = &port.address {
-                block.insert("address".into(), serde_json::Value::String(address.clone()));
-            }
-            root.insert("port".into(), json_object(block));
+        // §7 rule 5: one grant is the bare object — byte-identical to the
+        // single-port form, which is what keeps the pinned vector's digest —
+        // and two or more are a list in canonical order.
+        if !self.ports.is_empty() {
+            let grants = self.ports.iter().map(PortGrant::canonical_value).collect();
+            root.insert("port".into(), scalar_or_list(grants));
         }
         json_object(root)
     }
@@ -747,29 +937,42 @@ impl ConfinementManifest {
                     manifest = manifest.with_allowed_host(host)?;
                 }
             }
-            if let Some(port) = network.get("connectLocal") {
-                let port = port.as_u64().ok_or_else(|| {
-                    ExecutionError::invalid("network.connectLocal must be an integer port")
-                })?;
-                let port = u16::try_from(port).map_err(|_| {
-                    ExecutionError::invalid(format!(
-                        "network.connectLocal {port} exceeds the 16-bit port space"
-                    ))
-                })?;
-                manifest = manifest.with_connect_local(port)?;
+            if let Some(ports) = network.get("connectLocal") {
+                for port in one_or_many(ports, "§3 network.connectLocal")? {
+                    let port = port.as_u64().ok_or_else(|| {
+                        ExecutionError::invalid(
+                            "network.connectLocal must be an integer port or a list of them",
+                        )
+                    })?;
+                    let port = u16::try_from(port).map_err(|_| {
+                        ExecutionError::invalid(format!(
+                            "network.connectLocal {port} exceeds the 16-bit port space"
+                        ))
+                    })?;
+                    manifest = manifest.with_connect_local(port)?;
+                }
             }
         }
 
-        if let Some(port) = object.get("port") {
-            let bind = port
-                .get("bind")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| ExecutionError::invalid("port must carry an integer `bind`"))?;
-            let bind = u16::try_from(bind).map_err(|_| {
-                ExecutionError::invalid(format!("port.bind {bind} exceeds the 16-bit port space"))
-            })?;
-            let address = port.get("address").and_then(serde_json::Value::as_str);
-            manifest = manifest.with_port_bind(bind, address)?;
+        if let Some(ports) = object.get("port") {
+            for port in one_or_many(ports, "§4 port")? {
+                if !port.is_object() {
+                    return Err(ExecutionError::invalid(
+                        "a §4 port grant must be an object carrying `bind`",
+                    ));
+                }
+                let bind = port
+                    .get("bind")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| ExecutionError::invalid("port must carry an integer `bind`"))?;
+                let bind = u16::try_from(bind).map_err(|_| {
+                    ExecutionError::invalid(format!(
+                        "port.bind {bind} exceeds the 16-bit port space"
+                    ))
+                })?;
+                let address = port.get("address").and_then(serde_json::Value::as_str);
+                manifest = manifest.with_port_bind(bind, address)?;
+            }
         }
 
         Ok(manifest)

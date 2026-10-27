@@ -131,8 +131,13 @@ pub fn confinement_manifest(
     // what LLO grants itself, and §3/§5 are refused by the compiler on both
     // tiers — merging a dimension whose tier refuses it would turn a clean
     // refusal into a digest mismatch, a worse diagnostic for the same outcome.
-    if let Some((bind, address)) = authorized.and_then(|m| m.dimensions().port) {
-        manifest = manifest.with_port_bind(bind, address)?;
+    // Every grant, not the first: a fold that took one listener of N would
+    // still be caught by the equality contract below, but as a refusal of a
+    // document the tier can deliver.
+    if let Some(authorized) = authorized {
+        for grant in authorized.dimensions().ports {
+            manifest = manifest.with_port_bind(grant.bind(), grant.address())?;
+        }
     }
     // §6 folds on both tiers, because both deliver it — through different
     // mechanisms, which is `Tier`'s concern at compile time, not the fold's.
@@ -173,8 +178,10 @@ pub fn confinement_manifest(
     // ConnectTcp per port, and Seatbelt scopes network-outbound per port
     // (measured — ADR-0037, `ley-line-open-e41717`). Refused on the microVM
     // tier, where the workload's egress boundary is the hypervisor.
-    if let Some(port) = authorized.and_then(|m| m.dimensions().connect_local) {
-        manifest = manifest.with_connect_local(port)?;
+    if let Some(authorized) = authorized {
+        for port in authorized.dimensions().connect_local {
+            manifest = manifest.with_connect_local(*port)?;
+        }
     }
     // A carried document is a COMMITMENT, not a menu. The folds above take §4
     // and §6 — the two dimensions a grant can originate — and everything
@@ -220,7 +227,7 @@ fn differing_dimensions(a: &ConfinementManifest, b: &ConfinementManifest) -> Vec
     let Dimensions {
         fs_allow: a_fs,
         allow_hosts: a_hosts,
-        port: a_port,
+        ports: a_port,
         credential_source: a_cred,
         unix_sockets: a_sockets,
         connect_local: a_connect,
@@ -228,7 +235,7 @@ fn differing_dimensions(a: &ConfinementManifest, b: &ConfinementManifest) -> Vec
     let Dimensions {
         fs_allow: b_fs,
         allow_hosts: b_hosts,
-        port: b_port,
+        ports: b_port,
         credential_source: b_cred,
         unix_sockets: b_sockets,
         connect_local: b_connect,
@@ -296,7 +303,7 @@ pub fn capabilities_from_manifest(
     let Dimensions {
         fs_allow,
         allow_hosts,
-        port,
+        ports,
         credential_source,
         unix_sockets,
         connect_local,
@@ -437,10 +444,16 @@ pub fn capabilities_from_manifest(
         )));
     }
 
-    // §4 listener. On Linux this is exactly the shape cloister-harness runs
-    // today — deny everything, then open one loopback port to the vault-proxy
-    // shim. On macOS it cannot be expressed at all; see below.
-    if let Some((bind, address)) = port {
+    // §4 listeners. On Linux this is exactly the shape cloister-harness runs
+    // today — deny everything, then open each declared loopback port. On macOS
+    // it cannot be expressed at all; see below.
+    //
+    // A refusal of any one grant refuses the whole set: compiling the grants
+    // that pass and
+    // dropping the rest would attest N listeners and deliver fewer — the
+    // declared-but-dead class §9 condition 6 forbids, one grant at a time.
+    for grant in ports {
+        let (bind, address) = (grant.bind(), grant.address());
         // §4 defaults to 127.0.0.1 and requires anything wider to be declared
         // explicitly. That declaration is precisely what cannot be honoured
         // here: with Landlock filtering on port alone, a grant for 0.0.0.0 and
@@ -550,10 +563,10 @@ pub fn capabilities_from_manifest(
     // egress crosses the hypervisor, and this profile confines the VMM host.
     // Granting the VMM a dial right the guest cannot use would attest a
     // channel the workload does not have — §9 condition 6.
-    if let Some(connect) = connect_local {
+    if let Some((&connect, further)) = connect_local.split_first() {
         if matches!(tier, Tier::MicroVm) {
             return Err(ExecutionError::invalid(format!(
-                "confinement/v1 §3 network.connectLocal {connect} is not deliverable \
+                "confinement/v1 §3 network.connectLocal {connect_local:?} is not deliverable \
                  on the microVM tier: the workload runs in the guest and reaches the \
                  host only over vsock, which pairs a guest port with a host UNIX \
                  SOCKET and has no TCP analogue. Carrying it would require socket \
@@ -563,17 +576,61 @@ pub fn capabilities_from_manifest(
                  TCP host-side if the upstream needs it."
             )));
         }
-        // `proxy_only` sets the network MODE, so it replaces the
-        // `block_network()` this function otherwise ends with rather than
-        // adding to it. Both are closed by default; ProxyOnly is Blocked plus
-        // exactly one outbound destination.
-        capabilities = match port {
-            // §4 and §3 together: one listener and one dial target. Only
-            // reachable on Linux, since §4 is refused above on Seatbelt.
-            Some((bind, _)) => capabilities.proxy_only_with_bind(connect, vec![bind]),
-            None => capabilities.proxy_only(connect),
-        };
-        return Ok(capabilities);
+        // ONE port: unchanged from the single-valued dimension. `proxy_only`
+        // sets the network MODE, so it replaces the `block_network()` this
+        // function otherwise ends with rather than adding to it. Both are
+        // closed by default; ProxyOnly is Blocked plus exactly one outbound
+        // destination.
+        if further.is_empty() {
+            let binds: Vec<u16> = ports.iter().map(|grant| grant.bind()).collect();
+            capabilities = if binds.is_empty() {
+                capabilities.proxy_only(connect)
+            } else {
+                // §4 and §3 together. Only reachable on Linux, since §4 is
+                // refused above on Seatbelt.
+                capabilities.proxy_only_with_bind(connect, binds)
+            };
+            return Ok(capabilities);
+        }
+        // TWO OR MORE ports (ley-line-open-e2c33f). nono's ProxyOnly mode
+        // carries exactly one destination, so the list compiles per platform
+        // to the same per-port rule each kernel already enforces:
+        //
+        //   Linux: deny-all plus one Landlock `ConnectTcp` rule per port
+        //     (`allow_tcp_connect`). Deliberately NOT ProxyOnly-plus-extras:
+        //     on a kernel without Landlock network rules (ABI < 4) nono falls
+        //     back to a seccomp proxy filter that knows only ProxyOnly's one
+        //     port and would drop the rest without a word. Blocked mode with
+        //     per-port rules has no seccomp fallback, so that kernel refuses
+        //     the whole set at apply — loud, never narrower than attested.
+        //   macOS: ProxyOnly for the first port, and for each further port the
+        //     exact rule ProxyOnly emits for its own — `(allow network-outbound
+        //     (remote tcp "localhost:N"))` — as a platform rule. Platform rules
+        //     are emitted after the network block, and an `allow` scoped to
+        //     one remote port adds that destination and nothing else: no
+        //     network-bind, no network-inbound, since `bind_ports` and
+        //     `localhost_ports` stay empty.
+        #[cfg(target_os = "linux")]
+        {
+            capabilities = capabilities.block_network();
+            for port in connect_local {
+                capabilities = capabilities.allow_tcp_connect(*port);
+            }
+            return Ok(capabilities);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // §4 is refused above on Seatbelt, so there are no binds here.
+            capabilities = capabilities.proxy_only(connect);
+            for port in further {
+                capabilities = capabilities
+                    .platform_rule(format!(
+                        "(allow network-outbound (remote tcp \"localhost:{port}\"))"
+                    ))
+                    .map_err(nono_error)?;
+            }
+            return Ok(capabilities);
+        }
     }
 
     Ok(capabilities.block_network())
@@ -762,6 +819,43 @@ pub const VSOCK_UNIX_BASE_PORT: u32 = 0x1_0000;
 /// Note what this makes expressible that the native tier cannot: `bind` —
 /// serve-without-dial — is deliverable here precisely because the withhold
 /// is a boundary (the muxer's reset) rather than a filter.
+/// The libkrun guest port map for a manifest's §4 listeners: one `N:N` entry
+/// per declared grant, in canonical order, and nothing else.
+///
+/// Pure, and derived from the attested document alone, so the issuer can
+/// compute every published port from what they signed. `N:N` because libkrun
+/// exposes a guest listener at its HOST port number; any other mapping would
+/// leave the guest's own view of §4 disagreeing with the document.
+///
+/// Refused without socket hijacking (`tsi_features == 0`): a guest `AF_INET`
+/// bind is then carried nowhere, so a declared listener could never receive a
+/// connection — a declaration with no effect. An empty map is returned for a
+/// manifest declaring no listener, whatever the TSI features, and libkrun is
+/// still handed that empty map explicitly (`prepare_vm`), because its NULL
+/// default is to publish every listening guest port.
+pub fn guest_port_map(
+    manifest: &ConfinementManifest,
+    tsi_features: u32,
+) -> Result<Vec<std::ffi::CString>, ExecutionError> {
+    let ports = manifest.dimensions().ports;
+    if !ports.is_empty() && tsi_features == 0 {
+        let binds: Vec<u16> = ports.iter().map(|grant| grant.bind()).collect();
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1 §4 port {binds:?} is not deliverable on the microVM \
+             tier without socket hijacking: the guest's AF_INET bind is not \
+             carried anywhere, so the listener could never be reached. Start the \
+             worker with --tsi-hijack-inet, or omit the dimension."
+        )));
+    }
+    ports
+        .iter()
+        .map(|grant| {
+            std::ffi::CString::new(format!("{0}:{0}", grant.bind()))
+                .map_err(|_| ExecutionError::invalid("port map entry contains a NUL byte"))
+        })
+        .collect()
+}
+
 pub fn vsock_unix_mappings(
     manifest: &ConfinementManifest,
 ) -> Result<Vec<VsockUnixMapping>, ExecutionError> {

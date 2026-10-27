@@ -6,6 +6,7 @@
 
 pub mod authorization;
 pub mod backends;
+pub mod cas_evidence;
 mod catalog;
 pub mod confinement;
 mod error;
@@ -15,8 +16,9 @@ pub mod transport;
 
 pub use authorization::{
     ArtifactIdentity, AuthorizedExecution, CasDsseEvidenceVerifier, EvidenceBinding, EvidenceField,
-    EvidenceRef, EvidenceStore, EvidenceVerifier, GrantSignature, MetadataOnlyEvidenceVerifier,
-    RejectUnverifiedEvidence, SchemaIntent, SignedGrant, WorkspaceInput,
+    EvidenceRef, EvidenceRejection, EvidenceStore, EvidenceVerifier, GrantSignature,
+    MetadataOnlyEvidenceVerifier, RejectUnverifiedEvidence, SchemaIntent, SignedGrant,
+    WorkspaceInput,
 };
 pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};

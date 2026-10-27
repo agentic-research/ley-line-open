@@ -148,10 +148,25 @@ enum Cmd {
 
         /// Explicitly accept unverified authority for local fixtures: no
         /// issuer signature on the RunGrant, and metadata-only evidence
-        /// validation. Production Cloister integrations must provide a real
-        /// Signet/NotMe/Interlace verifier instead.
-        #[arg(long, default_value_t = false)]
+        /// validation. Production deployments configure `--trust-key` and
+        /// `--evidence-store` instead; this flag refuses to combine with
+        /// either.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["trust_keys", "evidence_store"])]
         allow_unverified_evidence: bool,
+
+        /// Ed25519 public key trusted to sign RunGrants and their DSSE
+        /// evidence; repeatable. Each file holds one key: 64 hex characters,
+        /// or a PEM `PUBLIC KEY` block (canonical RFC 8410 SPKI). LLO ships
+        /// no trust keys. Requires `--evidence-store`.
+        #[arg(long = "trust-key", requires = "evidence_store")]
+        trust_keys: Vec<PathBuf>,
+
+        /// Existing CAS blob-store directory holding the DSSE evidence
+        /// envelopes grants reference, addressed `blake3-256:<hex>`.
+        /// Requires at least one `--trust-key`. Without both, every start is
+        /// refused.
+        #[arg(long, requires = "trust_keys")]
+        evidence_store: Option<PathBuf>,
 
         /// Source directory the daemon's store is parsed from and its
         /// accepted proposals are written back into. With `--backend
@@ -366,10 +381,21 @@ async fn main() -> Result<()> {
             cdc,
             cdc_target,
             allow_unverified_evidence,
+            trust_keys,
+            evidence_store,
             source,
             language,
             workspace,
         } => {
+            // First, before any filesystem effect: a misconfigured verifier
+            // refuses startup (bead ley-line-open-410921).
+            let (verifier, _) = leyline_cli_lib::daemon::execution::EvidenceVerifierConfig {
+                allow_unverified_evidence,
+                trust_keys,
+                evidence_store,
+            }
+            .build()
+            .context("configure the execution evidence verifier")?;
             if !worker.is_file() {
                 bail!(
                     "native worker is not an executable file: {}",
@@ -411,12 +437,6 @@ async fn main() -> Result<()> {
                 mcp_no_auth: false,
                 mcp_uds: None,
                 reset_arena: false,
-            };
-            let verifier: Arc<dyn leyline_runtime::EvidenceVerifier> = if allow_unverified_evidence
-            {
-                Arc::new(leyline_runtime::MetadataOnlyEvidenceVerifier)
-            } else {
-                Arc::new(leyline_runtime::RejectUnverifiedEvidence)
             };
             match backend_kind {
                 ExecutionBackendKind::Native => {

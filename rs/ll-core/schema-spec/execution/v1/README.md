@@ -78,6 +78,28 @@ substrate derives the run identity before it checks any evidence and hands it
 to every verifier, so a verifier that accepts unbound evidence is choosing to;
 it has what it needs to refuse.
 
+## Verifier selection
+
+The verifier is local configuration, not wire content; nothing in a request
+selects it. An embedding authority passes its own. The first-party
+`leyline execution-daemon` installs one of three:
+
+- `--evidence-store DIR --trust-key FILE...` — LLO's `CasDsseEvidenceVerifier`
+  over a CAS blob store, trusting exactly the operator's Ed25519 keys. It
+  checks the grant signature above and resolves each `EvidenceRef.digest`
+  (`blake3-256:<hex>` over the exact DSSE envelope bytes) in the store.
+- No verifier flags — every start is refused `unauthenticated`.
+- `--allow-unverified-evidence` — metadata only, for local fixtures.
+
+Any partial or invalid configuration refuses startup; the downgrade never
+coexists with a real verifier. A signature is checked under every trusted key,
+and `RunGrant.signature.keyId` and the DSSE `keyid` select nothing. After every
+key has refused a signature, its hint is compared with the trusted keys'
+ADR-012 canonical kids only to name the refusal: `signature-invalid` when it
+names a trusted key, `untrusted-signer` otherwise. The wire `ExecutionError`
+is unchanged; LLO's verifier leads `message` with a stable rejection token
+(`grant-unsigned`, `evidence-missing`, …).
+
 ## Backend evidence
 
 `RunReceipt.backend.evidence` names its contract by media type. LLO's is

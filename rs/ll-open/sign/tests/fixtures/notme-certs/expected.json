@@ -1,0 +1,8 @@
+{
+  "epoch": 3,
+  "issuing_ca_pubkey_b64": "AtFyDvI9juEFnfpGdddX0G8xo/97SnAE5mj25kSkvKU=",
+  "task_signing_pubkey_b64": "/qAi4I+Usk3iLUdVE4x9q+LOPDhiLn6j4SRpUHTp8Q4=",
+  "direct_signing_pubkey_b64": "hKbnHD689uXpD06YtIW7dVyh+RocjQUOhef14/ZRfUo=",
+  "task_binding_hex": "170de5f60ee4aeba5545cc75edc213f67a52cfc6a47814553ac040826a4be968",
+  "direct_binding_hex": "9d9df8164681f2f9095f0060bd370743b4c9be3b14059f0f3663b2cdb1961c70"
+}

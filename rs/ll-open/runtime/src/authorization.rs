@@ -149,23 +149,176 @@ pub trait EvidenceVerifier: Send + Sync {
 }
 
 /// Minimal CAS interface needed by the built-in APAS DSSE verifier. Cloister
-/// can provide its mmap/SQLite CAS adapter without giving LLO host paths.
+/// can provide its mmap/SQLite CAS adapter without giving LLO host paths;
+/// [`crate::cas_evidence::CasEvidenceStore`] is LLO's own, over the
+/// filesystem blob store.
+///
+/// `digest` is an evidence digest — `blake3-256:<64 lowercase hex>` over the
+/// exact stored bytes, the blob-hash domain. An implementation reports an
+/// absent blob as [`EvidenceRejection::EvidenceMissing`] and bytes it cannot
+/// vouch for as [`EvidenceRejection::EvidenceIntegrity`], so a rejection
+/// names what failed.
 pub trait EvidenceStore: Send + Sync {
     fn load(&self, digest: &str) -> Result<Vec<u8>, ExecutionError>;
+}
+
+/// Why [`CasDsseEvidenceVerifier`] refused a grant or one of its evidence
+/// references.
+///
+/// Every rejection is reported as an [`ExecutionError`] — `Unauthenticated`,
+/// except [`Self::EvidenceMediaType`], which keeps `UnsupportedBackend` —
+/// whose `detail` begins with [`Self::as_str`] followed by `": "`. The wire
+/// `ExecutionError` is unchanged; the token is how a caller on the far side
+/// of the daemon recovers the typed reason ([`Self::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EvidenceRejection {
+    /// The verifier holds no trust keys, so nothing can verify.
+    NoTrustKeys,
+    /// The `RunGrant` carries no issuer signature.
+    GrantUnsigned,
+    /// The grant signature is not a 64-byte `ed25519` signature.
+    GrantSignatureMalformed,
+    /// No trusted key verifies the signature, and the signature's kid hint
+    /// names a trusted key: the signed bytes were altered after signing.
+    SignatureInvalid,
+    /// No trusted key verifies the signature, and its kid hint names no
+    /// trusted key: the signer is outside the trust set.
+    UntrustedSigner,
+    /// The evidence reference does not name APAS in-toto DSSE bytes.
+    EvidenceMediaType,
+    /// The evidence digest is not a `blake3-256` content address.
+    EvidenceDigestMalformed,
+    /// The evidence store holds no blob under the referenced digest.
+    EvidenceMissing,
+    /// The store cannot vouch for the bytes: they do not hash to the
+    /// reference, or they could not be read.
+    EvidenceIntegrity,
+    /// The bytes are not a DSSE envelope, or the authenticated payload is not
+    /// an in-toto statement.
+    EnvelopeMalformed,
+    /// The statement's predicate is not APAS Handoff/v1.
+    PredicateMismatch,
+    /// The statement carries no subject asserting this evidence role.
+    RoleNotAsserted,
+    /// The subject's run digest is not a run identity.
+    RunIdentityMalformed,
+    /// The statement asserts the role for a different run.
+    RunNotAuthorized,
+}
+
+impl EvidenceRejection {
+    const ALL: [Self; 14] = [
+        Self::NoTrustKeys,
+        Self::GrantUnsigned,
+        Self::GrantSignatureMalformed,
+        Self::SignatureInvalid,
+        Self::UntrustedSigner,
+        Self::EvidenceMediaType,
+        Self::EvidenceDigestMalformed,
+        Self::EvidenceMissing,
+        Self::EvidenceIntegrity,
+        Self::EnvelopeMalformed,
+        Self::PredicateMismatch,
+        Self::RoleNotAsserted,
+        Self::RunIdentityMalformed,
+        Self::RunNotAuthorized,
+    ];
+
+    /// The stable token that leads a rejection's `detail`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTrustKeys => "no-trust-keys",
+            Self::GrantUnsigned => "grant-unsigned",
+            Self::GrantSignatureMalformed => "grant-signature-malformed",
+            Self::SignatureInvalid => "signature-invalid",
+            Self::UntrustedSigner => "untrusted-signer",
+            Self::EvidenceMediaType => "evidence-media-type",
+            Self::EvidenceDigestMalformed => "evidence-digest-malformed",
+            Self::EvidenceMissing => "evidence-missing",
+            Self::EvidenceIntegrity => "evidence-integrity",
+            Self::EnvelopeMalformed => "envelope-malformed",
+            Self::PredicateMismatch => "predicate-mismatch",
+            Self::RoleNotAsserted => "role-not-asserted",
+            Self::RunIdentityMalformed => "run-identity-malformed",
+            Self::RunNotAuthorized => "run-not-authorized",
+        }
+    }
+
+    /// The error reporting this rejection, with `context` after the token.
+    pub fn error(self, context: impl std::fmt::Display) -> ExecutionError {
+        ExecutionError {
+            code: match self {
+                Self::EvidenceMediaType => crate::ErrorCode::UnsupportedBackend,
+                _ => crate::ErrorCode::Unauthenticated,
+            },
+            retryable: false,
+            detail: format!("{}: {context}", self.as_str()),
+        }
+    }
+
+    /// The typed reason an error reports, if it is an evidence rejection.
+    pub fn of(error: &ExecutionError) -> Option<Self> {
+        let (token, _) = error.detail.split_once(": ")?;
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == token && reason.error("").code == error.code)
+    }
+}
+
+impl std::fmt::Display for EvidenceRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Verifies APAS/in-toto DSSE evidence from a content-addressed store against
 /// embedding-provided trust keys. Key distribution/rotation remains owned by
 /// Signet/NotMe; this type only performs cryptographic verification and digest
-/// binding once Cloister supplies the active keys.
+/// binding once Cloister — or the operator, through `leyline
+/// execution-daemon --trust-key` — supplies the active keys.
+///
+/// A signature is checked under every trusted key; its kid hint selects
+/// nothing. Only after every key has refused it is the hint compared with the
+/// trusted keys' canonical kids, to label the rejection
+/// [`EvidenceRejection::SignatureInvalid`] rather than
+/// [`EvidenceRejection::UntrustedSigner`].
 pub struct CasDsseEvidenceVerifier<S> {
     store: std::sync::Arc<S>,
     trust_keys: Vec<VerifyingKey>,
+    /// ADR-012 canonical kid of each trusted key, index-aligned with
+    /// `trust_keys`. Rejection labels only.
+    trusted_kids: Vec<String>,
 }
 
 impl<S: EvidenceStore> CasDsseEvidenceVerifier<S> {
     pub fn new(store: std::sync::Arc<S>, trust_keys: Vec<VerifyingKey>) -> Self {
-        Self { store, trust_keys }
+        let trusted_kids = trust_keys
+            .iter()
+            .map(leyline_sign::kid::canonical_kid)
+            .collect();
+        Self {
+            store,
+            trust_keys,
+            trusted_kids,
+        }
+    }
+
+    /// The canonical kid of every trusted key, in configuration order.
+    pub fn trusted_kids(&self) -> Vec<String> {
+        self.trusted_kids.clone()
+    }
+
+    /// The reason a signature no trusted key verifies is refused.
+    fn unverified<'a>(&self, hints: impl IntoIterator<Item = &'a str>) -> EvidenceRejection {
+        let names_trusted_key = hints.into_iter().any(|hint| {
+            leyline_sign::kid::is_canonical_kid_shape(hint.as_bytes())
+                && self.trusted_kids.iter().any(|kid| kid == hint)
+        });
+        if names_trusted_key {
+            EvidenceRejection::SignatureInvalid
+        } else {
+            EvidenceRejection::UntrustedSigner
+        }
     }
 }
 
@@ -176,47 +329,49 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
         binding: &EvidenceBinding,
         evidence: &EvidenceRef,
     ) -> Result<(), ExecutionError> {
+        if self.trust_keys.is_empty() {
+            return Err(EvidenceRejection::NoTrustKeys
+                .error(format!("{field} DSSE signature is not trusted")));
+        }
         if evidence.media_type != "application/vnd.in-toto+json" {
-            return Err(ExecutionError::unsupported(format!(
-                "{field} is not an APAS in-toto evidence envelope"
-            )));
+            return Err(EvidenceRejection::EvidenceMediaType
+                .error(format!("{field} is not an APAS in-toto evidence envelope")));
         }
         let bytes = self.store.load(&evidence.digest)?;
+        // Re-checked here whatever the store promises: an embedding store is
+        // not obliged to verify on read.
         let observed = format!("blake3-256:{}", bytes.hash());
         if observed != evidence.digest {
-            return Err(ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} CAS digest does not match evidence bytes"),
-            });
+            return Err(EvidenceRejection::EvidenceIntegrity
+                .error(format!("{field} CAS digest does not match evidence bytes")));
         }
-        let envelope = Envelope::from_json_slice(&bytes).map_err(|error| ExecutionError {
-            code: crate::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail: format!("{field} DSSE envelope is invalid: {error}"),
+        let envelope = Envelope::from_json_slice(&bytes).map_err(|error| {
+            EvidenceRejection::EnvelopeMalformed
+                .error(format!("{field} DSSE envelope is invalid: {error}"))
         })?;
-        if self.trust_keys.is_empty() {
-            return Err(ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} DSSE signature is not trusted"),
-            });
+        let mut statement = None;
+        for key in &self.trust_keys {
+            match envelope.verify(key) {
+                Ok(verified) => {
+                    statement = Some(verified);
+                    break;
+                }
+                // The signature verified and the authenticated payload is not
+                // a statement: no other key changes that.
+                Err(leyline_envelope::VerifyError::Payload(error)) => {
+                    return Err(EvidenceRejection::EnvelopeMalformed
+                        .error(format!("{field} DSSE payload is not a statement: {error}")));
+                }
+                Err(leyline_envelope::VerifyError::SignatureInvalid) => {}
+            }
         }
-        let statement = self
-            .trust_keys
-            .iter()
-            .find_map(|key| envelope.verify(key).ok())
-            .ok_or_else(|| ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} DSSE signature is not trusted"),
-            })?;
+        let statement = statement.ok_or_else(|| {
+            self.unverified(envelope.keyids())
+                .error(format!("{field} DSSE signature is not trusted"))
+        })?;
         if statement.predicate_type() != APAS_PREDICATE_TYPE {
-            return Err(ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} DSSE predicate is not APAS Handoff/v1"),
-            });
+            return Err(EvidenceRejection::PredicateMismatch
+                .error(format!("{field} DSSE predicate is not APAS Handoff/v1")));
         }
         // The statement must assert *this* role for *this* run. A subject
         // named for the role is the issuer's assertion of it; the subject's
@@ -236,45 +391,38 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
             // equality against a run identity we derived — never look
             // anything up by it.
             if !is_run_id(claimed) {
-                return Err(ExecutionError {
-                    code: crate::ErrorCode::Unauthenticated,
-                    retryable: false,
-                    detail: format!("{field} subject digest is not a run identity"),
-                });
+                return Err(EvidenceRejection::RunIdentityMalformed
+                    .error(format!("{field} subject digest is not a run identity")));
             }
             if claimed == binding.run_id {
                 return Ok(());
             }
         }
-        Err(ExecutionError {
-            code: crate::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail: if asserts_role {
-                format!("{field} does not authorize this run")
-            } else {
-                format!("{field} statement asserts no {field} subject")
-            },
+        Err(if asserts_role {
+            EvidenceRejection::RunNotAuthorized
+                .error(format!("{field} does not authorize this run"))
+        } else {
+            EvidenceRejection::RoleNotAsserted
+                .error(format!("{field} statement asserts no {field} subject"))
         })
     }
 
     fn verify_grant(&self, grant: &SignedGrant) -> Result<(), ExecutionError> {
-        let unauthenticated = |detail: String| ExecutionError {
-            code: crate::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail,
-        };
-        let signature = grant
-            .signature
-            .as_ref()
-            .ok_or_else(|| unauthenticated("RunGrant carries no issuer signature".into()))?;
+        if self.trust_keys.is_empty() {
+            return Err(EvidenceRejection::NoTrustKeys
+                .error("RunGrant signature cannot be checked against an empty trust set"));
+        }
+        let signature = grant.signature.as_ref().ok_or_else(|| {
+            EvidenceRejection::GrantUnsigned.error("RunGrant carries no issuer signature")
+        })?;
         if signature.algorithm != GRANT_SIGNATURE_ALGORITHM {
-            return Err(unauthenticated(format!(
+            return Err(EvidenceRejection::GrantSignatureMalformed.error(format!(
                 "RunGrant signature algorithm {:?} is not supported",
                 signature.algorithm
             )));
         }
         let value: [u8; 64] = signature.value.as_slice().try_into().map_err(|_| {
-            unauthenticated(format!(
+            EvidenceRejection::GrantSignatureMalformed.error(format!(
                 "RunGrant ed25519 signature must be 64 bytes, got {}",
                 signature.value.len()
             ))
@@ -292,9 +440,9 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
         if trusted {
             Ok(())
         } else {
-            Err(unauthenticated(
-                "RunGrant signature is not by a trusted issuer".into(),
-            ))
+            Err(self
+                .unverified([signature.key_id.as_str()])
+                .error("RunGrant signature is not by a trusted issuer"))
         }
     }
 }

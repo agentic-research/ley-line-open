@@ -64,6 +64,16 @@ context, scoping notes, and review history are recoverable.
   `SCHEMA_VERSION`. `task runtime:test:cgroup` (in `task ci`) runs the
   cgroup tests against a real kernel on Linux, delegating a cgroup with
   sudo; it skips on macOS.
+- **The execution/v1 operation names are written once** (bead
+  `ley-line-open-6d811a`). `BASE_OP_NAMES` (`daemon::wire`) and the
+  `execution` cloister group (`daemon::mcp`) each carried a hand-typed copy
+  of the eight `llo_execution_*` names, with `provision` and `status`
+  transposed relative to `execution_contract::OP_NAMES` and the generated
+  `execution-tools.json`. Both lists are read as sets, so no dispatch or
+  routing was wrong. Both are now taken from `execution_contract::OP_NAMES`:
+  `BASE_OP_NAMES` splices it at compile time, the cloister group copies it.
+  `server.json`'s `execution` group lists `upstreamNames` in the contract's
+  order; the field is a set, and consumers resolve it by name.
 
 - **Breaking: build output and tool state are never proposals** (bead
   `ley-line-open-39998b`, ADR-0045 T9). In a guest run's share and on the
@@ -307,6 +317,21 @@ context, scoping notes, and review history are recoverable.
     `propose` with this release.
 
 ### Added
+
+- **Releases publish the execution/v1 schema** (bead
+  `ley-line-open-6d811a`). Two new release assets, listed in `SHA256SUMS`:
+  `execution.capnp` (`rs/ll-core/schema-spec/execution/v1/execution.capnp`)
+  and `traits.capnp` (`rs/ll-core/schema-spec/_traits.capnp`, the one file it
+  imports), byte-identical to the repository files. A consumer without an
+  LLO checkout can now generate its own `RunSpec`/`RunGrant`/`RunReceipt`
+  types with the same release's `capnpc-schema-bridge-zod` instead of
+  stopping at the `execution.tools.json` projection; the layout and command
+  are in `execution/v1/README.md` ("Release assets"). The leg that stages
+  `execution.tools.json` stages both, so the schema and its tooldefs cannot
+  ship apart, and staging refuses an `execution.capnp` that imports a file
+  the release does not ship. `tools/test_release_publication.sh` fails on a
+  missing or unlisted schema asset; `task schema:execution-asset-consumer-test`
+  and the release dry-run compile the staged assets standalone to zod.
 
 - **The release ships the macOS microVM worker, signed with the hypervisor
   entitlement** (beads `ley-line-open-984acf`, `ley-line-open-853c07`).
@@ -558,6 +583,17 @@ context, scoping notes, and review history are recoverable.
   release.
 
 ### Fixed
+
+- **The schema-bridge plugins run under their release asset names**
+  (bead `ley-line-open-6d811a`). Each plugin picks its output format from
+  its argv[0], and a release publishes it as `<bin>-<os>-<arch>`, so the
+  downloaded `capnpc-schema-bridge-zod-linux-amd64` failed with
+  `unknown output format 'zod-linux-amd64'` unless the consumer renamed it.
+  The plugin now strips a trailing release platform (`linux-amd64`,
+  `linux-arm64`, `darwin-amd64`, `darwin-arm64`) before matching the
+  format. Any other tail is still an unknown format.
+  `task schema:execution-asset-consumer-test` runs the plugin under every
+  zod asset name `tools/release-assets.txt` lists.
 
 - **The microVM backend is unavailable when its worker cannot enter the
   hypervisor** (bead `ley-line-open-831bf1`). On macOS `capabilities()`

@@ -27,3 +27,13 @@ tasks:
       - cargo test -p leyline-krun-worker
       # Builds on the worker binary the line above built.
       - cargo test -p leyline-cli --test agent_in_guest
+
+  test:cgroup:
+    desc: >-
+      Run the native tier's cgroup v2 ceiling tests against a real delegated
+      cgroup (bead ley-line-open-da36d2). Linux only, and needs passwordless
+      sudo once to delegate the cgroup; skips elsewhere, and fails on CI
+      rather than skip when sudo is missing.
+    dir: '{{.TASKFILE_DIR}}/../../..'
+    cmds:
+      - tools/test_runtime_cgroup.sh

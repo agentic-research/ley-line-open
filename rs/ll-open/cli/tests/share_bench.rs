@@ -40,8 +40,9 @@ const RESULT: &str = "bench/result.txt";
 const MAX_FILE: u64 = 4 << 20;
 const LIMITS: Limits = Limits {
     wall_time_ms: 900_000,
-    memory_bytes: 2048 << 20,
-    cpu_millis: 4_000,
+    memory_limit: 2048 << 20,
+    cpu_quota: 400_000,
+    cpu_period: 100_000,
 };
 
 fn repo_root() -> PathBuf {

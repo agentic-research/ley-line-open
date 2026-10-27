@@ -7,8 +7,9 @@ use std::time::Duration;
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
 use leyline_runtime::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
 use leyline_runtime::{
-    Backend, BackendClass, BackendRunStatus, DigestRef, ExecutionError, ExecutionRequest,
-    ResourceLimits, WorkerChannel, WorkspaceGrant, WorkspaceOperation,
+    Backend, BackendClass, BackendRunStatus, CpuLimits, DigestRef, ExecutionError,
+    ExecutionRequest, MemoryLimits, ResourceLimits, WorkerChannel, WorkspaceGrant,
+    WorkspaceOperation,
 };
 use tempfile::TempDir;
 
@@ -36,9 +37,13 @@ fn request() -> ExecutionRequest {
         confinement_manifest: None,
         workspaces: Vec::new(),
         limits: ResourceLimits {
-            vcpus: 1,
-            memory_mib: 512,
             wall_time_ms: 10_000,
+            memory: MemoryLimits { limit: 512 << 20 },
+            cpu: CpuLimits {
+                quota: 100_000,
+                period: 100_000,
+            },
+            ..ResourceLimits::default()
         },
     }
 }

@@ -174,18 +174,31 @@ impl Backend for KrunWorkerBackend {
             available: self.configured(),
             // `krun_set_vm_config(ctx, vcpus, ram_mib)` applies both at VM
             // configuration time, before the guest runs — see plan.rs, which
-            // carries `request.limits.vcpus` and `.memory_mib` straight
-            // through. The wall clock is still the supervisor's.
+            // derives them from `memory.limit` and `cpu.quota / cpu.period`.
+            // The wall clock is still the supervisor's. Nothing writes the
+            // guest's cgroups (layer 3 is not built), so pids is refused.
             enforced: crate::EnforcedCeilings {
                 wall_time: crate::CeilingMechanism::Supervisor,
-                vcpus: crate::CeilingMechanism::Hypervisor,
+                output_bytes: crate::CeilingMechanism::Unenforced,
                 memory: crate::CeilingMechanism::Hypervisor,
+                cpu: crate::CeilingMechanism::Hypervisor,
+                pids: crate::CeilingMechanism::Unenforced,
             },
         }
     }
 
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
+        // ADR-0035 §4 at the backend as well as the service, so a direct
+        // call cannot route around it.
+        self.capabilities().enforced.check(&request.limits)?;
+        // The hypervisor sizes the guest from these, so the tier has no
+        // "no ceiling" for either: the VM needs a RAM size and a vCPU count.
+        if request.limits.memory.limit == 0 || request.limits.cpu.quota == 0 {
+            return Err(ExecutionError::invalid(
+                "the microVM tier sizes the guest from memory.limit and cpu.quota; a run must grant both",
+            ));
+        }
         if !self.configured() {
             return Err(ExecutionError::backend(
                 "libkrun worker backend is not configured with existing first-party resources",

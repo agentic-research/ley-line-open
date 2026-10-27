@@ -24,10 +24,11 @@ fn request() -> ExecutionRequest {
         confinement_digest: String::new(),
         confinement_manifest: None,
         workspaces: Vec::new(),
+        // The wall clock only: without a delegated cgroup root this tier
+        // enforces nothing else, and refuses a memory, CPU or pids ceiling.
         limits: ResourceLimits {
-            vcpus: 1,
-            memory_mib: 64,
             wall_time_ms: 10_000,
+            ..ResourceLimits::default()
         },
     }
 }

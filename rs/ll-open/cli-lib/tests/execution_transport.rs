@@ -75,9 +75,13 @@ impl ExecutionResolver for Resolver {
             confinement_manifest: authorized.confinement_manifest.clone(),
             workspaces: authorized.workspaces.clone(),
             limits: ResourceLimits {
-                vcpus: 1,
-                memory_mib: 64,
                 wall_time_ms: 1_000,
+                memory: leyline_runtime::MemoryLimits { limit: 64 << 20 },
+                cpu: leyline_runtime::CpuLimits {
+                    quota: 100_000,
+                    period: 100_000,
+                },
+                ..ResourceLimits::default()
             },
         })
     }

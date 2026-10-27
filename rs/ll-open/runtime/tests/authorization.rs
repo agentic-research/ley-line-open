@@ -1115,11 +1115,7 @@ impl Backend for RecordingBackend {
             backend_id: "test/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
-            enforced: leyline_runtime::EnforcedCeilings {
-                wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                vcpus: leyline_runtime::CeilingMechanism::Hypervisor,
-                memory: leyline_runtime::CeilingMechanism::Hypervisor,
-            },
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
@@ -1145,11 +1141,7 @@ impl Backend for CompletingBackend {
             backend_id: "completing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
-            enforced: leyline_runtime::EnforcedCeilings {
-                wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                vcpus: leyline_runtime::CeilingMechanism::Hypervisor,
-                memory: leyline_runtime::CeilingMechanism::Hypervisor,
-            },
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
@@ -1195,9 +1187,13 @@ impl ExecutionResolver for TestResolver {
             confinement_manifest: authorized.confinement_manifest.clone(),
             workspaces: authorized.workspaces.clone(),
             limits: ResourceLimits {
-                vcpus: 1,
-                memory_mib: 128,
                 wall_time_ms: 1_000,
+                memory: leyline_runtime::MemoryLimits { limit: 128 << 20 },
+                cpu: leyline_runtime::CpuLimits {
+                    quota: 100_000,
+                    period: 100_000,
+                },
+                ..ResourceLimits::default()
             },
         })
     }
@@ -1521,11 +1517,7 @@ fn capabilities_projection_uses_declared_backend_class() {
                 backend_id: "native-nono/1".into(),
                 backend_class: BackendClass::Native,
                 available: false,
-                enforced: leyline_runtime::EnforcedCeilings {
-                    wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                    vcpus: leyline_runtime::CeilingMechanism::Unenforced,
-                    memory: leyline_runtime::CeilingMechanism::Unenforced,
-                },
+                enforced: leyline_runtime::EnforcedCeilings::wall_clock_only(),
             }
         }
 
@@ -1915,7 +1907,7 @@ fn run_id_vector_pins_the_derivation_for_other_implementations() {
 /// ADR-0035 §4: a ceiling the selected tier cannot enforce is a rejection,
 /// not a no-op.
 ///
-/// libkrun applies `vcpus` and `memory_mib` through `krun_set_vm_config`, so
+/// libkrun applies `memory.limit` and `cpu` through `krun_set_vm_config`, so
 /// a microVM grant's memory ceiling is real. The native tier reads neither —
 /// `native_backend.rs` consumes only `wall_time_ms` — so the identical grant
 /// silently becomes a suggestion there. A caller cannot tell the two apart
@@ -1930,11 +1922,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
                 backend_id: "native-nono/1".into(),
                 backend_class: BackendClass::Native,
                 available: true,
-                enforced: leyline_runtime::EnforcedCeilings {
-                    wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                    vcpus: leyline_runtime::CeilingMechanism::Unenforced,
-                    memory: leyline_runtime::CeilingMechanism::Unenforced,
-                },
+                enforced: leyline_runtime::EnforcedCeilings::wall_clock_only(),
             }
         }
         fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
@@ -1967,7 +1955,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
         .provision(BackendClass::Native, "provision-native")
         .expect("provision backend");
 
-    // TestResolver resolves memory_mib: 128 — a real ceiling under a
+    // TestResolver resolves memory.limit 128 MiB — a real ceiling under a
     // hypervisor and nothing at all under nono.
     let error = service
         .start_authorized(
@@ -1988,12 +1976,12 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
         "the rejection must say the ceiling is unenforceable: {}",
         error.detail
     );
-    // `TestResolver` requests both vcpus and memory, and this tier applies
+    // `TestResolver` requests both cpu and memory, and this tier applies
     // neither, so either name is a correct report — but it must name one, so
     // an operator learns which ceiling to drop rather than that "something"
     // was wrong.
     assert!(
-        error.detail.contains("vcpus") || error.detail.contains("memoryBytes"),
+        error.detail.contains("memory.limit") || error.detail.contains("cpu.quota"),
         "the rejection must name the ceiling: {}",
         error.detail
     );
@@ -2001,7 +1989,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
 
 /// The mirror, and the reason §4 is a rejection rather than a blanket ban:
 /// the same ceiling on the tier that *can* apply it must still run.
-/// libkrun passes `vcpus`/`memory_mib` to `krun_set_vm_config`, so a microVM
+/// libkrun passes `memory.limit` and `cpu` to `krun_set_vm_config`, so a microVM
 /// grant's ceilings are real and must be accepted.
 #[test]
 fn the_same_ceiling_is_accepted_by_the_tier_that_enforces_it() {

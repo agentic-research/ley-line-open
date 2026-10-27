@@ -15,6 +15,7 @@ use crate::{
     ExecutionRequest,
 };
 
+use super::cgroup::{CgroupRoot, RunCgroup};
 use super::native::WorkerEvent;
 use super::process::{
     SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
@@ -37,6 +38,10 @@ pub struct NativeWorkerConfig {
 
 pub struct NativeWorkerBackend {
     config: NativeWorkerConfig,
+    /// The operator-delegated cgroup v2 root, when there is one. Without it
+    /// this tier enforces the wall clock only, and refuses memory, CPU and
+    /// pids ceilings by name (ADR-0035, "OCI resources on execution/v1").
+    cgroup: Option<CgroupRoot>,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
@@ -53,12 +58,21 @@ impl NativeWorkerBackend {
     pub fn new(config: NativeWorkerConfig) -> Self {
         Self {
             config,
+            cgroup: None,
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             completion_cv: Arc::new(Condvar::new()),
         }
+    }
+
+    /// Enforce memory, CPU bandwidth and pids ceilings through `root`, for
+    /// each controller it delegates. Every run then gets its own cgroup under
+    /// `root`, which also makes teardown `cgroup.kill` of the whole tree.
+    pub fn with_cgroup_root(mut self, root: CgroupRoot) -> Self {
+        self.cgroup = Some(root);
+        self
     }
 
     fn configured(&self) -> bool {
@@ -117,17 +131,24 @@ impl Backend for NativeWorkerBackend {
             // "enforced by the supervisor. Requires exec_strategy:
             // \"supervised\"" — nono's CLI runner, not the library this
             // links. So the wall clock (which `supervise_worker` enforces
-            // here) is the only ceiling this tier applies.
-            enforced: crate::EnforcedCeilings {
-                wall_time: crate::CeilingMechanism::Supervisor,
-                vcpus: crate::CeilingMechanism::Unenforced,
-                memory: crate::CeilingMechanism::Unenforced,
-            },
+            // here) is this tier's only ceiling unless the operator delegated
+            // a cgroup v2 root, which only Linux has. macOS has no mechanism
+            // with the right semantics for memory, CPU bandwidth or pids:
+            // RLIMIT_AS is RLIMIT_RSS's alias there and lowering it fails,
+            // RLIMIT_CPU is CPU-seconds, RLIMIT_NPROC is per uid.
+            enforced: self.cgroup.as_ref().map_or_else(
+                crate::EnforcedCeilings::wall_clock_only,
+                CgroupRoot::enforced,
+            ),
         }
     }
 
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
+        // ADR-0035 §4 again, at the backend: `ExecutionService::start` checks
+        // too, but this is a public type an embedder can call directly, and a
+        // direct call once accepted `memory_mib: 64` and applied nothing.
+        self.capabilities().enforced.check(&request.limits)?;
         if !self.configured() {
             return Err(ExecutionError::backend(
                 "native nono worker backend is not configured with existing first-party resources",
@@ -142,6 +163,15 @@ impl Backend for NativeWorkerBackend {
             });
         }
 
+        // Created before the worker exists, so a ceiling the kernel refuses
+        // (an out-of-range value, a root that stopped being writable) fails
+        // the start with nothing to tear down but the directory. Dropped on
+        // every early return below, which removes it.
+        let run_cgroup: Option<RunCgroup> = self
+            .cgroup
+            .as_ref()
+            .map(|root| root.create_run(&request.run_id, &request.limits))
+            .transpose()?;
         let run_root = TempDirBuilder::new()
             .prefix("leyline-native-run-")
             .tempdir_in(&self.config.ephemeral_root)
@@ -170,6 +200,17 @@ impl Backend for NativeWorkerBackend {
                 ));
             }
         };
+        // Place the worker before it has its request. It reads the request
+        // before it materializes the rootfs, applies nono, or spawns the
+        // workload, so nothing the run executes starts outside the cgroup,
+        // and every process it spawns inherits it. A write to cgroup.procs
+        // here rather than a `pre_exec` hook keeps the `posix_spawn` path
+        // `configure_process_group` depends on.
+        if let Some(run_cgroup) = &run_cgroup
+            && let Err(error) = run_cgroup.place(child.id())
+        {
+            return Err(abort_failed_start(&mut child, run_root, LABELS, error));
+        }
         let Some(mut stdin) = child.stdin.take() else {
             return Err(abort_failed_start(
                 &mut child,
@@ -342,13 +383,28 @@ impl Backend for NativeWorkerBackend {
         let completed = Arc::clone(&self.completed);
         let completion_cv = Arc::clone(&self.completion_cv);
         std::thread::spawn(move || {
-            let result = supervise_worker(
+            let supervised = supervise_worker(
                 WorkerProcess::new(child),
                 run_root,
                 cancel_rx,
                 deadline,
                 LABELS,
             );
+            // After the worker is reaped: `cgroup.kill` takes whatever the
+            // group kill missed (a process that called setsid), and the
+            // directory goes. A teardown failure is reported, never dropped.
+            let removed = run_cgroup.map_or(Ok(()), RunCgroup::remove);
+            let result = match (supervised, removed) {
+                (Ok(()), removed) => removed,
+                (Err(error), Ok(())) => Err(error),
+                (Err(error), Err(cleanup)) => Err(ExecutionError {
+                    detail: format!(
+                        "{}; cgroup cleanup also failed: {}",
+                        error.detail, cleanup.detail
+                    ),
+                    ..error
+                }),
+            };
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }

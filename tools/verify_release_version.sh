@@ -75,6 +75,21 @@ if [ "$schema_version" != "$version" ]; then
              "SCHEMA_VERSION to $version or revert the schema-client change" >&2
         exit 1
     fi
+    # The Go schema-client is not the only published schema surface: the
+    # schema-spec IDL (execution/v1 among it, shipped as release assets) and
+    # its conformance vectors are too, and carry no Go type, so the check
+    # above cannot see a change to them. A binary-only release must not
+    # republish a changed contract under the old SCHEMA_VERSION
+    # (bead ley-line-open-da36d2).
+    if ! git diff --quiet "$old_schema_tag" -- \
+        ':(glob)rs/ll-core/schema-spec/**/*.capnp' \
+        ':(glob)rs/ll-core/schema-spec/*.capnp' \
+        ':(glob)rs/ll-core/schema-spec/**/test-vectors/**'; then
+        echo "SCHEMA_VERSION is unchanged at $schema_version, but the" \
+             "rs/ll-core/schema-spec IDL or vectors differ from $old_schema_tag" \
+             "— bump SCHEMA_VERSION to $version or revert the schema change" >&2
+        exit 1
+    fi
 fi
 
 grep -q "\"binary_version\": \"$version\"" compatibility.json

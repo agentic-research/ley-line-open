@@ -115,5 +115,39 @@ must not create a volume or initialize a backend. `provision`, `start`,
 Schema evolution is append-only within v1: add fields at new ordinals and add
 enum variants at the end. Removing or reinterpreting a field requires v2.
 
+*One recorded exception (2026-10-27, bead `ley-line-open-da36d2`).*
+`ResourceLimits` and `EnforcedCeilings` were replaced in place, pre-1.0, by
+the user's decision; see "Resource limits" below and ADR-0035 "OCI resources
+on execution/v1". The rule above holds for every other change.
+
+## Resource limits
+
+`ResourceLimits` carries OCI runtime-spec `linux.resources` `memory.limit`
+(bytes), `cpu.quota`/`cpu.period` (microseconds) and `pids.limit`, plus the
+LLO-only `wallTimeMs` and `outputBytes`. Zero means no ceiling for every
+field; a zero `cpu.period` means 100000, and a `cpu.period` without a
+`cpu.quota` is refused. A run is held to `RunGrant.limits`, which may only
+narrow `RunSpec.requestedLimits` (CPU compares bandwidth, `quota / period`).
+
+| field | microVM | native, Linux, `--cgroup-root` | native, macOS or no root |
+| --- | --- | --- | --- |
+| `wallTimeMs` | `supervisor` | `supervisor` | `supervisor` |
+| `outputBytes` | refused | refused | refused |
+| `memory.limit` | `hypervisor`, whole MiB | `cgroup` (`memory.max`) | refused |
+| `cpu.quota`/`period` | `hypervisor`, whole vCPUs 1..=255 | `cgroup` (`cpu.max`) | refused |
+| `pids.limit` | refused | `cgroup` (`pids.max`) | refused |
+
+A refused ceiling fails `start` with `unsupportedBackend` and names the field
+(`grant limit pids.limit cannot be enforced by the selected backend`). The
+microVM tier also requires `memory.limit` and `cpu.quota`, since it sizes the
+guest from them. `RunReceipt.backend.enforced` records one `CeilingMechanism`
+per field. `test-vectors/oci-resources.json` is the conformance case: one
+spec and grant, three tiers, the outcome each must produce.
+
+The replaced shape was `{wallTimeMs @0, memoryBytes @1, cpuMillis @2,
+outputBytes @3}`. A reader of the new shape decodes an old message's
+`memoryBytes` as `outputBytes`, which every tier refuses, and the JSON carrier
+refuses the keys `memoryBytes` and `cpuMillis` by name.
+
 The canonical vector in `test-vectors/canonical-run.json` pins the JSON carrier
 shape used by conformance tests. JSON is a carrier; Cap'n Proto remains the IDL.

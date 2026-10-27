@@ -149,6 +149,12 @@ grants rather than mounts, `network.allowHosts`, `credentialSource` — stay
 confinement/v1-native, because inventing there is legitimate and inventing over OCI is
 not.
 
+*Amended 2026-10-27 (bead `da36d2`).* The resources block is execution/v1
+`ResourceLimits`, not a confinement/v1 dimension, and it now carries OCI
+`linux.resources` `memory.limit`, `cpu.quota`/`cpu.period` and `pids.limit`. See
+"OCI resources on execution/v1" below for the mapping, the per-tier table, and the
+wire break.
+
 **3. Declare the mechanism and the layer, not just the ceiling.** `memory: 512MiB` means
 three different things under a hypervisor, a cgroup, and `RLIMIT_AS`. Since
 `confinementDigest` attests the policy, the receipt must record what actually applied.
@@ -532,3 +538,146 @@ bolted onto the compile-side change.
   have none. That asymmetry is not a defect to paper over — it is the exact input to §4,
   which requires a ceiling the selected tier cannot enforce to be a **rejection**. The
   empty cells are now enumerable rather than hypothetical.
+
+## OCI resources on execution/v1
+
+*Added 2026-10-27 (bead `da36d2`). Implements §2 and closes the per-tier half of §4.*
+
+### Where the resources block lives
+
+§2 placed the `resources` block in the confinement manifest. It belongs on
+execution/v1 instead. A ceiling is part of what a grant authorizes for one run, and
+`RunGrant.limits` is already the signed, narrow-only field for it; confinement/v1
+describes what a confined process may *reach*, and its README keeps resources out of
+scope. Two homes for one ceiling would reproduce the two-objects-one-name defect this ADR
+opened with. So `ResourceLimits` carries the OCI subset, and confinement/v1 stays
+resource-free.
+
+### Field mapping
+
+`ResourceLimits` before and after. OCI paths are `linux.resources.*` from the runtime
+spec's `config-linux.md`.
+
+| execution/v1 (new) | OCI `linux.resources` | unit | replaces |
+| --- | --- | --- | --- |
+| `wallTimeMs @0` | — (LLO only) | ms | `wallTimeMs @0`, unchanged |
+| `outputBytes @1` | — (LLO only) | bytes | `outputBytes @3` |
+| `memory @2 :MemoryLimits { limit @0 }` | `memory.limit` | bytes | `memoryBytes @1` |
+| `cpu @3 :CpuLimits { quota @0, period @1 }` | `cpu.quota`, `cpu.period` | µs | `cpuMillis @2` |
+| `pids @4 :PidsLimits { limit @0 }` | `pids.limit` | tasks | new |
+
+Zero means "no ceiling requested" for every field. On a `RunSpec` that leaves the
+dimension to the grant; on a `RunGrant` it means the grant authorizes no ceiling, which
+is refused when the spec asked for one (narrow-only, unchanged). A `cpu.period` of zero
+with a nonzero `cpu.quota` is the cgroup v2 default, 100000 µs; a nonzero `cpu.period`
+with a zero `cpu.quota` names no ceiling, and is refused rather than ignored.
+
+Divergences from OCI, each deliberate:
+
+- **Unsigned, and no `-1`.** OCI types `memory.limit`, `cpu.quota` and `pids.limit` as
+  `int64` with `-1` for unlimited. A grant can only narrow, so "unlimited" is not a value
+  a grant needs; it is the absence of a ceiling, which is zero here. Every positive OCI
+  value copies across unchanged.
+- **`cpu.quota`/`cpu.period`, not `cpu.shares`.** Shares (cgroup v2 `cpu.weight`) are a
+  relative weight that only matters under contention. They bound nothing, a grant cannot
+  meaningfully narrow a weight, and no tier could attest one as a ceiling. Quota over
+  period is a hard bandwidth ceiling, it is exactly cgroup v2 `cpu.max "$quota $period"`,
+  and it maps onto a hypervisor's vCPU count when the quota is a whole multiple of the
+  period.
+- **`cpuMillis` is gone, not mapped.** Its doc said "cumulative CPU time"; the catalog
+  read it as vCPUs × 1000 (`catalog.rs`, `1001 millis -> 2 vCPUs`). The two readings
+  disagree, and OCI models neither, so the field is removed rather than reinterpreted.
+- **Not modeled:** `memory.reservation`, `memory.swap`, `memory.kernel*`,
+  `cpu.cpus`/`cpu.mems`, `cpu.realtime*`, `blockIO`, `hugepageLimits`, `network`, `rdma`,
+  `unified`. No tier enforces them, so carrying them would only create fields to refuse.
+  Adding one later is an append.
+
+### Per-tier enforcement
+
+`CeilingMechanism` gains `cgroup @3`. `EnforcedCeilings` gains one entry per
+`ResourceLimits` field, so the receipt's `backend.enforced` names a mechanism for each.
+
+| field | microVM — libkrun (macOS, Linux) | native — Linux | native — macOS |
+| --- | --- | --- | --- |
+| `wallTimeMs` | `supervisor` | `supervisor` | `supervisor` |
+| `outputBytes` | refused | refused | refused |
+| `memory.limit` | `hypervisor`: `krun_set_vm_config` RAM; refused unless a whole MiB | `cgroup`: `memory.max`, plus `memory.swap.max=0` and `memory.oom.group=1` where present; refused without a delegated root enabling `memory` | refused |
+| `cpu.quota`/`period` | `hypervisor`: vCPUs = quota / period; refused unless a whole number in 1..=255 | `cgroup`: `cpu.max "$quota $period"`; refused without `cpu`, or outside the kernel's 1000..=1000000 µs period and ≥1000 µs quota | refused |
+| `pids.limit` | refused | `cgroup`: `pids.max`; refused without `pids` | refused |
+
+"Refused" is §4: authorization fails closed with `unsupportedBackend`, and the error
+names the field, for example `grant limit pids.limit cannot be enforced by the selected
+backend`. The check runs in `ExecutionService::start` and again in each backend's
+`start`, so an embedder calling a backend directly cannot route around it.
+
+Why each refused cell is refused:
+
+- **`outputBytes`, every tier.** No backend collects output into a bounded buffer yet.
+- **`pids.limit` on the microVM.** The guest is Linux, so a guest-side `pids.max` is
+  possible in principle, but nothing in LLO writes the guest's cgroups: that is layer 3,
+  which is not built.
+- **macOS native, `memory.limit`.** `RLIMIT_AS` is `RLIMIT_RSS`'s alias on Darwin (both
+  `5`), and lowering it fails. Measured on macOS 27.0.1: `setrlimit(RLIMIT_AS, 64 MiB)`
+  returns `EINVAL`, and a 512 MiB allocation, touched, then succeeds. Address space is
+  not `memory.limit` even where it is enforced.
+- **macOS native, `cpu`.** `RLIMIT_CPU` caps cumulative CPU-seconds and then signals.
+  That is a time budget, not bandwidth, and it cannot express quota over period.
+- **macOS native, `pids.limit`.** `RLIMIT_NPROC` counts every process of the uid, not
+  the run's tree (§3 already recorded this cell as having no mechanism).
+
+### Linux native: the cgroup root is delegated, never discovered
+
+The daemon does not create cgroups wherever it happens to run. The operator names a
+cgroup v2 directory with `execution-daemon --cgroup-root <dir>`, and the native tier
+enforces exactly the controllers that directory's `cgroup.subtree_control` enables.
+Without the flag, or on a filesystem that is not cgroup2, all three dimensions report
+`unenforced` and a grant asking for one is refused. This keeps the daemon from moving
+itself between cgroups (the kernel's no-internal-processes rule would otherwise force
+it), and makes the enforcing boundary an explicit operator decision, as `--tsi-hijack-inet`
+is for the network boundary.
+
+Per run, the backend creates `<root>/<run cgroup>`, writes the requested ceilings, and
+moves the worker into it **before** writing the request to the worker's stdin. The worker
+reads that request before it materializes the rootfs, applies nono or spawns the
+workload, so nothing the run executes is outside the cgroup. Placement is a write to
+`cgroup.procs` from the supervisor, not a `pre_exec` hook, so the worker keeps the
+`posix_spawn` path `configure_process_group` documents. Teardown writes `cgroup.kill`,
+waits for `cgroup.events` to report `populated 0`, and removes the directory.
+
+The kernel's migration rule applies: the daemon must be able to write `cgroup.procs` in
+the common ancestor of its own cgroup and the root. A systemd unit with `Delegate=yes`
+whose `--cgroup-root` is a child of the unit's cgroup satisfies it. A placement the kernel
+refuses fails the start; it never runs the workload unplaced.
+
+### The wire break
+
+execution/v1 shipped in v0.20.x, and its README said removing or reinterpreting a field
+requires v2. The user chose to break v1 in place: LLO is pre-1.0, there is one known
+consumer (cloister), and a parallel v2 would keep the misread `cpuMillis` alive for a
+deprecation window nobody depends on. The README now records the exception. What makes
+the break loud rather than silent:
+
+1. **Ordinal 1 is `outputBytes` on purpose.** An old-shape message stores `memoryBytes`
+   in data word 1. Every old message the previous runtime could run carried a nonzero
+   `memoryBytes` (`ExecutionRequest::validate` refused zero), and a new reader decodes
+   that word as `outputBytes`, which no tier enforces. So every previously runnable
+   old-shape message is refused by name rather than run with a dropped ceiling.
+2. **The JSON carrier refuses removed keys by name.** `capnp_json` ignores unknown keys,
+   so an old JSON `requestedLimits {memoryBytes, cpuMillis}` would otherwise decode to
+   "no ceiling". `start_json` refuses any key in `requestedLimits` or `limits` that
+   `ResourceLimits` does not define, naming its replacement.
+3. **Versioning.** `SCHEMA_VERSION` is set by the release that publishes a schema
+   surface (`tools/verify_release_version.sh`), so it does not move in this change; the
+   release that carries it must publish a new schema version, and that script now
+   refuses a binary-only release when `rs/ll-core/schema-spec/` differs from the reused
+   schema tag. `COMPAT_MIN_SCHEMA_VERSION` does not move: it is the floor for the Go
+   schema-client, which carries no execution/v1 type, and raising it would make mache,
+   which never sends `ResourceLimits`, refuse every daemon carrying this change.
+
+### Also fixed here: the grant's limits were dropped
+
+`authorize` checked that `RunGrant.limits` only narrows `RunSpec.requestedLimits`, and
+then `CatalogResolver::resolve` built the run from `requestedLimits`. A grant narrowing
+memory from 1 GiB to 512 MiB ran at 1 GiB. `AuthorizedExecution.limits` now carries the
+grant's resolved ceilings, and the resolver uses them. That is the only reading under
+which the per-tier check above checks what was authorized.

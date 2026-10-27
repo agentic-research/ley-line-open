@@ -435,26 +435,33 @@ fn evidence(mut evidence: execution_capnp::evidence_ref::Builder<'_>) {
     set_digest(evidence.init_digest(), &"a".repeat(64));
 }
 
-/// A run's resource limits: wall time and CPU in milliseconds, memory in
-/// bytes.
+/// A run's resource limits: wall time in milliseconds, OCI `memory.limit` in
+/// bytes, and OCI `cpu.quota` per `cpu.period` in microseconds.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub wall_time_ms: u64,
-    pub memory_bytes: u64,
-    pub cpu_millis: u64,
+    pub memory_limit: u64,
+    pub cpu_quota: u64,
+    pub cpu_period: u64,
 }
 
-/// The behavior scenarios' limits.
+/// The behavior scenarios' limits: two vCPUs, 512 MiB.
 pub const LIMITS: Limits = Limits {
     wall_time_ms: 300_000,
-    memory_bytes: 512 << 20,
-    cpu_millis: 2_000,
+    memory_limit: 512 << 20,
+    cpu_quota: 200_000,
+    cpu_period: 100_000,
 };
 
 fn set_limits(mut builder: execution_capnp::resource_limits::Builder<'_>, limits: Limits) {
     builder.set_wall_time_ms(limits.wall_time_ms);
-    builder.set_memory_bytes(limits.memory_bytes);
-    builder.set_cpu_millis(limits.cpu_millis);
+    builder
+        .reborrow()
+        .init_memory()
+        .set_limit(limits.memory_limit);
+    let mut cpu = builder.init_cpu();
+    cpu.set_quota(limits.cpu_quota);
+    cpu.set_period(limits.cpu_period);
 }
 
 fn spec_json(bytes: &[u8]) -> Value {

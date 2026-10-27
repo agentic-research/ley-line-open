@@ -12,6 +12,54 @@ context, scoping notes, and review history are recoverable.
 
 ### Changed
 
+- **Breaking: execution/v1 resource limits are OCI `linux.resources`**
+  (bead `ley-line-open-da36d2`, ADR-0035 "OCI resources on execution/v1").
+  `ResourceLimits` is now `{wallTimeMs @0, outputBytes @1, memory @2
+  {limit}, cpu @3 {quota, period}, pids @4 {limit}}`: OCI `memory.limit`
+  (bytes), `cpu.quota`/`cpu.period` (microseconds) and `pids.limit`.
+  `memoryBytes` and `cpuMillis` are removed; `cpuMillis` was documented as
+  cumulative CPU time and read as vCPUs × 1000. Zero means no ceiling. The
+  change is in place in v1 (pre-1.0, by decision); the README records the
+  exception to its append-only rule. `EnforcedCeilings` is one mechanism per
+  field (`wallTime`, `outputBytes`, `memory`, `cpu`, `pids`; `vcpus` is
+  gone), and `CeilingMechanism` gains `cgroup`. The JSON carrier refuses
+  `memoryBytes`, `cpuMillis` and any other unknown key in `requestedLimits`
+  or `limits` by name, and a capnp reader decodes an old message's
+  `memoryBytes` as `outputBytes`, which every tier refuses. Consumers that
+  generate from `execution.capnp` or vendor `execution-tools.json` and
+  `canonical-run.json` must regenerate.
+- **Breaking: every ceiling is enforced or refused by name, per tier**
+  (bead `ley-line-open-da36d2`). The microVM tier sizes the guest from
+  `memory.limit` (whole MiB) and `cpu.quota / cpu.period` (whole vCPUs) and
+  requires both; it refuses `pids.limit`. The native tier on Linux enforces
+  memory, CPU bandwidth and pids through a delegated cgroup v2 directory,
+  `execution-daemon --cgroup-root <dir>`: each run gets its own cgroup
+  (`memory.max` with `memory.swap.max=0` and `memory.oom.group=1`,
+  `cpu.max`, `pids.max`), the worker is placed in it before it reads its
+  request, and teardown is `cgroup.kill`. Without the flag, and on macOS
+  (where `setrlimit(RLIMIT_AS)` fails and is the `RLIMIT_RSS` alias), the
+  native tier enforces the wall clock only and refuses the rest.
+  `outputBytes` is refused everywhere. Backends check in `start` as well as
+  the service, so `NativeWorkerBackend::start` no longer accepts a memory
+  ceiling it never applied. Rust API: `SchemaLimits` is removed
+  (`SchemaIntent.requested_limits` is `ResourceLimits`); `ResourceLimits`
+  replaces `vcpus`/`memory_mib` with `memory`/`cpu`/`pids`/`output_bytes`;
+  new `MemoryLimits`, `CpuLimits`, `PidsLimits`, `backends::cgroup`,
+  `NativeWorkerBackend::with_cgroup_root`.
+- **A run is held to the grant's limits, not the spec's request** (bead
+  `ley-line-open-da36d2`). `authorize` checked that `RunGrant.limits`
+  narrows `RunSpec.requestedLimits` and the resolver then built the run from
+  the request, so a grant narrowing memory from 1 GiB to 512 MiB ran at
+  1 GiB. `AuthorizedExecution.limits` carries the grant's ceilings and
+  `CatalogResolver` uses them.
+- **A binary-only release refuses a changed schema-spec contract**
+  (bead `ley-line-open-da36d2`). `tools/verify_release_version.sh` now also
+  compares the schema-spec IDL and conformance vectors with the reused
+  schema tag, so the release carrying this change must publish a new
+  `SCHEMA_VERSION`. `task runtime:test:cgroup` (in `task ci`) runs the
+  cgroup tests against a real kernel on Linux, delegating a cgroup with
+  sudo; it skips on macOS.
+
 - **Breaking: build output and tool state are never proposals** (bead
   `ley-line-open-39998b`, ADR-0045 T9). In a guest run's share and on the
   host mount, a path the store does not hold is derived when a directory

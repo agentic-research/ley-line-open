@@ -75,9 +75,13 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
         confinement_manifest: None,
         workspaces: Vec::new(),
         limits: ResourceLimits {
-            vcpus: 1,
-            memory_mib: 256,
             wall_time_ms: 10_000,
+            memory: leyline_runtime::MemoryLimits { limit: 256 << 20 },
+            cpu: leyline_runtime::CpuLimits {
+                quota: 100_000,
+                period: 100_000,
+            },
+            ..ResourceLimits::default()
         },
     };
     // The worker inherits its standard streams and nothing else, as the

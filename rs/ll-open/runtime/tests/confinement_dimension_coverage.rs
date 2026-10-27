@@ -636,3 +636,137 @@ fn a_manifest_without_local_connect_still_blocks_the_network() {
         "a manifest declaring no channel must reach block_network()"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lists (bead ley-line-open-e2c33f): §4 `port` and §3 `connectLocal` carry N
+// grants. Every grant compiles, or the whole dimension is refused — never the
+// first one granted and the rest dropped, which would attest N listeners and
+// deliver one.
+// ---------------------------------------------------------------------------
+
+fn two_listeners() -> ConfinementManifest {
+    ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_only("/usr/lib/"))
+        .and_then(|m| m.with_port_bind(9090, None))
+        .and_then(|m| m.with_port_bind(8443, None))
+        .expect("two distinct listeners")
+}
+
+fn two_local_connects() -> ConfinementManifest {
+    ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_only("/usr/lib/"))
+        .and_then(|m| m.with_connect_local(9443))
+        .and_then(|m| m.with_connect_local(8443))
+        .expect("two distinct connectLocal ports")
+}
+
+/// Linux: N listeners compile to N per-port Landlock rules (`BindTcp` plus
+/// `ConnectTcp` each, through `allow_localhost_port`). macOS keeps refusing
+/// §4 by name: a list does not change what Seatbelt can scope.
+#[test]
+fn every_declared_listener_compiles_where_the_kernel_scopes_by_port() {
+    match compile(&two_listeners()) {
+        Ok(capabilities) => {
+            assert!(!SEATBELT, "Seatbelt cannot scope a bind by port");
+            assert_eq!(
+                capabilities.localhost_ports(),
+                &[8443, 9090],
+                "every listener must compile, in canonical order"
+            );
+            assert!(capabilities.is_network_blocked());
+        }
+        Err(error) => {
+            assert!(SEATBELT, "§4 lists must compile off Seatbelt: {error:?}");
+            let detail = format!("{error:?}");
+            assert!(
+                detail.contains("Seatbelt") && detail.contains("every listener"),
+                "macOS must refuse §4 by name, list or not: {detail}"
+            );
+        }
+    }
+}
+
+/// N connectLocal ports compile on both native platforms, each as a dial
+/// right with no bind right.
+///
+/// Linux: one Landlock `ConnectTcp` rule per port. macOS: nono's ProxyOnly
+/// mode carries exactly one outbound port, so the first port rides it and each
+/// further port is the same Seatbelt rule nono emits for it —
+/// `(allow network-outbound (remote tcp "localhost:N"))` — as a platform
+/// rule. Neither path populates `localhost_ports`, which would re-add
+/// `network-bind` and `network-inbound` on Seatbelt.
+#[test]
+fn every_local_connect_port_compiles_on_every_native_platform() {
+    let capabilities = compile(&two_local_connects()).expect("connectLocal lists compile");
+    assert!(
+        capabilities.localhost_ports().is_empty(),
+        "connectLocal must never go through the bidirectional localhost list"
+    );
+    if SEATBELT {
+        assert!(
+            matches!(
+                capabilities.network_mode(),
+                nono::NetworkMode::ProxyOnly { port: 8443, bind_ports } if bind_ports.is_empty()
+            ),
+            "the first port rides ProxyOnly with no bind ports: {:?}",
+            capabilities.network_mode()
+        );
+        assert_eq!(
+            capabilities.platform_rules(),
+            &["(allow network-outbound (remote tcp \"localhost:9443\"))".to_owned()],
+            "each further port is one outbound-only Seatbelt rule"
+        );
+    } else {
+        assert_eq!(capabilities.tcp_connect_ports(), &[8443, 9443]);
+        assert!(capabilities.tcp_bind_ports().is_empty());
+        assert!(
+            capabilities.is_network_blocked(),
+            "on Linux a connect list is deny-all plus per-port ConnectTcp rules"
+        );
+    }
+}
+
+/// Listeners and dial targets together, on Linux: N `BindTcp` and the
+/// connect ports, with neither list truncated.
+#[test]
+#[cfg(target_os = "linux")]
+fn listener_and_connect_lists_compile_together_on_landlock() {
+    let manifest = two_listeners()
+        .with_connect_local(9443)
+        .and_then(|m| m.with_connect_local(8443))
+        .expect("both lists");
+    let capabilities = compile(&manifest).expect("both lists compile on Landlock");
+    assert_eq!(capabilities.localhost_ports(), &[8443, 9090]);
+    assert_eq!(capabilities.tcp_connect_ports(), &[8443, 9443]);
+}
+
+/// The microVM tier publishes every declared listener, `N:N`, and nothing
+/// else.
+#[test]
+fn the_guest_port_map_carries_every_declared_listener() {
+    use leyline_runtime::backends::libkrun::confinement::guest_port_map;
+    use leyline_runtime::backends::libkrun::plan::KRUN_TSI_HIJACK_INET;
+
+    let map = guest_port_map(&two_listeners(), KRUN_TSI_HIJACK_INET).expect("hijacking on");
+    let entries: Vec<&str> = map
+        .iter()
+        .map(|entry| entry.to_str().expect("ascii"))
+        .collect();
+    assert_eq!(entries, vec!["8443:8443", "9090:9090"]);
+
+    let none = guest_port_map(
+        &ConfinementManifest::new()
+            .with_fs_grant(FsGrant::read_only("/usr/lib/"))
+            .expect("fs"),
+        0,
+    )
+    .expect("no listener needs no hijacking");
+    assert!(none.is_empty(), "no declared listener publishes nothing");
+
+    let error = guest_port_map(&two_listeners(), 0)
+        .expect_err("without hijacking a guest listener is unreachable");
+    assert!(
+        error.to_string().contains("--tsi-hijack-inet"),
+        "the refusal must name the operator flag: {error}"
+    );
+}

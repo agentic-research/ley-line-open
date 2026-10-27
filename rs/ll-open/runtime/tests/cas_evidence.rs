@@ -509,3 +509,49 @@ fn a_verifier_without_trust_keys_rejects_with_no_trust_keys() {
         authorize_with_verifier(&spec, &signed, &policy(), &verifier).expect_err("no trust keys");
     assert_eq!(rejection(&error), EvidenceRejection::NoTrustKeys);
 }
+
+/// Evidence in a format the verifier does not read keeps its own error code,
+/// `UnsupportedBackend`, and still carries its typed reason; a token under
+/// the wrong code is not that reason.
+#[test]
+fn a_non_in_toto_reference_is_evidence_media_type_under_unsupported_backend() {
+    use leyline_runtime::authorization::{EvidenceBinding, EvidenceField, EvidenceVerifier};
+    let operator = Operator::new();
+    let verifier = operator.verifier(&[&signer(51)]);
+    let error = verifier
+        .verify(
+            EvidenceField::Issuer,
+            &EvidenceBinding {
+                run_id: format!("run-{}", "0".repeat(64)),
+                spec_digest: format!("blake3-256:{}", "0".repeat(64)),
+            },
+            &leyline_runtime::EvidenceRef {
+                media_type: "application/x-not-in-toto".into(),
+                digest: format!("blake3-256:{}", "0".repeat(64)),
+            },
+        )
+        .expect_err("a non-in-toto media type");
+    assert_eq!(error.code, ErrorCode::UnsupportedBackend, "{error:?}");
+    assert_eq!(rejection(&error), EvidenceRejection::EvidenceMediaType);
+
+    let relabelled = ExecutionError {
+        code: ErrorCode::Unauthenticated,
+        ..error
+    };
+    assert_eq!(EvidenceRejection::of(&relabelled), None);
+}
+
+#[test]
+fn a_rejection_displays_as_its_stable_token() {
+    for reason in [
+        EvidenceRejection::GrantUnsigned,
+        EvidenceRejection::UntrustedSigner,
+        EvidenceRejection::EvidenceMediaType,
+    ] {
+        assert_eq!(reason.to_string(), reason.as_str());
+    }
+    assert_eq!(
+        EvidenceRejection::EvidenceMissing.to_string(),
+        "evidence-missing"
+    );
+}

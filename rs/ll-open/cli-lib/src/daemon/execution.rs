@@ -242,3 +242,7 @@ where
         Ok(transport::cancel_json(&self.service, &input.to_string())?)
     }
 }
+
+#[cfg(test)]
+#[path = "execution_evidence_config_tests.rs"]
+mod evidence_config_tests;

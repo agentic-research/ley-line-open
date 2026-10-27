@@ -4,10 +4,13 @@
 //! downgrade only from `--allow-unverified-evidence` alone; and reject-all
 //! when nothing is configured. No partial or invalid configuration ever
 //! yields a verifier.
+//!
+//! Lib tests rather than `tests/`: the diff-scoped mutants gate runs
+//! cli-lib's `--lib` tests, so this is where a mutant of `build` is caught.
 
 use std::path::PathBuf;
 
-use leyline_cli_lib::daemon::execution::{EvidenceVerifierConfig, EvidenceVerifierMode};
+use super::{EvidenceVerifierConfig, EvidenceVerifierMode};
 
 fn key_hex(seed: u8) -> String {
     ed25519_dalek::SigningKey::from_bytes(&[seed; 32])

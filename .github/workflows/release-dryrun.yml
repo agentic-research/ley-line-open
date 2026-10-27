@@ -20,6 +20,7 @@ on:
       - 'Taskfile.yml'
       - 'image.Dockerfile'
       - 'tools/stage_release_artifacts.sh'
+      - 'tools/test_execution_schema_asset.sh'
       - 'tools/cli_smoke.sh'
       - 'rs/ll-open/cli-lib/Taskfile.yml'
       - 'tools/prepare_public_release.sh'
@@ -138,7 +139,18 @@ jobs:
             capnpc-schema-bridge-tooldefs
             leyline-mcp-descriptor
           WASM_ASSETS: leyline_sign.wasm leyline_cas_ffi.wasm leyline_envelope.wasm
+          # Same flag release.yml's linux-amd64 leg sets: the execution/v1
+          # tooldefs and the schema bytes they come from (6bb789, 6d811a).
+          INCLUDE_TOOLDEFS: "true"
         run: task release:artifacts:stage
+
+      # What a consumer without an LLO checkout does with the schema assets:
+      # lay them out, compile with the STAGED zod plugin, get the three
+      # execution/v1 structs (ley-line-open-6d811a).
+      - name: Compile the staged execution/v1 schema standalone
+        run: >-
+          tools/test_execution_schema_asset.sh .artifacts/staged/leyline-linux-amd64
+          .artifacts/staged/leyline-linux-amd64/capnpc-schema-bridge-zod-linux-amd64
 
       - name: Verify staged wasm export surface
         run: |
@@ -157,9 +169,10 @@ jobs:
           missing=0
           while IFS= read -r want; do
             # This job stages the linux-amd64 set plus the platform-independent
-            # wasm artifacts, so both shapes are asserted here.
+            # wasm and execution/v1 artifacts, so all three shapes are
+            # asserted here.
             case "$want" in
-              *-linux-amd64 | *.wasm) ;;
+              *-linux-amd64 | *.wasm | execution.* | traits.capnp) ;;
               *) continue ;;
             esac
             printf '%s\n' "$staged" | grep -qx "$want" || {

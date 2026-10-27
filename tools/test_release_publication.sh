@@ -81,6 +81,11 @@ for wasm_asset in $wasm_assets; do
     make_source "$tmp_dir/wasm/$wasm_asset" 'wasm'
 done
 
+# The execution/v1 schema bytes (ley-line-open-6d811a) are staged from the
+# REAL schema-spec tree, not fabricated: the property under test includes the
+# stage script's import guard, which must accept the shipped execution.capnp.
+schema_root="$repo_root/rs/ll-core/schema-spec"
+
 mkdir -p "$tmp_dir/staged"
 
 OUTPUT_DIR="$tmp_dir/staged/leyline-linux-amd64" \
@@ -91,9 +96,44 @@ LIB_ASSET="libleyline_fs-linux-amd64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
 HEADER_SOURCE="$tmp_dir/leyline_fs.h" \
 TOOLDEFS_SOURCE="$tmp_dir/execution-tools.json" \
+EXECUTION_SCHEMA_ROOT="$schema_root" \
 WASM_ASSETS="$wasm_assets" \
 WASM_SOURCE_DIR="$tmp_dir/wasm" \
     "$repo_root/tools/stage_release_artifacts.sh"
+
+# The schema assets are the repository bytes, unrenamed in content.
+cmp "$tmp_dir/staged/leyline-linux-amd64/execution.capnp" \
+    "$schema_root/execution/v1/execution.capnp" ||
+    fail "staged execution.capnp differs from the schema-spec source"
+cmp "$tmp_dir/staged/leyline-linux-amd64/traits.capnp" \
+    "$schema_root/_traits.capnp" ||
+    fail "staged traits.capnp differs from the schema-spec source"
+
+# Staging refuses a schema tree it cannot ship whole: a missing traits file,
+# and an execution.capnp that imports something outside the shipped pair.
+stage_schema_case() {
+    case_root=$1
+    OUTPUT_DIR="$tmp_dir/schema-case-$(basename "$case_root")" \
+    CLI_SOURCE="$tmp_dir/leyline" \
+    ASSET_NAME="leyline-linux-amd64" \
+    EXECUTION_SCHEMA_ROOT="$case_root" \
+        "$repo_root/tools/stage_release_artifacts.sh"
+}
+
+mkdir -p "$tmp_dir/schema-missing-traits/execution/v1"
+cp "$schema_root/execution/v1/execution.capnp" \
+    "$tmp_dir/schema-missing-traits/execution/v1/execution.capnp"
+expect_failure schema-missing-traits \
+    stage_schema_case "$tmp_dir/schema-missing-traits"
+
+mkdir -p "$tmp_dir/schema-extra-import/execution/v1"
+cp "$schema_root/_traits.capnp" "$tmp_dir/schema-extra-import/_traits.capnp"
+{
+    cat "$schema_root/execution/v1/execution.capnp"
+    echo 'using Other = import "../other.capnp";'
+} > "$tmp_dir/schema-extra-import/execution/v1/execution.capnp"
+expect_failure schema-extra-import \
+    stage_schema_case "$tmp_dir/schema-extra-import"
 
 OUTPUT_DIR="$tmp_dir/staged/leyline-linux-arm64" \
 CLI_SOURCE="$tmp_dir/leyline" \
@@ -215,6 +255,38 @@ case_dir=$(mutation_case missing-wasm-envelope)
 rm "$case_dir/leyline_envelope.wasm"
 expect_failure missing-wasm-envelope \
     "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
+
+# The execution/v1 schema slot (ley-line-open-6d811a): single-uploader like
+# the wasm set, so one case per asset for the same reason as above. Both
+# assets must also be digest-listed: the published SHA256SUMS names each.
+grep -q '  execution\.capnp$' "$publication/SHA256SUMS" ||
+    fail "published SHA256SUMS does not list execution.capnp"
+grep -q '  traits\.capnp$' "$publication/SHA256SUMS" ||
+    fail "published SHA256SUMS does not list traits.capnp"
+
+case_dir=$(mutation_case missing-execution-schema)
+rm "$case_dir/execution.capnp"
+expect_failure missing-execution-schema \
+    "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
+
+case_dir=$(mutation_case missing-traits-schema)
+rm "$case_dir/traits.capnp"
+expect_failure missing-traits-schema \
+    "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
+
+# Staged but unlisted: a release-assets.txt that forgets the schema assets
+# must refuse a staged set carrying them, at preparation and at verification.
+grep -vx 'execution\.capnp' "$assets_file" |
+    grep -vx 'traits\.capnp' > "$tmp_dir/assets-without-schema"
+expect_failure unlisted-schema-prepare \
+    "$repo_root/tools/prepare_public_release.sh" \
+    "$tmp_dir/staged" "$tmp_dir/unlisted-must-not-exist" \
+    "$tmp_dir/assets-without-schema"
+test ! -e "$tmp_dir/unlisted-must-not-exist" ||
+    fail "failed preparation mutated its destination"
+expect_failure unlisted-schema-verify \
+    "$repo_root/tools/verify_public_release.sh" \
+    "$publication" "$tmp_dir/assets-without-schema"
 
 # The worker rides one leg only, so it too can vanish while every other
 # per-platform set stays complete (ley-line-open-984acf).

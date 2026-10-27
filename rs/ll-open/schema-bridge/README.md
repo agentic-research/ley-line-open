@@ -242,6 +242,13 @@ shape as `capnpc-rust` / `capnpc-go` / `capnpc-c++`. Today
 declares all three `[[bin]]` entries and they compile from the same
 `src/main.rs`.
 
+A release publishes each binary as `<bin>-<os>-<arch>` (for example
+`capnpc-schema-bridge-zod-linux-amd64`). The plugin strips a trailing
+release platform (`linux-amd64`, `linux-arm64`, `darwin-amd64`,
+`darwin-arm64`) from its argv[0] before matching the format, so the
+download runs under its published name with no rename. Any other tail is
+an unknown format.
+
 `capnp compile` invokes the binary with the parsed `CodeGeneratorRequest`
 on stdin. The binary writes `<output-dir>/<schema-basename>.<format-suffix>`
 (e.g. `cluster.zod.ts` from `manifest/cluster.capnp`) — zod schemas

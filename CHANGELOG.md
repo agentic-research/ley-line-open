@@ -492,6 +492,16 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **The schema-bridge plugins run under their release asset names**
+  (bead `ley-line-open-6d811a`). Each plugin picks its output format from
+  its argv[0], and a release publishes it as `<bin>-<os>-<arch>`, so the
+  downloaded `capnpc-schema-bridge-zod-linux-amd64` failed with
+  `unknown output format 'zod-linux-amd64'` unless the consumer renamed it.
+  The plugin now strips a trailing release platform (`linux-amd64`,
+  `linux-arm64`, `darwin-amd64`, `darwin-arm64`; pinned to
+  `tools/release-assets.txt` by a test) before matching the format. Any
+  other tail is still an unknown format.
+
 - **Share file times are the host's wall clock, so a host sleep cannot
   hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).
   storefs reported a path's time as the wall clock at the daemon's start

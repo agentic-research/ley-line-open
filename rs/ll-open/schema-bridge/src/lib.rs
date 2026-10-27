@@ -75,6 +75,13 @@ impl OutputFormat {
     // unknown format. Used by main.rs so the OS process is the
     // authoritative source of format selection (mirrors how
     // `capnpc-rust` / `capnpc-go` / `capnpc-c++` self-identify).
+    //
+    // A release publishes each plugin as `<bin>-<platform>` (e.g.
+    // `capnpc-schema-bridge-zod-linux-amd64`), and a consumer that runs the
+    // download as-is passes that name as argv[0]. So a trailing
+    // `-<platform>` from [`Self::RELEASE_PLATFORM_SUFFIXES`] is stripped
+    // before the format is matched. Only those exact platforms: any other
+    // tail still fails as an unknown format (ley-line-open-6d811a).
     pub fn from_binary_name(basename: &str) -> Result<Self> {
         let suffix = basename.strip_prefix(Self::BIN_PREFIX).ok_or_else(|| {
             SchemaBridgeError::UnknownOutputFormat {
@@ -90,8 +97,23 @@ impl OutputFormat {
                 ),
             }
         })?;
-        Self::parse(suffix)
+        let format_name = Self::RELEASE_PLATFORM_SUFFIXES
+            .iter()
+            .find_map(|platform| {
+                suffix
+                    .strip_suffix(platform)
+                    .and_then(|rest| rest.strip_suffix('-'))
+            })
+            .unwrap_or(suffix);
+        Self::parse(format_name)
     }
+
+    // The `<os>-<arch>` tails a release appends to every plugin asset name
+    // (tools/release-assets.txt; `GENERATOR_SUFFIX` in
+    // tools/stage_release_artifacts.sh). A test pins this list to the
+    // generator names release-assets.txt asserts.
+    pub const RELEASE_PLATFORM_SUFFIXES: &'static [&'static str] =
+        &["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64"];
 
     // Filename suffix written after the schema basename, e.g.
     // `cluster.capnp` + Zod → `cluster.zod.ts`. Excludes the leading

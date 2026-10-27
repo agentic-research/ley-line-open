@@ -464,9 +464,12 @@ tasks:
       - |
         set -eu
         (cd rs && cargo build --quiet -p leyline-schema-bridge --bin capnpc-schema-bridge-zod)
-        zod="$PWD/rs/target/debug/capnpc-schema-bridge-zod"
         tmp=$(mktemp -d "${TMPDIR:-/tmp}/leyline-execution-asset.XXXXXX")
         trap 'rm -rf "$tmp"' EXIT
+        # Run under a release asset name, as a consumer runs the download:
+        # the plugin must resolve its format through the platform suffix.
+        zod="$tmp/capnpc-schema-bridge-zod-linux-amd64"
+        cp rs/target/debug/capnpc-schema-bridge-zod "$zod"
         printf '#!/bin/sh\n' > "$tmp/leyline"
         # Staged by the release staging script itself, so the assets under
         # test are the bytes and names a release publishes.

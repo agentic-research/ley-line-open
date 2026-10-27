@@ -145,7 +145,7 @@ cd schema && capnp compile --no-standard-import \
 ```
 
 With `PLUGIN` set to the same release's `capnpc-schema-bridge-zod-<os>-<arch>`,
-this writes `execution.zod.ts` with `RunSpecSchema`, `RunGrantSchema` and
+run under its published name, this writes `execution.zod.ts` with `RunSpecSchema`, `RunGrantSchema` and
 `RunReceiptSchema`. Verify every asset against `SHA256SUMS` before use, and
 take the schema, plugin and tooldefs from one release. No other file is
 needed: staging refuses to publish an `execution.capnp` that imports anything

@@ -1239,6 +1239,72 @@ fn output_format_from_binary_name_rejects_unknown_suffix() {
 }
 
 #[test]
+fn output_format_from_binary_name_accepts_release_asset_names() {
+    // ley-line-open-6d811a: a release publishes `<bin>-<platform>`, and a
+    // consumer that runs the download as-is passes that as argv[0]. Every
+    // format resolves under every release platform, and unsuffixed.
+    let formats = [
+        ("zod", OutputFormat::Zod),
+        ("go", OutputFormat::Go),
+        ("jsonschema", OutputFormat::JsonSchema),
+        ("tooldefs", OutputFormat::ToolDefs),
+    ];
+    for (name, want) in formats {
+        let bare = format!("capnpc-schema-bridge-{name}");
+        assert_eq!(OutputFormat::from_binary_name(&bare).expect(&bare), want);
+        for platform in OutputFormat::RELEASE_PLATFORM_SUFFIXES {
+            let asset = format!("{bare}-{platform}");
+            assert_eq!(
+                OutputFormat::from_binary_name(&asset).expect(&asset),
+                want,
+                "{asset}"
+            );
+        }
+    }
+}
+
+#[test]
+fn output_format_from_binary_name_rejects_unknown_platform_suffix() {
+    // Only the release's own platforms are stripped. Any other tail stays
+    // part of the format name and fails loud rather than guessing.
+    for name in [
+        "capnpc-schema-bridge-zod-windows-amd64",
+        "capnpc-schema-bridge-zod-linux-riscv64",
+        "capnpc-schema-bridge-zodlinux-amd64",
+        "capnpc-schema-bridge-linux-amd64",
+    ] {
+        let err = OutputFormat::from_binary_name(name).expect_err(name);
+        match err {
+            SchemaBridgeError::UnknownOutputFormat { name: got, .. } => {
+                assert_eq!(
+                    Some(got.as_str()),
+                    name.strip_prefix("capnpc-schema-bridge-")
+                );
+            }
+            other => panic!("expected UnknownOutputFormat for {name}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn release_platform_suffixes_match_published_generator_assets() {
+    // The stripped set must be exactly the platforms the release ships the
+    // plugins under, read from the asset contract itself.
+    let assets_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/release-assets.txt");
+    let assets = std::fs::read_to_string(&assets_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", assets_path.display()));
+    let mut published: Vec<&str> = assets
+        .lines()
+        .filter_map(|line| line.strip_prefix("capnpc-schema-bridge-zod-"))
+        .collect();
+    published.sort_unstable();
+    let mut stripped = OutputFormat::RELEASE_PLATFORM_SUFFIXES.to_vec();
+    stripped.sort_unstable();
+    assert_eq!(stripped, published);
+}
+
+#[test]
 fn emit_dispatches_zod_equivalently_to_outputs_zod() {
     // Sanity: the multiplexer's emit(&schema, Zod) must produce the
     // same source as the direct call. Any divergence means the

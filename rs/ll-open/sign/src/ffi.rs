@@ -191,16 +191,18 @@ pub unsafe extern "C" fn leyline_verify(
 // — claims are small (~200 bytes), and adding serde_json to the wasm
 // build adds substantial size for a flat struct.
 
-/// Verify cert is signed by master_pubkey + write parsed claims as JSON
-/// into `claims_out_buf`. Returns claims byte length on success, -1 on
-/// failure.
+/// Verify an end-entity cert is signed by master_pubkey + write parsed
+/// claims as JSON into `claims_out_buf`. Returns claims byte length on
+/// success, -1 on failure.
 ///
 /// JSON shape (compact, no whitespace):
 ///   {"epk":"<base64url>","nb":<unix-secs>,"na":<unix-secs>,
-///    "ep":<u32>,"pf":"<utf8>","sc":"<utf8>"}
+///    "pr":"signet","ep":<u32>,"pf":"<utf8>","sc":"<utf8>","cd":"<base64url>"}
 ///
-/// `ep`, `pf`, `sc` are optional (omitted when the cert lacks the
-/// corresponding Interlace extension).
+/// `pr` appears only for Signet-profile certs (notme / signet); absent
+/// means the Interlace profile. `ep`, `pf`, `sc`, `cd` are optional;
+/// `pf` and `sc` never appear for a Signet-profile cert, whose `.1.5` /
+/// `.1.6` mean something else (bead `ley-line-open-9ac66d`).
 ///
 /// # Safety
 /// All input pointers must be non-null and valid for their stated
@@ -227,6 +229,83 @@ pub unsafe extern "C" fn leyline_verify_cert_chain(
     };
 
     match crate::cert_chain::verify_cert_chain(cert_der, master_pubkey) {
+        Ok(claims) => {
+            let json = crate::cert_chain::claims_to_json(&claims);
+            // SAFETY: claims_out_buf writable for claims_out_len bytes
+            // per outer fn's # Safety docstring; delegated to `c_output`.
+            unsafe { c_output(json.as_bytes(), claims_out_buf, claims_out_len) }
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Verify `leaf` through a path of intermediates to the Ed25519 trust
+/// anchor `anchor_pubkey` and write the leaf's claims as JSON (same shape
+/// as `leyline_verify_cert_chain`) into `claims_out_buf`. Returns claims
+/// byte length on success, -1 on failure.
+///
+/// `intermediates` is zero or more DER certificates concatenated, the
+/// leaf's issuer first and the anchor-signed certificate last (at most
+/// `cert_chain::MAX_INTERMEDIATES`). With `intermediates_len == 0` the
+/// pointer is not read and this is `leyline_verify_cert_chain`. For a
+/// path, `nb`/`na` are the intersection of every certificate's validity,
+/// `ep` is the minimum epoch (every certificate carries one, or none
+/// does), and `cd` appears only when every certificate carries the same
+/// confinementDigest. A missing `pf`/`sc` means "not read" under
+/// `"pr":"signet"`, never "unrestricted"; check `pr` first.
+///
+/// `expected_profile` binds the anchor to the profile it issues: `0` accepts
+/// either profile, `1` requires Interlace, `2` requires Signet (notme /
+/// signet), and any other value fails (`CertProfile::FFI_*`). A caller that
+/// knows which profile an anchor issues should pass it, so the issuer cannot
+/// present the other profile's claims.
+///
+/// # Safety
+/// All input pointers must be non-null and valid for their stated
+/// lengths (`intermediates_ptr` may be null when `intermediates_len` is
+/// 0). `claims_out_buf` must be non-null and writable for
+/// `claims_out_len` bytes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn leyline_verify_cert_path(
+    leaf_der_ptr: *const u8,
+    leaf_der_len: usize,
+    intermediates_ptr: *const u8,
+    intermediates_len: usize,
+    anchor_pubkey_ptr: *const u8,
+    anchor_pubkey_len: usize,
+    expected_profile: u32,
+    claims_out_buf: *mut u8,
+    claims_out_len: usize,
+) -> i32 {
+    let Ok(expected) = crate::cert_chain::CertProfile::from_ffi_code(expected_profile) else {
+        return -1;
+    };
+    // SAFETY: input pointers valid for their stated lengths per the outer
+    // fn's # Safety docstring; delegated to `c_input`.
+    let (Some(leaf_der), Some(anchor)) = (unsafe {
+        (
+            c_input(leaf_der_ptr, leaf_der_len),
+            c_input(anchor_pubkey_ptr, anchor_pubkey_len),
+        )
+    }) else {
+        return -1;
+    };
+    let intermediates_buf: &[u8] = if intermediates_len == 0 {
+        &[]
+    } else {
+        // SAFETY: as above.
+        match unsafe { c_input(intermediates_ptr, intermediates_len) } {
+            Some(b) => b,
+            None => return -1,
+        }
+    };
+    let Ok(intermediates) = crate::cert_chain::split_concatenated_der(intermediates_buf) else {
+        return -1;
+    };
+
+    match crate::cert_chain::verify_cert_path_expecting(leaf_der, &intermediates, anchor, expected)
+    {
         Ok(claims) => {
             let json = crate::cert_chain::claims_to_json(&claims);
             // SAFETY: claims_out_buf writable for claims_out_len bytes
@@ -306,5 +385,151 @@ mod tests {
             )
         };
         assert_eq!(sig_len, -1, "should fail with small buffer");
+    }
+
+    // Real notme certificates (bead ley-line-open-9ac66d); provenance in
+    // tests/fixtures/notme-certs/PROVENANCE.md.
+    const ROOT_PUB: &[u8] = include_bytes!("../tests/fixtures/notme-certs/root.pub");
+    const ISSUING_CA: &[u8] = include_bytes!("../tests/fixtures/notme-certs/issuing-ca.der");
+    const TASK_SIGNING: &[u8] = include_bytes!("../tests/fixtures/notme-certs/task-signing.der");
+    const DIRECT_SIGNING: &[u8] =
+        include_bytes!("../tests/fixtures/notme-certs/direct-signing.der");
+
+    use crate::cert_chain::CertProfile;
+
+    /// Call the path export; returns (rc, JSON written).
+    fn path_call(
+        leaf: &[u8],
+        intermediates: *const u8,
+        intermediates_len: usize,
+        anchor: &[u8],
+        expected_profile: u32,
+    ) -> (i32, String) {
+        let mut out = vec![0u8; 1024];
+        let n = unsafe {
+            leyline_verify_cert_path(
+                leaf.as_ptr(),
+                leaf.len(),
+                intermediates,
+                intermediates_len,
+                anchor.as_ptr(),
+                anchor.len(),
+                expected_profile,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        let json = if n > 0 {
+            String::from_utf8(out[..n as usize].to_vec()).unwrap()
+        } else {
+            String::new()
+        };
+        (n, json)
+    }
+
+    fn notme_path(expected_profile: u32) -> (i32, String) {
+        path_call(
+            TASK_SIGNING,
+            ISSUING_CA.as_ptr(),
+            ISSUING_CA.len(),
+            ROOT_PUB,
+            expected_profile,
+        )
+    }
+
+    #[test]
+    fn ffi_notme_path_writes_signet_claims() {
+        let (n, json) = notme_path(CertProfile::FFI_ANY);
+        assert!(n > 0, "ffi path verify returned {n}");
+        assert!(json.contains("\"pr\":\"signet\""), "{json}");
+        assert!(json.contains("\"ep\":3"), "{json}");
+        assert!(!json.contains("\"pf\""), "{json}");
+        assert!(!json.contains("\"sc\""), "{json}");
+    }
+
+    #[test]
+    fn ffi_path_without_intermediates_matches_chain_export() {
+        let (n, path_json) = path_call(
+            DIRECT_SIGNING,
+            core::ptr::null(),
+            0,
+            ROOT_PUB,
+            CertProfile::FFI_ANY,
+        );
+        let mut chain_out = vec![0u8; 1024];
+        let m = unsafe {
+            leyline_verify_cert_chain(
+                DIRECT_SIGNING.as_ptr(),
+                DIRECT_SIGNING.len(),
+                ROOT_PUB.as_ptr(),
+                ROOT_PUB.len(),
+                chain_out.as_mut_ptr(),
+                chain_out.len(),
+            )
+        };
+        assert!(n > 0 && n == m);
+        assert_eq!(path_json.as_bytes(), &chain_out[..m as usize]);
+    }
+
+    #[test]
+    fn ffi_path_rejects_trailing_bytes_and_missing_tier() {
+        let any = CertProfile::FFI_ANY;
+        let mut bad = ISSUING_CA.to_vec();
+        bad.push(0x30);
+        assert_eq!(
+            path_call(TASK_SIGNING, bad.as_ptr(), bad.len(), ROOT_PUB, any).0,
+            -1
+        );
+        // The task leaf does not chain to the root without its tier.
+        assert_eq!(
+            path_call(TASK_SIGNING, core::ptr::null(), 0, ROOT_PUB, any).0,
+            -1
+        );
+        // A non-empty intermediates length with a null pointer is refused.
+        assert_eq!(
+            path_call(TASK_SIGNING, core::ptr::null(), 5, ROOT_PUB, any).0,
+            -1
+        );
+    }
+
+    /// The notme anchor bound to the Signet profile accepts its own path and
+    /// refuses to be read as an Interlace issuer.
+    #[test]
+    fn ffi_expected_profile_binds_the_notme_anchor() {
+        assert!(notme_path(CertProfile::FFI_SIGNET).0 > 0);
+        assert_eq!(notme_path(CertProfile::FFI_INTERLACE).0, -1);
+        // Unknown codes fail rather than widen to "any".
+        for code in [3, 7, u32::MAX] {
+            assert_eq!(notme_path(code).0, -1, "code {code}");
+        }
+    }
+
+    /// An Interlace-shaped leaf signed by the notme anchor key is refused
+    /// when the caller binds that anchor to Signet, and accepted only when
+    /// bound to Interlace (or unbound).
+    #[test]
+    fn ffi_expected_profile_refuses_interlace_claims_from_a_signet_anchor() {
+        use ed25519_dalek::SigningKey;
+        let anchor = SigningKey::from_bytes(&[0x42; 32]);
+        let leaf_key = SigningKey::from_bytes(&[0x43; 32]);
+        let leaf = crate::cert_chain::tests_helpers::mint_test_cert(
+            &anchor,
+            &leaf_key,
+            1_700_000_000,
+            1_700_000_300,
+            Some(3),
+            Some("sha256:forged-peer"),
+            Some("bead_create:*"),
+            None,
+        );
+        let pk = anchor.verifying_key();
+        let call = |code| path_call(&leaf, core::ptr::null(), 0, pk.as_bytes(), code);
+        assert_eq!(call(CertProfile::FFI_SIGNET).0, -1);
+        let (n, json) = call(CertProfile::FFI_INTERLACE);
+        assert!(
+            n > 0 && json.contains("\"pf\":\"sha256:forged-peer\""),
+            "{json}"
+        );
+        assert_eq!(call(CertProfile::FFI_ANY), (n, json));
     }
 }

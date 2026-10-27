@@ -281,6 +281,46 @@ context, scoping notes, and review history are recoverable.
   missing or unlisted schema asset; `task schema:execution-asset-consumer-test`
   and the release dry-run compile the staged assets standalone to zod.
 
+- **`leyline-sign` verifies notme certificates, and never reads notme's
+  `.1.5` as a peer fingerprint** (bead `ley-line-open-9ac66d`). The
+  `1.3.6.1.4.1.99999.1.*` arc carries two allocations: cloister's
+  Interlace profile (`.1.5` peer_fp, `.1.6` scope) and the notme / signet
+  profile (`.1.5` authMethod or agent name, `.1.6` a 32-byte peer binding
+  or scope). A certificate carrying any of `.1.1`, `.1.2`, `.1.3`, `.1.8`,
+  `.1.9` is now read as the Signet profile: `.1.4` epoch and `.1.7`
+  confinementDigest are read, `.1.5` / `.1.6` are never reported, and a
+  critical one rejects. Before this change every notme certificate was
+  rejected at its critical BasicConstraints, and the `.1.5` UTF8String
+  would have parsed silently as `peer_fp`. BasicConstraints, KeyUsage and
+  SubjectAltName are now recognized and enforced (a CA certificate is not
+  an end entity; an end-entity KeyUsage must permit digitalSignature);
+  duplicate extensions, a non-Ed25519 `tbsCertificate.signature` and a
+  negative epoch reject. New `verify_cert_path` and wasm export
+  `leyline_verify_cert_path` verify root → Issuing CA → leaf paths (name
+  chaining, CA=true + keyCertSign on intermediates, pathLenConstraint,
+  validity intersected). On a path the epoch must be on every certificate
+  or none, and the reported `ep` is the minimum, so a revocation check
+  judges the oldest authority and a leaf stamped with a newer epoch cannot
+  carry an older tier forward. `cd` must be identical on every certificate
+  or absent from all, so a tier holder cannot add, change or drop it.
+  Claims gain `profile` (`CertProfile`); the claims JSON gains
+  `"pr":"signet"` for Signet-profile certificates only, so Interlace claims
+  serialize to the same bytes as before. Under `"pr":"signet"` an absent
+  `pf`/`sc` means "not read", never "unrestricted": consumers check `pr`
+  first. A caller that knows which profile an anchor issues binds them:
+  `verify_cert_path_expecting(.., Some(profile))`, and the
+  `expected_profile` argument of `leyline_verify_cert_path` (`0` either,
+  `1` Interlace, `2` Signet, anything else fails). A notme anchor bound to
+  Signet then cannot present Interlace claims, and the reverse.
+  `leyline_verify_cert_chain` and `verify_cert_path` are unchanged and
+  accept either profile. Breaking for Rust callers that build `CertClaims`
+  literals or match `ChainError` exhaustively (new `ConstraintViolation`).
+  Tested against real notme certificates minted by notme's
+  `cert-authority.ts` (`sign/tests/fixtures/notme-certs`, provenance
+  alongside; kept apart from the vendored CABundle mirror in
+  `tests/fixtures/notme`) and against cloister's committed Interlace
+  vectors.
+
 - **The release ships the macOS microVM worker, signed with the hypervisor
   entitlement** (beads `ley-line-open-984acf`, `ley-line-open-853c07`).
   `leyline-krun-worker-darwin-arm64` is a release asset, listed in

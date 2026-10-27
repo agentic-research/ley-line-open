@@ -255,6 +255,20 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **The native tier's confinement is proven at the kernel** (beads
+  `ley-line-open-704853`, `ley-line-open-f81567`).
+  `runtime/tests/native_confinement.rs` runs a guest through the compiled
+  `leyline-native-worker` (the linked nono library, not a nono CLI) and
+  checks the errno each system call returned under Seatbelt or Landlock: an
+  existing decoy outside the grant is EPERM/EACCES and never ENOENT; a
+  directory beside the run root, a `rootfs-sibling` sharing the rootfs's
+  name prefix, and the run root itself (list and write) are denied; with no
+  network grant, a connect to a loopback listener the test owns is denied
+  and the listener sees no connection; the granted rootfs stays readable
+  and writable. A host that cannot apply the sandbox reports a named
+  `SKIPPED (NOT a pass)`; `LEYLINE_REQUIRE_SANDBOX=1` makes it fail. The
+  0.15.0 entry below listed this port before it existed.
+
 - **The libkrun worker declares its workspace share, holds nothing else,
   and the receipt names it** (bead `ley-line-open-b83347`, ADR-0044 phase
   C). The share descriptor (`--workspace-share-fd`) is a channel the worker
@@ -465,6 +479,17 @@ context, scoping notes, and review history are recoverable.
   release.
 
 ### Fixed
+
+- **A worker that cannot confine itself is refused for that reason** (bead
+  `ley-line-open-704853`). A worker's stderr is its event channel, and
+  macOS libsandbox writes `sandbox initialization failed: Operation not
+  permitted` there before the worker's `failed` event when `sandbox_init`
+  is refused (for example under an outer Seatbelt sandbox). The native and
+  libkrun backends took that line as the readiness event and refused the
+  run as `invalid ... readiness event: expected value`, so the cause was
+  lost. The readiness reader now skips lines that are not JSON objects
+  (at most 64, and reports them if no event follows); a run still starts
+  only on a well-formed `ready` event for its own run id.
 
 - **Share file times are the host's wall clock, so a host sleep cannot
   hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).

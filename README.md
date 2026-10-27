@@ -112,9 +112,11 @@ substrate daemon with no execution backend; an embedding application must opt
 into `run_execution_daemon` after constructing a trusted resolver/backend
 handler. The service currently proves schema binding,
 provisioning, ordered lifecycle events, cancellation, cleanup, and
-content-addressed receipt assembly. Native backend conformance and mmap-backed
-CAS projection remain separate follow-on gates in beads
-`ley-line-open-f81567` and `ley-line-open-16c953`.
+content-addressed receipt assembly. The native nono backend's confinement is
+checked at the kernel by `rs/ll-open/runtime/tests/native_confinement.rs`
+(Seatbelt on macOS, Landlock on Linux; `LEYLINE_REQUIRE_SANDBOX=1` turns a
+host that cannot sandbox from a named skip into a failure). Mmap-backed CAS
+projection remains a follow-on gate in bead `ley-line-open-16c953`.
 
 For embedders that keep an explicit artifact catalog, `CatalogResolver` binds
 the authorized executable artifact and workspace graph identities to a

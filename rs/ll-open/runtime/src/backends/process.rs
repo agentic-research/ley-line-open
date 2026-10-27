@@ -300,12 +300,49 @@ pub(crate) fn read_request<T: serde::de::DeserializeOwned>(
         .unwrap_or_else(|| Err(serde_json::Error::custom("worker request was empty")))
 }
 
+/// How many foreign lines the readiness reader tolerates before the event.
+const READINESS_PREAMBLE_LINES: usize = 64;
+
+/// Read the worker's first event line from its stderr.
+///
+/// Every worker event is one JSON object per line, so the event is the first
+/// line that opens with `{`. Lines before it are foreign: the worker shares
+/// fd 2 with the libraries it calls before readiness, and macOS libsandbox
+/// writes `sandbox initialization failed: ...` there when `sandbox_init` is
+/// refused, ahead of the worker's own `failed` event naming the cause. Those
+/// lines are skipped rather than parsed as the event, which would replace the
+/// worker's refusal with a JSON syntax error. They are not dropped silently:
+/// a stream that ends, or exceeds [`READINESS_PREAMBLE_LINES`], before any
+/// event carries them in its error. Whatever is skipped, the run still starts
+/// only on a well-formed `ready` event for its own run id.
 pub(super) fn read_readiness_line(reader: &mut impl BufRead) -> Result<Option<String>, String> {
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map(|bytes| if bytes == 0 { None } else { Some(line) })
-        .map_err(|error| error.to_string())
+    let mut preamble = Vec::new();
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            if preamble.is_empty() {
+                return Ok(None);
+            }
+            return Err(format!(
+                "worker closed stderr before readiness, having written only: {}",
+                preamble.join(" | ")
+            ));
+        }
+        if line.trim_start().starts_with('{') {
+            return Ok(Some(line));
+        }
+        preamble.push(line.trim_end().to_owned());
+        if preamble.len() > READINESS_PREAMBLE_LINES {
+            return Err(format!(
+                "worker wrote more than {READINESS_PREAMBLE_LINES} non-event lines before \
+                 readiness; the last: {}",
+                preamble.last().map(String::as_str).unwrap_or_default()
+            ));
+        }
+    }
 }
 
 /// Supervise one started worker until a terminal event, then terminate its
@@ -502,9 +539,10 @@ pub(super) fn make_tree_removable(
 #[cfg(test)]
 mod tests {
     use super::{
-        SupervisionLabels, WorkerProcess, await_exit_without_reaping, cleanup_tempdir,
-        configure_process_group, finish_failed_start, make_tree_removable, read_readiness_line,
-        read_request, retry_while_interrupted, supervise_worker, terminate_process_group,
+        READINESS_PREAMBLE_LINES, SupervisionLabels, WorkerProcess, await_exit_without_reaping,
+        cleanup_tempdir, configure_process_group, finish_failed_start, make_tree_removable,
+        read_readiness_line, read_request, retry_while_interrupted, supervise_worker,
+        terminate_process_group,
     };
     use crate::ExecutionError;
     use std::fs;
@@ -762,14 +800,52 @@ mod tests {
 
     #[test]
     fn readiness_line_distinguishes_data_from_eof() {
-        let mut event = Cursor::new(b"ready\n");
+        let mut event = Cursor::new(b"{\"type\":\"ready\"}\n");
         assert_eq!(
             read_readiness_line(&mut event).expect("read readiness"),
-            Some("ready\n".into())
+            Some("{\"type\":\"ready\"}\n".into())
         );
 
         let mut eof = Cursor::new(Vec::<u8>::new());
         assert_eq!(read_readiness_line(&mut eof).expect("read EOF"), None);
+    }
+
+    /// The event channel is the worker's stderr, and the worker is not its
+    /// only writer before readiness: macOS libsandbox writes
+    /// `sandbox initialization failed: Operation not permitted` to fd 2 when
+    /// `sandbox_init` is refused (observed under an outer Seatbelt sandbox),
+    /// and only then does the worker emit its `failed` event naming the
+    /// cause. Taking that OS line as the event reported "invalid readiness
+    /// event: expected value" and discarded the real refusal (bead
+    /// `ley-line-open-704853`).
+    #[test]
+    fn readiness_skips_foreign_stderr_lines_before_the_event() {
+        let event = "{\"type\":\"failed\",\"error\":{\"detail\":\"apply\"}}\n";
+        let mut reader = Cursor::new(format!(
+            "sandbox initialization failed: Operation not permitted\n{event}"
+        ));
+        assert_eq!(
+            read_readiness_line(&mut reader).expect("read readiness"),
+            Some(event.into())
+        );
+    }
+
+    /// Skipped lines are diagnostics, not silence: a worker that writes only
+    /// foreign lines and exits must surface them in the refusal.
+    #[test]
+    fn foreign_stderr_without_an_event_is_reported_not_dropped() {
+        let mut reader = Cursor::new(b"dyld: Library not loaded\n".to_vec());
+        let error = read_readiness_line(&mut reader).expect_err("no event");
+        assert!(error.contains("dyld: Library not loaded"), "{error}");
+    }
+
+    /// Bounded: pre-readiness noise cannot make the reader buffer without
+    /// limit.
+    #[test]
+    fn foreign_stderr_before_readiness_is_bounded() {
+        let mut reader = Cursor::new("noise\n".repeat(READINESS_PREAMBLE_LINES + 1));
+        let error = read_readiness_line(&mut reader).expect_err("too much noise");
+        assert!(error.contains("before readiness"), "{error}");
     }
 
     #[test]

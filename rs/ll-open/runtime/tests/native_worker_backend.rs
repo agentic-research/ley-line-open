@@ -348,3 +348,36 @@ sleep 30
         .expect("a worker attesting exactly the authorized policy must start");
     assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
 }
+
+/// The refusal a worker reports must survive foreign stderr ahead of it.
+///
+/// Measured under an outer Seatbelt sandbox (bead `ley-line-open-704853`):
+/// macOS libsandbox itself writes `sandbox initialization failed: Operation
+/// not permitted` to the worker's stderr, which is the event channel, and only
+/// then does the worker emit the `failed` event that names the cause. The
+/// backend took the OS line as the readiness event and refused the run as
+/// "invalid native worker readiness event: expected value", so an operator
+/// could not tell a host that cannot sandbox from a corrupt worker. The run
+/// was still refused; the refusal must also name the reason.
+#[test]
+fn a_worker_refusal_after_foreign_stderr_keeps_its_cause() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend(
+        &fixture,
+        r#"#!/bin/sh
+IFS= read -r _
+echo 'sandbox initialization failed: Operation not permitted' >&2
+echo '{"type":"failed","error":{"code":"backend-failed","retryable":false,"detail":"apply native nono confinement: Sandbox initialization failed: Operation not permitted"}}' >&2
+exit 1
+"#,
+    );
+    let error = backend
+        .start(&request())
+        .expect_err("a worker that could not confine must not start");
+    assert!(
+        error.detail.contains("apply native nono confinement"),
+        "the refusal must carry the worker's cause, not the OS line before it: {error:?}"
+    );
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+}

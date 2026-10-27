@@ -255,6 +255,32 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **confinement/v1 §4 `port` and §3 `network.connectLocal` take lists**
+  (bead `ley-line-open-e2c33f`, for cloister ADR-0069's multi-listener
+  bundles and broker endpoints). An additive v1 extension, not v2: `port`
+  accepts one grant object or a non-empty list of distinct grants, and
+  `connectLocal` one integer or a non-empty list of distinct integers. The
+  canonical form (README §7 rule 5) emits a one-element list as the scalar,
+  so every existing document keeps its `confinementDigest` — the pinned
+  `manifest-canonical.json` (`d9b5b727…`) is unchanged, and its one-element
+  list form reaches the same digest. Two or more are a sorted list; an empty
+  list and a second grant for the same socket are refused. The README
+  defines the meet of two documents (set intersection of the two list
+  clauses, refused when any other dimension differs), and the new
+  `test-vectors/manifest-port-list.json` pins 0/1/2-grant canonicalization,
+  meets and refusals with their digests. Enforcement: Linux compiles one
+  Landlock `BindTcp`+`ConnectTcp` rule per listener and one `ConnectTcp`
+  rule per `connectLocal` port; macOS still refuses §4 by name and dials N
+  loopback ports with no bind right (ProxyOnly for the first port, the same
+  per-port Seatbelt outbound rule for each further one — measured by
+  `confinement_local_connect_probe`); the microVM tier's libkrun port map
+  takes one `N:N` entry per listener (`guest_port_map`). **Breaking (Rust
+  API):** `Dimensions.port` is now `Dimensions.ports: &[PortGrant]`,
+  `Dimensions.connect_local` and `ConfinementManifest::connect_local()`
+  return `&[u16]`, and `port_bind()` is replaced by `port_binds()`;
+  `with_port_bind` and `with_connect_local` add a grant per call. New:
+  `PortGrant`, `ConfinementManifest::meet`.
+
 - **`leyline-sign` tests consume notme's canonical CABundle fixtures**
   (bead `ley-line-open-0466c0`). notme's ADR-010 fixtures
   (`cabundle-basic`, `cabundle-multikey`) are vendored byte-for-byte

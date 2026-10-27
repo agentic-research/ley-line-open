@@ -13,7 +13,7 @@ use crate::{ExecutionError, ExecutionRequest, WorkerChannel};
 use serde::{Deserialize, Serialize};
 
 use super::confinement::{
-    VmmHostResources, apply_manifest, confinement_manifest, vsock_unix_mappings,
+    VmmHostResources, apply_manifest, confinement_manifest, guest_port_map, vsock_unix_mappings,
 };
 use super::plan::{DirectoryRootfsResolver, KRUN_TSI_HIJACK_INET, KrunConfig, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
@@ -491,8 +491,8 @@ pub fn prepare(
     // and from nowhere else: LLO's own policy never sets a port, and the
     // equality contract inside the fold refuses any carried document that
     // differs from the compiled one, differing dimensions named by section.
-    // So a `Some` here is always an issuer-committed listener, never caller
-    // intent, and never a partial document.
+    // So every grant in `dimensions().ports` here is an issuer-committed
+    // listener, never caller intent, and never a partial document.
     //
     // Two prior versions of this comment were each wrong in turn, in the
     // direction that misdirects hardest, and this file seems to attract the
@@ -504,28 +504,18 @@ pub fn prepare(
     // same commit that changed it.
     //
     // VERIFIED BY READING, NOT YET BY RUNNING: cloister executed the fold up
-    // to `dimensions().port == Some((bind, None))`, but no live microVM has
+    // to the folded §4 grant (then single-valued), but no live microVM has
     // exercised port_map delivery or the tsi refusal below — macOS has no
     // libkrun to run and CI has no KVM. `libkrun_guest_listener.rs` is the
     // test that does it — it self-skips via `hypervisor_or_skip()` when no
     // hypervisor is present, so it runs green-by-vacuity everywhere but real
     // Linux hardware. Run it there before calling the guest-listener path
     // proven.
-    if let Some((bind, _address)) = manifest.dimensions().port {
-        if config.tsi_features == 0 {
-            return Err(ExecutionError::invalid(format!(
-                "confinement/v1 §4 port.bind {bind} is not deliverable on the \
-                 microVM tier without socket hijacking: the guest's AF_INET \
-                 bind is not carried anywhere, so the listener could never be \
-                 reached. Start the worker with --tsi-hijack-inet, or omit the \
-                 dimension."
-            )));
-        }
-        config.port_map = vec![
-            std::ffi::CString::new(format!("{bind}:{bind}"))
-                .map_err(|_| ExecutionError::invalid("port map entry contains a NUL byte"))?,
-        ];
-    }
+    //
+    // Since ley-line-open-e2c33f, §4 is a list: every declared listener maps
+    // `N:N`, through the pure `guest_port_map` so the refusal and the mapping
+    // are testable without a VMM.
+    config.port_map = guest_port_map(&manifest, config.tsi_features)?;
 
     // §6 on this tier: the folded socket grants compile to vsock↔socket
     // mappings, consumed by `prepare_vm`. Derived from the same manifest the

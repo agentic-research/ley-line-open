@@ -271,11 +271,17 @@ context, scoping notes, and review history are recoverable.
   duplicate extensions, a non-Ed25519 `tbsCertificate.signature` and a
   negative epoch reject. New `verify_cert_path` and wasm export
   `leyline_verify_cert_path` verify root → Issuing CA → leaf paths (name
-  chaining, CA=true + keyCertSign on intermediates, pathLenConstraint, one
-  epoch across the path, validity intersected). Claims gain `profile`
-  (`CertProfile`); the claims JSON gains `"pr":"signet"` for Signet-profile
-  certificates only, so Interlace claims serialize to the same bytes as
-  before. Breaking for Rust callers that build `CertClaims` literals or
+  chaining, CA=true + keyCertSign on intermediates, pathLenConstraint,
+  validity intersected). On a path the epoch must be on every certificate
+  or none, and the reported `ep` is the minimum, so a revocation check
+  judges the oldest authority and a leaf stamped with a newer epoch cannot
+  carry an older tier forward. `cd` must be identical on every certificate
+  or absent from all, so a tier holder cannot add, change or drop it.
+  Claims gain `profile` (`CertProfile`); the claims JSON gains
+  `"pr":"signet"` for Signet-profile certificates only, so Interlace claims
+  serialize to the same bytes as before. Under `"pr":"signet"` an absent
+  `pf`/`sc` means "not read", never "unrestricted": consumers check `pr`
+  first. Breaking for Rust callers that build `CertClaims` literals or
   match `ChainError` exhaustively (new `ConstraintViolation`). Tested
   against real notme certificates minted by notme's
   `cert-authority.ts` (`sign/tests/fixtures/notme`, provenance alongside)

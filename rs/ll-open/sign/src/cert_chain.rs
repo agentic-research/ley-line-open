@@ -78,6 +78,22 @@
 //! Any other critical extension rejects the certificate (RFC 5280 §4.2).
 //! Duplicate extensions reject the certificate (RFC 5280 §4.2).
 //!
+//! # Paths
+//!
+//! [`verify_cert_path`] reports the leaf's claims, with three path-wide
+//! rules for the claims a tier holder could otherwise choose alone:
+//!
+//! - **Epoch:** every certificate carries `.1.4` or none does; the reported
+//!   epoch is the minimum. notme stamps a task leaf with a caller-supplied
+//!   epoch, so after a rotation a tier from epoch N can sign leaves at N+1.
+//!   Reporting the minimum keeps that path usable while the consumer's
+//!   revocation check still judges the tier.
+//! - **confinementDigest:** every certificate carries the same `.1.7` or
+//!   none does, so the digest is attested by the anchor-signed certificate.
+//! - **Profile:** every certificate is read under the same profile.
+//!
+//! `peer_fp` and `scope` come from the leaf alone.
+//!
 //! # Certificate format expectations
 //!
 //! - X.509 v3, Ed25519 signature (outer and `tbsCertificate.signature`),
@@ -123,6 +139,18 @@ impl CertProfile {
 }
 
 /// Result of a successful verification + claims extraction.
+///
+/// **Who attests what.** Under [`verify_cert_chain`] every claim is in a
+/// certificate the trust anchor signed. Under [`verify_cert_path`] the leaf
+/// is signed by the lowest intermediate, so a leaf-only claim is chosen by
+/// whoever holds that tier's key, not by the anchor. Each field below says
+/// which certificates it is drawn from.
+///
+/// **Absent is not unrestricted.** Under [`CertProfile::Signet`], `peer_fp`
+/// and `scope` are `None` because `.1.5` / `.1.6` are deliberately not read,
+/// never because the certificate grants an unrestricted peer or scope.
+/// Consumers MUST check `profile` (JSON `pr`) before giving an absent claim
+/// any meaning, and SHOULD reject a profile they do not handle.
 #[derive(Debug, Clone)]
 pub struct CertClaims {
     /// Ephemeral pubkey from the end-entity SubjectPublicKeyInfo.
@@ -131,19 +159,27 @@ pub struct CertClaims {
     /// certificate's window (latest notBefore, earliest notAfter).
     pub not_before: i64,
     pub not_after: i64,
-    /// Arc allocation the certificate was read under.
+    /// Arc allocation the certificate was read under. Every certificate in a
+    /// path must be read under the same profile.
     pub profile: CertProfile,
-    /// `.1.4` epoch. For a path, every certificate must carry the same epoch
-    /// or none may carry one.
+    /// `.1.4` epoch. For a path, every certificate carries an epoch or none
+    /// does, and this is the MINIMUM across the path: a consumer's
+    /// revocation check then judges the oldest authority in the chain, and a
+    /// leaf minted under a newer epoch cannot carry an older tier forward.
     pub epoch: Option<u32>,
-    /// `.1.5` interlace-peer. Always `None` under [`CertProfile::Signet`].
+    /// `.1.5` interlace-peer, from the leaf only. Always `None` under
+    /// [`CertProfile::Signet`] (not read; see above).
     pub peer_fp: Option<String>,
-    /// `.1.6` interlace-scope. Always `None` under [`CertProfile::Signet`].
+    /// `.1.6` interlace-scope, from the leaf only. Always `None` under
+    /// [`CertProfile::Signet`] (not read; see above).
     pub scope: Option<String>,
     /// Bead `ley-line-open-c79ea8`: BLAKE3-256 of the §6-canonical
-    /// `ConfinementManifest` (cloister/confinement/v1). When `Some`, a
-    /// substrate runner MUST verify at bundle-start that the manifest it is
-    /// about to enforce hashes to this digest.
+    /// `ConfinementManifest` (cloister/confinement/v1). For a path, every
+    /// certificate carries the same digest or none does, so a `Some` here
+    /// is attested by the anchor-signed certificate and no tier holder can
+    /// add, change or drop it. When `Some`, a substrate runner MUST verify
+    /// at bundle-start that the manifest it is about to enforce hashes to
+    /// this digest.
     pub confinement_digest: Option<[u8; 32]>,
 }
 
@@ -266,7 +302,9 @@ pub fn verify_cert_chain(cert_der: &[u8], master_pubkey: &[u8]) -> Result<CertCl
 /// Enforced: Ed25519 signatures on every link, issuer name == signer subject
 /// name (DER equality) below the anchor, the BasicConstraints / KeyUsage /
 /// pathLenConstraint rules in the module documentation, one profile across
-/// the path, and one epoch across the path (all equal, or all absent).
+/// the path, an epoch on every certificate or on none (the minimum is
+/// reported), and the same confinementDigest on every certificate or on
+/// none. See [`CertClaims`] for what each reported field is attested by.
 pub fn verify_cert_path(
     leaf_der: &[u8],
     intermediates_der: &[&[u8]],
@@ -307,15 +345,30 @@ pub fn verify_cert_path(
 
     let mut not_before = leaf_link.not_before;
     let mut not_after = leaf_link.not_after;
+    let mut epoch = leaf_link.epoch;
     for link in &links {
         if link.profile != leaf_link.profile {
             return Err(ChainError::ConstraintViolation(
                 "certificates in the path were read under different profiles",
             ));
         }
-        if link.epoch != leaf_link.epoch {
+        // Epoch: all present or all absent; the path reports the minimum so
+        // the consumer's revocation check judges the oldest authority.
+        epoch = match (epoch, link.epoch) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (None, None) => None,
+            _ => {
+                return Err(ChainError::ConstraintViolation(
+                    "epoch present on some certificates in the path and absent on others",
+                ));
+            }
+        };
+        // confinementDigest: every certificate carries the same value, or
+        // none does, so `cd` is attested from the anchor-signed certificate
+        // down and no tier holder can introduce or drop it.
+        if link.confinement_digest != leaf_link.confinement_digest {
             return Err(ChainError::ConstraintViolation(
-                "epoch differs across the path",
+                "confinementDigest differs across the path",
             ));
         }
         not_before = not_before.max(link.not_before);
@@ -327,7 +380,7 @@ pub fn verify_cert_path(
         not_before,
         not_after,
         profile: leaf_link.profile,
-        epoch: leaf_link.epoch,
+        epoch,
         peer_fp: leaf_link.peer_fp,
         scope: leaf_link.scope,
         confinement_digest: leaf_link.confinement_digest,
@@ -540,17 +593,15 @@ fn parse_epoch(value: &[u8]) -> Result<u32, ChainError> {
     let int = der::asn1::Int::from_der(value)
         .map_err(|_| ChainError::BadExtension("epoch is not a DER INTEGER"))?;
     let raw = int.as_bytes();
-    if raw.is_empty() || raw.len() > 5 {
-        return Err(ChainError::BadExtension("epoch out of range"));
-    }
-    if raw[0] & 0x80 != 0 {
+    let Some(&first) = raw.first() else {
+        return Err(ChainError::BadExtension("epoch is not a DER INTEGER"));
+    };
+    if first & 0x80 != 0 {
         return Err(ChainError::BadExtension("epoch is negative"));
     }
-    let stripped: &[u8] = if raw[0] == 0x00 && raw.len() > 1 {
-        &raw[1..]
-    } else {
-        raw
-    };
+    // Canonical DER carries a leading 0x00 only as a sign byte, so removing
+    // it leaves the magnitude (empty for epoch 0, which reads as 0).
+    let stripped = raw.strip_prefix(&[0x00]).unwrap_or(raw);
     if stripped.len() > 4 {
         return Err(ChainError::BadExtension("epoch > u32"));
     }
@@ -739,15 +790,9 @@ pub mod tests_helpers {
         .expect("test fixture: BasicConstraints → DER")
     }
 
-    /// DER KeyUsage with digitalSignature and/or keyCertSign (at least one).
-    pub fn der_key_usage(digital_signature: bool, key_cert_sign: bool) -> Vec<u8> {
-        let flags = match (digital_signature, key_cert_sign) {
-            (true, true) => KeyUsages::DigitalSignature | KeyUsages::KeyCertSign,
-            (true, false) => KeyUsages::DigitalSignature.into(),
-            (false, true) => KeyUsages::KeyCertSign.into(),
-            (false, false) => panic!("test fixture: KeyUsage needs at least one bit"),
-        };
-        KeyUsage(flags)
+    /// DER KeyUsage carrying exactly one usage bit.
+    pub fn der_key_usage(usage: KeyUsages) -> Vec<u8> {
+        KeyUsage(usage.into())
             .to_der()
             .expect("test fixture: KeyUsage → DER")
     }
@@ -935,7 +980,7 @@ pub mod tests_helpers {
             (
                 const_oid::db::rfc5280::ID_CE_KEY_USAGE,
                 true,
-                der_key_usage(true, false),
+                der_key_usage(KeyUsages::DigitalSignature),
             ),
             (oid_signet::SUBJECT, false, der_utf8("fixture")),
             (
@@ -961,6 +1006,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::RngCore;
     use rand::rngs::OsRng;
+    use x509_cert::ext::pkix::KeyUsages;
 
     fn now() -> i64 {
         std::time::SystemTime::now()
@@ -1012,7 +1058,7 @@ mod tests {
                 true,
                 der_basic_constraints(true, path_len),
             ),
-            (ID_CE_KEY_USAGE, true, der_key_usage(false, true)),
+            (ID_CE_KEY_USAGE, true, der_key_usage(KeyUsages::KeyCertSign)),
         ];
         if signet {
             v.push((oid_signet::SUBJECT, false, der_utf8("tier")));
@@ -1375,7 +1421,7 @@ mod tests {
         let cert = mint(
             &master,
             &ephemeral,
-            vec![(ID_CE_KEY_USAGE, true, der_key_usage(false, true))],
+            vec![(ID_CE_KEY_USAGE, true, der_key_usage(KeyUsages::KeyCertSign))],
         );
         assert!(matches!(
             verify_cert_chain(&cert, master.verifying_key().as_bytes()),
@@ -1452,19 +1498,86 @@ mod tests {
         verify_cert_chain(&p.leaf_der, p.tier.verifying_key().as_bytes()).unwrap();
     }
 
+    /// C1: the path reports the OLDEST epoch, so a consumer's revocation
+    /// check judges the oldest authority. A leaf minted after a rotation
+    /// under a tier from the previous epoch verifies, and reports the tier's
+    /// epoch; it does not launder the tier forward.
     #[test]
-    fn path_epoch_disagreement_rejects() {
-        let p = signet_path(4, 5);
-        assert!(matches!(
-            verify_cert_path(
+    fn path_reports_minimum_epoch() {
+        for (tier, leaf) in [(3, 4), (4, 3), (5, 5)] {
+            let p = signet_path(tier, leaf);
+            let claims = verify_cert_path(
                 &p.leaf_der,
                 &[&p.tier_der],
-                p.root.verifying_key().as_bytes()
-            ),
-            Err(ChainError::ConstraintViolation(
-                "epoch differs across the path"
-            ))
-        ));
+                p.root.verifying_key().as_bytes(),
+            )
+            .unwrap_or_else(|e| panic!("tier {tier} leaf {leaf}: {e:?}"));
+            assert_eq!(
+                claims.epoch,
+                Some(tier.min(leaf)),
+                "tier {tier} leaf {leaf}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_epoch_on_some_links_only_rejects() {
+        let root = random_signing_key();
+        let tier = random_signing_key();
+        let leaf = random_signing_key();
+        let with = vec![(oid_interlace::EPOCH, false, der_u32(3))];
+        for (tier_epoch, leaf_exts) in [(None, with.clone()), (Some(3), vec![])] {
+            let tier_der = mint(&root, &tier, ca_exts(None, tier_epoch, false));
+            let leaf_der = mint(&tier, &leaf, leaf_exts);
+            assert!(matches!(
+                verify_cert_path(&leaf_der, &[&tier_der], root.verifying_key().as_bytes()),
+                Err(ChainError::ConstraintViolation(
+                    "epoch present on some certificates in the path and absent on others"
+                ))
+            ));
+        }
+    }
+
+    fn cd_ext(digest: [u8; 32]) -> RawExtension {
+        let inner = der::asn1::OctetString::new(digest.to_vec())
+            .unwrap()
+            .to_der()
+            .unwrap();
+        (oid_interlace::CONFINEMENT_DIGEST, false, inner)
+    }
+
+    /// C2: `.1.7` under a path is only reported when every certificate,
+    /// starting with the one the anchor signed, carries the same digest.
+    #[test]
+    fn path_confinement_digest_must_be_carried_by_every_certificate() {
+        let root = random_signing_key();
+        let tier = random_signing_key();
+        let leaf = random_signing_key();
+        let a = [0xA1; 32];
+        let b = [0xB2; 32];
+        let path = |tier_cd: Option<[u8; 32]>, leaf_cd: Option<[u8; 32]>| {
+            let mut te = ca_exts(None, None, false);
+            te.extend(tier_cd.map(cd_ext));
+            let tier_der = mint(&root, &tier, te);
+            let leaf_der = mint(&tier, &leaf, leaf_cd.map(cd_ext).into_iter().collect());
+            verify_cert_path(&leaf_der, &[&tier_der], root.verifying_key().as_bytes())
+        };
+
+        assert_eq!(path(Some(a), Some(a)).unwrap().confinement_digest, Some(a));
+        assert_eq!(path(None, None).unwrap().confinement_digest, None);
+        for (tier_cd, leaf_cd) in [(None, Some(a)), (Some(a), None), (Some(a), Some(b))] {
+            assert!(
+                matches!(
+                    path(tier_cd, leaf_cd),
+                    Err(ChainError::ConstraintViolation(
+                        "confinementDigest differs across the path"
+                    ))
+                ),
+                "tier {:?} leaf {:?}",
+                tier_cd.map(|d| d[0]),
+                leaf_cd.map(|d| d[0])
+            );
+        }
     }
 
     #[test]
@@ -1513,7 +1626,11 @@ mod tests {
                     true,
                     der_basic_constraints(true, None),
                 ),
-                (ID_CE_KEY_USAGE, true, der_key_usage(true, false)),
+                (
+                    ID_CE_KEY_USAGE,
+                    true,
+                    der_key_usage(KeyUsages::DigitalSignature),
+                ),
             ],
         ] {
             let tier_der = mint(&root, &tier, tier_exts);
@@ -1558,13 +1675,114 @@ mod tests {
 
     #[test]
     fn path_too_many_intermediates_rejects() {
-        let root = random_signing_key();
-        let leaf = random_signing_key();
-        let leaf_der = mint(&root, &leaf, vec![]);
-        let many: Vec<&[u8]> = vec![&leaf_der[..]; MAX_INTERMEDIATES + 1];
+        // A valid path of `depth` unconstrained CAs: root -> i[depth-1] -> ...
+        // -> i[0] -> leaf. Returns (root, leaf_der, intermediates leaf-first).
+        fn valid_path(depth: usize) -> (SigningKey, Vec<u8>, Vec<Vec<u8>>) {
+            let root = random_signing_key();
+            let keys: Vec<SigningKey> = (0..depth).map(|_| random_signing_key()).collect();
+            let mut intermediates = Vec::new();
+            for (i, key) in keys.iter().enumerate() {
+                let signer = keys.get(i + 1).unwrap_or(&root);
+                intermediates.push(mint(signer, key, ca_exts(None, None, false)));
+            }
+            let leaf = random_signing_key();
+            let leaf_der = mint(keys.first().unwrap_or(&root), &leaf, vec![]);
+            (root, leaf_der, intermediates)
+        }
+
+        // Exactly the cap verifies.
+        let (root, leaf_der, ints) = valid_path(MAX_INTERMEDIATES);
+        let refs: Vec<&[u8]> = ints.iter().map(Vec::as_slice).collect();
+        verify_cert_path(&leaf_der, &refs, root.verifying_key().as_bytes())
+            .expect("a valid path at MAX_INTERMEDIATES verifies");
+
+        // One past the cap is refused by the cap, even though every link is valid.
+        let (root, leaf_der, ints) = valid_path(MAX_INTERMEDIATES + 1);
+        let refs: Vec<&[u8]> = ints.iter().map(Vec::as_slice).collect();
         assert!(matches!(
-            verify_cert_path(&leaf_der, &many, root.verifying_key().as_bytes()),
-            Err(ChainError::ConstraintViolation(_))
+            verify_cert_path(&leaf_der, &refs, root.verifying_key().as_bytes()),
+            Err(ChainError::ConstraintViolation(
+                "path has more intermediates than MAX_INTERMEDIATES"
+            ))
+        ));
+    }
+
+    /// Re-sign `cert_der` with `key` after setting the inner
+    /// (`tbsCertificate.signature`) and outer signature algorithm OIDs.
+    fn resign_with_algorithms(
+        cert_der: &[u8],
+        key: &SigningKey,
+        inner: ObjectIdentifier,
+        outer: ObjectIdentifier,
+    ) -> Vec<u8> {
+        use der::asn1::BitString;
+        use ed25519_dalek::Signer;
+        let mut cert = Certificate::from_der(cert_der).unwrap();
+        cert.tbs_certificate.signature.oid = inner;
+        cert.signature_algorithm.oid = outer;
+        let sig = key.sign(&cert.tbs_certificate.to_der().unwrap());
+        cert.signature = BitString::from_bytes(&sig.to_bytes()).unwrap();
+        cert.to_der().unwrap()
+    }
+
+    #[test]
+    fn inner_or_outer_signature_algorithm_not_ed25519_rejects() {
+        // ecdsa-with-SHA256: a real algorithm that is not Ed25519.
+        const ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let cert = mint(&master, &ephemeral, vec![]);
+        let pk = master.verifying_key();
+
+        let both = resign_with_algorithms(&cert, &master, ID_ED25519, ID_ED25519);
+        verify_cert_chain(&both, pk.as_bytes()).expect("Ed25519 inner and outer verifies");
+        for (inner, outer) in [(ECDSA_SHA256, ID_ED25519), (ID_ED25519, ECDSA_SHA256)] {
+            let c = resign_with_algorithms(&cert, &master, inner, outer);
+            assert!(
+                matches!(
+                    verify_cert_chain(&c, pk.as_bytes()),
+                    Err(ChainError::NotEd25519)
+                ),
+                "inner {inner} outer {outer}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_u32_boundaries() {
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let read = |value: Vec<u8>| {
+            let cert = mint(
+                &master,
+                &ephemeral,
+                vec![(oid_interlace::EPOCH, false, value)],
+            );
+            verify_cert_chain(&cert, master.verifying_key().as_bytes()).map(|c| c.epoch)
+        };
+        for v in [
+            0,
+            1,
+            127,
+            128,
+            255,
+            256,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0x0100_0000,
+            u32::MAX,
+        ] {
+            assert_eq!(read(der_u32(v)).unwrap(), Some(v), "epoch {v}");
+        }
+        // 2^32: canonical `02 05 01 00 00 00 00`, one byte past u32.
+        assert!(matches!(
+            read(vec![0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            Err(ChainError::BadExtension("epoch > u32"))
+        ));
+        // 2^40 with a sign byte: `02 06 00 80 00 00 00 00`.
+        assert!(matches!(
+            read(vec![0x02, 0x06, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00]),
+            Err(ChainError::BadExtension("epoch > u32"))
         ));
     }
 

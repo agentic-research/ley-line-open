@@ -248,8 +248,11 @@ pub unsafe extern "C" fn leyline_verify_cert_chain(
 /// leaf's issuer first and the anchor-signed certificate last (at most
 /// `cert_chain::MAX_INTERMEDIATES`). With `intermediates_len == 0` the
 /// pointer is not read and this is `leyline_verify_cert_chain`. For a
-/// path, `nb`/`na` are the intersection of every certificate's validity
-/// and `ep` is the single epoch every certificate carries.
+/// path, `nb`/`na` are the intersection of every certificate's validity,
+/// `ep` is the minimum epoch (every certificate carries one, or none
+/// does), and `cd` appears only when every certificate carries the same
+/// confinementDigest. A missing `pf`/`sc` means "not read" under
+/// `"pr":"signet"`, never "unrestricted"; check `pr` first.
 ///
 /// # Safety
 /// All input pointers must be non-null and valid for their stated

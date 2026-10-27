@@ -219,21 +219,25 @@ impl Host {
 
     /// Run a daemon that must refuse to start, and return its output.
     fn refuses(&self, verifier_args: &[&std::ffi::OsStr]) -> Output {
-        let mut child = self
+        let child = self
             .command(verifier_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn leyline execution-daemon");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while child.try_wait().expect("poll daemon").is_none() {
-            if Instant::now() > deadline {
-                let _ = child.kill();
+        let pid = child.id();
+        let (done, exited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(child.wait_with_output());
+        });
+        let output = match exited.recv_timeout(Duration::from_secs(30)) {
+            Ok(output) => output.expect("daemon output"),
+            Err(_) => {
+                // SAFETY: signalling a child this test spawned and still owns.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
                 panic!("the daemon started with {verifier_args:?}; it must refuse");
             }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let output = child.wait_with_output().expect("daemon output");
+        };
         assert!(
             !output.status.success(),
             "a refused configuration exits non-zero: {verifier_args:?}"
@@ -268,7 +272,9 @@ impl Host {
                 Instant::now() < deadline,
                 "the daemon socket never answered"
             );
-            std::thread::sleep(Duration::from_millis(20));
+            // Every wait is a poll of the condition itself, as in
+            // guest_harness: no fixed sleep.
+            std::thread::yield_now();
         }
         let provision = call(
             &daemon.sock,

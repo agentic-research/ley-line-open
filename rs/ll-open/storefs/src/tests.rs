@@ -37,13 +37,23 @@ pub(crate) fn freshness() -> Freshness {
     }
 }
 
-/// A clock the test moves: no test sleeps.
+/// A clock the test moves: no test sleeps. [`TestClock::advance`] moves the
+/// monotonic and the wall clock together; [`TestClock::host_sleep`] moves
+/// only the wall clock, as a host sleep does to a monotonic clock that stops
+/// while the host sleeps (macOS `CLOCK_UPTIME_RAW`, Rust's `Instant`).
 #[derive(Default)]
-pub(crate) struct TestClock(parking_lot::Mutex<Duration>);
+pub(crate) struct TestClock {
+    monotonic: parking_lot::Mutex<Duration>,
+    slept: parking_lot::Mutex<Duration>,
+}
 
 impl TestClock {
     pub(crate) fn advance(&self, by: Duration) {
-        *self.0.lock() += by;
+        *self.monotonic.lock() += by;
+    }
+
+    pub(crate) fn host_sleep(&self, by: Duration) {
+        *self.slept.lock() += by;
     }
 }
 
@@ -53,11 +63,15 @@ pub(crate) const ORIGIN: Duration = Duration::new(1_760_000_000, 500);
 
 impl Clock for TestClock {
     fn now(&self) -> Duration {
-        *self.0.lock()
+        *self.monotonic.lock()
     }
 
     fn origin(&self) -> Duration {
         ORIGIN
+    }
+
+    fn wall(&self) -> Duration {
+        ORIGIN + *self.monotonic.lock() + *self.slept.lock()
     }
 }
 
@@ -1787,6 +1801,28 @@ fn the_monotonic_clocks_origin_is_the_wall_clock_at_its_creation() {
     );
 }
 
+#[test]
+fn the_monotonic_clocks_wall_time_is_the_wall_clock_now() {
+    // A clock made 5 s ago with an origin of ORIGIN: wall() reads the wall
+    // clock at the call, not the origin plus the monotonic count.
+    let clock = MonotonicClock {
+        origin: std::time::Instant::now() - Duration::from_secs(5),
+        wall: ORIGIN,
+    };
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+    };
+    let before = wall();
+    let now = clock.wall();
+    let after = wall();
+    assert!(
+        before <= now && now <= after,
+        "{before:?} {now:?} {after:?}"
+    );
+}
+
 // ── file times (bead `ley-line-open-b8100d`) ──────────────────────────────
 //
 // git decides whether to rehash a file from its stat (size, mtime, ctime,
@@ -1809,6 +1845,60 @@ fn mtime(f: &Fixture, path: &str) -> Duration {
 fn tick(f: &Fixture) -> Duration {
     f.clock.advance(Duration::from_secs(1));
     ORIGIN + f.clock.now()
+}
+
+/// Bead `ley-line-open-2a7d66`: a file's time is the host's wall-clock time
+/// of its change, like every file on the host's own filesystems (the
+/// guest's rootfs, where git keeps its index). A time counted on a
+/// monotonic clock that stops while the host sleeps falls behind them by
+/// every sleep since the daemon started, and git's racy-clean check then
+/// trusts a stale same-second stat.
+#[test]
+fn a_change_after_the_host_slept_reports_the_wall_clock_time() {
+    let f = fixture(whole());
+    f.clock.advance(Duration::from_secs(3));
+    f.clock.host_sleep(Duration::from_secs(57));
+    let h = edit(&f, "a.go", "package a // after the sleep\n");
+    assert_eq!(f.fs.flush(h), Ok(()));
+    assert_eq!(mtime(&f, "a.go"), f.clock.wall());
+    assert_eq!(mtime(&f, ""), f.clock.wall());
+}
+
+/// Save `text` to `path` through a write handle and land it.
+fn landed_edit(f: &Fixture, path: &str, text: &str) {
+    let h = edit(f, path, text);
+    assert_eq!(f.fs.flush(h), Ok(()));
+    f.fs.release(h);
+}
+
+/// A change reported after a host sleep is still later than every time
+/// reported before it, and the next change in the same instant moves past it.
+#[test]
+fn file_times_across_a_host_sleep_still_increase_per_path() {
+    let f = fixture(whole());
+    landed_edit(&f, "a.go", "package a // one\n");
+    let before = mtime(&f, "a.go");
+    f.clock.host_sleep(Duration::from_secs(30));
+    landed_edit(&f, "a.go", "package a // two\n");
+    let after = mtime(&f, "a.go");
+    assert!(
+        after > before + Duration::from_secs(29),
+        "{before:?} {after:?}"
+    );
+    landed_edit(&f, "a.go", "package a // three\n");
+    assert!(mtime(&f, "a.go") > after);
+}
+
+/// A host sleep does not shorten how long a changed path keeps the short
+/// timeout: freshness counts monotonic time.
+#[test]
+fn a_host_sleep_does_not_move_freshness() {
+    let f = fixture(whole());
+    landed_edit(&f, "a.go", "package a // changed\n");
+    let changed = f.fs.lookup(ROOT_INODE, b"a.go").unwrap().ttl;
+    assert_eq!(changed, SHORT);
+    f.clock.host_sleep(WINDOW * 2);
+    assert_eq!(f.fs.lookup(ROOT_INODE, b"a.go").unwrap().ttl, changed);
 }
 
 #[test]

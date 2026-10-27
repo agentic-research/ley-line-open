@@ -1,9 +1,9 @@
 //! Real notme certificates through `leyline_sign::cert_chain` (bead
 //! `ley-line-open-9ac66d`).
 //!
-//! The fixtures in `tests/fixtures/notme/` were minted by notme's own
+//! The fixtures in `tests/fixtures/notme-certs/` were minted by notme's own
 //! `worker/src/cert-authority.ts`, unmodified; see
-//! `tests/fixtures/notme/PROVENANCE.md`. They are not hand-built, so these
+//! `tests/fixtures/notme-certs/PROVENANCE.md`. They are not hand-built, so these
 //! tests measure LLO against what notme actually emits:
 //!
 //! - critical BasicConstraints / KeyUsage / SubjectAltName, which LLO
@@ -41,11 +41,11 @@ fn notme_anchor_bound_to_signet_profile() {
     ));
 }
 
-const ROOT_PUB: &[u8] = include_bytes!("fixtures/notme/root.pub");
-const ISSUING_CA: &[u8] = include_bytes!("fixtures/notme/issuing-ca.der");
-const TASK_SIGNING: &[u8] = include_bytes!("fixtures/notme/task-signing.der");
-const TASK_MTLS: &[u8] = include_bytes!("fixtures/notme/task-mtls.der");
-const DIRECT_SIGNING: &[u8] = include_bytes!("fixtures/notme/direct-signing.der");
+const ROOT_PUB: &[u8] = include_bytes!("fixtures/notme-certs/root.pub");
+const ISSUING_CA: &[u8] = include_bytes!("fixtures/notme-certs/issuing-ca.der");
+const TASK_SIGNING: &[u8] = include_bytes!("fixtures/notme-certs/task-signing.der");
+const TASK_MTLS: &[u8] = include_bytes!("fixtures/notme-certs/task-mtls.der");
+const DIRECT_SIGNING: &[u8] = include_bytes!("fixtures/notme-certs/direct-signing.der");
 
 /// `expected.json` values, recorded by the mint script.
 const EPOCH: u32 = 3;

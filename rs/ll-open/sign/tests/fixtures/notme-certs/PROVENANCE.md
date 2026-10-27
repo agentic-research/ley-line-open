@@ -1,7 +1,12 @@
 # notme certificate fixtures
 
 Real certificates minted by notme's own code, used by `tests/notme_chain.rs`
-(bead `ley-line-open-9ac66d`). Nothing here is hand-built.
+and `src/ffi.rs` tests (bead `ley-line-open-9ac66d`). Nothing here is
+hand-built.
+
+These live apart from `../notme/`, which is a byte-for-byte mirror of notme's
+`schema/fixtures/` pinned by its `PROVENANCE` (bead `ley-line-open-0466c0`)
+and whose test treats every `*.json` there as a CABundle fixture.
 
 ## Source
 

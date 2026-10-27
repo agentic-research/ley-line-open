@@ -388,11 +388,12 @@ mod tests {
     }
 
     // Real notme certificates (bead ley-line-open-9ac66d); provenance in
-    // tests/fixtures/notme/PROVENANCE.md.
-    const ROOT_PUB: &[u8] = include_bytes!("../tests/fixtures/notme/root.pub");
-    const ISSUING_CA: &[u8] = include_bytes!("../tests/fixtures/notme/issuing-ca.der");
-    const TASK_SIGNING: &[u8] = include_bytes!("../tests/fixtures/notme/task-signing.der");
-    const DIRECT_SIGNING: &[u8] = include_bytes!("../tests/fixtures/notme/direct-signing.der");
+    // tests/fixtures/notme-certs/PROVENANCE.md.
+    const ROOT_PUB: &[u8] = include_bytes!("../tests/fixtures/notme-certs/root.pub");
+    const ISSUING_CA: &[u8] = include_bytes!("../tests/fixtures/notme-certs/issuing-ca.der");
+    const TASK_SIGNING: &[u8] = include_bytes!("../tests/fixtures/notme-certs/task-signing.der");
+    const DIRECT_SIGNING: &[u8] =
+        include_bytes!("../tests/fixtures/notme-certs/direct-signing.der");
 
     use crate::cert_chain::CertProfile;
 

@@ -287,11 +287,28 @@ context, scoping notes, and review history are recoverable.
   `1` Interlace, `2` Signet, anything else fails). A notme anchor bound to
   Signet then cannot present Interlace claims, and the reverse.
   `leyline_verify_cert_chain` and `verify_cert_path` are unchanged and
-  accept either profile. Breaking for Rust callers that build `CertClaims` literals or
-  match `ChainError` exhaustively (new `ConstraintViolation`). Tested
-  against real notme certificates minted by notme's
-  `cert-authority.ts` (`sign/tests/fixtures/notme`, provenance alongside)
-  and against cloister's committed Interlace vectors.
+  accept either profile. Breaking for Rust callers that build `CertClaims`
+  literals or match `ChainError` exhaustively (new `ConstraintViolation`).
+  Tested against real notme certificates minted by notme's
+  `cert-authority.ts` (`sign/tests/fixtures/notme-certs`, provenance
+  alongside; kept apart from the vendored CABundle mirror in
+  `tests/fixtures/notme`) and against cloister's committed Interlace
+  vectors.
+
+- **`leyline-sign` tests consume notme's canonical CABundle fixtures**
+  (bead `ley-line-open-0466c0`). notme's ADR-010 fixtures
+  (`cabundle-basic`, `cabundle-multikey`) are vendored byte-for-byte
+  under `rs/ll-open/sign/tests/fixtures/notme/`. `PROVENANCE` pins them
+  to notme commit `e9694201` and records each file's SHA-256, and the
+  test re-checks those sums. The test checks that each `.bin` equals the
+  decoded `.expected.hex`. An RFC 8949 §4.2.1 reference encoder in the
+  test must reproduce every fixture from its `.json`. The multikey
+  fixture's unsorted keys must fail to reproduce it. The decoy
+  `signature` is excluded, and an unknown field is refused. A 32-byte
+  fixture key must sit under its ADR-012 `canonical_kid`. LLO ships no
+  CABundle encoder, so the encoding test checks the fixtures and the
+  three-way contract, not an LLO producer. No current fixture carries an
+  Ed25519 key.
 
 - **The libkrun worker declares its workspace share, holds nothing else,
   and the receipt names it** (bead `ley-line-open-b83347`, ADR-0044 phase
@@ -504,6 +521,24 @@ context, scoping notes, and review history are recoverable.
 
 ### Fixed
 
+- **Share file times are the host's wall clock, so a host sleep cannot
+  hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).
+  storefs reported a path's time as the wall clock at the daemon's start
+  plus `Instant` elapsed; on macOS `Instant` reads `CLOCK_UPTIME_RAW`,
+  which stops while the host sleeps (a laptop on battery cycles through
+  maintenance sleeps), so share times fell behind the wall clock by every
+  sleep since the daemon started. The guest's rootfs is host APFS, which
+  stamps wall-clock times, so git's index carried a time seconds to a
+  minute later than the share's file times; git built without `USE_NSEC`
+  compares whole seconds, its racy-clean check trusted a stale
+  same-second stat, and a second same-size edit was invisible to `git
+  status` (agent_in_guest (m) failed 11 of 20 runs on a host that slept).
+  `Clock::wall` gives file times (strictly increasing per path, from the
+  clock's origin); freshness timeouts keep the monotonic `Clock::now`. The
+  host mount reports the same wall-clock times. The guest's own clock still
+  counts on the hypervisor's counter, which also stops while the host
+  sleeps, so after a sleep it trails the host: never ahead of a share
+  time, which is the direction git's check needs.
 - **Two processes on one host NFS mount never lose an edit** (bead
   `ley-line-open-5ec040`). One NFS client serves every process on the host,
   so a process that read a file before another process's save could save

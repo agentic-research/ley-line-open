@@ -1013,7 +1013,7 @@ pub mod tests_helpers {
     /// signing cert): critical BasicConstraints CA=false and KeyUsage
     /// digitalSignature, `.1.1` subject, `.1.2` issuance time, `.1.4` epoch,
     /// `.1.5` authMethod as DER UTF8String, `.1.6` 32 raw binding bytes.
-    /// For unit tests; `tests/fixtures/notme` carries real notme output.
+    /// For unit tests; `tests/fixtures/notme-certs` carries real notme output.
     pub fn signet_profile_leaf_extensions(epoch: u32, auth_method: &str) -> Vec<RawExtension> {
         vec![
             (

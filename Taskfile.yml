@@ -377,6 +377,15 @@ tasks:
         vars:
           ARTIFACT_ROOT: '{{.FIXTURE_DIR}}/artifacts'
       - |
+        set -eu
+        # INCLUDE_TOOLDEFS also stages the execution/v1 schema bytes, byte-
+        # identical to the repository files and listed in SHA256SUMS (6d811a).
+        staged="{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64"
+        cmp "$staged/execution.capnp" rs/ll-core/schema-spec/execution/v1/execution.capnp
+        cmp "$staged/traits.capnp" rs/ll-core/schema-spec/_traits.capnp
+        grep -q '  execution\.capnp$' "$staged/SHA256SUMS"
+        grep -q '  traits\.capnp$' "$staged/SHA256SUMS"
+      - |
         printf 'corruption' >> "{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64/leyline-test-amd64"
         if tools/verify_release_artifacts.sh "{{.FIXTURE_DIR}}/artifacts"; then
           echo "corrupted release artifact unexpectedly verified"
@@ -448,6 +457,32 @@ tasks:
     desc: Compile the Apache daemon/wire API from an external Go module
     cmds:
       - tools/test_go_schema_consumer.sh
+
+  schema:execution-asset-consumer-test:
+    desc: Compile the execution/v1 schema release assets standalone to zod RunSpec/RunGrant/RunReceipt (6d811a)
+    cmds:
+      - |
+        set -eu
+        (cd rs && cargo build --quiet -p leyline-schema-bridge --bin capnpc-schema-bridge-zod)
+        zod="$PWD/rs/target/debug/capnpc-schema-bridge-zod"
+        tmp=$(mktemp -d "${TMPDIR:-/tmp}/leyline-execution-asset.XXXXXX")
+        trap 'rm -rf "$tmp"' EXIT
+        printf '#!/bin/sh\n' > "$tmp/leyline"
+        # Staged by the release staging script itself, so the assets under
+        # test are the bytes and names a release publishes.
+        OUTPUT_DIR="$tmp/staged" CLI_SOURCE="$tmp/leyline" \
+          ASSET_NAME=leyline-fixture \
+          EXECUTION_SCHEMA_ROOT="$PWD/rs/ll-core/schema-spec" \
+          tools/stage_release_artifacts.sh
+        tools/test_execution_schema_asset.sh "$tmp/staged" "$zod"
+        # The compile is real: a traits asset without the annotations the
+        # schema uses must fail it.
+        printf '@0xd3b652fd6a4debe6;\n' > "$tmp/staged/traits.capnp"
+        if tools/test_execution_schema_asset.sh "$tmp/staged" "$zod" 2>/dev/null; then
+          echo "execution.capnp compiled against a traits asset without its annotations"
+          exit 1
+        fi
+        echo "execution/v1 schema asset consumer test rejected a broken traits asset"
 
   schema:mcp-protocol-pin-test:
     desc: Prove the vendored MCP wire schema (ley-line-open-60f0d3) is git-tracked, digest-pinned, and structurally the 2026-07-28 revision
@@ -653,6 +688,7 @@ tasks:
       DEFAULT_STATICLIB_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/libleyline_fs.a'
       DEFAULT_HEADER_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/fs/include/leyline_fs.h'
       DEFAULT_TOOLDEFS_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/cli-lib/src/daemon/execution-tools.json'
+      DEFAULT_EXECUTION_SCHEMA_ROOT: '{{.ROOT_DIR}}/rs/ll-core/schema-spec'
     env:
       ASSET_NAME: '{{.ASSET_NAME}}'
       BUILD_TARGET: '{{.BUILD_TARGET}}'
@@ -662,7 +698,9 @@ tasks:
       INCLUDE_HEADER: '{{.INCLUDE_HEADER | default "false"}}'
       # The generated execution/v1 tool definitions — one platform-independent
       # JSON, so exactly ONE release job sets this (same single-uploader rule
-      # as INCLUDE_HEADER). Off by default.
+      # as INCLUDE_HEADER). Off by default. The same flag stages the
+      # execution/v1 schema bytes (`execution.capnp`, `traits.capnp`) the
+      # tooldefs are generated from, so the two cannot ship apart.
       #
       # Only the FLAG lives here. `TOOLDEFS_SOURCE` is exported from `cmds`
       # under this flag, exactly as `HEADER_SOURCE` is: putting the path in
@@ -696,6 +734,9 @@ tasks:
         fi
         if [ "${INCLUDE_TOOLDEFS:-false}" = "true" ]; then
           export TOOLDEFS_SOURCE='{{.TOOLDEFS_SOURCE | default .DEFAULT_TOOLDEFS_SOURCE}}'
+          # The execution/v1 schema bytes ship beside their tooldefs
+          # projection: same contract, same single uploader (6d811a).
+          export EXECUTION_SCHEMA_ROOT='{{.EXECUTION_SCHEMA_ROOT | default .DEFAULT_EXECUTION_SCHEMA_ROOT}}'
         fi
         tools/stage_release_artifacts.sh
 
@@ -1580,6 +1621,7 @@ tasks:
       - task: release:publish:fixture-test
       - task: release:retry:fixture-test
       - task: schema:consumer-fixture-test
+      - task: schema:execution-asset-consumer-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check
       - task: release:crates:fixture-test

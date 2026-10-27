@@ -64,7 +64,8 @@ jobs:
             # definitions are one platform-independent JSON, shipped so a
             # consumer can advance its contract lock by fetch + digest-verify
             # instead of needing an LLO checkout and a capnp toolchain
-            # (ley-line-open-6bb789).
+            # (ley-line-open-6bb789). The flag also stages the execution/v1
+            # schema bytes, execution.capnp + traits.capnp (6d811a).
             include_tooldefs: true
             # wasm_assets present → this job also builds + stages the
             # platform-independent wasm32 artifacts (ley-line-open-a2099a;

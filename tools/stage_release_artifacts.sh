@@ -231,6 +231,55 @@ if [ -n "${GENERATOR_BINS:-}" ]; then
     done
 fi
 
+# The microVM worker (ley-line-open-984acf).
+#
+# leyline-krun-worker links libkrun, which creates the guest through
+# Hypervisor.framework on macOS; a worker without
+# com.apple.security.hypervisor fails VM creation with EINVAL. So the STAGED
+# copy is signed here, ad hoc, by tools/sign_krun_worker.sh (the one signing
+# path), and the entitlement is then checked on the staged bytes before
+# SHA256SUMS digests them. A signing step that silently stops granting it
+# fails the release instead of shipping a worker that fails at its first run.
+#
+# The check needs macOS codesign, so a darwin worker staged anywhere else is
+# refused. RELEASE_FIXTURE_UNCHECKED_WORKER=1 lifts that for the publication
+# fixture on a Linux runner only, which stages a stand-in to prove the asset
+# inventory; release.yml never sets it.
+if [ -n "${KRUN_WORKER_SOURCE:-}" ] || [ -n "${KRUN_WORKER_ASSET:-}" ]; then
+    : "${KRUN_WORKER_SOURCE:?KRUN_WORKER_SOURCE is required with KRUN_WORKER_ASSET}"
+    : "${KRUN_WORKER_ASSET:?KRUN_WORKER_ASSET is required with KRUN_WORKER_SOURCE}"
+    case "$KRUN_WORKER_ASSET" in
+        *[!A-Za-z0-9._-]*)
+            echo "unsafe krun worker asset name: $KRUN_WORKER_ASSET" >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -f "$KRUN_WORKER_SOURCE" ]; then
+        echo "krun worker not built: $KRUN_WORKER_SOURCE" >&2
+        echo "run 'task krun-worker:release:target' for this BUILD_TARGET" >&2
+        exit 1
+    fi
+    if [ -e "$OUTPUT_DIR/$KRUN_WORKER_ASSET" ]; then
+        echo "release asset names would collide: $KRUN_WORKER_ASSET" >&2
+        exit 1
+    fi
+    staged_worker="$OUTPUT_DIR/$KRUN_WORKER_ASSET"
+    cp "$KRUN_WORKER_SOURCE" "$staged_worker"
+    chmod +x "$staged_worker"
+    case "$KRUN_WORKER_ASSET" in
+        *-darwin-*)
+            if [ "$(uname -s)" = Darwin ]; then
+                "$(dirname "$0")/sign_krun_worker.sh" "$staged_worker"
+                "$(dirname "$0")/sign_krun_worker.sh" --check "$staged_worker"
+            elif [ "${RELEASE_FIXTURE_UNCHECKED_WORKER:-}" != 1 ]; then
+                echo "a darwin krun worker must be staged on macOS, where its" >&2
+                echo "hypervisor entitlement can be signed and checked" >&2
+                exit 1
+            fi
+            ;;
+    esac
+fi
+
 manifest_tmp="$OUTPUT_DIR/.SHA256SUMS.tmp.$$"
 manifest_unsorted="$OUTPUT_DIR/.SHA256SUMS.unsorted.$$"
 trap 'rm -f "$manifest_tmp" "$manifest_unsorted"' 0 1 2 15

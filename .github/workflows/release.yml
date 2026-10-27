@@ -93,6 +93,9 @@ jobs:
             target: aarch64-apple-darwin
             asset: leyline-darwin-arm64
             lib_asset: libleyline_fs-darwin-arm64.a
+            # The microVM worker, staged ad-hoc signed with
+            # com.apple.security.hypervisor (ley-line-open-984acf).
+            krun_worker_asset: leyline-krun-worker-darwin-arm64
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (matches ci.yml).
       # `persist-credentials: false` so the GITHUB_TOKEN written by
@@ -212,11 +215,26 @@ jobs:
           task cas-ffi:wasm:build
           task envelope:wasm:build
 
+      # ---- microVM worker (ley-line-open-984acf) ----
+      # Links the vendored libkrun, whose Linux guest init needs zig on
+      # macOS (tools/krun_init_cc.sh). `krun-worker:release:target` signs it,
+      # and staging re-signs and checks the staged copy's entitlement.
+      - name: Install krun guest-init compiler
+        if: matrix.krun_worker_asset
+        run: task deps:krun-init-cc
+
+      - name: Build leyline-krun-worker
+        if: matrix.krun_worker_asset
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: task krun-worker:release:target
+
       - name: Stage exact build outputs and checksum manifest
         env:
           BUILD_TARGET: ${{ matrix.target }}
           ASSET_NAME: ${{ matrix.asset }}
           LIB_ASSET: ${{ matrix.lib_asset }}
+          KRUN_WORKER_ASSET: ${{ matrix.krun_worker_asset }}
           INCLUDE_HEADER: ${{ matrix.include_header }}
           INCLUDE_TOOLDEFS: ${{ matrix.include_tooldefs }}
           # Staged as `<bin>-<suffix>`; the suffix derives from ASSET_NAME.

@@ -35,6 +35,10 @@ on:
       - 'rs/ll-open/schema-bridge/**'
       - 'rs/ll-core/mcp-descriptor/**'
       - 'rs/ll-open/cli/**'
+      # The macOS microVM worker asset (ley-line-open-984acf).
+      - 'rs/ll-open/krun-worker/**'
+      - 'tools/sign_krun_worker.sh'
+      - 'entitlements.plist'
       # The crates behind the published wasm artifacts (ley-line-open-a2099a,
       # ley-line-open-be5f86).
       - 'rs/ll-open/sign/**'
@@ -221,3 +225,60 @@ jobs:
           REF="localhost/leyline:v${VERSION}"
           docker image inspect "$REF" >/dev/null
           echo "built $REF"
+
+  # release.yml's darwin-arm64 leg builds leyline-krun-worker, and staging
+  # signs it with com.apple.security.hypervisor and checks the staged copy
+  # (ley-line-open-984acf). That leg needs macOS codesign and zig for the
+  # guest init, neither of which the Linux stage job above exercises, so
+  # without this job the tag would be the first run of either.
+  krun-worker:
+    name: build + sign + stage krun worker (macOS, no publish)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+          cache-targets: false
+
+      - name: Install system deps
+        run: task deps:capnp
+
+      - name: Install krun guest-init compiler
+        run: task deps:krun-init-cc
+
+      - name: Build leyline-krun-worker
+        env:
+          BUILD_TARGET: aarch64-apple-darwin
+        run: task krun-worker:release:target
+
+      # The worker stands in for the CLI here: this job proves the worker
+      # leg of staging, and the stage job above proves the CLI's.
+      - name: Stage the worker as release.yml does
+        env:
+          BUILD_TARGET: aarch64-apple-darwin
+          ASSET_NAME: leyline-darwin-arm64
+          CLI_SOURCE: ${{ github.workspace }}/rs/target/aarch64-apple-darwin/release/leyline-krun-worker
+          KRUN_WORKER_ASSET: leyline-krun-worker-darwin-arm64
+        run: task release:artifacts:stage
+
+      - name: Assert the staged worker carries the hypervisor entitlement
+        run: |
+          set -eu
+          staged=.artifacts/staged/leyline-darwin-arm64
+          tools/sign_krun_worker.sh --check "$staged/leyline-krun-worker-darwin-arm64"
+          grep -q '  leyline-krun-worker-darwin-arm64$' "$staged/SHA256SUMS"
+          codesign -d --entitlements - "$staged/leyline-krun-worker-darwin-arm64"

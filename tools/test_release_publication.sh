@@ -143,13 +143,60 @@ LIB_ASSET="libleyline_fs-linux-arm64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
     "$repo_root/tools/stage_release_artifacts.sh"
 
+# The microVM worker (ley-line-open-984acf) rides the darwin-arm64 leg. On
+# macOS the stand-in is a real Mach-O (a copy of /usr/bin/true), so staging
+# signs it for real and the entitlement is asserted below with codesign on
+# the STAGED bytes. Elsewhere codesign does not exist: the stand-in only
+# proves the asset inventory, and the skip says so.
+worker_asset=leyline-krun-worker-darwin-arm64
+if [ "$(uname -s)" = Darwin ]; then
+    cp /usr/bin/true "$tmp_dir/leyline-krun-worker"
+    worker_check=codesign
+else
+    make_source "$tmp_dir/leyline-krun-worker" '#!/bin/sh'
+    worker_check=skipped
+    RELEASE_FIXTURE_UNCHECKED_WORKER=1
+    export RELEASE_FIXTURE_UNCHECKED_WORKER
+fi
+
 OUTPUT_DIR="$tmp_dir/staged/leyline-darwin-arm64" \
 CLI_SOURCE="$tmp_dir/leyline" \
 ASSET_NAME="leyline-darwin-arm64" \
 GENERATOR_SUFFIX="darwin-arm64" \
 LIB_ASSET="libleyline_fs-darwin-arm64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
+KRUN_WORKER_SOURCE="$tmp_dir/leyline-krun-worker" \
+KRUN_WORKER_ASSET="$worker_asset" \
     "$repo_root/tools/stage_release_artifacts.sh"
+
+staged_worker="$tmp_dir/staged/leyline-darwin-arm64/$worker_asset"
+grep -q "  $worker_asset\$" "$tmp_dir/staged/leyline-darwin-arm64/SHA256SUMS" ||
+    fail "the staged SHA256SUMS does not list $worker_asset"
+if [ "$worker_check" = codesign ]; then
+    /usr/bin/codesign -d --entitlements - --xml "$staged_worker" 2>/dev/null |
+        tr -d ' \t\r\n' |
+        grep -q '<key>com.apple.security.hypervisor</key><true/>' ||
+        fail "staged $worker_asset lacks com.apple.security.hypervisor"
+
+    # A worker that loses its entitlement after staging is caught by the
+    # same check staging runs.
+    cp "$staged_worker" "$tmp_dir/unentitled-worker"
+    /usr/bin/codesign --force --sign - "$tmp_dir/unentitled-worker" 2>/dev/null
+    expect_failure unentitled-worker-check \
+        "$repo_root/tools/sign_krun_worker.sh" --check "$tmp_dir/unentitled-worker"
+else
+    echo "SKIPPED (NOT a pass): the $worker_asset entitlement check needs macOS codesign" >&2
+    # Off macOS, staging a darwin worker without the fixture's explicit
+    # opt-out is refused: nothing there could sign or check it.
+    expect_failure darwin-worker-off-macos \
+        env -u RELEASE_FIXTURE_UNCHECKED_WORKER \
+        OUTPUT_DIR="$tmp_dir/off-macos-worker" \
+        CLI_SOURCE="$tmp_dir/leyline" \
+        ASSET_NAME="leyline-darwin-arm64" \
+        KRUN_WORKER_SOURCE="$tmp_dir/leyline-krun-worker" \
+        KRUN_WORKER_ASSET="$worker_asset" \
+        "$repo_root/tools/stage_release_artifacts.sh"
+fi
 
 OUTPUT_DIR="$tmp_dir/staged/leyline-darwin-amd64" \
 CLI_SOURCE="$tmp_dir/leyline" \
@@ -240,6 +287,13 @@ test ! -e "$tmp_dir/unlisted-must-not-exist" ||
 expect_failure unlisted-schema-verify \
     "$repo_root/tools/verify_public_release.sh" \
     "$publication" "$tmp_dir/assets-without-schema"
+
+# The worker rides one leg only, so it too can vanish while every other
+# per-platform set stays complete (ley-line-open-984acf).
+case_dir=$(mutation_case missing-krun-worker)
+rm "$case_dir/$worker_asset"
+expect_failure missing-krun-worker \
+    "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
 
 case_dir=$(mutation_case extra-file)
 make_source "$case_dir/extra" extra

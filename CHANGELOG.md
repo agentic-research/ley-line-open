@@ -281,6 +281,31 @@ context, scoping notes, and review history are recoverable.
   missing or unlisted schema asset; `task schema:execution-asset-consumer-test`
   and the release dry-run compile the staged assets standalone to zod.
 
+- **The release ships the macOS microVM worker, signed with the hypervisor
+  entitlement** (beads `ley-line-open-984acf`, `ley-line-open-853c07`).
+  `leyline-krun-worker-darwin-arm64` is a release asset, listed in
+  `tools/release-assets.txt` and `SHA256SUMS`. `entitlements.plist` gains
+  `com.apple.security.hypervisor`; without it libkrun reaches
+  `krun_start_enter` and fails VM creation with `EINVAL`.
+  `tools/sign_krun_worker.sh` is the one signing path (ad hoc, `--sign -`):
+  `task krun-worker:build`, `krun-worker:release:target`,
+  `krun-worker:install`, release staging, and the real-guest tests call it,
+  and it asserts the entitlement after signing. Staging re-checks the
+  staged bytes before digesting them, and refuses to stage a darwin worker
+  off macOS. Developer ID signing and notarization are not done; a
+  quarantined download is refused by Gatekeeper.
+
+- **A hypervisor-suite receipt gates tagging** (bead `ley-line-open-16a994`).
+  `task release:hypervisor:record` runs `task runtime:test` with
+  `LEYLINE_REQUIRE_HYPERVISOR=1` and records a receipt for the exact tree
+  when it passes and the tree did not change during the run.
+  `tools/tag_release.sh`, and so `task release:publish`, refuses to tag a
+  tree without one and names the command. It is a manual gate: no hosted
+  runner can boot a guest. The record task installs the worker with
+  `task krun-worker:install` and the guest tests run that installed worker
+  (`LEYLINE_KRUN_WORKER`, entitlement-checked first); the receipt records
+  its sha256.
+
 - **`leyline-sign` tests consume notme's canonical CABundle fixtures**
   (bead `ley-line-open-0466c0`). notme's ADR-010 fixtures
   (`cabundle-basic`, `cabundle-multikey`) are vendored byte-for-byte
@@ -517,6 +542,18 @@ context, scoping notes, and review history are recoverable.
   format. Any other tail is still an unknown format.
   `task schema:execution-asset-consumer-test` runs the plugin under every
   zod asset name `tools/release-assets.txt` lists.
+
+- **The microVM backend is unavailable when its worker cannot enter the
+  hypervisor** (bead `ley-line-open-831bf1`). On macOS `capabilities()`
+  reads the worker binary's signature (`codesign -d --entitlements -`) and
+  reports `available: false`, with `unavailable_reason` naming
+  `com.apple.security.hypervisor`, when the entitlement is absent; `start`
+  and `provision` refuse with the same reason. Before, a worker that passed
+  the file checks accepted a run and died inside the VMM.
+  `BackendCapabilities` gains `unavailable_reason`. The test hooks that
+  bypass or retarget the check exist only under leyline-runtime's
+  non-default `test-support` feature, which no shipping build enables
+  (`tools/feature-ledger.txt`, enforced by `lint:feature-reachability`).
 
 - **Share file times are the host's wall clock, so a host sleep cannot
   hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).

@@ -26,7 +26,21 @@ rustix = { version = "1.1.4", features = ["fs"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# Test-only hooks on KrunWorkerBackend that bypass or retarget the
+# hypervisor-entitlement capability check (bead ley-line-open-831bf1):
+# `with_unverified_hypervisor_access` for fake shell-script workers, and
+# `with_entitlement_platform` to apply the macOS rule on Linux. Off in every
+# shipping build: no shipping configuration enables it (tools/feature-ledger.txt
+# row, enforced by tools/check_feature_reachability.sh); this crate's own
+# tests enable it through the dev-dependency on itself below.
+test-support = []
+
 [dev-dependencies]
+# The crate itself with `test-support`, so its integration tests reach the
+# hooks. Dev-dependencies never reach a dependent's build, and a path-only
+# dev-dependency is dropped from the published manifest.
+leyline-runtime = { path = ".", features = ["test-support"] }
 hex = { workspace = true }
 wait-timeout = "0.2"
 # `kill(pid, 0)` liveness probes for the grandchild-reaping regression test

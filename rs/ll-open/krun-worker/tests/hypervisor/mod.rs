@@ -83,25 +83,73 @@ pub fn compile_guest(source: &Path, output: &Path) {
 /// binaries that exec it.
 pub fn entitled_copy(binary: &Path, dest: &Path) {
     fs::copy(binary, dest).expect("copy VMM binary for signing");
-    if !cfg!(target_os = "macos") {
-        return;
+    sign_krun_worker(dest);
+}
+
+/// The worker a guest test runs. `LEYLINE_KRUN_WORKER` names an INSTALLED
+/// worker (`task krun-worker:install`'s output; bead ley-line-open-984acf):
+/// it runs as installed, unsigned by the test, after
+/// `tools/sign_krun_worker.sh --check` proves it carries the hypervisor
+/// entitlement, so a pass is a statement about the artifact a user runs.
+/// Unset, the cargo-built `binary` is copied to `dest` and signed there.
+pub fn worker_under_test(binary: &Path, dest: &Path) -> PathBuf {
+    let Some(installed) = std::env::var_os("LEYLINE_KRUN_WORKER") else {
+        entitled_copy(binary, dest);
+        return dest.to_path_buf();
+    };
+    let installed = PathBuf::from(installed);
+    assert!(
+        installed.is_file(),
+        "LEYLINE_KRUN_WORKER names no file: {}",
+        installed.display()
+    );
+    // The entitlement is a macOS rule; elsewhere there is nothing to check.
+    if cfg!(target_os = "macos") {
+        run_sign_script(&["--check"], &installed);
     }
-    let entitlements = dest.with_extension("entitlements.plist");
-    fs::write(
-        &entitlements,
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>com.apple.security.hypervisor</key><true/>
-</dict></plist>
-"#,
-    )
-    .expect("write hypervisor entitlement");
-    let status = Command::new("codesign")
-        .args(["--force", "--sign", "-", "--entitlements"])
-        .arg(&entitlements)
-        .arg(dest)
+    eprintln!(
+        "guest test runs the installed worker {}",
+        installed.display()
+    );
+    installed
+}
+
+/// Sign `binary` in place exactly as the build, install, and release paths
+/// do: through `tools/sign_krun_worker.sh`, the single source of the
+/// entitlements plist and the codesign flags (bead ley-line-open-984acf). A
+/// no-op off macOS.
+pub fn sign_krun_worker(binary: &Path) {
+    run_sign_script(&[], binary);
+}
+
+/// Run `tools/sign_krun_worker.sh <args> <binary>`; panic unless it passes.
+///
+/// The script is found beside the checkout (every crate that includes this
+/// module sits at rs/ll-open/<crate>), or at `LEYLINE_SIGN_KRUN_WORKER`. The
+/// variable is for a copy of the workspace without the repository around it:
+/// cargo-mutants tests a copy of `rs/` alone, and tools/mutants_diff.sh points
+/// it at the real script.
+fn run_sign_script(args: &[&str], binary: &Path) {
+    let script = std::env::var_os("LEYLINE_SIGN_KRUN_WORKER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/sign_krun_worker.sh")
+        });
+    assert!(
+        script.is_file(),
+        "the worker signing script {} does not exist; outside a full checkout, \
+         set LEYLINE_SIGN_KRUN_WORKER to tools/sign_krun_worker.sh",
+        script.display()
+    );
+    let status = Command::new("/bin/sh")
+        .arg(&script)
+        .args(args)
+        .arg(binary)
         .status()
-        .expect("ad-hoc sign VMM binary");
-    assert!(status.success(), "codesign failed: {status}");
+        .expect("run tools/sign_krun_worker.sh");
+    assert!(
+        status.success(),
+        "tools/sign_krun_worker.sh {args:?} failed for {}: {status}",
+        binary.display()
+    );
 }

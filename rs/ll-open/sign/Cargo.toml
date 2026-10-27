@@ -189,6 +189,9 @@ keyring = { version = "3", optional = true, default-features = false, features =
 rand = "0.8"
 hex = { workspace = true }
 base64 = "0.22"
+# Parses notme's vendored CABundle fixture inputs (tests/fixtures/notme/*.json,
+# bead ley-line-open-0466c0). Dev-only: the non-host lib stays serde-free.
+serde_json = { workspace = true }
 # Host-side tests use reqwest + tokio; cfg-gated so wasm build doesn't drag them.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }

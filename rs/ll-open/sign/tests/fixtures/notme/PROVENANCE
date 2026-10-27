@@ -1,0 +1,22 @@
+# Vendored, byte-for-byte, from notme (the ADR-010 canonical-encoding
+# fixture gate, bead notme-e9d2b8). notme owns these bytes; LLO consumes them.
+# NEVER edit a vendored file to make a test pass: refresh from notme instead.
+#
+# source-repo:   github.com/agentic-research/notme
+# source-commit: e969420158b46b477a53424f1bb4a049d9e3df20
+# source-path:   schema/fixtures/
+#
+# Each file's git blob id equals `git ls-tree e9694201 schema/fixtures/`.
+# Refresh: copy the files from a notme checkout at the new commit, update
+# source-commit and the sums below (`shasum -a 256 <file>`), then run
+# `cargo test -p leyline-sign --test notme_cabundle_fixtures`.
+#
+# tests/notme_cabundle_fixtures.rs re-hashes every file against these sums.
+# sha256                                                            file
+c4a8e1ca7891fe00e9f806e1165b21c1687f5b0d847272b2a098b2f45e6e3a8b  cabundle-basic.bin
+d2012f25cbb4c6286ff730f9a028ef7878bd203741811e01bbf21996e2e60df2  cabundle-basic.expected.hex
+6c3968edd5c881ae6a9fbdf2ef5b85d60da6af987a47988d883042fb5019de33  cabundle-basic.json
+e07d8298b2a6ab1b767063cedd26910e23c06026f700410e8683603b069ee1b4  cabundle-multikey.bin
+668a0d7febd1aa53e6e305f6b949284deb0211d75ec1efdce51b9276a6f541fc  cabundle-multikey.expected.hex
+9b748966cc197628387c59305e9f10151d73a69451a36c8fe37eb421665cdd32  cabundle-multikey.json
+7b8556dd2cbdc211be37ee162787ef0859893d19dca33a185d8a20a2ea000a90  README.md

@@ -1,0 +1,52 @@
+version: '3'
+
+# Crate-scoped tasks for leyline-krun-worker, the microVM worker that links
+# the vendored libkrun. Included by the root Taskfile under `krun-worker:`.
+#
+# Every task that produces a worker binary signs it through
+# tools/sign_krun_worker.sh (bead ley-line-open-984acf): on macOS the worker
+# needs com.apple.security.hypervisor or libkrun fails VM creation with
+# EINVAL. The script is the single source of the entitlements and the
+# codesign flags; the tests that boot real guests call it too.
+#
+# Building the worker compiles libkrun's Linux guest init with
+# tools/krun_init_cc.sh, which needs zig off Linux (`task deps:krun-init-cc`).
+
+tasks:
+  build:
+    desc: Build leyline-krun-worker (release) and ad-hoc sign it with the hypervisor entitlement (macOS)
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build --release -p leyline-krun-worker
+      - '{{.TASKFILE_DIR}}/../../../tools/sign_krun_worker.sh target/release/leyline-krun-worker'
+
+  release:target:
+    desc: Build and sign leyline-krun-worker for BUILD_TARGET (used by release.yml)
+    deps: [':cache:sccache:install']
+    requires:
+      vars: [BUILD_TARGET]
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - cargo build --release -p leyline-krun-worker --target "{{.BUILD_TARGET}}"
+      - '{{.TASKFILE_DIR}}/../../../tools/sign_krun_worker.sh "target/{{.BUILD_TARGET}}/release/leyline-krun-worker"'
+
+  install:
+    desc: Build, sign (macOS), and install leyline-krun-worker to INSTALL_DIR (default ~/.local/bin), then verify the installed copy's entitlement
+    deps: [build]
+    vars:
+      INSTALL_DIR: '{{.INSTALL_DIR | default (printf "%s/.local/bin" .HOME)}}'
+    dir: '{{.TASKFILE_DIR}}/../..'
+    cmds:
+      - |
+        set -eu
+        mkdir -p "{{.INSTALL_DIR}}"
+        staged=$(mktemp "{{.INSTALL_DIR}}/.leyline-krun-worker.XXXXXX")
+        trap 'rm -f "$staged"' EXIT
+        cp target/release/leyline-krun-worker "$staged"
+        chmod 755 "$staged"
+        mv -f "$staged" "{{.INSTALL_DIR}}/leyline-krun-worker"
+      # The copy carries the embedded signature; check the bytes that will
+      # run, not the build output.
+      - cmd: '{{.TASKFILE_DIR}}/../../../tools/sign_krun_worker.sh --check "{{.INSTALL_DIR}}/leyline-krun-worker"'
+        platforms: [darwin]
+      - echo "installed {{.INSTALL_DIR}}/leyline-krun-worker"

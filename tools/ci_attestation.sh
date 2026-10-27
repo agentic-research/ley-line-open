@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    echo "usage: $0 begin|finish|check|verify-head" >&2
+    echo "usage: $0 begin|finish|check|snapshot|verify-head" >&2
     exit 2
 }
 
@@ -97,6 +97,11 @@ case "$command" in
             exit 1
         fi
         echo "task ci receipt matches tree $current_snapshot"
+        ;;
+    snapshot)
+        # The tree a receipt names, for other receipts that must name trees
+        # the same way (tools/hypervisor_attestation.sh).
+        ci_snapshot
         ;;
     verify-head)
         current_snapshot=$(ci_snapshot)

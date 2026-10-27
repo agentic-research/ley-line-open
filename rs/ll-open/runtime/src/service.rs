@@ -36,7 +36,10 @@ pub trait Backend: Send + Sync + 'static {
             Ok(capabilities)
         } else {
             Err(ExecutionError::unsupported(
-                "requested execution backend is unavailable",
+                match capabilities.unavailable_reason {
+                    Some(reason) => format!("requested execution backend is unavailable: {reason}"),
+                    None => "requested execution backend is unavailable".into(),
+                },
             ))
         }
     }

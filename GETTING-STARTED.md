@@ -62,6 +62,14 @@ need those, build from source (below).
 
 The release also attaches the FFI staticlibs (`libleyline_fs-{darwin,linux}-*.a` + `leyline_fs.h`) for C consumers that link the arena reader directly.
 
+**microVM worker (macOS Apple Silicon)**: `leyline execution-daemon --backend micro-vm` runs guests through `leyline-krun-worker`, which links libkrun. The release attaches `leyline-krun-worker-darwin-arm64`, ad-hoc signed with `com.apple.security.hypervisor`; without that entitlement Hypervisor.framework refuses VM creation, and the backend reports itself unavailable, naming the entitlement, before it accepts a run. The signature is ad hoc, not Developer ID: it is not notarized, so Gatekeeper refuses a copy that carries the quarantine attribute a browser download sets (`xattr -d com.apple.quarantine <file>` removes it). `curl` sets no quarantine attribute. From source, `task krun-worker:install` builds, signs, and installs the worker to `~/.local/bin` (it needs `zig` for libkrun's guest init: `brew install zig`).
+
+```bash
+curl -L https://github.com/agentic-research/ley-line-open/releases/latest/download/leyline-krun-worker-darwin-arm64 \
+  -o ~/.local/bin/leyline-krun-worker && chmod +x ~/.local/bin/leyline-krun-worker
+codesign -d --entitlements - ~/.local/bin/leyline-krun-worker   # shows com.apple.security.hypervisor
+```
+
 #### From source (needed for `vec` or `mount`)
 
 ```bash
@@ -204,12 +212,23 @@ Where to read next:
 
 ## Distribution status (the honest version)
 
-- **GitHub releases** (primary channel, actively used): cut on every `v*` tag via [.github/workflows/release.yml](.github/workflows/release.yml). Each release attaches the 32 assets named in [tools/release-assets.txt](tools/release-assets.txt) plus `SHA256SUMS`: 4 `leyline-{darwin,linux}-{amd64,arm64}` binaries (default features — `lsp` + `validate` + `hdc` + `cdc`; no `vec`, no mount), 4 `leyline-mcp-descriptor-*`, 16 `capnpc-schema-bridge-{go,jsonschema,tooldefs,zod}-*` generators, 3 `libleyline_fs-*.a` FFI staticlibs + `leyline_fs.h`, 3 wasm modules (`leyline_sign`, `leyline_cas_ffi`, `leyline_envelope`) and `execution.tools.json`. The workflow verifies the published set against that list before it reports success. Latest at [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest). Mache's auto-downloader pulls `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/` — that's the load-bearing consumer path.
+- **GitHub releases** (primary channel, actively used): cut on every `v*` tag via [.github/workflows/release.yml](.github/workflows/release.yml). Each release attaches the assets named in [tools/release-assets.txt](tools/release-assets.txt) plus `SHA256SUMS`: 4 `leyline-{darwin,linux}-{amd64,arm64}` binaries (default features — `lsp` + `validate` + `hdc` + `cdc`; no `vec`, no mount), `leyline-krun-worker-darwin-arm64` (the microVM worker, ad-hoc signed with the hypervisor entitlement; staging checks the entitlement on the staged bytes), 4 `leyline-mcp-descriptor-*`, 16 `capnpc-schema-bridge-{go,jsonschema,tooldefs,zod}-*` generators, 3 `libleyline_fs-*.a` FFI staticlibs + `leyline_fs.h`, 3 wasm modules (`leyline_sign`, `leyline_cas_ffi`, `leyline_envelope`) and `execution.tools.json`. The workflow verifies the published set against that list before it reports success. Latest at [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest). Mache's auto-downloader pulls `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/` — that's the load-bearing consumer path.
 - **Distroless OCI image**: `task image` builds `localhost/leyline:v<VERSION>` locally (~20 MB, headless MCP daemon on `:8384`) via `cargo zigbuild` static musl. A `v*` tag also publishes the multi-arch image (linux/amd64 + linux/arm64) to `ghcr.io/agentic-research/ley-line-open:vVERSION` with a build-provenance attestation, which is what `server.json` advertises.
 - **Homebrew**: legacy `homebrew-tap/Formula/leyline.rb` exists but points at the pre-LLO-extraction private repo (v0.2.0, private URLs, `license :cannot_represent`). Not actively maintained; the tap source (`kiln`) has been archived. **Don't `brew install`** today; use the binary-download install above.
 - **crates.io**: [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) runs on every `v*` tag, but publication is manual by decision until Trusted Publishing is set up on the crates.io side, so that workflow is expected to fail at authentication. Consumers link to the binary or the FFI staticlib, not the source crates.
 
-Open distribution work: homebrew formula update, crates.io Trusted Publishing. Pick this up if you want LLO to install via package-manager UX.
+- **Release gate: the hypervisor suite** (bead `ley-line-open-16a994`). No hosted runner can boot a guest (GitHub's macOS runners lack nested Hypervisor.framework), so CI skips every test that boots one. Before a tag, the real-guest suite (`task runtime:test` with `LEYLINE_REQUIRE_HYPERVISOR=1`, `agent_in_guest` included) is run by hand on an Apple-silicon host against the exact tree being released, and it records a receipt for that tree:
+
+  ```bash
+  LEYLINE_LIBKRUNFW_PATH=/opt/homebrew/lib/libkrunfw.5.dylib \
+  LEYLINE_GUEST_TOOLS=<rootfs tools/guest_tools.sh wrote> \
+    task release:hypervisor:record
+  task release:hypervisor:check   # does this tree have a receipt?
+  ```
+
+  `tools/tag_release.sh` (and so `task release:publish`) refuses to tag unless a passing receipt exists for `HEAD^{tree}`, and names that command. Receipts are keyed by tree and kept in the shared git directory (`.git/leyline-hypervisor-receipts/`), so a run in any worktree covers a promotion merge whose tree is the same bytes. A receipt is a local record that the run happened, like the `task ci` receipt, not an unforgeable attestation.
+
+Open distribution work: homebrew formula update, crates.io Trusted Publishing, Developer ID signing and notarization for the macOS worker. Pick this up if you want LLO to install via package-manager UX.
 
 ---
 

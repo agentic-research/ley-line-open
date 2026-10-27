@@ -83,25 +83,24 @@ pub fn compile_guest(source: &Path, output: &Path) {
 /// binaries that exec it.
 pub fn entitled_copy(binary: &Path, dest: &Path) {
     fs::copy(binary, dest).expect("copy VMM binary for signing");
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    let entitlements = dest.with_extension("entitlements.plist");
-    fs::write(
-        &entitlements,
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>com.apple.security.hypervisor</key><true/>
-</dict></plist>
-"#,
-    )
-    .expect("write hypervisor entitlement");
-    let status = Command::new("codesign")
-        .args(["--force", "--sign", "-", "--entitlements"])
-        .arg(&entitlements)
-        .arg(dest)
+    sign_krun_worker(dest);
+}
+
+/// Sign `binary` in place exactly as the build, install, and release paths
+/// do: through `tools/sign_krun_worker.sh`, the single source of the
+/// entitlements plist and the codesign flags (bead ley-line-open-984acf). A
+/// no-op off macOS.
+pub fn sign_krun_worker(binary: &Path) {
+    // Every crate that includes this module sits at rs/ll-open/<crate>.
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/sign_krun_worker.sh");
+    let status = Command::new("/bin/sh")
+        .arg(&script)
+        .arg(binary)
         .status()
-        .expect("ad-hoc sign VMM binary");
-    assert!(status.success(), "codesign failed: {status}");
+        .expect("run tools/sign_krun_worker.sh");
+    assert!(
+        status.success(),
+        "tools/sign_krun_worker.sh failed for {}: {status}",
+        binary.display()
+    );
 }

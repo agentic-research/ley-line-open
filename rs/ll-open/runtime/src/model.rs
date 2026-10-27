@@ -17,7 +17,14 @@ pub enum BackendClass {
 pub struct BackendCapabilities {
     pub backend_id: String,
     pub backend_class: BackendClass,
+    /// True only when the backend can start a run on this host: for the
+    /// microVM tier, that it can enter the hypervisor (bead
+    /// ley-line-open-831bf1), not merely that its files exist.
     pub available: bool,
+    /// Why `available` is false, in words an operator can act on; `None`
+    /// when the backend is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     /// Which resource ceilings this backend actually applies, and by what
     /// mechanism. See [`EnforcedCeilings`].
     pub enforced: EnforcedCeilings,

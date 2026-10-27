@@ -60,6 +60,11 @@ pub struct KrunWorkerBackend {
     /// Serves a run's granted workspace as the guest's `/work`. `None`: a
     /// run granted a workspace is refused, since nothing could deliver it.
     shares: Option<Arc<dyn WorkspaceShares>>,
+    /// Whether availability includes the worker's hypervisor entitlement.
+    hypervisor_access: HypervisorAccess,
+    /// The last entitlement verdict, keyed by the worker file's identity so a
+    /// re-signed or replaced binary is inspected again.
+    entitlement: Mutex<Option<(WorkerIdentity, Result<(), String>)>>,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
@@ -72,11 +77,43 @@ struct WorkerControl {
     finished: mpsc::Receiver<Result<(), ExecutionError>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HypervisorAccess {
+    /// Inspect the worker's code signature (the default, and the daemon's).
+    Verified,
+    /// The caller vouches for it: a fake worker in a supervision test, which
+    /// never enters a hypervisor and could not carry the entitlement (a shell
+    /// script holds no entitlements).
+    AssumedByCaller,
+}
+
+/// Enough of a file's metadata to notice it was replaced or re-signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: u64,
+}
+
+impl WorkerIdentity {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
 impl KrunWorkerBackend {
     pub fn new(config: KrunWorkerConfig) -> Self {
         Self {
             config,
             shares: None,
+            hypervisor_access: HypervisorAccess::Verified,
+            entitlement: Mutex::new(None),
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
@@ -118,12 +155,48 @@ impl KrunWorkerBackend {
         }
     }
 
+    /// Skip the worker's hypervisor-entitlement check, for a fake worker that
+    /// stands in for the VMM in a supervision-contract test. A backend built
+    /// this way can report `available` for a worker that cannot start a
+    /// guest, so nothing but such a test calls it; the daemon never does.
+    #[doc(hidden)]
+    pub fn with_unverified_hypervisor_access(mut self) -> Self {
+        self.hypervisor_access = HypervisorAccess::AssumedByCaller;
+        self
+    }
+
     fn configured(&self) -> bool {
         self.config.worker.is_file()
             && self.config.cas_root.is_dir()
             && self.config.ephemeral_root.is_dir()
             && self.config.runtime_files.iter().all(|path| path.is_file())
             && self.config.devices.iter().all(|path| path.exists())
+    }
+
+    /// `Ok` exactly when a run can start: the resources exist AND the worker
+    /// can enter the hypervisor (bead ley-line-open-831bf1, I1-I3). The
+    /// entitlement is checked here, at capability negotiation, so a worker
+    /// that would die inside `krun_start_enter` is never handed a run.
+    fn availability(&self) -> Result<(), String> {
+        if !self.configured() {
+            return Err(
+                "libkrun worker backend is not configured with existing first-party resources"
+                    .into(),
+            );
+        }
+        if self.hypervisor_access == HypervisorAccess::AssumedByCaller {
+            return Ok(());
+        }
+        let identity = WorkerIdentity::of(&self.config.worker);
+        let mut cached = self.entitlement.lock();
+        if let (Some(identity), Some((seen, verdict))) = (&identity, cached.as_ref())
+            && identity == seen
+        {
+            return verdict.clone();
+        }
+        let verdict = super::entitlement::hypervisor_entitlement(&self.config.worker);
+        *cached = identity.map(|identity| (identity, verdict.clone()));
+        verdict
     }
 
     /// Stop one backend run and release its parent-owned ephemeral rootfs.
@@ -168,10 +241,12 @@ impl KrunWorkerBackend {
 
 impl Backend for KrunWorkerBackend {
     fn capabilities(&self) -> BackendCapabilities {
+        let availability = self.availability();
         BackendCapabilities {
             backend_id: "libkrun/1".into(),
             backend_class: BackendClass::MicroVm,
-            available: self.configured(),
+            available: availability.is_ok(),
+            unavailable_reason: availability.err(),
             // `krun_set_vm_config(ctx, vcpus, ram_mib)` applies both at VM
             // configuration time, before the guest runs — see plan.rs, which
             // carries `request.limits.vcpus` and `.memory_mib` straight
@@ -186,10 +261,8 @@ impl Backend for KrunWorkerBackend {
 
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
-        if !self.configured() {
-            return Err(ExecutionError::backend(
-                "libkrun worker backend is not configured with existing first-party resources",
-            ));
+        if let Err(reason) = self.availability() {
+            return Err(ExecutionError::backend(reason));
         }
         // A run ID is not published in `children` until its worker reports
         // readiness. Serialize that reservation window so concurrent callers

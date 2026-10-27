@@ -20,6 +20,8 @@ includes:
     taskfile: rs/ll-open/envelope/Taskfile.yml
   fs:
     taskfile: rs/ll-open/fs/Taskfile.yml
+  krun-worker:
+    taskfile: rs/ll-open/krun-worker/Taskfile.yml
   rs:
     taskfile: rs/Taskfile.yml
   runtime:
@@ -300,6 +302,17 @@ tasks:
       - python3 -m pip install --break-system-packages ziglang
       - rustup target add "{{.RUST_TARGET}}"
 
+  deps:krun-init-cc:
+    desc: |
+      The compiler tools/krun_init_cc.sh needs to build libkrun's Linux guest
+      init into leyline-krun-worker: zig on macOS. A same-arch Linux host
+      uses its own cc, so there is nothing to install there.
+    cmds:
+      - cmd: HOMEBREW_NO_AUTO_UPDATE=1 brew install zig
+        platforms: [darwin]
+      - cmd: zig version
+        platforms: [darwin]
+
   # --------------------------------------------------------------------------
   # Vendored VMM (rs/third_party/libkrun, ADR-0044, bead ley-line-open-f1c46f).
   # Both fetch upstream from GitHub, so neither is part of `ci`; the build
@@ -496,6 +509,21 @@ tasks:
     cmds:
       - task: cli-lib:smoke
 
+  release:hypervisor:record:
+    desc: Run the real-guest suite (`task runtime:test`, LEYLINE_REQUIRE_HYPERVISOR=1) on this tree and record the receipt the release gate requires. Needs LEYLINE_LIBKRUNFW_PATH and LEYLINE_GUEST_TOOLS.
+    cmds:
+      - tools/hypervisor_attestation.sh record
+
+  release:hypervisor:check:
+    desc: Succeed only if a passing hypervisor-suite receipt exists for this tree
+    cmds:
+      - tools/hypervisor_attestation.sh check
+
+  release:hypervisor:fixture-test:
+    desc: Prove the hypervisor receipt records only a passing, unchanged tree and that tagging refuses without one
+    cmds:
+      - tools/test_hypervisor_attestation.sh
+
   release:publish:
     desc: Smoke the CLI, then atomically tag, wait for release CI, and verify public vVERSION
     requires:
@@ -685,9 +713,16 @@ tasks:
       # rule as INCLUDE_HEADER). Empty by default.
       WASM_ASSETS: '{{.WASM_ASSETS | default ""}}'
       WASM_SOURCE_DIR: '{{.WASM_SOURCE_DIR | default (printf "%s/rs/target/wasm32-unknown-unknown/release" .ROOT_DIR)}}'
+      # The microVM worker, staged signed with the hypervisor entitlement
+      # (ley-line-open-984acf). Empty by default; release.yml sets it on the
+      # darwin-arm64 leg, which builds it with `krun-worker:release:target`.
+      KRUN_WORKER_ASSET: '{{.KRUN_WORKER_ASSET | default ""}}'
     cmds:
       - |
         set -eu
+        if [ -n "${KRUN_WORKER_ASSET:-}" ]; then
+          export KRUN_WORKER_SOURCE='{{.KRUN_WORKER_SOURCE | default (printf "%s/rs/target/%s/release/leyline-krun-worker" .ROOT_DIR .BUILD_TARGET)}}'
+        fi
         if [ -n "${LIB_ASSET:-}" ]; then
           export STATICLIB_SOURCE='{{.STATICLIB_SOURCE | default .DEFAULT_STATICLIB_SOURCE}}'
         fi
@@ -1579,6 +1614,7 @@ tasks:
       - task: release:tags:fixture-test
       - task: release:publish:fixture-test
       - task: release:retry:fixture-test
+      - task: release:hypervisor:fixture-test
       - task: schema:consumer-fixture-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check

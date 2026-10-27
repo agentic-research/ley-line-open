@@ -18,7 +18,9 @@ merges three ways with what landed since it was read. Agents work through an
 ordinary filesystem: a libkrun microVM over the store-backed share, or the
 host mount, which now serves the same storefs core. A guest write costs one
 coalesced publish and one full flush (~17–22 ms, from ~15 s), and build
-output never enters the store. `SCHEMA_VERSION` moves to 0.21.0 with a
+output never enters the store. On the host NFS mount, a save made from an
+older read is refused `ESTALE` instead of silently replacing another
+process's edit. `SCHEMA_VERSION` moves to 0.21.0 with a
 matching `clients/go/leyline-schema/v0.21.0` tag. Crates are not published
 to crates.io for this release.
 

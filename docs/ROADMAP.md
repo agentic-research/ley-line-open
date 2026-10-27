@@ -38,9 +38,9 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 
 **Next**
 - `0fadab` — cut v0.21.0 from integration and hand mache the upgrade note
-  (release train `5de852`). It waits for the fix for silent loss with two
-  writers on one host NFS mount (`5ec040`); crates are not published for
-  v0.21.0 (publish-crates runs only by hand).
+  (release train `5de852`). The fix for silent loss with two writers on one
+  host NFS mount it waited for landed in #485 (`3889ec`); crates are not
+  published for v0.21.0 (publish-crates runs only by hand).
 - `18bfdd` — group commit: writes that land close together become one proposal,
   one parse pass, one durable flush and one publish, with each file keeping its
   own base, merge and `ESTALE`.

@@ -1859,7 +1859,10 @@ fn file_times_across_a_host_sleep_still_increase_per_path() {
     f.clock.host_sleep(Duration::from_secs(30));
     landed_edit(&f, "a.go", "package a // two\n");
     let after = mtime(&f, "a.go");
-    assert!(after > before + Duration::from_secs(29), "{before:?} {after:?}");
+    assert!(
+        after > before + Duration::from_secs(29),
+        "{before:?} {after:?}"
+    );
     landed_edit(&f, "a.go", "package a // three\n");
     assert!(mtime(&f, "a.go") > after);
 }

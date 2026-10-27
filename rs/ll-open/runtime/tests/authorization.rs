@@ -1115,6 +1115,7 @@ impl Backend for RecordingBackend {
             backend_id: "test/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -1141,6 +1142,7 @@ impl Backend for CompletingBackend {
             backend_id: "completing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -1517,6 +1519,7 @@ fn capabilities_projection_uses_declared_backend_class() {
                 backend_id: "native-nono/1".into(),
                 backend_class: BackendClass::Native,
                 available: false,
+                unavailable_reason: Some("fixture backend is unavailable".into()),
                 enforced: leyline_runtime::EnforcedCeilings::wall_clock_only(),
             }
         }
@@ -1922,6 +1925,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
                 backend_id: "native-nono/1".into(),
                 backend_class: BackendClass::Native,
                 available: true,
+                unavailable_reason: None,
                 enforced: leyline_runtime::EnforcedCeilings::wall_clock_only(),
             }
         }

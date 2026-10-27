@@ -126,6 +126,10 @@ impl Backend for NativeWorkerBackend {
             backend_id: "native-nono/1".into(),
             backend_class: BackendClass::Native,
             available: self.configured(),
+            unavailable_reason: (!self.configured()).then(|| {
+                "native nono worker backend is not configured with existing first-party resources"
+                    .into()
+            }),
             // nono mediates capabilities, not resources. Its manifest does
             // carry a `resources` block, but its own schema scopes that to
             // "enforced by the supervisor. Requires exec_strategy:

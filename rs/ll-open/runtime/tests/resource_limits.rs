@@ -289,6 +289,7 @@ impl Backend for VectorBackend {
             backend_id: "vector/1".into(),
             backend_class: self.class,
             available: true,
+            unavailable_reason: None,
             enforced: self.enforced,
         }
     }

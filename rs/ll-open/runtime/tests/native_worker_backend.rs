@@ -88,6 +88,17 @@ fn every_native_resource_is_required_independently() {
     fs::create_dir(&ephemeral_root).expect("runs");
     fs::write(&runtime_file, "runtime").expect("runtime file");
 
+    let complete = NativeWorkerBackend::new(NativeWorkerConfig {
+        worker: worker.clone(),
+        cas_root: cas_root.clone(),
+        ephemeral_root: ephemeral_root.clone(),
+        runtime_files: vec![runtime_file.clone()],
+        ready_timeout: Duration::from_secs(1),
+    })
+    .capabilities();
+    assert!(complete.available, "{complete:?}");
+    assert_eq!(complete.unavailable_reason, None);
+
     let configurations = [
         NativeWorkerConfig {
             worker: fixture.path().join("missing-worker"),
@@ -119,11 +130,10 @@ fn every_native_resource_is_required_independently() {
         },
     ];
     for configuration in configurations {
-        assert!(
-            !NativeWorkerBackend::new(configuration)
-                .capabilities()
-                .available
-        );
+        let capabilities = NativeWorkerBackend::new(configuration).capabilities();
+        assert!(!capabilities.available);
+        let reason = capabilities.unavailable_reason.unwrap_or_default();
+        assert!(reason.contains("not configured"), "{reason:?}");
     }
 }
 

@@ -60,6 +60,10 @@ pub struct KrunWorkerBackend {
     /// Serves a run's granted workspace as the guest's `/work`. `None`: a
     /// run granted a workspace is refused, since nothing could deliver it.
     shares: Option<Arc<dyn WorkspaceShares>>,
+    /// Whose hypervisor-entitlement rule applies to the worker: a
+    /// [`std::env::consts::OS`] value, or `None` when the caller vouches for
+    /// the worker. Only the `test-support` hooks below change it.
+    entitlement_platform: Option<&'static str>,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
@@ -77,6 +81,7 @@ impl KrunWorkerBackend {
         Self {
             config,
             shares: None,
+            entitlement_platform: Some(std::env::consts::OS),
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
@@ -118,12 +123,53 @@ impl KrunWorkerBackend {
         }
     }
 
+    /// Skip the worker's hypervisor-entitlement check, for a fake worker that
+    /// stands in for the VMM in a supervision-contract test. A backend built
+    /// this way can report `available` for a worker that cannot start a
+    /// guest, so it exists only under the non-default `test-support` feature,
+    /// which no shipping build enables (tools/feature-ledger.txt).
+    #[cfg(feature = "test-support")]
+    pub fn with_unverified_hypervisor_access(mut self) -> Self {
+        self.entitlement_platform = None;
+        self
+    }
+
+    /// Apply `os`'s hypervisor-entitlement rule instead of the host's, so a
+    /// test can hold the macOS rule to account on any platform. Like the
+    /// opt-out above, `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn with_entitlement_platform(mut self, os: &'static str) -> Self {
+        self.entitlement_platform = Some(os);
+        self
+    }
+
     fn configured(&self) -> bool {
         self.config.worker.is_file()
             && self.config.cas_root.is_dir()
             && self.config.ephemeral_root.is_dir()
             && self.config.runtime_files.iter().all(|path| path.is_file())
             && self.config.devices.iter().all(|path| path.exists())
+    }
+
+    /// `Ok` exactly when a run can start: the resources exist AND the worker
+    /// can enter the hypervisor (bead ley-line-open-831bf1, I1-I3). The
+    /// entitlement is checked here, at capability negotiation, so a worker
+    /// that would die inside `krun_start_enter` is never handed a run.
+    ///
+    /// Not cached: the signature is read on every call (one `codesign`
+    /// spawn on macOS), so a worker re-signed or replaced in place is judged
+    /// as it is now, and a guest boot dwarfs the cost.
+    fn availability(&self) -> Result<(), String> {
+        if !self.configured() {
+            return Err(
+                "libkrun worker backend is not configured with existing first-party resources"
+                    .into(),
+            );
+        }
+        match self.entitlement_platform {
+            Some(os) => super::entitlement::hypervisor_entitlement(os, &self.config.worker),
+            None => Ok(()),
+        }
     }
 
     /// Stop one backend run and release its parent-owned ephemeral rootfs.
@@ -168,10 +214,12 @@ impl KrunWorkerBackend {
 
 impl Backend for KrunWorkerBackend {
     fn capabilities(&self) -> BackendCapabilities {
+        let availability = self.availability();
         BackendCapabilities {
             backend_id: "libkrun/1".into(),
             backend_class: BackendClass::MicroVm,
-            available: self.configured(),
+            available: availability.is_ok(),
+            unavailable_reason: availability.err(),
             // `krun_set_vm_config(ctx, vcpus, ram_mib)` applies both at VM
             // configuration time, before the guest runs — see plan.rs, which
             // derives them from `memory.limit` and `cpu.quota / cpu.period`.
@@ -199,10 +247,8 @@ impl Backend for KrunWorkerBackend {
                 "the microVM tier sizes the guest from memory.limit and cpu.quota; a run must grant both",
             ));
         }
-        if !self.configured() {
-            return Err(ExecutionError::backend(
-                "libkrun worker backend is not configured with existing first-party resources",
-            ));
+        if let Err(reason) = self.availability() {
+            return Err(ExecutionError::backend(reason));
         }
         // A run ID is not published in `children` until its worker reports
         // readiness. Serialize that reservation window so concurrent callers

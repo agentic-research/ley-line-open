@@ -273,7 +273,9 @@ context, scoping notes, and review history are recoverable.
   rule per `connectLocal` port; macOS still refuses §4 by name and dials N
   loopback ports with no bind right (ProxyOnly for the first port, the same
   per-port Seatbelt outbound rule for each further one — measured by
-  `confinement_local_connect_probe`); the microVM tier's libkrun port map
+  `confinement_local_connect_probe`, which reports a named `SKIPPED (NOT a
+  pass)` on a host that cannot apply the sandbox and fails there under
+  `LEYLINE_REQUIRE_SANDBOX=1`); the microVM tier's libkrun port map
   takes one `N:N` entry per listener (`guest_port_map`). **Breaking (Rust
   API):** `Dimensions.port` is now `Dimensions.ports: &[PortGrant]`,
   `Dimensions.connect_local` and `ConfinementManifest::connect_local()`

@@ -12,8 +12,15 @@
 //! fact ADR-0037 records as believed until measured. So it is measured here.
 //!
 //! Applying a sandbox is irreversible for the process, so the parent test
-//! re-runs this test binary as a child (selected by `LLO_CONNECT_PROBE`),
-//! which confines itself and reports what it could reach.
+//! re-runs this test binary as a child (the `#[ignore]`d
+//! `connect_probe_child`, given its ports in `LLO_CONNECT_PROBE`), which
+//! confines itself and reports what it could reach.
+//!
+//! Fail closed: when the host cannot apply the sandbox (an outer sandbox
+//! already confines the test, or the kernel lacks Landlock network rules),
+//! the test prints a named `SKIPPED (NOT a pass)`. `LEYLINE_REQUIRE_SANDBOX=1`
+//! turns that into a failure, the same contract `native_confinement.rs`
+//! gives (bead `ley-line-open-704853`). Every other failure is a failure.
 
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -24,6 +31,23 @@ use leyline_runtime::confinement::ConfinementManifest;
 
 const PROBE_ENV: &str = "LLO_CONNECT_PROBE";
 
+/// The fail-closed gate. Returns normally only to report a named skip.
+fn sandbox_unavailable(reason: &str) {
+    assert!(
+        std::env::var_os("LEYLINE_REQUIRE_SANDBOX").is_none(),
+        "LEYLINE_REQUIRE_SANDBOX is set, so this host claims it can apply the native \
+         sandbox, but the connectLocal probe could not: {reason}. Refusing to report a \
+         pass for a confinement test that confined nothing."
+    );
+    eprintln!(
+        "SKIPPED (NOT a pass): the connectLocal probe could not apply nono confinement \
+         on this host ({reason}). Most often the test is already inside an outer sandbox \
+         (Seatbelt refuses to nest) or the kernel lacks Landlock network rules. Nothing \
+         about connectLocal enforcement was verified by this run. Set \
+         LEYLINE_REQUIRE_SANDBOX=1 to make this a failure."
+    );
+}
+
 fn reach(port: u16) -> &'static str {
     match TcpStream::connect(("127.0.0.1", port)) {
         Ok(_) => "ok",
@@ -31,12 +55,17 @@ fn reach(port: u16) -> &'static str {
     }
 }
 
-/// The confined half. A no-op unless the parent selected it.
+/// The confined half, run only by the parent below. Ignored rather than a
+/// silent no-op, so an ordinary run never reports it as a pass.
 #[test]
+#[ignore = "the confined child of every_declared_local_port_is_reachable_and_nothing_else_is"]
 fn connect_probe_child() {
-    let Ok(spec) = std::env::var(PROBE_ENV) else {
-        return;
-    };
+    let spec = std::env::var(PROBE_ENV).unwrap_or_else(|_| {
+        panic!(
+            "connect_probe_child is the confined half of a probe and needs its \
+             ports in {PROBE_ENV}; run every_declared_local_port_is_reachable_and_nothing_else_is"
+        )
+    });
     let ports: Vec<u16> = spec
         .split(',')
         .map(|port| port.parse().expect("probe port"))
@@ -71,9 +100,6 @@ fn connect_probe_child() {
 
 #[test]
 fn every_declared_local_port_is_reachable_and_nothing_else_is() {
-    if std::env::var(PROBE_ENV).is_ok() {
-        return;
-    }
     let listeners: Vec<TcpListener> = (0..3)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener"))
         .collect();
@@ -85,6 +111,7 @@ fn every_declared_local_port_is_reachable_and_nothing_else_is() {
         .args([
             "--exact",
             "connect_probe_child",
+            "--ignored",
             "--nocapture",
             "--test-threads=1",
         ])
@@ -110,14 +137,12 @@ fn every_declared_local_port_is_reachable_and_nothing_else_is() {
             )
         });
 
-    // A kernel without per-port network rules (Landlock ABI < 4) must refuse
-    // the whole set — never apply part of it.
+    // A host that cannot apply the policy refuses the whole set (a kernel
+    // without per-port network rules never applies part of it). That is
+    // fail-closed, but it verifies nothing, so it is a named skip, never a
+    // pass, and a failure where the host claims it can sandbox.
     if let Some(reason) = line.strip_prefix("apply-refused ") {
-        assert!(
-            cfg!(target_os = "linux"),
-            "only a Landlock kernel without network rules may refuse: {reason}"
-        );
-        eprintln!("kernel refused per-port network rules, fail-closed: {reason}");
+        sandbox_unavailable(reason);
         return;
     }
     let expected = format!(

@@ -482,3 +482,276 @@ fn the_microvm_tier_refuses_an_unsized_guest() {
     };
     assert!(error.detail.contains("pids.limit"), "{}", error.detail);
 }
+
+/// A pointer target laid out as the pre-OCI `ResourceLimits`: four `UInt64`
+/// data words `{wallTimeMs, memoryBytes, cpuMillis, outputBytes}` and no
+/// pointers, which is exactly what a producer built from the old schema writes.
+/// Generalized to any section sizes, so a test can also lay out a struct a
+/// NEWER producer would write: more data words than this reader knows.
+struct RawStruct<'a, const DATA: u16, const POINTERS: u16>(
+    capnp::private::layout::StructBuilder<'a>,
+);
+type PreOciLimits<'a> = RawStruct<'a, 4, 0>;
+
+impl<'a, const DATA: u16, const POINTERS: u16> capnp::traits::FromPointerBuilder<'a>
+    for RawStruct<'a, DATA, POINTERS>
+{
+    fn init_pointer(builder: capnp::private::layout::PointerBuilder<'a>, _length: u32) -> Self {
+        Self(builder.init_struct(capnp::private::layout::StructSize {
+            data: DATA,
+            pointers: POINTERS,
+        }))
+    }
+    fn get_from_pointer(
+        _builder: capnp::private::layout::PointerBuilder<'a>,
+        _default: Option<&'a [capnp::Word]>,
+    ) -> capnp::Result<Self> {
+        unreachable!("only initialized")
+    }
+}
+
+/// `{spec, grant}` serialized, with `old` (four words) written in the
+/// pre-OCI layout as the spec's `requestedLimits` or the grant's `limits`,
+/// and the grant bound to the resulting spec.
+fn with_pre_oci_limits(in_grant: bool, old: [u64; 4]) -> (Vec<u8>, Vec<u8>) {
+    use leyline_public_schema::execution_capnp;
+    let vector = vector();
+
+    let mut old_message = capnp::message::Builder::new_default();
+    let raw = old_message
+        .init_root::<capnp::any_pointer::Builder<'_>>()
+        .init_as::<PreOciLimits<'_>>();
+    for (word, value) in old.into_iter().enumerate() {
+        raw.0.set_data_field::<u64>(word, value);
+    }
+    let old_limits = old_message
+        .get_root_as_reader::<execution_capnp::resource_limits::Reader<'_>>()
+        .expect("old limits read as the new type");
+    // The self-check this fixture rests on: a current reader sees word 0
+    // where it always was, and nothing in memory, cpu or pids.
+    assert_eq!(old_limits.get_wall_time_ms(), old[0]);
+    assert!(!old_limits.has_memory() && !old_limits.has_cpu() && !old_limits.has_pids());
+
+    let mut spec_message = capnp::message::Builder::new_default();
+    capnp_json::from_json(
+        &vector["spec"].to_string(),
+        spec_message.init_root::<execution_capnp::run_spec::Builder<'_>>(),
+    )
+    .expect("spec");
+    if !in_grant {
+        spec_message
+            .get_root::<execution_capnp::run_spec::Builder<'_>>()
+            .expect("spec root")
+            .set_requested_limits(old_limits)
+            .expect("set old limits");
+    }
+    let mut spec_bytes = Vec::new();
+    capnp::serialize::write_message(&mut spec_bytes, &spec_message).expect("spec bytes");
+    let digest = leyline_runtime::authorization::canonical_digest(&spec_bytes).expect("digest");
+
+    let mut grant = vector["grant"].clone();
+    grant["runSpecDigest"]["value"] = json!(digest.strip_prefix("blake3-256:").unwrap());
+    let mut grant_message = capnp::message::Builder::new_default();
+    capnp_json::from_json(
+        &grant.to_string(),
+        grant_message.init_root::<execution_capnp::run_grant::Builder<'_>>(),
+    )
+    .expect("grant");
+    if in_grant {
+        grant_message
+            .get_root::<execution_capnp::run_grant::Builder<'_>>()
+            .expect("grant root")
+            .set_limits(old_limits)
+            .expect("set old limits");
+    }
+    let mut grant_bytes = Vec::new();
+    capnp::serialize::write_message(&mut grant_bytes, &grant_message).expect("grant bytes");
+    (spec_bytes, grant_bytes)
+}
+
+fn authorize_microvm(spec: &[u8], grant: &[u8]) -> Result<(), ExecutionError> {
+    leyline_runtime::authorization::authorize_with_verifier(
+        spec,
+        grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+        &MetadataOnlyEvidenceVerifier,
+    )
+    .map(|_| ())
+}
+
+/// The binary half of the wire break. A current reader decodes an old
+/// message's `cpuMillis` (word 2) and `outputBytes` (word 3) as nothing at
+/// all, so before this check `{cpuMillis: 2000}` authorized a run with no CPU
+/// ceiling. Every old ceiling word is refused by its old name, on the spec
+/// and on the grant.
+#[test]
+fn a_pre_oci_binary_limits_struct_is_refused_by_its_old_field_name() {
+    // The grant must narrow the spec, so a spec-side case keeps the grant's
+    // own (new-layout) limits and a grant-side case keeps the spec's.
+    for in_grant in [false, true] {
+        for (word, name) in [(1, "memoryBytes"), (2, "cpuMillis"), (3, "outputBytes")] {
+            let mut old = [60_000, 0, 0, 0];
+            old[word] = 2_000;
+            let (spec, grant) = with_pre_oci_limits(in_grant, old);
+            let error = authorize_microvm(&spec, &grant).expect_err(&format!(
+                "pre-OCI {name} must not read as no ceiling (in grant: {in_grant})"
+            ));
+            assert_eq!(error.code, ErrorCode::InvalidSpec, "{}", error.detail);
+            assert!(
+                error.detail.contains("pre-OCI") && error.detail.contains(name),
+                "{name} (in grant: {in_grant}): {}",
+                error.detail
+            );
+        }
+    }
+}
+
+/// Lay out a struct with `DATA` data words (set to `words`) and `POINTERS`
+/// null pointers in its own message.
+fn raw_message<const DATA: u16, const POINTERS: u16>(
+    words: &[u64],
+) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+    let mut message = capnp::message::Builder::new_default();
+    let raw = message
+        .init_root::<capnp::any_pointer::Builder<'_>>()
+        .init_as::<RawStruct<'_, DATA, POINTERS>>();
+    for (word, value) in words.iter().enumerate() {
+        raw.0.set_data_field::<u64>(word, *value);
+    }
+    message
+}
+
+/// A ceiling a newer producer appended is a data word this reader does not
+/// decode, so it would be unenforced: refused, on the top-level struct and
+/// on each nested one, rather than ignored as ordinary evolution tolerance.
+#[test]
+fn a_ceiling_word_this_reader_does_not_know_is_refused() {
+    use leyline_public_schema::execution_capnp::{
+        cpu_limits, memory_limits, pids_limits, resource_limits, run_spec,
+    };
+    let vector = vector();
+    for target in ["limits", "memory", "cpu", "pids"] {
+        let mut spec_message = capnp::message::Builder::new_default();
+        capnp_json::from_json(
+            &vector["spec"].to_string(),
+            spec_message.init_root::<run_spec::Builder<'_>>(),
+        )
+        .expect("spec");
+        {
+            let mut spec = spec_message
+                .get_root::<run_spec::Builder<'_>>()
+                .expect("spec root");
+            match target {
+                // The current layout (3 pointers) plus a third data word.
+                "limits" => {
+                    let raw = raw_message::<3, 3>(&[60_000, 0, 7]);
+                    spec.set_requested_limits(
+                        raw.get_root_as_reader::<resource_limits::Reader<'_>>()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                }
+                "memory" => {
+                    let raw = raw_message::<2, 0>(&[512 << 20, 7]);
+                    let mut limits = spec.reborrow().get_requested_limits().unwrap();
+                    limits
+                        .set_memory(
+                            raw.get_root_as_reader::<memory_limits::Reader<'_>>()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+                "cpu" => {
+                    let raw = raw_message::<3, 0>(&[200_000, 100_000, 7]);
+                    let mut limits = spec.reborrow().get_requested_limits().unwrap();
+                    limits
+                        .set_cpu(raw.get_root_as_reader::<cpu_limits::Reader<'_>>().unwrap())
+                        .unwrap();
+                }
+                _ => {
+                    let raw = raw_message::<2, 0>(&[64, 7]);
+                    let mut limits = spec.reborrow().get_requested_limits().unwrap();
+                    limits
+                        .set_pids(raw.get_root_as_reader::<pids_limits::Reader<'_>>().unwrap())
+                        .unwrap();
+                }
+            }
+        }
+        let mut spec_bytes = Vec::new();
+        capnp::serialize::write_message(&mut spec_bytes, &spec_message).unwrap();
+        let digest = leyline_runtime::authorization::canonical_digest(&spec_bytes).unwrap();
+        let mut grant = vector["grant"].clone();
+        grant["runSpecDigest"]["value"] = json!(digest.strip_prefix("blake3-256:").unwrap());
+        let mut grant_message = capnp::message::Builder::new_default();
+        capnp_json::from_json(
+            &grant.to_string(),
+            grant_message
+                .init_root::<leyline_public_schema::execution_capnp::run_grant::Builder<'_>>(),
+        )
+        .unwrap();
+        let mut grant_bytes = Vec::new();
+        capnp::serialize::write_message(&mut grant_bytes, &grant_message).unwrap();
+
+        let error = authorize_microvm(&spec_bytes, &grant_bytes)
+            .expect_err(&format!("an unknown word in {target} must be refused"));
+        assert_eq!(error.code, ErrorCode::InvalidSpec, "{}", error.detail);
+        assert!(
+            error.detail.contains("does not know"),
+            "{target}: {}",
+            error.detail
+        );
+        if target != "limits" {
+            assert!(
+                error.detail.contains(&format!("requestedLimits.{target}")),
+                "{target}: {}",
+                error.detail
+            );
+        }
+    }
+}
+
+/// `cloister/execution/v1` did not change when `ResourceLimits` did, so the
+/// layout revision is its own capability entry: a client checks it before
+/// `start` and refuses a daemon that does not advertise revision 2, which
+/// would read OCI ceilings as its old four words and drop them.
+#[test]
+fn capabilities_advertise_the_resource_limits_revision() {
+    for (class, enforced) in [
+        (BackendClass::MicroVm, microvm()),
+        (BackendClass::Native, native_without_cgroup()),
+    ] {
+        let service = ExecutionService::new(VectorBackend { class, enforced });
+        let output: Value =
+            serde_json::from_str(&transport::capabilities_json(&service).expect("capabilities"))
+                .expect("capabilities JSON");
+        let entries = output["capabilities"].as_array().expect("list");
+        let revision = entries
+            .iter()
+            .find(|entry| entry["name"] == transport::RESOURCE_LIMITS_CAPABILITY)
+            .unwrap_or_else(|| panic!("no resource-limits entry in {output}"));
+        assert_eq!(revision["version"], "2");
+        assert_eq!(
+            transport::RESOURCE_LIMITS_CAPABILITY,
+            "cloister/execution/v1/resource-limits"
+        );
+        // The contract and backend entries are still there.
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["name"] == "cloister/execution/v1")
+        );
+        assert_eq!(entries.len(), 3, "{output}");
+    }
+}
+
+/// A pre-OCI struct that sets only the wall clock means the same thing in
+/// both layouts, so it is not refused for its shape.
+#[test]
+fn a_pre_oci_struct_carrying_only_the_wall_clock_reads_unchanged() {
+    let (spec, grant) = with_pre_oci_limits(false, [60_000, 0, 0, 0]);
+    authorize_microvm(&spec, &grant).expect("word 0 is wallTimeMs in both layouts");
+}

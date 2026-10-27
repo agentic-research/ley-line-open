@@ -24,8 +24,20 @@ use std::time::{Duration, Instant};
 use crate::{CeilingMechanism, EnforcedCeilings, ExecutionError, ResourceLimits};
 
 /// `CGROUP2_SUPER_MAGIC` from `linux/magic.h`.
+pub(super) const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+
+// The one platform-specific step, the filesystem's magic, lives in a file of
+// its own per platform. cargo-mutants does not evaluate `cfg`, so a gated item
+// in this file would be enumerated on the other platform, build unchanged, and
+// read as a surviving mutant; a file can be excluded from the slice of the
+// platform that does not compile it (tools/mutants_diff.sh).
 #[cfg(target_os = "linux")]
-const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+#[path = "cgroup_fs_linux.rs"]
+mod platform;
+#[cfg(not(target_os = "linux"))]
+#[path = "cgroup_fs_other.rs"]
+mod platform;
+use platform::filesystem_magic;
 
 /// How long teardown waits for `cgroup.kill` to empty the run's cgroup.
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,36 +62,25 @@ impl CgroupRoot {
     /// platform but Linux, which has none), or when its
     /// `cgroup.subtree_control` cannot be read.
     pub fn open(path: &Path) -> Result<Self, ExecutionError> {
-        #[cfg(target_os = "linux")]
-        {
-            let stat = rustix::fs::statfs(path).map_err(|error| {
-                ExecutionError::backend(format!("cgroup root {}: statfs: {error}", path.display()))
-            })?;
-            // `f_type`'s integer type differs by architecture; the magic is
-            // a 32-bit value on all of them.
-            #[allow(clippy::unnecessary_cast)]
-            let fs_type = stat.f_type as u64;
-            if fs_type != CGROUP2_SUPER_MAGIC {
-                return Err(ExecutionError::backend(format!(
-                    "cgroup root {} is not on a cgroup v2 filesystem",
-                    path.display()
-                )));
-            }
-            Self::inspect(path, false)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(ExecutionError::backend(format!(
-                "cgroup root {}: cgroup v2 exists only on Linux",
+        Self::on_filesystem(path, filesystem_magic(path)?)
+    }
+
+    /// The decision `open` makes once it knows the filesystem's magic,
+    /// separated from the platform's `statfs` so it is the same code, and the
+    /// same tests, on every platform.
+    fn on_filesystem(path: &Path, magic: u64) -> Result<Self, ExecutionError> {
+        if magic != CGROUP2_SUPER_MAGIC {
+            return Err(ExecutionError::backend(format!(
+                "cgroup root {} is not on a cgroup v2 filesystem",
                 path.display()
-            )))
+            )));
         }
+        Self::inspect(path, false)
     }
 
     /// Read which controllers the directory delegates, without checking the
     /// filesystem. `open` is the public constructor; this is the file
     /// protocol it shares with the unit tests, which pass `stand_in`.
-    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     fn inspect(path: &Path, stand_in: bool) -> Result<Self, ExecutionError> {
         let controllers =
             fs::read_to_string(path.join("cgroup.subtree_control")).map_err(|error| {
@@ -554,11 +555,47 @@ mod tests {
         );
     }
 
+    /// On a Linux host whose hierarchy is cgroup v2, the hierarchy itself is a
+    /// root: `statfs` reports the cgroup2 magic. A platform step that reported
+    /// any other value would refuse every real root and pass every refusal
+    /// test, so this is the assertion that it reads the right number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_cgroup2_hierarchy_opens_as_a_root() {
+        let mounts = fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        let cgroup2 = mounts.lines().any(|line| {
+            line.split_whitespace().nth(1) == Some("/sys/fs/cgroup") && line.contains(" cgroup2 ")
+        });
+        if !cgroup2 {
+            eprintln!("skipped: /sys/fs/cgroup is not a cgroup2 mount here");
+            return;
+        }
+        CgroupRoot::open(Path::new("/sys/fs/cgroup")).expect("the cgroup2 hierarchy is a root");
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn there_is_no_cgroup_root_off_linux() {
         let dir = tempfile::tempdir().expect("dir");
         let error = CgroupRoot::open(dir.path()).expect_err("no cgroups here");
         assert!(error.detail.contains("only on Linux"), "{}", error.detail);
+    }
+
+    #[test]
+    fn only_the_cgroup2_magic_makes_a_root() {
+        let dir = tempfile::tempdir().expect("dir");
+        fs::write(dir.path().join("cgroup.subtree_control"), "memory\n").expect("controllers");
+        let root = CgroupRoot::on_filesystem(dir.path(), CGROUP2_SUPER_MAGIC).expect("cgroup2");
+        assert_eq!(root.enforced().memory, CeilingMechanism::Cgroup);
+        // A real root writes control files and never creates them.
+        assert!(!root.stand_in);
+        for other in [0, 1, 0xEF53 /* ext4 */, CGROUP2_SUPER_MAGIC + 1] {
+            let error = CgroupRoot::on_filesystem(dir.path(), other).expect_err("not cgroup2");
+            assert!(
+                error.detail.contains("not on a cgroup v2"),
+                "{}",
+                error.detail
+            );
+        }
     }
 }

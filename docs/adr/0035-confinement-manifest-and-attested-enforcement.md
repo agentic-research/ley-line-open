@@ -657,11 +657,16 @@ consumer (cloister), and a parallel v2 would keep the misread `cpuMillis` alive 
 deprecation window nobody depends on. The README now records the exception. What makes
 the break loud rather than silent:
 
-1. **Ordinal 1 is `outputBytes` on purpose.** An old-shape message stores `memoryBytes`
-   in data word 1. Every old message the previous runtime could run carried a nonzero
-   `memoryBytes` (`ExecutionRequest::validate` refused zero), and a new reader decodes
-   that word as `outputBytes`, which no tier enforces. So every previously runnable
-   old-shape message is refused by name rather than run with a dropped ceiling.
+1. **The old binary layout is recognized and refused.** An old message is four data
+   words and no pointers. Cap'n Proto would let a current reader see words 0 and 1 and
+   ignore 2 and 3, so `{cpuMillis: 2000}` would read as "no ceiling" and run, where the
+   old runtime refused it. `read_limits` therefore refuses, naming the old field, any
+   `ResourceLimits` with no pointer section and a nonzero `memoryBytes`, `cpuMillis` or
+   `outputBytes`, and more generally any nonzero data word past those the reader knows
+   in `ResourceLimits` or its nested structs: an unread ceiling is an unenforced one.
+   (`outputBytes` sits at ordinal 1, where `memoryBytes` was, so even a reader without
+   this check would refuse an old `memoryBytes` as an unenforceable `outputBytes`; the
+   check makes that refusal say what actually happened.)
 2. **The JSON carrier refuses removed keys by name.** `capnp_json` ignores unknown keys,
    so an old JSON `requestedLimits {memoryBytes, cpuMillis}` would otherwise decode to
    "no ceiling". `start_json` refuses any key in `requestedLimits` or `limits` that
@@ -673,6 +678,11 @@ the break loud rather than silent:
    schema tag. `COMPAT_MIN_SCHEMA_VERSION` does not move: it is the floor for the Go
    schema-client, which carries no execution/v1 type, and raising it would make mache,
    which never sends `ResourceLimits`, refuse every daemon carrying this change.
+4. **The layout has a revision a client can check.** The direction an old daemon cannot
+   refuse is a new client: it reads OCI ceilings as its old four words and drops them.
+   `cloister/execution/v1` did not change, so `llo_execution_capabilities` advertises
+   `cloister/execution/v1/resource-limits` at version `2`, and a client MUST find it
+   before `start`. Its absence identifies a daemon that predates this change.
 
 ### Also fixed here: the grant's limits were dropped
 

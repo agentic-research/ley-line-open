@@ -145,9 +145,30 @@ per field. `test-vectors/oci-resources.json` is the conformance case: one
 spec and grant, three tiers, the outcome each must produce.
 
 The replaced shape was `{wallTimeMs @0, memoryBytes @1, cpuMillis @2,
-outputBytes @3}`. A reader of the new shape decodes an old message's
-`memoryBytes` as `outputBytes`, which every tier refuses, and the JSON carrier
-refuses the keys `memoryBytes` and `cpuMillis` by name.
+outputBytes @3}`: four data words and no pointers. What an old producer gets
+from a current daemon:
+
+- **Binary.** Cap'n Proto would let a current reader see only words 0 and 1
+  (as `wallTimeMs` and `outputBytes`) and null `memory`, `cpu` and `pids`,
+  dropping `cpuMillis` and the old `outputBytes` without a trace. The daemon
+  does not let it: a `ResourceLimits` with no pointer section and more than
+  two data words is the old layout, and any nonzero `memoryBytes`, `cpuMillis`
+  or `outputBytes` in it is refused with `invalidSpec`, naming the old field.
+  An old struct that sets only `wallTimeMs` means the same in both layouts and
+  is accepted. More generally, any nonzero data word past the ones this
+  reader knows, in `ResourceLimits` or in `memory`, `cpu` or `pids`, is
+  refused rather than ignored: an unread ceiling is an unenforced one.
+- **JSON.** The carrier refuses the keys `memoryBytes`, `cpuMillis`, and any
+  other key `ResourceLimits` does not define, by name.
+
+What a current client gets from an OLD daemon is not something the old daemon
+can refuse: it reads the OCI layout as its four words, and `memory`, `cpu` and
+`pids` vanish. So the layout has a revision of its own, which
+`llo_execution_capabilities` advertises as the entry
+`{name: "cloister/execution/v1/resource-limits", version: "2"}`. A client MUST
+find that entry before it sends `start`, and treat its absence as a daemon
+that would drop every OCI ceiling. Revision 1, the pre-OCI layout, was never
+advertised.
 
 The canonical vector in `test-vectors/canonical-run.json` pins the JSON carrier
 shape used by conformance tests. JSON is a carrier; Cap'n Proto remains the IDL.

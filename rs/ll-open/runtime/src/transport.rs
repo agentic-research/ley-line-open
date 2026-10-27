@@ -11,6 +11,22 @@ use leyline_public_schema::execution_capnp;
 use crate::authorization::AuthorizationPolicy;
 use crate::{ExecutionError, ExecutionResolver, ExecutionService, RunState};
 
+/// The capability a daemon advertises for the `ResourceLimits` layout it
+/// decodes (ADR-0035, "OCI resources on execution/v1").
+///
+/// `cloister/execution/v1` names the contract, and it did not change when
+/// `ResourceLimits` was replaced in place, so it cannot tell a client which
+/// layout the daemon reads. A daemon that predates the OCI layout reads an
+/// OCI-shaped `ResourceLimits` as its own four words — `memory`, `cpu` and
+/// `pids` vanish — and advertises no such entry. A client MUST find this name
+/// at [`RESOURCE_LIMITS_REVISION`] in `llo_execution_capabilities` before it
+/// sends `start`.
+pub const RESOURCE_LIMITS_CAPABILITY: &str = "cloister/execution/v1/resource-limits";
+
+/// The `ResourceLimits` layout revision: `1` was `{wallTimeMs, memoryBytes,
+/// cpuMillis, outputBytes}` (never advertised), `2` is the OCI layout.
+pub const RESOURCE_LIMITS_REVISION: &str = "2";
+
 pub fn capabilities_json<B: crate::Backend>(
     service: &ExecutionService<B>,
 ) -> Result<String, ExecutionError> {
@@ -19,7 +35,15 @@ pub fn capabilities_json<B: crate::Backend>(
     let capabilities = service.capabilities();
     // Advertise only backends actually owned by this service. A placeholder
     // native entry would make capability discovery lie to Cloister.
-    let mut entries = output.reborrow().init_capabilities(2);
+    let mut entries = output.reborrow().init_capabilities(3);
+    entries
+        .reborrow()
+        .get(2)
+        .set_name(RESOURCE_LIMITS_CAPABILITY);
+    entries
+        .reborrow()
+        .get(2)
+        .set_version(RESOURCE_LIMITS_REVISION);
     entries.reborrow().get(0).set_name("cloister/execution/v1");
     entries.reborrow().get(0).set_version("v1");
     let backend_name = match capabilities.backend_class {

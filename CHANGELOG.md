@@ -22,12 +22,17 @@ context, scoping notes, and review history are recoverable.
   change is in place in v1 (pre-1.0, by decision); the README records the
   exception to its append-only rule. `EnforcedCeilings` is one mechanism per
   field (`wallTime`, `outputBytes`, `memory`, `cpu`, `pids`; `vcpus` is
-  gone), and `CeilingMechanism` gains `cgroup`. The JSON carrier refuses
-  `memoryBytes`, `cpuMillis` and any other unknown key in `requestedLimits`
-  or `limits` by name, and a capnp reader decodes an old message's
-  `memoryBytes` as `outputBytes`, which every tier refuses. Consumers that
-  generate from `execution.capnp` or vendor `execution-tools.json` and
-  `canonical-run.json` must regenerate.
+  gone), and `CeilingMechanism` gains `cgroup`. An old producer is refused,
+  never read as "no ceiling": the JSON carrier refuses `memoryBytes`,
+  `cpuMillis` and any other unknown key in `requestedLimits` or `limits` by
+  name, and a binary `ResourceLimits` in the old layout (four data words, no
+  pointers) with a nonzero `memoryBytes`, `cpuMillis` or `outputBytes` is
+  refused naming that field, as is any nonzero data word past those the
+  reader knows. An old daemon cannot refuse a new client, so
+  `llo_execution_capabilities` now advertises
+  `cloister/execution/v1/resource-limits` at version `2`, and a client must
+  check it before `start`. Consumers that generate from `execution.capnp` or
+  vendor `execution-tools.json` and `canonical-run.json` must regenerate.
 - **Breaking: every ceiling is enforced or refused by name, per tier**
   (bead `ley-line-open-da36d2`). The microVM tier sizes the guest from
   `memory.limit` (whole MiB) and `cpu.quota / cpu.period` (whole vCPUs) and

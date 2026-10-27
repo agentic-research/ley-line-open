@@ -929,6 +929,59 @@ fn read_intent(
     })
 }
 
+/// Data words `ResourceLimits` defines: `wallTimeMs` and `outputBytes`.
+const RESOURCE_LIMITS_DATA_WORDS: usize = 2;
+
+/// The `ResourceLimits` layout before ADR-0035's OCI amendment: four `UInt64`
+/// data words and no pointers, `{wallTimeMs, memoryBytes, cpuMillis,
+/// outputBytes}`. A reader of the current layout sees word 0 and word 1 (as
+/// `wallTimeMs` and `outputBytes`) and nothing else, with null `memory`,
+/// `cpu` and `pids`: an old message would read as "no ceiling".
+const PRE_OCI_LIMIT_WORDS: [&str; 4] = ["wallTimeMs", "memoryBytes", "cpuMillis", "outputBytes"];
+
+/// Refuse a ceiling struct carrying a value this reader does not decode.
+///
+/// Cap'n Proto lets a reader ignore data beyond the fields it knows, which is
+/// ordinary evolution tolerance everywhere except here: an unread ceiling is
+/// an unenforced one (ADR-0035 §4). Two cases, both refused by name:
+///
+/// - the pre-OCI layout (no pointer section, more data words than this
+///   reader knows), whose `memoryBytes`, `cpuMillis` or `outputBytes` would
+///   otherwise be dropped or misread;
+/// - any other nonzero data word past the known ones, such as a ceiling a
+///   newer producer appended.
+///
+/// A zero word bounds nothing, so it is accepted either way.
+fn refuse_unread_ceilings<'a>(
+    reader: impl capnp::traits::IntoInternalStructReader<'a>,
+    known_words: usize,
+    top_level: bool,
+    field: &str,
+) -> Result<(), ExecutionError> {
+    let raw = reader.into_internal_struct_reader();
+    let words = (raw.get_data_section_size() / 64) as usize;
+    // Only the top-level struct had a pre-OCI layout; the nested ones are new.
+    let pre_oci =
+        top_level && raw.get_pointer_section_size() == 0 && words > RESOURCE_LIMITS_DATA_WORDS;
+    let first_word = if pre_oci { 1 } else { known_words };
+    for word in first_word..words {
+        if raw.get_data_field::<u64>(word) == 0 {
+            continue;
+        }
+        return Err(match PRE_OCI_LIMIT_WORDS.get(word).filter(|_| pre_oci) {
+            Some(name) => ExecutionError::invalid(format!(
+                "{field} uses the removed pre-OCI ResourceLimits layout and sets {name}; \
+                 use memory.limit, cpu.quota/cpu.period and outputBytes"
+            )),
+            None => ExecutionError::invalid(format!(
+                "{field} carries a value in data word {word}, which this reader does not \
+                 know; an unread ceiling would be unenforced, so it is refused"
+            )),
+        });
+    }
+    Ok(())
+}
+
 /// Read one execution/v1 `ResourceLimits` into the runtime's OCI-shaped model.
 fn read_limits(
     limits: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
@@ -936,15 +989,19 @@ fn read_limits(
 ) -> Result<ResourceLimits, ExecutionError> {
     let limits =
         limits.map_err(|error| ExecutionError::invalid(format!("invalid {field}: {error}")))?;
+    refuse_unread_ceilings(limits, RESOURCE_LIMITS_DATA_WORDS, true, field)?;
     let memory = limits
         .get_memory()
         .map_err(|error| ExecutionError::invalid(format!("invalid {field}.memory: {error}")))?;
+    refuse_unread_ceilings(memory, 1, false, &format!("{field}.memory"))?;
     let cpu = limits
         .get_cpu()
         .map_err(|error| ExecutionError::invalid(format!("invalid {field}.cpu: {error}")))?;
+    refuse_unread_ceilings(cpu, 2, false, &format!("{field}.cpu"))?;
     let pids = limits
         .get_pids()
         .map_err(|error| ExecutionError::invalid(format!("invalid {field}.pids: {error}")))?;
+    refuse_unread_ceilings(pids, 1, false, &format!("{field}.pids"))?;
     let limits = ResourceLimits {
         wall_time_ms: limits.get_wall_time_ms(),
         output_bytes: limits.get_output_bytes(),

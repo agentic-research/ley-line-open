@@ -255,6 +255,21 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **`leyline-sign` tests consume notme's canonical CABundle fixtures**
+  (bead `ley-line-open-0466c0`). notme's ADR-010 fixtures
+  (`cabundle-basic`, `cabundle-multikey`) are vendored byte-for-byte
+  under `rs/ll-open/sign/tests/fixtures/notme/`. `PROVENANCE` pins them
+  to notme commit `e9694201` and records each file's SHA-256, and the
+  test re-checks those sums. The test checks that each `.bin` equals the
+  decoded `.expected.hex`. An RFC 8949 §4.2.1 reference encoder in the
+  test must reproduce every fixture from its `.json`. The multikey
+  fixture's unsorted keys must fail to reproduce it. The decoy
+  `signature` is excluded, and an unknown field is refused. A 32-byte
+  fixture key must sit under its ADR-012 `canonical_kid`. LLO ships no
+  CABundle encoder, so the encoding test checks the fixtures and the
+  three-way contract, not an LLO producer. No current fixture carries an
+  Ed25519 key.
+
 - **The libkrun worker declares its workspace share, holds nothing else,
   and the receipt names it** (bead `ley-line-open-b83347`, ADR-0044 phase
   C). The share descriptor (`--workspace-share-fd`) is a channel the worker

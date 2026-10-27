@@ -160,8 +160,25 @@ execution path.
 
 ## Decision
 
-**None yet.** This is a proposal for the other implementer of
-`cloister/confinement/v1` to review. If question 1 answers "not yet", the
-correct outcome is to leave this recorded on `ley-line-open-0e73e8` and build
-nothing — the gap is real either way, and knowing it exists is most of the
-value.
+**Accepted 2026-08-05; shipped in v0.18.0.** Cloister reviewed the proposal
+and confirmed the §3 placement. The channel is `network.connectLocal`: the
+single loopback TCP port a workload may `connect(2)` to and must not bind.
+
+- Schema: `confinement.schema.json` `network.connectLocal`, an integer
+  1–65535, absent-omitted in canonical JSON, so the pinned vector and every
+  existing digest are unmoved.
+- Enforcement: on macOS, `(allow network-outbound (remote tcp "localhost:N"))`
+  with no `network-bind` or `network-inbound`; on Linux, one Landlock
+  `ConnectTcp` rule. The microVM tier refuses it by name (§9 condition 6),
+  because a guest's loopback is its own.
+- Tests: `rs/ll-open/runtime/tests/confinement_dimension_coverage.rs`
+  (`with_connect_local`).
+
+It names the port, not the peer: a loopback port is a shared host namespace,
+so a channel named this way authenticates in its protocol or not at all.
+
+**Open: single-valued.** Like `port.bind`, `connectLocal` holds one port. A
+bundle whose declared connections reach several loopback broker endpoints
+(cloister ADR-0069) needs a list. That question is shared with
+`ley-line-open-e2c33f` (a list of `port` grants) and the broker,
+`ley-line-open-e2c5ce`; it is decided there, not here.

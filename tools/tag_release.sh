@@ -34,6 +34,12 @@ if [ "$head_commit" != "$origin_main" ]; then
     exit 1
 fi
 
+# The manual hypervisor gate (bead ley-line-open-16a994): no hosted runner can
+# boot a guest, so the real-guest suite must have passed on exactly this tree,
+# recorded by `task release:hypervisor:record`. Checked before any tag exists.
+"$script_root/hypervisor_attestation.sh" check \
+    "$("$git_bin" rev-parse "$head_commit^{tree}")"
+
 schema_version=$(sed -nE \
     's/^pub const SCHEMA_VERSION: &str = "([^"]+)";/\1/p' \
     rs/ll-open/cli-lib/src/daemon/version.rs)

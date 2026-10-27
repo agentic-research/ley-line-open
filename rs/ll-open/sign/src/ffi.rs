@@ -372,4 +372,91 @@ mod tests {
         };
         assert_eq!(sig_len, -1, "should fail with small buffer");
     }
+
+    // Real notme certificates (bead ley-line-open-9ac66d); provenance in
+    // tests/fixtures/notme/PROVENANCE.md.
+    const ROOT_PUB: &[u8] = include_bytes!("../tests/fixtures/notme/root.pub");
+    const ISSUING_CA: &[u8] = include_bytes!("../tests/fixtures/notme/issuing-ca.der");
+    const TASK_SIGNING: &[u8] = include_bytes!("../tests/fixtures/notme/task-signing.der");
+    const DIRECT_SIGNING: &[u8] = include_bytes!("../tests/fixtures/notme/direct-signing.der");
+
+    fn path_json(leaf: &[u8], intermediates: *const u8, intermediates_len: usize) -> i32 {
+        let mut out = vec![0u8; 1024];
+        unsafe {
+            leyline_verify_cert_path(
+                leaf.as_ptr(),
+                leaf.len(),
+                intermediates,
+                intermediates_len,
+                ROOT_PUB.as_ptr(),
+                ROOT_PUB.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn ffi_notme_path_writes_signet_claims() {
+        let mut out = vec![0u8; 1024];
+        let n = unsafe {
+            leyline_verify_cert_path(
+                TASK_SIGNING.as_ptr(),
+                TASK_SIGNING.len(),
+                ISSUING_CA.as_ptr(),
+                ISSUING_CA.len(),
+                ROOT_PUB.as_ptr(),
+                ROOT_PUB.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(n > 0, "ffi path verify returned {n}");
+        let json = std::str::from_utf8(&out[..n as usize]).unwrap();
+        assert!(json.contains("\"pr\":\"signet\""), "{json}");
+        assert!(json.contains("\"ep\":3"), "{json}");
+        assert!(!json.contains("\"pf\""), "{json}");
+        assert!(!json.contains("\"sc\""), "{json}");
+    }
+
+    #[test]
+    fn ffi_path_without_intermediates_matches_chain_export() {
+        let mut path_out = vec![0u8; 1024];
+        let n = unsafe {
+            leyline_verify_cert_path(
+                DIRECT_SIGNING.as_ptr(),
+                DIRECT_SIGNING.len(),
+                core::ptr::null(),
+                0,
+                ROOT_PUB.as_ptr(),
+                ROOT_PUB.len(),
+                path_out.as_mut_ptr(),
+                path_out.len(),
+            )
+        };
+        let mut chain_out = vec![0u8; 1024];
+        let m = unsafe {
+            leyline_verify_cert_chain(
+                DIRECT_SIGNING.as_ptr(),
+                DIRECT_SIGNING.len(),
+                ROOT_PUB.as_ptr(),
+                ROOT_PUB.len(),
+                chain_out.as_mut_ptr(),
+                chain_out.len(),
+            )
+        };
+        assert!(n > 0 && n == m);
+        assert_eq!(path_out[..n as usize], chain_out[..m as usize]);
+    }
+
+    #[test]
+    fn ffi_path_rejects_trailing_bytes_and_missing_tier() {
+        let mut bad = ISSUING_CA.to_vec();
+        bad.push(0x30);
+        assert_eq!(path_json(TASK_SIGNING, bad.as_ptr(), bad.len()), -1);
+        // The task leaf does not chain to the root without its tier.
+        assert_eq!(path_json(TASK_SIGNING, core::ptr::null(), 0), -1);
+        // A non-empty intermediates length with a null pointer is refused.
+        assert_eq!(path_json(TASK_SIGNING, core::ptr::null(), 5), -1);
+    }
 }

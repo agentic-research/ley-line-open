@@ -492,28 +492,23 @@ mod tests {
         );
     }
 
+    /// Teardown gives the kill its whole timeout before reporting a cgroup
+    /// that is still populated: it neither gives up at the first poll nor
+    /// polls forever. (That a cgroup emptying mid-wait is then removed is
+    /// observed against a real kernel, `tests/native_cgroup.rs`.)
     #[test]
-    fn teardown_waits_for_the_kill_to_empty_the_cgroup() {
+    fn teardown_reports_a_cgroup_that_never_empties_after_its_timeout() {
         let dir = tempfile::tempdir().expect("dir");
         let run = stand_in_run(&dir.path().join("run"));
-        let events = run.path().join("cgroup.events");
-        fs::write(&events, "populated 1\n").expect("events");
-        let flipper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            fs::write(&events, "populated 0\n").expect("flip");
-        });
-        let path = run.path().to_path_buf();
-        run.remove().expect("removed once the kill has emptied it");
-        flipper.join().expect("flipper");
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn teardown_reports_a_cgroup_that_never_empties() {
-        let dir = tempfile::tempdir().expect("dir");
-        let run = stand_in_run(&dir.path().join("run"));
+        let timeout = run.kill_timeout;
         fs::write(run.path().join("cgroup.events"), "populated 1\n").expect("events");
+        let started = Instant::now();
         let error = run.remove().expect_err("still populated");
+        assert!(
+            started.elapsed() >= timeout,
+            "gave up after {:?}, before the {timeout:?} timeout",
+            started.elapsed()
+        );
         assert!(
             error.detail.contains("still holds processes"),
             "{}",

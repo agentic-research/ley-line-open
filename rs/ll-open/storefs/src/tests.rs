@@ -1801,6 +1801,28 @@ fn the_monotonic_clocks_origin_is_the_wall_clock_at_its_creation() {
     );
 }
 
+#[test]
+fn the_monotonic_clocks_wall_time_is_the_wall_clock_now() {
+    // A clock made 5 s ago with an origin of ORIGIN: wall() reads the wall
+    // clock at the call, not the origin plus the monotonic count.
+    let clock = MonotonicClock {
+        origin: std::time::Instant::now() - Duration::from_secs(5),
+        wall: ORIGIN,
+    };
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+    };
+    let before = wall();
+    let now = clock.wall();
+    let after = wall();
+    assert!(
+        before <= now && now <= after,
+        "{before:?} {now:?} {after:?}"
+    );
+}
+
 // ── file times (bead `ley-line-open-b8100d`) ──────────────────────────────
 //
 // git decides whether to rehash a file from its stat (size, mtime, ctime,

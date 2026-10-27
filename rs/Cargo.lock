@@ -4652,6 +4652,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "leyline-cli-lib",
+ "leyline-envelope",
  "leyline-public-schema",
  "leyline-runtime",
  "leyline-storefs",
@@ -4862,6 +4863,8 @@ dependencies = [
 name = "leyline-runtime"
 version = "0.20.5"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
  "blake3",
  "capnp",
  "capnp-json",
@@ -4870,12 +4873,14 @@ dependencies = [
  "leyline-envelope",
  "leyline-public-schema",
  "leyline-runtime",
+ "leyline-sign",
  "libc",
  "nono",
  "parking_lot",
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "wait-timeout",

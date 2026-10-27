@@ -1,68 +1,206 @@
-//! Ed25519 cert-chain verification + claims parsing.
+//! Ed25519 certificate verification and claims extraction for certificates
+//! that carry extensions under the `1.3.6.1.4.1.99999.1.*` arc.
 //!
-//! Used by consumers like cloister's lease middleware (cloister-bd7770)
-//! to verify that an ephemeral Signet cert was signed by the cluster's
-//! master CA, and to extract the cert's claims (validity window,
-//! ephemeral pubkey, and the Interlace-specific extensions:
-//! peer_fingerprint, scope, epoch).
+//! Consumers: cloister's lease middleware (cloister-bd7770) calls this
+//! through the wasm32 build (`leyline_verify_cert_chain`,
+//! `leyline_verify_cert_path`) to check that an ephemeral certificate was
+//! issued under a pinned Ed25519 trust anchor and to read its claims.
 //!
-//! The verifier is generic over input cert bytes — it doesn't know
-//! whether the cert was minted by notme's `mintBridgeCertPair` or by
-//! some other Signet-aware CA. It only checks that the cert's signature
-//! verifies under the supplied master public key. Cert minting is the
-//! CA's job (e.g. notme-bd2a72); cert verification is this module's.
+//! # Two profiles share one arc
 //!
-//! # Cert format expectations
+//! `1.3.6.1.4.1.99999` is the IANA example / private-experiment arc. Two
+//! independent allocations live under it and assign different meanings to
+//! the same OIDs (bead `ley-line-open-9ac66d`):
 //!
-//! - X.509 v3 certificate with Ed25519 subject + Ed25519 signature.
-//! - SubjectPublicKeyInfo carries the ephemeral pubkey (32 bytes).
-//! - Validity period as standard X.509 `Time` (UTCTime or GeneralizedTime).
-//! - Optional Interlace extensions under the OID arc `1.3.6.1.4.1.99999.*`:
-//!     - `1.3.6.1.4.1.99999.1.4` — interlace-epoch, encoded as DER INTEGER.
-//!     - `1.3.6.1.4.1.99999.1.5` — interlace-peer, encoded as DER UTF8String.
-//!     - `1.3.6.1.4.1.99999.1.6` — interlace-scope, encoded as DER UTF8String.
-//!     - `1.3.6.1.4.1.99999.1.7` — confinementDigest, encoded as DER
-//!       OctetString containing exactly 32 bytes (BLAKE3-256 of the
-//!       cloister/confinement/v1 §6-canonical `ConfinementManifest`).
-//!       Lane-2 identity commit for confinement/v1 §7: a substrate
-//!       runner enforcing a `ConfinementManifest` whose digest differs
-//!       from this claim MUST refuse to start the bundle. Bead
-//!       `ley-line-open-c79ea8`.
+//! | OID      | Interlace profile (cloister spec, LLO) | Signet profile (notme, signet)                |
+//! |----------|----------------------------------------|-----------------------------------------------|
+//! | `.1.1`   | not allocated                          | subject                                       |
+//! | `.1.2`   | not allocated                          | issuance time                                 |
+//! | `.1.3`   | not allocated                          | scopes / capabilities                         |
+//! | `.1.4`   | epoch, DER INTEGER                     | epoch, DER INTEGER (notme)                    |
+//! | `.1.5`   | interlace-peer, DER UTF8String         | authMethod (notme) / agent name (signet)      |
+//! | `.1.6`   | interlace-scope, DER UTF8String        | peer binding, 32 raw bytes (notme) / scope (signet) |
+//! | `.1.7`   | confinementDigest, OCTET STRING (32)   | not allocated (notme defers it to LLO)        |
+//! | `.1.8`   | not allocated                          | principal kind (notme)                        |
+//! | `.1.9`   | not allocated                          | task scope (notme)                            |
 //!
-//! These are documented at notme/worker/src/cert-authority.ts:57-63 (the
-//! custom-OID arc is shared with the existing GHA bridge cert minting).
+//! `.1.5` is the dangerous row: notme writes a DER UTF8String there, so a
+//! verifier that reads `.1.5` as interlace-peer parses notme's authMethod
+//! (`"passkey"`) as a peer fingerprint without any error.
 //!
-//! Missing Interlace extensions are not an error — the verifier returns
-//! the validity window + ephemeral pubkey as required claims, and the
-//! extension fields as `Option`. The lease middleware's caller decides
-//! whether a cert without an `epoch` claim is acceptable.
+//! # The discriminator
+//!
+//! Before any arc extension is interpreted, the certificate is classified
+//! from its own signed extension list:
+//!
+//! - **Signet profile** iff it carries at least one of `.1.1`, `.1.2`,
+//!   `.1.3`, `.1.8`, `.1.9`. The Interlace allocation never uses these
+//!   OIDs; every notme mint path (`mintGHABridgeCert`, `mintBridgeCertPair`,
+//!   `mintIssuingCaCert`, `mintTaskCertPair`) and the signet Go authority
+//!   write `.1.1` and `.1.2` unconditionally.
+//! - **Interlace profile** otherwise.
+//!
+//! The rule is a property of the signed bytes, not of which key signed them:
+//! cloister's production trust anchor is notme's master key, so the issuer
+//! key alone cannot tell the profiles apart. It is not "try to parse and
+//! ignore failures": `.1.5`/`.1.6` are read only under the Interlace profile,
+//! and under that profile a malformed value rejects the certificate.
+//!
+//! Under the Signet profile `.1.5` and `.1.6` are **never reported**. Their
+//! meaning differs inside the Signet family itself (notme: authMethod and a
+//! 32-byte peer binding; signet Go: agent name and scope, raw UTF-8), and no
+//! byte-level rule separates notme from signet, so any claim read from them
+//! would be a guess. They are treated as unrecognized: ignored when
+//! non-critical, rejected when critical. `.1.4` (epoch) and `.1.7`
+//! (confinementDigest) mean the same thing in both profiles and are read in
+//! both. The profile is reported in [`CertClaims::profile`].
+//!
+//! Residual risk, stated plainly: a Signet-family issuer that omitted all
+//! five marker OIDs would be classified as Interlace and its `.1.5` read as
+//! a peer fingerprint. No current issuer does this; the permanent fix is a
+//! private enterprise number per project (notme-229dc3), which removes the
+//! shared arc.
+//!
+//! # Standard extensions
+//!
+//! notme certificates carry critical BasicConstraints, KeyUsage and
+//! SubjectAltName. These are recognized and processed:
+//!
+//! - BasicConstraints: an end-entity certificate must not be a CA; an
+//!   intermediate must be a CA and its pathLenConstraint must admit the
+//!   intermediates below it.
+//! - KeyUsage: an end-entity certificate, when KeyUsage is present, must
+//!   permit digitalSignature; an intermediate must carry KeyUsage with
+//!   keyCertSign.
+//! - SubjectAltName: must decode as GeneralNames. Its contents are not
+//!   reported.
+//!
+//! Any other critical extension rejects the certificate (RFC 5280 §4.2).
+//! Duplicate extensions reject the certificate (RFC 5280 §4.2).
+//!
+//! # Paths
+//!
+//! [`verify_cert_path`] reports the leaf's claims, with three path-wide
+//! rules for the claims a tier holder could otherwise choose alone:
+//!
+//! - **Epoch:** every certificate carries `.1.4` or none does; the reported
+//!   epoch is the minimum. notme stamps a task leaf with a caller-supplied
+//!   epoch, so after a rotation a tier from epoch N can sign leaves at N+1.
+//!   Reporting the minimum keeps that path usable while the consumer's
+//!   revocation check still judges the tier.
+//! - **confinementDigest:** every certificate carries the same `.1.7` or
+//!   none does, so the digest is attested by the anchor-signed certificate.
+//! - **Profile:** every certificate is read under the same profile.
+//!
+//! `peer_fp` and `scope` come from the leaf alone.
+//!
+//! # Certificate format expectations
+//!
+//! - X.509 v3, Ed25519 signature (outer and `tbsCertificate.signature`),
+//!   Ed25519 SubjectPublicKeyInfo (32 bytes).
+//! - Validity as UTCTime or GeneralizedTime; returned, not enforced.
+//!
+//! Missing arc extensions are not an error: the extension claims are
+//! `Option`, and the caller decides which ones it requires.
 
-use der::{Decode, Encode};
+use const_oid::ObjectIdentifier;
+use const_oid::db::rfc5280::{ID_CE_BASIC_CONSTRAINTS, ID_CE_KEY_USAGE, ID_CE_SUBJECT_ALT_NAME};
+use der::{Decode, Encode, Reader};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use x509_cert::Certificate;
+use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, SubjectAltName};
+use x509_cert::name::Name;
 
 use crate::oid::ID_ED25519;
 
-/// Result of a successful cert-chain verification + claims extraction.
+/// Upper bound on intermediates accepted by [`verify_cert_path`]. notme's
+/// deepest path today is one Issuing CA tier; the cap bounds work done on
+/// attacker-supplied input.
+pub const MAX_INTERMEDIATES: usize = 4;
+
+/// Which allocation of the `1.3.6.1.4.1.99999.1.*` arc a certificate was
+/// read under. See the module documentation for the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertProfile {
+    /// cloister Interlace profile: `.1.5` peer_fp and `.1.6` scope are read.
+    Interlace,
+    /// notme / signet profile: `.1.5` and `.1.6` are never reported.
+    Signet,
+}
+
+impl CertProfile {
+    /// FFI code for "accept either profile" (`leyline_verify_cert_path`).
+    pub const FFI_ANY: u32 = 0;
+    /// FFI code for [`CertProfile::Interlace`].
+    pub const FFI_INTERLACE: u32 = 1;
+    /// FFI code for [`CertProfile::Signet`].
+    pub const FFI_SIGNET: u32 = 2;
+
+    /// Decode an FFI expected-profile code. `Ok(None)` is "either profile";
+    /// an unknown code is `Err`, so a caller cannot mistype its way into
+    /// accepting any profile.
+    pub fn from_ffi_code(code: u32) -> Result<Option<CertProfile>, ChainError> {
+        match code {
+            Self::FFI_ANY => Ok(None),
+            Self::FFI_INTERLACE => Ok(Some(CertProfile::Interlace)),
+            Self::FFI_SIGNET => Ok(Some(CertProfile::Signet)),
+            _ => Err(ChainError::ConstraintViolation(
+                "unknown expected-profile code",
+            )),
+        }
+    }
+
+    /// Stable lowercase name used in the claims JSON (`"pr"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CertProfile::Interlace => "interlace",
+            CertProfile::Signet => "signet",
+        }
+    }
+}
+
+/// Result of a successful verification + claims extraction.
+///
+/// **Who attests what.** Under [`verify_cert_chain`] every claim is in a
+/// certificate the trust anchor signed. Under [`verify_cert_path`] the leaf
+/// is signed by the lowest intermediate, so a leaf-only claim is chosen by
+/// whoever holds that tier's key, not by the anchor. Each field below says
+/// which certificates it is drawn from.
+///
+/// **Absent is not unrestricted.** Under [`CertProfile::Signet`], `peer_fp`
+/// and `scope` are `None` because `.1.5` / `.1.6` are deliberately not read,
+/// never because the certificate grants an unrestricted peer or scope.
+/// Consumers MUST check `profile` (JSON `pr`) before giving an absent claim
+/// any meaning, and SHOULD reject a profile they do not handle.
 #[derive(Debug, Clone)]
 pub struct CertClaims {
-    /// Ephemeral pubkey from SubjectPublicKeyInfo (32 bytes for Ed25519).
+    /// Ephemeral pubkey from the end-entity SubjectPublicKeyInfo.
     pub ephemeral_pubkey: [u8; 32],
-    /// Cert validity window — Unix seconds.
+    /// Validity window, Unix seconds. For a path, the intersection of every
+    /// certificate's window (latest notBefore, earliest notAfter).
     pub not_before: i64,
     pub not_after: i64,
-    /// Interlace-specific custom-OID extensions; None if cert wasn't minted
-    /// with these (e.g. legacy cert from a pre-reshape `mintBridgeCertPair`).
+    /// Arc allocation the certificate was read under. Every certificate in a
+    /// path must be read under the same profile.
+    pub profile: CertProfile,
+    /// `.1.4` epoch. For a path, every certificate carries an epoch or none
+    /// does, and this is the MINIMUM across the path: a consumer's
+    /// revocation check then judges the oldest authority in the chain, and a
+    /// leaf minted under a newer epoch cannot carry an older tier forward.
     pub epoch: Option<u32>,
+    /// `.1.5` interlace-peer, from the leaf only. Always `None` under
+    /// [`CertProfile::Signet`] (not read; see above).
     pub peer_fp: Option<String>,
+    /// `.1.6` interlace-scope, from the leaf only. Always `None` under
+    /// [`CertProfile::Signet`] (not read; see above).
     pub scope: Option<String>,
     /// Bead `ley-line-open-c79ea8`: BLAKE3-256 of the §6-canonical
-    /// `ConfinementManifest` (cloister/confinement/v1). `None` when
-    /// the cert was minted before this extension existed, or when
-    /// the workload doesn't commit to a confinement manifest. When
-    /// `Some`, a substrate runner MUST verify at bundle-start that
-    /// the manifest it's about to enforce hashes to this digest —
-    /// mismatch is a fail-closed identity check.
+    /// `ConfinementManifest` (cloister/confinement/v1). For a path, every
+    /// certificate carries the same digest or none does, so a `Some` here
+    /// is attested by the anchor-signed certificate and no tier holder can
+    /// add, change or drop it. When `Some`, a substrate runner MUST verify
+    /// at bundle-start that the manifest it is about to enforce hashes to
+    /// this digest.
     pub confinement_digest: Option<[u8; 32]>,
 }
 
@@ -84,107 +222,307 @@ pub enum ChainError {
     BadExtension(&'static str),
     #[error("cert has critical unknown extension OID {0}")]
     UnknownCriticalExtension(String),
+    /// A well-formed certificate or path violates a structural rule:
+    /// BasicConstraints, KeyUsage, pathLenConstraint, issuer/subject name
+    /// chaining, or epoch / profile agreement across the path.
+    #[error("certificate constraint violated: {0}")]
+    ConstraintViolation(&'static str),
 }
 
-/// OID arc for cloister's Interlace cert extensions. Shared with notme's
-/// custom-OID extensions (cert-authority.ts:57-63).
+/// Interlace-profile OIDs (cloister interlace-spec/0.1.0/wire/cert-extensions.md).
 mod oid_interlace {
     use const_oid::ObjectIdentifier;
-    /// interlace-epoch — DER INTEGER.
+    /// epoch — DER INTEGER. Same meaning in both profiles.
     pub const EPOCH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.4");
-    /// interlace-peer — DER UTF8String.
+    /// interlace-peer — DER UTF8String. Interlace profile only.
     pub const PEER_FP: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.5");
-    /// interlace-scope — DER UTF8String.
+    /// interlace-scope — DER UTF8String. Interlace profile only.
     pub const SCOPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.6");
-    /// confinementDigest — DER OctetString containing exactly 32 bytes
-    /// (BLAKE3-256 of the §6-canonical confinement/v1 manifest). Bead
-    /// `ley-line-open-c79ea8`.
+    /// confinementDigest — DER OctetString of exactly 32 bytes. Bead
+    /// `ley-line-open-c79ea8`. notme records `.1.7` as LLO's.
     pub const CONFINEMENT_DIGEST: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.7");
 }
 
-/// Verify the cert is signed by `master_pubkey` and extract its claims.
+/// Signet-profile marker OIDs (notme worker/src/cert-authority.ts, signet
+/// pkg/sigid/identity.go). Presence of any one selects the Signet profile.
+pub mod oid_signet {
+    use const_oid::ObjectIdentifier;
+    /// subject identity.
+    pub const SUBJECT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.1");
+    /// issuance time.
+    pub const ISSUANCE_TIME: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.2");
+    /// scopes (notme) / capabilities (signet).
+    pub const SCOPES: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.3");
+    /// principal kind (notme).
+    pub const PRINCIPAL_KIND: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.8");
+    /// task scope (notme).
+    pub const TASK_SCOPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.9");
+    /// The marker set. The Interlace allocation uses none of these.
+    pub const MARKERS: [ObjectIdentifier; 5] =
+        [SUBJECT, ISSUANCE_TIME, SCOPES, PRINCIPAL_KIND, TASK_SCOPE];
+}
+
+/// Classify a certificate's extension list. See the module documentation.
+pub fn classify_profile(cert: &Certificate) -> CertProfile {
+    let marked = cert
+        .tbs_certificate
+        .extensions
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|e| oid_signet::MARKERS.contains(&e.extn_id));
+    if marked {
+        CertProfile::Signet
+    } else {
+        CertProfile::Interlace
+    }
+}
+
+/// Position of a certificate in the path being verified.
+#[derive(Debug, Clone, Copy)]
+enum Role {
+    /// The certificate whose key the caller will use (lease signer).
+    EndEntity,
+    /// A CA certificate; `below` intermediates sit between it and the leaf.
+    Intermediate { below: usize },
+}
+
+/// Claims read from one certificate after its signature verified.
+struct LinkClaims {
+    pubkey: [u8; 32],
+    not_before: i64,
+    not_after: i64,
+    profile: CertProfile,
+    epoch: Option<u32>,
+    peer_fp: Option<String>,
+    scope: Option<String>,
+    confinement_digest: Option<[u8; 32]>,
+}
+
+/// Verify that `cert_der` is an end-entity certificate signed by
+/// `master_pubkey` and extract its claims. Equivalent to
+/// [`verify_cert_path`] with no intermediates.
 ///
-/// On success: returns `CertClaims` with the validity window, ephemeral
-/// pubkey, and (optionally) Interlace extensions.
-///
-/// On failure: returns a `ChainError` describing what went wrong. No
-/// info leaks back to the caller beyond the variant — callers that want
-/// to log details can match on the variant; production error responses
-/// should treat all failures as opaque "auth failed" to avoid signaling
-/// to attackers what specifically rejected.
+/// On failure, callers should report an opaque "auth failed" externally;
+/// the variant is for logs and tests.
 pub fn verify_cert_chain(cert_der: &[u8], master_pubkey: &[u8]) -> Result<CertClaims, ChainError> {
-    if master_pubkey.len() != 32 {
-        return Err(ChainError::BadMasterKey);
+    verify_cert_path(cert_der, &[], master_pubkey)
+}
+
+/// [`verify_cert_path`], then require the path's profile to be `expected`.
+///
+/// The profile is read from bytes the issuer signed, so on its own it only
+/// says what the issuer chose to write. A caller that knows which profile an
+/// anchor issues binds the two here: an anchor trusted for notme (Signet)
+/// certificates then cannot be used to present Interlace claims, and the
+/// reverse. `None` accepts either profile and is [`verify_cert_path`].
+/// A mismatch is [`ChainError::ConstraintViolation`].
+pub fn verify_cert_path_expecting(
+    leaf_der: &[u8],
+    intermediates_der: &[&[u8]],
+    anchor_pubkey: &[u8],
+    expected: Option<CertProfile>,
+) -> Result<CertClaims, ChainError> {
+    let claims = verify_cert_path(leaf_der, intermediates_der, anchor_pubkey)?;
+    match expected {
+        Some(profile) if profile != claims.profile => Err(ChainError::ConstraintViolation(
+            "certificate profile is not the profile the caller bound to this anchor",
+        )),
+        _ => Ok(claims),
+    }
+}
+
+/// Verify `leaf_der` through `intermediates_der` up to the Ed25519 trust
+/// anchor `anchor_pubkey`, and return the leaf's claims.
+///
+/// `intermediates_der[0]` is the leaf's issuer, `intermediates_der[1]` that
+/// certificate's issuer, and so on; the last one is signed by the anchor.
+/// The anchor is a bare public key, so the topmost certificate's issuer name
+/// is not checked against anything.
+///
+/// Enforced: Ed25519 signatures on every link, issuer name == signer subject
+/// name (DER equality) below the anchor, the BasicConstraints / KeyUsage /
+/// pathLenConstraint rules in the module documentation, one profile across
+/// the path, an epoch on every certificate or on none (the minimum is
+/// reported), and the same confinementDigest on every certificate or on
+/// none. See [`CertClaims`] for what each reported field is attested by.
+pub fn verify_cert_path(
+    leaf_der: &[u8],
+    intermediates_der: &[&[u8]],
+    anchor_pubkey: &[u8],
+) -> Result<CertClaims, ChainError> {
+    let anchor: [u8; 32] = anchor_pubkey
+        .try_into()
+        .map_err(|_| ChainError::BadMasterKey)?;
+    let anchor = VerifyingKey::from_bytes(&anchor).map_err(|_| ChainError::BadMasterKey)?;
+    if intermediates_der.len() > MAX_INTERMEDIATES {
+        return Err(ChainError::ConstraintViolation(
+            "path has more intermediates than MAX_INTERMEDIATES",
+        ));
     }
 
-    let cert = Certificate::from_der(cert_der).map_err(|e| ChainError::BadDer(e.to_string()))?;
+    let leaf = parse_cert(leaf_der)?;
+    let intermediates = intermediates_der
+        .iter()
+        .map(|d| parse_cert(d))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Check signature algorithm is Ed25519.
-    if cert.signature_algorithm.oid != ID_ED25519 {
+    // Walk from the anchor down to the leaf.
+    let mut signer_key = anchor;
+    let mut signer_subject: Option<&Name> = None;
+    let mut links: Vec<LinkClaims> = Vec::with_capacity(intermediates.len() + 1);
+    for (below, cert) in intermediates.iter().enumerate().rev() {
+        let link = verify_link(
+            cert,
+            &signer_key,
+            signer_subject,
+            Role::Intermediate { below },
+        )?;
+        signer_key = VerifyingKey::from_bytes(&link.pubkey).map_err(|_| ChainError::BadSpki)?;
+        signer_subject = Some(&cert.tbs_certificate.subject);
+        links.push(link);
+    }
+    let leaf_link = verify_link(&leaf, &signer_key, signer_subject, Role::EndEntity)?;
+
+    let mut not_before = leaf_link.not_before;
+    let mut not_after = leaf_link.not_after;
+    let mut epoch = leaf_link.epoch;
+    for link in &links {
+        if link.profile != leaf_link.profile {
+            return Err(ChainError::ConstraintViolation(
+                "certificates in the path were read under different profiles",
+            ));
+        }
+        // Epoch: all present or all absent; the path reports the minimum so
+        // the consumer's revocation check judges the oldest authority.
+        epoch = match (epoch, link.epoch) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (None, None) => None,
+            _ => {
+                return Err(ChainError::ConstraintViolation(
+                    "epoch present on some certificates in the path and absent on others",
+                ));
+            }
+        };
+        // confinementDigest: every certificate carries the same value, or
+        // none does, so `cd` is attested from the anchor-signed certificate
+        // down and no tier holder can introduce or drop it.
+        if link.confinement_digest != leaf_link.confinement_digest {
+            return Err(ChainError::ConstraintViolation(
+                "confinementDigest differs across the path",
+            ));
+        }
+        not_before = not_before.max(link.not_before);
+        not_after = not_after.min(link.not_after);
+    }
+
+    Ok(CertClaims {
+        ephemeral_pubkey: leaf_link.pubkey,
+        not_before,
+        not_after,
+        profile: leaf_link.profile,
+        epoch,
+        peer_fp: leaf_link.peer_fp,
+        scope: leaf_link.scope,
+        confinement_digest: leaf_link.confinement_digest,
+    })
+}
+
+/// Split a buffer holding zero or more concatenated DER certificates (the
+/// FFI encoding of `intermediates_der`). Each element must be one complete
+/// TLV; trailing garbage rejects. At most [`MAX_INTERMEDIATES`] elements.
+pub fn split_concatenated_der(buf: &[u8]) -> Result<Vec<&[u8]>, ChainError> {
+    let mut out = Vec::new();
+    if buf.is_empty() {
+        return Ok(out);
+    }
+    let mut reader = der::SliceReader::new(buf).map_err(|e| ChainError::BadDer(e.to_string()))?;
+    while !reader.is_finished() {
+        if out.len() == MAX_INTERMEDIATES {
+            return Err(ChainError::ConstraintViolation(
+                "path has more intermediates than MAX_INTERMEDIATES",
+            ));
+        }
+        let tlv = reader
+            .tlv_bytes()
+            .map_err(|e| ChainError::BadDer(e.to_string()))?;
+        out.push(tlv);
+    }
+    Ok(out)
+}
+
+fn parse_cert(der_bytes: &[u8]) -> Result<Certificate, ChainError> {
+    Certificate::from_der(der_bytes).map_err(|e| ChainError::BadDer(e.to_string()))
+}
+
+/// Verify one certificate's signature under `signer`, then read its claims
+/// under `role`.
+fn verify_link(
+    cert: &Certificate,
+    signer: &VerifyingKey,
+    signer_subject: Option<&Name>,
+    role: Role,
+) -> Result<LinkClaims, ChainError> {
+    if cert.signature_algorithm.oid != ID_ED25519
+        || cert.tbs_certificate.signature.oid != ID_ED25519
+    {
         return Err(ChainError::NotEd25519);
     }
 
-    // Re-encode tbs_certificate as DER — that's what the master signed.
-    // We can't just slice the input because the signature covers the
-    // canonical DER encoding; trusting the parser to round-trip the
-    // exact same bytes is fragile but necessary (no way to access the
-    // original TBS slice after parsing).
+    // The signature covers the DER encoding of tbs_certificate. DER is
+    // canonical, so re-encoding the parsed structure reproduces the signed
+    // bytes for any DER input; non-DER input fails signature verification.
     let tbs_der = cert
         .tbs_certificate
         .to_der()
         .map_err(|e| ChainError::EncodingFailed(e.to_string()))?;
-
-    let sig_bytes = cert.signature.raw_bytes();
-    if sig_bytes.len() != 64 {
-        return Err(ChainError::BadSignature);
-    }
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| ChainError::BadSignature)?;
-    let signature = Signature::from_bytes(&sig_arr);
-
-    let master_arr: [u8; 32] = master_pubkey
+    let sig_arr: [u8; 64] = cert
+        .signature
+        .raw_bytes()
         .try_into()
-        .map_err(|_| ChainError::BadMasterKey)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&master_arr).map_err(|_| ChainError::BadMasterKey)?;
-
-    verifying_key
-        .verify(&tbs_der, &signature)
+        .map_err(|_| ChainError::BadSignature)?;
+    signer
+        .verify(&tbs_der, &Signature::from_bytes(&sig_arr))
         .map_err(|_| ChainError::BadSignature)?;
 
-    // Signature verified. Now extract claims.
+    if let Some(expected) = signer_subject
+        && cert.tbs_certificate.issuer != *expected
+    {
+        return Err(ChainError::ConstraintViolation(
+            "issuer name does not match the signing certificate's subject",
+        ));
+    }
 
-    // Ephemeral pubkey from SPKI.
     let spki = &cert.tbs_certificate.subject_public_key_info;
     if spki.algorithm.oid != ID_ED25519 {
         return Err(ChainError::BadSpki);
     }
-    let ephemeral_raw = spki.subject_public_key.raw_bytes();
-    if ephemeral_raw.len() != 32 {
-        return Err(ChainError::BadSpki);
-    }
-    let ephemeral_pubkey: [u8; 32] = ephemeral_raw.try_into().map_err(|_| ChainError::BadSpki)?;
+    let pubkey: [u8; 32] = spki
+        .subject_public_key
+        .raw_bytes()
+        .try_into()
+        .map_err(|_| ChainError::BadSpki)?;
 
-    // Validity window — convert Time to Unix seconds.
     let not_before = time_to_unix(&cert.tbs_certificate.validity.not_before);
     let not_after = time_to_unix(&cert.tbs_certificate.validity.not_after);
 
-    // Interlace extensions (optional).
-    let (epoch, peer_fp, scope, confinement_digest) = extract_interlace_extensions(&cert)?;
-
-    Ok(CertClaims {
-        ephemeral_pubkey,
+    let ext = extract_extensions(cert, role)?;
+    Ok(LinkClaims {
+        pubkey,
         not_before,
         not_after,
-        epoch,
-        peer_fp,
-        scope,
-        confinement_digest,
+        profile: ext.profile,
+        epoch: ext.epoch,
+        peer_fp: ext.peer_fp,
+        scope: ext.scope,
+        confinement_digest: ext.confinement_digest,
     })
 }
 
-/// Convert an x509-cert `Time` to Unix-seconds (i64). Both UTCTime and
-/// GeneralizedTime variants supported.
+/// Convert an x509-cert `Time` to Unix seconds.
 fn time_to_unix(t: &x509_cert::time::Time) -> i64 {
     use x509_cert::time::Time;
     match t {
@@ -193,111 +531,155 @@ fn time_to_unix(t: &x509_cert::time::Time) -> i64 {
     }
 }
 
-/// Interlace extension fields extracted from a cert's optional
-/// custom-OID extensions. All four are `Option` because the verifier
-/// returns the validity window + ephemeral pubkey as required claims
-/// even when none of the Interlace extensions are present.
-type InterlaceExtensions = (
-    Option<u32>,
-    Option<String>,
-    Option<String>,
-    Option<[u8; 32]>,
-);
-
-/// Walk cert.tbs_certificate.extensions; pull the four Interlace OIDs
-/// if present. Order-independent. Each extension's value is DER-decoded
-/// per its expected type.
-fn extract_interlace_extensions(cert: &Certificate) -> Result<InterlaceExtensions, ChainError> {
-    let mut epoch: Option<u32> = None;
-    let mut peer_fp: Option<String> = None;
-    let mut scope: Option<String> = None;
-    let mut confinement_digest: Option<[u8; 32]> = None;
-
-    let Some(extensions) = &cert.tbs_certificate.extensions else {
-        return Ok((None, None, None, None));
-    };
-
-    for ext in extensions {
-        let value_bytes = ext.extn_value.as_bytes();
-        if ext.extn_id == oid_interlace::EPOCH {
-            // DER INTEGER → u32.
-            let int = der::asn1::Int::from_der(value_bytes)
-                .map_err(|_| ChainError::BadExtension("epoch is not a DER INTEGER"))?;
-            // x509's Int can be arbitrary-width; coerce to i64 then to u32.
-            let raw = int.as_bytes();
-            // Big-endian, two's complement. We only support non-negative,
-            // ≤ 4 bytes.
-            if raw.is_empty() || raw.len() > 5 {
-                return Err(ChainError::BadExtension("epoch out of range"));
-            }
-            // Strip leading 0x00 sign byte if present.
-            let stripped: &[u8] = if raw[0] == 0x00 && raw.len() > 1 {
-                &raw[1..]
-            } else {
-                raw
-            };
-            if stripped.len() > 4 {
-                return Err(ChainError::BadExtension("epoch > u32"));
-            }
-            let mut buf = [0u8; 4];
-            buf[4 - stripped.len()..].copy_from_slice(stripped);
-            epoch = Some(u32::from_be_bytes(buf));
-        } else if ext.extn_id == oid_interlace::PEER_FP {
-            let s = der::asn1::Utf8StringRef::from_der(value_bytes)
-                .map_err(|_| ChainError::BadExtension("peer_fp is not DER UTF8String"))?;
-            peer_fp = Some(s.as_str().to_string());
-        } else if ext.extn_id == oid_interlace::SCOPE {
-            let s = der::asn1::Utf8StringRef::from_der(value_bytes)
-                .map_err(|_| ChainError::BadExtension("scope is not DER UTF8String"))?;
-            scope = Some(s.as_str().to_string());
-        } else if ext.extn_id == oid_interlace::CONFINEMENT_DIGEST {
-            // Bead `ley-line-open-c79ea8` / cloister/confinement/v1 §7:
-            // extension value is a DER OctetString wrapping exactly 32
-            // bytes (BLAKE3-256 of the §6-canonical manifest). Any other
-            // length is a spec violation — reject rather than truncate
-            // or pad so a mis-encoded cert can't silently satisfy
-            // identity-commit checks downstream.
-            let octets = der::asn1::OctetStringRef::from_der(value_bytes).map_err(|_| {
-                ChainError::BadExtension("confinementDigest is not DER OctetString")
-            })?;
-            let bytes = octets.as_bytes();
-            if bytes.len() != 32 {
-                return Err(ChainError::BadExtension(
-                    "confinementDigest must be exactly 32 bytes (BLAKE3-256)",
-                ));
-            }
-            let mut digest = [0u8; 32];
-            digest.copy_from_slice(bytes);
-            confinement_digest = Some(digest);
-        } else if ext.critical {
-            // Per RFC 5280 §4.2 + threat-model §6.1.6 (cloister-c71977):
-            // a verifier MUST reject any cert it does not recognize when
-            // the extension is critical-flagged. Standard X.509 critical
-            // extensions (BasicConstraints, KeyUsage, ExtKeyUsage, SAN,
-            // etc.) are NOT in the cloister verifier's known set because
-            // Interlace certs minted by notme don't carry them today; if
-            // they do in the future, expand the allow-list before flipping
-            // them critical.
-            return Err(ChainError::UnknownCriticalExtension(
-                ext.extn_id.to_string(),
-            ));
-        }
-        // Non-critical unknown extensions are ignored per RFC 5280.
-    }
-
-    Ok((epoch, peer_fp, scope, confinement_digest))
+struct Extracted {
+    profile: CertProfile,
+    epoch: Option<u32>,
+    peer_fp: Option<String>,
+    scope: Option<String>,
+    confinement_digest: Option<[u8; 32]>,
 }
 
-/// Hand-rolled JSON encoding of CertClaims. Used by the FFI export in
-/// ffi.rs to write claims into a caller-allocated output buffer.
+/// Classify the certificate, then read each extension under that profile.
+fn extract_extensions(cert: &Certificate, role: Role) -> Result<Extracted, ChainError> {
+    let exts = cert.tbs_certificate.extensions.as_deref().unwrap_or(&[]);
+    for (i, e) in exts.iter().enumerate() {
+        if exts[..i].iter().any(|prev| prev.extn_id == e.extn_id) {
+            return Err(ChainError::BadExtension("duplicate extension"));
+        }
+    }
+
+    let profile = classify_profile(cert);
+    let interlace = profile == CertProfile::Interlace;
+
+    let mut out = Extracted {
+        profile,
+        epoch: None,
+        peer_fp: None,
+        scope: None,
+        confinement_digest: None,
+    };
+    let mut basic: Option<BasicConstraints> = None;
+    let mut key_usage: Option<KeyUsage> = None;
+
+    for ext in exts {
+        let value = ext.extn_value.as_bytes();
+        let id: ObjectIdentifier = ext.extn_id;
+        if id == oid_interlace::EPOCH {
+            out.epoch = Some(parse_epoch(value)?);
+        } else if id == oid_interlace::CONFINEMENT_DIGEST {
+            out.confinement_digest = Some(parse_confinement_digest(value)?);
+        } else if interlace && id == oid_interlace::PEER_FP {
+            out.peer_fp = Some(parse_utf8(value, "peer_fp is not DER UTF8String")?);
+        } else if interlace && id == oid_interlace::SCOPE {
+            out.scope = Some(parse_utf8(value, "scope is not DER UTF8String")?);
+        } else if id == ID_CE_BASIC_CONSTRAINTS {
+            basic = Some(
+                BasicConstraints::from_der(value)
+                    .map_err(|_| ChainError::BadExtension("BasicConstraints is malformed"))?,
+            );
+        } else if id == ID_CE_KEY_USAGE {
+            key_usage = Some(
+                KeyUsage::from_der(value)
+                    .map_err(|_| ChainError::BadExtension("KeyUsage is malformed"))?,
+            );
+        } else if id == ID_CE_SUBJECT_ALT_NAME {
+            SubjectAltName::from_der(value)
+                .map_err(|_| ChainError::BadExtension("SubjectAltName is malformed"))?;
+        } else if ext.critical {
+            // RFC 5280 §4.2: reject a critical extension this verifier does
+            // not process. Under the Signet profile this includes `.1.5` and
+            // `.1.6`, which are deliberately not read.
+            return Err(ChainError::UnknownCriticalExtension(id.to_string()));
+        }
+        // Non-critical unrecognized extensions are ignored per RFC 5280.
+    }
+
+    match role {
+        Role::EndEntity => {
+            if basic.as_ref().is_some_and(|b| b.ca) {
+                return Err(ChainError::ConstraintViolation(
+                    "a CA certificate cannot be the end entity",
+                ));
+            }
+            if key_usage.as_ref().is_some_and(|k| !k.digital_signature()) {
+                return Err(ChainError::ConstraintViolation(
+                    "end-entity KeyUsage does not permit digitalSignature",
+                ));
+            }
+        }
+        Role::Intermediate { below } => {
+            let b = basic.ok_or(ChainError::ConstraintViolation(
+                "intermediate carries no BasicConstraints",
+            ))?;
+            if !b.ca {
+                return Err(ChainError::ConstraintViolation("intermediate is not a CA"));
+            }
+            if let Some(limit) = b.path_len_constraint
+                && below > usize::from(limit)
+            {
+                return Err(ChainError::ConstraintViolation(
+                    "pathLenConstraint exceeded",
+                ));
+            }
+            if !key_usage.as_ref().is_some_and(|k| k.key_cert_sign()) {
+                return Err(ChainError::ConstraintViolation(
+                    "intermediate KeyUsage does not permit keyCertSign",
+                ));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// `.1.4` epoch: canonical DER INTEGER, non-negative, fits u32.
+fn parse_epoch(value: &[u8]) -> Result<u32, ChainError> {
+    let int = der::asn1::Int::from_der(value)
+        .map_err(|_| ChainError::BadExtension("epoch is not a DER INTEGER"))?;
+    let raw = int.as_bytes();
+    let Some(&first) = raw.first() else {
+        return Err(ChainError::BadExtension("epoch is not a DER INTEGER"));
+    };
+    if first & 0x80 != 0 {
+        return Err(ChainError::BadExtension("epoch is negative"));
+    }
+    // Canonical DER carries a leading 0x00 only as a sign byte, so removing
+    // it leaves the magnitude (empty for epoch 0, which reads as 0).
+    let stripped = raw.strip_prefix(&[0x00]).unwrap_or(raw);
+    if stripped.len() > 4 {
+        return Err(ChainError::BadExtension("epoch > u32"));
+    }
+    let mut buf = [0u8; 4];
+    buf[4 - stripped.len()..].copy_from_slice(stripped);
+    Ok(u32::from_be_bytes(buf))
+}
+
+fn parse_utf8(value: &[u8], what: &'static str) -> Result<String, ChainError> {
+    der::asn1::Utf8StringRef::from_der(value)
+        .map(|s| s.as_str().to_string())
+        .map_err(|_| ChainError::BadExtension(what))
+}
+
+/// `.1.7` confinementDigest (bead `ley-line-open-c79ea8`): a DER OctetString
+/// of exactly 32 bytes. Any other length rejects rather than truncating, so
+/// a mis-encoded cert cannot satisfy a downstream identity-commit check.
+fn parse_confinement_digest(value: &[u8]) -> Result<[u8; 32], ChainError> {
+    let octets = der::asn1::OctetStringRef::from_der(value)
+        .map_err(|_| ChainError::BadExtension("confinementDigest is not DER OctetString"))?;
+    octets.as_bytes().try_into().map_err(|_| {
+        ChainError::BadExtension("confinementDigest must be exactly 32 bytes (BLAKE3-256)")
+    })
+}
+
+/// Hand-rolled JSON encoding of CertClaims, written by the FFI exports.
 ///
-/// Format is stable + minimal:
-///   {"epk":"<base64>","nb":1234,"na":5678,"ep":7,"pf":"...","sc":"...","cd":"<base64>"}
+///   {"epk":"<base64>","nb":1234,"na":5678,"pr":"signet","ep":7,"pf":"...","sc":"...","cd":"<base64>"}
 ///
-/// Optional fields (`ep`, `pf`, `sc`, `cd`) are emitted only when present.
-/// Strings are escaped per RFC 8259 §7. Caller writes consumed bytes and
-/// can parse with `JSON.parse` on the JS side. `cd` is base64url-nopad of
-/// the 32-byte confinementDigest (bead `ley-line-open-c79ea8`).
+/// `pr` is emitted only for [`CertProfile::Signet`]; its absence means the
+/// Interlace profile, so Interlace claims serialize to the same bytes as
+/// before `pr` existed. `ep`, `pf`, `sc`, `cd` are emitted only when present
+/// (`pf` and `sc` are never present under the Signet profile). `cd` is
+/// base64url-nopad of the 32-byte confinementDigest.
 pub fn claims_to_json(claims: &CertClaims) -> String {
     let mut out = String::with_capacity(256);
     out.push('{');
@@ -310,6 +692,12 @@ pub fn claims_to_json(claims: &CertClaims) -> String {
 
     out.push_str(",\"na\":");
     out.push_str(&claims.not_after.to_string());
+
+    if claims.profile != CertProfile::Interlace {
+        out.push_str(",\"pr\":\"");
+        out.push_str(claims.profile.as_str());
+        out.push('"');
+    }
 
     if let Some(ep) = claims.epoch {
         out.push_str(",\"ep\":");
@@ -380,21 +768,36 @@ fn base64_url_encode_no_pad(bytes: &[u8]) -> String {
     out
 }
 
-/// Test helpers — minting fixtures for cert-chain verification. `pub`
-/// because integration tests (`tests/*.rs`) link the crate as a
-/// normal dep and don't inherit `#[cfg(test)]`. Intentionally
-/// permissive (no input validation, panics on bad inputs) for
-/// ergonomic test code — every `.expect()` documents the
-/// test-fixture invariant that must hold.
+/// Test helpers — minting fixtures for cert verification. `pub` because
+/// integration tests and downstream dev tools (cloister's mint-dev-cert,
+/// harness-sandbox) link the crate as a normal dependency. Intentionally
+/// permissive (panics on bad inputs); every `.expect()` documents the
+/// fixture invariant that must hold.
 pub mod tests_helpers {
-    use super::oid_interlace;
+    use super::{oid_interlace, oid_signet};
     use crate::oid::ID_ED25519;
+    use const_oid::ObjectIdentifier;
+    use der::{
+        Encode,
+        asn1::{BitString, OctetString, Utf8StringRef},
+    };
     use ed25519_dalek::{Signer, SigningKey};
+    use std::str::FromStr;
+    use x509_cert::{
+        Certificate,
+        certificate::TbsCertificate,
+        ext::{
+            Extension, Extensions,
+            pkix::{BasicConstraints, KeyUsage, KeyUsages},
+        },
+        name::Name,
+        serial_number::SerialNumber,
+        spki::{AlgorithmIdentifier, SubjectPublicKeyInfo},
+        time::{Time, Validity},
+    };
 
-    /// Hand-encode unsigned u32 as a canonical DER INTEGER. `Int::new`
-    /// accepts the raw 4-byte BE form but emits leading zeros that
-    /// strict parsers reject as non-canonical.
-    fn encode_u32_as_der_int(v: u32) -> Vec<u8> {
+    /// Canonical DER INTEGER for an unsigned u32.
+    pub fn der_u32(v: u32) -> Vec<u8> {
         let raw = v.to_be_bytes();
         let mut start = 0;
         while start < 3 && raw[start] == 0 {
@@ -413,121 +816,94 @@ pub mod tests_helpers {
         out
     }
 
-    /// Mint a self-signed-by-master ephemeral cert with the given key
-    /// material + Interlace extensions. Returns DER bytes. Test-quality
-    /// only — issuer/subject are empty Names, no KeyUsage / EKU, etc.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mint_test_cert(
-        master: &SigningKey,
-        ephemeral: &SigningKey,
-        not_before: i64,
-        not_after: i64,
-        epoch: Option<u32>,
-        peer_fp: Option<&str>,
-        scope: Option<&str>,
-        confinement_digest: Option<[u8; 32]>,
-    ) -> Vec<u8> {
-        use der::{
-            Encode,
-            asn1::{BitString, OctetString, Utf8StringRef},
-        };
-        use x509_cert::{
-            Certificate,
-            certificate::TbsCertificate,
-            ext::{Extension, Extensions},
-            name::{Name, RdnSequence},
-            serial_number::SerialNumber,
-            spki::{AlgorithmIdentifier, SubjectPublicKeyInfo},
-            time::{Time, Validity},
-        };
+    /// DER UTF8String.
+    pub fn der_utf8(s: &str) -> Vec<u8> {
+        Utf8StringRef::new(s)
+            .expect("test fixture: valid UTF-8")
+            .to_der()
+            .expect("test fixture: Utf8String → DER")
+    }
 
+    /// DER BasicConstraints.
+    pub fn der_basic_constraints(ca: bool, path_len: Option<u8>) -> Vec<u8> {
+        BasicConstraints {
+            ca,
+            path_len_constraint: path_len,
+        }
+        .to_der()
+        .expect("test fixture: BasicConstraints → DER")
+    }
+
+    /// DER KeyUsage carrying exactly one usage bit.
+    pub fn der_key_usage(usage: KeyUsages) -> Vec<u8> {
+        KeyUsage(usage.into())
+            .to_der()
+            .expect("test fixture: KeyUsage → DER")
+    }
+
+    /// One extension: (OID, critical, extnValue contents).
+    pub type RawExtension = (ObjectIdentifier, bool, Vec<u8>);
+
+    /// Everything a fixture certificate varies on.
+    pub struct CertSpec<'a> {
+        pub issuer_key: &'a SigningKey,
+        pub subject_key: &'a SigningKey,
+        /// RFC 4514 string; empty for an empty Name.
+        pub issuer: &'a str,
+        pub subject: &'a str,
+        pub not_before: i64,
+        pub not_after: i64,
+        pub extensions: Vec<RawExtension>,
+    }
+
+    fn name(s: &str) -> Name {
+        if s.is_empty() {
+            Name::default()
+        } else {
+            Name::from_str(s).expect("test fixture: RFC 4514 name parses")
+        }
+    }
+
+    fn utc(secs: i64) -> Time {
+        Time::UtcTime(
+            der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(secs as u64))
+                .expect("test fixture: time within UtcTime range"),
+        )
+    }
+
+    /// Mint an Ed25519 certificate from `spec`. Returns DER bytes.
+    pub fn mint_cert(spec: CertSpec<'_>) -> Vec<u8> {
         let alg_ed25519 = AlgorithmIdentifier {
             oid: ID_ED25519,
             parameters: None,
         };
-
         let spki = SubjectPublicKeyInfo {
             algorithm: alg_ed25519.clone(),
-            subject_public_key: BitString::from_bytes(ephemeral.verifying_key().as_bytes())
+            subject_public_key: BitString::from_bytes(spec.subject_key.verifying_key().as_bytes())
                 .expect("Ed25519 verifying key is 32 bytes — valid BIT STRING"),
         };
-
-        let issuer: Name = RdnSequence::default();
-        let subject = issuer.clone();
-
-        let validity = Validity {
-            not_before: Time::UtcTime(
-                der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
-                    not_before as u64,
-                ))
-                .expect("test fixture: not_before within UtcTime range"),
-            ),
-            not_after: Time::UtcTime(
-                der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
-                    not_after as u64,
-                ))
-                .expect("test fixture: not_after within UtcTime range"),
-            ),
-        };
-
-        let mut extensions: Vec<Extension> = Vec::new();
-        if let Some(ep) = epoch {
-            let int_der = encode_u32_as_der_int(ep);
-            extensions.push(Extension {
-                extn_id: oid_interlace::EPOCH,
-                critical: false,
-                extn_value: OctetString::new(int_der)
-                    .expect("test fixture: encode_u32_as_der_int emits valid DER"),
-            });
-        }
-        if let Some(pf) = peer_fp {
-            let s_der = Utf8StringRef::new(pf)
-                .expect("test fixture: peer_fp is valid UTF-8")
-                .to_der()
-                .expect("test fixture: Utf8String → DER");
-            extensions.push(Extension {
-                extn_id: oid_interlace::PEER_FP,
-                critical: false,
-                extn_value: OctetString::new(s_der)
-                    .expect("test fixture: DER bytes form a valid OctetString"),
-            });
-        }
-        if let Some(sc) = scope {
-            let s_der = Utf8StringRef::new(sc)
-                .expect("test fixture: scope is valid UTF-8")
-                .to_der()
-                .expect("test fixture: Utf8String → DER");
-            extensions.push(Extension {
-                extn_id: oid_interlace::SCOPE,
-                critical: false,
-                extn_value: OctetString::new(s_der)
-                    .expect("test fixture: DER bytes form a valid OctetString"),
-            });
-        }
-        if let Some(cd) = confinement_digest {
-            // Wrap the 32-byte digest in a DER OctetString so the outer
-            // extn_value carries `OCTET STRING { OCTET STRING { .. } }`,
-            // matching the epoch/peer_fp/scope shape and the §7 spec.
-            let inner_der = OctetString::new(cd.to_vec())
-                .expect("test fixture: 32-byte digest is a valid OctetString")
-                .to_der()
-                .expect("test fixture: OctetString → DER");
-            extensions.push(Extension {
-                extn_id: oid_interlace::CONFINEMENT_DIGEST,
-                critical: false,
-                extn_value: OctetString::new(inner_der)
-                    .expect("test fixture: inner DER wraps into an OctetString"),
-            });
-        }
+        let extensions: Vec<Extension> = spec
+            .extensions
+            .into_iter()
+            .map(|(extn_id, critical, value)| Extension {
+                extn_id,
+                critical,
+                extn_value: OctetString::new(value)
+                    .expect("test fixture: extension value wraps into an OctetString"),
+            })
+            .collect();
 
         let tbs = TbsCertificate {
             version: x509_cert::Version::V3,
             serial_number: SerialNumber::new(&[1])
                 .expect("test fixture: single-byte serial is valid"),
             signature: alg_ed25519.clone(),
-            issuer,
-            validity,
-            subject,
+            issuer: name(spec.issuer),
+            validity: Validity {
+                not_before: utc(spec.not_before),
+                not_after: utc(spec.not_after),
+            },
+            subject: name(spec.subject),
             subject_public_key_info: spki,
             issuer_unique_id: None,
             subject_unique_id: None,
@@ -544,148 +920,137 @@ pub mod tests_helpers {
         let tbs_der = tbs
             .to_der()
             .expect("test fixture: TbsCertificate encodes to DER");
-        let sig = master.sign(&tbs_der);
-
-        let cert = Certificate {
+        let sig = spec.issuer_key.sign(&tbs_der);
+        Certificate {
             tbs_certificate: tbs,
             signature_algorithm: alg_ed25519,
             signature: BitString::from_bytes(&sig.to_bytes())
                 .expect("test fixture: Ed25519 signature is 64 bytes"),
-        };
-
-        cert.to_der()
-            .expect("test fixture: Certificate encodes to DER")
+        }
+        .to_der()
+        .expect("test fixture: Certificate encodes to DER")
     }
 
-    /// Mint a self-signed-by-master cert with one extra extension on top
-    /// of the standard Interlace ones. Used to test cloister-c71977's
-    /// rejection of critical-flagged unknown extensions (RFC 5280 §4.2).
-    /// Caller picks the OID, the critical flag, and the raw DER value.
+    /// Interlace-profile extensions in the order cloister mints them.
+    fn interlace_extensions(
+        epoch: Option<u32>,
+        peer_fp: Option<&str>,
+        scope: Option<&str>,
+        confinement_digest: Option<[u8; 32]>,
+    ) -> Vec<RawExtension> {
+        let mut exts = Vec::new();
+        if let Some(ep) = epoch {
+            exts.push((oid_interlace::EPOCH, false, der_u32(ep)));
+        }
+        if let Some(pf) = peer_fp {
+            exts.push((oid_interlace::PEER_FP, false, der_utf8(pf)));
+        }
+        if let Some(sc) = scope {
+            exts.push((oid_interlace::SCOPE, false, der_utf8(sc)));
+        }
+        if let Some(cd) = confinement_digest {
+            let inner = OctetString::new(cd.to_vec())
+                .expect("test fixture: 32-byte digest is a valid OctetString")
+                .to_der()
+                .expect("test fixture: OctetString → DER");
+            exts.push((oid_interlace::CONFINEMENT_DIGEST, false, inner));
+        }
+        exts
+    }
+
+    /// Mint an Interlace-profile ephemeral cert signed by `master`. Empty
+    /// issuer/subject Names, no standard extensions — the shape cloister's
+    /// dev tooling mints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_test_cert(
+        master: &SigningKey,
+        ephemeral: &SigningKey,
+        not_before: i64,
+        not_after: i64,
+        epoch: Option<u32>,
+        peer_fp: Option<&str>,
+        scope: Option<&str>,
+        confinement_digest: Option<[u8; 32]>,
+    ) -> Vec<u8> {
+        mint_cert(CertSpec {
+            issuer_key: master,
+            subject_key: ephemeral,
+            issuer: "",
+            subject: "",
+            not_before,
+            not_after,
+            extensions: interlace_extensions(epoch, peer_fp, scope, confinement_digest),
+        })
+    }
+
+    /// Interlace cert (epoch 7, peer `sha256:test`, scope `test:scope`) plus
+    /// one extra extension. Used to test cloister-c71977's rejection of
+    /// critical-flagged unknown extensions (RFC 5280 §4.2).
     pub fn mint_test_cert_with_extra_ext(
         master: &SigningKey,
         ephemeral: &SigningKey,
         not_before: i64,
         not_after: i64,
-        extra_oid: const_oid::ObjectIdentifier,
+        extra_oid: ObjectIdentifier,
         extra_critical: bool,
         extra_value_der: Vec<u8>,
     ) -> Vec<u8> {
-        use der::{
-            Encode,
-            asn1::{BitString, OctetString, Utf8StringRef},
-        };
-        use x509_cert::{
-            Certificate,
-            certificate::TbsCertificate,
-            ext::{Extension, Extensions},
-            name::{Name, RdnSequence},
-            serial_number::SerialNumber,
-            spki::{AlgorithmIdentifier, SubjectPublicKeyInfo},
-            time::{Time, Validity},
-        };
+        let mut extensions =
+            interlace_extensions(Some(7), Some("sha256:test"), Some("test:scope"), None);
+        extensions.push((extra_oid, extra_critical, extra_value_der));
+        mint_cert(CertSpec {
+            issuer_key: master,
+            subject_key: ephemeral,
+            issuer: "",
+            subject: "",
+            not_before,
+            not_after,
+            extensions,
+        })
+    }
 
-        let alg_ed25519 = AlgorithmIdentifier {
-            oid: ID_ED25519,
-            parameters: None,
-        };
-        let spki = SubjectPublicKeyInfo {
-            algorithm: alg_ed25519.clone(),
-            subject_public_key: BitString::from_bytes(ephemeral.verifying_key().as_bytes())
-                .expect("Ed25519 verifying key is 32 bytes — valid BIT STRING"),
-        };
-        let issuer: Name = RdnSequence::default();
-        let subject = issuer.clone();
-        let validity = Validity {
-            not_before: Time::UtcTime(
-                der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
-                    not_before as u64,
-                ))
-                .expect("test fixture: not_before within UtcTime range"),
+    /// The notme mint shape (worker/src/cert-authority.ts `mintBridgeCertPair`
+    /// signing cert): critical BasicConstraints CA=false and KeyUsage
+    /// digitalSignature, `.1.1` subject, `.1.2` issuance time, `.1.4` epoch,
+    /// `.1.5` authMethod as DER UTF8String, `.1.6` 32 raw binding bytes.
+    /// For unit tests; `tests/fixtures/notme-certs` carries real notme output.
+    pub fn signet_profile_leaf_extensions(epoch: u32, auth_method: &str) -> Vec<RawExtension> {
+        vec![
+            (
+                const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS,
+                true,
+                der_basic_constraints(false, None),
             ),
-            not_after: Time::UtcTime(
-                der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(
-                    not_after as u64,
-                ))
-                .expect("test fixture: not_after within UtcTime range"),
+            (
+                const_oid::db::rfc5280::ID_CE_KEY_USAGE,
+                true,
+                der_key_usage(KeyUsages::DigitalSignature),
             ),
-        };
-
-        // Standard Interlace extensions (non-critical) + the extra one.
-        let mut extensions: Vec<Extension> = Vec::new();
-        let int_der = encode_u32_as_der_int(7);
-        extensions.push(Extension {
-            extn_id: oid_interlace::EPOCH,
-            critical: false,
-            extn_value: OctetString::new(int_der)
-                .expect("test fixture: encode_u32_as_der_int emits valid DER"),
-        });
-        let s_der = Utf8StringRef::new("sha256:test")
-            .expect("test fixture: literal is valid UTF-8")
-            .to_der()
-            .expect("test fixture: Utf8String → DER");
-        extensions.push(Extension {
-            extn_id: oid_interlace::PEER_FP,
-            critical: false,
-            extn_value: OctetString::new(s_der)
-                .expect("test fixture: DER bytes form a valid OctetString"),
-        });
-        let s_der = Utf8StringRef::new("test:scope")
-            .expect("test fixture: literal is valid UTF-8")
-            .to_der()
-            .expect("test fixture: Utf8String → DER");
-        extensions.push(Extension {
-            extn_id: oid_interlace::SCOPE,
-            critical: false,
-            extn_value: OctetString::new(s_der)
-                .expect("test fixture: DER bytes form a valid OctetString"),
-        });
-        extensions.push(Extension {
-            extn_id: extra_oid,
-            critical: extra_critical,
-            extn_value: OctetString::new(extra_value_der)
-                .expect("test fixture: caller-supplied DER bytes wrap into an OctetString"),
-        });
-
-        let tbs = TbsCertificate {
-            version: x509_cert::Version::V3,
-            serial_number: SerialNumber::new(&[1])
-                .expect("test fixture: single-byte serial is valid"),
-            signature: alg_ed25519.clone(),
-            issuer,
-            validity,
-            subject,
-            subject_public_key_info: spki,
-            issuer_unique_id: None,
-            subject_unique_id: None,
-            extensions: Some(
-                Extensions::try_from(extensions)
-                    .expect("test fixture: extension list is well-formed"),
+            (oid_signet::SUBJECT, false, der_utf8("fixture")),
+            (
+                oid_signet::ISSUANCE_TIME,
+                false,
+                der_utf8("2026-10-27T00:00:00Z"),
             ),
-        };
-
-        let tbs_der = tbs
-            .to_der()
-            .expect("test fixture: TbsCertificate encodes to DER");
-        let sig = master.sign(&tbs_der);
-        let cert = Certificate {
-            tbs_certificate: tbs,
-            signature_algorithm: alg_ed25519,
-            signature: BitString::from_bytes(&sig.to_bytes())
-                .expect("test fixture: Ed25519 signature is 64 bytes"),
-        };
-        cert.to_der()
-            .expect("test fixture: Certificate encodes to DER")
+            (oid_interlace::EPOCH, false, der_u32(epoch)),
+            (oid_interlace::PEER_FP, false, der_utf8(auth_method)),
+            (oid_interlace::SCOPE, false, vec![0xAB; 32]),
+        ]
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::tests_helpers::{
+        CertSpec, RawExtension, der_basic_constraints, der_key_usage, der_u32, der_utf8, mint_cert,
+        mint_test_cert, mint_test_cert_with_extra_ext, signet_profile_leaf_extensions,
+    };
     use super::*;
+    use const_oid::db::rfc5280::{ID_CE_BASIC_CONSTRAINTS, ID_CE_KEY_USAGE};
     use ed25519_dalek::SigningKey;
     use rand::RngCore;
     use rand::rngs::OsRng;
-
-    use super::tests_helpers::mint_test_cert;
+    use x509_cert::ext::pkix::KeyUsages;
 
     fn now() -> i64 {
         std::time::SystemTime::now()
@@ -706,6 +1071,48 @@ mod tests {
         SigningKey::from_bytes(&seed)
     }
 
+    fn mint(issuer: &SigningKey, subject: &SigningKey, exts: Vec<RawExtension>) -> Vec<u8> {
+        mint_named(issuer, subject, "", "", now(), now() + 300, exts)
+    }
+
+    fn mint_named(
+        issuer_key: &SigningKey,
+        subject_key: &SigningKey,
+        issuer: &str,
+        subject: &str,
+        not_before: i64,
+        not_after: i64,
+        extensions: Vec<RawExtension>,
+    ) -> Vec<u8> {
+        mint_cert(CertSpec {
+            issuer_key,
+            subject_key,
+            issuer,
+            subject,
+            not_before,
+            not_after,
+            extensions,
+        })
+    }
+
+    fn ca_exts(path_len: Option<u8>, epoch: Option<u32>, signet: bool) -> Vec<RawExtension> {
+        let mut v = vec![
+            (
+                ID_CE_BASIC_CONSTRAINTS,
+                true,
+                der_basic_constraints(true, path_len),
+            ),
+            (ID_CE_KEY_USAGE, true, der_key_usage(KeyUsages::KeyCertSign)),
+        ];
+        if signet {
+            v.push((oid_signet::SUBJECT, false, der_utf8("tier")));
+        }
+        if let Some(ep) = epoch {
+            v.push((oid_interlace::EPOCH, false, der_u32(ep)));
+        }
+        v
+    }
+
     #[test]
     fn happy_path_minimum_cert() {
         let master = random_signing_key();
@@ -722,6 +1129,7 @@ mod tests {
         );
         assert_eq!(claims.not_before, nb);
         assert_eq!(claims.not_after, na);
+        assert_eq!(claims.profile, CertProfile::Interlace);
         assert!(claims.epoch.is_none());
         assert!(claims.peer_fp.is_none());
         assert!(claims.scope.is_none());
@@ -746,6 +1154,7 @@ mod tests {
 
         let claims = verify_cert_chain(&cert_der, master.verifying_key().as_bytes()).unwrap();
 
+        assert_eq!(claims.profile, CertProfile::Interlace);
         assert_eq!(claims.epoch, Some(7));
         assert_eq!(claims.peer_fp.as_deref(), Some("sha256:abc123"));
         assert_eq!(claims.scope.as_deref(), Some("bead_create:/repos/foo"));
@@ -804,12 +1213,28 @@ mod tests {
         assert!(matches!(result, Err(ChainError::BadMasterKey)));
     }
 
+    // ── Claims JSON ──
+
+    fn sample_claims(profile: CertProfile) -> CertClaims {
+        CertClaims {
+            ephemeral_pubkey: [0xAB; 32],
+            not_before: 1,
+            not_after: 2,
+            profile,
+            epoch: Some(7),
+            peer_fp: Some("sha256:abc".to_string()),
+            scope: Some("bead_create:*".to_string()),
+            confinement_digest: None,
+        }
+    }
+
     #[test]
     fn claims_json_minimum_cert() {
         let claims = CertClaims {
             ephemeral_pubkey: [0xAB; 32],
             not_before: 1700000000,
             not_after: 1700000300,
+            profile: CertProfile::Interlace,
             epoch: None,
             peer_fp: None,
             scope: None,
@@ -822,48 +1247,43 @@ mod tests {
         assert!(!j.contains("\"ep\""));
         assert!(!j.contains("\"pf\""));
         assert!(!j.contains("\"sc\""));
+        assert!(!j.contains("\"pr\""));
+    }
+
+    /// Interlace claims serialize to exactly the bytes they did before the
+    /// profile field existed — cloister's parser sees no change.
+    #[test]
+    fn claims_json_interlace_bytes_unchanged() {
+        assert_eq!(
+            claims_to_json(&sample_claims(CertProfile::Interlace)),
+            "{\"epk\":\"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s\",\"nb\":1,\"na\":2,\
+             \"ep\":7,\"pf\":\"sha256:abc\",\"sc\":\"bead_create:*\"}"
+        );
     }
 
     #[test]
-    fn claims_json_with_extensions() {
-        let claims = CertClaims {
-            ephemeral_pubkey: [0xAB; 32],
-            not_before: 1,
-            not_after: 2,
-            epoch: Some(7),
-            peer_fp: Some("sha256:abc".to_string()),
-            scope: Some("bead_create:*".to_string()),
-            confinement_digest: None,
-        };
-        let j = claims_to_json(&claims);
-        assert!(j.contains("\"ep\":7"));
-        assert!(j.contains("\"pf\":\"sha256:abc\""));
-        assert!(j.contains("\"sc\":\"bead_create:*\""));
+    fn claims_json_signet_profile_emits_pr() {
+        let mut claims = sample_claims(CertProfile::Signet);
+        claims.peer_fp = None;
+        claims.scope = None;
+        assert_eq!(
+            claims_to_json(&claims),
+            "{\"epk\":\"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s\",\"nb\":1,\"na\":2,\
+             \"pr\":\"signet\",\"ep\":7}"
+        );
     }
 
     #[test]
     fn claims_json_escapes_strings() {
-        let claims = CertClaims {
-            ephemeral_pubkey: [0; 32],
-            not_before: 0,
-            not_after: 0,
-            epoch: None,
-            peer_fp: Some("a\"b\\c\n".to_string()),
-            scope: None,
-            confinement_digest: None,
-        };
+        let mut claims = sample_claims(CertProfile::Interlace);
+        claims.peer_fp = Some("a\"b\\c\n".to_string());
         let j = claims_to_json(&claims);
-        // Embedded quote, backslash, newline must be escaped.
         assert!(j.contains("\"pf\":\"a\\\"b\\\\c\\n\""));
     }
 
     // ── Critical-extension rejection (cloister-c71977 / RFC 5280 §4.2) ──
 
-    use super::tests_helpers::mint_test_cert_with_extra_ext;
-    use const_oid::ObjectIdentifier;
-
     /// An OID under a private arc that the verifier doesn't know about.
-    /// Per RFC 5280: when this is critical, the verifier MUST reject.
     const UNKNOWN_PRIVATE_OID: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.42.1");
 
@@ -871,18 +1291,14 @@ mod tests {
     fn rejects_critical_unknown_extension() {
         let master = random_signing_key();
         let ephemeral = random_signing_key();
-        let nb = now() - 60;
-        let na = now() + 600;
-
-        // Mint with a critical-flagged unknown extension.
         let cert = mint_test_cert_with_extra_ext(
             &master,
             &ephemeral,
-            nb,
-            na,
+            now() - 60,
+            now() + 600,
             UNKNOWN_PRIVATE_OID,
-            true,                   // critical
-            vec![0x04, 0x01, 0x01], // arbitrary DER (OCTET STRING { 0x01 })
+            true,
+            vec![0x04, 0x01, 0x01],
         );
 
         let result = verify_cert_chain(&cert, master.verifying_key().as_bytes());
@@ -898,51 +1314,535 @@ mod tests {
     fn accepts_non_critical_unknown_extension() {
         let master = random_signing_key();
         let ephemeral = random_signing_key();
-        let nb = now() - 60;
-        let na = now() + 600;
-
-        // Same OID, but non-critical — RFC 5280 says "MAY ignore".
         let cert = mint_test_cert_with_extra_ext(
             &master,
             &ephemeral,
-            nb,
-            na,
+            now() - 60,
+            now() + 600,
             UNKNOWN_PRIVATE_OID,
-            false, // non-critical
+            false,
             vec![0x04, 0x01, 0x01],
         );
 
-        let result = verify_cert_chain(&cert, master.verifying_key().as_bytes());
-        let claims = result.expect("non-critical unknown should be ignored");
+        let claims = verify_cert_chain(&cert, master.verifying_key().as_bytes())
+            .expect("non-critical unknown should be ignored");
         assert_eq!(claims.epoch, Some(7));
         assert_eq!(claims.peer_fp.as_deref(), Some("sha256:test"));
     }
 
+    // ── Profile discrimination (bead ley-line-open-9ac66d) ──
+
+    /// The notme leaf shape: `.1.5` holds authMethod as a DER UTF8String.
+    /// Before the discriminator this parsed silently as peer_fp.
     #[test]
-    fn accepts_critical_known_interlace_extensions() {
-        // Sanity: the verifier doesn't reject Interlace extensions even
-        // if a future minter flags them critical. Our known-OID list is
-        // the EPOCH/PEER_FP/SCOPE arc; critical flag on those is fine.
+    fn signet_profile_never_reads_auth_method_as_peer_fp() {
         let master = random_signing_key();
         let ephemeral = random_signing_key();
-        let nb = now() - 60;
-        let na = now() + 600;
-
-        // Use the standard mint_test_cert (non-critical) — sanity baseline.
-        let cert = mint_test_cert(
+        let cert = mint(
             &master,
             &ephemeral,
-            nb,
-            na,
-            Some(7),
-            Some("sha256:abc"),
-            Some("bead_create:/r/foo"),
-            None,
+            signet_profile_leaf_extensions(3, "passkey"),
         );
 
         let claims = verify_cert_chain(&cert, master.verifying_key().as_bytes())
-            .expect("standard interlace cert should verify");
-        assert_eq!(claims.epoch, Some(7));
+            .expect("signet-profile leaf verifies");
+        assert_eq!(claims.profile, CertProfile::Signet);
+        assert_eq!(claims.epoch, Some(3));
+        assert_eq!(claims.peer_fp, None);
+        assert_eq!(claims.scope, None);
+    }
+
+    /// Each marker on its own selects the Signet profile.
+    #[test]
+    fn each_marker_selects_signet_profile() {
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        for marker in oid_signet::MARKERS {
+            let cert = mint(
+                &master,
+                &ephemeral,
+                vec![
+                    (marker, false, der_utf8("x")),
+                    (oid_interlace::PEER_FP, false, der_utf8("sha256:abc")),
+                    (oid_interlace::SCOPE, false, der_utf8("bead_create:*")),
+                ],
+            );
+            let claims = verify_cert_chain(&cert, master.verifying_key().as_bytes()).unwrap();
+            assert_eq!(claims.profile, CertProfile::Signet, "marker {marker}");
+            assert_eq!(claims.peer_fp, None, "marker {marker}");
+            assert_eq!(claims.scope, None, "marker {marker}");
+        }
+    }
+
+    /// `.1.5`/`.1.6` are not processed under the Signet profile, so a
+    /// critical one is an unrecognized critical extension.
+    #[test]
+    fn signet_profile_rejects_critical_unread_arc_extension() {
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let cert = mint(
+            &master,
+            &ephemeral,
+            vec![
+                (oid_signet::SUBJECT, false, der_utf8("x")),
+                (oid_interlace::PEER_FP, true, der_utf8("passkey")),
+            ],
+        );
+        assert!(matches!(
+            verify_cert_chain(&cert, master.verifying_key().as_bytes()),
+            Err(ChainError::UnknownCriticalExtension(oid)) if oid == "1.3.6.1.4.1.99999.1.5"
+        ));
+    }
+
+    // ── Fail closed on malformed known extensions ──
+
+    fn expect_bad_extension(exts: Vec<RawExtension>) {
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let cert = mint(&master, &ephemeral, exts);
+        let r = verify_cert_chain(&cert, master.verifying_key().as_bytes());
+        assert!(matches!(r, Err(ChainError::BadExtension(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn interlace_scope_raw_bytes_rejects() {
+        // notme's 32 raw binding bytes, without any Signet marker.
+        expect_bad_extension(vec![(oid_interlace::SCOPE, false, vec![0x17; 32])]);
+    }
+
+    #[test]
+    fn non_canonical_epoch_rejects_in_both_profiles() {
+        // notme before 466074f: fixed-width `02 04 00 00 00 01`.
+        let old_notme_epoch = vec![0x02, 0x04, 0x00, 0x00, 0x00, 0x01];
+        expect_bad_extension(vec![(oid_interlace::EPOCH, false, old_notme_epoch.clone())]);
+        expect_bad_extension(vec![
+            (oid_signet::SUBJECT, false, der_utf8("x")),
+            (oid_interlace::EPOCH, false, old_notme_epoch),
+        ]);
+    }
+
+    #[test]
+    fn negative_epoch_rejects() {
+        expect_bad_extension(vec![(oid_interlace::EPOCH, false, vec![0x02, 0x01, 0xFF])]);
+    }
+
+    #[test]
+    fn malformed_standard_extensions_reject() {
+        expect_bad_extension(vec![(ID_CE_BASIC_CONSTRAINTS, true, vec![0x04, 0x00])]);
+        expect_bad_extension(vec![(ID_CE_KEY_USAGE, true, vec![0x0C, 0x00])]);
+        expect_bad_extension(vec![(
+            const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME,
+            true,
+            vec![0x02, 0x01, 0x00],
+        )]);
+    }
+
+    #[test]
+    fn duplicate_extension_rejects() {
+        expect_bad_extension(vec![
+            (oid_interlace::PEER_FP, false, der_utf8("sha256:a")),
+            (oid_interlace::PEER_FP, false, der_utf8("sha256:b")),
+        ]);
+    }
+
+    // ── End-entity constraints ──
+
+    #[test]
+    fn ca_certificate_as_end_entity_rejects() {
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let cert = mint(&master, &ephemeral, ca_exts(Some(0), None, true));
+        assert!(matches!(
+            verify_cert_chain(&cert, master.verifying_key().as_bytes()),
+            Err(ChainError::ConstraintViolation(_))
+        ));
+    }
+
+    #[test]
+    fn end_entity_key_usage_without_digital_signature_rejects() {
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let cert = mint(
+            &master,
+            &ephemeral,
+            vec![(ID_CE_KEY_USAGE, true, der_key_usage(KeyUsages::KeyCertSign))],
+        );
+        assert!(matches!(
+            verify_cert_chain(&cert, master.verifying_key().as_bytes()),
+            Err(ChainError::ConstraintViolation(_))
+        ));
+    }
+
+    // ── Paths ──
+
+    struct Path {
+        root: SigningKey,
+        tier: SigningKey,
+        leaf_key: SigningKey,
+        tier_der: Vec<u8>,
+        leaf_der: Vec<u8>,
+    }
+
+    fn signet_path(tier_epoch: u32, leaf_epoch: u32) -> Path {
+        let root = random_signing_key();
+        let tier = random_signing_key();
+        let leaf_key = random_signing_key();
+        let tier_der = mint_named(
+            &root,
+            &tier,
+            "CN=signet-authority,O=notme",
+            "CN=machine,O=notme",
+            100,
+            10_000,
+            ca_exts(Some(0), Some(tier_epoch), true),
+        );
+        let leaf_der = mint_named(
+            &tier,
+            &leaf_key,
+            "CN=machine,O=notme",
+            "CN=task,O=notme",
+            200,
+            20_000,
+            signet_profile_leaf_extensions(leaf_epoch, "passkey"),
+        );
+        Path {
+            root,
+            tier,
+            leaf_key,
+            tier_der,
+            leaf_der,
+        }
+    }
+
+    #[test]
+    fn path_verifies_and_intersects_validity() {
+        let p = signet_path(5, 5);
+        let claims = verify_cert_path(
+            &p.leaf_der,
+            &[&p.tier_der],
+            p.root.verifying_key().as_bytes(),
+        )
+        .expect("path verifies");
+        assert_eq!(
+            claims.ephemeral_pubkey,
+            *p.leaf_key.verifying_key().as_bytes()
+        );
+        assert_eq!(claims.not_before, 200);
+        assert_eq!(claims.not_after, 10_000);
+        assert_eq!(claims.epoch, Some(5));
+        assert_eq!(claims.profile, CertProfile::Signet);
+        assert_eq!(claims.peer_fp, None);
+
+        // The leaf alone does not chain to the root.
+        assert!(matches!(
+            verify_cert_chain(&p.leaf_der, p.root.verifying_key().as_bytes()),
+            Err(ChainError::BadSignature)
+        ));
+        // The leaf alone verifies under the tier key.
+        verify_cert_chain(&p.leaf_der, p.tier.verifying_key().as_bytes()).unwrap();
+    }
+
+    /// C1: the path reports the OLDEST epoch, so a consumer's revocation
+    /// check judges the oldest authority. A leaf minted after a rotation
+    /// under a tier from the previous epoch verifies, and reports the tier's
+    /// epoch; it does not launder the tier forward.
+    #[test]
+    fn path_reports_minimum_epoch() {
+        for (tier, leaf) in [(3, 4), (4, 3), (5, 5)] {
+            let p = signet_path(tier, leaf);
+            let claims = verify_cert_path(
+                &p.leaf_der,
+                &[&p.tier_der],
+                p.root.verifying_key().as_bytes(),
+            )
+            .unwrap_or_else(|e| panic!("tier {tier} leaf {leaf}: {e:?}"));
+            assert_eq!(
+                claims.epoch,
+                Some(tier.min(leaf)),
+                "tier {tier} leaf {leaf}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_epoch_on_some_links_only_rejects() {
+        let root = random_signing_key();
+        let tier = random_signing_key();
+        let leaf = random_signing_key();
+        let with = vec![(oid_interlace::EPOCH, false, der_u32(3))];
+        for (tier_epoch, leaf_exts) in [(None, with.clone()), (Some(3), vec![])] {
+            let tier_der = mint(&root, &tier, ca_exts(None, tier_epoch, false));
+            let leaf_der = mint(&tier, &leaf, leaf_exts);
+            assert!(matches!(
+                verify_cert_path(&leaf_der, &[&tier_der], root.verifying_key().as_bytes()),
+                Err(ChainError::ConstraintViolation(
+                    "epoch present on some certificates in the path and absent on others"
+                ))
+            ));
+        }
+    }
+
+    fn cd_ext(digest: [u8; 32]) -> RawExtension {
+        let inner = der::asn1::OctetString::new(digest.to_vec())
+            .unwrap()
+            .to_der()
+            .unwrap();
+        (oid_interlace::CONFINEMENT_DIGEST, false, inner)
+    }
+
+    /// C2: `.1.7` under a path is only reported when every certificate,
+    /// starting with the one the anchor signed, carries the same digest.
+    #[test]
+    fn path_confinement_digest_must_be_carried_by_every_certificate() {
+        let root = random_signing_key();
+        let tier = random_signing_key();
+        let leaf = random_signing_key();
+        let a = [0xA1; 32];
+        let b = [0xB2; 32];
+        let path = |tier_cd: Option<[u8; 32]>, leaf_cd: Option<[u8; 32]>| {
+            let mut te = ca_exts(None, None, false);
+            te.extend(tier_cd.map(cd_ext));
+            let tier_der = mint(&root, &tier, te);
+            let leaf_der = mint(&tier, &leaf, leaf_cd.map(cd_ext).into_iter().collect());
+            verify_cert_path(&leaf_der, &[&tier_der], root.verifying_key().as_bytes())
+        };
+
+        assert_eq!(path(Some(a), Some(a)).unwrap().confinement_digest, Some(a));
+        assert_eq!(path(None, None).unwrap().confinement_digest, None);
+        for (tier_cd, leaf_cd) in [(None, Some(a)), (Some(a), None), (Some(a), Some(b))] {
+            assert!(
+                matches!(
+                    path(tier_cd, leaf_cd),
+                    Err(ChainError::ConstraintViolation(
+                        "confinementDigest differs across the path"
+                    ))
+                ),
+                "tier {:?} leaf {:?}",
+                tier_cd.map(|d| d[0]),
+                leaf_cd.map(|d| d[0])
+            );
+        }
+    }
+
+    #[test]
+    fn path_issuer_name_mismatch_rejects() {
+        let p = signet_path(5, 5);
+        let wrong_issuer = mint_named(
+            &p.tier,
+            &p.leaf_key,
+            "CN=signet-authority,O=notme",
+            "CN=task,O=notme",
+            200,
+            20_000,
+            signet_profile_leaf_extensions(5, "passkey"),
+        );
+        assert!(matches!(
+            verify_cert_path(
+                &wrong_issuer,
+                &[&p.tier_der],
+                p.root.verifying_key().as_bytes()
+            ),
+            Err(ChainError::ConstraintViolation(_))
+        ));
+    }
+
+    #[test]
+    fn path_intermediate_must_be_ca_with_key_cert_sign() {
+        let root = random_signing_key();
+        let tier = random_signing_key();
+        let leaf = random_signing_key();
+        let leaf_der = mint(&tier, &leaf, vec![]);
+        for tier_exts in [
+            vec![],
+            vec![(
+                ID_CE_BASIC_CONSTRAINTS,
+                true,
+                der_basic_constraints(false, None),
+            )],
+            vec![(
+                ID_CE_BASIC_CONSTRAINTS,
+                true,
+                der_basic_constraints(true, None),
+            )],
+            vec![
+                (
+                    ID_CE_BASIC_CONSTRAINTS,
+                    true,
+                    der_basic_constraints(true, None),
+                ),
+                (
+                    ID_CE_KEY_USAGE,
+                    true,
+                    der_key_usage(KeyUsages::DigitalSignature),
+                ),
+            ],
+        ] {
+            let tier_der = mint(&root, &tier, tier_exts);
+            assert!(matches!(
+                verify_cert_path(&leaf_der, &[&tier_der], root.verifying_key().as_bytes()),
+                Err(ChainError::ConstraintViolation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn path_len_constraint_enforced() {
+        let root = random_signing_key();
+        let upper = random_signing_key();
+        let lower = random_signing_key();
+        let leaf = random_signing_key();
+        let leaf_der = mint(&lower, &leaf, vec![]);
+        let lower_der = mint(&upper, &lower, ca_exts(Some(0), None, false));
+        for (limit, ok) in [(Some(0u8), false), (Some(1), true), (None, true)] {
+            let upper_der = mint(&root, &upper, ca_exts(limit, None, false));
+            let r = verify_cert_path(
+                &leaf_der,
+                &[&lower_der, &upper_der],
+                root.verifying_key().as_bytes(),
+            );
+            assert_eq!(r.is_ok(), ok, "pathLen {limit:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn path_profile_disagreement_rejects() {
+        let root = random_signing_key();
+        let tier = random_signing_key();
+        let leaf = random_signing_key();
+        let tier_der = mint(&root, &tier, ca_exts(None, None, true));
+        let leaf_der = mint(&tier, &leaf, vec![]);
+        assert!(matches!(
+            verify_cert_path(&leaf_der, &[&tier_der], root.verifying_key().as_bytes()),
+            Err(ChainError::ConstraintViolation(_))
+        ));
+    }
+
+    #[test]
+    fn path_too_many_intermediates_rejects() {
+        // A valid path of `depth` unconstrained CAs: root -> i[depth-1] -> ...
+        // -> i[0] -> leaf. Returns (root, leaf_der, intermediates leaf-first).
+        fn valid_path(depth: usize) -> (SigningKey, Vec<u8>, Vec<Vec<u8>>) {
+            let root = random_signing_key();
+            let keys: Vec<SigningKey> = (0..depth).map(|_| random_signing_key()).collect();
+            let mut intermediates = Vec::new();
+            for (i, key) in keys.iter().enumerate() {
+                let signer = keys.get(i + 1).unwrap_or(&root);
+                intermediates.push(mint(signer, key, ca_exts(None, None, false)));
+            }
+            let leaf = random_signing_key();
+            let leaf_der = mint(keys.first().unwrap_or(&root), &leaf, vec![]);
+            (root, leaf_der, intermediates)
+        }
+
+        // Exactly the cap verifies.
+        let (root, leaf_der, ints) = valid_path(MAX_INTERMEDIATES);
+        let refs: Vec<&[u8]> = ints.iter().map(Vec::as_slice).collect();
+        verify_cert_path(&leaf_der, &refs, root.verifying_key().as_bytes())
+            .expect("a valid path at MAX_INTERMEDIATES verifies");
+
+        // One past the cap is refused by the cap, even though every link is valid.
+        let (root, leaf_der, ints) = valid_path(MAX_INTERMEDIATES + 1);
+        let refs: Vec<&[u8]> = ints.iter().map(Vec::as_slice).collect();
+        assert!(matches!(
+            verify_cert_path(&leaf_der, &refs, root.verifying_key().as_bytes()),
+            Err(ChainError::ConstraintViolation(
+                "path has more intermediates than MAX_INTERMEDIATES"
+            ))
+        ));
+    }
+
+    /// Re-sign `cert_der` with `key` after setting the inner
+    /// (`tbsCertificate.signature`) and outer signature algorithm OIDs.
+    fn resign_with_algorithms(
+        cert_der: &[u8],
+        key: &SigningKey,
+        inner: ObjectIdentifier,
+        outer: ObjectIdentifier,
+    ) -> Vec<u8> {
+        use der::asn1::BitString;
+        use ed25519_dalek::Signer;
+        let mut cert = Certificate::from_der(cert_der).unwrap();
+        cert.tbs_certificate.signature.oid = inner;
+        cert.signature_algorithm.oid = outer;
+        let sig = key.sign(&cert.tbs_certificate.to_der().unwrap());
+        cert.signature = BitString::from_bytes(&sig.to_bytes()).unwrap();
+        cert.to_der().unwrap()
+    }
+
+    #[test]
+    fn inner_or_outer_signature_algorithm_not_ed25519_rejects() {
+        // ecdsa-with-SHA256: a real algorithm that is not Ed25519.
+        const ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let cert = mint(&master, &ephemeral, vec![]);
+        let pk = master.verifying_key();
+
+        let both = resign_with_algorithms(&cert, &master, ID_ED25519, ID_ED25519);
+        verify_cert_chain(&both, pk.as_bytes()).expect("Ed25519 inner and outer verifies");
+        for (inner, outer) in [(ECDSA_SHA256, ID_ED25519), (ID_ED25519, ECDSA_SHA256)] {
+            let c = resign_with_algorithms(&cert, &master, inner, outer);
+            assert!(
+                matches!(
+                    verify_cert_chain(&c, pk.as_bytes()),
+                    Err(ChainError::NotEd25519)
+                ),
+                "inner {inner} outer {outer}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_u32_boundaries() {
+        let master = random_signing_key();
+        let ephemeral = random_signing_key();
+        let read = |value: Vec<u8>| {
+            let cert = mint(
+                &master,
+                &ephemeral,
+                vec![(oid_interlace::EPOCH, false, value)],
+            );
+            verify_cert_chain(&cert, master.verifying_key().as_bytes()).map(|c| c.epoch)
+        };
+        for v in [
+            0,
+            1,
+            127,
+            128,
+            255,
+            256,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0x0100_0000,
+            u32::MAX,
+        ] {
+            assert_eq!(read(der_u32(v)).unwrap(), Some(v), "epoch {v}");
+        }
+        // 2^32: canonical `02 05 01 00 00 00 00`, one byte past u32.
+        assert!(matches!(
+            read(vec![0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            Err(ChainError::BadExtension("epoch > u32"))
+        ));
+        // 2^40 with a sign byte: `02 06 00 80 00 00 00 00`.
+        assert!(matches!(
+            read(vec![0x02, 0x06, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00]),
+            Err(ChainError::BadExtension("epoch > u32"))
+        ));
+    }
+
+    #[test]
+    fn split_concatenated_der_round_trips_and_rejects_garbage() {
+        let p = signet_path(1, 1);
+        let mut buf = p.tier_der.clone();
+        buf.extend_from_slice(&p.leaf_der);
+        let parts = split_concatenated_der(&buf).unwrap();
+        assert_eq!(parts, vec![&p.tier_der[..], &p.leaf_der[..]]);
+        assert!(split_concatenated_der(&[]).unwrap().is_empty());
+        buf.push(0x30);
+        assert!(matches!(
+            split_concatenated_der(&buf),
+            Err(ChainError::BadDer(_))
+        ));
     }
 
     // ── Wire-format preservation gates (ed25519-dalek 3.x bump, bead 474c0a) ──

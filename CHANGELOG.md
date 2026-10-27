@@ -281,6 +281,111 @@ context, scoping notes, and review history are recoverable.
   missing or unlisted schema asset; `task schema:execution-asset-consumer-test`
   and the release dry-run compile the staged assets standalone to zod.
 
+- **`leyline-sign` verifies notme certificates, and never reads notme's
+  `.1.5` as a peer fingerprint** (bead `ley-line-open-9ac66d`). The
+  `1.3.6.1.4.1.99999.1.*` arc carries two allocations: cloister's
+  Interlace profile (`.1.5` peer_fp, `.1.6` scope) and the notme / signet
+  profile (`.1.5` authMethod or agent name, `.1.6` a 32-byte peer binding
+  or scope). A certificate carrying any of `.1.1`, `.1.2`, `.1.3`, `.1.8`,
+  `.1.9` is now read as the Signet profile: `.1.4` epoch and `.1.7`
+  confinementDigest are read, `.1.5` / `.1.6` are never reported, and a
+  critical one rejects. Before this change every notme certificate was
+  rejected at its critical BasicConstraints, and the `.1.5` UTF8String
+  would have parsed silently as `peer_fp`. BasicConstraints, KeyUsage and
+  SubjectAltName are now recognized and enforced (a CA certificate is not
+  an end entity; an end-entity KeyUsage must permit digitalSignature);
+  duplicate extensions, a non-Ed25519 `tbsCertificate.signature` and a
+  negative epoch reject. New `verify_cert_path` and wasm export
+  `leyline_verify_cert_path` verify root → Issuing CA → leaf paths (name
+  chaining, CA=true + keyCertSign on intermediates, pathLenConstraint,
+  validity intersected). On a path the epoch must be on every certificate
+  or none, and the reported `ep` is the minimum, so a revocation check
+  judges the oldest authority and a leaf stamped with a newer epoch cannot
+  carry an older tier forward. `cd` must be identical on every certificate
+  or absent from all, so a tier holder cannot add, change or drop it.
+  Claims gain `profile` (`CertProfile`); the claims JSON gains
+  `"pr":"signet"` for Signet-profile certificates only, so Interlace claims
+  serialize to the same bytes as before. Under `"pr":"signet"` an absent
+  `pf`/`sc` means "not read", never "unrestricted": consumers check `pr`
+  first. A caller that knows which profile an anchor issues binds them:
+  `verify_cert_path_expecting(.., Some(profile))`, and the
+  `expected_profile` argument of `leyline_verify_cert_path` (`0` either,
+  `1` Interlace, `2` Signet, anything else fails). A notme anchor bound to
+  Signet then cannot present Interlace claims, and the reverse.
+  `leyline_verify_cert_chain` and `verify_cert_path` are unchanged and
+  accept either profile. Breaking for Rust callers that build `CertClaims`
+  literals or match `ChainError` exhaustively (new `ConstraintViolation`).
+  Tested against real notme certificates minted by notme's
+  `cert-authority.ts` (`sign/tests/fixtures/notme-certs`, provenance
+  alongside; kept apart from the vendored CABundle mirror in
+  `tests/fixtures/notme`) and against cloister's committed Interlace
+  vectors.
+
+- **`leyline execution-daemon` can install a real evidence verifier** (bead
+  `ley-line-open-410921`). `--evidence-store DIR` with one or more
+  `--trust-key FILE` installs `CasDsseEvidenceVerifier` over
+  `leyline_runtime::cas_evidence::CasEvidenceStore`, an `EvidenceStore` over
+  `leyline-core`'s `FsBlobStore` (BLAKE3-addressed, verified on read). It
+  checks the `RunGrant` issuer signature and each DSSE evidence envelope
+  against exactly the operator's Ed25519 keys; LLO ships none. A key file
+  holds 64 hex characters or a canonical RFC 8410 PEM `PUBLIC KEY`, and is
+  logged by its ADR-012 canonical kid (SHA-256 over SPKI DER); evidence is
+  addressed `blake3-256:<hex>` over the envelope bytes. Startup is refused
+  when only one of the two flags is given, when a key is unreadable,
+  malformed or repeated, when the store directory does not exist, or when
+  `--allow-unverified-evidence` is combined with either. No verifier flags
+  still refuses every start. `CasDsseEvidenceVerifier` now reports each
+  refusal as an `EvidenceRejection` (`grant-unsigned`, `untrusted-signer`,
+  `signature-invalid`, `evidence-missing`, `evidence-integrity`,
+  `no-trust-keys`, …): its `ExecutionError.detail` begins with the reason's
+  stable token, which `EvidenceRejection::of` recovers on the far side of the
+  daemon; the wire `ExecutionError` is unchanged. A trust set's empty-key case
+  now refuses the grant signature as `no-trust-keys` rather than as an
+  untrusted issuer. `leyline-runtime` takes `anyhow`, `base64` and
+  `leyline-sign` (`root-signer`).
+
+- **The native tier's confinement is proven at the kernel** (beads
+  `ley-line-open-704853`, `ley-line-open-f81567`).
+  `runtime/tests/native_confinement.rs` runs a guest through the compiled
+  `leyline-native-worker` (the linked nono library, not a nono CLI) and
+  checks the errno each system call returned under Seatbelt or Landlock: an
+  existing decoy outside the grant is EPERM/EACCES and never ENOENT; a
+  directory beside the run root, a `rootfs-sibling` sharing the rootfs's
+  name prefix, and the run root itself (list and write) are denied; with no
+  network grant, a connect to a loopback listener the test owns is denied
+  and the listener sees no connection; the granted rootfs stays readable
+  and writable. A host that cannot apply the sandbox reports a named
+  `SKIPPED (NOT a pass)`; `LEYLINE_REQUIRE_SANDBOX=1` makes it fail. The
+  0.15.0 entry below listed this port before it existed.
+
+- **confinement/v1 §4 `port` and §3 `network.connectLocal` take lists**
+  (bead `ley-line-open-e2c33f`, for cloister ADR-0069's multi-listener
+  bundles and broker endpoints). An additive v1 extension, not v2: `port`
+  accepts one grant object or a non-empty list of distinct grants, and
+  `connectLocal` one integer or a non-empty list of distinct integers. The
+  canonical form (README §7 rule 5) emits a one-element list as the scalar,
+  so every existing document keeps its `confinementDigest` — the pinned
+  `manifest-canonical.json` (`d9b5b727…`) is unchanged, and its one-element
+  list form reaches the same digest. Two or more are a sorted list; an empty
+  list and a second grant for the same socket are refused. The README
+  defines the meet of two documents (set intersection of the two list
+  clauses, refused when any other dimension differs), and the new
+  `test-vectors/manifest-port-list.json` pins 0/1/2-grant canonicalization,
+  meets and refusals with their digests. Enforcement: Linux compiles one
+  Landlock `BindTcp`+`ConnectTcp` rule per listener and one `ConnectTcp`
+  rule per `connectLocal` port; macOS still refuses §4 by name and dials N
+  loopback ports with no bind right (ProxyOnly for the first port, the same
+  per-port Seatbelt outbound rule for each further one — measured by
+  `confinement_local_connect_probe`, which reports a named `SKIPPED (NOT a
+  pass)` on a host that cannot apply the sandbox and fails there under
+  `LEYLINE_REQUIRE_SANDBOX=1`); the microVM tier's libkrun port map
+  takes one `N:N` entry per listener (`guest_port_map`). **Breaking (Rust
+  API):** `Dimensions.port` is now `Dimensions.ports: &[PortGrant]`,
+  `Dimensions.connect_local` and `ConfinementManifest::connect_local()`
+  return `&[u16]`, and `port_bind()` is replaced by `port_binds()`;
+  `with_port_bind` and `with_connect_local` add a grant per call. New:
+  `PortGrant`, `ConfinementManifest::meet`.
+
 - **The release ships the macOS microVM worker, signed with the hypervisor
   entitlement** (beads `ley-line-open-984acf`, `ley-line-open-853c07`).
   `leyline-krun-worker-darwin-arm64` is a release asset, listed in
@@ -542,6 +647,17 @@ context, scoping notes, and review history are recoverable.
   format. Any other tail is still an unknown format.
   `task schema:execution-asset-consumer-test` runs the plugin under every
   zod asset name `tools/release-assets.txt` lists.
+
+- **A worker that cannot confine itself is refused for that reason** (bead
+  `ley-line-open-704853`). A worker's stderr is its event channel, and
+  macOS libsandbox writes `sandbox initialization failed: Operation not
+  permitted` there before the worker's `failed` event when `sandbox_init`
+  is refused (for example under an outer Seatbelt sandbox). The native and
+  libkrun backends took that line as the readiness event and refused the
+  run as `invalid ... readiness event: expected value`, so the cause was
+  lost. The readiness reader now skips lines that are not JSON objects
+  (at most 64, and reports them if no event follows); a run still starts
+  only on a well-formed `ready` event for its own run id.
 
 - **The microVM backend is unavailable when its worker cannot enter the
   hypervisor** (bead `ley-line-open-831bf1`). On macOS `capabilities()`

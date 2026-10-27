@@ -11,6 +11,10 @@ license = "AGPL-3.0-or-later"
 # vendored libkrun (ADR-0044, bead ley-line-open-395e43).
 
 [dependencies]
+anyhow = { workspace = true }
+# PEM `PUBLIC KEY` trust-key files (cas_evidence.rs). Same major as
+# leyline-envelope's.
+base64 = "0.22"
 blake3 = { workspace = true }
 capnp = { workspace = true }
 capnp-json = { workspace = true }
@@ -18,6 +22,9 @@ leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.20.
 libc = { workspace = true }
 leyline-core = { path = "../../ll-core/core", version = "0.20.5" }
 leyline-envelope = { path = "../envelope", version = "0.20.5" }
+# The ADR-012 canonical kid of each operator trust key. Features match
+# leyline-envelope's pin: `ffi` off, `root-signer` on.
+leyline-sign = { path = "../sign", version = "0.20.5", default-features = false, features = ["root-signer"] }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -42,6 +49,8 @@ test-support = []
 # dev-dependency is dropped from the published manifest.
 leyline-runtime = { path = ".", features = ["test-support"] }
 hex = { workspace = true }
+# tests/cas_evidence.rs: recomputes the ADR-012 kid independently.
+sha2 = { workspace = true }
 wait-timeout = "0.2"
 # `kill(pid, 0)` liveness probes for the grandchild-reaping regression test
 # (bead rs-a1e8d0).

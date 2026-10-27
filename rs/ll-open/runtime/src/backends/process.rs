@@ -848,6 +848,22 @@ mod tests {
         assert!(error.contains("before readiness"), "{error}");
     }
 
+    /// The bound is inclusive: exactly [`READINESS_PREAMBLE_LINES`] foreign
+    /// lines still reach the event. Pins the boundary that `>=` or `==` in
+    /// place of `>` would move (cargo-mutants on PR #492).
+    #[test]
+    fn foreign_stderr_at_the_bound_still_reaches_the_event() {
+        let event = "{\"type\":\"ready\"}\n";
+        let mut reader = Cursor::new(format!(
+            "{}{event}",
+            "noise\n".repeat(READINESS_PREAMBLE_LINES)
+        ));
+        assert_eq!(
+            read_readiness_line(&mut reader).expect("event within the bound"),
+            Some(event.into())
+        );
+    }
+
     #[test]
     fn termination_closes_descendant_inherited_handles() {
         let mut command = Command::new("sh");

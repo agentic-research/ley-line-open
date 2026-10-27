@@ -191,16 +191,18 @@ pub unsafe extern "C" fn leyline_verify(
 // — claims are small (~200 bytes), and adding serde_json to the wasm
 // build adds substantial size for a flat struct.
 
-/// Verify cert is signed by master_pubkey + write parsed claims as JSON
-/// into `claims_out_buf`. Returns claims byte length on success, -1 on
-/// failure.
+/// Verify an end-entity cert is signed by master_pubkey + write parsed
+/// claims as JSON into `claims_out_buf`. Returns claims byte length on
+/// success, -1 on failure.
 ///
 /// JSON shape (compact, no whitespace):
 ///   {"epk":"<base64url>","nb":<unix-secs>,"na":<unix-secs>,
-///    "ep":<u32>,"pf":"<utf8>","sc":"<utf8>"}
+///    "pr":"signet","ep":<u32>,"pf":"<utf8>","sc":"<utf8>","cd":"<base64url>"}
 ///
-/// `ep`, `pf`, `sc` are optional (omitted when the cert lacks the
-/// corresponding Interlace extension).
+/// `pr` appears only for Signet-profile certs (notme / signet); absent
+/// means the Interlace profile. `ep`, `pf`, `sc`, `cd` are optional;
+/// `pf` and `sc` never appear for a Signet-profile cert, whose `.1.5` /
+/// `.1.6` mean something else (bead `ley-line-open-9ac66d`).
 ///
 /// # Safety
 /// All input pointers must be non-null and valid for their stated
@@ -227,6 +229,69 @@ pub unsafe extern "C" fn leyline_verify_cert_chain(
     };
 
     match crate::cert_chain::verify_cert_chain(cert_der, master_pubkey) {
+        Ok(claims) => {
+            let json = crate::cert_chain::claims_to_json(&claims);
+            // SAFETY: claims_out_buf writable for claims_out_len bytes
+            // per outer fn's # Safety docstring; delegated to `c_output`.
+            unsafe { c_output(json.as_bytes(), claims_out_buf, claims_out_len) }
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Verify `leaf` through a path of intermediates to the Ed25519 trust
+/// anchor `anchor_pubkey` and write the leaf's claims as JSON (same shape
+/// as `leyline_verify_cert_chain`) into `claims_out_buf`. Returns claims
+/// byte length on success, -1 on failure.
+///
+/// `intermediates` is zero or more DER certificates concatenated, the
+/// leaf's issuer first and the anchor-signed certificate last (at most
+/// `cert_chain::MAX_INTERMEDIATES`). With `intermediates_len == 0` the
+/// pointer is not read and this is `leyline_verify_cert_chain`. For a
+/// path, `nb`/`na` are the intersection of every certificate's validity
+/// and `ep` is the single epoch every certificate carries.
+///
+/// # Safety
+/// All input pointers must be non-null and valid for their stated
+/// lengths (`intermediates_ptr` may be null when `intermediates_len` is
+/// 0). `claims_out_buf` must be non-null and writable for
+/// `claims_out_len` bytes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn leyline_verify_cert_path(
+    leaf_der_ptr: *const u8,
+    leaf_der_len: usize,
+    intermediates_ptr: *const u8,
+    intermediates_len: usize,
+    anchor_pubkey_ptr: *const u8,
+    anchor_pubkey_len: usize,
+    claims_out_buf: *mut u8,
+    claims_out_len: usize,
+) -> i32 {
+    // SAFETY: input pointers valid for their stated lengths per the outer
+    // fn's # Safety docstring; delegated to `c_input`.
+    let (Some(leaf_der), Some(anchor)) = (unsafe {
+        (
+            c_input(leaf_der_ptr, leaf_der_len),
+            c_input(anchor_pubkey_ptr, anchor_pubkey_len),
+        )
+    }) else {
+        return -1;
+    };
+    let intermediates_buf: &[u8] = if intermediates_len == 0 {
+        &[]
+    } else {
+        // SAFETY: as above.
+        match unsafe { c_input(intermediates_ptr, intermediates_len) } {
+            Some(b) => b,
+            None => return -1,
+        }
+    };
+    let Ok(intermediates) = crate::cert_chain::split_concatenated_der(intermediates_buf) else {
+        return -1;
+    };
+
+    match crate::cert_chain::verify_cert_path(leaf_der, &intermediates, anchor) {
         Ok(claims) => {
             let json = crate::cert_chain::claims_to_json(&claims);
             // SAFETY: claims_out_buf writable for claims_out_len bytes

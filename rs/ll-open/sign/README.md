@@ -24,6 +24,23 @@ primitives and a gpgsm-compatible binary for jj commit signing.
 The signing/verification wiring in the CLI is opt-in via `LEYLINE_HEAD_SIGNING_KEY`
 (sign) and `LEYLINE_HEAD_TRUSTED_KEYS` (verify), off by default.
 
+## Ephemeral certificate verification (`cert_chain`)
+
+- **`verify_cert_chain` / `verify_cert_path`** (wasm exports
+  `leyline_verify_cert_chain`, `leyline_verify_cert_path`) — verify an
+  Ed25519 end-entity certificate, directly under a trust-anchor public key
+  or through Issuing CA intermediates, and return its claims as `CertClaims`
+  (JSON over the FFI). Paths enforce issuer/subject name chaining,
+  BasicConstraints, KeyUsage, pathLenConstraint and one epoch across the
+  path.
+- **Two profiles on `1.3.6.1.4.1.99999.1.*`.** cloister's Interlace profile
+  and the notme / signet profile give `.1.5` and `.1.6` different meanings.
+  A certificate carrying any of `.1.1`, `.1.2`, `.1.3`, `.1.8`, `.1.9` is
+  read as the Signet profile (`profile = Signet`, JSON `"pr":"signet"`),
+  and its `.1.5` / `.1.6` are never reported as `peer_fp` / `scope`.
+  Everything else is the Interlace profile, whose claims are unchanged. See
+  the `cert_chain` module documentation (bead `ley-line-open-9ac66d`).
+
 ## CMS + jj commit signing
 
 - **Certificate** — Ed25519 self-signed X.509 certificate generation.

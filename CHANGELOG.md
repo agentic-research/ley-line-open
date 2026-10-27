@@ -255,6 +255,32 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- **`leyline-sign` verifies notme certificates, and never reads notme's
+  `.1.5` as a peer fingerprint** (bead `ley-line-open-9ac66d`). The
+  `1.3.6.1.4.1.99999.1.*` arc carries two allocations: cloister's
+  Interlace profile (`.1.5` peer_fp, `.1.6` scope) and the notme / signet
+  profile (`.1.5` authMethod or agent name, `.1.6` a 32-byte peer binding
+  or scope). A certificate carrying any of `.1.1`, `.1.2`, `.1.3`, `.1.8`,
+  `.1.9` is now read as the Signet profile: `.1.4` epoch and `.1.7`
+  confinementDigest are read, `.1.5` / `.1.6` are never reported, and a
+  critical one rejects. Before this change every notme certificate was
+  rejected at its critical BasicConstraints, and the `.1.5` UTF8String
+  would have parsed silently as `peer_fp`. BasicConstraints, KeyUsage and
+  SubjectAltName are now recognized and enforced (a CA certificate is not
+  an end entity; an end-entity KeyUsage must permit digitalSignature);
+  duplicate extensions, a non-Ed25519 `tbsCertificate.signature` and a
+  negative epoch reject. New `verify_cert_path` and wasm export
+  `leyline_verify_cert_path` verify root → Issuing CA → leaf paths (name
+  chaining, CA=true + keyCertSign on intermediates, pathLenConstraint, one
+  epoch across the path, validity intersected). Claims gain `profile`
+  (`CertProfile`); the claims JSON gains `"pr":"signet"` for Signet-profile
+  certificates only, so Interlace claims serialize to the same bytes as
+  before. Breaking for Rust callers that build `CertClaims` literals or
+  match `ChainError` exhaustively (new `ConstraintViolation`). Tested
+  against real notme certificates minted by notme's
+  `cert-authority.ts` (`sign/tests/fixtures/notme`, provenance alongside)
+  and against cloister's committed Interlace vectors.
+
 - **The libkrun worker declares its workspace share, holds nothing else,
   and the receipt names it** (bead `ley-line-open-b83347`, ADR-0044 phase
   C). The share descriptor (`--workspace-share-fd`) is a channel the worker

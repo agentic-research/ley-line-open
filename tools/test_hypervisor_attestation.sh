@@ -97,6 +97,33 @@ grep -q '^suite LEYLINE_REQUIRE_HYPERVISOR=1 ' "$receipts/$tree" ||
 "$attest" check 2>/dev/null || fail "check refused the matching receipt"
 "$attest" check "$tree" 2>/dev/null || fail "check refused the explicit tree"
 
+# An installed worker (LEYLINE_KRUN_WORKER, as `task release:hypervisor:record`
+# sets it) reaches the suite, and the receipt names its digest. On macOS it
+# must carry the hypervisor entitlement first; elsewhere there is none to hold.
+cat > "$tmp_dir/suite-worker" <<'EOF'
+#!/bin/sh
+test "${LEYLINE_REQUIRE_HYPERVISOR:-}" = 1
+test -f "${LEYLINE_KRUN_WORKER:?the suite was not handed the installed worker}"
+EOF
+chmod +x "$tmp_dir/suite-worker"
+if [ "$(uname -s)" = Darwin ]; then
+    cp /usr/bin/true "$tmp_dir/installed-worker"
+    /usr/bin/codesign --force --sign - "$tmp_dir/installed-worker" 2>/dev/null
+    expect_failure unentitled-installed-worker \
+        env LEYLINE_KRUN_WORKER="$tmp_dir/installed-worker" \
+        HYPERVISOR_SUITE="$tmp_dir/suite-worker" "$attest" record
+    "$repo_root/tools/sign_krun_worker.sh" "$tmp_dir/installed-worker" 2>/dev/null
+else
+    printf 'worker' > "$tmp_dir/installed-worker"
+fi
+expect_failure missing-installed-worker \
+    env LEYLINE_KRUN_WORKER="$tmp_dir/no-such-worker" \
+    HYPERVISOR_SUITE="$tmp_dir/suite-worker" "$attest" record
+LEYLINE_KRUN_WORKER="$tmp_dir/installed-worker" \
+    HYPERVISOR_SUITE="$tmp_dir/suite-worker" "$attest" record >/dev/null
+grep -q "^worker $tmp_dir/installed-worker sha256 [0-9a-f]\{64\}\$" "$receipts/$tree" ||
+    fail "the receipt does not name the installed worker and its digest"
+
 # Uncommitted edits are a different tree.
 printf '%s\n' edited > file
 expect_failure dirty-tree "$attest" check

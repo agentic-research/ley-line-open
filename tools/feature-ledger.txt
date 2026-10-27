@@ -79,6 +79,12 @@ ll-open/fs            verify             not-shipping    skip    ley-line-open-b
 # ADR-0020 falsifiability gates. mutants=skip: the gated block is a counter
 # increment consumed only by tests that enable the feature.
 ll-open/sheaf         test-spy           not-shipping    skip    -
+# Test hooks that bypass or retarget KrunWorkerBackend's hypervisor-entitlement
+# check. Must never ship: this row's not-shipping claim is the assertion that
+# no leyline-cli configuration can reach them. mutants `-`: runtime has its own
+# slice, whose `cargo test -p leyline-runtime` turns the feature on through the
+# crate's dev-dependency on itself, so the gated hooks compile under mutation.
+ll-open/runtime       test-support       not-shipping    -       ley-line-open-831bf1
 
 # ADR-0019 — interactive HOST signing lives cloister-side; LLO ships
 # verify-only. mutants=skip: host paths want a keyring (libdbus on Linux)

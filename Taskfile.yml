@@ -510,9 +510,17 @@ tasks:
       - task: cli-lib:smoke
 
   release:hypervisor:record:
-    desc: Run the real-guest suite (`task runtime:test`, LEYLINE_REQUIRE_HYPERVISOR=1) on this tree and record the receipt the release gate requires. Needs LEYLINE_LIBKRUNFW_PATH and LEYLINE_GUEST_TOOLS.
+    desc: Install the worker (`krun-worker:install`), run the real-guest suite (`task runtime:test`, LEYLINE_REQUIRE_HYPERVISOR=1) against that installed worker on this tree, and record the receipt the release gate requires. Needs LEYLINE_LIBKRUNFW_PATH and LEYLINE_GUEST_TOOLS; INSTALL_DIR as for krun-worker:install.
+    vars:
+      INSTALL_DIR: '{{.INSTALL_DIR | default (printf "%s/.local/bin" .HOME)}}'
     cmds:
-      - tools/hypervisor_attestation.sh record
+      # The guest tests run the INSTALLED worker, as installed (bead
+      # ley-line-open-984acf): the receipt is then a statement about the
+      # artifact a user runs, and names its digest.
+      - task: krun-worker:install
+        vars:
+          INSTALL_DIR: '{{.INSTALL_DIR}}'
+      - LEYLINE_KRUN_WORKER="{{.INSTALL_DIR}}/leyline-krun-worker" tools/hypervisor_attestation.sh record
 
   release:hypervisor:check:
     desc: Succeed only if a passing hypervisor-suite receipt exists for this tree

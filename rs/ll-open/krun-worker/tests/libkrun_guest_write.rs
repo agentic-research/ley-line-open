@@ -54,10 +54,11 @@ fn guest_writes_the_ephemeral_root_without_mutating_cas() {
     fs::write(immutable_root.join("rootfs.manifest.json"), manifest).expect("manifest");
     let run_root = fixture.path().join("run-root");
     fs::create_dir(&run_root).expect("run root");
-    let signed_worker = fixture.path().join("leyline-krun-worker");
-    hypervisor::entitled_copy(
+    // The installed worker when LEYLINE_KRUN_WORKER names one (bead
+    // ley-line-open-984acf); otherwise a signed copy of the cargo build.
+    let signed_worker = hypervisor::worker_under_test(
         std::path::Path::new(env!("CARGO_BIN_EXE_leyline-krun-worker")),
-        &signed_worker,
+        &fixture.path().join("leyline-krun-worker"),
     );
 
     let request = ExecutionRequest {

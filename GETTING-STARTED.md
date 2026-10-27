@@ -226,7 +226,7 @@ Where to read next:
   task release:hypervisor:check   # does this tree have a receipt?
   ```
 
-  `tools/tag_release.sh` (and so `task release:publish`) refuses to tag unless a passing receipt exists for `HEAD^{tree}`, and names that command. Receipts are keyed by tree and kept in the shared git directory (`.git/leyline-hypervisor-receipts/`), so a run in any worktree covers a promotion merge whose tree is the same bytes. A receipt is a local record that the run happened, like the `task ci` receipt, not an unforgeable attestation.
+  `release:hypervisor:record` first runs `task krun-worker:install` (to `INSTALL_DIR`, default `~/.local/bin`), and the guest tests run that installed worker as installed (`LEYLINE_KRUN_WORKER`), after checking its entitlement; the receipt records the worker's sha256. `tools/tag_release.sh` (and so `task release:publish`) refuses to tag unless a passing receipt exists for `HEAD^{tree}`, and names that command. Receipts are keyed by tree and kept in the shared git directory (`.git/leyline-hypervisor-receipts/`), so a run in any worktree covers a promotion merge whose tree is the same bytes. A receipt is a local record that the run happened, like the `task ci` receipt, not an unforgeable attestation.
 
 Open distribution work: homebrew formula update, crates.io Trusted Publishing, Developer ID signing and notarization for the macOS worker. Pick this up if you want LLO to install via package-manager UX.
 

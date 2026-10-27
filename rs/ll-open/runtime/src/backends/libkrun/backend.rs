@@ -62,7 +62,7 @@ pub struct KrunWorkerBackend {
     shares: Option<Arc<dyn WorkspaceShares>>,
     /// Whose hypervisor-entitlement rule applies to the worker: a
     /// [`std::env::consts::OS`] value, or `None` when the caller vouches for
-    /// the worker (see [`Self::with_unverified_hypervisor_access`]).
+    /// the worker. Only the `test-support` hooks below change it.
     entitlement_platform: Option<&'static str>,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
@@ -126,8 +126,9 @@ impl KrunWorkerBackend {
     /// Skip the worker's hypervisor-entitlement check, for a fake worker that
     /// stands in for the VMM in a supervision-contract test. A backend built
     /// this way can report `available` for a worker that cannot start a
-    /// guest, so nothing but such a test calls it; the daemon never does.
-    #[doc(hidden)]
+    /// guest, so it exists only under the non-default `test-support` feature,
+    /// which no shipping build enables (tools/feature-ledger.txt).
+    #[cfg(feature = "test-support")]
     pub fn with_unverified_hypervisor_access(mut self) -> Self {
         self.entitlement_platform = None;
         self
@@ -135,8 +136,8 @@ impl KrunWorkerBackend {
 
     /// Apply `os`'s hypervisor-entitlement rule instead of the host's, so a
     /// test can hold the macOS rule to account on any platform. Like the
-    /// opt-out above, only tests call it.
-    #[doc(hidden)]
+    /// opt-out above, `test-support` only.
+    #[cfg(feature = "test-support")]
     pub fn with_entitlement_platform(mut self, os: &'static str) -> Self {
         self.entitlement_platform = Some(os);
         self

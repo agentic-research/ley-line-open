@@ -275,7 +275,10 @@ context, scoping notes, and review history are recoverable.
   when it passes and the tree did not change during the run.
   `tools/tag_release.sh`, and so `task release:publish`, refuses to tag a
   tree without one and names the command. It is a manual gate: no hosted
-  runner can boot a guest.
+  runner can boot a guest. The record task installs the worker with
+  `task krun-worker:install` and the guest tests run that installed worker
+  (`LEYLINE_KRUN_WORKER`, entitlement-checked first); the receipt records
+  its sha256.
 
 - **`leyline-sign` tests consume notme's canonical CABundle fixtures**
   (bead `ley-line-open-0466c0`). notme's ADR-010 fixtures
@@ -510,7 +513,10 @@ context, scoping notes, and review history are recoverable.
   `com.apple.security.hypervisor`, when the entitlement is absent; `start`
   and `provision` refuse with the same reason. Before, a worker that passed
   the file checks accepted a run and died inside the VMM.
-  `BackendCapabilities` gains `unavailable_reason`.
+  `BackendCapabilities` gains `unavailable_reason`. The test hooks that
+  bypass or retarget the check exist only under leyline-runtime's
+  non-default `test-support` feature, which no shipping build enables
+  (`tools/feature-ledger.txt`, enforced by `lint:feature-reachability`).
 
 - **Share file times are the host's wall clock, so a host sleep cannot
   hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).

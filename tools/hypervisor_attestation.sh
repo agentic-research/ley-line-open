@@ -27,6 +27,10 @@
 #
 # Like the task ci receipt, this is a local record that the run happened, not
 # an unforgeable attestation: anyone with write access to .git can write one.
+# `task release:hypervisor:record` first runs `task krun-worker:install` and
+# sets LEYLINE_KRUN_WORKER to the installed worker, so the guest tests run that
+# artifact as installed and the receipt records its sha256.
+#
 # HYPERVISOR_SUITE overrides the suite command for tools/test_*.sh fixtures,
 # and the receipt names the command that actually ran.
 set -eu
@@ -80,6 +84,24 @@ case "$command" in
             echo "usage: $record_command" >&2
             exit 1
         fi
+        # LEYLINE_KRUN_WORKER: the INSTALLED worker the guest tests run
+        # (`task release:hypervisor:record` sets it to what
+        # `task krun-worker:install` produced, bead ley-line-open-984acf).
+        # Its entitlement is checked here, before the run, and its digest
+        # goes in the receipt.
+        worker=${LEYLINE_KRUN_WORKER:-}
+        if [ -n "$worker" ]; then
+            if [ ! -f "$worker" ]; then
+                echo "LEYLINE_KRUN_WORKER names no file: $worker" >&2
+                exit 1
+            fi
+            if [ "$(uname -s)" = Darwin ]; then
+                "$script_root/sign_krun_worker.sh" --check "$worker"
+            fi
+            worker_line="worker $worker sha256 $(sha256_of "$worker")"
+        else
+            worker_line="worker cargo-built, signed per test by tools/sign_krun_worker.sh"
+        fi
         before=$(snapshot)
         echo "running the hypervisor suite on tree $before: LEYLINE_REQUIRE_HYPERVISOR=1 $suite" >&2
         # Unquoted on purpose: the suite is a command line ("task runtime:test").
@@ -87,6 +109,7 @@ case "$command" in
         if ! env LEYLINE_REQUIRE_HYPERVISOR=1 \
             LEYLINE_LIBKRUNFW_PATH="$libkrunfw" \
             LEYLINE_GUEST_TOOLS="$guest_tools" \
+            ${worker:+LEYLINE_KRUN_WORKER="$worker"} \
             $suite
         then
             echo "hypervisor suite failed on tree $before; no receipt recorded" >&2
@@ -107,6 +130,7 @@ case "$command" in
             printf 'suite LEYLINE_REQUIRE_HYPERVISOR=1 %s\n' "$suite"
             printf 'libkrunfw %s sha256 %s\n' "$libkrunfw" "$(sha256_of "$libkrunfw")"
             printf 'guest-tools %s\n' "$guest_tools"
+            printf '%s\n' "$worker_line"
             printf 'host %s\n' "$(host_description)"
             printf 'rustc %s\n' "$(rustc --version 2>/dev/null || echo unavailable)"
             printf 'recorded %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

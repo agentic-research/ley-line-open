@@ -33,9 +33,12 @@ rules; the `leyline` binary injects the mount into the daemon as
   id. A READ with nothing staged rereads it, so the bytes the client takes
   are its base; the base it replaces stays among the handle's earlier reads,
   because the macOS client READs a page again before a partial WRITE once it
-  saw the file change. A save lands only when it means the same against
-  every read since the handle last landed (`StoreFs::agree`), and the READ
-  after a refusal settles the handle (bead `4a8953`). A WRITE is checked against the store at once and refused
+  saw the file change, and so does the base a landed save replaced, because
+  another process on the same client may still hold it (bead `5ec040`). A
+  save lands only when its own edit leaves untouched every line the store
+  changed since each of those reads (`StoreFs::agree`); at most 32 are kept,
+  and past that every save is refused until a READ. The READ after a refusal
+  settles the handle (bead `4a8953`). A WRITE is checked against the store at once and refused
   `NFS3ERR_STALE` exactly when its COMMIT would be, because the macOS client
   reports a refused WRITE and ignores a refused COMMIT. A SETATTR of the size
   stages unchecked (a save truncates before it writes); a truncate with no
@@ -48,9 +51,11 @@ rules; the `leyline` binary injects the mount into the daemon as
   own handles: a guest's virtio-fs session, a FUSE open, a socket proposal.
   Two processes through one NFS mount share the host's one NFS client and
   its page cache; NFSv3 has no open state, so the server sees one client
-  and cannot tell that one process wrote over an older read. The last save
-  wins: the other process's edit is lost, overlapping or not (bead
-  `ley-line-open-5ec040`, a session per writer). macOS FUSE through fuse-t
+  and cannot tell that one process wrote over an older read. No edit is lost:
+  a save made from a read older than the last landed save is refused
+  `ESTALE` at `fsync`/`close`, overlapping or not, and lands after the
+  process reloads. The two processes' disjoint edits do not merge as
+  separate writers' do (bead `ley-line-open-5ec040`, a session per writer). macOS FUSE through fuse-t
   is an NFS server to the kernel's client; its writer separation is not
   measured.
 - **macOS gate.** `host::mount_nfs` refuses Tahoe before 26.7 and Sequoia

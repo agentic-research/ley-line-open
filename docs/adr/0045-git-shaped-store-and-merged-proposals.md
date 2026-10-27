@@ -251,12 +251,19 @@ handle per file id; a READ with nothing staged rereads it (the bytes the client 
 base). The base it replaces stays among the handle's earlier reads (bead `4a8953`): the macOS
 client READs a page again before a partial WRITE once its attribute cache saw the file change, so
 a READ can hand another writer's bytes to the kernel while the editor still holds the bytes it
-read first. The server cannot tell which read an edit was made from, so a save lands only when
-its three-way merge with what the store holds is clean against every read since the handle last
-landed and all of them give the same bytes (`StoreFs::agree`), decided at the WRITE and again at
-the COMMIT under the store's writer; otherwise it is `NFS3ERR_STALE`. An edit next to the other
-writer's change can be refused this way although the editor reloaded; the READ after the
-refusal settles the handle, and the retry lands. The macOS NFS client reports a refused WRITE (at `fsync` or `close`) and ignores a refused
+read first. A landed save stays among them too (bead `5ec040`): one NFS client serves every
+process on the host, so a process that read before another process's save may save next. The
+server cannot tell which read an edit was made from, so a save lands only when it keeps every
+change the store took since each remembered read (`StoreFs::agree`): for each read that differs
+from what the store holds now, the lines changed since that read (read → current) must be
+untouched by the save's own edit (current → save), compared as line ranges of the current file;
+a save that touches them may have been made from that read and would undo them. Decided at the
+WRITE and again at the COMMIT under the store's writer; otherwise it is `NFS3ERR_STALE`. A
+handle remembers at most `MAX_REMEMBERED_READS` (32) reads; past that bound every save is
+refused until a READ settles the handle, rather than checked against an incomplete history. One
+writer's successive saves land; a save that reverts a line the store took since an earlier read
+is refused once, and the READ after the refusal settles the handle so the retry lands. Guest and
+FUSE handles are never reread and keep no such history. The macOS NFS client reports a refused WRITE (at `fsync` or `close`) and ignores a refused
 COMMIT, so each WRITE runs the COMMIT's own decision (`source_write::check`: grant, bases, merge,
 structure) on the bytes it stages and refuses `NFS3ERR_STALE` exactly when that decision does. A
 SETATTR of the size stages unchecked: a save truncates before it writes, and the empty file
@@ -276,9 +283,12 @@ its own handle, its base taken at OPEN), the socket's `propose` op. Two processe
 **one NFS mount** are not two writers. NFSv3 carries no open state, and both processes share the
 host's one NFS client and its page cache, so the server receives one client's READs and WRITEs
 against one handle per file and cannot know that one process's bytes rest on an older read than
-the other's. The last save to reach the server wins: a disjoint edit from the other process is
-lost, and an overlapping one is not refused. Separating writers on one mount needs a session per
-writer (`ley-line-open-5ec040`). macOS FUSE through fuse-t is itself an NFS server to the
+the other's. No edit is lost silently: the handle keeps every read and landed save since it last
+settled, so a save made from an older read than the last landed one touches the lines that save
+changed and is refused `NFS3ERR_STALE` at `fsync` or `close`, whether the two edits overlap or
+not; the writer reloads and saves again. What one mount cannot do is merge the two processes'
+disjoint edits the way separate writers' edits merge: that needs a session per writer
+(`ley-line-open-5ec040`). macOS FUSE through fuse-t is itself an NFS server to the
 kernel's NFS client; whether it separates writers is not measured.
 
 **The macOS NFS client gate.** Before Tahoe 26.7 and Sequoia 15.8, Apple's NFS client corrupts
@@ -355,7 +365,8 @@ entries and the scratch entries under the same directory; a name both hold lists
   Two agents editing the same lines: the second's `close` or `fsync` is `ESTALE`, and the
   refusal names the conflicting lines. This holds for agents that are separate writers (their
   own virtio-fs sessions, FUSE handles or socket proposals); two processes through one host NFS
-  mount are one client, and the last save wins (T8, `ley-line-open-5ec040`).
+  mount are one client: the second save made from an older read is refused, never lands over
+  the first, and their disjoint edits do not merge (T8, `ley-line-open-5ec040`).
 - A `cargo build`, `npm install` or `git` command in the guest or on the host mount writes its
   output to scratch: nothing it writes under a derived path reaches the store, the tree root or
   the checkout, and none of it outlives the run or the mount session (T9).

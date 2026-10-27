@@ -1964,3 +1964,42 @@ fn a_file_only_the_session_holds_moves_its_time_at_each_flush() {
     tick(&f);
     assert_eq!(mtime(&f, "notes.txt"), at);
 }
+
+fn lines(start: u32, end: u32) -> leyline_cli_lib::merge::LineRange {
+    leyline_cli_lib::merge::LineRange { start, end }
+}
+
+/// Changed lines and an edit of them touch when they share a line, never
+/// when they only meet at a boundary (bead 5ec040).
+#[test]
+fn changed_lines_touch_an_edit_that_shares_a_line() {
+    assert!(touches(lines(2, 4), lines(3, 5)));
+    assert!(touches(lines(2, 4), lines(1, 3)));
+    assert!(touches(lines(2, 4), lines(2, 4)));
+    assert!(touches(lines(2, 4), lines(0, 9)));
+    assert!(!touches(lines(2, 4), lines(4, 6)));
+    assert!(!touches(lines(2, 4), lines(0, 2)));
+}
+
+/// A deletion since the read touches an edit that starts, ends or spans the
+/// line it removed, and an insertion there: either may put the lines back.
+#[test]
+fn a_deletion_touches_an_edit_at_its_line() {
+    assert!(touches(lines(3, 3), lines(3, 3)));
+    assert!(touches(lines(3, 3), lines(3, 5)));
+    assert!(touches(lines(3, 3), lines(1, 3)));
+    assert!(touches(lines(3, 3), lines(2, 4)));
+    assert!(!touches(lines(3, 3), lines(4, 6)));
+    assert!(!touches(lines(3, 3), lines(0, 2)));
+    assert!(!touches(lines(3, 3), lines(2, 2)));
+}
+
+/// An inserted line overwrites nothing: it touches changed lines only when
+/// it falls strictly inside them.
+#[test]
+fn an_insertion_touches_only_inside_changed_lines() {
+    assert!(touches(lines(2, 5), lines(3, 3)));
+    assert!(!touches(lines(2, 5), lines(2, 2)));
+    assert!(!touches(lines(2, 5), lines(5, 5)));
+    assert!(!touches(lines(2, 5), lines(7, 7)));
+}

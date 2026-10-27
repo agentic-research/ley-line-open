@@ -54,6 +54,39 @@ pub fn merge(base: &[u8], ours: &[u8], theirs: &[u8]) -> Merged {
     }
 }
 
+/// One hunk of a line diff `from` → `to`: the lines of `from` it replaces
+/// and the lines of `to` that replace them, each 0-based and half-open. An
+/// insertion has an empty `from` range; a deletion an empty `to` range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Change {
+    pub from: LineRange,
+    pub to: LineRange,
+}
+
+/// The hunks of the line diff `from` → `to` (Myers over lines,
+/// post-processed for lines, as [`merge`] diffs). Bytes need not be UTF-8:
+/// lines are split on `\n`.
+pub fn changed_lines(from: &[u8], to: &[u8]) -> Vec<Change> {
+    let input = imara_diff::InternedInput::new(
+        imara_diff::sources::byte_lines(from),
+        imara_diff::sources::byte_lines(to),
+    );
+    let mut diff = imara_diff::Diff::compute(imara_diff::Algorithm::Myers, &input);
+    diff.postprocess_lines(&input);
+    diff.hunks()
+        .map(|h| Change {
+            from: LineRange {
+                start: h.before.start,
+                end: h.before.end,
+            },
+            to: LineRange {
+                start: h.after.start,
+                end: h.after.end,
+            },
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
     Ours,
@@ -258,6 +291,51 @@ mod tests {
         assert_eq!(
             merge(BASE.as_bytes(), ours.as_bytes(), theirs.as_bytes()),
             Merged::Conflict(vec![LineRange { start: 7, end: 7 }])
+        );
+    }
+
+    fn range(start: u32, end: u32) -> LineRange {
+        LineRange { start, end }
+    }
+
+    /// A replaced line, an inserted line and a deleted line, each reported
+    /// with the lines of both sides it spans.
+    #[test]
+    fn changed_lines_reports_each_hunk_on_both_sides() {
+        let from = "a\nb\nc\nd\n";
+        assert_eq!(
+            changed_lines(from.as_bytes(), "a\nB\nc\nd\n".as_bytes()),
+            vec![Change {
+                from: range(1, 2),
+                to: range(1, 2)
+            }]
+        );
+        assert_eq!(
+            changed_lines(from.as_bytes(), "a\nb\nx\nc\nd\n".as_bytes()),
+            vec![Change {
+                from: range(2, 2),
+                to: range(2, 3)
+            }]
+        );
+        assert_eq!(
+            changed_lines(from.as_bytes(), "a\nb\nd\n".as_bytes()),
+            vec![Change {
+                from: range(2, 3),
+                to: range(2, 2)
+            }]
+        );
+        assert_eq!(changed_lines(from.as_bytes(), from.as_bytes()), vec![]);
+    }
+
+    /// Lines are split on newlines whatever the bytes are.
+    #[test]
+    fn changed_lines_diffs_bytes_that_are_not_utf8() {
+        assert_eq!(
+            changed_lines(b"\xff\nb\n", b"\xff\nc\n"),
+            vec![Change {
+                from: range(1, 2),
+                to: range(1, 2)
+            }]
         );
     }
 

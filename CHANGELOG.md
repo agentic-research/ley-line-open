@@ -155,9 +155,9 @@ Breaking changes downstream must absorb:
   - Writers: the merge and `ESTALE` hold between separate writers (a
     guest's virtio-fs session, a FUSE handle, a socket proposal). Two
     processes through one NFS mount share the host's NFS client and page
-    cache, which NFSv3 presents to the server as one client: the last save
-    wins, and the other's edit is lost whether or not the two overlap
-    (`ley-line-open-5ec040`).
+    cache, which NFSv3 presents to the server as one client: the second
+    save made from an older read is refused `ESTALE`, and their disjoint
+    edits do not merge (`ley-line-open-5ec040`).
   - Known: the macOS NFS client's AppleDouble `._*` files (its xattr
     fallback) land in the store (`ley-line-open-8d6a8a`).
   - macOS: the NFS mount refuses Tahoe before 26.7 and Sequoia before 15.8,
@@ -511,6 +511,21 @@ Breaking changes downstream must absorb:
 
 ### Fixed
 
+- **Two processes on one host NFS mount never lose an edit** (bead
+  `ley-line-open-5ec040`). One NFS client serves every process on the host,
+  so a process that read a file before another process's save could save
+  next, and its WRITE landed as a plain replace of the other's bytes,
+  dropping their edit with no error to either. A host-mount handle now keeps
+  the base each landed save replaced beside the reads it served (at most 32;
+  past that, saves are refused until a READ), and a save lands only when its
+  own edit leaves untouched every line the store changed since each of
+  those (`StoreFs::agree`, now stated as that loss check over line ranges,
+  `leyline_cli_lib::merge::changed_lines`). The stale save is refused
+  `ESTALE` at `fsync`/`close` and lands after a reload. One writer's
+  successive saves still land; a save reverting a line the store took
+  since an earlier read is refused once, and its retry after the READ
+  lands. Disjoint edits from two processes on one mount do not merge (that
+  needs a session per writer). Guest and FUSE handles are unchanged.
 - **A host NFS save can no longer silently undo another writer's change**
   (bead `ley-line-open-4a8953`). The macOS NFS client READs a page again
   before a partial WRITE once it saw the file change, and that READ moved

@@ -60,6 +60,9 @@ blake3 = { workspace = true }
 capnp = { workspace = true }
 capnp-json = { workspace = true }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
+# tests/execution_evidence.rs: signs the RunGrants and DSSE evidence the
+# daemon's --trust-key verifier checks.
+leyline-envelope = { path = "../envelope" }
 # tests/agent_in_guest.rs (d): reads the daemon's `_parse_diagnostics` row
 # for the half-written file the guest saved (ADR-0045 T3).
 rusqlite = { workspace = true, features = ["bundled"] }

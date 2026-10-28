@@ -59,7 +59,7 @@ fi
 
 # Every fixture under tools/ that runs `git commit`. The check below keeps
 # this list in step with the scripts.
-fixtures="tools/test_ci_attestation.sh tools/test_release_tags.sh"
+fixtures="tools/test_ci_attestation.sh tools/test_hypervisor_attestation.sh tools/test_release_tags.sh"
 found=$(cd "$repo_root" && grep -l 'git \(-C "[^"]*" \)\?commit' tools/test_*.sh \
     | grep -v '^tools/test_fixture_hooks\.sh$' | sort | tr '\n' ' ')
 expected=$(printf '%s\n' $fixtures | sort | tr '\n' ' ')

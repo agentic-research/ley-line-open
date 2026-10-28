@@ -78,6 +78,28 @@ substrate derives the run identity before it checks any evidence and hands it
 to every verifier, so a verifier that accepts unbound evidence is choosing to;
 it has what it needs to refuse.
 
+## Verifier selection
+
+The verifier is local configuration, not wire content; nothing in a request
+selects it. An embedding authority passes its own. The first-party
+`leyline execution-daemon` installs one of three:
+
+- `--evidence-store DIR --trust-key FILE...` — LLO's `CasDsseEvidenceVerifier`
+  over a CAS blob store, trusting exactly the operator's Ed25519 keys. It
+  checks the grant signature above and resolves each `EvidenceRef.digest`
+  (`blake3-256:<hex>` over the exact DSSE envelope bytes) in the store.
+- No verifier flags — every start is refused `unauthenticated`.
+- `--allow-unverified-evidence` — metadata only, for local fixtures.
+
+Any partial or invalid configuration refuses startup; the downgrade never
+coexists with a real verifier. A signature is checked under every trusted key,
+and `RunGrant.signature.keyId` and the DSSE `keyid` select nothing. After every
+key has refused a signature, its hint is compared with the trusted keys'
+ADR-012 canonical kids only to name the refusal: `signature-invalid` when it
+names a trusted key, `untrusted-signer` otherwise. The wire `ExecutionError`
+is unchanged; LLO's verifier leads `message` with a stable rejection token
+(`grant-unsigned`, `evidence-missing`, …).
+
 ## Backend evidence
 
 `RunReceipt.backend.evidence` names its contract by media type. LLO's is
@@ -117,3 +139,37 @@ enum variants at the end. Removing or reinterpreting a field requires v2.
 
 The canonical vector in `test-vectors/canonical-run.json` pins the JSON carrier
 shape used by conformance tests. JSON is a carrier; Cap'n Proto remains the IDL.
+
+## Release assets
+
+Every LLO release publishes this contract in two forms, each listed with its
+SHA-256 in the release's `SHA256SUMS`:
+
+| Asset | Contents |
+| --- | --- |
+| `execution.capnp` | This directory's `execution.capnp`, byte for byte. |
+| `traits.capnp` | `rs/ll-core/schema-spec/_traits.capnp`, byte for byte: the one file `execution.capnp` imports. |
+| `execution.tools.json` | The MCP tool definitions `capnpc-schema-bridge-tooldefs` emits from `execution.capnp`. |
+
+`execution.tools.json` is a projection: JSON Schema for the eight
+`llo_execution_*` payloads. A consumer that wants its own types for `RunSpec`,
+`RunGrant` and `RunReceipt` compiles the schema assets instead. The traits file
+ships as `traits.capnp`, without its leading underscore, and
+`execution.capnp` imports it as `../../_traits.capnp`, so lay the two out
+before compiling:
+
+```sh
+mkdir -p schema/execution/v1
+cp traits.capnp    schema/_traits.capnp
+cp execution.capnp schema/execution/v1/execution.capnp
+cd schema && capnp compile --no-standard-import \
+  -o"$PLUGIN:$OUT" execution/v1/execution.capnp
+```
+
+With `PLUGIN` set to the same release's `capnpc-schema-bridge-zod-<os>-<arch>`,
+run under its published name, this writes `execution.zod.ts` with `RunSpecSchema`, `RunGrantSchema` and
+`RunReceiptSchema`. Verify every asset against `SHA256SUMS` before use, and
+take the schema, plugin and tooldefs from one release. No other file is
+needed: staging refuses to publish an `execution.capnp` that imports anything
+but the traits file, and `task schema:execution-asset-consumer-test` (in
+`task ci`) and the release dry-run compile the staged assets exactly this way.

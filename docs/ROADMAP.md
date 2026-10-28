@@ -20,7 +20,7 @@ v1.0.0 tag is published with its crates on crates.io, and
 
 | v1 criterion | What it means | Beads |
 |---|---|---|
-| Portable, proven | The in-guest end-to-end test runs in CI on Apple silicon and on Linux/KVM, not only on a developer machine | `16a994`, `5c2040` |
+| Portable, proven | The in-guest end-to-end test gates every release on Apple silicon (a manual run recorded as a per-tree receipt that tagging requires, `16a994`) and runs on Linux/KVM; the released macOS worker carries the hypervisor entitlement (`984acf`) | `16a994`, `5c2040`, `984acf` |
 | Stable contracts | The `propose` wire, the projection ABI (`_tree`, `_source`, `_parse_diagnostics`), execution/v1 and the share header are frozen under semver, with fixtures that fail on a breaking change; the governing ADRs have a decided status | `b70e44`, `10075e` |
 | Write path for real workloads | Build output stays out of the store; bursts of authored writes commit as one batch; a write is acknowledged after one durable append; a guest write stays under 50 ms | `39998b`, `18bfdd`, `98d0c3` |
 | Fail-closed authority | A run writes only inside its grant's write scope; a backend refuses a workspace it cannot serve | `483134`, `204a94` |
@@ -48,7 +48,13 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   prefixes); storefs refuses writes outside it.
 - `204a94` — the native backend refuses a workspace-bearing run instead of
   starting without the workspace.
-- `16a994`, `5c2040` — VM tests in CI (a self-hosted Apple-silicon runner; Linux/KVM).
+- `5c2040` — VM tests on Linux/KVM. Apple silicon is a manual release gate
+  instead of CI (hosted macOS runners lack nested Hypervisor.framework):
+  `task release:hypervisor:record` writes the receipt `tools/tag_release.sh`
+  requires (`16a994`). The release ships `leyline-krun-worker-darwin-arm64`,
+  ad-hoc signed with `com.apple.security.hypervisor`, and the microVM backend
+  reports itself unavailable for a worker without it (`984acf`, `831bf1`).
+  Developer ID signing and notarization follow.
 
 **Measure, then cut operations**
 - `be495a` — count operations per workload (FUSE requests, guest exits, socket

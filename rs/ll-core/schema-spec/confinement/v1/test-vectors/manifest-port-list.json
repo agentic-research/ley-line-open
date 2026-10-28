@@ -1,0 +1,527 @@
+{
+  "version": "cloister/confinement/v1",
+  "description": "confinement/v1 README §4 port and §3 network.connectLocal as lists (ley-line-open-e2c33f). `cases` pin canonicalization and confinementDigest; `meets` pin the meet (set intersection) of two documents, which is commutative; `meetRefusals` pin where the meet is undefined; every `rejects` input is refused by the parser, and by the schema where `schemaRefuses` is true.",
+  "cases": [
+    {
+      "name": "port-scalar-is-the-pinned-vector",
+      "description": "The pinned single-port vector, unchanged: the scalar form canonicalizes to itself, so its digest is the one CONFINEMENT_DIGESTS.blake3 already pins.",
+      "input": {
+        "credentialSource": "keychain://bundle-X-credentials",
+        "fs": {
+          "allow": [
+            "/etc/hosts",
+            {
+              "mode": "rw",
+              "path": "/var/lib/bundle-X/"
+            }
+          ]
+        },
+        "network": {
+          "allowHosts": [
+            "*.telemetry.example.com",
+            "api.example.com"
+          ]
+        },
+        "version": "cloister/confinement/v1",
+        "port": {
+          "address": "127.0.0.1",
+          "bind": 8443
+        }
+      },
+      "canonical": "{\n  \"credentialSource\": \"keychain://bundle-X-credentials\",\n  \"fs\": {\n    \"allow\": [\n      \"/etc/hosts\",\n      {\n        \"mode\": \"rw\",\n        \"path\": \"/var/lib/bundle-X/\"\n      }\n    ]\n  },\n  \"network\": {\n    \"allowHosts\": [\n      \"*.telemetry.example.com\",\n      \"api.example.com\"\n    ]\n  },\n  \"port\": {\n    \"address\": \"127.0.0.1\",\n    \"bind\": 8443\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:d9b5b7270bb6e5ec068aec92798dd76b0f71d1fe2640b3a09833b7742d51c617"
+    },
+    {
+      "name": "port-one-element-list-is-the-scalar",
+      "description": "A one-element list canonicalizes to the scalar object form. Byte-identical to manifest-canonical.json, so it reaches the same pinned digest.",
+      "input": {
+        "credentialSource": "keychain://bundle-X-credentials",
+        "fs": {
+          "allow": [
+            "/etc/hosts",
+            {
+              "mode": "rw",
+              "path": "/var/lib/bundle-X/"
+            }
+          ]
+        },
+        "network": {
+          "allowHosts": [
+            "*.telemetry.example.com",
+            "api.example.com"
+          ]
+        },
+        "version": "cloister/confinement/v1",
+        "port": [
+          {
+            "address": "127.0.0.1",
+            "bind": 8443
+          }
+        ]
+      },
+      "canonical": "{\n  \"credentialSource\": \"keychain://bundle-X-credentials\",\n  \"fs\": {\n    \"allow\": [\n      \"/etc/hosts\",\n      {\n        \"mode\": \"rw\",\n        \"path\": \"/var/lib/bundle-X/\"\n      }\n    ]\n  },\n  \"network\": {\n    \"allowHosts\": [\n      \"*.telemetry.example.com\",\n      \"api.example.com\"\n    ]\n  },\n  \"port\": {\n    \"address\": \"127.0.0.1\",\n    \"bind\": 8443\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:d9b5b7270bb6e5ec068aec92798dd76b0f71d1fe2640b3a09833b7742d51c617"
+    },
+    {
+      "name": "port-zero-grants",
+      "description": "No listener: the `port` block is omitted.",
+      "input": {
+        "credentialSource": "keychain://bundle-X-credentials",
+        "fs": {
+          "allow": [
+            "/etc/hosts",
+            {
+              "mode": "rw",
+              "path": "/var/lib/bundle-X/"
+            }
+          ]
+        },
+        "network": {
+          "allowHosts": [
+            "*.telemetry.example.com",
+            "api.example.com"
+          ]
+        },
+        "version": "cloister/confinement/v1"
+      },
+      "canonical": "{\n  \"credentialSource\": \"keychain://bundle-X-credentials\",\n  \"fs\": {\n    \"allow\": [\n      \"/etc/hosts\",\n      {\n        \"mode\": \"rw\",\n        \"path\": \"/var/lib/bundle-X/\"\n      }\n    ]\n  },\n  \"network\": {\n    \"allowHosts\": [\n      \"*.telemetry.example.com\",\n      \"api.example.com\"\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:f4f59678429a6dc21b96b9f73dafee91639e573f7529b26f37edb73db5330d53"
+    },
+    {
+      "name": "port-two-grants-sorted",
+      "description": "Two grants, given out of order. The canonical list is sorted by `bind`, then by effective address (an omitted address sorts as 127.0.0.1); each grant keeps its own spelling of `address`.",
+      "input": {
+        "credentialSource": "keychain://bundle-X-credentials",
+        "fs": {
+          "allow": [
+            "/etc/hosts",
+            {
+              "mode": "rw",
+              "path": "/var/lib/bundle-X/"
+            }
+          ]
+        },
+        "network": {
+          "allowHosts": [
+            "*.telemetry.example.com",
+            "api.example.com"
+          ]
+        },
+        "version": "cloister/confinement/v1",
+        "port": [
+          {
+            "bind": 9090
+          },
+          {
+            "address": "127.0.0.1",
+            "bind": 8443
+          }
+        ]
+      },
+      "canonical": "{\n  \"credentialSource\": \"keychain://bundle-X-credentials\",\n  \"fs\": {\n    \"allow\": [\n      \"/etc/hosts\",\n      {\n        \"mode\": \"rw\",\n        \"path\": \"/var/lib/bundle-X/\"\n      }\n    ]\n  },\n  \"network\": {\n    \"allowHosts\": [\n      \"*.telemetry.example.com\",\n      \"api.example.com\"\n    ]\n  },\n  \"port\": [\n    {\n      \"address\": \"127.0.0.1\",\n      \"bind\": 8443\n    },\n    {\n      \"bind\": 9090\n    }\n  ],\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:8f97af7b6665809ab8064c2e9047ac9f681efa318b4fdd5cb38fd6d0d61edffe"
+    },
+    {
+      "name": "connect-local-one-element-list-is-the-scalar",
+      "description": "A one-element connectLocal list canonicalizes to the integer.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "network": {
+          "connectLocal": [
+            8443
+          ]
+        }
+      },
+      "canonical": "{\n  \"network\": {\n    \"connectLocal\": 8443\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:8d06856d298fb3c3d642cb83ae3575313e99c74aadc4d56beb2e2b7c6befbc2b"
+    },
+    {
+      "name": "connect-local-two-ports-sorted",
+      "description": "Two connectLocal ports, given out of order, canonicalize to an ascending list.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "network": {
+          "connectLocal": [
+            9443,
+            8443
+          ]
+        }
+      },
+      "canonical": "{\n  \"network\": {\n    \"connectLocal\": [\n      8443,\n      9443\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:f6aeec6e16471d033ea90a6bb3fc3182ce0eb8eefcd49a61d9a857898ab4ad85"
+    }
+  ],
+  "meets": [
+    {
+      "name": "port-overlap",
+      "description": "Two grants on each side, one in common: the meet is the one shared grant, which canonicalizes to the scalar form.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": [
+          {
+            "bind": 8443
+          },
+          {
+            "bind": 9090
+          }
+        ]
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": [
+          {
+            "bind": 9090
+          },
+          {
+            "bind": 9100
+          }
+        ]
+      },
+      "canonical": "{\n  \"fs\": {\n    \"allow\": [\n      \"/srv/app/\"\n    ]\n  },\n  \"port\": {\n    \"bind\": 9090\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:831a5df479195250096f1ff9b81c3065763ddcdf0c1d6bf19122f4330f661266"
+    },
+    {
+      "name": "port-disjoint-is-zero-grants",
+      "description": "No grant in common: the meet has zero grants and omits `port`. A union would keep both; this is the case that tells the two apart.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": {
+          "bind": 8443
+        }
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": {
+          "bind": 9090
+        }
+      },
+      "canonical": "{\n  \"fs\": {\n    \"allow\": [\n      \"/srv/app/\"\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:d69bb2bb594d5597db0429a2862076713916e49ad28836510eb4dbdc118429b9"
+    },
+    {
+      "name": "port-identical-lists",
+      "description": "Identical operands, given in different orders: the meet is idempotent.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": [
+          {
+            "bind": 8443
+          },
+          {
+            "bind": 9090
+          }
+        ]
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": [
+          {
+            "bind": 9090
+          },
+          {
+            "bind": 8443
+          }
+        ]
+      },
+      "canonical": "{\n  \"fs\": {\n    \"allow\": [\n      \"/srv/app/\"\n    ]\n  },\n  \"port\": [\n    {\n      \"bind\": 8443\n    },\n    {\n      \"bind\": 9090\n    }\n  ],\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:a93a46c0673e314c39a4a9ff030b5f9b2ea53160bb66011d0ac85b24d78c644c"
+    },
+    {
+      "name": "port-spelling-must-match",
+      "description": "An omitted address and an explicit 127.0.0.1 bind the same socket but are different declarations. The meet compares canonical grants, so the grant is dropped: the meet only narrows.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": {
+          "bind": 8443
+        }
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": {
+          "address": "127.0.0.1",
+          "bind": 8443
+        }
+      },
+      "canonical": "{\n  \"fs\": {\n    \"allow\": [\n      \"/srv/app/\"\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:d69bb2bb594d5597db0429a2862076713916e49ad28836510eb4dbdc118429b9"
+    },
+    {
+      "name": "connect-local-overlap",
+      "description": "connectLocal meets by set intersection, like `port`.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "network": {
+          "connectLocal": [
+            8443,
+            9443
+          ]
+        }
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "network": {
+          "connectLocal": [
+            9443,
+            10443
+          ]
+        }
+      },
+      "canonical": "{\n  \"fs\": {\n    \"allow\": [\n      \"/srv/app/\"\n    ]\n  },\n  \"network\": {\n    \"connectLocal\": 9443\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:65425611733c74d8495e868cec6013029ba43ddc12f7a60f0c373b7501b6a9b1"
+    },
+    {
+      "name": "connect-local-disjoint-drops-network",
+      "description": "No connectLocal port in common and no allowHosts: the `network` block has no clause left and is omitted, exactly as in a document that never declared it.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "network": {
+          "connectLocal": 8443
+        }
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "network": {
+          "connectLocal": 9443
+        }
+      },
+      "canonical": "{\n  \"fs\": {\n    \"allow\": [\n      \"/srv/app/\"\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:d69bb2bb594d5597db0429a2862076713916e49ad28836510eb4dbdc118429b9"
+    },
+    {
+      "name": "both-lists-at-once",
+      "description": "Both lists meet independently in one operation; the other dimensions are equal on both sides and carry through.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "network": {
+          "allowHosts": [
+            "api.example.com"
+          ],
+          "connectLocal": [
+            8443,
+            9443
+          ]
+        },
+        "port": [
+          {
+            "bind": 8443
+          },
+          {
+            "bind": 9090
+          }
+        ]
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "network": {
+          "allowHosts": [
+            "api.example.com"
+          ],
+          "connectLocal": 8443
+        },
+        "port": {
+          "bind": 9090
+        }
+      },
+      "canonical": "{\n  \"fs\": {\n    \"allow\": [\n      \"/srv/app/\"\n    ]\n  },\n  \"network\": {\n    \"allowHosts\": [\n      \"api.example.com\"\n    ],\n    \"connectLocal\": 8443\n  },\n  \"port\": {\n    \"bind\": 9090\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:57719d058e4b96d1b63c5306feafeab5637954c0864fd2b9d280ffa39ae635e6"
+    }
+  ],
+  "meetRefusals": [
+    {
+      "name": "other-dimension-differs",
+      "description": "The meet is defined for the two list clauses only. Operands that differ in any other dimension are refused, naming it, rather than met by a rule v1 does not define.",
+      "left": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/app/"
+          ]
+        },
+        "port": {
+          "bind": 8443
+        }
+      },
+      "right": {
+        "version": "cloister/confinement/v1",
+        "fs": {
+          "allow": [
+            "/srv/other/"
+          ]
+        },
+        "port": {
+          "bind": 8443
+        }
+      },
+      "refusedNaming": "§2 fs.allow"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "empty-port-list",
+      "schemaRefuses": true,
+      "description": "An empty `port` list declares nothing; the omitted block already means MUST NOT bind.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "port": []
+      }
+    },
+    {
+      "name": "duplicate-port-grant",
+      "schemaRefuses": true,
+      "description": "The same grant twice.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "port": [
+          {
+            "bind": 8443
+          },
+          {
+            "bind": 8443
+          }
+        ]
+      }
+    },
+    {
+      "name": "duplicate-effective-port-grant",
+      "schemaRefuses": false,
+      "description": "The same socket spelled two ways in one list: one grant, one spelling. JSON Schema cannot express this; the parser refuses it.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "port": [
+          {
+            "bind": 8443
+          },
+          {
+            "address": "127.0.0.1",
+            "bind": 8443
+          }
+        ]
+      }
+    },
+    {
+      "name": "privileged-port-in-list",
+      "schemaRefuses": true,
+      "description": "Every list element obeys the scalar rules.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "port": [
+          {
+            "bind": 8443
+          },
+          {
+            "bind": 80
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-connect-local-list",
+      "schemaRefuses": true,
+      "description": "An empty connectLocal list declares nothing.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "network": {
+          "connectLocal": []
+        }
+      }
+    },
+    {
+      "name": "duplicate-connect-local-port",
+      "schemaRefuses": true,
+      "description": "The same port twice.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "network": {
+          "connectLocal": [
+            8443,
+            8443
+          ]
+        }
+      }
+    },
+    {
+      "name": "zero-connect-local-port-in-list",
+      "schemaRefuses": true,
+      "description": "Every list element obeys the scalar rules.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "network": {
+          "connectLocal": [
+            8443,
+            0
+          ]
+        }
+      }
+    }
+  ]
+}

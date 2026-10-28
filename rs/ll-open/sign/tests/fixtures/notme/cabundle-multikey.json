@@ -1,0 +1,11 @@
+{
+  "epoch": 1,
+  "seqno": 1,
+  "keys": {
+    "ab": "Ag==",
+    "b": "AQ=="
+  },
+  "keyId": "b",
+  "prevKeyId": "",
+  "issuedAt": 1234
+}

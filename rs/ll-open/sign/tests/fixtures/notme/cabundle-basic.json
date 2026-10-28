@@ -1,0 +1,10 @@
+{
+  "epoch": 1,
+  "seqno": 1,
+  "keys": {
+    "kid": "q80="
+  },
+  "keyId": "kid",
+  "prevKeyId": "",
+  "issuedAt": 1234
+}

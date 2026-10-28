@@ -112,9 +112,11 @@ substrate daemon with no execution backend; an embedding application must opt
 into `run_execution_daemon` after constructing a trusted resolver/backend
 handler. The service currently proves schema binding,
 provisioning, ordered lifecycle events, cancellation, cleanup, and
-content-addressed receipt assembly. Native backend conformance and mmap-backed
-CAS projection remain separate follow-on gates in beads
-`ley-line-open-f81567` and `ley-line-open-16c953`.
+content-addressed receipt assembly. The native nono backend's confinement is
+checked at the kernel by `rs/ll-open/runtime/tests/native_confinement.rs`
+(Seatbelt on macOS, Landlock on Linux; `LEYLINE_REQUIRE_SANDBOX=1` turns a
+host that cannot sandbox from a named skip into a failure). Mmap-backed CAS
+projection remains a follow-on gate in bead `ley-line-open-16c953`.
 
 For embedders that keep an explicit artifact catalog, `CatalogResolver` binds
 the authorized executable artifact and workspace graph identities to a
@@ -131,7 +133,9 @@ leyline execution-daemon \
   --cas-root /var/lib/leyline/cas \
   --run-root /var/lib/leyline/runs \
   --worker /usr/libexec/leyline-native-worker \
-  --catalog /etc/leyline/execution-catalog.json
+  --catalog /etc/leyline/execution-catalog.json \
+  --evidence-store /var/lib/leyline/evidence \
+  --trust-key /etc/leyline/trust/issuer.pub
 ```
 
 The catalog is local trusted configuration; it is not a substitute for the
@@ -139,22 +143,44 @@ signed `RunSpec`/`RunGrant` wire contract. Signet/NotMe/Interlace trust roots
 remain embedding-owned: production callers must pass an `EvidenceVerifier` to
 `start_authorized_with_verifier`, which resolves each content-addressed
 evidence reference and verifies its signed envelope or certificate chain. The
-default first-party CLI rejects execution unless an embedding verifier is
-installed. `--allow-unverified-evidence` exists only for local fixtures and is
-an explicit downgrade. The legacy `start_authorized` path uses a metadata-only
-fixture verifier and is not a production trust boundary. The daemon owns the
-worker and UDS lifecycle, while callers provide logical intent and the
-embedding verifier.
+legacy `start_authorized` path uses a metadata-only fixture verifier and is not
+a production trust boundary. The daemon owns the worker and UDS lifecycle,
+while callers provide logical intent and the verifier's configuration.
 
-LLO also ships `CasDsseEvidenceVerifier`, which verifies APAS
-`application/vnd.in-toto+json` envelopes from an embedding-provided
-content-addressed store against embedding-provided Signet/NotMe trust keys.
-It requires the APAS Handoff/v1 predicate as well as the in-toto envelope
-type. Cloister may use that adapter or supply its own verifier for Interlace
-certificate/lease evidence; key distribution and rotation remain outside LLO.
+LLO ships `CasDsseEvidenceVerifier`, which verifies the `RunGrant` issuer
+signature and APAS `application/vnd.in-toto+json` evidence envelopes from a
+content-addressed store against supplied Ed25519 trust keys. It requires the
+APAS Handoff/v1 predicate as well as the in-toto envelope type. Cloister may
+use that adapter or supply its own verifier for Interlace certificate/lease
+evidence; key distribution and rotation remain outside LLO.
+
+`leyline execution-daemon` selects its verifier from three flags, and fails
+closed:
+
+| Flags | Verifier |
+| --- | --- |
+| `--evidence-store DIR` and one or more `--trust-key FILE` | `CasDsseEvidenceVerifier` over the CAS blob store at `DIR` (`<DIR>/<aa>/<62 hex>`, BLAKE3-addressed, verified on read), trusting exactly those keys |
+| none | `RejectUnverifiedEvidence`: every start is refused |
+| `--allow-unverified-evidence` | `MetadataOnlyEvidenceVerifier`: authenticates nothing; local fixtures only |
+
+LLO ships no trust keys. A trust-key file holds one Ed25519 public key, as
+64 hex characters or a PEM `PUBLIC KEY` block in canonical RFC 8410 SPKI form;
+the daemon logs each key's ADR-012 canonical kid
+(`lowercasehex(SHA-256(SPKI DER)[:16])`). Startup is refused when only one of
+`--trust-key`/`--evidence-store` is given, when a key file is unreadable,
+malformed or repeated, when the store directory does not exist, or when
+`--allow-unverified-evidence` is combined with either. Evidence is addressed
+`blake3-256:<hex>` over the exact envelope bytes; that digest names content and
+a kid names a key, and neither stands in for the other. A refused start reports
+`Unauthenticated` with a detail that begins with a stable rejection token
+(`grant-unsigned`, `untrusted-signer`, `signature-invalid`,
+`evidence-missing`, …; `EvidenceRejection` in `leyline-runtime`).
 
 To select the embedded VM path, use `--backend micro-vm --worker
-/path/to/leyline-krun-worker`, grant libkrunfw with `--runtime-file`, and
+/path/to/leyline-krun-worker` (the release's `leyline-krun-worker-darwin-arm64`,
+or `task krun-worker:install`; on macOS the worker must carry
+`com.apple.security.hypervisor`, and the backend reports itself unavailable
+when it does not), grant libkrunfw with `--runtime-file`, and
 repeat `--device` only for explicitly granted device paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
 `krunvm` CLI.
 

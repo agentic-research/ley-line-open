@@ -28,6 +28,11 @@ set -eu
 # absolute path; an explicit CC_LINUX still wins (ley-line-open-f1c46f).
 : "${CC_LINUX:=$(CDPATH='' cd -P -- "$(dirname "$0")" && pwd -P)/krun_init_cc.sh}"
 export CC_LINUX
+# Same reason for the worker signing script the runtime and krun-worker tests
+# run (rs/ll-open/krun-worker/tests/hypervisor/mod.rs, ley-line-open-984acf):
+# it lives in tools/, outside the copy.
+: "${LEYLINE_SIGN_KRUN_WORKER:=$(CDPATH='' cd -P -- "$(dirname "$0")" && pwd -P)/sign_krun_worker.sh}"
+export LEYLINE_SIGN_KRUN_WORKER
 
 DIFF=${1:?usage: mutants_diff.sh <diff-file>}
 SCOPE=${2:-all}

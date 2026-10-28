@@ -104,6 +104,60 @@ if [ -n "${TOOLDEFS_SOURCE:-}" ]; then
     cp "$TOOLDEFS_SOURCE" "$OUTPUT_DIR/execution.tools.json"
 fi
 
+# The execution/v1 schema bytes (ley-line-open-6d811a).
+#
+# `execution.tools.json` is one projection of execution/v1: JSON Schema for
+# the MCP payloads. A consumer that wants its own types for RunSpec, RunGrant
+# and RunReceipt (cloister generates zod through capnpc-schema-bridge-zod)
+# needs the IDL itself, and cloister CI has no LLO checkout. So the normative
+# schema ships as two assets, byte-identical to the repository files:
+#
+#   execution.capnp  <- rs/ll-core/schema-spec/execution/v1/execution.capnp
+#   traits.capnp     <- rs/ll-core/schema-spec/_traits.capnp
+#
+# `execution.capnp` imports `../../_traits.capnp`, so a consumer lays them out
+# as `<root>/execution/v1/execution.capnp` and `<root>/_traits.capnp` before it
+# compiles (execution/v1/README.md, "Release assets"). The traits asset drops
+# the leading underscore because the asset name is a URL path segment; the
+# bytes are unchanged.
+#
+# Fail closed on the import set: if execution.capnp gains an import this
+# release does not ship, the published schema would not compile anywhere but
+# here. The only accepted import is the traits file.
+#
+# Platform-independent, so it rides the same single job as the tooldefs.
+if [ -n "${EXECUTION_SCHEMA_ROOT:-}" ]; then
+    execution_schema_src="$EXECUTION_SCHEMA_ROOT/execution/v1/execution.capnp"
+    traits_schema_src="$EXECUTION_SCHEMA_ROOT/_traits.capnp"
+    for schema_src in "$execution_schema_src" "$traits_schema_src"; do
+        if [ ! -f "$schema_src" ]; then
+            echo "execution/v1 schema file is missing: $schema_src" >&2
+            exit 1
+        fi
+    done
+    unshipped_imports=$(
+        grep -o 'import "[^"]*"' "$execution_schema_src" |
+            grep -vx 'import "\.\./\.\./_traits\.capnp"' || true
+    )
+    if [ -n "$unshipped_imports" ]; then
+        echo "execution.capnp imports a file the release does not ship:" >&2
+        printf '%s\n' "$unshipped_imports" >&2
+        exit 1
+    fi
+    if grep -q 'import "' "$traits_schema_src"; then
+        echo "_traits.capnp imports a file the release does not ship" >&2
+        exit 1
+    fi
+    for schema_asset in execution.capnp traits.capnp; do
+        if [ "$ASSET_NAME" = "$schema_asset" ] || [ -e "$OUTPUT_DIR/$schema_asset" ]; then
+            echo "release asset names would collide: $schema_asset" >&2
+            exit 1
+        fi
+    done
+    cp "$execution_schema_src" "$OUTPUT_DIR/execution.capnp"
+    cp "$traits_schema_src" "$OUTPUT_DIR/traits.capnp"
+fi
+
 # Platform-independent wasm32 artifacts (ley-line-open-a2099a; envelope
 # joined under ley-line-open-be5f86).
 #
@@ -175,6 +229,55 @@ if [ -n "${GENERATOR_BINS:-}" ]; then
         cp "$generator_src" "$OUTPUT_DIR/$generator_asset"
         chmod +x "$OUTPUT_DIR/$generator_asset"
     done
+fi
+
+# The microVM worker (ley-line-open-984acf).
+#
+# leyline-krun-worker links libkrun, which creates the guest through
+# Hypervisor.framework on macOS; a worker without
+# com.apple.security.hypervisor fails VM creation with EINVAL. So the STAGED
+# copy is signed here, ad hoc, by tools/sign_krun_worker.sh (the one signing
+# path), and the entitlement is then checked on the staged bytes before
+# SHA256SUMS digests them. A signing step that silently stops granting it
+# fails the release instead of shipping a worker that fails at its first run.
+#
+# The check needs macOS codesign, so a darwin worker staged anywhere else is
+# refused. RELEASE_FIXTURE_UNCHECKED_WORKER=1 lifts that for the publication
+# fixture on a Linux runner only, which stages a stand-in to prove the asset
+# inventory; release.yml never sets it.
+if [ -n "${KRUN_WORKER_SOURCE:-}" ] || [ -n "${KRUN_WORKER_ASSET:-}" ]; then
+    : "${KRUN_WORKER_SOURCE:?KRUN_WORKER_SOURCE is required with KRUN_WORKER_ASSET}"
+    : "${KRUN_WORKER_ASSET:?KRUN_WORKER_ASSET is required with KRUN_WORKER_SOURCE}"
+    case "$KRUN_WORKER_ASSET" in
+        *[!A-Za-z0-9._-]*)
+            echo "unsafe krun worker asset name: $KRUN_WORKER_ASSET" >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -f "$KRUN_WORKER_SOURCE" ]; then
+        echo "krun worker not built: $KRUN_WORKER_SOURCE" >&2
+        echo "run 'task krun-worker:release:target' for this BUILD_TARGET" >&2
+        exit 1
+    fi
+    if [ -e "$OUTPUT_DIR/$KRUN_WORKER_ASSET" ]; then
+        echo "release asset names would collide: $KRUN_WORKER_ASSET" >&2
+        exit 1
+    fi
+    staged_worker="$OUTPUT_DIR/$KRUN_WORKER_ASSET"
+    cp "$KRUN_WORKER_SOURCE" "$staged_worker"
+    chmod +x "$staged_worker"
+    case "$KRUN_WORKER_ASSET" in
+        *-darwin-*)
+            if [ "$(uname -s)" = Darwin ]; then
+                "$(dirname "$0")/sign_krun_worker.sh" "$staged_worker"
+                "$(dirname "$0")/sign_krun_worker.sh" --check "$staged_worker"
+            elif [ "${RELEASE_FIXTURE_UNCHECKED_WORKER:-}" != 1 ]; then
+                echo "a darwin krun worker must be staged on macOS, where its" >&2
+                echo "hypervisor entitlement can be signed and checked" >&2
+                exit 1
+            fi
+            ;;
+    esac
 fi
 
 manifest_tmp="$OUTPUT_DIR/.SHA256SUMS.tmp.$$"

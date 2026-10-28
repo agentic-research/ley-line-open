@@ -47,7 +47,8 @@ tree, the patches or the script, and weekly (bead `ley-line-open-396d77`).
 
 Prepared as an upstream pull request; not yet submitted. Each is one
 `git format-patch` commit. `0001`–`0006` were written on top of `v1.19.4`
-and apply unchanged to `v1.19.6`; `0007` was written on top of `v1.19.6`:
+and apply unchanged to `v1.19.6`; `0007` and `0008` were written on top of
+`v1.19.6`:
 
 1. `0001` — **libkrun/macos: start the mapping worker for virtio-fs DAX
    windows.** On macOS a virtio-fs DAX mapping is serviced by the VMM worker
@@ -86,6 +87,17 @@ and apply unchanged to `v1.19.6`; `0007` was written on top of `v1.19.6`:
    with host-clock share mtimes and missed a same-second, same-size edit.
    The guest now trails the host by the VMM's setup time (75–150 ms
    measured) and is never ahead (bead `ley-line-open-f8138d`).
+8. `0008` — **devices/vsock: a configured TSI port map lists every
+   published listener.** Upstream's TSI stream proxy used the port map only
+   to rename ports: a guest listen on an unmapped port was bound on the host
+   anyway, at the address the guest asked for. With a map configured
+   (`krun_set_port_map` called, as the worker always does), an unmapped
+   INET/INET6 listen is now refused with `EACCES`, and a mapped one is bound
+   on the host's loopback interface instead of the guest's `0.0.0.0`. Found
+   by the live-guest §4 test, which on macOS reached an undeclared guest
+   listener and reached the declared ones on the host's LAN address: the
+   VMM's Seatbelt profile grants `network-bind` for every port once a §4
+   grant opens one (bead `ley-line-open-7d4d45`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

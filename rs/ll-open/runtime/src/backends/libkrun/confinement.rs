@@ -369,7 +369,7 @@ pub fn capabilities_from_manifest(
     // at this ABI nor needs to. What this profile carries under MicroVm is
     // the VMM's HOST half of each channel, below.
     #[cfg(target_os = "linux")]
-    if matches!(tier, Tier::Native) && !unix_sockets.is_empty() {
+    if workload_declares_unix_sockets(tier, unix_sockets) {
         return Err(ExecutionError::invalid(format!(
             "confinement/v1 §6 unixSocket.allow is not enforceable by the \
              Landlock ABI this build targets, so the {} declared socket \
@@ -802,6 +802,17 @@ fn vmm_unix_socket_mode(grant: &UnixSocketGrant) -> UnixSocketMode {
     } else {
         UnixSocketMode::Connect
     }
+}
+
+/// Whether the confined process is the WORKLOAD and holds §6 grants — the
+/// case the Linux tier refuses, since Landlock at this ABI cannot mediate a
+/// pathname AF_UNIX socket. Split out for the same reason as
+/// [`vmm_creates_socket`]: inline under `cfg(target_os = "linux")` the
+/// decision was compiled out on macOS, so a mutation run there could not
+/// reach it; the decision is portable, only the refusal is per-platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn workload_declares_unix_sockets(tier: Tier, unix_sockets: &[UnixSocketGrant]) -> bool {
+    matches!(tier, Tier::Native) && !unix_sockets.is_empty()
 }
 
 /// Whether the confined process is the one that creates this §6 grant's
@@ -1304,6 +1315,17 @@ mod tests {
             error.to_string().contains("parent directory and leaf"),
             "{error}"
         );
+    }
+
+    /// The Linux §6 refusal's decision, on every platform: only a workload
+    /// (Native) holding at least one socket grant is refused.
+    #[test]
+    fn only_a_workload_holding_socket_grants_is_the_linux_refusal_case() {
+        let grants = [UnixSocketGrant::connect("/run/llo/s.sock")];
+        assert!(workload_declares_unix_sockets(Tier::Native, &grants));
+        assert!(!workload_declares_unix_sockets(Tier::Native, &[]));
+        assert!(!workload_declares_unix_sockets(Tier::MicroVm, &grants));
+        assert!(!workload_declares_unix_sockets(Tier::MicroVm, &[]));
     }
 
     /// Every branch of the decision, on every platform: the mutation slice

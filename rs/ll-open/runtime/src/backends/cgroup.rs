@@ -19,7 +19,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{CeilingMechanism, EnforcedCeilings, ExecutionError, ResourceLimits};
 
@@ -39,8 +39,14 @@ mod platform;
 mod platform;
 use platform::filesystem_magic;
 
-/// How long teardown waits for `cgroup.kill` to empty the run's cgroup.
-const KILL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The pause between two reads of `cgroup.events` while teardown waits for
+/// `cgroup.kill` to empty the run's cgroup.
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How many pauses teardown takes before it reports a cgroup that will not
+/// empty: 1000 × 5 ms, five seconds. Counted in polls rather than measured
+/// on a clock, so the wait is a number the tests can observe exactly.
+const KILL_POLLS: u32 = 1000;
 
 /// An operator-delegated cgroup v2 directory, and which of the controllers
 /// LLO uses it delegates to its children.
@@ -145,7 +151,6 @@ impl CgroupRoot {
             path,
             removed: false,
             stand_in: self.stand_in,
-            kill_timeout: KILL_TIMEOUT,
         };
         let ResourceLimits {
             wall_time_ms: _,
@@ -180,9 +185,6 @@ pub struct RunCgroup {
     path: PathBuf,
     removed: bool,
     stand_in: bool,
-    /// How long teardown waits for the cgroup to empty; [`KILL_TIMEOUT`]
-    /// except in the unit tests, which shorten it.
-    kill_timeout: Duration,
 }
 
 impl RunCgroup {
@@ -200,9 +202,17 @@ impl RunCgroup {
     }
 
     /// Kill everything in the cgroup, wait until it is empty, and remove it.
-    pub fn remove(mut self) -> Result<(), ExecutionError> {
+    pub fn remove(self) -> Result<(), ExecutionError> {
+        // The production pause only spaces the polls in real time; how many
+        // there are, and every outcome, is decided by `KILL_POLLS`.
+        self.remove_pausing(&|| std::thread::sleep(POLL_INTERVAL))
+    }
+
+    /// [`Self::remove`] with the pause between polls supplied by the caller,
+    /// so a test observes how many times teardown waited instead of how long.
+    fn remove_pausing(mut self, pause: &dyn Fn()) -> Result<(), ExecutionError> {
         self.removed = true;
-        remove_run_cgroup(&self.path, self.stand_in, self.kill_timeout)
+        remove_run_cgroup(&self.path, self.stand_in, pause)
     }
 
     fn write(&self, file: &str, value: &str) -> Result<(), ExecutionError> {
@@ -234,16 +244,14 @@ impl RunCgroup {
 impl Drop for RunCgroup {
     fn drop(&mut self) {
         if !self.removed {
-            let _ = remove_run_cgroup(&self.path, self.stand_in, self.kill_timeout);
+            let _ = remove_run_cgroup(&self.path, self.stand_in, &|| {
+                std::thread::sleep(POLL_INTERVAL)
+            });
         }
     }
 }
 
-fn remove_run_cgroup(
-    path: &Path,
-    stand_in: bool,
-    kill_timeout: Duration,
-) -> Result<(), ExecutionError> {
+fn remove_run_cgroup(path: &Path, stand_in: bool, pause: &dyn Fn()) -> Result<(), ExecutionError> {
     if !path.exists() {
         return Ok(());
     }
@@ -258,7 +266,7 @@ fn remove_run_cgroup(
     // A cgroup can be removed only once it holds no process. `cgroup.events`
     // reports `populated 0` when the kill has finished.
     let events = path.join("cgroup.events");
-    let deadline = Instant::now() + kill_timeout;
+    let mut pauses_left = KILL_POLLS;
     while events.exists() {
         let populated = fs::read_to_string(&events)
             .map(|text| text.lines().any(|line| line == "populated 1"))
@@ -266,13 +274,14 @@ fn remove_run_cgroup(
         if !populated {
             break;
         }
-        if Instant::now() >= deadline {
+        if pauses_left == 0 {
             return Err(ExecutionError::backend(format!(
                 "run cgroup {} still holds processes after cgroup.kill",
                 path.display()
             )));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        pauses_left -= 1;
+        pause();
     }
     // cgroupfs removes a cgroup with `rmdir` while its control files are
     // still listed: they are not removable entries. The stand-in's files are.
@@ -438,16 +447,35 @@ mod tests {
         }
     }
 
-    /// A stand-in run cgroup the test lays out by hand, with a short kill
-    /// timeout so the waiting paths are observable in milliseconds.
+    /// A stand-in run cgroup the test lays out by hand.
     fn stand_in_run(dir: &Path) -> RunCgroup {
         fs::create_dir_all(dir).expect("run dir");
         RunCgroup {
             path: dir.to_path_buf(),
             removed: false,
             stand_in: true,
-            kill_timeout: Duration::from_millis(300),
         }
+    }
+
+    /// Tear `run` down with a pause that takes no time and counts itself,
+    /// calling `on_pause` with the pause's number (1-based). A teardown that
+    /// pauses past its budget panics instead of looping, so a broken
+    /// countdown fails rather than hangs.
+    fn remove_counting(
+        run: RunCgroup,
+        on_pause: impl Fn(u32),
+    ) -> (Result<(), ExecutionError>, u32) {
+        let pauses = std::cell::Cell::new(0u32);
+        let result = run.remove_pausing(&|| {
+            let count = pauses.get() + 1;
+            assert!(
+                count <= KILL_POLLS,
+                "teardown paused past its {KILL_POLLS}-poll budget"
+            );
+            pauses.set(count);
+            on_pause(count);
+        });
+        (result, pauses.get())
     }
 
     #[test]
@@ -483,32 +511,57 @@ mod tests {
         fs::write(run.path().join("cgroup.kill"), "").expect("kill file");
         fs::write(run.path().join("cgroup.events"), "populated 0\nfrozen 0\n").expect("events");
         let path = run.path().to_path_buf();
-        let started = Instant::now();
-        run.remove().expect("an empty cgroup is removed");
+        let (result, pauses) = remove_counting(run, |_| {});
+        result.expect("an empty cgroup is removed");
         assert!(!path.exists());
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "an already-empty cgroup is removed without waiting out the timeout"
+        assert_eq!(
+            pauses, 0,
+            "an already-empty cgroup is removed without waiting"
         );
     }
 
-    /// Teardown gives the kill its whole timeout before reporting a cgroup
-    /// that is still populated: it neither gives up at the first poll nor
-    /// polls forever. (That a cgroup emptying mid-wait is then removed is
-    /// observed against a real kernel, `tests/native_cgroup.rs`.)
+    /// The production `remove` (real pause) on paths that never wait: an
+    /// empty cgroup goes, and a refused kill is reported.
     #[test]
-    fn teardown_reports_a_cgroup_that_never_empties_after_its_timeout() {
+    fn the_production_teardown_removes_an_empty_cgroup() {
         let dir = tempfile::tempdir().expect("dir");
         let run = stand_in_run(&dir.path().join("run"));
-        let timeout = run.kill_timeout;
+        fs::write(run.path().join("cgroup.events"), "populated 0\n").expect("events");
+        let path = run.path().to_path_buf();
+        run.remove().expect("removed");
+        assert!(!path.exists());
+    }
+
+    /// A cgroup the kill empties partway through the wait is removed at the
+    /// first poll that sees it empty. Here the "kernel" empties it during the
+    /// third pause, so teardown pauses exactly three times.
+    #[test]
+    fn teardown_removes_a_cgroup_the_kill_empties_mid_wait() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
+        let events = run.path().join("cgroup.events");
+        fs::write(&events, "populated 1\n").expect("events");
+        let path = run.path().to_path_buf();
+        let (result, pauses) = remove_counting(run, |pause| {
+            if pause == 3 {
+                fs::write(&events, "populated 0\n").expect("empty");
+            }
+        });
+        result.expect("removed once the kill has emptied it");
+        assert_eq!(pauses, 3);
+        assert!(!path.exists());
+    }
+
+    /// Teardown pauses exactly its whole budget before reporting a cgroup
+    /// that stays populated: it neither gives up early nor polls forever.
+    #[test]
+    fn teardown_reports_a_cgroup_that_never_empties_after_its_whole_budget() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = stand_in_run(&dir.path().join("run"));
         fs::write(run.path().join("cgroup.events"), "populated 1\n").expect("events");
-        let started = Instant::now();
-        let error = run.remove().expect_err("still populated");
-        assert!(
-            started.elapsed() >= timeout,
-            "gave up after {:?}, before the {timeout:?} timeout",
-            started.elapsed()
-        );
+        let (result, pauses) = remove_counting(run, |_| {});
+        let error = result.expect_err("still populated");
+        assert_eq!(pauses, KILL_POLLS, "the whole budget, then the refusal");
         assert!(
             error.detail.contains("still holds processes"),
             "{}",

@@ -415,7 +415,7 @@ pub fn capabilities_from_manifest(
         // the live-guest test). One literal leaf, never the parent directory:
         // the VMM may create this socket and nothing beside it.
         #[cfg(target_os = "macos")]
-        if matches!(tier, Tier::MicroVm) && grant.permits_bind() && !path.ends_with('/') {
+        if vmm_creates_socket(tier, grant) {
             capabilities = capabilities
                 .platform_rule(socket_create_rule(Path::new(path))?)
                 .map_err(nono_error)?;
@@ -802,6 +802,21 @@ fn vmm_unix_socket_mode(grant: &UnixSocketGrant) -> UnixSocketMode {
     } else {
         UnixSocketMode::Connect
     }
+}
+
+/// Whether the confined process is the one that creates this §6 grant's
+/// socket node: the microVM VMM, for a grant that binds, on a leaf (a
+/// directory grant names no single node to create, and the tier refuses it
+/// at `vsock_unix_mappings`).
+///
+/// A free function, not inline in `capabilities_from_manifest`, because the
+/// rule it gates is Seatbelt-only: inline under `cfg(target_os = "macos")`,
+/// the decision was compiled out on Linux, where cargo-mutants runs, and its
+/// mutants survived with no test able to reach them. The decision itself is
+/// platform-independent; only the rule it selects is not.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn vmm_creates_socket(tier: Tier, grant: &UnixSocketGrant) -> bool {
+    matches!(tier, Tier::MicroVm) && grant.permits_bind() && !grant.path().ends_with('/')
 }
 
 /// The Seatbelt rule letting the VMM create the socket node `bind(2)` makes at
@@ -1289,6 +1304,50 @@ mod tests {
             error.to_string().contains("parent directory and leaf"),
             "{error}"
         );
+    }
+
+    /// Every branch of the decision, on every platform: the mutation slice
+    /// runs on Linux, where the Seatbelt rule it gates is compiled out.
+    #[test]
+    fn only_the_microvm_vmm_creates_a_bound_leaf_socket() {
+        let leaf = "/run/llo/s.sock";
+        // MicroVm + bind + leaf: the one case that creates the node.
+        assert!(vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::bind(leaf)
+        ));
+        assert!(vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::connect_bind(leaf)
+        ));
+        // Native + bind + leaf: the workload binds, not a VMM.
+        assert!(!vmm_creates_socket(
+            Tier::Native,
+            &UnixSocketGrant::bind(leaf)
+        ));
+        assert!(!vmm_creates_socket(
+            Tier::Native,
+            &UnixSocketGrant::connect_bind(leaf)
+        ));
+        // MicroVm + connect only + leaf: nothing is bound, so nothing created.
+        assert!(!vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::connect(leaf)
+        ));
+        // MicroVm + bind + directory: no single node to create.
+        assert!(!vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::bind("/run/llo/")
+        ));
+        assert!(!vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::connect_bind("/run/llo/")
+        ));
+        // Native + connect + directory: false on every axis.
+        assert!(!vmm_creates_socket(
+            Tier::Native,
+            &UnixSocketGrant::connect("/run/llo/")
+        ));
     }
 
     /// The microVM VMM binds a `bind` grant's socket, so its profile carries

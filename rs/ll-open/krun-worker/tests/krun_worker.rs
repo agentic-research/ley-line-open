@@ -49,9 +49,13 @@ fn request_fixture(cas: &TempDir) -> ExecutionRequest {
         confinement_manifest: None,
         workspaces: Vec::new(),
         limits: ResourceLimits {
-            vcpus: 1,
-            memory_mib: 512,
             wall_time_ms: 10_000,
+            memory: leyline_runtime::MemoryLimits { limit: 512 << 20 },
+            cpu: leyline_runtime::CpuLimits {
+                quota: 100_000,
+                period: 100_000,
+            },
+            ..ResourceLimits::default()
         },
     }
 }

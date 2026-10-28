@@ -335,6 +335,15 @@ pub fn prepare_vm<'api>(
 ) -> Result<PreparedVm<'api>, ExecutionError> {
     let rootfs = CString::new(config.rootfs.canonical_path.as_os_str().as_bytes())
         .map_err(|_| ExecutionError::invalid("rootfs host path contains an interior NUL byte"))?;
+    // `compile_plan` writes zero for a ceiling the hypervisor cannot size,
+    // and the supervisor refuses such a request before this worker exists.
+    // Refused again here so an unsized VM is never configured with whatever
+    // libkrun would make of zero.
+    if config.vcpus == 0 || config.ram_mib == 0 {
+        return Err(ExecutionError::invalid(
+            "the microVM needs whole vCPUs (cpu.quota / cpu.period) and whole MiB (memory.limit)",
+        ));
+    }
     let context = api.create_context()?;
     let vm = PreparedVm {
         api,
@@ -381,6 +390,13 @@ pub fn prepare_vm<'api>(
     // the host may reach, and its absence would mean all of them. Unconditional
     // here so that enabling hijacking can never also silently publish every
     // port the guest happens to bind.
+    //
+    // "Decides" needs LLO libkrun patch 0008. Upstream's TSI proxy used the
+    // map only to rename ports: an unmapped listen was bound anyway, at the
+    // guest's requested address, and only the VMM's own nono profile stood in
+    // the way — which on Seatbelt a §4 grant opens for every port. With the
+    // patch an unmapped listen is refused (EACCES in the guest) and a mapped
+    // one is bound on loopback (bead ley-line-open-7d4d45).
     api.set_port_map(context, &config.port_map)?;
 
     api.set_workdir(context, &config.workdir)?;

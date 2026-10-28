@@ -503,14 +503,17 @@ pub fn prepare(
     // comment ever disagree again, trust the code and fix the comment in the
     // same commit that changed it.
     //
-    // VERIFIED BY READING, NOT YET BY RUNNING: cloister executed the fold up
-    // to the folded §4 grant (then single-valued), but no live microVM has
-    // exercised port_map delivery or the tsi refusal below — macOS has no
-    // libkrun to run and CI has no KVM. `libkrun_guest_listener.rs` is the
-    // test that does it — it self-skips via `hypervisor_or_skip()` when no
-    // hypervisor is present, so it runs green-by-vacuity everywhere but real
-    // Linux hardware. Run it there before calling the guest-listener path
-    // proven.
+    // RUN ON A LIVE GUEST (macOS/HVF, bead ley-line-open-7d4d45):
+    // `krun-worker/tests/libkrun_guest_listener.rs` declares two listeners,
+    // reaches both from the host, and fails to reach a third the guest binds.
+    // Running it found that libkrun's port map limited nothing — an unmapped
+    // guest listen was bound at the guest's own address, and on Seatbelt a §4
+    // grant gives the VMM an unqualified `network-bind` — so every guest
+    // listener, on every host interface, was published. LLO libkrun patch
+    // 0008 makes the map the complete list (unmapped: EACCES to the guest)
+    // and binds mapped ports on loopback. The tests skip without a hypervisor
+    // (`LEYLINE_REQUIRE_HYPERVISOR` makes that a failure); a Linux/KVM run is
+    // still owed.
     //
     // Since ley-line-open-e2c33f, §4 is a list: every declared listener maps
     // `N:N`, through the pure `guest_port_map` so the refusal and the mapping

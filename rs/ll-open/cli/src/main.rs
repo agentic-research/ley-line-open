@@ -124,6 +124,19 @@ enum Cmd {
         #[arg(long)]
         tsi_hijack_inet: bool,
 
+        /// A delegated cgroup v2 directory the native backend creates each
+        /// run's cgroup in (Linux only).
+        ///
+        /// With it, the native tier enforces OCI `memory.limit`, `cpu.quota`
+        /// /`cpu.period` and `pids.limit` for every controller the directory's
+        /// `cgroup.subtree_control` enables. Without it, the native tier
+        /// enforces the wall clock only, and a grant carrying any of those
+        /// ceilings is refused by name. The daemon must be able to move its
+        /// workers into it: a systemd unit with `Delegate=yes`, naming a child
+        /// of its own cgroup, satisfies that. Native backend only.
+        #[arg(long)]
+        cgroup_root: Option<PathBuf>,
+
         /// Activate or resume the private CDC index.
         #[arg(long, default_value_t = false)]
         cdc: bool,
@@ -364,6 +377,7 @@ async fn main() -> Result<()> {
             runtime_files,
             ready_timeout_ms,
             tsi_hijack_inet,
+            cgroup_root,
             cdc,
             cdc_target,
             allow_unverified_evidence,
@@ -439,6 +453,16 @@ async fn main() -> Result<()> {
                                 ready_timeout: Duration::from_millis(ready_timeout_ms),
                             },
                         );
+                    // A root that is not a cgroup v2 directory is a startup
+                    // error, not a silent fall back to wall-clock-only.
+                    let backend = match &cgroup_root {
+                        Some(path) => backend.with_cgroup_root(
+                            leyline_runtime::backends::cgroup::CgroupRoot::open(path).map_err(
+                                |error| anyhow::anyhow!("--cgroup-root: {}", error.detail),
+                            )?,
+                        ),
+                        None => backend,
+                    };
                     let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::Native,
@@ -461,6 +485,11 @@ async fn main() -> Result<()> {
                     .await
                 }
                 ExecutionBackendKind::MicroVm => {
+                    if cgroup_root.is_some() {
+                        bail!(
+                            "--cgroup-root requires --backend native; the microVM's ceilings are the hypervisor's"
+                        );
+                    }
                     if devices.iter().any(|path| !path.exists()) {
                         bail!("all --device paths must exist");
                     }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
@@ -202,20 +202,27 @@ impl TsiStreamProxy {
             return 0;
         }
 
+        // A configured port map is the complete list of guest listeners the
+        // host may reach: a mapped port is published on the host's loopback
+        // interface at its host port, and an unmapped one is refused. Without
+        // a map (krun_set_port_map never called) every guest listener is
+        // published at the address the guest asked for, as before.
         let addr: SockaddrStorage = if let Some(port_map) = host_port_map {
             if let Some(sin) = req.addr.as_sockaddr_in() {
                 debug!("sockaddr is ipv4");
                 if let Some(port) = port_map.get(&sin.port()) {
-                    SocketAddrV4::new(sin.ip(), *port).into()
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port).into()
                 } else {
-                    req.addr
+                    warn!("listen: guest port {} is not in the port map", sin.port());
+                    return -libc::EACCES;
                 }
             } else if let Some(sin6) = req.addr.as_sockaddr_in6() {
                 debug!("sockaddr is ipv6");
                 if let Some(port) = port_map.get(&sin6.port()) {
-                    SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.flowinfo()).into()
+                    SocketAddrV6::new(Ipv6Addr::LOCALHOST, *port, 0, 0).into()
                 } else {
-                    req.addr
+                    warn!("listen: guest port {} is not in the port map", sin6.port());
+                    return -libc::EACCES;
                 }
             } else if req.addr.as_unix_addr().is_some() {
                 debug!("sockaddr is unix");

@@ -5,7 +5,7 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-10-26, at integration `ac742873` (latest tag v0.20.5).
+Last updated: 2026-10-26, at integration `c9577606` (latest tag v0.20.5; v0.21.0 is the release candidate).
 
 ## v1.0: single host, portable
 
@@ -38,7 +38,9 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 
 **Next**
 - `0fadab` — cut v0.21.0 from integration and hand mache the upgrade note
-  (release train `5de852`).
+  (release train `5de852`). The fix for silent loss with two writers on one
+  host NFS mount it waited for landed in #485 (`3889ec`); crates are not
+  published for v0.21.0 (publish-crates runs only by hand).
 - `18bfdd` — group commit: writes that land close together become one proposal,
   one parse pass, one durable flush and one publish, with each file keeping its
   own base, merge and `ESTALE`.
@@ -139,7 +141,7 @@ an ordinary repository to git, CI, review, editors and build tools.
 - **Upstream libkrun** (`10feaa`): submit LLO's seven patches to
   containers/libkrun, on the owner's go-ahead.
 
-## Shipped in the 0.21.0 cycle (integration)
+## Shipped in the 0.21.0 cycle (release candidate; crates not published)
 
 | PR | Change | Bead |
 |---|---|---|

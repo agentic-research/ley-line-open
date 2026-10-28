@@ -277,9 +277,8 @@ mod tests {
             confinement_manifest: None,
             workspaces: Vec::new(),
             limits: ResourceLimits {
-                vcpus: 1,
-                memory_mib: 64,
                 wall_time_ms: 1_000,
+                ..ResourceLimits::default()
             },
         }
     }

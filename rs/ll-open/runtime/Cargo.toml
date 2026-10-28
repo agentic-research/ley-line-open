@@ -1,6 +1,6 @@
 [package]
 name = "leyline-runtime"
-version = "0.20.5"
+version = "0.21.0"
 edition = "2024"
 description = "Capability-resolved execution lifecycle and isolation backends for Leyline"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -18,13 +18,13 @@ base64 = "0.22"
 blake3 = { workspace = true }
 capnp = { workspace = true }
 capnp-json = { workspace = true }
-leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.20.5" }
+leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.21.0" }
 libc = { workspace = true }
-leyline-core = { path = "../../ll-core/core", version = "0.20.5" }
-leyline-envelope = { path = "../envelope", version = "0.20.5" }
+leyline-core = { path = "../../ll-core/core", version = "0.21.0" }
+leyline-envelope = { path = "../envelope", version = "0.21.0" }
 # The ADR-012 canonical kid of each operator trust key. Features match
 # leyline-envelope's pin: `ffi` off, `root-signer` on.
-leyline-sign = { path = "../sign", version = "0.20.5", default-features = false, features = ["root-signer"] }
+leyline-sign = { path = "../sign", version = "0.21.0", default-features = false, features = ["root-signer"] }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

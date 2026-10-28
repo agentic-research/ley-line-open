@@ -8,8 +8,11 @@ substrate-side runner. If your enforcement engine consumes a
 conformance vectors in `test-vectors/`, you're conformant.
 
 **Non-goals:** v1 does NOT cover eBPF-level syscall filtering, seccomp
-profile authorship, gVisor / kata runtime selection, cgroup CPU/memory
-limits, or per-syscall audit logging. Those are v2+ surfaces.
+profile authorship, gVisor / kata runtime selection, or per-syscall audit
+logging. Those are v2+ surfaces. Resource ceilings (OCI `linux.resources`
+memory, CPU and pids) are not a confinement dimension: they are
+`execution/v1` `ResourceLimits`, carried by the signed `RunGrant.limits`
+(ADR-0035, "OCI resources on execution/v1").
 
 ## What this capability is
 

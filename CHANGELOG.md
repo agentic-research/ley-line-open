@@ -10,8 +10,143 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-26
+
+**Security:** on the microVM tier, a grant declaring any `confinement/v1`
+§4 listener published every port the guest listened on, on every host
+interface. libkrun patch 0008 makes the port map the complete list: an
+undeclared listen fails in the guest with `EACCES`, and a declared one is
+bound on loopback. Upgrade from any earlier release that grants §4 ports.
+
+Many agents, one store. The store is a git-shaped tree that holds any bytes
+with git modes, symlinks and empty directories, and a save whose base moved
+merges three ways with what landed since it was read. Agents work through an
+ordinary filesystem: a libkrun microVM over the store-backed share, or the
+host mount, which now serves the same storefs core. A guest write costs one
+coalesced publish and one full flush (~17–22 ms, from ~15 s), and build
+output never enters the store. On the host NFS mount, a save made from an
+older read is refused `ESTALE` instead of silently replacing another
+process's edit.
+
+The execution tier hardens for cloister and notme: `leyline-sign` verifies
+notme certificates; `leyline execution-daemon` installs a real evidence
+verifier; the native tier's confinement is proven at the kernel;
+confinement/v1 `port` and `network.connectLocal` take lists; a run carries
+OCI resource limits; the release ships the macOS microVM worker signed with
+the hypervisor entitlement, and a hypervisor-suite receipt gates tagging;
+the execution/v1 schema is published as release assets.
+
+`SCHEMA_VERSION` moves to 0.21.0 with a
+matching `clients/go/leyline-schema/v0.21.0` tag. Crates are not published
+to crates.io for this release.
+
+Breaking changes downstream must absorb:
+
+- **Projection v7.** `_tree (path, mode, blob_hash, mtime, size)` lists every
+  entry the store holds, explicit directories included; `_source` lists only
+  the files the parse projects; `_parse_diagnostics` names each file that did
+  not parse cleanly. A v6 arena is refused at parse open and rebuilt cold.
+- **The `propose` wire.** `base` is required (a blob hash, `"any"` or
+  `"absent"`); `kind` is `replace`, `create`, `delete`, `mkdir` or `rmdir`;
+  `mode` is `100644`, `100755` or `120000`. A clean three-way merge answers
+  `merged`; overlapping edits refuse `stale` with `conflicts` as 0-based,
+  half-open line ranges. New refusal reasons `exists`, `not_empty`,
+  `not_a_directory`, `is_a_directory`; `syntax`, `no_language` and
+  `no_stored_blob` are never sent.
+- **The host mount** serves the store's plain files through storefs; the
+  syntax-node directory view and `leyline serve --language` are removed. The
+  macOS NFS mount is refused below Tahoe 26.7 and Sequoia 15.8 (Apple
+  NFS-client CVE-2026-43686 and CVE-2026-84549).
+- **`leyline-runtime`** has no `vmm` feature and links no libkrun; the
+  microVM worker is the unpublished `leyline-krun-worker` crate.
+- **execution/v1:** a workspace grant whose `expectedGeneration` is nonzero is
+  refused before the run starts. `ResourceLimits` is OCI `linux.resources`
+  (`memory.limit`, `cpu.quota`/`cpu.period`, `pids.limit`); `memoryBytes` and
+  `cpuMillis` are removed and refused by name, and clients check
+  `cloister/execution/v1/resource-limits` version `2` before `start`.
+- **`treeRoot`** covers modes and empty directories, so a cloister grant whose
+  `graphRoot` predates ADR-0045 over such a tree no longer matches; re-derive
+  it from the daemon's `read_source` `tree_root`.
+- **Derived paths** (`target/`, `node_modules/`, `.venv/`, `.git/`, `._*`,
+  `.gitignore` matches) are never proposals; they live in per-run or
+  per-mount-session scratch.
+
+### Security
+
+- **The microVM tier publishes exactly the declared §4 listeners, on
+  loopback** (bead `ley-line-open-7d4d45`). A grant declaring one or more
+  `confinement/v1` §4 listeners on the libkrun tier published EVERY port the
+  guest listened on, on every host interface. libkrun's TSI port map renamed
+  ports and limited none — an unmapped guest listen was bound at the guest's
+  requested address — and on macOS the VMM's Seatbelt profile grants
+  `network-bind` for all ports once one is granted, so nothing else stood in
+  the way. LLO libkrun patch 0008 makes a configured map the complete list:
+  an undeclared listen fails in the guest with `EACCES`, and a declared one
+  is bound on `127.0.0.1`/`::1`, which is what §4 means without an
+  `address`. Found by the new live-guest test
+  `every_declared_guest_listener_is_reachable_and_an_undeclared_one_is_not`.
+  Linux confines the VMM per port with Landlock, so the undeclared-port half
+  did not reach Linux; the loopback half did.
+
 ### Changed
 
+- **Crates are published by hand, never by a tag** (bead
+  `ley-line-open-0fadab`). `.github/workflows/publish-crates.yml` runs on
+  `workflow_dispatch` with a release tag input instead of on every `v*` tag
+  push, so tagging v0.21.0 publishes binaries and the image only. Publishing
+  crates resumes as a deliberate run (bead `ley-line-open-c3e8c6`).
+- **Breaking: execution/v1 resource limits are OCI `linux.resources`**
+  (bead `ley-line-open-da36d2`, ADR-0035 "OCI resources on execution/v1").
+  `ResourceLimits` is now `{wallTimeMs @0, outputBytes @1, memory @2
+  {limit}, cpu @3 {quota, period}, pids @4 {limit}}`: OCI `memory.limit`
+  (bytes), `cpu.quota`/`cpu.period` (microseconds) and `pids.limit`.
+  `memoryBytes` and `cpuMillis` are removed; `cpuMillis` was documented as
+  cumulative CPU time and read as vCPUs × 1000. Zero means no ceiling. The
+  change is in place in v1 (pre-1.0, by decision); the README records the
+  exception to its append-only rule. `EnforcedCeilings` is one mechanism per
+  field (`wallTime`, `outputBytes`, `memory`, `cpu`, `pids`; `vcpus` is
+  gone), and `CeilingMechanism` gains `cgroup`. An old producer is refused,
+  never read as "no ceiling": the JSON carrier refuses `memoryBytes`,
+  `cpuMillis` and any other unknown key in `requestedLimits` or `limits` by
+  name, and a binary `ResourceLimits` in the old layout (four data words, no
+  pointers) with a nonzero `memoryBytes`, `cpuMillis` or `outputBytes` is
+  refused naming that field, as is any nonzero data word past those the
+  reader knows. An old daemon cannot refuse a new client, so
+  `llo_execution_capabilities` now advertises
+  `cloister/execution/v1/resource-limits` at version `2`, and a client must
+  check it before `start`. Consumers that generate from `execution.capnp` or
+  vendor `execution-tools.json` and `canonical-run.json` must regenerate.
+- **Breaking: every ceiling is enforced or refused by name, per tier**
+  (bead `ley-line-open-da36d2`). The microVM tier sizes the guest from
+  `memory.limit` (whole MiB) and `cpu.quota / cpu.period` (whole vCPUs) and
+  requires both; it refuses `pids.limit`. The native tier on Linux enforces
+  memory, CPU bandwidth and pids through a delegated cgroup v2 directory,
+  `execution-daemon --cgroup-root <dir>`: each run gets its own cgroup
+  (`memory.max` with `memory.swap.max=0` and `memory.oom.group=1`,
+  `cpu.max`, `pids.max`), the worker is placed in it before it reads its
+  request, and teardown is `cgroup.kill`. Without the flag, and on macOS
+  (where `setrlimit(RLIMIT_AS)` fails and is the `RLIMIT_RSS` alias), the
+  native tier enforces the wall clock only and refuses the rest.
+  `outputBytes` is refused everywhere. Backends check in `start` as well as
+  the service, so `NativeWorkerBackend::start` no longer accepts a memory
+  ceiling it never applied. Rust API: `SchemaLimits` is removed
+  (`SchemaIntent.requested_limits` is `ResourceLimits`); `ResourceLimits`
+  replaces `vcpus`/`memory_mib` with `memory`/`cpu`/`pids`/`output_bytes`;
+  new `MemoryLimits`, `CpuLimits`, `PidsLimits`, `backends::cgroup`,
+  `NativeWorkerBackend::with_cgroup_root`.
+- **A run is held to the grant's limits, not the spec's request** (bead
+  `ley-line-open-da36d2`). `authorize` checked that `RunGrant.limits`
+  narrows `RunSpec.requestedLimits` and the resolver then built the run from
+  the request, so a grant narrowing memory from 1 GiB to 512 MiB ran at
+  1 GiB. `AuthorizedExecution.limits` carries the grant's ceilings and
+  `CatalogResolver` uses them.
+- **A binary-only release refuses a changed schema-spec contract**
+  (bead `ley-line-open-da36d2`). `tools/verify_release_version.sh` now also
+  compares the schema-spec IDL and conformance vectors with the reused
+  schema tag, so the release carrying this change must publish a new
+  `SCHEMA_VERSION`. `task runtime:test:cgroup` (in `task ci`) runs the
+  cgroup tests against a real kernel on Linux, delegating a cgroup with
+  sudo; it skips on macOS.
 - **The execution/v1 operation names are written once** (bead
   `ley-line-open-6d811a`). `BASE_OP_NAMES` (`daemon::wire`) and the
   `execution` cloister group (`daemon::mcp`) each carried a hand-typed copy
@@ -22,7 +157,6 @@ context, scoping notes, and review history are recoverable.
   `BASE_OP_NAMES` splices it at compile time, the cloister group copies it.
   `server.json`'s `execution` group lists `upstreamNames` in the contract's
   order; the field is a set, and consumers resolve it by name.
-
 - **Breaking: build output and tool state are never proposals** (bead
   `ley-line-open-39998b`, ADR-0045 T9). In a guest run's share and on the
   host mount, a path the store does not hold is derived when a directory
@@ -264,7 +398,73 @@ context, scoping notes, and review history are recoverable.
     merges a moved base. Go bindings regenerated. Move clients of
     `propose` with this release.
 
+
+- **Breaking: execution/v1 carries workspace grants to the backend**
+  (bead `ley-line-open-f210c2`). `AuthorizedExecution.workspaces` and
+  `ExecutionRequest.workspaces` hold each RunGrant `WorkspaceGrant` (name,
+  graph root, expected generation, operations); the catalog resolver
+  carries them, and the service refuses a resolver that changes them
+  (`identity-policy-mismatch`). Both structs gained a field: struct
+  literals outside this repository need `workspaces`. A microVM run granted
+  a workspace is refused (`unsupported-backend`) when the backend has no
+  `WorkspaceShares`, and when it is granted more than one.
+
+- **Breaking (`leyline-storefs`): `Options::ttl` is replaced by
+  `Options::freshness`, `open` returns `Opened`, and WRITE refuses a stale
+  base** (bead `ley-line-open-e650d7`). A WRITE on a handle whose blob base
+  is no longer the path's `_source.content_hash` (another writer changed
+  or deleted the file) answers `ESTALE` and stages nothing, so `write(2)`
+  reports the conflict before any bytes are staged; FLUSH and FSYNC keep
+  their checks for changes that land after the WRITE.
+- **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**
+  (bead `ley-line-open-f1c46f`). `leyline-krun-worker`,
+  `KrunWorkerConfig` and `leyline execution-daemon --backend micro-vm`
+  no longer take a libkrun library path, and the worker refuses
+  `--libkrun`. libkrunfw is still loaded at run time: grant it with
+  `--runtime-file`. `DynamicKrunApi` is replaced by `LinkedKrunApi`.
+  `leyline-runtime` gains a default `vmm` feature that links the VMM and
+  builds the worker; `leyline-cli-lib` and `leyline-cli` turn it off and
+  do not compile libkrun. Consumers that keep default features compile
+  libkrun and need `CC_LINUX` (or `zig` on macOS through this
+  repository's `.cargo/config.toml`). The libkrun guest tests gate on
+  `LEYLINE_LIBKRUNFW_PATH` alone. The unused `libloading` workspace
+  dependency is removed.
+
+- **Breaking: `propose` requires `base`, and `any` is the explicit "no
+  check"** (bead `ley-line-open-5dc3a5`). `ProposedWrite.base` was
+  optional, and an agent that omitted it silently got last-writer-wins.
+  A write without `base` is now refused as a malformed request; an
+  empty or non-hex `base` is refused as `malformed_base`; `any` writes
+  whatever the file holds. The MCP `propose` schema lists `base` as
+  required.
+
+- **Breaking: every `propose` refusal is typed, and a stale one names
+  every file that moved** (bead `ley-line-open-5dc3a5`). The response's
+  `stale {path, expected, current}` is replaced by
+  `refusal {reason, path, moved}`. `reason` is one of `stale`,
+  `outside_grant`, `no_such_file`, `duplicate_path`, `different_roots`,
+  `no_tree_root`, `syntax`, `malformed_base`, `no_stored_blob` and
+  `empty`; `moved` lists `{path, expected, current}` for each moved
+  file, where `stale` named only the first. A response with `ok: false`
+  and no `refusal` is an internal error. In Rust,
+  `source_write::propose` returns a `Refusal` error for each case. The
+  daemon schema (`daemon.capnp`) gains `ProposalRefusal` and the
+  `RefusalReason` enum, the Go bindings are regenerated, and
+  `SCHEMA_VERSION` moves (0.21.0, with this release's Go client tag). Move
+  clients of `propose` with this release.
+
 ### Added
+
+- **Real-guest lifecycle and listener proofs** (beads `ley-line-open-f839c1`,
+  `ley-line-open-17536d`, `ley-line-open-7d4d45`). `krun-worker/tests/
+  libkrun_guest_cancel.rs` starts a blocked guest through
+  `ExecutionService::start_authorized` on `KrunWorkerBackend`, cancels it,
+  collects a `Cancelled` receipt, and checks the VMM process, its process
+  group and the ephemeral rootfs are gone. `libkrun_guest_listener.rs` adds
+  the positive §4 case (two declared ports reached with a byte exchange, a
+  third refused, no answer off loopback) and the §6 vsock sibling. All run
+  under `LEYLINE_REQUIRE_HYPERVISOR=1` against the installed worker and
+  synchronize on guest events only.
 
 - **Releases publish the execution/v1 schema** (bead
   `ley-line-open-6d811a`). Two new release assets, listed in `SHA256SUMS`:
@@ -579,63 +779,17 @@ context, scoping notes, and review history are recoverable.
   `ENOENT`, `EXDEV`, `ENOTEMPTY` and `EINVAL` as `rename(2)` and `rmdir(2)`
   answer them.
 
-### Changed
-
-- **Breaking: execution/v1 carries workspace grants to the backend**
-  (bead `ley-line-open-f210c2`). `AuthorizedExecution.workspaces` and
-  `ExecutionRequest.workspaces` hold each RunGrant `WorkspaceGrant` (name,
-  graph root, expected generation, operations); the catalog resolver
-  carries them, and the service refuses a resolver that changes them
-  (`identity-policy-mismatch`). Both structs gained a field: struct
-  literals outside this repository need `workspaces`. A microVM run granted
-  a workspace is refused (`unsupported-backend`) when the backend has no
-  `WorkspaceShares`, and when it is granted more than one.
-
-- **Breaking (`leyline-storefs`): `Options::ttl` is replaced by
-  `Options::freshness`, `open` returns `Opened`, and WRITE refuses a stale
-  base** (bead `ley-line-open-e650d7`). A WRITE on a handle whose blob base
-  is no longer the path's `_source.content_hash` (another writer changed
-  or deleted the file) answers `ESTALE` and stages nothing, so `write(2)`
-  reports the conflict before any bytes are staged; FLUSH and FSYNC keep
-  their checks for changes that land after the WRITE.
-- **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**
-  (bead `ley-line-open-f1c46f`). `leyline-krun-worker`,
-  `KrunWorkerConfig` and `leyline execution-daemon --backend micro-vm`
-  no longer take a libkrun library path, and the worker refuses
-  `--libkrun`. libkrunfw is still loaded at run time: grant it with
-  `--runtime-file`. `DynamicKrunApi` is replaced by `LinkedKrunApi`.
-  `leyline-runtime` gains a default `vmm` feature that links the VMM and
-  builds the worker; `leyline-cli-lib` and `leyline-cli` turn it off and
-  do not compile libkrun. Consumers that keep default features compile
-  libkrun and need `CC_LINUX` (or `zig` on macOS through this
-  repository's `.cargo/config.toml`). The libkrun guest tests gate on
-  `LEYLINE_LIBKRUNFW_PATH` alone. The unused `libloading` workspace
-  dependency is removed.
-
-- **Breaking: `propose` requires `base`, and `any` is the explicit "no
-  check"** (bead `ley-line-open-5dc3a5`). `ProposedWrite.base` was
-  optional, and an agent that omitted it silently got last-writer-wins.
-  A write without `base` is now refused as a malformed request; an
-  empty or non-hex `base` is refused as `malformed_base`; `any` writes
-  whatever the file holds. The MCP `propose` schema lists `base` as
-  required.
-
-- **Breaking: every `propose` refusal is typed, and a stale one names
-  every file that moved** (bead `ley-line-open-5dc3a5`). The response's
-  `stale {path, expected, current}` is replaced by
-  `refusal {reason, path, moved}`. `reason` is one of `stale`,
-  `outside_grant`, `no_such_file`, `duplicate_path`, `different_roots`,
-  `no_tree_root`, `syntax`, `malformed_base`, `no_stored_blob` and
-  `empty`; `moved` lists `{path, expected, current}` for each moved
-  file, where `stale` named only the first. A response with `ok: false`
-  and no `refusal` is an internal error. In Rust,
-  `source_write::propose` returns a `Refusal` error for each case. The
-  daemon schema (`daemon.capnp`) gains `ProposalRefusal` and the
-  `RefusalReason` enum, the Go bindings are regenerated, and
-  `SCHEMA_VERSION` moves to 0.20.5. Move clients of `propose` with this
-  release.
-
 ### Fixed
+
+- **A §6 `bind` grant on the microVM tier creates its socket on macOS**
+  (bead `ley-line-open-7d4d45`). The VMM's profile carried the socket's
+  `network-bind` but not the `file-write-create` that `bind(2)` needs for
+  the socket node, which nono's library leaves to its caller. libkrun's muxer
+  failed to create the socket, logged a warning, and the declared channel
+  never existed. The VMM now gets `file-write-create` on that one resolved
+  leaf. Proven by the live-guest test
+  `a_declared_unix_socket_reaches_a_guest_vsock_listener_and_nothing_else_does`,
+  which also shows the guest's dial on a `bind` port is reset.
 
 - **The schema-bridge plugins run under their release asset names**
   (bead `ley-line-open-6d811a`). Each plugin picks its output format from

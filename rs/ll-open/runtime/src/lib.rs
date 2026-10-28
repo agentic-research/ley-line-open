@@ -17,15 +17,16 @@ pub mod transport;
 pub use authorization::{
     ArtifactIdentity, AuthorizedExecution, CasDsseEvidenceVerifier, EvidenceBinding, EvidenceField,
     EvidenceRef, EvidenceRejection, EvidenceStore, EvidenceVerifier, GrantSignature,
-    MetadataOnlyEvidenceVerifier, RejectUnverifiedEvidence, SchemaIntent, SchemaLimits,
-    SignedGrant, WorkspaceInput,
+    MetadataOnlyEvidenceVerifier, RejectUnverifiedEvidence, SchemaIntent, SignedGrant,
+    WorkspaceInput,
 };
 pub use catalog::{CatalogBuilder, CatalogResolver};
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
     BackendCapabilities, BackendClass, BackendEvidenceDocument, BackendRun, BackendRunStatus,
-    CeilingMechanism, DigestRef, EnforcedCeilings, ExecutionRequest, ReceiptContext,
-    ResourceLimits, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
-    WorkerChannel, WorkspaceGrant, WorkspaceOperation,
+    CeilingMechanism, CpuLimits, DEFAULT_CPU_PERIOD_US, DigestRef, EnforcedCeilings,
+    ExecutionRequest, MemoryLimits, PidsLimits, ReceiptContext, ResourceLimits, RunEventRecord,
+    RunInspection, RunReceiptData, RunRecord, RunState, WorkerChannel, WorkspaceGrant,
+    WorkspaceOperation,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

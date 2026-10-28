@@ -369,7 +369,7 @@ pub fn capabilities_from_manifest(
     // at this ABI nor needs to. What this profile carries under MicroVm is
     // the VMM's HOST half of each channel, below.
     #[cfg(target_os = "linux")]
-    if matches!(tier, Tier::Native) && !unix_sockets.is_empty() {
+    if workload_declares_unix_sockets(tier, unix_sockets) {
         return Err(ExecutionError::invalid(format!(
             "confinement/v1 §6 unixSocket.allow is not enforceable by the \
              Landlock ABI this build targets, so the {} declared socket \
@@ -402,6 +402,24 @@ pub fn capabilities_from_manifest(
                 .allow_unix_socket(Path::new(path), mode)
                 .map_err(nono_error)?
         };
+        // On the microVM tier the VMM is the process that binds a `bind`
+        // grant's socket: libkrun's muxer creates it at `path` when the vsock
+        // device activates. `bind(2)` makes a filesystem node, and Seatbelt
+        // checks that as `file-write-create` on the path, separately from the
+        // `network-bind` the socket capability emits. nono's library leaves
+        // that filesystem half to its caller (`emit_unix_socket_rules`: "the
+        // CLI-side sugar in nono-cli auto-registers the fs grant"), so
+        // without this rule the bind is denied, libkrun logs a warning, and
+        // the declared channel silently never exists — a delivered-in-the-
+        // digest, dead-on-the-host grant (bead ley-line-open-7d4d45, found by
+        // the live-guest test). One literal leaf, never the parent directory:
+        // the VMM may create this socket and nothing beside it.
+        #[cfg(target_os = "macos")]
+        if vmm_creates_socket(tier, grant) {
+            capabilities = capabilities
+                .platform_rule(socket_create_rule(Path::new(path))?)
+                .map_err(nono_error)?;
+        }
     }
 
     // §3 egress. nono's CapabilitySet filters by PORT, never by hostname —
@@ -498,7 +516,10 @@ pub fn capabilities_from_manifest(
         // NATIVE tier only: the refusal is about what the WORKLOAD's own
         // profile can express, and under MicroVm the workload's §4 boundary
         // is not this profile at all — it is the guest port map, which
-        // exposes exactly the declared port and nothing else (`worker.rs`).
+        // exposes exactly the declared ports, on loopback, and nothing else
+        // (`worker.rs`). That holds because of LLO libkrun patch 0008: before
+        // it the map only renamed ports, and this profile's unqualified bind
+        // published every guest listener (bead ley-line-open-7d4d45).
         // What this profile carries under MicroVm is the VMM's host half:
         // with hijacking on, the VMM process is what actually binds, so it
         // needs the TCP capability, and Seatbelt's unqualified bind is
@@ -781,6 +802,79 @@ fn vmm_unix_socket_mode(grant: &UnixSocketGrant) -> UnixSocketMode {
     } else {
         UnixSocketMode::Connect
     }
+}
+
+/// Whether the confined process is the WORKLOAD and holds §6 grants — the
+/// case the Linux tier refuses, since Landlock at this ABI cannot mediate a
+/// pathname AF_UNIX socket. Split out for the same reason as
+/// [`vmm_creates_socket`]: inline under `cfg(target_os = "linux")` the
+/// decision was compiled out on macOS, so a mutation run there could not
+/// reach it; the decision is portable, only the refusal is per-platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn workload_declares_unix_sockets(tier: Tier, unix_sockets: &[UnixSocketGrant]) -> bool {
+    matches!(tier, Tier::Native) && !unix_sockets.is_empty()
+}
+
+/// Whether the confined process is the one that creates this §6 grant's
+/// socket node: the microVM VMM, for a grant that binds, on a leaf (a
+/// directory grant names no single node to create, and the tier refuses it
+/// at `vsock_unix_mappings`).
+///
+/// A free function, not inline in `capabilities_from_manifest`, because the
+/// rule it gates is Seatbelt-only: inline under `cfg(target_os = "macos")`,
+/// the decision was compiled out on Linux, where cargo-mutants runs, and its
+/// mutants survived with no test able to reach them. The decision itself is
+/// platform-independent; only the rule it selects is not.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn vmm_creates_socket(tier: Tier, grant: &UnixSocketGrant) -> bool {
+    matches!(tier, Tier::MicroVm) && grant.permits_bind() && !grant.path().ends_with('/')
+}
+
+/// The Seatbelt rule letting the VMM create the socket node `bind(2)` makes at
+/// `path`: `file-write-create` on that one literal, resolved path.
+///
+/// The socket does not exist yet (libkrun refuses a `listen` mapping whose
+/// path exists), so the parent is canonicalized and the leaf re-appended —
+/// the same anchoring nono applies to the socket capability itself, so both
+/// rules name the path Seatbelt will see (`/private/var/...`, not `/var/...`).
+/// A path Seatbelt's string syntax would need escaping for is refused rather
+/// than escaped: it cannot come from a canonical host path an issuer would
+/// sign, and a mis-escaped literal is a rule naming some other path.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn socket_create_rule(path: &Path) -> Result<String, ExecutionError> {
+    let resolved = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+                return Err(ExecutionError::invalid(format!(
+                    "confinement/v1 §6 socket path {} has no parent directory and leaf",
+                    path.display()
+                )));
+            };
+            parent
+                .canonicalize()
+                .map_err(|error| {
+                    ExecutionError::invalid(format!(
+                        "confinement/v1 §6 socket directory {}: {error}",
+                        parent.display()
+                    ))
+                })?
+                .join(leaf)
+        }
+    };
+    let text = resolved.to_str().ok_or_else(|| {
+        ExecutionError::invalid(format!(
+            "confinement/v1 §6 socket path {} is not UTF-8",
+            resolved.display()
+        ))
+    })?;
+    if text.contains(['"', '\\']) {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1 §6 socket path {text:?} contains a quote or backslash, \
+             which a Seatbelt literal would have to escape"
+        )));
+    }
+    Ok(format!("(allow file-write-create (literal \"{text}\"))"))
 }
 
 /// A guest-vsock-port ↔ host-UNIX-socket pairing `prepare_vm` hands to
@@ -1166,5 +1260,166 @@ mod tests {
             error.to_string().contains("allowHosts"),
             "the refusal must name the dimension: {error}"
         );
+    }
+
+    /// The rule names the path Seatbelt will see: an existing path resolves
+    /// through its symlinks, and a socket not yet bound (the case that
+    /// matters: libkrun refuses a listen mapping whose path exists) anchors
+    /// its leaf in the canonical parent.
+    #[test]
+    fn the_socket_create_rule_names_the_resolved_leaf() {
+        let directory = tempfile::tempdir().expect("socket directory");
+        let canonical = directory
+            .path()
+            .canonicalize()
+            .expect("canonical directory");
+
+        let absent = directory.path().join("s.sock");
+        assert_eq!(
+            socket_create_rule(&absent).expect("an unbound leaf in a real directory"),
+            format!(
+                "(allow file-write-create (literal \"{}\"))",
+                canonical.join("s.sock").display()
+            )
+        );
+
+        let present = directory.path().join("present");
+        std::fs::write(&present, b"").expect("an existing leaf");
+        assert_eq!(
+            socket_create_rule(&present).expect("an existing leaf"),
+            format!(
+                "(allow file-write-create (literal \"{}\"))",
+                canonical.join("present").display()
+            )
+        );
+    }
+
+    #[test]
+    fn the_socket_create_rule_refuses_what_it_cannot_name_exactly() {
+        let directory = tempfile::tempdir().expect("socket directory");
+
+        let error = socket_create_rule(&directory.path().join("absent/s.sock"))
+            .expect_err("a leaf in a directory that does not exist");
+        assert!(error.to_string().contains("socket directory"), "{error}");
+
+        let error = socket_create_rule(&directory.path().join("a\"b.sock"))
+            .expect_err("a quote would end the Seatbelt literal early");
+        assert!(error.to_string().contains("quote or backslash"), "{error}");
+
+        let error = socket_create_rule(&directory.path().join("a\\b.sock"))
+            .expect_err("a backslash is a Seatbelt escape");
+        assert!(error.to_string().contains("quote or backslash"), "{error}");
+
+        let error = socket_create_rule(Path::new("")).expect_err("an empty path names no socket");
+        assert!(
+            error.to_string().contains("parent directory and leaf"),
+            "{error}"
+        );
+    }
+
+    /// The Linux §6 refusal's decision, on every platform: only a workload
+    /// (Native) holding at least one socket grant is refused.
+    #[test]
+    fn only_a_workload_holding_socket_grants_is_the_linux_refusal_case() {
+        let grants = [UnixSocketGrant::connect("/run/llo/s.sock")];
+        assert!(workload_declares_unix_sockets(Tier::Native, &grants));
+        assert!(!workload_declares_unix_sockets(Tier::Native, &[]));
+        assert!(!workload_declares_unix_sockets(Tier::MicroVm, &grants));
+        assert!(!workload_declares_unix_sockets(Tier::MicroVm, &[]));
+    }
+
+    /// Every branch of the decision, on every platform: the mutation slice
+    /// runs on Linux, where the Seatbelt rule it gates is compiled out.
+    #[test]
+    fn only_the_microvm_vmm_creates_a_bound_leaf_socket() {
+        let leaf = "/run/llo/s.sock";
+        // MicroVm + bind + leaf: the one case that creates the node.
+        assert!(vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::bind(leaf)
+        ));
+        assert!(vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::connect_bind(leaf)
+        ));
+        // Native + bind + leaf: the workload binds, not a VMM.
+        assert!(!vmm_creates_socket(
+            Tier::Native,
+            &UnixSocketGrant::bind(leaf)
+        ));
+        assert!(!vmm_creates_socket(
+            Tier::Native,
+            &UnixSocketGrant::connect_bind(leaf)
+        ));
+        // MicroVm + connect only + leaf: nothing is bound, so nothing created.
+        assert!(!vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::connect(leaf)
+        ));
+        // MicroVm + bind + directory: no single node to create.
+        assert!(!vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::bind("/run/llo/")
+        ));
+        assert!(!vmm_creates_socket(
+            Tier::MicroVm,
+            &UnixSocketGrant::connect_bind("/run/llo/")
+        ));
+        // Native + connect + directory: false on every axis.
+        assert!(!vmm_creates_socket(
+            Tier::Native,
+            &UnixSocketGrant::connect("/run/llo/")
+        ));
+    }
+
+    /// The microVM VMM binds a `bind` grant's socket, so its profile carries
+    /// the filesystem half of that bind — on that one leaf, and for nothing
+    /// that only dials. Found by the live-guest §6 test: without the rule
+    /// libkrun's muxer could not create the socket and the declared channel
+    /// never existed (bead ley-line-open-7d4d45).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_microvm_vmm_may_create_exactly_the_sockets_it_binds() {
+        let directory = tempfile::tempdir().expect("socket directory");
+        let canonical = directory
+            .path()
+            .canonicalize()
+            .expect("canonical directory");
+        let run_rootfs = tempfile::tempdir().expect("run rootfs");
+        let creates = |grant: UnixSocketGrant, tier: Tier| -> Vec<String> {
+            let manifest = ConfinementManifest::new()
+                .with_fs_grant(FsGrant::read_write(ATTESTED_RUN_ROOTFS))
+                .and_then(|manifest| manifest.with_unix_socket(grant))
+                .expect("a legal §6 document");
+            capabilities_from_manifest(&manifest, run_rootfs.path(), tier)
+                .expect("compiles on this tier")
+                .platform_rules()
+                .iter()
+                .filter(|rule| rule.contains("file-write-create"))
+                .cloned()
+                .collect()
+        };
+        let socket = directory.path().join("s.sock").display().to_string();
+        let expected = vec![format!(
+            "(allow file-write-create (literal \"{}\"))",
+            canonical.join("s.sock").display()
+        )];
+
+        assert_eq!(
+            creates(UnixSocketGrant::bind(&socket), Tier::MicroVm),
+            expected
+        );
+        assert_eq!(
+            creates(UnixSocketGrant::connect_bind(&socket), Tier::MicroVm),
+            expected
+        );
+        assert!(creates(UnixSocketGrant::connect(bound_endpoint()), Tier::MicroVm).is_empty());
+        // A directory grant names no leaf to create; the tier refuses it at
+        // `vsock_unix_mappings`, and the profile adds nothing for it.
+        let tree = format!("{}/", directory.path().display());
+        assert!(creates(UnixSocketGrant::connect_bind(tree), Tier::MicroVm).is_empty());
+        // On the native tier the confined process is the workload, whose
+        // profile is not this projection.
+        assert!(creates(UnixSocketGrant::connect_bind(&socket), Tier::Native).is_empty());
     }
 }

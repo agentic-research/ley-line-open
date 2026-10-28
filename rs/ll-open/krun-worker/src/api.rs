@@ -381,6 +381,13 @@ pub fn prepare_vm<'api>(
     // the host may reach, and its absence would mean all of them. Unconditional
     // here so that enabling hijacking can never also silently publish every
     // port the guest happens to bind.
+    //
+    // "Decides" needs LLO libkrun patch 0008. Upstream's TSI proxy used the
+    // map only to rename ports: an unmapped listen was bound anyway, at the
+    // guest's requested address, and only the VMM's own nono profile stood in
+    // the way — which on Seatbelt a §4 grant opens for every port. With the
+    // patch an unmapped listen is refused (EACCES in the guest) and a mapped
+    // one is bound on loopback (bead ley-line-open-7d4d45).
     api.set_port_map(context, &config.port_map)?;
 
     api.set_workdir(context, &config.workdir)?;

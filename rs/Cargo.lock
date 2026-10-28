@@ -4800,6 +4800,8 @@ name = "leyline-krun-worker"
 version = "0.20.5"
 dependencies = [
  "blake3",
+ "capnp",
+ "leyline-public-schema",
  "leyline-runtime",
  "libc",
  "libkrun",

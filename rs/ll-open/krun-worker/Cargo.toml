@@ -25,6 +25,10 @@ krun = { package = "libkrun", path = "../../third_party/libkrun/src/libkrun" }
 
 [dev-dependencies]
 blake3 = { workspace = true }
+# The real-guest cancel test builds an execution/v1 RunSpec and RunGrant and
+# starts them through ExecutionService::start_authorized.
+capnp = { workspace = true }
+leyline-public-schema = { path = "../../ll-core/public-schema" }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 wait-timeout = "0.2"

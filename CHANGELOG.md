@@ -10,6 +10,48 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Security
+
+- **The microVM tier publishes exactly the declared §4 listeners, on
+  loopback** (bead `ley-line-open-7d4d45`). A grant declaring one or more
+  `confinement/v1` §4 listeners on the libkrun tier published EVERY port the
+  guest listened on, on every host interface. libkrun's TSI port map renamed
+  ports and limited none — an unmapped guest listen was bound at the guest's
+  requested address — and on macOS the VMM's Seatbelt profile grants
+  `network-bind` for all ports once one is granted, so nothing else stood in
+  the way. LLO libkrun patch 0008 makes a configured map the complete list:
+  an undeclared listen fails in the guest with `EACCES`, and a declared one
+  is bound on `127.0.0.1`/`::1`, which is what §4 means without an
+  `address`. Found by the new live-guest test
+  `every_declared_guest_listener_is_reachable_and_an_undeclared_one_is_not`.
+  Linux confines the VMM per port with Landlock, so the undeclared-port half
+  did not reach Linux; the loopback half did.
+
+### Fixed
+
+- **A §6 `bind` grant on the microVM tier creates its socket on macOS**
+  (bead `ley-line-open-7d4d45`). The VMM's profile carried the socket's
+  `network-bind` but not the `file-write-create` that `bind(2)` needs for
+  the socket node, which nono's library leaves to its caller. libkrun's muxer
+  failed to create the socket, logged a warning, and the declared channel
+  never existed. The VMM now gets `file-write-create` on that one resolved
+  leaf. Proven by the live-guest test
+  `a_declared_unix_socket_reaches_a_guest_vsock_listener_and_nothing_else_does`,
+  which also shows the guest's dial on a `bind` port is reset.
+
+### Added
+
+- **Real-guest lifecycle and listener proofs** (beads `ley-line-open-f839c1`,
+  `ley-line-open-17536d`, `ley-line-open-7d4d45`). `krun-worker/tests/
+  libkrun_guest_cancel.rs` starts a blocked guest through
+  `ExecutionService::start_authorized` on `KrunWorkerBackend`, cancels it,
+  collects a `Cancelled` receipt, and checks the VMM process, its process
+  group and the ephemeral rootfs are gone. `libkrun_guest_listener.rs` adds
+  the positive §4 case (two declared ports reached with a byte exchange, a
+  third refused, no answer off loopback) and the §6 vsock sibling. All run
+  under `LEYLINE_REQUIRE_HYPERVISOR=1` against the installed worker and
+  synchronize on guest events only.
+
 ### Changed
 
 - **The execution/v1 operation names are written once** (bead

@@ -181,9 +181,13 @@ fn main() {{
         confinement_manifest: None,
         workspaces: Vec::new(),
         limits: ResourceLimits {
-            vcpus: 1,
-            memory_mib: 256,
             wall_time_ms: 20_000,
+            memory: leyline_runtime::MemoryLimits { limit: 256 << 20 },
+            cpu: leyline_runtime::CpuLimits {
+                quota: 100_000,
+                period: 100_000,
+            },
+            ..ResourceLimits::default()
         },
     };
 

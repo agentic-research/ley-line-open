@@ -335,6 +335,15 @@ pub fn prepare_vm<'api>(
 ) -> Result<PreparedVm<'api>, ExecutionError> {
     let rootfs = CString::new(config.rootfs.canonical_path.as_os_str().as_bytes())
         .map_err(|_| ExecutionError::invalid("rootfs host path contains an interior NUL byte"))?;
+    // `compile_plan` writes zero for a ceiling the hypervisor cannot size,
+    // and the supervisor refuses such a request before this worker exists.
+    // Refused again here so an unsized VM is never configured with whatever
+    // libkrun would make of zero.
+    if config.vcpus == 0 || config.ram_mib == 0 {
+        return Err(ExecutionError::invalid(
+            "the microVM needs whole vCPUs (cpu.quota / cpu.period) and whole MiB (memory.limit)",
+        ));
+    }
     let context = api.create_context()?;
     let vm = PreparedVm {
         api,

@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::{
-    ExecutionError, ExecutionRequest, ExecutionResolver, ResourceLimits,
-    authorization::{AuthorizedExecution, SchemaLimits, WorkspaceInput},
+    ExecutionError, ExecutionRequest, ExecutionResolver,
+    authorization::{AuthorizedExecution, WorkspaceInput},
     model::DigestRef,
 };
 
@@ -161,7 +161,6 @@ impl ExecutionResolver for CatalogResolver {
                 "execution workspace identity is not present in the trusted catalog",
             ));
         }
-        let limits = resource_limits(authorized.intent.requested_limits)?;
         let request = ExecutionRequest {
             run_id: authorized.run_id.clone(),
             replay_key: authorized.replay_key.clone(),
@@ -170,7 +169,13 @@ impl ExecutionResolver for CatalogResolver {
             arguments: authorized.intent.arguments.clone(),
             public_environment: authorized.intent.public_environment.clone(),
             allowed_egress: authorized.allowed_egress.clone(),
-            limits,
+            // The grant's resolved ceilings, carried and never chosen. Before
+            // this the run was built from `intent.requested_limits`, the
+            // caller's request, so a grant that narrowed memory from 1 GiB to
+            // 512 MiB was checked as narrowing and then ran at 1 GiB. Whether
+            // the selected tier can enforce each one is the backend's check
+            // (`EnforcedCeilings::check`), not a unit conversion here.
+            limits: authorized.limits,
             // Carried, never chosen: this is the digest the grant committed
             // to, forwarded so the supervisor can check the worker's
             // attestation against it. The resolver must not substitute its
@@ -188,40 +193,6 @@ impl ExecutionResolver for CatalogResolver {
         request.validate()?;
         Ok(request)
     }
-}
-
-fn resource_limits(limits: SchemaLimits) -> Result<ResourceLimits, ExecutionError> {
-    if limits.output_bytes != 0 {
-        return Err(ExecutionError::unsupported(
-            "output byte limits are not enforced by the execution backend",
-        ));
-    }
-    // The backend accepts whole vCPUs/MiB. Rounding up would widen the
-    // caller's authorized ceiling (e.g. 1001 millis -> 2 vCPUs), so reject
-    // values that cannot be represented exactly instead.
-    if !limits.cpu_millis.is_multiple_of(1_000) || !limits.memory_bytes.is_multiple_of(1024 * 1024)
-    {
-        return Err(ExecutionError::invalid(
-            "cpu and memory limits must be whole backend units",
-        ));
-    }
-    let vcpus = limits
-        .cpu_millis
-        .checked_div(1_000)
-        .ok_or_else(|| ExecutionError::invalid("cpu limit conversion failed"))?
-        .try_into()
-        .map_err(|_| ExecutionError::invalid("cpu limit exceeds backend capacity"))?;
-    let memory_mib = limits
-        .memory_bytes
-        .checked_div(1024 * 1024)
-        .ok_or_else(|| ExecutionError::invalid("memory limit conversion failed"))?
-        .try_into()
-        .map_err(|_| ExecutionError::invalid("memory limit exceeds backend capacity"))?;
-    Ok(ResourceLimits {
-        vcpus,
-        memory_mib,
-        wall_time_ms: limits.wall_time_ms,
-    })
 }
 
 fn validate_guest_path(value: &str) -> Result<(), ExecutionError> {
@@ -246,6 +217,7 @@ mod tests {
 
     use super::*;
     use crate::authorization::{ArtifactIdentity, SchemaIntent};
+    use crate::{MemoryLimits, ResourceLimits};
 
     #[test]
     fn json_catalog_is_used_to_resolve_a_guest_entrypoint() {
@@ -283,16 +255,25 @@ mod tests {
                 arguments: Vec::new(),
                 public_environment: BTreeMap::new(),
                 workspace_inputs: Vec::new(),
-                requested_limits: SchemaLimits {
-                    wall_time_ms: 1_000,
-                    memory_bytes: 1024 * 1024,
-                    cpu_millis: 1_000,
-                    output_bytes: 0,
+                requested_limits: ResourceLimits {
+                    wall_time_ms: 2_000,
+                    memory: MemoryLimits { limit: 1 << 30 },
+                    ..ResourceLimits::default()
                 },
+            },
+            // The grant narrowed the request on both dimensions.
+            limits: ResourceLimits {
+                wall_time_ms: 1_000,
+                memory: MemoryLimits { limit: 512 << 20 },
+                ..ResourceLimits::default()
             },
             workspaces: Vec::new(),
         };
         let request = resolver.resolve(&authorized).expect("resolve catalog");
         assert_eq!(request.executable, "bin/agent");
+        // The run is held to the grant, not to the caller's request: the
+        // resolver once built limits from `requested_limits`, so a narrowed
+        // grant ran at the requested 1 GiB.
+        assert_eq!(request.limits, authorized.limits);
     }
 }

@@ -1700,6 +1700,9 @@ tasks:
       - task: tier:isolation
       - task: check:all-features
       - task: test
+      # The native tier's cgroup ceilings against a real kernel: Linux CI
+      # only (it delegates a cgroup with sudo); a skip elsewhere.
+      - task: runtime:test:cgroup
       # After `test`: the fixture parses with the debug leyline binary that
       # `test` has already built.
       - task: index:clones:fixture-test

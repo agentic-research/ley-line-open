@@ -384,10 +384,11 @@ impl Fixture {
             confinement_digest: String::new(),
             confinement_manifest: None,
             workspaces: Vec::new(),
+            // The wall clock only: without a delegated cgroup root the native
+            // tier refuses a memory, CPU or pids ceiling (ADR-0035 §4).
             limits: ResourceLimits {
-                vcpus: 1,
-                memory_mib: 256,
                 wall_time_ms: 60_000,
+                ..ResourceLimits::default()
             },
         }
     }

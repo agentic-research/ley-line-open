@@ -570,7 +570,19 @@ fi
 if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then
   if package_changed_in_diff ll-open/runtime; then
     claim_package ll-open/runtime
-    run_slice integration --package leyline-runtime --test-workspace=false
+    # `backends/cgroup.rs` takes the filesystem magic of a cgroup root from a
+    # per-platform file (bead ley-line-open-da36d2): `cgroup_fs_linux.rs`
+    # (`statfs(2)`) or `cgroup_fs_other.rs` (no cgroup v2, so a refusal). A
+    # platform gate is a feature gate cargo-mutants cannot see, so each file
+    # is excluded where it does not compile — there every mutant would build
+    # unchanged and read as a phantom MISSED — and mutated where it does.
+    if [ "$(uname -s)" = Linux ]; then
+        run_slice integration --package leyline-runtime --test-workspace=false \
+            --exclude 'll-open/runtime/src/backends/cgroup_fs_other.rs'
+    else
+        run_slice integration --package leyline-runtime --test-workspace=false \
+            --exclude 'll-open/runtime/src/backends/cgroup_fs_linux.rs'
+    fi
   fi
   # The worker crate (bead ley-line-open-395e43) is the runtime's libkrun half:
   # its api.rs and worker.rs are asserted by its own tests/, which the

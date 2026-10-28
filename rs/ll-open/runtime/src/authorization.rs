@@ -14,7 +14,10 @@ use leyline_core::ContentAddressed;
 use leyline_envelope::{Envelope, VerifyingKey};
 use leyline_public_schema::execution_capnp;
 
-use crate::{BackendClass, ExecutionError, WorkspaceGrant, WorkspaceOperation};
+use crate::{
+    BackendClass, CpuLimits, ExecutionError, MemoryLimits, PidsLimits, ResourceLimits,
+    WorkspaceGrant, WorkspaceOperation,
+};
 
 pub const EXECUTION_SCHEMA_VERSION: &str = "cloister/execution/v1";
 pub const EXECUTION_CAPABILITY: &str = "urn:signet:cap:execute:run";
@@ -528,6 +531,13 @@ pub struct AuthorizedExecution {
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
     pub intent: SchemaIntent,
+    /// The grant's resolved `limits`: the ceilings the run is held to.
+    ///
+    /// Verified to narrow `intent.requested_limits` on every dimension the
+    /// request bounds. The run is built from these, never from the request:
+    /// the request is caller intent, and a grant that narrows it must be the
+    /// value enforced.
+    pub limits: ResourceLimits,
     /// The grant's `workspaces`, each with exactly the operations it
     /// permits. Validated to resolve exactly `intent.workspace_inputs`.
     pub workspaces: Vec<WorkspaceGrant>,
@@ -544,7 +554,7 @@ pub struct SchemaIntent {
     pub arguments: Vec<String>,
     pub public_environment: BTreeMap<String, String>,
     pub workspace_inputs: Vec<WorkspaceInput>,
-    pub requested_limits: SchemaLimits,
+    pub requested_limits: ResourceLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,14 +567,6 @@ pub struct ArtifactIdentity {
 pub struct WorkspaceInput {
     pub name: String,
     pub graph_root: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchemaLimits {
-    pub wall_time_ms: u64,
-    pub memory_bytes: u64,
-    pub cpu_millis: u64,
-    pub output_bytes: u64,
 }
 
 /// Validate and bind serialized execution/v1 `RunSpec` and `RunGrant` values.
@@ -706,7 +708,7 @@ pub fn authorize_with_verifier(
             "RunGrant confinement digest does not match the enforcement policy",
         ));
     }
-    validate_limits(spec.get_requested_limits(), grant.get_limits())?;
+    let limits = validate_limits(spec.get_requested_limits(), grant.get_limits())?;
     let workspaces = validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
     let intent = read_intent(&spec)?;
 
@@ -767,6 +769,7 @@ pub fn authorize_with_verifier(
         backend,
         allowed_egress,
         intent,
+        limits,
         workspaces,
     })
 }
@@ -1060,9 +1063,7 @@ fn read_intent(
             })
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
-    let limits = spec
-        .get_requested_limits()
-        .map_err(|error| ExecutionError::invalid(format!("invalid requestedLimits: {error}")))?;
+    let requested_limits = read_limits(spec.get_requested_limits(), "requestedLimits")?;
 
     Ok(SchemaIntent {
         executable: ArtifactIdentity {
@@ -1072,52 +1073,114 @@ fn read_intent(
         arguments,
         public_environment,
         workspace_inputs,
-        requested_limits: SchemaLimits {
-            wall_time_ms: limits.get_wall_time_ms(),
-            memory_bytes: limits.get_memory_bytes(),
-            cpu_millis: limits.get_cpu_millis(),
-            output_bytes: limits.get_output_bytes(),
-        },
+        requested_limits,
     })
 }
 
+/// Data words `ResourceLimits` defines: `wallTimeMs` and `outputBytes`.
+const RESOURCE_LIMITS_DATA_WORDS: usize = 2;
+
+/// The `ResourceLimits` layout before ADR-0035's OCI amendment: four `UInt64`
+/// data words and no pointers, `{wallTimeMs, memoryBytes, cpuMillis,
+/// outputBytes}`. A reader of the current layout sees word 0 and word 1 (as
+/// `wallTimeMs` and `outputBytes`) and nothing else, with null `memory`,
+/// `cpu` and `pids`: an old message would read as "no ceiling".
+const PRE_OCI_LIMIT_WORDS: [&str; 4] = ["wallTimeMs", "memoryBytes", "cpuMillis", "outputBytes"];
+
+/// Refuse a ceiling struct carrying a value this reader does not decode.
+///
+/// Cap'n Proto lets a reader ignore data beyond the fields it knows, which is
+/// ordinary evolution tolerance everywhere except here: an unread ceiling is
+/// an unenforced one (ADR-0035 §4). Two cases, both refused by name:
+///
+/// - the pre-OCI layout (no pointer section, more data words than this
+///   reader knows), whose `memoryBytes`, `cpuMillis` or `outputBytes` would
+///   otherwise be dropped or misread;
+/// - any other nonzero data word past the known ones, such as a ceiling a
+///   newer producer appended.
+///
+/// A zero word bounds nothing, so it is accepted either way.
+fn refuse_unread_ceilings<'a>(
+    reader: impl capnp::traits::IntoInternalStructReader<'a>,
+    known_words: usize,
+    top_level: bool,
+    field: &str,
+) -> Result<(), ExecutionError> {
+    let raw = reader.into_internal_struct_reader();
+    let data = raw.get_data_section_as_blob();
+    // Only the top-level struct had a pre-OCI layout; the nested ones are new.
+    let pre_oci = top_level
+        && raw.get_pointer_section_size() == 0
+        && data.len() > RESOURCE_LIMITS_DATA_WORDS * 8;
+    let first_word = if pre_oci { 1 } else { known_words };
+    for (word, bytes) in data.chunks_exact(8).enumerate().skip(first_word) {
+        if bytes.iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        return Err(match PRE_OCI_LIMIT_WORDS.get(word).filter(|_| pre_oci) {
+            Some(name) => ExecutionError::invalid(format!(
+                "{field} uses the removed pre-OCI ResourceLimits layout and sets {name}; \
+                 use memory.limit, cpu.quota/cpu.period and outputBytes"
+            )),
+            None => ExecutionError::invalid(format!(
+                "{field} carries a value in data word {word}, which this reader does not \
+                 know; an unread ceiling would be unenforced, so it is refused"
+            )),
+        });
+    }
+    Ok(())
+}
+
+/// Read one execution/v1 `ResourceLimits` into the runtime's OCI-shaped model.
+fn read_limits(
+    limits: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
+    field: &str,
+) -> Result<ResourceLimits, ExecutionError> {
+    let limits =
+        limits.map_err(|error| ExecutionError::invalid(format!("invalid {field}: {error}")))?;
+    refuse_unread_ceilings(limits, RESOURCE_LIMITS_DATA_WORDS, true, field)?;
+    let memory = limits
+        .get_memory()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}.memory: {error}")))?;
+    refuse_unread_ceilings(memory, 1, false, &format!("{field}.memory"))?;
+    let cpu = limits
+        .get_cpu()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}.cpu: {error}")))?;
+    refuse_unread_ceilings(cpu, 2, false, &format!("{field}.cpu"))?;
+    let pids = limits
+        .get_pids()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}.pids: {error}")))?;
+    refuse_unread_ceilings(pids, 1, false, &format!("{field}.pids"))?;
+    let limits = ResourceLimits {
+        wall_time_ms: limits.get_wall_time_ms(),
+        output_bytes: limits.get_output_bytes(),
+        memory: MemoryLimits {
+            limit: memory.get_limit(),
+        },
+        cpu: CpuLimits {
+            quota: cpu.get_quota(),
+            period: cpu.get_period(),
+        },
+        pids: PidsLimits {
+            limit: pids.get_limit(),
+        },
+    };
+    limits
+        .validate()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}: {}", error.detail)))?;
+    Ok(limits)
+}
+
+/// Refuse a grant whose limits widen the spec's request, and return the
+/// grant's limits: the ceilings the run is held to.
 fn validate_limits(
     requested: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
     resolved: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
-) -> Result<(), ExecutionError> {
-    let requested = requested
-        .map_err(|error| ExecutionError::invalid(format!("invalid requestedLimits: {error}")))?;
-    let resolved = resolved
-        .map_err(|error| ExecutionError::invalid(format!("invalid grant limits: {error}")))?;
-    for (name, requested, resolved) in [
-        (
-            "wallTimeMs",
-            requested.get_wall_time_ms(),
-            resolved.get_wall_time_ms(),
-        ),
-        (
-            "memoryBytes",
-            requested.get_memory_bytes(),
-            resolved.get_memory_bytes(),
-        ),
-        (
-            "cpuMillis",
-            requested.get_cpu_millis(),
-            resolved.get_cpu_millis(),
-        ),
-        (
-            "outputBytes",
-            requested.get_output_bytes(),
-            resolved.get_output_bytes(),
-        ),
-    ] {
-        if requested != 0 && (resolved == 0 || resolved > requested) {
-            return Err(ExecutionError::invalid(format!(
-                "grant limit {name} widens the requested limit"
-            )));
-        }
-    }
-    Ok(())
+) -> Result<ResourceLimits, ExecutionError> {
+    let requested = read_limits(requested, "requestedLimits")?;
+    let resolved = read_limits(resolved, "grant limits")?;
+    resolved.narrows(&requested)?;
+    Ok(resolved)
 }
 
 fn validate_workspaces(

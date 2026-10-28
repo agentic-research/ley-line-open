@@ -75,11 +75,25 @@ struct SecretHandle $Traits.doc("Opaque reference to a credential broker entry."
   brokerRef @1 :Text $Traits.doc("Opaque broker reference; never the credential value.");
 }
 
-struct ResourceLimits $Traits.doc("Resolved or requested resource ceilings.") {
-  wallTimeMs   @0 :UInt64 $Traits.doc("Maximum wall-clock runtime in milliseconds; zero means policy default.");
-  memoryBytes  @1 :UInt64 $Traits.doc("Maximum memory in bytes; zero means policy default.");
-  cpuMillis    @2 :UInt64 $Traits.doc("Maximum cumulative CPU time in milliseconds; zero means policy default.");
-  outputBytes  @3 :UInt64 $Traits.doc("Maximum collected output bytes; zero means policy default.");
+struct MemoryLimits $Traits.doc("OCI linux.resources.memory, the subset LLO enforces.") {
+  limit @0 :UInt64 $Traits.doc("OCI memory.limit: maximum memory in bytes; zero means no ceiling.");
+}
+
+struct CpuLimits $Traits.doc("OCI linux.resources.cpu bandwidth: at most quota microseconds of CPU per period.") {
+  quota  @0 :UInt64 $Traits.doc("OCI cpu.quota: CPU microseconds allowed per period; zero means no ceiling.");
+  period @1 :UInt64 $Traits.doc("OCI cpu.period in microseconds; zero means the cgroup v2 default, 100000. Nonzero without a quota is refused.");
+}
+
+struct PidsLimits $Traits.doc("OCI linux.resources.pids.") {
+  limit @0 :UInt64 $Traits.doc("OCI pids.limit: maximum tasks in the run's process tree; zero means no ceiling.");
+}
+
+struct ResourceLimits $Traits.doc("Resolved or requested resource ceilings: OCI linux.resources memory, cpu and pids, plus the LLO-only wall clock and output size. A ceiling the selected tier cannot enforce is refused by name, never accepted silently.") {
+  wallTimeMs  @0 :UInt64       $Traits.doc("Maximum wall-clock runtime in milliseconds; zero means no ceiling requested. LLO-only: OCI does not model it.");
+  outputBytes @1 :UInt64       $Traits.doc("Maximum collected output bytes; zero means no ceiling. LLO-only. Ordinal 1 is deliberate: an old-shape message's memoryBytes decodes here and is refused.");
+  memory      @2 :MemoryLimits $Traits.doc("OCI linux.resources.memory.");
+  cpu         @3 :CpuLimits    $Traits.doc("OCI linux.resources.cpu quota and period.");
+  pids        @4 :PidsLimits   $Traits.doc("OCI linux.resources.pids.");
 }
 
 struct WorkspaceIntent $Traits.doc("Requested logical Graph workspace; carries no host path authority.") {
@@ -135,7 +149,7 @@ struct RunGrant $Traits.doc("Authenticated, resolved execution authority bound t
   capabilities               @7  :List(CapabilityGrant) $Traits.doc("Exact verified grants and interface mappings.");
   confinementDigest          @8  :DigestRef             $Traits.doc("confinement/v1 digest that enforcement must match.");
   backendClass               @9  :BackendClass          $Traits.doc("Required isolation class; callers cannot weaken it.");
-  limits                     @10 :ResourceLimits        $Traits.doc("Resolved ceilings.");
+  limits                     @10 :ResourceLimits        $Traits.doc("Resolved ceilings the run is held to; each may only narrow the spec's requestedLimits.");
   workspaces                 @11 :List(WorkspaceGrant)  $Traits.doc("Resolved Graph authority.");
   allowedEgress              @12 :List(Text)            $Traits.doc("Resolved egress endpoints or capability references.");
   credentialBrokerRefs       @13 :List(Text)            $Traits.doc("Resolved credential brokers; never credential values.");
@@ -174,12 +188,15 @@ enum CeilingMechanism $Traits.doc("How a tier applies one resource ceiling, or t
   unenforced @0 $Traits.doc("This tier does not apply the ceiling; a grant requesting one is rejected, not accepted silently.");
   supervisor @1 $Traits.doc("The supervising process applies it — a deadline it observes and acts on.");
   hypervisor @2 $Traits.doc("The hypervisor applies it at VM configuration time, before the guest runs.");
+  cgroup     @3 $Traits.doc("A cgroup v2 directory the run's whole process tree is placed in before it executes.");
 }
 
-struct EnforcedCeilings $Traits.doc("Which resource ceilings the selected backend actually applied, and by what mechanism. A ceiling means different things under a hypervisor, a cgroup, and a supervisor, so the number alone attests less than it appears to.") {
-  wallTime @0 :CeilingMechanism $Traits.doc("Wall-clock deadline.");
-  vcpus    @1 :CeilingMechanism $Traits.doc("vCPU count.");
-  memory   @2 :CeilingMechanism $Traits.doc("Memory ceiling.");
+struct EnforcedCeilings $Traits.doc("Which resource ceilings the selected backend actually applied, and by what mechanism, one entry per ResourceLimits field. A ceiling means different things under a hypervisor, a cgroup, and a supervisor, so the number alone attests less than it appears to.") {
+  wallTime    @0 :CeilingMechanism $Traits.doc("ResourceLimits.wallTimeMs.");
+  outputBytes @1 :CeilingMechanism $Traits.doc("ResourceLimits.outputBytes.");
+  memory      @2 :CeilingMechanism $Traits.doc("ResourceLimits.memory.limit.");
+  cpu         @3 :CeilingMechanism $Traits.doc("ResourceLimits.cpu quota and period.");
+  pids        @4 :CeilingMechanism $Traits.doc("ResourceLimits.pids.limit.");
 }
 
 struct BackendEvidence $Traits.doc("Implementation and enforcement evidence for the selected backend class.") {

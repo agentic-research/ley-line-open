@@ -48,6 +48,9 @@ pub enum CeilingMechanism {
     /// The hypervisor applies it at VM configuration time, before the guest
     /// runs.
     Hypervisor,
+    /// A cgroup v2 directory the run's whole process tree is placed in before
+    /// it executes (the native tier on Linux, with a delegated root).
+    Cgroup,
 }
 
 impl CeilingMechanism {
@@ -56,53 +59,87 @@ impl CeilingMechanism {
     }
 }
 
-/// The per-ceiling enforcement declaration for one backend.
+/// The per-ceiling enforcement declaration for one backend: one entry per
+/// [`ResourceLimits`] field (ADR-0035, "OCI resources on execution/v1").
 ///
-/// This exists because the two tiers genuinely differ: libkrun applies vCPU
-/// and memory ceilings through `krun_set_vm_config` before the guest starts,
-/// while the native tier's confinement is nono, which mediates capabilities
-/// rather than resources — its `resources` block is enforced by nono's own
-/// supervised CLI runner, not by the library LLO links. A ceiling accepted
-/// where nothing applies it turns the grant into a suggestion and makes the
-/// receipt's attestation false.
+/// This exists because the tiers genuinely differ: libkrun applies vCPU and
+/// memory ceilings through `krun_set_vm_config` before the guest starts; the
+/// native tier on Linux applies memory, CPU bandwidth and pids through a
+/// delegated cgroup v2 directory when the operator names one; and the native
+/// tier on macOS has no mechanism with the right semantics for any of them.
+/// A ceiling accepted where nothing applies it turns the grant into a
+/// suggestion and makes the receipt's attestation false.
+///
+/// Never derive `Default`: every construction site is a full struct literal,
+/// so a new field is a compile error at each tier rather than a silent
+/// `Unenforced` (see `ConfinementManifest::dimensions`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnforcedCeilings {
     pub wall_time: CeilingMechanism,
-    pub vcpus: CeilingMechanism,
+    pub output_bytes: CeilingMechanism,
     pub memory: CeilingMechanism,
+    pub cpu: CeilingMechanism,
+    pub pids: CeilingMechanism,
 }
+
+/// cgroup v2's default `cpu.max` period, which a zero `cpu.period` means.
+pub const DEFAULT_CPU_PERIOD_US: u64 = 100_000;
 
 impl EnforcedCeilings {
     /// A tier whose only ceiling is the supervisor's wall clock — the native
-    /// / nono profile.
+    /// tier on macOS, and on Linux without a delegated cgroup root.
     pub const fn wall_clock_only() -> Self {
         Self {
             wall_time: CeilingMechanism::Supervisor,
-            vcpus: CeilingMechanism::Unenforced,
+            output_bytes: CeilingMechanism::Unenforced,
             memory: CeilingMechanism::Unenforced,
+            cpu: CeilingMechanism::Unenforced,
+            pids: CeilingMechanism::Unenforced,
         }
     }
 
     /// A tier that additionally applies vCPU and memory ceilings at VM
-    /// configuration time — the libkrun profile.
+    /// configuration time — the libkrun profile. Nothing writes the guest's
+    /// cgroups, so `pids` is not enforced.
     pub const fn hypervisor_backed() -> Self {
         Self {
             wall_time: CeilingMechanism::Supervisor,
-            vcpus: CeilingMechanism::Hypervisor,
+            output_bytes: CeilingMechanism::Unenforced,
             memory: CeilingMechanism::Hypervisor,
+            cpu: CeilingMechanism::Hypervisor,
+            pids: CeilingMechanism::Unenforced,
         }
     }
 
-    /// Reject any ceiling `limits` requests that this backend cannot apply.
+    /// Reject any ceiling `limits` requests that this backend cannot apply,
+    /// naming the field (ADR-0035 §4).
     ///
-    /// Zero means "policy default" throughout execution/v1, so only a
-    /// non-zero request can be unenforceable.
-    pub(crate) fn check(&self, limits: &ResourceLimits) -> Result<(), ExecutionError> {
+    /// Zero means "no ceiling" for every field, so only a non-zero request can
+    /// be unenforceable. A mechanism that enforces a dimension may still be
+    /// unable to express a particular value — a hypervisor sizes whole vCPUs
+    /// and whole MiB, a cgroup has a period range — and that is refused here
+    /// too, rather than rounded: rounding up widens the grant, and rounding
+    /// down applies a ceiling nobody authorized.
+    pub fn check(&self, limits: &ResourceLimits) -> Result<(), ExecutionError> {
+        limits.validate()?;
+        // Destructured with no `..`: a new ResourceLimits field is a compile
+        // error here until this check decides what enforces it.
+        let ResourceLimits {
+            wall_time_ms,
+            output_bytes,
+            memory: MemoryLimits {
+                limit: memory_limit,
+            },
+            cpu: CpuLimits { quota, period: _ },
+            pids: PidsLimits { limit: pids_limit },
+        } = *limits;
         for (name, requested, mechanism) in [
-            ("wallTimeMs", limits.wall_time_ms, self.wall_time),
-            ("vcpus", u64::from(limits.vcpus), self.vcpus),
-            ("memoryBytes", u64::from(limits.memory_mib), self.memory),
+            ("wallTimeMs", wall_time_ms, self.wall_time),
+            ("outputBytes", output_bytes, self.output_bytes),
+            ("memory.limit", memory_limit, self.memory),
+            ("cpu.quota", quota, self.cpu),
+            ("pids.limit", pids_limit, self.pids),
         ] {
             if requested != 0 && !mechanism.is_enforced() {
                 return Err(ExecutionError::unsupported(format!(
@@ -110,8 +147,130 @@ impl EnforcedCeilings {
                 )));
             }
         }
+        if self.memory == CeilingMechanism::Hypervisor {
+            limits.memory.hypervisor_ram_mib()?;
+        }
+        match self.cpu {
+            CeilingMechanism::Hypervisor => {
+                limits.cpu.hypervisor_vcpus()?;
+            }
+            CeilingMechanism::Cgroup => {
+                limits.cpu.cgroup_max()?;
+            }
+            CeilingMechanism::Unenforced | CeilingMechanism::Supervisor => {}
+        }
         Ok(())
     }
+}
+
+/// OCI `linux.resources.memory`: the subset LLO enforces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryLimits {
+    /// OCI `memory.limit`, in bytes. Zero means no ceiling.
+    pub limit: u64,
+}
+
+impl MemoryLimits {
+    /// The hypervisor's RAM size for this ceiling, in whole MiB.
+    ///
+    /// `None` when no ceiling is requested; refused when the ceiling is not a
+    /// whole MiB or does not fit `krun_set_vm_config`'s `u32`.
+    pub fn hypervisor_ram_mib(&self) -> Result<Option<u32>, ExecutionError> {
+        const MIB: u64 = 1024 * 1024;
+        if self.limit == 0 {
+            return Ok(None);
+        }
+        if !self.limit.is_multiple_of(MIB) {
+            return Err(ExecutionError::unsupported(
+                "grant limit memory.limit is not a whole MiB, which is the unit the hypervisor sizes the guest in",
+            ));
+        }
+        u32::try_from(self.limit / MIB).map(Some).map_err(|_| {
+            ExecutionError::unsupported(
+                "grant limit memory.limit exceeds what the hypervisor can size",
+            )
+        })
+    }
+}
+
+/// OCI `linux.resources.cpu` bandwidth: at most `quota` microseconds of CPU in
+/// each `period` microseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuLimits {
+    /// OCI `cpu.quota`, in microseconds per period. Zero means no ceiling.
+    pub quota: u64,
+    /// OCI `cpu.period`, in microseconds. Zero means
+    /// [`DEFAULT_CPU_PERIOD_US`].
+    pub period: u64,
+}
+
+impl CpuLimits {
+    /// The period this ceiling is measured over.
+    pub const fn effective_period(&self) -> u64 {
+        if self.period == 0 {
+            DEFAULT_CPU_PERIOD_US
+        } else {
+            self.period
+        }
+    }
+
+    /// The hypervisor's vCPU count for this ceiling.
+    ///
+    /// `None` when no ceiling is requested; refused unless the quota is a
+    /// whole multiple of the period between 1 and 255 vCPUs (`krun_set_vm_config`
+    /// takes a `u8`).
+    pub fn hypervisor_vcpus(&self) -> Result<Option<u8>, ExecutionError> {
+        if self.quota == 0 {
+            return Ok(None);
+        }
+        let period = self.effective_period();
+        if !self.quota.is_multiple_of(period) {
+            return Err(ExecutionError::unsupported(
+                "grant limit cpu.quota is not a whole multiple of cpu.period, and the hypervisor sizes whole vCPUs",
+            ));
+        }
+        // A non-zero quota that is a whole multiple of the period is at least
+        // one period, so the quotient is never zero here.
+        u8::try_from(self.quota / period).map(Some).map_err(|_| {
+            ExecutionError::unsupported(
+                "grant limit cpu.quota exceeds what the hypervisor can size",
+            )
+        })
+    }
+
+    /// The cgroup v2 `cpu.max` line for this ceiling, `"$quota $period"`.
+    ///
+    /// `None` when no ceiling is requested; refused outside the kernel's
+    /// ranges (period 1000..=1000000 µs, quota at least 1000 µs), which the
+    /// kernel would otherwise reject at write time with a bare `EINVAL`.
+    pub fn cgroup_max(&self) -> Result<Option<String>, ExecutionError> {
+        if self.quota == 0 {
+            return Ok(None);
+        }
+        let period = self.effective_period();
+        if !(1_000..=1_000_000).contains(&period) {
+            return Err(ExecutionError::unsupported(
+                "grant limit cpu.period is outside cgroup v2's 1000..=1000000 microseconds",
+            ));
+        }
+        if self.quota < 1_000 {
+            return Err(ExecutionError::unsupported(
+                "grant limit cpu.quota is below cgroup v2's 1000-microsecond minimum",
+            ));
+        }
+        Ok(Some(format!("{} {period}", self.quota)))
+    }
+}
+
+/// OCI `linux.resources.pids`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PidsLimits {
+    /// OCI `pids.limit`: maximum tasks in the run's process tree. Zero means
+    /// no ceiling.
+    pub limit: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,12 +301,74 @@ impl DigestRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// execution/v1 `ResourceLimits`: OCI `linux.resources` memory, cpu and pids,
+/// plus the LLO-only wall clock and output size (ADR-0035, "OCI resources on
+/// execution/v1"). Zero means "no ceiling" for every field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceLimits {
-    pub vcpus: u8,
-    pub memory_mib: u32,
+    /// Maximum wall-clock runtime in milliseconds.
     pub wall_time_ms: u64,
+    /// Maximum collected output bytes. No tier enforces it yet, so a non-zero
+    /// value is refused everywhere.
+    pub output_bytes: u64,
+    pub memory: MemoryLimits,
+    pub cpu: CpuLimits,
+    pub pids: PidsLimits,
+}
+
+impl ResourceLimits {
+    /// Refuse a combination that names no ceiling while looking like one.
+    ///
+    /// A `cpu.period` without a `cpu.quota` is the one: it bounds nothing, and
+    /// ignoring it would be silently accepting a field.
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        if self.cpu.quota == 0 && self.cpu.period != 0 {
+            return Err(ExecutionError::invalid(
+                "cpu.period without cpu.quota names no ceiling",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether `self` is no wider than `requested` on every dimension the
+    /// request bounds. A request of zero bounds nothing; a non-zero request
+    /// requires a non-zero ceiling no larger than it. CPU compares bandwidth,
+    /// `quota / period`, so a grant may restate a ceiling over another period.
+    pub fn narrows(&self, requested: &Self) -> Result<(), ExecutionError> {
+        let ResourceLimits {
+            wall_time_ms,
+            output_bytes,
+            memory,
+            cpu,
+            pids,
+        } = *self;
+        for (name, requested, resolved) in [
+            ("wallTimeMs", requested.wall_time_ms, wall_time_ms),
+            ("outputBytes", requested.output_bytes, output_bytes),
+            ("memory.limit", requested.memory.limit, memory.limit),
+            ("pids.limit", requested.pids.limit, pids.limit),
+        ] {
+            if requested != 0 && (resolved == 0 || resolved > requested) {
+                return Err(ExecutionError::invalid(format!(
+                    "grant limit {name} widens the requested limit"
+                )));
+            }
+        }
+        if requested.cpu.quota != 0 {
+            // resolved.quota / resolved.period <= requested.quota / requested.period,
+            // cross-multiplied in u128 so no product overflows.
+            let widens = cpu.quota == 0
+                || u128::from(cpu.quota) * u128::from(requested.cpu.effective_period())
+                    > u128::from(requested.cpu.quota) * u128::from(cpu.effective_period());
+            if widens {
+                return Err(ExecutionError::invalid(
+                    "grant limit cpu.quota widens the requested limit",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,11 +457,14 @@ impl ExecutionRequest {
         }
         self.rootfs.validate_blake3()?;
         validate_guest_path(&self.executable)?;
-        if self.limits.vcpus == 0 || self.limits.memory_mib == 0 || self.limits.wall_time_ms == 0 {
-            return Err(ExecutionError::invalid(
-                "vcpus, memory_mib, and wall_time_ms must be non-zero",
-            ));
+        // The wall clock is the one ceiling every tier enforces, and the
+        // supervisor needs a deadline. Memory, CPU and pids may be absent: a
+        // tier that requires one (the microVM sizes its guest from memory and
+        // CPU) refuses its absence itself.
+        if self.limits.wall_time_ms == 0 {
+            return Err(ExecutionError::invalid("wall_time_ms must be non-zero"));
         }
+        self.limits.validate()?;
         if !self.allowed_egress.is_empty() {
             return Err(ExecutionError::unsupported(
                 "the configured execution backend does not yet support egress grants",

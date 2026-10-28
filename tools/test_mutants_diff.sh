@@ -288,6 +288,86 @@ if grep -q -- "--exclude ll-open/fs/\*\*.*--features" "$log"; then
     exit 1
 fi
 
+# A diff touching several generic-slice packages that carry enable rows —
+# a release promotion's diff touches most of them. Each package's features
+# must reach only that package's invocation: cargo rejects a `--features`
+# name no SELECTED package declares, and a sharded slice selects only the
+# packages of the mutants in its shard. One invocation carrying the union of
+# every touched package's features (`interrupt,root-signer,hcl,pyproject`)
+# failed every generic shard of the v0.21.0 promotion as BASELINE BROKEN
+# (bead ley-line-open-c1f8bc).
+cat > "$fixture_dir/generic-multi.diff" <<'DIFF'
+diff --git a/ll-core/core/src/lib.rs b/ll-core/core/src/lib.rs
+--- a/ll-core/core/src/lib.rs
++++ b/ll-core/core/src/lib.rs
+diff --git a/ll-open/sign/src/lib.rs b/ll-open/sign/src/lib.rs
+--- a/ll-open/sign/src/lib.rs
++++ b/ll-open/sign/src/lib.rs
+diff --git a/ll-open/ts/src/lib.rs b/ll-open/ts/src/lib.rs
+--- a/ll-open/ts/src/lib.rs
++++ b/ll-open/ts/src/lib.rs
+diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
+--- a/ll-open/vcs/src/lib.rs
++++ b/ll-open/vcs/src/lib.rs
+DIFF
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/generic-multi.diff" generic
+assert_call "mutants .* -C --lib .*--file ll-core/core/\*\* --features interrupt( |\$)" \
+    'leyline-core is mutated alone, with its own feature'
+assert_call "mutants .* -C --lib .*--file ll-open/sign/\*\* --features root-signer( |\$)" \
+    'leyline-sign is mutated alone, with its own feature'
+assert_call "mutants .* -C --lib .*--file ll-open/ts/\*\* --features hcl,pyproject( |\$)" \
+    'leyline-ts is mutated alone, with both of its features'
+# Every feature-carrying generic invocation is confined to one package, and
+# carries only that package's ledger features.
+ledger_rows=$(awk '!/^[[:space:]]*(#|$)/ && $4 == "enable" { print $1, $2 }' \
+    "$repo_root/tools/feature-ledger.txt")
+grep -- ' --features ' "$log" | grep -v -- '--package ' > "$fixture_dir/featured.log" || true
+while IFS= read -r call; do
+    file_glob=$(printf '%s\n' "$call" | sed -n 's/.* --file \([^ ]*\)\/\*\* .*/\1/p')
+    if [ -z "$file_glob" ]; then
+        echo "a generic invocation carries features without naming its package: $call" >&2
+        exit 1
+    fi
+    features=$(printf '%s\n' "$call" | sed -n 's/.* --features \([^ ]*\).*/\1/p')
+    for feature in $(printf '%s' "$features" | tr ',' ' '); do
+        if ! printf '%s\n' "$ledger_rows" | grep -qx "$file_glob $feature"; then
+            echo "$file_glob was handed $feature, which is not its feature: $call" >&2
+            exit 1
+        fi
+    done
+done < "$fixture_dir/featured.log"
+if [ "$(wc -l < "$fixture_dir/featured.log" | tr -d ' ')" -ne 3 ]; then
+    echo 'expected one feature-carrying invocation per featured package:' >&2
+    cat "$fixture_dir/featured.log" >&2
+    exit 1
+fi
+# The rest of the generic slice (ll-open/vcs here) runs once, featureless,
+# with the packages mutated above excluded so no mutant is run twice.
+assert_call "mutants .* -C --lib .*--exclude ll-open/runtime/\*\* .*--exclude ll-core/core/\*\* --exclude ll-open/sign/\*\* --exclude ll-open/ts/\*\*" \
+    'the featureless remainder excludes the packages mutated with their features'
+if grep -- '--exclude ll-core/core/\*\*' "$log" | grep -q -- '--features'; then
+    echo 'the featureless remainder was handed features' >&2
+    exit 1
+fi
+
+# A diff whose generic packages carry no enable rows is unchanged: exactly one
+# featureless generic invocation.
+cat > "$fixture_dir/generic-plain.diff" <<'DIFF'
+diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
+--- a/ll-open/vcs/src/lib.rs
++++ b/ll-open/vcs/src/lib.rs
+DIFF
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/generic-plain.diff" generic
+if [ "$(grep -c -- ' -C --lib ' "$log")" -ne 1 ] || grep -q -- '--features\|--file ' "$log"; then
+    echo 'a diff with no featured package did not run exactly one featureless generic invocation:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+
 # --------------------------------------------------------------------------
 # `list-scopes`: the plan the CI matrix is built from. Runs no cargo.
 # --------------------------------------------------------------------------
@@ -390,3 +470,4 @@ fi
 echo 'diff mutation fixture proved package-specific integration-test routing'
 echo 'diff mutation fixture proved excluded packages must be claimed by a slice'
 echo 'diff mutation fixture proved the fs and storefs slices enable what they mutate'
+echo 'diff mutation fixture proved each generic package is built with its own features'

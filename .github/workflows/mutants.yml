@@ -70,6 +70,8 @@ jobs:
       scopes: ${{ steps.plan.outputs.scopes }}
       any: ${{ steps.plan.outputs.any }}
       allowlist: ${{ steps.scope.outputs.allowlist }}
+      shards: ${{ steps.scope.outputs.shards }}
+      shard_count: ${{ steps.scope.outputs.shard_count }}
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -99,6 +101,19 @@ jobs:
         run: |
           set -eu
           changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          # Shards per slice. A promotion's diff is the whole release, so its
+          # slices are the largest this gate ever sees: v0.21.0's cli slice
+          # (~500 mutants, ~27 s each on a hosted runner) cancelled two of its
+          # four shards at the 60-minute limit, the other two finishing at 58
+          # and 59 minutes (ley-line-open-c1f8bc). Promotions split each slice
+          # eight ways; feature PRs, whose diffs are one change, keep four.
+          if [ "$BASE_REF" = "main" ]; then
+            echo "shard_count=8" >> "$GITHUB_OUTPUT"
+            echo "shards=[0,1,2,3,4,5,6,7]" >> "$GITHUB_OUTPUT"
+          else
+            echo "shard_count=4" >> "$GITHUB_OUTPUT"
+            echo "shards=[0,1,2,3]" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$BASE_REF" = "main" ] && printf '%s\n' "$changed" | grep -qE \
             '^(rs/ll-open/cdc/.*\.rs$|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
             echo "allowlist=true" >> "$GITHUB_OUTPUT"
@@ -186,7 +201,7 @@ jobs:
   # single slice ever approaches this, the next move is splitting THAT slice,
   # not lifting the number: a slice too slow to fit is a slice doing too much.
   diff:
-    name: cargo mutants (${{ matrix.scope }} ${{ matrix.shard }}/4)
+    name: cargo mutants (${{ matrix.scope }} ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }})
     needs: plan
     if: needs.plan.outputs.any == 'true'
     runs-on: ubuntu-latest
@@ -195,11 +210,12 @@ jobs:
       fail-fast: false
       matrix:
         scope: ${{ fromJSON(needs.plan.outputs.scopes) }}
-        # Each slice runs as four shards (MUTANTS_SHARD=k/4) on separate
+        # Each slice runs as N shards (MUTANTS_SHARD=k/N) on separate
         # runners: a 290-mutant cli-lib diff (ADR-0045, #470) overran the 60
         # minute limit as one job and again as two shards (~25 s a mutant on a
-        # hosted runner). Splitting the slice, not lifting the limit.
-        shard: [0, 1, 2, 3]
+        # hosted runner). Splitting the slice, not lifting the limit. N is 4
+        # for a feature PR and 8 for a promotion (the plan job says why).
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -241,9 +257,9 @@ jobs:
           git diff --relative=rs "$BASE_SHA...$HEAD_SHA" -- rs/ > /tmp/pr.diff
           wc -l < /tmp/pr.diff
 
-      - name: task mutants:diff (${{ matrix.scope }} ${{ matrix.shard }}/4)
+      - name: task mutants:diff (${{ matrix.scope }} ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }})
         env:
-          MUTANTS_SHARD: ${{ matrix.shard }}/4
+          MUTANTS_SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }}
         run: task mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=${{ matrix.scope }}
 
       - name: Upload mutants report

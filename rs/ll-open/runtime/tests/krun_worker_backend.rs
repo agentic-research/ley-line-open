@@ -5,12 +5,28 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
+use leyline_runtime::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
 use leyline_runtime::{
-    Backend, BackendClass, BackendRunStatus, DigestRef, ExecutionRequest, ResourceLimits,
+    Backend, BackendClass, BackendRunStatus, CpuLimits, DigestRef, ExecutionError,
+    ExecutionRequest, MemoryLimits, ResourceLimits, WorkerChannel, WorkspaceGrant,
+    WorkspaceOperation,
 };
 use tempfile::TempDir;
 
 mod common;
+// Signs a worker the way the build, install, and release paths do.
+#[allow(dead_code)]
+#[path = "../../krun-worker/tests/hypervisor/mod.rs"]
+mod hypervisor;
+
+/// A backend over a FAKE worker: a shell script that speaks the worker
+/// protocol and never enters a hypervisor. A script cannot carry the
+/// hypervisor entitlement, so these supervision-contract tests vouch for it;
+/// `a_worker_without_the_hypervisor_entitlement_is_unavailable` below is
+/// the test of the check they skip.
+fn fake_worker_backend(config: KrunWorkerConfig) -> KrunWorkerBackend {
+    KrunWorkerBackend::new(config).with_unverified_hypervisor_access()
+}
 
 fn run_root_count(path: &std::path::Path) -> usize {
     fs::read_dir(path).expect("enumerate run roots").count()
@@ -32,10 +48,15 @@ fn request() -> ExecutionRequest {
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
         confinement_manifest: None,
+        workspaces: Vec::new(),
         limits: ResourceLimits {
-            vcpus: 1,
-            memory_mib: 512,
             wall_time_ms: 10_000,
+            memory: MemoryLimits { limit: 512 << 20 },
+            cpu: CpuLimits {
+                quota: 100_000,
+                period: 100_000,
+            },
+            ..ResourceLimits::default()
         },
     }
 }
@@ -51,13 +72,10 @@ fn backend_with_worker(
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -91,15 +109,12 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
     let cas = fixture.path().join("cas");
     fs::create_dir(&cas).expect("CAS");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root: cas,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -136,13 +151,10 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -203,13 +215,10 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -239,13 +248,10 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -284,13 +290,10 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -338,13 +341,10 @@ printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":fal
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -372,13 +372,10 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root: ephemeral_root.clone(),
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -408,13 +405,10 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
     let ephemeral_root = fixture.path().join("runs");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("ephemeral root");
-    let libkrun = fixture.path().join("libkrun.dylib");
-    fs::write(&libkrun, b"library").expect("library fixture");
-    let backend = Arc::new(KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = Arc::new(fake_worker_backend(KrunWorkerConfig {
         worker,
         cas_root,
         ephemeral_root,
-        libkrun,
         runtime_files: Vec::new(),
         devices: Vec::new(),
         ready_timeout: READY_TIMEOUT,
@@ -478,14 +472,11 @@ fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
         let ephemeral_root = fixture.path().join("runs");
         fs::create_dir(&cas_root).expect("CAS");
         fs::create_dir(&ephemeral_root).expect("ephemeral root");
-        let libkrun = fixture.path().join("libkrun.dylib");
-        fs::write(&libkrun, b"library").expect("library fixture");
 
-        let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        let backend = fake_worker_backend(KrunWorkerConfig {
             worker,
             cas_root,
             ephemeral_root,
-            libkrun,
             runtime_files: Vec::new(),
             devices: Vec::new(),
             ready_timeout: READY_TIMEOUT,
@@ -588,7 +579,7 @@ fn readiness_announcing_another_run_is_rejected() {
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
 
-/// `configured()` is a six-term `&&` chain, and until now nothing observed any
+/// `configured()` is a five-term `&&` chain, and until now nothing observed any
 /// individual term: every `&&` in it, plus the whole function's return, could
 /// be mutated without a test noticing. A backend that reports itself available
 /// while missing its worker binary or its CAS root fails at `start` instead of
@@ -598,7 +589,7 @@ fn readiness_announcing_another_run_is_rejected() {
 /// The native tier already pins this shape in
 /// `every_native_resource_is_required_independently`; this is its microVM
 /// counterpart. Each case removes exactly one resource and leaves the other
-/// five intact, which is what makes it a test of that term rather than of the
+/// four intact, which is what makes it a test of that term rather than of the
 /// conjunction.
 #[test]
 fn every_libkrun_resource_is_required_independently() {
@@ -607,14 +598,12 @@ fn every_libkrun_resource_is_required_independently() {
     let worker = fixture.path().join("worker");
     let cas_root = fixture.path().join("cas");
     let ephemeral_root = fixture.path().join("runs");
-    let libkrun = fixture.path().join("libkrun.dylib");
     let runtime_file = fixture.path().join("runtime");
     let device = fixture.path().join("device");
     fs::write(&worker, "#!/bin/sh\n").expect("worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
     fs::create_dir(&cas_root).expect("CAS");
     fs::create_dir(&ephemeral_root).expect("runs");
-    fs::write(&libkrun, b"library").expect("library");
     fs::write(&runtime_file, b"runtime").expect("runtime file");
     fs::write(&device, b"device").expect("device");
 
@@ -622,7 +611,6 @@ fn every_libkrun_resource_is_required_independently() {
         worker: worker.clone(),
         cas_root: cas_root.clone(),
         ephemeral_root: ephemeral_root.clone(),
-        libkrun: libkrun.clone(),
         runtime_files: vec![runtime_file.clone()],
         devices: vec![device.clone()],
         ready_timeout: READY_TIMEOUT,
@@ -630,7 +618,7 @@ fn every_libkrun_resource_is_required_independently() {
     };
 
     assert!(
-        KrunWorkerBackend::new(complete()).capabilities().available,
+        fake_worker_backend(complete()).capabilities().available,
         "a fully provisioned host must report the backend available, or the \
          cases below would pass for the wrong reason"
     );
@@ -652,11 +640,6 @@ fn every_libkrun_resource_is_required_independently() {
             c.ephemeral_root = missing.clone();
             c
         }),
-        ("libkrun library", {
-            let mut c = complete();
-            c.libkrun = missing.clone();
-            c
-        }),
         ("runtime file", {
             let mut c = complete();
             c.runtime_files = vec![missing.clone()];
@@ -669,13 +652,23 @@ fn every_libkrun_resource_is_required_independently() {
         }),
     ];
     for (resource, configuration) in incomplete {
+        let capabilities = fake_worker_backend(configuration).capabilities();
         assert!(
-            !KrunWorkerBackend::new(configuration)
-                .capabilities()
-                .available,
+            !capabilities.available,
             "a missing {resource} must make the backend unavailable"
         );
+        let reason = capabilities.unavailable_reason.unwrap_or_default();
+        assert!(
+            reason.contains("not configured"),
+            "a missing {resource} must say why: {reason:?}"
+        );
     }
+    assert_eq!(
+        fake_worker_backend(complete())
+            .capabilities()
+            .unavailable_reason,
+        None
+    );
 }
 
 /// A rejection kill must reach the worker's DESCENDANTS, not just the
@@ -721,5 +714,394 @@ fn rejection_kills_the_workers_grandchildren_too() {
              rejection kill did not reach the worker's descendants"
         );
         std::hint::spin_loop();
+    }
+}
+
+// ── Workspace shares (ADR-0044 phase C, bead ley-line-open-f210c2) ──────
+
+/// Records each request the worker's end of the share sends.
+struct RecordingShare {
+    seen: std::sync::Mutex<std::sync::mpsc::Sender<Request>>,
+}
+
+impl FsService for RecordingShare {
+    fn call(&self, request: Request) -> Reply {
+        let _ = self.seen.lock().unwrap().send(request);
+        Reply::Done
+    }
+}
+
+/// Opens [`RecordingShare`]s, or refuses with `refusal`, and records what it
+/// was asked to open.
+struct Shares {
+    refusal: Option<ExecutionError>,
+    opened: std::sync::Mutex<Vec<(String, WorkspaceGrant)>>,
+    seen: std::sync::Mutex<std::sync::mpsc::Sender<Request>>,
+}
+
+impl Shares {
+    fn new(refusal: Option<ExecutionError>) -> (Arc<Self>, std::sync::mpsc::Receiver<Request>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                refusal,
+                opened: std::sync::Mutex::new(Vec::new()),
+                seen: std::sync::Mutex::new(tx),
+            }),
+            rx,
+        )
+    }
+}
+
+impl WorkspaceShares for Shares {
+    fn open(
+        &self,
+        run_id: &str,
+        grant: &WorkspaceGrant,
+    ) -> Result<Arc<dyn FsService>, ExecutionError> {
+        self.opened
+            .lock()
+            .unwrap()
+            .push((run_id.to_owned(), grant.clone()));
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
+        Ok(Arc::new(RecordingShare {
+            seen: std::sync::Mutex::new(self.seen.lock().unwrap().clone()),
+        }))
+    }
+}
+
+fn workspace(name: &str) -> WorkspaceGrant {
+    WorkspaceGrant {
+        name: name.into(),
+        graph_root: format!("blake3-256:{}", "e".repeat(64)),
+        expected_generation: 0,
+        operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+    }
+}
+
+fn request_with(workspaces: Vec<WorkspaceGrant>) -> ExecutionRequest {
+    ExecutionRequest {
+        workspaces,
+        ..request()
+    }
+}
+
+/// A fake worker that logs its arguments to `args_log`, then reports ready
+/// and sleeps.
+fn arg_logging_worker(args_log: &std::path::Path) -> String {
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+        args_log.display()
+    )
+}
+
+/// A fake worker that finds the descriptor named by `--workspace-share-fd`
+/// and reports ready with `inherited` (shell text, `$fd` expanded) as its
+/// declared descriptors, after running `before_ready`.
+fn share_worker(before_ready: &str, inherited: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+fd=
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--workspace-share-fd" ]; then fd="$arg"; fi
+  prev="$arg"
+done
+IFS= read -r _
+{before_ready}
+printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-backend-01\",\"inherited\":[{inherited}]}}" >&2
+exec /usr/bin/tail -f /dev/null
+"#
+    )
+}
+
+/// The worker's declaration of the share it was handed, as JSON with the
+/// descriptor left to the shell (`$fd`).
+const DECLARED_SHARE: &str = r#"{\"descriptor\":$fd,\"channel\":{\"role\":\"workspaceShare\",\"workspace\":\"repo\",\"graphRoot\":\"blake3-256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}"#;
+
+#[test]
+fn a_granted_workspace_is_served_to_the_worker_over_an_inherited_socket() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    // The worker sends one framed INIT request down its share: a 32-byte
+    // header (one Cap'n Proto segment of three words: the root pointer, a
+    // data word whose union tag 0 is INIT, a null pointer), no payload.
+    let script = share_worker(
+        r#"[ -n "$fd" ] || exit 3
+eval "printf '\040\000\000\000\000\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000\001\000\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000' >&$fd" || exit 4"#,
+        DECLARED_SHARE,
+    );
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
+    let (shares, seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares.clone());
+
+    let started = backend
+        .start(&request_with(vec![workspace("repo")]))
+        .expect("a ready worker with its share");
+    assert_eq!(
+        seen.recv_timeout(READY_TIMEOUT)
+            .expect("the worker's request reached the share"),
+        Request::Init
+    );
+    assert_eq!(
+        *shares.opened.lock().unwrap(),
+        vec![("run-backend-01".to_owned(), workspace("repo"))],
+        "the provider opens the run's one granted workspace"
+    );
+    // The run names the share it holds, for the receipt.
+    assert_eq!(
+        started.channels,
+        vec![WorkerChannel::WorkspaceShare {
+            workspace: "repo".into(),
+            graph_root: format!("blake3-256:{}", "e".repeat(64)),
+        }]
+    );
+}
+
+/// The worker's declared descriptors must be exactly what the backend handed
+/// it: a worker that does not declare its share, or declares one it was not
+/// handed, never reaches running.
+#[test]
+fn a_worker_declaring_other_descriptors_than_it_was_handed_never_reaches_running() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+
+    // Handed a share, declares none.
+    let (backend, ephemeral_root) = backend_with_worker(&fixture, &share_worker(":", ""));
+    let (shares, _seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares);
+    let error = backend
+        .start(&request_with(vec![workspace("repo")]))
+        .expect_err("an undeclared share");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("descriptor"), "{error:?}");
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+
+    // Handed nothing, declares a share.
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) =
+        backend_with_worker(&fixture, &share_worker("fd=7", DECLARED_SHARE));
+    let error = backend
+        .start(&request())
+        .expect_err("a declared share nothing handed");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        "{error:?}"
+    );
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// A descriptor this process holds without close-on-exec (inherited from
+/// its own parent, as a build tool's jobserver pipes are) does not reach the
+/// worker: the backend hands it its standard streams and declared channels
+/// only, so the worker's own check finds nothing undeclared.
+#[test]
+fn a_descriptor_the_backend_holds_open_across_exec_does_not_reach_the_worker() {
+    use std::os::fd::AsRawFd;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let leaked = fs::File::open("/dev/null").expect("a descriptor");
+    let fd = leaked.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this test owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        assert!(flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) >= 0);
+    }
+    let script = format!(
+        "#!/bin/sh\nIFS= read -r _\n[ -e /dev/fd/{fd} ] && exit 9\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n"
+    );
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
+    let started = backend.start(&request());
+    drop(leaked);
+    started.expect("the worker did not inherit the backend's open descriptor");
+}
+
+#[test]
+fn a_run_without_workspaces_is_handed_no_share() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let args_log = fixture.path().join("args.log");
+    let (backend, _ephemeral_root) = backend_with_worker(&fixture, &arg_logging_worker(&args_log));
+    let (shares, _seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares.clone());
+
+    let started = backend.start(&request()).expect("ready worker");
+    let args = fs::read_to_string(&args_log).expect("worker arguments");
+    assert!(
+        !args.contains("--workspace-share-fd"),
+        "no workspace, no share: {args}"
+    );
+    assert_eq!(started.channels, Vec::new(), "no workspace, no channel");
+    assert!(shares.opened.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_granted_workspace_is_refused_before_spawn_where_no_share_can_serve_it() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let args_log = fixture.path().join("args.log");
+
+    // No provider: the grant cannot be delivered, so the run does not start
+    // without it.
+    let (backend, ephemeral_root) = backend_with_worker(&fixture, &arg_logging_worker(&args_log));
+    let error = backend
+        .start(&request_with(vec![workspace("repo")]))
+        .expect_err("a workspace grant with nothing to serve it");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert!(error.detail.contains("repo"), "{error}");
+
+    // Two workspaces: the tier attaches one.
+    let (shares, _seen) = Shares::new(None);
+    let backend = backend.with_workspace_shares(shares.clone());
+    let error = backend
+        .start(&request_with(vec![workspace("repo"), workspace("docs")]))
+        .expect_err("two workspaces");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert!(shares.opened.lock().unwrap().is_empty());
+
+    // The provider refuses: its error is the run's.
+    let refusal = ExecutionError {
+        code: leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        retryable: false,
+        detail: "the store no longer holds the granted root".into(),
+    };
+    let (shares, _seen) = Shares::new(Some(refusal.clone()));
+    let backend = backend.with_workspace_shares(shares);
+    assert_eq!(
+        backend
+            .start(&request_with(vec![workspace("repo")]))
+            .expect_err("the provider refused"),
+        refusal
+    );
+
+    assert!(!args_log.exists(), "no worker was spawned");
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// Bead ley-line-open-831bf1, I1-I3: a microVM backend reports
+/// `available=true` only for a worker that can enter the hypervisor, and says
+/// why not BEFORE any run is accepted. On macOS that is the worker binary's
+/// `com.apple.security.hypervisor` entitlement, read from its signature.
+///
+/// The binaries are real Mach-O copies of this test executable: one with no
+/// signature at all, one with the linker's ad-hoc signature and no
+/// entitlements (what `cargo build` leaves), and one signed by
+/// `tools/sign_krun_worker.sh`, the path every build, install, and release
+/// takes. Nothing is executed, so the copies need not be workers.
+#[test]
+fn a_worker_without_the_hypervisor_entitlement_is_unavailable() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let this_binary = std::env::current_exe().expect("test binary");
+    let cas_root = fixture.path().join("cas");
+    let ephemeral_root = fixture.path().join("runs");
+    fs::create_dir(&cas_root).expect("CAS");
+    fs::create_dir(&ephemeral_root).expect("runs");
+    let backend_for = |worker: &std::path::Path| {
+        KrunWorkerBackend::new(KrunWorkerConfig {
+            worker: worker.to_path_buf(),
+            cas_root: cas_root.clone(),
+            ephemeral_root: ephemeral_root.clone(),
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            ready_timeout: READY_TIMEOUT,
+            tsi_hijack_inet: false,
+        })
+    };
+
+    let unsigned = fixture.path().join("unsigned-worker");
+    fs::copy(&this_binary, &unsigned).expect("copy");
+    let linker_signed = fixture.path().join("linker-signed-worker");
+    fs::copy(&this_binary, &linker_signed).expect("copy");
+    let signed = fixture.path().join("signed-worker");
+    fs::copy(&this_binary, &signed).expect("copy");
+    hypervisor::sign_krun_worker(&signed);
+
+    // Off macOS no entitlement exists to hold (KVM access is a device grant),
+    // so the host's rule admits every copy. The macOS rule is then applied
+    // explicitly: with no codesign to read a signature, it admits none.
+    let macos = cfg!(target_os = "macos");
+    if !macos {
+        for worker in [&unsigned, &linker_signed, &signed] {
+            let capabilities = backend_for(worker).capabilities();
+            assert!(capabilities.available, "{capabilities:?}");
+            assert_eq!(capabilities.unavailable_reason, None);
+        }
+    } else {
+        let status = std::process::Command::new("/usr/bin/codesign")
+            .arg("--remove-signature")
+            .arg(&unsigned)
+            .status()
+            .expect("codesign --remove-signature");
+        assert!(status.success(), "remove signature: {status}");
+
+        let entitled = backend_for(&signed).capabilities();
+        assert!(
+            entitled.available,
+            "a worker signed by tools/sign_krun_worker.sh must be available, or \
+             the cases below would pass for the wrong reason: {entitled:?}"
+        );
+        assert_eq!(entitled.unavailable_reason, None);
+    }
+
+    for (label, worker) in [("unsigned", &unsigned), ("linker-signed", &linker_signed)] {
+        let backend = backend_for(worker).with_entitlement_platform("macos");
+        let capabilities = backend.capabilities();
+        assert!(
+            !capabilities.available,
+            "an {label} worker cannot enter the hypervisor, so the backend \
+             must not report itself available"
+        );
+        let reason = capabilities
+            .unavailable_reason
+            .unwrap_or_else(|| panic!("an unavailable {label} worker must say why"));
+        assert!(
+            reason.contains("com.apple.security.hypervisor"),
+            "the {label} reason must name the entitlement: {reason}"
+        );
+
+        // A run is never accepted: neither by direct start, which would
+        // otherwise spawn the worker and die inside krun_start_enter, nor
+        // by capability negotiation through the service.
+        let error = backend.start(&request()).expect_err("unentitled start");
+        assert!(
+            error.detail.contains("com.apple.security.hypervisor"),
+            "{error}"
+        );
+        assert_eq!(run_root_count(&ephemeral_root), 0, "no run root was made");
+        let service = leyline_runtime::ExecutionService::new(backend);
+        let error = service
+            .provision(BackendClass::MicroVm, "provision-unentitled")
+            .expect_err("unentitled provision");
+        assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+        assert!(
+            error.detail.contains("com.apple.security.hypervisor"),
+            "{error}"
+        );
+    }
+
+    // A caller that vouches for its worker (a fake in a supervision test)
+    // skips the rule, even the macOS one; that is the only way around it.
+    let vouched = backend_for(&unsigned)
+        .with_entitlement_platform("macos")
+        .with_unverified_hypervisor_access()
+        .capabilities();
+    assert!(vouched.available, "{vouched:?}");
+    assert_eq!(vouched.unavailable_reason, None);
+
+    if macos {
+        // The verdict follows the binary: signing the same path makes it
+        // available without rebuilding the backend.
+        let backend = backend_for(&linker_signed);
+        assert!(!backend.capabilities().available);
+        hypervisor::sign_krun_worker(&linker_signed);
+        assert!(backend.capabilities().available);
     }
 }

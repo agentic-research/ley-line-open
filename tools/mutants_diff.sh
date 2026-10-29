@@ -21,6 +21,19 @@
 # nothing, from a path prefix. Generate with `git diff --relative=rs`.
 set -eu
 
+# cargo-mutants builds a copy of rs/ outside the repository, where the
+# repository-root .cargo/config.toml is not on cargo's config search path. That
+# file points libkrun's guest-init compiler (CC_LINUX) at tools/krun_init_cc.sh;
+# without it the vendored libkrun cannot build off Linux. Carry it as an
+# absolute path; an explicit CC_LINUX still wins (ley-line-open-f1c46f).
+: "${CC_LINUX:=$(CDPATH='' cd -P -- "$(dirname "$0")" && pwd -P)/krun_init_cc.sh}"
+export CC_LINUX
+# Same reason for the worker signing script the runtime and krun-worker tests
+# run (rs/ll-open/krun-worker/tests/hypervisor/mod.rs, ley-line-open-984acf):
+# it lives in tools/, outside the copy.
+: "${LEYLINE_SIGN_KRUN_WORKER:=$(CDPATH='' cd -P -- "$(dirname "$0")" && pwd -P)/sign_krun_worker.sh}"
+export LEYLINE_SIGN_KRUN_WORKER
+
 DIFF=${1:?usage: mutants_diff.sh <diff-file>}
 SCOPE=${2:-all}
 test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
@@ -36,7 +49,7 @@ test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
 # same drift class `ley-line-open-cb1e29` collapsed the feature ledger to fix.
 #
 # Format: `<scope>=<package>[,<package>...]`. Everything below derives from it.
-MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge'
+MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime,ll-open/krun-worker cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge storefs=ll-open/storefs'
 
 # Every package owned by SOME package slice — i.e. exactly what the generic
 # slice must exclude. Each MUST be claimed by a slice of its own below. A
@@ -104,6 +117,21 @@ if [ "$SCOPE_IS_VALID" != yes ]; then
         printf '\n'
     } >&2
     exit 1
+fi
+
+# A shard is `k/n` with 0 <= k < n, as cargo-mutants numbers them. A typo
+# here would otherwise run a slice of nothing and pass.
+if [ -n "${MUTANTS_SHARD:-}" ]; then
+    shard_k=${MUTANTS_SHARD%/*}
+    shard_n=${MUTANTS_SHARD#*/}
+    case "$shard_k$shard_n" in
+        *[!0-9]*|'') shard_ok=no ;;
+        *) if [ "$shard_k" -lt "$shard_n" ]; then shard_ok=yes; else shard_ok=no; fi ;;
+    esac
+    if [ "$shard_ok" != yes ] || [ "$MUTANTS_SHARD" != "$shard_k/$shard_n" ]; then
+        echo "MUTANTS_SHARD must be k/n with 0 <= k < n, got '$MUTANTS_SHARD'" >&2
+        exit 1
+    fi
 fi
 
 # `list-scopes` prints the scopes that have work for this diff, one per line,
@@ -370,9 +398,17 @@ run_slice() {
     # Clearing it first makes the check able to see only THIS slice's result,
     # which is the difference between a gate and a rumour.
     rm -f mutants.out/missed.txt
+    # MUTANTS_SHARD=k/n runs one of n shards of the slice. CI splits a slow
+    # slice across runners this way instead of lifting a job's time limit; a
+    # slice too slow to fit is a slice doing too much (mutants.yml).
+    if [ -n "${MUTANTS_SHARD:-}" ]; then
+        set -- "$@" --shard "$MUTANTS_SHARD"
+    fi
     set +e
     if [ "$mode" = lib ]; then
         cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"
+    elif [ "$mode" = bins ]; then
+        cargo mutants --in-diff "$DIFF" -C --bins -E 'replace main' "$@"
     else
         cargo mutants --in-diff "$DIFF" -E 'replace main' "$@"
     fi
@@ -465,17 +501,23 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = generic ]; then
         } >&2
         exit 1
     fi
-    generic_features=''
-    add_generic_features() {
-        package_changed_in_diff "$1" || return 0
-        generic_features="${generic_features:+$generic_features,}$2"
-    }
+    # The packages in the diff that carry enable rows, each named once.
+    featured_packages=''
     while read -r pkg feat; do
         [ -n "$pkg" ] || continue
-        add_generic_features "$pkg" "$feat"
+        package_changed_in_diff "$pkg" || continue
+        case " $featured_packages " in
+            *" $pkg "*) ;;
+            *) featured_packages="${featured_packages:+$featured_packages }$pkg" ;;
+        esac
     done <<LEDGER_ROWS
 $enable_rows
 LEDGER_ROWS
+    # One package's enable-row features, comma-joined.
+    features_of() {
+        printf '%s\n' "$enable_rows" \
+            | awk -v pkg="$1" '$1 == pkg { printf "%s%s", sep, $2; sep = "," }'
+    }
 
     # File-level exclusions come from the same ledger (`exclude-file:` rows).
     # Today that is witchcraft.rs alone — its row's prose says why exclusion
@@ -490,29 +532,71 @@ LEDGER_ROWS
         exclude_file_args="$exclude_file_args --exclude $excluded"
     done
 
+    # Each package's features reach ONLY that package's build, so a package
+    # carrying enable rows gets an invocation of its own, confined to its
+    # files with `--file`. One invocation carrying the union is wrong: cargo
+    # rejects a `--features` name none of the SELECTED packages declares,
+    # and cargo-mutants selects only the packages whose mutants it runs —
+    # which, once a slice is sharded, is a subset of the diff's packages.
+    # Package-qualified names (`leyline-ts/hcl`) do not help; cargo refuses
+    # those too for an unselected package. The v0.21.0 promotion diff hit it
+    # in every generic shard: shard 0 held only leyline-core and leyline-sign
+    # mutants, was handed `hcl,pyproject` for leyline-ts, and reported
+    # BASELINE BROKEN having mutated nothing (bead ley-line-open-c1f8bc).
+    #
     # $exclude_file_args expands unquoted by design: it is a flag list, and
     # ledger paths carry no whitespace.
-    # shellcheck disable=SC2086
-    if [ -n "$generic_features" ]; then
-        echo "generic slice features (from packages in the diff): $generic_features"
-        run_slice lib \
-            --features "$generic_features" \
-            $exclude_file_args \
-            --exclude 'll-open/fs/**' \
-            --exclude 'll-open/runtime/**' \
-            --exclude 'll-open/cli-lib/**' \
-            --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**'
-    else
+    for pkg in $featured_packages; do
+        pkg_features=$(features_of "$pkg")
+        echo "generic slice: $pkg with its own features: $pkg_features"
         # shellcheck disable=SC2086
-        run_slice lib \
-            $exclude_file_args \
-            --exclude 'll-open/fs/**' \
-            --exclude 'll-open/runtime/**' \
-            --exclude 'll-open/cli-lib/**' \
-            --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**'
-    fi
+        run_slice lib --file "$pkg/**" --features "$pkg_features" $exclude_file_args
+    done
+
+    # A generic-slice package with no library target cannot run under
+    # `-C --lib`: cargo answers "no library targets found in package" and the
+    # slice reports BASELINE BROKEN. A package selected alongside a library
+    # package hides this, so it surfaces exactly when sharding puts a
+    # binary-only package's mutants in a shard of their own — the v0.21.0
+    # promotion's two `rs/tools/smell-projector` mutants did. Such a package
+    # keeps its unit tests in its binary, so it runs them with `-C --bins`, in
+    # an invocation of its own. Found from the diff's paths: the nearest
+    # directory holding a Cargo.toml is the package, and it is binary-only
+    # when it has neither `src/lib.rs` nor a `[lib]` table.
+    owned_packages=$(derive_generic_excludes)
+    bin_only_packages=''
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        dir=$(dirname -- "$path")
+        while [ "$dir" != . ] && [ "$dir" != / ] && [ ! -f "$dir/Cargo.toml" ]; do
+            dir=$(dirname -- "$dir")
+        done
+        # `.` is the workspace manifest, not a package of the generic slice.
+        [ "$dir" != . ] && [ -f "$dir/Cargo.toml" ] || continue
+        case " $owned_packages $featured_packages $bin_only_packages " in
+            *" $dir "*) continue ;;
+        esac
+        if [ ! -f "$dir/src/lib.rs" ] && ! grep -q '^\[lib\]' "$dir/Cargo.toml"; then
+            bin_only_packages="${bin_only_packages:+$bin_only_packages }$dir"
+        fi
+    done <<CHANGED_PATHS
+$(sed -n 's|^+++ b/\(.*\.rs\)$|\1|p' "$DIFF")
+CHANGED_PATHS
+    for pkg in $bin_only_packages; do
+        echo "generic slice: $pkg has no library target; its binary's tests run"
+        # shellcheck disable=SC2086
+        run_slice bins --file "$pkg/**" $exclude_file_args
+    done
+
+    # Everything else in the generic slice, with no feature flags: the
+    # packages a scope owns (from the table, never the test override) and
+    # the packages mutated above are excluded.
+    set --
+    for pkg in $owned_packages $featured_packages $bin_only_packages; do
+        set -- "$@" --exclude "$pkg/**"
+    done
+    # shellcheck disable=SC2086
+    run_slice lib $exclude_file_args "$@"
 fi
 
 # schema-bridge is the same case runtime and cli-lib are, in its purest form:
@@ -532,7 +616,26 @@ fi
 if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then
   if package_changed_in_diff ll-open/runtime; then
     claim_package ll-open/runtime
-    run_slice integration --package leyline-runtime --test-workspace=false
+    # `backends/cgroup.rs` takes the filesystem magic of a cgroup root from a
+    # per-platform file (bead ley-line-open-da36d2): `cgroup_fs_linux.rs`
+    # (`statfs(2)`) or `cgroup_fs_other.rs` (no cgroup v2, so a refusal). A
+    # platform gate is a feature gate cargo-mutants cannot see, so each file
+    # is excluded where it does not compile — there every mutant would build
+    # unchanged and read as a phantom MISSED — and mutated where it does.
+    if [ "$(uname -s)" = Linux ]; then
+        run_slice integration --package leyline-runtime --test-workspace=false \
+            --exclude 'll-open/runtime/src/backends/cgroup_fs_other.rs'
+    else
+        run_slice integration --package leyline-runtime --test-workspace=false \
+            --exclude 'll-open/runtime/src/backends/cgroup_fs_linux.rs'
+    fi
+  fi
+  # The worker crate (bead ley-line-open-395e43) is the runtime's libkrun half:
+  # its api.rs and worker.rs are asserted by its own tests/, which the
+  # lib-only generic slice would never run.
+  if package_changed_in_diff ll-open/krun-worker; then
+    claim_package ll-open/krun-worker
+    run_slice integration --package leyline-krun-worker --test-workspace=false
   fi
 fi
 
@@ -560,13 +663,6 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # it. The whole binary set below compiles with the feature and its deps are
     # already in Cargo.lock, so this costs a longer link, not a download.
     #
-    # `mount`, for the same reason: `cmd_serve` and the mount's source writer
-    # (`source_write::MountWriter`) are behind it, and the one-write-path PR
-    # (`ley-line-open-f2ffbd`) reported both as 0s-build MISSED under `vec`
-    # alone. It links libfuse (deps:ci installs libfuse-dev; the Taskfile's
-    # PKG_CONFIG_PATH finds fuse-t on macOS) and mounts nothing: the lib
-    # tests it adds stop before a mount.
-    #
     # lsp_enrich_pipeline: kills the whole-function replacement mutants on
     # `enrich_files_with_client` (four survived on the PR that added the
     # test — nothing observed that function's counts or writes before it).
@@ -581,8 +677,25 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # collapses every injected nid to 0 and the fact rows leave the host's
     # range entirely. Verified before routing: the mutation leaves the lib
     # suite green and fails five tests in this binary.
+    # watcher_enrichment_gap1_test: the only tests that call
+    # `cmd_daemon::run_watcher_enrichment` and observe its phase change and
+    # `daemon.enrichment.*` emits. `replace run_watcher_enrichment with ()`
+    # survived on the sheaf-feature PR (bead 39e239); verified before
+    # routing: that mutation fails all three tests in this binary.
+    #
+    # `durable/apple.rs` (`F_BARRIERFSYNC`) and `durable/other.rs` (`fsync`)
+    # are platform gates (bead `ley-line-open-98d0c3`): the file a runner's
+    # platform does not build would report every mutant as a phantom MISSED,
+    # so it is excluded there and mutated where it compiles, where
+    # `durable::tests::order_reports_a_descriptor_it_cannot_sync` kills it.
+    if [ "$(uname -s)" = Darwin ]; then
+        durable_unbuilt='ll-open/cli-lib/src/durable/other.rs'
+    else
+        durable_unbuilt='ll-open/cli-lib/src/durable/apple.rs'
+    fi
     run_slice integration \
-        --features vec,mount \
+        --exclude "$durable_unbuilt" \
+        --features vec \
         -C --lib \
         -C --test -C execution_client \
         -C --test -C execution_transport \
@@ -591,49 +704,82 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
         -C --test -C lsp_enrich_pipeline \
         -C --test -C pointer_store_dual_write_test \
         -C --test -C injection_extraction_test \
+        -C --test -C watcher_enrichment_gap1_test \
         --package leyline-cli-lib --test-workspace=false
   fi
 fi
 
+if { [ "$SCOPE" = all ] || [ "$SCOPE" = storefs ]; } && package_changed_in_diff ll-open/storefs; then
+    claim_package ll-open/storefs
+    # The host mount (`host/`, bead `ley-line-open-3e73dc`) is gated on
+    # storefs's non-default `mount` feature, so the slice names it: without it
+    # every adapter mutant compiles out and reports a phantom MISSED. Lib
+    # tests only (`run_slice lib`): they drive the adapters below the kernel.
+    # `tests/host_mount.rs` mounts through the kernel's NFS or FUSE client,
+    # and a mutation run must never mount.
+    #
+    # `host/fuse.rs` is excluded: it is the `fuser::Filesystem` glue, whose
+    # requests and replies only a `/dev/fuse` session can build (fuser keeps
+    # `Request::new` and `ReplySender` private), so lib tests cannot reach it
+    # and every mutant there would report MISSED. Every decision it makes
+    # lives in `host/fuse_abi.rs`, which this slice mutates; the glue is
+    # exercised through the kernel by `tests/host_mount.rs` and
+    # `tools/cli_smoke.sh --mount`. The gap is `ley-line-open-5241ee`.
+    #
+    # `host/macos.rs` is `#[cfg(target_os = "macos")]` (a `sysctlbyname(3)`
+    # read): a platform gate is a feature gate cargo-mutants cannot see either,
+    # so on any other runner every mutant in it builds in 0s and reports a
+    # phantom MISSED. It is excluded there and mutated on macOS, where its test
+    # checks it against `sw_vers`.
+    if [ "$(uname -s)" = Darwin ]; then
+        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+            --exclude 'll-open/storefs/src/host/fuse.rs'
+    else
+        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+            --exclude 'll-open/storefs/src/host/fuse.rs' \
+            --exclude 'll-open/storefs/src/host/macos.rs'
+    fi
+fi
+
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = fs ]; } && package_changed_in_diff ll-open/fs; then
     claim_package ll-open/fs
-    # This is the ONLY slice that passes `--no-default-features`, which makes it
-    # the only place tools/feature-ledger.txt's standing exemption for
-    # default-enabled features ("cargo resolves them, mutants compiles them") is
-    # false. `fuse` and `nfs` ARE in leyline-fs's default set, so the ledger is
-    # right not to carry them — but these flags compile `fuse.rs`, `nfs.rs` and
-    # `verified.rs` out, while cargo-mutants parses with syn, never evaluates
-    # cfg, and enumerates every mutant inside them anyway. Each then builds in
-    # 0s, every test trivially passes, and it is reported MISSED: a phantom
-    # survivor on healthy code, indistinguishable in the log from a real missing
-    # assertion (bead `ley-line-open-b23c41`).
-    #
-    # A slice that opts out of default features owes an exclusion for what that
-    # choice removes — the exclusions below are not a policy about mount, they
-    # are this invocation being consistent with itself. Enabling the features
-    # instead would be worse: `ley-line-open-aed167` records that mount ships
-    # with no tests at any level, so the phantoms would become REAL survivors
-    # and redden every mount PR over a coverage debt this gate did not incur.
-    # `verified` is the same shape (`ley-line-open-b6a4dd`).
+    # This is the ONLY slice that passes `--no-default-features`, so it names
+    # every feature whose code it mutates: `cdc` (the chunked read path and
+    # GC), `validate`, and `verify` (verify-on-fault serving: `verified.rs`
+    # and the `#[cfg(feature = "verify")]` loaders in `graph.rs`). A gated
+    # module the flags compiled out would still have every mutant enumerated —
+    # cargo-mutants parses with syn and never evaluates cfg — and each would
+    # build in 0s, pass every test, and be reported MISSED: a phantom survivor
+    # on healthy code (bead `ley-line-open-b23c41`). `verify` does not ship
+    # (`ley-line-open-b6a4dd`), but `fs:test:cdc` runs the crate's tests with
+    # it, so its mutants are killable and the slice enables it.
     #
     # Kept in step by tools/check_mutants_cfg_coverage.sh, which fails if a
-    # cfg-gated module is neither enabled by its slice nor excluded here. That
-    # guard is load-bearing: enumerating this list BY HAND missed `verified.rs`.
+    # cfg-gated module is neither enabled by its slice nor excluded here.
     run_slice lib --package leyline-fs --test-workspace=false \
-        --no-default-features --features cdc,splice,validate \
-        --exclude 'll-open/fs/src/fuse.rs' \
-        --exclude 'll-open/fs/src/nfs.rs' \
-        --exclude 'll-open/fs/src/verified.rs'
+        --no-default-features --features cdc,validate,verify
 fi
 
 # `ll-open/cli` is the thin clap binary: its only mutant is `replace main`,
 # which `-E` excludes because subprocess tests, not lib tests, kill it. It is
 # claimed here so the pairing check stays honest — the moment that crate grows
 # a mutable helper, the claim is a lie and the exclude list needs a real slice.
+cli_binary_only=0
 if package_changed_in_diff ll-open/cli; then
     claim_package ll-open/cli
     echo "NOTE: ll-open/cli carries only 'replace main', which -E excludes;"
     echo "      its behavior is gated by leyline-cli-lib's slice."
+    cli_binary_only=1
+fi
+
+# The planner gives a binary-only diff the `cli` leg so the pairing check has a
+# claim to satisfy; that leg has, by policy, nothing to mutate. Say so and stop,
+# as NO MUTABLE LINES does, instead of calling the plan misconfigured.
+if [ "$SCOPE" = cli ] && [ "$ran_slice" -eq 0 ] && [ "$cli_binary_only" -eq 1 ]; then
+    echo "NO MUTABLE LINES: scope 'cli' — the diff changes only ll-open/cli, whose"
+    echo "                  one mutant is excluded. This is NOT a pass; no"
+    echo "                  mutation testing ran in this scope."
+    exit 0
 fi
 
 if [ "$SCOPE" = all ]; then

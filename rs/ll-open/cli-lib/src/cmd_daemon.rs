@@ -9,13 +9,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use leyline_core::ContentAddressed;
 
-use crate::cmd_serve;
 use crate::daemon::{
     DaemonContext, DaemonExt, DaemonPhase, DaemonState, EventRouter, NoExt,
     execution::{ExecutionDaemonExt, ExecutionHandler},
 };
+use crate::lifecycle;
 
 // ---------------------------------------------------------------------------
 // Tuning constants — extracted from the daemon orchestration so each magic
@@ -47,15 +46,16 @@ const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 /// won't be reparsed until the next one.
 const GIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// When the live db outgrows the arena, auto-resize to `db_bytes *
-/// ARENA_GROWTH_FACTOR + ARENA_HEADROOM_BYTES` so the next few
-/// snapshots don't trigger another resize. Factor must be ≥2 (each
-/// arena holds two buffers — one active, one inactive).
-const ARENA_GROWTH_FACTOR: u64 = 2;
+/// When an image outgrows the arena's buffer, the new buffer holds the
+/// image plus `1 / ARENA_HEADROOM_DIVISOR` of it (bead
+/// `ley-line-open-8c8ded`), so a growing db resizes O(log n) times. The
+/// arena is two such buffers (active and inactive) after its header.
+/// Sizing the buffer to the image alone, as before, rewrote the whole
+/// arena for every few KiB the db grew.
+const ARENA_HEADROOM_DIVISOR: u64 = 4;
 
-/// Slack added on top of `db_bytes * ARENA_GROWTH_FACTOR` during arena
-/// auto-resize, so a slowly growing db doesn't churn through resizes.
-const ARENA_HEADROOM_BYTES: u64 = 1024 * 1024; // 1 MiB
+/// The smallest buffer a resize allocates.
+const ARENA_MIN_BUFFER_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 // Compile-time invariants on the tuning constants. Each fails the build
 // if a future edit violates the documented constraint — cheaper than a
@@ -64,9 +64,8 @@ const ARENA_HEADROOM_BYTES: u64 = 1024 * 1024; // 1 MiB
 // (Clippy correctly notes that runtime assertions on these would be
 // constant-folded; const _ asserts are the idiomatic Rust answer.)
 const _: () = assert!(
-    ARENA_GROWTH_FACTOR >= 2,
-    "arena holds 2 buffers (active + inactive); growth factor < 2 \
-     can't fit both copies after a resize",
+    ARENA_HEADROOM_DIVISOR > 0,
+    "the headroom is a fraction of the image",
 );
 const _: () = assert!(
     SNAPSHOT_INTERVAL.as_millis() < GIT_POLL_INTERVAL.as_millis(),
@@ -87,7 +86,7 @@ const _: () = assert!(
 pub struct DaemonConfig {
     /// Path to the arena file (backing store for the substrate).
     pub arena: std::path::PathBuf,
-    /// Arena size hint in MiB. Grown auto per `ARENA_GROWTH_FACTOR`.
+    /// Arena size hint in MiB. Grown automatically by [`arena_size_for`].
     pub arena_size_mib: u64,
     /// Optional control socket path. Auto-derived from arena if `None`.
     pub control: Option<std::path::PathBuf>,
@@ -136,7 +135,7 @@ pub struct DaemonConfig {
 /// Kept separate from [`DaemonConfig`] so downstream crates that construct the
 /// long-lived public config with struct literals do not break when an opt-in
 /// behavior is added.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonOptions {
     /// Activate/resume the private CDC index before the first arena snapshot,
     /// over the named target. `None` leaves CDC inactive.
@@ -149,7 +148,49 @@ pub struct DaemonOptions {
     /// points force their own name so an execution daemon cannot silently
     /// take over `~/.mache/default.sock` from a running substrate daemon.
     pub discovery: crate::daemon::socket::SocketDiscovery,
+    /// What serves `--mount` (bead `ley-line-open-3e73dc`): the store's
+    /// filesystem behind the host's FUSE or NFS client. `leyline-storefs`
+    /// provides it; cli-lib cannot, since storefs depends on cli-lib. A
+    /// daemon asked to mount with none is refused before it starts.
+    pub host_mount: Option<HostMountRef>,
 }
+
+/// The guard of a host mount: dropping it unmounts, and lands what the
+/// mount holds staged, before the daemon's final snapshot.
+pub type MountGuard = Box<dyn Send>;
+
+/// Mounts the daemon's store at a path (bead `ley-line-open-3e73dc`, ADR-0045
+/// T8): every file, mode, symlink and directory `_tree` holds, read and
+/// written as storefs reads and writes them for a guest, on the daemon's
+/// one writer.
+pub trait HostMount: Send + Sync {
+    fn mount<'a>(
+        &'a self,
+        ctx: Arc<crate::daemon::DaemonContext>,
+        at: &'a Path,
+        backend: &'a str,
+        nfs_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MountGuard>> + Send + 'a>>;
+}
+
+/// A [`HostMount`] held by [`DaemonOptions`]. Two are equal when they are the
+/// same provider.
+#[derive(Clone)]
+pub struct HostMountRef(pub Arc<dyn HostMount>);
+
+impl std::fmt::Debug for HostMountRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostMountRef")
+    }
+}
+
+impl PartialEq for HostMountRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HostMountRef {}
 
 pub async fn cmd_daemon(config: DaemonConfig) -> Result<()> {
     let ext: Arc<dyn DaemonExt> = Arc::new(NoExt);
@@ -199,6 +240,24 @@ pub async fn run_execution_daemon_with_options(
     .await
 }
 
+/// [`run_execution_daemon_with_options`], publishing the daemon's context to
+/// `context` once it exists: the embedder's workspace-share provider serves
+/// a run's `/work` from that context's store, on the socket's one writer
+/// (ADR-0044 V5).
+pub async fn run_execution_daemon_with_context(
+    config: DaemonConfig,
+    handler: Arc<dyn ExecutionHandler>,
+    options: DaemonOptions,
+    context: crate::daemon::ContextSlot,
+) -> Result<()> {
+    run_daemon_with_options(
+        config,
+        Arc::new(ExecutionDaemonExt::new(handler).with_context_slot(context)),
+        execution_daemon_options(options),
+    )
+    .await
+}
+
 /// The execution surface always publishes under its own discovery name,
 /// whatever the caller passed. Sharing `default.sock` with the substrate
 /// daemon means whichever starts second silently steals the other's clients:
@@ -209,6 +268,27 @@ fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
         discovery: crate::daemon::socket::SocketDiscovery::Execution,
         ..options
     }
+}
+
+/// The arena's size in bytes for `--arena-size-mib`.
+fn arena_bytes(arena_size_mib: u64) -> u64 {
+    arena_size_mib * 1024 * 1024
+}
+
+/// Refuse a mount nothing can provide. A daemon asked to mount that ran
+/// headless instead gave its caller no mount and no failure (bead
+/// `ley-line-open-2be4a7`). `provided` says whether the caller passed a
+/// [`HostMount`]: the `leyline` binary does when it is built with the
+/// `mount` feature.
+fn refuse_unavailable_mount(mount: Option<&Path>, provided: bool) -> Result<()> {
+    if let (Some(path), false) = (mount, provided) {
+        anyhow::bail!(
+            "cannot mount at {}: this leyline was built without the `mount` feature. \
+             Build with `--features mount`, or omit --mount to run headless.",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Run the daemon with explicit additive behavior options.
@@ -237,6 +317,7 @@ pub async fn run_daemon_with_options(
     let arena = arena.as_path();
     let control = control.as_deref();
     let mount = mount.as_deref();
+    refuse_unavailable_mount(mount, options.host_mount.is_some())?;
     let source = source.as_deref();
     let backend = backend.as_str();
     let language = language.as_deref();
@@ -299,8 +380,7 @@ pub async fn run_daemon_with_options(
         .context("arena admission control (owner sentinel)")?;
 
     // 1. Arena setup.
-    let arena_bytes = arena_size_mib * 1024 * 1024;
-    let ctrl_path = cmd_serve::setup_arena(arena, arena_bytes, control)?;
+    let ctrl_path = lifecycle::setup_arena(arena, arena_bytes(arena_size_mib), control)?;
 
     // Lifecycle state — starts as Initializing, transitions through Parsing /
     // Enriching / Ready / Error. Shared with op_status and background tasks.
@@ -484,6 +564,7 @@ pub async fn run_daemon_with_options(
     // of run. Closes bead `ley-line-open-3af437` (sheaf gap 2):
     // previously the pass dropped the derived complex on return,
     // forcing every `op_sheaf_*` consumer query to trigger a rebuild.
+    #[cfg(feature = "sheaf")]
     let sheaf = {
         let s = Arc::new(crate::daemon::sheaf_ops::SheafState::new());
         // Wire the event bus so `sheaf_set_topology` / `sheaf_invalidate`
@@ -520,6 +601,7 @@ pub async fn run_daemon_with_options(
             // (written by SessionObservationPass) and builds a CellComplex
             // + drives CoChangeTracker. Installs the built complex +
             // tracker into `sheaf.cache` at end of run (bead `3af437`).
+            #[cfg(feature = "sheaf")]
             passes.push(Box::new(
                 crate::daemon::complex_build_pass::ComplexBuildPass::new(sheaf.clone()),
             ));
@@ -544,8 +626,12 @@ pub async fn run_daemon_with_options(
         embed_queue: embed_queue.clone(),
         #[cfg(feature = "text-search")]
         text_search,
+        #[cfg(feature = "sheaf")]
         sheaf,
     });
+    // Before the socket: whatever the extension serves from the context
+    // shares the socket's one writer from the first request on.
+    ext.on_context(&ctx);
 
     // Spawn the embed-queue drainer: query ops promote node_ids; this loop
     // drains them in priority order and refreshes the sidecar VectorIndex.
@@ -658,40 +744,25 @@ pub async fn run_daemon_with_options(
     // 7. Mount (optional — omit --mount for headless mode).
     // The guard lives until shutdown, which drops it — unmounting — before
     // the final snapshot.
-    #[cfg(feature = "mount")]
-    let mounted = if let Some(mount_path) = mount {
-        // ADR-0040 D4 (bead `ley-line-open-f2ee9f`): the in-process mount
-        // reads `live.db` through the daemon's reader pool and writes through
-        // its single writer. It is not a private copy of the arena, so a
-        // mount write is durable the moment it commits and a reparse of
-        // another file cannot drop it (bead `192018`), and no image is
-        // deserialised to serve it (bead `af6c9d`). The arena and
-        // `current_root` remain the publication for out-of-process consumers;
-        // the mount's `fsync` publishes through `snapshot_to_arena`.
-        let source = Arc::new(crate::daemon::live_graph::LiveDbSource::new(ctx.clone()));
-        let mut graph = leyline_fs::graph::SqliteGraphAdapter::live(source)?;
-        // ADR-0040 D3: an edit to a parsed file goes through the one write
-        // path. The daemon owns its tree, so the mount holds the whole grant.
-        graph.set_source_writer(Arc::new(crate::source_write::MountWriter {
-            grant: crate::source_write::Grant::Whole,
-        }));
-        if let Some(lang_ext) = language {
-            let ts_lang = leyline_fs::validate::language_for_extension(lang_ext)
-                .with_context(|| format!("unsupported language: {lang_ext}"))?;
-            graph.set_default_language(ts_lang);
+    // The mount serves the store (bead `ley-line-open-3e73dc`): `live.db`
+    // through the daemon's reader pool and its one writer, each landed
+    // proposal written into the checkout and published to the arena, as a
+    // guest's share is served. `refuse_unavailable_mount` refused a mount
+    // path with no provider above.
+    let mounted = match (mount, options.host_mount.as_ref()) {
+        (Some(mount_path), Some(provider)) => {
+            let guard = provider
+                .0
+                .mount(ctx.clone(), mount_path, backend, nfs_port)
+                .await?;
+            eprintln!("mounted at {}", mount_path.display());
+            Some(guard)
         }
-        let graph: Arc<dyn leyline_fs::graph::Graph> = Arc::new(graph);
-
-        Some(cmd_serve::mount_backend(graph, mount_path, backend, nfs_port).await?)
-    } else {
-        eprintln!("headless mode (no mount)");
-        None
+        _ => {
+            eprintln!("headless mode (no mount)");
+            None
+        }
     };
-    #[cfg(not(feature = "mount"))]
-    {
-        let _ = (mount, backend, nfs_port);
-        eprintln!("headless mode (mount features not compiled)");
-    }
 
     // 7. Extension post-mount.
     ext.on_post_mount(&ctrl_path, &router);
@@ -738,34 +809,34 @@ pub async fn run_daemon_with_options(
         let snap_ctx = ctx.clone();
         let snap_ctrl = ctrl_path.clone();
         let emitter = router.emitter();
+        // The daemon's publisher (bead `ley-line-open-8c8ded`): it wakes on
+        // a landed proposal's `request_publish` or on the tick, and
+        // publishes once for every commit since its last publish. The
+        // publish runs on the blocking pool, off the writer.
         tokio::spawn(async move {
             use tokio::time::interval;
             let mut tick = interval(SNAPSHOT_INTERVAL);
-            let mut last_snapshot_changes: u64 =
-                read_total_changes(&snap_ctx.live_db.writer).unwrap_or(0);
+            let mut last = read_total_changes(&snap_ctx.live_db.writer).unwrap_or(0);
             loop {
-                tick.tick().await;
-                // Cheap dirty-check: read `total_changes()` under a
-                // brief try_lock. If the counter hasn't advanced since
-                // the last successful snapshot, skip the whole
-                // serialize/msync path — nothing to persist.
-                let current_changes = match read_total_changes(&snap_ctx.live_db.writer) {
-                    Some(n) => n,
-                    None => continue, // contended; try again next tick
-                };
-                if current_changes == last_snapshot_changes {
-                    continue; // db is clean; no work to do
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = snap_ctx.live_db.publish_requested.notified() => {}
                 }
-                // Non-blocking: skip this tick if op_reparse / op_enrich
-                // is mid-flight rather than queuing snapshots behind it.
-                // 5fea4e — block-the-tokio-worker prevention.
-                if try_snapshot_or_log(
-                    &snap_ctx.live_db.writer,
-                    &snap_ctrl,
-                    "periodic snapshot failed",
-                ) {
-                    last_snapshot_changes = current_changes;
-                    emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
+                let ctx = Arc::clone(&snap_ctx);
+                let ctrl = snap_ctrl.clone();
+                let published = tokio::task::spawn_blocking(move || {
+                    let mut seen = last;
+                    publish_if_dirty(&ctx.live_db, &ctrl, &mut seen).map(|p| (p, seen))
+                })
+                .await;
+                match published {
+                    Ok(Ok((true, seen))) => {
+                        last = seen;
+                        emitter.emit("daemon.snapshot", "leyline", serde_json::json!({}));
+                    }
+                    Ok(Ok((false, _))) => {}
+                    Ok(Err(e)) => log::error!("publish failed: {e:#}"),
+                    Err(e) => log::error!("publish task failed: {e}"),
                 }
             }
         });
@@ -774,18 +845,14 @@ pub async fn run_daemon_with_options(
     eprintln!("daemon ready — press Ctrl+C to stop");
 
     // 11. Wait for shutdown.
-    cmd_serve::wait_for_shutdown(timeout).await?;
+    lifecycle::wait_for_shutdown(timeout).await?;
 
     // 12. Graceful shutdown: unmount, final snapshot, cleanup.
-    #[cfg(feature = "mount")]
     drop(mounted);
-    {
-        let guard = ctx.live_db.writer.lock();
-        if let Err(e) = snapshot_to_arena(&guard, &ctrl_path) {
-            eprintln!("warn: final snapshot failed: {e:#}");
-        } else {
-            eprintln!("final snapshot saved to arena");
-        }
+    if let Err(e) = publish_living_db(&ctx.live_db, &ctrl_path) {
+        eprintln!("warn: final snapshot failed: {e:#}");
+    } else {
+        eprintln!("final snapshot saved to arena");
     }
     if let Some(handle) = mcp_handle {
         handle.abort();
@@ -826,9 +893,14 @@ pub fn live_db_path_for(ctrl_path: &Path) -> std::path::PathBuf {
 ///   run's write live (ADR-0040), and the mount acknowledges a write at
 ///   the client's fsync or NFS COMMIT; under `NORMAL` that write
 ///   survived a process crash but not a power loss or OS crash (bead
-///   `ley-line-open-0a9931`). The guarantee is `fsync(2)`'s: on macOS
-///   that reaches the drive, not past its cache (`F_FULLFSYNC`, SQLite's
-///   `fullfsync`, is not set).
+///   `ley-line-open-0a9931`).
+/// - `fullfsync = ON`, `checkpoint_fullfsync = ON` — on macOS the commit's
+///   sync is `F_FULLFSYNC`, which reaches past the drive's cache; plain
+///   `fsync(2)` there stops at the drive. This commit is a proposal's
+///   acknowledgement: its one full flush. The checkout and the Σ head it
+///   writes after are ordered with `F_BARRIERFSYNC`, not flushed
+///   (`crate::durable`, bead `ley-line-open-98d0c3`). Elsewhere SQLite
+///   ignores both.
 /// - `wal_autocheckpoint = 1000` — checkpoint every ~1000 pages
 ///   (~4 MiB at default 4KB page size). Keeps the WAL from
 ///   growing unbounded on a write-heavy daemon; ensures the
@@ -847,6 +919,10 @@ fn configure_wal(conn: &rusqlite::Connection) -> Result<()> {
     }
     conn.pragma_update(None, "synchronous", "FULL")
         .context("set PRAGMA synchronous=FULL")?;
+    conn.pragma_update(None, "fullfsync", true)
+        .context("set PRAGMA fullfsync=ON")?;
+    conn.pragma_update(None, "checkpoint_fullfsync", true)
+        .context("set PRAGMA checkpoint_fullfsync=ON")?;
     conn.pragma_update(None, "wal_autocheckpoint", 1000i64)
         .context("set PRAGMA wal_autocheckpoint=1000")?;
     Ok(())
@@ -1074,11 +1150,14 @@ fn verify_source_root_matches(conn: &rusqlite::Connection, current_source: &Path
     );
 }
 
-/// Run a full-tree parse + log the standard `N parsed, N unchanged, N
-/// deleted, N errors` summary. Shared by the warm-start and cold-start
-/// branches of `init_living_db`. The `kind` prefix lets each branch
-/// label its log line ("incremental reparse" vs "parsing") while
-/// keeping the summary format identical so log scrapers see one shape.
+/// Reconcile the whole checkout of `source_dir` (bead
+/// `ley-line-open-60f39f`): materialize what the store accepted while the
+/// directory did not receive it, ingest what changed in the directory while
+/// the daemon was down, report conflicts, and parse the tree. Logs the
+/// standard `N parsed, N unchanged, N deleted, N errors` summary and a
+/// checkout line. Shared by the warm-start and cold-start branches of
+/// `init_living_db`; the `kind` prefix labels the first log line
+/// ("incremental reparse" vs "parsing").
 fn run_initial_parse(
     conn: &rusqlite::Connection,
     source_dir: &Path,
@@ -1086,11 +1165,22 @@ fn run_initial_parse(
     kind: &str,
 ) -> Result<()> {
     eprintln!("{kind} {} ...", source_dir.display());
-    let result = crate::cmd_parse::parse_into_conn(conn, source_dir, language, None)?;
+    let reconciled = crate::checkout::reconcile(conn, source_dir, language, None)?;
+    if let Some(result) = &reconciled.parse {
+        eprintln!(
+            "{} parsed, {} unchanged, {} deleted, {} errors",
+            result.parsed, result.unchanged, result.deleted, result.errors,
+        );
+    }
     eprintln!(
-        "{} parsed, {} unchanged, {} deleted, {} errors",
-        result.parsed, result.unchanged, result.deleted, result.errors,
+        "checkout: {} materialized, {} conflicts, {} files read to compare",
+        reconciled.materialized.len(),
+        reconciled.conflicts.len(),
+        reconciled.hashed,
     );
+    if let Some(problems) = reconciled.problems() {
+        eprintln!("warn: checkout: {problems}");
+    }
     Ok(())
 }
 
@@ -1220,34 +1310,45 @@ fn try_warm_start_from_arena(
     Ok(Some(conn))
 }
 
-/// Take the live-db lock, snapshot to arena, and log any failure under
-/// `label`. Used by the background timers (periodic snapshot, post-watch
-/// snapshot) where a snapshot failure is recoverable — the next tick
-/// retries — but should still surface in logs. The graceful-shutdown
-/// path uses `eprintln!` directly because it has a distinct success
-/// message; this helper is for the fire-and-forget periodic shape.
-pub fn snapshot_or_log(
-    live_db: &parking_lot::Mutex<rusqlite::Connection>,
-    ctrl_path: &Path,
-    label: &str,
-) {
-    let guard = live_db.lock();
-    if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
-        log::error!("{label}: {e:#}");
-    }
+/// Publish the living db into the arena: the daemon's one publish path
+/// (bead `ley-line-open-8c8ded`).
+///
+/// Holds [`LiveDb::publish_lock`](crate::daemon::db_pool::LiveDb) from the
+/// serialize to the root advance, so publishes are serialized against each
+/// other, and reads the image through a pool connection: one read
+/// transaction, so the image is one committed state, and the writer stays
+/// free. A proposal that commits during the publish is in the next one.
+pub fn publish_living_db(live_db: &crate::daemon::db_pool::LiveDb, ctrl_path: &Path) -> Result<()> {
+    let _publisher = live_db.publish_lock.lock();
+    let conn = live_db
+        .reader_pool
+        .get()
+        .map_err(|e| anyhow::anyhow!("reader pool checkout for a publish failed: {e}"))?;
+    snapshot_to_arena(&conn, ctrl_path)
 }
 
-/// Non-blocking variant of `snapshot_or_log` for the periodic snapshot
-/// timer (5fea4e). Uses `try_lock`: if the live_db lock is contended
-/// (e.g. `op_reparse` holds it across `parse_into_conn`), this tick is
-/// skipped with a debug log instead of blocking the tokio worker for
-/// the duration of the long-running operation.
-///
-/// Without this guard, a 500ms+ reparse would queue every subsequent
-/// snapshot tick behind it; on completion the queue drains in a burst,
-/// and any concurrent UDS query (which only borrows the db read-only)
-/// blocks behind the burst. `WouldBlock` and `Poisoned` are both
-/// recoverable — the next tick retries the lock.
+/// Publish when anything committed since the last publish this caller made
+/// (`last` is the writer's `total_changes()` then). Returns whether it
+/// published. A contended writer reads as "unknown": nothing is published
+/// and the caller's next wake retries.
+pub fn publish_if_dirty(
+    live_db: &crate::daemon::db_pool::LiveDb,
+    ctrl_path: &Path,
+    last: &mut u64,
+) -> Result<bool> {
+    let Some(changes) = read_total_changes(&live_db.writer) else {
+        return Ok(false);
+    };
+    if changes == *last {
+        return Ok(false);
+    }
+    // Every commit counted in `changes` is visible to the read transaction
+    // the publish opens after this point.
+    publish_living_db(live_db, ctrl_path)?;
+    *last = changes;
+    Ok(true)
+}
+
 /// Best-effort read of `sqlite3_total_changes()` under a brief try_lock.
 ///
 /// Returns `None` if the mutex is contended (some other task is holding
@@ -1272,23 +1373,44 @@ pub fn read_total_changes(live_db: &parking_lot::Mutex<rusqlite::Connection>) ->
     live_db.try_lock().map(|g| g.total_changes())
 }
 
-pub fn try_snapshot_or_log(
-    live_db: &parking_lot::Mutex<rusqlite::Connection>,
-    ctrl_path: &Path,
-    label: &str,
-) -> bool {
-    match live_db.try_lock() {
-        Some(guard) => {
-            if let Err(e) = snapshot_to_arena(&guard, ctrl_path) {
-                log::error!("{label}: {e:#}");
-            }
-            true
-        }
-        None => {
-            log::debug!("{label}: live_db contended, skipping this tick");
-            false
-        }
+/// The arena size an image of `image_len` bytes is written into, given the
+/// arena's current size: unchanged while the image fits a buffer, else two
+/// buffers with headroom (bead `ley-line-open-8c8ded`).
+pub fn arena_size_for(current: u64, image_len: u64) -> u64 {
+    if image_len <= leyline_core::ArenaHeader::buffer_size(current) {
+        return current;
     }
+    let buffer = std::cmp::max(
+        image_len + image_len / ARENA_HEADROOM_DIVISOR,
+        ARENA_MIN_BUFFER_BYTES,
+    );
+    leyline_core::ArenaHeader::HEADER_SIZE + 2 * buffer
+}
+
+/// `current_root` of a published image: BLAKE3 over its exact bytes, the
+/// substrate's `ContentAddressed` hash. The image hashes across cores;
+/// BLAKE3's tree mode gives the same bytes as the serial hash, and
+/// `update_rayon` hashes a small input on the calling thread.
+pub fn image_root(image: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new()
+        .update_rayon(image)
+        .finalize()
+        .as_bytes()
+}
+
+/// `image` as a standalone rollback-mode database, when it is a SQLite
+/// image stamped WAL. The live db is WAL-mode, and its serialized image
+/// keeps the stamp in header bytes 18 and 19 (file format write and read
+/// versions, 2 = WAL). `sqlite3_deserialize` of a WAL-stamped image fails
+/// every query with `SQLITE_CANTOPEN`, so a published image must say 1
+/// (rollback) there (bead `ley-line-open-2bd77c`). The pages are unchanged,
+/// and any other bytes are returned as they are.
+pub(crate) fn rollback_image(mut image: Vec<u8>) -> Vec<u8> {
+    const MAGIC: &[u8] = b"SQLite format 3\0";
+    if image.starts_with(MAGIC) && image.get(18..20) == Some(&[2, 2][..]) {
+        image[18..20].fill(1);
+    }
+    image
 }
 
 /// Serialize the living db and write it into the arena.
@@ -1314,21 +1436,26 @@ pub fn try_snapshot_or_log(
 /// 3. **`current_root` advance is the publish point (T2.4).** Polling
 ///    readers (HotSwapGraph) compare `current_root`; they don't refresh
 ///    until it changes. `set_arena_with_root` advances size and root
-///    together under the seqlock. Its error aborts the snapshot;
-///    callers (snapshot_or_log) move the daemon into Error phase so
-///    operators see it.
+///    together under the seqlock. Its error aborts the snapshot and
+///    reaches the caller ([`publish_living_db`]'s callers log it, and the
+///    next publish repairs it).
+///
+/// In the daemon every call goes through [`publish_living_db`], which
+/// holds the single-publisher lock: two concurrent calls would write the
+/// same inactive buffer.
 pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
-    let db_bytes = conn.serialize("main").context("serialize living db")?;
+    let db_bytes = rollback_image(
+        conn.serialize("main")
+            .context("serialize living db")?
+            .to_vec(),
+    );
 
     let mut ctrl =
         leyline_core::Controller::open_or_create(ctrl_path).context("open controller")?;
     let arena_path = ctrl.arena_path();
     let arena_size = ctrl.arena_size();
 
-    let min_arena = leyline_core::ArenaHeader::HEADER_SIZE
-        + db_bytes.len() as u64 * ARENA_GROWTH_FACTOR
-        + ARENA_HEADROOM_BYTES;
-    let new_size = std::cmp::max(arena_size, min_arena);
+    let new_size = arena_size_for(arena_size, db_bytes.len() as u64);
 
     let buf_capacity = leyline_core::ArenaHeader::buffer_size(new_size) as usize;
     if db_bytes.len() > buf_capacity {
@@ -1369,14 +1496,9 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     // observe (new_size, new active_buffer, new current_root).
     // current_root = σ(serialized db bytes) via the substrate's
     // ContentAddressed impl; Σ §3.4 locks BLAKE3. Retrofitted from
-    // inline `blake3::hash` per bead `ley-line-open-32201a`.
-    //
-    // Explicit `&[u8]` annotation on `as_ref` — rusqlite's
-    // `SerializedData` has multiple `AsRef<T>` impls now that the
-    // walker dep tree pulled `ignore`/`regex` in (bead
-    // ley-line-open-25685d), so inference needs a hint.
-    let db_slice: &[u8] = db_bytes.as_ref();
-    let current_root: [u8; 32] = *db_slice.hash().as_bytes();
+    // inline `blake3::hash` per bead `ley-line-open-32201a`; `image_root`
+    // computes those bytes across cores (bead `ley-line-open-8c8ded`).
+    let current_root: [u8; 32] = image_root(&db_bytes);
     ctrl.set_arena_with_root(&arena_path, new_size, current_root)
         .context("publish current_root (snapshot advance)")?;
 
@@ -1543,6 +1665,11 @@ async fn git_watch_loop(
             last_head = current_head;
         }
 
+        // 3. Reconcile the checkout (bead `ley-line-open-60f39f`), scoped to
+        //    the paths whose dirty state moved so we don't re-stat the
+        //    entire source tree on every tick.
+        let scope = watch_scope(head_changed, &last_dirty, &current_dirty);
+
         if dirty_changed {
             let new_files: Vec<&String> = current_dirty.difference(&last_dirty).collect();
             if !new_files.is_empty() {
@@ -1558,19 +1685,24 @@ async fn git_watch_loop(
             last_dirty = current_dirty;
         }
 
-        // 3. Incremental reparse, scoped to the dirty set so we don't re-stat
-        //    the entire source tree on every tick.
         ctx.state.write().phase = DaemonPhase::Parsing;
         let lang = ctx.lang_filter.as_deref();
-        let dirty_vec: Vec<String> = last_dirty.iter().cloned().collect();
-        let scope: Option<&[String]> = if dirty_vec.is_empty() {
-            None
-        } else {
-            Some(dirty_vec.as_slice())
-        };
         let guard = ctx.live_db.writer.lock();
-        match crate::cmd_parse::parse_into_conn(&guard, source_dir, lang, scope) {
-            Ok(result) => {
+        // A materialized file changes no projected row, only the checkout
+        // index, which the periodic snapshot publishes.
+        let reconciled = crate::checkout::reconcile(&guard, source_dir, lang, scope.as_deref())
+            .map(|reconciled| {
+                if let Some(problems) = reconciled.problems() {
+                    log::warn!("watch: checkout: {problems}");
+                }
+                reconciled.parse
+            });
+        match reconciled {
+            Ok(None) => {
+                drop(guard);
+                ctx.state.write().phase = DaemonPhase::Ready;
+            }
+            Ok(Some(result)) => {
                 if result.parsed > 0 || result.deleted > 0 {
                     eprintln!(
                         "watch: {} parsed, {} unchanged, {} deleted",
@@ -1578,8 +1710,11 @@ async fn git_watch_loop(
                     );
                     drop(guard);
 
-                    // 4. Snapshot to arena.
-                    snapshot_or_log(&ctx.live_db.writer, &ctx.ctrl_path, "watch snapshot failed");
+                    // 4. Publish before the events below: a consumer that
+                    // reads the arena on them sees the reparse.
+                    if let Err(e) = publish_living_db(&ctx.live_db, &ctx.ctrl_path) {
+                        log::error!("watch snapshot failed: {e:#}");
+                    }
 
                     // 5. Update state + emit events.
                     {
@@ -1635,6 +1770,23 @@ async fn git_watch_loop(
             }
         }
     }
+}
+
+/// The paths one watcher tick reconciles: the whole checkout when HEAD
+/// moved, else every path whose git dirty state moved — dirty now, or dirty
+/// at the last tick and clean now, since a revert changes the file too.
+fn watch_scope(
+    head_changed: bool,
+    last: &std::collections::HashSet<String>,
+    current: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    (!head_changed).then(|| {
+        last.union(current)
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
+            .collect()
+    })
 }
 
 /// Run the enrichment pipeline scoped to `changed_files` and emit
@@ -1736,6 +1888,7 @@ pub fn run_watcher_enrichment(
             // production path), otherwise `scope: "all-known"` — see
             // `emit_watcher_sheaf_invalidate` docs for the full
             // fallback contract.
+            #[cfg(feature = "sheaf")]
             emit_watcher_sheaf_invalidate(ctx, changed_files, emitter);
         }
         Err(e) => {
@@ -1835,6 +1988,7 @@ pub fn run_watcher_enrichment(
 ///
 /// Exposed to integration tests so the wire has a direct entry point
 /// that doesn't require spinning up the full git-poll loop.
+#[cfg(feature = "sheaf")]
 pub fn emit_watcher_sheaf_invalidate(
     ctx: &Arc<crate::daemon::DaemonContext>,
     changed_files: &[String],
@@ -2053,36 +2207,22 @@ mod tests {
     // parking_lot doesn't poison, so `read_total_changes` returning
     // None specifically on poison is not expressible. The remaining
     // contract — `read_total_changes` returns None when the lock is
-    // contended (uncontended → Some(counter)) — is covered by the
-    // `try_snapshot_or_log_*` tests below.
+    // contended (uncontended → Some(counter)) — is covered by
+    // `the_publisher_skips_a_wake_while_the_writer_is_busy` below.
 
     #[test]
-    fn try_snapshot_or_log_skips_when_lock_contended() {
-        // 5fea4e contract: when the live_db mutex is contended (e.g.
-        // op_reparse holds it across parse_into_conn), the periodic
-        // snapshot timer must skip the tick — NOT block the tokio
-        // worker thread waiting for the lock to release. Pin so a
-        // refactor that swapped try_lock for blocking lock would
-        // surface here as a hung test.
+    fn the_publisher_skips_a_wake_while_the_writer_is_busy() {
+        // 5fea4e contract: while the writer is held (op_reparse across
+        // parse_into_conn, a proposal mid-commit), the publisher's dirty
+        // check cannot read the counter; it returns at once without
+        // publishing, and its next wake retries. A blocking lock here
+        // would hang this test, which holds the writer on its own thread.
         let dir = TempDir::new().unwrap();
-        let ctrl_path = dir.path().join("contended.ctrl");
-        // Need a real arena for snapshot_to_arena to find — it'll
-        // bail when called, but the lock-skip path returns BEFORE we
-        // get there, so we don't need a working snapshot.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let live_db = StdMutex::new(conn);
-
-        // Hold the lock from this thread.
-        let _held_guard = live_db.lock();
-
-        // Now invoke try_snapshot_or_log — it must observe WouldBlock
-        // and return false WITHOUT trying to take the lock again
-        // (which would deadlock since we hold it on the same thread).
-        let snapshotted = try_snapshot_or_log(&live_db, &ctrl_path, "contention test");
-        assert!(
-            !snapshotted,
-            "try_snapshot_or_log must return false when lock is held by another holder",
-        );
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        let _held_guard = live.writer.lock();
+        let mut last = 0;
+        assert!(!publish_if_dirty(&live, &ctrl_path, &mut last).unwrap());
+        assert_eq!(last, 0, "nothing recorded as published");
     }
 
     // The pre-parking_lot poison-recovery test lived here — deleted
@@ -2092,8 +2232,8 @@ mod tests {
     // returns `MutexGuard` directly, so a panic-during-lock leaves no
     // Err state to recover from — the next lock just proceeds. The
     // "acquire when uncontended, skip when contended" contract that
-    // matters is still pinned by `try_snapshot_or_log_returns_false_when_lock_held`
-    // above.
+    // matters is still pinned by
+    // `the_publisher_skips_a_wake_while_the_writer_is_busy` above.
 
     #[test]
     fn warm_start_returns_none_on_missing_ctrl() {
@@ -2361,6 +2501,61 @@ mod tests {
         );
     }
 
+    /// Bead `ley-line-open-98d0c3`: the cost of one accepted proposal and
+    /// its write-through to the checkout, on the daemon's `live.db`
+    /// configuration, without a VM or a socket in the way. Prints the
+    /// median and mean over `LEYLINE_BENCH_PROPOSALS` (default 100) one-file
+    /// proposals into a `LEYLINE_BENCH_FILES` (default 2,000) file tree.
+    #[test]
+    #[ignore = "a benchmark: run with --ignored --nocapture"]
+    fn bench_one_proposal_and_its_checkout_write() {
+        use crate::source_write::{Base, Grant, Proposed, propose};
+        let files: usize = std::env::var("LEYLINE_BENCH_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
+        let proposals: usize = std::env::var("LEYLINE_BENCH_PROPOSALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        for i in 0..files {
+            let path = src.join(format!("d{}/f{i}.go", i % 50));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!("package d\n\nfunc F{i}() int {{ return {i} }}\n"),
+            )
+            .unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("bench.live.db")).unwrap();
+        configure_wal(&conn).unwrap();
+        crate::checkout::reconcile(&conn, &src, None, None).unwrap();
+        let mut took = Vec::with_capacity(proposals);
+        for n in 0..proposals {
+            let rel = format!("d{}/f{n}.go", n % 50);
+            let bytes = format!("package d\n\nfunc F{n}() int {{ return -{n} }}\n").into_bytes();
+            let start = std::time::Instant::now();
+            propose(
+                &conn,
+                &Grant::Whole,
+                vec![Proposed::write(&rel, Base::Any, bytes)],
+            )
+            .unwrap();
+            let r = crate::checkout::reconcile(&conn, &src, None, Some(&[rel])).unwrap();
+            took.push(start.elapsed());
+            assert_eq!(r.materialized.len(), 1);
+        }
+        took.sort();
+        let mean = took.iter().sum::<std::time::Duration>() / took.len() as u32;
+        println!(
+            "proposal+checkout over {files} files, {proposals} proposals: median {:.2} ms, mean {:.2} ms",
+            took[took.len() / 2].as_secs_f64() * 1e3,
+            mean.as_secs_f64() * 1e3
+        );
+    }
+
     #[test]
     fn configure_wal_activates_wal_on_file_backed_connection() {
         // The 15a load-bearing check: PRAGMA journal_mode=WAL must
@@ -2383,6 +2578,14 @@ mod tests {
         // at fsync or NFS COMMIT is on disk, not only in the page cache
         // (bead ley-line-open-0a9931).
         assert_eq!(synchronous, 2, "synchronous must be FULL (=2)");
+        // The commit is a proposal's acknowledgement and its one full
+        // flush: F_FULLFSYNC on macOS (bead ley-line-open-98d0c3).
+        for pragma in ["fullfsync", "checkpoint_fullfsync"] {
+            let on: i64 = conn
+                .query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(on, 1, "{pragma} must be ON");
+        }
         let autocheckpoint: i64 = conn
             .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
             .unwrap();
@@ -2582,6 +2785,103 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_this_build_cannot_provide_is_refused() {
+        let at = Some(Path::new("/mnt/x"));
+        assert!(refuse_unavailable_mount(None, false).is_ok(), "headless");
+        assert!(refuse_unavailable_mount(None, true).is_ok(), "headless");
+        assert!(refuse_unavailable_mount(at, true).is_ok(), "a mount build");
+        let err = refuse_unavailable_mount(at, false).unwrap_err().to_string();
+        assert!(err.contains("`mount` feature"), "{err}");
+        assert!(err.contains("/mnt/x"), "{err}");
+    }
+
+    /// `--arena-size-mib` is mebibytes.
+    #[test]
+    fn the_arena_size_is_mebibytes() {
+        assert_eq!(arena_bytes(1), 1_048_576);
+        assert_eq!(arena_bytes(64), 67_108_864);
+    }
+
+    /// Two [`HostMountRef`]s are equal when they hold the same provider, and
+    /// a provider prints by name, so `DaemonOptions` stays `Debug` and `Eq`.
+    #[test]
+    fn host_mount_refs_compare_by_provider() {
+        struct Never;
+        impl HostMount for Never {
+            fn mount<'a>(
+                &'a self,
+                _ctx: Arc<crate::daemon::DaemonContext>,
+                _at: &'a Path,
+                _backend: &'a str,
+                _nfs_port: u16,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MountGuard>> + Send + 'a>>
+            {
+                Box::pin(async { anyhow::bail!("never mounts") })
+            }
+        }
+        let one = HostMountRef(Arc::new(Never));
+        let same = one.clone();
+        let other = HostMountRef(Arc::new(Never));
+        assert_eq!(one, same);
+        assert_ne!(one, other);
+        assert_eq!(format!("{one:?}"), "HostMountRef");
+    }
+
+    #[test]
+    fn only_a_wal_stamped_sqlite_image_is_restamped() {
+        let header = |w: u8, r: u8| {
+            let mut h = b"SQLite format 3\0".to_vec();
+            h.extend_from_slice(&[0x10, 0x00, w, r, 0, 64, 32, 32]);
+            h
+        };
+        assert_eq!(rollback_image(header(2, 2))[18..20], [1, 1]);
+        assert_eq!(rollback_image(header(1, 1)), header(1, 1));
+        assert_eq!(rollback_image(header(2, 1)), header(2, 1), "a mixed stamp");
+        let raw = b"not a database, though byte 18 is \x02\x02 here".to_vec();
+        assert_eq!(rollback_image(raw.clone()), raw, "other bytes as they are");
+        let mut lookalike = header(2, 2);
+        lookalike[0] = b'X';
+        assert_eq!(rollback_image(lookalike.clone()), lookalike);
+    }
+
+    #[test]
+    fn a_published_image_opens_in_an_in_memory_reader() {
+        // Bead ley-line-open-2bd77c: the live db is WAL-mode, and its
+        // serialized image carried the WAL stamp (header bytes 18/19 = 2).
+        // sqlite3_deserialize of a WAL-stamped image fails every query with
+        // SQLITE_CANTOPEN, so no in-memory reader could open a published
+        // arena. The published image is a standalone rollback-mode database.
+        let dir = TempDir::new().unwrap();
+        let arena_path = dir.path().join("img.arena");
+        let ctrl_path = dir.path().join("img.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+        let _mmap = leyline_core::create_arena(&arena_path, 2 * 1024 * 1024).unwrap();
+        leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
+            .unwrap();
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE img_rows (id INTEGER PRIMARY KEY, payload TEXT);
+             INSERT INTO img_rows (payload) VALUES ('one'), ('two');",
+        )
+        .unwrap();
+
+        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+
+        let graph = leyline_fs::SqliteGraph::from_arena(&ctrl_path).unwrap();
+        let rows: i64 = graph
+            .conn()
+            .query_row("SELECT count(*) FROM img_rows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        let live_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live_mode.to_lowercase(), "wal", "the live db stays WAL");
+    }
+
+    #[test]
     fn snapshot_to_arena_works_with_wal_backed_connection() {
         // Load-bearing 15a invariant (per bead ley-line-open-98fb67):
         // `snapshot_to_arena` calls `conn.serialize("main")` on the
@@ -2700,6 +3000,22 @@ mod tests {
             grown.arena_size() > small,
             "the second snapshot must grow the arena"
         );
+        // The grown arena is sized from the image it holds: two buffers of
+        // the image plus a quarter, and the file is exactly that long (bead
+        // `ley-line-open-8c8ded`: a sizing bug must fail here, not fill the
+        // disk).
+        let grown_file = std::fs::File::open(&arena_path).unwrap();
+        let mut grown_header = [0u8; std::mem::size_of::<leyline_core::ArenaHeader>()];
+        grown_file.read_exact_at(&mut grown_header, 0).unwrap();
+        let grown_header: leyline_core::ArenaHeader = *bytemuck::from_bytes(&grown_header);
+        let image_len = grown_header.data_size;
+        assert_eq!(
+            grown.arena_size(),
+            leyline_core::ArenaHeader::HEADER_SIZE
+                + 2 * std::cmp::max(image_len + image_len / 4, 1024 * 1024),
+            "the grown arena is the header and two buffers of the image plus a quarter"
+        );
+        assert_eq!(grown_file.metadata().unwrap().len(), grown.arena_size());
         assert_ne!(grown.current_root(), published_root);
 
         let mut image = vec![0u8; header.data_size as usize];
@@ -2717,7 +3033,7 @@ mod tests {
     /// `ley-line-open-e37e03`, filed by mache: `--reset-arena` ALWAYS
     /// failed, including on a completely fresh arena with no prior
     /// state, because the reset zeroed the arena PATH along with the
-    /// root — but `cmd_serve::setup_arena` (this function's real
+    /// root — but `lifecycle::setup_arena` (this function's real
     /// caller, always run first) had already stamped the path, and
     /// nothing re-stamps it. The next `snapshot_to_arena` then opens
     /// an empty path and fails with "open arena file".
@@ -2737,7 +3053,7 @@ mod tests {
         // The real caller, not a hand-rolled mimic — the bug is specifically
         // about what THIS stamps and the reset then blanks.
         let ctrl_path_returned =
-            cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
+            lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
                 .expect("setup_arena on a completely fresh arena");
         assert_eq!(ctrl_path_returned, ctrl_path);
 
@@ -2791,7 +3107,7 @@ mod tests {
         // First daemon: cold start against repo A, snapshot it — this is
         // the prior state a shared arena (e.g. `~/.mache/default.arena`)
         // carries into the next run.
-        cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
+        lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
             .expect("setup_arena for repo A");
         let conn_a = init_living_db(
             &ctrl_path,
@@ -2908,6 +3224,67 @@ mod tests {
         let live_db_path = live_db_path_for(ctrl_path);
         let writer = rusqlite::Connection::open(&live_db_path).unwrap();
         configure_wal(&writer).unwrap();
+        context_over(ctrl_path, ext, source, writer)
+    }
+
+    /// An execution handler with nothing behind it.
+    struct NoExecution;
+
+    impl crate::daemon::execution::ExecutionHandler for NoExecution {
+        fn capabilities(&self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn provision(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn start(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn status(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn inspect(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn collect(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cleanup(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cancel(&self, _: &serde_json::Value) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// A run's workspace share is served from the daemon's own context: the
+    /// execution extension hands the context it is given to the slot its
+    /// embedder holds, once.
+    #[tokio::test]
+    async fn the_execution_extension_publishes_the_daemon_context_to_its_slot() {
+        let dir = TempDir::new().unwrap();
+        let slot = crate::daemon::ContextSlot::default();
+        let ext = crate::daemon::ExecutionDaemonExt::new(Arc::new(NoExecution))
+            .with_context_slot(Arc::clone(&slot));
+        let ctx = test_ctx(&dir.path().join("slot.ctrl"), Arc::new(NoExt), dir.path());
+        assert!(slot.get().is_none());
+        ext.on_context(&ctx);
+        assert!(Arc::ptr_eq(slot.get().expect("published"), &ctx));
+
+        // Without a slot the hook does nothing (and the trait default too).
+        crate::daemon::ExecutionDaemonExt::new(Arc::new(NoExecution)).on_context(&ctx);
+        NoExt.on_context(&ctx);
+    }
+
+    /// A daemon context over `writer`, the live db's writer connection at
+    /// `live_db_path_for(ctrl_path)`, whose checkout is `source`.
+    fn context_over(
+        ctrl_path: &Path,
+        ext: Arc<dyn DaemonExt>,
+        source: &Path,
+        writer: rusqlite::Connection,
+    ) -> Arc<DaemonContext> {
+        let live_db_path = live_db_path_for(ctrl_path);
         let live_db = crate::daemon::db_pool::LiveDb::new(writer, &live_db_path, 4).unwrap();
         #[cfg(feature = "vec")]
         let vec_index = {
@@ -2937,6 +3314,269 @@ mod tests {
             text_search: Arc::new(leyline_text_search::null::NullEngine::new()),
             sheaf: Arc::new(crate::daemon::sheaf_ops::SheafState::new()),
         })
+    }
+
+    // ── The checkout across restarts (bead `ley-line-open-60f39f`) ─────
+    //
+    // Each test runs daemon lifetimes through the startup path a real
+    // daemon runs: `setup_arena`, `init_living_db` (cold, then warm), and
+    // the first publish. Dropping a lifetime's context is a kill: nothing
+    // runs at exit, so what the next start sees is what was committed.
+
+    const CHECKOUT_A: &str = "package a\n\nfunc A() int { return 1 }\n";
+    const CHECKOUT_PROPOSED: &str = "package a\n\nfunc A() int { return 2 }\n";
+    const CHECKOUT_EDITED: &str = "package a\n\nfunc A() int { return 3 }\n";
+    const CHECKOUT_B: &str = "package a\n\nfunc B() string { return \"b\" }\n";
+
+    /// A source directory holding `a.go` and `b.go`, and a state directory
+    /// for the arena, controller and live db.
+    fn checkout_fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(src.join("a.go"), CHECKOUT_A).unwrap();
+        std::fs::write(src.join("b.go"), CHECKOUT_B).unwrap();
+        (dir, src, state)
+    }
+
+    /// One daemon lifetime over `src`, started the way `run_daemon` starts.
+    fn boot(state: &Path, src: &Path) -> Arc<DaemonContext> {
+        let ctrl = lifecycle::setup_arena(
+            &state.join("arena"),
+            8 * 1024 * 1024,
+            Some(&state.join("arena.ctrl")),
+        )
+        .unwrap();
+        let live = live_db_path_for(&ctrl);
+        let conn = init_living_db(&ctrl, &live, Some(src), Some("go"), false).unwrap();
+        snapshot_to_arena(&conn, &ctrl).unwrap();
+        context_over(&ctrl, Arc::new(NoExt), src, conn)
+    }
+
+    fn op(ctx: &Arc<DaemonContext>, request: serde_json::Value) -> serde_json::Value {
+        let out = crate::daemon::ops::handle_base_op_value(ctx, request).expect("a base op");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    fn read_source(ctx: &Arc<DaemonContext>, path: &str) -> serde_json::Value {
+        op(ctx, serde_json::json!({"op": "read_source", "path": path}))
+    }
+
+    /// Propose `content` for `path` against what `path` holds now.
+    fn propose_over(ctx: &Arc<DaemonContext>, path: &str, content: &str) -> serde_json::Value {
+        let base = read_source(ctx, path)["blob_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        op(
+            ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": path, "base": base, "content": content},
+            ]}),
+        )
+    }
+
+    /// What the checkout's conflict record holds for `path`, read through
+    /// the daemon's `query` op.
+    fn conflict_rows(ctx: &Arc<DaemonContext>, path: &str) -> Vec<serde_json::Value> {
+        let r = op(
+            ctx,
+            serde_json::json!({"op": "query", "sql": format!(
+                "SELECT path, hex(disk_hash) AS disk, hex(stored_hash) AS stored \
+                   FROM _checkout_conflict WHERE path = '{path}'"
+            )}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        r["rows"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn upper_hex(text: &str) -> String {
+        use leyline_core::ContentAddressed;
+        text.as_bytes().hash().to_string().to_uppercase()
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_an_accepted_proposal_and_the_directory_holds_it() {
+        let (_dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        let accepted = propose_over(&ctx, "a.go", CHECKOUT_PROPOSED);
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert!(accepted.get("post_commit_error").is_none(), "{accepted}");
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED,
+            "an accepted proposal is materialized into the source directory",
+        );
+        drop(ctx);
+
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_PROPOSED);
+        assert_eq!(read_source(&ctx, "b.go")["content"], CHECKOUT_B);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_commit_and_materialization_is_materialized_at_restart() {
+        let (_dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        // The file cannot be staged: a directory sits where its temp file goes.
+        let staging = crate::checkout::staging_path(&src.join("a.go"));
+        std::fs::create_dir(&staging).unwrap();
+        let accepted = propose_over(&ctx, "a.go", CHECKOUT_PROPOSED);
+        assert_eq!(accepted["ok"], true, "the proposal commits: {accepted}");
+        assert!(
+            accepted["post_commit_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("a.go")),
+            "the failed materialization is reported: {accepted}",
+        );
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_A
+        );
+        drop(ctx);
+        std::fs::remove_dir(&staging).unwrap();
+
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_PROPOSED);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED,
+            "startup materializes the proposal instead of reverting it",
+        );
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_edit_made_while_the_daemon_was_down_is_ingested() {
+        let (_dir, src, state) = checkout_fixture();
+        drop(boot(&state, &src));
+        std::fs::write(src.join("a.go"), CHECKOUT_EDITED).unwrap();
+        std::fs::remove_file(src.join("b.go")).unwrap();
+        std::fs::write(src.join("c.go"), CHECKOUT_B).unwrap();
+
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_EDITED);
+        assert_eq!(
+            read_source(&ctx, "b.go")["ok"],
+            false,
+            "a deleted file leaves"
+        );
+        assert_eq!(read_source(&ctx, "c.go")["content"], CHECKOUT_B);
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+        drop(ctx);
+
+        // The ingest was recorded: the next start changes nothing.
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_EDITED);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_EDITED
+        );
+        assert!(!src.join("b.go").exists(), "a deleted file is not restored");
+    }
+
+    #[tokio::test]
+    async fn both_sides_changed_is_a_conflict_that_keeps_both() {
+        let (_dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        let staging = crate::checkout::staging_path(&src.join("a.go"));
+        std::fs::create_dir(&staging).unwrap();
+        assert_eq!(propose_over(&ctx, "a.go", CHECKOUT_PROPOSED)["ok"], true);
+        drop(ctx);
+        std::fs::remove_dir(&staging).unwrap();
+        // While the daemon is down, a person edits the file it never wrote.
+        std::fs::write(src.join("a.go"), CHECKOUT_EDITED).unwrap();
+
+        let ctx = boot(&state, &src);
+        assert_eq!(
+            read_source(&ctx, "a.go")["content"],
+            CHECKOUT_PROPOSED,
+            "the store keeps the proposal",
+        );
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_EDITED,
+            "the directory keeps the edit",
+        );
+        assert_eq!(
+            conflict_rows(&ctx, "a.go"),
+            vec![serde_json::json!({
+                "path": "a.go",
+                "disk": upper_hex(CHECKOUT_EDITED),
+                "stored": upper_hex(CHECKOUT_PROPOSED),
+            })],
+        );
+        drop(ctx);
+
+        // Proposing the directory's bytes resolves it.
+        let ctx = boot(&state, &src);
+        assert_eq!(propose_over(&ctx, "a.go", CHECKOUT_EDITED)["ok"], true);
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+        drop(ctx);
+        let ctx = boot(&state, &src);
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_EDITED);
+        assert!(conflict_rows(&ctx, "a.go").is_empty());
+    }
+
+    /// `reparse` over the daemon's own checkout reconciles it: a proposal
+    /// the directory never received is written out, not replaced by the
+    /// directory's older bytes. A reparse of another directory parses it.
+    #[tokio::test]
+    async fn a_reparse_of_the_checkout_reconciles_it() {
+        let (dir, src, state) = checkout_fixture();
+        let ctx = boot(&state, &src);
+        let staging = crate::checkout::staging_path(&src.join("a.go"));
+        std::fs::create_dir(&staging).unwrap();
+        assert_eq!(propose_over(&ctx, "a.go", CHECKOUT_PROPOSED)["ok"], true);
+        std::fs::remove_dir(&staging).unwrap();
+
+        let r = op(&ctx, serde_json::json!({"op": "reparse"}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(read_source(&ctx, "a.go")["content"], CHECKOUT_PROPOSED);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            CHECKOUT_PROPOSED
+        );
+
+        // Scoped to a file with nothing to ingest: no parse ran.
+        let quiet = op(
+            &ctx,
+            serde_json::json!({"op": "reparse", "files": ["a.go"]}),
+        );
+        assert_eq!(quiet["ok"], true, "{quiet}");
+        assert_eq!(quiet["parsed"], "0", "{quiet}");
+
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("c.go"), CHECKOUT_B).unwrap();
+        let r = op(
+            &ctx,
+            serde_json::json!({"op": "reparse", "source": other.to_string_lossy()}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["parsed"], "1", "{r}");
+    }
+
+    #[test]
+    fn the_watcher_reconciles_every_path_whose_dirty_state_moved() {
+        let set = |paths: &[&str]| -> std::collections::HashSet<String> {
+            paths.iter().map(|p| p.to_string()).collect()
+        };
+        assert_eq!(
+            watch_scope(false, &set(&["a.go", "b.go"]), &set(&["b.go", "c.go"])),
+            Some(vec![
+                "a.go".to_string(),
+                "b.go".to_string(),
+                "c.go".to_string()
+            ]),
+        );
+        assert_eq!(watch_scope(true, &set(&["a.go"]), &set(&[])), None);
     }
 
     /// Subscribe to one topic, return the event receiver.
@@ -3185,7 +3825,7 @@ mod tests {
 
         let error = run_execution_daemon_with_options(
             rejected_execution_config(&tmp.path().join("execution-options.arena")),
-            handler,
+            Arc::clone(&handler),
             DaemonOptions {
                 cdc: Some(crate::CdcTarget::Nodes),
                 ..DaemonOptions::default()
@@ -3193,6 +3833,16 @@ mod tests {
         )
         .await
         .expect_err("execution daemon options entry point must preserve admission");
+        assert!(format!("{error:#}").contains("--mcp-allow-public"));
+
+        let error = run_execution_daemon_with_context(
+            rejected_execution_config(&tmp.path().join("execution-context.arena")),
+            handler,
+            DaemonOptions::default(),
+            crate::daemon::ContextSlot::default(),
+        )
+        .await
+        .expect_err("execution daemon context entry point must preserve admission");
         assert!(format!("{error:#}").contains("--mcp-allow-public"));
     }
 
@@ -3259,6 +3909,171 @@ mod tests {
             );
         }
     }
+
+    // --- bead ley-line-open-8c8ded: a publish costs one image, off the writer
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_arena_keeps_its_size_while_the_image_fits_its_buffer() {
+        let header = leyline_core::ArenaHeader::HEADER_SIZE;
+        let arena = header + 2 * (100 * MIB);
+        // An image that fits the inactive buffer exactly, or with room to
+        // spare, is written in place: no new arena.
+        assert_eq!(arena_size_for(arena, 100 * MIB), arena);
+        assert_eq!(arena_size_for(arena, 1), arena);
+        assert_eq!(arena_size_for(arena, 0), arena);
+    }
+
+    #[test]
+    fn a_grown_arena_leaves_room_for_the_image_to_grow() {
+        let header = leyline_core::ArenaHeader::HEADER_SIZE;
+        let image = 1_312_063_488u64;
+        let grown = arena_size_for(64 * MIB, image);
+        let buffer = leyline_core::ArenaHeader::buffer_size(grown);
+        assert!(buffer >= image, "the image fits the new buffer");
+        assert_eq!(
+            buffer,
+            image + image / 4,
+            "the new buffer leaves exactly a quarter of the image free, no more"
+        );
+        assert_eq!(
+            grown,
+            header + 2 * buffer,
+            "the arena is the header and two buffers"
+        );
+        // The case the share benchmark hit: a few KiB of growth after a
+        // resize rewrote the whole 2.6 GB arena. It now stays in place.
+        assert_eq!(arena_size_for(grown, image + 64 * 1024), grown);
+        // A small image still gets a usable minimum.
+        let small = arena_size_for(header, 10);
+        assert_eq!(leyline_core::ArenaHeader::buffer_size(small), MIB);
+    }
+
+    #[test]
+    fn the_image_root_is_the_substrate_hash_of_the_image() {
+        use leyline_core::ContentAddressed;
+        // Sizes across BLAKE3's chunk (1 KiB) and its multi-chunk tree.
+        for len in [
+            0usize,
+            1,
+            1023,
+            1024,
+            1025,
+            64 * 1024 + 3,
+            3 * 1024 * 1024 + 7,
+        ] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let expected = *bytes.as_slice().hash().as_bytes();
+            assert_eq!(image_root(&bytes), expected, "len {len}");
+        }
+    }
+
+    /// A living db file-backed beside `ctrl_path`, wrapped as the daemon
+    /// wraps it, with a small arena registered.
+    fn publishing_live_db(dir: &TempDir) -> (crate::daemon::db_pool::LiveDb, std::path::PathBuf) {
+        let arena_path = dir.path().join("pub.arena");
+        let ctrl_path = dir.path().join("pub.ctrl");
+        let live_db_path = live_db_path_for(&ctrl_path);
+        let _mmap = leyline_core::create_arena(&arena_path, 2 * MIB).unwrap();
+        leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .set_arena(&arena_path.to_string_lossy(), 2 * MIB)
+            .unwrap();
+        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        conn.execute_batch("CREATE TABLE landed (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let live = crate::daemon::db_pool::LiveDb::new(conn, &live_db_path, 2).unwrap();
+        (live, ctrl_path)
+    }
+
+    fn published_names(ctrl_path: &Path) -> Vec<String> {
+        let graph = leyline_fs::SqliteGraph::from_arena(ctrl_path).unwrap();
+        let mut stmt = graph
+            .conn()
+            .prepare("SELECT name FROM landed ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn every_commit_before_a_publish_is_in_the_image_it_publishes() {
+        let dir = TempDir::new().unwrap();
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        for name in ["a", "b", "c", "d"] {
+            live.writer
+                .lock()
+                .execute("INSERT INTO landed (name) VALUES (?1)", [name])
+                .unwrap();
+        }
+        publish_living_db(&live, &ctrl_path).unwrap();
+        assert_eq!(published_names(&ctrl_path), ["a", "b", "c", "d"]);
+        let root = leyline_core::Controller::open_or_create(&ctrl_path)
+            .unwrap()
+            .current_root();
+        assert_ne!(root, [0u8; 32], "the publish advanced current_root");
+    }
+
+    #[test]
+    fn a_publish_does_not_wait_for_the_writer() {
+        // The writer is held (a proposal mid-commit) for the whole publish:
+        // the publish reads a committed snapshot through the pool and
+        // finishes. Publishing on the writer deadlocked here.
+        let dir = TempDir::new().unwrap();
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        live.writer
+            .lock()
+            .execute("INSERT INTO landed (name) VALUES ('committed')", [])
+            .unwrap();
+        let live = Arc::new(live);
+        let held = live.writer.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let publisher = {
+            let live = Arc::clone(&live);
+            let ctrl_path = ctrl_path.clone();
+            std::thread::spawn(move || {
+                done_tx
+                    .send(publish_living_db(&live, &ctrl_path).is_ok())
+                    .unwrap();
+            })
+        };
+        let published = done_rx.recv_timeout(std::time::Duration::from_secs(60));
+        drop(held);
+        publisher.join().unwrap();
+        assert_eq!(
+            published,
+            Ok(true),
+            "the publish finished while the writer was held"
+        );
+        assert_eq!(published_names(&ctrl_path), ["committed"]);
+    }
+
+    #[test]
+    fn the_publisher_publishes_only_when_something_committed() {
+        let dir = TempDir::new().unwrap();
+        let (live, ctrl_path) = publishing_live_db(&dir);
+        let mut last = read_total_changes(&live.writer).unwrap();
+        assert!(
+            !publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "clean: no publish"
+        );
+        live.writer
+            .lock()
+            .execute("INSERT INTO landed (name) VALUES ('x')", [])
+            .unwrap();
+        assert!(
+            publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "dirty: one publish"
+        );
+        assert_eq!(published_names(&ctrl_path), ["x"]);
+        assert!(
+            !publish_if_dirty(&live, &ctrl_path, &mut last).unwrap(),
+            "nothing since: no second publish of the same image"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3271,6 +4086,7 @@ mod execution_discovery_tests {
         let caller = DaemonOptions {
             cdc: Some(crate::CdcTarget::SourceBlobs),
             discovery: SocketDiscovery::Substrate,
+            host_mount: None,
         };
         let effective = execution_daemon_options(caller);
         assert_eq!(

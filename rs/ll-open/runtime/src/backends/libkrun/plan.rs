@@ -59,6 +59,13 @@ impl RootfsResolver for DirectoryRootfsResolver {
     }
 }
 
+/// `KRUN_TSI_HIJACK_INET` from `libkrun.h` — carry the guest's `AF_INET`
+/// sockets over vsock instead of leaving them unreachable.
+///
+/// Named here rather than written as a bare `1` at the call site so the one
+/// place that weakens the boundary says what it is doing.
+pub const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
+
 #[derive(Debug)]
 pub struct KrunConfig {
     pub run_id: String,
@@ -132,8 +139,28 @@ pub fn compile_plan(
             .map(|(key, value)| c_string(&format!("{key}={value}"), "environment"))
             .collect::<Result<_, _>>()?,
         workdir: CString::new("/").expect("static workdir has no NUL"),
-        vcpus: request.limits.vcpus,
-        ram_mib: request.limits.memory_mib,
+        // Hypervisor sizing, zero meaning "unsized". The native tier compiles
+        // this plan too and never reads these, and may legitimately carry a
+        // ceiling no hypervisor can size (1.5 CPUs under a cgroup), so a value
+        // that is not whole vCPUs or MiB is not an error HERE. On the microVM
+        // tier it never arrives: `KrunWorkerBackend::start` refuses, by name,
+        // both an unsized request and one the hypervisor cannot size exactly,
+        // before a worker exists, and the worker refuses an unsized plan
+        // before `krun_set_vm_config`.
+        vcpus: request
+            .limits
+            .cpu
+            .hypervisor_vcpus()
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+        ram_mib: request
+            .limits
+            .memory
+            .hypervisor_ram_mib()
+            .ok()
+            .flatten()
+            .unwrap_or(0),
         wall_time_ms: request.limits.wall_time_ms,
         // Both default closed, and neither is derived from the request: a
         // workload does not get to widen its own boundary. Socket hijacking is

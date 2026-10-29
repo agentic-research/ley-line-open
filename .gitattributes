@@ -1,0 +1,12 @@
+# Vendored upstream bytes and the patches against them are kept exactly as
+# upstream wrote them, trailing whitespace and CRLF included:
+# tools/vendor_libkrun.sh check diffs them byte for byte. (ley-line-open-f1c46f)
+rs/third_party/libkrun/** -whitespace -text
+rs/third_party/libkrun-patches/** -whitespace -text
+rs/third_party/libkrun/** linguist-vendored
+
+# notme's canonical-encoding fixtures, vendored byte-for-byte: PROVENANCE pins
+# each file's SHA-256 and tests/notme_cabundle_fixtures.rs re-checks it, so no
+# EOL conversion may touch them. (ley-line-open-0466c0)
+rs/ll-open/sign/tests/fixtures/notme/** -whitespace -text
+rs/ll-open/sign/tests/fixtures/notme/** linguist-vendored

@@ -8,7 +8,8 @@ Most people use it through [mache](https://github.com/agentic-research/mache):
 mache installs or starts `leyline` for you. Start with
 [GETTING-STARTED.md](GETTING-STARTED.md). This README is the short orientation;
 the implementation-level contract is in
-[docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md).
+[docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md). Where the project is
+headed, and in what order, is [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## The useful mental model
 
@@ -85,26 +86,37 @@ outside the guest's writable boundary. Embedders select a backend explicitly
 when constructing `run_execution_daemon`; the ordinary daemon remains backend-
 free for compatibility.
 
-The portable runtime tests use a fake worker and do not require libkrun or
-Hypervisor.framework. The real Apple Silicon guest-write proof is ignored by
-default because it requires a locally installed libkrun/libkrunfw toolchain and
-the Hypervisor.framework entitlement; see
-[`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs) and
-bead `ley-line-open-16a994` for the CI/release gate.
+LLO builds the VMM it runs: the libkrun worker links libkrun from
+[`rs/third_party/libkrun`](rs/third_party/README.md) (upstream v1.19.6 plus LLO's
+patches, ADR-0044) instead of loading an installed libkrun. The guest kernel,
+libkrunfw, is still an installed library. Building the worker compiles
+libkrun's guest init for Linux; on macOS that needs `zig`
+(`brew install zig`; see `tools/krun_init_cc.sh`).
+
+The portable runtime tests use a fake worker or the linked library without a
+hypervisor. The tests that boot a real guest run where
+`LEYLINE_LIBKRUNFW_PATH` names libkrunfw and report a skip otherwise (set
+`LEYLINE_REQUIRE_HYPERVISOR` to make that skip fail); on macOS they ad-hoc
+sign the VMM with the Hypervisor.framework entitlement. See
+[`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs),
+[`libkrun_virtiofs_backend.rs`](rs/ll-open/runtime/tests/libkrun_virtiofs_backend.rs)
+and bead `ley-line-open-16a994` for the CI/release gate.
 
 The execution/v1 API is exposed through the runtime crate, the explicit
 `run_execution_daemon` UDS entry point, first-party CLI client, and MCP
 registry. Its schema version
 (`cloister/execution/v1`) is deliberately independent of the repository and
 crate release version; consumers must negotiate API compatibility rather than
-infer it from `v0.20.5`. The ordinary open `leyline daemon` command remains a
+infer it from `v0.21.0`. The ordinary open `leyline daemon` command remains a
 substrate daemon with no execution backend; an embedding application must opt
 into `run_execution_daemon` after constructing a trusted resolver/backend
 handler. The service currently proves schema binding,
 provisioning, ordered lifecycle events, cancellation, cleanup, and
-content-addressed receipt assembly. Native backend conformance and mmap-backed
-CAS projection remain separate follow-on gates in beads
-`ley-line-open-f81567` and `ley-line-open-16c953`.
+content-addressed receipt assembly. The native nono backend's confinement is
+checked at the kernel by `rs/ll-open/runtime/tests/native_confinement.rs`
+(Seatbelt on macOS, Landlock on Linux; `LEYLINE_REQUIRE_SANDBOX=1` turns a
+host that cannot sandbox from a named skip into a failure). Mmap-backed CAS
+projection remains a follow-on gate in bead `ley-line-open-16c953`.
 
 For embedders that keep an explicit artifact catalog, `CatalogResolver` binds
 the authorized executable artifact and workspace graph identities to a
@@ -121,7 +133,9 @@ leyline execution-daemon \
   --cas-root /var/lib/leyline/cas \
   --run-root /var/lib/leyline/runs \
   --worker /usr/libexec/leyline-native-worker \
-  --catalog /etc/leyline/execution-catalog.json
+  --catalog /etc/leyline/execution-catalog.json \
+  --evidence-store /var/lib/leyline/evidence \
+  --trust-key /etc/leyline/trust/issuer.pub
 ```
 
 The catalog is local trusted configuration; it is not a substitute for the
@@ -129,23 +143,45 @@ signed `RunSpec`/`RunGrant` wire contract. Signet/NotMe/Interlace trust roots
 remain embedding-owned: production callers must pass an `EvidenceVerifier` to
 `start_authorized_with_verifier`, which resolves each content-addressed
 evidence reference and verifies its signed envelope or certificate chain. The
-default first-party CLI rejects execution unless an embedding verifier is
-installed. `--allow-unverified-evidence` exists only for local fixtures and is
-an explicit downgrade. The legacy `start_authorized` path uses a metadata-only
-fixture verifier and is not a production trust boundary. The daemon owns the
-worker and UDS lifecycle, while callers provide logical intent and the
-embedding verifier.
+legacy `start_authorized` path uses a metadata-only fixture verifier and is not
+a production trust boundary. The daemon owns the worker and UDS lifecycle,
+while callers provide logical intent and the verifier's configuration.
 
-LLO also ships `CasDsseEvidenceVerifier`, which verifies APAS
-`application/vnd.in-toto+json` envelopes from an embedding-provided
-content-addressed store against embedding-provided Signet/NotMe trust keys.
-It requires the APAS Handoff/v1 predicate as well as the in-toto envelope
-type. Cloister may use that adapter or supply its own verifier for Interlace
-certificate/lease evidence; key distribution and rotation remain outside LLO.
+LLO ships `CasDsseEvidenceVerifier`, which verifies the `RunGrant` issuer
+signature and APAS `application/vnd.in-toto+json` evidence envelopes from a
+content-addressed store against supplied Ed25519 trust keys. It requires the
+APAS Handoff/v1 predicate as well as the in-toto envelope type. Cloister may
+use that adapter or supply its own verifier for Interlace certificate/lease
+evidence; key distribution and rotation remain outside LLO.
 
-To select the embedded VM path, use `--backend micro-vm --libkrun
-/path/to/libkrun` and repeat `--device` only for explicitly granted device
-paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
+`leyline execution-daemon` selects its verifier from three flags, and fails
+closed:
+
+| Flags | Verifier |
+| --- | --- |
+| `--evidence-store DIR` and one or more `--trust-key FILE` | `CasDsseEvidenceVerifier` over the CAS blob store at `DIR` (`<DIR>/<aa>/<62 hex>`, BLAKE3-addressed, verified on read), trusting exactly those keys |
+| none | `RejectUnverifiedEvidence`: every start is refused |
+| `--allow-unverified-evidence` | `MetadataOnlyEvidenceVerifier`: authenticates nothing; local fixtures only |
+
+LLO ships no trust keys. A trust-key file holds one Ed25519 public key, as
+64 hex characters or a PEM `PUBLIC KEY` block in canonical RFC 8410 SPKI form;
+the daemon logs each key's ADR-012 canonical kid
+(`lowercasehex(SHA-256(SPKI DER)[:16])`). Startup is refused when only one of
+`--trust-key`/`--evidence-store` is given, when a key file is unreadable,
+malformed or repeated, when the store directory does not exist, or when
+`--allow-unverified-evidence` is combined with either. Evidence is addressed
+`blake3-256:<hex>` over the exact envelope bytes; that digest names content and
+a kid names a key, and neither stands in for the other. A refused start reports
+`Unauthenticated` with a detail that begins with a stable rejection token
+(`grant-unsigned`, `untrusted-signer`, `signature-invalid`,
+`evidence-missing`, …; `EvidenceRejection` in `leyline-runtime`).
+
+To select the embedded VM path, use `--backend micro-vm --worker
+/path/to/leyline-krun-worker` (the release's `leyline-krun-worker-darwin-arm64`,
+or `task krun-worker:install`; on macOS the worker must carry
+`com.apple.security.hypervisor`, and the backend reports itself unavailable
+when it does not), grant libkrunfw with `--runtime-file`, and
+repeat `--device` only for explicitly granted device paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
 `krunvm` CLI.
 
 Mutation testing is invoked through the repository Taskfile. Run
@@ -159,9 +195,9 @@ tests. The Taskfile fixture gate rejects Rust diffs that enumerate no mutants,
 focused scopes that run no matching slice, and baseline suites that cannot run
 inside cargo-mutants' scratch tree.
 
-The current release is `v0.20.5`. It publishes platform binaries, FFI
+The current release is `v0.21.0`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
-`clients/go/leyline-schema/v0.20.4`. See
+`clients/go/leyline-schema/v0.21.0`. See
 [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
 for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 
@@ -181,7 +217,7 @@ them per platform, so consuming one is a download rather than a Rust build:
 ```bash
 # capnp resolves `-o<plugin>` by PATH-searching `capnpc-<plugin>`, so the
 # schema-bridge assets must be installed under their unsuffixed names.
-curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.20.5/capnpc-schema-bridge-zod-darwin-arm64
+curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.21.0/capnpc-schema-bridge-zod-darwin-arm64
 install -m 0755 capnpc-schema-bridge-zod-darwin-arm64 ~/.local/bin/capnpc-schema-bridge-zod
 ```
 
@@ -199,18 +235,18 @@ dependency and build a build-tool from source — which meant a fix could be
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged
-`localhost/leyline:v0.20.5`. It uses
+`localhost/leyline:v0.21.0`. It uses
 `cargo zigbuild` for the static musl binary
 and `cgr.dev/chainguard/static:latest` as the runtime base.
 
 Pushing a `v*` tag publishes the multi-arch image (linux/amd64 + linux/arm64)
-to `ghcr.io/agentic-research/ley-line-open:v0.20.5`, with a
+to `ghcr.io/agentic-research/ley-line-open:v0.21.0`, with a
 [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 recorded against the pushed digest:
 
 ```bash
-docker pull ghcr.io/agentic-research/ley-line-open:v0.20.5
-gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.20.5 \
+docker pull ghcr.io/agentic-research/ley-line-open:v0.21.0
+gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.21.0 \
   --repo agentic-research/ley-line-open
 ```
 

@@ -43,7 +43,7 @@ fn activated_projection_publishes_chunked_4k_reads_to_a_real_arena() {
 
     let arena_path = temp.path().join("graph.arena");
     let ctrl_path = temp.path().join("graph.ctrl");
-    leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
+    leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
     let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(
         &conn,
@@ -118,7 +118,7 @@ fn the_daemon_entry_point_honors_the_source_blobs_target() {
 
     let arena_path = temp.path().join("blobs.arena");
     let ctrl_path = temp.path().join("blobs.ctrl");
-    leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
+    leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
     let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(
         &conn,
@@ -176,7 +176,7 @@ fn no_target_activates_nothing_and_still_publishes() {
 
     let arena_path = temp.path().join("off.arena");
     let ctrl_path = temp.path().join("off.ctrl");
-    leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
+    leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
     let report =
         leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, None).unwrap();
@@ -234,6 +234,12 @@ fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+        .unwrap();
+    // A downstream projection is nodes-only: it has no syntax tree and no
+    // source files. A database with `_source` is a store, where a write is
+    // an edit of a parsed file proposed at its flush (ADR-0045 T8) — not
+    // the chunk lifecycle under test.
+    conn.execute_batch("DELETE FROM _ast; DROP TABLE _source;")
         .unwrap();
     drop(conn);
 

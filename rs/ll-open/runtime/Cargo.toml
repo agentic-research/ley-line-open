@@ -1,20 +1,30 @@
 [package]
 name = "leyline-runtime"
-version = "0.20.5"
+version = "0.21.0"
 edition = "2024"
 description = "Capability-resolved execution lifecycle and isolation backends for Leyline"
 repository = "https://github.com/agentic-research/ley-line-open"
 license = "AGPL-3.0-or-later"
 
+# No VMM here: the libkrun backend supervises the leyline-krun-worker binary,
+# which the unpublished leyline-krun-worker crate builds and which links the
+# vendored libkrun (ADR-0044, bead ley-line-open-395e43).
+
 [dependencies]
+anyhow = { workspace = true }
+# PEM `PUBLIC KEY` trust-key files (cas_evidence.rs). Same major as
+# leyline-envelope's.
+base64 = "0.22"
 blake3 = { workspace = true }
 capnp = { workspace = true }
 capnp-json = { workspace = true }
-leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.20.5" }
-libloading = { workspace = true }
+leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.21.0" }
 libc = { workspace = true }
-leyline-core = { path = "../../ll-core/core", version = "0.20.5" }
-leyline-envelope = { path = "../envelope", version = "0.20.5" }
+leyline-core = { path = "../../ll-core/core", version = "0.21.0" }
+leyline-envelope = { path = "../envelope", version = "0.21.0" }
+# The ADR-012 canonical kid of each operator trust key. Features match
+# leyline-envelope's pin: `ffi` off, `root-signer` on.
+leyline-sign = { path = "../sign", version = "0.21.0", default-features = false, features = ["root-signer"] }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -23,8 +33,24 @@ rustix = { version = "1.1.4", features = ["fs"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# Test-only hooks on KrunWorkerBackend that bypass or retarget the
+# hypervisor-entitlement capability check (bead ley-line-open-831bf1):
+# `with_unverified_hypervisor_access` for fake shell-script workers, and
+# `with_entitlement_platform` to apply the macOS rule on Linux. Off in every
+# shipping build: no shipping configuration enables it (tools/feature-ledger.txt
+# row, enforced by tools/check_feature_reachability.sh); this crate's own
+# tests enable it through the dev-dependency on itself below.
+test-support = []
+
 [dev-dependencies]
+# The crate itself with `test-support`, so its integration tests reach the
+# hooks. Dev-dependencies never reach a dependent's build, and a path-only
+# dev-dependency is dropped from the published manifest.
+leyline-runtime = { path = ".", features = ["test-support"] }
 hex = { workspace = true }
+# tests/cas_evidence.rs: recomputes the ADR-012 kid independently.
+sha2 = { workspace = true }
 wait-timeout = "0.2"
 # `kill(pid, 0)` liveness probes for the grandchild-reaping regression test
 # (bead rs-a1e8d0).

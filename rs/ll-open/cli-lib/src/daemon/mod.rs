@@ -4,6 +4,7 @@ pub mod arena_lock;
 pub mod arena_owner;
 pub mod auth;
 pub mod client;
+#[cfg(feature = "sheaf")]
 pub mod complex_build_pass;
 pub mod db_pool;
 #[cfg(feature = "vec")]
@@ -13,19 +14,21 @@ pub mod events;
 pub mod execution;
 pub mod execution_contract;
 pub mod ext;
+#[cfg(feature = "sheaf")]
 pub mod granularity_router;
 #[cfg(feature = "hdc")]
 pub mod hdc_enrich;
 #[cfg(feature = "hdc")]
 pub mod hdc_pass;
-pub mod live_graph;
 #[cfg(feature = "lsp")]
 pub mod lsp_pass;
 pub mod mcp;
 pub mod observation_schema;
 pub mod ops;
 pub mod session_observation_pass;
+#[cfg(feature = "sheaf")]
 pub mod sheaf_ablation;
+#[cfg(feature = "sheaf")]
 pub mod sheaf_ops;
 pub mod socket;
 #[cfg(feature = "vec")]
@@ -45,6 +48,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use events::EventRouter;
+
+/// Where a running daemon's context is published for code that serves its
+/// store outside the socket ([`DaemonExt::on_context`]); empty until the
+/// daemon has built it.
+pub type ContextSlot = Arc<std::sync::OnceLock<Arc<DaemonContext>>>;
 pub use execution::ExecutionDaemonExt;
 pub use ext::{DaemonExt, NoExt};
 
@@ -150,8 +158,10 @@ pub struct DaemonContext {
     ///
     /// The downside is that long sync work blocks the tokio worker thread.
     /// Mitigations:
-    /// - Periodic snapshot timer uses `try_snapshot_or_log` (try_lock + skip)
-    ///   so it doesn't queue behind a long reparse.
+    /// - The publisher (`cmd_daemon::publish_living_db`) reads through the
+    ///   pool under its own lock, never the writer, and its dirty check
+    ///   (`publish_if_dirty`) try_locks the writer and skips while it is
+    ///   held, so it doesn't queue behind a long reparse.
     /// - Future op_reparse refactor: wrap the lock+work in
     ///   `tokio::task::spawn_blocking` to move the blocking work to the
     ///   blocking pool. Tracked as a follow-up under 5fea4e.
@@ -209,6 +219,7 @@ pub struct DaemonContext {
     /// only queries. The cache emits `sheaf.topology` and
     /// `sheaf.invalidate` events on the bus once `EventRouter::emitter`
     /// is wired in via `sheaf.set_emitter(...)`.
+    #[cfg(feature = "sheaf")]
     pub sheaf: Arc<sheaf_ops::SheafState>,
 }
 

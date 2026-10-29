@@ -558,9 +558,9 @@ fn test_serve_creates_arena() {
     let arena_size_mib: u64 = 2;
     let arena_bytes = arena_size_mib * 1024 * 1024;
 
-    // Run setup_arena — the reusable core of cmd_serve.
+    // Run setup_arena — the arena and controller every daemon starts from.
     let returned_ctrl =
-        leyline_cli_lib::cmd_serve::setup_arena(&arena_path, arena_bytes, Some(&ctrl_path))
+        leyline_cli_lib::lifecycle::setup_arena(&arena_path, arena_bytes, Some(&ctrl_path))
             .expect("setup_arena should succeed");
 
     // Verify the arena file was created with the expected size.
@@ -605,7 +605,7 @@ fn test_serve_derives_control_path() {
     let dir = TempDir::new().expect("create temp dir");
     let arena_path = dir.path().join("my.arena");
 
-    let ctrl_path = leyline_cli_lib::cmd_serve::setup_arena(&arena_path, 2 * 1024 * 1024, None)
+    let ctrl_path = leyline_cli_lib::lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, None)
         .expect("setup_arena should succeed");
 
     // Should derive .ctrl extension from .arena
@@ -3436,6 +3436,211 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
         failures.is_empty(),
         "daemon protocol drift gate caught {} failure(s):\n  {}",
         failures.len(),
+        failures.join("\n  "),
+    );
+}
+
+/// Where the shape of `got` differs from the shape of `want`: an object's
+/// key set, recursively, and each array element against `want`'s first.
+/// Values are not compared — hashes and roots vary by run; the shape is the
+/// contract.
+fn shape_mismatches(at: &str, want: &serde_json::Value, got: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    match (want, got) {
+        (Value::Object(w), Value::Object(g)) => {
+            let wk: std::collections::BTreeSet<&String> = w.keys().collect();
+            let gk: std::collections::BTreeSet<&String> = g.keys().collect();
+            let mut out = Vec::new();
+            if wk != gk {
+                out.push(format!("{at}: keys {gk:?}, fixture {wk:?}"));
+            }
+            for k in wk.intersection(&gk) {
+                out.extend(shape_mismatches(&format!("{at}.{k}"), &w[*k], &g[*k]));
+            }
+            out
+        }
+        (Value::Array(w), Value::Array(g)) => match w.first() {
+            Some(first) => g
+                .iter()
+                .enumerate()
+                .flat_map(|(i, item)| shape_mismatches(&format!("{at}[{i}]"), first, item))
+                .collect(),
+            None => Vec::new(),
+        },
+        (Value::Object(_) | Value::Array(_), _) | (_, Value::Object(_) | Value::Array(_)) => {
+            vec![format!("{at}: {got} where the fixture has {want}")]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Bead `ley-line-open-5dc3a5`: the `read_source` / `propose` fixtures are
+/// what the daemon produces. Against a seeded source, a real read, a real
+/// stale refusal, a real typed refusal and a real applied proposal (with a
+/// failure after its commit) each answer exactly the fixture's key set,
+/// nested objects included. The Go gate decodes the same fixtures into
+/// the typed bindings, so handler, fixture and schema agree.
+#[tokio::test]
+async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (_arena, ctrl_path) = fresh_arena(dir.path());
+    let ctx = Arc::new(default_test_ctx(ctrl_path.clone()));
+    let src = dir.path().join("tree");
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::write(src.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(src.join("src/old.rs"), "fn old() {}\n").unwrap();
+    {
+        let guard = ctx.live_db.writer.lock();
+        leyline_cli_lib::cmd_parse::parse_into_conn(&guard, &src, None, None).unwrap();
+    }
+    let sock_path = dir.path().join("test.sock");
+    spawn_test_socket(ctx, sock_path.clone()).await;
+    let fixtures = load_daemon_protocol_fixtures();
+    let mut failures = Vec::new();
+    let mut check = |name: &str, got: &serde_json::Value| {
+        let want = &fixtures[name]["response"];
+        failures.extend(shape_mismatches(name, want, got));
+    };
+
+    let read = uds_round_trip(
+        &sock_path,
+        r#"{"op": "read_source", "path": "src/main.rs"}"#,
+    )
+    .await;
+    assert_eq!(read["ok"], true, "{read}");
+    assert_eq!(read["mode"], "100644", "{read}");
+    check("read_source", &read);
+    let base = read["blob_hash"].as_str().unwrap().to_string();
+
+    // Another writer moves the file; the first author's edit overlaps it,
+    // so the merge conflicts on the one line both changed (ADR-0045 T5).
+    let moved = uds_round_trip(
+        &sock_path,
+        r#"{"op": "propose", "writes": [{"path": "src/main.rs", "base": "any", "content": "fn main() { let _ = 1; }\n"}]}"#,
+    )
+    .await;
+    assert_eq!(moved["ok"], true, "{moved}");
+    let stale = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "src/main.rs", "base": base, "content": "fn main() { let _ = 2; }\n"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(stale["refusal"]["reason"], "stale", "{stale}");
+    assert_eq!(
+        stale["refusal"]["moved"][0]["conflicts"],
+        serde_json::json!([{"start": 0, "end": 1}]),
+        "{stale}"
+    );
+    check("propose", &stale);
+
+    // An edit that touches other lines against the same moved base merges.
+    let merged = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "src/main.rs", "base": base, "content": "fn main() {}\n\nfn ours() {}\n"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(merged["ok"], true, "{merged}");
+    assert_eq!(
+        merged["merged"],
+        serde_json::json!(["src/main.rs"]),
+        "{merged}"
+    );
+    let after = uds_round_trip(
+        &sock_path,
+        r#"{"op": "read_source", "path": "src/main.rs"}"#,
+    )
+    .await;
+    assert_eq!(
+        after["content"],
+        "fn main() { let _ = 1; }\n\nfn ours() {}\n"
+    );
+    check("propose_merged", &merged);
+
+    // Any bytes at any path, modes, symlinks and directories (T4).
+    let tree = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "docs/empty", "kind": "mkdir", "base": "absent"},
+            {"path": "README.md", "kind": "create", "base": "absent", "content": "# tree\n"},
+            {"path": "run.sh", "kind": "create", "base": "absent", "content": "#!/bin/sh\n", "mode": "100755"},
+            {"path": "main.link", "kind": "create", "base": "absent", "content": "src/main.rs", "mode": "120000"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(tree["ok"], true, "{tree}");
+    check("propose_tree", &tree);
+    let script = uds_round_trip(&sock_path, r#"{"op": "read_source", "path": "run.sh"}"#).await;
+    assert_eq!(script["mode"], "100755", "{script}");
+    let link = uds_round_trip(&sock_path, r#"{"op": "read_source", "path": "main.link"}"#).await;
+    assert_eq!(
+        (&link["mode"], &link["content"]),
+        (&"120000".into(), &"src/main.rs".into())
+    );
+
+    let refused = uds_round_trip(
+        &sock_path,
+        r#"{"op": "propose", "writes": [{"path": "src", "kind": "rmdir", "base": "any"}]}"#,
+    )
+    .await;
+    assert_eq!(refused["refusal"]["reason"], "not_empty", "{refused}");
+    check("propose_refused", &refused);
+
+    // A half-written file lands; it no longer refuses as `syntax`.
+    let half = uds_round_trip(
+        &sock_path,
+        r#"{"op": "propose", "writes": [{"path": "src/old.rs", "base": "any", "content": "fn old( {\n"}]}"#,
+    )
+    .await;
+    assert_eq!(half["ok"], true, "{half}");
+
+    // Bead `ley-line-open-47fb03`: a create over a file is stale with an
+    // `absent` base; a create and a delete land as one proposal.
+    let create_stale = uds_round_trip(
+        &sock_path,
+        r#"{"op": "propose", "writes": [{"path": "src/main.rs", "kind": "create", "base": "absent", "content": "fn main() {}\n"}]}"#,
+    )
+    .await;
+    assert_eq!(
+        create_stale["refusal"]["moved"][0]["expected"], "absent",
+        "{create_stale}"
+    );
+    check("propose_create_stale", &create_stale);
+    let structural = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "src/lib.rs", "kind": "create", "base": "absent", "content": "pub fn lib() {}\n"},
+            {"path": "src/old.rs", "kind": "delete", "base": "any"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(structural["ok"], true, "{structural}");
+    check("propose_structural", &structural);
+
+    // A head the chain refuses: the proposal commits and its head write
+    // fails after the commit.
+    let head = leyline_cli_lib::cmd_parse::head_path_for(&ctrl_path.with_extension("live.db"));
+    std::fs::write(&head, b"not a head").unwrap();
+    let applied = uds_round_trip(
+        &sock_path,
+        r#"{"op": "propose", "writes": [{"path": "src/main.rs", "base": "any", "content": "fn main() {}\n"}]}"#,
+    )
+    .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    check("propose_applied", &applied);
+
+    assert!(
+        failures.is_empty(),
+        "the daemon's proposal responses differ from the fixtures:\n  {}",
         failures.join("\n  "),
     );
 }

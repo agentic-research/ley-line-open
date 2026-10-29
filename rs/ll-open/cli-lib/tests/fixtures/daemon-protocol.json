@@ -110,10 +110,11 @@
       "ok": true,
       "content": "fn main() {}\n",
       "blob_hash": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"
+      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "mode": "100644"
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["content", "blob_hash", "tree_root", "error"],
+    "response_optional_keys": ["content", "blob_hash", "tree_root", "mode", "error"],
     "go_binding": "ReadSourceResponse",
     "go_drift_skip": null
   },
@@ -131,15 +132,162 @@
     },
     "response": {
       "ok": false,
-      "error": "proposal refused: 'src/main.rs' moved since it was read (read blob 3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a, now 0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9)",
-      "stale": {
-        "path": "src/main.rs",
-        "expected": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
-        "current": "0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"
+      "error": "proposal refused: 'src/main.rs' moved since it was read (read blob 3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a, now blob 0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9), and its changes overlap the other writer's at base lines 1..2",
+      "refusal": {
+        "reason": "stale",
+        "moved": [
+          {
+            "path": "src/main.rs",
+            "expected": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
+            "current": "0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9",
+            "conflicts": [{"start": 0, "end": 1}]
+          }
+        ]
       }
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "stale", "error"],
+    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "go_binding": "ProposeResponse",
+    "go_drift_skip": null
+  },
+
+  "propose_merged": {
+    "request": {
+      "op": "propose",
+      "writes": [
+        {
+          "path": "src/main.rs",
+          "base": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
+          "content": "fn main() {}\n\nfn ours() {}\n"
+        }
+      ]
+    },
+    "response": {
+      "ok": true,
+      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "blobs": [
+        {
+          "path": "src/main.rs",
+          "blob_hash": "5e6f7a8b9c0d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d"
+        }
+      ],
+      "merged": ["src/main.rs"]
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "go_binding": "ProposeResponse",
+    "go_drift_skip": null
+  },
+
+  "propose_tree": {
+    "request": {
+      "op": "propose",
+      "writes": [
+        {"path": "docs/empty", "kind": "mkdir", "base": "absent"},
+        {"path": "README.md", "kind": "create", "base": "absent", "content": "# tree\n"},
+        {"path": "run.sh", "kind": "create", "base": "absent", "content": "#!/bin/sh\n", "mode": "100755"},
+        {"path": "main.link", "kind": "create", "base": "absent", "content": "src/main.rs", "mode": "120000"}
+      ]
+    },
+    "response": {
+      "ok": true,
+      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "blobs": [
+        {"path": "README.md", "blob_hash": "5e6f7a8b9c0d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d"}
+      ]
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "go_binding": "ProposeResponse",
+    "go_drift_skip": null
+  },
+
+  "propose_refused": {
+    "request": {
+      "op": "propose",
+      "writes": [
+        {"path": "src", "kind": "rmdir", "base": "any"}
+      ]
+    },
+    "response": {
+      "ok": false,
+      "error": "proposal refused: the directory 'src' is not empty",
+      "refusal": {
+        "reason": "not_empty",
+        "path": "src"
+      }
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "go_binding": "ProposeResponse",
+    "go_drift_skip": null
+  },
+
+  "propose_applied": {
+    "request": {
+      "op": "propose",
+      "writes": [
+        {"path": "src/main.rs", "base": "any", "content": "fn main() {}\n"}
+      ]
+    },
+    "response": {
+      "ok": true,
+      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "blobs": [
+        {"path": "src/main.rs", "blob_hash": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a"}
+      ],
+      "post_commit_error": "Σ head write after a committed parse failed; the rows are committed but the head was not advanced"
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "go_binding": "ProposeResponse",
+    "go_drift_skip": null
+  },
+
+  "propose_structural": {
+    "request": {
+      "op": "propose",
+      "writes": [
+        {"path": "src/lib.rs", "kind": "create", "base": "absent", "content": "pub fn lib() {}\n"},
+        {"path": "src/old.rs", "kind": "delete", "base": "any"}
+      ]
+    },
+    "response": {
+      "ok": true,
+      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "blobs": [
+        {"path": "src/lib.rs", "blob_hash": "5e6f7a8b9c0d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d"}
+      ]
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "go_binding": "ProposeResponse",
+    "go_drift_skip": null
+  },
+
+  "propose_create_stale": {
+    "request": {
+      "op": "propose",
+      "writes": [
+        {"path": "src/main.rs", "kind": "create", "base": "absent", "content": "fn main() {}\n"}
+      ]
+    },
+    "response": {
+      "ok": false,
+      "error": "proposal refused: 'src/main.rs' moved since it was read (read no file, now blob 0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9)",
+      "refusal": {
+        "reason": "stale",
+        "moved": [
+          {
+            "path": "src/main.rs",
+            "expected": "absent",
+            "current": "0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"
+          }
+        ]
+      }
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },

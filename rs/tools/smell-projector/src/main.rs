@@ -922,7 +922,8 @@ fn is_cfg_test_attr(line: &str) -> bool {
 }
 
 /// True iff this file (`file_path`) is `#[cfg(test)]`-gated in its
-/// parent module — i.e., the parent `lib.rs` or `mod.rs` contains
+/// parent module — i.e., the parent `lib.rs`, `mod.rs`, `main.rs`, or
+/// `<dir>.rs` beside the file's directory contains
 /// `#[cfg(test)]\n[pub ]?mod <basename>;`. Files gated this way are
 /// entirely test-only; every unwrap/unsafe in them should be
 /// excluded from the projections.
@@ -940,10 +941,13 @@ fn is_file_cfg_test_gated(file_path: &Path) -> bool {
     if stem == "lib" || stem == "mod" || stem == "main" {
         return false;
     }
+    // The 2018 layout declares `<dir>/<name>.rs` in `<dir>.rs` beside the
+    // directory.
     let parent_candidates = [
         parent_dir.join("mod.rs"),
         parent_dir.join("lib.rs"),
         parent_dir.join("main.rs"),
+        parent_dir.with_extension("rs"),
     ];
     for parent in &parent_candidates {
         let Ok(text) = fs::read_to_string(parent) else {
@@ -1915,6 +1919,35 @@ mod tests {
     //! future edits to `contains_unsafe_keyword` can't silently
     //! re-introduce them.
     use super::*;
+
+    // ── is_file_cfg_test_gated ─────────────────────────────────────────
+
+    /// A child module file is gated by its parent module, whether the
+    /// parent is `<dir>/mod.rs` or, in the 2018 layout, `<dir>.rs` beside
+    /// the directory (`cmd_parse.rs` declaring `#[cfg(test)] mod
+    /// tree_tests;` for `cmd_parse/tree_tests.rs`).
+    #[test]
+    fn a_child_module_file_is_gated_by_a_2018_style_parent() {
+        let root =
+            std::env::temp_dir().join(format!("smell-projector-gated-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("parent")).expect("fixture directory");
+        fs::write(
+            root.join("parent.rs"),
+            "mod real;\n\n#[cfg(test)]\nmod gated;\n",
+        )
+        .expect("parent module");
+        fs::write(root.join("parent/gated.rs"), "fn f() {}\n").expect("gated child");
+        fs::write(root.join("parent/real.rs"), "fn f() {}\n").expect("real child");
+        let gated = is_file_cfg_test_gated(&root.join("parent/gated.rs"));
+        let real = is_file_cfg_test_gated(&root.join("parent/real.rs"));
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            gated,
+            "a #[cfg(test)] mod in <dir>.rs gates <dir>/<name>.rs"
+        );
+        assert!(!real, "an ungated mod stays production code");
+    }
 
     // ── contains_unsafe_keyword tokenizer ─────────────────────────────
 

@@ -34,7 +34,8 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | [`leyline-text-search`](ll-open/text-search/) | Unstructured-text semantic search backend abstraction. `NullEngine` default; `WitchcraftEngine` (XTR-WARP) behind feature flag |
 | [`leyline-chat-embed`](ll-open/chat-embed/) | CLI binary: semantic search over Claude Code chat databases via fastembed/MiniLM |
 | [`leyline-cli-lib`](ll-open/cli-lib/) | Daemon: living SQLite db + arena flip + Σ root advance + MCP/UDS surfaces; hosts every enrichment pass |
-| [`leyline-cli`](ll-open/cli/) | `leyline` binary — `parse`, `lsp`, `daemon`, `serve`, `inspect` subcommands |
+| [`leyline-storefs`](ll-open/storefs/) | Store-backed filesystem core for the virtio-fs device (ADR-0044 V2) and the host mount (ADR-0045 T8, `mount` feature: FUSE and loopback NFSv3 adapters): FUSE-shaped requests answered from the store, writes landed as ADR-0042 proposals at FLUSH/FSYNC, refusals as Linux errno values |
+| [`leyline-cli`](ll-open/cli/) | `leyline` binary — `parse`, `lsp`, `daemon`, `inspect` subcommands |
 
 ## Crate dependency graph
 
@@ -68,6 +69,7 @@ graph TD
         clilib[leyline-cli-lib]
         cli[leyline-cli]
         runtime[leyline-runtime]
+        storefs[leyline-storefs]
         envelope[leyline-envelope]
         sign[leyline-sign]
         lsp[leyline-lsp]

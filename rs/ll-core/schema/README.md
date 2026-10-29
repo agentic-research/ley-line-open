@@ -1,7 +1,7 @@
 # leyline-schema
 
 Shared SQLite schema — the contract between ley-line crates. This README
-describes `projection-v6` (v0.20.0). The full table-by-table contract,
+describes `projection-v7` (ADR-0045). The full table-by-table contract,
 including the sidecar tables other crates add, is `docs/TABLE_CONTRACT.md`.
 
 ## Node ids
@@ -42,7 +42,7 @@ and `NID_ORDINAL_MASK`.
   keyed by a file and how (`FileKey::NidRange` with its extra nid columns,
   `FileKey::FileId`, or `FileKey::SourcePath`); `delete_file_rows`,
   `delete_file_rows_by_id`, `move_file_rows` and
-  `refresh_source_paths_under_dir` iterate it. A splice, a mount `rm` or
+  `refresh_source_paths_under_dir` iterate it. A splice, a graph `rm` or
   `mv`, and a scoped reparse all go through these; `table_exists` probes
   the optional sidecars.
 - **`SQLITE_MAX_BOUND_PARAMS`** — the one bound-parameter ceiling every
@@ -93,6 +93,10 @@ and `_cfg`; `leyline-lsp` adds `_lsp`, `_lsp_defs`, `_lsp_refs`,
 `_lsp_hover` and `_lsp_completions`. All of them key by `nid`, `file_id`
 or the file's relative path — exactly the three shapes `FILE_KEYED_TABLES`
 enumerates. The `_meta` table and its `set_meta` / `get_meta` accessors
-live in `leyline-ts`, not here. `_meta.projection_schema_version` is
-`projection-v6`; a binary refuses an older label at parse open and asks
-for a cold reparse.
+live in `leyline-ts`, not here. `leyline-cli-lib` adds the store's
+manifest `_tree` (every stored path with its git mode, every directory)
+and `_parse_diagnostics`; `_tree` rows belong to the store, not to a
+file's projection, so they are not in `FILE_KEYED_TABLES` and outlive a
+file leaving the projection (ADR-0045). `_meta.projection_schema_version`
+is `projection-v7`; a binary refuses an older label at parse open and
+asks for a cold reparse.

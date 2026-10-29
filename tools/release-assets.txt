@@ -14,9 +14,11 @@ capnpc-schema-bridge-zod-darwin-amd64
 capnpc-schema-bridge-zod-darwin-arm64
 capnpc-schema-bridge-zod-linux-amd64
 capnpc-schema-bridge-zod-linux-arm64
+execution.capnp
 execution.tools.json
 leyline-darwin-amd64
 leyline-darwin-arm64
+leyline-krun-worker-darwin-arm64
 leyline-linux-amd64
 leyline-linux-arm64
 leyline-mcp-descriptor-darwin-amd64
@@ -30,3 +32,4 @@ leyline_sign.wasm
 libleyline_fs-darwin-arm64.a
 libleyline_fs-linux-amd64.a
 libleyline_fs-linux-arm64.a
+traits.capnp

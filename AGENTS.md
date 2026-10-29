@@ -9,9 +9,18 @@ For non-trivial work:
 1. Use `rsry` to search for an existing bead before changing code. Create one when no suitable bead exists, record meaningful progress, and close it only when its acceptance criteria are verified. Beads, not GitHub issues or ad hoc investigation logs, are the work ledger.
 2. Use `mache.get_overview` before exploring unfamiliar code, then use its symbol and community tools to narrow the relevant seam. If mache is unavailable, record the tooling failure in its existing bead before falling back to targeted repository reads.
 3. Use `lectio` when available for repository history and observational context. Tooling absence must not be mistaken for evidence about the code.
-4. Read the governing material in this order: `README.md`, `docs/TECHNICAL_OVERVIEW.md`, `docs/ARCHITECTURE.md`, `docs/TABLE_CONTRACT.md`, then the relevant ADR, specification, crate README, and tests.
+4. Read the governing material in this order: `README.md`, `docs/ROADMAP.md`, `docs/TECHNICAL_OVERVIEW.md`, `docs/ARCHITECTURE.md`, `docs/TABLE_CONTRACT.md`, then the relevant ADR, specification, crate README, and tests.
 
 Treat a bead as a pointer, not as proof. Verify every claim against the current source, generated surfaces, and tests.
+
+## Direction
+
+`docs/ROADMAP.md` is the plan: v1.0 is **single host, portable** (one daemon owns one store on one machine, the same on macOS and Linux; epic `ley-line-open-b2e687`). Prefer work that closes a v1 blocker. Multi-host stores, blob-mapped reads and construct-aware merge come after v1 unless the roadmap says otherwise. A pull request that closes a roadmap bead or changes the plan updates `docs/ROADMAP.md` in the same pull request.
+
+Two design rules the roadmap depends on:
+
+- **A write's behavior follows its path's class, not a mode.** Authored paths are proposals (merged, durable, in `treeRoot`). Derived paths, the ones the tree's ignore rules match, are never proposals; they live in per-run scratch at native speed (`39998b`).
+- **Accepted means durable in `live.db`.** Publication of the arena is a derived, coalesced step (#478); a reply promises only what one durable append guarantees (`98d0c3`).
 
 ## Review Routing
 
@@ -35,7 +44,7 @@ Do not use “root,” “hash,” or “identity” without naming the domain a
 | --- | --- | --- | --- |
 | `Controller.current_root` | One exact serialized SQLite arena snapshot | BLAKE3 over the complete serialized byte image | Shipped |
 | `Head.rootHash` | The Cap'n Proto segments produced by one parse run (a run receipt: truncated per run, carries absolute paths and mtimes) | Tagged fold over canonical segment addresses | Shipped |
-| `Head.treeRoot` | The source tree: every `_source` row as (relative path, content hash), under one `parserId` | Tagged fold `leyline/tree-root/v1` over the committed `_source` table, `parserId` as params; recomputed by `leyline verify-head` | Shipped (ADR-0040 D1) |
+| `Head.treeRoot` | The store's manifest: every `_tree` file entry as (relative path, git mode, blob hash) and every empty directory, under one `parserId` | Tagged fold `leyline/tree-root/v1` over the committed `_tree` table (mode `0o100644` folds as before; other modes and empty directories are framed by their git mode), `parserId` as params; recomputed by `leyline verify-head` | Shipped (ADR-0040 D1; modes and directories ADR-0045 T2) |
 | `Head.parserId` | The derivation `treeRoot` was computed under | Tagged fold `leyline/parser-id/v1` over IR and projection schema versions, extraction/injection/query-set epochs, and every compiled grammar's digest | Shipped (ADR-0040 D1) |
 | Blob hash | One content-addressed blob or CDC payload | BLAKE3 over that payload | Shipped |
 | SQL projection ABI | Consumer-visible relational shape and behavior | Tables, columns, constraints, semantics, fixtures | Shipped; not an identity domain |

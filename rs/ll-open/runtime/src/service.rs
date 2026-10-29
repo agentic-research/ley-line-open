@@ -36,7 +36,10 @@ pub trait Backend: Send + Sync + 'static {
             Ok(capabilities)
         } else {
             Err(ExecutionError::unsupported(
-                "requested execution backend is unavailable",
+                match capabilities.unavailable_reason {
+                    Some(reason) => format!("requested execution backend is unavailable: {reason}"),
+                    None => "requested execution backend is unavailable".into(),
+                },
             ))
         }
     }
@@ -70,6 +73,10 @@ struct ServiceState {
     starting: HashMap<String, String>,
     events: HashMap<String, Vec<RunEventRecord>>,
     receipts: HashMap<String, ReceiptContext>,
+    /// The channels each run's worker held beyond its confinement manifest,
+    /// as its backend verified them at start; the receipt's backend
+    /// evidence names them.
+    channels: HashMap<String, Vec<crate::WorkerChannel>>,
     provisioned: bool,
     provisioned_backend: Option<String>,
 }
@@ -228,6 +235,9 @@ impl<B: Backend> ExecutionService<B> {
         state
             .replay
             .insert(request.replay_key, request.run_id.clone());
+        state
+            .channels
+            .insert(request.run_id.clone(), started.channels);
         state.runs.insert(request.run_id, record.clone());
         let run_id = record.run_id.clone();
         state.events.insert(
@@ -317,6 +327,14 @@ impl<B: Backend> ExecutionService<B> {
                 "resolver changed the grant's confinement digest",
             ));
         }
+        // The fifth: a resolver that dropped a workspace grant would run the
+        // workload without the share it was granted, and one that widened
+        // its operations would let it propose where it may only read.
+        if request.workspaces != authorized.workspaces {
+            return Err(ExecutionError::identity_mismatch(
+                "resolver changed the grant's workspaces",
+            ));
+        }
         let record = self.start(request)?;
         self.state.write().receipts.insert(
             record.run_id.clone(),
@@ -370,6 +388,12 @@ impl<B: Backend> ExecutionService<B> {
             terminal_state: record.state,
             event_log_root: format!("blake3-256:{}", event_bytes.hash()),
             backend_id: record.backend_id.clone(),
+            backend_evidence: crate::BackendEvidenceDocument {
+                backend_id: record.backend_id.clone(),
+                channels: state.channels.get(run_id).cloned().ok_or_else(|| {
+                    ExecutionError::internal("run has no recorded worker channels")
+                })?,
+            },
             enforced: self.backend.capabilities().enforced,
             context,
             started_at_unix_ms,

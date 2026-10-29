@@ -39,7 +39,7 @@ pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v0.11.0 release advances both. Binary-only releases leave this literal
 /// unchanged; a public consumer-contract release requires a matching nested
 /// Go-module tag.
-pub const SCHEMA_VERSION: &str = "0.20.4";
+pub const SCHEMA_VERSION: &str = "0.21.0";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions
@@ -128,13 +128,21 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   that join (`leyline_ts::schema::read_file_stats`). The "a projection
 ///   exists here" probe moves from `_file_index` to `_source`. Nothing else
 ///   changes; a v5 arena is refused at parse open like every earlier shape.
+/// - `projection-v7` — the store's manifest and the parse's diagnostics
+///   (ADR-0045, bead `ley-line-open-bb8aa6`). `_tree (path, mode, blob_hash,
+///   mtime, size)` holds every file the store holds, with its git mode, and
+///   every directory; `_source` keeps only the files the parse projects.
+///   `_parse_diagnostics (path, blob_hash, projected, start_byte, end_byte,
+///   start_row, start_col, message)` names each stored file that did not
+///   parse cleanly. `treeRoot` folds `_tree`. A v6 arena is refused at
+///   parse open.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v6";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v7";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

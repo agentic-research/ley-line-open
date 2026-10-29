@@ -11,6 +11,22 @@ use leyline_public_schema::execution_capnp;
 use crate::authorization::AuthorizationPolicy;
 use crate::{ExecutionError, ExecutionResolver, ExecutionService, RunState};
 
+/// The capability a daemon advertises for the `ResourceLimits` layout it
+/// decodes (ADR-0035, "OCI resources on execution/v1").
+///
+/// `cloister/execution/v1` names the contract, and it did not change when
+/// `ResourceLimits` was replaced in place, so it cannot tell a client which
+/// layout the daemon reads. A daemon that predates the OCI layout reads an
+/// OCI-shaped `ResourceLimits` as its own four words — `memory`, `cpu` and
+/// `pids` vanish — and advertises no such entry. A client MUST find this name
+/// at [`RESOURCE_LIMITS_REVISION`] in `llo_execution_capabilities` before it
+/// sends `start`.
+pub const RESOURCE_LIMITS_CAPABILITY: &str = "cloister/execution/v1/resource-limits";
+
+/// The `ResourceLimits` layout revision: `1` was `{wallTimeMs, memoryBytes,
+/// cpuMillis, outputBytes}` (never advertised), `2` is the OCI layout.
+pub const RESOURCE_LIMITS_REVISION: &str = "2";
+
 pub fn capabilities_json<B: crate::Backend>(
     service: &ExecutionService<B>,
 ) -> Result<String, ExecutionError> {
@@ -19,7 +35,15 @@ pub fn capabilities_json<B: crate::Backend>(
     let capabilities = service.capabilities();
     // Advertise only backends actually owned by this service. A placeholder
     // native entry would make capability discovery lie to Cloister.
-    let mut entries = output.reborrow().init_capabilities(2);
+    let mut entries = output.reborrow().init_capabilities(3);
+    entries
+        .reborrow()
+        .get(2)
+        .set_name(RESOURCE_LIMITS_CAPABILITY);
+    entries
+        .reborrow()
+        .get(2)
+        .set_version(RESOURCE_LIMITS_REVISION);
     entries.reborrow().get(0).set_name("cloister/execution/v1");
     entries.reborrow().get(0).set_version("v1");
     let backend_name = match capabilities.backend_class {
@@ -53,6 +77,62 @@ pub fn start_json<B: crate::Backend, R: ExecutionResolver>(
     )
 }
 
+/// Refuse a `requestedLimits` or grant `limits` object carrying a key
+/// `ResourceLimits` does not define, naming it.
+///
+/// `capnp_json` skips unknown keys. For most of the contract that is ordinary
+/// carrier tolerance, but a ceiling is the one place it fails open: an
+/// old-shape `{"memoryBytes": …, "cpuMillis": …}` (execution/v1 before
+/// ADR-0035's OCI amendment) would decode to "no ceiling" and run with none.
+/// The removed keys are named with their replacements so the refusal says how
+/// to fix the request.
+fn refuse_unknown_limit_keys(input_json: &str) -> Result<(), ExecutionError> {
+    const LIMIT_KEYS: [&str; 5] = ["wallTimeMs", "outputBytes", "memory", "cpu", "pids"];
+    const NESTED_KEYS: [(&str, &[&str]); 3] = [
+        ("memory", &["limit"]),
+        ("cpu", &["quota", "period"]),
+        ("pids", &["limit"]),
+    ];
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input_json) else {
+        // Malformed JSON is capnp_json's to report, with its own message.
+        return Ok(());
+    };
+    for (object, field, path) in [
+        ("spec", "requestedLimits", "spec.requestedLimits"),
+        ("grant", "limits", "grant.limits"),
+    ] {
+        let Some(limits) = value.get(object).and_then(|o| o.get(field)) else {
+            continue;
+        };
+        let Some(limits) = limits.as_object() else {
+            continue;
+        };
+        for key in limits.keys() {
+            if !LIMIT_KEYS.contains(&key.as_str()) {
+                let replacement = match key.as_str() {
+                    "memoryBytes" => "; it was replaced by memory.limit",
+                    "cpuMillis" => "; it was replaced by cpu.quota and cpu.period",
+                    _ => "",
+                };
+                return Err(ExecutionError::invalid(format!(
+                    "{path}.{key} is not an execution/v1 ResourceLimits field{replacement}"
+                )));
+            }
+        }
+        for (nested, allowed) in NESTED_KEYS {
+            let Some(inner) = limits.get(nested).and_then(|v| v.as_object()) else {
+                continue;
+            };
+            if let Some(key) = inner.keys().find(|key| !allowed.contains(&key.as_str())) {
+                return Err(ExecutionError::invalid(format!(
+                    "{path}.{nested}.{key} is not an execution/v1 ResourceLimits field"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn start_json_with_verifier<B: crate::Backend, R: ExecutionResolver>(
     service: &ExecutionService<B>,
     input_json: &str,
@@ -60,6 +140,7 @@ pub fn start_json_with_verifier<B: crate::Backend, R: ExecutionResolver>(
     resolver: &R,
     verifier: &dyn crate::EvidenceVerifier,
 ) -> Result<String, ExecutionError> {
+    refuse_unknown_limit_keys(input_json)?;
     let mut input_message = Builder::new_default();
     let input = input_message.init_root::<execution_capnp::start_input::Builder<'_>>();
     capnp_json::from_json(input_json, input).map_err(|error| {
@@ -287,13 +368,28 @@ pub fn collect_json<B: crate::Backend>(
         // ADR-0035 §3: the ceiling's meaning is the mechanism, so the receipt
         // records which layer applied each one rather than only the number.
         let mut enforced = backend.reborrow().init_enforced();
-        enforced.set_wall_time(to_schema_mechanism(receipt_data.enforced.wall_time));
-        enforced.set_vcpus(to_schema_mechanism(receipt_data.enforced.vcpus));
-        enforced.set_memory(to_schema_mechanism(receipt_data.enforced.memory));
+        let crate::EnforcedCeilings {
+            wall_time,
+            output_bytes,
+            memory,
+            cpu,
+            pids,
+        } = receipt_data.enforced;
+        enforced.set_wall_time(to_schema_mechanism(wall_time));
+        enforced.set_output_bytes(to_schema_mechanism(output_bytes));
+        enforced.set_memory(to_schema_mechanism(memory));
+        enforced.set_cpu(to_schema_mechanism(cpu));
+        enforced.set_pids(to_schema_mechanism(pids));
     }
+    // The backend evidence document: the backend, and every channel its
+    // worker held beyond the confinement manifest (the workspace share).
+    // The event log already has its own field, `eventLogRoot`.
     let mut evidence = backend.reborrow().init_evidence();
-    evidence.set_media_type("application/vnd.leyline.backend-evidence");
-    set_digest(evidence.init_digest(), &receipt_data.event_log_root)?;
+    evidence.set_media_type(crate::BackendEvidenceDocument::MEDIA_TYPE);
+    set_digest(
+        evidence.init_digest(),
+        &receipt_data.backend_evidence.digest(),
+    )?;
     let mut roots = receipt
         .reborrow()
         .init_input_roots(receipt_data.context.input_roots.len() as u32);
@@ -441,6 +537,7 @@ fn to_schema_mechanism(mechanism: crate::CeilingMechanism) -> execution_capnp::C
         crate::CeilingMechanism::Unenforced => execution_capnp::CeilingMechanism::Unenforced,
         crate::CeilingMechanism::Supervisor => execution_capnp::CeilingMechanism::Supervisor,
         crate::CeilingMechanism::Hypervisor => execution_capnp::CeilingMechanism::Hypervisor,
+        crate::CeilingMechanism::Cgroup => execution_capnp::CeilingMechanism::Cgroup,
     }
 }
 

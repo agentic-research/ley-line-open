@@ -1,28 +1,17 @@
 [package]
 name = "leyline-cli-lib"
-version = "0.20.5"
+version = "0.21.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [features]
-default = ["lsp", "validate", "hdc", "cdc"]
+default = ["lsp", "validate", "hdc", "cdc", "sheaf"]
 lsp = ["dep:leyline-lsp"]
 # Tree-sitter syntactic validation surface exposed as a daemon op for
 # mache's writeback path (ley-line-open-fa8638). Pulls leyline-fs's
-# `validate` feature only; does not pull `fuse`/`nfs`. Default-on so
-# the op is always available; turn off for ultra-slim builds.
+# `validate` feature. Default-on so the op is always available; turn off
+# for ultra-slim builds.
 validate = ["leyline-fs/validate"]
-# `splice` rides with `mount` rather than standing alone, because the only
-# caller of `flush_node` is the mount write path (`fs/src/fuse.rs` flush +
-# fsync). Without it the trait's default `flush_node` — a bare `Ok(())` —
-# was what every shipped binary compiled, so a FUSE write reported success
-# and never reprojected (ley-line-open-918a75; DECISION 2026-07-27 was
-# "FINISH IT, do not remove"). Mounting without splice is the broken
-# configuration, so the two are not separable knobs.
-#
-# Costs no new system dep: `leyline-fs/splice` pulls `leyline-ts`, which
-# cli-lib already depends on directly.
-mount = ["leyline-fs/nfs", "leyline-fs/fuse", "leyline-fs/validate", "leyline-fs/splice"]
 vec = ["dep:sqlite-vec", "dep:fastembed"]
 # HDC structural-equivalence surface exposed as daemon ops
 # (ley-line-open-c32596). Pulls leyline-hdc + leyline-ts's `rust`
@@ -40,13 +29,19 @@ text-search = ["dep:leyline-text-search"]
 # Pure Rust and runtime opt-in, so the command is present in ordinary builds
 # without changing any database merely by opening it.
 cdc = ["leyline-fs/cdc"]
+# The sheaf surface (bead ley-line-open-39e239): the `sheaf_*` and
+# `agreement` daemon ops, the co-change complex pass, the granularity
+# router and the watcher's `daemon.sheaf.invalidate` emit, all over
+# `leyline-sheaf`. Default-on because mache's cascade calls those ops;
+# off, the ops are not dispatched and leyline-sheaf is not linked.
+sheaf = ["dep:leyline-sheaf"]
 
 [dependencies]
 parking_lot = { workspace = true }
 leyline-lsp = { path = "../lsp", optional = true }
 leyline-hdc = { path = "../hdc", optional = true }
 leyline-text-search = { path = "../text-search", optional = true }
-leyline-sheaf = { path = "../sheaf" }
+leyline-sheaf = { path = "../sheaf", optional = true }
 leyline-ts = { path = "../ts", features = [
     "html", "markdown", "json", "yaml", "go", "python", "elixir", "hcl",
     "rust", "proto", "javascript", "typescript",
@@ -62,7 +57,8 @@ leyline-schema-capnp = { path = "../../ll-core/schema-capnp" }
 # instead of hand-encoding string literals that go stale.
 leyline-mcp-protocol-schema = { path = "../../ll-core/mcp-protocol-schema" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
-leyline-runtime = { path = "../runtime" }
+# Supervises the krun worker; the VMM is the leyline-krun-worker crate's.
+leyline-runtime = { path = "../runtime", default-features = false }
 leyline-core = { path = "../../ll-core/core" }
 # S1: the one RootSigner implementation, used to sign the at-rest Head.
 leyline-sign = { path = "../sign", features = ["root-signer"] }
@@ -70,7 +66,10 @@ leyline-sign = { path = "../sign", features = ["root-signer"] }
 capnp = { workspace = true }
 # daemon wire codec (see daemon/wire.rs and ADR-0014 interim status).
 capnp-json = { workspace = true }
-blake3 = { workspace = true }
+# `rayon`: a published image's `current_root` is hashed across cores
+# (`cmd_daemon::image_root`, bead ley-line-open-8c8ded); same bytes as
+# `blake3::hash`.
+blake3 = { workspace = true, features = ["rayon"] }
 # MCP wire auth (ADR-0022 / bead ley-line-open-b885d1). Constant-time
 # token comparison + random token generation + hex encoding.
 subtle = "2"
@@ -119,6 +118,14 @@ tempfile = { workspace = true }
 # `node_modules`/`target`/`vendor`/etc still get skipped even
 # without a matching gitignore entry.
 ignore = "0.4"
+# ADR-0045 T5: the three-way merge a proposal against a moved base gets —
+# gitoxide's builtin text driver, in process. Exact pins: 0.17.0 is the
+# gix-merge release built on the same gix-* set as the gix 0.84 jj-lib
+# already brings (gix-diff 0.64, gix-object 0.61, gix-hash 0.25), so no
+# second copy of gitoxide lands. MIT OR Apache-2.0, as is gix-imara-diff,
+# which computes the conflict ranges with gix-merge's own overlap rule.
+gix-merge = { version = "=0.17.0", default-features = false, features = ["sha1"] }
+imara-diff = { package = "gix-imara-diff", version = "=0.2.3" }
 
 # Unix-only: flock(2) for daemon arena admission control
 # (bead ley-line-open-0cba88). Kept as a direct dep so the fcntl call

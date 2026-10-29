@@ -1,6 +1,6 @@
 //! Thin binary wrapper for ley-line (open edition).
 //!
-//! Shared commands (parse, splice, serve, load, inspect, lsp) live in
+//! Shared commands (parse, splice, load, inspect, lsp) live in
 //! `leyline_cli_lib::Commands`. The `Daemon` variant is defined here so
 //! ley-line (private) can define its own extended Daemon without conflict.
 
@@ -10,13 +10,54 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use leyline_cli_lib::cmd_serve;
+use leyline_cli_lib::lifecycle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ExecutionBackendKind {
     Native,
     #[value(name = "micro-vm")]
     MicroVm,
+}
+
+/// How long a guest may cache what a workspace share tells it (ADR-0044 V3,
+/// "Read freshness"; `leyline_storefs::Freshness`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::Args)]
+struct WorkspaceFreshness {
+    /// Entry and attribute timeout of a path with no recent change.
+    #[arg(long, default_value_t = 60_000)]
+    workspace_ttl_ms: u64,
+    /// Entry and attribute timeout of a recently changed path.
+    #[arg(long, default_value_t = 1_000)]
+    workspace_changed_ttl_ms: u64,
+    /// How long a change keeps a path's timeouts short.
+    #[arg(long, default_value_t = 60_000)]
+    workspace_change_window_ms: u64,
+}
+
+impl WorkspaceFreshness {
+    fn freshness(self) -> leyline_storefs::Freshness {
+        leyline_storefs::Freshness {
+            settled: Duration::from_millis(self.workspace_ttl_ms),
+            changed: Duration::from_millis(self.workspace_changed_ttl_ms),
+            window: Duration::from_millis(self.workspace_change_window_ms),
+        }
+    }
+}
+
+/// What serves `daemon --mount`: the store's filesystem behind the host's
+/// FUSE or NFS client (bead `ley-line-open-3e73dc`), in a `mount` build.
+#[cfg(feature = "mount")]
+fn host_mount() -> Option<leyline_cli_lib::cmd_daemon::HostMountRef> {
+    Some(leyline_cli_lib::cmd_daemon::HostMountRef(Arc::new(
+        leyline_storefs::host::DaemonHostMount::new(leyline_storefs::Freshness::default()),
+    )))
+}
+
+/// A build without `mount` has nothing to serve `daemon --mount`; the daemon
+/// refuses the flag.
+#[cfg(not(feature = "mount"))]
+fn host_mount() -> Option<leyline_cli_lib::cmd_daemon::HostMountRef> {
+    None
 }
 
 #[derive(Subcommand)]
@@ -44,7 +85,8 @@ enum Cmd {
         #[arg(long)]
         run_root: PathBuf,
 
-        /// First-party leyline-native-worker executable.
+        /// First-party worker executable: leyline-native-worker, or for
+        /// `--backend micro-vm` leyline-krun-worker, which links libkrun.
         #[arg(long)]
         worker: PathBuf,
 
@@ -55,10 +97,6 @@ enum Cmd {
         /// Backend to supervise: native nono or embedded libkrun microVM.
         #[arg(long, value_enum, default_value_t = ExecutionBackendKind::Native)]
         backend: ExecutionBackendKind,
-
-        /// Embedded libkrun shared library (required for `--backend micro-vm`).
-        #[arg(long)]
-        libkrun: Option<PathBuf>,
 
         /// Device paths explicitly granted to the libkrun worker.
         #[arg(long = "device")]
@@ -86,6 +124,19 @@ enum Cmd {
         #[arg(long)]
         tsi_hijack_inet: bool,
 
+        /// A delegated cgroup v2 directory the native backend creates each
+        /// run's cgroup in (Linux only).
+        ///
+        /// With it, the native tier enforces OCI `memory.limit`, `cpu.quota`
+        /// /`cpu.period` and `pids.limit` for every controller the directory's
+        /// `cgroup.subtree_control` enables. Without it, the native tier
+        /// enforces the wall clock only, and a grant carrying any of those
+        /// ceilings is refused by name. The daemon must be able to move its
+        /// workers into it: a systemd unit with `Delegate=yes`, naming a child
+        /// of its own cgroup, satisfies that. Native backend only.
+        #[arg(long)]
+        cgroup_root: Option<PathBuf>,
+
         /// Activate or resume the private CDC index.
         #[arg(long, default_value_t = false)]
         cdc: bool,
@@ -97,10 +148,39 @@ enum Cmd {
 
         /// Explicitly accept unverified authority for local fixtures: no
         /// issuer signature on the RunGrant, and metadata-only evidence
-        /// validation. Production Cloister integrations must provide a real
-        /// Signet/NotMe/Interlace verifier instead.
-        #[arg(long, default_value_t = false)]
+        /// validation. Production deployments configure `--trust-key` and
+        /// `--evidence-store` instead; this flag refuses to combine with
+        /// either.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["trust_keys", "evidence_store"])]
         allow_unverified_evidence: bool,
+
+        /// Ed25519 public key trusted to sign RunGrants and their DSSE
+        /// evidence; repeatable. Each file holds one key: 64 hex characters,
+        /// or a PEM `PUBLIC KEY` block (canonical RFC 8410 SPKI). LLO ships
+        /// no trust keys. Requires `--evidence-store`.
+        #[arg(long = "trust-key", requires = "evidence_store")]
+        trust_keys: Vec<PathBuf>,
+
+        /// Existing CAS blob-store directory holding the DSSE evidence
+        /// envelopes grants reference, addressed `blake3-256:<hex>`.
+        /// Requires at least one `--trust-key`. Without both, every start is
+        /// refused.
+        #[arg(long, requires = "trust_keys")]
+        evidence_store: Option<PathBuf>,
+
+        /// Source directory the daemon's store is parsed from and its
+        /// accepted proposals are written back into. With `--backend
+        /// micro-vm`, a run whose grant carries a workspace sees this store
+        /// as its `/work` (ADR-0044); without it, such a run is refused.
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Language filter for `--source`.
+        #[arg(long)]
+        language: Option<String>,
+
+        #[command(flatten)]
+        workspace: WorkspaceFreshness,
     },
 
     /// Run the daemon: arena + mount + UDS socket for coordination.
@@ -122,7 +202,7 @@ enum Cmd {
         mount: Option<PathBuf>,
 
         /// Filesystem backend: "nfs" or "fuse".
-        #[arg(long, default_value_t = cmd_serve::default_backend())]
+        #[arg(long, default_value_t = lifecycle::default_backend())]
         backend: String,
 
         /// NFS listen port (0 = auto-assign).
@@ -293,15 +373,29 @@ async fn main() -> Result<()> {
             worker,
             catalog,
             backend: backend_kind,
-            libkrun,
             devices,
             runtime_files,
             ready_timeout_ms,
             tsi_hijack_inet,
+            cgroup_root,
             cdc,
             cdc_target,
             allow_unverified_evidence,
+            trust_keys,
+            evidence_store,
+            source,
+            language,
+            workspace,
         } => {
+            // First, before any filesystem effect: a misconfigured verifier
+            // refuses startup (bead ley-line-open-410921).
+            let (verifier, _) = leyline_cli_lib::daemon::execution::EvidenceVerifierConfig {
+                allow_unverified_evidence,
+                trust_keys,
+                evidence_store,
+            }
+            .build()
+            .context("configure the execution evidence verifier")?;
             if !worker.is_file() {
                 bail!(
                     "native worker is not an executable file: {}",
@@ -332,11 +426,11 @@ async fn main() -> Result<()> {
                 arena_size_mib: 64,
                 control,
                 mount: None,
-                backend: cmd_serve::default_backend(),
+                backend: lifecycle::default_backend(),
                 nfs_port: 0,
-                language: None,
+                language,
                 timeout: None,
-                source: None,
+                source: source.clone(),
                 mcp_port: None,
                 mcp_bind: None,
                 mcp_allow_public: false,
@@ -344,16 +438,10 @@ async fn main() -> Result<()> {
                 mcp_uds: None,
                 reset_arena: false,
             };
-            let verifier: Arc<dyn leyline_runtime::EvidenceVerifier> = if allow_unverified_evidence
-            {
-                Arc::new(leyline_runtime::MetadataOnlyEvidenceVerifier)
-            } else {
-                Arc::new(leyline_runtime::RejectUnverifiedEvidence)
-            };
             match backend_kind {
                 ExecutionBackendKind::Native => {
-                    if libkrun.is_some() || !devices.is_empty() {
-                        bail!("--libkrun and --device require --backend micro-vm");
+                    if !devices.is_empty() {
+                        bail!("--device requires --backend micro-vm");
                     }
                     let backend =
                         leyline_runtime::backends::native_backend::NativeWorkerBackend::new(
@@ -365,6 +453,16 @@ async fn main() -> Result<()> {
                                 ready_timeout: Duration::from_millis(ready_timeout_ms),
                             },
                         );
+                    // A root that is not a cgroup v2 directory is a startup
+                    // error, not a silent fall back to wall-clock-only.
+                    let backend = match &cgroup_root {
+                        Some(path) => backend.with_cgroup_root(
+                            leyline_runtime::backends::cgroup::CgroupRoot::open(path).map_err(
+                                |error| anyhow::anyhow!("--cgroup-root: {}", error.detail),
+                            )?,
+                        ),
+                        None => backend,
+                    };
                     let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::Native,
@@ -387,11 +485,10 @@ async fn main() -> Result<()> {
                     .await
                 }
                 ExecutionBackendKind::MicroVm => {
-                    let Some(libkrun) = libkrun else {
-                        bail!("--libkrun is required with --backend micro-vm");
-                    };
-                    if !libkrun.is_file() {
-                        bail!("libkrun is not an existing file: {}", libkrun.display());
+                    if cgroup_root.is_some() {
+                        bail!(
+                            "--cgroup-root requires --backend native; the microVM's ceilings are the hypervisor's"
+                        );
                     }
                     if devices.iter().any(|path| !path.exists()) {
                         bail!("all --device paths must exist");
@@ -402,13 +499,24 @@ async fn main() -> Result<()> {
                                 worker,
                                 cas_root,
                                 ephemeral_root: run_root,
-                                libkrun,
                                 runtime_files,
                                 devices,
                                 ready_timeout: Duration::from_millis(ready_timeout_ms),
                                 tsi_hijack_inet,
                             },
                         );
+                    // With a source tree, a run's granted workspace is that
+                    // tree's store, served from this daemon's context: the
+                    // share and the socket propose on one writer.
+                    let context = leyline_cli_lib::daemon::ContextSlot::default();
+                    let backend = if source.is_some() {
+                        backend.with_workspace_shares(Arc::new(leyline_storefs::DaemonShares::new(
+                            Arc::clone(&context),
+                            workspace.freshness(),
+                        )))
+                    } else {
+                        backend
+                    };
                     let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::MicroVm,
@@ -420,13 +528,14 @@ async fn main() -> Result<()> {
                             Arc::clone(&verifier),
                         ),
                     );
-                    leyline_cli_lib::cmd_daemon::run_execution_daemon_with_options(
+                    leyline_cli_lib::cmd_daemon::run_execution_daemon_with_context(
                         config,
                         handler,
                         leyline_cli_lib::cmd_daemon::DaemonOptions {
                             cdc: cdc.then_some(cdc_target),
                             ..Default::default()
                         },
+                        context,
                     )
                     .await
                 }
@@ -487,6 +596,7 @@ async fn main() -> Result<()> {
                 Arc::new(leyline_cli_lib::daemon::NoExt),
                 leyline_cli_lib::cmd_daemon::DaemonOptions {
                     cdc: cdc.then_some(cdc_target),
+                    host_mount: host_mount(),
                     ..Default::default()
                 },
             )
@@ -651,22 +761,85 @@ mod tests {
             "/worker",
             "--catalog",
             "/catalog.json",
-            "--libkrun",
-            "/lib/libkrun.dylib",
             "--device",
             "/dev/null",
         ])
         .unwrap();
         match cli.command {
             Cmd::ExecutionDaemon {
-                backend,
-                libkrun,
-                devices,
-                ..
+                backend, devices, ..
             } => {
                 assert_eq!(backend, ExecutionBackendKind::MicroVm);
-                assert_eq!(libkrun, Some(PathBuf::from("/lib/libkrun.dylib")));
                 assert_eq!(devices, vec![PathBuf::from("/dev/null")]);
+            }
+            _ => panic!("expected execution-daemon command"),
+        }
+    }
+
+    const EXECUTION_DAEMON: [&str; 10] = [
+        "leyline",
+        "execution-daemon",
+        "--cas-root",
+        "/cas",
+        "--run-root",
+        "/runs",
+        "--worker",
+        "/worker",
+        "--catalog",
+        "/catalog.json",
+    ];
+
+    /// A source tree is what a run's workspace share serves; without one
+    /// the daemon serves none, and the share's timeouts default to
+    /// `Freshness::default()`.
+    #[test]
+    fn execution_daemon_serves_workspaces_from_a_source_tree() {
+        let cli = Cli::try_parse_from(EXECUTION_DAEMON).unwrap();
+        match cli.command {
+            Cmd::ExecutionDaemon {
+                source,
+                language,
+                workspace,
+                ..
+            } => {
+                assert_eq!(source, None);
+                assert_eq!(language, None);
+                assert_eq!(workspace.freshness(), leyline_storefs::Freshness::default());
+            }
+            _ => panic!("expected execution-daemon command"),
+        }
+
+        let mut arguments = EXECUTION_DAEMON.to_vec();
+        arguments.extend([
+            "--source",
+            "/repo",
+            "--language",
+            "go",
+            "--workspace-ttl-ms",
+            "4000",
+            "--workspace-changed-ttl-ms",
+            "250",
+            "--workspace-change-window-ms",
+            "9000",
+        ]);
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        match cli.command {
+            Cmd::ExecutionDaemon {
+                source,
+                language,
+                workspace,
+                ..
+            } => {
+                assert_eq!(source, Some(PathBuf::from("/repo")));
+                assert_eq!(language.as_deref(), Some("go"));
+                assert_eq!(
+                    workspace.freshness(),
+                    leyline_storefs::Freshness {
+                        settled: Duration::from_millis(4000),
+                        changed: Duration::from_millis(250),
+                        window: Duration::from_millis(9000),
+                    }
+                );
             }
             _ => panic!("expected execution-daemon command"),
         }

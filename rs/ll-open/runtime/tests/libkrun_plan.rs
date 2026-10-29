@@ -4,7 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 
 use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, compile_plan};
-use leyline_runtime::{DigestRef, ErrorCode, ExecutionRequest, ResourceLimits};
+use leyline_runtime::{
+    CpuLimits, DigestRef, ErrorCode, ExecutionRequest, MemoryLimits, ResourceLimits,
+};
 use tempfile::TempDir;
 
 mod common;
@@ -44,10 +46,15 @@ fn rootfs_fixture() -> RootfsFixture {
             allowed_egress: Vec::new(),
             confinement_digest: String::new(),
             confinement_manifest: None,
+            workspaces: Vec::new(),
             limits: ResourceLimits {
-                vcpus: 2,
-                memory_mib: 2048,
                 wall_time_ms: 30_000,
+                memory: MemoryLimits { limit: 2048 << 20 },
+                cpu: CpuLimits {
+                    quota: 200_000,
+                    period: 100_000,
+                },
+                ..ResourceLimits::default()
             },
         },
         _cas: cas,

@@ -14,7 +14,10 @@ use leyline_core::ContentAddressed;
 use leyline_envelope::{Envelope, VerifyingKey};
 use leyline_public_schema::execution_capnp;
 
-use crate::{BackendClass, ExecutionError};
+use crate::{
+    BackendClass, CpuLimits, ExecutionError, MemoryLimits, PidsLimits, ResourceLimits,
+    WorkspaceGrant, WorkspaceOperation,
+};
 
 pub const EXECUTION_SCHEMA_VERSION: &str = "cloister/execution/v1";
 pub const EXECUTION_CAPABILITY: &str = "urn:signet:cap:execute:run";
@@ -146,23 +149,176 @@ pub trait EvidenceVerifier: Send + Sync {
 }
 
 /// Minimal CAS interface needed by the built-in APAS DSSE verifier. Cloister
-/// can provide its mmap/SQLite CAS adapter without giving LLO host paths.
+/// can provide its mmap/SQLite CAS adapter without giving LLO host paths;
+/// [`crate::cas_evidence::CasEvidenceStore`] is LLO's own, over the
+/// filesystem blob store.
+///
+/// `digest` is an evidence digest — `blake3-256:<64 lowercase hex>` over the
+/// exact stored bytes, the blob-hash domain. An implementation reports an
+/// absent blob as [`EvidenceRejection::EvidenceMissing`] and bytes it cannot
+/// vouch for as [`EvidenceRejection::EvidenceIntegrity`], so a rejection
+/// names what failed.
 pub trait EvidenceStore: Send + Sync {
     fn load(&self, digest: &str) -> Result<Vec<u8>, ExecutionError>;
+}
+
+/// Why [`CasDsseEvidenceVerifier`] refused a grant or one of its evidence
+/// references.
+///
+/// Every rejection is reported as an [`ExecutionError`] — `Unauthenticated`,
+/// except [`Self::EvidenceMediaType`], which keeps `UnsupportedBackend` —
+/// whose `detail` begins with [`Self::as_str`] followed by `": "`. The wire
+/// `ExecutionError` is unchanged; the token is how a caller on the far side
+/// of the daemon recovers the typed reason ([`Self::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EvidenceRejection {
+    /// The verifier holds no trust keys, so nothing can verify.
+    NoTrustKeys,
+    /// The `RunGrant` carries no issuer signature.
+    GrantUnsigned,
+    /// The grant signature is not a 64-byte `ed25519` signature.
+    GrantSignatureMalformed,
+    /// No trusted key verifies the signature, and the signature's kid hint
+    /// names a trusted key: the signed bytes were altered after signing.
+    SignatureInvalid,
+    /// No trusted key verifies the signature, and its kid hint names no
+    /// trusted key: the signer is outside the trust set.
+    UntrustedSigner,
+    /// The evidence reference does not name APAS in-toto DSSE bytes.
+    EvidenceMediaType,
+    /// The evidence digest is not a `blake3-256` content address.
+    EvidenceDigestMalformed,
+    /// The evidence store holds no blob under the referenced digest.
+    EvidenceMissing,
+    /// The store cannot vouch for the bytes: they do not hash to the
+    /// reference, or they could not be read.
+    EvidenceIntegrity,
+    /// The bytes are not a DSSE envelope, or the authenticated payload is not
+    /// an in-toto statement.
+    EnvelopeMalformed,
+    /// The statement's predicate is not APAS Handoff/v1.
+    PredicateMismatch,
+    /// The statement carries no subject asserting this evidence role.
+    RoleNotAsserted,
+    /// The subject's run digest is not a run identity.
+    RunIdentityMalformed,
+    /// The statement asserts the role for a different run.
+    RunNotAuthorized,
+}
+
+impl EvidenceRejection {
+    const ALL: [Self; 14] = [
+        Self::NoTrustKeys,
+        Self::GrantUnsigned,
+        Self::GrantSignatureMalformed,
+        Self::SignatureInvalid,
+        Self::UntrustedSigner,
+        Self::EvidenceMediaType,
+        Self::EvidenceDigestMalformed,
+        Self::EvidenceMissing,
+        Self::EvidenceIntegrity,
+        Self::EnvelopeMalformed,
+        Self::PredicateMismatch,
+        Self::RoleNotAsserted,
+        Self::RunIdentityMalformed,
+        Self::RunNotAuthorized,
+    ];
+
+    /// The stable token that leads a rejection's `detail`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTrustKeys => "no-trust-keys",
+            Self::GrantUnsigned => "grant-unsigned",
+            Self::GrantSignatureMalformed => "grant-signature-malformed",
+            Self::SignatureInvalid => "signature-invalid",
+            Self::UntrustedSigner => "untrusted-signer",
+            Self::EvidenceMediaType => "evidence-media-type",
+            Self::EvidenceDigestMalformed => "evidence-digest-malformed",
+            Self::EvidenceMissing => "evidence-missing",
+            Self::EvidenceIntegrity => "evidence-integrity",
+            Self::EnvelopeMalformed => "envelope-malformed",
+            Self::PredicateMismatch => "predicate-mismatch",
+            Self::RoleNotAsserted => "role-not-asserted",
+            Self::RunIdentityMalformed => "run-identity-malformed",
+            Self::RunNotAuthorized => "run-not-authorized",
+        }
+    }
+
+    /// The error reporting this rejection, with `context` after the token.
+    pub fn error(self, context: impl std::fmt::Display) -> ExecutionError {
+        ExecutionError {
+            code: match self {
+                Self::EvidenceMediaType => crate::ErrorCode::UnsupportedBackend,
+                _ => crate::ErrorCode::Unauthenticated,
+            },
+            retryable: false,
+            detail: format!("{}: {context}", self.as_str()),
+        }
+    }
+
+    /// The typed reason an error reports, if it is an evidence rejection.
+    pub fn of(error: &ExecutionError) -> Option<Self> {
+        let (token, _) = error.detail.split_once(": ")?;
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == token && reason.error("").code == error.code)
+    }
+}
+
+impl std::fmt::Display for EvidenceRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Verifies APAS/in-toto DSSE evidence from a content-addressed store against
 /// embedding-provided trust keys. Key distribution/rotation remains owned by
 /// Signet/NotMe; this type only performs cryptographic verification and digest
-/// binding once Cloister supplies the active keys.
+/// binding once Cloister — or the operator, through `leyline
+/// execution-daemon --trust-key` — supplies the active keys.
+///
+/// A signature is checked under every trusted key; its kid hint selects
+/// nothing. Only after every key has refused it is the hint compared with the
+/// trusted keys' canonical kids, to label the rejection
+/// [`EvidenceRejection::SignatureInvalid`] rather than
+/// [`EvidenceRejection::UntrustedSigner`].
 pub struct CasDsseEvidenceVerifier<S> {
     store: std::sync::Arc<S>,
     trust_keys: Vec<VerifyingKey>,
+    /// ADR-012 canonical kid of each trusted key, index-aligned with
+    /// `trust_keys`. Rejection labels only.
+    trusted_kids: Vec<String>,
 }
 
 impl<S: EvidenceStore> CasDsseEvidenceVerifier<S> {
     pub fn new(store: std::sync::Arc<S>, trust_keys: Vec<VerifyingKey>) -> Self {
-        Self { store, trust_keys }
+        let trusted_kids = trust_keys
+            .iter()
+            .map(leyline_sign::kid::canonical_kid)
+            .collect();
+        Self {
+            store,
+            trust_keys,
+            trusted_kids,
+        }
+    }
+
+    /// The canonical kid of every trusted key, in configuration order.
+    pub fn trusted_kids(&self) -> Vec<String> {
+        self.trusted_kids.clone()
+    }
+
+    /// The reason a signature no trusted key verifies is refused.
+    fn unverified<'a>(&self, hints: impl IntoIterator<Item = &'a str>) -> EvidenceRejection {
+        let names_trusted_key = hints.into_iter().any(|hint| {
+            leyline_sign::kid::is_canonical_kid_shape(hint.as_bytes())
+                && self.trusted_kids.iter().any(|kid| kid == hint)
+        });
+        if names_trusted_key {
+            EvidenceRejection::SignatureInvalid
+        } else {
+            EvidenceRejection::UntrustedSigner
+        }
     }
 }
 
@@ -173,47 +329,49 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
         binding: &EvidenceBinding,
         evidence: &EvidenceRef,
     ) -> Result<(), ExecutionError> {
+        if self.trust_keys.is_empty() {
+            return Err(EvidenceRejection::NoTrustKeys
+                .error(format!("{field} DSSE signature is not trusted")));
+        }
         if evidence.media_type != "application/vnd.in-toto+json" {
-            return Err(ExecutionError::unsupported(format!(
-                "{field} is not an APAS in-toto evidence envelope"
-            )));
+            return Err(EvidenceRejection::EvidenceMediaType
+                .error(format!("{field} is not an APAS in-toto evidence envelope")));
         }
         let bytes = self.store.load(&evidence.digest)?;
+        // Re-checked here whatever the store promises: an embedding store is
+        // not obliged to verify on read.
         let observed = format!("blake3-256:{}", bytes.hash());
         if observed != evidence.digest {
-            return Err(ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} CAS digest does not match evidence bytes"),
-            });
+            return Err(EvidenceRejection::EvidenceIntegrity
+                .error(format!("{field} CAS digest does not match evidence bytes")));
         }
-        let envelope = Envelope::from_json_slice(&bytes).map_err(|error| ExecutionError {
-            code: crate::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail: format!("{field} DSSE envelope is invalid: {error}"),
+        let envelope = Envelope::from_json_slice(&bytes).map_err(|error| {
+            EvidenceRejection::EnvelopeMalformed
+                .error(format!("{field} DSSE envelope is invalid: {error}"))
         })?;
-        if self.trust_keys.is_empty() {
-            return Err(ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} DSSE signature is not trusted"),
-            });
+        let mut statement = None;
+        for key in &self.trust_keys {
+            match envelope.verify(key) {
+                Ok(verified) => {
+                    statement = Some(verified);
+                    break;
+                }
+                // The signature verified and the authenticated payload is not
+                // a statement: no other key changes that.
+                Err(leyline_envelope::VerifyError::Payload(error)) => {
+                    return Err(EvidenceRejection::EnvelopeMalformed
+                        .error(format!("{field} DSSE payload is not a statement: {error}")));
+                }
+                Err(leyline_envelope::VerifyError::SignatureInvalid) => {}
+            }
         }
-        let statement = self
-            .trust_keys
-            .iter()
-            .find_map(|key| envelope.verify(key).ok())
-            .ok_or_else(|| ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} DSSE signature is not trusted"),
-            })?;
+        let statement = statement.ok_or_else(|| {
+            self.unverified(envelope.keyids())
+                .error(format!("{field} DSSE signature is not trusted"))
+        })?;
         if statement.predicate_type() != APAS_PREDICATE_TYPE {
-            return Err(ExecutionError {
-                code: crate::ErrorCode::Unauthenticated,
-                retryable: false,
-                detail: format!("{field} DSSE predicate is not APAS Handoff/v1"),
-            });
+            return Err(EvidenceRejection::PredicateMismatch
+                .error(format!("{field} DSSE predicate is not APAS Handoff/v1")));
         }
         // The statement must assert *this* role for *this* run. A subject
         // named for the role is the issuer's assertion of it; the subject's
@@ -233,45 +391,38 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
             // equality against a run identity we derived — never look
             // anything up by it.
             if !is_run_id(claimed) {
-                return Err(ExecutionError {
-                    code: crate::ErrorCode::Unauthenticated,
-                    retryable: false,
-                    detail: format!("{field} subject digest is not a run identity"),
-                });
+                return Err(EvidenceRejection::RunIdentityMalformed
+                    .error(format!("{field} subject digest is not a run identity")));
             }
             if claimed == binding.run_id {
                 return Ok(());
             }
         }
-        Err(ExecutionError {
-            code: crate::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail: if asserts_role {
-                format!("{field} does not authorize this run")
-            } else {
-                format!("{field} statement asserts no {field} subject")
-            },
+        Err(if asserts_role {
+            EvidenceRejection::RunNotAuthorized
+                .error(format!("{field} does not authorize this run"))
+        } else {
+            EvidenceRejection::RoleNotAsserted
+                .error(format!("{field} statement asserts no {field} subject"))
         })
     }
 
     fn verify_grant(&self, grant: &SignedGrant) -> Result<(), ExecutionError> {
-        let unauthenticated = |detail: String| ExecutionError {
-            code: crate::ErrorCode::Unauthenticated,
-            retryable: false,
-            detail,
-        };
-        let signature = grant
-            .signature
-            .as_ref()
-            .ok_or_else(|| unauthenticated("RunGrant carries no issuer signature".into()))?;
+        if self.trust_keys.is_empty() {
+            return Err(EvidenceRejection::NoTrustKeys
+                .error("RunGrant signature cannot be checked against an empty trust set"));
+        }
+        let signature = grant.signature.as_ref().ok_or_else(|| {
+            EvidenceRejection::GrantUnsigned.error("RunGrant carries no issuer signature")
+        })?;
         if signature.algorithm != GRANT_SIGNATURE_ALGORITHM {
-            return Err(unauthenticated(format!(
+            return Err(EvidenceRejection::GrantSignatureMalformed.error(format!(
                 "RunGrant signature algorithm {:?} is not supported",
                 signature.algorithm
             )));
         }
         let value: [u8; 64] = signature.value.as_slice().try_into().map_err(|_| {
-            unauthenticated(format!(
+            EvidenceRejection::GrantSignatureMalformed.error(format!(
                 "RunGrant ed25519 signature must be 64 bytes, got {}",
                 signature.value.len()
             ))
@@ -289,9 +440,9 @@ impl<S: EvidenceStore> EvidenceVerifier for CasDsseEvidenceVerifier<S> {
         if trusted {
             Ok(())
         } else {
-            Err(unauthenticated(
-                "RunGrant signature is not by a trusted issuer".into(),
-            ))
+            Err(self
+                .unverified([signature.key_id.as_str()])
+                .error("RunGrant signature is not by a trusted issuer"))
         }
     }
 }
@@ -380,6 +531,16 @@ pub struct AuthorizedExecution {
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
     pub intent: SchemaIntent,
+    /// The grant's resolved `limits`: the ceilings the run is held to.
+    ///
+    /// Verified to narrow `intent.requested_limits` on every dimension the
+    /// request bounds. The run is built from these, never from the request:
+    /// the request is caller intent, and a grant that narrows it must be the
+    /// value enforced.
+    pub limits: ResourceLimits,
+    /// The grant's `workspaces`, each with exactly the operations it
+    /// permits. Validated to resolve exactly `intent.workspace_inputs`.
+    pub workspaces: Vec<WorkspaceGrant>,
 }
 
 /// Owned, policy-free intent extracted from the generated `RunSpec` reader.
@@ -393,7 +554,7 @@ pub struct SchemaIntent {
     pub arguments: Vec<String>,
     pub public_environment: BTreeMap<String, String>,
     pub workspace_inputs: Vec<WorkspaceInput>,
-    pub requested_limits: SchemaLimits,
+    pub requested_limits: ResourceLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,14 +567,6 @@ pub struct ArtifactIdentity {
 pub struct WorkspaceInput {
     pub name: String,
     pub graph_root: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchemaLimits {
-    pub wall_time_ms: u64,
-    pub memory_bytes: u64,
-    pub cpu_millis: u64,
-    pub output_bytes: u64,
 }
 
 /// Validate and bind serialized execution/v1 `RunSpec` and `RunGrant` values.
@@ -555,8 +708,8 @@ pub fn authorize_with_verifier(
             "RunGrant confinement digest does not match the enforcement policy",
         ));
     }
-    validate_limits(spec.get_requested_limits(), grant.get_limits())?;
-    validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
+    let limits = validate_limits(spec.get_requested_limits(), grant.get_limits())?;
+    let workspaces = validate_workspaces(spec.get_workspace_inputs(), grant.get_workspaces())?;
     let intent = read_intent(&spec)?;
 
     let mut has_execution_capability = false;
@@ -616,6 +769,8 @@ pub fn authorize_with_verifier(
         backend,
         allowed_egress,
         intent,
+        limits,
+        workspaces,
     })
 }
 
@@ -908,9 +1063,7 @@ fn read_intent(
             })
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
-    let limits = spec
-        .get_requested_limits()
-        .map_err(|error| ExecutionError::invalid(format!("invalid requestedLimits: {error}")))?;
+    let requested_limits = read_limits(spec.get_requested_limits(), "requestedLimits")?;
 
     Ok(SchemaIntent {
         executable: ArtifactIdentity {
@@ -920,52 +1073,114 @@ fn read_intent(
         arguments,
         public_environment,
         workspace_inputs,
-        requested_limits: SchemaLimits {
-            wall_time_ms: limits.get_wall_time_ms(),
-            memory_bytes: limits.get_memory_bytes(),
-            cpu_millis: limits.get_cpu_millis(),
-            output_bytes: limits.get_output_bytes(),
-        },
+        requested_limits,
     })
 }
 
+/// Data words `ResourceLimits` defines: `wallTimeMs` and `outputBytes`.
+const RESOURCE_LIMITS_DATA_WORDS: usize = 2;
+
+/// The `ResourceLimits` layout before ADR-0035's OCI amendment: four `UInt64`
+/// data words and no pointers, `{wallTimeMs, memoryBytes, cpuMillis,
+/// outputBytes}`. A reader of the current layout sees word 0 and word 1 (as
+/// `wallTimeMs` and `outputBytes`) and nothing else, with null `memory`,
+/// `cpu` and `pids`: an old message would read as "no ceiling".
+const PRE_OCI_LIMIT_WORDS: [&str; 4] = ["wallTimeMs", "memoryBytes", "cpuMillis", "outputBytes"];
+
+/// Refuse a ceiling struct carrying a value this reader does not decode.
+///
+/// Cap'n Proto lets a reader ignore data beyond the fields it knows, which is
+/// ordinary evolution tolerance everywhere except here: an unread ceiling is
+/// an unenforced one (ADR-0035 §4). Two cases, both refused by name:
+///
+/// - the pre-OCI layout (no pointer section, more data words than this
+///   reader knows), whose `memoryBytes`, `cpuMillis` or `outputBytes` would
+///   otherwise be dropped or misread;
+/// - any other nonzero data word past the known ones, such as a ceiling a
+///   newer producer appended.
+///
+/// A zero word bounds nothing, so it is accepted either way.
+fn refuse_unread_ceilings<'a>(
+    reader: impl capnp::traits::IntoInternalStructReader<'a>,
+    known_words: usize,
+    top_level: bool,
+    field: &str,
+) -> Result<(), ExecutionError> {
+    let raw = reader.into_internal_struct_reader();
+    let data = raw.get_data_section_as_blob();
+    // Only the top-level struct had a pre-OCI layout; the nested ones are new.
+    let pre_oci = top_level
+        && raw.get_pointer_section_size() == 0
+        && data.len() > RESOURCE_LIMITS_DATA_WORDS * 8;
+    let first_word = if pre_oci { 1 } else { known_words };
+    for (word, bytes) in data.chunks_exact(8).enumerate().skip(first_word) {
+        if bytes.iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        return Err(match PRE_OCI_LIMIT_WORDS.get(word).filter(|_| pre_oci) {
+            Some(name) => ExecutionError::invalid(format!(
+                "{field} uses the removed pre-OCI ResourceLimits layout and sets {name}; \
+                 use memory.limit, cpu.quota/cpu.period and outputBytes"
+            )),
+            None => ExecutionError::invalid(format!(
+                "{field} carries a value in data word {word}, which this reader does not \
+                 know; an unread ceiling would be unenforced, so it is refused"
+            )),
+        });
+    }
+    Ok(())
+}
+
+/// Read one execution/v1 `ResourceLimits` into the runtime's OCI-shaped model.
+fn read_limits(
+    limits: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
+    field: &str,
+) -> Result<ResourceLimits, ExecutionError> {
+    let limits =
+        limits.map_err(|error| ExecutionError::invalid(format!("invalid {field}: {error}")))?;
+    refuse_unread_ceilings(limits, RESOURCE_LIMITS_DATA_WORDS, true, field)?;
+    let memory = limits
+        .get_memory()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}.memory: {error}")))?;
+    refuse_unread_ceilings(memory, 1, false, &format!("{field}.memory"))?;
+    let cpu = limits
+        .get_cpu()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}.cpu: {error}")))?;
+    refuse_unread_ceilings(cpu, 2, false, &format!("{field}.cpu"))?;
+    let pids = limits
+        .get_pids()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}.pids: {error}")))?;
+    refuse_unread_ceilings(pids, 1, false, &format!("{field}.pids"))?;
+    let limits = ResourceLimits {
+        wall_time_ms: limits.get_wall_time_ms(),
+        output_bytes: limits.get_output_bytes(),
+        memory: MemoryLimits {
+            limit: memory.get_limit(),
+        },
+        cpu: CpuLimits {
+            quota: cpu.get_quota(),
+            period: cpu.get_period(),
+        },
+        pids: PidsLimits {
+            limit: pids.get_limit(),
+        },
+    };
+    limits
+        .validate()
+        .map_err(|error| ExecutionError::invalid(format!("invalid {field}: {}", error.detail)))?;
+    Ok(limits)
+}
+
+/// Refuse a grant whose limits widen the spec's request, and return the
+/// grant's limits: the ceilings the run is held to.
 fn validate_limits(
     requested: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
     resolved: capnp::Result<execution_capnp::resource_limits::Reader<'_>>,
-) -> Result<(), ExecutionError> {
-    let requested = requested
-        .map_err(|error| ExecutionError::invalid(format!("invalid requestedLimits: {error}")))?;
-    let resolved = resolved
-        .map_err(|error| ExecutionError::invalid(format!("invalid grant limits: {error}")))?;
-    for (name, requested, resolved) in [
-        (
-            "wallTimeMs",
-            requested.get_wall_time_ms(),
-            resolved.get_wall_time_ms(),
-        ),
-        (
-            "memoryBytes",
-            requested.get_memory_bytes(),
-            resolved.get_memory_bytes(),
-        ),
-        (
-            "cpuMillis",
-            requested.get_cpu_millis(),
-            resolved.get_cpu_millis(),
-        ),
-        (
-            "outputBytes",
-            requested.get_output_bytes(),
-            resolved.get_output_bytes(),
-        ),
-    ] {
-        if requested != 0 && (resolved == 0 || resolved > requested) {
-            return Err(ExecutionError::invalid(format!(
-                "grant limit {name} widens the requested limit"
-            )));
-        }
-    }
-    Ok(())
+) -> Result<ResourceLimits, ExecutionError> {
+    let requested = read_limits(requested, "requestedLimits")?;
+    let resolved = read_limits(resolved, "grant limits")?;
+    resolved.narrows(&requested)?;
+    Ok(resolved)
 }
 
 fn validate_workspaces(
@@ -975,7 +1190,7 @@ fn validate_workspaces(
     resolved: capnp::Result<
         capnp::struct_list::Reader<'_, execution_capnp::workspace_grant::Owned>,
     >,
-) -> Result<(), ExecutionError> {
+) -> Result<Vec<WorkspaceGrant>, ExecutionError> {
     let requested = requested
         .map_err(|error| ExecutionError::invalid(format!("invalid workspaceInputs: {error}")))?;
     let resolved = resolved
@@ -989,7 +1204,7 @@ fn validate_workspaces(
             ))
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
-    let resolved = resolved
+    let grants = resolved
         .iter()
         .map(|workspace| {
             let name = text(workspace.get_name(), "grant workspace name")?;
@@ -1002,9 +1217,26 @@ fn validate_workspaces(
                     "grant workspace {name} has no authorized operations"
                 )));
             }
-            Ok((name, graph_root))
+            let operations = operations
+                .iter()
+                .map(|operation| {
+                    operation.map(workspace_operation).map_err(|error| {
+                        ExecutionError::invalid(format!("invalid operation for {name}: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            Ok(WorkspaceGrant {
+                name,
+                graph_root,
+                expected_generation: workspace.get_expected_generation(),
+                operations,
+            })
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
+    let resolved: Vec<(String, String)> = grants
+        .iter()
+        .map(|grant| (grant.name.clone(), grant.graph_root.clone()))
+        .collect();
 
     // A grant must resolve exactly the requested workspace set.  A strict
     // equality check prevents an omitted workspace from silently becoming an
@@ -1023,5 +1255,15 @@ fn validate_workspaces(
             "grant workspaces must exactly match RunSpec.workspaceInputs",
         ));
     }
-    Ok(())
+    Ok(grants)
+}
+
+fn workspace_operation(operation: execution_capnp::WorkspaceOperation) -> WorkspaceOperation {
+    match operation {
+        execution_capnp::WorkspaceOperation::Read => WorkspaceOperation::Read,
+        execution_capnp::WorkspaceOperation::List => WorkspaceOperation::List,
+        execution_capnp::WorkspaceOperation::Query => WorkspaceOperation::Query,
+        execution_capnp::WorkspaceOperation::Mutate => WorkspaceOperation::Mutate,
+        execution_capnp::WorkspaceOperation::Commit => WorkspaceOperation::Commit,
+    }
 }

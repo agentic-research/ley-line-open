@@ -11,6 +11,24 @@ repo_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyline-release-tags.XXXXXX")
 trap 'rm -rf "$tmp_dir"' 0 1 2 15
 
+# Tagging needs a passing hypervisor-suite receipt for the tree (bead
+# ley-line-open-16a994). Fixtures record one with a stand-in suite through
+# the real tools/hypervisor_attestation.sh, so the gate under test is the
+# shipped one; the refusal itself is the no-receipt case at the end.
+printf '#!/bin/sh\ntest "$LEYLINE_REQUIRE_HYPERVISOR" = 1\n' > "$tmp_dir/suite"
+chmod +x "$tmp_dir/suite"
+printf 'kernel' > "$tmp_dir/libkrunfw"
+mkdir -p "$tmp_dir/guest-tools"
+record_receipt() {
+    (
+        cd "$1"
+        HYPERVISOR_SUITE="$tmp_dir/suite" \
+            LEYLINE_LIBKRUNFW_PATH="$tmp_dir/libkrunfw" \
+            LEYLINE_GUEST_TOOLS="$tmp_dir/guest-tools" \
+            "$repo_root/tools/hypervisor_attestation.sh" record >/dev/null 2>&1
+    )
+}
+
 new_fixture() {
     name=$1
     bare="$tmp_dir/$name.git"
@@ -33,6 +51,7 @@ new_fixture() {
         git commit -m seed >/dev/null
         git push -u origin main >/dev/null
     )
+    record_receipt "$work"
     printf '%s\n' "$work"
 }
 
@@ -75,6 +94,7 @@ work=$(new_fixture unchanged)
     git commit -m binary-only >/dev/null
     git push origin main >/dev/null
 )
+record_receipt "$work"
 REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
     "$repo_root/tools/tag_release.sh" 0.10.5 >/dev/null
 test -n "$(git -C "$work" ls-remote origin refs/tags/v0.10.5)"
@@ -103,6 +123,7 @@ old_commit=$(git -C "$work" rev-parse HEAD)
     git commit -m newer >/dev/null
     git push origin main >/dev/null
 )
+record_receipt "$work"
 expect_failure wrong-commit \
     env REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
     "$repo_root/tools/tag_release.sh" 0.10.4
@@ -120,4 +141,30 @@ fi
 printf '%s\n' "$detached_err" | grep -q "not 'detached HEAD'"
 test -z "$(git -C "$work" ls-remote origin refs/tags/v0.10.4)"
 
-echo "release tag fixture proved atomic, idempotent, and fail-closed rules"
+# No hypervisor receipt for the tree being released: refused before any tag
+# exists, naming the command that produces one (bead ley-line-open-16a994).
+work=$(new_fixture no-receipt)
+(
+    cd "$work"
+    printf '%s\n' untested > untested
+    git add untested
+    git commit -m untested >/dev/null
+    git push origin main >/dev/null
+)
+if receipt_err=$(REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
+    "$repo_root/tools/tag_release.sh" 0.10.4 2>&1 >/dev/null)
+then
+    echo "no-receipt unexpectedly succeeded" >&2
+    exit 1
+fi
+printf '%s\n' "$receipt_err" | grep -q 'no passing hypervisor-suite receipt'
+printf '%s\n' "$receipt_err" | grep -q 'task release:hypervisor:record'
+test -z "$(git -C "$work" ls-remote origin refs/tags/v0.10.4)"
+test -z "$(git -C "$work" tag -l v0.10.4)"
+# The same tree, once recorded, tags.
+record_receipt "$work"
+REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
+    "$repo_root/tools/tag_release.sh" 0.10.4 >/dev/null
+test -n "$(git -C "$work" ls-remote origin refs/tags/v0.10.4)"
+
+echo "release tag fixture proved atomic, idempotent, receipt-gated, and fail-closed rules"

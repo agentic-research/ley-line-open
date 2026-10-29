@@ -8,8 +8,9 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 
 | Field | Value |
 |---|---|
-| LLO version | v0.20.5 |
-| Last verified | 2026-07-27 |
+| LLO version | v0.21.0 |
+| Last verified | 2026-07-27 (status row and roadmap pointer updated 2026-10-23) |
+| Direction | [ROADMAP.md](ROADMAP.md): v1.0 is single host, portable (epic `ley-line-open-b2e687`); integration carries the 0.21.0 cycle |
 | Authority model | [ADR-0032](adr/0032-declared-decompositions.md) §D4 — see [Authority model](#authority-model) |
 | Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `docs/decades/*.md`, `CHANGELOG.md` |
 
@@ -40,7 +41,7 @@ impossibility results (A)–(D) forbid it.
 |---|---|---|
 | **SQLite arena snapshot root** (`Controller.current_root`) | integrity of one serialized byte image | shipped — `rs/ll-open/cli-lib/src/cmd_daemon.rs:1263-1266` |
 | **Cap'n Proto segment root** (`Head.rootHash`) | which parse run produced these segments (a run receipt: truncated per run, commits to absolute paths and mtimes) | shipped — `rs/ll-open/cli-lib/src/cmd_parse.rs` `hash_segment_files` |
-| **tree root** (`Head.treeRoot`) | the source tree: every `_source` row as (relative path, content hash) under one `parserId`; the same for a cold, incremental, scoped or relocated parse of the same bytes | shipped — `rs/ll-open/cli-lib/src/tree_root.rs`, ADR-0040 D1; verified by `leyline verify-head` |
+| **tree root** (`Head.treeRoot`) | the store's manifest: every `_tree` file entry as (relative path, mode, blob hash) and every empty directory, under one `parserId`; the same for a cold, incremental, scoped or relocated parse of the same bytes, and for a proposal that produces that tree | shipped — `rs/ll-open/cli-lib/src/tree_root.rs`, ADR-0040 D1, modes and directories ADR-0045 T2; verified by `leyline verify-head` |
 | **parser identity** (`Head.parserId`) | the derivation `treeRoot` was computed under: IR and projection schema versions, extraction/injection/query-set epochs, every compiled grammar's digest | shipped — `rs/ll-open/cli-lib/src/tree_root.rs`, ADR-0040 D1 |
 | **blob hash** | one CDC/CAS payload | shipped — `rs/ll-core/core/src/substrate.rs:167-179` |
 | **SQL projection ABI** | the queryable tables, columns, and indexes | shipped — a contract, **not** an identity domain; see §D4 below |
@@ -124,7 +125,7 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-text-search` | Unstructured-text semantic search backend abstraction. `NullEngine` default; `WitchcraftEngine` (XTR-WARP) behind feature flag | `TextSearchEngine` trait |
 | `leyline-chat-embed` | CLI binary: semantic search over Claude Code chat databases (mache's `claude-chats` ingest) via fastembed/MiniLM | `chat-embed` binary |
 | `leyline-cli-lib` | The daemon. Owns the living db + UDS control socket + MCP HTTP transport; hosts all enrichment passes | `cmd_daemon`, `daemon::ops` |
-| `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib` | `parse`, `daemon`, `serve`, `inspect` |
+| `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib`; injects the storefs host mount into `daemon --mount` | `parse`, `daemon`, `inspect` |
 
 **Contract:** The `nodes` + `_ast` + `_source` + `node_content` tables form the
 core **SQL projection ABI**; enrichment passes write derived sidecars (`_lsp*`,
@@ -376,6 +377,9 @@ Architectural decisions that shape LLO today:
 | [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` | Proposed — D1, D3, D4 and D6 shipped (v0.20.2); D5 open; D7 is ADR-0041 |
 | [ADR-0041](adr/0041-publication-snapshots.md) | Publication — immutable snapshot files of whole proposals under control block v4 with `(epoch, seq)`; `current_root` retired for `treeRoot`; one producer; transport carries what proposals carry | Proposed — no implementation exists |
 | [ADR-0042](adr/0042-proposals.md) | Proposals — a write names the bytes its author read and is applied whole or refused whole; file bases, daemon `read_source`/`propose`, mount `ESTALE`; node bases and the closure check open | Proposed — file bases, one-transaction writes, durable acknowledgement, daemon ops and mount bases implemented (#437-#440, `843e03`) |
+| [ADR-0043](adr/0043-one-store-refs-and-checkouts.md) | One store — branches are refs, worktrees are checkouts with an index, git is read and written natively (no subprocess); closes the restart that reverted proposals (`60f39f`) | Accepted — built in phases; phase 0 (single checkout) is #459 |
+| [ADR-0044](adr/0044-userspace-data-plane.md) | Agents see a filesystem served from userspace — the agent runs in a libkrun microVM and its working tree is a virtio-fs share whose backend is LLO (reads from the store, writes as proposals, refusals as errno); host NFS/FUSE mounts are compatibility | Accepted — LLO carries a libkrun patch; phases A–C |
+| [ADR-0045](adr/0045-git-shaped-store-and-merged-proposals.md) | The store is a git-shaped tree — every path holds any bytes with a git mode, directories are entries, `treeRoot` covers both; parsing is a projection and an unparseable file is stored with a diagnostic; a proposal whose base moved merges three ways (`gix-merge`) and overlapping hunks refuse with their ranges; amends ADR-0042 and ADR-0044; T8: the host mount is storefs | Accepted — phases 1–6 (store, proposals, wire, storefs, host mount) |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 
@@ -388,9 +392,9 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 | `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` + `cdc` — the structural-analysis core plus explicit CDC activation |
 | `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
 | `leyline` binary (everything including mount) | `task install:full+mount` — `--features full`. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at runtime |
-| Distroless OCI image | `task image` — produces `localhost/leyline:v0.20.5` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.20.5` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
+| Distroless OCI image | `task image` — produces `localhost/leyline:v0.21.0` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.21.0` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
 | FFI staticlibs + header | `task release:fs-static:target` — builds the mache-facing `leyline-fs` staticlib with explicit CDC support and publishes it as a verified GitHub release artifact (linux amd64/arm64 + darwin arm64; macOS amd64 staticlib currently absent) |
-| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.20.5 is its tested compatibility point |
+| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.21.0 is its tested compatibility point |
 
 Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern). See [README.md § Install and build](../README.md#install-and-build) for the recommended install path per user type.
 

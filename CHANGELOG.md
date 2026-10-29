@@ -10,6 +10,1060 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-26
+
+**Security:** on the microVM tier, a grant declaring any `confinement/v1`
+§4 listener published every port the guest listened on, on every host
+interface. libkrun patch 0008 makes the port map the complete list: an
+undeclared listen fails in the guest with `EACCES`, and a declared one is
+bound on loopback. Upgrade from any earlier release that grants §4 ports.
+
+Many agents, one store. The store is a git-shaped tree that holds any bytes
+with git modes, symlinks and empty directories, and a save whose base moved
+merges three ways with what landed since it was read. Agents work through an
+ordinary filesystem: a libkrun microVM over the store-backed share, or the
+host mount, which now serves the same storefs core. A guest write costs one
+coalesced publish and one full flush (~17–22 ms, from ~15 s), and build
+output never enters the store. On the host NFS mount, a save made from an
+older read is refused `ESTALE` instead of silently replacing another
+process's edit.
+
+The execution tier hardens for cloister and notme: `leyline-sign` verifies
+notme certificates; `leyline execution-daemon` installs a real evidence
+verifier; the native tier's confinement is proven at the kernel;
+confinement/v1 `port` and `network.connectLocal` take lists; a run carries
+OCI resource limits; the release ships the macOS microVM worker signed with
+the hypervisor entitlement, and a hypervisor-suite receipt gates tagging;
+the execution/v1 schema is published as release assets.
+
+`SCHEMA_VERSION` moves to 0.21.0 with a
+matching `clients/go/leyline-schema/v0.21.0` tag. Crates are not published
+to crates.io for this release.
+
+Breaking changes downstream must absorb:
+
+- **Projection v7.** `_tree (path, mode, blob_hash, mtime, size)` lists every
+  entry the store holds, explicit directories included; `_source` lists only
+  the files the parse projects; `_parse_diagnostics` names each file that did
+  not parse cleanly. A v6 arena is refused at parse open and rebuilt cold.
+- **The `propose` wire.** `base` is required (a blob hash, `"any"` or
+  `"absent"`); `kind` is `replace`, `create`, `delete`, `mkdir` or `rmdir`;
+  `mode` is `100644`, `100755` or `120000`. A clean three-way merge answers
+  `merged`; overlapping edits refuse `stale` with `conflicts` as 0-based,
+  half-open line ranges. New refusal reasons `exists`, `not_empty`,
+  `not_a_directory`, `is_a_directory`; `syntax`, `no_language` and
+  `no_stored_blob` are never sent.
+- **The host mount** serves the store's plain files through storefs; the
+  syntax-node directory view and `leyline serve --language` are removed. The
+  macOS NFS mount is refused below Tahoe 26.7 and Sequoia 15.8 (Apple
+  NFS-client CVE-2026-43686 and CVE-2026-84549).
+- **`leyline-runtime`** has no `vmm` feature and links no libkrun; the
+  microVM worker is the unpublished `leyline-krun-worker` crate.
+- **execution/v1:** a workspace grant whose `expectedGeneration` is nonzero is
+  refused before the run starts. `ResourceLimits` is OCI `linux.resources`
+  (`memory.limit`, `cpu.quota`/`cpu.period`, `pids.limit`); `memoryBytes` and
+  `cpuMillis` are removed and refused by name, and clients check
+  `cloister/execution/v1/resource-limits` version `2` before `start`.
+- **`treeRoot`** covers modes and empty directories, so a cloister grant whose
+  `graphRoot` predates ADR-0045 over such a tree no longer matches; re-derive
+  it from the daemon's `read_source` `tree_root`.
+- **Derived paths** (`target/`, `node_modules/`, `.venv/`, `.git/`, `._*`,
+  `.gitignore` matches) are never proposals; they live in per-run or
+  per-mount-session scratch.
+
+### Security
+
+- **The microVM tier publishes exactly the declared §4 listeners, on
+  loopback** (bead `ley-line-open-7d4d45`). A grant declaring one or more
+  `confinement/v1` §4 listeners on the libkrun tier published EVERY port the
+  guest listened on, on every host interface. libkrun's TSI port map renamed
+  ports and limited none — an unmapped guest listen was bound at the guest's
+  requested address — and on macOS the VMM's Seatbelt profile grants
+  `network-bind` for all ports once one is granted, so nothing else stood in
+  the way. LLO libkrun patch 0008 makes a configured map the complete list:
+  an undeclared listen fails in the guest with `EACCES`, and a declared one
+  is bound on `127.0.0.1`/`::1`, which is what §4 means without an
+  `address`. Found by the new live-guest test
+  `every_declared_guest_listener_is_reachable_and_an_undeclared_one_is_not`.
+  Linux confines the VMM per port with Landlock, so the undeclared-port half
+  did not reach Linux; the loopback half did.
+
+### Changed
+
+- **Crates are published by hand, never by a tag** (bead
+  `ley-line-open-0fadab`). `.github/workflows/publish-crates.yml` runs on
+  `workflow_dispatch` with a release tag input instead of on every `v*` tag
+  push, so tagging v0.21.0 publishes binaries and the image only. Publishing
+  crates resumes as a deliberate run (bead `ley-line-open-c3e8c6`).
+- **Breaking: execution/v1 resource limits are OCI `linux.resources`**
+  (bead `ley-line-open-da36d2`, ADR-0035 "OCI resources on execution/v1").
+  `ResourceLimits` is now `{wallTimeMs @0, outputBytes @1, memory @2
+  {limit}, cpu @3 {quota, period}, pids @4 {limit}}`: OCI `memory.limit`
+  (bytes), `cpu.quota`/`cpu.period` (microseconds) and `pids.limit`.
+  `memoryBytes` and `cpuMillis` are removed; `cpuMillis` was documented as
+  cumulative CPU time and read as vCPUs × 1000. Zero means no ceiling. The
+  change is in place in v1 (pre-1.0, by decision); the README records the
+  exception to its append-only rule. `EnforcedCeilings` is one mechanism per
+  field (`wallTime`, `outputBytes`, `memory`, `cpu`, `pids`; `vcpus` is
+  gone), and `CeilingMechanism` gains `cgroup`. An old producer is refused,
+  never read as "no ceiling": the JSON carrier refuses `memoryBytes`,
+  `cpuMillis` and any other unknown key in `requestedLimits` or `limits` by
+  name, and a binary `ResourceLimits` in the old layout (four data words, no
+  pointers) with a nonzero `memoryBytes`, `cpuMillis` or `outputBytes` is
+  refused naming that field, as is any nonzero data word past those the
+  reader knows. An old daemon cannot refuse a new client, so
+  `llo_execution_capabilities` now advertises
+  `cloister/execution/v1/resource-limits` at version `2`, and a client must
+  check it before `start`. Consumers that generate from `execution.capnp` or
+  vendor `execution-tools.json` and `canonical-run.json` must regenerate.
+- **Breaking: every ceiling is enforced or refused by name, per tier**
+  (bead `ley-line-open-da36d2`). The microVM tier sizes the guest from
+  `memory.limit` (whole MiB) and `cpu.quota / cpu.period` (whole vCPUs) and
+  requires both; it refuses `pids.limit`. The native tier on Linux enforces
+  memory, CPU bandwidth and pids through a delegated cgroup v2 directory,
+  `execution-daemon --cgroup-root <dir>`: each run gets its own cgroup
+  (`memory.max` with `memory.swap.max=0` and `memory.oom.group=1`,
+  `cpu.max`, `pids.max`), the worker is placed in it before it reads its
+  request, and teardown is `cgroup.kill`. Without the flag, and on macOS
+  (where `setrlimit(RLIMIT_AS)` fails and is the `RLIMIT_RSS` alias), the
+  native tier enforces the wall clock only and refuses the rest.
+  `outputBytes` is refused everywhere. Backends check in `start` as well as
+  the service, so `NativeWorkerBackend::start` no longer accepts a memory
+  ceiling it never applied. Rust API: `SchemaLimits` is removed
+  (`SchemaIntent.requested_limits` is `ResourceLimits`); `ResourceLimits`
+  replaces `vcpus`/`memory_mib` with `memory`/`cpu`/`pids`/`output_bytes`;
+  new `MemoryLimits`, `CpuLimits`, `PidsLimits`, `backends::cgroup`,
+  `NativeWorkerBackend::with_cgroup_root`.
+- **A run is held to the grant's limits, not the spec's request** (bead
+  `ley-line-open-da36d2`). `authorize` checked that `RunGrant.limits`
+  narrows `RunSpec.requestedLimits` and the resolver then built the run from
+  the request, so a grant narrowing memory from 1 GiB to 512 MiB ran at
+  1 GiB. `AuthorizedExecution.limits` carries the grant's ceilings and
+  `CatalogResolver` uses them.
+- **A binary-only release refuses a changed schema-spec contract**
+  (bead `ley-line-open-da36d2`). `tools/verify_release_version.sh` now also
+  compares the schema-spec IDL and conformance vectors with the reused
+  schema tag, so the release carrying this change must publish a new
+  `SCHEMA_VERSION`. `task runtime:test:cgroup` (in `task ci`) runs the
+  cgroup tests against a real kernel on Linux, delegating a cgroup with
+  sudo; it skips on macOS.
+- **The execution/v1 operation names are written once** (bead
+  `ley-line-open-6d811a`). `BASE_OP_NAMES` (`daemon::wire`) and the
+  `execution` cloister group (`daemon::mcp`) each carried a hand-typed copy
+  of the eight `llo_execution_*` names, with `provision` and `status`
+  transposed relative to `execution_contract::OP_NAMES` and the generated
+  `execution-tools.json`. Both lists are read as sets, so no dispatch or
+  routing was wrong. Both are now taken from `execution_contract::OP_NAMES`:
+  `BASE_OP_NAMES` splices it at compile time, the cloister group copies it.
+  `server.json`'s `execution` group lists `upstreamNames` in the contract's
+  order; the field is a set, and consumers resolve it by name.
+- **Breaking: build output and tool state are never proposals** (bead
+  `ley-line-open-39998b`, ADR-0045 T9). In a guest run's share and on the
+  host mount, a path the store does not hold is derived when a directory
+  component is `target`, `node_modules`, `__pycache__`, `__pypackages__`,
+  `venv`, `.venv` or `.git`, when it is a macOS metadata file (`._*`,
+  `.DS_Store`, bead `8d6a8a`), when a `.gitignore` rule matches it, or when
+  its parent is derived. Derived paths live in a scratch directory per run
+  (per mount session) outside the store, its tree root and the checkout,
+  and are removed with it; a path the store holds stays a proposal. A
+  `cargo build` in the guest no longer lands its artifacts in the store:
+  300 build files took 3.9 ms each through the share, where an accepted
+  proposal takes ~47 ms. Scratch is limited (`ENOSPC` past 16 GiB),
+  confined (`openat` with `O_NOFOLLOW` beneath its root), and carries no
+  durability. A directory renamed between a derived and an authored path is
+  `EXDEV`. `storefs::Options` gains `derived`; `leyline-storefs` takes
+  `ignore` and an unconditional `libc` dependency.
+
+- **A proposal issues one full flush: its `live.db` commit** (bead
+  `ley-line-open-98d0c3`, ADR-0041 amendment 2026-10-23). The daemon's
+  `live.db` connection sets `fullfsync` and `checkpoint_fullfsync`, so on
+  macOS the commit that acknowledges a proposal reaches past the drive's
+  cache (it was plain `fsync(2)`, which stops at it). The checkout file,
+  its directory, the Σ head and its directory, each flushed with
+  `F_FULLFSYNC` before, are ordered with `F_BARRIERFSYNC`: a file's bytes
+  before its rename, the rename before the `_checkout_index` row that
+  records it. Reconcile advances the index in one transaction after every
+  write, committed without a sync of its own. A power loss can roll the
+  checkout or the head back to its predecessor; the next reconcile or
+  parse brings it forward from the durable rows.
+
+- **Breaking: a proposal is published by the daemon's publisher, not
+  inline** (bead `ley-line-open-8c8ded`, ADR-0041 amendment 2026-10-22).
+  `propose` and storefs's FLUSH reply once the proposal is committed to
+  `live.db` and request a publish; the publisher coalesces every proposal
+  landed before it runs. Out-of-process arena readers see a proposal after
+  that publish; `snapshot` publishes on demand. A publish no longer holds
+  the writer: it reads one committed state through the reader pool under a
+  single-publisher lock, which `load` also takes. `propose` no longer
+  reports a publish failure in `post_commit_error`. storefs's
+  `Store::publish` is now `Store::request_publish` and cannot fail.
+- **The arena keeps its size while the image fits a buffer, and grows
+  with a quarter of headroom** (bead `ley-line-open-8c8ded`). Before, any
+  growth after a resize rewrote the whole arena; on a 1.3 GB store that
+  was a new 2.6 GB file per proposal.
+- **A grown arena the image does not justify, or the disk cannot hold, is
+  refused** (bead `ley-line-open-8c8ded`). `leyline_core::write_grown_arena`
+  returns a typed `GrowRefused` before creating any file when the target
+  exceeds `max_grown_arena_size` (two buffers of twice the image plus 1 MiB)
+  or the filesystem's free space less 1 GiB. A sizing mutant had made a grow
+  test write a 3.8 TB sparse arena (152 GB on disk).
+- **`current_root` hashes across cores** (bead `ley-line-open-8c8ded`):
+  `blake3::Hasher::update_rayon`, the same bytes as before.
+- **Breaking: the microVM worker is its own crate; `leyline-runtime` has no
+  libkrun and no `vmm` feature** (bead `ley-line-open-395e43`). The
+  `leyline-krun-worker` binary, the libkrun API (`api::LinkedKrunApi`,
+  `KrunApi`, `prepare_vm`, `PreparedVm`, `DynFileSystem`, `virtio_fs`), the
+  share device (`ShareFs`) and the VM half of the worker
+  (`execute_with_ready`) move to the unpublished `leyline-krun-worker` crate
+  (`rs/ll-open/krun-worker`), the only one that links the vendored libkrun.
+  `leyline-runtime` keeps the worker's options, descriptor checks, events and
+  a new `worker::prepare`, which does everything before the VMM and returns a
+  `PreparedRun`. The runtime's `vmm` feature is removed: `cargo package -p
+  leyline-runtime` no longer fails on libkrun's path-only dependency, and a
+  default-features build of the runtime no longer compiles libkrun or needs
+  `CC_LINUX`. Build the worker with `cargo build -p leyline-krun-worker`.
+  `KRUN_TSI_HIJACK_INET` moves to `backends::libkrun::plan` (re-exported by
+  the worker crate's `api`), and `ExecutionError::invalid` and
+  `ExecutionError::backend` are public. `worker::execute`, which nothing
+  called, is removed; `execute_with_ready` and
+  `execute_from_reader_with_events` remain.
+- **Breaking: the host mount is storefs — `daemon --mount` presents the
+  store's files and writes them by the store's rules** (beads
+  `ley-line-open-53d701`, `ley-line-open-3e73dc`, ADR-0045 T8).
+  - The FUSE and NFS host mounts serve `leyline_storefs::StoreFs`, the core
+    a guest's virtio-fs share serves, behind `storefs::host::fuse::HostFuse`
+    and `storefs::host::nfs::HostNfs` (new `leyline-storefs` feature
+    `mount`; the CLI's `mount` feature now enables it). A host process sees
+    the tree a guest sees — every file of any kind, mode, symlink and
+    directory in `_tree` — and each save, create, mkdir, rmdir, rename,
+    symlink and `chmod` is the proposal a guest's is: a moved base merges
+    three ways, overlapping edits answer `ESTALE`/`NFS3ERR_STALE`, an
+    unparseable save lands with its `_parse_diagnostics` row, and every
+    landed proposal is written into the daemon's checkout and published.
+  - Before, the host mount presented the projection: a parsed file as a
+    directory of its syntax nodes, a file of no language not at all, and
+    create, mkdir and mode changes refused `EPERM`. Paths under a mount
+    change: `util.go` is a file, not `util.go/package_clause/...`.
+  - NFS: each WRITE runs the COMMIT's own decision (`source_write::check`)
+    and refuses exactly what it refuses, because the macOS client ignores a
+    refused COMMIT; a SETATTR of the size stages unchecked (a save truncates
+    before it writes); a refused WRITE or COMMIT voids the client's save —
+    the handle drops what it staged, keeps its base, and refuses every
+    WRITE, size SETATTR and COMMIT until a READ. CREATE lands the empty
+    file at once.
+  - Writers: the merge and `ESTALE` hold between separate writers (a
+    guest's virtio-fs session, a FUSE handle, a socket proposal). Two
+    processes through one NFS mount share the host's NFS client and page
+    cache, which NFSv3 presents to the server as one client: the second
+    save made from an older read is refused `ESTALE`, and their disjoint
+    edits do not merge (`ley-line-open-5ec040`).
+  - Known: the macOS NFS client's AppleDouble `._*` files (its xattr
+    fallback) land in the store (`ley-line-open-8d6a8a`).
+  - macOS: the NFS mount refuses Tahoe before 26.7 and Sequoia before 15.8,
+    whose NFS client corrupts kernel memory on server replies
+    (CVE-2026-43686, CVE-2026-84549; bead `ley-line-open-2d49ce`). The
+    client's attribute cache is `actimeo=1`.
+  - Embedders: `run_daemon_with_options` mounts only through a provider in
+    the new `DaemonOptions::host_mount` (`cmd_daemon::HostMount`;
+    `leyline_storefs::host::DaemonHostMount` is LLO's). A daemon asked to
+    `--mount` with none is refused before it starts. `DaemonOptions` is no
+    longer `Copy`.
+  - `leyline-fs` writes no store: every write, create, removal, truncate
+    and rename of a store's nodes is refused.
+  - Removed: `leyline serve` (use `leyline daemon --mount`);
+    `leyline_cli_lib::cmd_serve` (its arena, duration and shutdown helpers
+    are `leyline_cli_lib::lifecycle`); `source_write::MountWriter`;
+    `daemon::live_graph`; cli-lib's `mount` feature; `leyline-fs`'s `fuse`,
+    `nfs` and `splice` features with `leyline_fs::fuse`, `leyline_fs::nfs`,
+    `graph::{SourceWriter, Proposal, Refused, RefusalKind, refusal_kind,
+    LiveSource, Handle, MOUNT_HANDLE}`, `SqliteGraphAdapter::live` and
+    `set_source_writer`, `HotSwapGraph::with_source_writer`, the `Graph`
+    methods `note_base`, `note_read`, `flush_node`, `mtime_tracks_entries`,
+    `release` and the `*_as` handle variants, `Node::perm`, and the
+    `_errors` table; the mount's syntax validation and shadow copies,
+    `SqliteGraphAdapter::set_default_language`,
+    `HotSwapGraph::with_validation`, `leyline serve --language` and
+    `leyline_ts::splice::check_syntax`; the `deps:fuse` and
+    `fs:build:nfs-isolated` tasks (leyline-fs links no libfuse).
+  - ADR-0045's conflict ranges are documented as `daemon.capnp` defines
+    them: 0-based, half-open `[start, end)`.
+- **The workspace share's frame header is Cap'n Proto, and the shipped
+  share path is measured** (bead `ley-line-open-39d3a4`).
+  - Each FUSE request the `leyline-krun-worker` forwards to the daemon, and
+    each reply, carries its header as one message of the new internal
+    schema `rs/ll-core/public-schema/capnp/share.capnp` instead of JSON.
+    The framing (two little-endian `u32` lengths, then the header, then the
+    payload) is unchanged. The worker and the daemon ship in one release,
+    so the schema has no Go or TypeScript bindings and is not in
+    `compatibility.json`; a worker and a daemon from different releases do
+    not interoperate.
+  - Decoding fails closed: a header that is not exactly one share message,
+    a request or reply kind the reader does not know, a time whose
+    nanosecond count is a second or more, or a payload on a kind that
+    carries none fails the stream, and the guest's request answers `EIO`.
+  - `rs/ll-open/cli/tests/share_bench.rs` (ignored; run with `--ignored`)
+    measures the shipped path (guest -> worker -> share socket -> daemon
+    storefs) against APFS. Results and method:
+    `docs/benchmarks/2026-10-20-share-path.md`. It found that every
+    accepted write re-snapshots the whole store: one small-file create
+    takes seconds on a 2,000-file store (bead `ley-line-open-8c8ded`).
+  - The guest-run host harness moves from `tests/agent_in_guest.rs` to
+    `tests/guest_harness/`, shared by both tests.
+- **The sheaf surface is a cargo feature** (bead `ley-line-open-39e239`).
+  `leyline-cli-lib` and `leyline-cli` gain a default-on `sheaf` feature
+  that owns the `leyline-sheaf` dependency, the `sheaf_*` and `agreement`
+  daemon ops, `ComplexBuildPass`, the granularity router, the topology
+  pass and the watcher's `daemon.sheaf.invalidate` emit. Default, `all`
+  and `full` builds are unchanged. A build of `leyline-cli-lib` with
+  `--no-default-features` no longer links `leyline-sheaf`, and its daemon
+  does not dispatch those ops (as with `hdc` and `vec`).
+  `task check:all-features` asserts it.
+- **Breaking: a workspace grant that claims a generation is refused**
+  (bead `ley-line-open-39abfa`). `WorkspaceGrant.expectedGeneration` is
+  ADR-0041 S1's commit `seq`, which no store records yet, so the daemon's
+  workspace share now refuses a grant whose `expectedGeneration` is nonzero
+  with `identityPolicyMismatch` before the run starts. Before, the value
+  was carried to the backend and ignored. A grant pinned by `graphRoot`
+  alone carries `expectedGeneration` 0 (execution/v1 README "Workspace
+  generation").
+- **The vendored libkrun moves from v1.19.4 to v1.19.6** (bead
+  `ley-line-open-397fa6`). Upstream's virtio-fs and vsock fixes and a GPU
+  bounds check; LLO's six patches apply unchanged. The guest kernel
+  (libkrunfw) is still an installed library.
+- **CI checks the vendored libkrun tree** (bead `ley-line-open-396d77`).
+  The new `vendor-libkrun` workflow runs `task vmm:vendor:check` on every
+  pull request touching `rs/third_party/` or `tools/vendor_libkrun.sh`, and
+  weekly: a hand edit to the vendored tree fails it.
+- **Breaking: the store is a git-shaped tree; parsing is a projection over
+  it; a proposal whose base moved merges three ways** (bead
+  `ley-line-open-bb8aa6`, ADR-0045).
+  - The store's manifest is the new table `_tree (path, mode, blob_hash,
+    mtime, size)`: every walked file of any language with its git mode
+    (`100644`, `100755`, `120000` for a symlink whose blob is its target),
+    and every directory, empty ones included. `_source` keeps only the
+    files the parse projects. `--language` narrows the projection, not the
+    store or the checkout.
+  - `treeRoot` folds `_tree`: a tree of regular files, all projected, with
+    no empty directory, keeps its root; an executable, a symlink, an empty
+    directory or an unprojected file moves it (ADR-0045 T2).
+  - A file that does not parse cleanly is stored and diagnosed in the new
+    table `_parse_diagnostics`: syntax errors are projected with their
+    error nodes; a binary or oversized file is stored with no projection
+    rows. `projection-v7`; a v6 arena is refused at parse open and rebuilt
+    cold. `leyline splice` follows the same write path: a syntax-breaking
+    splice is stored with its diagnostic instead of refused
+    (`tools/cli_smoke.sh` asserts the new behavior).
+  - `source_write::propose_with(.., Rules::Tree)` takes any bytes at any
+    plain path, `Change::Write { bytes, mode }`, `Mkdir`, `Rmdir`, and
+    `rename_dir`; a write against a moved base is merged with `gix-merge`
+    0.17.0's text driver (new dependency, MIT OR Apache-2.0, sharing gix
+    0.84's `gix-*` set) and lands as the write (`Accepted::merged`);
+    overlapping hunks refuse with `Refusal::Conflict` naming the base line
+    ranges. New refusals `Exists`, `NotEmpty`, `NotADirectory`,
+    `IsADirectory`; removed: `Refusal::Syntax`, `Refusal::NoLanguage`,
+    `Refusal::NoStoredBlob` (every manifest entry names its blob) and
+    `source_write::can_hold`. `Grant::covers_dir` admits a directory
+    change under a granted path.
+  - **storefs (ADR-0045 phase 4):** every file the guest makes lands in the
+    store (no session-only files); MKDIR, RMDIR, a directory RENAME (one
+    proposal over every path under it; no more `EXDEV`), SETATTR of the mode
+    (`chmod`, `fchmod`) and SYMLINK are proposals, READLINK answers a
+    symlink's target, and `Kind::Symlink` is served as `S_IFLNK`/`DT_LNK`.
+    WRITE no longer answers `ESTALE` for a moved base (reverses bead
+    `e650d7`): it stages, and FLUSH/FSYNC merge; a clean merge lands, the
+    handle serves the merged bytes, and the next read-only open drops the
+    guest's pages; overlapping edits are `ESTALE`. A half-written file lands
+    with a diagnostic. `errno_for` maps the directory refusals to `EEXIST`,
+    `ENOTEMPTY`, `ENOTDIR`, `EISDIR`. The share wire gains `Request::Symlink`
+    and `Request::Readlink` and `DT_LNK`; libkrun patch `0006` forwards
+    READLINK and SYMLINK through `DynFileSystem`. The compatibility mount's
+    `MountWriter` proposes under the same rules.
+  - `tests/agent_in_guest.rs` adds scenarios (c) merge, (C) conflict, (d)
+    half-written file with a diagnostic, and (p) README, a file in no
+    projected language, `chmod +x`, a symlink, an empty directory and a
+    directory rename, each checked again after the restart (h).
+  - A file deleted from the store leaves its directories; the checkout no
+    longer removes emptied directories. The checkout materializes modes,
+    symlinks and directories, ingests them from the directory, and its
+    index records each entry's mode.
+  - Daemon wire (`daemon.capnp`, schema 0.20.5 unreleased): `read_source`
+    reads any stored file and answers its `mode`; `ProposedWrite` gains
+    `mode` and `WriteKind` gains `mkdir` and `rmdir`; `StaleRefusal` gains
+    `conflicts` (`LineRange {start, end}`, base lines, 0-based half-open);
+    `ProposeResponse` gains `merged`; `RefusalReason` gains `exists`,
+    `not_empty`, `not_a_directory`, `is_a_directory`, and retires `syntax`,
+    `no_language` and `no_stored_blob` (ordinals kept, renamed
+    `retired_*`, never sent). The socket's `propose` no longer refuses a
+    file that does not parse or a file in no projected language, and
+    merges a moved base. Go bindings regenerated. Move clients of
+    `propose` with this release.
+
+
+- **Breaking: execution/v1 carries workspace grants to the backend**
+  (bead `ley-line-open-f210c2`). `AuthorizedExecution.workspaces` and
+  `ExecutionRequest.workspaces` hold each RunGrant `WorkspaceGrant` (name,
+  graph root, expected generation, operations); the catalog resolver
+  carries them, and the service refuses a resolver that changes them
+  (`identity-policy-mismatch`). Both structs gained a field: struct
+  literals outside this repository need `workspaces`. A microVM run granted
+  a workspace is refused (`unsupported-backend`) when the backend has no
+  `WorkspaceShares`, and when it is granted more than one.
+
+- **Breaking (`leyline-storefs`): `Options::ttl` is replaced by
+  `Options::freshness`, `open` returns `Opened`, and WRITE refuses a stale
+  base** (bead `ley-line-open-e650d7`). A WRITE on a handle whose blob base
+  is no longer the path's `_source.content_hash` (another writer changed
+  or deleted the file) answers `ESTALE` and stages nothing, so `write(2)`
+  reports the conflict before any bytes are staged; FLUSH and FSYNC keep
+  their checks for changes that land after the WRITE.
+- **Breaking: the libkrun worker links libkrun; `--libkrun` is gone**
+  (bead `ley-line-open-f1c46f`). `leyline-krun-worker`,
+  `KrunWorkerConfig` and `leyline execution-daemon --backend micro-vm`
+  no longer take a libkrun library path, and the worker refuses
+  `--libkrun`. libkrunfw is still loaded at run time: grant it with
+  `--runtime-file`. `DynamicKrunApi` is replaced by `LinkedKrunApi`.
+  `leyline-runtime` gains a default `vmm` feature that links the VMM and
+  builds the worker; `leyline-cli-lib` and `leyline-cli` turn it off and
+  do not compile libkrun. Consumers that keep default features compile
+  libkrun and need `CC_LINUX` (or `zig` on macOS through this
+  repository's `.cargo/config.toml`). The libkrun guest tests gate on
+  `LEYLINE_LIBKRUNFW_PATH` alone. The unused `libloading` workspace
+  dependency is removed.
+
+- **Breaking: `propose` requires `base`, and `any` is the explicit "no
+  check"** (bead `ley-line-open-5dc3a5`). `ProposedWrite.base` was
+  optional, and an agent that omitted it silently got last-writer-wins.
+  A write without `base` is now refused as a malformed request; an
+  empty or non-hex `base` is refused as `malformed_base`; `any` writes
+  whatever the file holds. The MCP `propose` schema lists `base` as
+  required.
+
+- **Breaking: every `propose` refusal is typed, and a stale one names
+  every file that moved** (bead `ley-line-open-5dc3a5`). The response's
+  `stale {path, expected, current}` is replaced by
+  `refusal {reason, path, moved}`. `reason` is one of `stale`,
+  `outside_grant`, `no_such_file`, `duplicate_path`, `different_roots`,
+  `no_tree_root`, `syntax`, `malformed_base`, `no_stored_blob` and
+  `empty`; `moved` lists `{path, expected, current}` for each moved
+  file, where `stale` named only the first. A response with `ok: false`
+  and no `refusal` is an internal error. In Rust,
+  `source_write::propose` returns a `Refusal` error for each case. The
+  daemon schema (`daemon.capnp`) gains `ProposalRefusal` and the
+  `RefusalReason` enum, the Go bindings are regenerated, and
+  `SCHEMA_VERSION` moves (0.21.0, with this release's Go client tag). Move
+  clients of `propose` with this release.
+
+### Added
+
+- **Real-guest lifecycle and listener proofs** (beads `ley-line-open-f839c1`,
+  `ley-line-open-17536d`, `ley-line-open-7d4d45`). `krun-worker/tests/
+  libkrun_guest_cancel.rs` starts a blocked guest through
+  `ExecutionService::start_authorized` on `KrunWorkerBackend`, cancels it,
+  collects a `Cancelled` receipt, and checks the VMM process, its process
+  group and the ephemeral rootfs are gone. `libkrun_guest_listener.rs` adds
+  the positive §4 case (two declared ports reached with a byte exchange, a
+  third refused, no answer off loopback) and the §6 vsock sibling. All run
+  under `LEYLINE_REQUIRE_HYPERVISOR=1` against the installed worker and
+  synchronize on guest events only.
+
+- **Releases publish the execution/v1 schema** (bead
+  `ley-line-open-6d811a`). Two new release assets, listed in `SHA256SUMS`:
+  `execution.capnp` (`rs/ll-core/schema-spec/execution/v1/execution.capnp`)
+  and `traits.capnp` (`rs/ll-core/schema-spec/_traits.capnp`, the one file it
+  imports), byte-identical to the repository files. A consumer without an
+  LLO checkout can now generate its own `RunSpec`/`RunGrant`/`RunReceipt`
+  types with the same release's `capnpc-schema-bridge-zod` instead of
+  stopping at the `execution.tools.json` projection; the layout and command
+  are in `execution/v1/README.md` ("Release assets"). The leg that stages
+  `execution.tools.json` stages both, so the schema and its tooldefs cannot
+  ship apart, and staging refuses an `execution.capnp` that imports a file
+  the release does not ship. `tools/test_release_publication.sh` fails on a
+  missing or unlisted schema asset; `task schema:execution-asset-consumer-test`
+  and the release dry-run compile the staged assets standalone to zod.
+
+- **`leyline-sign` verifies notme certificates, and never reads notme's
+  `.1.5` as a peer fingerprint** (bead `ley-line-open-9ac66d`). The
+  `1.3.6.1.4.1.99999.1.*` arc carries two allocations: cloister's
+  Interlace profile (`.1.5` peer_fp, `.1.6` scope) and the notme / signet
+  profile (`.1.5` authMethod or agent name, `.1.6` a 32-byte peer binding
+  or scope). A certificate carrying any of `.1.1`, `.1.2`, `.1.3`, `.1.8`,
+  `.1.9` is now read as the Signet profile: `.1.4` epoch and `.1.7`
+  confinementDigest are read, `.1.5` / `.1.6` are never reported, and a
+  critical one rejects. Before this change every notme certificate was
+  rejected at its critical BasicConstraints, and the `.1.5` UTF8String
+  would have parsed silently as `peer_fp`. BasicConstraints, KeyUsage and
+  SubjectAltName are now recognized and enforced (a CA certificate is not
+  an end entity; an end-entity KeyUsage must permit digitalSignature);
+  duplicate extensions, a non-Ed25519 `tbsCertificate.signature` and a
+  negative epoch reject. New `verify_cert_path` and wasm export
+  `leyline_verify_cert_path` verify root → Issuing CA → leaf paths (name
+  chaining, CA=true + keyCertSign on intermediates, pathLenConstraint,
+  validity intersected). On a path the epoch must be on every certificate
+  or none, and the reported `ep` is the minimum, so a revocation check
+  judges the oldest authority and a leaf stamped with a newer epoch cannot
+  carry an older tier forward. `cd` must be identical on every certificate
+  or absent from all, so a tier holder cannot add, change or drop it.
+  Claims gain `profile` (`CertProfile`); the claims JSON gains
+  `"pr":"signet"` for Signet-profile certificates only, so Interlace claims
+  serialize to the same bytes as before. Under `"pr":"signet"` an absent
+  `pf`/`sc` means "not read", never "unrestricted": consumers check `pr`
+  first. A caller that knows which profile an anchor issues binds them:
+  `verify_cert_path_expecting(.., Some(profile))`, and the
+  `expected_profile` argument of `leyline_verify_cert_path` (`0` either,
+  `1` Interlace, `2` Signet, anything else fails). A notme anchor bound to
+  Signet then cannot present Interlace claims, and the reverse.
+  `leyline_verify_cert_chain` and `verify_cert_path` are unchanged and
+  accept either profile. Breaking for Rust callers that build `CertClaims`
+  literals or match `ChainError` exhaustively (new `ConstraintViolation`).
+  Tested against real notme certificates minted by notme's
+  `cert-authority.ts` (`sign/tests/fixtures/notme-certs`, provenance
+  alongside; kept apart from the vendored CABundle mirror in
+  `tests/fixtures/notme`) and against cloister's committed Interlace
+  vectors.
+
+- **`leyline execution-daemon` can install a real evidence verifier** (bead
+  `ley-line-open-410921`). `--evidence-store DIR` with one or more
+  `--trust-key FILE` installs `CasDsseEvidenceVerifier` over
+  `leyline_runtime::cas_evidence::CasEvidenceStore`, an `EvidenceStore` over
+  `leyline-core`'s `FsBlobStore` (BLAKE3-addressed, verified on read). It
+  checks the `RunGrant` issuer signature and each DSSE evidence envelope
+  against exactly the operator's Ed25519 keys; LLO ships none. A key file
+  holds 64 hex characters or a canonical RFC 8410 PEM `PUBLIC KEY`, and is
+  logged by its ADR-012 canonical kid (SHA-256 over SPKI DER); evidence is
+  addressed `blake3-256:<hex>` over the envelope bytes. Startup is refused
+  when only one of the two flags is given, when a key is unreadable,
+  malformed or repeated, when the store directory does not exist, or when
+  `--allow-unverified-evidence` is combined with either. No verifier flags
+  still refuses every start. `CasDsseEvidenceVerifier` now reports each
+  refusal as an `EvidenceRejection` (`grant-unsigned`, `untrusted-signer`,
+  `signature-invalid`, `evidence-missing`, `evidence-integrity`,
+  `no-trust-keys`, …): its `ExecutionError.detail` begins with the reason's
+  stable token, which `EvidenceRejection::of` recovers on the far side of the
+  daemon; the wire `ExecutionError` is unchanged. A trust set's empty-key case
+  now refuses the grant signature as `no-trust-keys` rather than as an
+  untrusted issuer. `leyline-runtime` takes `anyhow`, `base64` and
+  `leyline-sign` (`root-signer`).
+
+- **The native tier's confinement is proven at the kernel** (beads
+  `ley-line-open-704853`, `ley-line-open-f81567`).
+  `runtime/tests/native_confinement.rs` runs a guest through the compiled
+  `leyline-native-worker` (the linked nono library, not a nono CLI) and
+  checks the errno each system call returned under Seatbelt or Landlock: an
+  existing decoy outside the grant is EPERM/EACCES and never ENOENT; a
+  directory beside the run root, a `rootfs-sibling` sharing the rootfs's
+  name prefix, and the run root itself (list and write) are denied; with no
+  network grant, a connect to a loopback listener the test owns is denied
+  and the listener sees no connection; the granted rootfs stays readable
+  and writable. A host that cannot apply the sandbox reports a named
+  `SKIPPED (NOT a pass)`; `LEYLINE_REQUIRE_SANDBOX=1` makes it fail. The
+  0.15.0 entry below listed this port before it existed.
+
+- **confinement/v1 §4 `port` and §3 `network.connectLocal` take lists**
+  (bead `ley-line-open-e2c33f`, for cloister ADR-0069's multi-listener
+  bundles and broker endpoints). An additive v1 extension, not v2: `port`
+  accepts one grant object or a non-empty list of distinct grants, and
+  `connectLocal` one integer or a non-empty list of distinct integers. The
+  canonical form (README §7 rule 5) emits a one-element list as the scalar,
+  so every existing document keeps its `confinementDigest` — the pinned
+  `manifest-canonical.json` (`d9b5b727…`) is unchanged, and its one-element
+  list form reaches the same digest. Two or more are a sorted list; an empty
+  list and a second grant for the same socket are refused. The README
+  defines the meet of two documents (set intersection of the two list
+  clauses, refused when any other dimension differs), and the new
+  `test-vectors/manifest-port-list.json` pins 0/1/2-grant canonicalization,
+  meets and refusals with their digests. Enforcement: Linux compiles one
+  Landlock `BindTcp`+`ConnectTcp` rule per listener and one `ConnectTcp`
+  rule per `connectLocal` port; macOS still refuses §4 by name and dials N
+  loopback ports with no bind right (ProxyOnly for the first port, the same
+  per-port Seatbelt outbound rule for each further one — measured by
+  `confinement_local_connect_probe`, which reports a named `SKIPPED (NOT a
+  pass)` on a host that cannot apply the sandbox and fails there under
+  `LEYLINE_REQUIRE_SANDBOX=1`); the microVM tier's libkrun port map
+  takes one `N:N` entry per listener (`guest_port_map`). **Breaking (Rust
+  API):** `Dimensions.port` is now `Dimensions.ports: &[PortGrant]`,
+  `Dimensions.connect_local` and `ConfinementManifest::connect_local()`
+  return `&[u16]`, and `port_bind()` is replaced by `port_binds()`;
+  `with_port_bind` and `with_connect_local` add a grant per call. New:
+  `PortGrant`, `ConfinementManifest::meet`.
+
+- **The release ships the macOS microVM worker, signed with the hypervisor
+  entitlement** (beads `ley-line-open-984acf`, `ley-line-open-853c07`).
+  `leyline-krun-worker-darwin-arm64` is a release asset, listed in
+  `tools/release-assets.txt` and `SHA256SUMS`. `entitlements.plist` gains
+  `com.apple.security.hypervisor`; without it libkrun reaches
+  `krun_start_enter` and fails VM creation with `EINVAL`.
+  `tools/sign_krun_worker.sh` is the one signing path (ad hoc, `--sign -`):
+  `task krun-worker:build`, `krun-worker:release:target`,
+  `krun-worker:install`, release staging, and the real-guest tests call it,
+  and it asserts the entitlement after signing. Staging re-checks the
+  staged bytes before digesting them, and refuses to stage a darwin worker
+  off macOS. Developer ID signing and notarization are not done; a
+  quarantined download is refused by Gatekeeper.
+
+- **A hypervisor-suite receipt gates tagging** (bead `ley-line-open-16a994`).
+  `task release:hypervisor:record` runs `task runtime:test` with
+  `LEYLINE_REQUIRE_HYPERVISOR=1` and records a receipt for the exact tree
+  when it passes and the tree did not change during the run.
+  `tools/tag_release.sh`, and so `task release:publish`, refuses to tag a
+  tree without one and names the command. It is a manual gate: no hosted
+  runner can boot a guest. The record task installs the worker with
+  `task krun-worker:install` and the guest tests run that installed worker
+  (`LEYLINE_KRUN_WORKER`, entitlement-checked first); the receipt records
+  its sha256.
+
+- **`leyline-sign` tests consume notme's canonical CABundle fixtures**
+  (bead `ley-line-open-0466c0`). notme's ADR-010 fixtures
+  (`cabundle-basic`, `cabundle-multikey`) are vendored byte-for-byte
+  under `rs/ll-open/sign/tests/fixtures/notme/`. `PROVENANCE` pins them
+  to notme commit `e9694201` and records each file's SHA-256, and the
+  test re-checks those sums. The test checks that each `.bin` equals the
+  decoded `.expected.hex`. An RFC 8949 §4.2.1 reference encoder in the
+  test must reproduce every fixture from its `.json`. The multikey
+  fixture's unsorted keys must fail to reproduce it. The decoy
+  `signature` is excluded, and an unknown field is refused. A 32-byte
+  fixture key must sit under its ADR-012 `canonical_kid`. LLO ships no
+  CABundle encoder, so the encoding test checks the fixtures and the
+  three-way contract, not an LLO producer. No current fixture carries an
+  Ed25519 key.
+
+- **The libkrun worker declares its workspace share, holds nothing else,
+  and the receipt names it** (bead `ley-line-open-b83347`, ADR-0044 phase
+  C). The share descriptor (`--workspace-share-fd`) is a channel the worker
+  inherits open, outside its `confinement/v1` manifest and any sandbox
+  profile.
+  - `leyline_runtime::backends::libkrun::worker::declared_descriptors`
+    derives the worker's declared descriptors beyond its standard streams
+    from the grant: the share (`InheritedDescriptor { descriptor, channel:
+    WorkerChannel::WorkspaceShare { workspace, graphRoot } }`) for a run
+    granted a workspace, none otherwise. Before it reads the rootfs the
+    worker lists its open descriptors (`/dev/fd`) and refuses to start
+    holding any it does not declare (`IdentityPolicyMismatch`, naming
+    them; `refuse_undeclared_descriptors`).
+  - `worker::inherit_only(command, keep)`: the child marks every
+    descriptor its spawner holds above the standard streams close-on-exec,
+    except `keep`. `KrunWorkerBackend` spawns the worker through it with
+    the declared share, so a descriptor the daemon inherited open from its
+    own parent (a build tool's jobserver pipes) does not reach the worker.
+  - `WorkerEvent::Ready` carries the declaration (`inherited`);
+    `KrunWorkerBackend` refuses a readiness whose declaration differs from
+    what it handed the worker, before the run is published.
+  - `BackendRun.channels`, `WorkerChannel`, `BackendEvidenceDocument`,
+    `RunReceiptData.backend_evidence`. The receipt's `backend.evidence` is
+    now the digest of the backend evidence document (media type
+    `application/vnd.leyline.execution.backend-evidence+json`, the one the
+    canonical vector names; canonical bytes in the execution/v1 README
+    "Backend evidence"): the backend id and every channel its worker held.
+    It was the event log root under `application/vnd.leyline.backend-evidence`,
+    a value the receipt already carries as `eventLogRoot`.
+  - `WorkspaceGrant.expectedGeneration` stays carried and unchecked,
+    now documented: it is ADR-0041 S1's commit `seq`, which no store
+    implements, and the share is pinned by its `graphRoot` check.
+
+- **Agents run in a libkrun guest whose `/work` is the daemon's store**
+  (bead `ley-line-open-f210c2`, ADR-0044 phase C). An execution/v1 run
+  whose RunGrant carries a `WorkspaceGrant` gets that workspace as a
+  virtio-fs share at `/work`, its working directory; the agent uses its
+  own file syscalls and no LLO tool.
+  - `leyline execution-daemon --backend micro-vm --source <dir>`
+    (`--language`, `--workspace-ttl-ms`, `--workspace-changed-ttl-ms`,
+    `--workspace-change-window-ms`) serves each run's share from its own
+    store: reads on its reader pool, proposals on its one writer, each
+    landed proposal written into the source directory and published to the
+    arena, as the socket's `propose` op does. The share opens only when the
+    store's `treeRoot` (ADR-0040 D1) is the grant's `graphRoot`; `read` and
+    `list` let the guest see the tree, `mutate` and `commit` let it propose.
+  - `leyline_runtime::backends::libkrun::share`: the FUSE request and
+    reply wire between the VMM worker and the daemon (JSON header, READ and
+    WRITE bytes as raw payload), `serve`, `RemoteFs`, the `WorkspaceShares`
+    seam, and `ShareFs` (`vmm`), libkrun's `DynFileSystem` over any
+    `FsService`. `KrunWorkerBackend::with_workspace_shares` hands the
+    worker one end of a socket pair (`--workspace-share-fd`); the worker
+    checks it is a socket matching the grant and attaches it under tag
+    `work`.
+  - `leyline-storefs`: `StoreShare` (the README "Adapter" mapping),
+    `impl Store for DaemonContext`, `Store::publish`, `DaemonShares`,
+    `scope_for`.
+  - `leyline-cli-lib`: `DaemonExt::on_context`, `ContextSlot`,
+    `ExecutionDaemonExt::with_context_slot`,
+    `run_execution_daemon_with_context`.
+  - libkrun patch `0005`: the guest init mounts the virtio-fs devices
+    `KRUN_VIRTIOFS_MOUNTS` lists (`tag:/dir`, comma-separated) before the
+    workload runs and refuses to start it when one does not mount. A
+    workload's `publicEnvironment` may not set the variable.
+  - `tests/agent_in_guest.rs` (leyline-cli) runs scenarios (a)–(h) inside
+    the guest against the real daemon; `tools/guest_tools.sh` fetches the
+    guest's git and ripgrep (Alpine aarch64, SHA-256 pinned).
+
+- **storefs read freshness: READDIRPLUS, fresh-at-open page caching,
+  adaptive timeouts** (beads `ley-line-open-789e0f`, `e650d7`, decided in
+  `e6269a`; ADR-0044 V3 "Read freshness"). libkrun patch `0004` forwards
+  READDIRPLUS through `DynFileSystem` (object-safe:
+  `&mut dyn FnMut(DirEntry, Entry)`), and `StoreFs::readdirplus` answers
+  each entry with its attributes and timeout. `StoreFs::open` returns
+  `Opened { handle, keep_cache, direct_io }`: every OPEN reads the current
+  blob, a read-only open keeps the guest's pages only when the blob is the
+  one the previous (read-only) open of the inode served, and write opens
+  are `direct_io`; `StoreFs::opendir` applies the rule to a directory's
+  listing. Entry, attribute and negative-entry (`negative_ttl`) timeouts
+  are `Freshness::changed` (default 1 s) for a path, and its parent,
+  changed within `Freshness::window` (default 60 s) — by a proposal
+  storefs landed or a state change it observed — and
+  `Freshness::settled` (default 60 s) otherwise; the clock is injected
+  (`Clock`, `StoreFs::with_clock`). `docs/benchmarks/2026-10-15-vf3-virtiofs.md`
+  records the V-F3 measurements behind it.
+
+- **LLO builds the VMM it runs** (bead `ley-line-open-f1c46f`, ADR-0044
+  phase A). `rs/third_party/libkrun` is libkrun v1.19.4 (commit
+  `728df812`, Apache-2.0) with three patches from
+  `rs/third_party/libkrun-patches/`: the macOS DAX mapping-worker fix,
+  `DynFileSystem` (an object-safe virtio-fs backend supplied by the
+  embedding process), and `krun_add_virtiofs_backend`.
+  `tools/vendor_libkrun.sh check` (`task vmm:vendor:check`) proves the
+  tree is the pinned commit plus the patches; provenance and license
+  are in `rs/third_party/README.md`. The guest init is compiled from the
+  vendored `init.c` (`tools/krun_init_cc.sh`: host `cc` on Linux,
+  `zig cc` elsewhere); nothing is read from an installed libkrun.
+- **A guest can mount a share the VMM serves from memory.**
+  `PreparedVm::add_virtiofs_backend(tag, dax_window, backend)` attaches
+  a virtio-fs device whose FUSE requests a `DynFileSystem` in the worker
+  process answers; `leyline_runtime::backends::libkrun::api` re-exports
+  `DynFileSystem` and `virtio_fs`. Tags are checked against the 36-byte
+  virtio-fs config field and the root tag. `libkrun_virtiofs_backend.rs`
+  boots a guest that reads a file an in-memory backend serves.
+
+- **`leyline-storefs`: the store-backed filesystem core for the virtio-fs
+  device** (bead `ley-line-open-f1ea99`, ADR-0044 V2). A new crate,
+  `rs/ll-open/storefs`, whose `StoreFs` answers LOOKUP, GETATTR, READDIR,
+  OPEN, READ, WRITE, FLUSH, FSYNC, RELEASE and SETATTR from the store
+  (`_source` → `source_blobs`) with Linux errno values. An open for writing
+  records the blob it read as its base; WRITE and `ftruncate` stage bytes
+  on the handle; FLUSH and FSYNC propose them through
+  `source_write::propose` on the store's one writer and, when a checkout is
+  attached, bring it up to the accepted bytes. A stale base answers
+  `ESTALE` (116), a path outside the grant `EACCES` (13), a syntax refusal
+  and every other failure `EIO` (5). `Scope { see, propose }` carries a
+  run's `WorkspaceGrant` resolved to paths: unseen paths are `ENOENT`.
+  The crate adds no persisted state and no libkrun code; phase C adapts it
+  onto libkrun's `DynFileSystem`. The contract is in
+  `rs/ll-open/storefs/README.md`.
+
+- **A proposal creates, deletes and renames files** (bead
+  `ley-line-open-47fb03`, ADR-0042 P1a, ADR-0044 phase B2). A write is a
+  replace, a create (base `absent`: refused `stale` when the path holds a
+  file) or a delete (refused `stale` when the file moved or is gone); a
+  rename is one proposal deleting the old path and creating or replacing
+  the new one. Deleted files' rows leave in the proposal's transaction and
+  `treeRoot` covers creates and deletes. A create is refused when its path
+  is not plain and relative (`malformed_path`), names no projected
+  language (`no_language`, which also covers a language the daemon's
+  `--language` excludes), or is under a file or the directory of one
+  (`path_conflict`). A replace against a blob base whose file was deleted
+  is now `stale` with `current` `absent` (it was `no_such_file`; a `base:
+  any` write to a missing file still is). In Rust, `source_write::Proposed` carries a `Change`
+  (`Write` or `Delete`), `Base` gains `Absent`, and a `Stale` entry's
+  `expected` and `current` are `Option`s. The daemon checkout removes a
+  file the store deleted (unlink, `fsync` of its directory), keeps a
+  directory edit to one as a conflict, and carries out a delete committed
+  before a crash at the next reconcile; `_checkout_conflict.stored_hash` is
+  NULL for a deleted file. `daemon.capnp`'s `ProposedWrite` gains `kind
+  :WriteKind` (`replace`, `create`, `delete`; omitted reads as `replace`,
+  so existing clients behave as before), `base` accepts `absent`,
+  `content` is optional for a delete, a stale refusal spells "no file"
+  `absent`, and `RefusalReason` gains `no_language`, `malformed_path` and
+  `path_conflict`; the Go bindings are regenerated and the MCP `propose`
+  tool takes `kind`. `leyline-storefs` answers CREATE (a create at the first
+  FLUSH), UNLINK (a delete), RENAME (one proposal; a write-temp-then-rename
+  save included), MKDIR and RMDIR (session directories) instead of `EPERM`;
+  a created file the store cannot hold (an editor's temp file) lives in the
+  session, and errno values are `EEXIST` for a create beaten to its path,
+  `ENOENT`, `EXDEV`, `ENOTEMPTY` and `EINVAL` as `rename(2)` and `rmdir(2)`
+  answer them.
+
+### Fixed
+
+- **A §6 `bind` grant on the microVM tier creates its socket on macOS**
+  (bead `ley-line-open-7d4d45`). The VMM's profile carried the socket's
+  `network-bind` but not the `file-write-create` that `bind(2)` needs for
+  the socket node, which nono's library leaves to its caller. libkrun's muxer
+  failed to create the socket, logged a warning, and the declared channel
+  never existed. The VMM now gets `file-write-create` on that one resolved
+  leaf. Proven by the live-guest test
+  `a_declared_unix_socket_reaches_a_guest_vsock_listener_and_nothing_else_does`,
+  which also shows the guest's dial on a `bind` port is reset.
+
+- **The schema-bridge plugins run under their release asset names**
+  (bead `ley-line-open-6d811a`). Each plugin picks its output format from
+  its argv[0], and a release publishes it as `<bin>-<os>-<arch>`, so the
+  downloaded `capnpc-schema-bridge-zod-linux-amd64` failed with
+  `unknown output format 'zod-linux-amd64'` unless the consumer renamed it.
+  The plugin now strips a trailing release platform (`linux-amd64`,
+  `linux-arm64`, `darwin-amd64`, `darwin-arm64`) before matching the
+  format. Any other tail is still an unknown format.
+  `task schema:execution-asset-consumer-test` runs the plugin under every
+  zod asset name `tools/release-assets.txt` lists.
+
+- **A worker that cannot confine itself is refused for that reason** (bead
+  `ley-line-open-704853`). A worker's stderr is its event channel, and
+  macOS libsandbox writes `sandbox initialization failed: Operation not
+  permitted` there before the worker's `failed` event when `sandbox_init`
+  is refused (for example under an outer Seatbelt sandbox). The native and
+  libkrun backends took that line as the readiness event and refused the
+  run as `invalid ... readiness event: expected value`, so the cause was
+  lost. The readiness reader now skips lines that are not JSON objects
+  (at most 64, and reports them if no event follows); a run still starts
+  only on a well-formed `ready` event for its own run id.
+
+- **The microVM backend is unavailable when its worker cannot enter the
+  hypervisor** (bead `ley-line-open-831bf1`). On macOS `capabilities()`
+  reads the worker binary's signature (`codesign -d --entitlements -`) and
+  reports `available: false`, with `unavailable_reason` naming
+  `com.apple.security.hypervisor`, when the entitlement is absent; `start`
+  and `provision` refuse with the same reason. Before, a worker that passed
+  the file checks accepted a run and died inside the VMM.
+  `BackendCapabilities` gains `unavailable_reason`. The test hooks that
+  bypass or retarget the check exist only under leyline-runtime's
+  non-default `test-support` feature, which no shipping build enables
+  (`tools/feature-ledger.txt`, enforced by `lint:feature-reachability`).
+
+- **Share file times are the host's wall clock, so a host sleep cannot
+  hide an edit from git in the guest** (bead `ley-line-open-2a7d66`).
+  storefs reported a path's time as the wall clock at the daemon's start
+  plus `Instant` elapsed; on macOS `Instant` reads `CLOCK_UPTIME_RAW`,
+  which stops while the host sleeps (a laptop on battery cycles through
+  maintenance sleeps), so share times fell behind the wall clock by every
+  sleep since the daemon started. The guest's rootfs is host APFS, which
+  stamps wall-clock times, so git's index carried a time seconds to a
+  minute later than the share's file times; git built without `USE_NSEC`
+  compares whole seconds, its racy-clean check trusted a stale
+  same-second stat, and a second same-size edit was invisible to `git
+  status` (agent_in_guest (m) failed 11 of 20 runs on a host that slept).
+  `Clock::wall` gives file times (strictly increasing per path, from the
+  clock's origin); freshness timeouts keep the monotonic `Clock::now`. The
+  host mount reports the same wall-clock times. The guest's own clock still
+  counts on the hypervisor's counter, which also stops while the host
+  sleeps, so after a sleep it trails the host: never ahead of a share
+  time, which is the direction git's check needs.
+- **Two processes on one host NFS mount never lose an edit** (bead
+  `ley-line-open-5ec040`). One NFS client serves every process on the host,
+  so a process that read a file before another process's save could save
+  next, and its WRITE landed as a plain replace of the other's bytes,
+  dropping their edit with no error to either. A host-mount handle now keeps
+  the base each landed save replaced beside the reads it served (at most 32;
+  past that, saves are refused until a READ), and a save lands only when its
+  own edit leaves untouched every line the store changed since each of
+  those (`StoreFs::agree`, now stated as that loss check over line ranges,
+  `leyline_cli_lib::merge::changed_lines`). The stale save is refused
+  `ESTALE` at `fsync`/`close` and lands after a reload. One writer's
+  successive saves still land; a save reverting a line the store took
+  since an earlier read is refused once, and its retry after the READ
+  lands. Disjoint edits from two processes on one mount do not merge (that
+  needs a session per writer). Guest and FUSE handles are unchanged.
+- **A host NFS save can no longer silently undo another writer's change**
+  (bead `ley-line-open-4a8953`). The macOS NFS client READs a page again
+  before a partial WRITE once it saw the file change, and that READ moved
+  the mount handle's base to the other writer's bytes, so a save made from
+  the editor's first read checked as a plain replace and landed over their
+  change. The handle now keeps the blobs it served since it last landed; a
+  save lands only when it means the same against each of them, checked at
+  the WRITE and again at the COMMIT, and is `ESTALE` otherwise. An edit next
+  to the other writer's line can be refused once although the editor
+  reloaded; the READ after the refusal settles it and the retry lands. The
+  intermittent `storefs` `host_mount` failure was this.
+- **A guest's clock no longer runs ahead of the host's** (bead
+  `ley-line-open-f8138d`). The guest kernel took its first time from the
+  RTC's whole seconds, set to the middle of the second, so a guest started
+  up to half a second ahead of or behind the host. Ahead, git's racy-clean
+  check (the index file's mtime on the guest's clock against each entry's
+  on the share's host clock) missed a same-size edit made in the same
+  second as `git add`, and `agent_in_guest` (m) failed intermittently.
+  Vendored libkrun patch `0007` passes the host's wall clock to init
+  (`KRUN_REALTIME_NS`), which sets the guest's clock to it plus the time
+  since boot: never later than the host's, trailing it by the VMM's setup
+  time.
+- **`git status` in a guest missed a same-size edit** (bead
+  `ley-line-open-b8100d`). The virtio-fs share reported every file time as
+  zero, and git decides whether to rehash a file from its stat (size,
+  mtime, ctime, inode): after its first run, an edit that kept the file's
+  size was invisible to `git status`. Every attribute reply now carries an
+  access, modification and change time (one value, since the Unix epoch):
+  the clock's origin (the wall-clock time `StoreFs` was created) for a
+  path no change was recorded for, then the time of the latest change
+  `StoreFs` recorded to it — a proposal it landed, another writer's
+  proposal observed when it next serves the path, a change to a file or
+  directory only the session holds — strictly increasing per path. A
+  directory's time moves when an entry is created, removed or renamed in
+  it, or an OPENDIR lists other names than the previous one. No state is
+  persisted: a new `StoreFs` reports its own origin, so git rehashes each
+  file once per session. The share wire's `Attr` gains `atime`, `mtime`
+  and `ctime`, which `ShareFs` transcribes into `stat`. The in-guest
+  end-to-end test gains scenario (m): two successive same-size edits are
+  each reported by `git status --porcelain`.
+
+- **A guest read a grown file cut to its old size** (bead
+  `ley-line-open-f210c2`, found by the in-guest end-to-end test). An OPEN
+  reply carries no attributes, and the guest bounds a cached read by the
+  size it holds: after another writer grew `g.go` from 37 to 88 bytes the
+  guest's next open read the new blob's first 37 bytes. `StoreFs` records
+  the size each LOOKUP, GETATTR, SETATTR, READDIRPLUS and CREATE reply
+  tells the guest, and answers a read-only open that serves another size
+  with `direct_io`.
+
+- **A daemon restart keeps accepted proposals** (bead
+  `ley-line-open-60f39f`). `leyline daemon --source <dir>` stored an
+  accepted proposal (the `propose` op, or a mount edit) and never wrote
+  `<dir>`, and the warm-start reparse then saw the file's disk bytes
+  differ from the store and re-ingested them over the proposal; the git
+  watcher and `reparse` did the same. The daemon now checks `<dir>` out:
+  `_checkout_index` (in `live.db`, LLO-private) records per path the
+  blob last written into the directory or read from it. An accepted
+  proposal commits, is written into the directory (temp file, `fsync`,
+  `rename`), and only then advances the index. Startup, the watcher and
+  `reparse` over the checkout compare the directory and the store each
+  against the index: the store's moves are written out, the directory's
+  edits are ingested, and a path both changed to different bytes is a
+  conflict that overwrites neither side, is logged, and is recorded in
+  `_checkout_conflict` (readable through the `query` op). A crash
+  between the commit and the file write is written out at the next
+  start. A materialization that fails rides in `post_commit_error`.
+  A daemon without `--source` writes no file. In Rust,
+  `source_write::MountWriter` gains `checkout: Option<PathBuf>`.
+
+- **`leyline inspect --query` prints every value** (bead
+  `ley-line-open-12c0fa`). It read each column as text and printed
+  integers, reals, NULLs and blobs as empty strings, so `SELECT count(*)`
+  answered nothing. Numbers print as numbers, NULL as `NULL`, and blobs as
+  SQL hex literals (`x'00ff'`).
+
+- **An NFS mount edit made before another writer moved the file is
+  refused** (bead `ley-line-open-6116c9`). The mount handle's base was
+  taken at the file's first uncommitted WRITE. A macOS client holds
+  UNSTABLE writes until `fsync` or close, so after an agent read a node,
+  wrote and flushed its buffer, and a socket proposal then moved the
+  file, the server first saw the WRITE after the proposal, took the
+  base from the moved file, and the `fsync` landed the edit over the
+  proposal. Now every NFS READ of a node of a parsed file, while the
+  mount has no edit to that file staged, re-takes the file's base
+  before the bytes are served (new `Graph::note_read`, forwarded by
+  `HotSwapGraph`); a landed COMMIT sets the base to the bytes it wrote;
+  a refused edit keeps it, so a retry with no READ in between is
+  refused again. A WRITE or truncate to a file that no longer holds the
+  base is refused `NFS3ERR_STALE` before it is staged: a macOS client
+  reports a failed WRITE as `ESTALE` at `fsync`, and ignores a failed
+  COMMIT (measured: `fsync` and `close` returned success on a COMMIT
+  answered `NFS3ERR_STALE` or `NFS3ERR_IO`). Checked: an edit is staged
+  and lands only if the file holds the bytes of the client's last
+  server READ of it (with nothing staged) or of the mount's last landed
+  edit to it, whichever is later. Not checked: an edit from a cache
+  filled with no READ to this server process and no landed edit through
+  it (a previous mount or server process), whose base is still taken at
+  its WRITE; and, the base being per file, an edit to one node from a
+  cache older than the client's latest READ of another node of the same
+  file. A refusal only the COMMIT can make (the file moved between the
+  WRITE and the COMMIT, or the edit does not parse) discards the edit
+  but is not reported by a macOS client. The mount holds one base per
+  file it has served, replaced in place. Behaviour change: after a
+  refused edit, the client must READ the file before an edit through
+  the mount lands.
+
+- **An applied proposal is reported as applied** (bead
+  `ley-line-open-5db28e`). When the head write, an index build or the
+  publish failed after `COMMIT`, the daemon answered `{ok: false}` and
+  skipped the publish although the bytes had landed, and through the
+  mount the edit ran the refusal path. The steps after `COMMIT` now run
+  to the end and report their failure beside the result: `propose`
+  answers `ok: true` with `post_commit_error`, always publishes, and the
+  mount's writer answers `Ok`. `leyline splice` reports that the splice
+  landed. A whole-tree parse still fails on a head it cannot advance.
+
+- **The head is replaced atomically** (bead `ley-line-open-5db28e`). It
+  was truncated and rewritten in place, so a crash mid-write left a head
+  the chain refuses, and every later proposal committed and then failed.
+  It is now written to a temp file, synced, renamed over the old head,
+  and the directory synced; a failed write leaves the previous head
+  readable.
+
+- **A rolled-back proposal leaves the capnp sidecars unchanged** (bead
+  `ley-line-open-5db28e`). `ast.capnp` and `source.capnp` were
+  truncated inside the transaction and kept the rolled-back rows. They
+  are now written beside the old ones and renamed into place after
+  `COMMIT`; a pass that rolls back removes its temp files.
+
+- **`read_source` returns the hash `propose` compares** (bead
+  `ley-line-open-5dc3a5`). It hashed the bytes it fetched while
+  `propose` compared `_source.content_hash`; it now returns the column,
+  so the two agree by construction. A file whose `content_hash` is NULL
+  is refused as `no_stored_blob` for every blob base: the zero hash used
+  to stand in for the missing one, so `Base::Blob(ZERO)` matched it.
+
+- **The protocol gate runs `read_source` and `propose` against a real
+  source** (bead `ley-line-open-5dc3a5`). It ran them on an empty
+  database and checked only `ok`. It now seeds a file and compares the
+  key sets of a real read, a stale refusal, a typed refusal and an
+  applied proposal with a post-commit failure against the fixtures,
+  which the Go gate decodes into the typed bindings. Comments in the
+  schema and `cli-lib` that cited "ADR-0041 P1/P2" for proposals now
+  cite ADR-0042.
+
+- **A daemon-published arena opens in an in-memory reader** (bead
+  `ley-line-open-2bd77c`). The live database is WAL-mode, and the image
+  the daemon published kept the WAL stamp in its header (bytes 18 and 19).
+  `sqlite3_deserialize` of a WAL-stamped image fails every query with
+  `SQLITE_CANTOPEN`, so `leyline inspect --control-path`,
+  `SqliteGraph::from_arena` and the `leyline_fs` FFI could not read a
+  daemon's arena. The published image is now stamped rollback-mode, and
+  `current_root` hashes exactly the published bytes. `leyline load`
+  normalises a WAL-mode `.db` the same way. mache opens images as files
+  and was not affected. Found by an end-to-end test of the v0.20.5
+  binary.
+
+- **`leyline daemon --mount` fails in a build without the `mount`
+  feature** (bead `ley-line-open-2be4a7`). The release binaries are built
+  without it, and the daemon ran headless when asked to mount, so the
+  caller got no mount and no failure. It now refuses at startup and names
+  the feature.
+
+- **A mount edit is checked against the bytes its own writer read, so a
+  second writer's edit is refused with `ESTALE`, never landed unchecked or
+  lost** (bead `ley-line-open-5da276`). The base of an edit (ADR-0042 P2)
+  and its pending bytes were kept per file per mount. When two FUSE opens
+  edited one file, the second inherited the first's base, took the file
+  after the first's flush as its base once that flush dropped it, and
+  shared one overlay with the first. Its edit landed over bytes it never
+  read, interleaved with the first's bytes, or was carried away by the
+  first flush while its own `close` and `fsync` reported success. Each
+  FUSE open is now its own handle with its own base, taken at the open,
+  and its own pending bytes: a read through the handle sees its edit,
+  every other read sees the stored file, and a node is sized as its
+  largest edit in progress. After a handle's flush lands, its base is the
+  file it wrote, held until `release`. A handle whose base no longer
+  matches the file gets `ESTALE` at `flush` and `fsync`, and every later
+  edit through it gets the same until the file is opened again. The mount
+  asks the kernel for `FUSE_ATOMIC_O_TRUNC`, so `open(O_TRUNC)` truncates
+  the new handle's own edit. A kernel without it sends the truncate as a
+  SETATTR naming no handle, which goes to the handles open for writing on
+  the file. With none open (`truncate(2)` by path), the truncate lands
+  through the write path before it returns and leaves no edit behind.
+  NFSv3 has no
+  opens and names no client on a WRITE, so an NFS edit is the mount
+  handle's: its base is taken when the file's first uncommitted write or
+  truncate arrives and held until the COMMIT of the file's last staged
+  node lands. A COMMIT whose file moved since then (another mount, a batch
+  splice, or the COMMIT of another node of the same file) is refused with
+  `NFS3ERR_STALE`, which the client reports as `ESTALE`; before, the first
+  COMMIT dropped the base and the second landed unchecked. Two NFS clients
+  writing the same node still share its staged bytes, since nothing on the
+  wire tells them apart. A batch splice no longer drops edits in progress
+  to the nodes it rewrites; their flushes refuse them as stale. `Graph`
+  gains `note_base_as`, `write_content_as`, `read_content_as`,
+  `truncate_as`, `flush_node_as` and `release`, defaulting to the methods
+  that name no handle.
+
+- **An edit that empties a node lands at its flush** (bead
+  `ley-line-open-8a26d8`). Its flush returned success without landing,
+  and the empty edit stayed pending: the node read and sized as empty
+  through the mount while the stored file kept its text, and `: > f`
+  over NFS never committed. It now reaches the write path like any other
+  edit, which refuses it when the file it makes does not parse.
 ## [0.20.5] — 2026-10-13
 
 Publication safety. A publisher that dies mid-publish no longer wedges

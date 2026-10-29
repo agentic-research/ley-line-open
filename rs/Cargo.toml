@@ -4,6 +4,10 @@ members = [
     "ll-open/*",
     "tools/*",
 ]
+# Vendored upstream source LLO builds but does not own (third_party/README.md):
+# path dependencies, never members, so workspace lints, fmt, tests and
+# mutation testing do not reach it.
+exclude = ["third_party"]
 resolver = "2"
 
 # ADR-0026 / bead 3b2f55 — canonical dep versions for the workspace.
@@ -33,7 +37,6 @@ capnpc = "=0.25.0"
 # Async / IO
 tokio = "1.47"
 libc = "0.2.175"
-libloading = "0.9.0"
 memmap2 = "0.9.9"
 nono = { version = "0.71.0", default-features = false }
 

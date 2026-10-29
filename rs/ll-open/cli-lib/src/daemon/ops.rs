@@ -10,12 +10,14 @@ use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
 
+#[cfg(feature = "sheaf")]
+use super::wire::AgreementRequest;
 #[cfg(feature = "validate")]
 use super::wire::ValidateRequest;
 use super::wire::{
-    AgreementRequest, BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest,
-    LspFile, LspPosition, ProposeRequest, ReadSourceRequest, Ref as WireRef, SearchSymbolsRequest,
-    TokenMapEntry,
+    BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest, LspFile,
+    LspPosition, ProposeRequest, ProposedWriteInput, ReadSourceRequest, Ref as WireRef,
+    SearchSymbolsRequest, TokenMapEntry, WriteKind,
 };
 #[cfg(feature = "hdc")]
 use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
@@ -122,7 +124,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
     let result: Result<String> = match req {
         BaseRequest::Status => op_status(ctx),
         BaseRequest::Flush => op_flush(&ctx.ctrl_path),
-        BaseRequest::Load { db } => op_load(&ctx.ctrl_path, &db),
+        BaseRequest::Load { db } => op_load(ctx, &db),
         BaseRequest::Query { sql, limit } => op_query(ctx, &sql, limit),
         BaseRequest::Reparse {
             source,
@@ -153,6 +155,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::VecSearch { query, k } => op_vec_search(ctx, &query, k),
         #[cfg(feature = "text-search")]
         BaseRequest::TextSearch { query, k } => op_text_search(ctx, &query, k),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafSetTopology {
             regions,
             restrictions,
@@ -163,17 +166,24 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
             &restrictions,
             node_stalk_dim,
         ),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafUpdateTopology {
             delta,
             node_stalk_dim,
         } => super::sheaf_ops::op_sheaf_update_topology(&ctx.sheaf, &delta, node_stalk_dim),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafInvalidate { regions, stalks } => {
             super::sheaf_ops::op_sheaf_invalidate(&ctx.sheaf, &ctx.ctrl_path, &regions, &stalks)
         }
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafDefect => super::sheaf_ops::op_sheaf_defect(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafStalks => super::sheaf_ops::op_sheaf_stalks(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafStatus => super::sheaf_ops::op_sheaf_status(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafLearnedWeights => super::sheaf_ops::op_sheaf_learned_weights(&ctx.sheaf),
+        #[cfg(feature = "sheaf")]
         BaseRequest::SheafReap => super::sheaf_ops::op_sheaf_reap(&ctx.sheaf),
         BaseRequest::LeylineVersion => op_leyline_version(),
         #[cfg(feature = "validate")]
@@ -188,6 +198,7 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::AtPosition(p) => op_at_position(ctx, &p),
         BaseRequest::InspectNeighborhood(r) => op_inspect_neighborhood(ctx, &r),
         BaseRequest::SearchSymbols(r) => op_search_symbols(ctx, &r),
+        #[cfg(feature = "sheaf")]
         BaseRequest::Agreement(r) => op_agreement(ctx, &r),
         BaseRequest::LloExecutionCapabilities => op_execution_capabilities(ctx),
         BaseRequest::LloExecutionProvision {
@@ -484,26 +495,19 @@ pub(crate) fn read_root_hex(ctrl_path: &Path) -> Result<String> {
     Ok(s)
 }
 
-/// Acquire the living-db lock and snapshot to the arena. Used by every
-/// state-changing op (reparse, enrich, snapshot) to publish the latest
-/// db image to mache/remote consumers.
+/// Publish the living db to the arena before replying. Used by the ops
+/// whose reply promises a published image (reparse, enrich, snapshot);
+/// a proposal requests a publish instead and does not wait for it.
 ///
-/// **Lock window:** the write lock is held for the *full* duration of
-/// `snapshot_to_arena`, which serializes the entire SQLite database to
-/// the on-disk arena (a disk write proportional to db size). This is
-/// not a cheap window. Concurrent readers and writers block until the
-/// snapshot completes. Don't add work inside this function expecting
-/// the lock to be held briefly — it isn't. If we ever want concurrent
-/// reads during snapshot, the path is `serialize_with_flags(NO_COPY)`
-/// followed by an out-of-lock disk write, but that's a deliberate
-/// refactor, not something to assume here. Doc rewritten after iter-35
-/// adversarial review caught the previous false minimal-lock claim.
+/// **Lock window:** the publish costs one serialize, write and hash of
+/// the whole database. It holds the single-publisher lock, not the
+/// writer, and reads one committed state through a pool connection:
+/// readers and proposals proceed while it runs (bead
+/// `ley-line-open-8c8ded`). A second publish waits for this one.
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
-    // Snapshot classified as `with_write`: `conn.serialize("main")` needs
-    // exclusive access to the DB (SQLite serialize takes an internal
-    // schema-write lock). Bead `ley-line-open-ba8294` Phase 2 intent-
-    // marking; behavior identical under today's Mutex.
-    ctx.with_write(|conn| crate::cmd_daemon::snapshot_to_arena(conn, &ctx.ctrl_path))
+    // The daemon's one publish path: a pool read transaction under the
+    // single-publisher lock, off the writer (bead `ley-line-open-8c8ded`).
+    crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -594,12 +598,19 @@ fn op_flush(ctrl_path: &Path) -> Result<String> {
     Ok(capnp_json::to_json(reader)?)
 }
 
-fn op_load(ctrl_path: &Path, db_b64: &str) -> Result<String> {
+fn op_load(ctx: &DaemonContext, db_b64: &str) -> Result<String> {
     use base64::Engine;
+    let ctrl_path = ctx.ctrl_path.as_path();
     let db_bytes = base64::engine::general_purpose::STANDARD
         .decode(db_b64)
         .context("invalid base64 in \"db\" field")?;
-    crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
+    {
+        // The arena has one writer at a time: a load writes the inactive
+        // buffer the daemon's publisher also writes (bead
+        // `ley-line-open-8c8ded`).
+        let _publisher = ctx.live_db.publish_lock.lock();
+        crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
+    }
     let current_root = read_root_hex(ctrl_path)?;
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::load_response::Builder = builder.init_root();
@@ -691,10 +702,26 @@ fn op_reparse(
     // Parse directly into the living db. Classified as `with_write` —
     // `parse_into_conn` runs INSERT/UPDATE/COMMIT under the guard.
     // Bead `ley-line-open-ba8294` Phase 2 intent-marking.
+    //
+    // A reparse of the daemon's own checkout reconciles it (bead
+    // `ley-line-open-60f39f`): a file whose store moved since the directory
+    // last agreed is not replaced with the directory's older bytes.
+    let checkout = ctx
+        .source_dir
+        .as_deref()
+        .filter(|dir| same_directory(dir, &source_dir));
     ctx.state.write().phase = DaemonPhase::Parsing;
-    let result = match ctx
-        .with_write(|conn| crate::cmd_parse::parse_into_conn(conn, &source_dir, lang, scope))
-    {
+    let parsed = ctx.with_write(|conn| match checkout {
+        Some(dir) => {
+            let reconciled = crate::checkout::reconcile(conn, dir, lang, scope)?;
+            if let Some(problems) = reconciled.problems() {
+                log::warn!("reparse: checkout: {problems}");
+            }
+            Ok(reconciled.parse)
+        }
+        None => crate::cmd_parse::parse_into_conn(conn, &source_dir, lang, scope).map(Some),
+    });
+    let result = match parsed {
         Ok(r) => r,
         Err(e) => {
             ctx.state.write().phase = DaemonPhase::Error(format!("reparse failed: {e:#}"));
@@ -717,17 +744,32 @@ fn op_reparse(
         builder.init_root();
     root.set_ok(true);
     root.set_current_root(&current_root);
-    root.set_parsed(result.parsed as u64);
-    root.set_unchanged(result.unchanged as u64);
-    root.set_deleted(result.deleted as u64);
-    root.set_errors(result.errors as u64);
-    let mut changed = root.init_changed_files(result.changed_files.len() as u32);
-    for (i, f) in result.changed_files.iter().enumerate() {
+    // A scoped reconcile that ingested nothing ran no parse: every count is
+    // 0 and no file changed.
+    let changed_files: &[String] = match &result {
+        Some(result) => {
+            root.set_parsed(result.parsed);
+            root.set_unchanged(result.unchanged);
+            root.set_deleted(result.deleted);
+            root.set_errors(result.errors);
+            &result.changed_files
+        }
+        None => &[],
+    };
+    let mut changed = root.init_changed_files(changed_files.len() as u32);
+    for (i, f) in changed_files.iter().enumerate() {
         changed.set(i as u32, f);
     }
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::reparse_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
+}
+
+/// Whether two paths name one directory once symlinks resolve; a path that
+/// does not resolve is compared as written.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    resolve(a) == resolve(b)
 }
 
 fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> Result<String> {
@@ -1044,39 +1086,39 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
 
 /// A whole source file by its `_source.id`, with its blob hash and the
 /// arena's `treeRoot`, read in one transaction so the three agree. The blob
-/// hash is the base a later `propose` names (ADR-0041 P2).
+/// hash is the file's manifest entry's `blob_hash` (ADR-0045 T1) — the
+/// value a later `propose` compares its base against (ADR-0042 P2), not a
+/// hash recomputed here, so the two agree by construction.
 fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String> {
-    use leyline_core::ContentAddressed;
-    use rusqlite::OptionalExtension;
     let path = req.path.as_str();
     ctx.with_read(|conn| {
         conn.execute_batch("BEGIN")?;
-        let read = (|| -> Result<(String, leyline_core::Hash, Option<leyline_core::Hash>)> {
-            let bytes: Vec<u8> = conn
-                .query_row(
-                    "SELECT b.blob_bytes FROM _source s \
-                       JOIN source_blobs b ON b.blob_hash = s.content_hash \
-                      WHERE s.id = ?1",
-                    [path],
-                    |r| r.get(0),
-                )
-                .optional()?
+        let read = (|| -> Result<(String, String, String, Option<leyline_core::Hash>)> {
+            // The manifest entry (ADR-0045 T1) is what `propose` checks a
+            // base against, so the hash is read from the same row.
+            let entry = crate::tree::entry(conn, path)?
                 .with_context(|| format!("read_source: no stored source for '{path}'"))?;
+            let crate::tree::Entry::File { blob, mode } = entry else {
+                anyhow::bail!("read_source: '{path}' is a directory");
+            };
+            let bytes = crate::tree::blob_bytes(conn, blob)?.with_context(|| {
+                format!("read_source: the store holds no blob {blob} for '{path}'")
+            })?;
             let tree_root = crate::tree_root::DerivedFrom::read(conn)?.map(|d| d.tree_root);
-            let blob_hash = bytes.as_slice().hash();
             let content = String::from_utf8(bytes)
                 .with_context(|| format!("read_source: '{path}' is not UTF-8"))?;
-            Ok((content, blob_hash, tree_root))
+            Ok((content, blob.to_string(), mode.octal(), tree_root))
         })();
         conn.execute_batch("COMMIT")?;
-        let (content, blob_hash, tree_root) = read?;
+        let (content, blob_hash, mode, tree_root) = read?;
 
         let mut builder = capnp::message::Builder::new_default();
         let mut root: leyline_public_schema::daemon_capnp::read_source_response::Builder =
             builder.init_root();
         root.set_ok(true);
         root.set_content(&content);
-        root.set_blob_hash(blob_hash.to_string());
+        root.set_blob_hash(blob_hash);
+        root.set_mode(mode);
         if let Some(t) = tree_root {
             root.set_tree_root(t.to_string());
         }
@@ -1086,66 +1128,221 @@ fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String
     })
 }
 
-/// Several files written as one change through the daemon's single writer
-/// (ADR-0041 P1): applied whole, or refused whole. A refusal because a file
-/// moved since its author read it carries `stale`, naming the file and both
-/// blob hashes. An accepted proposal is published so out-of-process readers
-/// see it.
-fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
-    use crate::source_write::{Base, Grant, Proposed, Stale};
-    let mut writes = Vec::with_capacity(req.writes.len());
-    for w in req.writes {
-        let base = if w.base.is_empty() {
-            Base::Any
-        } else {
-            let bytes: [u8; 32] = hex::decode(&w.base)
-                .ok()
-                .and_then(|b| b.try_into().ok())
-                .with_context(|| {
-                    format!(
-                        "propose: the base for '{}' is not a 64-hex-char blob hash",
-                        w.path
-                    )
-                })?;
-            Base::Blob(leyline_core::Hash::from_bytes(bytes))
-        };
-        writes.push(Proposed {
-            path: w.path,
-            base,
-            bytes: w.content.into_bytes(),
-        });
+/// A wire base: [`crate::source_write::BASE_ANY`] writes without a check, a
+/// 64-hex-char blob hash is checked, [`crate::source_write::BASE_ABSENT`]
+/// names no file, and anything else is refused.
+fn parse_base(
+    path: &str,
+    base: &str,
+) -> Result<crate::source_write::Base, crate::source_write::Refusal> {
+    use crate::source_write::{BASE_ABSENT, BASE_ANY, Base, Refusal};
+    if base == BASE_ANY {
+        return Ok(Base::Any);
     }
+    if base == BASE_ABSENT {
+        return Ok(Base::Absent);
+    }
+    hex::decode(base)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map(|b| Base::Blob(leyline_core::Hash::from_bytes(b)))
+        .ok_or_else(|| Refusal::MalformedBase {
+            path: path.to_string(),
+        })
+}
+
+/// One wire write as a [`crate::source_write::Proposed`]. A create or mkdir
+/// names the `absent` base, an rmdir `any`, and a replace or delete a blob
+/// or `any`, else the write is refused `malformed_base`; a replace or
+/// create without `content`, or with a `mode` git does not store, is a
+/// malformed request.
+fn parse_write(w: ProposedWriteInput) -> Result<crate::source_write::Proposed> {
+    use crate::source_write::{Base, Change, Mode, Proposed, Refusal};
+    let base = parse_base(&w.path, &w.base)?;
+    let fits = match w.kind {
+        WriteKind::Create | WriteKind::Mkdir => base == Base::Absent,
+        WriteKind::Rmdir => base == Base::Any,
+        WriteKind::Replace | WriteKind::Delete => base != Base::Absent,
+    };
+    if !fits {
+        return Err(Refusal::MalformedBase { path: w.path }.into());
+    }
+    let change = match w.kind {
+        WriteKind::Delete => Change::Delete,
+        WriteKind::Mkdir => Change::Mkdir,
+        WriteKind::Rmdir => Change::Rmdir,
+        WriteKind::Replace | WriteKind::Create => {
+            let mode = w
+                .mode
+                .as_deref()
+                .map(|m| {
+                    Mode::from_octal(m).with_context(|| {
+                        format!(
+                            "propose: the write to '{}' names mode {m:?}; a mode is 100644, \
+                             100755 or 120000",
+                            w.path
+                        )
+                    })
+                })
+                .transpose()?;
+            let content = w.content.with_context(|| {
+                format!(
+                    "propose: the write to '{}' has no `content`; a replace or create needs it",
+                    w.path
+                )
+            })?;
+            Change::Write {
+                bytes: content.into_bytes(),
+                mode,
+            }
+        }
+    };
+    Ok(Proposed {
+        path: w.path,
+        base,
+        change,
+    })
+}
+
+/// Several paths changed as one change through the daemon's single writer
+/// (ADR-0042 P1, ADR-0045): applied whole, or refused whole. Any file at
+/// any plain path, modes and directories are proposals; a write that does
+/// not parse lands with a diagnostic; a write whose base moved is merged
+/// three ways, and the merged paths are named (`merged`). A refusal carries
+/// its typed reason (`refusal`); a stale one names every path that moved,
+/// with the lines a conflicting merge overlapped. An applied proposal is
+/// durable once committed to the living db; the daemon's publisher puts it
+/// in the arena for out-of-process readers with whatever else lands before
+/// that publish (bead `ley-line-open-8c8ded`), and `snapshot` publishes on
+/// demand. It is reported applied even when a step after its commit (the
+/// head write, an index build) fails: that failure rides in
+/// `post_commit_error` (beads `ley-line-open-5db28e`,
+/// `ley-line-open-5dc3a5`).
+fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
+    use crate::source_write::{Grant, Refusal};
+    let writes: Result<Vec<_>> = req.writes.into_iter().map(parse_write).collect();
+    // A daemon with a source directory materializes the accepted files into
+    // it, and removes the deleted ones, under the same writer lock, after
+    // the commit (bead `ley-line-open-60f39f`): a crash in between leaves
+    // the proposal in the store, and the next reconcile carries it out.
+    let outcome = writes.and_then(|writes| {
+        ctx.with_write(|conn| {
+            let accepted = crate::source_write::propose(conn, &Grant::Whole, writes)?;
+            let checkout = ctx.source_dir.as_deref().map(|dir| {
+                let paths: Vec<String> = accepted
+                    .blobs
+                    .keys()
+                    .chain(&accepted.removed)
+                    .chain(&accepted.mkdirs)
+                    .chain(&accepted.rmdirs)
+                    .cloned()
+                    .collect();
+                crate::checkout::reconcile(conn, dir, ctx.lang_filter.as_deref(), Some(&paths))
+            });
+            Ok((accepted, checkout))
+        })
+    });
 
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::propose_response::Builder =
         builder.init_root();
-    match ctx.with_write(|conn| crate::source_write::propose(conn, &Grant::Whole, writes)) {
-        Ok(accepted) => {
-            snapshot_living_db(ctx)?;
+    match outcome {
+        Ok((accepted, checkout)) => {
+            // Report whatever happened after the commit: the rows are
+            // committed whatever the steps after it did.
+            let mut post_commit: Vec<String> = accepted.post_commit_error.into_iter().collect();
+            match checkout {
+                Some(Ok(reconciled)) => post_commit.extend(reconciled.problems()),
+                Some(Err(e)) => post_commit.push(format!(
+                    "the source directory was not brought up to the proposal: {e:#}"
+                )),
+                None => {}
+            }
+            // The arena image follows through the daemon's publisher, which
+            // coalesces every proposal landed since its last publish (bead
+            // `ley-line-open-8c8ded`); `snapshot` publishes on demand.
+            ctx.live_db.request_publish();
             root.set_ok(true);
             root.set_tree_root(accepted.tree_root.to_string());
-            let mut blobs = root.init_blobs(accepted.blobs.len() as u32);
+            let mut blobs = root.reborrow().init_blobs(accepted.blobs.len() as u32);
             for (i, (path, hash)) in accepted.blobs.iter().enumerate() {
                 let mut b = blobs.reborrow().get(i as u32);
                 b.set_path(path);
                 b.set_blob_hash(hash.to_string());
             }
+            if !post_commit.is_empty() {
+                root.set_post_commit_error(post_commit.join("; "));
+            }
+            if !accepted.merged.is_empty() {
+                let mut merged = root.reborrow().init_merged(accepted.merged.len() as u32);
+                for (i, path) in accepted.merged.iter().enumerate() {
+                    merged.set(i as u32, path.as_str());
+                }
+            }
         }
         Err(err) => {
-            let Some(stale) = err.downcast_ref::<Stale>() else {
+            let Some(refusal) = err.downcast_ref::<Refusal>() else {
                 return Err(err);
             };
             root.set_ok(false);
-            root.set_error(stale.to_string());
-            let mut s = root.init_stale();
-            s.set_path(&stale.path);
-            s.set_expected(stale.expected.to_string());
-            s.set_current(stale.current.to_string());
+            root.set_error(refusal.to_string());
+            set_refusal(root.init_refusal(), refusal);
         }
     }
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::propose_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
+}
+
+/// The wire shape of a [`crate::source_write::Refusal`].
+fn set_refusal(
+    mut out: leyline_public_schema::daemon_capnp::proposal_refusal::Builder<'_>,
+    refusal: &crate::source_write::Refusal,
+) {
+    use crate::source_write::Refusal;
+    use leyline_public_schema::daemon_capnp::RefusalReason as R;
+    out.set_reason(match refusal {
+        Refusal::Stale(_) | Refusal::Conflict { .. } => R::Stale,
+        Refusal::OutsideGrant { .. } => R::OutsideGrant,
+        Refusal::NoSuchFile { .. } => R::NoSuchFile,
+        Refusal::DuplicatePath { .. } => R::DuplicatePath,
+        Refusal::DifferentRoots { .. } => R::DifferentRoots,
+        Refusal::NoTreeRoot { .. } => R::NoTreeRoot,
+        Refusal::MalformedBase { .. } => R::MalformedBase,
+        Refusal::Empty => R::Empty,
+        Refusal::MalformedPath { .. } => R::MalformedPath,
+        Refusal::PathConflict { .. } => R::PathConflict,
+        Refusal::Exists { .. } => R::Exists,
+        Refusal::NotEmpty { .. } => R::NotEmpty,
+        Refusal::NotADirectory { .. } => R::NotADirectory,
+        Refusal::IsADirectory { .. } => R::IsADirectory,
+    });
+    if let Some(path) = refusal.path() {
+        out.set_path(path);
+    }
+    let moved = refusal.moved();
+    if !moved.is_empty() {
+        use crate::source_write::Stale;
+        let conflicts = match refusal {
+            Refusal::Conflict { conflicts, .. } => Some(conflicts),
+            _ => None,
+        };
+        let mut list = out.init_moved(moved.len() as u32);
+        for (i, m) in moved.iter().enumerate() {
+            let mut s = list.reborrow().get(i as u32);
+            s.set_path(&m.path);
+            s.set_expected(Stale::spell(m.expected));
+            s.set_current(Stale::spell(m.current));
+            if let Some(ranges) = conflicts.and_then(|c| c.get(&m.path)) {
+                let mut out = s.init_conflicts(ranges.len() as u32);
+                for (j, r) in ranges.iter().enumerate() {
+                    let mut range = out.reborrow().get(j as u32);
+                    range.set_start(r.start);
+                    range.set_end(r.end);
+                }
+            }
+        }
+    }
 }
 
 /// Find callers of a token (queries node_refs).
@@ -3319,6 +3516,7 @@ fn op_search_symbols(
 /// One observation row decoded for agreement scoring: the source name
 /// plus the decoded f32 stalk vector. Mirrors the per-source 0-cell
 /// the agreement op feeds into the degenerate `CellComplex`.
+#[cfg(feature = "sheaf")]
 #[derive(Debug, Clone)]
 struct AgreementRow {
     source: String,
@@ -3330,6 +3528,7 @@ struct AgreementRow {
 /// The token filter uses ADR-0020's `observation_by_mentions` index
 /// via `json_each` — same shape the future `agreement` Gate 4 property
 /// test will exercise.
+#[cfg(feature = "sheaf")]
 fn query_agreement_observations(
     conn: &Connection,
     token: &str,
@@ -3381,6 +3580,7 @@ fn query_agreement_observations(
 /// out instead of crashing the op). When the typed-payload registry
 /// (ley-line-open-503971) ships, this is the single point that learns
 /// to dispatch by `payload_kind`.
+#[cfg(feature = "sheaf")]
 fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
@@ -3415,8 +3615,10 @@ fn decode_inline_payload(bytes: &[u8]) -> Option<Vec<f32>> {
 /// corrupted incidence is wire-indistinguishable from a valid answer);
 /// `build_agreement_complex` asserts it as a backstop. Bead
 /// `ley-line-open-4fece1`.
+#[cfg(feature = "sheaf")]
 const AGREEMENT_EDGE_BASE: u32 = 1_000;
 
+#[cfg(feature = "sheaf")]
 fn build_agreement_complex(
     rows: &[AgreementRow],
 ) -> Option<(leyline_sheaf::complex::CellComplex, Vec<String>)> {
@@ -3478,6 +3680,7 @@ fn build_agreement_complex(
 /// for, per math-friend bead `ley-line-open-659a39`. The op surfaces
 /// the mismatch as an explicit error envelope rather than coercing to
 /// an empty-defects success.
+#[cfg(feature = "sheaf")]
 fn classify_agreement_dims(
     rows: &[AgreementRow],
 ) -> std::result::Result<Option<usize>, (String, usize, String, usize)> {
@@ -3503,6 +3706,7 @@ fn classify_agreement_dims(
 /// provenance, certainty}`. Builds a degenerate CellComplex from the
 /// most-recent `payload_inline` per source and reports
 /// `detect_violations`. Read-only.
+#[cfg(feature = "sheaf")]
 fn op_agreement(ctx: &std::sync::Arc<DaemonContext>, req: &AgreementRequest) -> Result<String> {
     // Lazy schema install for edge-case callers (test fixtures / fresh
     // daemons) — production ensures the schema via
@@ -4187,7 +4391,9 @@ mod tests {
             blobs.contains(&serde_json::json!({"path": "b.go", "blob_hash": hex_hash(PROPOSE_B2)}))
         );
 
-        // A second author still holding the first read is refused.
+        // A second author still holding the first read changed the same
+        // line: the merge conflicts there and the proposal is refused
+        // (ADR-0045 T5).
         let stale = call(
             &ctx,
             serde_json::json!({"op": "propose", "writes": [
@@ -4196,11 +4402,15 @@ mod tests {
         );
         assert_eq!(stale["ok"], false, "{stale}");
         assert_eq!(
-            stale["stale"],
+            stale["refusal"],
             serde_json::json!({
-                "path": "a.go",
-                "expected": hex_hash(PROPOSE_A),
-                "current": hex_hash(PROPOSE_A2),
+                "reason": "stale",
+                "moved": [{
+                    "path": "a.go",
+                    "expected": hex_hash(PROPOSE_A),
+                    "current": hex_hash(PROPOSE_A2),
+                    "conflicts": [{"start": 2, "end": 3}],
+                }],
             })
         );
         assert!(
@@ -4219,21 +4429,523 @@ mod tests {
         );
     }
 
+    /// Bead `ley-line-open-5dc3a5`: a base that is neither a blob hash nor
+    /// `any` — the empty string included — is a typed refusal, and changes
+    /// nothing.
     #[tokio::test]
     async fn propose_refuses_a_base_that_is_not_a_blob_hash() {
+        let (_dir, ctx) = setup_parsed();
+        for base in ["not-hex", ""] {
+            let r = call(
+                &ctx,
+                serde_json::json!({"op": "propose", "writes": [
+                    {"path": "a.go", "base": base, "content": PROPOSE_A2},
+                ]}),
+            );
+            assert_eq!(r["ok"], false, "{r}");
+            assert_eq!(
+                r["refusal"],
+                serde_json::json!({"reason": "malformed_base", "path": "a.go"}),
+                "{r}"
+            );
+            assert!(r["error"].as_str().unwrap().contains("base"), "{r}");
+        }
+        let unchanged = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(unchanged["content"], PROPOSE_A);
+    }
+
+    /// Bead `ley-line-open-5dc3a5`: `base` is required. A write that omits
+    /// it is refused instead of silently overwriting; `any` is the explicit
+    /// way to write without a check.
+    #[tokio::test]
+    async fn propose_requires_a_base_and_any_writes_without_a_check() {
         let (_dir, ctx) = setup_parsed();
         let r = call(
             &ctx,
             serde_json::json!({"op": "propose", "writes": [
-                {"path": "a.go", "base": "not-hex", "content": PROPOSE_A2},
+                {"path": "a.go", "content": PROPOSE_A2},
             ]}),
         );
         assert_eq!(r["ok"], false, "{r}");
         assert!(r["error"].as_str().unwrap().contains("base"), "{r}");
+        let unchanged = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(
+            unchanged["content"], PROPOSE_A,
+            "an omitted base writes nothing"
+        );
+
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": "any", "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        let written = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(written["content"], PROPOSE_A2);
+    }
+
+    /// Bead `ley-line-open-5dc3a5`: every refusal reaches the client typed,
+    /// so it is told apart from an internal error.
+    #[tokio::test]
+    async fn propose_refusals_carry_their_reason_and_path() {
+        let (_dir, ctx) = setup_parsed();
+        let cases = [
+            (
+                serde_json::json!([{"path": "a.go", "kind": "rmdir", "base": "any"}]),
+                serde_json::json!({"reason": "not_a_directory", "path": "a.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "a.go", "kind": "mkdir", "base": "absent"}]),
+                serde_json::json!({"reason": "exists", "path": "a.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "a.go/x", "kind": "mkdir", "base": "absent"}]),
+                serde_json::json!({"reason": "path_conflict", "path": "a.go/x"}),
+            ),
+            (
+                serde_json::json!([{"path": "d", "kind": "mkdir", "base": "any"}]),
+                serde_json::json!({"reason": "malformed_base", "path": "d"}),
+            ),
+            (
+                serde_json::json!([{"path": "z.go", "base": "any", "content": PROPOSE_A2}]),
+                serde_json::json!({"reason": "no_such_file", "path": "z.go"}),
+            ),
+            (
+                serde_json::json!([
+                    {"path": "a.go", "base": "any", "content": PROPOSE_A2},
+                    {"path": "a.go", "base": "any", "content": PROPOSE_A3},
+                ]),
+                serde_json::json!({"reason": "duplicate_path", "path": "a.go"}),
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!({"reason": "empty"}),
+            ),
+        ];
+        for (writes, refusal) in cases {
+            let r = call(&ctx, serde_json::json!({"op": "propose", "writes": writes}));
+            assert_eq!(r["ok"], false, "{r}");
+            assert_eq!(r["refusal"], refusal, "{r}");
+            assert!(
+                r["error"].as_str().unwrap().starts_with("proposal refused"),
+                "{r}"
+            );
+        }
+    }
+
+    /// ADR-0045 over the socket: a file no grammar claims, a mode and a
+    /// directory land; a `--language` daemon stores another language too;
+    /// a write that does not parse lands; a malformed mode is a malformed
+    /// request, not a guess.
+    #[tokio::test]
+    async fn propose_carries_any_file_modes_and_directories() {
+        let (_dir, ctx) = setup_parsed();
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "notes.txt", "kind": "create", "base": "absent", "content": "n\n"},
+                {"path": "lib.py", "kind": "create", "base": "absent", "content": "def f(:\n"},
+                {"path": "bin/run", "kind": "create", "base": "absent", "content": "#!/bin/sh\n", "mode": "100755"},
+                {"path": "empty", "kind": "mkdir", "base": "absent"},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(
+            r.get("merged").is_none(),
+            "nothing merged, no `merged`: {r}"
+        );
+        let run = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "bin/run"}),
+        );
+        assert_eq!(run["mode"], "100755", "{run}");
+        let dir = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "empty"}),
+        );
+        assert_eq!(dir["ok"], false, "{dir}");
+        let removed = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [{"path": "empty", "kind": "rmdir", "base": "any"}]}),
+        );
+        assert_eq!(removed["ok"], true, "{removed}");
+        let bad = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "x", "kind": "create", "base": "absent", "content": "", "mode": "777"}
+            ]}),
+        );
+        assert_eq!(bad["ok"], false, "{bad}");
+        assert!(
+            bad.get("refusal").is_none(),
+            "a malformed request, not a refusal: {bad}"
+        );
+        assert!(bad["error"].as_str().unwrap().contains("mode"), "{bad}");
+    }
+
+    /// Bead `ley-line-open-5db28e`: a step after `COMMIT` that fails does
+    /// not turn an applied proposal into a reported failure. The response
+    /// says it was applied, names the blobs, and reports the failure
+    /// beside them; the daemon still publishes.
+    /// A daemon without a source directory has no checkout: an accepted
+    /// proposal lands in the store and nowhere else (ADR-0040 D3, bead
+    /// `ley-line-open-60f39f`).
+    #[tokio::test]
+    async fn a_headless_daemon_writes_nothing_to_disk() {
+        let (dir, ctx) = setup_parsed();
+        assert!(ctx.source_dir.is_none(), "setup_parsed is headless");
+        let src = dir.path().join("src");
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": hex_hash(PROPOSE_A), "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r.get("post_commit_error").is_none(), "{r}");
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(read["content"], PROPOSE_A2);
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.go")).unwrap(),
+            PROPOSE_A
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&src)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a.go", "b.go"],
+            "nothing was staged beside the files"
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_reports_an_applied_proposal_as_applied_when_its_head_write_fails() {
+        let (_dir, ctx) = setup_parsed();
+        let live = ctx.ctrl_path.with_extension("live.db");
+        std::fs::write(crate::cmd_parse::head_path_for(&live), b"not a head").unwrap();
+        let root_before = Controller::open_or_create(&ctx.ctrl_path)
+            .unwrap()
+            .current_root();
+
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": hex_hash(PROPOSE_A), "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(
+            r["ok"], true,
+            "an applied proposal is reported as applied: {r}"
+        );
+        assert!(r.get("refusal").is_none(), "{r}");
+        assert_eq!(
+            r["blobs"],
+            serde_json::json!([{"path": "a.go", "blob_hash": hex_hash(PROPOSE_A2)}])
+        );
+        assert!(
+            r["post_commit_error"].as_str().unwrap().contains("head"),
+            "{r}"
+        );
+        let stored: Vec<u8> = ctx
+            .with_read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
+                    [hex::decode(hex_hash(PROPOSE_A2)).unwrap()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(stored, PROPOSE_A2.as_bytes());
+        // The proposal requested a publish and did not wait for one (bead
+        // `ley-line-open-8c8ded`); the publisher's next image carries it.
+        assert_eq!(
+            Controller::open_or_create(&ctx.ctrl_path)
+                .unwrap()
+                .current_root(),
+            root_before,
+            "the proposal did not publish inline"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.live_db.publish_requested.notified(),
+        )
+        .await
+        .expect("the applied proposal requested a publish");
+        let snap = call(&ctx, serde_json::json!({"op": "snapshot"}));
+        assert_eq!(snap["ok"], true, "{snap}");
+        assert_ne!(
+            Controller::open_or_create(&ctx.ctrl_path)
+                .unwrap()
+                .current_root(),
+            root_before,
+            "the applied proposal is published"
+        );
+    }
+
+    /// Beads `ley-line-open-5db28e`, `ley-line-open-8c8ded`: a publish that
+    /// fails after a proposal committed fails the publish, never the
+    /// proposal. The proposal stays applied and readable.
+    #[tokio::test]
+    async fn a_failed_publish_leaves_an_applied_proposal_applied() {
+        let (dir, ctx) = setup_parsed();
+        let nowhere = dir.path().join("missing-dir").join("x.arena");
+        Controller::open_or_create(&ctx.ctrl_path)
+            .unwrap()
+            .set_arena(&nowhere.to_string_lossy(), 2 * 1024 * 1024)
+            .unwrap();
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": hex_hash(PROPOSE_A), "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r.get("post_commit_error").is_none(), "{r}");
+        let snap = call(&ctx, serde_json::json!({"op": "snapshot"}));
+        assert_ne!(
+            snap["ok"], true,
+            "the publish into a missing arena fails: {snap}"
+        );
+        let written = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(written["content"], PROPOSE_A2);
+    }
+
+    /// Bead `ley-line-open-5dc3a5`: `read_source` returns the hash
+    /// `propose` compares — the file's manifest entry's `blob_hash`
+    /// (ADR-0045 T1) — so a read followed by a propose against it agrees by
+    /// construction, even when the stored key is not the hash of the bytes
+    /// it names.
+    #[tokio::test]
+    async fn read_source_returns_the_hash_propose_compares() {
+        let (_dir, ctx) = setup_parsed();
+        let key = [7u8; 32].to_vec();
+        ctx.with_write(|conn| {
+            conn.execute(
+                "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+                rusqlite::params![key, PROPOSE_A.as_bytes()],
+            )?;
+            conn.execute(
+                "UPDATE _tree SET blob_hash = ?1 WHERE path = 'a.go'",
+                [&key],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(read["blob_hash"], hex::encode(&key), "{read}");
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": read["blob_hash"], "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
     }
 
     fn setup_rooted() -> (TempDir, std::sync::Arc<DaemonContext>) {
         setup_full(Arc::new(crate::daemon::NoExt), true)
+    }
+
+    /// A daemon whose source directory (its checkout) holds `a.go` and
+    /// `b.go`, reconciled once as at startup.
+    fn setup_checkout() -> (TempDir, std::sync::Arc<DaemonContext>) {
+        let (dir, ctx) = setup_rooted();
+        std::fs::write(dir.path().join("a.go"), PROPOSE_A).unwrap();
+        std::fs::write(dir.path().join("b.go"), PROPOSE_B).unwrap();
+        ctx.with_write(|conn| crate::checkout::reconcile(conn, dir.path(), None, None))
+            .unwrap();
+        (dir, ctx)
+    }
+
+    /// Bead `ley-line-open-47fb03`: a create and a delete are one
+    /// proposal over the socket. The created file is readable and written
+    /// into the checkout; the deleted one is gone from both.
+    #[tokio::test]
+    async fn propose_creates_and_deletes_files_in_the_store_and_the_checkout() {
+        let (dir, ctx) = setup_checkout();
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "sub/c.go", "kind": "create", "base": "absent", "content": PROPOSE_A3},
+                {"path": "b.go", "kind": "delete", "base": hex_hash(PROPOSE_B)},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(
+            r["blobs"],
+            serde_json::json!([{"path": "sub/c.go", "blob_hash": hex_hash(PROPOSE_A3)}])
+        );
+        assert!(r.get("post_commit_error").is_none(), "{r}");
+        let created = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "sub/c.go"}),
+        );
+        assert_eq!(created["content"], PROPOSE_A3, "{created}");
+        let deleted = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "b.go"}),
+        );
+        assert_eq!(deleted["ok"], false, "{deleted}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/c.go")).unwrap(),
+            PROPOSE_A3
+        );
+        assert!(!dir.path().join("b.go").exists());
+
+        // A rename is a delete and a create in one proposal.
+        let renamed = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "kind": "delete", "base": hex_hash(PROPOSE_A)},
+                {"path": "renamed.go", "kind": "create", "base": "absent", "content": PROPOSE_A},
+            ]}),
+        );
+        assert_eq!(renamed["ok"], true, "{renamed}");
+        assert!(!dir.path().join("a.go").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("renamed.go")).unwrap(),
+            PROPOSE_A
+        );
+    }
+
+    /// ADR-0045 T3: a daemon whose `--language` filter excludes a created
+    /// file's language stores it, writes it into its checkout, and keeps it
+    /// through a whole-directory parse; only the projection skips it.
+    #[tokio::test]
+    async fn a_create_outside_the_daemons_language_is_stored_and_not_projected() {
+        let (dir, ctx) = setup_checkout();
+        let mut ctx = std::sync::Arc::into_inner(ctx).expect("one owner");
+        ctx.lang_filter = Some("go".to_string());
+        let ctx = std::sync::Arc::new(ctx);
+        // The startup pass of a `--language go` daemon records its filter.
+        ctx.with_write(|conn| crate::checkout::reconcile(conn, dir.path(), Some("go"), None))
+            .unwrap();
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "tool.py", "kind": "create", "base": "absent", "content": "x = 1\n"},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tool.py")).unwrap(),
+            "x = 1\n"
+        );
+        ctx.with_write(|conn| {
+            crate::checkout::reconcile(conn, dir.path(), Some("go"), None)?;
+            let projected: i64 = conn.query_row(
+                "SELECT count(*) FROM _source WHERE id = 'tool.py'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(projected, 0);
+            Ok(())
+        })
+        .unwrap();
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "tool.py"}),
+        );
+        assert_eq!(read["content"], "x = 1\n", "{read}");
+        let go = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "tool.go", "kind": "create", "base": "absent", "content": PROPOSE_A},
+            ]}),
+        );
+        assert_eq!(go["ok"], true, "{go}");
+    }
+
+    /// A create over a file and a change to a deleted file are stale, with
+    /// `absent` on the side that holds no file; a base that does not fit
+    /// its kind is `malformed_base`; a created path that is not plain, or is
+    /// under a file, says why.
+    #[tokio::test]
+    async fn structural_proposals_are_refused_typed() {
+        let (_dir, ctx) = setup_checkout();
+        call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "b.go", "kind": "delete", "base": "any"},
+            ]}),
+        );
+        let cases = [
+            (
+                serde_json::json!([{"path": "a.go", "kind": "create", "base": "absent", "content": PROPOSE_A2}]),
+                serde_json::json!({"reason": "stale", "moved": [
+                    {"path": "a.go", "expected": "absent", "current": hex_hash(PROPOSE_A)}
+                ]}),
+            ),
+            (
+                serde_json::json!([{"path": "b.go", "kind": "delete", "base": hex_hash(PROPOSE_B)}]),
+                serde_json::json!({"reason": "stale", "moved": [
+                    {"path": "b.go", "expected": hex_hash(PROPOSE_B), "current": "absent"}
+                ]}),
+            ),
+            (
+                serde_json::json!([{"path": "c.go", "kind": "create", "base": "any", "content": PROPOSE_A}]),
+                serde_json::json!({"reason": "malformed_base", "path": "c.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "a.go", "kind": "delete", "base": "absent"}]),
+                serde_json::json!({"reason": "malformed_base", "path": "a.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "a.go", "base": "absent", "content": PROPOSE_A2}]),
+                serde_json::json!({"reason": "malformed_base", "path": "a.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "../up.go", "kind": "create", "base": "absent", "content": PROPOSE_A}]),
+                serde_json::json!({"reason": "malformed_path", "path": "../up.go"}),
+            ),
+            (
+                serde_json::json!([{"path": "a.go/c.go", "kind": "create", "base": "absent", "content": PROPOSE_A}]),
+                serde_json::json!({"reason": "path_conflict", "path": "a.go/c.go"}),
+            ),
+        ];
+        for (writes, refusal) in cases {
+            let r = call(&ctx, serde_json::json!({"op": "propose", "writes": writes}));
+            assert_eq!(r["ok"], false, "{r}");
+            assert_eq!(r["refusal"], refusal, "{writes}: {r}");
+        }
+        // A replace or create without content is a malformed request, not
+        // an empty file.
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": "any"},
+            ]}),
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r.get("refusal").is_none(), "{r}");
+        assert!(r["error"].as_str().unwrap().contains("content"), "{r}");
+        let a = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        assert_eq!(a["content"], PROPOSE_A, "nothing landed");
     }
 
     fn setup_full(
@@ -5399,6 +6111,39 @@ mod tests {
                 assert!(
                     !msg.starts_with("unknown variant"),
                     "BASE_OP_NAMES contains `{name}` but BaseRequest has no matching variant: {msg}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn execution_contract_op_names_map_to_base_request_variants() {
+        // Drift guard (6d811a): `execution_contract::OP_NAMES` is the
+        // single source for execution/v1 operation names. `BASE_OP_NAMES`
+        // splices it in at compile time and `mcp::cloister_groups()`
+        // clones it, so both of those agree by construction. What is NOT
+        // derivable is the `BaseRequest::LloExecution*` variant set —
+        // serde's `rename_all = "snake_case"` tags are produced from
+        // hand-written variant names. This asserts that mapping directly
+        // against OP_NAMES rather than transitively through
+        // BASE_OP_NAMES, so it keeps holding even if a future refactor
+        // un-derives the splice.
+        use super::BaseRequest;
+        use crate::daemon::execution_contract::OP_NAMES;
+        use serde_json::json;
+
+        for name in OP_NAMES {
+            assert!(
+                is_known_base_op(name),
+                "execution_contract::OP_NAMES has `{name}` but BASE_OP_NAMES does not",
+            );
+            let result: std::result::Result<BaseRequest, _> =
+                serde_json::from_value(json!({"op": name}));
+            if let Err(e) = result {
+                let msg = e.to_string();
+                assert!(
+                    !msg.starts_with("unknown variant"),
+                    "no BaseRequest variant carries the serde tag `{name}`: {msg}",
                 );
             }
         }

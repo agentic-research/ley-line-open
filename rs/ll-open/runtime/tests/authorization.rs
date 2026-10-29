@@ -13,7 +13,8 @@ use leyline_runtime::transport::{
 };
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
-    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits,
+    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits, WorkerChannel,
+    WorkspaceGrant, WorkspaceOperation,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -955,6 +956,137 @@ fn workspace_grants_require_exact_identity_cardinality_and_unique_names() {
         .expect_err("duplicate workspace names are ambiguous authority");
 }
 
+/// A spec requesting `repo` and `docs`, and a grant resolving both with the
+/// given operations and generations, `docs` first.
+fn two_workspace_grant(
+    repo: Vec<execution_capnp::WorkspaceOperation>,
+    docs: Vec<execution_capnp::WorkspaceOperation>,
+) -> (Vec<u8>, Vec<u8>) {
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &a), ("docs", &b)]);
+    let confinement = "b".repeat(64);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![("docs", &b, docs), ("repo", &a, repo)],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    // Generations, set on a copy of the grant: 7 on `docs`, 9 on `repo`.
+    let mut input = grant.as_slice();
+    let reader = capnp::serialize::read_message(&mut input, ReaderOptions::new()).unwrap();
+    let mut message = Builder::new_default();
+    message
+        .set_root(
+            reader
+                .get_root::<execution_capnp::run_grant::Reader<'_>>()
+                .unwrap(),
+        )
+        .unwrap();
+    {
+        let root = message
+            .get_root::<execution_capnp::run_grant::Builder<'_>>()
+            .unwrap();
+        let mut workspaces = root.get_workspaces().unwrap();
+        workspaces.reborrow().get(0).set_expected_generation(7);
+        workspaces.get(1).set_expected_generation(9);
+    }
+    let mut grant = Vec::new();
+    capnp::serialize::write_message(&mut grant, &message).unwrap();
+    (spec, grant)
+}
+
+#[test]
+fn an_authorized_run_carries_each_workspace_grant_in_grant_order() {
+    use execution_capnp::WorkspaceOperation as Op;
+    let (spec, grant) = two_workspace_grant(
+        vec![Op::Read, Op::List, Op::Mutate, Op::Commit],
+        vec![Op::Read, Op::Query],
+    );
+    let authorized = authorize(
+        &spec,
+        &grant,
+        &AuthorizationPolicy {
+            now_unix_ms: Some(1_000),
+            required_backend: BackendClass::MicroVm,
+            required_confinement_digest: None,
+        },
+    )
+    .expect("an exact workspace grant authorizes");
+    assert_eq!(
+        authorized.workspaces,
+        vec![
+            WorkspaceGrant {
+                name: "docs".into(),
+                graph_root: format!("blake3-256:{}", "b".repeat(64)),
+                expected_generation: 7,
+                operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Query],
+            },
+            WorkspaceGrant {
+                name: "repo".into(),
+                graph_root: format!("blake3-256:{}", "a".repeat(64)),
+                expected_generation: 9,
+                operations: vec![
+                    WorkspaceOperation::Read,
+                    WorkspaceOperation::List,
+                    WorkspaceOperation::Mutate,
+                    WorkspaceOperation::Commit,
+                ],
+            },
+        ]
+    );
+}
+
+/// A resolver that resolves as [`TestResolver`] and then drops the grant's
+/// workspace authority.
+struct DroppingResolver;
+
+impl ExecutionResolver for DroppingResolver {
+    fn resolve(
+        &self,
+        authorized: &leyline_runtime::authorization::AuthorizedExecution,
+    ) -> Result<ExecutionRequest, ExecutionError> {
+        let mut request = TestResolver.resolve(authorized)?;
+        request.workspaces.clear();
+        Ok(request)
+    }
+}
+
+#[test]
+fn the_service_refuses_a_resolver_that_changes_the_granted_workspaces() {
+    use execution_capnp::WorkspaceOperation as Op;
+    let (spec, grant) = two_workspace_grant(vec![Op::Read], vec![Op::Read]);
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let service = ExecutionService::new(RecordingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-workspaces")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &policy, &DroppingResolver)
+        .expect_err("a resolver must carry the granted workspaces");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
+    assert!(error.detail.contains("workspaces"), "{error}");
+    service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect("a resolver that carries them starts the run");
+}
+
 #[test]
 fn rejects_grant_with_a_confinement_policy_the_backend_will_not_enforce() {
     let spec = spec_bytes();
@@ -983,17 +1115,15 @@ impl Backend for RecordingBackend {
             backend_id: "test/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
-            enforced: leyline_runtime::EnforcedCeilings {
-                wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                vcpus: leyline_runtime::CeilingMechanism::Hypervisor,
-                memory: leyline_runtime::CeilingMechanism::Hypervisor,
-            },
+            unavailable_reason: None,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
     fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: format!("test/{}", request.run_id),
+            channels: Vec::new(),
         })
     }
 
@@ -1012,17 +1142,15 @@ impl Backend for CompletingBackend {
             backend_id: "completing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
-            enforced: leyline_runtime::EnforcedCeilings {
-                wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                vcpus: leyline_runtime::CeilingMechanism::Hypervisor,
-                memory: leyline_runtime::CeilingMechanism::Hypervisor,
-            },
+            unavailable_reason: None,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
 
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -1059,10 +1187,15 @@ impl ExecutionResolver for TestResolver {
             // vacuously as a result.
             confinement_digest: authorized.confinement_digest.clone(),
             confinement_manifest: authorized.confinement_manifest.clone(),
+            workspaces: authorized.workspaces.clone(),
             limits: ResourceLimits {
-                vcpus: 1,
-                memory_mib: 128,
                 wall_time_ms: 1_000,
+                memory: leyline_runtime::MemoryLimits { limit: 128 << 20 },
+                cpu: leyline_runtime::CpuLimits {
+                    quota: 100_000,
+                    period: 100_000,
+                },
+                ..ResourceLimits::default()
             },
         })
     }
@@ -1148,6 +1281,131 @@ fn natural_backend_completion_can_collect_a_schema_receipt() {
         .expect("collect terminal receipt");
     assert_eq!(receipt.terminal_state, leyline_runtime::RunState::Succeeded);
     assert!(receipt.event_log_root.starts_with("blake3-256:"));
+}
+
+/// Completes at once, holding the workspace share of each granted
+/// workspace, as the libkrun backend reports it.
+struct SharingBackend;
+
+impl Backend for SharingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        CompletingBackend.capabilities()
+    }
+
+    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "sharing/1".into(),
+            channels: request
+                .workspaces
+                .iter()
+                .map(|grant| WorkerChannel::WorkspaceShare {
+                    workspace: grant.name.clone(),
+                    graph_root: grant.graph_root.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(Some(BackendRunStatus::Succeeded))
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(true)
+    }
+}
+
+/// The receipt's backend evidence names every channel the run's worker held
+/// beyond its confinement manifest: the workspace share for a run granted a
+/// workspace, none for a run without one. The receipt carries the evidence
+/// document's digest under the execution/v1 media type.
+#[test]
+fn the_receipt_names_the_workspace_share_the_run_held() {
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let confinement = "b".repeat(64);
+    let root = "a".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &root)]);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![(
+                "repo",
+                &root,
+                vec![execution_capnp::WorkspaceOperation::Read],
+            )],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    let plain_spec = spec_bytes();
+    let plain_grant = grant_bytes(&plain_spec, true, 2_000, 0);
+
+    let service = ExecutionService::new(SharingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-sharing")
+        .expect("provision backend");
+    let shared = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect("a run granted a workspace");
+    // Its own service: both grants carry one replay key, and a replayed
+    // start answers the first run.
+    let plain_service = ExecutionService::new(SharingBackend);
+    plain_service
+        .provision(BackendClass::MicroVm, "provision-plain")
+        .expect("provision backend");
+    let plain = plain_service
+        .start_authorized(&plain_spec, &plain_grant, &policy, &TestResolver)
+        .expect("a run without a workspace");
+
+    let receipt = service.collect(&shared.run_id).expect("collect");
+    assert_eq!(
+        receipt.backend_evidence.channels,
+        vec![WorkerChannel::WorkspaceShare {
+            workspace: "repo".into(),
+            graph_root: format!("blake3-256:{root}"),
+        }]
+    );
+    assert_eq!(receipt.backend_evidence.backend_id, "sharing/1");
+    let wire: serde_json::Value = serde_json::from_str(
+        &collect_json(&service, &json!({"runId": shared.run_id}).to_string())
+            .expect("collect JSON"),
+    )
+    .expect("receipt JSON");
+    let evidence = &wire["receipt"]["backend"]["evidence"];
+    assert_eq!(
+        evidence["mediaType"],
+        "application/vnd.leyline.execution.backend-evidence+json"
+    );
+    assert_eq!(
+        format!(
+            "{}:{}",
+            evidence["digest"]["algorithm"].as_str().unwrap(),
+            evidence["digest"]["value"].as_str().unwrap()
+        ),
+        receipt.backend_evidence.digest()
+    );
+    assert_eq!(
+        receipt.backend_evidence.digest(),
+        format!(
+            "blake3-256:{}",
+            blake3::hash(&receipt.backend_evidence.canonical_bytes()).to_hex()
+        )
+    );
+
+    assert_ne!(plain.run_id, shared.run_id);
+    let receipt = plain_service.collect(&plain.run_id).expect("collect");
+    assert_eq!(receipt.backend_evidence.channels, Vec::new());
 }
 
 fn spec_json(bytes: &[u8]) -> String {
@@ -1261,11 +1519,8 @@ fn capabilities_projection_uses_declared_backend_class() {
                 backend_id: "native-nono/1".into(),
                 backend_class: BackendClass::Native,
                 available: false,
-                enforced: leyline_runtime::EnforcedCeilings {
-                    wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                    vcpus: leyline_runtime::CeilingMechanism::Unenforced,
-                    memory: leyline_runtime::CeilingMechanism::Unenforced,
-                },
+                unavailable_reason: Some("fixture backend is unavailable".into()),
+                enforced: leyline_runtime::EnforcedCeilings::wall_clock_only(),
             }
         }
 
@@ -1655,7 +1910,7 @@ fn run_id_vector_pins_the_derivation_for_other_implementations() {
 /// ADR-0035 §4: a ceiling the selected tier cannot enforce is a rejection,
 /// not a no-op.
 ///
-/// libkrun applies `vcpus` and `memory_mib` through `krun_set_vm_config`, so
+/// libkrun applies `memory.limit` and `cpu` through `krun_set_vm_config`, so
 /// a microVM grant's memory ceiling is real. The native tier reads neither —
 /// `native_backend.rs` consumes only `wall_time_ms` — so the identical grant
 /// silently becomes a suggestion there. A caller cannot tell the two apart
@@ -1670,11 +1925,8 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
                 backend_id: "native-nono/1".into(),
                 backend_class: BackendClass::Native,
                 available: true,
-                enforced: leyline_runtime::EnforcedCeilings {
-                    wall_time: leyline_runtime::CeilingMechanism::Supervisor,
-                    vcpus: leyline_runtime::CeilingMechanism::Unenforced,
-                    memory: leyline_runtime::CeilingMechanism::Unenforced,
-                },
+                unavailable_reason: None,
+                enforced: leyline_runtime::EnforcedCeilings::wall_clock_only(),
             }
         }
         fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
@@ -1707,7 +1959,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
         .provision(BackendClass::Native, "provision-native")
         .expect("provision backend");
 
-    // TestResolver resolves memory_mib: 128 — a real ceiling under a
+    // TestResolver resolves memory.limit 128 MiB — a real ceiling under a
     // hypervisor and nothing at all under nono.
     let error = service
         .start_authorized(
@@ -1728,12 +1980,12 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
         "the rejection must say the ceiling is unenforceable: {}",
         error.detail
     );
-    // `TestResolver` requests both vcpus and memory, and this tier applies
+    // `TestResolver` requests both cpu and memory, and this tier applies
     // neither, so either name is a correct report — but it must name one, so
     // an operator learns which ceiling to drop rather than that "something"
     // was wrong.
     assert!(
-        error.detail.contains("vcpus") || error.detail.contains("memoryBytes"),
+        error.detail.contains("memory.limit") || error.detail.contains("cpu.quota"),
         "the rejection must name the ceiling: {}",
         error.detail
     );
@@ -1741,7 +1993,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
 
 /// The mirror, and the reason §4 is a rejection rather than a blanket ban:
 /// the same ceiling on the tier that *can* apply it must still run.
-/// libkrun passes `vcpus`/`memory_mib` to `krun_set_vm_config`, so a microVM
+/// libkrun passes `memory.limit` and `cpu` to `krun_set_vm_config`, so a microVM
 /// grant's ceilings are real and must be accepted.
 #[test]
 fn the_same_ceiling_is_accepted_by_the_tier_that_enforces_it() {

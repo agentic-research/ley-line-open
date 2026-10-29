@@ -20,12 +20,16 @@ includes:
     taskfile: rs/ll-open/envelope/Taskfile.yml
   fs:
     taskfile: rs/ll-open/fs/Taskfile.yml
+  krun-worker:
+    taskfile: rs/ll-open/krun-worker/Taskfile.yml
   rs:
     taskfile: rs/Taskfile.yml
   runtime:
     taskfile: rs/ll-open/runtime/Taskfile.yml
   sign:
     taskfile: rs/ll-open/sign/Taskfile.yml
+  storefs:
+    taskfile: rs/ll-open/storefs/Taskfile.yml
 
 vars:
   SCCACHE_VERSION: 0.15.0
@@ -279,33 +283,12 @@ tasks:
   deps:ci:
     desc: |
       Everything `task ci` compiles against on a Linux runner: the capnp
-      toolchain plus libdbus-1-dev (keyring) and libfuse-dev (fuser).
+      toolchain plus libdbus-1-dev (keyring) and libfuse-dev (fuser, behind
+      storefs's `mount`).
       ci.yml calls this; the extras ride on deps:capnp's apt-get update.
     cmds:
       - task: deps:capnp
       - sudo apt-get install -y --no-install-recommends libdbus-1-dev libfuse-dev
-
-  deps:fuse:
-    desc: |
-      FUSE headers for the leyline-fs staticlib build (`fuse` feature links
-      libfuse3). release.yml's build job calls this only for matrix entries
-      that carry lib_asset.
-    cmds:
-      - |
-        set -eu
-        case "${RUNNER_OS:-$(uname -s)}" in
-          Linux)
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends libfuse3-dev
-            ;;
-          macOS|Darwin)
-            brew install --cask fuse-t
-            ;;
-          *)
-            echo "deps:fuse: unsupported OS '${RUNNER_OS:-$(uname -s)}'" >&2
-            exit 1
-            ;;
-        esac
 
   deps:zig:
     desc: |
@@ -318,6 +301,32 @@ tasks:
       - cargo install cargo-zigbuild --locked
       - python3 -m pip install --break-system-packages ziglang
       - rustup target add "{{.RUST_TARGET}}"
+
+  deps:krun-init-cc:
+    desc: |
+      The compiler tools/krun_init_cc.sh needs to build libkrun's Linux guest
+      init into leyline-krun-worker: zig on macOS. A same-arch Linux host
+      uses its own cc, so there is nothing to install there.
+    cmds:
+      - cmd: HOMEBREW_NO_AUTO_UPDATE=1 brew install zig
+        platforms: [darwin]
+      - cmd: zig version
+        platforms: [darwin]
+
+  # --------------------------------------------------------------------------
+  # Vendored VMM (rs/third_party/libkrun, ADR-0044, bead ley-line-open-f1c46f).
+  # Both fetch upstream from GitHub, so neither is part of `ci`; the build
+  # reads only the committed tree. See rs/third_party/README.md.
+  # --------------------------------------------------------------------------
+  vmm:vendor:check:
+    desc: Prove rs/third_party/libkrun is the pinned upstream commit plus rs/third_party/libkrun-patches (network)
+    cmds:
+      - tools/vendor_libkrun.sh check
+
+  vmm:vendor:sync:
+    desc: Rewrite rs/third_party/libkrun from the pinned upstream commit and the patches (network)
+    cmds:
+      - tools/vendor_libkrun.sh sync
 
   deps:cargo-mutants:
     desc: |
@@ -380,6 +389,15 @@ tasks:
       - task: release:artifacts:verify
         vars:
           ARTIFACT_ROOT: '{{.FIXTURE_DIR}}/artifacts'
+      - |
+        set -eu
+        # INCLUDE_TOOLDEFS also stages the execution/v1 schema bytes, byte-
+        # identical to the repository files and listed in SHA256SUMS (6d811a).
+        staged="{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64"
+        cmp "$staged/execution.capnp" rs/ll-core/schema-spec/execution/v1/execution.capnp
+        cmp "$staged/traits.capnp" rs/ll-core/schema-spec/_traits.capnp
+        grep -q '  execution\.capnp$' "$staged/SHA256SUMS"
+        grep -q '  traits\.capnp$' "$staged/SHA256SUMS"
       - |
         printf 'corruption' >> "{{.FIXTURE_DIR}}/artifacts/leyline-test-amd64/leyline-test-amd64"
         if tools/verify_release_artifacts.sh "{{.FIXTURE_DIR}}/artifacts"; then
@@ -453,6 +471,40 @@ tasks:
     cmds:
       - tools/test_go_schema_consumer.sh
 
+  schema:execution-asset-consumer-test:
+    desc: Compile the execution/v1 schema release assets standalone to zod RunSpec/RunGrant/RunReceipt (6d811a)
+    cmds:
+      - |
+        set -eu
+        (cd rs && cargo build --quiet -p leyline-schema-bridge --bin capnpc-schema-bridge-zod)
+        tmp=$(mktemp -d "${TMPDIR:-/tmp}/leyline-execution-asset.XXXXXX")
+        trap 'rm -rf "$tmp"' EXIT
+        printf '#!/bin/sh\n' > "$tmp/leyline"
+        # Staged by the release staging script itself, so the assets under
+        # test are the bytes and names a release publishes.
+        OUTPUT_DIR="$tmp/staged" CLI_SOURCE="$tmp/leyline" \
+          ASSET_NAME=leyline-fixture \
+          EXECUTION_SCHEMA_ROOT="$PWD/rs/ll-core/schema-spec" \
+          tools/stage_release_artifacts.sh
+        # Run the plugin under EVERY zod asset name the release publishes,
+        # as a consumer runs the download: it must resolve its format
+        # through each platform suffix (OutputFormat::RELEASE_PLATFORM_SUFFIXES).
+        zod_assets=$(grep '^capnpc-schema-bridge-zod-' tools/release-assets.txt)
+        test -n "$zod_assets"
+        for zod_asset in $zod_assets; do
+          zod="$tmp/$zod_asset"
+          cp rs/target/debug/capnpc-schema-bridge-zod "$zod"
+          tools/test_execution_schema_asset.sh "$tmp/staged" "$zod"
+        done
+        # The compile is real: a traits asset without the annotations the
+        # schema uses must fail it.
+        printf '@0xd3b652fd6a4debe6;\n' > "$tmp/staged/traits.capnp"
+        if tools/test_execution_schema_asset.sh "$tmp/staged" "$zod" 2>/dev/null; then
+          echo "execution.capnp compiled against a traits asset without its annotations"
+          exit 1
+        fi
+        echo "execution/v1 schema asset consumer test rejected a broken traits asset"
+
   schema:mcp-protocol-pin-test:
     desc: Prove the vendored MCP wire schema (ley-line-open-60f0d3) is git-tracked, digest-pinned, and structurally the 2026-07-28 revision
     dir: rs
@@ -500,6 +552,29 @@ tasks:
     cmds:
       - task: cli-lib:smoke
 
+  release:hypervisor:record:
+    desc: Install the worker (`krun-worker:install`), run the real-guest suite (`task runtime:test`, LEYLINE_REQUIRE_HYPERVISOR=1) against that installed worker on this tree, and record the receipt the release gate requires. Needs LEYLINE_LIBKRUNFW_PATH and LEYLINE_GUEST_TOOLS; INSTALL_DIR as for krun-worker:install.
+    vars:
+      INSTALL_DIR: '{{.INSTALL_DIR | default (printf "%s/.local/bin" .HOME)}}'
+    cmds:
+      # The guest tests run the INSTALLED worker, as installed (bead
+      # ley-line-open-984acf): the receipt is then a statement about the
+      # artifact a user runs, and names its digest.
+      - task: krun-worker:install
+        vars:
+          INSTALL_DIR: '{{.INSTALL_DIR}}'
+      - LEYLINE_KRUN_WORKER="{{.INSTALL_DIR}}/leyline-krun-worker" tools/hypervisor_attestation.sh record
+
+  release:hypervisor:check:
+    desc: Succeed only if a passing hypervisor-suite receipt exists for this tree
+    cmds:
+      - tools/hypervisor_attestation.sh check
+
+  release:hypervisor:fixture-test:
+    desc: Prove the hypervisor receipt records only a passing, unchanged tree and that tagging refuses without one
+    cmds:
+      - tools/test_hypervisor_attestation.sh
+
   release:publish:
     desc: Smoke the CLI, then atomically tag, wait for release CI, and verify public vVERSION
     requires:
@@ -524,9 +599,20 @@ tasks:
 
       `check` not `build`: this catches the type errors at a fraction of the
       link cost. `task release:full` still does the real build.
+
+      The other end of the lattice: cli-lib with no default features builds,
+      and links no leyline-sheaf (bead ley-line-open-39e239), so the sheaf
+      surface stays a feature rather than drifting back into a hard
+      dependency.
     dir: rs
     cmds:
       - cargo check -p leyline-cli --features all
+      - cargo check -p leyline-cli-lib --no-default-features
+      - |
+        if cargo tree -p leyline-cli-lib --no-default-features -e normal -i leyline-sheaf 2>/dev/null | grep -q leyline-sheaf; then
+          echo "leyline-cli-lib links leyline-sheaf with its default features off" >&2
+          exit 1
+        fi
 
   # --------------------------------------------------------------------------
   # Build
@@ -646,6 +732,7 @@ tasks:
       DEFAULT_STATICLIB_SOURCE: '{{.ROOT_DIR}}/rs/target/{{.BUILD_TARGET}}/release/libleyline_fs.a'
       DEFAULT_HEADER_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/fs/include/leyline_fs.h'
       DEFAULT_TOOLDEFS_SOURCE: '{{.ROOT_DIR}}/rs/ll-open/cli-lib/src/daemon/execution-tools.json'
+      DEFAULT_EXECUTION_SCHEMA_ROOT: '{{.ROOT_DIR}}/rs/ll-core/schema-spec'
     env:
       ASSET_NAME: '{{.ASSET_NAME}}'
       BUILD_TARGET: '{{.BUILD_TARGET}}'
@@ -655,7 +742,9 @@ tasks:
       INCLUDE_HEADER: '{{.INCLUDE_HEADER | default "false"}}'
       # The generated execution/v1 tool definitions — one platform-independent
       # JSON, so exactly ONE release job sets this (same single-uploader rule
-      # as INCLUDE_HEADER). Off by default.
+      # as INCLUDE_HEADER). Off by default. The same flag stages the
+      # execution/v1 schema bytes (`execution.capnp`, `traits.capnp`) the
+      # tooldefs are generated from, so the two cannot ship apart.
       #
       # Only the FLAG lives here. `TOOLDEFS_SOURCE` is exported from `cmds`
       # under this flag, exactly as `HEADER_SOURCE` is: putting the path in
@@ -678,9 +767,16 @@ tasks:
       # rule as INCLUDE_HEADER). Empty by default.
       WASM_ASSETS: '{{.WASM_ASSETS | default ""}}'
       WASM_SOURCE_DIR: '{{.WASM_SOURCE_DIR | default (printf "%s/rs/target/wasm32-unknown-unknown/release" .ROOT_DIR)}}'
+      # The microVM worker, staged signed with the hypervisor entitlement
+      # (ley-line-open-984acf). Empty by default; release.yml sets it on the
+      # darwin-arm64 leg, which builds it with `krun-worker:release:target`.
+      KRUN_WORKER_ASSET: '{{.KRUN_WORKER_ASSET | default ""}}'
     cmds:
       - |
         set -eu
+        if [ -n "${KRUN_WORKER_ASSET:-}" ]; then
+          export KRUN_WORKER_SOURCE='{{.KRUN_WORKER_SOURCE | default (printf "%s/rs/target/%s/release/leyline-krun-worker" .ROOT_DIR .BUILD_TARGET)}}'
+        fi
         if [ -n "${LIB_ASSET:-}" ]; then
           export STATICLIB_SOURCE='{{.STATICLIB_SOURCE | default .DEFAULT_STATICLIB_SOURCE}}'
         fi
@@ -689,6 +785,9 @@ tasks:
         fi
         if [ "${INCLUDE_TOOLDEFS:-false}" = "true" ]; then
           export TOOLDEFS_SOURCE='{{.TOOLDEFS_SOURCE | default .DEFAULT_TOOLDEFS_SOURCE}}'
+          # The execution/v1 schema bytes ship beside their tooldefs
+          # projection: same contract, same single uploader (6d811a).
+          export EXECUTION_SCHEMA_ROOT='{{.EXECUTION_SCHEMA_ROOT | default .DEFAULT_EXECUTION_SCHEMA_ROOT}}'
         fi
         tools/stage_release_artifacts.sh
 
@@ -1073,9 +1172,9 @@ tasks:
   #
   # Climb the ladder in tier order, because the tier boundary decides the cost.
   # `ll-core/*` compiles without `ll-open/*` (the tier-isolation gate), so those
-  # crates mutate with no feature incantation at all — note `mutants:fs` needs
-  # `--no-default-features --features cdc,splice,validate` purely because
-  # leyline-fs reaches libfuse. Ask "which tier is this in?" before "is this
+  # crates mutate with no feature incantation at all — note `mutants:fs` names
+  # `--no-default-features --features cdc,validate` to mutate the chunked
+  # read path, which is opt-in. Ask "which tier is this in?" before "is this
   # important?": a file in the wrong tier is expensive to mutate regardless.
   #
   # Next rungs, both already tier-clean: the schema-bridge emitters
@@ -1162,7 +1261,7 @@ tasks:
       # missed. Exit 2 (a mutant no test caught) still fails.
       - >-
         cargo mutants -p leyline-fs --test-workspace=false
-        --no-default-features --features cdc,splice,validate
+        --no-default-features --features cdc,validate
         -C --lib --file ll-open/fs/src/chunked.rs
         || [ $? -eq 3 ]
 
@@ -1173,7 +1272,7 @@ tasks:
       # Exit 3 tolerated for the same reason as mutants:fs/mutants:cdc.
       - >-
         cargo mutants -p leyline-fs --test-workspace=false
-        --no-default-features --features cdc,splice,validate
+        --no-default-features --features cdc,validate
         -C --lib --file ll-open/fs/src/gc.rs
         || [ $? -eq 3 ]
 
@@ -1572,7 +1671,9 @@ tasks:
       - task: release:tags:fixture-test
       - task: release:publish:fixture-test
       - task: release:retry:fixture-test
+      - task: release:hypervisor:fixture-test
       - task: schema:consumer-fixture-test
+      - task: schema:execution-asset-consumer-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check
       - task: release:crates:fixture-test
@@ -1591,15 +1692,17 @@ tasks:
       - task: clippy
       - task: smells
       - task: fs:build:static
-      - task: fs:build:nfs-isolated
       - task: fs:test:cdc
       - task: cli-lib:test:cdc-activation
       - task: cli-lib:test:search
-      - task: cli-lib:test:mount
+      - task: storefs:test:mount
       - task: cli-lib:smoke:dev
       - task: tier:isolation
       - task: check:all-features
       - task: test
+      # The native tier's cgroup ceilings against a real kernel: Linux CI
+      # only (it delegates a cgroup with sudo); a skip elsewhere.
+      - task: runtime:test:cgroup
       # After `test`: the fixture parses with the debug leyline binary that
       # `test` has already built.
       - task: index:clones:fixture-test

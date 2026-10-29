@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use leyline_runtime::{
-    ArtifactIdentity, AuthorizedExecution, CatalogBuilder, CatalogResolver, DigestRef, ErrorCode,
-    ExecutionResolver, SchemaIntent, SchemaLimits, WorkspaceInput,
+    ArtifactIdentity, AuthorizedExecution, CatalogBuilder, CatalogResolver, CpuLimits, DigestRef,
+    ErrorCode, ExecutionResolver, MemoryLimits, ResourceLimits, SchemaIntent, WorkspaceGrant,
+    WorkspaceInput, WorkspaceOperation,
 };
 
 fn authorized() -> AuthorizedExecution {
@@ -29,35 +30,44 @@ fn authorized() -> AuthorizedExecution {
                 name: "repo".into(),
                 graph_root: "blake3-256:graph".into(),
             }],
-            requested_limits: SchemaLimits {
+            requested_limits: ResourceLimits {
                 wall_time_ms: 2_000,
-                memory_bytes: 2 * 1024 * 1024,
-                cpu_millis: 2_000,
-                output_bytes: 0,
+                memory: MemoryLimits { limit: 4 << 20 },
+                cpu: CpuLimits {
+                    quota: 200_000,
+                    period: 100_000,
+                },
+                ..ResourceLimits::default()
             },
         },
+        // Narrower than the request on memory and CPU.
+        limits: ResourceLimits {
+            wall_time_ms: 2_000,
+            memory: MemoryLimits { limit: 2 << 20 },
+            cpu: CpuLimits {
+                quota: 100_000,
+                period: 100_000,
+            },
+            ..ResourceLimits::default()
+        },
+        workspaces: vec![WorkspaceGrant {
+            name: "repo".into(),
+            graph_root: "blake3-256:graph".into(),
+            expected_generation: 4,
+            operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+        }],
     }
 }
 
 #[test]
-fn catalog_resolver_rejects_limits_that_would_round_up() {
+fn catalog_resolver_holds_the_run_to_the_grant_not_the_request() {
+    // `authorize` verified the grant narrows the request; the resolver once
+    // built the run from the request anyway, so a narrowed grant ran wide.
     let mut intent = authorized();
-    intent.intent.requested_limits.cpu_millis = 1_001;
-    let error = resolver()
-        .resolve(&intent)
-        .expect_err("fractional CPU units must not be widened");
-    assert_eq!(error.code, ErrorCode::InvalidSpec);
-
-    let mut intent = authorized();
-    // This is divisible by the two obvious broken unit factors (`1024 + 1024`
-    // and `1024 / 1024`) but not by one MiB. It therefore proves that this
-    // check uses the exact backend unit rather than merely rejecting a small
-    // value later as zero MiB.
-    intent.intent.requested_limits.memory_bytes = 1024 * 1024 + 2048;
-    let error = resolver()
-        .resolve(&intent)
-        .expect_err("fractional MiB units must not be widened");
-    assert_eq!(error.code, ErrorCode::InvalidSpec);
+    intent.intent.requested_limits.memory.limit = 1 << 30;
+    intent.limits.memory.limit = 512 << 20;
+    let request = resolver().resolve(&intent).expect("resolve");
+    assert_eq!(request.limits.memory.limit, 512 << 20);
 }
 
 fn resolver() -> CatalogResolver {
@@ -88,9 +98,12 @@ fn catalog_resolver_binds_artifact_and_workspace_to_guest_request() {
     assert_eq!(request.executable, "bin/agent");
     assert_eq!(request.arguments, vec!["--audit"]);
     assert_eq!(request.public_environment["MODE"], "audit");
-    assert_eq!(request.limits.vcpus, 2);
-    assert_eq!(request.limits.memory_mib, 2);
-    assert_eq!(request.limits.wall_time_ms, 2_000);
+    // The grant's ceilings, not the spec's request.
+    assert_eq!(request.limits, authorized().limits);
+    assert_ne!(request.limits, authorized().intent.requested_limits);
+    // Carried, never chosen: the grant's workspace authority, operations
+    // and generation included, reaches the backend unchanged.
+    assert_eq!(request.workspaces, authorized().workspaces);
 }
 
 #[test]
@@ -113,17 +126,6 @@ fn catalog_resolver_rejects_workspace_identity_drift() {
         .resolve(&intent)
         .expect_err("workspace identity drift must fail closed");
     assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch);
-}
-
-#[test]
-fn catalog_resolver_rejects_unenforced_output_limit() {
-    let mut intent = authorized();
-    intent.intent.requested_limits.output_bytes = 1;
-
-    let error = resolver()
-        .resolve(&intent)
-        .expect_err("unenforced output limit must fail closed");
-    assert_eq!(error.code, ErrorCode::UnsupportedBackend);
 }
 
 #[test]
@@ -198,19 +200,28 @@ fn catalog_builder_rejects_each_unsafe_guest_path_shape() {
 }
 
 #[test]
-fn catalog_resolver_rejects_each_zero_backend_limit() {
-    for mutate in [
-        |limits: &mut SchemaLimits| limits.cpu_millis = 0,
-        |limits: &mut SchemaLimits| limits.memory_bytes = 0,
-        |limits: &mut SchemaLimits| limits.wall_time_ms = 0,
-    ] {
-        let mut intent = authorized();
-        mutate(&mut intent.intent.requested_limits);
-        let error = resolver()
-            .resolve(&intent)
-            .expect_err("every backend limit must be non-zero");
-        assert_eq!(error.code, ErrorCode::InvalidSpec);
-    }
+fn catalog_resolver_refuses_a_run_without_a_wall_clock() {
+    let mut intent = authorized();
+    intent.limits.wall_time_ms = 0;
+    let error = resolver()
+        .resolve(&intent)
+        .expect_err("the supervisor needs a deadline");
+    assert_eq!(error.code, ErrorCode::InvalidSpec);
+}
+
+#[test]
+fn catalog_resolver_accepts_a_run_with_no_memory_or_cpu_ceiling() {
+    // Zero means "no ceiling" now, so a grant that sets none resolves; it is
+    // the selected tier that decides whether it needs one (the microVM sizes
+    // its guest from both), not the resolver.
+    let mut intent = authorized();
+    intent.limits.memory = MemoryLimits::default();
+    intent.limits.cpu = CpuLimits::default();
+    let request = resolver()
+        .resolve(&intent)
+        .expect("no ceiling is a valid grant");
+    assert_eq!(request.limits.memory.limit, 0);
+    assert_eq!(request.limits.cpu.quota, 0);
 }
 
 #[test]

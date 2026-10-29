@@ -6,7 +6,7 @@
 //! - **Parallel**: tree-sitter parsing runs on all cores via rayon.
 //! - **Batched**: all inserts happen in a single SQLite transaction.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -166,6 +166,65 @@ pub(crate) struct ParsedFile {
     /// own content-addressed subtree. Merged into `hash_by_id` in the
     /// insert loop, next to the `_ast`-derived entries.
     injected_hashes: Vec<(String, [u8; 32])>,
+    /// ADR-0045 T3: the first `ERROR` or `MISSING` node tree-sitter
+    /// produced, when the file did not parse cleanly. The file is projected
+    /// either way; this becomes its `_parse_diagnostics` row.
+    syntax_error: Option<SyntaxError>,
+}
+
+/// Where a projected file first fails to parse cleanly (ADR-0045 T3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyntaxError {
+    pub start_byte: i64,
+    pub end_byte: i64,
+    pub start_row: i64,
+    pub start_col: i64,
+    pub message: String,
+}
+
+/// The first `ERROR` or `MISSING` node under `root` in pre-order, or `None`
+/// when the tree has no error.
+fn first_syntax_error(root: tree_sitter::Node<'_>) -> Option<SyntaxError> {
+    if !root.has_error() {
+        return None;
+    }
+    let mut cursor = root.walk();
+    let mut found = root;
+    'walk: loop {
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            found = node;
+            break 'walk;
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    let at = found.start_position();
+    let what = if found.is_missing() {
+        format!("missing {}", found.kind())
+    } else {
+        "unexpected input".to_string()
+    };
+    Some(SyntaxError {
+        start_byte: found.start_byte() as i64,
+        end_byte: found.end_byte() as i64,
+        start_row: at.row as i64,
+        start_col: at.column as i64,
+        message: format!(
+            "syntax error: {what} at line {}, column {}",
+            at.row + 1,
+            at.column + 1
+        ),
+    })
 }
 
 /// Per-parse extraction context threaded through the fold (bead
@@ -777,21 +836,87 @@ pub struct ParseResult {
     pub tree_root: leyline_core::Hash,
 }
 
+/// A pass whose transaction committed. The steps after `COMMIT` (moving
+/// the sidecars into place, the index builds, the head write) change no
+/// committed row, so their failure is reported beside the result, not in
+/// place of it: the rows landed either way (bead `ley-line-open-5db28e`).
+#[derive(Debug)]
+pub(crate) struct Committed {
+    pub result: ParseResult,
+    /// What failed after `COMMIT`, if anything. The arena holds the
+    /// committed rows; its head or sidecars may still describe the
+    /// previous pass until a later pass succeeds.
+    pub post_commit: Option<anyhow::Error>,
+}
+
+impl Committed {
+    /// The result, or the post-commit failure as the pass's error: what a
+    /// whole-tree parse reports, since its head is the run's receipt (bead
+    /// `ley-line-open-0c8ee7`).
+    fn into_result(self) -> Result<ParseResult> {
+        match self.post_commit {
+            None => Ok(self.result),
+            Some(e) => Err(e),
+        }
+    }
+}
+
 /// Bytes a pass reads from memory instead of from disk.
 enum InMemory<'a> {
-    /// ADR-0040 D3: the files one proposal writes, keyed by `_source.id`;
-    /// the rest of the tree is untouched. Built only by
-    /// [`crate::source_write::propose`].
-    Written(&'a BTreeMap<String, Vec<u8>>),
-    /// ADR-0040 D6: the whole tree, keyed by `_source.id`, read from
-    /// `source_blobs` by `leyline rebuild`. No file is read from disk.
-    Tree(&'a BTreeMap<String, Vec<u8>>),
+    /// ADR-0040 D3: the files one proposal writes, keyed by `_source.id`,
+    /// and the files it removes (bead `ley-line-open-47fb03`): a removed
+    /// file is out of the tree whether or not the directory holds it. The
+    /// rest of the tree is untouched. Built by
+    /// [`crate::source_write::propose`] and by a checkout's reconcile.
+    Written {
+        files: &'a BTreeMap<String, Vec<u8>>,
+        removed: &'a BTreeSet<String>,
+        edits: &'a TreeEdits,
+    },
+    /// ADR-0040 D6: the whole tree, keyed by `_tree` path, read from
+    /// `source_blobs` by `leyline rebuild`, with its modes and directories
+    /// in `edits`. No file is read from disk.
+    Tree {
+        files: &'a BTreeMap<String, Vec<u8>>,
+        edits: &'a TreeEdits,
+    },
+}
+
+/// The `_meta` key a whole-directory pass records its `--language` filter
+/// under; a proposal's pass projects under it (ADR-0045 T3).
+pub(crate) const PROJECTION_LANGUAGE_KEY: &str = "projection_language";
+
+/// `_meta` key of the unbound-reference count the head records, kept with
+/// the rows it counts (bead `ley-line-open-8c8ded`).
+pub const UNBOUND_FACTS_KEY: &str = "unbound_facts";
+
+/// What a pass read from memory changes in the manifest beyond file bytes
+/// (ADR-0045 T1): a written file's mode (absent: the entry's current mode,
+/// or regular for a new file), and directories made and removed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TreeEdits {
+    pub modes: BTreeMap<String, crate::tree::Mode>,
+    pub mkdirs: BTreeSet<String>,
+    pub rmdirs: BTreeSet<String>,
 }
 
 impl InMemory<'_> {
     fn bytes(&self, rel: &str) -> Option<&Vec<u8>> {
         match self {
-            InMemory::Written(files) | InMemory::Tree(files) => files.get(rel),
+            InMemory::Written { files, .. } | InMemory::Tree { files, .. } => files.get(rel),
+        }
+    }
+
+    fn removes(&self, rel: &str) -> bool {
+        match self {
+            InMemory::Written { removed, .. } => removed.contains(rel),
+            InMemory::Tree { .. } => false,
+        }
+    }
+
+    fn edits(&self) -> &TreeEdits {
+        match self {
+            InMemory::Written { edits, .. } | InMemory::Tree { edits, .. } => edits,
         }
     }
 }
@@ -959,39 +1084,106 @@ pub fn parse_into_conn(
     lang_filter: Option<&str>,
     scope: Option<&[String]>,
 ) -> Result<ParseResult> {
-    parse_into_conn_with(conn, source, lang_filter, scope, None)
+    parse_into_conn_with(conn, source, lang_filter, scope, None)?.into_result()
 }
 
 /// Project written files through the cold parse (ADR-0040 D3), in one pass
-/// and one transaction. The pass is scoped to `written`'s paths and reads
-/// their bytes from it, never from disk; any written file that fails to
-/// parse rolls the whole pass back.
+/// and one transaction, and remove the `removed` files' rows in the same
+/// transaction (bead `ley-line-open-47fb03`). The pass is scoped to those
+/// paths and reads the written bytes from `written`, never from disk; a
+/// removed file is removed whether or not the directory holds it, and
+/// `edits` sets modes and makes and removes directories (ADR-0045 T1). A
+/// written file that does not parse is stored with a diagnostic (T3). `Ok`
+/// means the transaction committed; a failure after `COMMIT` rides in
+/// [`Committed::post_commit`].
 pub(crate) fn parse_written_files(
     conn: &Connection,
     source: &Path,
     written: &BTreeMap<String, Vec<u8>>,
-) -> Result<ParseResult> {
-    let scope: Vec<String> = written.keys().cloned().collect();
+    removed: &BTreeSet<String>,
+    edits: &TreeEdits,
+) -> Result<Committed> {
+    let scope: Vec<String> = written.keys().chain(removed).cloned().collect();
     parse_into_conn_with(
         conn,
         source,
         None,
         Some(&scope),
-        Some(InMemory::Written(written)),
+        Some(InMemory::Written {
+            files: written,
+            removed,
+            edits,
+        }),
     )
 }
 
-/// Project a whole tree whose bytes are `files` (`_source.id` → bytes)
-/// through the cold parse, as if `source` held exactly those files
-/// (ADR-0040 D6). Nothing is read from disk and `source` need not exist; it
-/// only names the root the `_source.path` column is rendered under. Any
-/// file that fails to parse fails the pass.
+/// Parse a daemon's checkout from disk, except the files in `kept`, whose
+/// bytes come from `kept` whether or not the directory holds them, and the
+/// files in `removed`, which stay out of the store whether or not it does
+/// (beads `ley-line-open-60f39f`, `ley-line-open-47fb03`). `kept` carries
+/// the stored bytes of each checkout conflict and `removed` each path the
+/// store deleted that the directory still holds, so a pass over the
+/// directory overrides neither side.
+pub(crate) fn parse_checkout(
+    conn: &Connection,
+    source: &Path,
+    lang_filter: Option<&str>,
+    scope: Option<&[String]>,
+    kept: &BTreeMap<String, Vec<u8>>,
+    removed: &BTreeSet<String>,
+) -> Result<ParseResult> {
+    parse_into_conn_with(
+        conn,
+        source,
+        lang_filter,
+        scope,
+        Some(InMemory::Written {
+            files: kept,
+            removed,
+            edits: &TreeEdits::default(),
+        }),
+    )?
+    .into_result()
+}
+
+/// The language a file under the tree is parsed as: by extension, then by
+/// file name (Dockerfile and the like), and `None` when the pass would
+/// skip it, including when `lang_filter` names another language.
+pub(crate) fn file_language(path: &Path, lang_filter: Option<TsLanguage>) -> Option<TsLanguage> {
+    let lang = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(TsLanguage::from_extension)
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(TsLanguage::from_filename)
+        })?;
+    match lang_filter {
+        Some(filter) if lang != filter => None,
+        _ => Some(lang),
+    }
+}
+
+/// Project a whole tree whose file bytes are `files` (`_tree` path →
+/// bytes), with the modes and directories `edits` names, through the cold
+/// parse, as if `source` held exactly that tree (ADR-0040 D6, ADR-0045).
+/// Nothing is read from disk and `source` need not exist; it only names
+/// the root the `_source.path` column is rendered under.
 pub(crate) fn parse_tree_from_memory(
     conn: &Connection,
     source: &Path,
     files: &BTreeMap<String, Vec<u8>>,
+    edits: &TreeEdits,
 ) -> Result<ParseResult> {
-    parse_into_conn_with(conn, source, None, None, Some(InMemory::Tree(files)))
+    parse_into_conn_with(
+        conn,
+        source,
+        None,
+        None,
+        Some(InMemory::Tree { files, edits }),
+    )?
+    .into_result()
 }
 
 fn parse_into_conn_with(
@@ -1000,18 +1192,35 @@ fn parse_into_conn_with(
     lang_filter: Option<&str>,
     scope: Option<&[String]>,
     memory: Option<InMemory<'_>>,
-) -> Result<ParseResult> {
+) -> Result<Committed> {
     // The bytes of `rel`, when this pass reads it from memory.
     let written_bytes = |rel: &str| -> Option<&Vec<u8>> { memory.as_ref()?.bytes(rel) };
+    // Whether this pass takes `rel` out of the tree, whatever the disk holds.
+    let removed = |rel: &str| memory.as_ref().is_some_and(|m| m.removes(rel));
     let tree_in_memory = match &memory {
-        Some(InMemory::Tree(files)) => Some(*files),
+        Some(InMemory::Tree { files, .. }) => Some(*files),
         _ => None,
     };
+    // A whole-directory pass walks the tree once: its files are what the
+    // parse may project, and its files, symlinks and directories are what
+    // the store holds (ADR-0045 T3).
+    let mut walked: Option<crate::walk::Walked> = None;
     if tree_in_memory.is_none() && !source.is_dir() {
         bail!("{} is not a directory", source.display());
     }
 
-    let lang_filter = lang_filter
+    // A whole-directory pass records its `--language` filter; a proposal's
+    // pass, which names none, projects under the one recorded, so the
+    // projection is the same whichever path wrote a file (ADR-0045 T3).
+    let recorded_filter = match (&memory, lang_filter) {
+        (Some(InMemory::Written { .. }), None) => {
+            get_meta(conn, PROJECTION_LANGUAGE_KEY).ok().flatten()
+        }
+        _ => None,
+    };
+    let filter_name = lang_filter.map(str::to_string).or(recorded_filter);
+    let lang_filter = filter_name
+        .as_deref()
         .map(TsLanguage::from_name)
         .transpose()
         .context("invalid --lang")?;
@@ -1023,7 +1232,10 @@ fn parse_into_conn_with(
         let mut v: Vec<PathBuf> = Vec::with_capacity(scope.len());
         for rel in scope {
             let abs = source.join(rel);
-            if abs.exists() || written_bytes(rel).is_some() {
+            // A symlink on disk is stored by the tree sync, never parsed
+            // through to its target (ADR-0045 T3).
+            let regular_file = std::fs::symlink_metadata(&abs).is_ok_and(|m| m.is_file());
+            if !removed(rel) && (regular_file || written_bytes(rel).is_some()) {
                 v.push(abs);
             }
         }
@@ -1036,8 +1248,28 @@ fn parse_into_conn_with(
         // front (no cheap way without a pre-pass), so the inner Vec
         // resizes during traversal. Acceptable trade-off: registry-scale
         // walks dominated by stat/readdir cost, not Vec resizing.
-        let mut v = Vec::new();
-        collect_files(source, &mut v)?;
+        let walk = crate::walk::walk_tree(source)?;
+        let mut v = walk.files.clone();
+        walked = Some(walk);
+        // A file read from memory is in the tree whether or not the
+        // directory holds it (a checkout conflict whose directory side
+        // was deleted, `parse_checkout`).
+        // A removed file is out of the tree whether or not the directory
+        // holds it (a path the store deleted whose directory side could
+        // not be removed, or changed since).
+        if let Some(InMemory::Written { files, removed, .. }) = &memory {
+            v.retain(|abs| {
+                let rel = abs.strip_prefix(source).unwrap_or(abs);
+                !removed.contains(rel.to_string_lossy().as_ref())
+            });
+            let walked: HashSet<PathBuf> = v.iter().cloned().collect();
+            v.extend(
+                files
+                    .keys()
+                    .map(|rel| source.join(rel))
+                    .filter(|abs| !walked.contains(abs)),
+            );
+        }
         v
     };
 
@@ -1075,6 +1307,8 @@ fn parse_into_conn_with(
     // and so the FK check at COMMIT finds both tables present.
     create_query_blob_tables(conn)?;
     create_index_schema(conn)?;
+    // ADR-0045 T1, T3: the store's manifest and the parse's diagnostics.
+    crate::tree::ensure_tables(conn)?;
 
     let mtime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1182,27 +1416,18 @@ fn parse_into_conn_with(
     let mut to_parse: Vec<FileToParse> = Vec::with_capacity(files.len());
     let mut unchanged = 0u64;
     let mut oversized = 0u64;
+    // ADR-0045 T3: files the parse took up and could not project (oversized,
+    // binary), with why — stored with a diagnostic — and the files it
+    // projected, with their blob and their first syntax error if any.
+    let mut unprojected: BTreeMap<String, String> = BTreeMap::new();
+    let mut projected_now: HashMap<String, ([u8; 32], Option<SyntaxError>)> = HashMap::new();
+    // Symlinks written by this pass: stored, not projected, no diagnostic.
+    let mut unprojected_links: Vec<String> = Vec::new();
 
     for path in &files {
-        // Try extension first, then filename for extensionless files (Dockerfile, etc).
-        let lang = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(TsLanguage::from_extension)
-            .or_else(|| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(TsLanguage::from_filename)
-            });
-        let lang = match lang {
-            Some(l) => l,
-            None => continue,
-        };
-        if let Some(filter) = lang_filter
-            && lang != filter
-        {
+        let Some(lang) = file_language(path, lang_filter) else {
             continue;
-        }
+        };
 
         let rel = path.strip_prefix(source).unwrap_or(path);
         let rel_str = rel.to_string_lossy().to_string();
@@ -1210,6 +1435,29 @@ fn parse_into_conn_with(
         // A written file has no stat pair: its mtime is the write's, its size
         // the written bytes'.
         let written_here = written_bytes(&rel_str);
+        // A symlink is stored, never projected (ADR-0045 T3): bytes written
+        // with the symlink mode, or over a symlink without naming a mode,
+        // are its target. A file it replaces leaves the projection.
+        if written_here.is_some() {
+            let mode = match memory
+                .as_ref()
+                .and_then(|m| m.edits().modes.get(&rel_str).copied())
+            {
+                Some(mode) => Some(mode),
+                None => match crate::tree::exists(conn)
+                    .then(|| crate::tree::entry(conn, &rel_str))
+                    .transpose()?
+                    .flatten()
+                {
+                    Some(crate::tree::Entry::File { mode, .. }) => Some(mode),
+                    _ => None,
+                },
+            };
+            if mode == Some(crate::tree::Mode::Symlink) {
+                unprojected_links.push(rel_str);
+                continue;
+            }
+        }
         let (file_mtime, file_size) = match written_here {
             Some(bytes) => (mtime, bytes.len() as i64),
             None => {
@@ -1275,16 +1523,18 @@ fn parse_into_conn_with(
         // dump, vendored package-lock, minified bundle) would either OOM
         // the worker or take many minutes producing nodes that have no
         // semantic value anyway.
+        // The store holds it; the projection does not (ADR-0045 T3).
         if file_size > MAX_PARSE_FILE_SIZE {
-            if written_here.is_some() {
-                bail!(
-                    "written file {rel_str}: size {file_size} bytes exceeds \
-                     MAX_PARSE_FILE_SIZE ({MAX_PARSE_FILE_SIZE} bytes)"
-                );
-            }
             log::warn!(
                 "skip {rel_str}: size {file_size} bytes exceeds MAX_PARSE_FILE_SIZE \
                  ({MAX_PARSE_FILE_SIZE} bytes)",
+            );
+            unprojected.insert(
+                rel_str,
+                format!(
+                    "not projected: {file_size} bytes exceeds MAX_PARSE_FILE_SIZE \
+                     ({MAX_PARSE_FILE_SIZE} bytes)"
+                ),
             );
             oversized += 1;
             continue;
@@ -1379,6 +1629,14 @@ fn parse_into_conn_with(
             delete_file_rows(conn, rel)?;
         }
     }
+    // A file that grew past the parse's size limit, or became a symlink,
+    // leaves the projection.
+    for rel in unprojected.keys().chain(&unprojected_links) {
+        if old_index.contains_key(rel) {
+            delete_file_rows(conn, rel)?;
+            deleted += 1;
+        }
+    }
 
     // ---- Parallel parse (CPU-bound tree-sitter on all cores) ----
 
@@ -1435,11 +1693,10 @@ fn parse_into_conn_with(
 
                 // Skip binary files (null byte in first 8KB — same heuristic as git).
                 let check_len = content.len().min(8192);
+                // The message names the relative path: it becomes the
+                // file's diagnostic, a function of the tree (ADR-0045 T3).
                 if content[..check_len].contains(&0) {
-                    bail!(
-                        "binary file (null byte in first 8KB): {}",
-                        abs_path.display()
-                    );
+                    bail!("binary file (null byte in first 8KB): {rel}");
                 }
 
                 // Canonicalize so `_source.path` matches the LSP-derived
@@ -1503,11 +1760,13 @@ fn parse_into_conn_with(
     conn.pragma_update(None, "defer_foreign_keys", "ON")?;
 
     // capnp dual-write (bead `ley-line-open-cdf098`) — open snapshot
-    // files alongside the SQL writes. Truncate-and-rewrite semantics:
-    // each parse run produces a fresh snapshot of `_ast` and `_source`.
+    // files alongside the SQL writes. Each parse run produces a fresh
+    // snapshot of `_ast` and `_source`, written beside the previous one and
+    // renamed over it only after `COMMIT`, so a pass that rolls back leaves
+    // the previous snapshot in place (bead `ley-line-open-5db28e`).
     // `:memory:` connections skip (no path to write next to). The
     // segment-hashing → Σ root advance is bead `ley-line-open-ce55b1`.
-    let (mut ast_writer, mut source_writer) = sibling_snapshot_writers(conn);
+    let (mut ast_writer, mut source_writer, sidecars) = sibling_snapshot_writers(conn);
 
     // Per-table row buffers. Owned strings/values so we can hand
     // ToSql references to params_from_iter without lifetime gymnastics
@@ -1590,9 +1849,11 @@ fn parse_into_conn_with(
 
         let chunk_buffer_start = std::time::Instant::now();
 
-        for result in parsed_files {
+        for (result, (chunk_rel, ..)) in parsed_files.into_iter().zip(chunk) {
             match result {
                 Ok(pf) => {
+                    projected_now
+                        .insert(pf.rel.clone(), (pf.content_hash, pf.syntax_error.clone()));
                     // ── projection-v5 minting (bead `ley-line-open-17c271`) ──
                     //
                     // The file's identity: `ensure_file_id` interns the rel
@@ -1941,12 +2202,12 @@ fn parse_into_conn_with(
                     changed_files.push(pf.rel);
                     parsed += 1;
                 }
-                // A file read from memory that does not parse is the write
-                // or the rebuild failing, not a file left out of the tree:
-                // the rollback guard restores the arena.
-                Err(e) if memory.is_some() => return Err(e),
+                // A file the parse cannot project is still stored, with a
+                // diagnostic, whether it came from disk or from a proposal
+                // (ADR-0045 T3).
                 Err(e) => {
                     eprintln!("warn: {e:#}");
+                    unprojected.insert(chunk_rel.clone(), format!("not projected: {e:#}"));
                     errors += 1;
                 }
             }
@@ -2047,14 +2308,33 @@ fn parse_into_conn_with(
     // `create_post_load_indexes` runs — so no second connection contends for
     // the db lock. Whole-db
     // count, so it stays correct if a later run reparses only part of the tree.
-    let unbound_facts: u64 = conn
-        .query_row(
-            "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n as u64)
-        .unwrap_or(0);
+    //
+    // The count scans every reference: O(store). It is a function of
+    // node_refs and node_defs alone, and a pass changes those only when it
+    // parses or deletes a file; any other pass (a proposal of a file the
+    // parse does not project) reuses the count recorded with the rows, in
+    // this transaction's `_meta` (bead `ley-line-open-8c8ded`).
+    let facts_changed = !to_parse.is_empty() || deleted > 0;
+    let recorded = if facts_changed {
+        None
+    } else {
+        get_meta(conn, UNBOUND_FACTS_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let unbound_facts: u64 = match recorded {
+        Some(n) => n,
+        None => conn
+            .query_row(
+                "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .unwrap_or(0),
+    };
+    set_meta(conn, UNBOUND_FACTS_KEY, &unbound_facts.to_string())?;
 
     // Pre-grab the db_path so we can dispatch the head-write hash pass
     // (pure filesystem work, reads ast.capnp + source.capnp) on a worker
@@ -2079,6 +2359,24 @@ fn parse_into_conn_with(
     // `_source` inside the transaction — the whole corpus, not this run's
     // delta — on the main thread where the connection is. The head writer
     // stays pure filesystem work and just stamps them, after COMMIT.
+    // ADR-0045 T1, T3: the manifest follows what this pass saw — every file
+    // (projected or not), symlink and directory — and the diagnostics
+    // follow what the parse made of the files it took up.
+    let reach = match (&walked, scope) {
+        (Some(w), _) => tree_sync::Reach::Walked(w),
+        (None, Some(paths)) => tree_sync::Reach::Paths(paths),
+        (None, None) => tree_sync::Reach::Tree,
+    };
+    tree_sync::sync(
+        conn,
+        source,
+        reach,
+        memory.as_ref(),
+        &tree_sync::Outcomes {
+            projected: &projected_now,
+            unprojected: &unprojected,
+        },
+    )?;
     let parser_id = crate::tree_root::ParserInputs::current(&query_set).parser_id();
     let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
 
@@ -2119,6 +2417,17 @@ fn parse_into_conn_with(
         .unwrap_or_default()
         .as_secs();
     set_meta(conn, "parse_time", &now.to_string())?;
+    if scope.is_none() && tree_in_memory.is_none() {
+        match &filter_name {
+            Some(name) => set_meta(conn, PROJECTION_LANGUAGE_KEY, name)?,
+            None => {
+                conn.execute(
+                    "DELETE FROM _meta WHERE key = ?1",
+                    [PROJECTION_LANGUAGE_KEY],
+                )?;
+            }
+        }
+    }
     // Merkle-AST IR generation lineage (ADR-0027): the head.capnp root shape
     // changed (span left symbol identity), so this is a new schema
     // generation. Bump the meta marker so consumers can tell the merkle-AST
@@ -2176,7 +2485,25 @@ fn parse_into_conn_with(
     tx_guard.armed = false;
     let sub_commit_end = std::time::Instant::now();
 
-    let head_handle = db_path_for_head.map(|p| {
+    // From here the rows are committed. Every later step changes no query
+    // result; a failure is collected and reported beside the result rather
+    // than in place of it, and the remaining steps still run (bead
+    // `ley-line-open-5db28e`).
+    let mut post_commit: Vec<anyhow::Error> = Vec::new();
+
+    // The new sidecars replace the previous ones. The head hashes them, so
+    // when they could not be moved into place the head is not advanced over
+    // the previous sidecars.
+    let sidecars_in_place = match sidecars.commit() {
+        Ok(()) => true,
+        Err(e) => {
+            post_commit.push(e.context(
+                "the capnp sidecars of a committed parse were not replaced; the head was not advanced",
+            ));
+            false
+        }
+    };
+    let head_handle = db_path_for_head.filter(|_| sidecars_in_place).map(|p| {
         std::thread::spawn(move || -> Result<()> {
             write_head_for_path(&p, unbound_facts, tree_root, parser_id)
         })
@@ -2199,14 +2526,18 @@ fn parse_into_conn_with(
     // resulting index is empty; the mache flow paths build their own
     // schema with the indexes mache needs, so skipping here is safe.
     // See bead `ley-line-open-cbbedf` Attack 3.
-    create_post_load_indexes_skip_unused(conn)?;
+    if let Err(e) = create_post_load_indexes_skip_unused(conn) {
+        post_commit.push(e.context("building the post-load indexes after a committed parse"));
+    }
     // Unified code-fact IR (ADR-0027): the `symbols`/`fact_edges` traversal
     // indexes (idx_symbols_node/kind, idx_edges_src/dst) are deferred to here
     // — same rationale as the other post-load indexes: one sorted scan per
     // index is cheaper than incremental B-tree maintenance during the insert.
     // The UNIQUE symbol_id index the FK targets was built earlier (pre-insert)
     // by create_ir_tables and is not rebuilt here.
-    create_ir_indexes(conn)?;
+    if let Err(e) = create_ir_indexes(conn) {
+        post_commit.push(e.context("building the IR indexes after a committed parse"));
+    }
     let sub_index_end = std::time::Instant::now();
 
     let insert_elapsed = insert_start.elapsed();
@@ -2238,27 +2569,26 @@ fn parse_into_conn_with(
     // with post-COMMIT index creation. `:memory:` connections skipped (no
     // head_handle in that case).
     //
-    // A head-write failure fails the parse (bead `ley-line-open-0c8ee7`).
-    // It used to log and return Ok: the rows are committed, so the parse
+    // A head-write failure is reported (bead `ley-line-open-0c8ee7`). It
+    // used to log and return Ok: the rows are committed, so the parse
     // "worked". But the head is what names what was committed — the run
     // receipt, and since ADR-0040 D1 the tree identity — and a parse whose
     // head could not be advanced (a corrupt existing head the chain refuses
     // to re-root over, an unwritable sidecar, a signing-key error) must say
     // so, not advertise a head that still describes the previous tree. The
-    // rows stay committed either way; the error tells the caller the arena
-    // and its head disagree until the cause is fixed.
+    // rows stay committed either way: the failure rides beside the result
+    // in `Committed::post_commit`, and a whole-tree parse turns it into its
+    // error (bead `ley-line-open-5db28e`).
     let head_write_start = std::time::Instant::now();
     if let Some(h) = head_handle {
         match h.join() {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err(e.context(
-                    "Σ head write after a committed parse failed; the rows are committed but the head was not advanced",
-                ));
-            }
-            Err(_) => anyhow::bail!(
+            Ok(Err(e)) => post_commit.push(e.context(
+                "Σ head write after a committed parse failed; the rows are committed but the head was not advanced",
+            )),
+            Err(_) => post_commit.push(anyhow::anyhow!(
                 "Σ head-write thread panicked after a committed parse; the rows are committed but the head was not advanced"
-            ),
+            )),
         }
     }
     let head_write_elapsed = head_write_start.elapsed();
@@ -2296,14 +2626,24 @@ fn parse_into_conn_with(
     // weren't parsed, so the caller's "did this run produce data for
     // every file" check stays honest. The dedicated summary field makes
     // it easy for clients to distinguish skip-by-size from parse failure.
-    Ok(ParseResult {
-        parsed,
-        unchanged,
-        deleted,
-        errors: errors + oversized,
-        changed_files,
-        tree_root,
+    Ok(Committed {
+        result: ParseResult {
+            parsed,
+            unchanged,
+            deleted,
+            errors: errors + oversized,
+            changed_files,
+            tree_root,
+        },
+        post_commit: combine_post_commit(post_commit),
     })
+}
+
+/// One error for the steps that failed after `COMMIT`, naming each with
+/// its full chain of context.
+fn combine_post_commit(failures: Vec<anyhow::Error>) -> Option<anyhow::Error> {
+    let all: Vec<String> = failures.iter().map(|e| format!("{e:#}")).collect();
+    (!all.is_empty()).then(|| anyhow::anyhow!("{}", all.join("; ")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,15 +3072,11 @@ fn write_head_for_path(
             h.set_signer_kid(kid.as_bytes());
         }
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&head_path)
-        .with_context(|| format!("open head {}", head_path.display()))?;
-    leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(&src, &mut f)
-        .context("write Head capnp record")?;
-    Ok(())
+    let mut bytes = Vec::new();
+    leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(&src, &mut bytes)
+        .context("encode Head capnp record")?;
+    replace_file_atomically(&head_path, &bytes)
+        .with_context(|| format!("write head {}", head_path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2762,7 +3098,12 @@ fn write_head_for_path(
 /// system-call rate drops by ~30×. See bead `ley-line-open-9ccbc7`.
 type CapnpWriter = BufWriter<std::fs::File>;
 
-fn sibling_snapshot_writers(conn: &Connection) -> (Option<CapnpWriter>, Option<CapnpWriter>) {
+fn sibling_snapshot_writers(
+    conn: &Connection,
+) -> (Option<CapnpWriter>, Option<CapnpWriter>, PendingSidecars) {
+    let mut pending = PendingSidecars {
+        renames: Vec::new(),
+    };
     let row: rusqlite::Result<String> = conn.query_row(
         "SELECT file FROM pragma_database_list WHERE name = 'main' LIMIT 1",
         [],
@@ -2770,23 +3111,98 @@ fn sibling_snapshot_writers(conn: &Connection) -> (Option<CapnpWriter>, Option<C
     );
     let db_path = match row {
         Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
-        _ => return (None, None),
+        _ => return (None, None, pending),
     };
 
-    let ast_path = with_extension(&db_path, "ast.capnp");
-    let source_path = with_extension(&db_path, "source.capnp");
-
-    let open = |p: &Path| -> Option<CapnpWriter> {
-        std::fs::OpenOptions::new()
+    let mut open = |ext: &str| -> Option<CapnpWriter> {
+        let path = with_extension(&db_path, ext);
+        let temp = temp_path_for(&path);
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(p)
-            .ok()
-            .map(BufWriter::new)
+            .open(&temp)
+            .ok()?;
+        pending.renames.push((temp, path));
+        Some(BufWriter::new(file))
     };
 
-    (open(&ast_path), open(&source_path))
+    let ast = open("ast.capnp");
+    let source = open("source.capnp");
+    (ast, source, pending)
+}
+
+/// The sidecars a pass is writing, each in a temp file beside the one it
+/// replaces. [`PendingSidecars::commit`] renames them into place after the
+/// pass's `COMMIT`; dropped uncommitted (the pass failed and rolled back),
+/// it removes them, so the previous sidecars stay as they were (bead
+/// `ley-line-open-5db28e`).
+struct PendingSidecars {
+    /// `(temp, final)` pairs.
+    renames: Vec<(PathBuf, PathBuf)>,
+}
+
+impl PendingSidecars {
+    fn commit(mut self) -> Result<()> {
+        for (temp, path) in std::mem::take(&mut self.renames) {
+            if let Err(e) = std::fs::rename(&temp, &path) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e).with_context(|| format!("move sidecar into {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingSidecars {
+    fn drop(&mut self) {
+        for (temp, _) in &self.renames {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
+/// The temp file a replacement of `path` is written to before it is
+/// renamed over `path`: `foo.head.capnp` → `foo.head.capnp.tmp`.
+fn temp_path_for(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// Replace `path` with `bytes` atomically: the bytes go to a temp file
+/// beside it, are ordered to the disk before the temp file is renamed over
+/// `path`, and the rename is ordered after them (`crate::durable`). A
+/// reader sees the previous file or the new one, never a partial one, a
+/// power loss included; a write that fails leaves the previous file as it
+/// was (bead `ley-line-open-5db28e`). The rename becomes durable at the
+/// next `F_FULLFSYNC` (bead `ley-line-open-98d0c3`).
+fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let temp = temp_path_for(path);
+    let written = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp)
+            .with_context(|| format!("open {}", temp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("write {}", temp.display()))?;
+        crate::durable::order(&f, &temp).with_context(|| format!("sync {}", temp.display()))?;
+        crate::durable::rename(&temp, path)
+            .with_context(|| format!("rename {} over {}", temp.display(), path.display()))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return written;
+    }
+    let path = std::path::absolute(path).with_context(|| format!("resolve {}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        crate::durable::order_dir(dir)
+            .with_context(|| format!("sync directory {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// `set_extension` replaces only the *last* dotted component, so
@@ -3094,6 +3510,7 @@ pub(crate) fn parse_file_pure(
     let content_hash: [u8; 32] = *content.hash().as_bytes();
 
     let root = tree.root_node();
+    let syntax_error = first_syntax_error(root);
     let lang_name = language.name();
 
     let mut nodes = Vec::new();
@@ -3250,6 +3667,7 @@ pub(crate) fn parse_file_pure(
         pointer_blob_hash,
         source_blob_bytes,
         injected_hashes,
+        syntax_error,
     })
 }
 
@@ -3945,10 +4363,18 @@ pub(crate) fn is_bloat_dir(name: &str) -> bool {
 /// `ignore` crate — see `crate::walk`) AND directories matched by
 /// `is_bloat_dir`. See `tests::collect_files_skips_known_bloat_dirs`
 /// for the skip-list pin and `tests::collect_files_respects_gitignore`
-/// for the gitignore pin.
+/// for the gitignore pin. The pass itself walks with
+/// [`crate::walk::walk_tree`], which applies the same excludes.
+#[cfg(test)]
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     crate::walk::walk_into(dir, out)
 }
+
+mod tree_sync;
+pub(crate) use tree_sync::{disk_mode, link_bytes};
+
+#[cfg(test)]
+mod tree_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4886,7 +5312,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v6",
+            "projection-v7",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -4899,7 +5325,7 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v6"),
+            Some("projection-v7"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
@@ -4918,7 +5344,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v6"),
+            msg.contains("projection-v4") && msg.contains("projection-v7"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(
@@ -5481,15 +5907,25 @@ mod tests {
         assert_eq!(parser_7, parser_1, "the derivation did not change");
 
         // The verifier agrees with the head it just wrote, and disagrees once
-        // the source set changes under it.
+        // the manifest changes under it (ADR-0045 T2: `treeRoot` names
+        // `_tree`), whether a blob or only a mode moves.
         assert!(matches!(
             crate::tree_root::verify(&db_a).unwrap(),
             crate::tree_root::Verification::Valid { .. }
         ));
         {
             let conn = Connection::open(&db_a).unwrap();
+            conn.execute("UPDATE _tree SET mode = 33261 WHERE path = 'a.go'", [])
+                .unwrap();
+        }
+        assert!(matches!(
+            crate::tree_root::verify(&db_a).unwrap(),
+            crate::tree_root::Verification::TreeRootMismatch { .. }
+        ));
+        {
+            let conn = Connection::open(&db_a).unwrap();
             conn.execute(
-                "UPDATE _source SET content_hash = zeroblob(32) WHERE id = 'a.go'",
+                "UPDATE _tree SET mode = 33188, blob_hash = zeroblob(32) WHERE path = 'a.go'",
                 [],
             )
             .unwrap();
@@ -5810,6 +6246,198 @@ mod tests {
         assert!(
             !td.path().join(".ast.capnp").exists() && !td.path().join(".source.capnp").exists(),
             "T8.3: :memory: parse must not produce capnp snapshots",
+        );
+    }
+
+    /// Bead `ley-line-open-5db28e`: the head is replaced, never rewritten in
+    /// place. A reader holding the previous head reads it whole after the
+    /// next head lands, so a crash mid-write cannot leave a head that
+    /// `read_head_for_chain` refuses. Rewritten in place, the held handle
+    /// reads the new (or a truncated) head through the same inode.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn a_head_write_replaces_the_file_and_never_rewrites_it_in_place() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("atomic.db");
+        std::fs::write(&db, b"").unwrap();
+        write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO).unwrap();
+        let head = head_path_for(&db);
+        let before = std::fs::read(&head).unwrap();
+        let mut held = std::fs::File::open(&head).unwrap();
+
+        write_head_for_path(
+            &db,
+            7,
+            leyline_core::Hash::from_bytes([1u8; 32]),
+            leyline_core::Hash::ZERO,
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        held.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, before, "the previous head's bytes are untouched");
+        let after = std::fs::read(&head).unwrap();
+        assert_ne!(after, before, "the new head is in place");
+        assert_eq!(
+            read_head_for_chain(&head).unwrap().1,
+            3,
+            "the chain is at generation 2"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file is left: {leftovers:?}");
+    }
+
+    /// Bead `ley-line-open-5db28e`: a head write that fails leaves the
+    /// previous head readable, so the next write chains onto it. The
+    /// failure is a directory the writer cannot create its new file in.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn a_failed_head_write_leaves_the_previous_head_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let heads = dir.path().join("heads");
+        std::fs::create_dir(&heads).unwrap();
+        let db = heads.join("failed.db");
+        std::fs::write(&db, b"").unwrap();
+        write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO).unwrap();
+        let head = head_path_for(&db);
+        let before = std::fs::read(&head).unwrap();
+
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let wrote = write_head_for_path(
+            &db,
+            7,
+            leyline_core::Hash::from_bytes([1u8; 32]),
+            leyline_core::Hash::ZERO,
+        );
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(wrote.is_err(), "the write cannot land: {wrote:?}");
+        assert_eq!(std::fs::read(&head).unwrap(), before);
+        assert_eq!(read_head_for_chain(&head).unwrap().1, 2);
+    }
+
+    // --- bead ley-line-open-8c8ded: the unbound count is carried, not rescanned
+
+    /// A Go tree with one call (`println`) that nothing defines.
+    fn unbound_fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc main() {\n\tprintln(add(1, 2))\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("util.go"),
+            "package main\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The head's `unboundFacts` for the file-backed db at `db_path`.
+    fn head_unbound_facts(db_path: &Path) -> u64 {
+        use leyline_schema_capnp::head_capnp::head;
+        let bytes = std::fs::read(head_path_for(db_path)).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let msg = capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+            .unwrap();
+        let h: head::Reader = msg.get_root().unwrap();
+        h.get_unbound_facts()
+    }
+
+    fn recount_unbound(conn: &Connection) -> u64 {
+        conn.query_row(
+            "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as u64
+    }
+
+    /// A pass that changes no reference or definition reuses the recorded
+    /// count instead of scanning every reference, and the head stays exact
+    /// across passes that do change them.
+    #[test]
+    fn unbound_facts_stay_exact_across_passes_that_do_and_do_not_change_facts() {
+        let src = unbound_fixture();
+        let out = TempDir::new().unwrap();
+        let db_path = out.path().join("test.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let parse = |scope: &[&str]| {
+            let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+            parse_into_conn(&conn, src.path(), Some("go"), Some(&scope)).unwrap();
+        };
+        parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+        assert_eq!(head_unbound_facts(&db_path), 1, "println has no def");
+
+        // A file the parse does not project: no fact changes.
+        std::fs::write(src.path().join("notes.txt"), "notes\n").unwrap();
+        parse(&["notes.txt"]);
+        assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+        assert_eq!(head_unbound_facts(&db_path), 1);
+
+        // A call to a function nothing defines: one more unbound reference.
+        std::fs::write(
+            src.path().join("extra.go"),
+            "package main\n\nfunc extra() { missing() }\n",
+        )
+        .unwrap();
+        parse(&["extra.go"]);
+        assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+        assert_eq!(head_unbound_facts(&db_path), 2);
+
+        // Defining it elsewhere binds the reference.
+        std::fs::write(
+            src.path().join("defs.go"),
+            "package main\n\nfunc missing() {}\n",
+        )
+        .unwrap();
+        parse(&["defs.go"]);
+        assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+        assert_eq!(head_unbound_facts(&db_path), 1);
+
+        // Deleting the definition unbinds it again.
+        std::fs::remove_file(src.path().join("defs.go")).unwrap();
+        parse(&["defs.go"]);
+        assert_eq!(head_unbound_facts(&db_path), recount_unbound(&conn));
+        assert_eq!(head_unbound_facts(&db_path), 2);
+    }
+
+    /// The carried count is the one recorded with the rows, not a recount:
+    /// with the record set to a marker, a pass that changes no fact reports
+    /// the marker, and the marker is written back for the next pass.
+    #[test]
+    fn a_pass_that_changes_no_facts_carries_the_recorded_unbound_count() {
+        let src = unbound_fixture();
+        let out = TempDir::new().unwrap();
+        let db_path = out.path().join("test.db");
+        let conn = Connection::open(&db_path).unwrap();
+        parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
+        assert_eq!(
+            get_meta(&conn, UNBOUND_FACTS_KEY).unwrap().as_deref(),
+            Some("1"),
+            "a full pass records the count it scanned"
+        );
+        set_meta(&conn, UNBOUND_FACTS_KEY, "999").unwrap();
+        std::fs::write(src.path().join("notes.txt"), "notes\n").unwrap();
+        parse_into_conn(
+            &conn,
+            src.path(),
+            Some("go"),
+            Some(&["notes.txt".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(head_unbound_facts(&db_path), 999);
+        assert_eq!(
+            get_meta(&conn, UNBOUND_FACTS_KEY).unwrap().as_deref(),
+            Some("999")
         );
     }
 }

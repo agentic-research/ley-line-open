@@ -22,6 +22,7 @@ impl Backend for CompletingBackend {
             backend_id: "transport-test/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -29,6 +30,7 @@ impl Backend for CompletingBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "transport-test/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -72,10 +74,15 @@ impl ExecutionResolver for Resolver {
             // one implementation.
             confinement_digest: authorized.confinement_digest.clone(),
             confinement_manifest: authorized.confinement_manifest.clone(),
+            workspaces: authorized.workspaces.clone(),
             limits: ResourceLimits {
-                vcpus: 1,
-                memory_mib: 64,
                 wall_time_ms: 1_000,
+                memory: leyline_runtime::MemoryLimits { limit: 64 << 20 },
+                cpu: leyline_runtime::CpuLimits {
+                    quota: 100_000,
+                    period: 100_000,
+                },
+                ..ResourceLimits::default()
             },
         })
     }

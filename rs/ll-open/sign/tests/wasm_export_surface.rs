@@ -59,6 +59,7 @@ fn wasm_export_surface_is_exact() {
             "leyline_sign_data_without_attributes",
             "leyline_verify",
             "leyline_verify_cert_chain",
+            "leyline_verify_cert_path",
             "lsign_alloc",
             "lsign_free",
         ],

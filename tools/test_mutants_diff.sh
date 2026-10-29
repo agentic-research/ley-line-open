@@ -21,6 +21,10 @@ case " $* " in
       *cli-mutants-only.diff*|*runtime-tests-only.diff*)
         printf '%s\n' 'll-open/cli-lib/src/daemon/client.rs:65:9: fixture mutant'
         ;;
+      *plan-cli-binary.diff*)
+        # What the real listing shows for the clap binary: `main` only.
+        printf '%s\n' 'll-open/cli/src/main.rs:12:5: replace main with ()'
+        ;;
       *)
         printf '%s\n' 'll-open/runtime/src/authorization.rs:65:9: fixture mutant'
         ;;
@@ -88,6 +92,21 @@ if grep -E -- '--package leyline-cli-lib| -C --lib ' "$log" >/dev/null; then
     sed -n '1,120p' "$log" >&2
     exit 1
 fi
+
+# MUTANTS_SHARD splits a slice across CI runners: it reaches cargo-mutants as
+# --shard, and a malformed one is refused before anything runs.
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" MUTANTS_SHARD=1/2 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/pr.diff" runtime
+assert_call 'mutants .*--package leyline-runtime .*--shard 1/2' \
+    'a sharded slice passes its shard to cargo-mutants'
+for bad in 2/2 x/2 1/ /2 12; do
+    if PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" MUTANTS_SHARD=$bad \
+        "$repo_root/tools/mutants_diff.sh" "$fixture_dir/pr.diff" runtime 2>/dev/null; then
+        echo "MUTANTS_SHARD=$bad was accepted" >&2
+        exit 1
+    fi
+done
 
 cat > "$fixture_dir/cli-only.diff" <<'DIFF'
 diff --git a/ll-open/cli-lib/src/daemon/client.rs b/ll-open/cli-lib/src/daemon/client.rs
@@ -230,37 +249,165 @@ if MUTANTS_GENERIC_EXCLUDES='ll-open/orphan' \
     exit 1
 fi
 
-# The fs slice is the ONLY one that passes `--no-default-features`, which makes
-# it the only place the ledger's standing exemption for default-enabled features
-# ("cargo resolves them, mutants compiles them") is false. `fuse` and `nfs` ARE
-# in leyline-fs's default set, so the ledger correctly declines to carry them —
-# but this slice's own flags compile `fuse.rs` and `nfs.rs` out, while
-# cargo-mutants (which parses with syn and never evaluates cfg) still enumerates
-# every mutant inside them. Each then builds in 0s, every test trivially passes,
-# and it reports MISSED: a phantom survivor on healthy code.
-#
-# A slice that opts out of default features owes an exclusion for what that
-# choice removes. Their missing tests are a real gap owned by
-# `ley-line-open-aed167`, so exclusion is the honest move here rather than
-# enabling the features and reddening the gate on a coverage debt this gate did
-# not incur.
+# The fs slice is the ONLY one that passes `--no-default-features`, so it must
+# enable every gated module it mutates: cargo-mutants parses with syn, never
+# evaluates cfg, and would report each mutant inside a compiled-out
+# `verified.rs` as a phantom MISSED.
 : > "$log"
-cat > "$fixture_dir/fs-mount.diff" <<'DIFF'
-diff --git a/ll-open/fs/src/fuse.rs b/ll-open/fs/src/fuse.rs
---- a/ll-open/fs/src/fuse.rs
-+++ b/ll-open/fs/src/fuse.rs
+cat > "$fixture_dir/fs-verify.diff" <<'DIFF'
+diff --git a/ll-open/fs/src/verified.rs b/ll-open/fs/src/verified.rs
+--- a/ll-open/fs/src/verified.rs
++++ b/ll-open/fs/src/verified.rs
 @@ -1 +1 @@
 -old
 +new
 DIFF
 PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
-  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/fs-mount.diff"
-assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/fuse\.rs' \
-    'fs slice excludes the fuse module its --no-default-features compiles out'
-assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/nfs\.rs' \
-    'fs slice excludes the nfs module its --no-default-features compiles out'
-assert_call 'mutants .*--package leyline-fs .*--exclude ll-open/fs/src/verified\.rs' \
-    'fs slice excludes the verify module its feature set compiles out'
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/fs-verify.diff"
+assert_call 'mutants .*--package leyline-fs .*--features cdc,validate,verify' \
+    'fs slice enables the verify module it mutates'
+
+# storefs's host mount is gated on its `mount` feature; storefs's own slice
+# names it, so its adapter mutants compile and their lib tests run, and the
+# generic slice leaves storefs alone.
+: > "$log"
+cat > "$fixture_dir/storefs-host.diff" <<'DIFF'
+diff --git a/ll-open/storefs/src/host/nfs.rs b/ll-open/storefs/src/host/nfs.rs
+--- a/ll-open/storefs/src/host/nfs.rs
++++ b/ll-open/storefs/src/host/nfs.rs
+@@ -1 +1 @@
+-old
++new
+DIFF
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/storefs-host.diff"
+assert_call 'mutants .*-C --lib .*--package leyline-storefs .*--features mount' \
+    'a storefs diff runs the storefs slice with the mount feature, lib tests only'
+if grep -q -- "--exclude ll-open/fs/\*\*.*--features" "$log"; then
+    echo 'the generic slice was handed storefs features' >&2
+    exit 1
+fi
+
+# A diff touching several generic-slice packages that carry enable rows —
+# a release promotion's diff touches most of them. Each package's features
+# must reach only that package's invocation: cargo rejects a `--features`
+# name no SELECTED package declares, and a sharded slice selects only the
+# packages of the mutants in its shard. One invocation carrying the union of
+# every touched package's features (`interrupt,root-signer,hcl,pyproject`)
+# failed every generic shard of the v0.21.0 promotion as BASELINE BROKEN
+# (bead ley-line-open-c1f8bc).
+cat > "$fixture_dir/generic-multi.diff" <<'DIFF'
+diff --git a/ll-core/core/src/lib.rs b/ll-core/core/src/lib.rs
+--- a/ll-core/core/src/lib.rs
++++ b/ll-core/core/src/lib.rs
+diff --git a/ll-open/sign/src/lib.rs b/ll-open/sign/src/lib.rs
+--- a/ll-open/sign/src/lib.rs
++++ b/ll-open/sign/src/lib.rs
+diff --git a/ll-open/ts/src/lib.rs b/ll-open/ts/src/lib.rs
+--- a/ll-open/ts/src/lib.rs
++++ b/ll-open/ts/src/lib.rs
+diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
+--- a/ll-open/vcs/src/lib.rs
++++ b/ll-open/vcs/src/lib.rs
+DIFF
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/generic-multi.diff" generic
+assert_call "mutants .* -C --lib .*--file ll-core/core/\*\* --features interrupt( |\$)" \
+    'leyline-core is mutated alone, with its own feature'
+assert_call "mutants .* -C --lib .*--file ll-open/sign/\*\* --features root-signer( |\$)" \
+    'leyline-sign is mutated alone, with its own feature'
+assert_call "mutants .* -C --lib .*--file ll-open/ts/\*\* --features hcl,pyproject( |\$)" \
+    'leyline-ts is mutated alone, with both of its features'
+# Every feature-carrying generic invocation is confined to one package, and
+# carries only that package's ledger features.
+ledger_rows=$(awk '!/^[[:space:]]*(#|$)/ && $4 == "enable" { print $1, $2 }' \
+    "$repo_root/tools/feature-ledger.txt")
+grep -- ' --features ' "$log" | grep -v -- '--package ' > "$fixture_dir/featured.log" || true
+while IFS= read -r call; do
+    file_glob=$(printf '%s\n' "$call" | sed -n 's/.* --file \([^ ]*\)\/\*\* .*/\1/p')
+    if [ -z "$file_glob" ]; then
+        echo "a generic invocation carries features without naming its package: $call" >&2
+        exit 1
+    fi
+    features=$(printf '%s\n' "$call" | sed -n 's/.* --features \([^ ]*\).*/\1/p')
+    for feature in $(printf '%s' "$features" | tr ',' ' '); do
+        if ! printf '%s\n' "$ledger_rows" | grep -qx "$file_glob $feature"; then
+            echo "$file_glob was handed $feature, which is not its feature: $call" >&2
+            exit 1
+        fi
+    done
+done < "$fixture_dir/featured.log"
+if [ "$(wc -l < "$fixture_dir/featured.log" | tr -d ' ')" -ne 3 ]; then
+    echo 'expected one feature-carrying invocation per featured package:' >&2
+    cat "$fixture_dir/featured.log" >&2
+    exit 1
+fi
+# The rest of the generic slice (ll-open/vcs here) runs once, featureless,
+# with the packages mutated above excluded so no mutant is run twice.
+assert_call "mutants .* -C --lib .*--exclude ll-open/runtime/\*\* .*--exclude ll-core/core/\*\* --exclude ll-open/sign/\*\* --exclude ll-open/ts/\*\*" \
+    'the featureless remainder excludes the packages mutated with their features'
+if grep -- '--exclude ll-core/core/\*\*' "$log" | grep -q -- '--features'; then
+    echo 'the featureless remainder was handed features' >&2
+    exit 1
+fi
+
+# A diff whose generic packages carry no enable rows is unchanged: exactly one
+# featureless generic invocation.
+cat > "$fixture_dir/generic-plain.diff" <<'DIFF'
+diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
+--- a/ll-open/vcs/src/lib.rs
++++ b/ll-open/vcs/src/lib.rs
+DIFF
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/generic-plain.diff" generic
+if [ "$(grep -c -- ' -C --lib ' "$log")" -ne 1 ] || grep -q -- '--features\|--file ' "$log"; then
+    echo 'a diff with no featured package did not run exactly one featureless generic invocation:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+
+# A generic-slice package with no library target (rs/tools/smell-projector is
+# one) cannot run under `-C --lib`: cargo finds no library target, and once
+# sharding gives its mutants a shard of their own the slice is BASELINE
+# BROKEN. It runs its binary's tests in an invocation of its own, and the
+# library remainder excludes it. Run from a directory where both packages'
+# manifests resolve, as the real gate runs from rs/.
+mkdir -p "$fixture_dir/ws/tools/projector/src" "$fixture_dir/ws/ll-open/vcs/src"
+printf '[package]\nname = "projector"\n\n[[bin]]\nname = "projector"\npath = "src/main.rs"\n' \
+    > "$fixture_dir/ws/tools/projector/Cargo.toml"
+: > "$fixture_dir/ws/tools/projector/src/main.rs"
+printf '[package]\nname = "vcs"\n' > "$fixture_dir/ws/ll-open/vcs/Cargo.toml"
+: > "$fixture_dir/ws/ll-open/vcs/src/lib.rs"
+printf '[workspace]\n' > "$fixture_dir/ws/Cargo.toml"
+cat > "$fixture_dir/generic-bin-only.diff" <<'DIFF'
+diff --git a/tools/projector/src/main.rs b/tools/projector/src/main.rs
+--- a/tools/projector/src/main.rs
++++ b/tools/projector/src/main.rs
+diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
+--- a/ll-open/vcs/src/lib.rs
++++ b/ll-open/vcs/src/lib.rs
+DIFF
+: > "$log"
+(
+    cd "$fixture_dir/ws"
+    PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+      "$repo_root/tools/mutants_diff.sh" "$fixture_dir/generic-bin-only.diff" generic
+)
+assert_call 'mutants .* -C --bins .*--file tools/projector/\*\*' \
+    'a binary-only package runs its binary tests in an invocation of its own'
+assert_call 'mutants .* -C --lib .*--exclude tools/projector/\*\*' \
+    'the library remainder excludes the binary-only package'
+if grep -- ' -C --lib ' "$log" | grep -q -- '--file tools/projector/'; then
+    echo 'a binary-only package was mutated under -C --lib' >&2
+    exit 1
+fi
+if grep -q -- '--file ll-open/vcs/\|--file \./' "$log"; then
+    echo 'a library package or the workspace root was routed as binary-only:' >&2
+    cat "$log" >&2
+    exit 1
+fi
 
 # --------------------------------------------------------------------------
 # `list-scopes`: the plan the CI matrix is built from. Runs no cargo.
@@ -304,6 +451,20 @@ diff --git a/ll-open/cli/src/main.rs b/ll-open/cli/src/main.rs
 +++ b/ll-open/cli/src/main.rs
 DIFF
 plan_is "$fixture_dir/plan-cli-binary.diff" 'cli'
+
+# ...and the `cli` leg that plan starts must finish. The binary's only mutant
+# is excluded by policy, so the leg reports that and exits 0; MISCONFIGURED
+# here failed every PR that touched only ll-open/cli (PR #464).
+if ! out=$(cd "$repo_root/rs" && PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+    "$repo_root/tools/mutants_diff.sh" "$fixture_dir/plan-cli-binary.diff" cli 2>&1); then
+    echo "a cli-binary-only diff failed its planned cli leg:" >&2
+    echo "$out" >&2
+    exit 1
+fi
+case "$out" in
+    *"ll-open/cli carries only 'replace main'"*) ;;
+    *) echo "the cli leg did not say why nothing ran: $out" >&2; exit 1 ;;
+esac
 
 # The planner emits a scope for ANY Rust change in its package, tests included.
 # It runs no cargo, so it cannot know what will enumerate; the leg asks
@@ -349,4 +510,5 @@ fi
 
 echo 'diff mutation fixture proved package-specific integration-test routing'
 echo 'diff mutation fixture proved excluded packages must be claimed by a slice'
-echo 'diff mutation fixture proved the fs slice excludes what it compiles out'
+echo 'diff mutation fixture proved the fs and storefs slices enable what they mutate'
+echo 'diff mutation fixture proved each generic package is built with its own features'

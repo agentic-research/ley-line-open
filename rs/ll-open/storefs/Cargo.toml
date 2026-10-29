@@ -1,0 +1,59 @@
+[package]
+name = "leyline-storefs"
+version = "0.21.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "The store-backed filesystem core behind LLO's virtio-fs device (ADR-0044 V2): FUSE-shaped requests answered from the store, writes landed as ADR-0042 proposals, refusals returned as Linux errno values."
+repository = "https://github.com/agentic-research/ley-line-open"
+publish = false
+
+[dependencies]
+# `source_write::propose` (ADR-0042), `checkout::reconcile` (ADR-0043 phase 0)
+# and `daemon::db_pool::LiveDb` (the daemon's one writer + reader pool) live
+# here. The dependency points down: cli-lib never depends on this crate, and
+# neither may leyline-runtime (cli-lib depends on it), so the libkrun adapter
+# is built by whoever links both — see README.md.
+# Default features off: the CLI that links this crate picks cli-lib's
+# features; nothing here needs lsp, hdc or cdc.
+leyline-cli-lib = { path = "../cli-lib", default-features = false }
+leyline-core = { path = "../../ll-core/core" }
+# The share wire (`backends::libkrun::share`): the request and reply types the
+# adapter answers, and the workspace-share seam the libkrun backend calls.
+# The daemon serves shares; it never links the VMM (leyline-krun-worker does).
+leyline-runtime = { path = "../runtime", default-features = false }
+anyhow = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled", "serialize"] }
+# Derived paths (ADR-0045 T9): `.gitignore` rules, matched as the parse
+# walk's `ignore` crate matches them, and scratch access through `openat`
+# with `O_NOFOLLOW` beneath the scratch root.
+ignore = "0.4"
+libc = { workspace = true }
+# The host mount (`host`, bead `ley-line-open-3e73dc`): this filesystem
+# behind the host's FUSE client and a loopback NFSv3 server.
+#
+# `features = ["libfuse"]` is REQUIRED: fuser 0.16's default feature set is
+# `[]`, the pure-Rust mount, which is Linux-only, so a macOS build fails in
+# fuser's build.rs. libfuse2 via the fuse-t wrapper in rs/pkgconfig on
+# macOS, libfuse3 on Linux. 0.16 for GHSA-cvmj-47v9-35m9.
+fuser = { version = "0.16", optional = true, features = ["libfuse"] }
+# nfsserve 0.11.0 plus a COMMIT procedure, a WRITE that reports the
+# stability it achieved, and AUTH_UNIX credentials (bead 3c4893). Pinned
+# exactly: the fork has one publisher, and its diff against upstream 0.11.0
+# was read before it was taken; a new version gets the same reading.
+nfsserve = { package = "nessie-nfsserve", version = "=0.3.1", optional = true }
+async-trait = { version = "0.1", optional = true }
+# `time` + `macros`: the NFS server's idle committer.
+tokio = { workspace = true, optional = true, features = ["net", "time", "macros", "rt"] }
+
+[features]
+mount = ["dep:fuser", "dep:nfsserve", "dep:async-trait", "dep:tokio"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# A daemon context's event router spawns its dispatch loop on a runtime.
+tokio = { workspace = true, features = ["rt", "macros"] }
+# The share tests build a DaemonContext as the shipped daemon does, and the
+# shipped daemon carries the sheaf state (cli-lib's default `sheaf` feature).
+leyline-cli-lib = { path = "../cli-lib", default-features = false, features = ["sheaf"] }

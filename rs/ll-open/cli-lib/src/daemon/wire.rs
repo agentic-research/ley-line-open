@@ -21,9 +21,11 @@
 //! - `BASE_OP_NAMES`: the canonical string-list of every known op
 //!   name. Single source of truth for `is_known_base_op`, the
 //!   `base_op_names()` test helper, and the `mcp::tool_registry` drift
-//!   check. Adding a new op means editing this list AND adding a
-//!   `BaseRequest` variant (the two are tied together by drift tests
-//!   in `ops.rs`).
+//!   check. Adding a new op means editing `NATIVE_OP_NAMES` AND adding
+//!   a `BaseRequest` variant (the two are tied together by drift tests
+//!   in `ops.rs`). The execution/v1 tail is not written here at all —
+//!   it is spliced in at compile time from
+//!   `execution_contract::OP_NAMES`.
 //! - `LspPosition` / `LspFile`: small typed-args structs the LSP ops
 //!   consume.
 //! - `Ref` / `TokenMapEntry`: intermediate data types used inside
@@ -34,8 +36,12 @@
 //! Beads:
 //! - `ley-line-open-b0ea2e` (the wire.rs codegen / capnp-json adoption thread)
 //! - `ley-line-open-b632ee` (collapse of 4 op-name SoTs into BASE_OP_NAMES)
+//! - `ley-line-open-6d811a` (execution/v1 tail derived from
+//!   `execution_contract::OP_NAMES` instead of re-typed here)
 
 use serde::Deserialize;
+
+use super::execution_contract;
 
 // ---------------------------------------------------------------------------
 // Canonical op-name list.
@@ -51,20 +57,24 @@ use serde::Deserialize;
 //
 // Adding a new op means:
 //   1. Add a `BaseRequest` variant below.
-//   2. Add the snake_case name to `BASE_OP_NAMES`.
+//   2. Add the snake_case name to `NATIVE_OP_NAMES`.
 //   3. Add a match arm in `ops.rs::dispatch_typed` (compiler-enforced).
 //   4. Optionally expose it via `tool_registry()` in `daemon::mcp`
 //      (drift test enforces tool_registry ⊆ BASE_OP_NAMES).
+//
+// The execution/v1 ops are the exception to step 2: their names live in
+// `execution_contract::OP_NAMES` (which the `execution-tools.json`
+// generator pins) and are spliced onto the tail of `BASE_OP_NAMES` at
+// compile time. There is no second copy to keep in sync.
 //
 // Down from 4-5 hand-maintained lists (pre-b632ee) to 2 paired
 // structures with bidirectional drift tests.
 // ---------------------------------------------------------------------------
 
-/// The canonical set of op names the daemon's UDS dispatcher recognizes.
-/// Feature-gated entries appear conditionally; the consts below pin the
-/// expected counts so a refactor that drops a name without updating the
-/// gates is caught at compile time.
-pub const BASE_OP_NAMES: &[&str] = &[
+/// Op names the daemon implements natively, i.e. everything that is not
+/// an IDL-generated execution/v1 operation. Feature-gated entries appear
+/// conditionally. Consumers want [`BASE_OP_NAMES`], not this.
+const NATIVE_OP_NAMES: &[&str] = &[
     "status",
     "flush",
     "load",
@@ -90,13 +100,21 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "lsp_refs",
     "lsp_symbols",
     "lsp_diagnostics",
+    #[cfg(feature = "sheaf")]
     "sheaf_set_topology",
+    #[cfg(feature = "sheaf")]
     "sheaf_update_topology",
+    #[cfg(feature = "sheaf")]
     "sheaf_invalidate",
+    #[cfg(feature = "sheaf")]
     "sheaf_defect",
+    #[cfg(feature = "sheaf")]
     "sheaf_stalks",
+    #[cfg(feature = "sheaf")]
     "sheaf_status",
+    #[cfg(feature = "sheaf")]
     "sheaf_learned_weights",
+    #[cfg(feature = "sheaf")]
     "sheaf_reap",
     "leyline_version",
     #[cfg(feature = "vec")]
@@ -115,16 +133,42 @@ pub const BASE_OP_NAMES: &[&str] = &[
     "at_position",
     "inspect_neighborhood",
     "search_symbols",
+    #[cfg(feature = "sheaf")]
     "agreement",
-    "llo_execution_capabilities",
-    "llo_execution_provision",
-    "llo_execution_status",
-    "llo_execution_start",
-    "llo_execution_inspect",
-    "llo_execution_cancel",
-    "llo_execution_collect",
-    "llo_execution_cleanup",
 ];
+
+/// Length of [`BASE_OP_NAMES`]: the natively-implemented ops plus every
+/// execution/v1 op name the shared contract exports.
+const BASE_OP_NAMES_LEN: usize = NATIVE_OP_NAMES.len() + execution_contract::OP_NAMES.len();
+
+/// Splice `NATIVE_OP_NAMES ++ execution_contract::OP_NAMES` at compile
+/// time. Deriving rather than re-typing the execution names means the
+/// class of bug this replaced — a second hand-maintained list that
+/// silently disagreed with the generated contract about order — is not
+/// expressible any more.
+const fn concat_base_op_names() -> [&'static str; BASE_OP_NAMES_LEN] {
+    let mut names = [""; BASE_OP_NAMES_LEN];
+    let mut i = 0;
+    while i < NATIVE_OP_NAMES.len() {
+        names[i] = NATIVE_OP_NAMES[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < execution_contract::OP_NAMES.len() {
+        names[NATIVE_OP_NAMES.len() + j] = execution_contract::OP_NAMES[j];
+        j += 1;
+    }
+    names
+}
+
+const BASE_OP_NAMES_STORAGE: [&str; BASE_OP_NAMES_LEN] = concat_base_op_names();
+
+/// The canonical set of op names the daemon's UDS dispatcher recognizes.
+///
+/// Membership, not position, is what every consumer reads: `is_known_base_op`
+/// does a `contains`, the drift tests iterate or collect into a `HashSet`.
+/// Nothing indexes this slice, so the splice point is free to sit at the tail.
+pub const BASE_OP_NAMES: &[&str] = &BASE_OP_NAMES_STORAGE;
 
 // ---------------------------------------------------------------------------
 // Request enum — typed dispatch surface for socket.rs.
@@ -175,10 +219,10 @@ pub enum BaseRequest {
         id: String,
     },
     /// Read-only: a whole source file by its `_source.id`, with the blob
-    /// hash a later `propose` names as its base (ADR-0041 P2).
+    /// hash a later `propose` names as its base (ADR-0042 P2).
     ReadSource(ReadSourceRequest),
     /// Mutating: several files written as one change through the daemon's
-    /// single writer, applied whole or refused whole (ADR-0041 P1).
+    /// single writer, applied whole or refused whole (ADR-0042 P1).
     Propose(ProposeRequest),
     FindCallers {
         token: String,
@@ -213,6 +257,7 @@ pub enum BaseRequest {
         #[serde(default = "default_text_search_k")]
         k: u32,
     },
+    #[cfg(feature = "sheaf")]
     SheafSetTopology {
         #[serde(default)]
         regions: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
@@ -221,22 +266,29 @@ pub enum BaseRequest {
         #[serde(default)]
         node_stalk_dim: u32,
     },
+    #[cfg(feature = "sheaf")]
     SheafUpdateTopology {
         #[serde(default)]
         delta: crate::daemon::sheaf_ops::TopologyDeltaInput,
         #[serde(default)]
         node_stalk_dim: u32,
     },
+    #[cfg(feature = "sheaf")]
     SheafInvalidate {
         #[serde(default)]
         regions: Vec<u32>,
         #[serde(default)]
         stalks: Vec<crate::daemon::sheaf_ops::SheafStalkInput>,
     },
+    #[cfg(feature = "sheaf")]
     SheafDefect,
+    #[cfg(feature = "sheaf")]
     SheafStalks,
+    #[cfg(feature = "sheaf")]
     SheafStatus,
+    #[cfg(feature = "sheaf")]
     SheafLearnedWeights,
+    #[cfg(feature = "sheaf")]
     SheafReap,
     /// Wire-compat handshake. Takes no args; returns the daemon's
     /// version + wire-format identity (bead ley-line-open-cb8960).
@@ -292,6 +344,7 @@ pub enum BaseRequest {
     /// `CellComplex` with identity restrictions, runs
     /// `detect_violations`, and returns `coherence_defect` + per-pair
     /// `defects`. Read-only.
+    #[cfg(feature = "sheaf")]
     Agreement(AgreementRequest),
     /// Generated execution/v1 capability discovery delegated to the shared
     /// LLO runtime handler.
@@ -591,6 +644,7 @@ fn default_search_limit() -> u32 {
 //   table has for this `(token, payload_kind)`.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "sheaf")]
 #[derive(Deserialize, Debug)]
 pub struct AgreementRequest {
     /// Observer-emitted stable token (per ADR-0020 §1). Looked up
@@ -603,7 +657,7 @@ pub struct AgreementRequest {
 
 #[derive(Deserialize, Debug)]
 pub struct ReadSourceRequest {
-    /// The file's `_source.id`: its path relative to the tree root.
+    /// The file's `_tree` path: its path relative to the tree root.
     pub path: String,
 }
 
@@ -614,14 +668,38 @@ pub struct ProposeRequest {
 
 #[derive(Deserialize, Debug)]
 pub struct ProposedWriteInput {
-    /// The file's `_source.id`.
+    /// The path's `_tree` path.
     pub path: String,
-    /// The blob hash (64 hex chars) the author read, from `read_source`;
-    /// empty means no check.
-    #[serde(default)]
+    /// Required: the blob hash (64 hex chars) the author read, from
+    /// `read_source`, [`crate::source_write::BASE_ANY`] to write without
+    /// a check, or [`crate::source_write::BASE_ABSENT`] for a create. A
+    /// write that omits it is refused rather than silently overwriting
+    /// (bead `ley-line-open-5dc3a5`).
     pub base: String,
-    /// The file's new content.
-    pub content: String,
+    /// The file's new content: required by a replace and a create, ignored
+    /// by a delete.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// What the write does (`daemon.capnp` `WriteKind`); `replace` when
+    /// omitted, the only kind before it existed (bead `ley-line-open-47fb03`).
+    #[serde(default)]
+    pub kind: WriteKind,
+    /// A replace's or create's git mode, six octal digits (ADR-0045 T4);
+    /// unset keeps the file's mode.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// `daemon.capnp` `WriteKind` in its wire spelling.
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteKind {
+    #[default]
+    Replace,
+    Create,
+    Delete,
+    Mkdir,
+    Rmdir,
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,13 @@ fn main() {
         .run()
         .expect("capnp compile daemon.capnp");
 
+    // The workspace share's frame header: internal to one LLO release
+    // (worker <-> daemon), Rust only, so regen.sh does not compile it.
+    capnpc::CompilerCommand::new()
+        .file("capnp/share.capnp")
+        .run()
+        .expect("capnp compile share.capnp");
+
     // execution/v1 lives with its normative spec and conformance vectors.
     // Compile that exact file rather than maintaining a public-schema copy:
     // Rust, JSON Schema, and MCP projections therefore share one IDL input.

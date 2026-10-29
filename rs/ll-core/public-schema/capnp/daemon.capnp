@@ -274,32 +274,71 @@ struct ReadContentResponse {
   error   @2 :Text;
 }
 
-# A whole source file by its path relative to the tree root (`_source.id`),
-# with the blob hash a later `propose` names as its base (ADR-0041 P2).
+# A whole file by its path relative to the tree root (its `_tree` path),
+# with the blob hash a later `propose` names as its base (ADR-0042 P2). The
+# store holds any file, not only those the parse projects (ADR-0045 T1).
 struct ReadSourceRequest {
   path @0 :Text;
 }
 
 struct ReadSourceResponse {
   ok       @0 :Bool;
+  # The file's bytes as UTF-8; a symlink's target. A file that is not
+  # UTF-8 answers `error`.
   content  @1 :Text;
-  # BLAKE3 of `content`'s bytes, 64 hex chars: the `source_blobs` key.
+  # The file's `_tree.blob_hash`, 64 hex chars: the `source_blobs` key of
+  # `content` and the hash `propose` compares a base against.
   blobHash @2 :Text  $Json.name("blob_hash");
   # The arena's treeRoot (ADR-0040 D1) the file was read under, 64 hex chars.
   treeRoot @3 :Text  $Json.name("tree_root");
   error    @4 :Text;
+  # The file's git mode, six octal digits: `100644` (regular), `100755`
+  # (executable) or `120000` (symlink; `content` is its target). ADR-0045.
+  mode     @5 :Text;
 }
 
-# One file of a proposal: its path, the blob hash its author read (empty:
-# no check), and its new content.
+# What one write of a proposal does at its path (ADR-0042 P1, ADR-0045 T4).
+enum WriteKind {
+  # The file's content becomes `content`. `base` is the `blob_hash` the
+  # author read, or `any`. A base that moved is merged three ways with what
+  # the path holds (ADR-0045 T5).
+  replace @0;
+  # A new file holding `content`. `base` is `absent`: refused `stale` when
+  # the path holds a file with other bytes, `exists` when it holds a
+  # directory.
+  create  @1;
+  # The file leaves the store; its directories stay. `base` is the
+  # `blob_hash` the author read, or `any`; `content` is ignored.
+  delete  @2;
+  # A directory, with its missing parents. `base` is `absent`; `content`
+  # and `mode` are ignored.
+  mkdir   @3;
+  # The directory leaves the store; nothing may remain under it once the
+  # proposal's other writes apply (`not_empty`). `base` is `any`.
+  rmdir   @4;
+}
+
+# One path of a proposal: its path, the base its author read, its new
+# content, and what the write does. `base` is required: the `blob_hash`
+# from `read_source` (64 hex chars), `any` to write whatever the file
+# holds, or `absent` for a create or mkdir. `kind` defaults to `replace`,
+# the only kind before it existed. A rename is one proposal: a `delete` of
+# the old path and a `create` (or `replace`) of the new one with its
+# content; a directory rename is that for every path under it, with an
+# `rmdir` of each old directory and an `mkdir` of each new one.
 struct ProposedWrite {
   path    @0 :Text;
   base    @1 :Text;
   content @2 :Text;
+  kind    @3 :WriteKind;
+  # A replace's or create's git mode: `100644`, `100755` or `120000`
+  # (`content` is the symlink's target). Unset keeps the file's mode; a
+  # create without it is `100644`. Any other value is a malformed request.
+  mode    @4 :Text;
 }
 
 # Several files written as one change, applied whole or refused whole
-# (ADR-0041 P1).
+# (ADR-0042 P1).
 struct ProposeRequest {
   writes @0 :List(ProposedWrite);
 }
@@ -309,24 +348,107 @@ struct PathHash {
   blobHash @1 :Text  $Json.name("blob_hash");
 }
 
-# Why a proposal was refused when a file moved since its author read it.
-struct StaleRefusal {
-  path     @0 :Text;
-  # The blob the author read.
-  expected @1 :Text;
-  # The blob the file holds now.
-  current  @2 :Text;
+# A range of a base's lines, 0-based and half-open: `[start, end)`. Two
+# insertions at one line are the empty range `[line, line)`.
+struct LineRange {
+  start @0 :UInt32;
+  end   @1 :UInt32;
 }
 
+# A path that moved since its author read it. Either side is `absent` when
+# it is no file: a create's `expected`, or the `current` of a file deleted
+# since it was read.
+struct StaleRefusal {
+  path      @0 :Text;
+  # The blob the author read, or `absent`.
+  expected  @1 :Text;
+  # The blob the path holds now, or `absent`.
+  current   @2 :Text;
+  # Set when the write was merged three ways with `current` and the two
+  # sides changed overlapping lines (ADR-0045 T5): the lines of `expected`
+  # where they overlap. Unset when the path could not be merged at all (a
+  # delete, a create, a symlink, bytes that are not UTF-8).
+  conflicts @3 :List(LineRange);
+}
+
+# Why a proposal was refused (ADR-0042 P1, P2, ADR-0045). Every refusal is
+# decided before anything is written and changes nothing.
+enum RefusalReason {
+  # Paths moved since their author read them and could not be merged;
+  # `moved` names every one, with the conflicting lines of a merge. A create
+  # whose path holds other bytes is stale with `expected` `absent`.
+  stale          @0;
+  # A path is outside the writer's grant.
+  outsideGrant   @1 $Json.name("outside_grant");
+  # A path names no file or directory in the arena.
+  noSuchFile     @2 $Json.name("no_such_file");
+  # A path appears twice.
+  duplicatePath  @3 $Json.name("duplicate_path");
+  # A file is under a different tree root than the proposal's first file.
+  differentRoots @4 $Json.name("different_roots");
+  # The arena records no tree root for a file.
+  noTreeRoot     @5 $Json.name("no_tree_root");
+  # Retired by ADR-0045 and never sent: a file that does not parse is
+  # stored with a diagnostic. Its ordinal is kept; `syntax` is no longer a
+  # reason.
+  retiredSyntax  @6 $Json.name("retired_syntax");
+  # A base does not fit its write's kind: a replace or delete names a
+  # 64-hex-char blob hash or `any`, a create or mkdir names `absent`, an
+  # rmdir `any`.
+  malformedBase  @7 $Json.name("malformed_base");
+  # Retired by ADR-0045 and never sent: every manifest file entry names its
+  # blob. Its ordinal is kept; `no_stored_blob` is no longer a reason.
+  retiredNoStoredBlob @8 $Json.name("retired_no_stored_blob");
+  # The proposal writes no file.
+  empty          @9;
+  # Retired by ADR-0045 and never sent: the store holds any file. Its
+  # ordinal is kept; `no_language` is no longer a reason.
+  retiredNoLanguage @10 $Json.name("retired_no_language");
+  # A created path is not a plain relative path.
+  malformedPath  @11 $Json.name("malformed_path");
+  # A created path is under a file.
+  pathConflict   @12 $Json.name("path_conflict");
+  # An mkdir where the path holds an entry, or a create where it holds a
+  # directory.
+  exists         @13;
+  # An rmdir with entries left under the directory.
+  notEmpty       @14 $Json.name("not_empty");
+  # An rmdir of a file.
+  notADirectory  @15 $Json.name("not_a_directory");
+  # A replace or delete of a directory.
+  isADirectory   @16 $Json.name("is_a_directory");
+}
+
+struct ProposalRefusal {
+  reason @0 :RefusalReason;
+  # The file the refusal names; unset for `stale` and `empty`.
+  path   @1 :Text;
+  # `stale` only: every file that moved.
+  moved  @2 :List(StaleRefusal);
+}
+
+# `ok` true means the proposal was applied: its files are committed. `ok`
+# false with `refusal` means it was refused and nothing changed; `ok` false
+# without `refusal` is an internal error (a projection failure rolls back,
+# so nothing changed either).
 struct ProposeResponse {
-  ok       @0 :Bool;
+  ok              @0 :Bool;
   # The arena's treeRoot after the proposal (ok only).
-  treeRoot @1 :Text  $Json.name("tree_root");
+  treeRoot        @1 :Text  $Json.name("tree_root");
   # Each written path's new blob hash (ok only).
-  blobs    @2 :List(PathHash);
-  # Set when the proposal was refused because a base moved.
-  stale    @3 :StaleRefusal;
-  error    @4 :Text;
+  blobs           @2 :List(PathHash);
+  # Set when the proposal was refused.
+  refusal         @3 :ProposalRefusal;
+  error           @4 :Text;
+  # ok only: a step after the commit that failed (the head write, an index
+  # build, the checkout). The proposal is applied; the head may lag it until
+  # the next write or reparse advances it. The arena image follows through
+  # the daemon's publisher, never in this reply.
+  postCommitError @5 :Text  $Json.name("post_commit_error");
+  # ok only: the written paths whose base had moved and whose content is
+  # the three-way merge with what the path held (ADR-0045 T5); what landed
+  # is not the `content` sent. Unset when nothing merged.
+  merged          @6 :List(Text);
 }
 
 struct FindCallersRequest {

@@ -390,8 +390,8 @@ fn an_authorized_listener_reaches_the_compiled_manifest_and_moves_its_digest() {
     )
     .expect("valid manifest");
     assert_eq!(
-        without.dimensions().port,
-        None,
+        without.dimensions().ports,
+        &[],
         "a run with no authorized document must compile exactly the policy it \
          compiled before this field existed"
     );
@@ -419,8 +419,12 @@ fn an_authorized_listener_reaches_the_compiled_manifest_and_moves_its_digest() {
     .expect("valid manifest");
 
     assert_eq!(
-        with.dimensions().port,
-        Some((8443, None)),
+        with.dimensions()
+            .ports
+            .iter()
+            .map(|grant| (grant.bind(), grant.address()))
+            .collect::<Vec<_>>(),
+        vec![(8443, None)],
         "the listener the grant authorized must be the listener the tier compiles"
     );
     assert_ne!(
@@ -456,8 +460,8 @@ fn an_authorized_document_without_a_listener_does_not_acquire_one() {
     .expect("valid manifest");
 
     assert_eq!(
-        compiled.dimensions().port,
-        None,
+        compiled.dimensions().ports,
+        &[],
         "a document that declares no listener must not produce one"
     );
     assert_eq!(
@@ -743,23 +747,23 @@ fn a_local_connect_grant_moves_the_digest_and_round_trips() {
     // Read back through the ACCESSOR, not just structural equality. The
     // assertions above compare whole manifests with PartialEq, which reads the
     // fields directly and so never executes `connect_local()` — cloister's
-    // actual read surface, alongside `unix_sockets()` and `port_bind()`. Three
+    // actual read surface, alongside `unix_sockets()` and `port_binds()`. Three
     // mutants of that getter survived the first gate on this branch for
     // exactly that reason. The port is deliberately neither 0 nor 1, so a
     // getter stubbed to any constant fails here.
     assert_eq!(
         with.connect_local(),
-        Some(8443),
+        &[8443],
         "the accessor must report the declared port"
     );
     assert_eq!(
         reparsed.connect_local(),
-        Some(8443),
+        &[8443],
         "the accessor must survive a canonical-JSON round trip"
     );
     assert_eq!(
         base.connect_local(),
-        None,
+        &[] as &[u16],
         "a manifest that never declared the dimension must report None"
     );
 }

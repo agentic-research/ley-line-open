@@ -70,6 +70,7 @@ impl Backend for CompletingBackend {
             backend_id: "completing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -77,6 +78,7 @@ impl Backend for CompletingBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -95,6 +97,7 @@ impl Backend for FailingBackend {
             backend_id: "failing/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -102,6 +105,7 @@ impl Backend for FailingBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "failing/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -124,6 +128,7 @@ impl Backend for BlockingBackend {
             backend_id: "blocking/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -144,6 +149,7 @@ impl Backend for BlockingBackend {
         }
         Ok(BackendRun {
             backend_id: "blocking/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -164,6 +170,7 @@ impl Backend for RecordingBackend {
             backend_id: "recording/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -175,6 +182,7 @@ impl Backend for RecordingBackend {
             .push("start");
         Ok(BackendRun {
             backend_id: "recording/1".into(),
+            channels: Vec::new(),
         })
     }
 
@@ -201,10 +209,10 @@ fn request(replay_key: &str) -> ExecutionRequest {
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
         confinement_manifest: None,
+        workspaces: Vec::new(),
         limits: ResourceLimits {
-            vcpus: 2,
-            memory_mib: 2048,
             wall_time_ms: 30_000,
+            ..ResourceLimits::default()
         },
     }
 }
@@ -466,6 +474,7 @@ impl Backend for JustFinishedBackend {
             backend_id: "just-finished/1".into(),
             backend_class: BackendClass::MicroVm,
             available: true,
+            unavailable_reason: None,
             enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
         }
     }
@@ -473,6 +482,7 @@ impl Backend for JustFinishedBackend {
     fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "just-finished/1".into(),
+            channels: Vec::new(),
         })
     }
 

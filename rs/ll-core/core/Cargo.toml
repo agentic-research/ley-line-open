@@ -1,6 +1,6 @@
 [package]
 name = "leyline-core"
-version = "0.20.5"
+version = "0.21.0"
 edition = "2024"
 description = "Σ substrate core for ley-line: BLAKE3 content addressing, the BlobStore contract, arena layout and mmap primitives, and the incremental outboard hash tree"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -15,6 +15,11 @@ serde = { workspace = true, features = ["derive"] }
 # T2.2: BLAKE3 for σ(arena buffer) computed at snapshot time. Locked
 # to BLAKE3 per Σ §3.4 (decade write-up 2026-merkle-cas-substrate.md).
 blake3 = { workspace = true }
+
+# statvfs: a grown arena is refused when the filesystem cannot hold it
+# (bead ley-line-open-8c8ded).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [features]
 default = []

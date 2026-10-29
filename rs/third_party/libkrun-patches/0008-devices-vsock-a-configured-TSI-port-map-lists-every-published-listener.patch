@@ -1,0 +1,77 @@
+From dc7e7062c95bc79d97ee92950e2d96f996a0d74a Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Tue, 27 Oct 2026 18:21:56 -0600
+Subject: [PATCH] devices/vsock: a configured TSI port map lists every
+ published listener
+
+krun_set_port_map documents two states: never called, every guest
+listener is exposed to the host; called with an array, only the listed
+ports are. The second was not what the TSI stream proxy did. try_listen
+looked the guest port up in the map and, on a miss, bound the host
+socket at the address the guest asked for anyway, so an unmapped port
+was published exactly as in the never-called case. The map renamed
+ports; it did not limit them. An embedder that confines the VMM process
+per port (Landlock BindTcp) never saw this; one that cannot (Seatbelt
+grants network-bind for every port or none) published every guest
+listener the moment it mapped one.
+
+With a map configured, a listen on an unmapped INET or INET6 port is now
+refused with EACCES, which the guest sees from listen(2). A mapped port
+is bound on the host's loopback interface rather than the guest's
+requested address: a guest binding 0.0.0.0 is otherwise published on
+every host interface, which the embedder never asked for and could not
+narrow. Unix-domain listeners and the never-called case are unchanged.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+Signed-off-by: jamestexas <18285880+jamestexas@users.noreply.github.com>
+---
+ src/devices/src/virtio/vsock/tsi_stream.rs | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/devices/src/virtio/vsock/tsi_stream.rs b/src/devices/src/virtio/vsock/tsi_stream.rs
+index 6cb6288..03b517b 100644
+--- a/src/devices/src/virtio/vsock/tsi_stream.rs
++++ b/src/devices/src/virtio/vsock/tsi_stream.rs
+@@ -1,6 +1,6 @@
+ use std::collections::HashMap;
+ use std::fs;
+-use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
++use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+ use std::num::Wrapping;
+ use std::os::fd::{FromRawFd, OwnedFd};
+ use std::os::unix::fs::FileTypeExt;
+@@ -202,20 +202,27 @@ impl TsiStreamProxy {
+             return 0;
+         }
+ 
++        // A configured port map is the complete list of guest listeners the
++        // host may reach: a mapped port is published on the host's loopback
++        // interface at its host port, and an unmapped one is refused. Without
++        // a map (krun_set_port_map never called) every guest listener is
++        // published at the address the guest asked for, as before.
+         let addr: SockaddrStorage = if let Some(port_map) = host_port_map {
+             if let Some(sin) = req.addr.as_sockaddr_in() {
+                 debug!("sockaddr is ipv4");
+                 if let Some(port) = port_map.get(&sin.port()) {
+-                    SocketAddrV4::new(sin.ip(), *port).into()
++                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, *port).into()
+                 } else {
+-                    req.addr
++                    warn!("listen: guest port {} is not in the port map", sin.port());
++                    return -libc::EACCES;
+                 }
+             } else if let Some(sin6) = req.addr.as_sockaddr_in6() {
+                 debug!("sockaddr is ipv6");
+                 if let Some(port) = port_map.get(&sin6.port()) {
+-                    SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.flowinfo()).into()
++                    SocketAddrV6::new(Ipv6Addr::LOCALHOST, *port, 0, 0).into()
+                 } else {
+-                    req.addr
++                    warn!("listen: guest port {} is not in the port map", sin6.port());
++                    return -libc::EACCES;
+                 }
+             } else if req.addr.as_unix_addr().is_some() {
+                 debug!("sockaddr is unix");
+-- 
+2.50.1 (Apple Git-155)
+

@@ -23,10 +23,12 @@ fn request() -> ExecutionRequest {
         allowed_egress: Vec::new(),
         confinement_digest: String::new(),
         confinement_manifest: None,
+        workspaces: Vec::new(),
+        // The wall clock only: without a delegated cgroup root this tier
+        // enforces nothing else, and refuses a memory, CPU or pids ceiling.
         limits: ResourceLimits {
-            vcpus: 1,
-            memory_mib: 64,
             wall_time_ms: 10_000,
+            ..ResourceLimits::default()
         },
     }
 }
@@ -86,6 +88,17 @@ fn every_native_resource_is_required_independently() {
     fs::create_dir(&ephemeral_root).expect("runs");
     fs::write(&runtime_file, "runtime").expect("runtime file");
 
+    let complete = NativeWorkerBackend::new(NativeWorkerConfig {
+        worker: worker.clone(),
+        cas_root: cas_root.clone(),
+        ephemeral_root: ephemeral_root.clone(),
+        runtime_files: vec![runtime_file.clone()],
+        ready_timeout: Duration::from_secs(1),
+    })
+    .capabilities();
+    assert!(complete.available, "{complete:?}");
+    assert_eq!(complete.unavailable_reason, None);
+
     let configurations = [
         NativeWorkerConfig {
             worker: fixture.path().join("missing-worker"),
@@ -117,11 +130,10 @@ fn every_native_resource_is_required_independently() {
         },
     ];
     for configuration in configurations {
-        assert!(
-            !NativeWorkerBackend::new(configuration)
-                .capabilities()
-                .available
-        );
+        let capabilities = NativeWorkerBackend::new(configuration).capabilities();
+        assert!(!capabilities.available);
+        let reason = capabilities.unavailable_reason.unwrap_or_default();
+        assert!(reason.contains("not configured"), "{reason:?}");
     }
 }
 
@@ -346,4 +358,37 @@ sleep 30
         .start(&request)
         .expect("a worker attesting exactly the authorized policy must start");
     assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
+}
+
+/// The refusal a worker reports must survive foreign stderr ahead of it.
+///
+/// Measured under an outer Seatbelt sandbox (bead `ley-line-open-704853`):
+/// macOS libsandbox itself writes `sandbox initialization failed: Operation
+/// not permitted` to the worker's stderr, which is the event channel, and only
+/// then does the worker emit the `failed` event that names the cause. The
+/// backend took the OS line as the readiness event and refused the run as
+/// "invalid native worker readiness event: expected value", so an operator
+/// could not tell a host that cannot sandbox from a corrupt worker. The run
+/// was still refused; the refusal must also name the reason.
+#[test]
+fn a_worker_refusal_after_foreign_stderr_keeps_its_cause() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend(
+        &fixture,
+        r#"#!/bin/sh
+IFS= read -r _
+echo 'sandbox initialization failed: Operation not permitted' >&2
+echo '{"type":"failed","error":{"code":"backend-failed","retryable":false,"detail":"apply native nono confinement: Sandbox initialization failed: Operation not permitted"}}' >&2
+exit 1
+"#,
+    );
+    let error = backend
+        .start(&request())
+        .expect_err("a worker that could not confine must not start");
+    assert!(
+        error.detail.contains("apply native nono confinement"),
+        "the refusal must carry the worker's cause, not the OS line before it: {error:?}"
+    );
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
 }

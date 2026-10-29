@@ -10,6 +10,39 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Security
+
+- **The native tier refuses a workspace grant it cannot serve** (bead
+  `ley-line-open-f8ebcf`). `NativeWorkerBackend` has no workspace share, and
+  it started a run whose grant named a Graph workspace anyway: the workload
+  ran without the workspace while the receipt listed the workspace's
+  `graphRoot` as an input. It now refuses the run `UnsupportedBackend`,
+  naming the workspace, before the worker is spawned, as the microVM tier
+  does when it has no share provider.
+
+### Added
+
+- **The execution/v1 conformance matrix** (bead `ley-line-open-f8ebcf`):
+  one set of rows run against native nono and embedded libkrun with real
+  workers and real guests, covering read-only capabilities and status,
+  identical refusal codes, success, failure, cancellation and crash recovery
+  with bound receipts, denial of undeclared host paths and the daemon's
+  arena, workspace refusal, Graph I/O through the mediated share, and no
+  `krunvm` or Taskfile subprocess. Rows the host cannot run print
+  `SKIPPED (NOT a pass)`; `LEYLINE_REQUIRE_HYPERVISOR=1` and
+  `LEYLINE_REQUIRE_SANDBOX=1` make that a failure. Documented in
+  `rs/ll-open/runtime/README.md`.
+- **Transport receipt parity** (`cli-lib/tests/execution_transport_parity.rs`):
+  one request through the Rust handler, the daemon socket, the `leyline
+  execution` command line and MCP gives the same lifecycle and receipt.
+
+### Changed
+
+- **`cmd_execution`** exposes `request`, `respond` and `run` over
+  `ExecutionCommands` in place of one function per operation. `run` is what
+  `leyline execution` dispatches; `respond` returns the daemon's reply that
+  `run` prints.
+
 ## [0.21.0] — 2026-10-26
 
 **Security:** on the microVM tier, a grant declaring any `confinement/v1`

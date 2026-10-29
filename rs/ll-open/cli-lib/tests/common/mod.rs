@@ -27,6 +27,15 @@ use leyline_core::{Controller, create_arena};
 /// A minimal daemon context: controller + sheaf state, no reparse, no source
 /// dir. `dir` should be a `TempDir` path the caller keeps alive.
 pub fn daemon_context(dir: &Path) -> Arc<DaemonContext> {
+    daemon_context_with_ext(dir, Arc::new(NoExt))
+}
+
+/// [`daemon_context`] with `ext` as the daemon's extension — the execution
+/// surface, for instance (`ExecutionDaemonExt`).
+pub fn daemon_context_with_ext(
+    dir: &Path,
+    ext: Arc<dyn leyline_cli_lib::daemon::DaemonExt>,
+) -> Arc<DaemonContext> {
     use parking_lot::{Mutex, RwLock};
 
     let arena_path = dir.join("test.arena");
@@ -48,7 +57,7 @@ pub fn daemon_context(dir: &Path) -> Arc<DaemonContext> {
 
     Arc::new(DaemonContext {
         ctrl_path,
-        ext: Arc::new(NoExt),
+        ext,
         router,
         live_db,
         enrich_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),

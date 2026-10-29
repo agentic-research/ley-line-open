@@ -158,6 +158,18 @@ impl Backend for NativeWorkerBackend {
                 "native nono worker backend is not configured with existing first-party resources",
             ));
         }
+        // A workspace grant is Graph authority, and this tier has no share to
+        // deliver it through. Starting anyway ran the workload without the
+        // workspace while the receipt named its graph root as an input; the
+        // microVM tier refuses the same grant when it has no share provider
+        // (bead ley-line-open-f8ebcf).
+        if let Some(grant) = request.workspaces.first() {
+            return Err(ExecutionError::unsupported(format!(
+                "the run is granted workspace {:?}, and the native tier serves no \
+                 workspace shares; run it on the microVM tier",
+                grant.name
+            )));
+        }
         let _start_guard = self.start_lock.lock();
         if self.children.lock().contains_key(&request.run_id) {
             return Err(ExecutionError {

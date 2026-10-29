@@ -195,6 +195,45 @@ fn readiness_for_another_run_is_rejected_and_cleaned() {
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
 }
 
+/// A workspace grant is Graph authority the native tier cannot deliver. It
+/// used to start anyway, without the workspace, while the receipt named the
+/// workspace's graph root as an input (found by the conformance matrix, bead
+/// `ley-line-open-f8ebcf`). The refusal comes before the worker exists.
+#[test]
+fn a_granted_workspace_is_refused_before_the_worker_is_spawned() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    let (backend, runs) = backend(
+        &fixture,
+        &format!(
+            "#!/bin/sh\n: > '{}'\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"native-run-01\"}}' >&2\n",
+            spawned.display()
+        ),
+    );
+    let mut request = request();
+    request.workspaces = vec![leyline_runtime::WorkspaceGrant {
+        name: "repo".into(),
+        graph_root: format!("blake3-256:{}", "e".repeat(64)),
+        expected_generation: 0,
+        operations: vec![leyline_runtime::WorkspaceOperation::Read],
+    }];
+    let error = backend
+        .start(&request)
+        .expect_err("a workspace grant the native tier cannot serve");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::UnsupportedBackend,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("\"repo\""), "{error:?}");
+    assert!(
+        !spawned.exists(),
+        "the worker was spawned for a refused run"
+    );
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+}
+
 #[test]
 fn native_cleanup_restores_guest_created_permissions() {
     let _serial = common::serial();

@@ -30,3 +30,38 @@ This crate has no cargo features. The `vmm` feature it had until bead `ley-line-
 ## Correctness stance
 
 This crate crosses a trust boundary (a signed grant authorizing execution of untrusted content) and is directly consumed outside this repo. See `execution-boundary-adversary` review coverage for RunSpec/RunGrant binding, evidence verification, and backend-parity claims.
+
+## Conformance matrix
+
+One set of rows, run against both backends with a real worker and a real guest (bead `ley-line-open-f8ebcf`; Cloister's provider-adoption gate). The rows are written once, in [`tests/conformance/mod.rs`](tests/conformance/mod.rs), and the `conformance_rows!` macro expands all of them into `#[test]`s for each column, so a column cannot skip a row the other runs. The guest is one program, [`tests/conformance/guest.rs`](tests/conformance/guest.rs) (`std` only), compiled into the native column's test binary and as a static Linux program for the microVM column. A started guest proves it is running by dialing the host over its granted channel, and natural completion is the backend's completion condition variable: no row sleeps.
+
+| Column | Binary | Backend and worker | Guest channel | A host path is… |
+| --- | --- | --- | --- | --- |
+| native nono | `runtime/tests/conformance_matrix.rs` | `NativeWorkerBackend`, `leyline-native-worker` applying Seatbelt or Landlock | §3 `connectLocal` (loopback TCP) | visible, and kernel-denied: `EPERM`/`EACCES`, never `ENOENT` |
+| embedded libkrun | `krun-worker/tests/conformance_matrix.rs` | `KrunWorkerBackend`, the real `leyline-krun-worker` booting a guest | §6 `unixSocket.allow` (vsock to a host socket) | absent from the guest's namespace: `ENOENT` |
+
+| Row | What both columns assert |
+| --- | --- |
+| `capabilities_and_status_are_read_only` | Capabilities name the tier and its backend id; `status`, `inspect`, `collect`, `cleanup` and `cancel` of an unknown run are the same typed refusal; none of them provisions or writes. |
+| `refusals_are_identical_and_precede_backend_work` | Unprovisioned start (`NotProvisioned`), provisioning the other tier, a grant for the other tier (`UnsupportedBackend`), a grant for another confinement policy (`IdentityPolicyMismatch`), an expired grant (`InvalidSpec`), an egress grant and an unenforceable `pids` ceiling (`UnsupportedBackend`), and the channel grant the tier cannot deliver (`InvalidSpec`: §4 `port.bind` on Seatbelt, §6 on Landlock, §3 on the microVM tier). Each leaves the ephemeral root empty. |
+| `a_guest_that_exits_zero_is_succeeded_with_a_bound_receipt` | `Running` → `Succeeded`; the receipt binds the spec, grant and attested confinement digest, records the tier's enforcement mechanisms, and its event-log root is the BLAKE3 of the log `inspect` returns; collect is read-only; cleanup closes the lifecycle; the same authority started again is the same run. |
+| `a_guest_that_exits_nonzero_is_failed_with_a_content_addressed_detail` | `Failed` with `BackendFailed`; the terminal event carries the BLAKE3 of the typed error. |
+| `cancel_ends_a_blocked_guest_and_everything_it_ran` | A guest blocked forever is `Running` and has no receipt; `cancel` returns after the worker, its process group, the guest and the run root are gone and the channel has closed; the receipt is `Cancelled`; a repeated cancel is idempotent. |
+| `a_killed_worker_is_failed_reaped_and_cleaned` | Crash recovery: SIGKILL the native worker or the VMM. The run ends `Failed`, nothing it spawned survives, the run root is removed, and collect and cleanup still work. |
+| `undeclared_host_access_and_the_raw_arena_are_unreachable` | The guest reads and writes its own rootfs and reaches its granted channel, and cannot read an existing host file outside the grant, the daemon's arena or living database, or `~/.ssh`, nor reach an ungranted loopback listener (which never sees a connection). |
+| `a_workspace_grant_nothing_serves_is_refused_before_spawn` | A Graph workspace grant a backend cannot serve is `UnsupportedBackend` before anything is spawned. |
+| `graph_io_goes_through_the_mediated_workspace_share` | libkrun: a guest granted a workspace reads a real store's bytes through the share (storefs's `StoreShare`), lists it, writes through it, and the write lands in the store; the store's database is not in the guest's namespace or the listing. Native: the tier has no workspace share, so the row asserts the refusal and prints a named skip, never a pass. |
+
+Every guest row also puts `krunvm`, `task` and `go-task` traps first on `PATH` and fails if the execution path ran any of them.
+
+Run it with `task runtime:test`, or one column at a time:
+
+```sh
+cargo test -p leyline-runtime --test conformance_matrix            # native nono
+LEYLINE_LIBKRUNFW_PATH=/opt/homebrew/lib/libkrunfw.5.dylib \
+  cargo test -p leyline-krun-worker --test conformance_matrix      # embedded libkrun
+```
+
+Skips are named and are never passes. Without `LEYLINE_LIBKRUNFW_PATH` every libkrun row prints `SKIPPED (NOT a pass)`, and `LEYLINE_REQUIRE_HYPERVISOR=1` turns that into a failure; a host that cannot apply the native sandbox (an outer Seatbelt sandbox, a kernel without Landlock network rules) makes the native guest rows print the same, and `LEYLINE_REQUIRE_SANDBOX=1` turns that into a failure. No hosted CI runner can boot a guest, so the libkrun column runs in the release gate's hypervisor suite (`task release:hypervisor:record`).
+
+Receipt parity across the four surfaces is [`cli-lib/tests/execution_transport_parity.rs`](../cli-lib/tests/execution_transport_parity.rs): one request through the in-process `ExecutionHandler`, the daemon's control socket, a parsed `leyline execution` command line, and MCP `tools/call` gives the same lifecycle and receipt (identical apart from wall-clock fields), and one run read through all four gives byte-identical status, inspection, receipt and errors.

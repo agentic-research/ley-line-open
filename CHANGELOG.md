@@ -10,6 +10,15 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+### Added
+
+- `task lint:license-direction`, run by `task ci`, enforces the README's
+  Apache-2.0/AGPL carveout: every workspace crate declares `Apache-2.0` or
+  `AGPL-3.0-or-later`, and no Apache-2.0 crate reaches an AGPL crate through
+  normal or build dependencies, direct or transitive, under any feature.
+  `tools/test_license_direction.sh` proves it fails on inverted fixtures
+  (`ley-line-open-4392a2`).
+
 ## [0.21.0] — 2026-10-26
 
 **Security:** on the microVM tier, a grant declaring any `confinement/v1`

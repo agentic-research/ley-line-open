@@ -22,6 +22,12 @@ context, scoping notes, and review history are recoverable.
 
 ### Added
 
+- `task lint:license-direction`, run by `task ci`, enforces the README's
+  Apache-2.0/AGPL carveout: every workspace crate declares `Apache-2.0` or
+  `AGPL-3.0-or-later`, and no Apache-2.0 crate reaches an AGPL crate through
+  normal or build dependencies, direct or transitive, under any feature.
+  `tools/test_license_direction.sh` proves it fails on inverted fixtures
+  (`ley-line-open-4392a2`).
 - **The execution/v1 conformance matrix** (bead `ley-line-open-f8ebcf`):
   one set of rows run against native nono and embedded libkrun with real
   workers and real guests, covering read-only capabilities and status,

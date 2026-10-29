@@ -284,4 +284,6 @@ example `-p 127.0.0.1:18384:8384`) unless an authenticated proxy is in front.
 
 The schema and wire-contract crates are Apache-2.0. The implementation crates
 are AGPL-3.0-or-later. See [LICENSE-APACHE](LICENSE-APACHE) and
-[LICENSE](LICENSE).
+[LICENSE](LICENSE). Each crate's `Cargo.toml` declares which side it is on, and
+`task lint:license-direction` (part of `task ci`) fails when an Apache-2.0
+crate gains a normal or build dependency, direct or transitive, on AGPL code.

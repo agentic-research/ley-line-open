@@ -398,6 +398,11 @@ fn a_time_with_a_nanosecond_count_of_a_second_or_more_is_refused() {
 #[test]
 fn a_remote_service_answering_a_malformed_reply_fails_eio_from_then_on() {
     let (client, mut server) = UnixStream::pair().unwrap();
+    // A request that never reaches the server fails the test instead of
+    // hanging it.
+    for end in [&client, &server] {
+        end.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    }
     let remote = RemoteFs::new(client);
     let answer = std::thread::spawn(move || {
         read_request(&mut server).unwrap().expect("a request");
@@ -455,14 +460,20 @@ fn a_length_above_the_frame_limit_is_refused_before_allocating() {
 
 #[test]
 fn a_reader_error_other_than_an_interrupt_is_returned() {
-    /// Fails every read the same way.
-    struct Broken;
+    /// Fails its first read, and fails the test if it is read again: a frame
+    /// reader that retried this error would otherwise loop forever, which the
+    /// mutation harness can only stop by timing the whole suite out.
+    struct Broken {
+        read: bool,
+    }
     impl Read for Broken {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.read, "a non-interrupt error was retried");
+            self.read = true;
             Err(io::ErrorKind::ConnectionReset.into())
         }
     }
-    let error = read_request(&mut Broken).unwrap_err();
+    let error = read_request(&mut Broken { read: false }).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
 }
 

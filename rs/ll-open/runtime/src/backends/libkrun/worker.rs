@@ -257,22 +257,38 @@ pub fn inherit_only(command: &mut Command, keep: &[i32]) -> Result<(), Execution
     // nothing, and makes only fcntl calls, which are async-signal-safe.
     unsafe {
         command.pre_exec(move || {
-            use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
+            use rustix::io::{fcntl_getfd, fcntl_setfd};
             for &fd in held.iter().filter(|fd| !keep.contains(fd)) {
                 let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
                 // Closed since the listing: nothing to inherit.
                 if let Ok(flags) = fcntl_getfd(fd) {
-                    fcntl_setfd(fd, flags | FdFlags::CLOEXEC)?;
+                    fcntl_setfd(fd, child_descriptor_flags(flags, false))?;
                 }
             }
             for &fd in &keep {
                 let fd = std::os::fd::BorrowedFd::borrow_raw(fd);
-                fcntl_setfd(fd, fcntl_getfd(fd)?.difference(FdFlags::CLOEXEC))?;
+                fcntl_setfd(fd, child_descriptor_flags(fcntl_getfd(fd)?, true))?;
             }
             Ok(())
         });
     }
     Ok(())
+}
+
+/// The descriptor flags [`inherit_only`]'s child sets on a descriptor whose
+/// flags are `flags`: close-on-exec cleared when the worker keeps it, set
+/// otherwise, and every other flag unchanged.
+///
+/// A pure function so the decision is testable without forking: a descriptor
+/// Rust opened is already close-on-exec, and toggling the flag instead of
+/// setting it would pass exactly those descriptors to the worker.
+fn child_descriptor_flags(flags: rustix::io::FdFlags, keep: bool) -> rustix::io::FdFlags {
+    use rustix::io::FdFlags;
+    if keep {
+        flags.difference(FdFlags::CLOEXEC)
+    } else {
+        flags | FdFlags::CLOEXEC
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,12 +555,18 @@ pub fn prepare(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::{CString, OsString};
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
     use super::super::plan::{KrunConfig, ResolvedRootfs};
-    use super::mount_workspace;
-    use crate::DigestRef;
+    use super::*;
+    use crate::{
+        DigestRef, ErrorCode, ResourceLimits, WorkerChannel, WorkspaceGrant, WorkspaceOperation,
+    };
 
     #[test]
     fn a_mounted_workspace_is_the_guests_working_directory() {
@@ -586,5 +608,224 @@ mod tests {
         absolute.executable = CString::new("/usr/bin/agent").unwrap();
         mount_workspace(&mut absolute);
         assert_eq!(absolute.executable, CString::new("/usr/bin/agent").unwrap());
+    }
+
+    // The worker's own checks, asserted in-process. Each runs before libkrun
+    // is reached, and none needs a hypervisor, so they run on every platform
+    // the runtime's mutation slice does — the hypervisor tests that also
+    // cross these paths skip without one.
+
+    fn request() -> ExecutionRequest {
+        ExecutionRequest {
+            run_id: "run".into(),
+            replay_key: "replay".into(),
+            rootfs: DigestRef {
+                algorithm: "blake3-256".into(),
+                value: "0".repeat(64),
+            },
+            executable: "bin/agent".into(),
+            arguments: Vec::new(),
+            public_environment: BTreeMap::new(),
+            allowed_egress: Vec::new(),
+            confinement_digest: String::new(),
+            confinement_manifest: None,
+            workspaces: Vec::new(),
+            limits: ResourceLimits::default(),
+        }
+    }
+
+    fn grant(name: &str) -> WorkspaceGrant {
+        WorkspaceGrant {
+            name: name.into(),
+            graph_root: format!("blake3-256:{}", "1".repeat(64)),
+            expected_generation: 0,
+            operations: vec![WorkspaceOperation::Read],
+        }
+    }
+
+    fn arguments(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    /// A descriptor number no test process holds: far above any open file
+    /// and any reuse by a parallel test.
+    const NEVER_OPEN: i32 = 1 << 20;
+
+    #[test]
+    fn a_workload_cannot_set_the_guest_inits_mount_list() {
+        let mut request = request();
+        request
+            .public_environment
+            .insert("MODE".into(), "audit".into());
+        assert!(refuse_reserved_environment(&request).is_ok());
+
+        request
+            .public_environment
+            .insert(VIRTIOFS_MOUNTS_ENV.into(), "work:/".into());
+        let error = refuse_reserved_environment(&request).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains(VIRTIOFS_MOUNTS_ENV), "{error}");
+    }
+
+    #[test]
+    fn the_share_is_the_runs_one_granted_workspace_or_nothing() {
+        // No grant, no share: nothing to attach.
+        assert!(workspace_share(&request(), None).unwrap().is_none());
+
+        // A share the run is not granted.
+        let (ours, _peer) = UnixStream::pair().unwrap();
+        let error = workspace_share(&request(), Some(ours.as_raw_fd())).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("granted no workspace"), "{error}");
+
+        let mut granted = request();
+        granted.workspaces.push(grant("src"));
+
+        // A grant without a share.
+        let error = workspace_share(&granted, None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("\"src\""), "{error}");
+
+        // A descriptor that is not open, and one that is not a socket.
+        let error = workspace_share(&granted, Some(NEVER_OPEN)).unwrap_err();
+        assert!(error.detail.contains("is not open"), "{error}");
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let error = workspace_share(&granted, Some(file.as_raw_fd())).unwrap_err();
+        assert!(error.detail.contains("is not a socket"), "{error}");
+
+        // The granted share: the socket comes back, owned, still connected.
+        let (share, mut peer) = UnixStream::pair().unwrap();
+        let mut share = workspace_share(&granted, Some(share.into_raw_fd()))
+            .unwrap()
+            .expect("the granted share");
+        share.write_all(b"x").unwrap();
+        let mut byte = [0u8; 1];
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+
+        // Two workspaces: the tier attaches one.
+        granted.workspaces.push(grant("docs"));
+        let error = workspace_share(&granted, None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+    }
+
+    #[test]
+    fn undeclared_is_what_is_neither_a_standard_stream_nor_declared() {
+        let declared = [InheritedDescriptor {
+            descriptor: 5,
+            channel: WorkerChannel::WorkspaceShare {
+                workspace: "src".into(),
+                graph_root: String::new(),
+            },
+        }];
+        let held: BTreeSet<i32> = [0, 1, 2, 5, 7, 9].into();
+        assert_eq!(undeclared_descriptors(&held, &declared), vec![7, 9]);
+        // Nothing beyond what is declared: nothing undeclared.
+        let held: BTreeSet<i32> = [0, 1, 2, 5].into();
+        assert_eq!(undeclared_descriptors(&held, &declared), Vec::<i32>::new());
+        // Without the declaration, the share itself is undeclared.
+        assert_eq!(undeclared_descriptors(&held, &[]), vec![5]);
+    }
+
+    #[test]
+    fn a_held_descriptor_nothing_declares_is_refused() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let error = refuse_undeclared_descriptors(&[]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch);
+        assert!(
+            error.detail.contains(&file.as_raw_fd().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_spawned_worker_keeps_exactly_the_descriptors_it_is_handed() {
+        use rustix::io::FdFlags;
+        // A descriptor Rust opened is already close-on-exec; it must stay so.
+        assert_eq!(
+            child_descriptor_flags(FdFlags::CLOEXEC, false),
+            FdFlags::CLOEXEC
+        );
+        assert_eq!(
+            child_descriptor_flags(FdFlags::empty(), false),
+            FdFlags::CLOEXEC
+        );
+        assert_eq!(
+            child_descriptor_flags(FdFlags::CLOEXEC, true),
+            FdFlags::empty()
+        );
+        assert_eq!(
+            child_descriptor_flags(FdFlags::empty(), true),
+            FdFlags::empty()
+        );
+    }
+
+    #[test]
+    fn worker_options_parse_every_option_once() {
+        let options = WorkerOptions::parse(arguments(&[
+            "--cas-root",
+            "/cas",
+            "--run-root",
+            "/runs",
+            "--runtime-file",
+            "/lib/a",
+            "--runtime-file",
+            "/lib/b",
+            "--device",
+            "/dev/kvm",
+            "--tsi-hijack-inet",
+            WORKSPACE_SHARE_FD_ARG,
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(
+            options,
+            WorkerOptions {
+                cas_root: PathBuf::from("/cas"),
+                run_root: PathBuf::from("/runs"),
+                runtime_files: vec![PathBuf::from("/lib/a"), PathBuf::from("/lib/b")],
+                devices: vec![PathBuf::from("/dev/kvm")],
+                tsi_hijack_inet: true,
+                workspace_share_fd: Some(3),
+            }
+        );
+
+        // Descriptor 0 is a number like any other.
+        let options = WorkerOptions::parse(arguments(&[
+            "--cas-root",
+            "/cas",
+            "--run-root",
+            "/runs",
+            WORKSPACE_SHARE_FD_ARG,
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(options.workspace_share_fd, Some(0));
+        assert!(!options.tsi_hijack_inet);
+    }
+
+    #[test]
+    fn worker_options_refuse_duplicates_and_malformed_values() {
+        let base = ["--cas-root", "/cas", "--run-root", "/runs"];
+        for extra in [
+            &["--cas-root", "/other"][..],
+            &["--run-root", "/other"][..],
+            &[WORKSPACE_SHARE_FD_ARG, "3", WORKSPACE_SHARE_FD_ARG, "4"][..],
+            &[WORKSPACE_SHARE_FD_ARG, "-1"][..],
+            &[WORKSPACE_SHARE_FD_ARG, "three"][..],
+            &["--unknown", "x"][..],
+            &["--device"][..],
+        ] {
+            let mut values = base.to_vec();
+            values.extend_from_slice(extra);
+            let error = WorkerOptions::parse(arguments(&values)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidSpec, "{values:?}: {error}");
+        }
+        for missing in [&["--run-root", "/runs"][..], &["--cas-root", "/cas"][..]] {
+            assert!(
+                WorkerOptions::parse(arguments(missing)).is_err(),
+                "{missing:?}"
+            );
+        }
     }
 }

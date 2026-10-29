@@ -407,6 +407,8 @@ run_slice() {
     set +e
     if [ "$mode" = lib ]; then
         cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"
+    elif [ "$mode" = bins ]; then
+        cargo mutants --in-diff "$DIFF" -C --bins -E 'replace main' "$@"
     else
         cargo mutants --in-diff "$DIFF" -E 'replace main' "$@"
     fi
@@ -499,17 +501,23 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = generic ]; then
         } >&2
         exit 1
     fi
-    generic_features=''
-    add_generic_features() {
-        package_changed_in_diff "$1" || return 0
-        generic_features="${generic_features:+$generic_features,}$2"
-    }
+    # The packages in the diff that carry enable rows, each named once.
+    featured_packages=''
     while read -r pkg feat; do
         [ -n "$pkg" ] || continue
-        add_generic_features "$pkg" "$feat"
+        package_changed_in_diff "$pkg" || continue
+        case " $featured_packages " in
+            *" $pkg "*) ;;
+            *) featured_packages="${featured_packages:+$featured_packages }$pkg" ;;
+        esac
     done <<LEDGER_ROWS
 $enable_rows
 LEDGER_ROWS
+    # One package's enable-row features, comma-joined.
+    features_of() {
+        printf '%s\n' "$enable_rows" \
+            | awk -v pkg="$1" '$1 == pkg { printf "%s%s", sep, $2; sep = "," }'
+    }
 
     # File-level exclusions come from the same ledger (`exclude-file:` rows).
     # Today that is witchcraft.rs alone — its row's prose says why exclusion
@@ -524,33 +532,71 @@ LEDGER_ROWS
         exclude_file_args="$exclude_file_args --exclude $excluded"
     done
 
+    # Each package's features reach ONLY that package's build, so a package
+    # carrying enable rows gets an invocation of its own, confined to its
+    # files with `--file`. One invocation carrying the union is wrong: cargo
+    # rejects a `--features` name none of the SELECTED packages declares,
+    # and cargo-mutants selects only the packages whose mutants it runs —
+    # which, once a slice is sharded, is a subset of the diff's packages.
+    # Package-qualified names (`leyline-ts/hcl`) do not help; cargo refuses
+    # those too for an unselected package. The v0.21.0 promotion diff hit it
+    # in every generic shard: shard 0 held only leyline-core and leyline-sign
+    # mutants, was handed `hcl,pyproject` for leyline-ts, and reported
+    # BASELINE BROKEN having mutated nothing (bead ley-line-open-c1f8bc).
+    #
     # $exclude_file_args expands unquoted by design: it is a flag list, and
     # ledger paths carry no whitespace.
-    # shellcheck disable=SC2086
-    if [ -n "$generic_features" ]; then
-        echo "generic slice features (from packages in the diff): $generic_features"
-        run_slice lib \
-            --features "$generic_features" \
-            $exclude_file_args \
-            --exclude 'll-open/fs/**' \
-            --exclude 'll-open/runtime/**' \
-            --exclude 'll-open/krun-worker/**' \
-            --exclude 'll-open/cli-lib/**' \
-            --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**' \
-            --exclude 'll-open/storefs/**'
-    else
+    for pkg in $featured_packages; do
+        pkg_features=$(features_of "$pkg")
+        echo "generic slice: $pkg with its own features: $pkg_features"
         # shellcheck disable=SC2086
-        run_slice lib \
-            $exclude_file_args \
-            --exclude 'll-open/fs/**' \
-            --exclude 'll-open/runtime/**' \
-            --exclude 'll-open/krun-worker/**' \
-            --exclude 'll-open/cli-lib/**' \
-            --exclude 'll-open/cli/**' \
-            --exclude 'll-open/schema-bridge/**' \
-            --exclude 'll-open/storefs/**'
-    fi
+        run_slice lib --file "$pkg/**" --features "$pkg_features" $exclude_file_args
+    done
+
+    # A generic-slice package with no library target cannot run under
+    # `-C --lib`: cargo answers "no library targets found in package" and the
+    # slice reports BASELINE BROKEN. A package selected alongside a library
+    # package hides this, so it surfaces exactly when sharding puts a
+    # binary-only package's mutants in a shard of their own — the v0.21.0
+    # promotion's two `rs/tools/smell-projector` mutants did. Such a package
+    # keeps its unit tests in its binary, so it runs them with `-C --bins`, in
+    # an invocation of its own. Found from the diff's paths: the nearest
+    # directory holding a Cargo.toml is the package, and it is binary-only
+    # when it has neither `src/lib.rs` nor a `[lib]` table.
+    owned_packages=$(derive_generic_excludes)
+    bin_only_packages=''
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        dir=$(dirname -- "$path")
+        while [ "$dir" != . ] && [ "$dir" != / ] && [ ! -f "$dir/Cargo.toml" ]; do
+            dir=$(dirname -- "$dir")
+        done
+        # `.` is the workspace manifest, not a package of the generic slice.
+        [ "$dir" != . ] && [ -f "$dir/Cargo.toml" ] || continue
+        case " $owned_packages $featured_packages $bin_only_packages " in
+            *" $dir "*) continue ;;
+        esac
+        if [ ! -f "$dir/src/lib.rs" ] && ! grep -q '^\[lib\]' "$dir/Cargo.toml"; then
+            bin_only_packages="${bin_only_packages:+$bin_only_packages }$dir"
+        fi
+    done <<CHANGED_PATHS
+$(sed -n 's|^+++ b/\(.*\.rs\)$|\1|p' "$DIFF")
+CHANGED_PATHS
+    for pkg in $bin_only_packages; do
+        echo "generic slice: $pkg has no library target; its binary's tests run"
+        # shellcheck disable=SC2086
+        run_slice bins --file "$pkg/**" $exclude_file_args
+    done
+
+    # Everything else in the generic slice, with no feature flags: the
+    # packages a scope owns (from the table, never the test override) and
+    # the packages mutated above are excluded.
+    set --
+    for pkg in $owned_packages $featured_packages $bin_only_packages; do
+        set -- "$@" --exclude "$pkg/**"
+    done
+    # shellcheck disable=SC2086
+    run_slice lib $exclude_file_args "$@"
 fi
 
 # schema-bridge is the same case runtime and cli-lib are, in its purest form:

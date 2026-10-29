@@ -368,6 +368,47 @@ if [ "$(grep -c -- ' -C --lib ' "$log")" -ne 1 ] || grep -q -- '--features\|--fi
     exit 1
 fi
 
+# A generic-slice package with no library target (rs/tools/smell-projector is
+# one) cannot run under `-C --lib`: cargo finds no library target, and once
+# sharding gives its mutants a shard of their own the slice is BASELINE
+# BROKEN. It runs its binary's tests in an invocation of its own, and the
+# library remainder excludes it. Run from a directory where both packages'
+# manifests resolve, as the real gate runs from rs/.
+mkdir -p "$fixture_dir/ws/tools/projector/src" "$fixture_dir/ws/ll-open/vcs/src"
+printf '[package]\nname = "projector"\n\n[[bin]]\nname = "projector"\npath = "src/main.rs"\n' \
+    > "$fixture_dir/ws/tools/projector/Cargo.toml"
+: > "$fixture_dir/ws/tools/projector/src/main.rs"
+printf '[package]\nname = "vcs"\n' > "$fixture_dir/ws/ll-open/vcs/Cargo.toml"
+: > "$fixture_dir/ws/ll-open/vcs/src/lib.rs"
+printf '[workspace]\n' > "$fixture_dir/ws/Cargo.toml"
+cat > "$fixture_dir/generic-bin-only.diff" <<'DIFF'
+diff --git a/tools/projector/src/main.rs b/tools/projector/src/main.rs
+--- a/tools/projector/src/main.rs
++++ b/tools/projector/src/main.rs
+diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
+--- a/ll-open/vcs/src/lib.rs
++++ b/ll-open/vcs/src/lib.rs
+DIFF
+: > "$log"
+(
+    cd "$fixture_dir/ws"
+    PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+      "$repo_root/tools/mutants_diff.sh" "$fixture_dir/generic-bin-only.diff" generic
+)
+assert_call 'mutants .* -C --bins .*--file tools/projector/\*\*' \
+    'a binary-only package runs its binary tests in an invocation of its own'
+assert_call 'mutants .* -C --lib .*--exclude tools/projector/\*\*' \
+    'the library remainder excludes the binary-only package'
+if grep -- ' -C --lib ' "$log" | grep -q -- '--file tools/projector/'; then
+    echo 'a binary-only package was mutated under -C --lib' >&2
+    exit 1
+fi
+if grep -q -- '--file ll-open/vcs/\|--file \./' "$log"; then
+    echo 'a library package or the workspace root was routed as binary-only:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+
 # --------------------------------------------------------------------------
 # `list-scopes`: the plan the CI matrix is built from. Runs no cargo.
 # --------------------------------------------------------------------------

@@ -407,6 +407,8 @@ run_slice() {
     set +e
     if [ "$mode" = lib ]; then
         cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"
+    elif [ "$mode" = bins ]; then
+        cargo mutants --in-diff "$DIFF" -C --bins -E 'replace main' "$@"
     else
         cargo mutants --in-diff "$DIFF" -E 'replace main' "$@"
     fi
@@ -550,11 +552,47 @@ LEDGER_ROWS
         # shellcheck disable=SC2086
         run_slice lib --file "$pkg/**" --features "$pkg_features" $exclude_file_args
     done
+
+    # A generic-slice package with no library target cannot run under
+    # `-C --lib`: cargo answers "no library targets found in package" and the
+    # slice reports BASELINE BROKEN. A package selected alongside a library
+    # package hides this, so it surfaces exactly when sharding puts a
+    # binary-only package's mutants in a shard of their own — the v0.21.0
+    # promotion's two `rs/tools/smell-projector` mutants did. Such a package
+    # keeps its unit tests in its binary, so it runs them with `-C --bins`, in
+    # an invocation of its own. Found from the diff's paths: the nearest
+    # directory holding a Cargo.toml is the package, and it is binary-only
+    # when it has neither `src/lib.rs` nor a `[lib]` table.
+    owned_packages=$(derive_generic_excludes)
+    bin_only_packages=''
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        dir=$(dirname -- "$path")
+        while [ "$dir" != . ] && [ "$dir" != / ] && [ ! -f "$dir/Cargo.toml" ]; do
+            dir=$(dirname -- "$dir")
+        done
+        # `.` is the workspace manifest, not a package of the generic slice.
+        [ "$dir" != . ] && [ -f "$dir/Cargo.toml" ] || continue
+        case " $owned_packages $featured_packages $bin_only_packages " in
+            *" $dir "*) continue ;;
+        esac
+        if [ ! -f "$dir/src/lib.rs" ] && ! grep -q '^\[lib\]' "$dir/Cargo.toml"; then
+            bin_only_packages="${bin_only_packages:+$bin_only_packages }$dir"
+        fi
+    done <<CHANGED_PATHS
+$(sed -n 's|^+++ b/\(.*\.rs\)$|\1|p' "$DIFF")
+CHANGED_PATHS
+    for pkg in $bin_only_packages; do
+        echo "generic slice: $pkg has no library target; its binary's tests run"
+        # shellcheck disable=SC2086
+        run_slice bins --file "$pkg/**" $exclude_file_args
+    done
+
     # Everything else in the generic slice, with no feature flags: the
     # packages a scope owns (from the table, never the test override) and
-    # the featured packages mutated above are excluded.
+    # the packages mutated above are excluded.
     set --
-    for pkg in $(derive_generic_excludes) $featured_packages; do
+    for pkg in $owned_packages $featured_packages $bin_only_packages; do
         set -- "$@" --exclude "$pkg/**"
     done
     # shellcheck disable=SC2086

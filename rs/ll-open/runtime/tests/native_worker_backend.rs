@@ -180,6 +180,41 @@ fn failed_worker_is_reported_and_cleaned() {
     assert!(errors[0].detail.contains("native worker exited"));
 }
 
+/// Once completion is observed the run is no longer active, so a cancel
+/// after it is a no-op, not a second report of the run's failure.
+///
+/// The supervisor used to publish completion, then hand its result to a
+/// pending cancel, and only then drop the run from its active table. A
+/// cleanup arriving in that window took the run as still active, collected
+/// the supervisor's result — the worker's own failure — and returned it as
+/// the cleanup's error: `cleanup` of a crashed run failed under load
+/// (conformance row `a_killed_worker_is_failed_reaped_and_cleaned`, Linux
+/// CI, bead `ley-line-open-f8ebcf`). Repeated because the window is a
+/// scheduling race; one iteration rarely lands in it.
+#[test]
+fn a_cancel_after_observed_failure_is_a_no_op() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend(
+        &fixture,
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
+    );
+    for _ in 0..200 {
+        backend.start(&request()).expect("worker readiness");
+        assert!(matches!(
+            backend
+                .wait_for_completion("native-run-01")
+                .expect("worker completion"),
+            leyline_runtime::BackendRunStatus::Failed(_)
+        ));
+        assert!(
+            !Backend::cancel(&backend, "native-run-01").expect("a cancel after completion"),
+            "a completed run is no longer active"
+        );
+    }
+    assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+}
+
 #[test]
 fn readiness_for_another_run_is_rejected_and_cleaned() {
     let _serial = common::serial();

@@ -5,9 +5,10 @@
 //! them against `NativeWorkerBackend` supervising the real first-party
 //! `leyline-native-worker`, which verifies the rootfs, applies Seatbelt
 //! (macOS) or Landlock (Linux) irreversibly, and only then launches the
-//! guest. The embedded libkrun column runs the same rows from
-//! `krun-worker/tests/conformance_matrix.rs`; the matrix is documented in
-//! `runtime/README.md`.
+//! guest. The embedded libkrun column runs the same shared rows from
+//! `krun-worker/tests/conformance_matrix.rs`; its additional Graph I/O row
+//! covers the workspace-share capability native explicitly refuses. The
+//! matrix is documented in `runtime/README.md`.
 //!
 //! The guest is a copy of this test binary re-entered at
 //! [`conformance_guest`], the delivery `native_confinement.rs` uses. It
@@ -122,23 +123,4 @@ fn native() -> Option<Column> {
 conformance_rows! {
     column: native(),
     serial: common::serial(),
-    graph: graph_io_is_refused_on_the_native_tier(),
-}
-
-/// The native tier has no workspace-share mechanism: it cannot deliver a
-/// Graph workspace, and refuses a grant of one before spawning anything
-/// (the `a_workspace_grant_nothing_serves_is_refused_before_spawn` row).
-/// That refusal is asserted here too, and the positive Graph I/O row is a
-/// named skip, never a pass.
-fn graph_io_is_refused_on_the_native_tier() {
-    let Some(column) = native() else {
-        return;
-    };
-    conformance::row_a_workspace_grant_nothing_serves_is_refused_before_spawn(column);
-    eprintln!(
-        "SKIPPED (NOT a pass): Graph I/O through a workspace share is a microVM-tier \
-         capability (ADR-0044); the native tier refuses a workspace grant before spawn, \
-         which this row asserted. Graph I/O itself is verified by the libkrun column \
-         (krun-worker/tests/conformance_matrix.rs)."
-    );
 }

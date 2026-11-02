@@ -1,11 +1,12 @@
 //! The execution/v1 conformance matrix, embedded libkrun column (bead
 //! `ley-line-open-f8ebcf`).
 //!
-//! The rows are `runtime/tests/conformance/mod.rs`; this binary runs every
-//! one of them against `KrunWorkerBackend` supervising the real
+//! The shared rows are `runtime/tests/conformance/mod.rs`; this binary runs
+//! all of them plus the microVM-only Graph I/O row against
+//! `KrunWorkerBackend` supervising the real
 //! `leyline-krun-worker`, which links the vendored libkrun and boots a real
 //! guest. It lives in this crate because only this crate builds the worker.
-//! The native nono column runs the same rows from
+//! The native nono column runs the same shared rows from
 //! `runtime/tests/conformance_matrix.rs`; the matrix is documented in
 //! `runtime/README.md`.
 //!
@@ -143,7 +144,16 @@ fn libkrun_with(configure: impl FnOnce(KrunWorkerBackend) -> KrunWorkerBackend) 
 conformance_rows! {
     column: libkrun(),
     serial: common::serial(),
-    graph: graph_io(),
+}
+
+/// Graph workspace delivery is a microVM capability (ADR-0044). The native
+/// column's shared refusal row proves that it fails closed before spawn when
+/// no workspace share is available; this row proves the positive path on the
+/// backend that advertises and enforces it.
+#[test]
+fn graph_io_goes_through_the_mediated_workspace_share() {
+    let _serial = common::serial();
+    graph_io();
 }
 
 /// The Go source the store is cold-parsed from, and the edit the guest

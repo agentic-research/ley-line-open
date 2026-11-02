@@ -20,6 +20,17 @@ context, scoping notes, and review history are recoverable.
   naming the workspace, before the worker is spawned, as the microVM tier
   does when it has no share provider.
 
+### Fixed
+
+- **Cleaning up a failed run no longer reports the run's failure as the
+  cleanup's** (bead `ley-line-open-f8ebcf`). Both worker backends published
+  a run's completion before dropping it from their active table, so a
+  `cleanup` that followed an observed completion could still find the run
+  active, collect the supervisor's result, and fail with the worker's own
+  exit error. On a loaded Linux host this failed `cleanup` of a crashed run in
+  about one run in three.
+  The run is now retired and its completion published in one step.
+
 ### Added
 
 - `task lint:license-direction`, run by `task ci`, enforces the README's

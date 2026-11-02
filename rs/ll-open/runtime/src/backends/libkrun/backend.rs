@@ -566,16 +566,23 @@ impl Backend for KrunWorkerBackend {
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }
-            completed.lock().insert(
-                run_id.clone(),
-                match result.clone() {
-                    Ok(()) => BackendRunStatus::Succeeded,
-                    Err(error) => BackendRunStatus::Failed(error),
-                },
-            );
+            // Retire the run and publish its completion as one step, under
+            // the lock `wait_for_completion` holds while it reads `children`
+            // (the native backend explains the race; bead
+            // ley-line-open-f8ebcf).
+            {
+                let mut completed = completed.lock();
+                children.lock().remove(&run_id);
+                completed.insert(
+                    run_id,
+                    match result.clone() {
+                        Ok(()) => BackendRunStatus::Succeeded,
+                        Err(error) => BackendRunStatus::Failed(error),
+                    },
+                );
+            }
             completion_cv.notify_all();
             let _ = finished_tx.send(result);
-            children.lock().remove(&run_id);
         });
         Ok(BackendRun {
             backend_id: "libkrun/1".into(),

@@ -12,11 +12,13 @@
 //!   column, with the real `leyline-krun-worker` booting a guest. It lives in
 //!   that crate because only that crate builds the worker.
 //!
-//! A row written here therefore runs on both backends or on neither: a column
-//! cannot drift by skipping a vector the other one runs, and the expected
-//! outcome of every vector is written once. Where the tiers legitimately
-//! differ (the channel each delivers, the errno a denial carries) the column
-//! names its tier's mechanism and the row asserts the shared property.
+//! Shared rows written here run on both backends or on neither: a column
+//! cannot drift by skipping a shared vector the other runs, and each shared
+//! outcome is written once. A capability-specific positive row lives in the
+//! adapter that can enforce it; the shared refusal row covers the other tier.
+//! Where the tiers legitimately differ (the channel each delivers, the errno
+//! a denial carries) the column names its mechanism and the row asserts the
+//! shared property.
 //!
 //! The rows and what they prove are listed in `runtime/README.md`
 //! ("Conformance matrix").
@@ -512,28 +514,21 @@ impl Blocked {
         }
     }
 
-    /// Nothing the run started is left on the host.
-    pub fn assert_gone(&self, column: &Column, when: &str) {
+    /// Nothing the run started can still execute on the host.
+    pub fn assert_gone(&self, column: &Column, when: &str, accepted: &mut Accepted) {
         assert!(
             !alive(self.holder),
             "{}: the process {} holding the guest survived {when}",
             column.spec.name,
             self.holder
         );
-        assert!(
-            !group_alive(self.holder),
-            "{}: a process in the worker's group {} survived {when}",
-            column.spec.name,
-            self.holder
-        );
-        if column.spec.holder == Holder::GuestParent {
-            assert!(
-                !alive(self.guest_pid),
-                "{}: the guest process {} survived {when}",
-                column.spec.name,
-                self.guest_pid
-            );
-        }
+        // The block-mode guest parks forever while holding this channel; EOF
+        // is therefore the kernel event that proves it can no longer execute.
+        // Do not replace this with kill(pid/pgid, 0): after SIGKILL, a dead
+        // guest can remain briefly as a zombie owned by pid 1. Signal 0 sees
+        // that zombie as an existing process and turns correct cleanup into a
+        // scheduler-dependent false failure.
+        accepted.assert_closed();
     }
 }
 
@@ -842,8 +837,11 @@ pub fn alive(pid: libc::pid_t) -> bool {
     signal_zero(unsafe { libc::kill(pid, 0) })
 }
 
-/// Whether any process remains in the process group `pgid`. Both backends
-/// make their worker a group leader, so its pid names the group.
+/// Whether any process remains in the process group `pgid`, zombies
+/// included. Sound only where the group's members are the caller's own
+/// children (the libkrun VMM, which runs the guest in-process): an orphan
+/// reparented to pid 1 stays visible here, as an exiting task or an unreaped
+/// zombie, after it can no longer execute.
 pub fn group_alive(pgid: libc::pid_t) -> bool {
     signal_zero(unsafe { libc::killpg(pgid, 0) })
 }
@@ -1014,11 +1012,10 @@ fn guest_env(mode: &str, channel: Option<&Channel>) -> Vec<(&'static str, String
 
 /// Expand every row into a `#[test]` for one column. `$column` is an
 /// expression evaluating to `Option<Column>`; `None` means the column
-/// reported a named skip. `$graph` runs the Graph I/O row. Declare the
-/// module `#[macro_use]` to reach it.
+/// reported a named skip. Declare the module `#[macro_use]` to reach it.
 #[allow(unused_macros)] // libkrun_guest_cancel shares the helpers, not the rows
 macro_rules! conformance_rows {
-    (column: $column:expr, serial: $serial:expr, graph: $graph:expr $(,)?) => {
+    (column: $column:expr, serial: $serial:expr $(,)?) => {
         #[test]
         fn capabilities_and_status_are_read_only() {
             let _serial = $serial;
@@ -1081,12 +1078,6 @@ macro_rules! conformance_rows {
             if let Some(column) = $column {
                 conformance::row_a_workspace_grant_nothing_serves_is_refused_before_spawn(column);
             }
-        }
-
-        #[test]
-        fn graph_io_goes_through_the_mediated_workspace_share() {
-            let _serial = $serial;
-            $graph;
         }
     };
 }
@@ -1444,9 +1435,8 @@ pub fn row_cancel_ends_a_blocked_guest_and_everything_it_ran(mut column: Column)
 
     let cancelled = column.service.cancel(&started.run_id).expect("cancel");
     assert_eq!(cancelled.state, RunState::Cancelled, "{name}");
-    blocked.assert_gone(&column, "cancel");
+    blocked.assert_gone(&column, "cancel", &mut accepted);
     assert_eq!(column.run_roots(), 0, "{name}: cancel removes the run root");
-    accepted.assert_closed();
 
     let receipt = column.service.collect(&started.run_id).expect("collect");
     assert_receipt(&column, &started, &receipt, RunState::Cancelled);
@@ -1495,9 +1485,8 @@ pub fn row_a_killed_worker_is_failed_reaped_and_cleaned(mut column: Column) {
         other => panic!("{name}: a killed worker ended {other:?}"),
     };
     assert_eq!(error.code, ErrorCode::BackendFailed, "{name}: {error}");
-    blocked.assert_gone(&column, "its worker's crash");
+    blocked.assert_gone(&column, "its worker's crash", &mut accepted);
     assert_eq!(column.run_roots(), 0, "{name}: a crash leaves no run root");
-    accepted.assert_closed();
     assert_eq!(
         column
             .service

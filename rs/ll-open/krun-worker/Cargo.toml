@@ -29,6 +29,11 @@ blake3 = { workspace = true }
 # starts them through ExecutionService::start_authorized.
 capnp = { workspace = true }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
+# The conformance matrix's Graph I/O row (bead ley-line-open-f8ebcf) serves a
+# real store over the workspace share: a living database cold-parsed by
+# cli-lib, answered by storefs's adapter, exactly as the daemon serves one.
+leyline-cli-lib = { path = "../cli-lib", default-features = false }
+leyline-storefs = { path = "../storefs" }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 wait-timeout = "0.2"

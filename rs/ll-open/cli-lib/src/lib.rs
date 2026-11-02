@@ -363,42 +363,7 @@ pub enum ExecutionCommands {
 /// Dispatch a command to its implementation.
 pub async fn run(cmd: Commands) -> Result<()> {
     match cmd {
-        Commands::Execution { command } => match command {
-            ExecutionCommands::Capabilities { control } => {
-                cmd_execution::capabilities(&control).await
-            }
-            ExecutionCommands::Provision {
-                control,
-                backend_class,
-                idempotency_key,
-            } => cmd_execution::provision(&control, &backend_class, &idempotency_key).await,
-            ExecutionCommands::Status { control, run_id } => {
-                cmd_execution::status(&control, run_id.as_deref()).await
-            }
-            ExecutionCommands::Inspect {
-                control,
-                run_id,
-                after_sequence,
-            } => cmd_execution::inspect(&control, &run_id, after_sequence).await,
-            ExecutionCommands::Collect { control, run_id } => {
-                cmd_execution::collect(&control, &run_id).await
-            }
-            ExecutionCommands::Cleanup {
-                control,
-                run_id,
-                idempotency_key,
-            } => cmd_execution::cleanup(&control, &run_id, idempotency_key.as_deref()).await,
-            ExecutionCommands::Start {
-                control,
-                spec,
-                grant,
-            } => cmd_execution::start(&control, &spec, &grant).await,
-            ExecutionCommands::Cancel {
-                control,
-                run_id,
-                idempotency_key,
-            } => cmd_execution::cancel(&control, &run_id, idempotency_key.as_deref()).await,
-        },
+        Commands::Execution { command } => cmd_execution::run(&command).await,
         Commands::Parse {
             source,
             output,

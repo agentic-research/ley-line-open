@@ -4801,8 +4801,10 @@ version = "0.21.0"
 dependencies = [
  "blake3",
  "capnp",
+ "leyline-cli-lib",
  "leyline-public-schema",
  "leyline-runtime",
+ "leyline-storefs",
  "libc",
  "libkrun",
  "parking_lot",

@@ -33,31 +33,27 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use capnp::message::Builder;
-use leyline_public_schema::execution_capnp;
-use leyline_runtime::authorization::{
-    AuthorizationPolicy, AuthorizedExecution, EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION,
-    canonical_digest,
-};
+use leyline_runtime::authorization::AuthorizationPolicy;
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
 use leyline_runtime::backends::libkrun::confinement::{VSOCK_UNIX_BASE_PORT, confinement_manifest};
 use leyline_runtime::confinement::UnixSocketGrant;
-use leyline_runtime::{
-    BackendClass, DigestRef, ExecutionError, ExecutionRequest, ExecutionResolver, ExecutionService,
-    ResourceLimits, RunState,
-};
+use leyline_runtime::{BackendClass, ExecutionService, ResourceLimits, RunState};
 use tempfile::TempDir;
 
 #[path = "../../runtime/tests/common/mod.rs"]
 mod common;
+// The execution/v1 fixtures and kernel probes this test shares with the
+// conformance matrix (bead ley-line-open-f8ebcf).
+#[path = "../../runtime/tests/conformance/mod.rs"]
+mod conformance;
 mod hypervisor;
+
+use conformance::{GrantSpec, GuestResolver, alive, group_alive, peer_pid, run_roots};
 
 /// The line the guest writes once it is up, before it blocks.
 const BLOCKED: &str = "guest-blocked";
@@ -130,41 +126,23 @@ fn main() {{
 /// Maps every authorized run to the one rootfs this test published, carrying
 /// every grant-owned field through unchanged (the service refuses a resolver
 /// that drops or alters them).
-struct FixtureResolver {
-    rootfs: String,
-}
-
-impl ExecutionResolver for FixtureResolver {
-    fn resolve(
-        &self,
-        authorized: &AuthorizedExecution,
-    ) -> Result<ExecutionRequest, ExecutionError> {
-        Ok(ExecutionRequest {
-            run_id: authorized.run_id.clone(),
-            replay_key: authorized.replay_key.clone(),
-            rootfs: DigestRef {
-                algorithm: "blake3-256".into(),
-                value: self.rootfs.clone(),
+fn fixture_resolver(rootfs: String) -> GuestResolver {
+    GuestResolver {
+        rootfs,
+        executable: "bin/guest".into(),
+        arguments: vec!["guest".into()],
+        environment: BTreeMap::new(),
+        limits: ResourceLimits {
+            // Far beyond the test: the run must end by cancellation, and a
+            // wall-clock kill would also remove the run root.
+            wall_time_ms: 600_000,
+            memory: leyline_runtime::MemoryLimits { limit: 256 << 20 },
+            cpu: leyline_runtime::CpuLimits {
+                quota: 100_000,
+                period: 100_000,
             },
-            executable: "bin/guest".into(),
-            arguments: vec!["guest".into()],
-            public_environment: BTreeMap::new(),
-            allowed_egress: authorized.allowed_egress.clone(),
-            confinement_digest: authorized.confinement_digest.clone(),
-            confinement_manifest: authorized.confinement_manifest.clone(),
-            workspaces: authorized.workspaces.clone(),
-            limits: ResourceLimits {
-                // Far beyond the test: the run must end by cancellation, and a
-                // wall-clock kill would also remove the run root.
-                wall_time_ms: 600_000,
-                memory: leyline_runtime::MemoryLimits { limit: 256 << 20 },
-                cpu: leyline_runtime::CpuLimits {
-                    quota: 100_000,
-                    period: 100_000,
-                },
-                ..ResourceLimits::default()
-            },
-        })
+            ..ResourceLimits::default()
+        },
     }
 }
 
@@ -231,7 +209,7 @@ fn a_real_guest_is_cancelled_and_collected_with_a_cancelled_receipt() {
                 required_backend: BackendClass::MicroVm,
                 required_confinement_digest: Some(digest.clone()),
             },
-            &FixtureResolver { rootfs },
+            &fixture_resolver(rootfs),
         )
         .expect("start a real guest through execution/v1");
     assert_eq!(record.state, RunState::Running);
@@ -358,147 +336,18 @@ fn publish_guest(root: &Path, source: &str) -> String {
     let staged = root.join("guest");
     hypervisor::compile_guest(&source_path, &staged);
     let bytes = fs::read(&staged).expect("guest bytes");
-    let manifest = format!(
-        "{{\"version\":1,\"files\":[{{\"path\":\"bin/guest\",\"mode\":493,\"blake3\":\"{}\"}}]}}",
-        blake3::hash(&bytes).to_hex()
-    );
-    let digest = blake3::hash(manifest.as_bytes()).to_hex().to_string();
-    let immutable = root.join("cas").join(&digest);
-    fs::create_dir_all(immutable.join("bin")).expect("CAS rootfs");
-    fs::write(immutable.join("bin/guest"), &bytes).expect("install guest");
-    fs::set_permissions(
-        immutable.join("bin/guest"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .expect("guest mode");
-    fs::write(immutable.join("rootfs.manifest.json"), manifest).expect("rootfs manifest");
-    digest
+    conformance::publish_rootfs(&root.join("cas"), &[("bin/guest", &bytes, 0o755)])
 }
 
 /// A RunSpec and a RunGrant authorizing it, on the microVM tier, committing to
 /// the confinement document `document` (whose digest is `digest`).
 fn spec_and_grant(digest: &str, document: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut message = Builder::new_default();
-    let mut spec = message.init_root::<execution_capnp::run_spec::Builder<'_>>();
-    spec.set_schema_version(EXECUTION_SCHEMA_VERSION);
-    let mut executable = spec.init_executable();
-    executable.set_media_type("application/vnd.leyline.executable");
-    set_digest(executable.init_digest(), &"c".repeat(64));
-    let mut spec_bytes = Vec::new();
-    capnp::serialize::write_message(&mut spec_bytes, &message).expect("serialize spec");
-
-    let spec_digest = canonical_digest(&spec_bytes).expect("spec digest");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_millis() as u64;
-    let mut message = Builder::new_default();
-    let mut grant = message.init_root::<execution_capnp::run_grant::Builder<'_>>();
-    grant.set_grant_id("grant-cancel");
-    grant.set_expires_at_unix_ms(now + 3_600_000);
-    grant.set_replay_key(format!("cancel-{now}"));
-    set_digest(
-        grant.reborrow().init_run_spec_digest(),
-        spec_digest
-            .strip_prefix("blake3-256:")
-            .expect("digest prefix"),
+    let mut authority = GrantSpec::new(
+        BackendClass::MicroVm,
+        &format!("cancel-{}", conformance::now_unix_ms()),
+        digest,
+        document,
     );
-    placeholder_evidence(grant.reborrow().init_issuer_evidence());
-    placeholder_evidence(grant.reborrow().init_workload_identity_evidence());
-    placeholder_evidence(grant.reborrow().init_actor_provenance_evidence());
-    set_digest(
-        grant.reborrow().init_confinement_digest(),
-        digest.strip_prefix("blake3-256:").expect("digest prefix"),
-    );
-    grant.set_confinement_manifest(document);
-    grant.set_backend_class(execution_capnp::BackendClass::MicroVm);
-    let mut capability = grant.reborrow().init_capabilities(1).get(0);
-    capability.set_grant(EXECUTION_CAPABILITY);
-    capability.set_interface(EXECUTION_SCHEMA_VERSION);
-    let mut grant_bytes = Vec::new();
-    capnp::serialize::write_message(&mut grant_bytes, &message).expect("serialize grant");
-    (spec_bytes, grant_bytes)
-}
-
-fn set_digest(mut digest: execution_capnp::digest_ref::Builder<'_>, value: &str) {
-    digest.set_algorithm("blake3-256");
-    digest.set_value(value);
-}
-
-/// Unsigned evidence: accepted only by the metadata-only verifier
-/// `start_authorized` uses, which is a test adapter and not a trust boundary.
-fn placeholder_evidence(mut evidence: execution_capnp::evidence_ref::Builder<'_>) {
-    evidence.set_media_type("application/vnd.leyline.test-evidence");
-    set_digest(evidence.init_digest(), &"a".repeat(64));
-}
-
-fn run_roots(path: &Path) -> usize {
-    fs::read_dir(path).expect("enumerate run roots").count()
-}
-
-/// Whether a process with this pid exists. `kill(pid, 0)` delivers nothing; it
-/// only asks the kernel.
-fn alive(pid: libc::pid_t) -> bool {
-    signal_zero(unsafe { libc::kill(pid, 0) })
-}
-
-/// Whether any process remains in the process group `pgid`. The backend makes
-/// the worker a group leader, so its pid names the group.
-fn group_alive(pgid: libc::pid_t) -> bool {
-    signal_zero(unsafe { libc::killpg(pgid, 0) })
-}
-
-fn signal_zero(rc: i32) -> bool {
-    if rc == 0 {
-        return true;
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => false,
-        // Exists, but is not ours to signal.
-        Some(libc::EPERM) => true,
-        _ => panic!("kill(.., 0) failed unexpectedly: {error}"),
-    }
-}
-
-/// The pid of the process at the other end of a connected UNIX socket.
-fn peer_pid(stream: &UnixStream) -> libc::pid_t {
-    #[cfg(target_os = "macos")]
-    {
-        let mut pid: libc::pid_t = 0;
-        let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-        // SAFETY: a live socket and an out-parameter of the size passed.
-        let rc = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERPID,
-                (&mut pid as *mut libc::pid_t).cast(),
-                &mut length,
-            )
-        };
-        assert_eq!(rc, 0, "LOCAL_PEERPID: {}", std::io::Error::last_os_error());
-        pid
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: a live socket and an out-parameter of the size passed.
-        let rc = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credentials as *mut libc::ucred).cast(),
-                &mut length,
-            )
-        };
-        assert_eq!(rc, 0, "SO_PEERCRED: {}", std::io::Error::last_os_error());
-        credentials.pid
-    }
+    authority.grant_id = "grant-cancel".into();
+    conformance::spec_and_grant(&authority)
 }

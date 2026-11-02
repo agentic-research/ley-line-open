@@ -10,6 +10,20 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.21.1] — 2026-11-02
+
+**Security:** on the native tier, a run whose grant named a Graph workspace
+started without that workspace, and its receipt still listed the
+workspace's `graphRoot` as an input. The native backend now refuses such a
+run `UnsupportedBackend` before spawning the worker. Upgrade from v0.21.0 if
+you grant workspaces to native runs.
+
+This patch also fixes a completion race that made `cleanup` of a crashed run
+report the worker's exit error, adds the execution/v1 conformance matrix
+across native nono and embedded libkrun, and adds a `task ci` gate on the
+Apache-2.0/AGPL license direction. The public schema is unchanged:
+`SCHEMA_VERSION` stays `0.21.0`.
+
 ### Security
 
 - **The native tier refuses a workspace grant it cannot serve** (bead

@@ -556,13 +556,18 @@ tasks:
     desc: Install the worker (`krun-worker:install`), run the real-guest suite (`task runtime:test`, LEYLINE_REQUIRE_HYPERVISOR=1) against that installed worker on this tree, and record the receipt the release gate requires. Needs LEYLINE_LIBKRUNFW_PATH and LEYLINE_GUEST_TOOLS; INSTALL_DIR as for krun-worker:install.
     vars:
       INSTALL_DIR: '{{.INSTALL_DIR | default (printf "%s/.local/bin" .HOME)}}'
+    # Its own cargo target directory (bead ley-line-open-465ce2): sharing
+    # rs/target with a concurrent `task ci` made the two block on cargo's
+    # build-directory lock and rebuild over each other's artifacts. Exported
+    # to the process environment, so the nested `task` runs (the install and
+    # the suite tools/hypervisor_attestation.sh starts) build here too.
+    env:
+      CARGO_TARGET_DIR: '{{.ROOT_DIR}}/rs/target-hypervisor'
     cmds:
       # The guest tests run the INSTALLED worker, as installed (bead
       # ley-line-open-984acf): the receipt is then a statement about the
       # artifact a user runs, and names its digest.
-      - task: krun-worker:install
-        vars:
-          INSTALL_DIR: '{{.INSTALL_DIR}}'
+      - task krun-worker:install INSTALL_DIR="{{.INSTALL_DIR}}"
       - LEYLINE_KRUN_WORKER="{{.INSTALL_DIR}}/leyline-krun-worker" tools/hypervisor_attestation.sh record
 
   release:hypervisor:check:
@@ -1098,6 +1103,18 @@ tasks:
     desc: Prove the license-direction gate fails on direct, transitive, build, optional, and undeclared inversions
     cmds:
       - sh tools/test_license_direction.sh
+
+  # CHANGELOG entries are fragments under changes/, one file per change, so
+  # two PRs never conflict on CHANGELOG.md (ley-line-open-465ce2).
+  lint:changelog-fragments:
+    desc: Every changes/<bead-id>[-slug].md names a known section and has entry text; CHANGELOG.md's [Unreleased] holds no entries
+    cmds:
+      - sh tools/changelog_fragments.sh lint
+
+  changelog:fragments:fixture-test:
+    desc: Prove two PRs' fragments merge in either order without conflict, the release bump assembles both Security first, and the lint rejects malformed fragments
+    cmds:
+      - sh tools/test_changelog_fragments.sh
 
   # --------------------------------------------------------------------------
   # Smell-rule gate (workspace deps drift + unsafe/unwrap invariants).
@@ -1695,6 +1712,8 @@ tasks:
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims
       - task: lint:mutants-cfg-coverage
+      - task: lint:changelog-fragments
+      - task: changelog:fragments:fixture-test
       - task: readme:version-check
       - task: schema:version-check
       - task: check

@@ -18,7 +18,9 @@ tasks:
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
       - cargo build --release -p leyline-krun-worker
-      - '{{.TASKFILE_DIR}}/../../../tools/sign_krun_worker.sh target/release/leyline-krun-worker'
+      # CARGO_TARGET_DIR: `task release:hypervisor:record` builds in its own
+      # target directory (bead ley-line-open-465ce2).
+      - '{{.TASKFILE_DIR}}/../../../tools/sign_krun_worker.sh "${CARGO_TARGET_DIR:-target}/release/leyline-krun-worker"'
 
   release:target:
     desc: Build and sign leyline-krun-worker for BUILD_TARGET (used by release.yml)
@@ -42,7 +44,7 @@ tasks:
         mkdir -p "{{.INSTALL_DIR}}"
         staged=$(mktemp "{{.INSTALL_DIR}}/.leyline-krun-worker.XXXXXX")
         trap 'rm -f "$staged"' EXIT
-        cp target/release/leyline-krun-worker "$staged"
+        cp "${CARGO_TARGET_DIR:-target}/release/leyline-krun-worker" "$staged"
         chmod 755 "$staged"
         mv -f "$staged" "{{.INSTALL_DIR}}/leyline-krun-worker"
       # The copy carries the embedded signature; check the bytes that will

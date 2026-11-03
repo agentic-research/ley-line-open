@@ -10,6 +10,10 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+Pending entries live in [`changes/`](changes/README.md), one file per
+change. Do not add entries here: `tools/bump_release_version.sh` assembles
+the fragments into the next release's section.
+
 ## [0.21.1] — 2026-11-02
 
 **Security:** on the native tier, a run whose grant named a Graph workspace

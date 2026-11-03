@@ -63,6 +63,14 @@ if [ "$old_version" = "$new_version" ]; then
 fi
 echo "bumping $old_version -> $new_version" >&2
 
+# CHANGELOG entries come from changes/ (bead ley-line-open-465ce2). Refuse
+# before touching any file if a fragment is malformed or none exist.
+REPO_ROOT=$repo_root sh "$script_root/changelog_fragments.sh" lint
+if [ -z "$(find changes -maxdepth 1 -type f -name '*.md' ! -name README.md 2>/dev/null)" ]; then
+    echo "changes/ holds no fragments: nothing to write into the [$new_version] CHANGELOG section" >&2
+    exit 1
+fi
+
 # Every crate manifest in the canonical list, ALL occurrences per file.
 while IFS= read -r manifest; do
     [ -n "$manifest" ] || continue
@@ -167,13 +175,20 @@ sed -i.bak \
 rm -f "$arch.bak"
 echo "bumped $arch (3 currency claims)" >&2
 
+# CHANGELOG.md: the fragments become the new version's section, Security
+# first, and are deleted; [Unreleased] keeps only its pointer to changes/.
+# RELEASE_DATE overrides today's UTC date.
+release_date=${RELEASE_DATE:-$(date -u +%Y-%m-%d)}
+REPO_ROOT=$repo_root sh "$script_root/changelog_fragments.sh" assemble "$new_version" "$release_date"
+
 cat >&2 <<EOF
 
 Not done by this script — do these next:
   1. Regenerate server.json (from rs/):
        cargo run -p server-json-gen --quiet > ../server.json
-  2. Write the CHANGELOG entry: convert ## [Unreleased] to
-     ## [$new_version] — <date>, with a real summary of what shipped.
+  2. Read the assembled ## [$new_version] — $release_date section of
+     CHANGELOG.md and add a summary paragraph under its heading saying what
+     the release means for a user (upgrade advice, SCHEMA_VERSION status).
   3. cargo build (or any cargo command) to refresh rs/Cargo.lock.
   4. bash tools/verify_release_version.sh $new_version
 EOF

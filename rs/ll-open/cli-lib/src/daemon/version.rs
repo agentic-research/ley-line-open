@@ -146,13 +146,22 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   depend on the blob, and `treeRoot` folds `_tree`. `parserId` changes,
 ///   as it does at every bump, because it folds this label. A v7 arena is
 ///   refused at parse open.
+/// - `projection-v9` — the merkle-AST edges are interned (bead
+///   `ley-line-open-9b7d28`). `node_content` gains `content_id INTEGER
+///   PRIMARY KEY` (arena-local, not an identity) with `node_hash` kept as
+///   `NOT NULL UNIQUE`, the FK target it always was. The edges move to a
+///   new table `node_edge (parent_id, ordinal, child_id, field)`, `WITHOUT
+///   ROWID`, keyed on content ids. `node_child` becomes a read-only VIEW with
+///   the v8 columns (`parent_hash`, `ordinal`, `child_hash`, `field`), so
+///   every v8 read runs unchanged; a write to it fails. A v8 arena is refused
+///   at parse open.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v8";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v9";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

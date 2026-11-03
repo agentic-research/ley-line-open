@@ -154,6 +154,12 @@ version, not the same one, and Phase C (`6ee4c4`) is independent of both. The an
 `node_child` on the kibana slice, the first number this section asked for: 1,959,303 of 4,346,013
 edges (45.1%) point at a child whose subtree is never a named node anywhere in the arena.*
 
+*`9b7d28` shipped as projection-v9: `node_edge` keys the edges on `content_id`s and `node_child`
+became a view, taking the edges from 515.2 MB to 72.9 MB on the kibana slice with the edge set
+unchanged by hash. A named-only projection would remove the anonymous 45% on top of that but
+would make `node_hash` unrecoverable from the edges (its preimage folds every non-`extra` child),
+so it is not done.*
+
 `capnp_blobs` and `_ast_blob` are retired (ADR-0026 Phase 1 reversed; its §7 kill criteria were
 never evaluated and its Phase 2 read measurement was never built). `AstNode.sourceId` leaves the
 wire struct so the segment record is content-pure; blob hashes and `rootHash` move once at the

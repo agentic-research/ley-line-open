@@ -512,6 +512,26 @@ mod tests {
         );
     }
 
+    /// `run` creates the table it owns and reports itself by name, whether
+    /// or not a corpus is configured. A body replaced by
+    /// `Ok(Default::default())` does neither.
+    #[test]
+    fn run_creates_its_table_and_names_its_stats() {
+        let conn = Connection::open_in_memory().unwrap();
+        let stats = SessionObservationPass::new()
+            .run(&conn, Path::new("."), None)
+            .unwrap();
+        assert_eq!(stats.pass_name, "session-observation");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'observation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "run must create the observation table");
+    }
+
     #[test]
     fn extract_mentions_recovers_all_four_token_shapes() {
         // The four observer-emitted shapes the substrate cares

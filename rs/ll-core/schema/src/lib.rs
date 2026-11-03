@@ -979,6 +979,77 @@ mod tests {
         );
     }
 
+    /// A file-keyed fixture: `_ast` (nid-keyed) and `_imports` (path-keyed)
+    /// rows for `a.go` and `b.go`, the two key shapes `FILE_KEYED_TABLES`
+    /// knows.
+    fn file_keyed_fixture() -> (Connection, i64, i64) {
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE _ast (nid INTEGER PRIMARY KEY);
+             CREATE TABLE _imports (alias TEXT, path TEXT, source_id TEXT);",
+        )
+        .unwrap();
+        let a = ensure_file_id(&conn, "a.go").unwrap();
+        let b = ensure_file_id(&conn, "b.go").unwrap();
+        for (fid, rel) in [(a, "a.go"), (b, "b.go")] {
+            for ord in 0..3 {
+                conn.execute("INSERT INTO _ast (nid) VALUES (?1)", [file_nid(fid, ord)])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO _imports (alias, path, source_id) VALUES ('f', 'fmt', ?1)",
+                [rel],
+            )
+            .unwrap();
+        }
+        (conn, a, b)
+    }
+
+    fn ast_rows_of(conn: &Connection, fid: i64) -> i64 {
+        let (lo, hi) = file_nid_range(fid);
+        conn.query_row(
+            "SELECT count(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2",
+            [lo, hi],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn imports_of(conn: &Connection, rel: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM _imports WHERE source_id = ?1",
+            [rel],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn delete_file_rows_clears_both_key_shapes_for_that_file_only() {
+        let (conn, a, b) = file_keyed_fixture();
+        delete_file_rows(&conn, "a.go").unwrap();
+        assert_eq!(ast_rows_of(&conn, a), 0, "a.go's nid range is cleared");
+        assert_eq!(imports_of(&conn, "a.go"), 0, "a.go's path rows are cleared");
+        assert_eq!(ast_rows_of(&conn, b), 3, "b.go is untouched");
+        assert_eq!(imports_of(&conn, "b.go"), 1, "b.go is untouched");
+    }
+
+    #[test]
+    fn move_file_rows_rekeys_both_shapes_and_returns_the_new_file_id() {
+        let (conn, _a, b) = file_keyed_fixture();
+        let moved = move_file_rows(&conn, "b.go", "c.go").unwrap();
+        assert_eq!(Some(moved), lookup_file_id(&conn, "c.go").unwrap());
+        assert_ne!(moved, b);
+        assert_eq!(
+            ast_rows_of(&conn, moved),
+            3,
+            "the rows land in c.go's range"
+        );
+        assert_eq!(ast_rows_of(&conn, b), 0, "and leave b.go's");
+        assert_eq!(imports_of(&conn, "c.go"), 1);
+        assert_eq!(imports_of(&conn, "b.go"), 0);
+    }
+
     #[test]
     fn nid_scheme_round_trips_and_partitions() {
         let nid = file_nid(3, 41);

@@ -579,31 +579,33 @@ fn spelled(
     name: &std::ffi::OsStr,
     meta: &std::fs::Metadata,
 ) -> Result<Option<std::ffi::OsString>> {
-    let mut same = None;
-    for entry in std::fs::read_dir(parent)
+    let entries = std::fs::read_dir(parent)
         .with_context(|| format!("list {} for path aliasing", parent.display()))?
-    {
-        let entry = entry?;
-        let held = entry.file_name();
-        if held == name {
-            return Ok(Some(held));
-        }
-        if same.is_none() && same_file(&entry.metadata()?, meta) {
-            same = Some(held);
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if entries.iter().any(|e| e.file_name() == name) {
+        return Ok(Some(name.to_os_string()));
+    }
+    for entry in &entries {
+        if same_file(&entry.metadata()?, meta) {
+            return Ok(Some(entry.file_name()));
         }
     }
-    Ok(same)
+    Ok(None)
 }
 
-#[cfg(unix)]
+/// Whether `a` and `b` are one file (device and inode). Off unix nothing is
+/// known to be the same file, so no alias is named.
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    (a.dev(), a.ino()) == (b.dev(), b.ino())
-}
-
-#[cfg(not(unix))]
-fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
-    false
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
 }
 
 /// The first of `created` (path, is a directory) whose creation finds an
@@ -1853,11 +1855,39 @@ mod tests {
             None
         );
         assert_eq!(
+            aliases_of(&c, &[new_file("Sub/a.md"), new_file("Sub/A.md")]),
+            case(("Sub/A.md", "Sub/a.md"))
+        );
+        assert_eq!(
             aliases_of(&c, &[new_file("x.md"), Proposed::mkdir("x.md/y")]),
             None,
             "a path that cannot be made is left to the proposal's own checks"
         );
+        assert_eq!(
+            aliases_of(
+                &c,
+                &[new_file("x.md"), new_file("x.md/a"), new_file("x.md/A")]
+            ),
+            None,
+            "paths under a created file are left to the proposal's own checks"
+        );
         assert_eq!(names(&c.src), ["a.go".to_string()].into());
+    }
+
+    /// The alias names the entry the path resolved to, not another entry of
+    /// the same directory, whichever order the directory lists them in.
+    #[test]
+    fn an_alias_names_the_entry_it_resolves_to() {
+        let names = ["a.go", "b.go", "c.go", "d.go"];
+        let c = checkout(&names.map(|n| (n, A)));
+        let folds_case = folds(&c.src, "Probe", "probe");
+        for n in names {
+            let upper = n.to_uppercase();
+            assert_eq!(
+                aliases_of(&c, &[new_file(&upper)]),
+                folds_case.then(|| (upper.clone(), n.to_string())),
+            );
+        }
     }
 
     /// The names `dir` holds, hidden ones included.

@@ -411,7 +411,7 @@ impl EnrichmentPass for SessionObservationPass {
                 // INLINE_THRESHOLD are content-addressed into the
                 // arena-local `observation_blobs` table (dedup, no inline
                 // bloat) — kept inside the one .db, consistent with
-                // `source_blobs`/`capnp_blobs`, so the arena stays a single
+                // `source_blobs`, so the arena stays a single
                 // portable file. Cross-arena dedup via the global
                 // FsBlobStore is the separate design-gated bead d22735.
                 let (payload_inline, payload_hash) =

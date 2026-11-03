@@ -6,8 +6,8 @@
 //!
 //! Reparsing (or deleting) file X through the scoped path touches only rows
 //! that belong to X. For every other file, every row in every located table —
-//! `nodes`, `_ast`, `_source`, `node_refs`, `node_defs`, `_imports`,
-//! `_ast_blob` — is byte-for-byte unchanged: same identities,
+//! `nodes`, `_ast`, `_source`, `node_refs`, `node_defs`, `_imports` —
+//! is byte-for-byte unchanged: same identities,
 //! same spans, same hashes, same mtimes.
 //!
 //! ## How this differs from F4b
@@ -35,7 +35,7 @@
 //!
 //! ## What this gate is NOT
 //!
-//! Content-addressed tables (`node_content`, `node_child`, `capnp_blobs`,
+//! Content-addressed tables (`node_content`, `node_child`,
 //! `source_blobs`) are excluded: their rows are keyed by hash, shared across
 //! files, and legitimately grow on any parse. Locality for them is a
 //! GC/refcount question (ADR-0026), not an identity question.
@@ -88,7 +88,6 @@ fn file_rows(conn: &Connection, rel: &str) -> Vec<String> {
         ("_ast", "nid BETWEEN ?1 AND ?2"),
         ("node_refs", "nid BETWEEN ?1 AND ?2"),
         ("node_defs", "nid BETWEEN ?1 AND ?2"),
-        ("_ast_blob", "file_id BETWEEN (?1 >> 24) AND (?2 >> 24)"),
     ];
     let texty: &[(&str, &str)] = &[("_source", "id = ?1"), ("_imports", "source_id = ?1")];
     let table_exists = |table: &str| -> bool {

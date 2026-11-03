@@ -123,7 +123,7 @@ pub type ObservationPayloadColumns = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Store an observation payload per ADR-0020 §1's inline-vs-hash rule,
 /// keeping everything durable in the one `.db` (arena-local dedup — the
-/// same pattern `source_blobs`/`capnp_blobs` use, so an arena stays a
+/// same pattern `source_blobs` uses, so an arena stays a
 /// single portable file; no sidecar to detach).
 ///
 /// Returns `(payload_inline, payload_hash)` for the observation row:

@@ -9,7 +9,7 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | [`leyline-core`](ll-core/core/) | Arena header + Controller (mmap'd control block, `current_root: [u8; 32]`); `ContentAddressed` trait (σ substrate entry point, BLAKE3-locked) |
 | [`leyline-schema`](ll-core/schema/) | Shared SQLite `nodes` table DDL — local SQL projection contract |
 | [`leyline-public-schema`](ll-core/public-schema/) | Cap'n Proto schema for the daemon UDS + MCP wire (`daemon.capnp`) |
-| [`leyline-schema-capnp`](ll-core/schema-capnp/) | Cap'n Proto schemas for the Σ event log (AstNode, SourceFile, BindingRecord, Head, AstNodeList) |
+| [`leyline-schema-capnp`](ll-core/schema-capnp/) | Cap'n Proto schemas for the Σ event log (AstNode, SourceFile, BindingRecord, Head) |
 | [`leyline-schema-spec`](ll-core/schema-spec/) | Vendor-neutral capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`); ships canonical test vectors + SHA-256 integrity pins + BLAKE3-256 identity pins verified by cargo tests |
 | [`leyline-ffi-helpers`](ll-core/ffi-helpers/) | Typed helpers (`c_input`, `c_output`, `c_cstr`, `c_ref`) for the C-boundary raw-pointer pattern every LLO `extern "C" fn` uses |
 | [`leyline-mcp-descriptor`](ll-core/mcp-descriptor/) | MCP Registry `server.json` emitter — shared coverage-validation + render, used by `server-json-gen` |

@@ -86,7 +86,7 @@ Content-addressed storage and snapshot primitives used by the other crates.
 | `leyline-core` | Arena primitives. mmap'd files + control block (v3, published under a seqlock; readers poll `current_root` for hot-reload). `ContentAddressed` trait = the σ substrate entry point (BLAKE3-locked per Σ §3.4) | `ArenaHeader`, `Controller`, `ContentAddressed`, `Hash` |
 | `leyline-schema` | Shared SQLite schema for the `nodes` table + indexes | `create_schema`, `insert_node` |
 | `leyline-public-schema` | Capnp wire schema for the daemon UDS + MCP transport. Source of truth for every base op's request/response shape with `$Json.name` annotations for camel↔snake | `capnp/daemon.capnp` |
-| `leyline-schema-capnp` | Capnp schemas for the Σ event log (`AstNode`, `SourceFile`, `BindingRecord`, `Head`, `AstNodeList`). Decade `ley-line-open-9d30ac` | Generated Rust bindings |
+| `leyline-schema-capnp` | Capnp schemas for the Σ event log (`AstNode`, `SourceFile`, `BindingRecord`, `Head`). Decade `ley-line-open-9d30ac` | Generated Rust bindings |
 | `leyline-ffi-helpers` | Typed helpers for the C-boundary raw-pointer pattern used by every LLO `extern "C" fn`, so the SAFETY contract lives in one place | `c_input`, `c_output` |
 | `leyline-schema-spec` | Vendor-neutral IDL crate. Ships per-capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`) with canonical test vectors + integrity/identity pins. Verified by `verify_vectors_sha256` (SHA-256 integrity) + `verify_confinement_digest` (BLAKE3-256 identity) + `capability_mapping_coverage` + `version_bump_on_vector_change` cargo tests | Non-code artifact — spec dirs + pin files |
 | `leyline-mcp-descriptor` | MCP Registry `server.json` emitter — coverage validation + render, shared across ART producers (bead `ley-line-open-4ec276`) | `render`, `ServerMeta`, `ToolRef` |
@@ -360,7 +360,7 @@ Architectural decisions that shape LLO today:
 | [ADR-0023](adr/0023-agent-first-language-facts.md) | Agent-first language facts (analyzer-as-library, not LSP-wire) | Proposed |
 | [ADR-0024](adr/0024-hdc-substrate-identity-rewrite.md) | HDC substrate-identity rewrite (bundle composition, seeded leaves, fp-quantize) | Accepted (shipped v0.5.0) |
 | [ADR-0025](adr/0025-hdc-compositional-validation.md) | HDC compositional-vs-distance use modes (validate or remove) | Proposed |
-| [ADR-0026](adr/0026-content-addressed-pointer-store.md) | Content-addressed pointer store (`_ast_pointer` + `capnp_blobs`; Phase 1 dual-write) | Accepted (Phase 1 shipped) |
+| [ADR-0026](adr/0026-content-addressed-pointer-store.md) | Content-addressed pointer store (`_ast_pointer` + `capnp_blobs`; Phase 1 dual-write) | Superseded by ADR-0040 D5 (Phase 1 retired at `projection-v8`) |
 | [ADR-0027](adr/0027-unified-code-fact-ir-producer.md) | Unified code-fact IR: merkle-AST `node_hash` (κ kind + terminal + child hashes) + `node_content` / `node_child` git-tree object | Accepted (shipped v0.6.0) |
 | [ADR-0028](adr/0028-content-addressed-source-blobs.md) | Content-addressed source blobs (`source_blobs`; F-git compat with `git cat-file blob`) | Accepted (Phase 1 shipped) |
 | [ADR-0029](adr/0029-cas-backed-workspace.md) | CAS-backed workspace (mount driver + manifest; alternative to git-worktree flow) | Proposed (Phase 1 mount driver bead `de3f81`) |

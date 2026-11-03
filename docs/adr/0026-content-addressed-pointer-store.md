@@ -1,6 +1,6 @@
 # ADR-0026 — SQL projection as a content-addressed pointer store
 
-**Status:** Proposed (2026-07-07)
+**Status:** Proposed (2026-07-07). **Superseded by ADR-0040 D5 (2026-11-03):** Phase 1 retired at `projection-v8`; Phases 2 and 3 withdrawn. See the amendment at the end.
 **Bead:** `ley-line-open-5ff6aa`
 **Related:**
 - ADR-0014 (capnp as protocol; T8.3 producer contract)
@@ -380,3 +380,33 @@ Sub-bead `ley-line-open-5b58ff` (sheaf-driven granularity dispatcher) becomes ac
 | `ley-line-open-5ff6aa` | This bead; closes when the design doc lands |
 | `ley-line-open-569beb` | Daemon admission-control bug that contaminated the initial profile |
 | `ley-line-open-9ccbc7` | Prior perf bead for deferred indexes; local wins that don't address this reframe |
+
+---
+
+## 13. Amendment (2026-11-03): Phase 1 retired by ADR-0040 D5
+
+Bead `ley-line-open-f30fdf`, `projection-v8`. `capnp_blobs` and `_ast_blob` are no longer created or
+written, and the `AstNodeList` wrapper struct leaves `ast.capnp`. The §7 kill criteria were never
+evaluated because the §9.2 Phase 2 read path was never built: in four months nothing in LLO or mache
+SELECTed either table, and the only router that named the blob store (`granularity_router`, bead
+`5b58ff`) had no caller and is removed with it. Phases 2 and 3 are withdrawn.
+
+Measured on bead `17c271`'s pinned kibana slice (8,000 `.ts` files, 36,306,203 source bytes), cold
+parse, release build, darwin-arm64, before and after this change: `capnp_blobs` was 812.8 MB of a
+2,284.6 MB arena (35.6%). The tree is stored once, in the SQL projection (`_ast`, `node_content`,
+`node_child`), keyed by the location-free `node_hash` ADR-0027 defines; the per-file blob hash was
+not location-free, because `AstNode.sourceId` placed the relative path inside it.
+
+**Identity domains, named before and after.** No authority moves.
+
+| Domain | Authoritative bytes before | After |
+|---|---|---|
+| `Head.rootHash` | The `.source.capnp`, `.ast.capnp`, `.bindings.capnp` segment files one run wrote, folded under `leyline/segment-root/v1` | Unchanged. The segment records are built by `serialize_ast_node_record`, independently of the blob; the kibana parse writes a byte-identical `.ast.capnp` and `.source.capnp` before and after |
+| `Head.treeRoot` | `_tree` (path, mode, blob hash) under `parserId` | Unchanged definition. Its value moves once because `parserId` folds `projection_schema_version`, as at every projection bump |
+| `Head.parserId` | The derivation inputs, including `projection_schema_version` | Moves to the `projection-v8` input; definition unchanged |
+| Blob hash (`capnp_blobs.blob_hash`) | BLAKE3 of one canonical `AstNodeList` | Retired. It was folded into no root and named by no head |
+| `current_root` | The serialized arena image | Unchanged definition; the image is smaller |
+
+What ADR-0040 D5 also lists and this amendment does not do: `AstNode.sourceId` stays in the segment
+record, so `rootHash` keeps committing to it; whether the segment log survives, and in what shape,
+is decided with its one consumer (bead `ley-line-open-438772`).

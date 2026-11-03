@@ -14,8 +14,6 @@ pub mod events;
 pub mod execution;
 pub mod execution_contract;
 pub mod ext;
-#[cfg(feature = "sheaf")]
-pub mod granularity_router;
 #[cfg(feature = "hdc")]
 pub mod hdc_enrich;
 #[cfg(feature = "hdc")]

@@ -144,6 +144,15 @@ per save and the dual-writer divergence without touching any identity. `snapshot
 
 ### D5 — One stored copy of the syntax tree
 
+*As implemented (`f30fdf`, projection-v8, 2026-11-03): `capnp_blobs`, `_ast_blob` and the
+`AstNodeList` struct are retired; ADR-0026 carries the amendment, with the identity domains named
+before and after. No root moves: `rootHash` folds the segment files, whose bytes never depended on
+the blob. `sourceId` and the segment log's fate are not part of that change; they are
+`438772`, an identity-domain change to `rootHash` decided with the segment's consumer. `node_child` interning (`9b7d28`) is the next projection
+version, not the same one, and Phase C (`6ee4c4`) is independent of both. The anonymous share of
+`node_child` on the kibana slice, the first number this section asked for: 1,959,303 of 4,346,013
+edges (45.1%) point at a child whose subtree is never a named node anywhere in the arena.*
+
 `capnp_blobs` and `_ast_blob` are retired (ADR-0026 Phase 1 reversed; its §7 kill criteria were
 never evaluated and its Phase 2 read measurement was never built). `AstNode.sourceId` leaves the
 wire struct so the segment record is content-pure; blob hashes and `rootHash` move once at the

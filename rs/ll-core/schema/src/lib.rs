@@ -697,8 +697,8 @@ fn resolve_ast_segment(conn: &Connection, parent_nid: i64, segment: &str) -> Res
 //
 // Three modules used to decide what "a file's rows" are: `leyline-ts`'s
 // `delete_file_rows` knew the full list, `leyline-fs`'s mount `rm`/`mv`
-// touched `nodes` alone (leaving `_ast`, `node_refs`, `node_defs`, `_lsp*`
-// and `_ast_blob` pointing at the dead or old nid range), and `reproject`
+// touched `nodes` alone (leaving `_ast`, `node_refs`, `node_defs` and `_lsp*`
+// pointing at the dead or old nid range), and `reproject`
 // cleared three tables for the WHOLE arena before re-projecting one file
 // (beads `ley-line-open-af3817`, `ley-line-open-2b6444`). This crate owns
 // the nid encoding, every crate above depends on it without a feature
@@ -714,8 +714,6 @@ pub enum FileKey {
     NidRange {
         extra_nid_columns: &'static [&'static str],
     },
-    /// Rows carrying the file's `file_id`.
-    FileId,
     /// Rows carrying the file's rel path in a TEXT column.
     SourcePath { column: &'static str },
 }
@@ -748,8 +746,6 @@ pub const FILE_KEYED_TABLES: &[FileKeyedTable] = &[
     by_nid("_ast", &[]),
     by_nid("node_refs", &["container_nid"]),
     by_nid("node_defs", &["container_nid"]),
-    // ADR-0026 pointer store: additive, older arenas predate it.
-    keyed("_ast_blob", FileKey::FileId),
     // LSP enrichment tables exist only once the pass has run.
     by_nid("_lsp", &[]),
     by_nid("_lsp_defs", &[]),
@@ -847,19 +843,13 @@ fn delete_file_rows_keyed(conn: &Connection, file_id: Option<i64>, rel_path: &st
                     params![lo, hi],
                 )?;
             }
-            (FileKey::FileId, Some(file_id)) => {
-                conn.execute(
-                    &format!("DELETE FROM {} WHERE file_id = ?1", t.name),
-                    [file_id],
-                )?;
-            }
             (FileKey::SourcePath { column }, _) => {
                 conn.execute(
                     &format!("DELETE FROM {} WHERE {column} = ?1", t.name),
                     [rel_path],
                 )?;
             }
-            (FileKey::NidRange { .. } | FileKey::FileId, None) => {}
+            (FileKey::NidRange { .. }, None) => {}
         }
     }
     Ok(())
@@ -895,12 +885,6 @@ pub fn move_file_rows(conn: &Connection, old_rel: &str, new_rel: &str) -> Result
                         params![lo, hi, new_lo],
                     )?;
                 }
-            }
-            FileKey::FileId => {
-                conn.execute(
-                    &format!("UPDATE {} SET file_id = ?1 WHERE file_id = ?2", t.name),
-                    params![new_file_id, old_file_id],
-                )?;
             }
             FileKey::SourcePath { column } => {
                 conn.execute(

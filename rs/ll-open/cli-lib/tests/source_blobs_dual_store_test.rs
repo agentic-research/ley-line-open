@@ -487,15 +487,13 @@ fn f_git_git_blob_compat() {
 #[test]
 fn adversarial_transaction_atomicity() {
     use leyline_ts::schema::{
-        create_ast_tables, create_index_schema, create_pointer_store_tables, create_refs_tables,
-        create_source_blobs_table,
+        create_ast_tables, create_index_schema, create_refs_tables, create_source_blobs_table,
     };
 
     let conn = Connection::open_in_memory().unwrap();
     create_ast_tables(&conn).unwrap();
     create_refs_tables(&conn).unwrap();
     create_index_schema(&conn).unwrap();
-    create_pointer_store_tables(&conn).unwrap();
     create_source_blobs_table(&conn).unwrap();
 
     // Seed a conflicting _source row so the SECOND insert below fails on

@@ -10,7 +10,7 @@
 //! This is ADR-0026's thesis ("the SQL projection should be a lightweight index
 //! into content-addressed blobs, never re-materialize") applied at **chunk**
 //! granularity, using the same arena-local blob-table pattern as
-//! `source_blobs` / `capnp_blobs` so an arena stays a single portable `.db`.
+//! `source_blobs` so an arena stays a single portable `.db`.
 //!
 //! ## The shape
 //!

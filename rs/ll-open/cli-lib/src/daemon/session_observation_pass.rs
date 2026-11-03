@@ -411,7 +411,7 @@ impl EnrichmentPass for SessionObservationPass {
                 // INLINE_THRESHOLD are content-addressed into the
                 // arena-local `observation_blobs` table (dedup, no inline
                 // bloat) — kept inside the one .db, consistent with
-                // `source_blobs`/`capnp_blobs`, so the arena stays a single
+                // `source_blobs`, so the arena stays a single
                 // portable file. Cross-arena dedup via the global
                 // FsBlobStore is the separate design-gated bead d22735.
                 let (payload_inline, payload_hash) =
@@ -510,6 +510,26 @@ mod tests {
             &["_meta"],
             &["observation"],
         );
+    }
+
+    /// `run` creates the table it owns and reports itself by name, whether
+    /// or not a corpus is configured. A body replaced by
+    /// `Ok(Default::default())` does neither.
+    #[test]
+    fn run_creates_its_table_and_names_its_stats() {
+        let conn = Connection::open_in_memory().unwrap();
+        let stats = SessionObservationPass::new()
+            .run(&conn, Path::new("."), None)
+            .unwrap();
+        assert_eq!(stats.pass_name, "session-observation");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'observation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "run must create the observation table");
     }
 
     #[test]

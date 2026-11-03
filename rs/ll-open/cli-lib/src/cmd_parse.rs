@@ -52,9 +52,9 @@ use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
 use leyline_ts::schema::{
     create_ast_tables, create_index_schema, create_ir_indexes, create_ir_tables,
-    create_pointer_store_tables, create_post_load_indexes_skip_unused, create_query_blob_tables,
-    create_refs_tables, create_source_blobs_table, delete_file_rows, ensure_dir_nodes,
-    ensure_file_id, file_nid, get_meta, read_file_stats, set_meta, sweep_orphaned_dirs,
+    create_post_load_indexes_skip_unused, create_query_blob_tables, create_refs_tables,
+    create_source_blobs_table, delete_file_rows, ensure_dir_nodes, ensure_file_id, file_nid,
+    get_meta, read_file_stats, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -140,17 +140,6 @@ pub(crate) struct ParsedFile {
     /// mache bench) capnp serialization cost out of the serial insert
     /// phase and into the parallel parse phase.
     ast_capnp_bytes: Vec<u8>,
-    /// ADR-0026 pointer-store blob (bead `ley-line-open-3e87ad`, Phase 1):
-    /// canonical bytes of a single `AstNodeList` message containing every
-    /// AstEntry for this file. Written to `capnp_blobs.blob_bytes`; the
-    /// per-node offsets in `ast_entries.iter().enumerate()` land in
-    /// `_ast_pointer.offset_in_blob`. Built in the rayon worker so the
-    /// serial insert loop does no capnp work.
-    pointer_blob_bytes: Vec<u8>,
-    /// BLAKE3-32 of `pointer_blob_bytes`. Populates
-    /// `capnp_blobs.blob_hash` (PK) and every `_ast_pointer.blob_hash` FK
-    /// for this file's rows.
-    pointer_blob_hash: [u8; 32],
     /// ADR-0028 source-blob bytes (bead `ley-line-open-9e4416`, Phase 1):
     /// verbatim file bytes as read from disk by the rayon worker, moved into
     /// `source_blobs.blob_bytes` on the main-thread insert loop. Byte-identical
@@ -747,27 +736,6 @@ batch_table! {
 }
 
 batch_table! {
-    // ADR-0026 pointer-store blob rows (bead `ley-line-open-3e87ad`).
-    // `INSERT OR IGNORE` on the `blob_hash` PK == intrinsic dedup: two
-    // files with byte-identical AstNodeList canonical bytes share one blob.
-    // Phase 1 is per-file granularity; Phase 2 refines toward per-semantic-
-    // unit (ADR-0026 §2.2).
-    CapnpBlobBatch, CapnpBlobRow,
-    "INSERT OR IGNORE INTO capnp_blobs (blob_hash, blob_bytes) VALUES ",
-    2,
-    push_fn: (blob_hash: Vec<u8>, blob_bytes: Vec<u8>),
-    push_body: { CapnpBlobRow { blob_hash, blob_bytes } },
-    flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
-        for r in chunk {
-            out.push(&r.blob_hash);
-            out.push(&r.blob_bytes);
-        }
-        out
-    },
-}
-
-batch_table! {
     // ADR-0028 source-blob rows (bead `ley-line-open-9e4416`, Phase 1 dual-
     // store). `INSERT OR IGNORE` on the `blob_hash` PK == intrinsic dedup:
     // two files with byte-identical source content share one blob (F5s).
@@ -783,32 +751,6 @@ batch_table! {
         for r in chunk {
             out.push(&r.blob_hash);
             out.push(&r.blob_bytes);
-        }
-        out
-    },
-}
-
-batch_table! {
-    // ADR-0026 file-to-blob map — ONE row per source file (bead
-    // `ley-line-open-17c271`, superseding the per-node `_ast_pointer` from
-    // `ley-line-open-3e87ad`). `delete_file_rows` clears the prior row per
-    // file, so plain `INSERT` doesn't conflict.
-    //
-    // The per-node table it replaces stored, for each of 3.15M rows, a
-    // node_id already in `_ast`, a source_id already in `_ast`, a blob_hash
-    // with only 8000 distinct values, an offset that was the dense array
-    // index, and a kind derivable from `_ast.node_kind`. The offset now
-    // rides on `_ast.blob_ord`, on the row it describes.
-    AstBlobBatch, AstBlobRow,
-    "INSERT INTO _ast_blob (file_id, blob_hash) VALUES ",
-    2,
-    push_fn: (file_id: i64, blob_hash: Vec<u8>),
-    push_body: { AstBlobRow { file_id, blob_hash } },
-    flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 2);
-        for r in chunk {
-            out.push(&r.file_id);
-            out.push(&r.blob_hash);
         }
         out
     },
@@ -1291,10 +1233,9 @@ fn parse_into_conn_with(
     // (the additive ALTER migrations are gone — a pre-v5 arena is refused
     // at open, not patched).
     create_ir_tables(conn)?;
-    // ADR-0026 Phase 1 dual-write (bead `ley-line-open-3e87ad`): the pointer-
-    // store tables land alongside the row-projected schema. Both populated on
-    // every parse; F1 (round-trip integrity) asserts continuous agreement.
-    create_pointer_store_tables(conn)?;
+    // The ADR-0026 pointer store (`capnp_blobs`, `_ast_blob`) is retired at
+    // projection-v8 (ADR-0040 D5, bead `ley-line-open-f30fdf`): it was a
+    // second stored copy of the syntax tree that nothing read.
     // ADR-0028 Phase 1 dual-store (bead `ley-line-open-9e4416`): source_blobs
     // lands alongside `_source`. `_source.content_hash` (already populated for
     // the Σ head chain) becomes the FK-shaped pointer into source_blobs. F1s
@@ -1788,13 +1729,6 @@ fn parse_into_conn_with(
     let mut imports_buf: ImportBatch = ImportBatch::with_capacity(2_000);
     let mut source_buf: SourceBatch = SourceBatch::with_capacity(chunk_files);
 
-    // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`).
-    // One `capnp_blobs` row per file; one `_ast_pointer` row per AstEntry
-    // (mirrors the `_ast` row count 1-to-1). Pre-sized like `ast_buf` since
-    // pointer rows and _ast rows are in 1-to-1 correspondence.
-    let mut blob_buf: CapnpBlobBatch = CapnpBlobBatch::with_capacity(chunk_files);
-    let mut ast_blob_buf: AstBlobBatch = AstBlobBatch::with_capacity(chunk_files);
-
     // ADR-0028 source blobs (Phase 1 dual-store, bead `ley-line-open-9e4416`).
     // One `source_blobs` row per file *before* `INSERT OR IGNORE` dedup; unique
     // source content collapses at flush time. Pre-sized at one chunk's file
@@ -2094,11 +2028,8 @@ fn parse_into_conn_with(
                         }
                     }
 
-                    // `_ast` rows: the entry's index in the file's
-                    // `AstNodeList.nodes` — the same `enumerate()` order
-                    // `serialize_ast_node_list_record` wrote — IS the nid's
-                    // low 24 bits, so the pointer store's per-node ordinal
-                    // lives in the key (`ley-line-open-17c271`).
+                    // `_ast` rows: the entry's pre-order index in the file
+                    // IS the nid's low 24 bits (`ley-line-open-17c271`).
                     for (ordinal, a) in pf.ast_entries.iter().enumerate() {
                         let kind_id = kind_id_of(conn, &a.node_kind)?;
                         ast_buf.push(
@@ -2113,19 +2044,6 @@ fn parse_into_conn_with(
                             a.node_hash.to_vec(),
                         );
                     }
-
-                    // ADR-0026 dual-write (Phase 1, bead `ley-line-open-3e87ad`).
-                    // One `capnp_blobs` row per file (the per-file AstNodeList
-                    // canonical bytes, content-addressed by BLAKE3); one
-                    // `_ast_pointer` row per AstEntry, mirroring the `_ast` row
-                    // set. `offset_in_blob` is the list index — the same
-                    // enumerate() order `serialize_ast_node_list_record` used, so
-                    // decoding the blob at `offset` byte-identically reproduces
-                    // this entry's fields (asserted by the F1 integration test).
-                    // Moved for the same reason as `source_blob_bytes` above:
-                    // sole use, owned `pf`, by-value `push` (ley-line-open-cd052b).
-                    blob_buf.push(pf.pointer_blob_hash.to_vec(), pf.pointer_blob_bytes);
-                    ast_blob_buf.push(file_id, pf.pointer_blob_hash.to_vec());
 
                     // Fact rows translate the extraction pipeline's string
                     // correlation ids to nids here, where the file's ordinal
@@ -2234,9 +2152,8 @@ fn parse_into_conn_with(
         ast_buf.flush_batched(conn)?;
         // ADR-0028 source-blob dual-store (bead `ley-line-open-9e4416`). Flush
         // source_blobs BEFORE `_source` so the FK-shaped pointer (`_source.
-        // content_hash → source_blobs.blob_hash`) always finds its referent —
-        // matches the capnp_blobs→_ast_pointer ordering below. Phase 1 doesn't
-        // declare the FK (dual-store is additive; the FK becomes load-bearing
+        // content_hash → source_blobs.blob_hash`) always finds its referent.
+        // Phase 1 doesn't declare the FK (dual-store is additive; the FK becomes load-bearing
         // when Phase 2 flips consumers to reads), but ordering the writes
         // correctly means the promotion is a one-line edit.
         source_blob_buf.flush_batched(conn)?;
@@ -2250,14 +2167,6 @@ fn parse_into_conn_with(
         "INSERT INTO node_defs (token, nid, node_hash, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         imports_buf.flush_batched(conn)?;
-        // ADR-0026 pointer-store dual-write (bead `ley-line-open-3e87ad`). Flush
-        // blobs BEFORE the pointer rows so an implementation that later adds a FK
-        // on `_ast_pointer.blob_hash → capnp_blobs.blob_hash` finds every referent
-        // present. Phase 1 doesn't declare the FK (dual-write is additive; the
-        // FK becomes load-bearing when Phase 2 flips consumers to reads), but
-        // ordering the writes correctly means the promotion is a one-line edit.
-        blob_buf.flush_batched(conn)?;
-        ast_blob_buf.flush_batched(conn)?;
 
         flush_elapsed += chunk_flush_start.elapsed();
     }
@@ -2434,7 +2343,7 @@ fn parse_into_conn_with(
     // shape (node_content/node_child/_ast.node_hash) from the retired
     // symbols/fact_edges shape.
     set_meta(conn, "ir_schema_version", IR_SCHEMA_VERSION)?;
-    // Projection shape, so a consumer can tell `_ast_blob` from `_ast_pointer`
+    // Projection shape, so a consumer can tell one table shape from another
     // without interrogating `sqlite_master` (bead `ley-line-open-17c271`).
     set_meta(
         conn,
@@ -3266,8 +3175,11 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
     {
         let mut node: ast_node::Builder = src.init_root();
         // Phase A of bead ley-line-open-17c271: the locator is EVICTED from
-        // every hashed preimage — same rule as the AstNodeList blob below,
-        // where the full rationale lives.
+        // every hashed preimage. The path-shaped id was write-only freight
+        // that bound the segment root to the locator SCHEME, so re-keying the
+        // projection (Phase B) would have moved the Σ lineage with it.
+        // Emptied, not removed: capnp ordinals are never reused, so
+        // `nodeId @0` keeps its slot.
         node.set_node_id("");
         node.set_source_id(&a.source_id);
         node.set_node_kind(&a.node_kind);
@@ -3288,71 +3200,6 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 
     leyline_schema_capnp::canonical::write_canonical_message::<ast_node::Owned, _>(&src, buf)
         .context("write AstNode capnp record")?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// ADR-0026 pointer store — Phase 1 dual-write (bead `ley-line-open-3e87ad`)
-// ---------------------------------------------------------------------------
-//
-// Producer helpers for the content-addressed pointer store:
-//
-// - `serialize_ast_node_list_record` — canonicalize a per-file
-//   `AstNodeList` capnp message. Blob content per ADR-0026 §2.1.
-// (`semantic_kind_tag` and the SEMANTIC_KIND_* tags are gone: they fed the
-// per-node `_ast_pointer.kind` column, whose table died in projection-v2 —
-// the fn had been orphaned since, with zero callers.)
-
-/// ADR-0026 §2.1 — serialize the per-file `AstNodeList` capnp message
-/// (canonical form) into `buf`. Emits ONE root message per file whose
-/// `nodes` list contains an `AstNode` for every `AstEntry`, in the same
-/// order the entries were folded. The offset of each node in the list is
-/// its index in `entries`, which populates `_ast_pointer.offset_in_blob`.
-///
-/// The canonical bytes are hashed with BLAKE3 to produce `blob_hash`. The
-/// bytes then land verbatim in `capnp_blobs.blob_bytes` (no re-
-/// canonicalization at read time — the on-disk bytes ARE the blob).
-fn serialize_ast_node_list_record(buf: &mut Vec<u8>, entries: &[AstEntry]) -> Result<()> {
-    use leyline_schema_capnp::ast_capnp::ast_node_list;
-
-    let mut src = capnp::message::Builder::new_default();
-    {
-        let list_root: ast_node_list::Builder = src.init_root();
-        let n = u32::try_from(entries.len())
-            .context("AstNodeList: entries count exceeds u32 (capnp list bound)")?;
-        let mut list = list_root.init_nodes(n);
-        for (i, a) in entries.iter().enumerate() {
-            let mut node = list.reborrow().get(i as u32);
-            // Phase A of bead ley-line-open-17c271: the locator is EVICTED
-            // from every hashed preimage. A node's address inside the blob
-            // is its ordinal (`_ast_pointer.offset_in_blob` — the `i` of
-            // this very loop); the path-shaped id was write-only freight
-            // that bound `blob_hash` to the locator SCHEME, so re-keying
-            // the projection (Phase B) would have moved every blob hash
-            // and the Σ lineage with it. Emptied, not removed: persisted
-            // blobs pin capnp ordinals, so `nodeId @0` must keep its slot
-            // to keep old blobs decodable.
-            node.set_node_id("");
-            node.set_source_id(&a.source_id);
-            node.set_node_kind(&a.node_kind);
-            let mut r = node.init_range();
-            {
-                let mut s = r.reborrow().init_start();
-                s.set_line(a.start_row as u32);
-                s.set_column(a.start_col as u32);
-                s.set_byte(a.start_byte as u64);
-            }
-            {
-                let mut e = r.reborrow().init_end();
-                e.set_line(a.end_row as u32);
-                e.set_column(a.end_col as u32);
-                e.set_byte(a.end_byte as u64);
-            }
-        }
-    }
-
-    leyline_schema_capnp::canonical::write_canonical_message::<ast_node_list::Owned, _>(&src, buf)
-        .context("write AstNodeList capnp record")?;
     Ok(())
 }
 
@@ -3626,18 +3473,6 @@ pub(crate) fn parse_file_pure(
         serialize_ast_node_record(&mut ast_capnp_bytes, a)?;
     }
 
-    // ADR-0026 pointer store (Phase 1 dual-write, bead `ley-line-open-3e87ad`):
-    // build the per-file `AstNodeList` canonical capnp blob AND its BLAKE3
-    // address in the rayon worker. The main-thread insert loop just moves the
-    // byte buffer + hash into the DB, doing no capnp work.
-    //
-    // Blob size ~= sizeof(ast_capnp_bytes); a single canonical `AstNodeList`
-    // message is denser than N concatenated `AstNode` messages (one framing
-    // header, one segment table), so this over-allocates safely.
-    let mut pointer_blob_bytes = Vec::with_capacity(ast_capnp_bytes.len());
-    serialize_ast_node_list_record(&mut pointer_blob_bytes, &ast_entries)?;
-    let pointer_blob_hash: [u8; 32] = *pointer_blob_bytes.as_slice().hash().as_bytes();
-
     // ADR-0028 source-blob bytes (bead `ley-line-open-9e4416`, Phase 1 dual-
     // store). The caller's own allocation, moved — not copied. The main-thread
     // insert loop then moves it again into `source_blobs.blob_bytes`, so the
@@ -3663,8 +3498,6 @@ pub(crate) fn parse_file_pure(
         content_hash,
         source_capnp_bytes,
         ast_capnp_bytes,
-        pointer_blob_bytes,
-        pointer_blob_hash,
         source_blob_bytes,
         injected_hashes,
         syntax_error,
@@ -5312,7 +5145,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v7",
+            "projection-v8",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5325,8 +5158,28 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v7"),
+            Some("projection-v8"),
             "every parse must stamp _meta.projection_schema_version",
+        );
+    }
+
+    /// projection-v8 (ADR-0040 D5, bead `ley-line-open-f30fdf`): an arena
+    /// that still carries the v7 label is refused at open — its pointer-store
+    /// tables would otherwise sit beside a writer that no longer maintains
+    /// them, and a reparse's `delete_file_rows` would leave their rows stale.
+    #[test]
+    fn a_projection_v7_arena_is_refused_at_open() {
+        let td = TempDir::new().unwrap();
+        std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
+        set_meta(&conn, "projection_schema_version", "projection-v7").unwrap();
+        let err = parse_into_conn(&conn, td.path(), Some("go"), None)
+            .expect_err("a projection-v7 arena must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("projection-v7") && msg.contains("projection-v8"),
+            "the refusal must name both versions; got: {msg}",
         );
     }
 
@@ -5344,7 +5197,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v7"),
+            msg.contains("projection-v4") && msg.contains("projection-v8"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(

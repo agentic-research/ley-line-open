@@ -50,12 +50,13 @@ workspace are invisible to them. Re-derive rather than trust when it matters.
 | `source_blobs` | 11 | |
 | `node_content` | **0** | No SELECT anywhere. Survives as the FK target of `node_defs`/`node_refs.node_hash`. |
 | `node_child` | **0** | No SELECT, and nothing FKs into it. 3.41M rows / 405 MB on an 8000-file arena. **Do not treat as droppable**: its `field` column is the ONLY place a tree-sitter field name survives, and mache needs it (`ley-line-open-87ff3a`). See "Recovering a node's tree-sitter field" below. |
-| `capnp_blobs` | **0** | No SELECT. Load-bearing only for the ADR-0026 §6.F1 resolution capability via `_ast_blob`. |
-| `_ast_blob` | **0** | Same — written and gated by F1, not queried. |
-
 A zero here means "nothing in this workspace SELECTs it", which is not the same
-as "safe to delete": three of the four zeros are load-bearing for an FK or an
-ADR-stated capability. It does mean the row count is not being paid for a query.
+as "safe to delete": `node_content` is an FK target and `node_child` carries the
+field names. It does mean the row count is not being paid for a query. The two
+other zeros this table used to list, `capnp_blobs` and `_ast_blob`, were
+retired at `projection-v8` (ADR-0040 D5, bead `ley-line-open-f30fdf`): they had
+no reader in this workspace or in mache, and the capability that justified them
+(ADR-0026 §6.F1 resolution of an `_ast` row into a capnp blob) had no caller.
 
 `node_child` was the fourth — the one zero with no stated justification, and so
 the obvious thing to delete when someone goes looking for row count. It now has
@@ -161,12 +162,7 @@ the projection is derived-only, so no in-place migration exists.
 | `node_content` | One row per UNIQUE subtree, keyed on `node_hash BLOB PRIMARY KEY` (κ kind + terminal + child hashes). `INSERT OR IGNORE` dedups byte-identical subtrees cross-file. |
 | `node_child` | Git-tree object: (parent_hash, ordinal) → child_hash edges. Both endpoints REFERENCE `node_content(node_hash)` (FK-enforced). |
 
-**Pointer store** (added v0.6.0 per ADR-0026 Phase 1 dual-write):
-
-| Table | Purpose |
-|-------|---------|
-| `capnp_blobs` | Content-addressed blob store — `blob_hash BLOB PRIMARY KEY`, `blob_bytes BLOB`. |
-| `_ast_blob` | File-to-blob map — `file_id INTEGER PRIMARY KEY` (as of `projection-v5`), `blob_hash BLOB`. ONE row per source file. Replaced the row-per-AstNode `_ast_pointer` in `projection-v2` (bead `ley-line-open-17c271`): that table carried a node_id and source_id already on the `_ast` row, a blob_hash with only 8000 distinct values across 3.15M rows, and an offset that was provably the dense array index — ~294 bytes to address a ~370-byte record. Resolution is `nid >> 24 → blob_hash`, indexed at `nid & 0xFFFFFF`. |
+**Pointer store — retired at `projection-v8`** (ADR-0040 D5, bead `ley-line-open-f30fdf`; ADR-0026 Phase 1 reversed). `capnp_blobs` (one canonical `AstNodeList` blob per file) and `_ast_blob` (`file_id → blob_hash`) are no longer created or written. They were the second stored copy of the syntax tree — 812.8 MB, 35.6% of the 2,284.6 MB kibana arena (bead `ley-line-open-17c271`'s pinned slice) — with no reader. The tree is stored once in the SQL rows above and `node_content`/`node_child`, keyed by the location-free `node_hash`. No identity moved: `Head.rootHash` folds the `.source.capnp`/`.ast.capnp`/`.bindings.capnp` segment files, whose bytes never depended on the blob, and `treeRoot` folds `_tree`. A `projection-v7` arena is refused at parse open and rebuilt cold.
 
 **Source blobs** (added v0.6.0 per ADR-0028 Phase 1 dual-store):
 
@@ -258,7 +254,6 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `_dfg*` | analysis-substrate DFG layer (T2 of `analysis-substrate` decade; not yet shipped) |
 | `_taint*` | analysis-substrate taint fixpoint (T3 of `analysis-substrate` decade; not yet shipped) |
 | `node_content` / `node_child` | ADR-0027 merkle-AST IR (base; no prefix) |
-| `_ast_blob` / `capnp_blobs` | ADR-0026 pointer store (base; no prefix on blobs) |
 | `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
 | `content_chunks` / `content_manifest` / `content_manifest_meta` | CDC derived chunk cache — private, not part of the SQL projection ABI |

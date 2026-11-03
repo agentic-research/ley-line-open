@@ -314,7 +314,6 @@ mod tests {
                     .unwrap()
             };
             let source_hashes = named("content_hash", "_source");
-            let ast_blobs = named("blob_hash", "_ast_blob");
             let tables: Vec<String> = {
                 let mut stmt = conn
                     .prepare(
@@ -362,7 +361,6 @@ mod tests {
                             ("source_blobs", "blob_hash") if !keyed(&source_hashes) => {
                                 continue 'row;
                             }
-                            ("capnp_blobs", "blob_hash") if !keyed(&ast_blobs) => continue 'row,
                             ("node_content", "node_hash") | ("node_child", "parent_hash")
                                 if !keyed(&reach) =>
                             {

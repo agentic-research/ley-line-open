@@ -1733,10 +1733,10 @@ fn op_get_schema() -> Result<String> {
 }
 
 /// Export the daemon's filesystem paths — the .db location + sibling
-/// capnp segment files. mache's `serve_lsp.go` / `serve_find_smells.go`
-/// use these for an optional capnp readthrough fast-path; without them
-/// they fall back to slower SQL queries. Strictly opt-in optimization;
-/// the daemon's normal ops are unaffected.
+/// capnp segment files. mache decodes only `bindings.capnp` from these
+/// (`internal/lsp/binding_log.go`); it reads neither `ast.capnp` nor
+/// `source.capnp`, which it reaps as cache (ADR-0040 D5). Strictly
+/// opt-in; the daemon's normal ops are unaffected.
 fn op_get_db_path(ctrl_path: &Path) -> Result<String> {
     let ctrl_str = ctrl_path.to_string_lossy().to_string();
     // The .db path is the ctrl_path with .ctrl swapped for .db (mache's

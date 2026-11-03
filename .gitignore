@@ -82,6 +82,10 @@
 # Documentation
 !docs/**
 
+# Pending CHANGELOG entries, one file per change (bead ley-line-open-465ce2;
+# see changes/README.md).
+!changes/*.md
+
 # Smell-rule JSON definitions consumed by `cargo-toml-projector`
 # (bead `ley-line-open-3b2f55` Phase 3 + `ley-line-open-85fb1f`).
 !smell-rules/**
@@ -121,6 +125,9 @@
 
 # Re-deny build artifacts
 **/target/
+# `task release:hypervisor:record` builds here so it can run beside `task ci`
+# (bead ley-line-open-465ce2).
+rs/target-hypervisor/
 **/*.a
 **/*.o
 **/*.so

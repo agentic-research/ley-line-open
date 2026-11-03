@@ -67,6 +67,7 @@ A change is incomplete when any required edge is missing. In particular:
 - Publication must be atomic from the reader's point of view. Bytes, generation, and the authoritative root must not expose a mixed state.
 - Execution paths must fail closed. Confinement evidence must cover actual paths, sockets, network access, inherited descriptors, lifecycle transitions, and cleanup—not merely configuration intent.
 - Keep policy ownership in Cloister and mechanism ownership in LLO. Do not duplicate backend selection or authorization semantics across the boundary.
+- Never edit `CHANGELOG.md` in a change. Add one fragment, `changes/<bead-id>.md` or `changes/<bead-id>-<slug>.md`, whose first line is `Section: <Security|Breaking|Added|Changed|Fixed|Removed>` and whose remaining lines are the entry in the existing CHANGELOG style (`changes/README.md` has the template). Fragments never conflict between PRs; `tools/bump_release_version.sh` assembles them into the release's section, Security first, and deletes them. `task ci` lints them (`task lint:changelog-fragments`).
 
 For concurrent implementation work, make bead file scopes explicit and use separate worktrees. Do not assign overlapping edits to the same schema, generated artifact, compatibility manifest, task definition, or architecture document. Read-only reviews are safe to parallelize.
 
@@ -79,6 +80,8 @@ Run the narrowest test that proves the changed contract, then the relevant repos
 - `task check` for the standard repository checks.
 - `task smells` when architecture or dependency shape changes.
 - `task ci` when the change warrants the full CI-equivalent surface.
+- `task rs:mutants:pr` before every push that changes Rust: it mutation-tests the working-tree diff against `origin/integration`, the same diff the PR's mutation job tests.
+- `task release:hypervisor:record` (Apple silicon, with `LEYLINE_LIBKRUNFW_PATH` and `LEYLINE_GUEST_TOOLS`) builds in `rs/target-hypervisor`, so it runs beside `task ci` without sharing a cargo target directory.
 - `git diff --check` for every change.
 
 Report what was run, what was not run, and why. A passing producer test is not evidence that downstream consumers still agree.

@@ -1769,7 +1769,12 @@ fn parse_into_conn_with(
         [],
         |r| r.get(0),
     )?;
-    let arena_had_content = next_content_id > 1;
+    // Only a lookup-skipping optimisation: a cold arena has nothing to find,
+    // and a lookup that misses mints the same id it would have anyway.
+    let arena_had_content: bool =
+        conn.query_row("SELECT EXISTS (SELECT 1 FROM node_content)", [], |r| {
+            r.get(0)
+        })?;
     // Parents whose edges this pass has already buffered. A parent's edge
     // set is a function of its hash, emitted whole by the first file that
     // folds it; `INSERT OR IGNORE` covers a parent an earlier pass wrote.

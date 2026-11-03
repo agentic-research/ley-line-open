@@ -15,4 +15,5 @@ Section: Fixed
   `docs/TABLE_CONTRACT.md` record the policy. The daemon wire gains the
   `RefusalReason` enumerant `aliasesExisting` and the
   `ProposalRefusal.other` field (also set for `path_conflict`); both are
-  additive, and the Go bindings are regenerated.
+  additive, the Go bindings are regenerated, and `SCHEMA_VERSION` moves to
+  0.21.1.

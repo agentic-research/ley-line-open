@@ -197,7 +197,7 @@ inside cargo-mutants' scratch tree.
 
 The current release is `v0.21.1`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
-`clients/go/leyline-schema/v0.21.0`. See
+`clients/go/leyline-schema/v0.21.1`. See
 [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
 for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 

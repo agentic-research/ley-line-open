@@ -10,7 +10,7 @@ Section: Breaking
   read `node_edge` instead (TABLE_CONTRACT gives the SQL). On bead
   `ley-line-open-17c271`'s kibana slice the edges go from 515.2 MB
   (`node_child` + its autoindex) to 72.9 MB, the arena from 1,471.1 MB to
-  1,030.1 MB (42.5x to 28.4x source), and peak parse RSS from 4.58 GB to
+  1,030.1 MB (42.5x to 29.8x source), and peak parse RSS from 4.58 GB to
   4.09 GB; the edge set is unchanged by hash (4,346,013 rows, an `EXCEPT`
   of the two arenas is empty both ways). On this repository's `rs/` tree:
   168.4 MB to 23.7 MB. No identity moves: `node_hash` and `Head.rootHash`

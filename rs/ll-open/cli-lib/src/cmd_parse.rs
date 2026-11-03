@@ -1973,9 +1973,9 @@ fn parse_into_conn_with(
                         if edges_written.contains(&parent_id) {
                             continue;
                         }
-                        if parents_here.last() != Some(&parent_id) {
-                            parents_here.push(parent_id);
-                        }
+                        // Marked after the loop, not here: this file's later
+                        // edges of the same parent must still be buffered.
+                        parents_here.push(parent_id);
                         child_buf.push(parent_id, c.ordinal as i64, id_of(&c.child_hash)?, c.field);
                     }
                     edges_written.extend(parents_here);

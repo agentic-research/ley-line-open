@@ -161,6 +161,8 @@ tower = "0.5"
 # across the test suite, not just an inline SAFETY comment. Same
 # pattern the `leyline-sign` dev-deps introduced under cloister-da0f35.
 serial_test = "3"
+# Property tests of the proposal merge (bead ley-line-open-238c85).
+proptest = "1.8"
 
 [[bench]]
 name = "wal_snapshot_experiment"

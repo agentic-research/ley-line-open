@@ -1798,6 +1798,12 @@ impl<S: Store> StoreFs<S> {
             .store
             .with_write(|conn| {
                 precheck(conn)?;
+                // A path the checkout's file system folds onto another
+                // entry is refused before anything commits (bead
+                // `ley-line-open-23a26c`).
+                if let Some(checkout) = &self.options.checkout {
+                    leyline_cli_lib::checkout::refuse_aliases(conn, &checkout.dir, &writes)?;
+                }
                 let accepted = source_write::propose(conn, &self.scope.propose, writes)?;
                 if let Some(checkout) = &self.options.checkout {
                     match leyline_cli_lib::checkout::reconcile(
@@ -2523,7 +2529,7 @@ pub fn errno_for(err: &anyhow::Error) -> Errno {
         Some(Refusal::Stale(_) | Refusal::Conflict { .. }) => Errno::ESTALE,
         Some(Refusal::OutsideGrant { .. }) => Errno::EACCES,
         Some(Refusal::NoSuchFile { .. }) => Errno::ENOENT,
-        Some(Refusal::Exists { .. }) => Errno::EEXIST,
+        Some(Refusal::Exists { .. } | Refusal::AliasesExisting { .. }) => Errno::EEXIST,
         Some(Refusal::NotEmpty { .. }) => Errno::ENOTEMPTY,
         Some(Refusal::NotADirectory { .. } | Refusal::PathConflict { .. }) => Errno::ENOTDIR,
         Some(Refusal::IsADirectory { .. }) => Errno::EISDIR,

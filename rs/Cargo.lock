@@ -4700,6 +4700,7 @@ dependencies = [
  "log",
  "memmap2",
  "parking_lot",
+ "proptest",
  "r2d2",
  "r2d2_sqlite",
  "rand 0.9.4",

@@ -493,6 +493,174 @@ pub fn reconcile(
     })
 }
 
+/// Refuse a proposal that creates a path the checkout's file system would
+/// land on another entry (bead `ley-line-open-23a26c`, ADR-0043 R3): `_tree`
+/// paths are byte-distinct, but a file system that folds case or Unicode
+/// normalization (the default APFS volume folds both) resolves `Readme.md`
+/// to `README.md`, and NFD `é` to NFC `é`, so the two store entries would
+/// share one file and the checkout could never agree with `_tree`. The
+/// refusal is
+/// [`crate::source_write::Refusal::AliasesExisting`], naming both paths.
+///
+/// Folding is detected by asking the file system, never assumed from the
+/// platform: a created path is looked up under `dir` component by
+/// component, and a component that resolves to an entry the directory
+/// spells differently is an alias of that entry. Paths one proposal
+/// creates are checked against each other by creating them in a hidden
+/// scratch directory inside `dir` (one file system), where a create that
+/// finds its name taken is an alias. An alias of an entry the same
+/// proposal deletes is a rename, and lands. A path the store already holds
+/// is its own name and is not checked.
+pub fn refuse_aliases(
+    conn: &Connection,
+    dir: &Path,
+    writes: &[crate::source_write::Proposed],
+) -> Result<()> {
+    use crate::source_write::{Change, Refusal};
+    let removed: BTreeSet<&str> = writes
+        .iter()
+        .filter(|w| matches!(w.change, Change::Delete | Change::Rmdir))
+        .map(|w| w.path.as_str())
+        .collect();
+    let has_tree = crate::tree::exists(conn);
+    let mut created = Vec::new();
+    for w in writes {
+        if !matches!(w.change, Change::Write { .. } | Change::Mkdir) || !inside(&w.path) {
+            continue;
+        }
+        if has_tree && crate::tree::entry(conn, &w.path)?.is_some() {
+            continue;
+        }
+        if let Some(other) = alias_under(dir, &w.path)?
+            && !removed.contains(other.as_str())
+        {
+            return Err(Refusal::AliasesExisting {
+                path: w.path.clone(),
+                other,
+            }
+            .into());
+        }
+        created.push((w.path.as_str(), matches!(w.change, Change::Mkdir)));
+    }
+    if let Some((path, other)) = alias_among(dir, &created)? {
+        return Err(Refusal::AliasesExisting { path, other }.into());
+    }
+    Ok(())
+}
+
+/// The entry under `dir` that `rel` resolves to under another spelling, as
+/// the directory spells it; `None` when `rel` resolves to nothing, or to an
+/// entry spelled exactly as `rel`.
+fn alias_under(dir: &Path, rel: &str) -> Result<Option<String>> {
+    let mut held = PathBuf::new();
+    for component in Path::new(rel).components() {
+        let name = component.as_os_str();
+        let parent = dir.join(&held);
+        let Ok(meta) = std::fs::symlink_metadata(parent.join(name)) else {
+            return Ok(None);
+        };
+        match spelled(&parent, name, &meta)? {
+            Some(spelling) if spelling == name => held.push(name),
+            Some(spelling) => {
+                held.push(spelling);
+                return Ok(Some(held.to_string_lossy().into_owned()));
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// How `parent` spells the entry `name` resolved to: `name` itself when the
+/// directory holds that exact name, else the name of the entry with the
+/// same device and inode.
+fn spelled(
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    meta: &std::fs::Metadata,
+) -> Result<Option<std::ffi::OsString>> {
+    let mut same = None;
+    for entry in std::fs::read_dir(parent)
+        .with_context(|| format!("list {} for path aliasing", parent.display()))?
+    {
+        let entry = entry?;
+        let held = entry.file_name();
+        if held == name {
+            return Ok(Some(held));
+        }
+        if same.is_none() && same_file(&entry.metadata()?, meta) {
+            same = Some(held);
+        }
+    }
+    Ok(same)
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// The first of `created` (path, is a directory) whose creation finds an
+/// earlier one's entry under another spelling, with that spelling: each
+/// path is made, component by component, in a hidden scratch directory in
+/// `dir`, removed when done. A component that cannot be made for another
+/// reason (a file where a directory goes) is left to the proposal's own
+/// checks.
+fn alias_among(dir: &Path, created: &[(&str, bool)]) -> Result<Option<(String, String)>> {
+    let scratch = tempfile::Builder::new()
+        .prefix(".leyline-alias-probe")
+        .tempdir_in(dir)
+        .with_context(|| format!("make a scratch directory in {}", dir.display()))?;
+    let mut made: BTreeSet<PathBuf> = BTreeSet::new();
+    for (rel, is_dir) in created {
+        let components: Vec<_> = Path::new(rel).components().collect();
+        let mut prefix = PathBuf::new();
+        for (i, component) in components.iter().enumerate() {
+            let name = component.as_os_str();
+            let parent = scratch.path().join(&prefix);
+            prefix.push(name);
+            if made.contains(&prefix) {
+                continue;
+            }
+            let at = scratch.path().join(&prefix);
+            let made_it = if i + 1 == components.len() && !is_dir {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&at)
+                    .map(drop)
+            } else {
+                std::fs::create_dir(&at)
+            };
+            match made_it {
+                Ok(()) => {
+                    made.insert(prefix.clone());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = std::fs::symlink_metadata(&at)?;
+                    let Some(spelling) = spelled(&parent, name, &meta)?.filter(|s| s != name)
+                    else {
+                        break;
+                    };
+                    let other = prefix.with_file_name(spelling);
+                    return Ok(Some((
+                        rel.to_string(),
+                        other.to_string_lossy().into_owned(),
+                    )));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Write `bytes` as the file `rel` names under `dir`: staged beside it, its
 /// bytes ordered to the disk, renamed over it, and the directory ordered
 /// (`crate::durable`), so a crash or a power loss leaves the old file or the
@@ -1550,5 +1718,153 @@ mod tests {
             staging_path(Path::new("/w/src/pkg/a.go")),
             PathBuf::from("/w/src/pkg/.a.go.leyline-checkout")
         );
+    }
+
+    // ── path aliasing (bead `ley-line-open-23a26c`) ─────────────────────
+
+    /// Whether `dir`'s file system resolves `probe` to the file `made`.
+    fn folds(dir: &Path, made: &str, probe: &str) -> bool {
+        std::fs::write(dir.join(made), b"").unwrap();
+        let folded = dir.join(probe).exists();
+        std::fs::remove_file(dir.join(made)).unwrap();
+        folded
+    }
+
+    fn aliases_of(c: &Checkout, writes: &[Proposed]) -> Option<(String, String)> {
+        match refuse_aliases(&c.conn, &c.src, writes) {
+            Ok(()) => None,
+            Err(e) => match e.downcast_ref::<crate::source_write::Refusal>() {
+                Some(crate::source_write::Refusal::AliasesExisting { path, other }) => {
+                    Some((path.clone(), other.clone()))
+                }
+                _ => panic!("an untyped refusal: {e:#}"),
+            },
+        }
+    }
+
+    fn new_file(path: &str) -> Proposed {
+        Proposed::create(path, b"x\n".to_vec())
+    }
+
+    /// A created path is checked against the checkout's entries: a file or
+    /// a directory component it folds onto is named as the directory spells
+    /// it. A path spelled as the store holds it, a path that folds onto
+    /// nothing, and a case-only rename are not aliases; nor is any path on
+    /// a file system that folds nothing. The scratch directory is gone.
+    #[test]
+    fn a_created_path_the_checkout_folds_onto_an_entry_is_an_alias() {
+        let c = checkout(&[("README.md", A), ("docs/a.md", B)]);
+        let folds_case = folds(&c.src, "Probe", "probe");
+        let nfc = "\u{e9}.md";
+        let nfd = "e\u{301}.md";
+        let folds_nfd = folds(&c.src, nfc, nfd);
+        std::fs::write(c.src.join(nfc), A).unwrap();
+        reconcile(&c.conn, &c.src, None, None).unwrap();
+
+        let case = |want: (&str, &str)| folds_case.then(|| (want.0.into(), want.1.into()));
+        assert_eq!(
+            aliases_of(&c, &[new_file("Readme.md")]),
+            case(("Readme.md", "README.md"))
+        );
+        assert_eq!(
+            aliases_of(&c, &[new_file("Docs/b.md")]),
+            case(("Docs/b.md", "docs"))
+        );
+        assert_eq!(
+            aliases_of(&c, &[Proposed::mkdir("DOCS")]),
+            case(("DOCS", "docs"))
+        );
+        assert_eq!(
+            aliases_of(&c, &[new_file(nfd)]),
+            folds_nfd.then(|| (nfd.to_string(), nfc.to_string()))
+        );
+        assert_eq!(aliases_of(&c, &[new_file("docs/b.md")]), None);
+        assert_eq!(aliases_of(&c, &[new_file("other.md")]), None);
+        assert_eq!(
+            aliases_of(
+                &c,
+                &[Proposed::write("README.md", Base::Any, b"y\n".to_vec())]
+            ),
+            None,
+            "a path the store holds is its own name"
+        );
+        assert_eq!(
+            aliases_of(
+                &c,
+                &[
+                    Proposed::delete("README.md", Base::Blob(h(A))),
+                    new_file("Readme.md"),
+                ]
+            ),
+            None,
+            "a case-only rename aliases only what it deletes"
+        );
+        assert_eq!(
+            aliases_of(
+                &c,
+                &[
+                    Proposed::delete("docs/a.md", Base::Blob(h(B))),
+                    new_file("Readme.md"),
+                ]
+            ),
+            case(("Readme.md", "README.md")),
+            "deleting another entry does not license the alias"
+        );
+        assert_eq!(
+            aliases_of(&c, &[Proposed::delete("Readme.md", Base::Any)]),
+            None,
+            "a delete creates nothing"
+        );
+        assert_eq!(
+            names(&c.src),
+            ["README.md", "docs", nfc].map(String::from).into()
+        );
+
+        // A store that already holds two aliasing entries (proposed with no
+        // checkout check): a replace of either is its own name.
+        propose(&c.conn, &Grant::Whole, vec![new_file("Readme.md")]).unwrap();
+        assert_eq!(
+            aliases_of(
+                &c,
+                &[Proposed::write("Readme.md", Base::Any, b"y\n".to_vec())]
+            ),
+            None
+        );
+    }
+
+    /// Two paths one proposal creates are checked against each other, as
+    /// files and as directory components; paths that share a directory
+    /// spelled the same are not aliases.
+    #[test]
+    fn two_paths_one_proposal_creates_that_fold_together_are_aliases() {
+        let c = checkout(&[("a.go", A)]);
+        let folds_case = folds(&c.src, "Probe", "probe");
+        let case = |want: (&str, &str)| folds_case.then(|| (want.0.into(), want.1.into()));
+        assert_eq!(
+            aliases_of(&c, &[new_file("New.md"), new_file("new.md")]),
+            case(("new.md", "New.md"))
+        );
+        assert_eq!(
+            aliases_of(&c, &[new_file("Sub/a.md"), new_file("sub/b.md")]),
+            case(("sub/b.md", "Sub"))
+        );
+        assert_eq!(
+            aliases_of(&c, &[new_file("sub/a.md"), new_file("sub/b.md")]),
+            None
+        );
+        assert_eq!(
+            aliases_of(&c, &[new_file("x.md"), Proposed::mkdir("x.md/y")]),
+            None,
+            "a path that cannot be made is left to the proposal's own checks"
+        );
+        assert_eq!(names(&c.src), ["a.go".to_string()].into());
+    }
+
+    /// The names `dir` holds, hidden ones included.
+    fn names(dir: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
     }
 }

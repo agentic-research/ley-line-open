@@ -1227,6 +1227,11 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
     // the proposal in the store, and the next reconcile carries it out.
     let outcome = writes.and_then(|writes| {
         ctx.with_write(|conn| {
+            // A path the checkout's file system folds onto another entry is
+            // refused before anything commits (bead `ley-line-open-23a26c`).
+            if let Some(dir) = ctx.source_dir.as_deref() {
+                crate::checkout::refuse_aliases(conn, dir, &writes)?;
+            }
             let accepted = crate::source_write::propose(conn, &Grant::Whole, writes)?;
             let checkout = ctx.source_dir.as_deref().map(|dir| {
                 let paths: Vec<String> = accepted
@@ -1316,9 +1321,13 @@ fn set_refusal(
         Refusal::NotEmpty { .. } => R::NotEmpty,
         Refusal::NotADirectory { .. } => R::NotADirectory,
         Refusal::IsADirectory { .. } => R::IsADirectory,
+        Refusal::AliasesExisting { .. } => R::AliasesExisting,
     });
     if let Some(path) = refusal.path() {
         out.set_path(path);
+    }
+    if let Some(other) = refusal.other() {
+        out.set_other(other);
     }
     let moved = refusal.moved();
     if !moved.is_empty() {
@@ -4510,7 +4519,7 @@ mod tests {
             ),
             (
                 serde_json::json!([{"path": "a.go/x", "kind": "mkdir", "base": "absent"}]),
-                serde_json::json!({"reason": "path_conflict", "path": "a.go/x"}),
+                serde_json::json!({"reason": "path_conflict", "path": "a.go/x", "other": "a.go"}),
             ),
             (
                 serde_json::json!([{"path": "d", "kind": "mkdir", "base": "any"}]),
@@ -4922,7 +4931,7 @@ mod tests {
             ),
             (
                 serde_json::json!([{"path": "a.go/c.go", "kind": "create", "base": "absent", "content": PROPOSE_A}]),
-                serde_json::json!({"reason": "path_conflict", "path": "a.go/c.go"}),
+                serde_json::json!({"reason": "path_conflict", "path": "a.go/c.go", "other": "a.go"}),
             ),
         ];
         for (writes, refusal) in cases {

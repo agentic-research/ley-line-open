@@ -265,6 +265,12 @@ pub enum Refusal {
     NotADirectory { path: String },
     /// A file write or delete names a directory.
     IsADirectory { path: String },
+    /// A created path names, in the checkout's file system, the entry
+    /// `other`: the file system folds the two spellings (case, or Unicode
+    /// normalization), so the two would share one file on disk (bead
+    /// `ley-line-open-23a26c`). `other` is spelled as the checkout
+    /// holds it, or as the same proposal creates it.
+    AliasesExisting { path: String, other: String },
 }
 
 impl Refusal {
@@ -284,7 +290,20 @@ impl Refusal {
             | Refusal::Exists { path }
             | Refusal::NotEmpty { path }
             | Refusal::NotADirectory { path }
-            | Refusal::IsADirectory { path } => Some(path),
+            | Refusal::IsADirectory { path }
+            | Refusal::AliasesExisting { path, .. } => Some(path),
+        }
+    }
+
+    /// The second path a refusal names: the file a created path is under
+    /// ([`Refusal::PathConflict`]) or the entry it aliases
+    /// ([`Refusal::AliasesExisting`]).
+    pub fn other(&self) -> Option<&str> {
+        match self {
+            Refusal::PathConflict { other, .. } | Refusal::AliasesExisting { other, .. } => {
+                Some(other)
+            }
+            _ => None,
         }
     }
 
@@ -356,6 +375,11 @@ impl std::fmt::Display for Refusal {
             }
             Refusal::NotADirectory { path } => write!(f, "'{path}' is not a directory"),
             Refusal::IsADirectory { path } => write!(f, "'{path}' is a directory"),
+            Refusal::AliasesExisting { path, other } => write!(
+                f,
+                "'{path}' and '{other}' name one entry in the checkout: its file system \
+                 folds their case or Unicode normalization"
+            ),
         }
     }
 }
@@ -2067,5 +2091,222 @@ mod tests {
             PathBuf::from("/w/src"),
         );
         assert!(tree_root_dir(Path::new("/w/src/pkg/a.go"), "other/a.go").is_err());
+    }
+
+    // ── merge commutativity on the conflict-free fragment (bead 238c85) ──
+
+    /// One edit in base coordinates: base lines `[start, end)` replaced by
+    /// `with`.
+    #[derive(Clone, Debug)]
+    struct Edit {
+        start: usize,
+        end: usize,
+        with: Vec<&'static str>,
+    }
+
+    fn lines(ls: &[&str]) -> Vec<u8> {
+        ls.iter()
+            .flat_map(|l| [l.as_bytes(), b"\n"].concat())
+            .collect()
+    }
+
+    fn applied(base: &[&'static str], e: &Edit) -> Vec<u8> {
+        let mut out = base[..e.start].to_vec();
+        out.extend(&e.with);
+        out.extend(&base[e.end..]);
+        lines(&out)
+    }
+
+    /// What one order of two proposals lands: the merged bytes, or the
+    /// second proposal's typed refusal.
+    type Landed = std::result::Result<Vec<u8>, Refusal>;
+
+    /// What lands at `path` when it holds `first`, which replaced `base`,
+    /// and `second` is proposed against `base`: the second's base is stale,
+    /// so it is merged (ADR-0045 T5). Decided exactly as `propose` decides
+    /// it ([`decide`]), without committing.
+    fn second_lands(conn: &Connection, path: &str, base: &[u8], second: &[u8]) -> Landed {
+        let w = Proposed::write(path, Base::Blob(base.hash()), second.to_vec());
+        match decide(conn, vec![w]) {
+            Ok((plans, _)) => match &plans[..] {
+                [
+                    Plan {
+                        change: Change::Write { bytes, .. },
+                        ..
+                    },
+                ] => Ok(bytes.clone()),
+                _ => panic!("one write plans one write"),
+            },
+            Err(e) => Err(refusal_of(&e)),
+        }
+    }
+
+    /// Both arrival orders of each case's two edits, through the store:
+    /// each case gets two paths holding its base, `xy` takes `x` and `yx`
+    /// takes `y` in one accepted proposal, and the other edit is then
+    /// decided against each with the base as the blob its author read.
+    fn both_orders(cases: &[(Vec<&'static str>, Edit, Edit)]) -> Vec<(Landed, Landed)> {
+        let a = arena(&[]);
+        let base = |i: usize| lines(&cases[i].0);
+        let paths = |i: usize| (format!("c{i}/xy.txt"), format!("c{i}/yx.txt"));
+        let mut creates = Vec::new();
+        let mut firsts = Vec::new();
+        for (i, (b, x, y)) in cases.iter().enumerate() {
+            let (xy, yx) = paths(i);
+            creates.push(Proposed::create(xy.clone(), base(i)));
+            creates.push(Proposed::create(yx.clone(), base(i)));
+            firsts.push(Proposed::write(
+                xy,
+                Base::Blob(base(i).hash()),
+                applied(b, x),
+            ));
+            firsts.push(Proposed::write(
+                yx,
+                Base::Blob(base(i).hash()),
+                applied(b, y),
+            ));
+        }
+        propose(&a.conn, &Grant::Whole, creates).unwrap();
+        propose(&a.conn, &Grant::Whole, firsts).unwrap();
+        cases
+            .iter()
+            .enumerate()
+            .map(|(i, (b, x, y))| {
+                let (xy, yx) = paths(i);
+                (
+                    second_lands(&a.conn, &xy, &base(i), &applied(b, y)),
+                    second_lands(&a.conn, &yx, &base(i), &applied(b, x)),
+                )
+            })
+            .collect()
+    }
+
+    /// A base over the two-line alphabet {a, b} (repeated lines are where
+    /// Myers alignment has choices) and two edits disjoint in its
+    /// coordinates: the first ends at or before the second starts, and
+    /// two insertions never share a point.
+    fn disjoint_edits() -> impl proptest::strategy::Strategy<Value = (Vec<&'static str>, Edit, Edit)>
+    {
+        use proptest::prelude::*;
+        let line = || prop_oneof![Just("a"), Just("b")];
+        proptest::collection::vec(line(), 0..8)
+            .prop_flat_map(move |base| {
+                let n = base.len();
+                (Just(base), 0..=n)
+            })
+            .prop_flat_map(move |(base, s1)| {
+                let n = base.len();
+                (Just(base), Just(s1), s1..=n)
+            })
+            .prop_flat_map(move |(base, s1, e1)| {
+                let n = base.len();
+                (Just(base), Just(s1), Just(e1), e1..=n)
+            })
+            .prop_flat_map(move |(base, s1, e1, s2)| {
+                let n = base.len();
+                (
+                    Just(base),
+                    Just(s1),
+                    Just(e1),
+                    Just(s2),
+                    s2..=n,
+                    proptest::collection::vec(line(), 0..4),
+                    proptest::collection::vec(line(), 0..4),
+                )
+            })
+            .prop_filter(
+                "two insertions at one point overlap",
+                |(_, s1, e1, s2, e2, _, _)| !(s1 == e1 && e1 == s2 && s2 == e2),
+            )
+            .prop_map(|(base, s1, e1, s2, e2, w1, w2)| {
+                (
+                    base,
+                    Edit {
+                        start: s1,
+                        end: e1,
+                        with: w1,
+                    },
+                    Edit {
+                        start: s2,
+                        end: e2,
+                        with: w2,
+                    },
+                )
+            })
+    }
+
+    /// Whether both orders agree: the same bytes, or a refusal in both.
+    fn commute(orders: &(Landed, Landed)) -> bool {
+        match orders {
+            (Ok(l), Ok(r)) => l == r,
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Two proposals whose edits are disjoint in their shared base land the
+    /// same bytes in either arrival order, or are refused in both (bead
+    /// `ley-line-open-238c85`): 10,000 cases drawn from the fixed seed
+    /// `0x238c85`, each decided by the store as `propose` decides it. A
+    /// failure names the smallest disagreeing case.
+    #[test]
+    fn disjoint_stale_proposals_commute() {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::{Config, RngSeed, TestRunner};
+        let mut runner = TestRunner::new(Config {
+            rng_seed: RngSeed::Fixed(0x238c85),
+            ..Config::default()
+        });
+        let strategy = disjoint_edits();
+        let cases: Vec<_> = (0..10_000)
+            .map(|_| strategy.new_tree(&mut runner).unwrap().current())
+            .collect();
+        let decided: Vec<_> = cases
+            .chunks(1_000)
+            .flat_map(|chunk| chunk.iter().cloned().zip(both_orders(chunk)))
+            .collect();
+        // The property is not vacuous: both clean merges and refusals occur,
+        // and some clean merges are not the two edits applied in base
+        // coordinates (Myers re-aligned a repeated line), yet still commute.
+        let clean = decided.iter().filter(|(_, o)| o.0.is_ok()).count();
+        let refused = decided.iter().filter(|(_, o)| o.0.is_err()).count();
+        let mut realigned_cases: Vec<_> = decided
+            .iter()
+            .filter(|((b, x, y), o)| {
+                let (lo, hi) = if x.start <= y.start { (x, y) } else { (y, x) };
+                let mut both = b[..lo.start].to_vec();
+                both.extend(&lo.with);
+                both.extend(&b[lo.end..hi.start]);
+                both.extend(&hi.with);
+                both.extend(&b[hi.end..]);
+                o.0.as_ref().is_ok_and(|bytes| *bytes != lines(&both))
+            })
+            .collect();
+        realigned_cases.sort_by_key(|((b, x, y), _)| b.len() + x.with.len() + y.with.len());
+        let realigned = realigned_cases.len();
+        eprintln!(
+            "10000 cases: {clean} clean, {refused} refused, {realigned} clean but re-aligned; \
+             the smallest re-aligned: {:?}",
+            realigned_cases.first().map(|(case, o)| (
+                case,
+                o.0.as_ref()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+            ))
+        );
+        assert!(
+            clean > 1_000 && refused > 1_000,
+            "{clean} clean, {refused} refused"
+        );
+        let mut disagree: Vec<_> = decided
+            .into_iter()
+            .filter(|(_, orders)| !commute(orders))
+            .collect();
+        disagree.sort_by_key(|((b, x, y), _)| b.len() + x.with.len() + y.with.len());
+        assert!(
+            disagree.is_empty(),
+            "{} of 10000 cases land differently by arrival order; the smallest: {:?}",
+            disagree.len(),
+            disagree.first()
+        );
     }
 }

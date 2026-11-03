@@ -211,6 +211,7 @@ type proposalRefusal struct {
 	Reason *string        `json:"reason"`
 	Path   *string        `json:"path,omitempty"`
 	Moved  []staleRefusal `json:"moved,omitempty"`
+	Other  *string        `json:"other,omitempty"`
 }
 
 type proposeResponse struct {

@@ -71,6 +71,27 @@ proposal instead of reverting it. A person's edit made while the daemon was down
 directory changing against the index and is ingested, not lost. ADR-0040 D3 still holds for the
 write path itself: a proposal commits to the store, and materialization is the checkout's job.
 
+**Path aliasing** (bead `23a26c`, amendment 2026-11-03). `_tree` paths are byte-distinct; a
+checkout's file system need not be. The default APFS volume folds case and Unicode
+normalization, so `README.md` and `Readme.md`, or NFC `é.txt` and NFD `é.txt`, are two store
+entries and one file on disk. Before this rule the second create was accepted: reconcile read
+the first file's bytes through the second path, recorded a `_checkout_conflict` no edit could
+clear (an edit to the one file changes both paths), and `_tree` and the directory disagreed
+across every restart. A proposal to a ref that has a
+checkout is therefore refused `aliases_existing` before it commits when one of its new paths
+(a create or mkdir of a path the store does not hold) names, in that checkout's directory, an
+entry spelled differently (`checkout::refuse_aliases`). The refusal names the created path
+(`path`) and the entry it aliases (`other`), spelled as the directory holds it. Folding is
+detected by asking the checkout's file system, never assumed from the platform: each component
+of the new path is looked up under the directory, and one that resolves to an entry listed
+under another name is an alias. New paths of one proposal are checked against each other by
+creating them in a hidden scratch directory inside the checkout, where a create that finds its
+name taken is an alias. A case-only rename (delete `README.md`, create `Readme.md` in one
+proposal) aliases only the entry it deletes, and lands. A daemon without a checkout, or whose
+checkout's file system distinguishes the two spellings, accepts both as two files. A store that
+already holds two aliasing entries (written with no checkout, or on another file system) is not
+repaired by this rule; its checkout reports what it reads.
+
 ### R4 — git is read and written natively
 
 git interop goes through `gix` (directly, or through `jj-lib`, which LLO already depends on), never
@@ -132,3 +153,4 @@ names its ref). It decides R5's cost and is measured in phase 4 before it is cho
 | F4 | branches share storage | two refs that differ by one file; `source_blobs` grows by one blob |
 | F5 | no git subprocess | no `Command::new("git")` in the daemon; a smell rule enforces it |
 | F6 | git round trip | import a git commit, export the ref; the git tree ids match |
+| F7 | a path the checkout's file system folds onto another entry never overwrites it | `a_create_the_checkout_would_alias_onto_an_existing_file_is_refused` (cli-lib `cmd_daemon`): `README.md` then `Readme.md`, NFC then NFD `é.txt`; the second is refused `aliases_existing` where the file system folds them, and `_tree` and the directory agree across a restart; `checkout` `alias_tests` for one proposal's own paths, directory components and a case-only rename |

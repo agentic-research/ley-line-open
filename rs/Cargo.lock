@@ -4716,6 +4716,7 @@ dependencies = [
  "tokio",
  "tower",
  "tree-sitter",
+ "unicode-normalization",
  "ureq",
  "which",
 ]

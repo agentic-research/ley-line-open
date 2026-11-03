@@ -19,12 +19,13 @@ using Common = import "common.capnp";
 
 struct AstNode {
   # RETIRED (written empty since Phase A of bead ley-line-open-17c271).
-  # The slot is kept because capnp ordinals are never reused: removing @0
-  # would renumber the struct and break decoding of every segment record
-  # already written. The SQL projection's `_ast.nid` is the queryable
-  # locator. Keeping the locator OUT of the hashed preimage is what lets
-  # the projection re-key (integer nids, Phase B) without moving the
-  # segment root.
+  # The slot is kept because persisted `capnp_blobs` pin capnp ordinals —
+  # removing @0 would renumber the struct and break decoding of every
+  # stored blob. A node's address inside an `AstNodeList` is its ordinal
+  # (`_ast_pointer.offset_in_blob`); the SQL projection's `_ast.node_id`
+  # remains the queryable locator. Keeping the locator OUT of the hashed
+  # preimage is what lets the projection re-key (integer nids, Phase B)
+  # without moving every `blob_hash`.
   nodeId @0 :Text;
 
   # The `_source.id` (relative path) the node belongs to.
@@ -42,6 +43,21 @@ struct AstNode {
   range @3 :Common.Range;
 }
 
-# `AstNodeList` (the ADR-0026 per-file pointer-store blob) was removed at
-# projection-v8 with the `capnp_blobs` table it filled (ADR-0040 D5, bead
-# ley-line-open-f30fdf). No segment ever carried it.
+# AstNodeList — per-file aggregation of AstNode records.
+#
+# NO PRODUCER since projection-v8 (ADR-0040 D5, bead ley-line-open-f30fdf):
+# the `capnp_blobs` table it filled is retired and no segment ever carried
+# it. The struct stays in the published schema-client until the next public
+# schema release removes it (bead ley-line-open-438772 owns the AstNode
+# wire changes). The history below describes the retired store.
+#
+# ADR-0026 Phase 1 (bead ley-line-open-3e87ad): the pointer-store blob unit
+# is per-file. A single AstNodeList message contains every AstNode for one
+# source file; the canonical bytes of that message are hashed with BLAKE3 to
+# yield `capnp_blobs.blob_hash`, and each `_ast_pointer.offset_in_blob`
+# indexes into the `nodes` list. The wrapper struct exists so the ADR's
+# literal spec — `blob_hash = BLAKE3(canonical(List(AstNode)))` — has a
+# concrete capnp root (canonical form requires a single-root message).
+struct AstNodeList {
+  nodes @0 :List(AstNode);
+}

@@ -144,8 +144,9 @@ per save and the dual-writer divergence without touching any identity. `snapshot
 
 ### D5 — One stored copy of the syntax tree
 
-*As implemented (`f30fdf`, projection-v8, 2026-11-03): `capnp_blobs`, `_ast_blob` and the
-`AstNodeList` struct are retired; ADR-0026 carries the amendment, with the identity domains named
+*As implemented (`f30fdf`, projection-v8, 2026-11-03): `capnp_blobs` and `_ast_blob` are
+retired, and `AstNodeList` has no producer (its removal from the published schema waits for a
+schema release, `438772`); ADR-0026 carries the amendment, with the identity domains named
 before and after. No root moves: `rootHash` folds the segment files, whose bytes never depended on
 the blob. `sourceId` and the segment log's fate are not part of that change; they are
 `438772`, an identity-domain change to `rootHash` decided with the segment's consumer. `node_child` interning (`9b7d28`) is the next projection

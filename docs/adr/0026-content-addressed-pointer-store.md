@@ -386,7 +386,8 @@ Sub-bead `ley-line-open-5b58ff` (sheaf-driven granularity dispatcher) becomes ac
 ## 13. Amendment (2026-11-03): Phase 1 retired by ADR-0040 D5
 
 Bead `ley-line-open-f30fdf`, `projection-v8`. `capnp_blobs` and `_ast_blob` are no longer created or
-written, and the `AstNodeList` wrapper struct leaves `ast.capnp`. The §7 kill criteria were never
+written, and nothing produces the `AstNodeList` wrapper struct; it stays in the published Go
+schema-client until the next public schema release removes it (`ley-line-open-438772`). The §7 kill criteria were never
 evaluated because the §9.2 Phase 2 read path was never built: in four months nothing in LLO or mache
 SELECTed either table, and the only router that named the blob store (`granularity_router`, bead
 `5b58ff`) had no caller and is removed with it. Phases 2 and 3 are withdrawn.

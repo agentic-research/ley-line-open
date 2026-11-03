@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
-use std::path::Path;
 use std::sync::Arc;
 
+use leyline_cli_lib::ExecutionCommands;
 use leyline_cli_lib::cmd_execution;
 use leyline_cli_lib::daemon::client::ExecutionClient;
 use leyline_cli_lib::daemon::execution_contract;
@@ -214,33 +214,79 @@ async fn execution_commands_fail_closed_when_daemon_is_unavailable() {
     std::fs::write(&spec_path, br#"{"spec":true}"#).expect("write spec");
     std::fs::write(&grant_path, br#"{"grant":true}"#).expect("write grant");
 
-    assert_command_fails_without_daemon(cmd_execution::capabilities(&missing_socket)).await;
-    assert_command_fails_without_daemon(cmd_execution::provision(
-        &missing_socket,
-        "microVm",
-        "provision-1",
+    let control = || missing_socket.clone();
+    for command in [
+        ExecutionCommands::Capabilities { control: control() },
+        ExecutionCommands::Provision {
+            control: control(),
+            backend_class: "microVm".into(),
+            idempotency_key: "provision-1".into(),
+        },
+        ExecutionCommands::Status {
+            control: control(),
+            run_id: Some("run-1".into()),
+        },
+        ExecutionCommands::Start {
+            control: control(),
+            spec: spec_path.clone(),
+            grant: grant_path.clone(),
+        },
+        ExecutionCommands::Inspect {
+            control: control(),
+            run_id: "run-1".into(),
+            after_sequence: 0,
+        },
+        ExecutionCommands::Cancel {
+            control: control(),
+            run_id: "run-1".into(),
+            idempotency_key: Some("cancel-1".into()),
+        },
+        ExecutionCommands::Collect {
+            control: control(),
+            run_id: "run-1".into(),
+        },
+        ExecutionCommands::Cleanup {
+            control: control(),
+            run_id: "run-1".into(),
+            idempotency_key: Some("cleanup-1".into()),
+        },
+    ] {
+        assert_command_fails_without_daemon(cmd_execution::run(&command)).await;
+    }
+}
+
+/// `leyline execution` dispatches through `cmd_execution::run`, failure
+/// included.
+#[tokio::test]
+async fn the_cli_dispatch_reaches_the_execution_client() {
+    let dir = tempdir().expect("temp directory");
+    assert_command_fails_without_daemon(leyline_cli_lib::run(
+        leyline_cli_lib::Commands::Execution {
+            command: ExecutionCommands::Capabilities {
+                control: dir.path().join("missing.sock"),
+            },
+        },
     ))
     .await;
-    assert_command_fails_without_daemon(cmd_execution::status(&missing_socket, Some("run-1")))
-        .await;
-    assert_command_fails_without_daemon(cmd_execution::start(
-        &missing_socket,
-        Path::new(&spec_path),
-        Path::new(&grant_path),
-    ))
-    .await;
-    assert_command_fails_without_daemon(cmd_execution::inspect(&missing_socket, "run-1", 0)).await;
-    assert_command_fails_without_daemon(cmd_execution::cancel(
-        &missing_socket,
-        "run-1",
-        Some("cancel-1"),
-    ))
-    .await;
-    assert_command_fails_without_daemon(cmd_execution::collect(&missing_socket, "run-1")).await;
-    assert_command_fails_without_daemon(cmd_execution::cleanup(
-        &missing_socket,
-        "run-1",
-        Some("cleanup-1"),
-    ))
-    .await;
+}
+
+#[test]
+fn a_start_command_with_an_unreadable_spec_fails_before_dialing() {
+    let dir = tempdir().expect("temp directory");
+    let error = cmd_execution::request(&ExecutionCommands::Start {
+        control: dir.path().join("never-dialed.sock"),
+        spec: dir.path().join("missing-spec.json"),
+        grant: dir.path().join("missing-grant.json"),
+    })
+    .expect_err("a missing spec file");
+    assert!(error.to_string().contains("read spec"), "{error:#}");
+    let spec = dir.path().join("spec.json");
+    std::fs::write(&spec, b"not json").expect("write spec");
+    let error = cmd_execution::request(&ExecutionCommands::Start {
+        control: dir.path().join("never-dialed.sock"),
+        spec,
+        grant: dir.path().join("missing-grant.json"),
+    })
+    .expect_err("a malformed spec file");
+    assert!(error.to_string().contains("parse spec JSON"), "{error:#}");
 }

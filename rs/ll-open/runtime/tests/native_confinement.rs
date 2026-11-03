@@ -62,6 +62,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 mod common;
+mod native_guest;
+
+use native_guest::{guest_runtime_files, home_ssh, is_apply_failure};
 
 const WORKER: &str = env!("CARGO_BIN_EXE_leyline-native-worker");
 const RUN_ID: &str = "native-confinement-01";
@@ -418,59 +421,6 @@ impl Fixture {
     }
 }
 
-/// The host files the guest needs to execute at all, granted read-only as the
-/// worker's `--runtime-file`s.
-///
-/// macOS: none. dyld and the system libraries come from the shared cache,
-/// which Seatbelt does not mediate as file reads, so the guest runs with the
-/// rootfs as its only grant.
-///
-/// Linux: the guest is a copy of this dynamically linked test binary, and
-/// Landlock denies the loader and libc like any other path, so the guest
-/// could not start without them. The shared objects mapped into THIS process
-/// are exactly what the identical guest binary loads; they are granted
-/// file-by-file, which leaves every decoy (none is a mapped library) denied.
-fn guest_runtime_files() -> Vec<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        let exe = std::env::current_exe()
-            .and_then(|path| path.canonicalize())
-            .expect("test executable");
-        let maps = fs::read_to_string("/proc/self/maps").expect("/proc/self/maps");
-        let mut files = std::collections::BTreeSet::new();
-        for line in maps.lines() {
-            let Some(path) = line.split_whitespace().nth(5) else {
-                continue;
-            };
-            let path = Path::new(path);
-            if path.is_absolute()
-                && path.is_file()
-                && let Ok(canonical) = path.canonicalize()
-                && canonical != exe
-            {
-                files.insert(canonical);
-            }
-        }
-        // The loader consults its cache first; without it, it still finds the
-        // libraries on its default path, but the denied open is noise.
-        if Path::new("/etc/ld.so.cache").is_file() {
-            files.insert(PathBuf::from("/etc/ld.so.cache"));
-        }
-        files.into_iter().collect()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Vec::new()
-    }
-}
-
-/// `~/.ssh`, when this host has one: the AC's named example of undeclared
-/// host access.
-fn home_ssh() -> Option<PathBuf> {
-    let ssh = PathBuf::from(std::env::var_os("HOME")?).join(".ssh");
-    ssh.is_dir().then_some(ssh)
-}
-
 /// The fail-closed gate. Returns normally only to report a named skip.
 fn sandbox_unavailable(error: &ExecutionError) {
     assert!(
@@ -487,10 +437,6 @@ fn sandbox_unavailable(error: &ExecutionError) {
          to make this a failure.",
         error.detail
     );
-}
-
-fn is_apply_failure(error: &ExecutionError) -> bool {
-    error.detail.contains("apply native nono confinement")
 }
 
 /// Drive the compiled worker binary directly, so the guest's stdout — its

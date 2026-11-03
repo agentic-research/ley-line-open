@@ -10,6 +10,70 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+## [0.21.1] — 2026-11-02
+
+**Security:** on the native tier, a run whose grant named a Graph workspace
+started without that workspace, and its receipt still listed the
+workspace's `graphRoot` as an input. The native backend now refuses such a
+run `UnsupportedBackend` before spawning the worker. Upgrade from v0.21.0 if
+you grant workspaces to native runs.
+
+This patch also fixes a completion race that made `cleanup` of a crashed run
+report the worker's exit error, adds the execution/v1 conformance matrix
+across native nono and embedded libkrun, and adds a `task ci` gate on the
+Apache-2.0/AGPL license direction. The public schema is unchanged:
+`SCHEMA_VERSION` stays `0.21.0`.
+
+### Security
+
+- **The native tier refuses a workspace grant it cannot serve** (bead
+  `ley-line-open-f8ebcf`). `NativeWorkerBackend` has no workspace share, and
+  it started a run whose grant named a Graph workspace anyway: the workload
+  ran without the workspace while the receipt listed the workspace's
+  `graphRoot` as an input. It now refuses the run `UnsupportedBackend`,
+  naming the workspace, before the worker is spawned, as the microVM tier
+  does when it has no share provider.
+
+### Fixed
+
+- **Cleaning up a failed run no longer reports the run's failure as the
+  cleanup's** (bead `ley-line-open-f8ebcf`). Both worker backends published
+  a run's completion before dropping it from their active table, so a
+  `cleanup` that followed an observed completion could still find the run
+  active, collect the supervisor's result, and fail with the worker's own
+  exit error. On a loaded Linux host this failed `cleanup` of a crashed run in
+  about one run in three.
+  The run is now retired and its completion published in one step.
+
+### Added
+
+- `task lint:license-direction`, run by `task ci`, enforces the README's
+  Apache-2.0/AGPL carveout: every workspace crate declares `Apache-2.0` or
+  `AGPL-3.0-or-later`, and no Apache-2.0 crate reaches an AGPL crate through
+  normal or build dependencies, direct or transitive, under any feature.
+  `tools/test_license_direction.sh` proves it fails on inverted fixtures
+  (`ley-line-open-4392a2`).
+- **The execution/v1 conformance matrix** (bead `ley-line-open-f8ebcf`):
+  one set of rows run against native nono and embedded libkrun with real
+  workers and real guests, covering read-only capabilities and status,
+  identical refusal codes, success, failure, cancellation and crash recovery
+  with bound receipts, denial of undeclared host paths and the daemon's
+  arena, workspace refusal, Graph I/O through the mediated share, and no
+  `krunvm` or Taskfile subprocess. Rows the host cannot run print
+  `SKIPPED (NOT a pass)`; `LEYLINE_REQUIRE_HYPERVISOR=1` and
+  `LEYLINE_REQUIRE_SANDBOX=1` make that a failure. Documented in
+  `rs/ll-open/runtime/README.md`.
+- **Transport receipt parity** (`cli-lib/tests/execution_transport_parity.rs`):
+  one request through the Rust handler, the daemon socket, the `leyline
+  execution` command line and MCP gives the same lifecycle and receipt.
+
+### Changed
+
+- **`cmd_execution`** exposes `request`, `respond` and `run` over
+  `ExecutionCommands` in place of one function per operation. `run` is what
+  `leyline execution` dispatches; `respond` returns the daemon's reply that
+  `run` prints.
+
 ## [0.21.0] — 2026-10-26
 
 **Security:** on the microVM tier, a grant declaring any `confinement/v1`

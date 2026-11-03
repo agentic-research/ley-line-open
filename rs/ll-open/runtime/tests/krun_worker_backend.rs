@@ -200,6 +200,34 @@ fn backend_reports_a_nonzero_worker_exit_as_failed() {
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
 
+/// Once completion is observed the run is no longer active, so a cancel
+/// after it is a no-op rather than a second report of the worker's failure
+/// (the native twin, `a_cancel_after_observed_failure_is_a_no_op`, explains
+/// the race; bead `ley-line-open-f8ebcf`).
+#[test]
+fn a_cancel_after_observed_failure_is_a_no_op() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexit 7\n",
+    );
+    for _ in 0..200 {
+        backend.start(&request()).expect("ready worker");
+        assert!(matches!(
+            backend
+                .wait_for_completion("run-backend-01")
+                .expect("worker completion"),
+            BackendRunStatus::Failed(_)
+        ));
+        assert!(
+            !Backend::cancel(&backend, "run-backend-01").expect("a cancel after completion"),
+            "a completed run is no longer active"
+        );
+    }
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
 #[test]
 fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     let _serial = common::serial();

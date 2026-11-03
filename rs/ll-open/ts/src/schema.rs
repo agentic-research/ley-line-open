@@ -540,72 +540,6 @@ pub fn insert_import(conn: &Connection, alias: &str, path: &str, source_id: &str
 }
 
 // ---------------------------------------------------------------------------
-// ADR-0026 pointer store — Phase 1 dual-write (bead ley-line-open-3e87ad)
-// ---------------------------------------------------------------------------
-//
-// Content-addressed pointer store: SQL projection becomes a lightweight index
-// (`_ast_pointer`) into content-addressed capnp blobs (`capnp_blobs`) held in
-// Σ. The row-projected `_ast` schema stays populated in Phase 1 for
-// backward-compat + F1 round-trip integrity; Phase 2 migrates consumer reads.
-//
-// Blob unit: **per-file** (ADR-0026 §2.2 fallback — safer default; per-
-// semantic-unit refinement is Phase 2).
-
-/// DDL for `capnp_blobs` — content-addressed blob store. One row per unique
-/// per-file blob keyed on BLAKE3(canonical(AstNodeList)).
-pub const CAPNP_BLOBS_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS capnp_blobs (
-    blob_hash BLOB PRIMARY KEY,
-    blob_bytes BLOB NOT NULL
-);";
-
-/// DDL for `_ast_blob` — the file-to-blob map for the ADR-0026 pointer
-/// store. ONE row per source file, not per AST node.
-///
-/// This replaces `_ast_pointer`, which carried one row per AstNode and did
-/// not, in practice, store a pointer. Measured on an 8000-file TypeScript
-/// arena, each of its 3 150 849 rows held:
-///
-///   node_id         232 bytes   already the PK of `_ast`
-///   source_id        27.6 bytes already a column of `_ast`
-///   blob_hash        32 bytes   only 8000 DISTINCT values across all rows
-///   offset_in_blob   int        a dense 0..n-1 per file, verified with no
-///                               gaps or duplicates in 8000/8000 files
-///   kind             int        `semantic_kind_tag(node_kind)`, a pure
-///                               function of a column `_ast` already has
-///
-/// ~294 bytes per row to address a record of ~370 — the pointer was 80% the
-/// size of its referent — costing 927 MB plus an 830 MB shadow index for a
-/// mapping that is `blob(file)` plus an ordinal. Both survive here: the file
-/// keys this table (by its interned `file_id` as of projection-v5), and the
-/// ordinal is the nid's low 24 bits — a node's index into its file's
-/// `AstNodeList.nodes` IS `nid & 0xFFFFFF`, stored nowhere.
-///
-/// The ADR-0026 §6.F1 resolution capability is unchanged: any `_ast` row
-/// still resolves to its capnp record, via `nid >> 24 → blob_hash` here and
-/// `nid & 0xFFFFFF` as the index into that blob's `AstNodeList.nodes`.
-///
-/// Bead `ley-line-open-17c271`.
-pub const AST_BLOB_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS _ast_blob (
-    file_id INTEGER PRIMARY KEY,
-    blob_hash BLOB NOT NULL
-);";
-
-/// Create the pointer-store tables (idempotent). Must run alongside the
-/// existing row-projected schema; Phase 1 is dual-write.
-///
-/// projection-v5 folds the pre-v5 `_ast.blob_ord` column into the key
-/// itself: a node's index into its file's `AstNodeList.nodes` IS its
-/// pre-order ordinal, i.e. `nid & 0xFFFFFF`. One dense `0..n-1` per file,
-/// defined once, stored nowhere.
-pub fn create_pointer_store_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(CAPNP_BLOBS_DDL)?;
-    conn.execute_batch(AST_BLOB_DDL)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // ADR-0028 source_blobs — Phase 1 dual-store (bead ley-line-open-9e4416)
 // ---------------------------------------------------------------------------
 //
@@ -646,7 +580,7 @@ pub fn create_source_blobs_table(conn: &Connection) -> Result<()> {
 // An arena may carry OVERRIDE tree-sitter `.scm` query blobs that replace the
 // compiled-in `queries/<lang>/tags.scm` defaults for a language, behind a
 // BLAKE3-hash allowlist (operator-controlled env `LLO_TRUSTED_QUERY_HASHES`).
-// Storage mirrors source_blobs/capnp_blobs: a content-addressed blob table
+// Storage mirrors source_blobs: a content-addressed blob table
 // plus an FK-shaped pointer. Everything durable lives inside the one .db, so
 // an arena moves/backs-up as a single file — a sidecar would silently detach.
 //
@@ -978,7 +912,7 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     // (`FILE_KEYED_TABLES`), which every crate above can reach without a
     // feature flag — the mount's `rm`/`mv` and `reproject` used to keep
     // their own shorter lists (beads `ley-line-open-af3817`, `2b6444`).
-    // Content-addressed stores (`capnp_blobs`, `source_blobs`) are not
+    // Content-addressed stores (`source_blobs`, `node_content`) are not
     // per-file and are left to the GC sweep, as before.
     leyline_schema::delete_file_rows(conn, path)
 }
@@ -1884,49 +1818,6 @@ mod tests {
             !has_column(&conn, "t", "").unwrap(),
             "the empty name matches nothing"
         );
-    }
-
-    /// The ADR-0026 pointer store is `capnp_blobs` + the per-file `_ast_blob`
-    /// map; the ordinal into a blob's `AstNodeList.nodes` is `nid & 0xFFFFFF`
-    /// as of projection-v5 (no stored column). Nothing asserted the
-    /// constructor actually built the tables, so replacing its body with
-    /// `Ok(())` passed — an arena would then silently lack the resolution
-    /// path entirely.
-    #[test]
-    fn create_pointer_store_tables_builds_and_is_idempotent() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_ast_schema(&conn).unwrap();
-
-        assert!(
-            !leyline_schema::table_exists(&conn, "_ast_blob").unwrap(),
-            "precondition: the pointer store does not exist yet"
-        );
-
-        create_pointer_store_tables(&conn).unwrap();
-
-        for table in ["capnp_blobs", "_ast_blob"] {
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(n, 1, "{table} MUST exist after create_pointer_store_tables");
-        }
-        assert!(
-            has_column(&conn, "_ast_blob", "file_id").unwrap(),
-            "_ast_blob keys on the interned file_id as of projection-v5"
-        );
-        assert!(
-            leyline_schema::table_exists(&conn, "_ast_blob").unwrap(),
-            "the probe delete_file_rows keys the _ast_blob delete on MUST \
-             report the store just built; a constant-false gates that delete \
-             off and leaks a stale _ast_blob row on every reparse"
-        );
-
-        // Second call must be a no-op.
-        create_pointer_store_tables(&conn).unwrap();
     }
 
     /// Review-gate 3 of the identity ladder (bead `ley-line-open-17c271`):

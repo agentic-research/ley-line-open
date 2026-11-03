@@ -1,7 +1,7 @@
 # leyline-schema
 
 Shared SQLite schema — the contract between ley-line crates. This README
-describes `projection-v7` (ADR-0045). The full table-by-table contract,
+describes `projection-v8` (ADR-0045; ADR-0040 D5 removed the pointer store). The full table-by-table contract,
 including the sidecar tables other crates add, is `docs/TABLE_CONTRACT.md`.
 
 ## Node ids
@@ -40,7 +40,7 @@ and `NID_ORDINAL_MASK`.
   lookups, a recursive view cannot prune to one `nid`.
 - **A file's rows have one owner**: `FILE_KEYED_TABLES` lists every table
   keyed by a file and how (`FileKey::NidRange` with its extra nid columns,
-  `FileKey::FileId`, or `FileKey::SourcePath`); `delete_file_rows`,
+  or `FileKey::SourcePath`); `delete_file_rows`,
   `delete_file_rows_by_id`, `move_file_rows` and
   `refresh_source_paths_under_dir` iterate it. A splice, a graph `rm` or
   `mv`, and a scoped reparse all go through these; `table_exists` probes
@@ -88,15 +88,15 @@ from `kind_id` + `ord` (`v_node_name`), a filesystem row's from `name_id`.
 `NULL` and mache populates them.
 
 Every crate that reads or writes arena data uses this schema. `leyline-ts`
-adds `_ast`, `_ast_blob`, `_source`, `node_refs`, `node_defs`, `_imports`
+adds `_ast`, `_source`, `node_refs`, `node_defs`, `_imports`
 and `_cfg`; `leyline-lsp` adds `_lsp`, `_lsp_defs`, `_lsp_refs`,
-`_lsp_hover` and `_lsp_completions`. All of them key by `nid`, `file_id`
-or the file's relative path — exactly the three shapes `FILE_KEYED_TABLES`
+`_lsp_hover` and `_lsp_completions`. All of them key by `nid` or the
+file's relative path — exactly the two shapes `FILE_KEYED_TABLES`
 enumerates. The `_meta` table and its `set_meta` / `get_meta` accessors
 live in `leyline-ts`, not here. `leyline-cli-lib` adds the store's
 manifest `_tree` (every stored path with its git mode, every directory)
 and `_parse_diagnostics`; `_tree` rows belong to the store, not to a
 file's projection, so they are not in `FILE_KEYED_TABLES` and outlive a
 file leaving the projection (ADR-0045). `_meta.projection_schema_version`
-is `projection-v7`; a binary refuses an older label at parse open and
+is `projection-v8`; a binary refuses an older label at parse open and
 asks for a cold reparse.

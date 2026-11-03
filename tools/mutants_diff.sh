@@ -666,10 +666,11 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # lsp_enrich_pipeline: kills the whole-function replacement mutants on
     # `enrich_files_with_client` (four survived on the PR that added the
     # test — nothing observed that function's counts or writes before it).
-    # pointer_store_dual_write_test: kills the blob-serializer stubs
-    # (`serialize_ast_node_list_record -> Ok(())` survived on the Phase A
-    # locator-eviction PR — the F1 gate that observes blob content lived
-    # only in this file, which the slice did not run).
+    # syntax_tree_single_copy_test: the only test that decodes the
+    # `.ast.capnp` segment record by record against `_ast`, so it kills a
+    # `serialize_ast_node_record -> Ok(())` stub (the segment `Head.rootHash`
+    # folds). It replaced pointer_store_dual_write_test when projection-v8
+    # retired the pointer store (bead f30fdf).
     # injection_extraction_test: the only tests that observe an INJECTED
     # subtree's nid. `inj_injected_nid_scheme_pinned` asserts the injected nid
     # lands in its host file's range, which is what kills `base | ordinal`
@@ -702,7 +703,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
         -C --test -C cdc_activation_consumer_test \
         -C --test -C cdc_command_test \
         -C --test -C lsp_enrich_pipeline \
-        -C --test -C pointer_store_dual_write_test \
+        -C --test -C syntax_tree_single_copy_test \
         -C --test -C injection_extraction_test \
         -C --test -C watcher_enrichment_gap1_test \
         --package leyline-cli-lib --test-workspace=false

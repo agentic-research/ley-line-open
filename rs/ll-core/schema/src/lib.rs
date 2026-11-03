@@ -697,8 +697,8 @@ fn resolve_ast_segment(conn: &Connection, parent_nid: i64, segment: &str) -> Res
 //
 // Three modules used to decide what "a file's rows" are: `leyline-ts`'s
 // `delete_file_rows` knew the full list, `leyline-fs`'s mount `rm`/`mv`
-// touched `nodes` alone (leaving `_ast`, `node_refs`, `node_defs`, `_lsp*`
-// and `_ast_blob` pointing at the dead or old nid range), and `reproject`
+// touched `nodes` alone (leaving `_ast`, `node_refs`, `node_defs` and `_lsp*`
+// pointing at the dead or old nid range), and `reproject`
 // cleared three tables for the WHOLE arena before re-projecting one file
 // (beads `ley-line-open-af3817`, `ley-line-open-2b6444`). This crate owns
 // the nid encoding, every crate above depends on it without a feature
@@ -714,8 +714,6 @@ pub enum FileKey {
     NidRange {
         extra_nid_columns: &'static [&'static str],
     },
-    /// Rows carrying the file's `file_id`.
-    FileId,
     /// Rows carrying the file's rel path in a TEXT column.
     SourcePath { column: &'static str },
 }
@@ -748,8 +746,6 @@ pub const FILE_KEYED_TABLES: &[FileKeyedTable] = &[
     by_nid("_ast", &[]),
     by_nid("node_refs", &["container_nid"]),
     by_nid("node_defs", &["container_nid"]),
-    // ADR-0026 pointer store: additive, older arenas predate it.
-    keyed("_ast_blob", FileKey::FileId),
     // LSP enrichment tables exist only once the pass has run.
     by_nid("_lsp", &[]),
     by_nid("_lsp_defs", &[]),
@@ -847,19 +843,13 @@ fn delete_file_rows_keyed(conn: &Connection, file_id: Option<i64>, rel_path: &st
                     params![lo, hi],
                 )?;
             }
-            (FileKey::FileId, Some(file_id)) => {
-                conn.execute(
-                    &format!("DELETE FROM {} WHERE file_id = ?1", t.name),
-                    [file_id],
-                )?;
-            }
             (FileKey::SourcePath { column }, _) => {
                 conn.execute(
                     &format!("DELETE FROM {} WHERE {column} = ?1", t.name),
                     [rel_path],
                 )?;
             }
-            (FileKey::NidRange { .. } | FileKey::FileId, None) => {}
+            (FileKey::NidRange { .. }, None) => {}
         }
     }
     Ok(())
@@ -895,12 +885,6 @@ pub fn move_file_rows(conn: &Connection, old_rel: &str, new_rel: &str) -> Result
                         params![lo, hi, new_lo],
                     )?;
                 }
-            }
-            FileKey::FileId => {
-                conn.execute(
-                    &format!("UPDATE {} SET file_id = ?1 WHERE file_id = ?2", t.name),
-                    params![new_file_id, old_file_id],
-                )?;
             }
             FileKey::SourcePath { column } => {
                 conn.execute(
@@ -993,6 +977,77 @@ mod tests {
             err.to_string().contains("too many SQL variables"),
             "unexpected refusal: {err}"
         );
+    }
+
+    /// A file-keyed fixture: `_ast` (nid-keyed) and `_imports` (path-keyed)
+    /// rows for `a.go` and `b.go`, the two key shapes `FILE_KEYED_TABLES`
+    /// knows.
+    fn file_keyed_fixture() -> (Connection, i64, i64) {
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE _ast (nid INTEGER PRIMARY KEY);
+             CREATE TABLE _imports (alias TEXT, path TEXT, source_id TEXT);",
+        )
+        .unwrap();
+        let a = ensure_file_id(&conn, "a.go").unwrap();
+        let b = ensure_file_id(&conn, "b.go").unwrap();
+        for (fid, rel) in [(a, "a.go"), (b, "b.go")] {
+            for ord in 0..3 {
+                conn.execute("INSERT INTO _ast (nid) VALUES (?1)", [file_nid(fid, ord)])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO _imports (alias, path, source_id) VALUES ('f', 'fmt', ?1)",
+                [rel],
+            )
+            .unwrap();
+        }
+        (conn, a, b)
+    }
+
+    fn ast_rows_of(conn: &Connection, fid: i64) -> i64 {
+        let (lo, hi) = file_nid_range(fid);
+        conn.query_row(
+            "SELECT count(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2",
+            [lo, hi],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn imports_of(conn: &Connection, rel: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM _imports WHERE source_id = ?1",
+            [rel],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn delete_file_rows_clears_both_key_shapes_for_that_file_only() {
+        let (conn, a, b) = file_keyed_fixture();
+        delete_file_rows(&conn, "a.go").unwrap();
+        assert_eq!(ast_rows_of(&conn, a), 0, "a.go's nid range is cleared");
+        assert_eq!(imports_of(&conn, "a.go"), 0, "a.go's path rows are cleared");
+        assert_eq!(ast_rows_of(&conn, b), 3, "b.go is untouched");
+        assert_eq!(imports_of(&conn, "b.go"), 1, "b.go is untouched");
+    }
+
+    #[test]
+    fn move_file_rows_rekeys_both_shapes_and_returns_the_new_file_id() {
+        let (conn, _a, b) = file_keyed_fixture();
+        let moved = move_file_rows(&conn, "b.go", "c.go").unwrap();
+        assert_eq!(Some(moved), lookup_file_id(&conn, "c.go").unwrap());
+        assert_ne!(moved, b);
+        assert_eq!(
+            ast_rows_of(&conn, moved),
+            3,
+            "the rows land in c.go's range"
+        );
+        assert_eq!(ast_rows_of(&conn, b), 0, "and leave b.go's");
+        assert_eq!(imports_of(&conn, "c.go"), 1);
+        assert_eq!(imports_of(&conn, "b.go"), 0);
     }
 
     #[test]

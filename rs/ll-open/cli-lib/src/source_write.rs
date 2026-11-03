@@ -13,7 +13,7 @@
 //! - the bytes in `source_blobs` under their hash, and `_source.content_hash`
 //!   naming that row (bead `0d3b72`);
 //! - `_ast` rows with `node_hash`, their `node_content` / `node_child` rows,
-//!   `node_defs` / `node_refs`, and the `_ast_blob` pointer (bead `143f17`);
+//!   `node_defs` / `node_refs` (bead `143f17`);
 //! - `treeRoot` recomputed from the committed `_source` set and stamped into
 //!   the sibling head when the arena is file-backed (D1).
 //!
@@ -970,7 +970,6 @@ mod tests {
         children: Vec<(Vec<u8>, i64, Vec<u8>, Option<String>)>,
         defs: Vec<(String, i64, Option<Vec<u8>>)>,
         refs: Vec<(String, i64, Option<Vec<u8>>)>,
-        ast_blob_resolves: bool,
     }
 
     fn rows<T, F>(conn: &Connection, sql: &str, lo: i64, hi: i64, f: F) -> Vec<T>
@@ -1044,22 +1043,12 @@ mod tests {
             hi,
             |r| Ok((r.get(0)?, r.get::<_, i64>(1)? & mask, r.get(2)?)),
         );
-        let ast_blob_resolves = conn
-            .query_row(
-                "SELECT count(*) FROM _ast_blob b JOIN capnp_blobs c ON c.blob_hash = b.blob_hash \
-                  WHERE b.file_id = ?1",
-                [fid],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap()
-            == 1;
         FileImage {
             ast,
             content,
             children,
             defs,
             refs,
-            ast_blob_resolves,
         }
     }
 
@@ -1102,7 +1091,7 @@ mod tests {
 
     /// Bead `143f17`: a written file's rows are the rows a cold parse of the
     /// same bytes writes — `node_hash` on `_ast`, the `node_content` and
-    /// `node_child` rows, defs and refs, and a resolving `_ast_blob`.
+    /// `node_child` rows, defs and refs.
     #[test]
     fn a_write_projects_the_file_exactly_as_a_cold_parse_of_the_same_bytes() {
         let a = arena(&[("a.go", A), ("b.go", B)]);
@@ -1119,7 +1108,6 @@ mod tests {
             written.defs.iter().any(|d| d.0 == "B"),
             "the new def is extracted"
         );
-        assert!(written.ast_blob_resolves);
         assert_eq!(written, image(&cold.conn, "a.go"));
         assert_eq!(image(&a.conn, "b.go"), image(&cold.conn, "b.go"));
     }
@@ -1707,13 +1695,6 @@ mod tests {
         count("SELECT count(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2")
             + count("SELECT count(*) FROM node_defs WHERE nid BETWEEN ?1 AND ?2")
             + count("SELECT count(*) FROM node_refs WHERE nid BETWEEN ?1 AND ?2")
-            + conn
-                .query_row(
-                    "SELECT count(*) FROM _ast_blob WHERE file_id = ?1",
-                    [fid],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap()
     }
 
     fn refusal_of(err: &anyhow::Error) -> Refusal {

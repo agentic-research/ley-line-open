@@ -199,7 +199,7 @@ Work tracking lives in `.beads/beads.db` (Dolt-backed via [rsry](https://github.
 
 ## Project arc
 
-LLO is the open-source data-plane substrate extracted from the private `ley-line` repo (mid-2026). Mache (Go) is the primary consumer; cloister (TypeScript on workerd) consumes via Cap'n Proto FFI; future control-room (Swift) is on the same FFI path. Σ — the Merkle-CAS substrate — is the unifying primitive: BLAKE3-rooted content-addressed bytes that every consumer reads, all SQL projections (`nodes`, `_ast`, `_source`, `_ast_blob`, …) derived from it.
+LLO is the open-source data-plane substrate extracted from the private `ley-line` repo (mid-2026). Mache (Go) is the primary consumer; cloister (TypeScript on workerd) consumes via Cap'n Proto FFI; future control-room (Swift) is on the same FFI path. Σ — the Merkle-CAS substrate — is the unifying primitive: BLAKE3-rooted content-addressed bytes that every consumer reads, all SQL projections (`nodes`, `_ast`, `_source`, `node_content`, …) derived from it.
 
 Where to read next:
 

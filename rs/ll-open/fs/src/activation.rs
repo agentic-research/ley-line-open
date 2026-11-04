@@ -449,6 +449,44 @@ mod tests {
         );
     }
 
+    /// The report's counters are exact, not merely nonzero: three eligible
+    /// blobs populate three on the first run and read as three already-fresh
+    /// on the second, with the progress callback agreeing. A counter that
+    /// stops at 1 (`checked_increment -> Ok(1)`) cannot produce 3.
+    #[test]
+    fn activation_counts_every_blob_exactly_on_both_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+        for fill in [b'x', b'y', b'z'] {
+            let bytes = vec![fill; 9_000];
+            conn.execute(
+                "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+                rusqlite::params![bytes[..].hash().as_bytes().as_slice(), bytes],
+            )
+            .unwrap();
+        }
+
+        let mut last = None;
+        let first = activate_chunked_source_blobs_with_progress(
+            &conn,
+            ActivationOptions { batch_size: 2 },
+            |p| last = Some(p),
+        )
+        .unwrap();
+        assert_eq!(first.eligible_blobs, 3);
+        assert_eq!(first.populated_blobs, 3);
+        assert_eq!(first.already_fresh_blobs, 0);
+        assert_eq!(first.processed_source_bytes, 27_000);
+        let last = last.expect("a page of progress was reported");
+        assert_eq!(last.visited_blobs, 3);
+        assert_eq!(last.populated_blobs, 3);
+
+        let second = activate_chunked_source_blobs(&conn, ActivationOptions::default()).unwrap();
+        assert_eq!(second.populated_blobs, 0);
+        assert_eq!(second.already_fresh_blobs, 3);
+        assert_eq!(second.processed_source_bytes, 0);
+    }
+
     /// The convergence probe's two answers, asserted directly: an eligible
     /// blob with no manifest is reported (an unconditional `Ok(None)` here
     /// silently voids the completeness proof), and a converged state is not.

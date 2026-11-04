@@ -600,6 +600,7 @@ mod tests {
             crate::tree_root::Verification::Valid {
                 tree_root,
                 parser_id,
+                ..
             } => {
                 assert_eq!(stamp.tree_root, tree_root);
                 assert_eq!(stamp.parser_id, parser_id);

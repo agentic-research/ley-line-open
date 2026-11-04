@@ -8,7 +8,7 @@ primitives and a gpgsm-compatible binary for jj commit signing.
 - **`Ed25519RootSigner`** (`root_signer`, feature `root-signer`) — the one
   concrete `RootSigner` over Σ roots. Signs the canonical v2 head digest from
   `leyline_core::head_digest`, which binds the whole `HeadClaim`
-  `(generation, rootHash, parentHash, treeRoot, parserId)` — never `rootHash`
+  `(generation, rootHash, parentHash, parentDigest, treeRoot, parserId)` — never `rootHash`
   alone, so a signature cannot be replayed at another generation, grafted onto
   a forked chain, or cited for a tree it did not attest (bead `b68fa6`). **S1.**
 - **`verify_head`** — verify-on-load. Takes the head's `HeadClaim` (`None` when

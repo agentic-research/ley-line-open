@@ -282,8 +282,14 @@ impl DerivedFrom {
 /// What `verify` found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verification {
-    /// Both stamped roots match a recomputation from the arena.
-    Valid { tree_root: Hash, parser_id: Hash },
+    /// Both stamped roots match a recomputation from the arena. `signature`
+    /// says what the signature check established, so a valid verdict never
+    /// hides whether the stamp was attested.
+    Valid {
+        tree_root: Hash,
+        parser_id: Hash,
+        signature: crate::head_claim::SignatureCheck,
+    },
     /// The head predates ADR-0040 and carries neither field.
     NotStamped,
     /// The arena's source set does not fold to the stamped `treeRoot`
@@ -298,8 +304,14 @@ pub enum Verification {
 }
 
 /// Recompute `treeRoot` and `parserId` from `db_path` and compare them to the
-/// sibling `head.capnp`. Read-only.
+/// sibling `head.capnp`, under the head trust policy the environment
+/// configures. Read-only.
 pub fn verify(db_path: &Path) -> Result<Verification> {
+    verify_with(db_path, &crate::head_claim::HeadPolicy::from_env()?)
+}
+
+/// [`verify`] under an explicit head trust policy.
+pub fn verify_with(db_path: &Path, policy: &crate::head_claim::HeadPolicy) -> Result<Verification> {
     use leyline_schema_capnp::head_capnp::head;
     let head_path = crate::cmd_parse::head_path_for(db_path);
     let bytes =
@@ -313,8 +325,14 @@ pub fn verify(db_path: &Path) -> Result<Verification> {
     // The stamped treeRoot is what the signature attests (bead b68fa6), so a
     // configured trust set is checked before the stamp is compared with the
     // arena. Without this, an arena and a head rewritten together agree with
-    // each other and pass.
-    crate::head_claim::enforce_signature(h, &head_path)?;
+    // each other and pass. With a trust set configured an unsigned head is
+    // refused here, so stripping the signature is not a way around it.
+    let signature = crate::head_claim::enforce_signature(
+        h,
+        &head_path,
+        crate::head_claim::Reader::VerifyHead,
+        policy,
+    )?;
     let stamped_tree = hash_field(h.get_tree_root().ok().map(|x| x.get_bytes()))?;
     let stamped_parser = hash_field(h.get_parser_id().ok().map(|x| x.get_bytes()))?;
     let (Some(stamped_tree), Some(stamped_parser)) = (stamped_tree, stamped_parser) else {
@@ -342,6 +360,7 @@ pub fn verify(db_path: &Path) -> Result<Verification> {
     Ok(Verification::Valid {
         tree_root: stamped_tree,
         parser_id: stamped_parser,
+        signature,
     })
 }
 
@@ -368,8 +387,9 @@ pub fn cmd_verify_head(db: &Path) -> Result<()> {
         Verification::Valid {
             tree_root,
             parser_id,
+            signature,
         } => {
-            println!("valid treeRoot={tree_root} parserId={parser_id}");
+            println!("valid treeRoot={tree_root} parserId={parser_id} signature={signature}");
             Ok(())
         }
         Verification::NotStamped => bail!(

@@ -7,7 +7,7 @@
 //!
 //! **What gets signed.** Not a bare root — the canonical v2 head digest from
 //! [`leyline_core::head_digest`], which binds the whole [`HeadClaim`]:
-//! `(generation, rootHash, parentHash, treeRoot, parserId)`. Signing
+//! `(generation, rootHash, parentHash, parentDigest, treeRoot, parserId)`. Signing
 //! `rootHash` alone would let a signature be replayed at another generation,
 //! grafted onto a forked chain, or cited for a tree it never attested.
 //!
@@ -198,6 +198,7 @@ mod tests {
             generation,
             Hash::from_bytes(root),
             Hash::from_bytes(parent),
+            None,
             Hash::from_bytes(tree),
             Hash::from_bytes(parser),
         )

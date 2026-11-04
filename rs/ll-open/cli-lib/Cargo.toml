@@ -134,6 +134,11 @@ imara-diff = { package = "gix-imara-diff", version = "=0.2.3" }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# Path aliasing in a checkout (bead ley-line-open-23a26c): the NFC key a
+# normalization-folding file system compares names by. Already in the
+# lock through other crates. MIT OR Apache-2.0.
+unicode-normalization = "0.1"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
@@ -161,6 +166,8 @@ tower = "0.5"
 # across the test suite, not just an inline SAFETY comment. Same
 # pattern the `leyline-sign` dev-deps introduced under cloister-da0f35.
 serial_test = "3"
+# Property tests of the proposal merge (bead ley-line-open-238c85).
+proptest = "1.8"
 
 [[bench]]
 name = "wal_snapshot_experiment"

@@ -71,6 +71,31 @@ proposal instead of reverting it. A person's edit made while the daemon was down
 directory changing against the index and is ingested, not lost. ADR-0040 D3 still holds for the
 write path itself: a proposal commits to the store, and materialization is the checkout's job.
 
+**Path aliasing** (bead `23a26c`, amendment 2026-11-03). `_tree` paths are byte-distinct; a
+checkout's file system need not be. The default APFS volume folds case and Unicode
+normalization, so `README.md` and `Readme.md`, or NFC `é.txt` and NFD `é.txt`, are two store
+entries and one file on disk. Before this rule the second create was accepted: reconcile read
+the first file's bytes through the second path, recorded a `_checkout_conflict` no edit could
+clear (an edit to the one file changes both paths), and `_tree` and the directory disagreed
+across every restart. A proposal to a ref that has a
+checkout is therefore refused `aliases_existing` before it commits when one of its new paths
+(a create or mkdir of a path the store does not hold) names, in that checkout's directory, an
+entry spelled differently (`checkout::refuse_aliases`). The refusal names the created path
+(`path`) and the entry it aliases (`other`), spelled as the directory holds it. Which spellings
+fold together is asked of the checkout's file system once per directory, never assumed from
+the platform: a hidden scratch directory inside the checkout makes `A` and NFC `é` and looks up
+`a` and NFD `é` (`checkout::alias::Fold`). The decision is then a pure function of that rule,
+the directory's listing and the store (`checkout::alias::alias`): a component of a new path
+that the rule's key (NFC when it folds normalization, then Unicode lowercase when it folds
+case) matches to an entry listed under another spelling is an alias, and two new paths of one
+proposal alias when a prefix of each has one key under two spellings. Unicode lowercase
+approximates the file system's own case table; a pair only that table folds is not caught. A
+case-only rename (delete `README.md`, create `Readme.md` in one
+proposal) aliases only the entry it deletes, and lands. A daemon without a checkout, or whose
+checkout's file system distinguishes the two spellings, accepts both as two files. A store that
+already holds two aliasing entries (written with no checkout, or on another file system) is not
+repaired by this rule; its checkout reports what it reads.
+
 ### R4 — git is read and written natively
 
 git interop goes through `gix` (directly, or through `jj-lib`, which LLO already depends on), never
@@ -132,3 +157,4 @@ names its ref). It decides R5's cost and is measured in phase 4 before it is cho
 | F4 | branches share storage | two refs that differ by one file; `source_blobs` grows by one blob |
 | F5 | no git subprocess | no `Command::new("git")` in the daemon; a smell rule enforces it |
 | F6 | git round trip | import a git commit, export the ref; the git tree ids match |
+| F7 | a path the checkout's file system folds onto another entry never overwrites it | `a_create_the_checkout_would_alias_onto_an_existing_file_is_refused` (cli-lib `cmd_daemon`): `README.md` then `Readme.md`, NFC then NFD `é.txt`; the second is refused `aliases_existing` where the file system folds them, and `_tree` and the directory agree across a restart. On any file system, with a simulated folding rule: `checkout::alias::tests` (case-only and NFC/NFD collisions, directory components, a case-only rename that lands, one proposal's own paths, a rule that folds nothing, the probe against each simulated rule) and `checkout::tests::a_create_the_checkout_folds_onto_an_entry_is_refused_typed` |

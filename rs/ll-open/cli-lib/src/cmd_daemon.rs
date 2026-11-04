@@ -3563,6 +3563,117 @@ mod tests {
         assert_eq!(r["parsed"], "1", "{r}");
     }
 
+    // ── Path aliasing in the checkout (bead `ley-line-open-23a26c`) ────
+
+    /// Whether the file system under `dir` resolves `probe` to the file
+    /// `made` names: `made` is created, `probe` looked up, both removed.
+    fn folds(dir: &Path, made: &str, probe: &str) -> bool {
+        let at = dir.join(made);
+        std::fs::write(&at, b"").unwrap();
+        let folded = std::fs::symlink_metadata(dir.join(probe)).is_ok();
+        std::fs::remove_file(&at).unwrap();
+        folded
+    }
+
+    /// The names a directory holds, as the file system spells them.
+    fn names(dir: &Path) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| !n.starts_with('.'))
+            .collect()
+    }
+
+    /// Every path `_tree` holds, read through the daemon's `query` op.
+    fn tree_paths(ctx: &Arc<DaemonContext>) -> std::collections::BTreeSet<String> {
+        let r = op(
+            ctx,
+            serde_json::json!({"op": "query", "sql": "SELECT path FROM _tree"}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        r["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn create(ctx: &Arc<DaemonContext>, path: &str, content: &str) -> serde_json::Value {
+        op(
+            ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": path, "kind": "create", "base": "absent", "content": content},
+            ]}),
+        )
+    }
+
+    /// Two `_tree` paths that differ only by case, or only by Unicode
+    /// normalization, name one file in a checkout whose file system folds
+    /// them (the default APFS volume folds both). The second is refused
+    /// `aliases_existing`, naming both paths, and nothing is overwritten: the
+    /// directory and `_tree` agree, across a restart. Where the file system
+    /// keeps them apart, both land as two files.
+    #[tokio::test]
+    async fn a_create_the_checkout_would_alias_onto_an_existing_file_is_refused() {
+        let (_dir, src, state) = checkout_fixture();
+        sh(&src, &["git", "init", "-q"]);
+        let nfc = "\u{e9}.txt";
+        let nfd = "e\u{301}.txt";
+        let pairs = [("README.md", "Readme.md"), (nfc, nfd)];
+        let folded: Vec<bool> = pairs.iter().map(|(a, b)| folds(&src, a, b)).collect();
+
+        let ctx = boot(&state, &src);
+        for ((first, second), folded) in pairs.iter().zip(&folded) {
+            let r = create(&ctx, first, "first\n");
+            assert_eq!(r["ok"], true, "{r}");
+            let r = create(&ctx, second, "second\n");
+            if *folded {
+                assert_eq!(r["ok"], false, "{second} aliases {first}: {r}");
+                assert_eq!(r["refusal"]["reason"], "aliases_existing", "{r}");
+                assert_eq!(r["refusal"]["path"], *second, "{r}");
+                assert_eq!(r["refusal"]["other"], *first, "{r}");
+                let message = r["error"].as_str().unwrap();
+                assert!(
+                    message.contains(second) && message.contains(first),
+                    "the refusal names both paths: {message}"
+                );
+            } else {
+                assert_eq!(r["ok"], true, "{r}");
+                assert_eq!(
+                    std::fs::read_to_string(src.join(second)).unwrap(),
+                    "second\n"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(src.join(first)).unwrap(),
+                "first\n",
+                "{first} is not overwritten",
+            );
+        }
+
+        let agree = |ctx: &Arc<DaemonContext>| {
+            let on_disk = names(&src);
+            let stored = tree_paths(ctx);
+            assert_eq!(stored, on_disk, "_tree and the directory agree");
+            for (first, second) in &pairs {
+                assert_eq!(read_source(ctx, first)["content"], "first\n");
+                if stored.contains(*second) {
+                    assert_eq!(read_source(ctx, second)["content"], "second\n");
+                }
+            }
+            let r = op(
+                ctx,
+                serde_json::json!({"op": "query", "sql": "SELECT path FROM _checkout_conflict"}),
+            );
+            assert_eq!(r["rows"].as_array().map_or(0, Vec::len), 0, "{r}");
+        };
+        agree(&ctx);
+        drop(ctx);
+        let ctx = boot(&state, &src);
+        agree(&ctx);
+    }
+
     #[test]
     fn the_watcher_reconciles_every_path_whose_dirty_state_moved() {
         let set = |paths: &[&str]| -> std::collections::HashSet<String> {

@@ -137,6 +137,12 @@ struct StatusResponse {
   # on consumers. Added in b0ea2e (PR #12) after the Text field's
   # double-parse design flaw was caught in review.
   enrichmentTyped   @10 :List(EnrichmentEntry)  $Json.name("enrichment_typed");
+  # The daemon's `--source` directory, canonical (symlinks resolved): the
+  # tree a `propose`'s and `read_source`'s relative paths name, and the
+  # checkout an accepted proposal is materialized into. Unset (absent from
+  # the JSON) when the daemon runs without `--source`. Bead
+  # `ley-line-open-246526`.
+  sourceRoot        @11 :Text  $Json.name("source_root");
 }
 
 struct ReparseRequest {

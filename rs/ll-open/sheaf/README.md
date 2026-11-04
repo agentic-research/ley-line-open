@@ -35,7 +35,7 @@ The sheaf is the structural backbone for ADR-0020 (entity-observation lattice). 
 
 The δ⁰-driven invalidation path is implemented but not yet the production wire — current `SheafCache::on_change` uses the XOR pre-filter for the fast path with the BFS bound as the safety net. The defect-monitoring path runs in parallel and feeds the health metric. Promotion to δ⁰-driven invalidation is gated on the falsifiability tests in `leyline-cli-lib::tests` for ADR-0020.
 
-## Sub-components and their risk profiles
+## Three sub-components, three different risk profiles
 
 "The sheaf cache" is not one thing. Read [ADR-0030](../../../docs/adr/0030-sheaf-over-embeddings.md) and [ADR-0031](../../../docs/adr/0031-restriction-addressed-review-caching.md) before assuming otherwise:
 
@@ -43,8 +43,6 @@ The δ⁰-driven invalidation path is implemented but not yet the production wir
 |---|---|---|
 | `cache.rs` / `merkle.rs` — the hash-gated invalidation BFS | **Load-bearing, live** (ADR-0030 addendum) | Yes — `daemon/sheaf_ops.rs` consumes `SheafCache::on_change`/`reap` directly |
 | `complex.rs` — δ⁰/Čech cohomology, weighted restriction maps | **Live but diagnostic-only** (ADR-0030 verdict: NO-GO on using it for invalidation) | Yes, but only feeds the health metric + `agreement`/`h0_dimension` ops — confirmed off the invalidation path; `RestrictionMap::compose`/`weighted`/`new` have zero non-test callers |
-| `restriction_review.rs` — the ADR-0031 toy comparison | **Experiment only** | No — exercised by `tests/restriction_review_toy.rs` |
+| `restriction_cache.rs` — exact restriction-addressed derived-view caching | **Proven, gated, not yet shipped** (ADR-0031: positive result) | No — proven by its own test/bench suite (`tests/falsifiability_gates.rs`, `tests/restriction_review_real.rs`, `benches/restriction_git_replay.rs`), zero callers outside this crate. Blocked on beads `f38a86` (re-key on `node_hash`/stable container identity) and `f3a81e` (git-replay stress test) before it becomes a daemon consumer |
 
-The `restriction_cache.rs` module (ADR-0031 restriction-addressed derived-view caching) was removed in bead `ley-line-open-afa952`. It had no caller outside its own tests and bench, and its key was ambiguous: unit-separator framing that POSIX paths can contain, and no `parserId` binding (finding `80f037` F5). A future implementation keys length-prefixed fields with `parserId` bound; see ADR-0031 "Removal".
-
-`cache.rs` is the piece most likely under-covered relative to its actual correctness stakes.
+Do not add `restriction_cache.rs` to any daemon-facing mutation-testing allowlist until it actually ships — it would be testing code that isn't in production yet. `cache.rs` is the piece most likely under-covered relative to its actual correctness stakes.

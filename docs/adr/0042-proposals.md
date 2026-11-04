@@ -140,10 +140,9 @@ write-temp-then-rename case above, which reaches the store as one proposal.
 ### P3 — The closure check (extension; depends on ADR-0031)
 
 A proposal may carry restriction-addressed keys (ADR-0031) for cross-file facts its author relied
-on; the writer refuses if any changed. No key family is implemented: the call-target experiment
-(`sheaf/src/restriction_cache.rs`, test-only, not persisted, no scheme tag) caught a rename of a
-called function and not a signature or body change, and was removed in `ley-line-open-afa952`
-because its key was ambiguous and did not bind `parserId`. P3 ships only after ADR-0031 is
+on; the writer refuses if any changed. The only key family today is call-target resolution
+(`sheaf/src/restriction_cache.rs:197-250`, test-only, not persisted, no scheme tag), which catches a
+rename of a called function and not a signature or body change. P3 ships only after ADR-0031 is
 accepted with persisted, scheme-tagged keys, and claims per key family only what it covers.
 
 ### P4 — How a proposal begins and ends

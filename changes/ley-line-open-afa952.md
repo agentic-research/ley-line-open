@@ -21,9 +21,3 @@ Section: Removed
   under the old target keeps its node-manifest tables; nothing reads them,
   `leyline cdc gc` collects the chunks only they referenced, and
   `daemon --reset-arena` rebuilds without them.
-- **`leyline_sheaf::restriction_cache`** (bead `ley-line-open-afa952`). The
-  ADR-0031 restriction-addressed review cache had no caller outside its own
-  tests and the `restriction_git_replay` bench, both removed with it. Its key
-  joined rows with a unit separator that POSIX paths can contain and did not
-  bind `parserId` (finding `80f037` F5). ADR-0031's result stands; a future
-  implementation length-prefixes every field and binds `parserId`.

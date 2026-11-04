@@ -1,8 +1,7 @@
 # Restriction-Addressed Review Caching over Real Facts
 
 **Status:** measured, verdict GO (for this review family)
-**Artifact:** `rs/ll-open/sheaf/tests/restriction_review_real.rs` (removed with
-`restriction_cache.rs` in bead `ley-line-open-afa952`; see ADR-0031 "Removal")
+**Artifact:** `rs/ll-open/sheaf/tests/restriction_review_real.rs`
 **Predecessors:** the toy harness (`rs/ll-open/sheaf/src/restriction_review.rs`,
 `docs/superpowers/specs/2026-07-17-restriction-ast-review-toy-design.md`) and
 the ADR-0030 rung-2 experiment (`docs/research/sheaf-ablation-study.md`).

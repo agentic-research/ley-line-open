@@ -14,6 +14,55 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.23.0] — 2026-11-04
+
+**For Go clients of the daemon, and for anyone building with `mount`.** The
+wire change is additive: `status` gains `source_root`, and the Go module
+`clients/go/leyline-schema/v0.23.0` ships JSON types for `read_source` and
+`propose`, so a client such as mache can drop its own mirror. The projection
+is unchanged from v0.22.0 (`projection-v9`); arenas carry over. The breaking
+change is build-time only: `--features mount` no longer pulls in FUSE, and a
+Linux build that mounts on the default backend needs `--features fuse`.
+`SCHEMA_VERSION` is 0.23.0.
+
+### Breaking
+
+- **`mount` is the NFS host mount alone; FUSE is the new `fuse` feature**
+  (bead `ley-line-open-9d4712`). `leyline-cli --features mount` (and
+  `leyline-storefs --features mount`) now builds the loopback NFS server
+  without fuser: the binary links no libfuse-t or libfuse, needs no
+  `PKG_CONFIG_PATH`, and launches on a Mac without fuse-t. `--features fuse`
+  (which implies `mount`) adds `--backend fuse` and its libfuse link, and
+  `full` includes it, so `task install:full+mount` builds what it did. A
+  build without `fuse` refuses `--backend fuse` before making the
+  mountpoint, naming the feature. The default backend is unchanged: NFS on
+  macOS, FUSE elsewhere — so a Linux `mount`-only build mounts only with
+  `--backend nfs`; build Linux mounts with `--features fuse` to keep the
+  default working.
+
+### Added
+
+- **`status` reports the daemon's `--source` directory as `source_root`**
+  (bead `ley-line-open-246526`). A `propose`'s and a `read_source`'s paths
+  are relative to that tree, so a client attached to a daemon it did not
+  start reads the root from `status` instead of from the arena's owner
+  sentinel. The value is canonical (symlinks resolved, the spelling the
+  owner sentinel records); the field is absent when the daemon runs without
+  `--source`. Additive: Cap'n Proto `StatusResponse.sourceRoot @11`, and the
+  Go `daemon/wire` `StatusResponse.SourceRoot`. A JSON decoder that rejects
+  unknown fields must allow `source_root`.
+
+- **Go `daemon/wire` types for `read_source` and `propose`** (bead
+  `ley-line-open-247489`). `clients/go/leyline-schema/daemon/wire` exports
+  `ReadSourceResponse`, `ProposedWrite`, `ProposeResponse`,
+  `ProposalRefusal` (with `other`), `StaleRefusal`, `PathHash` and
+  `LineRange`, and the `WriteKind` and `RefusalReason` wire spellings as
+  constants (`aliases_existing` included), so a Go client decodes the UDS's
+  capnp-json without its own mirror. The daemon protocol fixtures decode
+  strictly into these types, and a test ties the constants to every
+  enumerant of the generated Cap'n Proto enums. A refused proposal carries
+  `error` beside `refusal`: decide on `ok` and `refusal`, not on `error`.
+
 ## [0.22.0] — 2026-11-04
 
 **Projection-breaking; the wire change is additive.** Arenas move from

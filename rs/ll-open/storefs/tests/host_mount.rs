@@ -378,6 +378,125 @@ async fn a_host_process_edits_the_store_through_the_mount() {
     assert_eq!(f.stored("main.link").as_deref(), Some("a.go"));
 }
 
+/// Bead `ley-line-open-bc7df6`: an empty file is a file through the
+/// kernel. A stored empty file reads as 0 bytes and stats `st_size` 0; a
+/// file truncated to empty rereads as empty; a zero-length write to a file
+/// changes nothing and to a new file creates it empty; an editor's save of
+/// an empty buffer (temp file, rename over) empties the file. Each lands in
+/// the store as BLAKE3(""), never as success with nothing landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_file_reads_and_writes_through_the_mount() {
+    #[cfg(target_os = "macos")]
+    if let Some(refusal) = host::unpatched_nfs_client(&host::macos::product_version().unwrap()) {
+        eprintln!("host_mount: SKIPPED on this host: {refusal}");
+        return;
+    }
+    let f = fixture();
+    f.fs.store()
+        .with_write(|conn| {
+            source_write::propose(
+                conn,
+                &Grant::Whole,
+                vec![
+                    Proposed::create("empty.txt", Vec::new()),
+                    Proposed::create("swap.txt", b"to be emptied\n".to_vec()),
+                ],
+            )
+        })
+        .unwrap();
+    let mut m = TestMount::new(Arc::clone(&f.fs)).await;
+    let root = m.path.clone();
+    let seen = with_kernel_deadline("empty-file reads and writes", &m.path, move || {
+        let mut seen = Vec::new();
+        let stat = |rel: &str| {
+            let meta = fs::metadata(root.join(rel)).unwrap();
+            assert!(meta.is_file(), "{rel} is a file");
+            meta.len()
+        };
+        // A stored empty file.
+        seen.push((
+            "cat empty.txt",
+            fs::read(root.join("empty.txt")).unwrap(),
+            stat("empty.txt"),
+        ));
+
+        // Truncate to empty, then reread.
+        let a = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("a.go"))
+            .unwrap();
+        a.set_len(0).unwrap();
+        a.sync_all().unwrap();
+        drop(a);
+        seen.push((
+            "truncated a.go",
+            fs::read(root.join("a.go")).unwrap(),
+            stat("a.go"),
+        ));
+
+        // A zero-length write to a file, and to a new one.
+        let mut b = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("pkg/b.go"))
+            .unwrap();
+        b.write_all(b"").unwrap();
+        b.sync_all().unwrap();
+        drop(b);
+        seen.push((
+            "0-byte write pkg/b.go",
+            fs::read(root.join("pkg/b.go")).unwrap(),
+            stat("pkg/b.go"),
+        ));
+        let mut z = fs::File::create(root.join("z.txt")).unwrap();
+        z.write_all(b"").unwrap();
+        z.sync_all().unwrap();
+        drop(z);
+        seen.push((
+            "0-byte write z.txt",
+            fs::read(root.join("z.txt")).unwrap(),
+            stat("z.txt"),
+        ));
+
+        // An editor saves an empty buffer: write a temp file, rename it over.
+        let tmp = root.join(".swap.txt.tmp");
+        let t = fs::File::create(&tmp).unwrap();
+        t.sync_all().unwrap();
+        drop(t);
+        fs::rename(&tmp, root.join("swap.txt")).unwrap();
+        seen.push((
+            "editor save swap.txt",
+            fs::read(root.join("swap.txt")).unwrap(),
+            stat("swap.txt"),
+        ));
+        seen
+    });
+    let expected: Vec<(&str, Vec<u8>, u64)> = vec![
+        ("cat empty.txt", Vec::new(), 0),
+        ("truncated a.go", Vec::new(), 0),
+        ("0-byte write pkg/b.go", b"package pkg\n".to_vec(), 12),
+        ("0-byte write z.txt", Vec::new(), 0),
+        ("editor save swap.txt", Vec::new(), 0),
+    ];
+    assert_eq!(seen, expected);
+    m.unmount();
+
+    let empty = Some(String::new());
+    assert_eq!(f.stored("empty.txt"), empty);
+    assert_eq!(f.stored("a.go"), empty, "the truncate landed");
+    assert_eq!(f.stored("pkg/b.go").as_deref(), Some("package pkg\n"));
+    assert_eq!(f.stored("z.txt"), empty, "the new file landed empty");
+    assert_eq!(f.stored("swap.txt"), empty, "the saved empty buffer landed");
+    assert_eq!(f.entry(".swap.txt.tmp"), None);
+    use leyline_core::ContentAddressed;
+    assert_eq!(
+        f.entry("a.go"),
+        Some(Entry::File {
+            mode: Mode::Regular,
+            blob: b"".as_slice().hash(),
+        })
+    );
+}
+
 /// Two processes on one mount read `a.go`; B saves an edit of one line,
 /// then A saves its edit of another line, made from what it read before
 /// B's save. Both go through one NFS client, so the server cannot tell A's

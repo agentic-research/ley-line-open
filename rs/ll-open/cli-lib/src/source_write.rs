@@ -943,6 +943,9 @@ fn tree_root_dir(abs: &Path, rel: &str) -> Result<PathBuf> {
 mod tree_tests;
 
 #[cfg(test)]
+mod empty_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use leyline_core::ContentAddressed;

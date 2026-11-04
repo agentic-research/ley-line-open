@@ -683,6 +683,11 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
     # `daemon.enrichment.*` emits. `replace run_watcher_enrichment with ()`
     # survived on the sheaf-feature PR (bead 39e239); verified before
     # routing: that mutation fails all three tests in this binary.
+    # head_policy_env: the only test that sets the head trust variables and
+    # reads them back through `HeadPolicy::from_env`. It is its own binary so
+    # setting `LEYLINE_HEAD_TRUSTED_KEYS` cannot race a lib test that
+    # verifies a head (bead b68fa6). It kills `from_env -> Ok(Default)`, which
+    # survives the lib suite.
     #
     # `durable/apple.rs` (`F_BARRIERFSYNC`) and `durable/other.rs` (`fsync`)
     # are platform gates (bead `ley-line-open-98d0c3`): the file a runner's
@@ -706,6 +711,7 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = cli ]; then
         -C --test -C syntax_tree_single_copy_test \
         -C --test -C injection_extraction_test \
         -C --test -C watcher_enrichment_gap1_test \
+        -C --test -C head_policy_env \
         --package leyline-cli-lib --test-workspace=false
   fi
 fi

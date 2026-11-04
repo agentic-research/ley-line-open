@@ -1844,6 +1844,43 @@ mod tests {
         .unwrap();
     }
 
+    /// projection-v10 (bead `ley-line-open-738dd9`): `create_ir_indexes`
+    /// builds `idx_ast_content`, and "every location of this subtree" —
+    /// the lookup `idx_ast_node_hash` served in v9 — plans as the
+    /// `node_content` UNIQUE probe then a search on it, not a scan of `_ast`.
+    /// Falsifier: `create_ir_indexes` doing nothing, or indexing the wrong
+    /// column.
+    #[test]
+    fn create_ir_indexes_builds_the_content_index_a_hash_lookup_uses() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_tables(&conn).unwrap();
+        assert!(!has_object(&conn, "index", "idx_ast_content"));
+        create_ir_indexes(&conn).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_index_info('idx_ast_content')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(cols, vec!["content_id".to_string()]);
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT a.nid FROM node_content c \
+                 JOIN _ast a ON a.content_id = c.content_id WHERE c.node_hash = ?1",
+            )
+            .unwrap()
+            .query_map([&[0u8; 32][..]], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.contains("idx_ast_content")),
+            "the hash lookup must search idx_ast_content; plan: {plan:?}"
+        );
+        create_ir_indexes(&conn).unwrap(); // idempotent
+    }
+
     /// projection-v10 (bead `ley-line-open-738dd9`): the three compatibility
     /// views render each occurrence's `content_id` back to the `node_hash`
     /// it names, keep the v9 column set (and only it — `content_id` stays

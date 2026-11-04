@@ -143,22 +143,37 @@ fn an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts() {
 
 // ── mount plumbing ───────────────────────────────────────────────────────
 
-/// NFS mounts in every `mount` build; FUSE only in a `fuse` build, and a
+/// NFS mounts in every `mount` build; FUSE only in a build with FUSE, and a
 /// build without it refuses `fuse` naming the feature; any other name is
-/// unknown.
+/// unknown. Both build shapes are decided here, whichever this one is.
 #[test]
 fn a_backend_mounts_only_in_a_build_that_has_it() {
-    check_backend("nfs").expect("every mount build mounts NFS");
-    let fuse = check_backend("fuse");
-    if cfg!(feature = "fuse") {
-        fuse.expect("a fuse build mounts FUSE");
-    } else {
-        let refusal = format!("{:#}", fuse.expect_err("an NFS-only build refuses FUSE"));
-        assert!(refusal.contains("`fuse` feature"), "{refusal}");
-        assert!(refusal.contains("--backend nfs"), "{refusal}");
+    for fuse_built in [false, true] {
+        assert_eq!(backend_for("nfs", fuse_built).unwrap(), Backend::Nfs);
+        let unknown = format!(
+            "{:#}",
+            backend_for("smb", fuse_built).expect_err("smb is no backend")
+        );
+        assert!(unknown.contains("unknown backend: smb"), "{unknown}");
     }
-    let unknown = format!("{:#}", check_backend("smb").expect_err("smb is no backend"));
-    assert!(unknown.contains("unknown backend: smb"), "{unknown}");
+    assert_eq!(backend_for("fuse", true).unwrap(), Backend::Fuse);
+    let refusal = format!(
+        "{:#}",
+        backend_for("fuse", false).expect_err("a build without FUSE refuses it")
+    );
+    assert!(refusal.contains("`fuse` feature"), "{refusal}");
+    assert!(refusal.contains("--backend nfs"), "{refusal}");
+}
+
+/// This build's backends are the ones its `fuse` feature says it has.
+#[test]
+fn this_builds_backends_follow_its_fuse_feature() {
+    assert_eq!(backend("nfs").unwrap(), Backend::Nfs);
+    assert_eq!(
+        backend("fuse").ok(),
+        cfg!(feature = "fuse").then_some(Backend::Fuse)
+    );
+    assert!(backend("smb").is_err());
 }
 
 /// An NFS-only build refuses a FUSE mount naming the feature, before the

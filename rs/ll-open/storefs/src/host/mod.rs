@@ -11,7 +11,7 @@
 //! The NFS backend is the `mount` feature and links no system library. The
 //! FUSE backend is the `fuse` feature, which links libfuse (bead
 //! `ley-line-open-9d4712`); a build without it refuses `fuse` by name
-//! ([`check_backend`]).
+//! ([`backend`]).
 
 #[cfg(feature = "fuse")]
 pub mod fuse;
@@ -250,38 +250,60 @@ pub enum Mounted<S: Store + 'static> {
     Fuse(FuseSession),
 }
 
-/// Whether this build can mount on `backend`: `nfs` always, `fuse` only in a
-/// build with the `fuse` feature. Anything else is refused, before any
-/// mountpoint is made or server bound.
-pub fn check_backend(backend: &str) -> Result<()> {
-    match backend {
-        "nfs" => Ok(()),
-        "fuse" if cfg!(feature = "fuse") => Ok(()),
-        "fuse" => anyhow::bail!(
-            "backend 'fuse' needs a leyline built with the `fuse` feature; this build \
-             mounts over NFS only. Build with `--features fuse`, or mount with --backend nfs."
-        ),
+/// A mount backend, by the name `--backend` gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Nfs,
+    Fuse,
+}
+
+/// Why a build without the `fuse` feature refuses `--backend fuse`.
+const FUSE_NOT_BUILT: &str = "backend 'fuse' needs a leyline built with the `fuse` feature; \
+     this build mounts over NFS only. Build with `--features fuse`, or mount with --backend nfs.";
+
+/// The backend `name` names, in a build that has FUSE (`fuse_built`) or not:
+/// `nfs` always, `fuse` only when built. Anything else is refused. The
+/// build's own answer is [`backend`].
+pub fn backend_for(name: &str, fuse_built: bool) -> Result<Backend> {
+    match name {
+        "nfs" => Ok(Backend::Nfs),
+        "fuse" if fuse_built => Ok(Backend::Fuse),
+        "fuse" => anyhow::bail!(FUSE_NOT_BUILT),
         other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
     }
 }
 
+/// The backend `name` names in this build ([`backend_for`] with this
+/// build's `fuse` feature).
+pub fn backend(name: &str) -> Result<Backend> {
+    backend_for(name, cfg!(feature = "fuse"))
+}
+
 /// Mount `fs` at `mount` on `backend` (`nfs`, or `fuse` in a `fuse` build).
+/// A backend this build refuses is refused before any mountpoint is made or
+/// server bound.
 pub async fn mount<S: Store + 'static>(
     fs: Arc<StoreFs<S>>,
     mount: &Path,
     backend: &str,
     nfs_port: u16,
 ) -> Result<Mounted<S>> {
-    check_backend(backend)?;
+    let backend = self::backend(backend)?;
     std::fs::create_dir_all(mount)
         .with_context(|| format!("create mountpoint {}", mount.display()))?;
-    #[cfg(feature = "fuse")]
-    if backend == "fuse" {
-        return Ok(Mounted::Fuse(mount_fuse(fs, mount)?));
+    match backend {
+        Backend::Nfs => {
+            let server = serve_nfs(fs, &nfs_listen_addr(nfs_port)).await?;
+            log::info!("NFS server listening on port {}", server.port());
+            Ok(Mounted::Nfs(mount_nfs(server, mount)?))
+        }
+        #[cfg(feature = "fuse")]
+        Backend::Fuse => Ok(Mounted::Fuse(mount_fuse(fs, mount)?)),
+        // `backend` never names FUSE in a build without it; refused all the
+        // same.
+        #[cfg(not(feature = "fuse"))]
+        Backend::Fuse => anyhow::bail!(FUSE_NOT_BUILT),
     }
-    let server = serve_nfs(fs, &nfs_listen_addr(nfs_port)).await?;
-    log::info!("NFS server listening on port {}", server.port());
-    Ok(Mounted::Nfs(mount_nfs(server, mount)?))
 }
 
 /// The daemon's host mount: the store behind the daemon's own reader pool

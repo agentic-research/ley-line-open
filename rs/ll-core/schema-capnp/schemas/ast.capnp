@@ -45,6 +45,12 @@ struct AstNode {
 
 # AstNodeList — per-file aggregation of AstNode records.
 #
+# NO PRODUCER since projection-v8 (ADR-0040 D5, bead ley-line-open-f30fdf):
+# the `capnp_blobs` table it filled is retired and no segment ever carried
+# it. The struct stays in the published schema-client until the next public
+# schema release removes it (bead ley-line-open-438772 owns the AstNode
+# wire changes). The history below describes the retired store.
+#
 # ADR-0026 Phase 1 (bead ley-line-open-3e87ad): the pointer-store blob unit
 # is per-file. A single AstNodeList message contains every AstNode for one
 # source file; the canonical bytes of that message are hashed with BLAKE3 to

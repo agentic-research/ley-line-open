@@ -65,6 +65,8 @@ func TestProposedWriteKindDefaultsToReplaceAndRoundTrips(t *testing.T) {
 		RefusalReason_notEmpty:            "notEmpty",
 		RefusalReason_notADirectory:       "notADirectory",
 		RefusalReason_isADirectory:        "isADirectory",
+		// Bead ley-line-open-23a26c: a path the checkout folds onto another.
+		RefusalReason_aliasesExisting: "aliasesExisting",
 	} {
 		if got := reason.String(); got != want {
 			t.Fatalf("reason %d spells %q, want %q", reason, got, want)

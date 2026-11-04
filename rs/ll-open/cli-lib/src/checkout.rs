@@ -62,6 +62,8 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::cmd_parse::ParseResult;
 use crate::tree::{Entry, Mode};
 
+pub mod alias;
+
 /// What reconciling one path does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -491,6 +493,38 @@ pub fn reconcile(
         conflicts,
         hashed,
     })
+}
+
+/// Refuse a proposal that creates a path the checkout's file system would
+/// land on another entry (bead `ley-line-open-23a26c`, ADR-0043 R3): `_tree`
+/// paths are byte-distinct, but a file system that folds case or Unicode
+/// normalization (the default APFS volume folds both) resolves `Readme.md`
+/// to `README.md`, and NFD `é` to NFC `é`, so the two store entries would
+/// share one file and the checkout could never agree with `_tree`. The
+/// refusal is
+/// [`crate::source_write::Refusal::AliasesExisting`], naming both paths.
+///
+/// `fold` is the rule the checkout's file system compares names by: the
+/// caller asks it of the file system with [`alias::Fold::of`], never
+/// assumes it from the platform. The decision is [`alias::alias`] over the
+/// directory's listing. An alias of an entry the same proposal deletes is a
+/// rename, and lands. A path the store already holds is its own name and is
+/// not checked.
+pub fn refuse_aliases(
+    conn: &Connection,
+    dir: &Path,
+    fold: alias::Fold,
+    writes: &[crate::source_write::Proposed],
+) -> Result<()> {
+    let has_tree = crate::tree::exists(conn);
+    let stored =
+        |path: &str| -> Result<bool> { Ok(has_tree && crate::tree::entry(conn, path)?.is_some()) };
+    match alias::alias(fold, writes, stored, |rel| alias::listing(dir, rel))? {
+        Some((path, other)) => {
+            Err(crate::source_write::Refusal::AliasesExisting { path, other }.into())
+        }
+        None => Ok(()),
+    }
 }
 
 /// Write `bytes` as the file `rel` names under `dir`: staged beside it, its
@@ -1550,5 +1584,98 @@ mod tests {
             staging_path(Path::new("/w/src/pkg/a.go")),
             PathBuf::from("/w/src/pkg/.a.go.leyline-checkout")
         );
+    }
+
+    // ── path aliasing (bead `ley-line-open-23a26c`) ─────────────────────
+
+    fn aliases_of(
+        c: &Checkout,
+        fold: alias::Fold,
+        writes: &[Proposed],
+    ) -> Option<(String, String)> {
+        match refuse_aliases(&c.conn, &c.src, fold, writes) {
+            Ok(()) => None,
+            Err(e) => match e.downcast_ref::<crate::source_write::Refusal>() {
+                Some(crate::source_write::Refusal::AliasesExisting { path, other }) => {
+                    Some((path.clone(), other.clone()))
+                }
+                _ => panic!("an untyped refusal: {e:#}"),
+            },
+        }
+    }
+
+    fn new_file(path: &str) -> Proposed {
+        Proposed::create(path, b"x\n".to_vec())
+    }
+
+    /// The checkout's own listing and store, under a folding rule given to
+    /// it rather than probed, so this runs alike on every file system: a
+    /// create that folds onto a file or directory of the checkout is refused
+    /// typed, naming both paths as the directory spells them; a path the
+    /// store holds and a case-only rename are not aliases; and a rule that
+    /// folds nothing refuses nothing.
+    #[test]
+    fn a_create_the_checkout_folds_onto_an_entry_is_refused_typed() {
+        let c = checkout(&[("README.md", A), ("docs/a.md", B)]);
+        let apfs = alias::Fold {
+            case: true,
+            normalization: true,
+        };
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(
+            aliases_of(&c, apfs, &[new_file("Readme.md")]),
+            pair("Readme.md", "README.md")
+        );
+        assert_eq!(
+            aliases_of(&c, apfs, &[new_file("Docs/b.md")]),
+            pair("Docs/b.md", "docs")
+        );
+        assert_eq!(
+            aliases_of(&c, apfs, &[new_file("New.md"), new_file("new.md")]),
+            pair("new.md", "New.md")
+        );
+        assert_eq!(
+            aliases_of(&c, alias::Fold::NONE, &[new_file("Readme.md")]),
+            None
+        );
+        assert_eq!(aliases_of(&c, apfs, &[new_file("docs/b.md")]), None);
+        assert_eq!(
+            aliases_of(
+                &c,
+                apfs,
+                &[
+                    Proposed::delete("README.md", Base::Blob(h(A))),
+                    new_file("Readme.md"),
+                ]
+            ),
+            None,
+            "a case-only rename aliases only what it deletes"
+        );
+        // A store that already holds the second spelling (proposed with no
+        // checkout check): a write to it is its own name.
+        propose(&c.conn, &Grant::Whole, vec![new_file("Readme.md")]).unwrap();
+        assert_eq!(
+            aliases_of(
+                &c,
+                apfs,
+                &[Proposed::write("Readme.md", Base::Any, b"y\n".to_vec())]
+            ),
+            None
+        );
+    }
+
+    /// Before a store exists nothing is stored, and a create is checked
+    /// against the directory alone.
+    #[test]
+    fn a_checkout_without_a_store_checks_the_directory() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("README.md"), A).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let fold = alias::Fold {
+            case: true,
+            normalization: false,
+        };
+        assert!(refuse_aliases(&conn, dir.path(), fold, &[new_file("Readme.md")]).is_err());
+        assert!(refuse_aliases(&conn, dir.path(), fold, &[new_file("Other.md")]).is_ok());
     }
 }

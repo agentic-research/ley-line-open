@@ -10,6 +10,120 @@ context, scoping notes, and review history are recoverable.
 
 ## [Unreleased]
 
+Pending entries live in [`changes/`](changes/README.md), one file per
+change. Do not add entries here: `tools/bump_release_version.sh` assembles
+the fragments into the next release's section.
+
+## [0.22.0] — 2026-11-04
+
+**Projection-breaking; the wire change is additive.** Arenas move from
+`projection-v7` to `projection-v9`: an older arena is refused at parse open,
+so rebuild it with a cold reparse. On the kibana slice the arena shrinks
+from 66.0x to 29.8x source, and `node_hash` and `Head.rootHash` are
+byte-identical across the change. SQL consumers that read `capnp_blobs`,
+`_ast_blob`, or `node_child` on the right side of a `LEFT JOIN` must move
+(mache: `node_edge`). A daemon with a checkout now refuses a create that its
+file system folds onto an existing entry, with the new refusal reason
+`aliases_existing`; propose clients should map it. `SCHEMA_VERSION` is
+0.22.0 and the Go module is tagged `clients/go/leyline-schema/v0.22.0`.
+
+### Breaking
+
+- **projection-v9: the merkle-AST edges are interned** (bead
+  `ley-line-open-9b7d28`). `node_content` gains `content_id INTEGER PRIMARY
+  KEY` (arena-local; not an identity) and keeps `node_hash` as `NOT NULL
+  UNIQUE`. The edges move to `node_edge (parent_id, ordinal, child_id,
+  field)`, `WITHOUT ROWID`, keyed on content ids instead of two 32-byte
+  hashes per edge. `node_child` is now a read-only VIEW with the v8
+  columns, so v8 reads run unchanged; on the right side of a `LEFT JOIN`,
+  read `node_edge` instead (TABLE_CONTRACT gives the SQL). On bead
+  `ley-line-open-17c271`'s kibana slice the edges go from 515.2 MB
+  (`node_child` + its autoindex) to 72.9 MB, the arena from 1,471.1 MB to
+  1,030.1 MB (42.5x to 29.8x source), and peak parse RSS from 4.58 GB to
+  4.09 GB; the edge set is unchanged by hash (4,346,013 rows, an `EXCEPT`
+  of the two arenas is empty both ways). On this repository's `rs/` tree:
+  168.4 MB to 23.7 MB. No identity moves: `node_hash` and `Head.rootHash`
+  are byte-identical. A `projection-v8` arena is refused at parse open.
+
+- **projection-v8: the pointer store leaves the projection** (ADR-0040 D5,
+  bead `ley-line-open-f30fdf`). `capnp_blobs` (one canonical `AstNodeList`
+  blob per file) and `_ast_blob` (`file_id → blob_hash`) are no longer
+  created or written. They were the second stored copy of the syntax tree
+  and had no reader in LLO or mache. On the kibana slice bead
+  `ley-line-open-17c271` pins (8,000 `.ts` files, 36.3 MB of source), a cold
+  parse goes from 2,284.6 MB to 1,471.1 MB (66.0x to 42.5x source); peak
+  RSS is unchanged (4.53 GB before, 4.58 GB after). A `projection-v7` arena
+  is refused at parse open; rebuild it with a cold reparse. No identity
+  moves: `Head.rootHash` folds the segment files, and the kibana parse
+  writes byte-identical `.ast.capnp` and `.source.capnp` segments and the
+  same `rootHash` before and after. `parserId` and `treeRoot` move once
+  because `parserId` folds the projection label. Nothing produces the
+  `AstNodeList` struct any more; it leaves the published schema at the next
+  schema release (bead `ley-line-open-438772`). The dead
+  `daemon::granularity_router` (no caller; it recommended reads from
+  `capnp_blobs`) and `leyline_schema::FileKey::FileId` (whose only table was
+  `_ast_blob`) are removed. ADR-0026 is amended.
+
+### Added
+
+- **A property test gates merge commutativity** (bead
+  `ley-line-open-238c85`). Two stale proposals whose edits are disjoint in
+  their shared base were suspected of landing different bytes depending on
+  arrival order, through Myers re-alignment on repeated lines. Over 10,000
+  cases on a two-line alphabet (fixed seed `0x238c85`), both orders always
+  agree: the same bytes, or a refusal in both. The test stays as a
+  regression gate. ADR-0045 T5 now states the rule over bytes: a merge keeps
+  what both sides' bytes determine, so on a repeated line two edits disjoint
+  in base coordinates can align to one (for the base `a\na\n`, deleting
+  either line proposes `a\n`, and the merge lands `a\n`).
+
+- **The propose wire gains the refusal reason `aliases_existing` and
+  `ProposalRefusal.other`** (bead `ley-line-open-23a26c`). A daemon with a
+  checkout refuses a create that its file system folds onto another entry.
+  `refusal.reason` is `aliases_existing` (Cap'n Proto `RefusalReason`
+  ordinal 17), `refusal.path` names the created path, and the new
+  `refusal.other` names the entry it aliases. `other` is also set for
+  `path_conflict`, where it names the file the created path is under. Propose
+  clients (mache's write path among them) should map the new reason. A
+  client that does not know it still reads `ok: false`: an unknown ordinal
+  or reason string is a refusal, never a success
+  (`clients/go/leyline-schema/daemon/aliases_existing_test.go`). A JSON
+  decoder that rejects unknown fields fails on `other`, so it must allow it.
+
+### Changed
+
+- **CHANGELOG entries are fragments, one file per change** (bead
+  `ley-line-open-465ce2`). A change adds `changes/<bead-id>.md` naming its
+  section on the first line instead of editing `CHANGELOG.md`, so two PRs no
+  longer conflict on the `[Unreleased]` block and force each other to rebase
+  and rerun CI. `tools/bump_release_version.sh` assembles the fragments into
+  the release's section, Security first, and deletes them;
+  `task lint:changelog-fragments`, run by `task ci`, checks their names,
+  sections, and text, and `tools/test_changelog_fragments.sh` proves two
+  PRs' fragments merge in either order and assemble identically.
+  `task release:hypervisor:record` now builds in `rs/target-hypervisor`, so
+  it runs beside `task ci` instead of contending for `rs/target`.
+
+### Fixed
+
+- **A checkout no longer splits from `_tree` through path aliasing** (bead
+  `ley-line-open-23a26c`). `_tree` paths are byte-distinct, but the default
+  APFS volume folds case and Unicode normalization. Creating `Readme.md`
+  beside `README.md`, or NFD `é.txt` beside NFC `é.txt`, was accepted as a
+  second store entry for one file on disk: the directory kept the first
+  file's bytes, `_tree` held both paths, and `_checkout_conflict` recorded a
+  conflict that no edit could clear, across restarts. A daemon (or storefs
+  mount) with a checkout now refuses such a create before it commits, with
+  the new refusal reason `aliases_existing`, naming the created path
+  (`path`) and the entry it aliases (`other`). Folding is probed on the
+  checkout's directory, not assumed from the platform, and a case-only
+  rename (delete and create in one proposal) still lands. ADR-0043 R3 and
+  `docs/TABLE_CONTRACT.md` record the policy. The daemon wire gains the
+  `RefusalReason` enumerant `aliasesExisting` and the
+  `ProposalRefusal.other` field (also set for `path_conflict`); both are
+  additive, the Go bindings are regenerated, and `SCHEMA_VERSION` moves to
+  0.22.0.
+
 ## [0.21.1] — 2026-11-02
 
 **Security:** on the native tier, a run whose grant named a Graph workspace

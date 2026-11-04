@@ -337,7 +337,7 @@ fn node_content_dedups_below_ast_row_count() {
         "node_content ({content_count}) must dedup below _ast ({ast_count})"
     );
 
-    // node_content PRIMARY KEY is node_hash → every row is a distinct subtree.
+    // node_content.node_hash is UNIQUE → every row is a distinct subtree.
     let distinct: i64 = conn
         .query_row(
             "SELECT count(DISTINCT node_hash) FROM node_content",
@@ -364,21 +364,33 @@ fn node_content_dedups_below_ast_row_count() {
 #[test]
 fn node_content_fk_rejects_dangling_child_edge() {
     // B2: `PRAGMA foreign_keys` stays ON for the connection after the parse.
-    // Inserting a node_child whose endpoints are not real content hashes must
-    // fail loudly (be6136 made loud) rather than persist a dangling edge.
+    // Inserting an edge whose endpoints are not real content rows must fail
+    // loudly (be6136 made loud) rather than persist a dangling edge. As of
+    // projection-v9 the edge is stored in `node_edge`, keyed on content ids.
     let src = create_go_fixture();
     let conn = cold_parse_go(src.path());
 
-    let bogus = vec![0xABu8; 32];
+    let max: i64 = conn
+        .query_row("SELECT MAX(content_id) FROM node_content", [], |r| r.get(0))
+        .unwrap();
     let res = conn.execute(
+        "INSERT INTO node_edge (parent_id, ordinal, child_id, field) \
+         VALUES (?1, 0, ?1, NULL)",
+        rusqlite::params![max + 1000],
+    );
+    let err = res.expect_err("an edge with no matching node_content must violate the FK");
+    assert!(
+        err.to_string().contains("FOREIGN KEY"),
+        "the refusal must be the FK, not something else; got: {err}"
+    );
+
+    // The hash-keyed shape is a view: it cannot be written at all.
+    let view_write = conn.execute(
         "INSERT INTO node_child (parent_hash, ordinal, child_hash, field) \
          VALUES (?1, 0, ?1, NULL)",
-        rusqlite::params![bogus],
+        rusqlite::params![vec![0xABu8; 32]],
     );
-    assert!(
-        res.is_err(),
-        "a node_child with no matching node_content must violate the FK"
-    );
+    assert!(view_write.is_err(), "node_child is a read-only view");
 }
 
 #[test]

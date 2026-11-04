@@ -243,6 +243,9 @@ mod tests {
         dirs: HashMap<i64, String>,
         names: HashMap<i64, String>,
         kinds: HashMap<i64, String>,
+        /// `content_id → node_hash`: content ids are arena-local
+        /// (projection-v9), so a row compares by the hash an id names.
+        content: HashMap<i64, Vec<u8>>,
     }
 
     /// One rendered row: its table, the file it belongs to (if any), and
@@ -287,6 +290,15 @@ mod tests {
                 dirs,
                 names,
                 kinds: map("SELECT kind_id, lang || ':' || raw_kind FROM kinds"),
+                content: {
+                    let mut stmt = conn
+                        .prepare("SELECT content_id, node_hash FROM node_content")
+                        .unwrap();
+                    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                },
             }
         }
 
@@ -314,7 +326,6 @@ mod tests {
                     .unwrap()
             };
             let source_hashes = named("content_hash", "_source");
-            let ast_blobs = named("blob_hash", "_ast_blob");
             let tables: Vec<String> = {
                 let mut stmt = conn
                     .prepare(
@@ -362,9 +373,14 @@ mod tests {
                             ("source_blobs", "blob_hash") if !keyed(&source_hashes) => {
                                 continue 'row;
                             }
-                            ("capnp_blobs", "blob_hash") if !keyed(&ast_blobs) => continue 'row,
-                            ("node_content", "node_hash") | ("node_child", "parent_hash")
-                                if !keyed(&reach) =>
+                            ("node_content", "node_hash") if !keyed(&reach) => {
+                                continue 'row;
+                            }
+                            // Arena-local handle, not content (projection-v9).
+                            ("node_content", "content_id") => continue,
+                            ("node_edge", "parent_id")
+                                if !matches!(&v, V::Integer(n)
+                                    if self.content.get(n).is_some_and(|h| reach.contains(h))) =>
                             {
                                 continue 'row;
                             }
@@ -384,6 +400,9 @@ mod tests {
                             }
                             ("name_id", V::Integer(n)) => self.names[n].clone(),
                             ("kind_id", V::Integer(n)) => self.kinds[n].clone(),
+                            ("parent_id" | "child_id", V::Integer(n)) => {
+                                hex::encode(&self.content[n])
+                            }
                             (_, V::Integer(n)) => n.to_string(),
                             (_, V::Real(x)) => x.to_string(),
                             (_, V::Text(s)) => format!("{s:?}"),
@@ -487,10 +506,10 @@ mod tests {
                         && hashes
                             .iter()
                             .any(|h| text.starts_with(&format!("node_hash={h} "))))
-                    || (table == "node_child"
+                    || (table == "node_edge"
                         && hashes
                             .iter()
-                            .any(|h| text.starts_with(&format!("parent_hash={h} "))))
+                            .any(|h| text.starts_with(&format!("parent_id={h} "))))
             })
             .map(|(table, _, text)| format!("{table}: {text}"))
             .collect()

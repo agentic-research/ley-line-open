@@ -85,8 +85,7 @@ pub fn create_ast_schema(conn: &Connection) -> Result<()> {
     // projection-v5: the occurrence tables carry a `node_hash REFERENCES
     // node_content(node_hash)` FK in their base DDL, so the content tables
     // must exist BEFORE any referencing table is written to.
-    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
-    conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
+    create_content_tables(conn)?;
     conn.execute_batch(AST_DDL)?;
     Ok(())
 }
@@ -97,8 +96,7 @@ pub fn create_ast_tables(conn: &Connection) -> Result<()> {
     create_nodes_table(conn)?;
     conn.execute_batch(SOURCE_DDL)?;
     // FK-target ordering — see `create_ast_schema`.
-    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
-    conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
+    create_content_tables(conn)?;
     conn.execute_batch(AST_TABLE_DDL)?;
     Ok(())
 }
@@ -378,53 +376,83 @@ CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 // `node_hash` — keying resolution on `node_hash` would silently collapse
 // two distinct callees with identical bodies.
 
-/// DDL for `node_content` — one row per UNIQUE subtree, keyed on the
-/// merkle-AST `node_hash` (a real single-column PRIMARY KEY). `INSERT OR
-/// IGNORE` on the PK == intrinsic dedup: the second occurrence of an
-/// identical subtree is silently ignored. `kind` is the hashed canonical
-/// κ kind; `raw_kind` is the grammar kind (a content column, NOT hashed).
-/// `token` is the terminal UTF-8 text for leaves (NULL for internal
-/// nodes); `arity` is the child count.
+/// DDL for `node_content` — one row per UNIQUE subtree. `node_hash` is the
+/// merkle-AST content address and stays the identity (`UNIQUE`, the FK
+/// target of `_ast`/`node_defs`/`node_refs`/`_cfg`); `content_id` is an
+/// arena-local integer handle for it (projection-v9, bead
+/// `ley-line-open-9b7d28`), declared `INTEGER PRIMARY KEY` so it is the
+/// rowid and survives `VACUUM`. It is NOT an identity: two arenas number the
+/// same subtree differently, and nothing outside this database may cite it.
+/// `kind` is the hashed canonical κ kind; `raw_kind` is the grammar kind (a
+/// content column, NOT hashed). `token` is the terminal UTF-8 text for
+/// leaves (NULL for internal nodes); `arity` is the child count.
 pub const NODE_CONTENT_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_content (
-    node_hash BLOB PRIMARY KEY,
-    node_tag  INTEGER NOT NULL,
-    kind      TEXT    NOT NULL,
-    raw_kind  TEXT    NOT NULL,
-    lang      TEXT    NOT NULL,
-    token     TEXT,
-    arity     INTEGER NOT NULL
+    content_id INTEGER PRIMARY KEY,
+    node_hash  BLOB    NOT NULL UNIQUE,
+    node_tag   INTEGER NOT NULL,
+    kind       TEXT    NOT NULL,
+    raw_kind   TEXT    NOT NULL,
+    lang       TEXT    NOT NULL,
+    token      TEXT,
+    arity      INTEGER NOT NULL
 );";
 
-/// DDL for `node_child` — the git-tree object. One row per (unique parent,
-/// ordinal) edge, deduped per unique parent subtree. `field` is the
+/// DDL for `node_edge` — the git-tree object, interned (projection-v9,
+/// bead `ley-line-open-9b7d28`). One row per (unique parent, ordinal) edge,
+/// deduped per unique parent subtree, keyed on the two endpoints'
+/// `node_content.content_id` instead of two 32-byte hashes. `field` is the
 /// tree-sitter field name ("name","body",…) or NULL when the child has no
-/// field. Both endpoints `REFERENCES node_content(node_hash)`; the
-/// post-order fold emits children before parents so FK enforcement holds
-/// under `PRAGMA foreign_keys = ON`.
-pub const NODE_CHILD_TABLE_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS node_child (
-    parent_hash BLOB    NOT NULL REFERENCES node_content(node_hash),
-    ordinal     INTEGER NOT NULL,
-    child_hash  BLOB    NOT NULL REFERENCES node_content(node_hash),
-    field       TEXT,
-    PRIMARY KEY (parent_hash, ordinal)
-);";
+/// field. `WITHOUT ROWID`: the primary key IS the table, so there is no
+/// second B-tree. Read it through the `node_child` view, which restores the
+/// hash-keyed shape; join it directly when the ids are already in hand.
+pub const NODE_EDGE_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS node_edge (
+    parent_id INTEGER NOT NULL REFERENCES node_content(content_id),
+    ordinal   INTEGER NOT NULL,
+    child_id  INTEGER NOT NULL REFERENCES node_content(content_id),
+    field     TEXT,
+    PRIMARY KEY (parent_id, ordinal)
+) WITHOUT ROWID;";
+
+/// `node_child` — the projection-v8 hash-keyed edge shape, as a read-only
+/// view over `node_edge`. Every query written against the stored table
+/// (`WHERE parent_hash = ?`, `JOIN node_content c ON c.node_hash =
+/// nc.child_hash`, `ORDER BY ordinal`) runs unchanged; each `parent_hash`
+/// lookup is one probe into `node_content`'s `node_hash` index, then a
+/// primary-key range on `node_edge`. Writes go to `node_edge`.
+pub const NODE_CHILD_VIEW_DDL: &str = "\
+CREATE VIEW IF NOT EXISTS node_child AS
+SELECT p.node_hash AS parent_hash,
+       e.ordinal   AS ordinal,
+       c.node_hash AS child_hash,
+       e.field     AS field
+  FROM node_edge e
+  JOIN node_content p ON p.content_id = e.parent_id
+  JOIN node_content c ON c.content_id = e.child_id;";
+
+/// Create `node_content`, `node_edge` and the `node_child` view, in FK
+/// order. Idempotent.
+fn create_content_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
+    conn.execute_batch(NODE_EDGE_TABLE_DDL)?;
+    conn.execute_batch(NODE_CHILD_VIEW_DDL)?;
+    Ok(())
+}
 
 /// Index over `_ast.node_hash` — "every location of this exact subtree".
 pub const AST_NODE_HASH_INDEX_DDL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ast_node_hash ON _ast(node_hash);";
 
-/// Create the merkle-AST IR tables (`node_content`, `node_child`).
-/// Idempotent.
+/// Create the merkle-AST IR tables (`node_content`, `node_edge`) and the
+/// `node_child` view. Idempotent.
 ///
 /// The occurrence tables' `node_hash` columns carry a
 /// `REFERENCES node_content(node_hash)` FK, so with `PRAGMA foreign_keys =
 /// ON` at write time a `node_hash` pointer that doesn't resolve to a real
 /// content row is a loud insert error.
 pub fn create_ir_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(NODE_CONTENT_TABLE_DDL)?;
-    conn.execute_batch(NODE_CHILD_TABLE_DDL)?;
+    create_content_tables(conn)?;
     // projection-v5: `node_hash` sits in the base DDL of `_ast`,
     // `node_defs`, and `node_refs` — the pre-v5 additive ALTERs are gone
     // (a pre-v5 arena is refused at open, not migrated).
@@ -433,7 +461,7 @@ pub fn create_ir_tables(conn: &Connection) -> Result<()> {
 
 /// Create the deferred merkle-AST IR index (idempotent). Called
 /// post-`COMMIT` alongside the other bulk-load index passes. `node_content`
-/// and `node_child` are covered by their PRIMARY KEYs; the only extra
+/// and `node_edge` are covered by their keys; the only extra
 /// traversal index is `idx_ast_node_hash`.
 pub fn create_ir_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(AST_NODE_HASH_INDEX_DDL)?;
@@ -540,72 +568,6 @@ pub fn insert_import(conn: &Connection, alias: &str, path: &str, source_id: &str
 }
 
 // ---------------------------------------------------------------------------
-// ADR-0026 pointer store — Phase 1 dual-write (bead ley-line-open-3e87ad)
-// ---------------------------------------------------------------------------
-//
-// Content-addressed pointer store: SQL projection becomes a lightweight index
-// (`_ast_pointer`) into content-addressed capnp blobs (`capnp_blobs`) held in
-// Σ. The row-projected `_ast` schema stays populated in Phase 1 for
-// backward-compat + F1 round-trip integrity; Phase 2 migrates consumer reads.
-//
-// Blob unit: **per-file** (ADR-0026 §2.2 fallback — safer default; per-
-// semantic-unit refinement is Phase 2).
-
-/// DDL for `capnp_blobs` — content-addressed blob store. One row per unique
-/// per-file blob keyed on BLAKE3(canonical(AstNodeList)).
-pub const CAPNP_BLOBS_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS capnp_blobs (
-    blob_hash BLOB PRIMARY KEY,
-    blob_bytes BLOB NOT NULL
-);";
-
-/// DDL for `_ast_blob` — the file-to-blob map for the ADR-0026 pointer
-/// store. ONE row per source file, not per AST node.
-///
-/// This replaces `_ast_pointer`, which carried one row per AstNode and did
-/// not, in practice, store a pointer. Measured on an 8000-file TypeScript
-/// arena, each of its 3 150 849 rows held:
-///
-///   node_id         232 bytes   already the PK of `_ast`
-///   source_id        27.6 bytes already a column of `_ast`
-///   blob_hash        32 bytes   only 8000 DISTINCT values across all rows
-///   offset_in_blob   int        a dense 0..n-1 per file, verified with no
-///                               gaps or duplicates in 8000/8000 files
-///   kind             int        `semantic_kind_tag(node_kind)`, a pure
-///                               function of a column `_ast` already has
-///
-/// ~294 bytes per row to address a record of ~370 — the pointer was 80% the
-/// size of its referent — costing 927 MB plus an 830 MB shadow index for a
-/// mapping that is `blob(file)` plus an ordinal. Both survive here: the file
-/// keys this table (by its interned `file_id` as of projection-v5), and the
-/// ordinal is the nid's low 24 bits — a node's index into its file's
-/// `AstNodeList.nodes` IS `nid & 0xFFFFFF`, stored nowhere.
-///
-/// The ADR-0026 §6.F1 resolution capability is unchanged: any `_ast` row
-/// still resolves to its capnp record, via `nid >> 24 → blob_hash` here and
-/// `nid & 0xFFFFFF` as the index into that blob's `AstNodeList.nodes`.
-///
-/// Bead `ley-line-open-17c271`.
-pub const AST_BLOB_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS _ast_blob (
-    file_id INTEGER PRIMARY KEY,
-    blob_hash BLOB NOT NULL
-);";
-
-/// Create the pointer-store tables (idempotent). Must run alongside the
-/// existing row-projected schema; Phase 1 is dual-write.
-///
-/// projection-v5 folds the pre-v5 `_ast.blob_ord` column into the key
-/// itself: a node's index into its file's `AstNodeList.nodes` IS its
-/// pre-order ordinal, i.e. `nid & 0xFFFFFF`. One dense `0..n-1` per file,
-/// defined once, stored nowhere.
-pub fn create_pointer_store_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(CAPNP_BLOBS_DDL)?;
-    conn.execute_batch(AST_BLOB_DDL)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // ADR-0028 source_blobs — Phase 1 dual-store (bead ley-line-open-9e4416)
 // ---------------------------------------------------------------------------
 //
@@ -646,7 +608,7 @@ pub fn create_source_blobs_table(conn: &Connection) -> Result<()> {
 // An arena may carry OVERRIDE tree-sitter `.scm` query blobs that replace the
 // compiled-in `queries/<lang>/tags.scm` defaults for a language, behind a
 // BLAKE3-hash allowlist (operator-controlled env `LLO_TRUSTED_QUERY_HASHES`).
-// Storage mirrors source_blobs/capnp_blobs: a content-addressed blob table
+// Storage mirrors source_blobs: a content-addressed blob table
 // plus an FK-shaped pointer. Everything durable lives inside the one .db, so
 // an arena moves/backs-up as a single file — a sidecar would silently detach.
 //
@@ -978,7 +940,7 @@ pub fn delete_file_rows(conn: &Connection, path: &str) -> Result<()> {
     // (`FILE_KEYED_TABLES`), which every crate above can reach without a
     // feature flag — the mount's `rm`/`mv` and `reproject` used to keep
     // their own shorter lists (beads `ley-line-open-af3817`, `2b6444`).
-    // Content-addressed stores (`capnp_blobs`, `source_blobs`) are not
+    // Content-addressed stores (`source_blobs`, `node_content`) are not
     // per-file and are left to the GC sweep, as before.
     leyline_schema::delete_file_rows(conn, path)
 }
@@ -1766,7 +1728,7 @@ mod tests {
         conn.execute_batch(REFS_TABLE_DDL).unwrap();
         create_ir_tables(&conn).unwrap();
 
-        for table in ["node_content", "node_child"] {
+        for table in ["node_content", "node_edge"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -1886,49 +1848,6 @@ mod tests {
         );
     }
 
-    /// The ADR-0026 pointer store is `capnp_blobs` + the per-file `_ast_blob`
-    /// map; the ordinal into a blob's `AstNodeList.nodes` is `nid & 0xFFFFFF`
-    /// as of projection-v5 (no stored column). Nothing asserted the
-    /// constructor actually built the tables, so replacing its body with
-    /// `Ok(())` passed — an arena would then silently lack the resolution
-    /// path entirely.
-    #[test]
-    fn create_pointer_store_tables_builds_and_is_idempotent() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_ast_schema(&conn).unwrap();
-
-        assert!(
-            !leyline_schema::table_exists(&conn, "_ast_blob").unwrap(),
-            "precondition: the pointer store does not exist yet"
-        );
-
-        create_pointer_store_tables(&conn).unwrap();
-
-        for table in ["capnp_blobs", "_ast_blob"] {
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(n, 1, "{table} MUST exist after create_pointer_store_tables");
-        }
-        assert!(
-            has_column(&conn, "_ast_blob", "file_id").unwrap(),
-            "_ast_blob keys on the interned file_id as of projection-v5"
-        );
-        assert!(
-            leyline_schema::table_exists(&conn, "_ast_blob").unwrap(),
-            "the probe delete_file_rows keys the _ast_blob delete on MUST \
-             report the store just built; a constant-false gates that delete \
-             off and leaks a stale _ast_blob row on every reparse"
-        );
-
-        // Second call must be a no-op.
-        create_pointer_store_tables(&conn).unwrap();
-    }
-
     /// Review-gate 3 of the identity ladder (bead `ley-line-open-17c271`):
     /// file-scoped deletes must plan as an index/PK range SEARCH, never a
     /// SCAN. The pre-v5 prefix-LIKE (`node_id LIKE ?1 || '/%'`) planned as
@@ -2031,7 +1950,7 @@ mod tests {
         // the same five tables, so a test that called it first would pass
         // against a `create_ast_tables` that did nothing at all.
         let conn = Connection::open_in_memory().unwrap();
-        for table in ["nodes", "_source", "node_content", "node_child", "_ast"] {
+        for table in ["nodes", "_source", "node_content", "node_edge", "_ast"] {
             assert!(
                 !has_object(&conn, "table", table),
                 "precondition: {table} must not exist before the call",
@@ -2039,8 +1958,9 @@ mod tests {
         }
 
         create_ast_tables(&conn).unwrap();
+        assert!(has_object(&conn, "view", "node_child"));
 
-        for table in ["nodes", "_source", "node_content", "node_child", "_ast"] {
+        for table in ["nodes", "_source", "node_content", "node_edge", "_ast"] {
             assert!(
                 has_object(&conn, "table", table),
                 "{table} MUST exist after create_ast_tables",
@@ -2105,13 +2025,14 @@ mod tests {
     fn create_ir_tables_creates_the_content_tables_on_a_bare_connection() {
         // The companion test above this one
         // (`create_ir_tables_builds_content_tables_and_fk_holds`) calls
-        // `create_ast_schema` first, which ALSO emits
-        // NODE_CONTENT_TABLE_DDL / NODE_CHILD_TABLE_DDL — so it cannot see
-        // the difference between this function working and doing nothing.
-        // This one starts bare, which is the only way to observe the effect.
+        // `create_ast_schema` first, which ALSO creates the content tables —
+        // so it cannot see the difference between this function working and
+        // doing nothing. This one starts bare, which is the only way to
+        // observe the effect.
         let conn = Connection::open_in_memory().unwrap();
         assert!(!has_object(&conn, "table", "node_content"));
-        assert!(!has_object(&conn, "table", "node_child"));
+        assert!(!has_object(&conn, "table", "node_edge"));
+        assert!(!has_object(&conn, "view", "node_child"));
 
         create_ir_tables(&conn).unwrap();
 
@@ -2120,18 +2041,42 @@ mod tests {
             "node_content MUST exist after create_ir_tables",
         );
         assert!(
-            has_object(&conn, "table", "node_child"),
-            "node_child MUST exist after create_ir_tables",
+            has_object(&conn, "table", "node_edge"),
+            "node_edge MUST exist after create_ir_tables",
+        );
+        assert!(
+            has_object(&conn, "view", "node_child"),
+            "the node_child view MUST exist after create_ir_tables",
         );
 
-        // Usable: a content row and an edge referencing it both insert.
+        // Usable: a content row and an edge referencing it both insert, and
+        // the view renders the edge by hash.
         insert_test_node_content(&conn, &[0xABu8; 32]);
+        let id: i64 = conn
+            .query_row(
+                "SELECT content_id FROM node_content WHERE node_hash = ?1",
+                params![&[0xABu8; 32][..]],
+                |r| r.get(0),
+            )
+            .unwrap();
         conn.execute(
-            "INSERT INTO node_child (parent_hash, ordinal, child_hash, field) \
+            "INSERT INTO node_edge (parent_id, ordinal, child_id, field) \
              VALUES (?1, 0, ?1, 'body')",
-            params![&[0xABu8; 32][..]],
+            params![id],
         )
         .unwrap();
+        let (parent, child, field): (Vec<u8>, Vec<u8>, String) = conn
+            .query_row(
+                "SELECT parent_hash, child_hash, field FROM node_child",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (parent.as_slice(), child.as_slice()),
+            (&[0xABu8; 32][..], &[0xABu8; 32][..])
+        );
+        assert_eq!(field, "body");
 
         create_ir_tables(&conn).unwrap(); // idempotent
     }

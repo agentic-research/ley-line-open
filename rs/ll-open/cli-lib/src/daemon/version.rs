@@ -39,7 +39,7 @@ pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v0.11.0 release advances both. Binary-only releases leave this literal
 /// unchanged; a public consumer-contract release requires a matching nested
 /// Go-module tag.
-pub const SCHEMA_VERSION: &str = "0.21.0";
+pub const SCHEMA_VERSION: &str = "0.22.0";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions
@@ -136,13 +136,32 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   start_row, start_col, message)` names each stored file that did not
 ///   parse cleanly. `treeRoot` folds `_tree`. A v6 arena is refused at
 ///   parse open.
+/// - `projection-v8` — the ADR-0026 pointer store leaves the projection
+///   (ADR-0040 D5, bead `ley-line-open-f30fdf`). `capnp_blobs` (one
+///   canonical `AstNodeList` per file) and `_ast_blob` (`file_id →
+///   blob_hash`) are no longer created or written: they were a second stored
+///   copy of the syntax tree, 35.6% of the kibana arena, with no reader. No
+///   identity moves: `Head.rootHash` folds the segment FILES
+///   (`source.capnp`, `ast.capnp`, `bindings.capnp`), whose bytes do not
+///   depend on the blob, and `treeRoot` folds `_tree`. `parserId` changes,
+///   as it does at every bump, because it folds this label. A v7 arena is
+///   refused at parse open.
+/// - `projection-v9` — the merkle-AST edges are interned (bead
+///   `ley-line-open-9b7d28`). `node_content` gains `content_id INTEGER
+///   PRIMARY KEY` (arena-local, not an identity) with `node_hash` kept as
+///   `NOT NULL UNIQUE`, the FK target it always was. The edges move to a
+///   new table `node_edge (parent_id, ordinal, child_id, field)`, `WITHOUT
+///   ROWID`, keyed on content ids. `node_child` becomes a read-only VIEW with
+///   the v8 columns (`parent_hash`, `ordinal`, `child_hash`, `field`), so
+///   every v8 read runs unchanged; a write to it fails. A v8 arena is refused
+///   at parse open.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v7";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v9";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

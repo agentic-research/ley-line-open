@@ -490,7 +490,7 @@ impl SqliteGraphAdapter {
         if let Some(dir_id) = leyline_schema::nid_dir_id(nid) {
             // Every file interned under this directory or any below it goes
             // through the one owner of a file's rows — `_ast`, `node_refs`,
-            // `node_defs`, `_lsp*`, `_ast_blob`, `_source`, `_imports` and
+            // `node_defs`, `_lsp*`, `_source`, `_imports` and
             // `nodes` alike (this used to clear `nodes` only: bead
             // `ley-line-open-af3817`) — then the directory rows themselves.
             const DESCENDANT_DIRS: &str = "WITH RECURSIVE sub(dir_id) AS ( \
@@ -893,7 +893,7 @@ impl SqliteGraphAdapter {
                 // ordinals, and rebase the internal `parent_nid` links that
                 // pointed into the old range.
                 // Every table that carries the file's rows moves with it —
-                // `_ast`, `node_refs`, `node_defs`, `_lsp*`, `_ast_blob`,
+                // `_ast`, `node_refs`, `node_defs`, `_lsp*`,
                 // `_source`, `_imports` — through the one owner in
                 // `leyline_schema`. This used to move `nodes` alone and leave
                 // the rest pointing at the old range (bead

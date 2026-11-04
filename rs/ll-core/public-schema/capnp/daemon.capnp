@@ -417,6 +417,10 @@ enum RefusalReason {
   notADirectory  @15 $Json.name("not_a_directory");
   # A replace or delete of a directory.
   isADirectory   @16 $Json.name("is_a_directory");
+  # A created path names, in the daemon's checkout, the entry `other`: the
+  # checkout's file system folds the two spellings (case, or Unicode
+  # normalization), so the two would share one file on disk.
+  aliasesExisting @17 $Json.name("aliases_existing");
 }
 
 struct ProposalRefusal {
@@ -425,6 +429,10 @@ struct ProposalRefusal {
   path   @1 :Text;
   # `stale` only: every file that moved.
   moved  @2 :List(StaleRefusal);
+  # The second path the refusal names: for `path_conflict` the file `path`
+  # is under, for `aliases_existing` the entry `path` aliases. Unset
+  # otherwise.
+  other  @3 :Text;
 }
 
 # `ok` true means the proposal was applied: its files are committed. `ok`

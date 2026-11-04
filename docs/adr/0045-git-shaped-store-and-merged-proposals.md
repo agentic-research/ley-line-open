@@ -191,6 +191,17 @@ paths land with it in one transaction, and a conflict on any path refuses the wh
 names every path that moved. A mode change merges trivially: the proposal's mode, when it names
 one, wins; otherwise the current entry's mode is kept.
 
+**Arrival order** (bead `238c85`, 2026-11-03). Two proposals read at one base whose edits are
+disjoint in its coordinates land the same bytes in either arrival order, or are refused in
+both: the second is merged against the first's bytes, and the diff from the base to those bytes
+is the same whichever proposal arrived first, so the merge sees the same two hunk sets. What a
+merge preserves is each side's *bytes*, not its author's edit positions: a proposal carries
+bytes, and its edit is recovered by Myers alignment against the base. Where a line repeats, two
+edits disjoint in base coordinates can align to one hunk. For the base `a\na\n`, one writer
+deleting the first line and another deleting the second both propose `a\n`; the two sides agree,
+and the merge lands `a\n`, not the empty file. The rule is stated over bytes: a clean merge is
+the result both sides' bytes determine, independent of arrival order.
+
 `gix-merge` is pinned `=0.17.0`, the release that shares its `gix-*` dependency set with the
 `gix 0.84` already in the build (MIT OR Apache-2.0). `gix-imara-diff` (`=0.2.3`, already in the
 build) computes the conflict ranges with `gix-merge`'s own overlap rule: a hunk of one side
@@ -403,6 +414,7 @@ rules and removed that mode, `Refusal::Syntax`, `Refusal::NoLanguage` and `can_h
 | M2 | the store holds every walked file, mode, symlink and empty directory | `a_cold_parse_stores_every_file_with_its_mode` (cli-lib `cmd_parse`) |
 | M3 | an unparseable file is stored with a diagnostic | `an_unparseable_write_lands_with_a_diagnostic`, `a_binary_file_is_stored_unprojected_with_a_diagnostic` |
 | M4 | disjoint edits merge; overlapping edits refuse with ranges | `a_moved_base_with_disjoint_edits_lands_the_merge`, `overlapping_edits_refuse_stale_with_conflict_ranges`, `binary_files_never_merge` |
+| M4a | a clean merge does not depend on arrival order | `disjoint_stale_proposals_commute` (cli-lib `source_write`): 10,000 cases over the line alphabet {`a`, `b`} from the fixed proptest seed `0x238c85`, both orders decided by the store; it also counts the clean merges that differ from the two edits applied in base coordinates |
 | M5 | directories are entries | `mkdir_and_rmdir_are_proposals`, `a_directory_rename_is_one_proposal` |
 | M6 | the checkout carries modes, symlinks and directories | `checkout_materializes_modes_symlinks_and_empty_dirs` |
 | M7 | the wire carries it | `daemon_protocol_gate_proposals_produce_the_fixture_shapes` (fixtures for `mode`, `mkdir`, `conflicts`) |

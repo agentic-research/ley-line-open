@@ -240,6 +240,20 @@ func TestReadSourceResponseRoundTrips(t *testing.T) {
 	}
 }
 
+// Bead ley-line-open-bc7df6: the daemon answers an empty file with
+// `content: ""`; it decodes as a present empty string, not nil, and
+// re-encodes with the field kept.
+func TestReadSourceResponseKeepsAnEmptyFile(t *testing.T) {
+	const emptyBlob = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+	data := []byte(`{"ok":true,"content":"","blob_hash":"` + emptyBlob +
+		`","tree_root":"` + emptyBlob + `","mode":"100644"}`)
+	var got ReadSourceResponse
+	roundTrip(t, data, &got)
+	if got.Content == nil || *got.Content != "" || got.BlobHash == nil || *got.BlobHash != emptyBlob {
+		t.Fatalf("an empty file: %+v", got)
+	}
+}
+
 // Bead ley-line-open-246526: status names the daemon's --source root, and
 // a daemon without one sends no source_root.
 func TestStatusResponseDecodesSourceRoot(t *testing.T) {

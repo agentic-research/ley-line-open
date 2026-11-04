@@ -296,6 +296,26 @@ mod tests {
         assert_eq!(listing(dir.path(), "docs/a.md").unwrap(), None);
     }
 
+    /// A directory that exists but cannot be read is an error, not an empty
+    /// or absent directory: the decision fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_fails_the_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_dir(&locked).is_ok();
+        let listed = listing(dir.path(), "locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable_anyway {
+            // Running as root, which reads any directory: nothing to refuse.
+            return;
+        }
+        assert!(listed.is_err(), "{listed:?}");
+    }
+
     /// A checkout holding `README.md`, `docs/a.md` and NFC `é.txt`, and a
     /// store holding `stored`.
     fn decide(fold: Fold, stored: &[&str], writes: &[Proposed]) -> Option<(String, String)> {

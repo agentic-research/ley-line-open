@@ -1230,7 +1230,8 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
             // A path the checkout's file system folds onto another entry is
             // refused before anything commits (bead `ley-line-open-23a26c`).
             if let Some(dir) = ctx.source_dir.as_deref() {
-                crate::checkout::refuse_aliases(conn, dir, &writes)?;
+                let fold = crate::checkout::alias::Fold::of(dir)?;
+                crate::checkout::refuse_aliases(conn, dir, fold, &writes)?;
             }
             let accepted = crate::source_write::propose(conn, &Grant::Whole, writes)?;
             let checkout = ctx.source_dir.as_deref().map(|dir| {

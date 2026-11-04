@@ -1802,7 +1802,8 @@ impl<S: Store> StoreFs<S> {
                 // entry is refused before anything commits (bead
                 // `ley-line-open-23a26c`).
                 if let Some(checkout) = &self.options.checkout {
-                    leyline_cli_lib::checkout::refuse_aliases(conn, &checkout.dir, &writes)?;
+                    use leyline_cli_lib::checkout::{alias::Fold, refuse_aliases};
+                    refuse_aliases(conn, &checkout.dir, Fold::of(&checkout.dir)?, &writes)?;
                 }
                 let accepted = source_write::propose(conn, &self.scope.propose, writes)?;
                 if let Some(checkout) = &self.options.checkout {

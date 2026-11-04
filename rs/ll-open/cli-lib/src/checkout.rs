@@ -504,21 +504,13 @@ pub fn reconcile(
 /// refusal is
 /// [`crate::source_write::Refusal::AliasesExisting`], naming both paths.
 ///
-/// Which spellings fold together is asked of the checkout's file system
-/// once ([`alias::Fold::of`]), never assumed from the platform; the
-/// decision itself is [`alias::alias`] over the directory's listing. An
-/// alias of an entry the same proposal deletes is a rename, and lands. A
-/// path the store already holds is its own name and is not checked.
+/// `fold` is the rule the checkout's file system compares names by: the
+/// caller asks it of the file system with [`alias::Fold::of`], never
+/// assumes it from the platform. The decision is [`alias::alias`] over the
+/// directory's listing. An alias of an entry the same proposal deletes is a
+/// rename, and lands. A path the store already holds is its own name and is
+/// not checked.
 pub fn refuse_aliases(
-    conn: &Connection,
-    dir: &Path,
-    writes: &[crate::source_write::Proposed],
-) -> Result<()> {
-    refuse_aliases_folding(conn, dir, alias::Fold::of(dir)?, writes)
-}
-
-/// [`refuse_aliases`] under the folding rule `fold`.
-pub fn refuse_aliases_folding(
     conn: &Connection,
     dir: &Path,
     fold: alias::Fold,
@@ -1601,7 +1593,7 @@ mod tests {
         fold: alias::Fold,
         writes: &[Proposed],
     ) -> Option<(String, String)> {
-        match refuse_aliases_folding(&c.conn, &c.src, fold, writes) {
+        match refuse_aliases(&c.conn, &c.src, fold, writes) {
             Ok(()) => None,
             Err(e) => match e.downcast_ref::<crate::source_write::Refusal>() {
                 Some(crate::source_write::Refusal::AliasesExisting { path, other }) => {
@@ -1683,7 +1675,7 @@ mod tests {
             case: true,
             normalization: false,
         };
-        assert!(refuse_aliases_folding(&conn, dir.path(), fold, &[new_file("Readme.md")]).is_err());
-        assert!(refuse_aliases_folding(&conn, dir.path(), fold, &[new_file("Other.md")]).is_ok());
+        assert!(refuse_aliases(&conn, dir.path(), fold, &[new_file("Readme.md")]).is_err());
+        assert!(refuse_aliases(&conn, dir.path(), fold, &[new_file("Other.md")]).is_ok());
     }
 }

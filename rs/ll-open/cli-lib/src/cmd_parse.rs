@@ -57,7 +57,7 @@ use leyline_ts::schema::{
     get_meta, read_file_stats, set_meta, sweep_orphaned_dirs,
 };
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 // ---------------------------------------------------------------------------
 // Data structures for parallel parse (no DB access)
@@ -102,7 +102,8 @@ struct ContentRow {
     arity: usize,
 }
 
-/// A `node_child` row — the git-tree edge parent→child at `ordinal`.
+/// A git-tree edge parent→child at `ordinal`, by hash; the insert loop
+/// interns both endpoints into a `node_edge` row.
 struct ChildRow {
     parent_hash: [u8; 32],
     ordinal: usize,
@@ -536,23 +537,24 @@ batch_table! {
 }
 
 batch_table! {
-    // Merkle-AST `node_content` rows (ADR-0027). One per UNIQUE subtree.
-    // `INSERT OR IGNORE` on the `node_hash` PRIMARY KEY == intrinsic dedup:
-    // the second occurrence of an identical subtree (a vendored copy, an
-    // empty `__init__.py`, a shared operator leaf) is silently ignored. No
-    // `gen` column — content identity is parse-run-invariant by
-    // construction, so re-emitting an existing subtree is a clean no-op.
+    // Merkle-AST `node_content` rows (ADR-0027). One per UNIQUE subtree,
+    // with the `content_id` the writer assigned in memory (projection-v9,
+    // bead `ley-line-open-9b7d28`) so `node_edge` rows can be built with
+    // their endpoint ids already in hand. Plain `INSERT`: the writer only
+    // emits a hash it has checked is new to the arena, so a conflict on
+    // either key is a writer bug and must fail the pass, not be ignored.
     NodeContentBatch, NodeContentRow,
-    "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, raw_kind, lang, token, arity) VALUES ",
-    7,
+    "INSERT INTO node_content (content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity) VALUES ",
+    8,
     push_fn: (
-        node_hash: Vec<u8>, node_tag: i64, kind: String, raw_kind: String,
+        content_id: i64, node_hash: Vec<u8>, node_tag: i64, kind: String, raw_kind: String,
         lang: String, token: Option<String>, arity: i64
     ),
-    push_body: { NodeContentRow { node_hash, node_tag, kind, raw_kind, lang, token, arity } },
+    push_body: { NodeContentRow { content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 7);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 8);
         for r in chunk {
+            out.push(&r.content_id);
             out.push(&r.node_hash);
             out.push(&r.node_tag);
             out.push(&r.kind);
@@ -566,21 +568,23 @@ batch_table! {
 }
 
 batch_table! {
-    // Merkle-AST `node_child` rows (ADR-0027) — the git-tree object.
-    // `INSERT OR IGNORE` on the (parent_hash, ordinal) PK dedups the child
-    // edges of an already-seen parent subtree. FK endpoints resolve because
+    // Merkle-AST `node_edge` rows (ADR-0027) — the git-tree object, keyed on
+    // the endpoints' `content_id`s (projection-v9, bead
+    // `ley-line-open-9b7d28`). `INSERT OR IGNORE` on the (parent_id,
+    // ordinal) PK keeps the pre-v9 semantics: a parent whose edges an
+    // earlier pass already wrote is a no-op. FK endpoints resolve because
     // `node_content` is flushed first.
-    NodeChildBatch, NodeChildRow,
-    "INSERT OR IGNORE INTO node_child (parent_hash, ordinal, child_hash, field) VALUES ",
+    NodeEdgeBatch, NodeEdgeRow,
+    "INSERT OR IGNORE INTO node_edge (parent_id, ordinal, child_id, field) VALUES ",
     4,
-    push_fn: (parent_hash: Vec<u8>, ordinal: i64, child_hash: Vec<u8>, field: Option<String>),
-    push_body: { NodeChildRow { parent_hash, ordinal, child_hash, field } },
+    push_fn: (parent_id: i64, ordinal: i64, child_id: i64, field: Option<String>),
+    push_body: { NodeEdgeRow { parent_id, ordinal, child_id, field } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
         for r in chunk {
-            out.push(&r.parent_hash);
+            out.push(&r.parent_id);
             out.push(&r.ordinal);
-            out.push(&r.child_hash);
+            out.push(&r.child_id);
             out.push(&r.field);
         }
         out
@@ -1741,7 +1745,7 @@ fn parse_into_conn_with(
     // pointer. No `gen`/edge machinery: contains is intrinsic (node_child),
     // and defines/references stay as occurrence rows keyed by token+node_id.
     let mut content_buf: NodeContentBatch = NodeContentBatch::with_capacity(chunk_rows);
-    let mut child_buf: NodeChildBatch = NodeChildBatch::with_capacity(chunk_rows);
+    let mut child_buf: NodeEdgeBatch = NodeEdgeBatch::with_capacity(chunk_rows);
     // Cross-file dedup in memory, NOT via `INSERT OR IGNORE`. The per-file
     // fold already dedups within a file, but identical subtrees recur across
     // files (~2M fold rows collapse to ~150k unique). Letting SQL dedup means
@@ -1751,8 +1755,30 @@ fn parse_into_conn_with(
     // magnitude cheaper than a BLOB index probe that misses to disk once the
     // index outgrows the page cache. `node_content` is a content-addressed
     // blob store; dedup belongs at the write, not in a per-row index probe.
-    let mut seen_content: HashSet<[u8; 32]> = HashSet::with_capacity(200_000);
-    let mut seen_edge: HashSet<([u8; 32], i64)> = HashSet::with_capacity(450_000);
+    //
+    // projection-v9 (bead `ley-line-open-9b7d28`): the same map assigns each
+    // unique subtree its `content_id`, so `node_edge` rows are built with
+    // both endpoint ids in hand. Resolving ids by a SQL join per flush was
+    // measured SLOWER than the hash-keyed insert it replaces; in-memory ids
+    // are 2.7x faster than it (bead comment, 771k edges). A hash an earlier
+    // pass stored is looked up once by its `node_hash` index — never on a
+    // cold parse, whose arena starts empty.
+    let mut content_ids: HashMap<[u8; 32], i64> = HashMap::with_capacity(200_000);
+    let mut next_content_id: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(content_id), 0) + 1 FROM node_content",
+        [],
+        |r| r.get(0),
+    )?;
+    // Only a lookup-skipping optimisation: a cold arena has nothing to find,
+    // and a lookup that misses mints the same id it would have anyway.
+    let arena_had_content: bool =
+        conn.query_row("SELECT EXISTS (SELECT 1 FROM node_content)", [], |r| {
+            r.get(0)
+        })?;
+    // Parents whose edges this pass has already buffered. A parent's edge
+    // set is a function of its hash, emitted whole by the first file that
+    // folds it; `INSERT OR IGNORE` covers a parent an earlier pass wrote.
+    let mut edges_written: HashSet<i64> = HashSet::with_capacity(200_000);
 
     // rel-path → leaf dir_id memo, so each file's dir chain hits SQL once.
     let mut dir_cache: HashMap<String, i64> = HashMap::new();
@@ -1771,7 +1797,7 @@ fn parse_into_conn_with(
     // flushed before the next chunk is read, so peak memory is bounded by
     // PARSE_CHUNK_FILES rather than by the size of the repository.
     //
-    // What deliberately does NOT reset per chunk: `seen_content` / `seen_edge`
+    // What deliberately does NOT reset per chunk: `content_ids` / `edges_written`
     // (cross-file content dedup — keyed by BLAKE3 hash and bounded by the
     // number of UNIQUE subtrees, ~150k, not by corpus size), `dirs_created`,
     // and `changed_files`. Resetting those would re-emit already-inserted
@@ -1899,33 +1925,65 @@ fn parse_into_conn_with(
 
                     // Merkle-AST content layer (post-order, children before
                     // parents). Cross-file dedup happens here in memory: only the
-                    // FIRST occurrence of a content hash / (parent,ordinal) edge is
-                    // buffered, so the SQL insert sees ~150k unique rows, not ~2M.
-                    // The `INSERT OR IGNORE` prefix stays as a byte-identical-file
-                    // backstop, but the probe storm is gone.
+                    // FIRST occurrence of a content hash is buffered, under the
+                    // `content_id` assigned here, so the SQL insert sees ~150k
+                    // unique rows, not ~2M. A file's fold lists every unique
+                    // subtree it contains, so both endpoints of each of its
+                    // edges have an id by the time the edge loop runs.
                     for c in pf.node_contents {
-                        if seen_content.insert(c.node_hash) {
-                            content_buf.push(
-                                c.node_hash.to_vec(),
-                                c.node_tag as i64,
-                                c.kind,
-                                c.raw_kind,
-                                c.lang,
-                                c.token,
-                                c.arity as i64,
-                            );
+                        if content_ids.contains_key(&c.node_hash) {
+                            continue;
                         }
+                        let stored = if arena_had_content {
+                            conn.prepare_cached(
+                                "SELECT content_id FROM node_content WHERE node_hash = ?1",
+                            )?
+                            .query_row([&c.node_hash[..]], |r| r.get::<_, i64>(0))
+                            .optional()?
+                        } else {
+                            None
+                        };
+                        let id = match stored {
+                            Some(id) => id,
+                            None => {
+                                let id = next_content_id;
+                                next_content_id += 1;
+                                content_buf.push(
+                                    id,
+                                    c.node_hash.to_vec(),
+                                    c.node_tag as i64,
+                                    c.kind,
+                                    c.raw_kind,
+                                    c.lang,
+                                    c.token,
+                                    c.arity as i64,
+                                );
+                                id
+                            }
+                        };
+                        content_ids.insert(c.node_hash, id);
                     }
+                    let id_of = |h: &[u8; 32]| -> Result<i64> {
+                        content_ids.get(h).copied().with_context(|| {
+                            format!(
+                                "node_edge endpoint {} has no node_content row in {}",
+                                hex::encode(h),
+                                pf.rel
+                            )
+                        })
+                    };
+                    let mut parents_here: Vec<i64> = Vec::new();
                     for c in pf.node_children {
-                        if seen_edge.insert((c.parent_hash, c.ordinal as i64)) {
-                            child_buf.push(
-                                c.parent_hash.to_vec(),
-                                c.ordinal as i64,
-                                c.child_hash.to_vec(),
-                                c.field,
-                            );
+                        let parent_id = id_of(&c.parent_hash)?;
+                        if edges_written.contains(&parent_id) {
+                            continue;
                         }
+                        // Marked after the loop, not here: this file's later
+                        // edges of the same parent must still be buffered.
+                        parents_here.push(parent_id);
+                        child_buf.push(parent_id, c.ordinal as i64, id_of(&c.child_hash)?, c.field);
                     }
+                    edges_written.extend(parents_here);
 
                     // node_id → node_hash for this file, so the additive
                     // node_hash pointer on node_defs/node_refs can be attached
@@ -2140,7 +2198,7 @@ fn parse_into_conn_with(
         // partial-size statement so we don't fall back to per-row execute.
         //
         // FK ordering (ADR-0027): with `foreign_keys = ON` the node_hash FKs
-        // (_ast/node_defs/node_refs → node_content, node_child → node_content)
+        // (_ast/node_defs/node_refs → node_content, node_edge → node_content)
         // are checked immediately per row. `node_content` must therefore land
         // FIRST so every referencing row finds its content target (uncommitted
         // rows in the same transaction satisfy the FK). The post-order fold
@@ -5145,7 +5203,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v8",
+            "projection-v9",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5158,28 +5216,104 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v8"),
+            Some("projection-v9"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
 
-    /// projection-v8 (ADR-0040 D5, bead `ley-line-open-f30fdf`): an arena
-    /// that still carries the v7 label is refused at open — its pointer-store
-    /// tables would otherwise sit beside a writer that no longer maintains
-    /// them, and a reparse's `delete_file_rows` would leave their rows stale.
+    /// projection-v9 (bead `ley-line-open-9b7d28`): an arena that still
+    /// carries the v8 label is refused at open — its hash-keyed `node_child`
+    /// TABLE would sit where this writer creates a view and writes
+    /// `node_edge`.
     #[test]
-    fn a_projection_v7_arena_is_refused_at_open() {
+    fn a_projection_v8_arena_is_refused_at_open() {
         let td = TempDir::new().unwrap();
         std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
         let conn = Connection::open_in_memory().unwrap();
         parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
-        set_meta(&conn, "projection_schema_version", "projection-v7").unwrap();
+        set_meta(&conn, "projection_schema_version", "projection-v8").unwrap();
         let err = parse_into_conn(&conn, td.path(), Some("go"), None)
-            .expect_err("a projection-v7 arena must be refused");
+            .expect_err("a projection-v8 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v7") && msg.contains("projection-v8"),
+            msg.contains("projection-v8") && msg.contains("projection-v9"),
             "the refusal must name both versions; got: {msg}",
+        );
+    }
+
+    /// The `node_child` edge set of each subtree, rendered by hash.
+    fn edges_by_hash(conn: &Connection) -> Vec<(Vec<u8>, i64, Vec<u8>, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT parent_hash, ordinal, child_hash, field FROM node_child \
+                 ORDER BY parent_hash, ordinal",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// projection-v9: a second pass over an arena that already holds content
+    /// resolves stored subtrees to their existing `content_id` instead of
+    /// minting a duplicate, so an incremental reparse of an edited file leaves
+    /// the same edge set (by hash) a cold parse of the edited tree holds.
+    /// Falsifier: skipping the stored-id lookup, which makes the new
+    /// `node_content` INSERT collide on `node_hash` and fail the pass, or
+    /// re-minting ids, which orphans edges.
+    #[test]
+    fn an_incremental_pass_reuses_stored_content_ids() {
+        let td = TempDir::new().unwrap();
+        let a = "package v\n\nfunc A(x int) int {\n\treturn x + 1\n}\n";
+        let b = "package v\n\nfunc B(x int) int {\n\treturn x + 1\n}\n\nfunc C() {}\n";
+        std::fs::write(td.path().join("a.go"), a).unwrap();
+        std::fs::write(td.path().join("b.go"), b).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM node_content", [], |r| r.get(0))
+            .unwrap();
+
+        // Edit a.go so it shares subtrees with b.go and adds a new one.
+        let a2 = "package v\n\nfunc A(x int) int {\n\treturn x + 2\n}\n\nfunc C() {}\n";
+        std::fs::write(td.path().join("a.go"), a2).unwrap();
+        let mtime = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(td.path().join("a.go"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT count(*) FROM node_content", [], |r| r.get(0))
+            .unwrap();
+        assert!(after > before, "the edit adds new subtrees");
+
+        let cold_dir = TempDir::new().unwrap();
+        std::fs::write(cold_dir.path().join("a.go"), a2).unwrap();
+        std::fs::write(cold_dir.path().join("b.go"), b).unwrap();
+        let cold = Connection::open_in_memory().unwrap();
+        parse_into_conn(&cold, cold_dir.path(), Some("go"), None).unwrap();
+
+        // Content-addressed stores keep replaced subtrees, so the incremental
+        // arena holds a superset; every cold edge must be present, with the
+        // same field, and every stored edge must render by hash.
+        let inc = edges_by_hash(&conn);
+        for e in edges_by_hash(&cold) {
+            assert!(
+                inc.contains(&e),
+                "edge {e:?} missing after the incremental pass"
+            );
+        }
+        let stored: i64 = conn
+            .query_row("SELECT count(*) FROM node_edge", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stored as usize,
+            inc.len(),
+            "every node_edge row resolves through the view"
         );
     }
 
@@ -5197,7 +5331,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v8"),
+            msg.contains("projection-v4") && msg.contains("projection-v9"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(

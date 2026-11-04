@@ -49,7 +49,7 @@ workspace are invisible to them. Re-derive rather than trust when it matters.
 | `node_defs` / `node_refs` | 32 | The symbol layer. Also the agent-facing one: `find_definition` returns `node_id` STRINGS straight through MCP, so these ids are user-visible output, not an internal key. |
 | `source_blobs` | 11 | |
 | `node_content` | **0** | No SELECT anywhere. Survives as the FK target of `node_defs`/`node_refs.node_hash`. |
-| `node_child` | **0** | No SELECT, and nothing FKs into it. 3.41M rows / 405 MB on an 8000-file arena. **Do not treat as droppable**: its `field` column is the ONLY place a tree-sitter field name survives, and mache needs it (`ley-line-open-87ff3a`). See "Recovering a node's tree-sitter field" below. |
+| `node_child` | **0** | No SELECT, and nothing FKs into it. A view over `node_edge` as of `projection-v9`; 4.35M edges on the 8000-file kibana slice, 515 MB hash-keyed before interning. **Do not treat as droppable**: its `field` column is the ONLY place a tree-sitter field name survives, and mache needs it (`ley-line-open-87ff3a`). See "Recovering a node's tree-sitter field" below. |
 A zero here means "nothing in this workspace SELECTs it", which is not the same
 as "safe to delete": `node_content` is an FK target and `node_child` carries the
 field names. It does mean the row count is not being paid for a query. The two
@@ -87,6 +87,21 @@ SELECT nc.field
   FROM node_child nc
  WHERE nc.parent_hash = :parent_node_hash
    AND nc.child_hash  = :child_node_hash;
+```
+
+As of `projection-v9` (bead `ley-line-open-9b7d28`) `node_child` is a view over
+the interned `node_edge`, so the query above runs unchanged. The same lookup
+against the stored table, for a reader that holds content ids or wants the plan
+spelled out — each hash resolves through `node_content`'s `node_hash` index,
+then one primary-key probe on `node_edge`:
+
+```sql
+SELECT e.field
+  FROM node_edge e
+  JOIN node_content p ON p.content_id = e.parent_id
+  JOIN node_content c ON c.content_id = e.child_id
+ WHERE p.node_hash = :parent_node_hash
+   AND c.node_hash = :child_node_hash;
 ```
 
 Two rules, both measured on a 460-file Rust arena at `projection-v5`:
@@ -159,8 +174,9 @@ the projection is derived-only, so no in-place migration exists.
 
 | Table | Purpose |
 |-------|---------|
-| `node_content` | One row per UNIQUE subtree, keyed on `node_hash BLOB PRIMARY KEY` (κ kind + terminal + child hashes). `INSERT OR IGNORE` dedups byte-identical subtrees cross-file. |
-| `node_child` | Git-tree object: (parent_hash, ordinal) → child_hash edges. Both endpoints REFERENCE `node_content(node_hash)` (FK-enforced). |
+| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes — the identity, and the FK target of `_ast`/`node_defs`/`node_refs`/`_cfg`), `node_tag`, `kind`, `raw_kind`, `lang`, `token`, `arity`. Byte-identical subtrees dedup cross-file to one row. |
+| `node_edge` | Git-tree object, interned (`projection-v9`, bead `ley-line-open-9b7d28`): `(parent_id, ordinal) PRIMARY KEY → child_id, field`, `WITHOUT ROWID`. Both endpoints REFERENCE `node_content(content_id)` (FK-enforced). One row per child of each unique parent, anonymous tokens included. A node's preimage is recoverable by one join: `ORDER BY ordinal`, map ids to `node_hash`, refold. |
+| `node_child` | **A read-only VIEW** (`projection-v9`) with the v8 table's columns — `parent_hash`, `ordinal`, `child_hash`, `field` — over `node_edge ⋈ node_content ×2`. Every v8 read (`WHERE parent_hash = ?`, `JOIN node_content c ON c.node_hash = nc.child_hash`, `ORDER BY ordinal`) runs unchanged, and an inner join or `IN` filter on `parent_hash` plans as two index probes. **Do not put it on the right of a `LEFT JOIN`:** SQLite cannot flatten a join view there and materializes all of it (kibana slice, one file: 7.7 s through the view, 0.11 s against `node_edge`). Write `LEFT JOIN node_content pc ON pc.node_hash = a.node_hash LEFT JOIN node_edge e ON e.parent_id = pc.content_id LEFT JOIN node_content cc ON cc.content_id = e.child_id` instead. A write to the view fails; the writer is `node_edge`. |
 
 **Pointer store — retired at `projection-v8`** (ADR-0040 D5, bead `ley-line-open-f30fdf`; ADR-0026 Phase 1 reversed). `capnp_blobs` (one canonical `AstNodeList` blob per file) and `_ast_blob` (`file_id → blob_hash`) are no longer created or written. They were the second stored copy of the syntax tree — 812.8 MB, 35.6% of the 2,284.6 MB kibana arena (bead `ley-line-open-17c271`'s pinned slice) — with no reader. The tree is stored once in the SQL rows above and `node_content`/`node_child`, keyed by the location-free `node_hash`. No identity moved: `Head.rootHash` folds the `.source.capnp`/`.ast.capnp`/`.bindings.capnp` segment files, whose bytes never depended on the blob, and `treeRoot` folds `_tree`. A `projection-v7` arena is refused at parse open and rebuilt cold.
 
@@ -253,7 +269,7 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `_cfg*` | analysis-substrate CFG layer (leyline-ts; T1 of `analysis-substrate` decade) |
 | `_dfg*` | analysis-substrate DFG layer (T2 of `analysis-substrate` decade; not yet shipped) |
 | `_taint*` | analysis-substrate taint fixpoint (T3 of `analysis-substrate` decade; not yet shipped) |
-| `node_content` / `node_child` | ADR-0027 merkle-AST IR (base; no prefix) |
+| `node_content` / `node_edge` / `node_child` (view) | ADR-0027 merkle-AST IR (base; no prefix) |
 | `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
 | `content_chunks` / `content_manifest` / `content_manifest_meta` | CDC derived chunk cache — private, not part of the SQL projection ABI |

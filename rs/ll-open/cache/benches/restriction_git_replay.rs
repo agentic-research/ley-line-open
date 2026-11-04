@@ -59,7 +59,7 @@
 //! # How to run
 //!
 //! ```text
-//! cargo bench -p leyline-sheaf --bench restriction_git_replay
+//! cargo bench -p leyline-cache --bench restriction_git_replay
 //! # knobs (env): RESTR_N_COMMITS (default 600), RESTR_MAX_EDITS (default 20000),
 //! #              RESTR_MAX_CORPUS_FILES (default 40, bounds review join cost)
 //! ```
@@ -71,7 +71,7 @@
 mod common;
 
 use common::{ReviewTarget, build_substrate, review_targets};
-use leyline_sheaf::restriction_cache::{
+use leyline_cache::restriction::{
     ContainerKeying, FactSubstrate, restriction_for_call_target, review_call_targets,
     whole_object_hash,
 };

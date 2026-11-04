@@ -13,7 +13,7 @@
 //! `node_refs` / `_imports` columns the live pipeline persists — modeled
 //! as [`DefRow`] / [`RefRow`] / [`ImportRow`]. A production consumer
 //! would populate a [`FactSubstrate`] from the daemon's SQL fact tables;
-//! `leyline-sheaf` stays free of `leyline-ts` / `tree-sitter` (they are
+//! `leyline-cache` stays free of `leyline-ts` / `tree-sitter` (they are
 //! dev/bench-deps only — see `Cargo.toml`). The **extraction** that turns
 //! Rust source into these rows via `leyline_ts::refs::extract_rust` lives
 //! in `tests/common/mod.rs`, shared by tests and benches, and is a

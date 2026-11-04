@@ -20,7 +20,7 @@
 //! scoped to what its review actually reads, not to the whole object.
 //!
 //! Three artifacts, kept structurally separate (see
-//! `leyline_sheaf::restriction_cache`):
+//! `leyline_cache::restriction`):
 //!   1. RESTRICTION (cheap, `restriction_for_public_api`): a hash over a
 //!      sound superset of the review's input — the def's token/qualifier/
 //!      kind, its visibility, the reflow- AND body-invariant SIGNATURE
@@ -37,7 +37,7 @@
 mod common;
 
 use common::{ast_shape_hash, build_api_defs, build_substrate};
-use leyline_sheaf::restriction_cache::{
+use leyline_cache::restriction::{
     ApiDefRow, ContainerKeying, FactSubstrate, FixtureResult, Policy, restriction_for_public_api,
     review_public_api, stats, whole_object_hash,
 };
@@ -531,7 +531,7 @@ fn public_api_restriction_is_cheaper_than_review() {
             "restriction-vs-review: skipping the wall-time assertion \
              (LLO_PERF_GATES != 1). Measured restriction={restriction_time:?} \
              review={review_time:?}; the row-count invariant was asserted above. \
-             Run `LLO_PERF_GATES=1 cargo test -p leyline-sheaf --test \
+             Run `LLO_PERF_GATES=1 cargo test -p leyline-cache --test \
              restriction_review_public_api` or `task test:perf` to enforce it."
         );
         return;

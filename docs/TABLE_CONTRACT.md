@@ -236,18 +236,22 @@ the projection is derived-only, so no in-place migration exists.
 | `_tree` | One row per entry the store holds — `path TEXT PRIMARY KEY` (relative, `/`-separated, no `''`/`.`/`..`), `mode INTEGER NOT NULL` (git mode: `0o100644` regular, `0o100755` executable, `0o120000` symlink whose blob is its target, `0o040000` directory), `blob_hash BLOB` (the `source_blobs` key; NULL for a directory), `mtime INTEGER` and `size INTEGER` (the walk's stat cache; not identity). Every file of any kind is an entry, projected or not; directories are explicit, so an empty directory is an entry, and the set is closed under parents. `treeRoot` folds `(path, mode, blob)` over it. |
 | `_parse_diagnostics` | One row per file the parse projects that did not parse cleanly — `path TEXT PRIMARY KEY` (the `_tree` path), `blob_hash BLOB NOT NULL` (the bytes described), `projected INTEGER NOT NULL` (`1`: projected as tree-sitter parsed it, error nodes included; `0`: stored with no projection rows — a NUL byte in the first 8 KiB or larger than `MAX_PARSE_FILE_SIZE`), `start_byte`, `end_byte`, `start_row` (0-based), `start_col` (the first `ERROR`/`MISSING` node; NULL when not projected), `message TEXT NOT NULL`. A function of the bytes and the grammar: a proposal and a cold parse of one tree write the same rows, and a file whose next version parses cleanly loses its row in the same transaction. |
 
-**CDC derived chunk cache** (per `rs/ll-open/fs/src/chunked.rs:83-121`, activated by `daemon --cdc` / `leyline cdc`):
+**CDC derived chunk cache** (per `rs/ll-open/fs/src/chunk_pool.rs` and `rs/ll-open/fs/src/blob_chunked.rs`, activated by `daemon --cdc` / `leyline cdc`):
 
 These tables are **private and derived**. They are not part of the SQL projection
 ABI, no consumer reads them (mache reads none of them), and changes to them do
-not bump `leyline-schema`. `nodes.record` stays authoritative; a missing or stale
-manifest falls back to it (`chunked.rs:936-946`, freshness gate `:789`).
+not bump `leyline-schema`. `source_blobs` stays authoritative; the manifests index
+its whole-file rows at or above the 8 KiB chunking floor.
 
 | Table | Purpose |
 |-------|---------|
-| `content_chunks` | Content-defined chunks keyed by blob hash, 8–128 KiB (`rs/ll-open/cdc/src/lib.rs:29-40`). Reads verify σ before returning and fail closed on mismatch (`chunked.rs:166-183`). |
-| `content_manifest` | Per-node chunk sequence, keyed `(node_id, seq)`. **Has no root** — it is a lookup index, not an identity domain. ADR-0032 §D3's `manifestRoot` is proposed, not implemented. |
-| `content_manifest_meta` | Freshness witness per node — the basis a manifest was built against, so a stale manifest is refused rather than trusted. |
+| `content_chunks` | Content-defined chunks keyed by blob hash, 8–128 KiB (`rs/ll-open/cdc/src/lib.rs:29-40`). Reads verify σ before returning and fail closed on mismatch (`chunk_pool.rs`). |
+| `blob_manifest` | Per-blob chunk sequence, keyed `(blob_hash, seq)`. No freshness witness: `source_blobs` rows are immutable, so a manifest's existence is its freshness. **Has no root** — it is a lookup index, not an identity domain. ADR-0032 §D3's `manifestRoot` is proposed, not implemented. |
+
+The per-node `nodes` target and its `content_manifest`, `content_manifest_meta`
+and `content_generation` tables were removed in `ley-line-open-afa952`. Nothing
+reads those tables in a database that still carries them, and `leyline cdc gc`
+collects the chunks only they referenced.
 
 **Daemon checkout** (bead `ley-line-open-60f39f`, `rs/ll-open/cli-lib/src/checkout.rs`):
 
@@ -316,7 +320,7 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` (views) | `projection-v10` `node_hash`-rendering compatibility views (base) |
 | `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
-| `content_chunks` / `content_manifest` / `content_manifest_meta` | CDC derived chunk cache — private, not part of the SQL projection ABI |
+| `content_chunks` / `blob_manifest` | CDC derived chunk cache — private, not part of the SQL projection ABI |
 | `_checkout*` | daemon checkout of its `--source` directory — private, not part of the SQL projection ABI |
 
 ## Composition Model
@@ -420,6 +424,6 @@ skip to a pass.
    for which parse run produced a set of segments and must not claim to name
    the same thing as `current_root`.
 6. **Private derived tables are not ABI**: the CDC tables (`content_chunks`,
-   `content_manifest`, `content_manifest_meta`) are a derived cache. They may
-   change shape without a `leyline-schema` bump, no consumer may depend on
-   them, and `nodes.record` remains authoritative for their contents.
+   `blob_manifest`) are a derived cache. They may change shape without a
+   `leyline-schema` bump, no consumer may depend on them, and `source_blobs`
+   remains authoritative for their contents.

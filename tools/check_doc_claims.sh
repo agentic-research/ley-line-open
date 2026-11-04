@@ -14,7 +14,7 @@ set -eu
 
 root=${1:-.}
 docs="$root/README.md $root/docs/ARCHITECTURE.md $root/docs/TABLE_CONTRACT.md $root/rs/README.md"
-rust_docs="$root/rs/ll-open/fs/src/chunked.rs"
+rust_docs="$root/rs/ll-open/fs/src/chunk_pool.rs $root/rs/ll-open/fs/src/blob_chunked.rs"
 all="$docs $rust_docs"
 failed=0
 
@@ -74,9 +74,9 @@ done
 
 # --- Claim 4: CDC's private cache is not the canonical substrate -------------
 #
-# content_chunks/content_manifest are a DERIVED accelerator; nodes.record stays
+# content_chunks/blob_manifest are a DERIVED accelerator; source_blobs stays
 # authoritative (ADR-0033 D1). Calling the cache canonical inverts that.
-if grep -nE '(content_chunks|content_manifest|chunk (manifest|cache))[^.]{0,80}(canonical substrate|is the substrate|authoritative substrate)' \
+if grep -nE '(content_chunks|blob_manifest|content_manifest|chunk (manifest|cache))[^.]{0,80}(canonical substrate|is the substrate|authoritative substrate)' \
      $all >/dev/null 2>&1; then
   fail "CDC's private chunk cache is described as the canonical substrate"
 fi

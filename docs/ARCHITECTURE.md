@@ -113,7 +113,7 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-ts` | Tree-sitter AST projection + bidirectional splice | `parse`, `splice` |
 | `leyline-lsp` | LSP client for ingesting language-server analysis into SQLite | `LspClient`, `document_symbols`, `hover` |
 | `leyline-hdc` | Hyperdimensional computing — D=8192 hypervectors via bundle composition + seeded leaves; popcount-Hamming distance (ADR-0024) | `EncoderNode`, `encode_fresh`, `Hypervector` |
-| `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020). **3 sub-components, 3 risk profiles** — see [`sheaf/README.md`](../rs/ll-open/sheaf/README.md) | `CellComplex`, `SheafCache` |
+| `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020). **2 live sub-components, 2 risk profiles** — see [`sheaf/README.md`](../rs/ll-open/sheaf/README.md) | `CellComplex`, `SheafCache` |
 | `leyline-cdc` | Content-defined chunking (GearHash, xet-compatible params), 8–128 KiB bounds (`cdc/src/lib.rs:29-40`). Produces blob hashes; produces **no** root | `chunk_into`, `read_range` |
 | `leyline-fs` | Filesystem presentation — mounts arena as FUSE or NFS; optional CDC-derived chunk manifests for bounded range reads. **Externally pinned** — cloister depends on this crate directly | `SqliteGraph`, `SqliteGraphAdapter`, `activate_chunked_content` |
 | `leyline-envelope` | DSSE envelope + in-toto Statement v1 attestation over `leyline-sign`'s root signer; byte-compatible hoist of rosary's `dsse.rs` | `Envelope`, `Statement`, `sign_payload`, `verify_payload` |
@@ -226,17 +226,18 @@ LLO's daemon runs a **living SQLite database in memory** with an **arena snapsho
 1. **Parse phase**: `leyline-ts` walks tree-sitter ASTs into the in-memory db.
 2. **Enrichment phase**: each registered pass (LSP → `_lsp*` tables; HDC → `_hdc*` tables; etc.) writes sidecar rows.
 3. **Optional CDC activation**: `daemon --cdc` resumably builds private chunk
-   manifests from authoritative readable `nodes.record` leaves before the
-   first snapshot. Missing or stale manifests fall back to the authoritative
-   record (`rs/ll-open/fs/src/chunked.rs:936-946`, freshness gate at `:789`);
-   no schema-client or wire contract changes. Chunk reads verify σ before
-   returning and fail closed on mismatch rather than silently re-reading
-   `nodes.record` (`rs/ll-open/fs/src/chunked.rs:166-183`). The manifest is
-   keyed by `(node_id, seq)` and **has no root** — see the authority model
-   above. Long-lived writable projections run explicit `leyline cdc gc` off
-   the hot path; one IMMEDIATE transaction deletes only chunk rows unreachable
-   from every manifest and reports rows and bytes before, unreachable, deleted,
-   and remaining.
+   manifests over the whole-file `source_blobs` rows at or above the 8 KiB
+   chunking floor before the first snapshot (`rs/ll-open/fs/src/activation.rs`).
+   No schema-client or wire contract changes. Rows are content-addressed and
+   immutable, so a manifest needs no freshness witness: its existence is its
+   freshness (`rs/ll-open/fs/src/blob_chunked.rs`). Chunk reads verify σ before
+   returning and fail closed on mismatch (`rs/ll-open/fs/src/chunk_pool.rs`).
+   The manifest is keyed by `(blob_hash, seq)` and **has no root** — see the
+   authority model above. Long-lived projections run explicit `leyline cdc gc`
+   off the hot path; one IMMEDIATE transaction reaps manifests whose
+   `source_blobs` row is gone, deletes only chunk rows unreachable from every
+   manifest, and reports rows and bytes before, unreachable, deleted, and
+   remaining.
 4. **Snapshot**: serialize current db state → arena buffer → BLAKE3-hash → advance `current_root` on the controller's generation counter.
 5. **Readers**: mmap the arena to validate the active serialized bytes, then
    `deserialize_read_exact` copies the verified slice into SQLite-owned memory;

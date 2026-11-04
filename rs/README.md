@@ -59,10 +59,9 @@ graph TD
         ffi[leyline-ffi-helpers]
     end
 
-    subgraph Sheaf["Sheaf — 3 risk profiles in 1 crate, see sheaf/README.md"]
+    subgraph Sheaf["Sheaf — 2 risk profiles in 1 crate, see sheaf/README.md"]
         sheafcache["cache.rs — live, correctness-critical"]
         sheafcomplex["complex.rs — live, diagnostic-only"]
-        sheafgated["restriction_cache.rs — proven, gated (ADR-0031)"]
     end
 
     subgraph DaemonShell["Daemon shell — orchestration"]

@@ -1,76 +1,60 @@
 #![cfg(feature = "cdc")]
 
 use leyline_core::{ContentAddressed, Controller};
-use leyline_fs::SqliteGraph;
-use leyline_fs::chunked::{ContentSource, chunks_touched, read_content_at_traced};
-use leyline_fs::graph::{Graph, SqliteGraphAdapter};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+/// The daemon entry point activates `source_blobs` CDC and then publishes the
+/// exact activated database to the arena. The removed `nodes` target leaves
+/// no trace: no `content_manifest` table is created.
 #[test]
-fn activated_projection_publishes_chunked_4k_reads_to_a_real_arena() {
+fn the_daemon_entry_point_activates_source_blobs_and_publishes_the_result() {
     let temp = TempDir::new().unwrap();
     let source_dir = temp.path().join("source");
     std::fs::create_dir(&source_dir).unwrap();
-    let payload = "abcdef0123456789".repeat(64 * 1024);
-    let source = format!("{{\"data\":\"{payload}\"}}\n");
-    std::fs::write(source_dir.join("big.json"), &source).unwrap();
+    // Comfortably above the 8 KiB chunking floor, so the target has real work
+    // and `populated_blobs > 0` distinguishes "activated" from "skipped".
+    let payload = "fedcba9876543210".repeat(64 * 1024);
+    std::fs::write(
+        source_dir.join("blobs.json"),
+        format!("{{\"data\":\"{payload}\"}}\n"),
+    )
+    .unwrap();
 
-    let db_path = temp.path().join("graph.db");
+    let db_path = temp.path().join("blobs.db");
     let conn = Connection::open(&db_path).unwrap();
-    let parsed =
-        leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None)
-            .unwrap();
-    assert_eq!(parsed.parsed, 1);
-    // projection-v5: `nodes` is keyed on an integer nid, which is also
-    // what `chunked::read_content_at_traced` / `chunks_touched` address
-    // a node by — no path render is involved on this path at all.
-    let (nid, authoritative): (i64, Vec<u8>) = conn
-        .query_row(
-            "SELECT nid, CAST(record AS BLOB)
-               FROM nodes
-              WHERE kind = 0 AND record IS NOT NULL
-              ORDER BY length(record) DESC
-              LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert!(
-        authoritative.len() >= 1024 * 1024,
-        "fixture must produce a large readable structural leaf"
-    );
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None).unwrap();
 
-    let arena_path = temp.path().join("graph.arena");
-    let ctrl_path = temp.path().join("graph.ctrl");
+    let arena_path = temp.path().join("blobs.arena");
+    let ctrl_path = temp.path().join("blobs.ctrl");
     leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
-    let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(
-        &conn,
-        &ctrl_path,
-        Some(leyline_cli_lib::CdcTarget::Nodes),
-    )
-    .unwrap()
-    .expect("CDC was enabled");
-    let leyline_cli_lib::cmd_daemon::CdcActivationReport::Nodes(report) = report else {
-        panic!("the `nodes` target must report a nodes activation");
-    };
-    assert!(report.populated_nodes > 0);
-    assert_eq!(report.populated_nodes, report.eligible_nodes);
-
-    let graph = SqliteGraph::from_arena(&ctrl_path).unwrap();
-    let offset = authoritative.len() / 2;
-    let mut actual = vec![0_u8; 4096];
-    let (read, content_source) =
-        read_content_at_traced(graph.conn(), nid, &mut actual, offset as u64).unwrap();
-    assert_eq!(read, 4096);
-    assert_eq!(actual, authoritative[offset..offset + 4096]);
-    assert_eq!(content_source, ContentSource::Chunked);
-
-    let touched = chunks_touched(graph.conn(), nid, offset as u64, 4096).unwrap();
+    let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, true)
+        .unwrap()
+        .expect("CDC was enabled");
     assert!(
-        touched <= 2,
-        "4 KiB range must touch at most two chunks, touched {touched}"
+        report.populated_blobs > 0,
+        "the fixture blob is above the chunking floor, so activation must populate it"
+    );
+    assert_eq!(report.populated_blobs, report.eligible_blobs);
+
+    let blob_spans: i64 = conn
+        .query_row("SELECT COUNT(*) FROM blob_manifest", [], |row| row.get(0))
+        .unwrap();
+    assert!(blob_spans > 0, "source_blobs activation must tile the blob");
+
+    let node_manifest_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table'
+                AND name IN ('content_manifest', 'content_manifest_meta', 'content_generation')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        node_manifest_tables, 0,
+        "activation must not create the removed nodes target's tables"
     );
 
     let controller = Controller::open_or_create(&ctrl_path).unwrap();
@@ -87,84 +71,9 @@ fn activated_projection_publishes_chunked_4k_reads_to_a_real_arena() {
     );
 }
 
-/// `ley-line-open-c3d746`: the daemon entry point hardcoded
-/// `activate_chunked_content`, so `--target source-blobs` reached only the
-/// standalone `leyline cdc enable` CLI and never the daemon path mache
-/// actually spawns. Mache traced this while trying to flip its own `--cdc`
-/// default and could not, because no daemon invocation could select the
-/// target.
-///
-/// The load-bearing assertion is the NEGATIVE one: `content_manifest` must
-/// stay empty. Asserting only that blob rows appeared would still pass if the
-/// daemon ran BOTH targets, or ran nodes and happened to leave blob rows from
-/// elsewhere. Empty `content_manifest` is what proves the selector chose.
+/// The disabled path must publish exactly once and activate nothing.
 #[test]
-fn the_daemon_entry_point_honors_the_source_blobs_target() {
-    let temp = TempDir::new().unwrap();
-    let source_dir = temp.path().join("source");
-    std::fs::create_dir(&source_dir).unwrap();
-    // Comfortably above the 8 KiB chunking floor, so the target has real work
-    // and `populated_blobs > 0` distinguishes "selected" from "skipped".
-    let payload = "fedcba9876543210".repeat(64 * 1024);
-    std::fs::write(
-        source_dir.join("blobs.json"),
-        format!("{{\"data\":\"{payload}\"}}\n"),
-    )
-    .unwrap();
-
-    let db_path = temp.path().join("blobs.db");
-    let conn = Connection::open(&db_path).unwrap();
-    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None).unwrap();
-
-    let arena_path = temp.path().join("blobs.arena");
-    let ctrl_path = temp.path().join("blobs.ctrl");
-    leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
-
-    let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(
-        &conn,
-        &ctrl_path,
-        Some(leyline_cli_lib::CdcTarget::SourceBlobs),
-    )
-    .unwrap()
-    .expect("CDC was enabled");
-    let leyline_cli_lib::cmd_daemon::CdcActivationReport::SourceBlobs(report) = report else {
-        panic!("the `source-blobs` target must report a source_blobs activation");
-    };
-    assert!(
-        report.populated_blobs > 0,
-        "the fixture blob is above the chunking floor, so the target must populate it"
-    );
-
-    let blob_spans: i64 = conn
-        .query_row("SELECT COUNT(*) FROM blob_manifest", [], |row| row.get(0))
-        .unwrap();
-    assert!(blob_spans > 0, "source_blobs activation must tile the blob");
-
-    let node_spans: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-              WHERE type = 'table' AND name = 'content_manifest'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    if node_spans > 0 {
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM content_manifest", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(
-            rows, 0,
-            "selecting source-blobs must NOT also build the nodes index — a \
-             populated content_manifest means the daemon ignored the target"
-        );
-    }
-}
-
-/// The disabled path must publish exactly once and activate neither target.
-#[test]
-fn no_target_activates_nothing_and_still_publishes() {
+fn disabled_cdc_activates_nothing_and_still_publishes() {
     let temp = TempDir::new().unwrap();
     let source_dir = temp.path().join("source");
     std::fs::create_dir(&source_dir).unwrap();
@@ -179,8 +88,8 @@ fn no_target_activates_nothing_and_still_publishes() {
     leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
     let report =
-        leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, None).unwrap();
-    assert!(report.is_none(), "no target must activate nothing");
+        leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, false).unwrap();
+    assert!(report.is_none(), "disabled CDC must activate nothing");
 
     let controller = Controller::open_or_create(&ctrl_path).unwrap();
     let serialized = conn.serialize("main").unwrap();
@@ -190,108 +99,4 @@ fn no_target_activates_nothing_and_still_publishes() {
         *serialized_bytes.hash().as_bytes(),
         "the disabled path must still publish the exact database bytes"
     );
-}
-
-#[test]
-fn downstream_nodes_only_projection_survives_the_complete_cdc_lifecycle() {
-    let temp = TempDir::new().unwrap();
-    let source_dir = temp.path().join("source");
-    std::fs::create_dir(&source_dir).unwrap();
-    let payload = "0123456789abcdef".repeat(64 * 1024);
-    std::fs::write(
-        source_dir.join("consumer.json"),
-        format!("{{\"data\":\"{payload}\"}}\n"),
-    )
-    .unwrap();
-
-    let db_path = temp.path().join("consumer.db");
-    let conn = Connection::open(&db_path).unwrap();
-    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None).unwrap();
-    let private_tables_before: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-              WHERE type = 'table' AND name LIKE 'content_%'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        private_tables_before, 0,
-        "the downstream producer starts without LLO-private content tables"
-    );
-    // The `Graph` surface stays path-addressed (it is the mount-visible
-    // presentation API and resolves through `resolve_path`), so this
-    // test needs both the display path — for `write_content` /
-    // `read_content` / `remove_node` — and the nid the row is keyed on.
-    let (node_path, nid, mut model): (String, i64, Vec<u8>) = conn
-        .query_row(
-            "SELECT p.path, n.nid, CAST(n.record AS BLOB)
-               FROM nodes n
-               JOIN v_node_path p ON p.nid = n.nid
-              WHERE n.kind = 0 AND n.record IS NOT NULL
-              ORDER BY length(n.record) DESC
-              LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    // A downstream projection is nodes-only: it has no syntax tree and no
-    // source files. A database with `_source` is a store, where a write is
-    // an edit of a parsed file proposed at its flush (ADR-0045 T8) — not
-    // the chunk lifecycle under test.
-    conn.execute_batch("DELETE FROM _ast; DROP TABLE _source;")
-        .unwrap();
-    drop(conn);
-
-    leyline_cli_lib::cmd_cdc::enable_database(
-        &db_path,
-        leyline_fs::activation::ActivationOptions::default(),
-    )
-    .unwrap();
-    let activated_bytes = std::fs::read(&db_path).unwrap();
-    let adapter = SqliteGraphAdapter::new_writable(&activated_bytes).unwrap();
-
-    let edit_offset = model.len() / 2;
-    let edit = b"CDC!";
-    adapter
-        .write_content(&node_path, edit, edit_offset as u64)
-        .unwrap();
-    model[edit_offset..edit_offset + edit.len()].copy_from_slice(edit);
-
-    let reopened_bytes = adapter.serialize().unwrap();
-    let reopened_adapter = SqliteGraphAdapter::new_writable(&reopened_bytes).unwrap();
-    let mut actual = vec![0_u8; 4096];
-    let range_offset = edit_offset - 2048;
-    let read = reopened_adapter
-        .read_content(&node_path, &mut actual, range_offset as u64)
-        .unwrap();
-    assert_eq!(read, actual.len());
-    assert_eq!(
-        actual,
-        model[range_offset..range_offset + actual.len()],
-        "serialized/reopened consumer bytes must match the authoritative edit"
-    );
-
-    reopened_adapter.remove_node(&node_path).unwrap();
-    std::fs::write(&db_path, reopened_adapter.serialize().unwrap()).unwrap();
-
-    let collected =
-        leyline_cli_lib::cmd_cdc::gc_database(&db_path, leyline_fs::gc::GcOptions::default())
-            .unwrap();
-    assert!(
-        collected.deleted_chunk_rows > 0,
-        "removing through the public graph surface must leave collectible history"
-    );
-    let second =
-        leyline_cli_lib::cmd_cdc::gc_database(&db_path, leyline_fs::gc::GcOptions::default())
-            .unwrap();
-    assert_eq!(second.deleted_chunk_rows, 0, "consumer GC is idempotent");
-
-    let final_conn = Connection::open(&db_path).unwrap();
-    let removed: i64 = final_conn
-        .query_row("SELECT COUNT(*) FROM nodes WHERE nid = ?1", [nid], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(removed, 0);
 }

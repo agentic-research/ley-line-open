@@ -1,28 +1,25 @@
-//! Chunk-backed storage for whole-file `source_blobs` — the second CDC
-//! activation target.
+//! Chunk-backed storage for whole-file `source_blobs` — the CDC activation
+//! target.
 //!
-//! ## Why a second target exists
+//! ## Why this target
 //!
-//! [`crate::activation`]'s original walk is over `nodes` — construct-granular
-//! rows. Measured on a real mache projection (bead `ley-line-open-baa57f`),
-//! 395,173 of 395,173 leaf nodes sat below the 8 KiB chunking floor: every
-//! manifest described exactly one chunk identical to its source, adding +21%
-//! database size (440 MB of manifest/witness overhead for 1.9 MB of dedup).
 //! `source_blobs` (ADR-0028) holds whole-FILE content, where chunk-level
-//! dedup actually pays; ADR-0028 §2.2 named CDC as the anticipated downstream
-//! refinement over exactly that table. ADR-0033 records both targets and the
-//! floor policy.
+//! dedup pays; ADR-0028 §2.2 named CDC as the anticipated downstream
+//! refinement over exactly that table. A per-node `nodes` target existed
+//! until `ley-line-open-afa952` and was removed: measured on a real mache
+//! projection (bead `ley-line-open-baa57f`), 395,173 of 395,173 leaf nodes
+//! sat below the 8 KiB chunking floor, so every manifest described one chunk
+//! identical to its source, adding +21% database size (440 MB of
+//! manifest/witness overhead for 1.9 MB of dedup). ADR-0033 records the
+//! target and the floor policy.
 //!
 //! ## The load-bearing simplification — existence is freshness
 //!
 //! `source_blobs` rows are content-addressed and IMMUTABLE by construction:
 //! `blob_hash` = BLAKE3(`blob_bytes`), populated by `INSERT OR IGNORE`, so no
 //! writer can ever change the bytes under a key — "a new version" of a file
-//! is a DIFFERENT row. A blob manifest therefore needs NO freshness witness.
-//! The entire apparatus the `nodes` target carries to survive mutation —
-//! `content_manifest_meta`, `content_generation`, the writer-proof triggers,
-//! the [`crate::chunked::WITNESS_FRESH_PREDICATE`] gate — defends against a
-//! writer class that cannot exist here, and is deliberately absent. A blob
+//! is a DIFFERENT row. A blob manifest therefore needs NO freshness witness:
+//! no generation counter, no writer triggers, no freshness predicate. A blob
 //! manifest row's existence IS its freshness proof.
 //!
 //! The one hazard that remains is DELETION of a blob row, which turns its
@@ -31,19 +28,18 @@
 //! and extends its unreachable-chunk predicate over this table, so a chunk
 //! referenced only by a blob manifest is never collected.
 //!
-//! ## The chunk pool is shared
+//! ## The chunk pool
 //!
-//! Blob chunks go into the same `content_chunks` table as node chunks
-//! ([`crate::chunked::CHUNK_POOL_DDL`]), through the same verify-on-read
-//! [`crate::chunked::SqliteBlobStore`]. Identical content reached through
-//! either target is stored once — cross-target dedup is a property of the
-//! pool, not of either manifest.
+//! Blob chunks go into the content-addressed `content_chunks` table
+//! ([`crate::chunk_pool::CHUNK_POOL_DDL`]) through the verify-on-read
+//! [`crate::chunk_pool::SqliteBlobStore`], so identical chunks across blobs
+//! are stored once.
 
 use anyhow::{Context, Result, ensure};
 use leyline_core::{BlobStore, ContentAddressed, Hash};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::chunked::{
+use crate::chunk_pool::{
     CHUNK_POOL_DDL, SqliteBlobStore, decode_manifest_chunk, seek_floor, sqlite_integer,
 };
 
@@ -63,8 +59,7 @@ CREATE TABLE IF NOT EXISTS blob_manifest (
     PRIMARY KEY (blob_hash, seq)
 );
 
--- The index that makes a range read a WHERE clause rather than a full scan
--- (same discipline as content_manifest_span).
+-- The index that makes a range read a WHERE clause rather than a full scan.
 CREATE INDEX IF NOT EXISTS blob_manifest_span
     ON blob_manifest(blob_hash, byte_offset);
 
@@ -74,11 +69,6 @@ CREATE INDEX IF NOT EXISTS blob_manifest_chunk_hash
     ON blob_manifest(chunk_hash);";
 
 /// Create the shared chunk pool + blob manifest tables (idempotent).
-///
-/// Deliberately does NOT call `create_chunked_content_schema`: that would
-/// install the `nodes` witness tables and generation triggers, taxing every
-/// future `nodes` write on a database whose operator chose this target
-/// precisely to keep the nodes path untouched.
 pub fn create_blob_chunked_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(CHUNK_POOL_DDL)
         .context("create shared chunk pool")?;
@@ -87,8 +77,7 @@ pub fn create_blob_chunked_schema(conn: &Connection) -> Result<()> {
 
 /// Idempotently ensure the blob manifest tables exist. All statements are
 /// IF-NOT-EXISTS-shaped and SQLite DDL is transactional, so GC can run this
-/// inside its own transaction and a dry run's rollback stays non-mutating —
-/// the same contract as [`crate::chunked::ensure_generation_infra`].
+/// inside its own transaction and a dry run's rollback stays non-mutating.
 pub(crate) fn ensure_blob_manifest_infra(conn: &Connection) -> Result<()> {
     conn.execute_batch(BLOB_MANIFEST_DDL)
         .context("create blob manifest schema")
@@ -237,14 +226,12 @@ fn select_blob_manifest(tx: &Transaction<'_>, blob_hash: Hash) -> Result<Vec<ley
     Ok(chunks)
 }
 
-/// The blob arm of the overlap predicate. `?1` = blob hash, `?2` = range end,
-/// `?3` = range start, `?4` = the seek floor. Same shape and the same
-/// seek-floor discipline as `chunked::OVERLAP_PREDICATE` (the `?4` bound
-/// exists because `byte_offset + byte_len` cannot drive an index seek, and
-/// CDC's `MAX_CHUNK` cap makes `byte_offset >= start - MAX_CHUNK` sound).
-/// Kept as its own single definition because the key column differs; every
-/// blob range selection MUST use this string, for the same drift reason as
-/// the node predicate.
+/// The overlap predicate. `?1` = blob hash, `?2` = range end, `?3` = range
+/// start, `?4` = the seek floor ([`crate::chunk_pool::seek_floor`]; the `?4`
+/// bound exists because `byte_offset + byte_len` cannot drive an index seek,
+/// and CDC's `MAX_CHUNK` cap makes `byte_offset >= start - MAX_CHUNK` sound).
+/// Every blob range selection MUST use this one string, so the read path and
+/// [`blob_chunks_touched`] cannot drift apart.
 const BLOB_OVERLAP_PREDICATE: &str = "blob_hash = ?1 AND byte_offset >= ?4 \
      AND byte_offset < ?2 AND (byte_offset + byte_len) > ?3";
 
@@ -270,7 +257,7 @@ fn blob_manifest_len(tx: &Transaction<'_>, blob_hash: Hash) -> Result<Option<usi
 /// request. Selection is [`BLOB_OVERLAP_PREDICATE`]; span validation and
 /// reconstruction belong to [`leyline_cdc::SelectedRange`] /
 /// [`leyline_cdc::read_range_into`], and chunk bytes are σ-verified by the
-/// pool store — the same canonical operation seam as the node read path.
+/// pool store (see [`crate::chunk_pool`] on operation ownership).
 /// The empty blob reads back as 0 bytes from its zero spans; any other blob
 /// with no manifest is an error.
 pub fn read_blob_range(
@@ -346,8 +333,7 @@ pub fn read_blob_range(
 
 /// How many manifest rows a read of `len` bytes at `offset` would touch —
 /// the cost of the read, in chunks. Uses [`BLOB_OVERLAP_PREDICATE`], so it
-/// measures the shipped selection (the counterpart of
-/// [`crate::chunked::chunks_touched`]).
+/// measures the shipped selection.
 pub fn blob_chunks_touched(
     conn: &Connection,
     blob_hash: Hash,

@@ -928,14 +928,7 @@ tasks:
       # regression. It always PRINTS its measurement in `task test`; this is
       # where the assertion is enforced.
       - cargo test --release -p leyline-cli-lib --test f2_concurrent_writers_throughput
-      # Sheaf restriction-vs-review wall-time corroboration. Same shape as F2:
-      # the ROW-COUNT invariant is asserted on every push inside the test, and
-      # only the wall-clock comparison is gated here. It measures at microsecond
-      # scale (7.6us vs 852us on a quiet run, but 649us vs 424us on a loaded
-      # one), so it is a scheduler race in the every-push gate and a real
-      # signal here.
-      - cargo test --release -p leyline-sheaf --test restriction_review_public_api
-      # WAL reader-pool throughput floor. Same shape again: the pool's
+      # WAL reader-pool throughput floor. Same shape as F2: the pool's
       # CORRECTNESS properties — query_only on every checkout, writers
       # serializing without corruption, exhaustion blocking rather than
       # failing — are asserted on every push inside that test, and only the
@@ -1192,7 +1185,10 @@ tasks:
   # Add a rung when a real defect justifies it, not when a file seems
   # important. Current allowlist and why each earned it:
   #
-  #   leyline-cdc, chunked.rs   the overlap-predicate class described above
+  #   leyline-cdc, blob_chunked.rs, chunk_pool.rs
+  #                             the overlap-predicate class described above
+  #                             (it lived in the removed chunked.rs until
+  #                             `ley-line-open-afa952`)
   #   gc.rs                     transactional reachability + accounting
   #   ll-core/core/partition.rs `ad272d3` collided materially different
   #                             decompositions into one address, and the only
@@ -1281,7 +1277,7 @@ tasks:
           MUTANTS_SCOPE: '{{.MUTANTS_SCOPE | default "all"}}'
 
   mutants:fs:
-    desc: Mutation-test leyline-fs::chunked (the SQL materialize-on-read path).
+    desc: Mutation-test leyline-fs's blob CDC range-read path and chunk pool.
     dir: rs
     cmds:
       # `-C --lib`: the FFI smoke test links against a staticlib in the real
@@ -1294,7 +1290,8 @@ tasks:
       - >-
         cargo mutants -p leyline-fs --test-workspace=false
         --no-default-features --features cdc,validate
-        -C --lib --file ll-open/fs/src/chunked.rs
+        -C --lib --file ll-open/fs/src/blob_chunked.rs
+        --file ll-open/fs/src/chunk_pool.rs
         || [ $? -eq 3 ]
 
   mutants:fs-gc:

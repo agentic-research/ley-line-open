@@ -121,8 +121,7 @@ pub fn file_nid_range(file_id: i64) -> (i64, i64) {
 /// load-bearing:
 ///
 /// - `files.file_id` feeds nids; deleting a row would let SQLite reuse the
-///   rowid and re-bind a dead file's nid range to an unrelated new file
-///   (the exact reuse hazard `content_manifest` invalidation documents).
+///   rowid and re-bind a dead file's nid range to an unrelated new file.
 ///   A deleted file's row simply goes stale; a re-created path re-binds to
 ///   its old `file_id`.
 /// - Renaming a directory is `UPDATE dirs SET name_id = ?` — ONE row for a
@@ -952,6 +951,63 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
         conn
+    }
+
+    /// `nodes.record` stores numeric-looking tokens verbatim: a leading-zero
+    /// literal, a markdown ordered-list marker and an identifier all read
+    /// back as TEXT with their exact bytes. A NUMERIC-affinity column type
+    /// (`record JSON`) coerced the first two (bead `ley-line-open-f7966d`).
+    #[test]
+    fn nodes_record_stores_numeric_tokens_verbatim() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_nodes_table(&conn).unwrap();
+        let mut nids = Vec::new();
+        for (file, ordinal, record) in [
+            ("a.rs", 1, "main"),
+            ("a.rs", 2, "007"),
+            ("README.md", 1, "1. "),
+        ] {
+            let file_id = ensure_file_id(&conn, file).unwrap();
+            ensure_dir_nodes(&conn, file, 7).unwrap();
+            let nid = file_nid(file_id, ordinal);
+            insert_node(
+                &conn,
+                nid,
+                Some(file_nid(file_id, 0)),
+                None,
+                None,
+                0,
+                ordinal,
+                record.len() as i64,
+                7,
+                record,
+            )
+            .unwrap();
+            nids.push((nid, record));
+        }
+
+        let coerced: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE typeof(record) <> 'text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(coerced, 0, "every record must read back as text");
+        for (nid, expected) in nids {
+            let stored: Vec<u8> = conn
+                .query_row(
+                    "SELECT CAST(record AS BLOB) FROM nodes WHERE nid = ?1",
+                    [nid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored,
+                expected.as_bytes(),
+                "nid {nid} round-trips verbatim"
+            );
+        }
     }
 
     // ── nid scheme ─────────────────────────────────────────────────────

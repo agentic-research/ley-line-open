@@ -55,7 +55,3 @@ leyline-perf-sample = { path = "../perf-sample" }
 [[bench]]
 name = "git_replay_invalidation"
 harness = false
-
-[[bench]]
-name = "restriction_git_replay"
-harness = false

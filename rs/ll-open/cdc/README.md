@@ -16,7 +16,7 @@ The load-bearing property, falsified in the tests: an insert/delete in one regio
 
 ## Used by
 
-- **`leyline-fs`** — via its `cdc` optional feature (`dep:leyline-cdc`), gating the chunk-manifest-backed range-read path (`fs/src/chunked.rs`, `fs/src/gc.rs`).
+- **`leyline-fs`** — via its `cdc` optional feature (`dep:leyline-cdc`), gating the chunk-manifest-backed `source_blobs` range-read path (`fs/src/blob_chunked.rs`, `fs/src/chunk_pool.rs`, `fs/src/gc.rs`).
 
 ## Correctness stance
 

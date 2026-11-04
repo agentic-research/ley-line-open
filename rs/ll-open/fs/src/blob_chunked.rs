@@ -271,6 +271,8 @@ fn blob_manifest_len(tx: &Transaction<'_>, blob_hash: Hash) -> Result<Option<usi
 /// reconstruction belong to [`leyline_cdc::SelectedRange`] /
 /// [`leyline_cdc::read_range_into`], and chunk bytes are σ-verified by the
 /// pool store — the same canonical operation seam as the node read path.
+/// The empty blob reads back as 0 bytes from its zero spans; any other blob
+/// with no manifest is an error.
 pub fn read_blob_range(
     conn: &Connection,
     blob_hash: Hash,
@@ -279,11 +281,16 @@ pub fn read_blob_range(
     let tx = conn
         .unchecked_transaction()
         .context("begin blob range read transaction")?;
-    let Some(source_len) = blob_manifest_len(&tx, blob_hash)? else {
-        anyhow::bail!(
+    let source_len = match blob_manifest_len(&tx, blob_hash)? {
+        Some(len) => len,
+        // The empty blob tiles as zero spans, so it has no manifest row to
+        // find; its content address names the empty byte string, which is
+        // all a read of it needs ([`has_blob_chunked`] reads it complete).
+        None if blob_hash == b"".as_slice().hash() => 0,
+        None => anyhow::bail!(
             "no chunk manifest for {} — activate the source_blobs target first",
             blob_label(blob_hash)
-        );
+        ),
     };
     let start = usize::try_from(range.start).context("blob range start exceeds usize")?;
     let end = usize::try_from(range.end).context("blob range end exceeds usize")?;
@@ -423,6 +430,97 @@ mod tests {
             blob_chunks_touched(&conn, hash, 0, 200_000).unwrap(),
             chunks
         );
+    }
+
+    /// Bead `ley-line-open-bc7df6`: the empty blob is a blob. It stores as
+    /// zero chunks, the completeness check reads zero rows as complete for
+    /// it, and every range read of it returns 0 bytes rather than "no
+    /// manifest": BLAKE3("") names the empty byte string, so no manifest row
+    /// is needed to know what it holds. A non-empty blob with no manifest is
+    /// still refused.
+    #[test]
+    fn the_empty_blob_is_zero_chunks_and_reads_back_empty() {
+        let conn = db();
+        leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+        let empty = b"".as_slice().hash();
+        conn.execute(
+            "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+            params![empty.as_bytes().as_slice(), Vec::<u8>::new()],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_eq!(
+            store_blob_chunked_in_transaction(&tx, empty, b"").unwrap(),
+            0
+        );
+        assert!(has_blob_chunked(&tx, empty).unwrap());
+        tx.commit().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blob_manifest", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the empty blob has no spans");
+        for range in [0..0, 0..1, 0..4096, 7..9] {
+            assert_eq!(
+                read_blob_range(&conn, empty, range.clone()).unwrap(),
+                Vec::<u8>::new(),
+                "{range:?}"
+            );
+        }
+        let reversed = std::ops::Range { start: 3, end: 1 };
+        assert!(
+            read_blob_range(&conn, empty, reversed).is_err(),
+            "a reversed range is refused for the empty blob too"
+        );
+        assert_eq!(blob_chunks_touched(&conn, empty, 0, 10).unwrap(), 0);
+        let one = b"x".as_slice().hash();
+        assert!(read_blob_range(&conn, one, 0..1).is_err());
+    }
+
+    /// Activation over an arena holding an empty blob beside an eligible
+    /// one: the empty blob is counted (sub-floor), keeps its `source_blobs`
+    /// row, reads back as 0 bytes, and GC reaps nothing of it or of the
+    /// live manifest.
+    #[test]
+    fn activation_and_gc_keep_an_empty_blob() {
+        let conn = Connection::open_in_memory().unwrap();
+        leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+        let big = prng_bytes(11, 40_000);
+        let (empty, big_hash) = (b"".as_slice().hash(), big[..].hash());
+        for bytes in [&[][..], &big[..]] {
+            conn.execute(
+                "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+                params![bytes.hash().as_bytes().as_slice(), bytes],
+            )
+            .unwrap();
+        }
+        let report = crate::activation::activate_chunked_source_blobs(
+            &conn,
+            crate::activation::ActivationOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.eligible_blobs, 1);
+        assert_eq!(report.populated_blobs, 1);
+        assert_eq!(
+            report.skipped_sub_floor_blobs, 1,
+            "the empty blob is counted"
+        );
+        let gc =
+            crate::gc::collect_unreachable_chunks(&conn, crate::gc::GcOptions::default()).unwrap();
+        assert_eq!(gc.reaped_blob_manifest_rows, 0);
+        assert_eq!(gc.deleted_chunk_rows, 0);
+        let empty_len: i64 = conn
+            .query_row(
+                "SELECT byte_len FROM source_blobs WHERE blob_hash = ?1",
+                params![empty.as_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty_len, 0, "GC leaves the empty blob's row");
+        assert_eq!(
+            read_blob_range(&conn, empty, 0..10).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert_eq!(read_blob_range(&conn, big_hash, 0..40_000).unwrap(), big);
     }
 
     /// The unactivated-blob error names the blob — the label is contract

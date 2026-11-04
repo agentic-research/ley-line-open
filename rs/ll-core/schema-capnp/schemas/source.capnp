@@ -28,9 +28,10 @@ struct SourceFile {
   # the join key on lookup).
   canonicalPath @2 :Text;
 
-  # BLAKE3 of file bytes (T8.5 will use this in segment hashing).
-  # Empty `bytes` if not yet populated — producer fills in during
-  # parse if `compute_hash` is enabled.
+  # BLAKE3 of the file's bytes — the same value as `_source.content_hash`
+  # and the path's `_tree.blob_hash`. Always set by the parse
+  # (`cmd_parse.rs` `serialize_source_file_record`). This record carries the hash,
+  # never the bytes: the bytes live in `source_blobs`.
   contentHash @3 :Common.Hash;
 
   # File mtime (Unix seconds) and size (bytes) — what the parse

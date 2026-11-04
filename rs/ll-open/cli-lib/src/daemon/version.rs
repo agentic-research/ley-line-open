@@ -39,7 +39,7 @@ pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v0.11.0 release advances both. Binary-only releases leave this literal
 /// unchanged; a public consumer-contract release requires a matching nested
 /// Go-module tag.
-pub const SCHEMA_VERSION: &str = "0.23.0";
+pub const SCHEMA_VERSION: &str = "0.24.0";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions
@@ -155,13 +155,24 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   the v8 columns (`parent_hash`, `ordinal`, `child_hash`, `field`), so
 ///   every v8 read runs unchanged; a write to it fails. A v8 arena is refused
 ///   at parse open.
+/// - `projection-v10` — the occurrence tables point at their subtree by
+///   `content_id` (bead `ley-line-open-738dd9`). `_ast.node_hash`,
+///   `node_refs.node_hash` and `node_defs.node_hash` (32-byte BLOBs) become
+///   `content_id INTEGER REFERENCES node_content(content_id)`, and
+///   `idx_ast_node_hash` becomes `idx_ast_content` on `_ast(content_id)`.
+///   `node_content.node_hash` stays the identity, and `_cfg` (keyed BY a
+///   subtree, not pointing at one) keeps its hash key. The read-only views
+///   `v_ast_hash`, `v_node_refs_hash` and `v_node_defs_hash` carry the v9
+///   column sets, `node_hash` included. No identity moves: `node_hash`,
+///   `Head.rootHash` and `treeRoot` are byte-identical. A v9 arena is
+///   refused at parse open.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v9";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v10";
 
 pub const WIRE_FORMAT_MAJOR: u32 = 1;
 

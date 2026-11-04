@@ -4522,6 +4522,75 @@ mod tests {
         assert_eq!(written["content"], PROPOSE_A2);
     }
 
+    /// Bead `ley-line-open-bc7df6`: an empty file is a file on the wire. A
+    /// propose with `content: ""` creates or replaces to 0 bytes, and
+    /// `read_source` of an empty file answers `content: ""` (present, not
+    /// omitted: Go decodes it into a `*string`, where absent is nil), the
+    /// blob hash BLAKE3 of no bytes, and the arena's tree root.
+    #[tokio::test]
+    async fn an_empty_file_reads_and_writes_through_the_wire() {
+        let (dir, ctx) = setup();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.go"), PROPOSE_A).unwrap();
+        std::fs::write(src.join("e.go"), "").unwrap();
+        ctx.with_write(|conn| crate::cmd_parse::parse_into_conn(conn, &src, None, None))
+            .unwrap();
+        let read = |path: &str| -> (String, serde_json::Value) {
+            let out =
+                handle_base_op_value(&ctx, serde_json::json!({"op": "read_source", "path": path}))
+                    .expect("a known op answers");
+            let value = serde_json::from_str(&out).unwrap();
+            (out, value)
+        };
+        let stamped = || {
+            ctx.with_read(crate::tree_root::DerivedFrom::read)
+                .unwrap()
+                .expect("a parse stamps derived_from")
+                .tree_root
+                .to_string()
+        };
+
+        let (raw, r) = read("e.go");
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r.get("content"), Some(&serde_json::json!("")), "{raw}");
+        assert_eq!(r["blob_hash"], hex_hash(""));
+        assert_eq!(r["mode"], "100644");
+        assert_eq!(r["tree_root"], stamped());
+
+        // A create and a replace with no bytes, against what was read.
+        let accepted = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "new.txt", "kind": "create", "base": "absent", "content": ""},
+                {"path": "a.go", "base": hex_hash(PROPOSE_A), "content": ""},
+            ]}),
+        );
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        let blobs = accepted["blobs"].as_array().unwrap();
+        for path in ["new.txt", "a.go"] {
+            assert!(
+                blobs.contains(&serde_json::json!({"path": path, "blob_hash": hex_hash("")})),
+                "{accepted}"
+            );
+            let (raw, r) = read(path);
+            assert_eq!(r.get("content"), Some(&serde_json::json!("")), "{raw}");
+            assert_eq!(r["blob_hash"], hex_hash(""));
+            assert_eq!(r["tree_root"], accepted["tree_root"]);
+        }
+        assert_eq!(accepted["tree_root"], stamped());
+
+        // Back to bytes against the empty blob.
+        let back = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "e.go", "base": hex_hash(""), "content": PROPOSE_A},
+            ]}),
+        );
+        assert_eq!(back["ok"], true, "{back}");
+        assert_eq!(read("e.go").1["content"], PROPOSE_A);
+    }
+
     /// Bead `ley-line-open-5dc3a5`: every refusal reaches the client typed,
     /// so it is told apart from an internal error.
     #[tokio::test]

@@ -1197,6 +1197,100 @@ mod tests {
         assert_eq!(indexed(&c, "a.go"), Some(h(A2)));
     }
 
+    /// Bead `ley-line-open-bc7df6`: an empty file is checked out as a file.
+    /// A cold checkout indexes it under BLAKE3(""); a proposed create of no
+    /// bytes and a replace to no bytes each materialize a 0-byte file and
+    /// advance the index; a file emptied in the directory is ingested.
+    #[test]
+    fn an_empty_file_is_checked_out_materialized_and_ingested() {
+        let c = checkout(&[("a.go", A), ("e.go", ""), ("b.go", B)]);
+        assert_eq!(stored(&c, "e.go"), Some(h("")));
+        assert_eq!(indexed(&c, "e.go"), Some(h("")));
+        assert_eq!(disk(&c, "e.go").as_deref(), Some(""));
+
+        commit(
+            &c,
+            vec![
+                Proposed::create("sub/new.txt", Vec::new()),
+                Proposed::write("a.go", Base::Blob(h(A)), Vec::new()),
+            ],
+        );
+        let r = reconcile(
+            &c.conn,
+            &c.src,
+            None,
+            Some(&scope(&["sub/new.txt", "a.go"])),
+        )
+        .unwrap();
+        assert_eq!(r.materialized, ["a.go", "sub/new.txt"]);
+        assert_eq!(r.problems(), None);
+        for path in ["sub/new.txt", "a.go"] {
+            let meta = std::fs::symlink_metadata(c.src.join(path)).unwrap();
+            assert!(meta.is_file() && meta.len() == 0, "{path} is a 0-byte file");
+            assert_eq!(indexed(&c, path), Some(h("")), "{path}");
+            assert_eq!(stored(&c, path), Some(h("")), "{path}");
+        }
+        let quiet = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert!(
+            quiet.materialized.is_empty() && quiet.conflicts.is_empty(),
+            "the empty files agree on every side"
+        );
+        assert_eq!(quiet.parse.as_ref().unwrap().errors, 0);
+
+        // Emptied in the directory: ingested, not skipped.
+        std::fs::write(c.src.join("b.go"), "").unwrap();
+        let r = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        assert_eq!(stored(&c, "b.go"), Some(h("")));
+        assert_eq!(indexed(&c, "b.go"), Some(h("")));
+        // And from empty to bytes in the directory.
+        std::fs::write(c.src.join("e.go"), B2).unwrap();
+        reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert_eq!(stored(&c, "e.go"), Some(h(B2)));
+    }
+
+    /// The conflict check compares an empty file by its blob like any other:
+    /// emptied in the directory while the store moved elsewhere is a
+    /// conflict that keeps both sides; emptied on both sides converges.
+    #[test]
+    fn an_empty_side_of_a_checkout_conflict_is_compared_by_its_blob() {
+        let c = checkout(&[("a.go", A), ("b.go", B)]);
+        commit_only(&c, "a.go", A2);
+        std::fs::write(c.src.join("a.go"), "").unwrap();
+        commit_only(&c, "b.go", "");
+        std::fs::write(c.src.join("b.go"), "").unwrap();
+
+        let r = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert_eq!(
+            r.conflicts,
+            [Conflict {
+                path: "a.go".to_string(),
+                disk: Some(file("")),
+                stored: Some(file(A2)),
+                index: Some(file(A)),
+            }]
+        );
+        assert_eq!(stored(&c, "a.go"), Some(h(A2)), "the store keeps its bytes");
+        assert_eq!(
+            disk(&c, "a.go").as_deref(),
+            Some(""),
+            "the directory keeps its"
+        );
+        assert_eq!(conflict_paths(&c), ["a.go"]);
+        assert_eq!(indexed(&c, "b.go"), Some(h("")), "both emptied: converged");
+        assert!(!r.materialized.contains(&"b.go".to_string()));
+
+        // The store comes to hold the empty file too: converged.
+        commit(
+            &c,
+            vec![Proposed::write("a.go", Base::Blob(h(A2)), Vec::new())],
+        );
+        let settled = reconcile(&c.conn, &c.src, None, None).unwrap();
+        assert!(settled.conflicts.is_empty());
+        assert!(conflict_paths(&c).is_empty());
+        assert_eq!(indexed(&c, "a.go"), Some(h("")));
+    }
+
     #[test]
     fn a_crash_after_the_rename_converges_without_a_write() {
         let c = checkout(&[("a.go", A)]);

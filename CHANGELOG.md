@@ -14,6 +14,100 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.24.0] — 2026-11-04
+
+**Upgrade if you sign heads; reparse every arena.** A signed head now attests
+`treeRoot` and `parserId`, so a signature can no longer be carried onto a
+rewritten tree. Heads signed by v0.23.0 or earlier must be re-signed. Arenas
+move from `projection-v9` to `projection-v10` and need a cold reparse. On
+17c271's pinned kibana slice the arena drops from 1,030.1 MiB to 790.4 MiB
+(29.8x to 22.8x source), and peak parse RSS from 4.09 GB to 3.88 GB.
+`node_hash` and `Head.rootHash` are unchanged. SQL consumers that read
+`node_hash` from `_ast`, `node_refs` or `node_defs` read it through the new
+`v_*_hash` views or join `node_content` (mache: `mache-99324b`). Empty files
+are now handled on every path. `SCHEMA_VERSION` is 0.24.0, and the Go module
+is tagged `clients/go/leyline-schema/v0.24.0` (`Head.parentDigest` added).
+
+### Security
+
+- **A signed `Head` now attests its `treeRoot`, `parserId` and the previous
+  head's claim** (bead `ley-line-open-b68fa6`). The head digest was
+  `BLAKE3_derive_key("leyline head digest v1", generation ‖ rootHash ‖ parentHash)`,
+  so a signed head whose `treeRoot` or `parserId` was rewritten after signing
+  verified as `Valid`, although ADR-0040 names `treeRoot` as the root that
+  signatures cite. The digest is now v2,
+  `BLAKE3_derive_key("leyline head digest v2", generation ‖ rootHash ‖ parentHash ‖ treeRoot ‖ parserId ‖ P)`,
+  where `P` is `0x00`, or `0x01 ‖ parentDigest` when the new
+  `Head.parentDigest` field names the previous head's v2 digest. `parentHash`
+  alone names only the previous run's segments, which a no-op rerun makes
+  equal across arenas. The digest is computed over a `HeadClaim` that cannot
+  be built without a stamped `treeRoot` and `parserId`: a head without them is
+  refused rather than signed, and a signature on one verifies as `Invalid`.
+  `leyline verify-head` checks the signature before it compares the stamped
+  `treeRoot` with the arena. With `LEYLINE_HEAD_TRUSTED_KEYS` set it refuses an
+  unsigned head, so stripping the signature and rewriting the head and arena
+  together no longer passes. With no trust set it refuses when
+  `LEYLINE_HEAD_REQUIRE_SIGNATURE` is set, and otherwise prints
+  `signature=not-checked`; its success line now always names the signature
+  verdict. `manifestRoot`, `hierarchyId` and `logicalRoot` do not exist yet and
+  are not bound.
+
+### Breaking
+
+- **projection-v10: the occurrence tables point at their subtree by
+  `content_id`** (bead `ley-line-open-738dd9`). `_ast.node_hash`,
+  `node_refs.node_hash` and `node_defs.node_hash` (a 32-byte BLOB on every
+  occurrence) become `content_id INTEGER REFERENCES node_content(content_id)`,
+  and `idx_ast_node_hash` becomes `idx_ast_content` on `_ast(content_id)`.
+  `node_content.node_hash` stays the identity, stored once per distinct
+  subtree; `content_id` stays arena-local and never leaves the database. The
+  read-only views `v_ast_hash`, `v_node_refs_hash` and `v_node_defs_hash` carry
+  the v9 column sets, `node_hash` included, so a v9 read runs unchanged against
+  the view; on the right of a `LEFT JOIN`, join `node_content` on `content_id`
+  instead (TABLE_CONTRACT gives the rewrites). `_cfg` keeps its `node_hash`
+  key. On this repository's `rs/` tree a cold parse goes from 321.19 MiB to
+  243.44 MiB (26.2x to 19.9x source): `_ast` 76.75 to 39.88, its hash index
+  55.06 to 18.25, `node_refs` 11.13 to 7.81, `node_defs` 2.81 to 2.06. The
+  `_ast`, `node_content`, edge, def, ref and def-to-ref join sets are
+  unchanged by hash (each `EXCEPT` of the v9 and v10 arenas is empty both
+  ways), and `node_hash` and `Head.rootHash` are byte-identical. `treeRoot`
+  moves only because `parserId` folds the projection label, as at every bump:
+  the v10 arena's `_tree` recomputed under the v9 `parserId` gives the v9
+  `treeRoot`. A `projection-v9` arena is refused at parse open.
+
+- **Head digest v1 is removed; heads signed by an earlier release must be
+  re-signed** (bead `ley-line-open-b68fa6`). A v1 signature does not verify
+  under v2, so with `LEYLINE_HEAD_TRUSTED_KEYS` set a parse refuses to chain
+  onto a head signed by v0.23.0 or earlier, and `leyline verify-head` refuses
+  it. Delete `${db}.head.capnp` and reparse with `LEYLINE_HEAD_SIGNING_KEY`
+  set to write a v2-signed head. Unsigned heads still chain. Rolling back
+  fails closed: an older binary with a trust set refuses a v2-signed head,
+  because it recomputes the v1 digest. `leyline verify-head` with a trust set
+  now refuses an unsigned head, and its success line gains
+  `signature=<verified|not-checked (...)>`. In `leyline-core`,
+  `head_digest(generation, root, parent)` is now `head_digest(&HeadClaim)` and
+  `HEAD_DIGEST_CONTEXT` is `"leyline head digest v2"`; in `leyline-sign`,
+  `verify_head(generation, root, parent, signature, kid, trusted)` is now
+  `verify_head(Option<&HeadClaim>, signature, kid, trusted)`. `Head` gains the
+  additive field `parentDigest @9` (Go bindings regenerated).
+
+### Fixed
+
+- **A range read of the empty blob returns 0 bytes** (bead
+  `ley-line-open-bc7df6`). `leyline_fs::blob_chunked::read_blob_range`
+  refused BLAKE3("") with "no chunk manifest" although the empty blob tiles as
+  zero spans and `has_blob_chunked` already reads it as complete, so an empty
+  file in a `source_blobs`-activated arena could not be read through the CDC
+  target. It now reads back as 0 bytes for any range; any other blob without
+  a manifest is still refused. Empty files are now pinned end to end: propose
+  (create, replace to and from empty, delete and recreate), `read_source`
+  (`content: ""`, present on the wire), the cold parse and reparse in Go, Rust,
+  Python and TypeScript, CDC activation and GC, checkout materialize, ingest
+  and conflict, the three-way merge with an empty side, `treeRoot` (an empty
+  file and an empty directory at one path give different roots), and the NFS
+  host mount (read, `st_size` 0, truncate to empty, a zero-length write, an
+  editor's save of an empty buffer).
+
 ## [0.23.0] — 2026-11-04
 
 **For Go clients of the daemon, and for anyone building with `mount`.** The

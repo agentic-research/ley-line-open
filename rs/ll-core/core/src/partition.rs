@@ -18,7 +18,7 @@
 //!   [`crate::substrate::RootSigner::sign`] accepts a bare 32-byte
 //!   [`Hash`] with no notion of what it addresses, so an untagged fold would
 //!   be indistinguishable from a content address under a shared key — the
-//!   same argument [`crate::head_digest`] makes for the head triple.
+//!   same argument [`crate::head_digest`] makes for the head claim.
 //! * **Injectivity.** Every variable-length field is length-prefixed, so the
 //!   address commits to the decomposition rather than to the concatenation of
 //!   its parts. `Head.rootHash` was the motivating defect (bead `b64505`): it

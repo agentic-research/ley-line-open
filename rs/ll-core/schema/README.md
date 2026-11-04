@@ -1,7 +1,7 @@
 # leyline-schema
 
 Shared SQLite schema — the contract between ley-line crates. This README
-describes `projection-v9` (ADR-0045; ADR-0040 D5 removed the pointer store; bead `9b7d28` interned the merkle-AST edges). The full table-by-table contract,
+describes `projection-v10` (ADR-0045; ADR-0040 D5 removed the pointer store; bead `9b7d28` interned the merkle-AST edges; bead `738dd9` interned the occurrence tables' subtree pointer to `content_id`). The full table-by-table contract,
 including the sidecar tables other crates add, is `docs/TABLE_CONTRACT.md`.
 
 ## Node ids
@@ -98,5 +98,5 @@ manifest `_tree` (every stored path with its git mode, every directory)
 and `_parse_diagnostics`; `_tree` rows belong to the store, not to a
 file's projection, so they are not in `FILE_KEYED_TABLES` and outlive a
 file leaving the projection (ADR-0045). `_meta.projection_schema_version`
-is `projection-v9`; a binary refuses an older label at parse open and
+is `projection-v10`; a binary refuses an older label at parse open and
 asks for a cold reparse.

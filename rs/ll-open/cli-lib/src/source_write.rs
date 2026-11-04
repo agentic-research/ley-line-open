@@ -12,7 +12,8 @@
 //!
 //! - the bytes in `source_blobs` under their hash, and `_source.content_hash`
 //!   naming that row (bead `0d3b72`);
-//! - `_ast` rows with `node_hash`, their `node_content` / `node_child` rows,
+//! - `_ast` rows pointing at their subtree (`content_id`, projection-v10),
+//!   their `node_content` / `node_edge` rows,
 //!   `node_defs` / `node_refs` (bead `143f17`);
 //! - `treeRoot` recomputed from the committed `_source` set and stamped into
 //!   the sibling head when the arena is file-backed (D1).
@@ -942,6 +943,9 @@ fn tree_root_dir(abs: &Path, rel: &str) -> Result<PathBuf> {
 mod tree_tests;
 
 #[cfg(test)]
+mod empty_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use leyline_core::ContentAddressed;
@@ -1007,6 +1011,9 @@ mod tests {
             .unwrap()
     }
 
+    /// Read through the `*_hash` views (projection-v10): a written arena and a
+    /// cold one number their subtrees differently, so the image compares
+    /// occurrences by the `node_hash` their `content_id` names.
     fn image(conn: &Connection, rel: &str) -> FileImage {
         let fid = file_id(conn, rel);
         let (lo, hi) = leyline_schema::file_nid_range(fid);
@@ -1015,7 +1022,7 @@ mod tests {
             conn,
             "SELECT a.nid, k.raw_kind, a.start_byte, a.end_byte, a.start_row, a.start_col, \
                     a.end_row, a.end_col, a.node_hash \
-               FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+               FROM v_ast_hash a JOIN kinds k ON k.kind_id = a.kind_id \
               WHERE a.nid BETWEEN ?1 AND ?2 ORDER BY a.nid",
             lo,
             hi,
@@ -1036,7 +1043,7 @@ mod tests {
         let content = rows(
             conn,
             "SELECT node_hash, kind, raw_kind, token, arity FROM node_content \
-              WHERE node_hash IN (SELECT node_hash FROM _ast WHERE nid BETWEEN ?1 AND ?2) \
+              WHERE node_hash IN (SELECT node_hash FROM v_ast_hash WHERE nid BETWEEN ?1 AND ?2) \
               ORDER BY node_hash",
             lo,
             hi,
@@ -1045,7 +1052,7 @@ mod tests {
         let children = rows(
             conn,
             "SELECT parent_hash, ordinal, child_hash, field FROM node_child \
-              WHERE parent_hash IN (SELECT node_hash FROM _ast WHERE nid BETWEEN ?1 AND ?2) \
+              WHERE parent_hash IN (SELECT node_hash FROM v_ast_hash WHERE nid BETWEEN ?1 AND ?2) \
               ORDER BY parent_hash, ordinal",
             lo,
             hi,
@@ -1053,7 +1060,7 @@ mod tests {
         );
         let defs = rows(
             conn,
-            "SELECT token, nid, node_hash FROM node_defs WHERE nid BETWEEN ?1 AND ?2 \
+            "SELECT token, nid, node_hash FROM v_node_defs_hash WHERE nid BETWEEN ?1 AND ?2 \
               ORDER BY nid, token",
             lo,
             hi,
@@ -1061,7 +1068,7 @@ mod tests {
         );
         let refs = rows(
             conn,
-            "SELECT token, nid, node_hash FROM node_refs WHERE nid BETWEEN ?1 AND ?2 \
+            "SELECT token, nid, node_hash FROM v_node_refs_hash WHERE nid BETWEEN ?1 AND ?2 \
               ORDER BY nid, token",
             lo,
             hi,

@@ -54,14 +54,15 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
         > 0
 }
 
-/// The file's `_ast.node_hash` multiset, in pre-order.
+/// The file's `_ast` `node_hash` multiset, in pre-order (read through
+/// `v_ast_hash`: the stored pointer is `content_id` as of projection-v10).
 fn node_hashes(conn: &Connection, rel: &str) -> Vec<Vec<u8>> {
     let fid = leyline_ts::schema::lookup_file_id(conn, rel)
         .unwrap()
         .unwrap_or_else(|| panic!("{rel} was not projected"));
     let (lo, hi) = leyline_ts::schema::file_nid_range(fid);
     let mut stmt = conn
-        .prepare("SELECT node_hash FROM _ast WHERE nid BETWEEN ?1 AND ?2 ORDER BY nid")
+        .prepare("SELECT node_hash FROM v_ast_hash WHERE nid BETWEEN ?1 AND ?2 ORDER BY nid")
         .unwrap();
     stmt.query_map([lo, hi], |r| r.get(0))
         .unwrap()

@@ -126,8 +126,11 @@ No bare hash of a concatenation is a valid address. `A(spec, children)` with the
 folded **into** the digest, not carried alongside it.
 
 The precedent is already correct in-repo at exactly one site: `head_digest`
-(`rs/ll-core/core/src/head_digest.rs:38-44`) uses `blake3::Hasher::new_derive_key(HEAD_DIGEST_CONTEXT)`
-binding `(generation, rootHash, parentHash)`. Its test at lines 50-65 states the rationale:
+(`rs/ll-core/core/src/head_digest.rs`) uses `blake3::Hasher::new_derive_key(HEAD_DIGEST_CONTEXT)`
+binding the `HeadClaim` (`generation, rootHash, parentHash, treeRoot, parserId`, and the
+previous head's digest with a presence byte, under
+`"leyline head digest v2"`, bead `b68fa6`; v1 bound only the first three). Its
+`digest_is_domain_separated_from_plain_blake3` test states the rationale:
 `RootSigner::sign` takes a bare 32-byte `Hash` whatever its provenance, so without a context tag
 a head signature would be bit-identical to a bare-root signature — *"the same key, two meanings."*
 

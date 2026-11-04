@@ -81,13 +81,30 @@ struct Head {
   # incremental parse's root covers only the files it re-parsed, and the
   # source record carries absolute paths and mtimes). `treeRoot` names the
   # TREE: a tagged fold (scheme `leyline/tree-root/v1`, `PartitionSpec`
-  # RowSet domain) over every `_source` row as `(BLAKE3(relative path), 2i,
-  # len)` and `(content_hash, 2i+1, 0)` with `i` the rank in path order,
-  # with `parserId` as the spec's params. Computed after COMMIT from the
-  # whole `_source` table, so it is the same for a cold parse, an
+  # RowSet domain, `canonVersion` 1) with `parserId`'s 32 bytes as the
+  # spec's params, over the store's manifest `_tree` (ADR-0045 T1/T2).
+  # The leaves are every file entry (regular, executable or symlink; a
+  # symlink's blob is its target) and every EMPTY directory; a non-empty
+  # directory is implied by its children and is not a leaf. Leaves are
+  # sorted by the relative path's bytes; leaf `i` contributes two entries:
+  #   (BLAKE3(relative path bytes), 2i,   byte length of the path)
+  #   (content,                     2i+1, modeTag)
+  # where `content` is the file's blob hash (`source_blobs` key) or, for an
+  # empty directory, BLAKE3 of no bytes; and `modeTag` is 0 for `0o100644`
+  # (so a tree of regular files folds as before ADR-0045) and the git mode
+  # itself otherwise (`0o100755`, `0o120000`, `0o040000`). Reference:
+  # `rs/ll-open/cli-lib/src/tree_root.rs` `tree_root_of`. Computed after
+  # COMMIT from the whole `_tree`, so it is the same for a cold parse, an
   # incremental parse, a scoped reparse, a second directory, and a touched
-  # mtime, and differs when one byte of one file differs. Anyone holding
-  # the arena recomputes it (`leyline verify-head`); a mismatch is refused.
+  # mtime, and differs when one byte, one path or one mode differs. Anyone
+  # holding the arena recomputes it (`leyline verify-head`); a mismatch is
+  # refused.
+  #
+  # NOT SIGNED: the head signature's digest (`head_digest`, context
+  # "leyline head digest v1") binds only `generation`, `rootHash` and
+  # `parentHash`. `treeRoot` and `parserId` are stamped beside it but are not
+  # covered, so a signature does not attest them (bead
+  # `ley-line-open-b68fa6`).
   #
   # Additive per ADR-0014 §1: a head that does not set these fields has the
   # same canonical bytes as before they existed. Empty = not stamped

@@ -10,9 +10,11 @@
 //! `143002`). It is a run receipt, and it stays one.
 //!
 //! `treeRoot` names the tree. It is a tagged fold (`PartitionSpec`, ADR-0032
-//! D2) over every `_source` row, computed after COMMIT from the arena rather
-//! than from what this run happened to write, with no path other than the
-//! relative one and no timestamp. Four parses of the same bytes — a second
+//! D2) over every `_tree` entry — (relative path, git mode, blob hash), with
+//! directories as entries (ADR-0045 T1/T2) — computed after COMMIT from the
+//! arena rather than from what this run happened to write, with no path other
+//! than the relative one and no timestamp. A file of no grammar has a `_tree`
+//! entry and no `_source` row, and still moves the root. Four parses of the same bytes — a second
 //! directory, touched mtimes, shuffled discovery, a no-op scoped reparse —
 //! yield one `treeRoot`. One changed byte changes it.
 //!
@@ -381,7 +383,7 @@ pub fn cmd_verify_head(db: &Path) -> Result<()> {
             stamped,
             recomputed,
         } => bail!(
-            "treeRoot mismatch: head stamped {stamped}, the arena's _source set folds to {recomputed}; the tree changed after the head was written or the head is not this arena's"
+            "treeRoot mismatch: head stamped {stamped}, the arena's _tree folds to {recomputed}; the tree changed after the head was written or the head is not this arena's"
         ),
     }
 }

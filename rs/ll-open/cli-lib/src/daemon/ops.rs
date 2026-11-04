@@ -576,7 +576,7 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     // `ley-line-open-246526`). Unset without `--source`, so the field is
     // absent from the JSON.
     if let Some(dir) = ctx.source_dir.as_deref() {
-        root.set_source_root(&status_source_root(dir));
+        root.set_source_root(status_source_root(dir));
     }
     // Typed enrichment — typed end-to-end, no double parse on
     // consumers. Each entry is `(name, PassStatus { last_run_at_ms,

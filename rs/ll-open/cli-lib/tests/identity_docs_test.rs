@@ -60,7 +60,9 @@ fn tree_root_docs_name_the_table_the_fold_reads() {
 /// directories as the code does, and must not claim the signature covers it.
 #[test]
 fn head_schema_describes_the_tree_root_the_code_computes() {
-    let schema = normalized(include_str!("../../../ll-core/schema-capnp/schemas/head.capnp"));
+    let schema = normalized(include_str!(
+        "../../../ll-core/schema-capnp/schemas/head.capnp"
+    ));
     let src = include_str!("../src/tree_root.rs");
     let digest = include_str!("../../../ll-core/core/src/head_digest.rs");
 
@@ -74,7 +76,10 @@ fn head_schema_describes_the_tree_root_the_code_computes() {
         "`modeTag` is 0 for `0o100644`",
         "NOT SIGNED",
     ] {
-        assert!(schema.contains(claim), "head.capnp's treeRoot description is missing: {claim}");
+        assert!(
+            schema.contains(claim),
+            "head.capnp's treeRoot description is missing: {claim}"
+        );
     }
 
     // Tie the description to the code it describes.

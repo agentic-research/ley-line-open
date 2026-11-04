@@ -45,6 +45,6 @@ The δ⁰-driven invalidation path is implemented but not yet the production wir
 | `complex.rs` — δ⁰/Čech cohomology, weighted restriction maps | **Live but diagnostic-only** (ADR-0030 verdict: NO-GO on using it for invalidation) | Yes, but only feeds the health metric + `agreement`/`h0_dimension` ops — confirmed off the invalidation path; `RestrictionMap::compose`/`weighted`/`new` have zero non-test callers |
 | `restriction_review.rs` — the ADR-0031 toy comparison | **Experiment only** | No — exercised by `tests/restriction_review_toy.rs` |
 
-The `restriction_cache.rs` module (ADR-0031 restriction-addressed derived-view caching) was removed in bead `ley-line-open-afa952`. It had no caller outside its own tests and bench, and its key was ambiguous: unit-separator framing that POSIX paths can contain, and no `parserId` binding (finding `80f037` F5). A future implementation keys length-prefixed fields with `parserId` bound; see ADR-0031 "Removal".
+The exact restriction-addressed derived-view cache (ADR-0031) that lived here as `restriction_cache.rs` is now the [`leyline-cache`](../cache/) crate (bead `ley-line-open-754aa1`), with a `PartitionSpec` key that binds `parserId`. It shares no code with this crate. The `sheaf_restriction_replay` bench measures `SheafCache` against it on the same git replay (`task cache:ablation`); `leyline-cache` is a dev-dependency here only.
 
 `cache.rs` is the piece most likely under-covered relative to its actual correctness stakes.

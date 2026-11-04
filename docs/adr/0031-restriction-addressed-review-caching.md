@@ -1,8 +1,7 @@
 # ADR-0031 — Restriction-addressed derived-view caching over CAS
 
-**Status:** Proposed (2026-07-17) — positive result, verified spike. The implementation
-(`rs/ll-open/sheaf/src/restriction_cache.rs`, its tests and the `restriction_git_replay`
-bench) was removed on 2026-11-04 (bead `ley-line-open-afa952`); see "Removal" below.
+**Status:** Proposed (2026-07-17) — positive result, verified spike; deployment gated on `f38a86`.
+Amended 2026-11-04 (`ley-line-open-754aa1`): lawful key, moved to `leyline-cache`, ablation; see the amendment below.
 **Bead:** `ley-line-open-f62327`
 **Related:**
 - ADR-0030 (the NO-GO this neighbors — approximate embedding-distance gating; see its 2026-07-17 addendum)
@@ -176,18 +175,68 @@ Deployment is gated on the caveats below (chiefly `f38a86`).
 - Land the experiment (currently `5b5b97c` on `codex-restriction-ast-review-toy`)
   on `main`.
 
-## Removal (2026-11-04, bead `ley-line-open-afa952`)
+## Amendment (2026-11-04, bead `ley-line-open-754aa1`): lawful key, `leyline-cache`, ablation
 
-The module had no production caller: its only users were its own tests and the
-`restriction_git_replay` bench. Its key was also ambiguous. Rows were joined with a unit
-separator (`\u{1f}`), which POSIX paths may contain, so two different row sets could hash
-to the same restriction, and the key did not bind `parserId`, so a key computed under one
-derivation matched one computed under another (finding `80f037` F5). Keeping an unused,
-ambiguous key in the crate cost maintenance and invited a consumer to adopt it as is.
+**Key re-founded as a `PartitionSpec` `RowSet` fold.** The spike's key joined each
+row's fields with U+001F, ended rows with `\n`, and took σ of the string. POSIX paths
+may hold both bytes, so two different fact sets could share a key, and the key bound no
+`parserId` (finding `80f037` F5; ADR-0032 D2: no bare hash of a concatenation is a valid
+address). The key is now
 
-The thesis and the experiment's result above stand. A future implementation (beads
-`ley-line-open-69305e`, `ley-line-open-d25f6e`) starts from this ADR, not from the removed
-code, and must length-prefix every hashed field and bind `parserId` into the key.
+```text
+rowAddr(r) = BLAKE3_derive_key("leyline/restriction/v1", n ‖ (|fᵢ| ‖ fᵢ)…)
+key(F)     = A({RowSet, scheme, params = parserId, canon 1},
+               { (rowAddr(r), a = kind(r), b = 0) : r ∈ closure(F) })
+```
+
+with the field count leading, every field length-prefixed, optional fields carrying a
+presence byte (`None` ≠ `Some("")`), the row kind in `a`, and the family and resolution
+rule named in the scheme: `leyline/restriction/call-target/token-eq/v1`,
+`leyline/restriction/public-api/token-eq/v1`. A proptest property over paths holding
+U+001F, newline, `/` and a shared `src/` prefix shows distinct row multisets give
+distinct keys; the same property run on a test-only copy of the old key is falsified
+(`rs/ll-open/cache/src/restriction.rs`, `key_tests::injectivity`).
+
+**Moved to `leyline-cache`.** `sheaf/src/restriction_cache.rs` is now
+`rs/ll-open/cache/src/restriction.rs` (restored from #521 by revert, then `git mv`), with
+its tests and the git-replay bench. The crate depends on `leyline-core` and `blake3`
+only. `sheaf/src/restriction_review.rs` (the toy) stays in `leyline-sheaf`; neither crate
+depends on the other in production. `leyline_cache::strategy` adds the cache interface
+the daemon wiring (`ley-line-open-69305e`) calls: `ReviewCache::get_or_compute` under a
+`KeyStrategy`.
+
+**Closure completeness.** Soundness needs the key to be injective (above) and the
+closure to be complete. `rs/ll-open/cache/tests/restriction_closure_completeness.rs`
+(a) runs a differential replay over a synthetic edit history and asserts 0 false skips
+for every caching arm, and (b) drops each closure row of a call-target fixture in turn,
+edits the substrate row it came from, and classifies the result: of 13 rows, 10 report
+a false skip when dropped (necessary), 2 are over-approximations (the container id, which
+the review value never reads, and a second import with the same alias, which resolution
+never reaches), and 1 is carried twice (a qualifier that also selects an import row).
+
+**Ablation** (`task cache:ablation`; 60 commits of this repository, 57 with a `.rs`
+corpus, 10,464 function lookups, 601 of them with a changed review value):
+
+| arm | hit rate | false skips | false misses | key time | e2e time |
+|---|---|---|---|---|---|
+| no cache | 0.0% | 0 | 9,863 | 0.25 ms | 99.4 ms |
+| whole-input `(treeRoot, parserId, target)` | 0.0% | 0 | 9,863 | 6.5 ms | 106.3 ms |
+| restriction | 94.0% | **0** | 32 | 73.9 ms | 85.9 ms |
+| `SheafCache`, heuristic (depth 3) | 68.1% | 154 | 2,889 | 39.5 ms | 87.2 ms |
+| `SheafCache`, δ⁰ | 68.1% | 154 | 2,888 | 45.5 ms | 93.6 ms |
+
+Every commit edits some file of its own corpus, so the whole-input key never repeats. The
+restriction key keeps 9,831 values the whole-input key discards, at 0 false skips. The
+stand-in review is a cheap indexed join (≈9.5 µs a lookup), so key cost is the same order
+as the review and end-to-end time moves little here; for a review that costs seconds
+(mache's 79–156 s `CommunityResult` re-derivations, `69305e`) the hit rate is the number
+that matters. `SheafCache`'s region graph is built from the parent's call edges; it keeps a
+function whose bytes did not change, so it serves stale values when a dependency moves
+outside that graph (154 false skips), and it invalidates every changed function and its
+call-graph neighbours whatever the review reads (2,889 false misses). Its δ⁰ mode gains
+nothing here because the bench's f32 stalks are derived from the byte hash, so every byte
+change moves the agreement subspace. Timings are one run on an Apple-silicon laptop; counts
+are deterministic for the replayed history.
 
 ## Non-goals
 

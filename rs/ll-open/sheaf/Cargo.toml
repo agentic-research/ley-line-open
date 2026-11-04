@@ -51,7 +51,16 @@ tree-sitter = { workspace = true }
 # Shared wall-clock sampling for the perf gates (min-of-N, interleaved
 # arms) — the technique lives in one place; see that crate's docs.
 leyline-perf-sample = { path = "../perf-sample" }
+# The `sheaf_restriction_replay` bench measures SheafCache against the
+# restriction key on leyline-cache's replay driver (bead
+# ley-line-open-754aa1). Dev-dep only, and one-way: leyline-cache depends
+# on nothing in this crate.
+leyline-cache = { path = "../cache" }
 
 [[bench]]
 name = "git_replay_invalidation"
+harness = false
+
+[[bench]]
+name = "sheaf_restriction_replay"
 harness = false

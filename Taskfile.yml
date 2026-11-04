@@ -904,6 +904,18 @@ tasks:
         fi
         python3 conformance/run.py
 
+  cache:ablation:
+    desc: Replay recent git history through the review-cache arms (no cache, whole-input key, restriction key, SheafCache heuristic and δ⁰) and print hit rate, false skips, false misses and cost (bead ley-line-open-754aa1). RESTR_N_COMMITS (default 60) sets the history length.
+    # Counts are deterministic for a given HEAD; timings are reported, never
+    # asserted. Each bench exits non-zero on a false skip in an arm that
+    # claims soundness. It needs the repository's history, so it is not part
+    # of `task ci` (CI checks out at depth 1); the closure-completeness test
+    # runs the same driver over a synthetic history on every push.
+    dir: rs
+    cmds:
+      - cargo bench -p leyline-cache --bench restriction_git_replay
+      - cargo bench -p leyline-sheaf --bench sheaf_restriction_replay
+
   test:perf:
     desc: Cold-parse perf regression gate (bead ley-line-open-a3f254).
     # Release mode is non-negotiable — the optimisations under test only
@@ -928,7 +940,14 @@ tasks:
       # regression. It always PRINTS its measurement in `task test`; this is
       # where the assertion is enforced.
       - cargo test --release -p leyline-cli-lib --test f2_concurrent_writers_throughput
-      # WAL reader-pool throughput floor. Same shape as F2: the pool's
+      # Restriction-vs-review wall-time corroboration. Same shape as F2:
+      # the ROW-COUNT invariant is asserted on every push inside the test, and
+      # only the wall-clock comparison is gated here. It measures at microsecond
+      # scale (7.6us vs 852us on a quiet run, but 649us vs 424us on a loaded
+      # one), so it is a scheduler race in the every-push gate and a real
+      # signal here.
+      - cargo test --release -p leyline-cache --test restriction_review_public_api
+      # WAL reader-pool throughput floor. Same shape again: the pool's
       # CORRECTNESS properties — query_only on every checkout, writers
       # serializing without corruption, exhaustion blocking rather than
       # failing — are asserted on every push inside that test, and only the

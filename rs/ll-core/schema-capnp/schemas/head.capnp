@@ -106,11 +106,11 @@ struct Head {
   # holding the arena recomputes it (`leyline verify-head`); a mismatch is
   # refused.
   #
-  # NOT SIGNED: the head signature's digest (`head_digest`, context
-  # "leyline head digest v1") binds only `generation`, `rootHash` and
-  # `parentHash`. `treeRoot` and `parserId` are stamped beside it but are not
-  # covered, so a signature does not attest them (bead
-  # `ley-line-open-b68fa6`).
+  # SIGNED: the head signature's digest (`head_digest`, context
+  # "leyline head digest v2") binds `treeRoot` and `parserId` with
+  # `generation`, `rootHash`, `parentHash` and `parentDigest` (bead
+  # `ley-line-open-b68fa6`). A head that does not stamp both has no claim and
+  # is never signed.
   #
   # Additive per ADR-0014 §1: a head that does not set these fields has the
   # same canonical bytes as before they existed. Empty = not stamped

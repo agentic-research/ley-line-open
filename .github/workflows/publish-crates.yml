@@ -32,7 +32,7 @@ name: Publish crates
 # schema-spec-before-public-schema — not the complete list; this is the full
 # topological sort computed from the real workspace dependency graph via
 # `cargo metadata`, 2026-08-07):
-#   leyline-chat-embed, leyline-core, leyline-ffi-helpers, leyline-hdc,
+#   leyline-chat-embed, leyline-core, leyline-cache, leyline-ffi-helpers, leyline-hdc,
 #   leyline-mcp-descriptor, leyline-schema, leyline-schema-bridge,
 #   leyline-schema-capnp, leyline-schema-spec, leyline-text-search,
 #   leyline-cas-ffi, leyline-cdc, leyline-lsp, leyline-public-schema,
@@ -157,7 +157,7 @@ jobs:
           set -u
           tag="${RELEASE_TAG#v}"
           for crate in \
-            leyline-chat-embed leyline-core leyline-ffi-helpers leyline-hdc \
+            leyline-chat-embed leyline-core leyline-cache leyline-ffi-helpers leyline-hdc \
             leyline-mcp-descriptor leyline-schema leyline-schema-bridge \
             leyline-schema-capnp leyline-schema-spec leyline-text-search \
             leyline-cas-ffi leyline-cdc leyline-lsp leyline-public-schema \

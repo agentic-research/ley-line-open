@@ -13,3 +13,4 @@
 //! none of its dependencies.
 
 pub mod restriction;
+pub mod strategy;

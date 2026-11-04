@@ -11,9 +11,31 @@
 
 #![allow(dead_code)] // each includer uses a subset
 
+pub mod ablation;
+pub mod git;
+
 use leyline_cache::restriction::{
-    ApiDefRow, ContainerKeying, DefRow, FactSubstrate, ImportRow, RefRow, US,
+    ApiDefRow, ContainerKeying, DefRow, FactSubstrate, ImportRow, RefRow,
 };
+use leyline_core::{ContentAddressed, Hash};
+
+/// Field separator of the [`ast_shape_hash`] baseline. That policy is the
+/// deliberately unsafe ADR-0030 representation, not a key this crate ships,
+/// so its framing is left as the sheaf-era tests had it.
+const US: char = '\u{1f}';
+
+/// The `parserId` stand-in for rows produced by this extraction: σ of the
+/// extractor's name and its extraction epoch, so an epoch bump (the
+/// `LLO_EXTRACTION_EPOCH` override) moves every key, as `Head.parserId`
+/// does in the daemon.
+pub fn test_parser_id() -> Hash {
+    format!(
+        "leyline-cache/tests/extract_rust/epoch={}",
+        leyline_ts::refs::current_extraction_epoch()
+    )
+    .as_bytes()
+    .hash()
+}
 use leyline_ts::languages::TsLanguage;
 use leyline_ts::refs::{ExtractedRef, extract_rust};
 use sha2::{Digest, Sha256};
@@ -94,6 +116,7 @@ pub fn build_substrate(corpus: &[(String, String)], keying: ContainerKeying) -> 
         refs.into_iter().collect(),
         imports.into_iter().collect(),
         container_by_fn,
+        test_parser_id(),
     )
 }
 

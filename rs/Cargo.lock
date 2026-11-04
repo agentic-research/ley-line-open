@@ -4951,6 +4951,7 @@ name = "leyline-sheaf"
 version = "0.24.0"
 dependencies = [
  "anyhow",
+ "leyline-cache",
  "leyline-core",
  "leyline-hdc",
  "leyline-perf-sample",

@@ -92,7 +92,8 @@ pub struct DaemonConfig {
     pub control: Option<std::path::PathBuf>,
     /// Optional mount point for FUSE/NFS. `None` = headless mode.
     pub mount: Option<std::path::PathBuf>,
-    /// Mount backend name (e.g. "fuse", "nfs"). Ignored when `mount = None`.
+    /// Mount backend name ("nfs", or "fuse" in a binary built with the
+    /// `fuse` feature). Ignored when `mount = None`.
     pub backend: String,
     /// TCP port for the NFS backend. Ignored when `mount = None` or `backend != "nfs"`.
     pub nfs_port: u16,

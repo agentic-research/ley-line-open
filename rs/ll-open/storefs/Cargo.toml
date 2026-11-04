@@ -31,7 +31,8 @@ rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 ignore = "0.4"
 libc = { workspace = true }
 # The host mount (`host`, bead `ley-line-open-3e73dc`): this filesystem
-# behind the host's FUSE client and a loopback NFSv3 server.
+# behind a loopback NFSv3 server (`mount`) and, in a `fuse` build, the
+# host's FUSE client (bead `ley-line-open-9d4712`: NFS links no libfuse).
 #
 # `features = ["libfuse"]` is REQUIRED: fuser 0.16's default feature set is
 # `[]`, the pure-Rust mount, which is Linux-only, so a macOS build fails in
@@ -48,7 +49,11 @@ async-trait = { version = "0.1", optional = true }
 tokio = { workspace = true, optional = true, features = ["net", "time", "macros", "rt"] }
 
 [features]
-mount = ["dep:fuser", "dep:nfsserve", "dep:async-trait", "dep:tokio"]
+# The host mount over NFS: pure Rust, no system library.
+mount = ["dep:nfsserve", "dep:async-trait", "dep:tokio"]
+# The host mount over FUSE as well: links libfuse (fuse-t through
+# rs/pkgconfig on macOS, libfuse on Linux), at build time and at launch.
+fuse = ["mount", "dep:fuser"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

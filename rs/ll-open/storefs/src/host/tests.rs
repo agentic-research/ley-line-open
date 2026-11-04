@@ -141,8 +141,57 @@ fn an_unpatched_macos_nfs_client_is_refused_and_a_patched_one_mounts() {
     }
 }
 
-/// This Mac's product version reads as `major.minor[.patch]`.
 // ── mount plumbing ───────────────────────────────────────────────────────
+
+/// NFS mounts in every `mount` build; FUSE only in a build with FUSE, and a
+/// build without it refuses `fuse` naming the feature; any other name is
+/// unknown. Both build shapes are decided here, whichever this one is.
+#[test]
+fn a_backend_mounts_only_in_a_build_that_has_it() {
+    for fuse_built in [false, true] {
+        assert_eq!(backend_for("nfs", fuse_built).unwrap(), Backend::Nfs);
+        let unknown = format!(
+            "{:#}",
+            backend_for("smb", fuse_built).expect_err("smb is no backend")
+        );
+        assert!(unknown.contains("unknown backend: smb"), "{unknown}");
+    }
+    assert_eq!(backend_for("fuse", true).unwrap(), Backend::Fuse);
+    let refusal = format!(
+        "{:#}",
+        backend_for("fuse", false).expect_err("a build without FUSE refuses it")
+    );
+    assert!(refusal.contains("`fuse` feature"), "{refusal}");
+    assert!(refusal.contains("--backend nfs"), "{refusal}");
+}
+
+/// This build's backends are the ones its `fuse` feature says it has.
+#[test]
+fn this_builds_backends_follow_its_fuse_feature() {
+    assert_eq!(backend("nfs").unwrap(), Backend::Nfs);
+    assert_eq!(
+        backend("fuse").ok(),
+        cfg!(feature = "fuse").then_some(Backend::Fuse)
+    );
+    assert!(backend("smb").is_err());
+}
+
+/// An NFS-only build refuses a FUSE mount naming the feature, before the
+/// mountpoint is made: the mount fails closed, leaving nothing behind.
+#[cfg(not(feature = "fuse"))]
+#[tokio::test]
+async fn an_nfs_only_build_refuses_fuse_before_the_mountpoint_is_made() {
+    let h = host();
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("mnt");
+    let refused = mount(Arc::clone(&h.fs), &at, "fuse", 0).await;
+    let refusal = format!(
+        "{:#}",
+        refused.err().expect("an NFS-only build refuses FUSE")
+    );
+    assert!(refusal.contains("`fuse` feature"), "{refusal}");
+    assert!(!at.exists(), "{} was created", at.display());
+}
 
 /// The NFS export is unauthenticated and writable, and the mount reaches it
 /// at 127.0.0.1, so it listens on loopback only.
@@ -194,7 +243,9 @@ async fn dropping_an_nfs_mount_unmounts_its_path_and_lands_what_is_staged() {
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_OTHER));
 }
 
-/// An unknown backend is refused by name, after the mountpoint is made.
+/// An unknown backend is refused by name, before the mountpoint is made:
+/// the mount fails closed, leaving nothing behind (bead
+/// `ley-line-open-9d4712`).
 #[tokio::test]
 async fn an_unknown_backend_is_refused_by_name() {
     let h = host();
@@ -209,8 +260,8 @@ async fn an_unknown_backend_is_refused_by_name() {
         "{err:#}"
     );
     assert!(
-        at.is_dir(),
-        "the mountpoint is made before the backend is chosen"
+        !at.exists(),
+        "the backend is refused before the mountpoint is made"
     );
 }
 
@@ -880,173 +931,180 @@ fn each_errno_reaches_the_client_as_its_nfs_status() {
 
 // ── the FUSE adapter's translations ──────────────────────────────────────
 
-/// The Linux errno values that differ from the host's are translated; the
-/// rest pass through.
-#[test]
-fn linux_errnos_reach_the_host_in_its_values() {
-    use super::fuse_abi::host_errno;
-    use crate::Errno;
-    assert_eq!(host_errno(Errno::ESTALE), libc::ESTALE);
-    assert_eq!(host_errno(Errno::ENOTEMPTY), libc::ENOTEMPTY);
-    assert_eq!(host_errno(Errno::ENOSYS), libc::ENOSYS);
-    for same in [
-        Errno::EPERM,
-        Errno::ENOENT,
-        Errno::EACCES,
-        Errno::EEXIST,
-        Errno::EISDIR,
-    ] {
-        assert_eq!(host_errno(same), same.0);
+/// `fuse_abi` is the `fuse` feature's; an NFS-only build has no FUSE
+/// adapter to translate for.
+#[cfg(feature = "fuse")]
+mod fuse_adapter {
+    use super::*;
+
+    /// The Linux errno values that differ from the host's are translated; the
+    /// rest pass through.
+    #[test]
+    fn linux_errnos_reach_the_host_in_its_values() {
+        use crate::Errno;
+        use crate::host::fuse_abi::host_errno;
+        assert_eq!(host_errno(Errno::ESTALE), libc::ESTALE);
+        assert_eq!(host_errno(Errno::ENOTEMPTY), libc::ENOTEMPTY);
+        assert_eq!(host_errno(Errno::ENOSYS), libc::ENOSYS);
+        for same in [
+            Errno::EPERM,
+            Errno::ENOENT,
+            Errno::EACCES,
+            Errno::EEXIST,
+            Errno::EISDIR,
+        ] {
+            assert_eq!(host_errno(same), same.0);
+        }
     }
-}
 
-/// The host's `open(2)` access mode and `O_TRUNC` reach the filesystem in
-/// Linux's values; other flags are not carried.
-#[test]
-fn host_open_flags_reach_the_filesystem_in_linux_values() {
-    use super::fuse_abi::linux_open_flags;
-    use crate::open_flags;
-    assert_eq!(linux_open_flags(libc::O_RDONLY), open_flags::O_RDONLY);
-    assert_eq!(linux_open_flags(libc::O_WRONLY), open_flags::O_WRONLY);
-    assert_eq!(linux_open_flags(libc::O_RDWR), open_flags::O_RDWR);
-    assert_eq!(
-        linux_open_flags(libc::O_RDWR | libc::O_TRUNC),
-        open_flags::O_RDWR | open_flags::O_TRUNC
-    );
-    assert_eq!(
-        linux_open_flags(libc::O_WRONLY | libc::O_APPEND),
-        open_flags::O_WRONLY
-    );
-}
+    /// The host's `open(2)` access mode and `O_TRUNC` reach the filesystem in
+    /// Linux's values; other flags are not carried.
+    #[test]
+    fn host_open_flags_reach_the_filesystem_in_linux_values() {
+        use crate::host::fuse_abi::linux_open_flags;
+        use crate::open_flags;
+        assert_eq!(linux_open_flags(libc::O_RDONLY), open_flags::O_RDONLY);
+        assert_eq!(linux_open_flags(libc::O_WRONLY), open_flags::O_WRONLY);
+        assert_eq!(linux_open_flags(libc::O_RDWR), open_flags::O_RDWR);
+        assert_eq!(
+            linux_open_flags(libc::O_RDWR | libc::O_TRUNC),
+            open_flags::O_RDWR | open_flags::O_TRUNC
+        );
+        assert_eq!(
+            linux_open_flags(libc::O_WRONLY | libc::O_APPEND),
+            open_flags::O_WRONLY
+        );
+    }
 
-/// macOS's `renamex_np(2)` flags reach the filesystem as Linux's
-/// `renameat2(2)` flags; a flag with no Linux spelling becomes one the
-/// filesystem refuses.
-#[test]
-fn macos_rename_flags_reach_the_filesystem_in_linux_values() {
-    use super::fuse_abi::{UNKNOWN_RENAME_FLAG, macos_rename_flags};
-    use crate::rename_flags;
-    assert_eq!(UNKNOWN_RENAME_FLAG, 0x8000_0000);
-    assert_eq!(macos_rename_flags(0), 0);
-    assert_eq!(macos_rename_flags(0x4), rename_flags::RENAME_NOREPLACE);
-    assert_eq!(macos_rename_flags(0x2), rename_flags::RENAME_EXCHANGE);
-    assert_eq!(
-        macos_rename_flags(0x6),
-        rename_flags::RENAME_NOREPLACE | rename_flags::RENAME_EXCHANGE
-    );
-    // RENAME_SECLUDE (0x1) is no RENAME_NOREPLACE, though Linux spells
-    // NOREPLACE with that bit.
-    assert_eq!(macos_rename_flags(0x1), UNKNOWN_RENAME_FLAG);
-    assert_eq!(macos_rename_flags(0x10), UNKNOWN_RENAME_FLAG);
-    assert_eq!(
-        macos_rename_flags(0x5),
-        UNKNOWN_RENAME_FLAG | rename_flags::RENAME_NOREPLACE
-    );
-}
+    /// macOS's `renamex_np(2)` flags reach the filesystem as Linux's
+    /// `renameat2(2)` flags; a flag with no Linux spelling becomes one the
+    /// filesystem refuses.
+    #[test]
+    fn macos_rename_flags_reach_the_filesystem_in_linux_values() {
+        use crate::host::fuse_abi::{UNKNOWN_RENAME_FLAG, macos_rename_flags};
+        use crate::rename_flags;
+        assert_eq!(UNKNOWN_RENAME_FLAG, 0x8000_0000);
+        assert_eq!(macos_rename_flags(0), 0);
+        assert_eq!(macos_rename_flags(0x4), rename_flags::RENAME_NOREPLACE);
+        assert_eq!(macos_rename_flags(0x2), rename_flags::RENAME_EXCHANGE);
+        assert_eq!(
+            macos_rename_flags(0x6),
+            rename_flags::RENAME_NOREPLACE | rename_flags::RENAME_EXCHANGE
+        );
+        // RENAME_SECLUDE (0x1) is no RENAME_NOREPLACE, though Linux spells
+        // NOREPLACE with that bit.
+        assert_eq!(macos_rename_flags(0x1), UNKNOWN_RENAME_FLAG);
+        assert_eq!(macos_rename_flags(0x10), UNKNOWN_RENAME_FLAG);
+        assert_eq!(
+            macos_rename_flags(0x5),
+            UNKNOWN_RENAME_FLAG | rename_flags::RENAME_NOREPLACE
+        );
+    }
 
-/// The host's rename flags: macOS's translated, Linux's as they are.
-#[test]
-fn host_rename_flags_are_the_platforms() {
-    use super::fuse_abi::linux_rename_flags;
-    use crate::rename_flags;
-    assert_eq!(linux_rename_flags(0), 0);
-    let noreplace = if cfg!(target_os = "macos") { 0x4 } else { 0x1 };
-    assert_eq!(
-        linux_rename_flags(noreplace),
-        rename_flags::RENAME_NOREPLACE
-    );
-}
+    /// The host's rename flags: macOS's translated, Linux's as they are.
+    #[test]
+    fn host_rename_flags_are_the_platforms() {
+        use crate::host::fuse_abi::linux_rename_flags;
+        use crate::rename_flags;
+        assert_eq!(linux_rename_flags(0), 0);
+        let noreplace = if cfg!(target_os = "macos") { 0x4 } else { 0x1 };
+        assert_eq!(
+            linux_rename_flags(noreplace),
+            rename_flags::RENAME_NOREPLACE
+        );
+    }
 
-/// A rename whose host flag has no Linux spelling is refused, not misread.
-#[test]
-fn a_rename_with_an_unknown_host_flag_is_refused() {
-    use super::fuse_abi::macos_rename_flags;
-    let f = fixture(crate::tests::whole());
-    let refused = f.fs.rename(
-        ROOT_INODE,
-        b"a.go",
-        ROOT_INODE,
-        b"b.go",
-        macos_rename_flags(0x1),
-    );
-    assert_eq!(refused, Err(crate::Errno::EINVAL));
-    assert!(f.fs.lookup(ROOT_INODE, b"a.go").is_ok());
-}
+    /// A rename whose host flag has no Linux spelling is refused, not misread.
+    #[test]
+    fn a_rename_with_an_unknown_host_flag_is_refused() {
+        use crate::host::fuse_abi::macos_rename_flags;
+        let f = fixture(crate::tests::whole());
+        let refused = f.fs.rename(
+            ROOT_INODE,
+            b"a.go",
+            ROOT_INODE,
+            b"b.go",
+            macos_rename_flags(0x1),
+        );
+        assert_eq!(refused, Err(crate::Errno::EINVAL));
+        assert!(f.fs.lookup(ROOT_INODE, b"a.go").is_ok());
+    }
 
-/// A node's FUSE attributes carry its inode, size, blocks, kind,
-/// permissions, link count and time, and the owner they are given.
-#[test]
-fn a_nodes_fuse_attributes_carry_what_storefs_answers() {
-    use super::fuse_abi::{BLKSIZE, file_attr};
-    use crate::{Attr, Kind};
-    use std::time::{Duration, UNIX_EPOCH};
-    let attr = Attr {
-        inode: 7,
-        kind: Kind::File,
-        size: 1025,
-        perm: 0o755,
-        mtime: Duration::new(1_760_000_000, 42),
-    };
-    let fa = file_attr(&attr, (501, 20));
-    assert_eq!(fa.ino, 7);
-    assert_eq!(fa.size, 1025);
-    assert_eq!(fa.blocks, 3);
-    assert_eq!(fa.mtime, UNIX_EPOCH + Duration::new(1_760_000_000, 42));
-    assert_eq!(fa.atime, fa.mtime);
-    assert_eq!(fa.ctime, fa.mtime);
-    assert_eq!(fa.crtime, fa.mtime);
-    assert_eq!(fa.kind, fuser::FileType::RegularFile);
-    assert_eq!(fa.perm, 0o755);
-    assert_eq!(fa.nlink, attr.nlink());
-    assert_eq!((fa.uid, fa.gid), (501, 20));
-    assert_eq!(fa.blksize, BLKSIZE);
-}
+    /// A node's FUSE attributes carry its inode, size, blocks, kind,
+    /// permissions, link count and time, and the owner they are given.
+    #[test]
+    fn a_nodes_fuse_attributes_carry_what_storefs_answers() {
+        use crate::host::fuse_abi::{BLKSIZE, file_attr};
+        use crate::{Attr, Kind};
+        use std::time::{Duration, UNIX_EPOCH};
+        let attr = Attr {
+            inode: 7,
+            kind: Kind::File,
+            size: 1025,
+            perm: 0o755,
+            mtime: Duration::new(1_760_000_000, 42),
+        };
+        let fa = file_attr(&attr, (501, 20));
+        assert_eq!(fa.ino, 7);
+        assert_eq!(fa.size, 1025);
+        assert_eq!(fa.blocks, 3);
+        assert_eq!(fa.mtime, UNIX_EPOCH + Duration::new(1_760_000_000, 42));
+        assert_eq!(fa.atime, fa.mtime);
+        assert_eq!(fa.ctime, fa.mtime);
+        assert_eq!(fa.crtime, fa.mtime);
+        assert_eq!(fa.kind, fuser::FileType::RegularFile);
+        assert_eq!(fa.perm, 0o755);
+        assert_eq!(fa.nlink, attr.nlink());
+        assert_eq!((fa.uid, fa.gid), (501, 20));
+        assert_eq!(fa.blksize, BLKSIZE);
+    }
 
-/// Each node kind has its FUSE file type.
-#[test]
-fn each_kind_has_its_fuse_file_type() {
-    use super::fuse_abi::file_type;
-    use crate::Kind;
-    assert_eq!(file_type(Kind::File), fuser::FileType::RegularFile);
-    assert_eq!(file_type(Kind::Directory), fuser::FileType::Directory);
-    assert_eq!(file_type(Kind::Symlink), fuser::FileType::Symlink);
-}
+    /// Each node kind has its FUSE file type.
+    #[test]
+    fn each_kind_has_its_fuse_file_type() {
+        use crate::Kind;
+        use crate::host::fuse_abi::file_type;
+        assert_eq!(file_type(Kind::File), fuser::FileType::RegularFile);
+        assert_eq!(file_type(Kind::Directory), fuser::FileType::Directory);
+        assert_eq!(file_type(Kind::Symlink), fuser::FileType::Symlink);
+    }
 
-/// A SETATTR naming the owner every node is presented with changes
-/// nothing; any other owner is passed on, to be refused.
-#[test]
-fn only_another_owner_is_an_owner_change() {
-    use super::fuse_abi::owner_change;
-    let owner = (501, 20);
-    assert_eq!(owner_change(None, None, owner), (None, None));
-    assert_eq!(owner_change(Some(501), Some(20), owner), (None, None));
-    assert_eq!(owner_change(Some(0), None, owner), (Some(0), None));
-    assert_eq!(owner_change(None, Some(0), owner), (None, Some(0)));
-    assert_eq!(
-        owner_change(Some(502), Some(21), owner),
-        (Some(502), Some(21))
-    );
-}
+    /// A SETATTR naming the owner every node is presented with changes
+    /// nothing; any other owner is passed on, to be refused.
+    #[test]
+    fn only_another_owner_is_an_owner_change() {
+        use crate::host::fuse_abi::owner_change;
+        let owner = (501, 20);
+        assert_eq!(owner_change(None, None, owner), (None, None));
+        assert_eq!(owner_change(Some(501), Some(20), owner), (None, None));
+        assert_eq!(owner_change(Some(0), None, owner), (Some(0), None));
+        assert_eq!(owner_change(None, Some(0), owner), (None, Some(0)));
+        assert_eq!(
+            owner_change(Some(502), Some(21), owner),
+            (Some(502), Some(21))
+        );
+    }
 
-/// A CREATE whose mode grants execute stages that mode; any other lands
-/// regular.
-#[test]
-fn a_create_that_grants_execute_stages_its_mode() {
-    use super::fuse_abi::create_mode;
-    assert_eq!(create_mode(0o755), Some(0o755));
-    assert_eq!(create_mode(0o100), Some(0o100));
-    assert_eq!(create_mode(0o001), Some(0o001));
-    assert_eq!(create_mode(0o644), None);
-    assert_eq!(create_mode(0o600), None);
-}
+    /// A CREATE whose mode grants execute stages that mode; any other lands
+    /// regular.
+    #[test]
+    fn a_create_that_grants_execute_stages_its_mode() {
+        use crate::host::fuse_abi::create_mode;
+        assert_eq!(create_mode(0o755), Some(0o755));
+        assert_eq!(create_mode(0o100), Some(0o100));
+        assert_eq!(create_mode(0o001), Some(0o001));
+        assert_eq!(create_mode(0o644), None);
+        assert_eq!(create_mode(0o600), None);
+    }
 
-/// Nodes are presented as owned by this process's user.
-#[test]
-fn nodes_are_owned_by_this_process() {
-    use super::fuse_abi::process_owner;
-    // SAFETY: `getuid(2)` and `getgid(2)` cannot fail and touch no memory.
-    let want = unsafe { (libc::getuid(), libc::getgid()) };
-    assert_eq!(process_owner(), want);
+    /// Nodes are presented as owned by this process's user.
+    #[test]
+    fn nodes_are_owned_by_this_process() {
+        use crate::host::fuse_abi::process_owner;
+        // SAFETY: `getuid(2)` and `getgid(2)` cannot fail and touch no memory.
+        let want = unsafe { (libc::getuid(), libc::getgid()) };
+        assert_eq!(process_owner(), want);
+    }
 }
 
 // ── the NFS adapter's attributes and owners ─────────────────────────────

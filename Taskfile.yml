@@ -34,7 +34,8 @@ includes:
 vars:
   SCCACHE_VERSION: 0.15.0
   SCCACHE_BIN: '{{.ROOT_DIR}}/.tools/bin/sccache'
-  # macOS needs our fuse-t pkg-config wrapper; Linux uses system libfuse3.
+  # macOS `fuse` builds need our fuse-t pkg-config wrapper; Linux uses system
+  # libfuse. A `mount` (NFS-only) build links no libfuse and reads none of it.
   FUSE_PKG_CONFIG_PATH:
     sh: 'if [ "$(uname)" = "Darwin" ]; then echo "{{.ROOT_DIR}}/rs/pkgconfig"; fi'
 
@@ -284,7 +285,7 @@ tasks:
     desc: |
       Everything `task ci` compiles against on a Linux runner: the capnp
       toolchain plus libdbus-1-dev (keyring) and libfuse-dev (fuser, behind
-      storefs's `mount`).
+      storefs's `fuse`).
       ci.yml calls this; the extras ride on deps:capnp's apt-get update.
     cmds:
       - task: deps:capnp
@@ -629,7 +630,7 @@ tasks:
       - cargo build -p leyline-cli
 
   build:mount:
-    desc: Build with FUSE/NFS mount support (requires libfuse-t on macOS)
+    desc: Build with NFS mount support (`--features mount`; no libfuse — `--features fuse` adds the FUSE backend)
     dir: rs
     cmds:
       - cargo build -p leyline-cli --features mount
@@ -641,7 +642,7 @@ tasks:
       - cargo build --release -p leyline-cli
 
   release:mount:
-    desc: Release build with FUSE/NFS mount support
+    desc: Release build with NFS mount support (`--features mount`; no libfuse)
     dir: rs
     cmds:
       - cargo build --release -p leyline-cli --features mount
@@ -677,7 +678,7 @@ tasks:
       - cargo build --release -p leyline-cli --features all
 
   release:full+mount:
-    desc: Release build with `--features full` — includes mount. Requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at BUILD and RUNTIME. Binary won't launch without the dylib.
+    desc: Release build with `--features full` — includes both mount backends, NFS and FUSE. The `fuse` backend requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at BUILD and RUNTIME. Binary won't launch without the dylib.
     dir: rs
     cmds:
       - cargo build --release -p leyline-cli --features full
@@ -848,7 +849,7 @@ tasks:
       - echo "installed (full) $(~/.local/bin/leyline --version)"
 
   "install:full+mount":
-    desc: Build with `--features full` INCLUDING mount, codesign (macOS), and install. ONLY use this if libfuse-t (macOS) / libfuse (Linux) is installed at runtime — otherwise the binary won't launch, even for non-mount ops.
+    desc: Build with `--features full` INCLUDING both mount backends (NFS and FUSE), codesign (macOS), and install. ONLY use this if libfuse-t (macOS) / libfuse (Linux) is installed at runtime — otherwise the binary won't launch, even for non-mount ops. For an NFS mount without libfuse, build `--features all,mount`.
     deps: [release:full+mount]
     cmds:
       # Thin wrapper over `leyline self install` — see `install:`.

@@ -69,7 +69,7 @@ Those two are the arbiters; this list is a summary of them.
 ```bash
 task install              # released/default feature set
 task install:full         # portable full feature set, no mount backend
-task install:full+mount   # add FUSE/NFS support
+task install:full+mount   # add NFS and FUSE mounts (FUSE links libfuse)
 task ci                   # check, clippy, formatting, tests, FFI gates
 task runtime:test        # embedded libkrun runtime contract tests (fake worker)
 ```

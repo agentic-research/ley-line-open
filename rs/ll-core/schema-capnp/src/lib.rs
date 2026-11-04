@@ -17,9 +17,16 @@
 //!
 //! The `leyline-schema` crate holds SQLite DDL — local-projection
 //! schemas. This crate holds *contract* schemas: what crosses the
-//! producer/consumer boundary. SQLite tables are derived from the
-//! capnp event log per the Σ data-plane reframe (2026-05-08, L2/L3
-//! synthesis).
+//! producer/consumer boundary.
+//!
+//! The SQLite projection is NOT derived from these records. `leyline
+//! parse` writes both from one parse: the SQL rows, and the
+//! `.source.capnp` / `.ast.capnp` / `.bindings.capnp` segments that
+//! `Head.rootHash` folds. The only production reader of the segments is that
+//! hash. The projection's own validity is its `derived_from` stamp
+//! (`treeRoot`, `parserId`, projection version; ADR-0040 D6). Deriving the
+//! projection from the log was the Σ data-plane reframe's proposal
+//! (2026-05-08) and is not built (bead `ley-line-open-5be950`).
 
 #![allow(clippy::all)]
 

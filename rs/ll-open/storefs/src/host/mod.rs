@@ -7,8 +7,15 @@
 //!
 //! macOS mounts NFSv3 from a loopback server (hf-mount's arrangement, on
 //! xetdata's `nfsserve`), since FUSE there needs macFUSE. Linux mounts FUSE.
+//!
+//! The NFS backend is the `mount` feature and links no system library. The
+//! FUSE backend is the `fuse` feature, which links libfuse (bead
+//! `ley-line-open-9d4712`); a build without it refuses `fuse` by name
+//! ([`check_backend`]).
 
+#[cfg(feature = "fuse")]
 pub mod fuse;
+#[cfg(feature = "fuse")]
 pub mod fuse_abi;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -122,7 +129,8 @@ pub fn unpatched_nfs_client(product_version: &str) -> Option<String> {
         format!(
             "refusing to mount NFS on macOS {}: its NFS client corrupts kernel memory on \
              server replies (CVE-2026-43686, CVE-2026-84549), fixed in macOS Tahoe 26.7 and \
-             Sequoia 15.8. Update macOS, or mount with --backend fuse (macFUSE or fuse-t).",
+             Sequoia 15.8. Update macOS, or mount with --backend fuse (a `fuse` build, with macFUSE \
+             or fuse-t).",
             product_version.trim()
         )
     })
@@ -215,12 +223,14 @@ pub fn run_mount(mount_cmd: &str, options: &str, path: &Path) -> Result<()> {
 }
 
 /// A FUSE session; dropping it unmounts.
+#[cfg(feature = "fuse")]
 pub type FuseSession = ::fuser::BackgroundSession;
 
 /// Mount `fs` over FUSE at `mountpoint`. No `auto_unmount`: on libfuse 2
 /// that option makes `fusermount` add `allow_other`, which a stock Linux
 /// refuses without `user_allow_other` in `/etc/fuse.conf`. The session's
 /// `Drop` is the unmount.
+#[cfg(feature = "fuse")]
 pub fn mount_fuse<S: Store + 'static>(
     fs: Arc<StoreFs<S>>,
     mountpoint: &Path,
@@ -236,27 +246,42 @@ pub fn mount_fuse<S: Store + 'static>(
 /// A mount this process holds while it serves; dropping it unmounts.
 pub enum Mounted<S: Store + 'static> {
     Nfs(NfsMount<S>),
+    #[cfg(feature = "fuse")]
     Fuse(FuseSession),
 }
 
-/// Mount `fs` at `mount` on `backend` (`nfs` or `fuse`).
+/// Whether this build can mount on `backend`: `nfs` always, `fuse` only in a
+/// build with the `fuse` feature. Anything else is refused, before any
+/// mountpoint is made or server bound.
+pub fn check_backend(backend: &str) -> Result<()> {
+    match backend {
+        "nfs" => Ok(()),
+        "fuse" if cfg!(feature = "fuse") => Ok(()),
+        "fuse" => anyhow::bail!(
+            "backend 'fuse' needs a leyline built with the `fuse` feature; this build \
+             mounts over NFS only. Build with `--features fuse`, or mount with --backend nfs."
+        ),
+        other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
+    }
+}
+
+/// Mount `fs` at `mount` on `backend` (`nfs`, or `fuse` in a `fuse` build).
 pub async fn mount<S: Store + 'static>(
     fs: Arc<StoreFs<S>>,
     mount: &Path,
     backend: &str,
     nfs_port: u16,
 ) -> Result<Mounted<S>> {
+    check_backend(backend)?;
     std::fs::create_dir_all(mount)
         .with_context(|| format!("create mountpoint {}", mount.display()))?;
-    match backend {
-        "nfs" => {
-            let server = serve_nfs(fs, &nfs_listen_addr(nfs_port)).await?;
-            log::info!("NFS server listening on port {}", server.port());
-            Ok(Mounted::Nfs(mount_nfs(server, mount)?))
-        }
-        "fuse" => Ok(Mounted::Fuse(mount_fuse(fs, mount)?)),
-        other => anyhow::bail!("unknown backend: {other} (expected 'nfs' or 'fuse')"),
+    #[cfg(feature = "fuse")]
+    if backend == "fuse" {
+        return Ok(Mounted::Fuse(mount_fuse(fs, mount)?));
     }
+    let server = serve_nfs(fs, &nfs_listen_addr(nfs_port)).await?;
+    log::info!("NFS server listening on port {}", server.port());
+    Ok(Mounted::Nfs(mount_nfs(server, mount)?))
 }
 
 /// The daemon's host mount: the store behind the daemon's own reader pool

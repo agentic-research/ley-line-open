@@ -281,8 +281,8 @@ diff --git a/ll-open/storefs/src/host/nfs.rs b/ll-open/storefs/src/host/nfs.rs
 DIFF
 PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/storefs-host.diff"
-assert_call 'mutants .*-C --lib .*--package leyline-storefs .*--features mount' \
-    'a storefs diff runs the storefs slice with the mount feature, lib tests only'
+assert_call 'mutants .*-C --lib .*--package leyline-storefs .*--features fuse' \
+    'a storefs diff runs the storefs slice with the fuse feature (NFS and FUSE adapters), lib tests only'
 if grep -q -- "--exclude ll-open/fs/\*\*.*--features" "$log"; then
     echo 'the generic slice was handed storefs features' >&2
     exit 1

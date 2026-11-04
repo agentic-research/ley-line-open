@@ -16,11 +16,12 @@ requests from `StoreFs`, and `DaemonShares` serves an execution/v1 run's
 granted workspace from the daemon's own store (ADR-0044 phase C, bead
 `ley-line-open-f210c2`); see "Adapter" below.
 
-## The host mount (`mount` feature)
+## The host mount (`mount` and `fuse` features)
 
 The same `StoreFs` serves `leyline daemon --mount` (ADR-0045 T8, bead
 `ley-line-open-3e73dc`): `host::fuse::HostFuse` behind the host's FUSE client
-(Linux; macOS with macFUSE or fuse-t) and `host::nfs::HostNfs`, a loopback
+(Linux; macOS with macFUSE or fuse-t; the `fuse` feature, which links libfuse)
+and `host::nfs::HostNfs` (the `mount` feature, pure Rust), a loopback
 NFSv3 server on `nessie-nfsserve`, behind the host's NFS client (the macOS
 default). A host process sees what a guest sees and writes by the same
 rules; the `leyline` binary injects the mount into the daemon as

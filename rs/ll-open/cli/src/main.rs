@@ -45,7 +45,8 @@ impl WorkspaceFreshness {
 }
 
 /// What serves `daemon --mount`: the store's filesystem behind the host's
-/// FUSE or NFS client (bead `ley-line-open-3e73dc`), in a `mount` build.
+/// NFS client (bead `ley-line-open-3e73dc`) in a `mount` build, and its FUSE
+/// client too in a `fuse` build (bead `ley-line-open-9d4712`).
 #[cfg(feature = "mount")]
 fn host_mount() -> Option<leyline_cli_lib::cmd_daemon::HostMountRef> {
     Some(leyline_cli_lib::cmd_daemon::HostMountRef(Arc::new(
@@ -201,7 +202,8 @@ enum Cmd {
         #[arg(long)]
         mount: Option<PathBuf>,
 
-        /// Filesystem backend: "nfs" or "fuse".
+        /// Filesystem backend: "nfs" or "fuse" ("fuse" needs a build with
+        /// the `fuse` feature).
         #[arg(long, default_value_t = lifecycle::default_backend())]
         backend: String,
 

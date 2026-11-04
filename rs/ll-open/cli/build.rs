@@ -1,4 +1,4 @@
-//! macOS `mount` builds: put fuse-t's library directory on the binary's rpath.
+//! macOS `fuse` builds: put fuse-t's library directory on the binary's rpath.
 //!
 //! fuse-t installs `libfuse-t.dylib` with the install name
 //! `@rpath/libfuse-t.dylib`. fuser's build script links it through the
@@ -9,14 +9,17 @@
 //! hid it by putting the link search path on DYLD_FALLBACK_LIBRARY_PATH; the
 //! release smoke (`tools/cli_smoke.sh --mount`) runs the binary directly and
 //! found it.
+//!
+//! A `mount` build without `fuse` mounts NFS only, links no fuser and needs
+//! no pkg-config (bead `ley-line-open-9d4712`).
 use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    let mount = std::env::var_os("CARGO_FEATURE_MOUNT").is_some();
+    let fuse = std::env::var_os("CARGO_FEATURE_FUSE").is_some();
     let macos = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
-    if !(mount && macos) {
+    if !(fuse && macos) {
         return;
     }
     let out = Command::new("pkg-config")

@@ -55,10 +55,10 @@ Ensure `~/.local/bin` is on your `PATH` (or drop the binary anywhere else on `PA
 
 **Feature set of the released binary**: default features only (`lsp` +
 `validate` + `hdc` + `cdc`). Enough for structural analysis, validation, HDC
-similarity search, and explicit chunk activation. The `vec` (fastembed) and
-`mount` (FUSE / NFS) features are gated OFF in the release binary so it
-doesn't drag libfuse or an ONNX model download onto every consumer. If you
-need those, build from source (below).
+similarity search, and explicit chunk activation. The `vec` (fastembed),
+`mount` (NFS) and `fuse` (FUSE, links libfuse) features are gated OFF in the
+release binary so it doesn't drag libfuse or an ONNX model download onto
+every consumer. If you need those, build from source (below).
 
 The release also attaches the FFI staticlibs (`libleyline_fs-{darwin,linux}-*.a` + `leyline_fs.h`) for C consumers that link the arena reader directly.
 
@@ -82,14 +82,16 @@ Three install shapes to choose from (see [README §Install](README.md#install) f
 
 - **`task install`** — same feature set as the released binary (`lsp` + `validate` + `hdc` + `cdc`). Use the released binary instead unless you need a specific commit.
 - **`task install:full`** — everything portable (`--features all`, no mount). Adds `vec` (fastembed model, ~100MB cache at `~/.cache/fastembed/` on first `vec_search`) and `text-search`.
-- **`task install:full+mount`** — everything including FUSE/NFS mount. Requires `libfuse-t` (macOS) or `libfuse` (Linux) at runtime.
+- **`task install:full+mount`** — everything including both mount backends, NFS (`mount`) and FUSE (`fuse`). Requires `libfuse-t` (macOS) or `libfuse` (Linux) at build time and at runtime.
 
 All three produce `~/.local/bin/leyline` (codesigned on macOS).
 
+The NFS mount alone is the `mount` feature and links no libfuse: `cd rs && cargo build --release -p leyline-cli --features all,mount` builds a binary that mounts with `--backend nfs` and needs no fuse-t, no libfuse and no `PKG_CONFIG_PATH`. The `fuse` feature adds `--backend fuse`; a build without it refuses `--backend fuse` by name.
+
 Runtime deps:
 - **None** for the `leyline parse` + `leyline daemon` happy path (daemon default is UDS-only on the control socket; MCP HTTP is opt-in via `--mcp-port`).
-- **None** for the default mount path on macOS under `install:full+mount` — `leyline daemon --mount /path` uses the kernel's native NFS client (`--backend nfs` is the macOS default; `--backend fuse` is opt-in and requires `fuse-t`). The NFS mount refuses macOS Tahoe before 26.7 and Sequoia before 15.8, whose NFS client corrupts kernel memory (CVE-2026-43686, CVE-2026-84549): update macOS, or use `--backend fuse`.
-- **libfuse3** on Linux for `install:full+mount` builds — Linux's default backend is FUSE (`--backend fuse`); NFS is opt-in.
+- **None** for the NFS mount (`mount` feature) — on macOS `leyline daemon --mount /path` uses the kernel's native NFS client (`--backend nfs` is the macOS default; `--backend fuse` needs a `fuse` build and `fuse-t`). The NFS mount refuses macOS Tahoe before 26.7 and Sequoia before 15.8, whose NFS client corrupts kernel memory (CVE-2026-43686, CVE-2026-84549): update macOS, or use `--backend fuse` from a `fuse` build.
+- **libfuse3** on Linux for `fuse` builds (`install:full+mount`) — Linux's default backend is FUSE (`--backend fuse`), so a Linux `mount`-only build mounts only with `--backend nfs` and refuses the default naming the `fuse` feature.
 - **A fastembed model cache** at `~/.cache/fastembed/` (~100 MB, downloaded on first `vec_search` use, only present under `install:full` and up). Skip if you don't use `vec_search`.
 
 ### Parse a corpus
@@ -158,11 +160,11 @@ You're here if you want to send PRs back.
 ```bash
 brew install capnp go-task        # capnp ≥1.3.0 (build.rs codegen); go-task is the build entry point
 rustup install stable             # current toolchain
-brew install fuse-t               # OPTIONAL — only if you want --backend fuse on macOS (default is --backend nfs, needs nothing extra)
+brew install fuse-t               # OPTIONAL — only for a `fuse` build (--backend fuse on macOS; the default --backend nfs needs nothing extra)
 brew install sccache              # Optional; Taskfile auto-detects + uses as RUSTC_WRAPPER for faster rebuilds (bead 488440)
 ```
 
-Linux equivalents: `apt-get install capnproto libfuse3-dev` + `cargo install task` (or whatever your distro packages). FUSE is the Linux default backend, so libfuse3 is the load-bearing mount-time dep there.
+Linux equivalents: `apt-get install capnproto libfuse3-dev` + `cargo install task` (or whatever your distro packages). FUSE is the Linux default backend, so libfuse3 is the load-bearing dep of a Linux `fuse` build.
 
 ### Build + test
 

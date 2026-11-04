@@ -55,6 +55,45 @@ fn tree_root_docs_name_the_table_the_fold_reads() {
     );
 }
 
+/// head.capnp is the cross-runtime description of `treeRoot`: another runtime
+/// implements the fold from it. It must name `_tree`, the mode tag and empty
+/// directories as the code does, and must not claim the signature covers it.
+#[test]
+fn head_schema_describes_the_tree_root_the_code_computes() {
+    let schema = normalized(include_str!("../../../ll-core/schema-capnp/schemas/head.capnp"));
+    let src = include_str!("../src/tree_root.rs");
+    let digest = include_str!("../../../ll-core/core/src/head_digest.rs");
+
+    assert!(
+        !schema.contains("over every `_source` row"),
+        "head.capnp still describes treeRoot as a fold over `_source` rows"
+    );
+    for claim in [
+        "over the store's manifest `_tree`",
+        "every EMPTY directory",
+        "`modeTag` is 0 for `0o100644`",
+        "NOT SIGNED",
+    ] {
+        assert!(schema.contains(claim), "head.capnp's treeRoot description is missing: {claim}");
+    }
+
+    // Tie the description to the code it describes.
+    assert!(
+        src.contains("if mode == 0o100644 { 0 } else { u64::from(mode) }"),
+        "tree_root.rs's mode tag changed; update head.capnp's treeRoot description with it"
+    );
+    assert!(
+        src.contains("content: b\"\".hash()"),
+        "tree_root.rs no longer folds an empty directory as BLAKE3 of no bytes; update head.capnp"
+    );
+    // "NOT SIGNED" is true only while the head digest omits treeRoot. When
+    // b68fa6 binds it, this assertion fails and the schema text must change.
+    assert!(
+        !digest.contains("tree_root") && !digest.contains("treeRoot"),
+        "head_digest now binds treeRoot; remove head.capnp's NOT SIGNED note"
+    );
+}
+
 /// The SQLite projection is written beside the capnp segments by one parse; it
 /// is not derived from them. The only production reader of a segment hashes it.
 #[test]

@@ -1,6 +1,12 @@
 # ADR-0040 — The write boundary: source and manifest are the data, the arena is a cache
 
 **Status:** Proposed (2026-10-10)
+**Shipped gap (2026-11-04):** this ADR calls the manifest root "the one identity that signatures
+… cite" and gives ring 0 a "signed root". As shipped, the head signature does not cover it:
+`head_digest` (`rs/ll-core/core/src/head_digest.rs`) binds `generation`, `rootHash` and
+`parentHash` only, and `treeRoot` / `parserId` are stamped beside the signature. A signed head
+with a rewritten `treeRoot` still verifies. Binding them is bead `ley-line-open-b68fa6`; until it
+lands, no signature attests a `treeRoot`.
 **Bead:** `ley-line-open-e79c0f` (review ledger; the beads under "Next moves" carry the work)
 **Related:**
 

@@ -205,3 +205,6 @@ serial_test = "3"
 # ley-line-open-a2099a): tests/wasm_export_surface.rs parses the real
 # export section of the built artifact, run via `task sign:wasm:verify`.
 wasmparser = { workspace = true }
+# Builds the removed v1 head digest in a test, so a v1-signed head is shown
+# not to verify under v2 (bead ley-line-open-b68fa6).
+blake3 = { workspace = true }

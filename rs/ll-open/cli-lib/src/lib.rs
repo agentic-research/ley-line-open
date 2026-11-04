@@ -21,6 +21,7 @@ pub mod cmd_self;
 pub mod cmd_splice;
 pub mod daemon;
 pub mod durable;
+pub mod head_claim;
 pub mod lifecycle;
 pub mod merge;
 pub mod source_write;

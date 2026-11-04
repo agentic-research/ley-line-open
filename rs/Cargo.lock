@@ -4960,6 +4960,7 @@ dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
  "base64ct",
+ "blake3",
  "clap",
  "cms",
  "const-oid 0.9.6",

@@ -2836,21 +2836,26 @@ pub fn parse_trusted_query_hashes(raw: Option<&str>) -> std::collections::HashSe
 }
 
 /// T8.5: read the existing `${db}.head.capnp`, returning the chain
-/// state. Returns `(parentHash, generation)` where parentHash is the
-/// previous root (zero if no Head exists yet) and generation is the
-/// next monotonic counter value (1 if no Head exists yet).
+/// state. Returns `(parentHash, generation, parentDigest)` where
+/// parentHash is the previous root (zero if no Head exists yet),
+/// generation is the next monotonic counter value (1 if no Head exists
+/// yet), and parentDigest is the v2 digest of the previous head's claim
+/// (`None` if there is no previous head or it had no claim; bead b68fa6).
 ///
 /// Fails closed (bead `ley-line-open-0c8ee7`): only a head that does not
 /// exist starts a chain. A head that exists but cannot be read, framed or
 /// decoded is an error, never a silent restart at generation 1 — a signed
 /// chain whose head file was truncated must not be re-rooted by the next
 /// parse. Deleting the file is the deliberate way to start over.
-fn read_head_for_chain(head_path: &Path) -> Result<([u8; 32], u64)> {
+fn read_head_for_chain(
+    head_path: &Path,
+    policy: &crate::head_claim::HeadPolicy,
+) -> Result<([u8; 32], u64, Option<leyline_core::Hash>)> {
     use leyline_schema_capnp::head_capnp::head;
 
     let bytes = match std::fs::read(head_path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(([0u8; 32], 1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(([0u8; 32], 1, None)),
         Err(e) => {
             return Err(e).with_context(|| {
                 format!(
@@ -2887,50 +2892,14 @@ fn read_head_for_chain(head_path: &Path) -> Result<([u8; 32], u64)> {
         })?;
     let prev_gen = h.get_generation();
 
-    // S2: verify before adopting this head as chain state. Only runs when the
-    // operator has configured a trust set — with no trusted keys there is
-    // nothing to verify against, and existing unsigned arenas must keep
-    // working.
-    let trusted = head_trusted_keys_from_env()?;
-    if !trusted.is_empty() {
-        let parent = h
-            .get_parent_hash()
-            .ok()
-            .and_then(|p| p.get_bytes().ok())
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-            .unwrap_or([0u8; 32]);
-        let signature = h.get_signature().unwrap_or(&[]);
-        let signer_kid = h.get_signer_kid().unwrap_or(&[]);
-        let verdict = leyline_sign::root_signer::verify_head(
-            prev_gen,
-            leyline_core::Hash::from_bytes(prev_root),
-            leyline_core::Hash::from_bytes(parent),
-            signature,
-            signer_kid,
-            &trusted,
-        );
-        match verdict {
-            leyline_sign::root_signer::HeadVerdict::Valid => {}
-            // Never acceptable: the head was edited after signing, corrupted,
-            // or signed by a key this reader does not trust.
-            leyline_sign::root_signer::HeadVerdict::Invalid => anyhow::bail!(
-                "head at {} failed signature verification — refusing to chain onto it",
-                head_path.display()
-            ),
-            leyline_sign::root_signer::HeadVerdict::Unsigned => {
-                if std::env::var("LEYLINE_HEAD_REQUIRE_SIGNATURE")
-                    .is_ok_and(|v| matches!(v.trim(), "1" | "true"))
-                {
-                    anyhow::bail!(
-                        "head at {} is unsigned and LEYLINE_HEAD_REQUIRE_SIGNATURE is set",
-                        head_path.display()
-                    );
-                }
-            }
-        }
-    }
+    // S2: verify before adopting this head as chain state; the signature
+    // covers the whole v2 claim (bead b68fa6). See `head_claim`.
+    crate::head_claim::enforce_signature(h, head_path, crate::head_claim::Reader::Chain, policy)
+        .context("refusing to chain onto the head")?;
+    let prev_digest = crate::head_claim::digest_of(h)
+        .with_context(|| format!("head at {} has a malformed claim", head_path.display()))?;
 
-    Ok((prev_root, prev_gen.saturating_add(1)))
+    Ok((prev_root, prev_gen.saturating_add(1), prev_digest))
 }
 
 /// S2: the trusted head-verification keys — a comma-separated list of
@@ -2940,7 +2909,7 @@ fn read_head_for_chain(head_path: &Path) -> Result<([u8; 32], u64)> {
 /// both the outgoing and incoming key verify. A malformed entry is a hard
 /// error for the same reason a malformed signing key is: a trust set that
 /// silently parsed to empty would disable verification while looking enabled.
-fn head_trusted_keys_from_env() -> Result<Vec<leyline_sign::root_signer::VerifyingKey>> {
+pub(crate) fn head_trusted_keys_from_env() -> Result<Vec<leyline_sign::root_signer::VerifyingKey>> {
     let Ok(raw) = std::env::var("LEYLINE_HEAD_TRUSTED_KEYS") else {
         return Ok(Vec::new());
     };
@@ -3000,7 +2969,8 @@ fn write_head_for_path(
 ) -> Result<()> {
     let (root, segment_bytes) = hash_segment_files(db_path)?;
     let head_path = head_path_for(db_path);
-    let (parent, generation) = read_head_for_chain(&head_path)?;
+    let (parent, generation, parent_digest) =
+        read_head_for_chain(&head_path, &crate::head_claim::HeadPolicy::from_env()?)?;
 
     use leyline_schema_capnp::head_capnp::head;
     let mut src = capnp::message::Builder::new_default();
@@ -3021,19 +2991,31 @@ fn write_head_for_path(
         h.reborrow()
             .init_parser_id()
             .set_bytes(parser_id.as_bytes());
+        // Bead b68fa6: the previous head's claim digest; left unset when
+        // there is none, so absence stays an unset field (ADR-0014 §1).
+        if let Some(d) = parent_digest {
+            h.reborrow().init_parent_digest().set_bytes(d.as_bytes());
+        }
 
         // S1: sign the head when a signing key is configured. The signature
-        // covers the canonical head digest — BLAKE3(generation ‖ root ‖
-        // parent) — not rootHash alone, so it cannot be replayed at another
-        // generation or grafted onto a forked chain. No key ⇒ the head is
-        // written unsigned, byte-identical to before.
+        // covers the v2 head digest over the whole claim — generation,
+        // rootHash, parentHash, parentDigest, treeRoot, parserId (bead
+        // b68fa6) — so it cannot be replayed at another generation, grafted
+        // onto another chain, or cited for another tree. A head without a
+        // stamped tree identity has no claim and is refused rather than
+        // signed. No key ⇒ the head is written unsigned.
         if let Some(signer) = head_signer_from_env()? {
             use leyline_core::RootSigner;
-            let digest = leyline_core::head_digest(
+            let claim = leyline_core::HeadClaim::new(
                 generation,
                 leyline_core::Hash::from_bytes(root),
                 leyline_core::Hash::from_bytes(parent),
-            );
+                parent_digest,
+                tree_root,
+                parser_id,
+            )
+            .context("refusing to sign a head without a stamped treeRoot and parserId")?;
+            let digest = leyline_core::head_digest(&claim);
             let sig = signer.sign(digest).context("sign head digest")?;
             let pk = signer.verifying_key();
             // kid = the canonical identifier signet ratified (ADR-012 /
@@ -5650,7 +5632,7 @@ mod tests {
         // SAFETY: edition-2024 env mutation, serialized against every other
         // test that touches the head signing/trust vars by the `serial` label.
         unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &hex) };
-        let wrote = write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO);
+        let wrote = write_head_for_path(&db, 0, TEST_TREE_ROOT, TEST_PARSER_ID);
         unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
         wrote.expect("write signed head");
 
@@ -5677,18 +5659,29 @@ mod tests {
             "head kid must equal canonical_kid(signing key)"
         );
 
-        // Re-derive the digest the way a verifier would, from the head itself.
-        let root: [u8; 32] = h.get_root_hash().unwrap().get_bytes().unwrap()[..]
-            .try_into()
-            .unwrap();
-        let parent: [u8; 32] = h.get_parent_hash().unwrap().get_bytes().unwrap()[..]
-            .try_into()
-            .unwrap();
-        let digest = leyline_core::head_digest(
-            h.get_generation(),
-            leyline_core::Hash::from_bytes(root),
-            leyline_core::Hash::from_bytes(parent),
+        // Re-derive the digest the way a verifier would, from the head itself:
+        // the whole v2 claim, treeRoot and parserId included.
+        let claim = crate::head_claim::claim_of(h)
+            .unwrap()
+            .expect("a signed head carries a claim");
+        assert_eq!(
+            claim,
+            leyline_core::HeadClaim::new(
+                1,
+                leyline_core::Hash::from_bytes(
+                    h.get_root_hash().unwrap().get_bytes().unwrap()[..]
+                        .try_into()
+                        .unwrap()
+                ),
+                leyline_core::Hash::ZERO,
+                None,
+                TEST_TREE_ROOT,
+                TEST_PARSER_ID,
+            )
+            .unwrap(),
+            "the signed claim carries the stamped treeRoot and parserId"
         );
+        let digest = leyline_core::head_digest(&claim);
 
         let sig = ed25519_dalek::Signature::from_bytes(sig_bytes.try_into().unwrap());
         let signer = leyline_sign::root_signer::Ed25519RootSigner::from_seed(&seed);
@@ -5702,10 +5695,13 @@ mod tests {
         );
     }
 
-    /// Write a signed head, then rewrite it on disk with `generation` bumped
-    /// while keeping the original signature — the cheapest real tamper. A
-    /// verifying reader must refuse it.
-    fn tamper_head_generation(head_path: &Path) {
+    /// Rewrite the head on disk: copy every field, signature included, then
+    /// let `tamper` overwrite some of them. The signature is kept, so a
+    /// verifying reader must refuse any field the signature covers.
+    fn rewrite_head(
+        head_path: &Path,
+        tamper: impl FnOnce(&mut leyline_schema_capnp::head_capnp::head::Builder),
+    ) {
         use leyline_schema_capnp::head_capnp::head;
         let bytes = std::fs::read(head_path).unwrap();
         let msg = capnp::serialize::read_message(&mut &bytes[..], Default::default()).unwrap();
@@ -5714,7 +5710,7 @@ mod tests {
         let mut out = capnp::message::Builder::new_default();
         {
             let mut h = out.init_root::<head::Builder>();
-            h.set_generation(old.get_generation() + 1); // <- the tamper
+            h.set_generation(old.get_generation());
             h.set_segment_bytes(old.get_segment_bytes());
             h.set_unbound_facts(old.get_unbound_facts());
             h.set_signature(old.get_signature().unwrap());
@@ -5725,10 +5721,197 @@ mod tests {
             h.reborrow()
                 .init_parent_hash()
                 .set_bytes(old.get_parent_hash().unwrap().get_bytes().unwrap());
+            h.reborrow()
+                .init_tree_root()
+                .set_bytes(old.get_tree_root().unwrap().get_bytes().unwrap());
+            h.reborrow()
+                .init_parser_id()
+                .set_bytes(old.get_parser_id().unwrap().get_bytes().unwrap());
+            if old.has_parent_digest() {
+                h.reborrow()
+                    .init_parent_digest()
+                    .set_bytes(old.get_parent_digest().unwrap().get_bytes().unwrap());
+            }
+            tamper(&mut h);
         }
         let mut buf = Vec::new();
         capnp::serialize::write_message(&mut buf, &out).unwrap();
         std::fs::write(head_path, buf).unwrap();
+    }
+
+    /// Bump `generation` while keeping the original signature — the cheapest
+    /// real tamper.
+    fn tamper_head_generation(head_path: &Path) {
+        rewrite_head(head_path, |h| {
+            let g = h.reborrow_as_reader().get_generation();
+            h.set_generation(g + 1);
+        });
+    }
+
+    /// Stamped identities for heads the signing tests write: a v2 claim needs
+    /// both, and neither may be the unstamped ZERO.
+    const TEST_TREE_ROOT: leyline_core::Hash = leyline_core::Hash::from_bytes([0x11; 32]);
+    const TEST_PARSER_ID: leyline_core::Hash = leyline_core::Hash::from_bytes([0x22; 32]);
+
+    /// Write a head signed by `seed` and return `(head path, trusted pk hex)`.
+    fn write_signed_test_head(db: &Path, seed: [u8; 32]) -> (std::path::PathBuf, String) {
+        std::fs::write(db, b"").unwrap();
+        let sk_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        let pk_hex: String = leyline_sign::root_signer::Ed25519RootSigner::from_seed(&seed)
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // SAFETY: callers hold the `env_leyline_head_keys` serial label.
+        unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &sk_hex) };
+        let wrote = write_head_for_path(db, 0, TEST_TREE_ROOT, TEST_PARSER_ID);
+        unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
+        wrote.expect("write signed head");
+        (with_extension(db, "head.capnp"), pk_hex)
+    }
+
+    /// A head policy trusting `pk_hex`, passed explicitly rather than through
+    /// the process environment, so no concurrent test sees it.
+    fn trusting(pk_hex: &str) -> crate::head_claim::HeadPolicy {
+        crate::head_claim::HeadPolicy {
+            trusted: vec![leyline_sign::root_signer::verifying_key_from_hex(pk_hex).unwrap()],
+            require_signature: false,
+        }
+    }
+
+    /// Read the head as chain state with `pk_hex` trusted.
+    fn read_head_trusting(
+        head_path: &Path,
+        pk_hex: &str,
+    ) -> Result<([u8; 32], u64, Option<leyline_core::Hash>)> {
+        read_head_for_chain(head_path, &trusting(pk_hex))
+    }
+
+    /// Bead b68fa6 (ADR-0040 D1: treeRoot is the root signatures cite): a
+    /// signed head whose treeRoot was rewritten after signing is refused.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn read_head_rejects_a_rewritten_tree_root_when_trust_set_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (head_path, pk_hex) = write_signed_test_head(&dir.path().join("t.db"), [5u8; 32]);
+        assert!(read_head_trusting(&head_path, &pk_hex).is_ok());
+        rewrite_head(&head_path, |h| {
+            h.reborrow().init_tree_root().set_bytes(&[0x33; 32]);
+        });
+        let got = read_head_trusting(&head_path, &pk_hex);
+        assert!(
+            got.is_err(),
+            "a rewritten treeRoot must be refused, got {got:?}"
+        );
+    }
+
+    /// Bead b68fa6: the same tree under another derivation is another claim,
+    /// so a rewritten parserId is refused.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn read_head_rejects_a_rewritten_parser_id_when_trust_set_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (head_path, pk_hex) = write_signed_test_head(&dir.path().join("p.db"), [5u8; 32]);
+        assert!(read_head_trusting(&head_path, &pk_hex).is_ok());
+        rewrite_head(&head_path, |h| {
+            h.reborrow().init_parser_id().set_bytes(&[0x44; 32]);
+        });
+        let got = read_head_trusting(&head_path, &pk_hex);
+        assert!(
+            got.is_err(),
+            "a rewritten parserId must be refused, got {got:?}"
+        );
+    }
+
+    /// Bead b68fa6 (identity review N1): each head names the previous head's
+    /// claim digest, and that link is signed. The first head has none; the
+    /// second carries the first's digest; rewriting it is refused.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn a_signed_head_binds_the_previous_heads_claim_digest() {
+        use leyline_schema_capnp::head_capnp::head;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("chain.db");
+        let read = |p: &Path| -> (Option<leyline_core::Hash>, Option<leyline_core::Hash>) {
+            let bytes = std::fs::read(p).unwrap();
+            let msg = capnp::serialize::read_message(&mut &bytes[..], Default::default()).unwrap();
+            let h: head::Reader = msg.get_root().unwrap();
+            let stamped = h.has_parent_digest().then(|| {
+                leyline_core::Hash::from_bytes(
+                    h.get_parent_digest().unwrap().get_bytes().unwrap()[..]
+                        .try_into()
+                        .unwrap(),
+                )
+            });
+            (stamped, crate::head_claim::digest_of(h).unwrap())
+        };
+        let (head_path, pk_hex) = write_signed_test_head(&db, [5u8; 32]);
+        let (first_parent, first_digest) = read(&head_path);
+        assert_eq!(first_parent, None, "the first head has no parent digest");
+        let (_, second_pk) = write_signed_test_head(&db, [5u8; 32]);
+        assert_eq!(pk_hex, second_pk);
+        let (second_parent, _) = read(&head_path);
+        assert_eq!(
+            second_parent, first_digest,
+            "the second head names the first's claim"
+        );
+        assert!(read_head_trusting(&head_path, &pk_hex).is_ok());
+
+        rewrite_head(&head_path, |h| {
+            h.reborrow().init_parent_digest().set_bytes(&[0x55; 32]);
+        });
+        let got = read_head_trusting(&head_path, &pk_hex);
+        assert!(
+            got.is_err(),
+            "a rewritten parentDigest must be refused, got {got:?}"
+        );
+    }
+
+    /// Bead b68fa6, the unstamped case: with a signing key configured, a head
+    /// without a stamped treeRoot or parserId is refused, never signed over a
+    /// ZERO stand-in.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn a_head_without_a_stamped_tree_identity_is_not_signed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk_hex: String = [5u8; 32].iter().map(|b| format!("{b:02x}")).collect();
+        for (name, tree, parser) in [
+            ("no_tree.db", leyline_core::Hash::ZERO, TEST_PARSER_ID),
+            ("no_parser.db", TEST_TREE_ROOT, leyline_core::Hash::ZERO),
+        ] {
+            let db = dir.path().join(name);
+            std::fs::write(&db, b"").unwrap();
+            // SAFETY: serialized by the `serial` label above.
+            unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &sk_hex) };
+            let wrote = write_head_for_path(&db, 0, tree, parser);
+            unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
+            let err = wrote.expect_err("an unstamped head must not be signed");
+            assert!(
+                format!("{err:#}").contains("treeRoot and parserId"),
+                "{err:#}"
+            );
+            assert!(
+                !head_path_for(&db).exists(),
+                "no head is written when it cannot be signed"
+            );
+        }
+    }
+
+    /// Bead b68fa6: a signed head whose fields were cleared to the unstamped
+    /// state no longer carries the claim its signature covers, so it is
+    /// refused rather than read as an unsigned pre-ADR-0040 head.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn read_head_rejects_a_signed_head_with_its_tree_identity_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let (head_path, pk_hex) = write_signed_test_head(&dir.path().join("c.db"), [5u8; 32]);
+        rewrite_head(&head_path, |h| {
+            h.reborrow().init_tree_root().set_bytes(&[]);
+            h.reborrow().init_parser_id().set_bytes(&[]);
+        });
+        let got = read_head_trusting(&head_path, &pk_hex);
+        assert!(got.is_err(), "a cleared claim must be refused, got {got:?}");
     }
 
     /// S2: a head whose fields were edited after signing must not be adopted
@@ -5737,35 +5920,15 @@ mod tests {
     #[serial_test::serial(env_leyline_head_keys)]
     fn read_head_rejects_a_tampered_head_when_trust_set_configured() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("tampered.db");
-        std::fs::write(&db, b"").unwrap();
-
-        let seed = [5u8; 32];
-        let sk_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
-        let signer = leyline_sign::root_signer::Ed25519RootSigner::from_seed(&seed);
-        let pk_hex: String = signer
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-
-        // SAFETY: serialized by the `serial` label above.
-        unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &sk_hex) };
-        let wrote = write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO);
-        unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
-        wrote.expect("write signed head");
-
-        let head_path = with_extension(&db, "head.capnp");
+        let (head_path, pk_hex) =
+            write_signed_test_head(&dir.path().join("tampered.db"), [5u8; 32]);
 
         // Untampered + trusted ⇒ reads fine.
-        unsafe { std::env::set_var("LEYLINE_HEAD_TRUSTED_KEYS", &pk_hex) };
-        let clean = read_head_for_chain(&head_path);
+        let clean = read_head_trusting(&head_path, &pk_hex);
         assert!(clean.is_ok(), "a validly signed head must read: {clean:?}");
 
         tamper_head_generation(&head_path);
-        let tampered = read_head_for_chain(&head_path);
-        unsafe { std::env::remove_var("LEYLINE_HEAD_TRUSTED_KEYS") };
+        let tampered = read_head_trusting(&head_path, &pk_hex);
 
         assert!(
             tampered.is_err(),
@@ -5784,7 +5947,10 @@ mod tests {
         std::fs::write(&db, b"").unwrap();
         write_head_for_path(&db, 0, leyline_core::Hash::ZERO, leyline_core::Hash::ZERO)
             .expect("write unsigned head");
-        let got = read_head_for_chain(&with_extension(&db, "head.capnp"));
+        let got = read_head_for_chain(
+            &with_extension(&db, "head.capnp"),
+            &crate::head_claim::HeadPolicy::default(),
+        );
         assert!(got.is_ok(), "unsigned head must still read: {got:?}");
     }
 
@@ -5931,6 +6097,104 @@ mod tests {
             crate::tree_root::verify(&db_a).unwrap(),
             crate::tree_root::Verification::TreeRootMismatch { .. }
         ));
+    }
+
+    /// Bead b68fa6: `leyline verify-head` checks the signature over the
+    /// stamped treeRoot when a trust set is configured, so a head whose
+    /// treeRoot was rewritten is refused on the signature, before (and
+    /// independently of) the comparison with the arena.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn verify_head_checks_the_signature_over_tree_root() {
+        let td = TempDir::new().unwrap();
+        let (db, pk_hex) = signed_parse(&td);
+
+        let policy = trusting(&pk_hex);
+        let clean = crate::tree_root::verify_with(&db, &policy);
+        rewrite_head(&head_path_for(&db), |h| {
+            h.reborrow().init_tree_root().set_bytes(&[0x33; 32]);
+        });
+        let forged = crate::tree_root::verify_with(&db, &policy);
+
+        assert!(
+            matches!(
+                clean,
+                Ok(crate::tree_root::Verification::Valid {
+                    signature: crate::head_claim::SignatureCheck::Verified,
+                    ..
+                })
+            ),
+            "{clean:?}"
+        );
+        let err = format!("{:#}", forged.expect_err("a rewritten treeRoot is refused"));
+        assert!(err.contains("failed signature verification"), "{err}");
+    }
+
+    /// Parse a one-file tree with a signing key configured; return the db
+    /// and the trusted public key hex. Callers hold `env_leyline_head_keys`.
+    fn signed_parse(td: &TempDir) -> (std::path::PathBuf, String) {
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n").unwrap();
+        let db = td.path().join("out.db");
+        let seed = [5u8; 32];
+        let sk_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        let pk_hex: String = leyline_sign::root_signer::Ed25519RootSigner::from_seed(&seed)
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // SAFETY: callers hold the `env_leyline_head_keys` serial label.
+        unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &sk_hex) };
+        parse_dir(&db, &src, None);
+        unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
+        (db, pk_hex)
+    }
+
+    /// Bead b68fa6 (identity review C1): a signed → unsigned downgrade. The
+    /// attacker strips the signature and kid, edits the arena, and restamps
+    /// treeRoot to match. With a trust set configured, `verify-head` must not
+    /// report that head as valid, with or without
+    /// `LEYLINE_HEAD_REQUIRE_SIGNATURE`.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn verify_head_refuses_a_stripped_signature_when_a_trust_set_is_configured() {
+        let td = TempDir::new().unwrap();
+        let (db, pk_hex) = signed_parse(&td);
+        let forged_tree = {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("UPDATE _tree SET mode = 33261 WHERE path = 'a.go'", [])
+                .unwrap();
+            let (_, _, parser_id) = read_head_roots(&db);
+            crate::tree_root::tree_root(&conn, leyline_core::Hash::from_bytes(parser_id)).unwrap()
+        };
+        rewrite_head(&head_path_for(&db), |h| {
+            h.set_signature(&[]);
+            h.set_signer_kid(&[]);
+            h.reborrow()
+                .init_tree_root()
+                .set_bytes(forged_tree.as_bytes());
+        });
+
+        let got = crate::tree_root::verify_with(&db, &trusting(&pk_hex));
+        let err = format!("{:#}", got.expect_err("a stripped signature is refused"));
+        assert!(err.contains("unsigned"), "{err}");
+
+        // With no trust set the stamp is consistent with the arena, and the
+        // verdict says the signature was not checked rather than a bare valid.
+        let unchecked =
+            crate::tree_root::verify_with(&db, &crate::head_claim::HeadPolicy::default());
+        assert!(
+            matches!(
+                unchecked,
+                Ok(crate::tree_root::Verification::Valid {
+                    signature: crate::head_claim::SignatureCheck::NotChecked,
+                    ..
+                })
+            ),
+            "{unchecked:?}"
+        );
     }
 
     /// A head written before ADR-0040 carries neither field; the verifier
@@ -6277,7 +6541,9 @@ mod tests {
         let after = std::fs::read(&head).unwrap();
         assert_ne!(after, before, "the new head is in place");
         assert_eq!(
-            read_head_for_chain(&head).unwrap().1,
+            read_head_for_chain(&head, &crate::head_claim::HeadPolicy::default())
+                .unwrap()
+                .1,
             3,
             "the chain is at generation 2"
         );
@@ -6317,7 +6583,12 @@ mod tests {
 
         assert!(wrote.is_err(), "the write cannot land: {wrote:?}");
         assert_eq!(std::fs::read(&head).unwrap(), before);
-        assert_eq!(read_head_for_chain(&head).unwrap().1, 2);
+        assert_eq!(
+            read_head_for_chain(&head, &crate::head_claim::HeadPolicy::default())
+                .unwrap()
+                .1,
+            2
+        );
     }
 
     // --- bead ley-line-open-8c8ded: the unbound count is carried, not rescanned

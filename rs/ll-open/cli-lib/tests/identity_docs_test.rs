@@ -57,7 +57,8 @@ fn tree_root_docs_name_the_table_the_fold_reads() {
 
 /// head.capnp is the cross-runtime description of `treeRoot`: another runtime
 /// implements the fold from it. It must name `_tree`, the mode tag and empty
-/// directories as the code does, and must not claim the signature covers it.
+/// directories as the code does, and must say the signature covers it, which
+/// `head_digest` does (bead b68fa6).
 #[test]
 fn head_schema_describes_the_tree_root_the_code_computes() {
     let schema = normalized(include_str!(
@@ -74,13 +75,18 @@ fn head_schema_describes_the_tree_root_the_code_computes() {
         "over the store's manifest `_tree`",
         "every EMPTY directory",
         "`modeTag` is 0 for `0o100644`",
-        "NOT SIGNED",
+        "SIGNED: the head signature's digest (`head_digest`, context",
+        "\"leyline head digest v2\") binds `treeRoot` and `parserId` with",
     ] {
         assert!(
             schema.contains(claim),
             "head.capnp's treeRoot description is missing: {claim}"
         );
     }
+    assert!(
+        !schema.contains("NOT SIGNED"),
+        "head.capnp still says treeRoot is not signed"
+    );
 
     // Tie the description to the code it describes.
     assert!(
@@ -91,12 +97,19 @@ fn head_schema_describes_the_tree_root_the_code_computes() {
         src.contains("content: b\"\".hash()"),
         "tree_root.rs no longer folds an empty directory as BLAKE3 of no bytes; update head.capnp"
     );
-    // "NOT SIGNED" is true only while the head digest omits treeRoot. When
-    // b68fa6 binds it, this assertion fails and the schema text must change.
-    assert!(
-        !digest.contains("tree_root") && !digest.contains("treeRoot"),
-        "head_digest now binds treeRoot; remove head.capnp's NOT SIGNED note"
-    );
+    // "SIGNED" is true only while the head digest binds treeRoot and
+    // parserId. If either leaves the preimage, this fails and the schema text
+    // must change with it.
+    for bound in [
+        "hasher.update(tree_root.as_bytes());",
+        "hasher.update(parser_id.as_bytes());",
+        "pub const HEAD_DIGEST_CONTEXT: &str = \"leyline head digest v2\";",
+    ] {
+        assert!(
+            digest.contains(bound),
+            "head_digest no longer binds `{bound}`; update head.capnp's SIGNED note"
+        );
+    }
 }
 
 /// The SQLite projection is written beside the capnp segments by one parse; it

@@ -53,9 +53,15 @@ struct Head {
   unboundFacts @4 :UInt64;
 
   # Signature over the canonical head digest — NOT over rootHash alone.
-  # The digest is BLAKE3(generation LE-8 ‖ rootHash ‖ parentHash); see
-  # `leyline_core::head_digest`. Binding all three stops a signature being
-  # replayed at another generation or grafted onto a forked chain. Ed25519
+  # The digest (v2) is BLAKE3_derive_key("leyline head digest v2",
+  # generation LE-8 ‖ rootHash ‖ parentHash ‖ treeRoot ‖ parserId ‖ P),
+  # P = 0x00 without a parentDigest, 0x01 ‖ parentDigest with one; see
+  # `leyline_core::head_digest`. Binding all six stops a signature being
+  # replayed at another generation, grafted onto a forked chain, or cited for
+  # a tree or derivation it did not attest. A head that does not stamp
+  # treeRoot and parserId has no claim and is never signed; a signature on
+  # one does not verify. v1 (the first three fields only) is removed: a v1
+  # signature does not verify under v2. Ed25519
   # (64 bytes), matching the frozen leyline-net/v1 manifest so the in-flight
   # manifest and the at-rest head share one scheme and one trust root.
   #
@@ -100,11 +106,11 @@ struct Head {
   # holding the arena recomputes it (`leyline verify-head`); a mismatch is
   # refused.
   #
-  # NOT SIGNED: the head signature's digest (`head_digest`, context
-  # "leyline head digest v1") binds only `generation`, `rootHash` and
-  # `parentHash`. `treeRoot` and `parserId` are stamped beside it but are not
-  # covered, so a signature does not attest them (bead
-  # `ley-line-open-b68fa6`).
+  # SIGNED: the head signature's digest (`head_digest`, context
+  # "leyline head digest v2") binds `treeRoot` and `parserId` with
+  # `generation`, `rootHash`, `parentHash` and `parentDigest` (bead
+  # `ley-line-open-b68fa6`). A head that does not stamp both has no claim and
+  # is never signed.
   #
   # Additive per ADR-0014 §1: a head that does not set these fields has the
   # same canonical bytes as before they existed. Empty = not stamped
@@ -119,4 +125,16 @@ struct Head {
   # Two arenas with the same source under different `parserId`s are
   # different derivations and must not share derived caches.
   parserId @8 :Common.Hash;
+
+  # Bead ley-line-open-b68fa6 — the v2 head digest of the previous head's
+  # claim (`leyline_core::head_digest`), bound into this head's signature.
+  # `parentHash` names only the previous run's segments, and a no-op rerun
+  # writes the same segments in every arena, so it does not identify which
+  # chain this head extends; this field names the previous claim, tree
+  # included. Empty when there is no previous head or the previous head had
+  # no claim (it stamped no treeRoot/parserId); the digest encodes that
+  # absence with a presence byte, never as zero.
+  #
+  # Additive per ADR-0014 §1: unset does not change canonical bytes.
+  parentDigest @9 :Common.Hash;
 }

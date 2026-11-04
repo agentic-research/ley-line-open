@@ -8,7 +8,7 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 
 | Field | Value |
 |---|---|
-| LLO version | v0.23.0 |
+| LLO version | v0.24.0 |
 | Last verified | 2026-07-27 (status row and roadmap pointer updated 2026-10-23) |
 | Direction | [ROADMAP.md](ROADMAP.md): v1.0 is single host, portable (epic `ley-line-open-b2e687`); integration carries the 0.21.0 cycle |
 | Authority model | [ADR-0032](adr/0032-declared-decompositions.md) §D4 — see [Authority model](#authority-model) |
@@ -393,9 +393,9 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 | `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
 | `leyline` binary (NFS mount, no libfuse) | `task build:mount` / `task release:mount` — `--features mount`. Mounts with `--backend nfs`; links no libfuse and needs no `PKG_CONFIG_PATH`; refuses `--backend fuse` naming the `fuse` feature |
 | `leyline` binary (everything including both mount backends) | `task install:full+mount` — `--features full` (`mount` + `fuse`). The FUSE backend requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at build time and at runtime |
-| Distroless OCI image | `task image` — produces `localhost/leyline:v0.23.0` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.23.0` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
+| Distroless OCI image | `task image` — produces `localhost/leyline:v0.24.0` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.24.0` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
 | FFI staticlibs + header | `task release:fs-static:target` — builds the mache-facing `leyline-fs` staticlib with explicit CDC support and publishes it as a verified GitHub release artifact (linux amd64/arm64 + darwin arm64; macOS amd64 staticlib currently absent) |
-| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.23.0 is its tested compatibility point |
+| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.24.0 is its tested compatibility point |
 
 Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern). See [README.md § Install and build](../README.md#install-and-build) for the recommended install path per user type.
 

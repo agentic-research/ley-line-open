@@ -15,7 +15,10 @@
 //! fails. No functional workload here loads the NFS client beyond a handful
 //! of operations.
 
-#![cfg(feature = "mount")]
+// The platform's default backend is FUSE off macOS, which only a `fuse`
+// build mounts; macOS's NFS default needs only `mount` (bead
+// `ley-line-open-9d4712`).
+#![cfg(all(feature = "mount", any(feature = "fuse", target_os = "macos")))]
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};

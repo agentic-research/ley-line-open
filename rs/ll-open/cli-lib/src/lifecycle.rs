@@ -11,7 +11,9 @@ use leyline_core::{Controller, create_arena};
 /// Return the default filesystem backend for the current platform.
 ///
 /// macOS: NFS (FUSE requires macfuse/osxfuse which is often unavailable).
-/// Linux and others: FUSE.
+/// Linux and others: FUSE. The default names a platform's backend, not the
+/// build's: a binary built with `mount` but not `fuse` refuses this default
+/// off macOS by name, and `--backend nfs` mounts there.
 pub fn default_backend() -> String {
     if cfg!(target_os = "macos") {
         "nfs".into()

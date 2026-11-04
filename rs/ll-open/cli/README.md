@@ -12,7 +12,8 @@ The `leyline` binary — entry point for parse, daemon and inspect operations. T
 ## Feature flags
 
 - `lsp` (default) — language-server enrichment via [`leyline-lsp`](../lsp/)
-- `mount` — `daemon --mount`: the store's filesystem behind the host's FUSE or NFS client via [`leyline-storefs`](../storefs/) (links libfuse: fuse-t on macOS, libfuse on Linux)
+- `mount` — `daemon --mount`: the store's filesystem behind the host's NFS client via [`leyline-storefs`](../storefs/) (`--backend nfs`; pure Rust, links no system library)
+- `fuse` — `mount` plus `--backend fuse`, the host's FUSE client (links libfuse: fuse-t on macOS, libfuse on Linux). Linux's default backend is FUSE, so a Linux build without `fuse` mounts only with `--backend nfs`
 - `vec` — embedding sidecar + `vec_search` op via `sqlite-vec`
 
 ## Used by

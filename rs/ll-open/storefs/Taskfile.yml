@@ -13,6 +13,13 @@ tasks:
       FUSE on Linux with libfuse from deps:ci). A macOS whose NFS client is
       unpatched is refused by the mount itself; the kernel tests report it
       and skip by name. Nothing else skips.
+
+      Two builds (bead ley-line-open-9d4712). `fuse` (which implies
+      `mount`) runs everything above. `mount` alone is the NFS-only build:
+      its lib tests run with PKG_CONFIG_PATH unset, proving the NFS mount
+      compiles and links without libfuse, and that it refuses `--backend
+      fuse` by name.
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
-      - cargo test -p leyline-storefs --features mount
+      - cargo test -p leyline-storefs --features fuse
+      - env -u PKG_CONFIG_PATH cargo test -p leyline-storefs --features mount --lib

@@ -713,8 +713,10 @@ fi
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = storefs ]; } && package_changed_in_diff ll-open/storefs; then
     claim_package ll-open/storefs
     # The host mount (`host/`, bead `ley-line-open-3e73dc`) is gated on
-    # storefs's non-default `mount` feature, so the slice names it: without it
-    # every adapter mutant compiles out and reports a phantom MISSED. Lib
+    # storefs's non-default `mount` feature and its FUSE adapter on `fuse`
+    # (which implies `mount`, bead `ley-line-open-9d4712`), so the slice names
+    # `fuse`: without it every adapter mutant compiles out and reports a
+    # phantom MISSED. Lib
     # tests only (`run_slice lib`): they drive the adapters below the kernel.
     # `tests/host_mount.rs` mounts through the kernel's NFS or FUSE client,
     # and a mutation run must never mount.
@@ -733,10 +735,10 @@ if { [ "$SCOPE" = all ] || [ "$SCOPE" = storefs ]; } && package_changed_in_diff 
     # phantom MISSED. It is excluded there and mutated on macOS, where its test
     # checks it against `sw_vers`.
     if [ "$(uname -s)" = Darwin ]; then
-        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+        run_slice lib --package leyline-storefs --test-workspace=false --features fuse \
             --exclude 'll-open/storefs/src/host/fuse.rs'
     else
-        run_slice lib --package leyline-storefs --test-workspace=false --features mount \
+        run_slice lib --package leyline-storefs --test-workspace=false --features fuse \
             --exclude 'll-open/storefs/src/host/fuse.rs' \
             --exclude 'll-open/storefs/src/host/macos.rs'
     fi

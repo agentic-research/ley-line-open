@@ -51,15 +51,17 @@ tasks:
   # script on an already-built binary — release.yml calls it per target.
   # `smoke:dev` is the `ci` gate on every PR and every local `task ci`, on
   # the same runners `test:mount` already mounts on. ONE debug build, with
-  # `mount`, runs both passes: every headless command is the same code in a
-  # mount build, and a second build with the features flipped recompiled
-  # cli-lib, leyline-fs and the binary for no extra coverage. The smoke
-  # itself takes about a second; the build is the cost.
+  # `fuse` (which implies `mount`), runs both passes: every headless command
+  # is the same code in a mount build, and a second build with the features
+  # flipped recompiled cli-lib, leyline-fs and the binary for no extra
+  # coverage. `fuse`, not `mount` alone: the smoke mounts on the platform's
+  # default backend, which is FUSE on Linux. The smoke itself takes about a
+  # second; the build is the cost.
   smoke:dev:
-    desc: Debug-build the CLI with `mount` once and smoke it end to end, headless then mounted (the `ci` gate)
+    desc: Debug-build the CLI with `fuse` once and smoke it end to end, headless then mounted (the `ci` gate)
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
-      - cargo build -p leyline-cli --features mount
+      - cargo build -p leyline-cli --features fuse
       - ../tools/cli_smoke.sh target/debug/leyline
       - ../tools/cli_smoke.sh target/debug/leyline --mount
 
@@ -71,10 +73,10 @@ tasks:
       - ../tools/cli_smoke.sh target/release/leyline
 
   smoke:mount:
-    desc: Build the release CLI with `mount` and smoke it, including a write through the mount (needs FUSE/fuse-t)
+    desc: Build the release CLI with `fuse` and smoke it, including a write through the mount on the platform's default backend (needs fuse-t on macOS, libfuse on Linux)
     dir: '{{.TASKFILE_DIR}}/../..'
     cmds:
-      - cargo build --release -p leyline-cli --features mount
+      - cargo build --release -p leyline-cli --features fuse
       - ../tools/cli_smoke.sh target/release/leyline --mount
 
   smoke:bin:

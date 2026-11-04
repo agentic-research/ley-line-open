@@ -14,8 +14,9 @@ on:
 # notarization-adjacent rabbit hole we don't need here).
 #
 # Default features (`lsp`, `validate`, `hdc`, `cdc`) are built. The `mount`
-# (FUSE) feature is gated off so the release binary doesn't depend on libfuse
-# at the consumer end — mache uses the daemon for MCP/UDS, not for mounting.
+# (NFS) and `fuse` (FUSE, links libfuse) features are gated off so the release
+# binary doesn't depend on libfuse at the consumer end — mache uses the daemon
+# for MCP/UDS, not for mounting.
 #
 # Security posture:
 # - No third-party actions for release management (built-in `gh` CLI)

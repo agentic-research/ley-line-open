@@ -128,7 +128,7 @@ fn ast_hash_map(db_path: &Path) -> Vec<(String, String)> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT p.path, lower(hex(a.node_hash)) FROM _ast a \
+            "SELECT p.path, lower(hex(a.node_hash)) FROM v_ast_hash a \
              JOIN v_node_path p ON p.nid = a.nid \
              ORDER BY p.path",
         )
@@ -182,7 +182,7 @@ fn md_inline_stays_opaque_in_ast_and_fenced_structure_is_unchanged() {
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT nc.kind FROM _ast a \
-                 JOIN node_content nc ON nc.node_hash = a.node_hash \
+                 JOIN node_content nc ON nc.content_id = a.content_id \
                  ORDER BY nc.kind",
             )
             .unwrap();

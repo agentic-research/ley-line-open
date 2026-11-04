@@ -165,7 +165,7 @@ DB=$W/out.db
 expect_eq "$(sql "$DB" 'SELECT id FROM _source ORDER BY id' | tr '\n' ' ')" "lib.rs util.go " "parsed files"
 expect_eq "$(sql "$DB" 'SELECT count(*) FROM _source s LEFT JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE b.blob_hash IS NULL')" 0 \
     "files whose content_hash names no source blob"
-expect_eq "$(sql "$DB" 'SELECT count(*) > 0, sum(node_hash IS NULL) FROM _ast')" "1|0" "_ast rows present, none without node_hash"
+expect_eq "$(sql "$DB" 'SELECT count(*) > 0, sum(node_hash IS NULL) FROM v_ast_hash')" "1|0" "_ast rows present, none without node_hash"
 step "parse: 2 files, every source in source_blobs, every _ast row hashed"
 
 # --- verify-head -----------------------------------------------------------
@@ -178,7 +178,7 @@ step "verify-head: $head1"
     fail "splice: $(cat "$W/splice.err")"
 expect_eq "$(sql "$DB" "SELECT b.blob_bytes FROM _source s JOIN source_blobs b ON b.blob_hash = s.content_hash WHERE s.id = 'util.go'" | head -1)" \
     "package util" "util.go's stored bytes after the splice"
-expect_eq "$(sql "$DB" 'SELECT sum(node_hash IS NULL) FROM _ast')" 0 "_ast rows without node_hash after the splice"
+expect_eq "$(sql "$DB" 'SELECT sum(node_hash IS NULL) FROM v_ast_hash')" 0 "_ast rows without node_hash after the splice"
 head2=$("$BIN" verify-head "$DB") || fail "verify-head after splice: $head2"
 [ "$head2" != "$head1" ] || fail "the splice did not move treeRoot"
 step "splice: bytes stored, file re-hashed, head restamped"

@@ -2,7 +2,8 @@
 # Exact structural clone index — tier 1 of bead ley-line-open-6e9f79.
 #
 # Parses a source tree into a scratch arena and groups every function by its
-# `_ast.node_hash`. node_hash is a Merkle hash over a node's kind, its token
+# `node_hash` (`node_content.node_hash` through `_ast.content_id` as of
+# projection-v10). node_hash is a Merkle hash over a node's kind, its token
 # text and its ordered children, so two functions share one only when they are
 # the same tree token for token: a Type-1 clone. A renamed copy hashes
 # differently and is not reported here (that is tier 2).
@@ -57,13 +58,13 @@ fi
 # One row per reported copy: group rank, lines, copies, file, 1-based line.
 sqlite3 -separator '	' "$db" >"$work/rows.tsv" <<SQL
 WITH fn AS (
-  SELECT a.nid, a.node_hash AS h, a.start_byte AS sb, a.end_byte AS eb,
+  SELECT a.nid, c.node_hash AS h, a.start_byte AS sb, a.end_byte AS eb,
          a.start_row AS sr, a.end_row - a.start_row + 1 AS lines, s.id AS file
   FROM _ast a
+  JOIN node_content c ON c.content_id = a.content_id
   JOIN kinds k ON k.kind_id = a.kind_id
   JOIN _source s ON s.file_id = (a.nid >> 24)
   WHERE k.raw_kind IN ($kinds)
-    AND a.node_hash IS NOT NULL
     AND a.end_row - a.start_row + 1 >= $min_lines
 ),
 dup AS (
@@ -97,7 +98,7 @@ report() {
   printf '# Exact structural clones in %s\n\n' "$src"
   printf '%s groups of %s+ lines; %s duplicated lines beyond the first copy of each.\n' \
     "$groups" "$min_lines" "$total"
-  printf 'Grouped by `_ast.node_hash`, ranked by lines x copies.\n'
+  printf 'Grouped by `node_hash`, ranked by lines x copies.\n'
   prev=""
   while IFS='	' read -r rnk lines copies file line; do
     if [ "$rnk" != "$prev" ]; then

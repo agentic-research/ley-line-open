@@ -1,6 +1,8 @@
 # ADR-0031 — Restriction-addressed derived-view caching over CAS
 
-**Status:** Proposed (2026-07-17) — positive result, verified spike; deployment gated on `f38a86`.
+**Status:** Proposed (2026-07-17) — positive result, verified spike. The implementation
+(`rs/ll-open/sheaf/src/restriction_cache.rs`, its tests and the `restriction_git_replay`
+bench) was removed on 2026-11-04 (bead `ley-line-open-afa952`); see "Removal" below.
 **Bead:** `ley-line-open-f62327`
 **Related:**
 - ADR-0030 (the NO-GO this neighbors — approximate embedding-distance gating; see its 2026-07-17 addendum)
@@ -173,6 +175,19 @@ Deployment is gated on the caveats below (chiefly `f38a86`).
   `_imports`, unsafe/unwrap review → a token/operator restriction.
 - Land the experiment (currently `5b5b97c` on `codex-restriction-ast-review-toy`)
   on `main`.
+
+## Removal (2026-11-04, bead `ley-line-open-afa952`)
+
+The module had no production caller: its only users were its own tests and the
+`restriction_git_replay` bench. Its key was also ambiguous. Rows were joined with a unit
+separator (`\u{1f}`), which POSIX paths may contain, so two different row sets could hash
+to the same restriction, and the key did not bind `parserId`, so a key computed under one
+derivation matched one computed under another (finding `80f037` F5). Keeping an unused,
+ambiguous key in the crate cost maintenance and invited a consumer to adopt it as is.
+
+The thesis and the experiment's result above stand. A future implementation (beads
+`ley-line-open-69305e`, `ley-line-open-d25f6e`) starts from this ADR, not from the removed
+code, and must length-prefix every hashed field and bind `parserId` into the key.
 
 ## Non-goals
 

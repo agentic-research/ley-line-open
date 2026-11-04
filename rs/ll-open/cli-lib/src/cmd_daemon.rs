@@ -138,13 +138,9 @@ pub struct DaemonConfig {
 /// behavior is added.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonOptions {
-    /// Activate/resume the private CDC index before the first arena snapshot,
-    /// over the named target. `None` leaves CDC inactive.
-    ///
-    /// One field rather than a `bool` plus a target, so "enabled but no
-    /// target" and "target but not enabled" are unrepresentable instead of
-    /// merely unreachable.
-    pub cdc: Option<crate::CdcTarget>,
+    /// Activate/resume the private CDC index over `source_blobs` before the
+    /// first arena snapshot.
+    pub cdc: bool,
     /// Auto-discovery symlink this daemon publishes. The execution entry
     /// points force their own name so an execution daemon cannot silently
     /// take over `~/.mache/default.sock` from a running substrate daemon.
@@ -426,52 +422,27 @@ pub async fn run_daemon_with_options(
                 return Err(error);
             }
         };
-        match report {
-            // `stranded_source_blobs_manifest_rows` is not padding either. A
-            // switch FROM `source_blobs` TO `nodes` on the same long-lived
-            // arena leaves the `source_blobs` index behind: normal GC cannot
-            // reclaim it (those rows are still fresh, not dead), so silence
-            // here reads as "nothing left over" when the arena is actually
-            // carrying two indexes (`ley-line-open-1869d0`).
-            Some(CdcActivationReport::Nodes(report)) => eprintln!(
-                "CDC activation (nodes): eligible={} populated={} already_fresh={} \
-                 source_bytes={} stranded_source_blobs_manifest_rows={}",
-                report.eligible_nodes,
-                report.populated_nodes,
-                report.already_fresh_nodes,
-                report.processed_source_bytes,
-                report.stranded_source_blobs_manifest_rows,
-            ),
-            // `skipped_sub_floor` is not padding. A `source_blobs` run over a
-            // corpus of small rows legitimately populates nothing, and without
-            // this count that outcome is indistinguishable from a silent
-            // no-op. It is the number that explains a disappointing result:
-            // 395,173 of 395,173 nodes fell below the chunking floor on a real
-            // mache projection (`ley-line-open-baa57f`). `stranded_nodes_manifest_rows`
-            // is the mirror of the nodes-branch count above, same reasoning.
-            Some(CdcActivationReport::SourceBlobs(report)) => eprintln!(
+        // `skipped_sub_floor` is not padding. A `source_blobs` run over a
+        // corpus of small rows legitimately populates nothing, and without
+        // this count that outcome is indistinguishable from a silent no-op.
+        if let Some(report) = report {
+            eprintln!(
                 "CDC activation (source-blobs): eligible={} populated={} \
-                 already_fresh={} skipped_sub_floor={} source_bytes={} \
-                 stranded_nodes_manifest_rows={}",
+                 already_fresh={} skipped_sub_floor={} source_bytes={}",
                 report.eligible_blobs,
                 report.populated_blobs,
                 report.already_fresh_blobs,
                 report.skipped_sub_floor_blobs,
                 report.processed_source_bytes,
-                report.stranded_nodes_manifest_rows,
-            ),
-            None => {}
+            );
         }
     }
     #[cfg(not(feature = "cdc"))]
     {
-        if let Some(target) = options.cdc {
+        if options.cdc {
             state.write().phase =
                 DaemonPhase::Error("CDC activation unavailable in this build".into());
-            anyhow::bail!(
-                "daemon --cdc --cdc-target {target} requires the 'cdc' feature \
-                 (compile with --features cdc)"
-            );
+            anyhow::bail!("daemon --cdc requires the 'cdc' feature (compile with --features cdc)");
         }
         snapshot_to_arena(&live_conn, &ctrl_path)?;
     }
@@ -1511,31 +1482,9 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     Ok(())
 }
 
-/// One activation result, tagged by the target that produced it.
-///
-/// The two targets report genuinely different quantities — `nodes` counts
-/// rows it populated, `source_blobs` additionally counts rows it declined to
-/// chunk — so they cannot share a struct without one target's fields being
-/// dead weight in the other's reports.
-#[cfg(feature = "cdc")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CdcActivationReport {
-    /// Construct-granular `nodes` activation.
-    Nodes(leyline_fs::activation::ActivationReport),
-    /// Whole-file `source_blobs` activation.
-    SourceBlobs(leyline_fs::activation::BlobActivationReport),
-}
-
-/// Optionally activate CDC over the requested target, then atomically publish
-/// the exact resulting database generation to the arena.
-///
-/// `target` is `None` when CDC is disabled. Carrying the target here rather
-/// than a bare `enabled: bool` is the whole point of `ley-line-open-c3d746`:
-/// the daemon previously hardcoded `activate_chunked_content`, so the
-/// `--target source-blobs` selector existed only on the standalone
-/// `leyline cdc enable` CLI and was unreachable from the daemon path that
-/// mache actually spawns. A bool has nowhere to put the answer, so the
-/// selector could not be plumbed without changing this signature.
+/// Optionally activate CDC over `source_blobs`, then atomically publish the
+/// exact resulting database generation to the arena. `None` when `cdc` is
+/// false.
 ///
 /// Activation failure leaves the previously published root intact.
 /// Successful activation and the disabled path both publish exactly once.
@@ -1543,19 +1492,18 @@ pub enum CdcActivationReport {
 pub fn activate_cdc_and_snapshot(
     conn: &rusqlite::Connection,
     ctrl_path: &Path,
-    target: Option<crate::CdcTarget>,
-) -> Result<Option<CdcActivationReport>> {
-    let options = leyline_fs::activation::ActivationOptions::default();
-    let report = match target {
-        Some(crate::CdcTarget::Nodes) => Some(CdcActivationReport::Nodes(
-            leyline_fs::activation::activate_chunked_content(conn, options)
-                .context("activate CDC `nodes` target in daemon living database")?,
-        )),
-        Some(crate::CdcTarget::SourceBlobs) => Some(CdcActivationReport::SourceBlobs(
-            leyline_fs::activation::activate_chunked_source_blobs(conn, options)
-                .context("activate CDC `source_blobs` target in daemon living database")?,
-        )),
-        None => None,
+    cdc: bool,
+) -> Result<Option<leyline_fs::activation::BlobActivationReport>> {
+    let report = if cdc {
+        Some(
+            leyline_fs::activation::activate_chunked_source_blobs(
+                conn,
+                leyline_fs::activation::ActivationOptions::default(),
+            )
+            .context("activate CDC `source_blobs` target in daemon living database")?,
+        )
+    } else {
+        None
     };
     snapshot_to_arena(conn, ctrl_path)?;
     Ok(report)
@@ -3939,7 +3887,7 @@ mod tests {
             rejected_execution_config(&tmp.path().join("execution-options.arena")),
             Arc::clone(&handler),
             DaemonOptions {
-                cdc: Some(crate::CdcTarget::Nodes),
+                cdc: true,
                 ..DaemonOptions::default()
             },
         )
@@ -4196,7 +4144,7 @@ mod execution_discovery_tests {
     #[test]
     fn execution_daemon_cannot_be_configured_onto_the_substrate_socket_name() {
         let caller = DaemonOptions {
-            cdc: Some(crate::CdcTarget::SourceBlobs),
+            cdc: true,
             discovery: SocketDiscovery::Substrate,
             host_mount: None,
         };
@@ -4206,13 +4154,8 @@ mod execution_discovery_tests {
             SocketDiscovery::Execution,
             "the execution surface must never publish default.sock"
         );
-        // Deliberately the non-default target: a `bool` field would have
-        // survived this assertion even if the override dropped the caller's
-        // CHOICE of target, which is exactly the bug c3d746 fixed.
-        assert_eq!(
-            effective.cdc,
-            Some(crate::CdcTarget::SourceBlobs),
-            "unrelated caller options must survive, target included"
-        );
+        // Deliberately the non-default value: the override must keep the
+        // caller's unrelated options.
+        assert!(effective.cdc, "unrelated caller options must survive");
     }
 }

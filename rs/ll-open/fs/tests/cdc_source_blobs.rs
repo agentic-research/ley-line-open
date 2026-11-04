@@ -1,14 +1,11 @@
 //! Falsifiers for the `source_blobs` CDC activation target: the sub-floor
-//! skip policy, complete tiling + byte-identical range reads, cross-target
-//! chunk-pool sharing, and — critically — GC's awareness of the second
-//! manifest table.
+//! skip policy, complete tiling + byte-identical range reads, and GC's
+//! reachability over the blob manifest.
 
 #![cfg(feature = "cdc")]
 
 use leyline_core::{ContentAddressed, Hash};
-use leyline_fs::activation::{
-    ActivationOptions, activate_chunked_content, activate_chunked_source_blobs,
-};
+use leyline_fs::activation::{ActivationOptions, activate_chunked_source_blobs};
 use leyline_fs::blob_chunked::{
     blob_chunks_touched, create_blob_chunked_schema, read_blob_range,
     store_blob_chunked_in_transaction,
@@ -30,16 +27,9 @@ fn prng(seed: u64, n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Deterministic ASCII bytes, for content that must survive a round trip
-/// through the TEXT-affinity `nodes.record` column byte-identically.
-fn ascii_prng(seed: u64, n: usize) -> Vec<u8> {
-    prng(seed, n).into_iter().map(|b| b'a' + (b % 26)).collect()
-}
-
 fn blob_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    // The CANONICAL contract, not a hand-rolled copy — same discipline as the
-    // GC tests' use of leyline_schema::create_nodes_table.
+    // The CANONICAL contract, not a hand-rolled copy.
     leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
     conn
 }
@@ -65,27 +55,6 @@ fn blob_manifest_rows(conn: &Connection, blob_hash: Hash) -> i64 {
         |row| row.get(0),
     )
     .unwrap()
-}
-
-/// Seed one eligible file leaf at `path`. A node's PATH is not stored under
-/// projection-v5, so this interns the components that render it.
-fn insert_node_leaf(conn: &Connection, path: &str, record: &str) {
-    let file_id = leyline_schema::ensure_file_id(conn, path).unwrap();
-    let dir_id = leyline_schema::ensure_dir_nodes(conn, path, 7).unwrap();
-    let name_id = leyline_schema::intern_name(conn, path).unwrap();
-    leyline_schema::insert_node(
-        conn,
-        leyline_schema::file_nid(file_id, 0),
-        Some(leyline_schema::dir_nid(dir_id)),
-        Some(name_id),
-        None,
-        0,
-        0,
-        record.len() as i64,
-        7,
-        record,
-    )
-    .unwrap();
 }
 
 #[test]
@@ -190,115 +159,29 @@ fn range_reads_touch_only_overlapping_manifest_rows() {
     assert_eq!(got, body[start as usize..start as usize + len]);
 }
 
+/// An unrepresentable batch size is refused before any CDC table is created.
 #[test]
-fn identical_content_in_nodes_and_source_blobs_shares_one_chunk_pool() {
-    let content = ascii_prng(31, 64 * 1024);
-    let text = std::str::from_utf8(&content).unwrap();
-
-    // Baseline: the nodes target alone.
-    let nodes_only = Connection::open_in_memory().unwrap();
-    leyline_schema::create_nodes_table(&nodes_only).unwrap();
-    insert_node_leaf(&nodes_only, "f.txt", text);
-    activate_chunked_content(&nodes_only, ActivationOptions::default()).unwrap();
-    let single_target_chunks = count(&nodes_only, "SELECT COUNT(*) FROM content_chunks");
-    assert!(single_target_chunks > 0);
-
-    // The same content reached through BOTH targets in one database.
-    let dual = Connection::open_in_memory().unwrap();
-    leyline_schema::create_nodes_table(&dual).unwrap();
-    leyline_ts::schema::create_source_blobs_table(&dual).unwrap();
-    insert_node_leaf(&dual, "f.txt", text);
-    insert_blob(&dual, &content);
-    let node_report = activate_chunked_content(&dual, ActivationOptions::default()).unwrap();
-    let blob_report = activate_chunked_source_blobs(&dual, ActivationOptions::default()).unwrap();
-    assert_eq!(node_report.populated_nodes, 1);
-    assert_eq!(blob_report.populated_blobs, 1);
-
-    assert_eq!(
-        count(&dual, "SELECT COUNT(*) FROM content_chunks"),
-        single_target_chunks,
-        "identical content through both targets must share one chunk pool, \
-         not store two copies"
-    );
-}
-
-/// `ley-line-open-1869d0`: switching which target a long-lived arena indexes
-/// is additive, not a migration — the target you stop using keeps its
-/// manifest rows, and ordinary GC cannot reclaim them because they are still
-/// FRESH (a stale witness or a deleted source row is what makes a manifest
-/// DEAD; a row nothing reads anymore is neither). Filed while reviewing
-/// #338 (`ley-line-open-c3d746`, daemon `--cdc-target`): that PR made the
-/// switch reachable, but nothing in activation reports what the switch
-/// leaves behind.
-///
-/// This is the falsifier for the cheapest of the bead's three sketched
-/// resolutions: report the OTHER target's resident row count at activation
-/// time rather than silently carrying it. Three states, in order, because
-/// the interesting bug is not "the count is ever nonzero" but "the count is
-/// zero exactly when the other target's manifest table does not exist yet,
-/// and nonzero exactly once it does":
-///   1. Only `nodes` activated: `source_blobs` was NEVER activated on this
-///      database, so `blob_manifest` does not exist. The reported count must
-///      be 0 — not merely small, but computed via a path that does not
-///      require creating the table to prove it is empty.
-///   2. `source_blobs` activated next, on the SAME database: its report
-///      must show the `nodes` target's manifest rows as stranded, and the
-///      count must equal the real `content_manifest` row count, not just be
-///      nonzero.
-///   3. `nodes` re-activated a second time: `blob_manifest` now exists (step
-///      2 created it), so the nodes report's count must flip from 0 to
-///      nonzero — proving the FIRST activation's 0 was "table absent", not a
-///      query that always returns 0.
-#[test]
-fn switching_targets_reports_the_abandoned_index_as_stranded() {
-    let conn = Connection::open_in_memory().unwrap();
-    leyline_schema::create_nodes_table(&conn).unwrap();
-    leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
-
-    let text = "abcdefghij".repeat(1024);
-    insert_node_leaf(&conn, "f.txt", &text);
-    insert_blob(&conn, text.as_bytes());
-
-    // 1. nodes only — source_blobs was never activated, blob_manifest does
-    // not exist. Nothing to strand yet.
-    let first_nodes = activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
-    assert_eq!(
-        first_nodes.stranded_source_blobs_manifest_rows, 0,
-        "no source_blobs activation has ever run — there is no manifest to strand"
-    );
-
-    // 2. source_blobs activated on the SAME database — the nodes index it
-    // did not touch must now read as stranded, at the real row count.
-    let blob_report = activate_chunked_source_blobs(&conn, ActivationOptions::default()).unwrap();
-    let real_node_manifest_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM content_manifest", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+fn activation_rejects_an_unrepresentable_batch_size_before_mutating() {
+    let conn = blob_db();
+    let error = activate_chunked_source_blobs(
+        &conn,
+        ActivationOptions {
+            batch_size: usize::MAX,
+        },
+    )
+    .unwrap_err();
     assert!(
-        real_node_manifest_rows > 0,
-        "precondition: the nodes activation above must have written spans"
+        format!("{error:#}").contains("batch_size exceeds SQLite i64"),
+        "unexpected error: {error:#}"
     );
     assert_eq!(
-        blob_report.stranded_nodes_manifest_rows, real_node_manifest_rows as u64,
-        "the reported count must be the REAL content_manifest row count, \
-         not merely nonzero"
-    );
-
-    // 3. nodes re-activated — blob_manifest exists now (step 2 created it),
-    // so the count must flip from 0 to nonzero, proving step 1's 0 meant
-    // "table absent" and not "always report 0".
-    let second_nodes = activate_chunked_content(&conn, ActivationOptions::default()).unwrap();
-    let real_blob_manifest_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM blob_manifest", [], |row| row.get(0))
-        .unwrap();
-    assert!(
-        real_blob_manifest_rows > 0,
-        "precondition: the source_blobs activation above must have written spans"
-    );
-    assert_eq!(
-        second_nodes.stranded_source_blobs_manifest_rows, real_blob_manifest_rows as u64,
-        "once blob_manifest exists, the nodes report must count its real rows"
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table' AND (name LIKE 'content_%' OR name LIKE 'blob_%')"
+        ),
+        0,
+        "invalid options must not mutate the database"
     );
 }
 

@@ -4,86 +4,19 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use leyline_fs::activation::{
-    ActivationOptions, ActivationProgress, ActivationReport, BlobActivationProgress,
-    BlobActivationReport, activate_chunked_content_with_progress,
+    ActivationOptions, BlobActivationProgress, BlobActivationReport,
     activate_chunked_source_blobs_with_progress,
 };
 use leyline_fs::gc::{GcOptions, GcReport, collect_unreachable_chunks};
 
-/// Activate chunk-backed content in an existing SQLite projection.
-pub fn enable_database(db: &Path, options: ActivationOptions) -> Result<ActivationReport> {
+/// Activate chunk-backed `source_blobs` storage in an existing SQLite
+/// projection.
+pub fn enable_database(db: &Path, options: ActivationOptions) -> Result<BlobActivationReport> {
     enable_database_with_progress(db, options, |_| {})
 }
 
 /// Activate a database while forwarding bounded page-level progress.
 pub fn enable_database_with_progress<F>(
-    db: &Path,
-    options: ActivationOptions,
-    on_progress: F,
-) -> Result<ActivationReport>
-where
-    F: FnMut(ActivationProgress),
-{
-    let conn =
-        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .with_context(|| format!("open CDC database {}", db.display()))?;
-    activate_chunked_content_with_progress(&conn, options, on_progress)
-        .with_context(|| format!("activate CDC in {}", db.display()))
-}
-
-/// Render one stable page-level progress line for stderr.
-pub fn format_progress(progress: ActivationProgress) -> String {
-    format!(
-        "CDC activation: visited={}/{} populated={} already_fresh={} source_bytes={}",
-        progress.visited_nodes,
-        progress.eligible_nodes,
-        progress.populated_nodes,
-        progress.already_fresh_nodes,
-        progress.processed_source_bytes,
-    )
-}
-
-/// Render a stable command result for humans or automation.
-pub fn format_report(report: ActivationReport, json: bool) -> Result<String> {
-    if json {
-        return serde_json::to_string(&report).context("encode CDC activation report");
-    }
-    Ok(format!(
-        "CDC enabled: eligible={} populated={} already_fresh={} source_bytes={} \
-         manifest_rows={} unique_chunks={} unique_chunk_bytes={} \
-         stranded_source_blobs_manifest_rows={}",
-        report.eligible_nodes,
-        report.populated_nodes,
-        report.already_fresh_nodes,
-        report.processed_source_bytes,
-        report.manifest_rows,
-        report.unique_chunk_rows,
-        report.unique_chunk_bytes,
-        report.stranded_source_blobs_manifest_rows,
-    ))
-}
-
-/// CLI entry point for `leyline cdc enable` (the default `nodes` target).
-pub fn cmd_cdc_enable(db: &Path, batch_size: usize, json: bool) -> Result<()> {
-    let report = enable_database_with_progress(db, ActivationOptions { batch_size }, |progress| {
-        eprintln!("{}", format_progress(progress))
-    })?;
-    println!("{}", format_report(report, json)?);
-    Ok(())
-}
-
-/// Activate chunk-backed `source_blobs` storage in an existing SQLite
-/// projection (`--target source-blobs`).
-pub fn enable_source_blobs_database(
-    db: &Path,
-    options: ActivationOptions,
-) -> Result<BlobActivationReport> {
-    enable_source_blobs_database_with_progress(db, options, |_| {})
-}
-
-/// Activate the `source_blobs` target while forwarding bounded page-level
-/// progress.
-pub fn enable_source_blobs_database_with_progress<F>(
     db: &Path,
     options: ActivationOptions,
     on_progress: F,
@@ -99,7 +32,7 @@ where
 }
 
 /// Render one stable page-level progress line for stderr.
-pub fn format_blob_progress(progress: BlobActivationProgress) -> String {
+pub fn format_progress(progress: BlobActivationProgress) -> String {
     format!(
         "CDC source_blobs activation: visited={}/{} populated={} already_fresh={} source_bytes={}",
         progress.visited_blobs,
@@ -111,14 +44,14 @@ pub fn format_blob_progress(progress: BlobActivationProgress) -> String {
 }
 
 /// Render a stable command result for humans or automation.
-pub fn format_blob_report(report: BlobActivationReport, json: bool) -> Result<String> {
+pub fn format_report(report: BlobActivationReport, json: bool) -> Result<String> {
     if json {
         return serde_json::to_string(&report).context("encode blob CDC activation report");
     }
     Ok(format!(
         "CDC source_blobs enabled: eligible={} populated={} already_fresh={} \
          skipped_sub_floor={} source_bytes={} manifest_rows={} unique_chunks={} \
-         unique_chunk_bytes={} stranded_nodes_manifest_rows={}",
+         unique_chunk_bytes={}",
         report.eligible_blobs,
         report.populated_blobs,
         report.already_fresh_blobs,
@@ -127,17 +60,15 @@ pub fn format_blob_report(report: BlobActivationReport, json: bool) -> Result<St
         report.manifest_rows,
         report.unique_chunk_rows,
         report.unique_chunk_bytes,
-        report.stranded_nodes_manifest_rows,
     ))
 }
 
-/// CLI entry point for `leyline cdc enable --target source-blobs`.
-pub fn cmd_cdc_enable_source_blobs(db: &Path, batch_size: usize, json: bool) -> Result<()> {
-    let report =
-        enable_source_blobs_database_with_progress(db, ActivationOptions { batch_size }, |p| {
-            eprintln!("{}", format_blob_progress(p))
-        })?;
-    println!("{}", format_blob_report(report, json)?);
+/// CLI entry point for `leyline cdc enable`.
+pub fn cmd_cdc_enable(db: &Path, batch_size: usize, json: bool) -> Result<()> {
+    let report = enable_database_with_progress(db, ActivationOptions { batch_size }, |p| {
+        eprintln!("{}", format_progress(p))
+    })?;
+    println!("{}", format_report(report, json)?);
     Ok(())
 }
 
@@ -159,7 +90,6 @@ pub fn format_gc_report(report: GcReport, json: bool) -> Result<String> {
         "CDC GC: dry_run={} before_rows={} before_bytes={} \
          unreachable_rows={} unreachable_bytes={} deleted_rows={} deleted_bytes={} \
          remaining_rows={} remaining_bytes={} \
-         reaped_manifest_rows={} reaped_manifest_nodes={} \
          reaped_blob_manifest_rows={} reaped_blob_manifest_blobs={}",
         report.dry_run,
         report.before_chunk_rows,
@@ -170,8 +100,6 @@ pub fn format_gc_report(report: GcReport, json: bool) -> Result<String> {
         report.deleted_chunk_bytes,
         report.remaining_chunk_rows,
         report.remaining_chunk_bytes,
-        report.reaped_manifest_rows,
-        report.reaped_manifest_nodes,
         report.reaped_blob_manifest_rows,
         report.reaped_blob_manifest_blobs,
     ))
@@ -191,10 +119,9 @@ pub fn cmd_cdc_gc(db: &Path, dry_run: bool, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leyline_fs::activation::{BlobActivationProgress, BlobActivationReport};
 
     /// Distinct value per field: a swap or dropped field cannot cancel out.
-    fn blob_report() -> BlobActivationReport {
+    fn report() -> BlobActivationReport {
         BlobActivationReport {
             eligible_blobs: 1,
             populated_blobs: 2,
@@ -204,49 +131,12 @@ mod tests {
             manifest_rows: 6,
             unique_chunk_rows: 7,
             unique_chunk_bytes: 8,
-            stranded_nodes_manifest_rows: 9,
         }
     }
 
-    /// Distinct value per field, matching `blob_report()`'s discipline.
-    fn nodes_report() -> ActivationReport {
-        ActivationReport {
-            eligible_nodes: 1,
-            populated_nodes: 2,
-            already_fresh_nodes: 3,
-            processed_source_bytes: 4,
-            manifest_rows: 5,
-            unique_chunk_rows: 6,
-            unique_chunk_bytes: 7,
-            stranded_source_blobs_manifest_rows: 8,
-        }
-    }
-
-    /// `format_report` (the `nodes` render) had no in-module twin, unlike
-    /// `format_blob_report` and `format_gc_report` right below — the module
-    /// header explains why that matters: the diff-scoped mutants gate sees
-    /// `--lib` only, so a constant-replacement mutant here is invisible to
-    /// `tests/cdc_command_test.rs` no matter how thorough that file is.
-    /// `ley-line-open-c3d746`'s own diff landed on this exact function and
-    /// found the gap live (`Ok(String::new())` and `Ok("xyzzy".into())`
-    /// both survived) before this test existed.
     #[test]
-    fn nodes_report_renders_stable_human_and_json_forms() {
-        assert_eq!(
-            format_report(nodes_report(), false).unwrap(),
-            "CDC enabled: eligible=1 populated=2 already_fresh=3 source_bytes=4 \
-             manifest_rows=5 unique_chunks=6 unique_chunk_bytes=7 \
-             stranded_source_blobs_manifest_rows=8"
-        );
-        let json: serde_json::Value =
-            serde_json::from_str(&format_report(nodes_report(), true).unwrap()).unwrap();
-        assert_eq!(json["eligible_nodes"], 1);
-        assert_eq!(json["stranded_source_blobs_manifest_rows"], 8);
-    }
-
-    #[test]
-    fn blob_progress_renders_every_counter_in_order() {
-        let line = format_blob_progress(BlobActivationProgress {
+    fn progress_renders_every_counter_in_order() {
+        let line = format_progress(BlobActivationProgress {
             visited_blobs: 1,
             eligible_blobs: 2,
             populated_blobs: 3,
@@ -260,17 +150,17 @@ mod tests {
     }
 
     #[test]
-    fn blob_report_renders_stable_human_and_json_forms() {
+    fn report_renders_stable_human_and_json_forms() {
         assert_eq!(
-            format_blob_report(blob_report(), false).unwrap(),
+            format_report(report(), false).unwrap(),
             "CDC source_blobs enabled: eligible=1 populated=2 already_fresh=3 \
              skipped_sub_floor=4 source_bytes=5 manifest_rows=6 unique_chunks=7 \
-             unique_chunk_bytes=8 stranded_nodes_manifest_rows=9"
+             unique_chunk_bytes=8"
         );
         let json: serde_json::Value =
-            serde_json::from_str(&format_blob_report(blob_report(), true).unwrap()).unwrap();
+            serde_json::from_str(&format_report(report(), true).unwrap()).unwrap();
         assert_eq!(json["skipped_sub_floor_blobs"], 4);
-        assert_eq!(json["stranded_nodes_manifest_rows"], 9);
+        assert_eq!(json["unique_chunk_bytes"], 8);
     }
 
     #[test]
@@ -284,8 +174,6 @@ mod tests {
             deleted_chunk_bytes: 6,
             remaining_chunk_rows: 7,
             remaining_chunk_bytes: 8,
-            reaped_manifest_rows: 9,
-            reaped_manifest_nodes: 10,
             reaped_blob_manifest_rows: 11,
             reaped_blob_manifest_blobs: 12,
             dry_run: true,
@@ -294,16 +182,15 @@ mod tests {
             format_gc_report(report, false).unwrap(),
             "CDC GC: dry_run=true before_rows=1 before_bytes=2 unreachable_rows=3 \
              unreachable_bytes=4 deleted_rows=5 deleted_bytes=6 remaining_rows=7 \
-             remaining_bytes=8 reaped_manifest_rows=9 reaped_manifest_nodes=10 \
-             reaped_blob_manifest_rows=11 reaped_blob_manifest_blobs=12"
+             remaining_bytes=8 reaped_blob_manifest_rows=11 reaped_blob_manifest_blobs=12"
         );
     }
 
     /// The command entry must surface failure — an `Ok(())` stub would
     /// print nothing and exit 0 on a database that does not exist.
     #[test]
-    fn enable_source_blobs_surfaces_a_missing_database_as_an_error() {
+    fn enable_surfaces_a_missing_database_as_an_error() {
         let missing = std::path::Path::new("/nonexistent/llo-cdc-test/x.db");
-        assert!(cmd_cdc_enable_source_blobs(missing, 16, false).is_err());
+        assert!(cmd_cdc_enable(missing, 16, false).is_err());
     }
 }

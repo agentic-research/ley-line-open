@@ -449,7 +449,8 @@ run_slice() {
 # every test trivially passes, and it is reported MISSED — a false survivor
 # on healthy code. This gate failed PR #306 with 24 such phantoms while the
 # feature-correct allowlist run caught all 86 real ones in the same file.
-# leyline-fs's covered modules (chunked.rs, gc.rs) are exactly that shape, so
+# leyline-fs's covered modules (blob_chunked.rs, chunk_pool.rs, gc.rs) are
+# exactly that shape, so
 # fs files route to their own invocation carrying the same feature set as
 # `mutants:fs`/`mutants:fs-gc`. If another crate ever hides covered code
 # behind non-default features, it needs the same routing — a default-features

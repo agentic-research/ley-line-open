@@ -35,15 +35,6 @@ pub struct GcReport {
     pub remaining_chunk_rows: u64,
     /// Deduplicated chunk payload bytes after collection.
     pub remaining_chunk_bytes: u64,
-    /// `content_manifest` span rows removed because their manifest was dead.
-    ///
-    /// Dead means the freshness witness cannot be satisfied: the node is gone,
-    /// its `(size, mtime)` moved on, or the witness row is missing entirely.
-    /// Such a manifest is already refused by every read — this reclaims the
-    /// storage it was pinning.
-    pub reaped_manifest_rows: u64,
-    /// `content_manifest_meta` witness rows removed (one per dead node).
-    pub reaped_manifest_nodes: u64,
     /// `blob_manifest` span rows removed because their manifest was dead.
     ///
     /// A blob manifest dies exactly one way: its `source_blobs` row is gone.
@@ -66,13 +57,9 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
     validate_gc_schema(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin CDC reachability GC transaction")?;
-    // Both per-target manifest schemas, idempotent inside this transaction —
-    // a projection activated for only ONE target still needs both tables to
-    // exist for the predicates below to reference, and an arena with the
-    // chunk pool but no witness table gains one here. A dry run's rollback
-    // keeps all of it non-mutating.
-    crate::chunked::create_chunked_content_schema(&tx)
-        .context("ensure node manifest schema before GC")?;
+    // Idempotent inside this transaction: an arena with the chunk pool but no
+    // blob manifest table gains one here, so the predicates below can
+    // reference it. A dry run's rollback keeps it non-mutating.
     crate::blob_chunked::ensure_blob_manifest_infra(&tx)
         .context("ensure blob manifest schema before GC")?;
     let (before_chunk_rows, before_chunk_bytes) =
@@ -82,21 +69,14 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
     // chunks they were holding. Doing this after would leave them referenced
     // for another whole cycle — and since every cycle can create new dead
     // manifests, "another cycle" is never.
-    let (reaped_manifest_rows, reaped_manifest_nodes) = reap_dead_manifests(&tx)?;
     let (reaped_blob_manifest_rows, reaped_blob_manifest_blobs) = reap_dead_blob_manifests(&tx)?;
 
-    // Reachable means referenced by EITHER manifest table: the chunk pool is
-    // shared across activation targets, so a chunk referenced only by a blob
-    // manifest is live. The previous single-table predicate here would have
-    // deleted live blob chunks the moment a second manifest table existed —
-    // `gc_keeps_chunks_referenced_only_by_blob_manifests` pins this.
+    // Reachable means referenced by a blob manifest. A `content_manifest`
+    // table left by the removed `nodes` target (`ley-line-open-afa952`) is not
+    // consulted: nothing reads it, so the chunks only it references are
+    // garbage.
     let unreachable_predicate = "\
         WHERE NOT EXISTS (
-            SELECT 1
-              FROM content_manifest AS manifest
-             WHERE manifest.chunk_hash = content_chunks.chunk_hash
-        )
-          AND NOT EXISTS (
             SELECT 1
               FROM blob_manifest AS blob_ref
              WHERE blob_ref.chunk_hash = content_chunks.chunk_hash
@@ -147,8 +127,6 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
         deleted_chunk_bytes,
         remaining_chunk_rows,
         remaining_chunk_bytes,
-        reaped_manifest_rows,
-        reaped_manifest_nodes,
         reaped_blob_manifest_rows,
         reaped_blob_manifest_blobs,
         dry_run: options.dry_run,
@@ -162,92 +140,6 @@ pub fn collect_unreachable_chunks(conn: &Connection, options: GcOptions) -> Resu
     Ok(report)
 }
 
-/// A manifest is dead when its freshness witness cannot be satisfied.
-///
-/// One predicate covers all three ways that happens, which is why it is
-/// written once and applied to both tables:
-///
-/// * the node is gone — the join finds nothing (nid reuse after
-///   `remove_node`/`rename_node`, the cross-generation leak from `0330c7`);
-/// * the witness disagrees — `(size, mtime)` moved on behind this crate;
-/// * the witness row is missing entirely — spans with no meta row.
-///
-/// In every case `has_chunked_content_in_transaction` already returns false,
-/// so reads are unaffected: this reclaims storage that was pinned by a
-/// manifest nothing could ever use. A dead manifest is also useless for
-/// incremental rechunking, which only accepts a *fresh* previous snapshot,
-/// so nothing downstream loses an optimization either.
-fn dead_manifest_predicate(table: &str) -> String {
-    // Freshness comes from the ONE definition the read gate uses
-    // (WITNESS_FRESH_PREDICATE) — a hand-written second copy is how the
-    // reaper and the gate drifted apart the first time (types-friend F3:
-    // this site was missing the source_len guard the tested Rust arm had,
-    // and predates the generation witness entirely).
-    format!(
-        "NOT EXISTS (
-             SELECT 1
-               FROM content_manifest_meta AS m
-               JOIN nodes AS n ON n.nid = m.nid
-              WHERE m.nid = {table}.nid
-                AND {}
-         )",
-        crate::chunked::WITNESS_FRESH_PREDICATE
-    )
-}
-
-/// Delete manifests whose freshness witness is dead. Returns
-/// `(span_rows, witness_rows)`.
-///
-/// Runs unconditionally inside the caller's transaction, including on a dry
-/// run: the reachability pass that follows must see post-reap state or the
-/// dry-run estimate understates what is actually reclaimable, which is the
-/// number the operator is asking for. The caller's rollback is what makes a
-/// dry run non-mutating.
-fn reap_dead_manifests(tx: &Transaction<'_>) -> Result<(u64, u64)> {
-    // Freshness is only evaluable against the live rows. A standalone chunk
-    // store has no `nodes` table and no witnesses; there is nothing to prove
-    // dead, so reap nothing rather than guessing.
-    let evaluable: i64 = tx
-        .query_row(
-            "SELECT COUNT(*)
-               FROM sqlite_master
-              WHERE type = 'table'
-                AND name IN ('nodes', 'content_manifest_meta')",
-            [],
-            |row| row.get(0),
-        )
-        .context("probe for manifest freshness inputs")?;
-    if evaluable < 2 {
-        return Ok((0, 0));
-    }
-
-    // Spans first: the witness rows are the predicate's own input, so
-    // deleting them first would make every remaining manifest look dead.
-    let spans = tx
-        .execute(
-            &format!(
-                "DELETE FROM content_manifest WHERE {}",
-                dead_manifest_predicate("content_manifest")
-            ),
-            [],
-        )
-        .context("reap dead manifest spans")?;
-    let witnesses = tx
-        .execute(
-            &format!(
-                "DELETE FROM content_manifest_meta WHERE {}",
-                dead_manifest_predicate("content_manifest_meta")
-            ),
-            [],
-        )
-        .context("reap dead manifest witnesses")?;
-
-    Ok((
-        u64::try_from(spans).context("reaped manifest span count exceeds u64")?,
-        u64::try_from(witnesses).context("reaped manifest witness count exceeds u64")?,
-    ))
-}
-
 /// Delete blob manifests whose `source_blobs` row is gone. Returns
 /// `(span_rows, distinct_blobs)`.
 ///
@@ -256,14 +148,14 @@ fn reap_dead_manifests(tx: &Transaction<'_>) -> Result<(u64, u64)> {
 /// stale-witness arm (see `blob_chunked`). When the `source_blobs` table
 /// itself is absent, EVERY blob manifest is dead by the same reasoning: the
 /// manifest is a derived index over `source_blobs` rows, and a database
-/// without the table has no authoritative row for any manifest to describe —
-/// so unlike the node reaper's "nothing to prove, reap nothing" stance, the
-/// absence here is itself the proof.
+/// without the table has no authoritative row for any manifest to describe,
+/// so the absence is itself the proof.
 ///
 /// Runs unconditionally inside the caller's transaction, including on a dry
-/// run, for the same reason as [`reap_dead_manifests`]: the reachability
-/// pass must see post-reap state or the dry-run estimate understates what is
-/// reclaimable.
+/// run: the reachability pass that follows must see post-reap state or the
+/// dry-run estimate understates what is actually reclaimable, which is the
+/// number the operator is asking for. The caller's rollback is what makes a
+/// dry run non-mutating.
 fn reap_dead_blob_manifests(tx: &Transaction<'_>) -> Result<(u64, u64)> {
     let source_blobs_present: bool = tx
         .query_row(
@@ -317,30 +209,18 @@ fn validate_gc_schema(conn: &Connection) -> Result<()> {
         )
         .with_context(|| format!("inspect CDC table {name} for reachability GC"))
     };
-    // The pool is the collection target and must already exist. The manifest
-    // tables are per-TARGET: a projection activated for only one target
-    // legitimately has one of them, and the missing one is created
-    // idempotently inside the GC transaction. A database with neither has no
-    // CDC schema at all and is refused rather than mutated.
+    // The pool is the collection target and must already exist; a database
+    // without it has no CDC schema at all and is refused rather than mutated.
+    // The blob manifest table is created idempotently inside the GC
+    // transaction when absent.
     let pool = table_present("content_chunks")?;
-    let node_manifest = table_present("content_manifest")?;
     let blob_manifest = table_present("blob_manifest")?;
-    ensure!(
-        pool && (node_manifest || blob_manifest),
-        "missing required CDC tables for reachability GC"
-    );
+    ensure!(pool, "missing required CDC tables for reachability GC");
     validate_table_columns(
         conn,
         "content_chunks",
         &["chunk_hash", "chunk_bytes", "chunk_len"],
     )?;
-    if node_manifest {
-        validate_table_columns(
-            conn,
-            "content_manifest",
-            &["nid", "seq", "chunk_hash", "byte_offset", "byte_len"],
-        )?;
-    }
     if blob_manifest {
         validate_table_columns(
             conn,
@@ -395,15 +275,17 @@ fn chunk_totals(conn: &Connection, predicate: &str, context: &'static str) -> Re
 #[cfg(test)]
 mod tests {
     use super::{GcOptions, collect_unreachable_chunks};
-    use crate::chunked::{
-        create_chunked_content_schema, invalidate_chunked_content, read_content_chunked,
-        store_content_chunked,
+    use crate::blob_chunked::{
+        create_blob_chunked_schema, read_blob_range, store_blob_chunked_in_transaction,
     };
+    use leyline_core::{ContentAddressed, Hash};
     use rusqlite::Connection;
 
+    /// A database carrying `source_blobs` and the blob CDC schema.
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        create_chunked_content_schema(&conn).unwrap();
+        leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+        create_blob_chunked_schema(&conn).unwrap();
         conn
     }
 
@@ -412,78 +294,100 @@ mod tests {
             .unwrap()
     }
 
-    /// A nid for a node this file never gives a `nodes` row. These tests
-    /// exercise the chunk pool and its reachability, where a nid is nothing
-    /// but the manifest's key.
-    fn node(file_id: i64) -> i64 {
-        leyline_schema::file_nid(file_id, 0)
+    fn prng(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect()
     }
 
-    /// A `nodes` row for `path`, so manifest freshness is evaluable. Returns
-    /// the nid the projection assigned it.
-    fn insert_node_row(conn: &Connection, path: &str, content: &str, mtime: i64) -> i64 {
-        // The CANONICAL contract, not a hand-rolled copy. A fixture that
-        // declares its own `nodes` DDL drifts from what producers ship
-        // against — which is how `record JSON`'s NUMERIC affinity went
-        // unnoticed (bead `ley-line-open-f7966d`).
-        leyline_schema::create_schema(conn).unwrap();
-        let file_id = leyline_schema::ensure_file_id(conn, path).unwrap();
-        let dir_id = leyline_schema::ensure_dir_nodes(conn, path, mtime).unwrap();
-        let name = path.rsplit('/').next().unwrap();
-        let name_id = leyline_schema::intern_name(conn, name).unwrap();
-        let nid = leyline_schema::file_nid(file_id, 0);
-        leyline_schema::insert_node(
-            conn,
-            nid,
-            Some(leyline_schema::dir_nid(dir_id)),
-            Some(name_id),
-            None,
-            0,
-            0,
-            content.len() as i64,
-            mtime,
-            content,
+    /// Insert `bytes` as a `source_blobs` row and store its chunk manifest.
+    fn store(conn: &Connection, bytes: &[u8]) -> Hash {
+        let hash = bytes.hash();
+        conn.execute(
+            "INSERT OR IGNORE INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+            rusqlite::params![hash.as_bytes().as_slice(), bytes],
         )
         .unwrap();
-        nid
+        let tx = conn.unchecked_transaction().unwrap();
+        store_blob_chunked_in_transaction(&tx, hash, bytes).unwrap();
+        tx.commit().unwrap();
+        hash
     }
 
-    fn count_manifest_rows(conn: &Connection, nid: i64) -> i64 {
+    /// Delete the authoritative row — the one way a blob manifest dies.
+    fn remove(conn: &Connection, hash: Hash) {
+        conn.execute(
+            "DELETE FROM source_blobs WHERE blob_hash = ?1",
+            rusqlite::params![hash.as_bytes().as_slice()],
+        )
+        .unwrap();
+    }
+
+    fn count_manifest_rows(conn: &Connection, hash: Hash) -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM content_manifest WHERE nid = ?1",
-            rusqlite::params![nid],
+            "SELECT COUNT(*) FROM blob_manifest WHERE blob_hash = ?1",
+            rusqlite::params![hash.as_bytes().as_slice()],
             |row| row.get(0),
         )
         .unwrap()
     }
 
-    /// A manifest whose node is gone is refused by every read (the freshness
-    /// witness has nothing to join against) yet still references its chunks —
-    /// so reachability GC sees them as live and reclaims nothing, forever.
-    /// `files` being append-only means the vacated nid is handed straight back
-    /// to whatever is created at that path next, so the orphan is reachable
-    /// again rather than merely wasted.
-    ///
-    /// Bead `ley-line-open-b5e56f`. This is the hygiene half of `0330c7`:
-    /// correctness degrades safely, storage does not.
+    /// A `content_manifest` table left by the removed `nodes` target
+    /// (`ley-line-open-afa952`) does not pin chunks: nothing reads it, so the
+    /// chunks only it references are collected.
     #[test]
-    fn gc_reaps_manifests_whose_node_is_gone() {
+    fn a_legacy_node_manifest_does_not_pin_chunks() {
         let conn = db();
-        let data = vec![b'x'; 40_000];
-        let nid = insert_node_row(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
-        store_content_chunked(&conn, nid, &data).unwrap();
+        let kept = store(&conn, &vec![b'k'; 40_000]);
+        let tx = conn.unchecked_transaction().unwrap();
+        let mut pool = crate::chunk_pool::SqliteBlobStore::new(&tx);
+        let orphan_hash =
+            leyline_core::BlobStore::put(&mut pool, b"only a legacy manifest names me").unwrap();
+        tx.commit().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE content_manifest (
+                nid INTEGER NOT NULL, seq INTEGER NOT NULL, chunk_hash BLOB NOT NULL,
+                byte_offset INTEGER NOT NULL, byte_len INTEGER NOT NULL,
+                PRIMARY KEY (nid, seq)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_manifest VALUES (1, 0, ?1, 0, 31)",
+            rusqlite::params![orphan_hash.as_bytes().as_slice()],
+        )
+        .unwrap();
+        let before = count_chunks(&conn);
+
+        let report = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
+
+        assert_eq!(report.deleted_chunk_rows, 1, "the legacy-only chunk goes");
+        assert_eq!(count_chunks(&conn), before - 1);
+        assert!(count_manifest_rows(&conn, kept) > 0, "live manifest kept");
+    }
+
+    /// A manifest whose `source_blobs` row is gone still references its
+    /// chunks, so without the reap reachability GC would see them as live and
+    /// reclaim nothing, forever (bead `ley-line-open-b5e56f`).
+    #[test]
+    fn gc_reaps_manifests_whose_blob_is_gone() {
+        let conn = db();
+        let hash = store(&conn, &vec![b'x'; 40_000]);
         assert!(count_chunks(&conn) > 0, "precondition: chunks stored");
 
-        // Removed out of band — exactly the nid-reuse orphan from 0330c7.
-        conn.execute("DELETE FROM nodes WHERE nid = ?1", [nid])
-            .unwrap();
-
+        remove(&conn, hash);
         collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
         assert_eq!(
-            count_manifest_rows(&conn, nid),
+            count_manifest_rows(&conn, hash),
             0,
-            "a manifest whose node is gone must be reaped"
+            "a manifest whose blob is gone must be reaped"
         );
         assert_eq!(
             count_chunks(&conn),
@@ -501,7 +405,6 @@ mod tests {
     #[test]
     fn gc_reports_exact_blob_reap_counts() {
         let conn = db();
-        leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
         // One blob past MAX_CHUNK (>= 2 manifest rows) plus one small
         // eligible blob: total rows >= 3 and distinct blobs == 2, so no
         // 0/1-valued tuple can coincide with the real counts.
@@ -544,59 +447,33 @@ mod tests {
         assert_eq!(count_chunks(&conn), 0, "their chunks must then collect");
     }
 
-    /// A manifest whose witness disagrees with the live row is refused by
-    /// reads and cannot serve incremental rechunking either, so it is dead
-    /// weight holding chunks alive.
+    /// The safety direction: a live manifest must survive GC untouched, or
+    /// the collector becomes a cache-destroyer.
     #[test]
-    fn gc_reaps_manifests_with_a_stale_witness() {
-        let conn = db();
-        let data = vec![b'y'; 40_000];
-        let nid = insert_node_row(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
-        store_content_chunked(&conn, nid, &data).unwrap();
-
-        // Record moved on behind this crate's back: size and mtime both shift.
-        conn.execute(
-            "UPDATE nodes SET record = 'zzz', size = 3, mtime = 999 WHERE nid = ?1",
-            [nid],
-        )
-        .unwrap();
-
-        collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
-
-        assert_eq!(
-            count_manifest_rows(&conn, nid),
-            0,
-            "a stale manifest must be reaped"
-        );
-        assert_eq!(count_chunks(&conn), 0, "and its chunks collected");
-    }
-
-    /// The safety direction: a manifest that IS fresh must survive GC
-    /// untouched, or the collector becomes a cache-destroyer.
-    #[test]
-    fn gc_preserves_fresh_manifests_and_their_chunks() {
+    fn gc_preserves_live_manifests_and_their_chunks() {
         let conn = db();
         let data = vec![b'z'; 40_000];
-        let nid = insert_node_row(&conn, "n", std::str::from_utf8(&data).unwrap(), 1);
-        store_content_chunked(&conn, nid, &data).unwrap();
+        let hash = store(&conn, &data);
         let before = count_chunks(&conn);
 
         collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
-        assert!(count_manifest_rows(&conn, nid) > 0, "fresh manifest kept");
-        assert_eq!(count_chunks(&conn), before, "fresh chunks kept");
-        let mut buf = vec![0u8; data.len()];
-        let n = read_content_chunked(&conn, nid, &mut buf, 0).unwrap();
-        assert_eq!(n, data.len());
-        assert_eq!(buf, data, "and the content still reads back");
+        assert!(count_manifest_rows(&conn, hash) > 0, "live manifest kept");
+        assert_eq!(count_chunks(&conn), before, "live chunks kept");
+        let len = data.len() as u64;
+        assert_eq!(
+            read_blob_range(&conn, hash, 0..len).unwrap(),
+            data,
+            "and the content still reads back"
+        );
     }
 
     #[test]
     fn dry_run_accounts_for_unreachable_chunks_without_mutating() {
         let conn = db();
         let data = vec![0x5a; 128 * 1024];
-        store_content_chunked(&conn, node(2), &data).unwrap();
-        invalidate_chunked_content(&conn, node(2)).unwrap();
+        let hash = store(&conn, &data);
+        remove(&conn, hash);
         let before = count_chunks(&conn);
         assert!(before > 0);
 
@@ -610,31 +487,48 @@ mod tests {
         assert!(report.unreachable_chunk_bytes > 0);
         assert_eq!(report.deleted_chunk_bytes, 0);
         assert_eq!(report.remaining_chunk_bytes, report.before_chunk_bytes);
+        assert!(
+            count_manifest_rows(&conn, hash) > 0,
+            "the dry run's reap rolled back"
+        );
     }
 
+    /// Two blobs sharing chunks: removing one keeps the shared chunks until
+    /// the last manifest naming them is gone.
     #[test]
     fn collection_preserves_shared_chunks_until_the_final_manifest_is_gone() {
         let conn = db();
-        let data = vec![0x33; 96 * 1024];
-        store_content_chunked(&conn, node(1), &data).unwrap();
-        store_content_chunked(&conn, node(2), &data).unwrap();
-        let shared_rows = count_chunks(&conn);
-        invalidate_chunked_content(&conn, node(2)).unwrap();
+        // Same pseudo-random 600 KB prefix, different tails: CDC boundaries
+        // are content-defined, so the prefix chunks are stored once and named
+        // by both manifests.
+        let shared = prng(0x5ead, 600_000);
+        let mut first_bytes = shared.clone();
+        first_bytes.extend_from_slice(&prng(1, 200_000));
+        let mut second_bytes = shared.clone();
+        second_bytes.extend_from_slice(&prng(2, 200_000));
+        let first_hash = store(&conn, &first_bytes);
+        let second_hash = store(&conn, &second_bytes);
+        let all_rows = count_chunks(&conn);
+        remove(&conn, second_hash);
 
         let first = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
-        assert_eq!(first.unreachable_chunk_rows, 0);
-        assert_eq!(first.deleted_chunk_rows, 0);
-        assert_eq!(count_chunks(&conn), shared_rows);
-        let mut round_trip = vec![0_u8; data.len()];
-        assert_eq!(
-            read_content_chunked(&conn, node(1), &mut round_trip, 0).unwrap(),
-            data.len()
+        let remaining_after_first = count_chunks(&conn);
+        assert!(
+            remaining_after_first < all_rows,
+            "the removed blob's own chunks go"
         );
-        assert_eq!(round_trip, data);
+        assert_eq!(first.remaining_chunk_rows as i64, remaining_after_first);
+        let len = first_bytes.len() as u64;
+        assert_eq!(
+            read_blob_range(&conn, first_hash, 0..len).unwrap(),
+            first_bytes,
+            "the surviving blob still reads back through the shared chunks"
+        );
 
-        invalidate_chunked_content(&conn, node(1)).unwrap();
+        remove(&conn, first_hash);
         let second = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
+        let shared_rows = remaining_after_first;
         assert_eq!(second.deleted_chunk_rows, shared_rows as u64);
         assert_eq!(second.deleted_chunk_bytes, second.before_chunk_bytes);
         assert_eq!(second.remaining_chunk_rows, 0);
@@ -646,9 +540,9 @@ mod tests {
         let conn = db();
         let live = vec![0x11; 96 * 1024];
         let removed = vec![0x77; 96 * 1024];
-        store_content_chunked(&conn, node(1), &live).unwrap();
-        store_content_chunked(&conn, node(2), &removed).unwrap();
-        invalidate_chunked_content(&conn, node(2)).unwrap();
+        let live_hash = store(&conn, &live);
+        let removed_hash = store(&conn, &removed);
+        remove(&conn, removed_hash);
 
         let report = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
 
@@ -662,19 +556,15 @@ mod tests {
             report.before_chunk_bytes,
             report.deleted_chunk_bytes + report.remaining_chunk_bytes
         );
-        let mut round_trip = vec![0_u8; live.len()];
-        assert_eq!(
-            read_content_chunked(&conn, node(1), &mut round_trip, 0).unwrap(),
-            live.len()
-        );
-        assert_eq!(round_trip, live);
+        let len = live.len() as u64;
+        assert_eq!(read_blob_range(&conn, live_hash, 0..len).unwrap(), live);
     }
 
     #[test]
     fn collection_is_idempotent_and_reports_deterministic_zeroes() {
         let conn = db();
-        store_content_chunked(&conn, node(2), b"historical").unwrap();
-        invalidate_chunked_content(&conn, node(2)).unwrap();
+        let hash = store(&conn, b"historical");
+        remove(&conn, hash);
 
         let first = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
         let second = collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
@@ -693,8 +583,8 @@ mod tests {
     #[test]
     fn failed_collection_rolls_back_every_chunk() {
         let conn = db();
-        store_content_chunked(&conn, node(2), b"historical").unwrap();
-        invalidate_chunked_content(&conn, node(2)).unwrap();
+        let hash = store(&conn, b"historical");
+        remove(&conn, hash);
         let before = count_chunks(&conn);
         conn.execute_batch(
             "CREATE TRIGGER fail_gc BEFORE DELETE ON content_chunks
@@ -709,6 +599,10 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert_eq!(count_chunks(&conn), before);
+        assert!(
+            count_manifest_rows(&conn, hash) > 0,
+            "the failed collection's reap rolled back too"
+        );
     }
 
     #[test]
@@ -723,7 +617,8 @@ mod tests {
         );
         let created: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'content_%'",
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name LIKE 'content_%' OR name LIKE 'blob_%'",
                 [],
                 |row| row.get(0),
             )
@@ -734,8 +629,8 @@ mod tests {
     #[test]
     fn collection_installs_and_uses_the_manifest_hash_index() {
         let conn = db();
-        store_content_chunked(&conn, node(1), b"still reachable").unwrap();
-        conn.execute("DROP INDEX content_manifest_chunk_hash", [])
+        store(&conn, b"still reachable");
+        conn.execute("DROP INDEX blob_manifest_chunk_hash", [])
             .unwrap();
 
         collect_unreachable_chunks(&conn, GcOptions::default()).unwrap();
@@ -747,8 +642,8 @@ mod tests {
                    FROM content_chunks
                   WHERE NOT EXISTS (
                     SELECT 1
-                      FROM content_manifest AS manifest
-                     WHERE manifest.chunk_hash = content_chunks.chunk_hash
+                      FROM blob_manifest AS blob_ref
+                     WHERE blob_ref.chunk_hash = content_chunks.chunk_hash
                   )",
             )
             .unwrap()
@@ -758,7 +653,7 @@ mod tests {
             .unwrap();
         assert!(
             details.iter().any(|detail| {
-                detail.contains("SEARCH manifest USING COVERING INDEX content_manifest_chunk_hash")
+                detail.contains("SEARCH blob_ref USING COVERING INDEX blob_manifest_chunk_hash")
             }),
             "reachability must use the manifest hash index, plan: {details:?}"
         );
@@ -767,8 +662,8 @@ mod tests {
     #[test]
     fn dry_run_rolls_back_the_legacy_projection_index_migration() {
         let conn = db();
-        store_content_chunked(&conn, node(1), b"still reachable").unwrap();
-        conn.execute("DROP INDEX content_manifest_chunk_hash", [])
+        store(&conn, b"still reachable");
+        conn.execute("DROP INDEX blob_manifest_chunk_hash", [])
             .unwrap();
 
         collect_unreachable_chunks(&conn, GcOptions { dry_run: true }).unwrap();
@@ -776,7 +671,7 @@ mod tests {
         let index_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
-                  WHERE type = 'index' AND name = 'content_manifest_chunk_hash'",
+                  WHERE type = 'index' AND name = 'blob_manifest_chunk_hash'",
                 [],
                 |row| row.get(0),
             )
@@ -795,7 +690,7 @@ mod tests {
                 chunk_hash BLOB PRIMARY KEY,
                 payload BLOB NOT NULL
              );
-             CREATE TABLE content_manifest (
+             CREATE TABLE blob_manifest (
                 node_id TEXT NOT NULL,
                 chunk_hash BLOB NOT NULL
              );

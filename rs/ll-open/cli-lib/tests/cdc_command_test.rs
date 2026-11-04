@@ -1,7 +1,8 @@
 #![cfg(feature = "cdc")]
 
 use clap::Parser;
-use leyline_fs::activation::{ActivationOptions, ActivationProgress, ActivationReport};
+use leyline_core::ContentAddressed;
+use leyline_fs::activation::{ActivationOptions, BlobActivationProgress, BlobActivationReport};
 use leyline_fs::gc::GcOptions;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -13,27 +14,18 @@ struct TestCli {
     command: leyline_cli_lib::Commands,
 }
 
+/// A projection file carrying two `source_blobs` rows above the 8 KiB
+/// chunking floor — the rows CDC activation consumes.
 fn seed_projection_file() -> (TempDir, std::path::PathBuf) {
     let temp = TempDir::new().unwrap();
     let db = temp.path().join("graph.db");
     let conn = Connection::open(&db).unwrap();
-    leyline_schema::create_schema(&conn).unwrap();
-    // Two leaf file nodes, minted the v5 way (kind 0, record = content —
-    // the mount-write shape CDC activation consumes).
-    for (rel, record) in [("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")] {
-        let fid = leyline_schema::ensure_file_id(&conn, rel).unwrap();
-        let dir = leyline_schema::ensure_dir_nodes(&conn, rel, 7).unwrap();
-        let name_id = leyline_schema::intern_name(&conn, rel).unwrap();
+    leyline_ts::schema::create_source_blobs_table(&conn).unwrap();
+    for fill in [b'a', b'b'] {
+        let bytes = vec![fill; 9_000];
         conn.execute(
-            "INSERT OR REPLACE INTO nodes (nid, parent_nid, name_id, kind, ord, size, mtime, record) \
-             VALUES (?1, ?2, ?3, 0, 0, ?4, 7, ?5)",
-            params![
-                leyline_schema::file_nid(fid, 0),
-                leyline_schema::dir_nid(dir),
-                name_id,
-                record.len() as i64,
-                record
-            ],
+            "INSERT INTO source_blobs (blob_hash, blob_bytes) VALUES (?1, ?2)",
+            params![bytes.as_slice().hash().as_bytes().as_slice(), bytes],
         )
         .unwrap();
     }
@@ -48,20 +40,20 @@ fn cdc_enable_mutates_a_real_db_and_returns_stable_json() {
         leyline_cli_lib::cmd_cdc::enable_database(&db, ActivationOptions { batch_size: 1 })
             .unwrap();
     let value = serde_json::to_value(report).unwrap();
-    assert_eq!(value["eligible_nodes"], 2);
-    assert_eq!(value["populated_nodes"], 2);
-    assert_eq!(value["already_fresh_nodes"], 0);
+    assert_eq!(value["eligible_blobs"], 2);
+    assert_eq!(value["populated_blobs"], 2);
+    assert_eq!(value["already_fresh_blobs"], 0);
 }
 
 #[test]
-fn cdc_enable_rejects_a_non_projection_database() {
+fn cdc_enable_rejects_a_database_without_the_source_blobs_table() {
     let temp = TempDir::new().unwrap();
     let db = temp.path().join("empty.db");
     Connection::open(&db).unwrap();
     let error =
         leyline_cli_lib::cmd_cdc::enable_database(&db, ActivationOptions::default()).unwrap_err();
     assert!(
-        format!("{error:#}").contains("missing required nodes table"),
+        format!("{error:#}").contains("missing required source_blobs table"),
         "unexpected error: {error:#}"
     );
 }
@@ -100,50 +92,21 @@ fn cdc_enable_cli_parses_nested_command_and_options() {
             command:
                 leyline_cli_lib::CdcCommands::Enable {
                     db,
-                    target,
                     batch_size,
                     json,
                 },
         } => {
             assert_eq!(db, std::path::PathBuf::from("graph.db"));
-            // Omitted --target must preserve the original behavior exactly.
-            assert_eq!(target, leyline_cli_lib::CdcTarget::Nodes);
             assert_eq!(batch_size, 8);
             assert!(json);
         }
         _ => panic!("expected cdc enable command"),
     }
-}
 
-#[test]
-fn cdc_enable_cli_parses_the_source_blobs_target() {
-    let cli = TestCli::try_parse_from([
-        "leyline",
-        "cdc",
-        "enable",
-        "--db",
-        "graph.db",
-        "--target",
-        "source-blobs",
-    ])
-    .unwrap();
-    match cli.command {
-        leyline_cli_lib::Commands::Cdc {
-            command: leyline_cli_lib::CdcCommands::Enable { target, .. },
-        } => assert_eq!(target, leyline_cli_lib::CdcTarget::SourceBlobs),
-        _ => panic!("expected cdc enable command"),
-    }
-
-    // A target outside the enum is a parse error, not a runtime branch.
+    // The removed `--target` selector is a parse error, not a silent no-op.
     assert!(
         TestCli::try_parse_from([
-            "leyline",
-            "cdc",
-            "enable",
-            "--db",
-            "graph.db",
-            "--target",
-            "capnp_blobs",
+            "leyline", "cdc", "enable", "--db", "graph.db", "--target", "nodes",
         ])
         .is_err()
     );
@@ -151,43 +114,45 @@ fn cdc_enable_cli_parses_the_source_blobs_target() {
 
 #[test]
 fn cdc_report_formats_as_stable_human_and_json_output() {
-    let report = ActivationReport {
-        eligible_nodes: 3,
-        populated_nodes: 2,
-        already_fresh_nodes: 1,
+    let report = BlobActivationReport {
+        eligible_blobs: 3,
+        populated_blobs: 2,
+        already_fresh_blobs: 1,
+        skipped_sub_floor_blobs: 9,
         processed_source_bytes: 99,
         manifest_rows: 7,
         unique_chunk_rows: 5,
         unique_chunk_bytes: 88,
-        stranded_source_blobs_manifest_rows: 6,
     };
     let human = leyline_cli_lib::cmd_cdc::format_report(report, false).unwrap();
     assert_eq!(
         human,
-        "CDC enabled: eligible=3 populated=2 already_fresh=1 source_bytes=99 \
-         manifest_rows=7 unique_chunks=5 unique_chunk_bytes=88 \
-         stranded_source_blobs_manifest_rows=6"
+        "CDC source_blobs enabled: eligible=3 populated=2 already_fresh=1 \
+         skipped_sub_floor=9 source_bytes=99 manifest_rows=7 unique_chunks=5 \
+         unique_chunk_bytes=88"
     );
 
     let json = leyline_cli_lib::cmd_cdc::format_report(report, true).unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(value["eligible_nodes"], 3);
+    assert_eq!(value["eligible_blobs"], 3);
+    // The counted policy field must survive serialization — it is how an
+    // operator sees the floor doing its job.
+    assert_eq!(value["skipped_sub_floor_blobs"], 9);
     assert_eq!(value["unique_chunk_bytes"], 88);
-    assert_eq!(value["stranded_source_blobs_manifest_rows"], 6);
 }
 
 #[test]
 fn cdc_progress_formats_as_one_stable_stderr_line() {
-    let line = leyline_cli_lib::cmd_cdc::format_progress(ActivationProgress {
-        visited_nodes: 8,
-        eligible_nodes: 21,
-        populated_nodes: 5,
-        already_fresh_nodes: 3,
+    let line = leyline_cli_lib::cmd_cdc::format_progress(BlobActivationProgress {
+        visited_blobs: 8,
+        eligible_blobs: 21,
+        populated_blobs: 5,
+        already_fresh_blobs: 3,
         processed_source_bytes: 4096,
     });
     assert_eq!(
         line,
-        "CDC activation: visited=8/21 populated=5 already_fresh=3 source_bytes=4096"
+        "CDC source_blobs activation: visited=8/21 populated=5 already_fresh=3 source_bytes=4096"
     );
 }
 
@@ -196,7 +161,7 @@ fn cdc_gc_dry_run_then_delete_mutates_a_real_projection() {
     let (_temp, db) = seed_projection_file();
     leyline_cli_lib::cmd_cdc::enable_database(&db, ActivationOptions::default()).unwrap();
     let conn = Connection::open(&db).unwrap();
-    conn.execute("DELETE FROM content_manifest", []).unwrap();
+    conn.execute("DELETE FROM source_blobs", []).unwrap();
     let before: i64 = conn
         .query_row("SELECT COUNT(*) FROM content_chunks", [], |row| row.get(0))
         .unwrap();
@@ -234,7 +199,7 @@ async fn cdc_gc_dispatches_through_the_public_command_runner() {
     let (_temp, db) = seed_projection_file();
     leyline_cli_lib::cmd_cdc::enable_database(&db, ActivationOptions::default()).unwrap();
     let conn = Connection::open(&db).unwrap();
-    conn.execute("DELETE FROM content_manifest", []).unwrap();
+    conn.execute("DELETE FROM source_blobs", []).unwrap();
     drop(conn);
 
     leyline_cli_lib::run(leyline_cli_lib::Commands::Cdc {
@@ -286,8 +251,6 @@ fn cdc_gc_cli_parses_options_and_formats_stable_json() {
         deleted_chunk_bytes: 0,
         remaining_chunk_rows: 4,
         remaining_chunk_bytes: 400,
-        reaped_manifest_rows: 3,
-        reaped_manifest_nodes: 1,
         reaped_blob_manifest_rows: 4,
         reaped_blob_manifest_blobs: 2,
         dry_run: true,
@@ -298,68 +261,6 @@ fn cdc_gc_cli_parses_options_and_formats_stable_json() {
     assert_eq!(value["dry_run"], true);
     // Dead-manifest reaping is operator-visible, or a silent reclaim looks
     // identical to nothing having happened (bead ley-line-open-b5e56f).
-    assert_eq!(value["reaped_manifest_rows"], 3);
-    assert_eq!(value["reaped_manifest_nodes"], 1);
     assert_eq!(value["reaped_blob_manifest_rows"], 4);
     assert_eq!(value["reaped_blob_manifest_blobs"], 2);
-}
-
-#[test]
-fn cdc_blob_report_formats_as_stable_human_and_json_output() {
-    let report = leyline_fs::activation::BlobActivationReport {
-        eligible_blobs: 3,
-        populated_blobs: 2,
-        already_fresh_blobs: 1,
-        skipped_sub_floor_blobs: 9,
-        processed_source_bytes: 99,
-        manifest_rows: 7,
-        unique_chunk_rows: 5,
-        unique_chunk_bytes: 88,
-        stranded_nodes_manifest_rows: 4,
-    };
-    let human = leyline_cli_lib::cmd_cdc::format_blob_report(report, false).unwrap();
-    assert_eq!(
-        human,
-        "CDC source_blobs enabled: eligible=3 populated=2 already_fresh=1 \
-         skipped_sub_floor=9 source_bytes=99 manifest_rows=7 unique_chunks=5 \
-         unique_chunk_bytes=88 stranded_nodes_manifest_rows=4"
-    );
-
-    let json = leyline_cli_lib::cmd_cdc::format_blob_report(report, true).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(value["eligible_blobs"], 3);
-    // The counted policy field must survive serialization — it is how an
-    // operator sees the floor doing its job.
-    assert_eq!(value["skipped_sub_floor_blobs"], 9);
-    assert_eq!(value["unique_chunk_bytes"], 88);
-    assert_eq!(value["stranded_nodes_manifest_rows"], 4);
-}
-
-#[test]
-fn cdc_blob_progress_formats_as_one_stable_stderr_line() {
-    let line = leyline_cli_lib::cmd_cdc::format_blob_progress(
-        leyline_fs::activation::BlobActivationProgress {
-            visited_blobs: 8,
-            eligible_blobs: 21,
-            populated_blobs: 5,
-            already_fresh_blobs: 3,
-            processed_source_bytes: 4096,
-        },
-    );
-    assert_eq!(
-        line,
-        "CDC source_blobs activation: visited=8/21 populated=5 already_fresh=3 source_bytes=4096"
-    );
-}
-
-#[test]
-fn cdc_enable_source_blobs_rejects_a_database_without_the_table() {
-    let (_temp, db) = seed_projection_file();
-    let error =
-        leyline_cli_lib::cmd_cdc::enable_source_blobs_database(&db, ActivationOptions::default())
-            .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("missing required source_blobs table"),
-        "unexpected error: {error:#}"
-    );
 }

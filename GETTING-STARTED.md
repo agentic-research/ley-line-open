@@ -109,9 +109,9 @@ To enable chunk-backed range reads for an existing projection:
 leyline cdc enable --db /tmp/my-code.db
 ```
 
-Activation is explicit, bounded, resumable, and idempotent. It keeps
-`nodes.record` authoritative while building private derived chunk tables, so
-budget for both representations. For a long-lived writable projection, inspect
+Activation is explicit, bounded, resumable, and idempotent. It chunks the
+whole-file `source_blobs` rows at or above 8 KiB into private derived tables
+and keeps `source_blobs` authoritative, so budget for both representations. For a long-lived writable projection, inspect
 and collect unreachable chunk history explicitly:
 
 ```bash

@@ -53,11 +53,12 @@ development, see [GETTING-STARTED.md](GETTING-STARTED.md).
   serialized byte image (`current_root`). That hash is authoritative for byte
   integrity only — it says nothing about logical content. The generalized
   arena↔consumer Cap'n Proto handoff is tracked by `ley-line-open-50be73`.
-- CDC is an explicit, derived read optimization. `nodes.record` remains
-  authoritative; activate and collect CDC manifests with `leyline cdc`.
-- The `content_chunks`, `content_manifest`, and `content_manifest_meta` tables
-  are private derived indexes. They never replace the authoritative record, no
-  consumer reads them, and changes to them do not bump `leyline-schema`.
+- CDC is an explicit, derived storage index over whole-file `source_blobs`.
+  `source_blobs` remains authoritative; activate and collect CDC manifests with
+  `leyline cdc`.
+- The `content_chunks` and `blob_manifest` tables are private derived indexes.
+  They never replace the authoritative record, no consumer reads them, and
+  changes to them do not bump `leyline-schema`.
 
 Which identity is authoritative for what is settled by
 [ADR-0032](docs/adr/0032-declared-decompositions.md) §D4 and applied in

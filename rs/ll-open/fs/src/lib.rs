@@ -1,15 +1,15 @@
 /// Explicit, resumable activation of the chunk-backed content index.
 #[cfg(feature = "cdc")]
 pub mod activation;
-/// Chunk-backed storage for whole-file `source_blobs` — the second CDC
-/// activation target. Content-addressed rows are immutable, so blob
-/// manifests carry no freshness witness (existence is freshness).
+/// Chunk-backed storage for whole-file `source_blobs` — the CDC activation
+/// target. Content-addressed rows are immutable, so blob manifests carry no
+/// freshness witness (existence is freshness).
 #[cfg(feature = "cdc")]
 pub mod blob_chunked;
-/// Chunk-backed content storage — a range read selects only the overlapping
-/// chunks instead of re-materializing the whole file. Opt-in (`--features cdc`).
+/// The shared content-addressed chunk pool (`content_chunks`) and its
+/// verify-on-read store. Opt-in (`--features cdc`).
 #[cfg(feature = "cdc")]
-pub mod chunked;
+pub(crate) mod chunk_pool;
 /// Explicit reachability garbage collection for unreferenced CDC chunks.
 #[cfg(feature = "cdc")]
 pub mod gc;

@@ -138,14 +138,9 @@ enum Cmd {
         #[arg(long)]
         cgroup_root: Option<PathBuf>,
 
-        /// Activate or resume the private CDC index.
+        /// Activate or resume the private CDC index over `source_blobs`.
         #[arg(long, default_value_t = false)]
         cdc: bool,
-
-        /// Which authoritative table `--cdc` builds the chunk index over.
-        /// Ignored without `--cdc`.
-        #[arg(long, value_enum, default_value_t = leyline_cli_lib::CdcTarget::Nodes)]
-        cdc_target: leyline_cli_lib::CdcTarget,
 
         /// Explicitly accept unverified authority for local fixtures: no
         /// issuer signature on the RunGrant, and metadata-only evidence
@@ -303,14 +298,15 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         reset_arena: bool,
 
-        /// Activate or resume the private CDC index before publishing the
-        /// daemon's first arena snapshot.
+        /// Activate or resume the private CDC index over `source_blobs` before
+        /// publishing the daemon's first arena snapshot.
         #[arg(long, default_value_t = false)]
         cdc: bool,
 
-        /// Which authoritative table `--cdc` builds the chunk index over.
-        /// Ignored without `--cdc`.
-        #[arg(long, value_enum, default_value_t = leyline_cli_lib::CdcTarget::Nodes)]
+        /// The CDC target. `source-blobs` is the only value; the flag is
+        /// accepted because mache's daemon spawn passes it (see
+        /// [`leyline_cli_lib::CdcTarget`]). Ignored without `--cdc`.
+        #[arg(long, value_enum, default_value_t = leyline_cli_lib::CdcTarget::SourceBlobs)]
         cdc_target: leyline_cli_lib::CdcTarget,
     },
 }
@@ -381,7 +377,6 @@ async fn main() -> Result<()> {
             tsi_hijack_inet,
             cgroup_root,
             cdc,
-            cdc_target,
             allow_unverified_evidence,
             trust_keys,
             evidence_store,
@@ -480,7 +475,7 @@ async fn main() -> Result<()> {
                         config,
                         handler,
                         leyline_cli_lib::cmd_daemon::DaemonOptions {
-                            cdc: cdc.then_some(cdc_target),
+                            cdc,
                             ..Default::default()
                         },
                     )
@@ -534,7 +529,7 @@ async fn main() -> Result<()> {
                         config,
                         handler,
                         leyline_cli_lib::cmd_daemon::DaemonOptions {
-                            cdc: cdc.then_some(cdc_target),
+                            cdc,
                             ..Default::default()
                         },
                         context,
@@ -560,7 +555,7 @@ async fn main() -> Result<()> {
             mcp_uds,
             reset_arena,
             cdc,
-            cdc_target,
+            cdc_target: leyline_cli_lib::CdcTarget::SourceBlobs,
         } => {
             // KNOWN scale limitation: arena_size_mib defaults to 64
             // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
@@ -597,7 +592,7 @@ async fn main() -> Result<()> {
                 config,
                 Arc::new(leyline_cli_lib::daemon::NoExt),
                 leyline_cli_lib::cmd_daemon::DaemonOptions {
-                    cdc: cdc.then_some(cdc_target),
+                    cdc,
                     host_mount: host_mount(),
                     ..Default::default()
                 },
@@ -661,54 +656,33 @@ mod tests {
         }
     }
 
-    /// `ley-line-open-c3d746`: the daemon hardcoded the `nodes` target, so
-    /// `--target source-blobs` was reachable only from the standalone
-    /// `leyline cdc enable` CLI — not from the daemon path mache spawns.
-    /// These assert the selector exists on BOTH daemon surfaces and that the
-    /// default is unmoved, since silently changing which table a running
-    /// daemon indexes would be a far worse break than not offering the choice.
+    /// mache spawns `leyline daemon --cdc --cdc-target source-blobs`
+    /// (`internal/leyline/socket.go`): that argv must keep parsing. The
+    /// removed `nodes` target is refused rather than silently mapped.
     #[test]
-    fn daemon_cdc_target_defaults_to_nodes_and_accepts_source_blobs() {
-        let default_cli = Cli::try_parse_from(["leyline", "daemon", "--cdc"]).unwrap();
-        match default_cli.command {
-            Cmd::Daemon { cdc_target, .. } => {
-                assert_eq!(cdc_target, leyline_cli_lib::CdcTarget::Nodes)
-            }
-            _ => panic!("expected Daemon variant"),
-        }
-
+    fn daemon_accepts_mache_s_cdc_spawn_args_and_refuses_the_nodes_target() {
         let blobs_cli =
             Cli::try_parse_from(["leyline", "daemon", "--cdc", "--cdc-target", "source-blobs"])
                 .unwrap();
         match blobs_cli.command {
-            Cmd::Daemon {
-                cdc, cdc_target, ..
-            } => {
-                assert!(cdc);
-                assert_eq!(cdc_target, leyline_cli_lib::CdcTarget::SourceBlobs);
-            }
+            Cmd::Daemon { cdc, .. } => assert!(cdc),
             _ => panic!("expected Daemon variant"),
         }
+
+        assert!(
+            Cli::try_parse_from(["leyline", "daemon", "--cdc", "--cdc-target", "nodes"]).is_err(),
+            "the removed nodes target must be refused"
+        );
     }
 
-    /// Without `--cdc` the target must not activate anything. This is the
-    /// `then_some` contract: a target named on a disabled daemon is inert,
-    /// never an implicit enable.
+    /// Without `--cdc` the target flag activates nothing: a target named on
+    /// a disabled daemon is inert, never an implicit enable.
     #[test]
     fn cdc_target_without_the_enable_flag_activates_nothing() {
         let cli =
             Cli::try_parse_from(["leyline", "daemon", "--cdc-target", "source-blobs"]).unwrap();
         match cli.command {
-            Cmd::Daemon {
-                cdc, cdc_target, ..
-            } => {
-                assert!(!cdc, "target alone must not enable CDC");
-                assert_eq!(
-                    cdc.then_some(cdc_target),
-                    None,
-                    "the daemon must receive no target when CDC is off"
-                );
-            }
+            Cmd::Daemon { cdc, .. } => assert!(!cdc, "target alone must not enable CDC"),
             _ => panic!("expected Daemon variant"),
         }
     }

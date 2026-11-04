@@ -127,7 +127,7 @@ fn defs_snapshot(db_path: &Path) -> Vec<(String, i64, Option<String>)> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT token, nid, lower(hex(node_hash)) FROM node_defs \
+            "SELECT token, nid, lower(hex(node_hash)) FROM v_node_defs_hash \
              ORDER BY token, nid",
         )
         .unwrap();

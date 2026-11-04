@@ -48,7 +48,7 @@ workspace are invisible to them. Re-derive rather than trust when it matters.
 | `_ast` | 34 | `fs/src/graph.rs`, `ts/src/splice.rs`, `lsp/src/project.rs`, `daemon/ops.rs`. `find_definition` stopped needing it at `projection-v3`, but the graph and splice paths still read it directly. |
 | `node_defs` / `node_refs` | 32 | The symbol layer. Also the agent-facing one: `find_definition` returns `node_id` STRINGS straight through MCP, so these ids are user-visible output, not an internal key. |
 | `source_blobs` | 11 | |
-| `node_content` | **0** | No SELECT anywhere. Survives as the FK target of `node_defs`/`node_refs.node_hash`. |
+| `node_content` | **0** | No SELECT anywhere outside the writer. Survives as the FK target of `_ast`/`node_defs`/`node_refs.content_id` (`projection-v10`) and `node_edge`, and as the one place `node_hash` is stored. |
 | `node_child` | **0** | No SELECT, and nothing FKs into it. A view over `node_edge` as of `projection-v9`; 4.35M edges on the 8000-file kibana slice, 515 MB hash-keyed before interning. **Do not treat as droppable**: its `field` column is the ONLY place a tree-sitter field name survives, and mache needs it (`ley-line-open-87ff3a`). See "Recovering a node's tree-sitter field" below. |
 A zero here means "nothing in this workspace SELECTs it", which is not the same
 as "safe to delete": `node_content` is an FK target and `node_child` carries the
@@ -117,6 +117,48 @@ Two rules, both measured on a 460-file Rust arena at `projection-v5`:
    different fields would have a higher rate. Measure before relying on it as a
    general per-node lookup.
 
+### Reading `node_hash` at `projection-v10`
+
+As of `projection-v10` (bead `ley-line-open-738dd9`) `_ast`, `node_refs` and
+`node_defs` point at their subtree by `content_id`, the arena-local handle of
+its `node_content` row, instead of storing the 32-byte `node_hash` on every
+occurrence. `node_content.node_hash NOT NULL UNIQUE` is still the identity and
+is stored once per distinct subtree; no hash moved. The v9 rule holds:
+`content_id` never leaves the database. Two arenas number one subtree
+differently, so compare across arenas by `node_hash` and never by id.
+
+Measured on a cold parse of this repository's `rs/` tree (859 files parsed,
+12.83 MB of source; dbstat, MiB):
+
+| Object | v9 | v10 |
+|---|---:|---:|
+| `_ast` | 76.75 | 39.88 |
+| `idx_ast_node_hash` → `idx_ast_content` | 55.06 | 18.25 |
+| `node_refs` | 11.13 | 7.81 |
+| `node_defs` | 2.81 | 2.06 |
+| arena | 321.19 | 243.44 |
+
+The `_ast`, `node_content`, edge, def, ref and def-to-ref join sets are equal
+by hash between the two arenas (`EXCEPT` empty both ways).
+
+The views `v_ast_hash`, `v_node_refs_hash` and `v_node_defs_hash` keep every v9
+read working by renaming the table. Reads that should move to the base tables:
+
+| v9 read | v10 read |
+|---|---|
+| `SELECT nid FROM _ast WHERE node_hash = :h` | `SELECT a.nid FROM node_content c JOIN _ast a ON a.content_id = c.content_id WHERE c.node_hash = :h` (the `node_hash` UNIQUE probe, then `idx_ast_content`) |
+| `SELECT ..., a.node_hash FROM _ast a WHERE a.nid BETWEEN :lo AND :hi` | `SELECT ..., c.node_hash FROM _ast a LEFT JOIN node_content c ON c.content_id = a.content_id WHERE a.nid BETWEEN :lo AND :hi` (or `FROM v_ast_hash`, which plans the same) |
+| `JOIN node_content c ON c.node_hash = a.node_hash` (likewise `r.`/`d.`) | `JOIN node_content c ON c.content_id = a.content_id` — an integer primary-key probe instead of a BLOB index probe |
+| `LEFT JOIN node_content pc ON pc.node_hash = a.node_hash LEFT JOIN node_edge e ON e.parent_id = pc.content_id` | `LEFT JOIN node_edge e ON e.parent_id = a.content_id` |
+| `d.node_hash = r.node_hash`, `GROUP BY a.node_hash` (one arena) | `d.content_id = r.content_id`, `GROUP BY a.content_id`, rendering the hash at the edge. Within one arena `content_id` and `node_hash` are in bijection, so the grouping is identical. |
+| `_ast` on the RIGHT of a `LEFT JOIN`, reading `node_hash` | keep `LEFT JOIN _ast a` and add `LEFT JOIN node_content c ON c.content_id = a.content_id`; never `LEFT JOIN v_ast_hash`, which SQLite materializes whole |
+
+`_cfg` / `_cfg_edge` keep `node_hash`: they are keyed BY a subtree (the
+`(node_hash, block_id)` primary key is their dedup identity and `_cfg_edge`'s
+FK target), where the occurrence tables point AT one. `leyline parse` does not
+write them (bead `ley-line-open-a0fadd`), so they hold no bytes in a parsed
+arena.
+
 ### Known external consumers
 
 mache reads this projection directly (no cgo) and is the reason several of these
@@ -163,10 +205,10 @@ the projection is derived-only, so no in-place migration exists.
 |-------|---------|
 | `names` / `dirs` / `files` / `kinds` | Interning tables (`projection-v5`). Every path component, directory link, file, and tree-sitter kind stored ONCE; all four are append-only — rows are never deleted or renumbered, which is what makes `file_id` reuse impossible and a directory rename a ONE-row `UPDATE dirs SET name_id`. `dirs.dir_id = 1` is the root ("", parent NULL). |
 | `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
-| `_ast` | AST positions (nid → kind_id, byte/row/col ranges, node_hash). No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
+| `_ast` | AST positions (nid → kind_id, byte/row/col ranges, `content_id`). `content_id INTEGER REFERENCES node_content(content_id)` replaced the 32-byte `node_hash` at `projection-v10` (bead `ley-line-open-738dd9`); read the hash through `v_ast_hash` or a join (see "Reading `node_hash` at projection-v10" below), and find every location of a subtree with `idx_ast_content`. No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
 | `_source` | Source file metadata (id → language, abs path, `file_id` — the interned integer that keys every node row's high bits). As of `projection-v7` (ADR-0045 T1) one row per file the parse PROJECTED: a file of no grammar, a binary or an oversized file has a `_tree` entry and no `_source` row. `content_hash` equals the path's `_tree.blob_hash`. List every file from `_tree`, not from here. |
-| `node_refs` | Token references (token → nid, node_hash, container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. |
-| `node_defs` | Token definitions (token → nid, node_hash, container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). No `qualifier` column. |
+| `node_refs` | Token references (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. |
+| `node_defs` | Token definitions (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). No `qualifier` column. |
 | `_imports` | Import statements (alias, path, source_id) |
 | `_meta` | Key-value metadata (source_root, parse_time, version vectors, and `derived_from` = `<treeRoot hex> <parserId hex> <projection_schema_version>`, the derivation the projection reproduces under `leyline rebuild`; ADR-0040 D6). `unbound_facts` = the count of `node_refs` rows whose token has no `node_defs` row, as the head's `unboundFacts` records it; written with the rows by every parse pass (bead `ley-line-open-8c8ded`) |
 
@@ -174,9 +216,10 @@ the projection is derived-only, so no in-place migration exists.
 
 | Table | Purpose |
 |-------|---------|
-| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes — the identity, and the FK target of `_ast`/`node_defs`/`node_refs`/`_cfg`), `node_tag`, `kind`, `raw_kind`, `lang`, `token`, `arity`. Byte-identical subtrees dedup cross-file to one row. |
+| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes — the identity, stored once per subtree; the FK target of `_cfg`, while `node_edge` (v9) and `_ast`/`node_defs`/`node_refs` (v10) reference `content_id`), `node_tag`, `kind`, `raw_kind`, `lang`, `token`, `arity`. Byte-identical subtrees dedup cross-file to one row. |
 | `node_edge` | Git-tree object, interned (`projection-v9`, bead `ley-line-open-9b7d28`): `(parent_id, ordinal) PRIMARY KEY → child_id, field`, `WITHOUT ROWID`. Both endpoints REFERENCE `node_content(content_id)` (FK-enforced). One row per child of each unique parent, anonymous tokens included. A node's preimage is recoverable by one join: `ORDER BY ordinal`, map ids to `node_hash`, refold. |
-| `node_child` | **A read-only VIEW** (`projection-v9`) with the v8 table's columns — `parent_hash`, `ordinal`, `child_hash`, `field` — over `node_edge ⋈ node_content ×2`. Every v8 read (`WHERE parent_hash = ?`, `JOIN node_content c ON c.node_hash = nc.child_hash`, `ORDER BY ordinal`) runs unchanged, and an inner join or `IN` filter on `parent_hash` plans as two index probes. **Do not put it on the right of a `LEFT JOIN`:** SQLite cannot flatten a join view there and materializes all of it (kibana slice, one file: 7.7 s through the view, 0.11 s against `node_edge`). Write `LEFT JOIN node_content pc ON pc.node_hash = a.node_hash LEFT JOIN node_edge e ON e.parent_id = pc.content_id LEFT JOIN node_content cc ON cc.content_id = e.child_id` instead. A write to the view fails; the writer is `node_edge`. |
+| `node_child` | **A read-only VIEW** (`projection-v9`) with the v8 table's columns — `parent_hash`, `ordinal`, `child_hash`, `field` — over `node_edge ⋈ node_content ×2`. Every v8 read (`WHERE parent_hash = ?`, `JOIN node_content c ON c.node_hash = nc.child_hash`, `ORDER BY ordinal`) runs unchanged, and an inner join or `IN` filter on `parent_hash` plans as two index probes. **Do not put it on the right of a `LEFT JOIN`:** SQLite cannot flatten a join view there and materializes all of it (kibana slice, one file: 7.7 s through the view, 0.11 s against `node_edge`). Write `LEFT JOIN node_edge e ON e.parent_id = a.content_id LEFT JOIN node_content cc ON cc.content_id = e.child_id` instead (`projection-v10`: `_ast` holds the parent's `content_id` itself; at v9 it took `LEFT JOIN node_content pc ON pc.node_hash = a.node_hash` first). A write to the view fails; the writer is `node_edge`. |
+| `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` | **Read-only VIEWs** (`projection-v10`, bead `ley-line-open-738dd9`) with the v9 column sets of `_ast`, `node_refs` and `node_defs` — `node_hash` in place of `content_id`, rendered by `LEFT JOIN node_content ON content_id`. `content_id` is not a column of any of them. Same planning caveat as `node_child`: on the right of a `LEFT JOIN` they materialize; join the base table instead. Not named `v_ast` because mache installs a TEMP `v_ast` with its own vocabulary on every connection, and a TEMP view shadows a main-schema one. |
 
 **Pointer store — retired at `projection-v8`** (ADR-0040 D5, bead `ley-line-open-f30fdf`; ADR-0026 Phase 1 reversed). `capnp_blobs` (one canonical `AstNodeList` blob per file) and `_ast_blob` (`file_id → blob_hash`) are no longer created or written. They were the second stored copy of the syntax tree — 812.8 MB, 35.6% of the 2,284.6 MB kibana arena (bead `ley-line-open-17c271`'s pinned slice) — with no reader. The tree is stored once in the SQL rows above and `node_content`/`node_child`, keyed by the location-free `node_hash`. No identity moved: `Head.rootHash` folds the `.source.capnp`/`.ast.capnp`/`.bindings.capnp` segment files, whose bytes never depended on the blob, and `treeRoot` folds `_tree`. A `projection-v7` arena is refused at parse open and rebuilt cold.
 
@@ -270,6 +313,7 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `_dfg*` | analysis-substrate DFG layer (T2 of `analysis-substrate` decade; not yet shipped) |
 | `_taint*` | analysis-substrate taint fixpoint (T3 of `analysis-substrate` decade; not yet shipped) |
 | `node_content` / `node_edge` / `node_child` (view) | ADR-0027 merkle-AST IR (base; no prefix) |
+| `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` (views) | `projection-v10` `node_hash`-rendering compatibility views (base) |
 | `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
 | `content_chunks` / `content_manifest` / `content_manifest_meta` | CDC derived chunk cache — private, not part of the SQL projection ABI |

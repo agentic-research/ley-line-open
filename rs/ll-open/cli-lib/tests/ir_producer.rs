@@ -10,8 +10,10 @@
 //!      comment-only edit, and changed under an identifier rename.
 //!   3. `node_content` / `node_child` — the deduped content layer + git-tree
 //!      object, with FK integrity under `PRAGMA foreign_keys = ON`.
-//!   4. `node_defs` / `node_refs` — occurrence rows now carrying `node_hash`,
-//!      and the `unbound_facts` counter in head.capnp (parity with the old
+//!   4. `node_defs` / `node_refs` — occurrence rows now pointing at their
+//!      subtree (by `content_id` as of projection-v10; every read of
+//!      `node_hash` here goes through the `v_*_hash` views or a join to
+//!      `node_content`), and the `unbound_facts` counter in head.capnp (parity with the old
 //!      `fact_edges WHERE dst IS NULL` count).
 
 use std::fs;
@@ -56,7 +58,7 @@ fn fn_hash(conn: &rusqlite::Connection, rel: &str) -> Vec<u8> {
         .unwrap_or_else(|| panic!("{rel} was never interned"));
     let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
     conn.query_row(
-        "SELECT a.node_hash FROM _ast a \
+        "SELECT a.node_hash FROM v_ast_hash a \
          JOIN kinds k ON k.kind_id = a.kind_id \
          WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind = 'function_declaration'",
         [lo, hi],
@@ -160,37 +162,49 @@ fn node_hash_is_populated_on_every_ast_row() {
     let src = create_go_fixture();
     let conn = cold_parse_go(src.path());
 
-    // Every _ast occurrence carries a 32-byte, non-null node_hash pointing at
-    // a real node_content row.
-    let (total, with_hash, min_len, max_len): (i64, i64, i64, i64) = conn
+    // Every _ast occurrence carries a non-null content_id (projection-v10)
+    // that names a real node_content row, so through `v_ast_hash` every row
+    // reads a 32-byte node_hash (the view's LEFT JOIN renders a dangling id
+    // as NULL).
+    let (total, with_id): (i64, i64) = conn
+        .query_row("SELECT count(*), count(content_id) FROM _ast", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert!(total > 0, "_ast must be populated");
+    assert_eq!(with_id, total, "every _ast row must carry a content_id");
+    let (viewed, with_hash, min_len, max_len): (i64, i64, i64, i64) = conn
         .query_row(
             "SELECT count(*), \
                     count(node_hash), \
                     min(length(node_hash)), \
                     max(length(node_hash)) \
-             FROM _ast",
+             FROM v_ast_hash",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
-    assert!(total > 0, "_ast must be populated");
-    assert_eq!(with_hash, total, "every _ast row must carry a node_hash");
+    assert_eq!(viewed, total, "the view keeps every _ast row");
+    assert_eq!(
+        with_hash, total,
+        "every _ast row must resolve to a node_hash"
+    );
     assert_eq!(min_len, 32, "every node_hash is a 32-byte digest");
     assert_eq!(max_len, 32, "every node_hash is a 32-byte digest");
 
-    // Referential integrity: no _ast.node_hash dangles off node_content.
+    // Referential integrity, stated on the base table.
     let dangling: i64 = conn
         .query_row(
             "SELECT count(*) FROM _ast a \
-             LEFT JOIN node_content c ON a.node_hash = c.node_hash \
-             WHERE c.node_hash IS NULL",
+             LEFT JOIN node_content c ON c.content_id = a.content_id \
+             WHERE c.content_id IS NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
         dangling, 0,
-        "every _ast.node_hash must resolve to node_content"
+        "every _ast.content_id must resolve to node_content"
     );
 }
 
@@ -235,7 +249,7 @@ fn node_hash_folds_anonymous_operators_add_vs_sub_differ() {
 
     let hash_of = |conn: &rusqlite::Connection| -> Vec<u8> {
         conn.query_row(
-            "SELECT a.node_hash FROM _ast a \
+            "SELECT a.node_hash FROM v_ast_hash a \
              JOIN kinds k ON k.kind_id = a.kind_id \
              WHERE k.raw_kind = 'binary_expression'",
             [],
@@ -434,48 +448,53 @@ fn defs_and_refs_carry_node_hash() {
     let src = create_go_fixture();
     let conn = cold_parse_go(src.path());
 
-    // The `add` definition occurrence carries a node_hash pointing at real
-    // content — the additive pointer B3 stamps on the occurrence tables.
+    // The `add` definition occurrence points at real content — the pointer
+    // B3 stamps on the occurrence tables, a `content_id` as of projection-v10.
     let dangling_defs: i64 = conn
         .query_row(
             "SELECT count(*) FROM node_defs d \
-             LEFT JOIN node_content c ON d.node_hash = c.node_hash \
-             WHERE d.node_hash IS NOT NULL AND c.node_hash IS NULL",
+             LEFT JOIN node_content c ON c.content_id = d.content_id \
+             WHERE d.content_id IS NOT NULL AND c.content_id IS NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
         dangling_defs, 0,
-        "node_defs.node_hash must resolve to content"
+        "node_defs.content_id must resolve to content"
     );
 
     let dangling_refs: i64 = conn
         .query_row(
             "SELECT count(*) FROM node_refs r \
-             LEFT JOIN node_content c ON r.node_hash = c.node_hash \
-             WHERE r.node_hash IS NOT NULL AND c.node_hash IS NULL",
+             LEFT JOIN node_content c ON c.content_id = r.content_id \
+             WHERE r.content_id IS NOT NULL AND c.content_id IS NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
         dangling_refs, 0,
-        "node_refs.node_hash must resolve to content"
+        "node_refs.content_id must resolve to content"
     );
 
-    // The `add` def occurrence exists and is populated (non-null hash).
-    let add_def_hash: Option<Vec<u8>> = conn
+    // The `add` def occurrence exists and reads a 32-byte node_hash through
+    // the compatibility view, equal to the hash of the `_ast` row at the same
+    // nid (the def's locator is that node).
+    let (add_def_hash, ast_hash): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
         .query_row(
-            "SELECT node_hash FROM node_defs WHERE token = 'add'",
+            "SELECT d.node_hash, a.node_hash FROM v_node_defs_hash d \
+             JOIN v_ast_hash a ON a.nid = d.nid WHERE d.token = 'add'",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .expect("an `add` def occurrence must exist");
-    assert!(
-        add_def_hash.is_some(),
+    assert_eq!(
+        add_def_hash.as_ref().map(Vec::len),
+        Some(32),
         "the `add` def must carry a node_hash"
     );
+    assert_eq!(add_def_hash, ast_hash, "def and _ast name one subtree");
 }
 
 #[test]
@@ -580,7 +599,7 @@ fn rust_defs_refs_and_unbound_flow_through_merkle() {
     let (kind, raw_kind): (String, String) = conn
         .query_row(
             "SELECT c.kind, c.raw_kind FROM _ast a \
-             JOIN node_content c ON a.node_hash = c.node_hash \
+             JOIN node_content c ON c.content_id = a.content_id \
              JOIN kinds k ON k.kind_id = a.kind_id \
              WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind = 'function_item'",
             [lo, hi],
@@ -596,7 +615,7 @@ fn rust_defs_refs_and_unbound_flow_through_merkle() {
     // defines: `add` recorded with a resolving node_hash.
     let defines_add: i64 = conn
         .query_row(
-            "SELECT count(*) FROM node_defs WHERE token = 'add' AND node_hash IS NOT NULL",
+            "SELECT count(*) FROM v_node_defs_hash WHERE token = 'add' AND node_hash IS NOT NULL",
             [],
             |r| r.get(0),
         )
@@ -655,7 +674,7 @@ fn impl_item_trait_and_type_children_are_separable_only_by_field() {
     // The fixture has exactly one impl_item; its content hash is the join key.
     let impl_hash: Vec<u8> = conn
         .query_row(
-            "SELECT a.node_hash FROM _ast a \
+            "SELECT a.node_hash FROM v_ast_hash a \
              JOIN kinds k ON k.kind_id = a.kind_id \
              WHERE k.raw_kind = 'impl_item'",
             [],

@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS _source (
 /// DDL for the `_ast` table — table only, no indexes. Pairs with
 /// [`AST_INDEXES_DDL`] for bulk-load callers (see bead
 /// `ley-line-open-9ccbc7`).
+///
+/// projection-v10 (bead `ley-line-open-738dd9`): the row points at its
+/// subtree by `content_id`, the arena-local handle of a `node_content` row,
+/// instead of repeating the 32-byte `node_hash` on every occurrence. The hash
+/// is stored once, in `node_content`; [`AST_HASH_VIEW_DDL`] renders it back.
 pub const AST_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _ast (
     nid INTEGER PRIMARY KEY,
@@ -45,7 +50,7 @@ CREATE TABLE IF NOT EXISTS _ast (
     start_col INTEGER NOT NULL,
     end_row INTEGER NOT NULL,
     end_col INTEGER NOT NULL,
-    node_hash BLOB REFERENCES node_content(node_hash)
+    content_id INTEGER REFERENCES node_content(content_id)
 );";
 
 /// DDL for the `_ast` indexes — deferred post-COMMIT for bulk-load.
@@ -55,8 +60,8 @@ CREATE TABLE IF NOT EXISTS _ast (
 /// PRIMARY KEY range SEARCH. The pre-v5 `idx_ast_source` existed to serve
 /// `WHERE source_id = ?`, which the nid range replaces outright (and the
 /// TEXT PK's `sqlite_autoindex__ast_1` — 830 MB measured — vanishes with
-/// the rowid-aliased INTEGER PK). `idx_ast_node_hash` still lands
-/// post-COMMIT via [`create_ir_indexes`].
+/// the rowid-aliased INTEGER PK). `idx_ast_content` (projection-v10; was
+/// `idx_ast_node_hash`) still lands post-COMMIT via [`create_ir_indexes`].
 pub const AST_INDEXES_DDL: &str =
     "-- no _ast secondary indexes in projection-v5 (PK range scan scopes by file)";
 
@@ -71,7 +76,7 @@ CREATE TABLE IF NOT EXISTS _ast (
     start_col INTEGER NOT NULL,
     end_row INTEGER NOT NULL,
     end_col INTEGER NOT NULL,
-    node_hash BLOB REFERENCES node_content(node_hash)
+    content_id INTEGER REFERENCES node_content(content_id)
 );";
 
 /// Create `nodes`, `_source`, and `_ast` tables + indexes (idempotent).
@@ -82,11 +87,13 @@ CREATE TABLE IF NOT EXISTS _ast (
 pub fn create_ast_schema(conn: &Connection) -> Result<()> {
     create_schema(conn)?;
     conn.execute_batch(SOURCE_DDL)?;
-    // projection-v5: the occurrence tables carry a `node_hash REFERENCES
-    // node_content(node_hash)` FK in their base DDL, so the content tables
-    // must exist BEFORE any referencing table is written to.
+    // The occurrence tables carry a `content_id REFERENCES
+    // node_content(content_id)` FK in their base DDL (projection-v10; a
+    // `node_hash` FK since v5), so the content tables must exist BEFORE any
+    // referencing table is written to.
     create_content_tables(conn)?;
     conn.execute_batch(AST_DDL)?;
+    conn.execute_batch(AST_HASH_VIEW_DDL)?;
     Ok(())
 }
 
@@ -98,6 +105,7 @@ pub fn create_ast_tables(conn: &Connection) -> Result<()> {
     // FK-target ordering — see `create_ast_schema`.
     create_content_tables(conn)?;
     conn.execute_batch(AST_TABLE_DDL)?;
+    conn.execute_batch(AST_HASH_VIEW_DDL)?;
     Ok(())
 }
 
@@ -152,7 +160,7 @@ pub fn insert_ast(
     start_col: usize,
     end_row: usize,
     end_col: usize,
-    node_hash: Option<&[u8]>,
+    content_id: Option<i64>,
 ) -> Result<()> {
     // rusqlite 0.39 dropped the blanket `ToSql for usize` — bind through
     // `i64` instead. Tree-sitter byte/row/col indices fit comfortably in
@@ -160,7 +168,7 @@ pub fn insert_ast(
     // cast is lossless.
     conn.execute(
         "INSERT OR REPLACE INTO _ast (nid, kind_id, start_byte, end_byte, \
-         start_row, start_col, end_row, end_col, node_hash) \
+         start_row, start_col, end_row, end_col, content_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             nid,
@@ -171,7 +179,7 @@ pub fn insert_ast(
             start_col as i64,
             end_row as i64,
             end_col as i64,
-            node_hash,
+            content_id,
         ],
     )?;
     Ok(())
@@ -229,7 +237,7 @@ CREATE TABLE IF NOT EXISTS node_refs (
     end_row INTEGER,
     end_col INTEGER,
     qualifier TEXT,
-    node_hash BLOB REFERENCES node_content(node_hash)
+    content_id INTEGER REFERENCES node_content(content_id)
 );";
 
 /// DDL for the `node_refs` indexes — deferred post-COMMIT.
@@ -257,7 +265,7 @@ CREATE TABLE IF NOT EXISTS node_refs (
     end_row INTEGER,
     end_col INTEGER,
     qualifier TEXT,
-    node_hash BLOB REFERENCES node_content(node_hash)
+    content_id INTEGER REFERENCES node_content(content_id)
 );
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
 CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(nid);
@@ -278,7 +286,7 @@ CREATE INDEX IF NOT EXISTS idx_refs_container ON node_refs(container_nid) WHERE 
 /// tree-sitter's 5 because it treats every `node_defs` row as a
 /// dead-code candidate; adding `WHERE canonical_kind IN ('function',
 /// 'method', 'type')` collapses the count without a JOIN through
-/// `node_content` (which requires `node_hash` populated on every row).
+/// `node_content` (which requires `content_id` populated on every row).
 pub const DEFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_defs (
     token TEXT NOT NULL,
@@ -301,7 +309,7 @@ CREATE TABLE IF NOT EXISTS node_defs (
     end_row INTEGER,
     end_col INTEGER,
     canonical_kind TEXT,
-    node_hash BLOB REFERENCES node_content(node_hash)
+    content_id INTEGER REFERENCES node_content(content_id)
 );";
 
 /// DDL for the `node_defs` indexes — deferred post-COMMIT.
@@ -329,7 +337,7 @@ CREATE TABLE IF NOT EXISTS node_defs (
     end_row INTEGER,
     end_col INTEGER,
     canonical_kind TEXT,
-    node_hash BLOB REFERENCES node_content(node_hash)
+    content_id INTEGER REFERENCES node_content(content_id)
 );
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
 CREATE INDEX IF NOT EXISTS idx_defs_node ON node_defs(nid);
@@ -366,6 +374,11 @@ CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 // deletion + one deduped content table (`node_content`), the git-tree
 // object (`node_child`), and a `node_hash` column stamped onto the
 // occurrence tables that already exist (`_ast`, `node_defs`, `node_refs`).
+// projection-v10 (bead `ley-line-open-738dd9`) stores that occurrence
+// pointer as `content_id` — the hash lives once, in `node_content` — and the
+// `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` views render it
+// back. Tables keyed BY a subtree rather than pointing at one (`_cfg`,
+// whose `(node_hash, block_id)` key is its dedup identity) keep the hash.
 //
 // `node_hash` is intrinsic (a function of κ kind + terminal token +
 // ordered child hashes — spans/paths/parse-run node_ids are OUT), so a
@@ -377,11 +390,12 @@ CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 // two distinct callees with identical bodies.
 
 /// DDL for `node_content` — one row per UNIQUE subtree. `node_hash` is the
-/// merkle-AST content address and stays the identity (`UNIQUE`, the FK
-/// target of `_ast`/`node_defs`/`node_refs`/`_cfg`); `content_id` is an
-/// arena-local integer handle for it (projection-v9, bead
-/// `ley-line-open-9b7d28`), declared `INTEGER PRIMARY KEY` so it is the
-/// rowid and survives `VACUUM`. It is NOT an identity: two arenas number the
+/// merkle-AST content address and stays the identity (`UNIQUE`, and the FK
+/// target of `_cfg`); `content_id` is an arena-local integer handle for it
+/// (projection-v9, bead `ley-line-open-9b7d28`), declared `INTEGER PRIMARY
+/// KEY` so it is the rowid and survives `VACUUM`. It is the FK target of
+/// `node_edge` (v9) and of `_ast`/`node_defs`/`node_refs` (projection-v10,
+/// bead `ley-line-open-738dd9`). It is NOT an identity: two arenas number the
 /// same subtree differently, and nothing outside this database may cite it.
 /// `kind` is the hashed canonical κ kind; `raw_kind` is the grammar kind (a
 /// content column, NOT hashed). `token` is the terminal UTF-8 text for
@@ -440,31 +454,79 @@ fn create_content_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Index over `_ast.node_hash` — "every location of this exact subtree".
-pub const AST_NODE_HASH_INDEX_DDL: &str =
-    "CREATE INDEX IF NOT EXISTS idx_ast_node_hash ON _ast(node_hash);";
+/// Index over `_ast.content_id` — "every location of this exact subtree".
+/// projection-v10 (bead `ley-line-open-738dd9`) replaces `idx_ast_node_hash`:
+/// a lookup by hash is one probe into `node_content`'s `node_hash` UNIQUE
+/// index for the `content_id`, then a range on this one.
+pub const AST_CONTENT_INDEX_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_ast_content ON _ast(content_id);";
+
+/// `v_ast_hash` — the projection-v9 `_ast` shape, `node_hash` included, as a
+/// read-only view (projection-v10, bead `ley-line-open-738dd9`). Every v9
+/// read of `_ast` runs unchanged against it: a filter on `nid` stays a
+/// primary-key range, and a filter on `node_hash` plans as the
+/// `node_content` UNIQUE probe then `idx_ast_content`. It is a join view, so
+/// SQLite materializes all of it when it sits on the RIGHT of a `LEFT JOIN`;
+/// there, join `_ast` and `node_content` on `content_id` instead
+/// (`docs/TABLE_CONTRACT.md`). `content_id` is deliberately not a column: it
+/// is arena-local and must not leave the database. `LEFT JOIN` because
+/// [`insert_ast`] may store a NULL `content_id`; such a row reads a NULL
+/// `node_hash`, as it did in v9.
+///
+/// Not named `v_ast`: mache installs a TEMP `v_ast` with its own vocabulary
+/// (`node_id`, `source_id`, `node_kind`, ...) on every connection, and a TEMP
+/// view shadows a main-schema one of the same name.
+pub const AST_HASH_VIEW_DDL: &str = "\
+CREATE VIEW IF NOT EXISTS v_ast_hash AS
+SELECT a.nid, a.kind_id, a.start_byte, a.end_byte,
+       a.start_row, a.start_col, a.end_row, a.end_col,
+       c.node_hash AS node_hash
+  FROM _ast a
+  LEFT JOIN node_content c ON c.content_id = a.content_id;";
+
+/// `v_node_refs_hash` — the projection-v9 `node_refs` shape, `node_hash`
+/// included, as a read-only view. Same contract as [`AST_HASH_VIEW_DDL`].
+pub const REFS_HASH_VIEW_DDL: &str = "\
+CREATE VIEW IF NOT EXISTS v_node_refs_hash AS
+SELECT r.token, r.nid, r.container_nid, r.node_kind,
+       r.start_byte, r.end_byte, r.start_row, r.start_col, r.end_row, r.end_col,
+       r.qualifier,
+       c.node_hash AS node_hash
+  FROM node_refs r
+  LEFT JOIN node_content c ON c.content_id = r.content_id;";
+
+/// `v_node_defs_hash` — the projection-v9 `node_defs` shape, `node_hash`
+/// included, as a read-only view. Same contract as [`AST_HASH_VIEW_DDL`].
+pub const DEFS_HASH_VIEW_DDL: &str = "\
+CREATE VIEW IF NOT EXISTS v_node_defs_hash AS
+SELECT d.token, d.nid, d.container_nid, d.node_kind,
+       d.start_byte, d.end_byte, d.start_row, d.start_col, d.end_row, d.end_col,
+       d.canonical_kind,
+       c.node_hash AS node_hash
+  FROM node_defs d
+  LEFT JOIN node_content c ON c.content_id = d.content_id;";
 
 /// Create the merkle-AST IR tables (`node_content`, `node_edge`) and the
 /// `node_child` view. Idempotent.
 ///
-/// The occurrence tables' `node_hash` columns carry a
-/// `REFERENCES node_content(node_hash)` FK, so with `PRAGMA foreign_keys =
-/// ON` at write time a `node_hash` pointer that doesn't resolve to a real
-/// content row is a loud insert error.
+/// The occurrence tables' `content_id` columns carry a
+/// `REFERENCES node_content(content_id)` FK, so with `PRAGMA foreign_keys =
+/// ON` at write time a pointer that doesn't resolve to a real content row is
+/// a loud insert error.
 pub fn create_ir_tables(conn: &Connection) -> Result<()> {
     create_content_tables(conn)?;
-    // projection-v5: `node_hash` sits in the base DDL of `_ast`,
-    // `node_defs`, and `node_refs` — the pre-v5 additive ALTERs are gone
-    // (a pre-v5 arena is refused at open, not migrated).
+    // The occurrence pointer sits in the base DDL of `_ast`, `node_defs`,
+    // and `node_refs` (`node_hash` since v5, `content_id` since v10) — an
+    // older arena is refused at open, not migrated.
     Ok(())
 }
 
 /// Create the deferred merkle-AST IR index (idempotent). Called
 /// post-`COMMIT` alongside the other bulk-load index passes. `node_content`
 /// and `node_edge` are covered by their keys; the only extra
-/// traversal index is `idx_ast_node_hash`.
+/// traversal index is `idx_ast_content`.
 pub fn create_ir_indexes(conn: &Connection) -> Result<()> {
-    conn.execute_batch(AST_NODE_HASH_INDEX_DDL)?;
+    conn.execute_batch(AST_CONTENT_INDEX_DDL)?;
     Ok(())
 }
 
@@ -478,6 +540,15 @@ pub fn create_refs_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(REFS_DDL)?;
     conn.execute_batch(DEFS_DDL)?;
     conn.execute_batch(IMPORTS_DDL)?;
+    create_occurrence_hash_views(conn)?;
+    Ok(())
+}
+
+/// The `node_hash`-rendering compatibility views over `node_refs` and
+/// `node_defs` (projection-v10). Idempotent.
+fn create_occurrence_hash_views(conn: &Connection) -> Result<()> {
+    conn.execute_batch(REFS_HASH_VIEW_DDL)?;
+    conn.execute_batch(DEFS_HASH_VIEW_DDL)?;
     Ok(())
 }
 
@@ -488,6 +559,7 @@ pub fn create_refs_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(REFS_TABLE_DDL)?;
     conn.execute_batch(DEFS_TABLE_DDL)?;
     conn.execute_batch(IMPORTS_TABLE_DDL)?;
+    create_occurrence_hash_views(conn)?;
     Ok(())
 }
 
@@ -1742,26 +1814,166 @@ mod tests {
         // Idempotent — runs on every parse.
         create_ir_tables(&conn).unwrap();
 
-        // The base-DDL `node_hash` FK is enforceable: with foreign_keys ON, a
-        // pointer at a nonexistent content row is a loud insert error, and a
-        // resolving pointer succeeds.
+        // The base-DDL `content_id` FK (projection-v10) is enforceable: with
+        // foreign_keys ON, a pointer at a nonexistent content row is a loud
+        // insert error, and a resolving pointer succeeds.
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         let dangling = conn.execute(
-            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) \
-             VALUES (1, 1, 0, 1, 0, 0, 0, 1, X'00')",
+            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) \
+             VALUES (1, 1, 0, 1, 0, 0, 0, 1, 4242)",
             [],
         );
+        let err = dangling.expect_err("a content_id with no node_content row must fail");
         assert!(
-            dangling.is_err(),
-            "a node_hash with no node_content row must fail under FK enforcement"
+            err.to_string().contains("FOREIGN KEY"),
+            "the refusal must be the FK; got: {err}"
         );
         insert_test_node_content(&conn, &[0u8; 32]);
+        let id: i64 = conn
+            .query_row(
+                "SELECT content_id FROM node_content WHERE node_hash = ?1",
+                params![&[0u8; 32][..]],
+                |r| r.get(0),
+            )
+            .unwrap();
         conn.execute(
-            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) \
+            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) \
              VALUES (1, 1, 0, 1, 0, 0, 0, 1, ?1)",
-            params![[0u8; 32]],
+            params![id],
         )
         .unwrap();
+    }
+
+    /// projection-v10 (bead `ley-line-open-738dd9`): `create_ir_indexes`
+    /// builds `idx_ast_content`, and "every location of this subtree" —
+    /// the lookup `idx_ast_node_hash` served in v9 — plans as the
+    /// `node_content` UNIQUE probe then a search on it, not a scan of `_ast`.
+    /// Falsifier: `create_ir_indexes` doing nothing, or indexing the wrong
+    /// column.
+    #[test]
+    fn create_ir_indexes_builds_the_content_index_a_hash_lookup_uses() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_tables(&conn).unwrap();
+        assert!(!has_object(&conn, "index", "idx_ast_content"));
+        create_ir_indexes(&conn).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_index_info('idx_ast_content')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(cols, vec!["content_id".to_string()]);
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT a.nid FROM node_content c \
+                 JOIN _ast a ON a.content_id = c.content_id WHERE c.node_hash = ?1",
+            )
+            .unwrap()
+            .query_map([&[0u8; 32][..]], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.contains("idx_ast_content")),
+            "the hash lookup must search idx_ast_content; plan: {plan:?}"
+        );
+        create_ir_indexes(&conn).unwrap(); // idempotent
+    }
+
+    /// projection-v10 (bead `ley-line-open-738dd9`): the three compatibility
+    /// views render each occurrence's `content_id` back to the `node_hash`
+    /// it names, keep the v9 column set (and only it — `content_id` stays
+    /// inside the base tables), and keep a row whose pointer is NULL.
+    /// Falsifier: a view joining on the wrong column, an INNER join (drops
+    /// the NULL row), or a view that leaks `content_id`.
+    #[test]
+    fn hash_views_render_content_ids_back_to_node_hash() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_ast_schema(&conn).unwrap();
+        create_refs_schema(&conn).unwrap();
+        for view in ["v_ast_hash", "v_node_refs_hash", "v_node_defs_hash"] {
+            assert!(has_object(&conn, "view", view), "{view} MUST exist");
+        }
+        // Two content rows, so a join on the wrong id renders the wrong hash.
+        insert_test_node_content(&conn, &[0x11u8; 32]);
+        insert_test_node_content(&conn, &[0x22u8; 32]);
+        let id: i64 = conn
+            .query_row(
+                "SELECT content_id FROM node_content WHERE node_hash = ?1",
+                params![&[0x22u8; 32][..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_ast(&conn, 7, 1, 0, 1, 0, 0, 0, 1, Some(id)).unwrap();
+        insert_ast(&conn, 8, 1, 0, 1, 0, 0, 0, 1, None).unwrap();
+        conn.execute(
+            "INSERT INTO node_refs (token, nid, content_id) VALUES ('r', 7, ?1)",
+            params![id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_defs (token, nid, content_id) VALUES ('d', 7, ?1)",
+            params![id],
+        )
+        .unwrap();
+
+        for view in ["v_ast_hash", "v_node_refs_hash", "v_node_defs_hash"] {
+            let h: Vec<u8> = conn
+                .query_row(
+                    &format!("SELECT node_hash FROM {view} WHERE nid = 7"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(h, vec![0x22u8; 32], "{view} renders the named hash");
+            assert!(
+                !has_column(&conn, view, "content_id").unwrap(),
+                "{view} must not expose the arena-local content_id"
+            );
+        }
+        let null_row: Option<Vec<u8>> = conn
+            .query_row("SELECT node_hash FROM v_ast_hash WHERE nid = 8", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(null_row, None, "a NULL pointer keeps its row, hash NULL");
+        let by_hash: i64 = conn
+            .query_row(
+                "SELECT nid FROM v_ast_hash WHERE node_hash = ?1",
+                params![&[0x22u8; 32][..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by_hash, 7, "a lookup by hash finds the occurrence");
+
+        // The v9 column sets, exactly.
+        for (view, base) in [
+            ("v_ast_hash", "_ast"),
+            ("v_node_refs_hash", "node_refs"),
+            ("v_node_defs_hash", "node_defs"),
+        ] {
+            let cols = |t: &str| -> Vec<String> {
+                let mut s = conn
+                    .prepare("SELECT name FROM pragma_table_info(?1)")
+                    .unwrap();
+                s.query_map([t], |r| r.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            };
+            let expected: Vec<String> = cols(base)
+                .into_iter()
+                .map(|c| {
+                    if c == "content_id" {
+                        "node_hash".into()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            assert_eq!(cols(view), expected, "{view} keeps {base}'s v9 columns");
+        }
     }
 
     /// **The v5 base DDL carries every occurrence column at birth.**
@@ -1780,7 +1992,7 @@ mod tests {
         for (table, cols) in [
             (
                 "_ast",
-                &["nid", "kind_id", "start_byte", "end_col", "node_hash"][..],
+                &["nid", "kind_id", "start_byte", "end_col", "content_id"][..],
             ),
             (
                 "node_defs",
@@ -1792,7 +2004,7 @@ mod tests {
                     "start_byte",
                     "end_col",
                     "canonical_kind",
-                    "node_hash",
+                    "content_id",
                 ][..],
             ),
             (
@@ -1805,7 +2017,7 @@ mod tests {
                     "start_byte",
                     "end_col",
                     "qualifier",
-                    "node_hash",
+                    "content_id",
                 ][..],
             ),
         ] {

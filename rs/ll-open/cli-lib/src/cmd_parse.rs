@@ -493,11 +493,15 @@ batch_table! {
     // projection-v5: the nid IS (file_id << 24) | blob_ord — the pointer
     // store's dense per-file ordinal moved into the key, so the
     // `source_id`/`blob_ord` columns are gone and `node_kind` interned.
+    //
+    // projection-v10 (bead `ley-line-open-738dd9`): the subtree pointer is
+    // the `content_id` the writer assigned its `node_content` row, not the
+    // 32-byte `node_hash` again.
     AstBatch, AstRow,
-    "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) VALUES ",
+    "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) VALUES ",
     9,
-    push_fn: (nid: i64, kind_id: i64, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, node_hash: Vec<u8>),
-    push_body: { AstRow { nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash } },
+    push_fn: (nid: i64, kind_id: i64, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, content_id: i64),
+    push_body: { AstRow { nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
         for r in chunk {
@@ -509,7 +513,7 @@ batch_table! {
             out.push(&r.start_col);
             out.push(&r.end_row);
             out.push(&r.end_col);
-            out.push(&r.node_hash);
+            out.push(&r.content_id);
         }
         out
     },
@@ -613,14 +617,14 @@ batch_table! {
     RefBatch, RefRow,
     "",
     12,
-    push_fn: (token: String, nid: i64, node_hash: Option<Vec<u8>>, container_nid: Option<i64>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
-    push_body: { RefRow { token, nid, node_hash, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    push_fn: (token: String, nid: i64, content_id: Option<i64>, container_nid: Option<i64>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
+    push_body: { RefRow { token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.nid);
-            out.push(&r.node_hash);
+            out.push(&r.content_id);
             out.push(&r.container_nid);
             out.push(&r.qualifier);
             out.push(&r.node_kind);
@@ -642,7 +646,7 @@ impl RefBatch {
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.nid);
-                out.push(&r.node_hash);
+                out.push(&r.content_id);
                 out.push(&r.container_nid);
                 out.push(&r.qualifier);
                 out.push(&r.node_kind);
@@ -671,18 +675,18 @@ batch_table! {
     push_fn: (
         token: String,
         nid: i64,
-        node_hash: Option<Vec<u8>>,
+        content_id: Option<i64>,
         container_nid: Option<i64>,
         canonical_kind: Option<&'static str>,
         node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>
     ),
-    push_body: { DefRow { token, nid, node_hash, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    push_body: { DefRow { token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.nid);
-            out.push(&r.node_hash);
+            out.push(&r.content_id);
             out.push(&r.container_nid);
             out.push(&r.canonical_kind);
             out.push(&r.node_kind);
@@ -704,7 +708,7 @@ impl DefBatch {
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.nid);
-                out.push(&r.node_hash);
+                out.push(&r.content_id);
                 out.push(&r.container_nid);
                 out.push(&r.canonical_kind);
                 out.push(&r.node_kind);
@@ -1232,10 +1236,10 @@ fn parse_into_conn_with(
     // `create_post_load_indexes`. See bead `ley-line-open-9ccbc7`.
     create_ast_tables(conn)?;
     create_refs_tables(conn)?;
-    // Merkle-AST IR (ADR-0027): node_content/node_child. The occurrence
-    // tables' node_hash columns are in their base DDL as of projection-v5
-    // (the additive ALTER migrations are gone — a pre-v5 arena is refused
-    // at open, not patched).
+    // Merkle-AST IR (ADR-0027): node_content/node_edge. The occurrence
+    // tables' subtree pointer is in their base DDL (`node_hash` as of
+    // projection-v5, `content_id` as of v10) — an older arena is refused at
+    // open, not patched.
     create_ir_tables(conn)?;
     // The ADR-0026 pointer store (`capnp_blobs`, `_ast_blob`) is retired at
     // projection-v8 (ADR-0040 D5, bead `ley-line-open-f30fdf`): it was a
@@ -1694,8 +1698,8 @@ fn parse_into_conn_with(
     let mut parsed = 0u64;
     let mut errors = 0u64;
 
-    // Defer FK enforcement to COMMIT: with immediate FKs, every node_child /
-    // _ast.node_hash insert probes node_content's BLOB PK synchronously (~880k
+    // Defer FK enforcement to COMMIT: with immediate FKs, every node_edge /
+    // occurrence-pointer insert probes node_content's key synchronously (~880k
     // per-row probes into a large index → cache thrash). `defer_foreign_keys`
     // batches all checks into a single validation pass at COMMIT — still
     // fail-loud (a dangling edge aborts the COMMIT), but no per-row probe. It
@@ -1741,8 +1745,8 @@ fn parse_into_conn_with(
 
     // Merkle-AST IR (ADR-0027). `node_content`/`node_child` are the deduped
     // content layer (`INSERT OR IGNORE` collapses identical subtrees across
-    // files); `_ast`/`node_defs`/`node_refs` carry the additive `node_hash`
-    // pointer. No `gen`/edge machinery: contains is intrinsic (node_child),
+    // files); `_ast`/`node_defs`/`node_refs` point at it by `content_id`
+    // (projection-v10). No `gen`/edge machinery: contains is intrinsic (node_edge),
     // and defines/references stay as occurrence rows keyed by token+node_id.
     let mut content_buf: NodeContentBatch = NodeContentBatch::with_capacity(chunk_rows);
     let mut child_buf: NodeEdgeBatch = NodeEdgeBatch::with_capacity(chunk_rows);
@@ -1963,10 +1967,14 @@ fn parse_into_conn_with(
                         };
                         content_ids.insert(c.node_hash, id);
                     }
+                    // Every pointer this file writes — `node_edge` endpoints
+                    // (v9), `_ast`/`node_defs`/`node_refs` occurrences (v10,
+                    // bead `ley-line-open-738dd9`) — resolves here. A miss is
+                    // a fold that named a subtree it did not emit: loud.
                     let id_of = |h: &[u8; 32]| -> Result<i64> {
                         content_ids.get(h).copied().with_context(|| {
                             format!(
-                                "node_edge endpoint {} has no node_content row in {}",
+                                "node_hash {} has no node_content row in {}",
                                 hex::encode(h),
                                 pf.rel
                             )
@@ -1985,9 +1993,10 @@ fn parse_into_conn_with(
                     }
                     edges_written.extend(parents_here);
 
-                    // node_id → node_hash for this file, so the additive
-                    // node_hash pointer on node_defs/node_refs can be attached
-                    // by the ref locator (which is always an `_ast` node_id).
+                    // node_id → node_hash for this file, so the subtree
+                    // pointer on node_defs/node_refs (its `content_id`, via
+                    // `id_of`) can be attached by the ref locator (which is
+                    // always an `_ast` node_id).
                     let mut hash_by_id: HashMap<&str, [u8; 32]> =
                         HashMap::with_capacity(pf.ast_entries.len() + pf.injected_hashes.len());
                     for a in &pf.ast_entries {
@@ -2099,7 +2108,7 @@ fn parse_into_conn_with(
                             a.start_col as i64,
                             a.end_row as i64,
                             a.end_col as i64,
-                            a.node_hash.to_vec(),
+                            id_of(&a.node_hash)?,
                         );
                     }
 
@@ -2122,7 +2131,7 @@ fn parse_into_conn_with(
                                 container_node_id,
                                 qualifier,
                             } => {
-                                let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                                let nh = hash_by_id.get(node_id.as_str()).map(id_of).transpose()?;
                                 let sp = span_of(node_id.as_str());
                                 let container_nid =
                                     container_node_id.as_deref().map(&nid_of).transpose()?;
@@ -2148,7 +2157,7 @@ fn parse_into_conn_with(
                                 container_node_id,
                                 canonical_kind,
                             } => {
-                                let nh = hash_by_id.get(node_id.as_str()).map(|h| h.to_vec());
+                                let nh = hash_by_id.get(node_id.as_str()).map(id_of).transpose()?;
                                 let sp = span_of(node_id.as_str());
                                 let container_nid =
                                     container_node_id.as_deref().map(&nid_of).transpose()?;
@@ -2218,11 +2227,11 @@ fn parse_into_conn_with(
         source_buf.flush_batched(conn)?;
         refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, nid, node_hash, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_refs (token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, nid, node_hash, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_defs (token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
     )?;
         imports_buf.flush_batched(conn)?;
 
@@ -4437,7 +4446,7 @@ mod tests {
 
         // b.go will intern as file_id 2; ordinal 0 is its file node.
         conn.execute(
-            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, node_hash) \
+            "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) \
              VALUES (?1, 1, 0, 0, 0, 0, 0, 0, NULL)",
             [leyline_schema::file_nid(2, 0)],
         )
@@ -5185,7 +5194,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v9",
+            "projection-v10",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5198,27 +5207,28 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v9"),
+            Some("projection-v10"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
 
-    /// projection-v9 (bead `ley-line-open-9b7d28`): an arena that still
-    /// carries the v8 label is refused at open — its hash-keyed `node_child`
-    /// TABLE would sit where this writer creates a view and writes
-    /// `node_edge`.
+    /// projection-v10 (bead `ley-line-open-738dd9`): an arena that still
+    /// carries the v9 label is refused at open — its `_ast`/`node_refs`/
+    /// `node_defs` hold a `node_hash` column where this writer inserts
+    /// `content_id`, and `CREATE TABLE IF NOT EXISTS` would keep the old
+    /// shape.
     #[test]
-    fn a_projection_v8_arena_is_refused_at_open() {
+    fn a_projection_v9_arena_is_refused_at_open() {
         let td = TempDir::new().unwrap();
         std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
         let conn = Connection::open_in_memory().unwrap();
         parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
-        set_meta(&conn, "projection_schema_version", "projection-v8").unwrap();
+        set_meta(&conn, "projection_schema_version", "projection-v9").unwrap();
         let err = parse_into_conn(&conn, td.path(), Some("go"), None)
-            .expect_err("a projection-v8 arena must be refused");
+            .expect_err("a projection-v9 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v8") && msg.contains("projection-v9"),
+            msg.contains("projection-v9") && msg.contains("projection-v10"),
             "the refusal must name both versions; got: {msg}",
         );
     }
@@ -5313,7 +5323,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v9"),
+            msg.contains("projection-v4") && msg.contains("projection-v10"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(

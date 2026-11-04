@@ -400,7 +400,10 @@ mod tests {
                             }
                             ("name_id", V::Integer(n)) => self.names[n].clone(),
                             ("kind_id", V::Integer(n)) => self.kinds[n].clone(),
-                            ("parent_id" | "child_id", V::Integer(n)) => {
+                            // `content_id` on `_ast`/`node_refs`/`node_defs`
+                            // (projection-v10); `node_content`'s own is
+                            // skipped above.
+                            ("parent_id" | "child_id" | "content_id", V::Integer(n)) => {
                                 hex::encode(&self.content[n])
                             }
                             (_, V::Integer(n)) => n.to_string(),
@@ -464,7 +467,9 @@ mod tests {
         seen
     }
 
-    const OCCURRENCES: &[&str] = &["_ast", "node_refs", "node_defs"];
+    /// The occurrence tables, read through their projection-v10 `*_hash`
+    /// views so the walk starts from hashes, not arena-local ids.
+    const OCCURRENCES: &[&str] = &["v_ast_hash", "v_node_refs_hash", "v_node_defs_hash"];
 
     fn logical(conn: &Connection) -> Vec<Row> {
         Logical::new(conn).rows(conn)

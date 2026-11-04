@@ -310,6 +310,11 @@ pub fn verify(db_path: &Path) -> Result<Verification> {
     let h: head::Reader = msg
         .get_root()
         .with_context(|| format!("read head root {}", head_path.display()))?;
+    // The stamped treeRoot is what the signature attests (bead b68fa6), so a
+    // configured trust set is checked before the stamp is compared with the
+    // arena. Without this, an arena and a head rewritten together agree with
+    // each other and pass.
+    crate::head_claim::enforce_signature(h, &head_path)?;
     let stamped_tree = hash_field(h.get_tree_root().ok().map(|x| x.get_bytes()))?;
     let stamped_parser = hash_field(h.get_parser_id().ok().map(|x| x.get_bytes()))?;
     let (Some(stamped_tree), Some(stamped_parser)) = (stamped_tree, stamped_parser) else {
@@ -342,7 +347,7 @@ pub fn verify(db_path: &Path) -> Result<Verification> {
 
 /// A `Common.Hash` field: absent or all-zero means "not stamped"; any other
 /// length than 32 is a malformed head and an error, never a silent default.
-fn hash_field(field: Option<capnp::Result<&[u8]>>) -> Result<Option<Hash>> {
+pub(crate) fn hash_field(field: Option<capnp::Result<&[u8]>>) -> Result<Option<Hash>> {
     let Some(field) = field else {
         return Ok(None);
     };

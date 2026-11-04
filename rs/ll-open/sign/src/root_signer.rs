@@ -5,10 +5,11 @@
 //! signing crate, alongside the certificate machinery (`cert_chain`) that the
 //! Signet trust root will hang off.
 //!
-//! **What gets signed.** Not a bare root — the canonical head digest from
-//! [`leyline_core::head_digest`], which binds `(generation, rootHash,
-//! parentHash)`. Signing `rootHash` alone would let a signature be replayed at
-//! another generation or grafted onto a forked chain.
+//! **What gets signed.** Not a bare root — the canonical v2 head digest from
+//! [`leyline_core::head_digest`], which binds the whole [`HeadClaim`]:
+//! `(generation, rootHash, parentHash, treeRoot, parserId)`. Signing
+//! `rootHash` alone would let a signature be replayed at another generation,
+//! grafted onto a forked chain, or cited for a tree it never attested.
 //!
 //! **Scheme alignment.** Ed25519, matching the frozen `leyline-net/v1`
 //! manifest so the transport manifest and the at-rest head share one trust
@@ -17,7 +18,7 @@
 
 use anyhow::Result;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
-use leyline_core::{Hash, RootSigner};
+use leyline_core::{Hash, HeadClaim, RootSigner};
 
 // Re-exported so verify-side consumers (the CLI read path, a wasm verifier)
 // can name a trust set without taking their own `ed25519-dalek` dependency.
@@ -118,10 +119,15 @@ pub enum HeadVerdict {
 /// the caller, so unsigned arenas keep working until a deployment opts into
 /// requiring signatures. Collapsing those two cases would either break every
 /// existing arena or silently accept tampered ones.
+///
+/// `claim` is the head's [`HeadClaim`], or `None` when the head does not carry
+/// every identity the v2 digest binds (an unstamped `treeRoot` or `parserId`).
+/// A signed head with no claim is [`HeadVerdict::Invalid`]: its signature
+/// cannot attest the tree, so it attests nothing. A head signed under the
+/// removed v1 digest is also `Invalid`: v1 and v2 use different derive-key
+/// contexts, so a v1 signature never verifies under v2.
 pub fn verify_head(
-    generation: u64,
-    root: Hash,
-    parent: Hash,
+    claim: Option<&HeadClaim>,
     signature: &[u8],
     kid: &[u8],
     trusted: &[VerifyingKey],
@@ -129,6 +135,9 @@ pub fn verify_head(
     if signature.is_empty() {
         return HeadVerdict::Unsigned;
     }
+    let Some(claim) = claim else {
+        return HeadVerdict::Invalid;
+    };
     // R4 (ADR-012): a present `kid` MUST match the canonical shape. A malformed
     // kid riding on an otherwise-signed head is tampering-adjacent — reject it
     // rather than shrug and fall back to "no kid". An empty kid is the
@@ -141,7 +150,7 @@ pub fn verify_head(
         return HeadVerdict::Invalid;
     };
     let sig = Signature::from_bytes(&raw);
-    let digest = leyline_core::head_digest(generation, root, parent);
+    let digest = leyline_core::head_digest(claim);
     // Re-deriving the digest here is what binds the verdict to the head the
     // caller actually holds: a signature lifted from another generation or
     // another chain verifies against *its* digest, never this one.
@@ -174,8 +183,33 @@ mod tests {
         Ed25519RootSigner::from_seed(&[7u8; 32])
     }
 
+    const TREE: [u8; 32] = [0x11; 32];
+    const PARSER: [u8; 32] = [0x22; 32];
+
+    /// A stamped claim with the fixed test tree and parser identities.
+    fn claim_with(
+        generation: u64,
+        root: [u8; 32],
+        parent: [u8; 32],
+        tree: [u8; 32],
+        parser: [u8; 32],
+    ) -> HeadClaim {
+        HeadClaim::new(
+            generation,
+            Hash::from_bytes(root),
+            Hash::from_bytes(parent),
+            Hash::from_bytes(tree),
+            Hash::from_bytes(parser),
+        )
+        .expect("stamped claim")
+    }
+
+    fn claim(generation: u64, root: [u8; 32], parent: [u8; 32]) -> HeadClaim {
+        claim_with(generation, root, parent, TREE, PARSER)
+    }
+
     fn digest(generation: u64) -> Hash {
-        head_digest(generation, Hash::from_bytes([1u8; 32]), Hash::ZERO)
+        head_digest(&claim(generation, [1u8; 32], [0u8; 32]))
     }
 
     #[test]
@@ -275,7 +309,7 @@ mod tests {
         let junk = verifying_key_from_hex(&"ff".repeat(32)).expect("parses");
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
-            verify_head(1, Hash::from_bytes(ROOT), Hash::ZERO, &sig, b"", &[junk]),
+            verify_head(Some(&claim(1, ROOT, [0u8; 32])), &sig, b"", &[junk]),
             HeadVerdict::Invalid
         );
     }
@@ -287,8 +321,75 @@ mod tests {
     /// Sign a head the way `write_head_for_path` does, returning raw bytes as
     /// they would be read back out of the capnp `signature` field.
     fn signed(generation: u64, root: [u8; 32], parent: [u8; 32]) -> Vec<u8> {
-        let d = head_digest(generation, Hash::from_bytes(root), Hash::from_bytes(parent));
+        let d = head_digest(&claim(generation, root, parent));
         signer().sign(d).expect("sign").to_bytes().to_vec()
+    }
+
+    /// Bead b68fa6: treeRoot is the root signatures cite (ADR-0040 D1). A
+    /// signature over one tree must not verify a head claiming another.
+    #[test]
+    fn verify_head_rejects_a_rewritten_tree_root() {
+        let sig = signed(1, ROOT, [0u8; 32]);
+        let forged = claim_with(1, ROOT, [0u8; 32], [0x33; 32], PARSER);
+        assert_eq!(
+            verify_head(Some(&forged), &sig, b"", &[signer().verifying_key()]),
+            HeadVerdict::Invalid
+        );
+    }
+
+    /// Bead b68fa6: the same tree under another derivation is another claim.
+    #[test]
+    fn verify_head_rejects_a_rewritten_parser_id() {
+        let sig = signed(1, ROOT, [0u8; 32]);
+        let forged = claim_with(1, ROOT, [0u8; 32], TREE, [0x44; 32]);
+        assert_eq!(
+            verify_head(Some(&forged), &sig, b"", &[signer().verifying_key()]),
+            HeadVerdict::Invalid
+        );
+    }
+
+    /// A signed head without a stamped treeRoot/parserId has no claim, so its
+    /// signature attests nothing: `Invalid`, never `Valid` and never
+    /// `Unsigned`.
+    #[test]
+    fn verify_head_rejects_a_signed_head_without_a_claim() {
+        let sig = signed(1, ROOT, [0u8; 32]);
+        assert_eq!(
+            verify_head(None, &sig, b"", &[signer().verifying_key()]),
+            HeadVerdict::Invalid
+        );
+    }
+
+    /// An unsigned, unstamped head is still `Unsigned`: the caller's policy
+    /// decides, as for any unsigned head.
+    #[test]
+    fn verify_head_reports_an_unsigned_head_without_a_claim_as_unsigned() {
+        assert_eq!(
+            verify_head(None, &[], b"", &[signer().verifying_key()]),
+            HeadVerdict::Unsigned
+        );
+    }
+
+    /// A head signed under the removed v1 digest (generation ‖ rootHash ‖
+    /// parentHash, context "leyline head digest v1") does not verify as
+    /// attesting treeRoot/parserId.
+    #[test]
+    fn verify_head_rejects_a_v1_signature() {
+        let mut v1 = blake3::Hasher::new_derive_key("leyline head digest v1");
+        v1.update(&1u64.to_le_bytes());
+        v1.update(&ROOT);
+        v1.update(&[0u8; 32]);
+        let v1_digest = Hash::from_bytes(*v1.finalize().as_bytes());
+        let sig = signer().sign(v1_digest).expect("sign").to_bytes();
+        assert_eq!(
+            verify_head(
+                Some(&claim(1, ROOT, [0u8; 32])),
+                &sig,
+                b"",
+                &[signer().verifying_key()]
+            ),
+            HeadVerdict::Invalid
+        );
     }
 
     #[test]
@@ -296,9 +397,7 @@ mod tests {
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &sig,
                 b"",
                 &[signer().verifying_key()]
@@ -314,9 +413,7 @@ mod tests {
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes([2u8; 32]), // attacker's arena
-                Hash::ZERO,
+                Some(&claim(1, [2u8; 32], [0u8; 32])), // attacker's arena
                 &sig,
                 b"",
                 &[signer().verifying_key()]
@@ -332,9 +429,7 @@ mod tests {
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
             verify_head(
-                2,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(2, ROOT, [0u8; 32])),
                 &sig,
                 b"",
                 &[signer().verifying_key()]
@@ -349,9 +444,7 @@ mod tests {
         let sig = signed(2, ROOT, [9u8; 32]);
         assert_eq!(
             verify_head(
-                2,
-                Hash::from_bytes(ROOT),
-                Hash::from_bytes([8u8; 32]),
+                Some(&claim(2, ROOT, [8u8; 32])),
                 &sig,
                 b"",
                 &[signer().verifying_key()]
@@ -367,9 +460,7 @@ mod tests {
         let stranger = Ed25519RootSigner::from_seed(&[9u8; 32]);
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &sig,
                 b"",
                 &[stranger.verifying_key()]
@@ -384,7 +475,7 @@ mod tests {
     fn verify_head_rejects_when_no_keys_are_trusted() {
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
-            verify_head(1, Hash::from_bytes(ROOT), Hash::ZERO, &sig, b"", &[]),
+            verify_head(Some(&claim(1, ROOT, [0u8; 32])), &sig, b"", &[]),
             HeadVerdict::Invalid
         );
     }
@@ -394,9 +485,7 @@ mod tests {
     fn verify_head_rejects_a_malformed_signature() {
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &[0u8; 17],
                 b"",
                 &[signer().verifying_key()]
@@ -411,9 +500,7 @@ mod tests {
     fn verify_head_reports_an_absent_signature_as_unsigned() {
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &[],
                 b"",
                 &[signer().verifying_key()]
@@ -430,9 +517,7 @@ mod tests {
         let stranger = Ed25519RootSigner::from_seed(&[9u8; 32]);
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &sig,
                 b"",
                 &[stranger.verifying_key(), signer().verifying_key()]
@@ -455,9 +540,7 @@ mod tests {
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &sig,
                 signer_kid().as_bytes(),
                 &[signer().verifying_key()]
@@ -476,9 +559,7 @@ mod tests {
             crate::kid::canonical_kid(&Ed25519RootSigner::from_seed(&[42u8; 32]).verifying_key());
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &sig,
                 stranger_kid.as_bytes(),
                 &[signer().verifying_key()]
@@ -494,13 +575,11 @@ mod tests {
     fn verify_head_rejects_untrusted_signature_even_with_a_known_kid() {
         // Signed by the stranger, but the head claims our trusted signer's kid.
         let stranger = Ed25519RootSigner::from_seed(&[9u8; 32]);
-        let d = head_digest(1, Hash::from_bytes(ROOT), Hash::ZERO);
+        let d = head_digest(&claim(1, ROOT, [0u8; 32]));
         let sig = stranger.sign(d).expect("sign").to_bytes();
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &sig,
                 signer_kid().as_bytes(),
                 &[signer().verifying_key()]
@@ -516,9 +595,7 @@ mod tests {
         let sig = signed(1, ROOT, [0u8; 32]);
         assert_eq!(
             verify_head(
-                1,
-                Hash::from_bytes(ROOT),
-                Hash::ZERO,
+                Some(&claim(1, ROOT, [0u8; 32])),
                 &sig,
                 b"not-a-valid-kid",
                 &[signer().verifying_key()]

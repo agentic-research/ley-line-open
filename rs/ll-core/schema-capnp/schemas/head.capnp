@@ -53,9 +53,14 @@ struct Head {
   unboundFacts @4 :UInt64;
 
   # Signature over the canonical head digest — NOT over rootHash alone.
-  # The digest is BLAKE3(generation LE-8 ‖ rootHash ‖ parentHash); see
-  # `leyline_core::head_digest`. Binding all three stops a signature being
-  # replayed at another generation or grafted onto a forked chain. Ed25519
+  # The digest (v2) is BLAKE3_derive_key("leyline head digest v2",
+  # generation LE-8 ‖ rootHash ‖ parentHash ‖ treeRoot ‖ parserId); see
+  # `leyline_core::head_digest`. Binding all five stops a signature being
+  # replayed at another generation, grafted onto a forked chain, or cited for
+  # a tree or derivation it did not attest. A head that does not stamp
+  # treeRoot and parserId has no claim and is never signed; a signature on
+  # one does not verify. v1 (the first three fields only) is removed: a v1
+  # signature does not verify under v2. Ed25519
   # (64 bytes), matching the frozen leyline-net/v1 manifest so the in-flight
   # manifest and the at-rest head share one scheme and one trust root.
   #

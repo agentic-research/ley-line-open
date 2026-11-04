@@ -34,6 +34,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon/wire"
 )
 
 // fixturePath joins the repo-root-relative path to the daemon protocol
@@ -136,6 +138,8 @@ type statusResponse struct {
 	HeadSHA         *string           `json:"head_sha,omitempty"`
 	LastReparseAtMs *int64            `json:"last_reparse_at_ms,string"`
 	Error           *string           `json:"error,omitempty"`
+	// Bead ley-line-open-246526: the canonical --source directory.
+	SourceRoot *string `json:"source_root,omitempty"`
 }
 
 type flushResponse struct {
@@ -345,8 +349,18 @@ type sheafLearnedWeightsResponse struct {
 // unknown — the gate treats unknown names as a fixture authoring error.
 func decoderFor(name string) func([]byte) error {
 	switch name {
+	// The shipped daemon/wire types decode the same fixtures strictly, so a
+	// field the daemon emits that wire lacks fails here (bead
+	// ley-line-open-247489).
 	case "StatusResponse":
-		return func(b []byte) error { var v statusResponse; return strictUnmarshal(b, &v) }
+		return func(b []byte) error {
+			var v statusResponse
+			if err := strictUnmarshal(b, &v); err != nil {
+				return err
+			}
+			var w wire.StatusResponse
+			return strictUnmarshal(b, &w)
+		}
 	case "FlushResponse":
 		return func(b []byte) error { var v flushResponse; return strictUnmarshal(b, &v) }
 	case "SnapshotResponse":
@@ -354,9 +368,23 @@ func decoderFor(name string) func([]byte) error {
 	case "ReadContentResponse":
 		return func(b []byte) error { var v readContentResponse; return strictUnmarshal(b, &v) }
 	case "ReadSourceResponse":
-		return func(b []byte) error { var v readSourceResponse; return strictUnmarshal(b, &v) }
+		return func(b []byte) error {
+			var v readSourceResponse
+			if err := strictUnmarshal(b, &v); err != nil {
+				return err
+			}
+			var w wire.ReadSourceResponse
+			return strictUnmarshal(b, &w)
+		}
 	case "ProposeResponse":
-		return func(b []byte) error { var v proposeResponse; return strictUnmarshal(b, &v) }
+		return func(b []byte) error {
+			var v proposeResponse
+			if err := strictUnmarshal(b, &v); err != nil {
+				return err
+			}
+			var w wire.ProposeResponse
+			return strictUnmarshal(b, &w)
+		}
 	case "ListChildrenResponse":
 		return func(b []byte) error { var v listChildrenResponse; return strictUnmarshal(b, &v) }
 	case "GetNodeResponse":

@@ -514,6 +514,18 @@ fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
 // Control ops (don't need the living db)
 // ---------------------------------------------------------------------------
 
+/// `status`'s `source_root`: the `--source` directory with its symlinks
+/// resolved, the same spelling the arena's owner sentinel records. A
+/// directory that no longer resolves (removed while the daemon runs) is
+/// reported as given rather than as absent, since absent means the daemon
+/// has no source.
+fn status_source_root(dir: &Path) -> String {
+    dir.canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn op_status(ctx: &DaemonContext) -> Result<String> {
     let ctrl = Controller::open_or_create(&ctx.ctrl_path).context("open controller")?;
     let state = ctx.state.read();
@@ -559,6 +571,12 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     }
     if let DaemonPhase::Error(msg) = &state.phase {
         root.set_error(msg);
+    }
+    // The tree a proposal's relative paths name (bead
+    // `ley-line-open-246526`). Unset without `--source`, so the field is
+    // absent from the JSON.
+    if let Some(dir) = ctx.source_dir.as_deref() {
+        root.set_source_root(status_source_root(dir));
     }
     // Typed enrichment — typed end-to-end, no double parse on
     // consumers. Each entry is `(name, PassStatus { last_run_at_ms,
@@ -5588,6 +5606,58 @@ mod tests {
         assert!(
             enriched.is_empty(),
             "fresh setup has no enrichment passes; got {enriched:?}"
+        );
+        // Bead ley-line-open-246526: no `--source`, no `source_root`.
+        assert!(
+            !obj.contains_key("source_root"),
+            "a daemon without --source reports no source_root; got keys {:?}",
+            obj.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// Bead `ley-line-open-246526`: `status` on a daemon with `--source`
+    /// names that directory, canonical, as `source_root`, the tree a
+    /// proposal's relative paths name.
+    #[tokio::test]
+    async fn op_status_reports_canonical_source_root() {
+        let (dir, ctx) = setup_rooted();
+        let result = handle_base_op_legacy(&ctx, "status", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let want = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            parsed["source_root"].as_str(),
+            Some(want.to_str().unwrap()),
+            "source_root is the canonical --source directory; got {parsed}"
+        );
+    }
+
+    /// A `--source` named through a symlink reports the directory it
+    /// resolves to, and one that no longer resolves is reported as given,
+    /// never as absent (bead `ley-line-open-246526`).
+    #[cfg(unix)]
+    #[test]
+    fn status_source_root_resolves_symlinks_and_keeps_a_vanished_dir() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        assert_eq!(
+            status_source_root(&link),
+            canonical.to_string_lossy(),
+            "a symlinked --source reports its target"
+        );
+        assert_ne!(
+            status_source_root(&link),
+            link.to_string_lossy(),
+            "the symlink's own spelling is not the canonical root"
+        );
+        let gone = tmp.path().join("gone");
+        assert_eq!(
+            status_source_root(&gone),
+            gone.to_string_lossy(),
+            "a directory that does not resolve is reported as given"
         );
     }
 

@@ -21,7 +21,7 @@
 //! * `cmd_parse` (fact derivation) reads nothing from the sheaf. It re-derives
 //!   on `epoch + mtime + size` and content-addresses every fact by
 //!   `node_hash` — file bytes fold to `_source.content_hash` (BLAKE3),
-//!   `_ast.node_hash`, and the `node_content` primary key.
+//!   `node_content.node_hash` (which `_ast.content_id` points at).
 //! * Query commands read `node_defs` / `node_refs` straight from the tables the
 //!   last parse wrote; they never consult the sheaf.
 //!

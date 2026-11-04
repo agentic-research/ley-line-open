@@ -137,8 +137,9 @@ fn defs_rows(db_path: &Path) -> Vec<DefRow> {
     let mut stmt = conn
         .prepare(
             "SELECT d.token, d.nid, s.id, p.path, d.canonical_kind, \
-             lower(hex(d.node_hash)) \
+             lower(hex(c.node_hash)) \
              FROM node_defs d \
+             LEFT JOIN node_content c ON c.content_id = d.content_id \
              JOIN _source s ON s.file_id = d.nid >> 24 \
              LEFT JOIN v_node_path p ON p.nid = d.container_nid \
              ORDER BY d.token, d.nid",
@@ -169,7 +170,7 @@ fn ast_hash_map(db_path: &Path) -> Vec<(String, String)> {
     let conn = Connection::open(db_path).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT p.path, lower(hex(a.node_hash)) FROM _ast a \
+            "SELECT p.path, lower(hex(a.node_hash)) FROM v_ast_hash a \
              JOIN v_node_path p ON p.nid = a.nid \
              ORDER BY p.path",
         )

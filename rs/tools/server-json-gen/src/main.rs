@@ -49,8 +49,10 @@ const SERVER_DESCRIPTION: &str =
     "Open-source data plane primitives — tree-sitter parse, LSP, sheaf cache, observation lattice.";
 
 /// Source-of-truth version — `CARGO_PKG_VERSION` of `leyline-cli-lib`, the
-/// workspace's single authoritative version string.
-const VERSION: &str = leyline_cli_lib::daemon::version::BINARY_VERSION;
+/// workspace's single authoritative version string. The release line, not
+/// the build's dev-suffixed version: server.json is committed and must not
+/// vary per commit (bead `ley-line-open-5139a3`).
+const VERSION: &str = leyline_cli_lib::daemon::version::RELEASE_VERSION;
 
 /// OCI path, **tagless**, per cloister ADR-0041 (bead `ley-line-open-04300f`).
 ///

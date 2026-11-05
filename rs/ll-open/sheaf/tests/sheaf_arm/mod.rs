@@ -45,7 +45,7 @@
 
 use crate::common::ablation::{Arm, Step, Value};
 use leyline_core::ContentAddressed;
-use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkHash};
+use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkDigest, StalkHash};
 use leyline_sheaf::complex::{CellComplex, RestrictionMap};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,8 +58,8 @@ const EDGE_ID_BASE: u32 = 1_000_000;
 pub struct Root(pub [u8; 32]);
 
 impl StalkHash for Root {
-    fn merkle_root(&self) -> [u8; 32] {
-        self.0
+    fn digest(&self) -> StalkDigest {
+        StalkDigest::Hash(self.0)
     }
 }
 

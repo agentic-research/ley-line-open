@@ -639,8 +639,10 @@ async fn test_daemon_socket_status_op() {
 
     let parsed = uds_round_trip(&sock_path, r#"{"op":"status"}"#).await;
     assert_eq!(parsed["ok"], true);
-    // T2.4: status emits `current_root` (hex). Fresh ctrl → zero sentinel.
-    assert_eq!(parsed["current_root"], "0".repeat(64));
+    // Bead `ley-line-open-80f037`: a fresh controller has published
+    // nothing, so `current_root` is omitted and `root_published` is false.
+    assert!(parsed.get("current_root").is_none(), "{parsed}");
+    assert_eq!(parsed["root_published"], false, "{parsed}");
 }
 
 #[tokio::test]
@@ -3254,12 +3256,16 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     }
 
     // T2.4: collect `current_root` hex strings from reparse + snapshot
-    // responses. Each response surfaces the controller's current root —
-    // a 64-char hex BLAKE3, or the zero sentinel if no snapshot has yet
-    // landed. With idempotent root semantics (same bytes → same root),
-    // unchanged dbs collapse to one root rather than 6 distinct ints.
-    // Race-safety assertion: every response is well-formed hex AND at
-    // least one snapshot completed and published a non-zero root.
+    // responses. Both ops publish before replying, so every response
+    // carries `root_published: true` and the 64-char hex BLAKE3 (bead
+    // `ley-line-open-80f037`: no zero sentinel). With idempotent root
+    // semantics (same bytes → same root), unchanged dbs collapse to one
+    // root rather than 6 distinct ints.
+    for r in &outcome {
+        if r.get("current_root").is_some() {
+            assert_eq!(r["root_published"], true, "{r}");
+        }
+    }
     let roots: Vec<String> = outcome
         .iter()
         .filter_map(|r| {
@@ -3686,7 +3692,7 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     // (zero) initial defect on the shared subspace.
     let topology_resp = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
     )
     .await;
     assert_eq!(
@@ -3707,7 +3713,7 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     // cascade must NOT include region 1, only the changed region 0.
     let invalidate_resp = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff","data":[1.0,0.5,42.0,7.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,42.0,7.0]}]}"#,
     )
     .await;
     let invalidated: Vec<u32> = invalidate_resp["invalidated"]
@@ -3730,7 +3736,7 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     // in-process cache has entries for these regions.
     let invalidate_resp2 = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee","data":[99.0,0.5,42.0,7.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee00000000000000000000000000000000000000000000000000000000000000","data":[99.0,0.5,42.0,7.0]}]}"#,
     )
     .await;
     let invalidated2: Vec<u32> = invalidate_resp2["invalidated"]
@@ -3782,7 +3788,7 @@ async fn e2e_sheaf_set_topology_heuristic_only_keeps_working() {
 
     let resp = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_set_topology","regions":[{"id":0,"hash":"aa"},{"id":1,"hash":"bb"}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0]}]}"#,
+        r#"{"op":"sheaf_set_topology","regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000"},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000"}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0]}]}"#,
     )
     .await;
     assert_eq!(resp["ok"], true);

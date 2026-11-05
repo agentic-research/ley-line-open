@@ -4,6 +4,10 @@
 //! a wrapper enum by downstream binaries (e.g. the private `leyline` binary
 //! that adds `daemon`, `embed`, `send`, etc.).
 
+// The build script includes this file to compute `LEYLINE_BUILD_VERSION`;
+// the crate compiles it only for its tests.
+#[cfg(test)]
+mod build_version;
 pub mod checkout;
 #[cfg(feature = "cdc")]
 pub mod cmd_cdc;

@@ -495,23 +495,17 @@ async fn file_change_drives_fine_grained_sheaf_invalidate_end_to_end() {
         changed_files_arr,
     );
 
-    // 5. `current_root` — 64-char lowercase hex string from the
-    //    substrate controller. Fresh arena returns the all-zeros
-    //    sentinel; anything non-empty proves `read_root_hex` reached
-    //    the controller successfully.
-    let root_hex = payload
-        .get("current_root")
-        .and_then(|v| v.as_str())
-        .expect("`current_root` must be a string");
+    // 5. The root, under the absence rule (bead `ley-line-open-80f037`).
+    //    This flow skips the snapshot, so the fresh arena has published
+    //    nothing: `root_published: false` and no `current_root`.
     assert_eq!(
-        root_hex.len(),
-        64,
-        "`current_root` must be a 64-char hex string; got {} chars: {root_hex:?}",
-        root_hex.len(),
+        payload.get("root_published"),
+        Some(&serde_json::Value::Bool(false)),
+        "nothing was published: {payload}",
     );
     assert!(
-        root_hex.chars().all(|c| c.is_ascii_hexdigit()),
-        "`current_root` must be lowercase hex; got {root_hex:?}",
+        payload.get("current_root").is_none(),
+        "`current_root` is omitted when nothing is published: {payload}",
     );
 
     // 6. `generation` — quoted u64. Bumped monotonically by

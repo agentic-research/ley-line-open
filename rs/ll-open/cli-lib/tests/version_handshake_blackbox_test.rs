@@ -121,20 +121,22 @@ async fn version_op_returns_known_shape() {
         "leyline_version must respond ok:true; got: {resp}",
     );
 
-    // `binary_version` — non-empty string, must match the daemon's
-    // own `CARGO_PKG_VERSION` (the constant the handler reads from).
+    // `binary_version` — the build's own version (bead
+    // `ley-line-open-5139a3`): the release line `CARGO_PKG_VERSION`, bare
+    // only on a tagged release build and `-dev+<shortsha>` otherwise.
     let bv = resp
         .get("binary_version")
         .and_then(|v| v.as_str())
         .expect("binary_version must be a string");
-    assert!(
-        !bv.is_empty(),
-        "binary_version must be non-empty; got {bv:?}",
-    );
     assert_eq!(
         bv,
-        env!("CARGO_PKG_VERSION"),
-        "binary_version must equal CARGO_PKG_VERSION at the consumer site",
+        leyline_cli_lib::daemon::version::BINARY_VERSION,
+        "binary_version must be the build's version",
+    );
+    assert!(
+        bv == env!("CARGO_PKG_VERSION")
+            || bv.starts_with(&format!("{}-dev+", env!("CARGO_PKG_VERSION"))),
+        "binary_version must be of this release line; got {bv:?}",
     );
     // `schema_version` is the independently versioned public schema contract.
     // v0.10.4 established daemon/wire as a supported public consumer surface;

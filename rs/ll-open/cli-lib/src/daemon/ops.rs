@@ -472,32 +472,37 @@ fn promote_touched(ctx: &DaemonContext, ids: &[&str]) {
 // closure" semantics today; the intent-marking becomes structural once
 // reads move to a checkout-from-pool path.
 
-/// T2.4: read the substrate's `current_root` and return as a 64-char
-/// lowercase hex string for the wire format. Centralizes the
-/// "open ctrl + read root" pair that every state-changing op includes
-/// in its JSON response. The `"open controller"` context string is
-/// part of the wire-error contract — clients see this when the
-/// controller path is broken. Wire-format key is `"current_root":
-/// "<hex>"` (paired with mache `mache-36d961` epic).
+/// T2.4: read the substrate's published root as 64-char lowercase hex for
+/// the wire. Centralizes the "open ctrl + read root" pair that every
+/// state-changing op includes in its JSON response. The `"open controller"`
+/// context string is part of the wire-error contract — clients see this when
+/// the controller path is broken.
 ///
-/// Before the first publish this is the 64-zero sentinel, never the BLAKE3
-/// of an arena. `status` states which case holds in `root_published` (bead
-/// `ley-line-open-80f037` F3); see `StatusResponse.rootPublished` in
-/// `daemon.capnp`.
+/// `None` means nothing is published (before the first publish, and after
+/// `--reset-arena` until the next one). The wire states that case by
+/// omitting `current_root` and setting `root_published: false`; it never
+/// spells it as 64 zero hex digits (bead `ley-line-open-80f037`). A read
+/// error is an `Err`, never an empty or zero root. See the absence rule on
+/// `StatusResponse` in `daemon.capnp`.
 ///
-/// `pub(crate)` since sheaf gap 3 (bead `ley-line-open-3b3476`): the
-/// watcher-driven `daemon.sheaf.invalidate` emit in `cmd_daemon.rs`
-/// needs the current root as a cache-invalidation key on its payload.
-/// Every other caller stays inside `ops.rs`.
-pub(crate) fn read_root_hex(ctrl_path: &Path) -> Result<String> {
+/// `pub(crate)` since sheaf gap 3 (bead `ley-line-open-3b3476`): the sheaf
+/// invalidate emits in `cmd_daemon.rs` and `sheaf_ops.rs` carry the root.
+pub(crate) fn read_root_hex(ctrl_path: &Path) -> Result<Option<String>> {
     let ctrl = Controller::open_or_create(ctrl_path).context("open controller")?;
-    let root = ctrl.current_root();
-    let mut s = String::with_capacity(64);
-    use std::fmt::Write;
-    for b in &root {
-        let _ = write!(s, "{b:02x}");
-    }
-    Ok(s)
+    Ok(ctrl.published_root().map(hex::encode))
+}
+
+/// Applies the daemon's root absence rule to one response builder:
+/// `root_published` always, `current_root` only when a root is published.
+/// A macro because each response is its own generated builder type.
+macro_rules! set_root_fields {
+    ($builder:expr, $root:expr) => {{
+        let root: &Option<String> = $root;
+        if let Some(hex) = root {
+            $builder.set_current_root(hex);
+        }
+        $builder.set_root_published(root.is_some());
+    }};
 }
 
 /// Publish the living db to the arena before replying. Used by the ops
@@ -542,20 +547,17 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     let mut entries: Vec<(&String, &super::PassStatus)> = state.enrichment.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    // T2.4 wire format: BLAKE3 of arena bytes as 64-char hex. Read once, so
-    // `current_root` and `root_published` describe the same snapshot; the
-    // zero sentinel's spelling stays for consumers pinned to it (bead
-    // `ley-line-open-80f037` F3).
-    let published = ctrl.published_root();
-    let current_root_hex = hex::encode(published.unwrap_or([0u8; 32]));
+    // T2.4 wire format: BLAKE3 of arena bytes as 64-char hex, under the root
+    // absence rule (bead `ley-line-open-80f037`). Read once, so
+    // `current_root` and `root_published` describe the same snapshot.
+    let current_root = ctrl.published_root().map(hex::encode);
 
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::status_response::Builder =
         builder.init_root();
     root.set_ok(true);
     root.set_phase(state.phase.as_str());
-    root.set_current_root(&current_root_hex);
-    root.set_root_published(published.is_some());
+    set_root_fields!(root, &current_root);
     root.set_arena_path(ctrl.arena_path());
     root.set_arena_size(ctrl.arena_size());
     // Legacy `enrichment @6 :Text` field deliberately left unset —
@@ -612,7 +614,7 @@ fn op_flush(ctrl_path: &Path) -> Result<String> {
     let mut root: leyline_public_schema::daemon_capnp::flush_response::Builder =
         builder.init_root();
     root.set_ok(true);
-    root.set_current_root(&current_root);
+    set_root_fields!(root, &current_root);
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::flush_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
@@ -635,7 +637,7 @@ fn op_load(ctx: &DaemonContext, db_b64: &str) -> Result<String> {
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::load_response::Builder = builder.init_root();
     root.set_ok(true);
-    root.set_current_root(&current_root);
+    set_root_fields!(root, &current_root);
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::load_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
@@ -763,7 +765,7 @@ fn op_reparse(
     let mut root: leyline_public_schema::daemon_capnp::reparse_response::Builder =
         builder.init_root();
     root.set_ok(true);
-    root.set_current_root(&current_root);
+    set_root_fields!(root, &current_root);
     // A scoped reconcile that ingested nothing ran no parse: every count is
     // 0 and no file changed.
     let changed_files: &[String] = match &result {
@@ -824,7 +826,7 @@ fn op_enrich(ctx: &DaemonContext, pass_name: &str, files: Option<&[String]>) -> 
     let mut root: leyline_public_schema::daemon_capnp::enrich_response::Builder =
         builder.init_root();
     root.set_ok(true);
-    root.set_current_root(&current_root);
+    set_root_fields!(root, &current_root);
     let mut passes_b = root.init_passes(stats.len() as u32);
     for (i, s) in stats.iter().enumerate() {
         let mut entry = passes_b.reborrow().get(i as u32);
@@ -854,7 +856,7 @@ fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
     let mut root: leyline_public_schema::daemon_capnp::snapshot_response::Builder =
         builder.init_root();
     root.set_ok(true);
-    root.set_current_root(&current_root);
+    set_root_fields!(root, &current_root);
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::snapshot_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
@@ -4351,7 +4353,7 @@ mod tests {
     fn setup_with_ext(
         ext: Arc<dyn crate::daemon::DaemonExt>,
     ) -> (TempDir, std::sync::Arc<DaemonContext>) {
-        setup_full(ext, false)
+        setup_full(ext, false, vec![])
     }
 
     /// A context whose `source_dir` is the temp dir itself, so absolute
@@ -4883,7 +4885,63 @@ mod tests {
     }
 
     fn setup_rooted() -> (TempDir, std::sync::Arc<DaemonContext>) {
-        setup_full(Arc::new(crate::daemon::NoExt), true)
+        setup_full(Arc::new(crate::daemon::NoExt), true, vec![])
+    }
+
+    /// An enrichment pass that writes nothing and reports one file.
+    struct NoopPass;
+
+    impl crate::daemon::enrichment::EnrichmentPass for NoopPass {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn reads(&self) -> &[&str] {
+            &[]
+        }
+        fn writes(&self) -> &[&str] {
+            &[]
+        }
+        fn run(
+            &self,
+            _conn: &Connection,
+            _source_dir: &std::path::Path,
+            _changed_files: Option<&[String]>,
+        ) -> Result<crate::daemon::enrichment::EnrichmentStats> {
+            Ok(crate::daemon::enrichment::EnrichmentStats {
+                pass_name: "noop".into(),
+                files_processed: 1,
+                items_added: 0,
+                duration_ms: 0,
+                skipped: vec![],
+            })
+        }
+    }
+
+    /// Bead `ley-line-open-80f037`: `enrich` publishes before it replies, so
+    /// its response carries the published root under the absence rule.
+    #[tokio::test]
+    async fn enrich_reports_the_root_it_published() {
+        let (_dir, ctx) = setup_full(
+            Arc::new(crate::daemon::NoExt),
+            true,
+            vec![Box::new(NoopPass)],
+        );
+        // The pass basis lives in `_meta`, which a parse creates.
+        ctx.with_write(|conn| {
+            Ok(conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)",
+            )?)
+        })
+        .unwrap();
+        let r = call(&ctx, json!({"op": "enrich", "pass": "noop"}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["root_published"], true, "{r}");
+        let published = Controller::open_or_create(&ctx.ctrl_path)
+            .unwrap()
+            .published_root()
+            .expect("enrich published a root");
+        assert_eq!(r["current_root"], hex::encode(published), "{r}");
+        assert_eq!(r["passes"][0]["pass_name"], "noop", "{r}");
     }
 
     /// A daemon whose source directory (its checkout) holds `a.go` and
@@ -5069,6 +5127,7 @@ mod tests {
     fn setup_full(
         ext: Arc<dyn crate::daemon::DaemonExt>,
         rooted: bool,
+        enrichment_passes: Vec<Box<dyn crate::daemon::enrichment::EnrichmentPass>>,
     ) -> (TempDir, std::sync::Arc<DaemonContext>) {
         let dir = TempDir::new().unwrap();
         let arena_path = dir.path().join("test.arena");
@@ -5109,7 +5168,7 @@ mod tests {
             enrich_inflight: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             source_dir: rooted.then(|| dir.path().to_path_buf()),
             lang_filter: None,
-            enrichment_passes: vec![],
+            enrichment_passes,
             state: Arc::new(RwLock::new(crate::daemon::DaemonState::initializing())),
             #[cfg(feature = "vec")]
             vec_index,
@@ -5417,21 +5476,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_op_status_returns_zero_root_for_fresh_controller() {
-        // T2.4: op_status emits `current_root` (hex) — not `generation`.
-        // A fresh controller with no arena published yields the
-        // 64-char zero sentinel.
+    async fn op_status_omits_current_root_for_fresh_controller() {
+        // Bead `ley-line-open-80f037`: a fresh controller has published
+        // nothing, so `current_root` is absent from the wire. No 64-zero
+        // stand-in.
         let (_dir, ctx) = setup();
         let result = handle_base_op_legacy(&ctx, "status", &json!({}));
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["ok"], true);
-        assert_eq!(parsed["current_root"], "0".repeat(64));
+        assert!(parsed.get("current_root").is_none(), "{parsed}");
+        assert_eq!(parsed["root_published"], false, "{parsed}");
     }
 
     /// Bead `ley-line-open-80f037` F3(b): whether a root has been published
-    /// is stated by `root_published`, not inferred from 64 zero hex digits.
-    /// `current_root` keeps its zero spelling for consumers pinned to it.
+    /// is stated by `root_published`, and `current_root` is present exactly
+    /// when it is `true`.
     #[tokio::test]
     async fn op_status_states_whether_a_root_is_published() {
         let (_dir, ctx) = setup();
@@ -5441,7 +5501,7 @@ mod tests {
         };
         let fresh = status(&ctx);
         assert_eq!(fresh["root_published"], false, "{fresh}");
-        assert_eq!(fresh["current_root"], "0".repeat(64), "{fresh}");
+        assert!(fresh.get("current_root").is_none(), "{fresh}");
 
         let mut ctrl = Controller::open_or_create(&ctx.ctrl_path).unwrap();
         let (path, size) = (ctrl.arena_path(), ctrl.arena_size());
@@ -5676,7 +5736,6 @@ mod tests {
         for required_field in [
             "ok",
             "phase",
-            "current_root",
             "root_published",
             "arena_path",
             "arena_size",
@@ -5704,12 +5763,14 @@ mod tests {
              got keys {:?}",
             obj.keys().collect::<Vec<_>>(),
         );
-        // current_root is 64-char hex (zero sentinel for fresh setup).
-        let root = parsed["current_root"]
-            .as_str()
-            .expect("current_root is a string");
-        assert_eq!(root.len(), 64, "current_root is BLAKE3 hex (64 chars)");
-        assert_eq!(root, "0".repeat(64), "fresh controller emits zero sentinel");
+        // Nothing is published on a fresh setup: `current_root` is absent
+        // and `root_published` says so (bead `ley-line-open-80f037`).
+        assert!(
+            !obj.contains_key("current_root"),
+            "a fresh controller publishes no root; got keys {:?}",
+            obj.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(parsed["root_published"], false);
         // phase from a fresh setup is "initializing".
         assert_eq!(parsed["phase"], "initializing");
         // enrichment_typed is a typed JSON array — no double parse on
@@ -5815,13 +5876,11 @@ mod tests {
         }
     }
 
+    /// Bead `ley-line-open-80f037`: a brand-new controller has published
+    /// nothing, and `read_root_hex` says so with `None`, never with 64 zero
+    /// hex digits. After a publish it returns that root's lowercase hex.
     #[test]
-    fn read_root_hex_is_zero_sentinel_for_fresh_controller() {
-        // T2.4 wire-contract: a brand-new controller reports
-        // current_root as 64 zero hex chars. This is what op_status /
-        // op_flush / op_load / op_reparse / op_enrich / op_snapshot
-        // surface to clients in the `current_root` field after the
-        // breaking version bump.
+    fn read_root_hex_is_none_for_fresh_controller() {
         let dir = TempDir::new().unwrap();
         let arena_path = dir.path().join("g.arena");
         let ctrl_path = dir.path().join("g.ctrl");
@@ -5831,7 +5890,38 @@ mod tests {
             .unwrap();
         drop(ctrl);
 
-        assert_eq!(read_root_hex(&ctrl_path).unwrap(), "0".repeat(64));
+        assert_eq!(read_root_hex(&ctrl_path).unwrap(), None);
+
+        let mut ctrl = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+        ctrl.set_arena_with_root(&arena_path.to_string_lossy(), 1024 * 1024, [0xC4; 32])
+            .unwrap();
+        drop(ctrl);
+        assert_eq!(read_root_hex(&ctrl_path).unwrap(), Some("c4".repeat(32)));
+    }
+
+    /// Bead `ley-line-open-80f037`: every response that carries a root
+    /// follows the status rule. `root_published` is always present, and
+    /// `current_root` is present exactly when it is `true`.
+    #[tokio::test]
+    async fn root_carrying_responses_state_absence_like_status() {
+        let (_dir, ctx) = setup();
+        let flush = call(&ctx, json!({"op": "flush"}));
+        assert_eq!(flush["ok"], true, "{flush}");
+        assert_eq!(flush["root_published"], false, "{flush}");
+        assert!(flush.get("current_root").is_none(), "{flush}");
+
+        let snap = call(&ctx, json!({"op": "snapshot"}));
+        assert_eq!(snap["ok"], true, "{snap}");
+        assert_eq!(snap["root_published"], true, "{snap}");
+        let published = Controller::open_or_create(&ctx.ctrl_path)
+            .unwrap()
+            .published_root()
+            .expect("snapshot published a root");
+        assert_eq!(snap["current_root"], hex::encode(published), "{snap}");
+
+        let flush = call(&ctx, json!({"op": "flush"}));
+        assert_eq!(flush["root_published"], true, "{flush}");
+        assert_eq!(flush["current_root"], hex::encode(published), "{flush}");
     }
 
     #[test]

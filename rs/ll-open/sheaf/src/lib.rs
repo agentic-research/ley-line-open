@@ -119,11 +119,12 @@ pub mod cache;
 pub mod complex;
 pub mod learn;
 pub mod merkle;
+pub mod region;
 pub mod restriction_review;
 pub mod sparse;
 pub mod topology;
 
-pub use cache::{CacheEntry, RestrictionEdge, SheafCache};
+pub use cache::{CacheEntry, RestrictionEdge, SheafCache, StalkDigest};
 pub use complex::{Cell, Cell2, CellComplex, RestrictionMap, Stalk, Violation};
 pub use learn::CoChangeTracker;
 pub use merkle::{MerkleProof, compute_merkle_root, hash_node, merkle_proof, verify_merkle_proof};

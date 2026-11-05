@@ -7,7 +7,6 @@
       "ok": true,
       "generation": "0",
       "phase": "ready",
-      "current_root": "0000000000000000000000000000000000000000000000000000000000000000",
       "arena_path": "/tmp/test/arena",
       "arena_size": "67108864",
       "enrichment_typed": [
@@ -17,8 +16,8 @@
       "source_root": "/tmp/test/source",
       "root_published": false
     },
-    "response_required_keys": ["ok", "generation", "phase", "current_root", "arena_path", "arena_size", "enrichment_typed", "last_reparse_at_ms", "root_published"],
-    "response_optional_keys": ["head_sha", "error", "enrichment", "source_root"],
+    "response_required_keys": ["ok", "generation", "phase", "arena_path", "arena_size", "enrichment_typed", "last_reparse_at_ms", "root_published"],
+    "response_optional_keys": ["current_root", "head_sha", "error", "enrichment", "source_root"],
     "go_binding": "StatusResponse",
     "go_drift_skip": null
   },
@@ -27,10 +26,10 @@
     "request": {"op": "flush"},
     "response": {
       "ok": true,
-      "current_root": "0000000000000000000000000000000000000000000000000000000000000000"
+      "root_published": false
     },
-    "response_required_keys": ["ok", "current_root"],
-    "response_optional_keys": [],
+    "response_required_keys": ["ok", "root_published"],
+    "response_optional_keys": ["current_root"],
     "go_binding": "FlushResponse",
     "go_drift_skip": null
   },
@@ -40,9 +39,10 @@
     "response": {
       "ok": true,
       "generation": "0",
-      "current_root": "0000000000000000000000000000000000000000000000000000000000000000"
+      "current_root": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "root_published": true
     },
-    "response_required_keys": ["ok", "generation", "current_root"],
+    "response_required_keys": ["ok", "generation", "current_root", "root_published"],
     "response_optional_keys": [],
     "go_binding": "SnapshotResponse",
     "go_drift_skip": null
@@ -416,11 +416,11 @@
     "request": {
       "op": "sheaf_set_topology",
       "regions": [
-        {"id": 0, "hash": "aa", "data": []},
-        {"id": 1, "hash": "bb", "data": []}
+        {"id": 0, "hash": "aa00000000000000000000000000000000000000000000000000000000000000", "data": []},
+        {"id": 1, "hash": "bb00000000000000000000000000000000000000000000000000000000000000", "data": []}
       ],
       "restrictions": [
-        {"a": 0, "b": 1, "boundary_hash": "11", "co_change_rate": 0.5, "revert_rate": 0.0, "weights": [1.0], "agreement_dim": 0}
+        {"a": 0, "b": 1, "boundary_hash": "1100000000000000000000000000000000000000000000000000000000000000", "co_change_rate": 0.5, "revert_rate": 0.0, "weights": [1.0], "agreement_dim": 0}
       ],
       "node_stalk_dim": 0
     },
@@ -435,7 +435,7 @@
     "request": {
       "op": "sheaf_invalidate",
       "regions": [0],
-      "stalks": [{"id": 0, "hash": "ff", "data": []}]
+      "stalks": [{"id": 0, "hash": "ff00000000000000000000000000000000000000000000000000000000000000", "data": []}]
     },
     "response": {"invalidated": [], "count": 0, "generation": "1"},
     "response_required_keys": ["invalidated", "count", "generation"],

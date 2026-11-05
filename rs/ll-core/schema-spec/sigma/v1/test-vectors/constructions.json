@@ -1,0 +1,286 @@
+{
+  "$comment": "Known-answer vectors for every Σ construction LLO ships (ADR-0047 §5, (DET); bead ley-line-open-10d71a). Each case pins its inputs and, where the construction hashes an encoding, the exact preimage bytes, so a second implementation checks its framing and its hash independently. Consumed by Rust tests in leyline-core (sigmaBytes, partition, headDigest), leyline-cli-lib (parserId, treeRoot, astNode) and leyline-cache (restrictionKey); run_id is pinned by ../../execution/v1/test-vectors/run-id.json. A changed value is an identity migration that needs a version bump, never an edit.",
+  "constructionSet": "leyline/sigma/v1",
+  "hash": "blake3-256",
+  "sigmaBytes": [
+    {
+      "address": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "inputHex": "",
+      "name": "empty"
+    },
+    {
+      "address": "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+      "inputHex": "616263",
+      "name": "abc"
+    },
+    {
+      "address": "3e4497618e12630b191454a7adc034162b3b1a319eb5688afcadd46d83f60096",
+      "len": 131073,
+      "name": "max-chunk-plus-one-ff",
+      "repeatByte": "ff"
+    }
+  ],
+  "partition": [
+    {
+      "address": "59ccdeaf15678545329319bcf862f7d8fa46c6dac9633ba11e7bf887566c51ca",
+      "canonVersion": 1,
+      "domain": "ByteStream",
+      "entries": [
+        {
+          "a": 0,
+          "addr": "0101010101010101010101010101010101010101010101010101010101010101",
+          "b": 10
+        },
+        {
+          "a": 10,
+          "addr": "0202020202020202020202020202020202020202020202020202020202020202",
+          "b": 10
+        }
+      ],
+      "name": "byte-stream",
+      "paramsHex": "",
+      "preimageHex": "01010000000e00000000000000746573742f736368656d652f763100000000000000000200000000000000010101010101010101010101010101010101010101010101010101010101010100000000000000000a0000000000000002020202020202020202020202020202020202020202020202020202020202020a000000000000000a00000000000000",
+      "scheme": "test/scheme/v1"
+    },
+    {
+      "address": "52b8944fc87ef63a9fa0e624adce5a36458d2cdeec7dbec4863286b26fa62657",
+      "canonVersion": 1,
+      "domain": "ChunkSet",
+      "entries": [
+        {
+          "a": 10,
+          "addr": "0202020202020202020202020202020202020202020202020202020202020202",
+          "b": 10
+        },
+        {
+          "a": 0,
+          "addr": "0101010101010101010101010101010101010101010101010101010101010101",
+          "b": 10
+        }
+      ],
+      "name": "chunk-set-enumerated-in-reverse",
+      "paramsHex": "",
+      "preimageHex": "02010000000e00000000000000746573742f736368656d652f763100000000000000000200000000000000010101010101010101010101010101010101010101010101010101010101010100000000000000000a0000000000000002020202020202020202020202020202020202020202020202020202020202020a000000000000000a00000000000000",
+      "scheme": "test/scheme/v1"
+    },
+    {
+      "address": "9057f8536f59da25ce81c97d5dae1f6b1a6d59957b05ad05ded36ca661e904b9",
+      "canonVersion": 2,
+      "domain": "RowSet",
+      "entries": [
+        {
+          "a": 5,
+          "addr": "0303030303030303030303030303030303030303030303030303030303030303",
+          "b": 0
+        },
+        {
+          "a": 1,
+          "addr": "0303030303030303030303030303030303030303030303030303030303030303",
+          "b": 0
+        },
+        {
+          "a": 0,
+          "addr": "0404040404040404040404040404040404040404040404040404040404040404",
+          "b": 7
+        }
+      ],
+      "name": "row-set-with-params",
+      "paramsHex": "706172616d73",
+      "preimageHex": "03020000000c00000000000000746573742f726f77732f76310600000000000000706172616d730300000000000000030303030303030303030303030303030303030303030303030303030303030301000000000000000000000000000000030303030303030303030303030303030303030303030303030303030303030305000000000000000000000000000000040404040404040404040404040404040404040404040404040404040404040400000000000000000700000000000000",
+      "scheme": "test/rows/v1"
+    },
+    {
+      "address": "28eeff840f27d2950cd6108afb9037f185f03927936269faf50632c7720e47bd",
+      "canonVersion": 1,
+      "domain": "RowSet",
+      "entries": [],
+      "name": "row-set-empty",
+      "paramsHex": "",
+      "preimageHex": "03010000000c00000000000000746573742f726f77732f763100000000000000000000000000000000",
+      "scheme": "test/rows/v1"
+    },
+    {
+      "address": "0f32f27c7afb66a2f00f099df5c981c6cd6e1a8a35b74a227b692e59ea04c0ef",
+      "canonVersion": 1,
+      "domain": "ByteStream",
+      "entries": [
+        {
+          "a": 0,
+          "addr": "0505050505050505050505050505050505050505050505050505050505050505",
+          "b": 100
+        },
+        {
+          "a": 1,
+          "addr": "0000000000000000000000000000000000000000000000000000000000000000",
+          "b": 0
+        },
+        {
+          "a": 2,
+          "addr": "0606060606060606060606060606060606060606060606060606060606060606",
+          "b": 50
+        }
+      ],
+      "name": "segment-root-with-absent-segment",
+      "paramsHex": "",
+      "preimageHex": "010100000017000000000000006c65796c696e652f7365676d656e742d726f6f742f763100000000000000000300000000000000050505050505050505050505050505050505050505050505050505050505050500000000000000006400000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000060606060606060606060606060606060606060606060606060606060606060602000000000000003200000000000000",
+      "scheme": "leyline/segment-root/v1"
+    }
+  ],
+  "headDigest": [
+    {
+      "digest": "435e67cfd5382447ee4527bd68a9b77bbb26d2bb349d5347b6f2a07cf48e6772",
+      "generation": 1,
+      "name": "first-head",
+      "parentDigest": null,
+      "parentHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "parserId": "3333333333333333333333333333333333333333333333333333333333333333",
+      "preimageHex": "0100000000000000111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000002222222222222222222222222222222222222222222222222222222222222222333333333333333333333333333333333333333333333333333333333333333300",
+      "rootHash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "treeRoot": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    {
+      "digest": "b2c2d59fbec3c532520effbfc09c2852ce80bf9b8599ace7a9bc344f8eb6143d",
+      "generation": 7,
+      "name": "with-parent-digest",
+      "parentDigest": "6666666666666666666666666666666666666666666666666666666666666666",
+      "parentHash": "5555555555555555555555555555555555555555555555555555555555555555",
+      "parserId": "8888888888888888888888888888888888888888888888888888888888888888",
+      "preimageHex": "07000000000000004444444444444444444444444444444444444444444444444444444444444444555555555555555555555555555555555555555555555555555555555555555577777777777777777777777777777777777777777777777777777777777777778888888888888888888888888888888888888888888888888888888888888888016666666666666666666666666666666666666666666666666666666666666666",
+      "rootHash": "4444444444444444444444444444444444444444444444444444444444444444",
+      "treeRoot": "7777777777777777777777777777777777777777777777777777777777777777"
+    }
+  ],
+  "parserId": [
+    {
+      "name": "fixed-inputs",
+      "scheme": "leyline/parser-id/v1",
+      "irSchemaVersion": "merkle-ast-v2",
+      "projectionSchemaVersion": "projection-v10",
+      "extractionEpoch": "7",
+      "injectionEpoch": "inj-3",
+      "querySetEpoch": "qs-0",
+      "grammars": [
+        {
+          "name": "rust",
+          "digest": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        },
+        {
+          "name": "go",
+          "digest": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        }
+      ],
+      "address": "dcb70a3ae4a87021560e88e8de27880e0835247716730e360f2375ee0a468230"
+    }
+  ],
+  "treeRoot": [
+    {
+      "name": "modes-and-empty-directory",
+      "scheme": "leyline/tree-root/v1",
+      "parserId": "dcb70a3ae4a87021560e88e8de27880e0835247716730e360f2375ee0a468230",
+      "leaves": [
+        {
+          "path": "src/main.rs",
+          "mode": 33188,
+          "content": "2d1ebfa706ba230165250f744796a92accba5e1b6fa357983b65319da33f8e93"
+        },
+        {
+          "path": "bin/run",
+          "mode": 33261,
+          "content": "bc1f407a11c9377c8b9b13f956b279c8462775105eb958fc9ae3c40de87cc96e"
+        },
+        {
+          "path": "link",
+          "mode": 40960,
+          "content": "6d9bc68d5fc74f698ad6621febe779b24b1882c1a4c3e4635b80b5b3534512ca"
+        },
+        {
+          "path": "empty",
+          "mode": 16384,
+          "content": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        }
+      ],
+      "address": "10c255639f95368d4dcf3502d23fdf6a240365cf5fb780c554d653ebad0b9091"
+    },
+    {
+      "name": "empty-store",
+      "scheme": "leyline/tree-root/v1",
+      "parserId": "dcb70a3ae4a87021560e88e8de27880e0835247716730e360f2375ee0a468230",
+      "leaves": [],
+      "address": "6fd24d1283530626dcb3733473e47628889499b3a5f3dfe2ec77a1a37efd520d"
+    }
+  ],
+  "astNode": [
+    {
+      "name": "leaf-fn-73add7",
+      "tag": "leaf",
+      "kind": "fn",
+      "token": "fn",
+      "preimageHex": "6c6c6f2f6173742f7631000002666e02666e",
+      "address": "48a1b7c4106f797a124a6804a620347194ddd1194ef7851612ef1e0799c8b8bd"
+    },
+    {
+      "name": "leaf-identifier",
+      "tag": "leaf",
+      "kind": "identifier",
+      "token": "main",
+      "preimageHex": "6c6c6f2f6173742f763100000a6964656e746966696572046d61696e",
+      "address": "ae3b28228438e1e4efa287ec838c779a6a42088e64e491522e7ecb252d93f677"
+    },
+    {
+      "name": "internal-function-item",
+      "tag": "internal",
+      "kind": "function_item",
+      "children": [
+        "48a1b7c4106f797a124a6804a620347194ddd1194ef7851612ef1e0799c8b8bd",
+        "ae3b28228438e1e4efa287ec838c779a6a42088e64e491522e7ecb252d93f677"
+      ],
+      "preimageHex": "6c6c6f2f6173742f763100010d66756e6374696f6e5f6974656d0248a1b7c4106f797a124a6804a620347194ddd1194ef7851612ef1e0799c8b8bdae3b28228438e1e4efa287ec838c779a6a42088e64e491522e7ecb252d93f677",
+      "address": "218d860b68d07098c10f16a1c6646ea8194a93e7bc90215247374b70ab6c6671"
+    }
+  ],
+  "restrictionKey": [
+    {
+      "name": "call-target-three-rows",
+      "scheme": "leyline/restriction/call-target/token-eq/v1",
+      "parserId": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+      "rows": [
+        {
+          "kind": 0,
+          "fieldsHex": [
+            "7372632f6c69622e7273",
+            "726576696577"
+          ],
+          "address": "e7ed14ad4ac92e9d3351be6f6c46a29e950cbb0ca1e5f5169f3017d96b9a3376"
+        },
+        {
+          "kind": 1,
+          "fieldsHex": [
+            "68656c706572",
+            "00"
+          ],
+          "address": "b77680d17907c3e281bd2143c92491170f16ddaa737114f1ff404e43af2803ed"
+        },
+        {
+          "kind": 3,
+          "fieldsHex": [
+            "68656c706572",
+            "7372632f7574696c2e7273",
+            "66756e6374696f6e"
+          ],
+          "address": "9d358a8da39afdb4b3bbdcb30931a570fce1cb7d6b629b76d83a0ae4cd144d39"
+        }
+      ],
+      "address": "ebf29aad9179a30809d58a675d4318fab46429ed17a6394982048384bdb091cb"
+    },
+    {
+      "name": "call-target-empty",
+      "scheme": "leyline/restriction/call-target/token-eq/v1",
+      "parserId": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+      "rows": [],
+      "address": "9cfc3ced4b1bcf3f41a5bb04b8a2328d1b9a9a138cd720c45556b2e2537e99a2"
+    }
+  ],
+  "runId": {
+    "vectors": "../../execution/v1/test-vectors/run-id.json"
+  }
+}

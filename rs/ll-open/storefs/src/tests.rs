@@ -272,6 +272,27 @@ fn a_read_serves_the_blob_the_store_holds_for_the_path() {
     assert_eq!(f.fs.read(h, A.len() as u64 + 10, 5).unwrap(), b"");
 }
 
+/// Σ (CA) as verify-on-read, decade F3 (ADR-0047 §5
+/// `ca_tampered_payload_is_refused`, bead `ley-line-open-10d71a`): a store
+/// whose bytes under a file's blob hash were changed in place serves `EIO`
+/// on open, never the tampered bytes as the file.
+#[test]
+fn ca_tampered_payload_is_refused() {
+    let f = fixture(whole());
+    let (_, blob) = read_source(&f, "a.go");
+    f.fs.store()
+        .with_write(|conn| {
+            conn.execute(
+                "UPDATE source_blobs SET blob_bytes = ?2 WHERE blob_hash = ?1",
+                rusqlite::params![blob.as_bytes().as_slice(), b"package tampered\n".as_slice()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let inode = ino(&f, "a.go");
+    assert_eq!(f.fs.open(inode, O_RDONLY).err(), Some(Errno::EIO));
+}
+
 #[test]
 fn an_open_reads_its_blob_once_and_keeps_serving_it() {
     let f = fixture(whole());

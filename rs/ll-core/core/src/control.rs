@@ -1414,4 +1414,168 @@ mod tests {
             );
         }
     }
+
+    /// Σ axiom (IM), decade F1, ADR-0047 §5 (bead `ley-line-open-10d71a`):
+    /// a writer SIGKILLed at any point of a publish never leaves a root a
+    /// reader can observe that does not resolve to a complete image hashing
+    /// to it. The kill points are deterministic, not timed: the writer is a
+    /// forked child that kills itself at a named point, the mid-root one
+    /// through [`Controller::set_arena_with_root_hooked`]'s seam between the
+    /// two halves of the root write.
+    ///
+    /// | Kill point                    | Observed root                     |
+    /// |-------------------------------|-----------------------------------|
+    /// | half of the new image written | the old root, over the old image  |
+    /// | image written, not published  | the old root, over the old image  |
+    /// | between the two root halves   | none (`[0; 32]`): never torn      |
+    /// | after the publish returned    | the new root, over the new image  |
+    ///
+    /// After every kill a restarted writer's publish is observed whole.
+    ///
+    /// The child touches only state prepared before the fork (a controller of
+    /// its own, an open image file, the image bytes), so it allocates
+    /// nothing. Its controller is opened before the fork and the parent's
+    /// copy is dropped at once, so the publish lock's open file description
+    /// dies with the child, as a killed daemon's does.
+    #[cfg(unix)]
+    #[test]
+    fn im_sigkill_mid_publish_never_exposes_torn_root() {
+        use std::os::fd::AsRawFd;
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum KillAt {
+            MidImageWrite,
+            ImageWrittenNotPublished,
+            MidRoot,
+            AfterPublish,
+        }
+
+        fn image(seed: u8) -> Vec<u8> {
+            (0..3 * 4096u32)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        }
+
+        fn sigma(bytes: &[u8]) -> [u8; 32] {
+            *blake3::hash(bytes).as_bytes()
+        }
+
+        /// Every observed root resolves to a complete image that hashes to
+        /// it; returns the root.
+        fn observe(ctrl: &Path) -> [u8; 32] {
+            let reader = Controller::open_or_create(ctrl).unwrap();
+            let root = reader.current_root();
+            if root != [0u8; 32] {
+                let bytes = std::fs::read(reader.arena_path()).unwrap();
+                assert_eq!(
+                    sigma(&bytes[..reader.arena_size() as usize]),
+                    root,
+                    "an observed root must resolve to the image that hashes to it"
+                );
+            }
+            root
+        }
+
+        fn kill_self() {
+            // SAFETY: async-signal-safe calls in a single-threaded child.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+        }
+
+        fn write_all(fd: i32, bytes: &[u8]) {
+            let mut done = 0;
+            while done < bytes.len() {
+                // SAFETY: `bytes[done..]` is a live, initialized buffer.
+                let n =
+                    unsafe { libc::write(fd, bytes[done..].as_ptr().cast(), bytes.len() - done) };
+                assert!(n > 0, "image write failed");
+                done += n as usize;
+            }
+        }
+
+        for at in [
+            KillAt::MidImageWrite,
+            KillAt::ImageWrittenNotPublished,
+            KillAt::MidRoot,
+            KillAt::AfterPublish,
+        ] {
+            let dir = tempdir().unwrap();
+            let ctrl = dir.path().join("im.ctrl");
+            let (v0, v1) = (image(0), image(1));
+            let (r0, r1) = (sigma(&v0), sigma(&v1));
+            let p0 = dir.path().join("arena-0.img");
+            let p1 = dir.path().join("arena-1.img");
+            let (p0s, p1s) = (
+                p0.to_str().unwrap().to_string(),
+                p1.to_str().unwrap().to_string(),
+            );
+            std::fs::write(&p0, &v0).unwrap();
+            Controller::open_or_create(&ctrl)
+                .unwrap()
+                .set_arena_with_root(&p0s, v0.len() as u64, r0)
+                .unwrap();
+            assert_eq!(observe(&ctrl), r0);
+
+            let mut child_writer = Some(Controller::open_or_create(&ctrl).unwrap());
+            let new_image = std::fs::File::create(&p1).unwrap();
+            let fd = new_image.as_raw_fd();
+
+            // SAFETY: the child runs only the prepared, allocation-free
+            // steps below and ends in SIGKILL; it never returns.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                let w = child_writer.as_mut().unwrap();
+                match at {
+                    KillAt::MidImageWrite => {
+                        write_all(fd, &v1[..v1.len() / 2]);
+                        kill_self();
+                    }
+                    KillAt::ImageWrittenNotPublished => {
+                        write_all(fd, &v1);
+                        kill_self();
+                    }
+                    KillAt::MidRoot => {
+                        write_all(fd, &v1);
+                        let _ =
+                            w.set_arena_with_root_hooked(&p1s, v1.len() as u64, r1, &mut kill_self);
+                    }
+                    KillAt::AfterPublish => {
+                        write_all(fd, &v1);
+                        let _ = w.set_arena_with_root(&p1s, v1.len() as u64, r1);
+                        kill_self();
+                    }
+                }
+                // Unreachable: every arm has killed the child.
+                // SAFETY: `_exit` is async-signal-safe and never returns.
+                unsafe { libc::_exit(1) };
+            }
+            drop(child_writer.take());
+            drop(new_image);
+            let mut status = 0;
+            // SAFETY: `pid` is this process's child.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(
+                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+                "{at:?}: the writer must die by SIGKILL at its kill point (status {status})"
+            );
+
+            let observed = observe(&ctrl);
+            let expected = match at {
+                KillAt::MidImageWrite | KillAt::ImageWrittenNotPublished => r0,
+                KillAt::MidRoot => [0u8; 32],
+                KillAt::AfterPublish => r1,
+            };
+            assert_eq!(observed, expected, "{at:?}: observed root");
+
+            // A restarted writer publishes the complete new image whole.
+            std::fs::write(&p1, &v1).unwrap();
+            Controller::open_or_create(&ctrl)
+                .unwrap()
+                .set_arena_with_root(&p1s, v1.len() as u64, r1)
+                .unwrap();
+            assert_eq!(observe(&ctrl), r1, "{at:?}: the restart's publish");
+        }
+    }
 }

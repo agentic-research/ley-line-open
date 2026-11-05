@@ -4852,11 +4852,34 @@ mod tests {
     /// Bead `ley-line-open-5dc3a5`: `read_source` returns the hash
     /// `propose` compares — the file's manifest entry's `blob_hash`
     /// (ADR-0045 T1) — so a read followed by a propose against it agrees by
-    /// construction, even when the stored key is not the hash of the bytes
-    /// it names.
+    /// construction. A stored key that is not the hash of the bytes it names
+    /// is a corrupt row, and `read_source` refuses it rather than serving it
+    /// (Σ (CA) verify-on-read, bead `ley-line-open-10d71a`).
     #[tokio::test]
     async fn read_source_returns_the_hash_propose_compares() {
         let (_dir, ctx) = setup_parsed();
+        let read = call(
+            &ctx,
+            serde_json::json!({"op": "read_source", "path": "a.go"}),
+        );
+        let manifest: Vec<u8> = ctx
+            .with_read(|conn| {
+                Ok(
+                    conn.query_row("SELECT blob_hash FROM _tree WHERE path = 'a.go'", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        assert_eq!(read["blob_hash"], hex::encode(&manifest), "{read}");
+        let r = call(
+            &ctx,
+            serde_json::json!({"op": "propose", "writes": [
+                {"path": "a.go", "base": read["blob_hash"], "content": PROPOSE_A2},
+            ]}),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+
         let key = [7u8; 32].to_vec();
         ctx.with_write(|conn| {
             conn.execute(
@@ -4870,18 +4893,12 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let read = call(
+        let corrupt = call(
             &ctx,
             serde_json::json!({"op": "read_source", "path": "a.go"}),
         );
-        assert_eq!(read["blob_hash"], hex::encode(&key), "{read}");
-        let r = call(
-            &ctx,
-            serde_json::json!({"op": "propose", "writes": [
-                {"path": "a.go", "base": read["blob_hash"], "content": PROPOSE_A2},
-            ]}),
-        );
-        assert_eq!(r["ok"], true, "{r}");
+        assert_ne!(corrupt["ok"], true, "a corrupt row is refused: {corrupt}");
+        assert!(corrupt.get("content").is_none(), "{corrupt}");
     }
 
     fn setup_rooted() -> (TempDir, std::sync::Arc<DaemonContext>) {

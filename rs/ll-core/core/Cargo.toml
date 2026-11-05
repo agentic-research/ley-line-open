@@ -29,3 +29,6 @@ interrupt = []
 tempfile = { workspace = true }
 # Fold-law properties over `PartitionSpec::address` (bead ley-line-open-80f037 F10).
 proptest = "1.8"
+# The Σ axiom suite reads the checked-in known-answer vectors
+# (`schema-spec/sigma/v1/test-vectors/constructions.json`, bead ley-line-open-10d71a).
+serde_json = { workspace = true }

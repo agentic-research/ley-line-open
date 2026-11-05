@@ -29,6 +29,9 @@ tree-sitter = { workspace = true }
 sha2 = "0.11"
 # Shared wall-clock sampling for the perf gate (min-of-N, interleaved arms).
 leyline-perf-sample = { path = "../perf-sample" }
+# The Σ axiom suite reads the checked-in known-answer vectors
+# (`schema-spec/sigma/v1/test-vectors/constructions.json`, bead ley-line-open-10d71a).
+serde_json = { workspace = true }
 
 [[bench]]
 name = "restriction_git_replay"

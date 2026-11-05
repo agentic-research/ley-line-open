@@ -322,12 +322,26 @@ pub fn stats(conn: &Connection) -> Result<std::collections::HashMap<String, (i64
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The bytes the store holds for `blob`.
+/// The bytes the store holds for `blob`, verified: `None` when the store
+/// holds no such blob, and an error when the bytes stored under `blob` do
+/// not hash to it. Σ (CA) as verify-on-read (`BlobStore::get`'s contract,
+/// decade F3): `read_source`, `storefs` and `rebuild` read source blobs
+/// here, so a row whose bytes were changed under its key fails closed
+/// instead of being served as the file the key names (bead
+/// `ley-line-open-10d71a`).
 pub fn blob_bytes(conn: &Connection, blob: Hash) -> Result<Option<Vec<u8>>> {
-    Ok(conn
+    let bytes: Option<Vec<u8>> = conn
         .prepare_cached("SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1")?
         .query_row([blob.as_bytes().as_slice()], |r| r.get(0))
-        .optional()?)
+        .optional()?;
+    if let Some(bytes) = &bytes {
+        use leyline_core::ContentAddressed;
+        let actual = bytes.as_slice().hash();
+        if actual != blob {
+            bail!("source blob {blob}: its stored bytes hash to {actual}, not to its address");
+        }
+    }
+    Ok(bytes)
 }
 
 /// A file's diagnostic (ADR-0045 T3): the first error tree-sitter found,

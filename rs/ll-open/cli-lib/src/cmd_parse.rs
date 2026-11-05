@@ -2353,8 +2353,10 @@ fn parse_into_conn_with(
             unprojected: &unprojected,
         },
     )?;
-    let parser_id = crate::tree_root::ParserInputs::current(&query_set).parser_id();
-    let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
+    let parser = crate::tree_root::ParserInputs::current(&query_set).parser_ref();
+    let tree = crate::tree_root::tree_root_ref(conn, parser)?;
+    // The stamps are wire and `_meta` fields: they carry the bare address.
+    let (parser_id, tree_root) = (*parser.as_hash(), *tree.as_hash());
 
     // ---- Post-sweep ----
     //
@@ -3331,6 +3333,44 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
     *p.hash().as_bytes()
 }
 
+/// The `node_hash` construction (`merkle-ast-v2`, ADR-0027), typed
+/// (ADR-0047 §2.3). Its fold is [`hash_leaf`] / [`hash_internal`]; nothing
+/// moves. A `Ref<AstNode>` does not compare with a `Ref<Blob>`, though today
+/// the two can share bytes: `node_hash` is plain σ over an in-band-prefixed
+/// preimage, which ADR-0047 M2 (`ley-line-open-73add7`) keys.
+pub enum AstNode {}
+
+/// What a `node_hash` is a function of: a leaf's canonical kind and token,
+/// or an internal node's canonical kind and its non-`extra` children in
+/// source order.
+#[derive(Clone, Copy, Debug)]
+pub enum AstNodeWitness<'w> {
+    Leaf {
+        kind: &'w str,
+        token: &'w str,
+    },
+    Internal {
+        kind: &'w str,
+        children: &'w [leyline_core::Ref<AstNode>],
+    },
+}
+
+impl leyline_core::Construction for AstNode {
+    const NAME: &'static str = "ast-node";
+    type Witness<'w> = AstNodeWitness<'w>;
+    fn fold(w: AstNodeWitness<'_>) -> leyline_core::Hash {
+        let addr = match w {
+            AstNodeWitness::Leaf { kind, token } => hash_leaf(kind, token),
+            AstNodeWitness::Internal { kind, children } => {
+                let children: Vec<[u8; 32]> =
+                    children.iter().map(|c| *c.as_hash().as_bytes()).collect();
+                hash_internal(kind, &children)
+            }
+        };
+        leyline_core::Hash::from_bytes(addr)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure file parser (no Connection — safe for rayon)
 // ---------------------------------------------------------------------------
@@ -4269,6 +4309,85 @@ mod tree_tests;
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Σ (DET), ADR-0047 §5 `det_known_answer_vectors`, the `node_hash` slice
+    /// (bead `ley-line-open-10d71a`): the private leaf and internal folds
+    /// reproduce the `astNode` cases of
+    /// `schema-spec/sigma/v1/test-vectors/constructions.json`, and each
+    /// pinned address is σ of its pinned preimage. That last equality is
+    /// law (c)'s known violation (`73add7`): it is what M2's keyed
+    /// `merkle-ast-v3` construction changes, together with these vectors.
+    #[test]
+    fn det_known_answer_vectors() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ll-core/schema-spec/sigma/v1/test-vectors/constructions.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let cases = v["astNode"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        let unhex = |s: &serde_json::Value| hex::decode(s.as_str().unwrap()).unwrap();
+        // The typed leaves, each derived from its own witness: the children
+        // an internal case's typed witness is built from.
+        let leaf_refs: Vec<leyline_core::Ref<AstNode>> = cases
+            .iter()
+            .filter(|c| c["tag"] == "leaf")
+            .map(|c| {
+                leyline_core::Ref::derive(AstNodeWitness::Leaf {
+                    kind: c["kind"].as_str().unwrap(),
+                    token: c["token"].as_str().unwrap(),
+                })
+            })
+            .collect();
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let (address, typed) = match case["tag"].as_str().unwrap() {
+                "leaf" => {
+                    let token = case["token"].as_str().unwrap();
+                    (
+                        hash_leaf(kind, token),
+                        leyline_core::Ref::<AstNode>::derive(AstNodeWitness::Leaf { kind, token }),
+                    )
+                }
+                "internal" => {
+                    let children: Vec<[u8; 32]> = case["children"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| unhex(c).try_into().unwrap())
+                        .collect();
+                    let typed_children: Vec<leyline_core::Ref<AstNode>> = children
+                        .iter()
+                        .map(|c| {
+                            *leaf_refs
+                                .iter()
+                                .find(|r| r.as_hash().as_bytes() == c)
+                                .expect("internal cases fold pinned leaves")
+                        })
+                        .collect();
+                    (
+                        hash_internal(kind, &children),
+                        leyline_core::Ref::derive(AstNodeWitness::Internal {
+                            kind,
+                            children: &typed_children,
+                        }),
+                    )
+                }
+                other => panic!("unknown tag {other}"),
+            };
+            assert_eq!(
+                address.to_vec(),
+                unhex(&case["address"]),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(typed.as_hash().as_bytes(), &address, "{}", case["name"]);
+            assert_eq!(
+                unhex(&case["preimageHex"]).as_slice().hash().as_bytes(),
+                &address,
+                "{}",
+                case["name"]
+            );
+        }
+    }
 
     #[test]
     fn collect_files_skips_known_bloat_dirs() {

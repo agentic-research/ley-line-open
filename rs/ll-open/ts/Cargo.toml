@@ -127,7 +127,7 @@ leyline-schema = { path = "../../ll-core/schema", version = "0.25.0" }
 # the `lint:blake3` gate. Adding leyline-core as a direct dep here keeps
 # leyline-ts on the σ substrate discipline without a new sanctioned
 # exception.
-leyline-core = { path = "../../ll-core/core", version = "0.25.0" }
+leyline-core = { path = "../../ll-core/core", version = "0.25.0", features = ["sqlite"] }
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

@@ -59,6 +59,13 @@
 # control to another enable row.
 ll-core/core          interrupt          not-shipping    enable  -
 
+# ley-line-open-12d305 — the one verify-on-read reader of `source_blobs`
+# (`source_blob`), behind `sqlite` so core's SQLite-free consumers do not
+# link rusqlite. Shipping: leyline-ts, leyline-fs and leyline-cli-lib enable
+# it. mutants=enable so the gated reader compiles under mutation and its
+# unit tests run against the mutants.
+ll-core/core          sqlite             ships-optin     enable  ley-line-open-12d305
+
 # Dev tooling — regenerates test fixtures; nothing user-facing gates on it.
 # mutants=skip: the gated paths run only during fixture regeneration.
 ll-core/schema-capnp  regen-fixtures     not-shipping    skip    -

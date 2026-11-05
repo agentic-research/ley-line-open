@@ -412,7 +412,7 @@ pub fn reconcile(
         log::warn!("checkout conflict: {c}");
         match c.stored {
             Some(Entry::File { blob: stored, .. }) => {
-                kept.insert(c.path.clone(), blob(conn, stored)?);
+                kept.insert(c.path.clone(), blob(conn, &c.path, stored)?);
             }
             Some(Entry::Dir) => {}
             None => {
@@ -592,8 +592,10 @@ fn materialize_entry(conn: &Connection, dir: &Path, rel: &str, entry: Entry) -> 
         Entry::File {
             mode: Mode::Symlink,
             blob: target,
-        } => link_into(dir, rel, &blob(conn, target)?),
-        Entry::File { mode, blob: held } => write_file(dir, rel, &blob(conn, held)?, Some(mode)),
+        } => link_into(dir, rel, &blob(conn, rel, target)?),
+        Entry::File { mode, blob: held } => {
+            write_file(dir, rel, &blob(conn, rel, held)?, Some(mode))
+        }
     }
 }
 
@@ -781,14 +783,11 @@ fn hashes(conn: &Connection, sql: &str) -> Result<HashMap<String, Hash>> {
     Ok(out)
 }
 
-fn blob(conn: &Connection, hash: Hash) -> Result<Vec<u8>> {
-    conn.query_row(
-        "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-        [hash.as_bytes().as_slice()],
-        |r| r.get(0),
-    )
-    .optional()?
-    .with_context(|| format!("the store holds no bytes for blob {hash}"))
+/// The verified bytes of `path`'s blob `hash` (bead `ley-line-open-12d305`):
+/// a row whose bytes do not hash to `hash` is refused, never materialised.
+fn blob(conn: &Connection, path: &str, hash: Hash) -> Result<Vec<u8>> {
+    crate::tree::blob_bytes_at(conn, path, hash)?
+        .with_context(|| format!("the store holds no bytes for '{path}' blob {hash}"))
 }
 
 /// How the index and the conflict table spell an entry's blob: the hash,
@@ -997,6 +996,34 @@ mod tests {
         let quiet = reconcile(&c.conn, &c.src, None, None).unwrap();
         assert!(quiet.removed.is_empty() && quiet.materialized.is_empty());
         assert_eq!(stored(&c, "b.go"), None);
+    }
+
+    /// Bead `ley-line-open-12d305`: a `source_blobs` row whose bytes were
+    /// changed under an unchanged key is refused at materialisation. The
+    /// tampered bytes never reach the directory, and the refusal names the
+    /// path and the blob.
+    #[test]
+    fn a_tampered_blob_is_refused_at_materialisation() {
+        let c = checkout(&[("a.go", A)]);
+        commit_only(&c, "a.go", A2);
+        c.conn
+            .execute(
+                "UPDATE source_blobs SET blob_bytes = ?1 WHERE blob_hash = ?2",
+                rusqlite::params![A3.as_bytes(), h(A2).as_bytes().as_slice()],
+            )
+            .unwrap();
+        let r = reconcile(&c.conn, &c.src, None, Some(&scope(&["a.go"]))).unwrap();
+        assert_ne!(
+            disk(&c, "a.go").as_deref(),
+            Some(A3),
+            "tampered bytes served"
+        );
+        assert_eq!(disk(&c, "a.go").as_deref(), Some(A));
+        assert!(r.materialized.is_empty(), "{:?}", r.materialized);
+        let problems = r.problems().expect("the refusal is reported");
+        assert!(problems.contains("a.go"), "{problems}");
+        assert!(problems.contains(&h(A2).to_string()), "{problems}");
+        assert!(problems.contains("content address"), "{problems}");
     }
 
     /// A create and a delete committed before a crash are carried out by

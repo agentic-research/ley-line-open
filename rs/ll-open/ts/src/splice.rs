@@ -8,7 +8,8 @@
 //! module never writes the arena.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension};
+use leyline_core::Hash;
+use rusqlite::Connection;
 
 /// Splice new text into a node's byte range, returning the modified source bytes.
 ///
@@ -89,22 +90,17 @@ pub fn source_bytes(conn: &Connection, file_id: i64) -> Result<Vec<u8>> {
     let bytes = match (content, &content_hash) {
         (Some(c), _) => c,
         (None, Some(hash)) => {
-            let blob: Option<Option<Vec<u8>>> =
-                if leyline_schema::table_exists(conn, "source_blobs")? {
-                    conn.query_row(
-                        "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                        [hash],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                } else {
-                    None
-                };
+            // The one verifying reader of `source_blobs` (bead
+            // `ley-line-open-12d305`): bytes that do not hash to their key,
+            // and a chunk-activated row, are refused naming the file.
+            let blob = match <[u8; 32]>::try_from(hash.as_slice()) {
+                Ok(key) if leyline_schema::table_exists(conn, "source_blobs")? => {
+                    leyline_core::source_blob::read_at(conn, &id, Hash::from_bytes(key))?
+                }
+                _ => None,
+            };
             match blob {
-                Some(Some(bytes)) => bytes,
-                Some(None) => bail!(
-                    "source '{id}' is chunk-activated in source_blobs; read it through leyline-fs"
-                ),
+                Some(bytes) => bytes,
                 None => bail!(
                     "source '{id}' names content hash {} but source_blobs holds no such blob",
                     hex_of(hash)
@@ -269,7 +265,13 @@ mod tests {
     fn source_bytes_refuses_a_blob_that_does_not_hash_to_its_key() {
         let key = hash_of(b"package a\n");
         let conn = blob_arena(&key, Some(b"package b\n"));
-        let msg = format!("{:#}", source_bytes(&conn, 7).unwrap_err());
+        let err = source_bytes(&conn, 7).unwrap_err();
+        let typed = err
+            .downcast_ref::<leyline_core::source_blob::SourceBlobError>()
+            .expect("the refusal is the typed source-blob error (bead 12d305)");
+        assert_eq!(typed.path.as_deref(), Some("a.go"));
+        assert_eq!(typed.blob.as_bytes()[..], key[..]);
+        let msg = format!("{err:#}");
         assert!(msg.contains("hash to"), "{msg}");
         assert!(msg.contains(&hex_of(&key)), "names the key: {msg}");
         assert!(

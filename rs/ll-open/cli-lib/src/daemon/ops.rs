@@ -4782,16 +4782,16 @@ mod tests {
             r["post_commit_error"].as_str().unwrap().contains("head"),
             "{r}"
         );
-        let stored: Vec<u8> = ctx
-            .with_read(|conn| {
-                Ok(conn.query_row(
-                    "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                    [hex::decode(hex_hash(PROPOSE_A2)).unwrap()],
-                    |row| row.get(0),
-                )?)
-            })
+        let blob = leyline_core::Hash::from_bytes(
+            hex::decode(hex_hash(PROPOSE_A2))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let stored = ctx
+            .with_read(|conn| crate::tree::blob_bytes(conn, blob))
             .unwrap();
-        assert_eq!(stored, PROPOSE_A2.as_bytes());
+        assert_eq!(stored.as_deref(), Some(PROPOSE_A2.as_bytes()));
         // The proposal requested a publish and did not wait for one (bead
         // `ley-line-open-8c8ded`); the publisher's next image carries it.
         assert_eq!(

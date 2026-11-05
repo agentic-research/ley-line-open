@@ -59,7 +59,7 @@ leyline-mcp-protocol-schema = { path = "../../ll-core/mcp-protocol-schema" }
 leyline-public-schema = { path = "../../ll-core/public-schema" }
 # Supervises the krun worker; the VMM is the leyline-krun-worker crate's.
 leyline-runtime = { path = "../runtime", default-features = false }
-leyline-core = { path = "../../ll-core/core" }
+leyline-core = { path = "../../ll-core/core", features = ["sqlite"] }
 # S1: the one RootSigner implementation, used to sign the at-rest Head.
 leyline-sign = { path = "../sign", features = ["root-signer"] }
 # ADR-0014 §3 — exact-pin declared in workspace (see schema-capnp/Cargo.toml).

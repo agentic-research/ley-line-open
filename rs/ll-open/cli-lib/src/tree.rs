@@ -328,20 +328,15 @@ pub fn stats(conn: &Connection) -> Result<std::collections::HashMap<String, (i64
 /// decade F3): `read_source`, `storefs` and `rebuild` read source blobs
 /// here, so a row whose bytes were changed under its key fails closed
 /// instead of being served as the file the key names (bead
-/// `ley-line-open-10d71a`).
+/// `ley-line-open-10d71a`). The read is [`leyline_core::source_blob::read`],
+/// the one reader of `source_blobs` bytes (bead `ley-line-open-12d305`).
 pub fn blob_bytes(conn: &Connection, blob: Hash) -> Result<Option<Vec<u8>>> {
-    let bytes: Option<Vec<u8>> = conn
-        .prepare_cached("SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1")?
-        .query_row([blob.as_bytes().as_slice()], |r| r.get(0))
-        .optional()?;
-    if let Some(bytes) = &bytes {
-        use leyline_core::ContentAddressed;
-        let actual = bytes.as_slice().hash();
-        if actual != blob {
-            bail!("source blob {blob}: its stored bytes hash to {actual}, not to its address");
-        }
-    }
-    Ok(bytes)
+    Ok(leyline_core::source_blob::read(conn, blob)?)
+}
+
+/// [`blob_bytes`] for the file at `path`: a refusal names the path.
+pub fn blob_bytes_at(conn: &Connection, path: &str, blob: Hash) -> Result<Option<Vec<u8>>> {
+    Ok(leyline_core::source_blob::read_at(conn, path, blob)?)
 }
 
 /// A file's diagnostic (ADR-0045 T3): the first error tree-sitter found,

@@ -59,7 +59,8 @@ const RELEASE_DOWNLOAD_BASE: &str =
 const SUMS_ASSET: &str = "SHA256SUMS";
 
 /// Sent on every HTTP request — the GitHub API rejects UA-less callers.
-const USER_AGENT: &str = concat!("leyline/", env!("CARGO_PKG_VERSION"));
+/// Carries the build's own version (`daemon::version::BINARY_VERSION`).
+const USER_AGENT: &str = concat!("leyline/", env!("LEYLINE_BUILD_VERSION"));
 
 /// Download ceiling for a single release file. A literal (not an
 /// expression) so there is no arithmetic to silently drift; release
@@ -84,8 +85,8 @@ pub struct SelfContext {
     pub shell: Option<String>,
     /// `std::env::current_exe()`; `None` when the OS cannot say.
     pub current_exe: Option<PathBuf>,
-    /// The running binary's version (daemon::version::BINARY_VERSION —
-    /// the crate's one version authority). Downgrade refusal compares
+    /// The running binary's release line (daemon::version::RELEASE_VERSION,
+    /// `X.Y.Z` without the dev-build suffix). Downgrade refusal compares
     /// release tags against this.
     pub current_version: String,
     /// Release-JSON root; `file://` fixture roots in tests.
@@ -107,7 +108,7 @@ impl SelfContext {
             path_env: std::env::var("PATH").unwrap_or_default(),
             shell: env_non_empty(std::env::var("SHELL")),
             current_exe: std::env::current_exe().ok(),
-            current_version: crate::daemon::version::BINARY_VERSION.to_string(),
+            current_version: crate::daemon::version::RELEASE_VERSION.to_string(),
             api_base: RELEASE_API_BASE.to_string(),
             download_base: RELEASE_DOWNLOAD_BASE.to_string(),
             github_token: env_non_empty(std::env::var("GITHUB_TOKEN")),
@@ -959,7 +960,11 @@ mod tests {
     #[test]
     fn from_process_captures_the_real_process_identity() {
         let ctx = SelfContext::from_process();
-        assert_eq!(ctx.current_version, crate::daemon::version::BINARY_VERSION);
+        assert_eq!(ctx.current_version, crate::daemon::version::RELEASE_VERSION);
+        assert_eq!(
+            USER_AGENT,
+            format!("leyline/{}", crate::daemon::version::BINARY_VERSION)
+        );
         assert_eq!(
             ctx.api_base,
             "https://api.github.com/repos/agentic-research/ley-line-open"

@@ -182,6 +182,20 @@ columns exist. Its measured dependencies, as of `mache-93e84b`:
 - `internal/fixturedb/schema_leyline.go` pins this DDL byte-identically and has
   a conformance test, so any column change here surfaces there as drift at
   whatever release mache re-pins to.
+- `current_root` on the daemon wire (the `status`, `reparse`, `snapshot`,
+  `flush`, `enrich` and `load` responses and the `daemon.sheaf.invalidate`
+  event) follows one absence rule: `root_published` is always present, and
+  `current_root` is present exactly when it is `true`. When nothing is
+  published the key is omitted; no zero or empty spelling stands in for it.
+  On the event, an unreadable controller sends `root_error` in place of both
+  (bead `ley-line-open-80f037`; the rule is on `StatusResponse.rootPublished`
+  in `daemon.capnp`).
+- A watcher of the daemon's `--source` checkout must treat `Rename` or
+  `Remove` on a path that still exists as a change to that path: an accepted
+  proposal lands by stage-then-rename (a hidden staging sibling renamed over
+  the target, `rs/ll-open/cli-lib/src/checkout.rs:188` and `:575`), which
+  fsnotify/kqueue reports as a rename or remove of the target (ADR-0045 T7,
+  bead `ley-line-open-514d0a`).
 
 ## Layer Ownership
 
@@ -203,7 +217,7 @@ the projection is derived-only, so no in-place migration exists.
 
 | Table | Purpose |
 |-------|---------|
-| `names` / `dirs` / `files` / `kinds` | Interning tables (`projection-v5`). Every path component, directory link, file, and tree-sitter kind stored ONCE; all four are append-only — rows are never deleted or renumbered, which is what makes `file_id` reuse impossible and a directory rename a ONE-row `UPDATE dirs SET name_id`. `dirs.dir_id = 1` is the root ("", parent NULL). |
+| `names` / `dirs` / `files` / `kinds` | Interning tables (`projection-v5`). Every path component, directory link, file, and tree-sitter kind stored ONCE; all four are append-only — rows are never deleted or renumbered, which is what makes `file_id` reuse impossible and a directory rename a ONE-row `UPDATE dirs SET name_id`. The rule is enforced in the database: `*_append_only_delete` and `*_append_only_update` triggers abort any DELETE and any UPDATE that changes a row's id (`INTERN_GUARDS_DDL`, bead `ley-line-open-80f037`). `dirs.dir_id = 1` is the root ("", parent NULL). |
 | `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
 | `_ast` | AST positions (nid → kind_id, byte/row/col ranges, `content_id`). `content_id INTEGER REFERENCES node_content(content_id)` replaced the 32-byte `node_hash` at `projection-v10` (bead `ley-line-open-738dd9`); read the hash through `v_ast_hash` or a join (see "Reading `node_hash` at projection-v10" below), and find every location of a subtree with `idx_ast_content`. No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
 | `_source` | Source file metadata (id → language, abs path, `file_id` — the interned integer that keys every node row's high bits). As of `projection-v7` (ADR-0045 T1) one row per file the parse PROJECTED: a file of no grammar, a binary or an oversized file has a `_tree` entry and no `_source` row. `content_hash` equals the path's `_tree.blob_hash`. List every file from `_tree`, not from here. |
@@ -236,18 +250,22 @@ the projection is derived-only, so no in-place migration exists.
 | `_tree` | One row per entry the store holds — `path TEXT PRIMARY KEY` (relative, `/`-separated, no `''`/`.`/`..`), `mode INTEGER NOT NULL` (git mode: `0o100644` regular, `0o100755` executable, `0o120000` symlink whose blob is its target, `0o040000` directory), `blob_hash BLOB` (the `source_blobs` key; NULL for a directory), `mtime INTEGER` and `size INTEGER` (the walk's stat cache; not identity). Every file of any kind is an entry, projected or not; directories are explicit, so an empty directory is an entry, and the set is closed under parents. `treeRoot` folds `(path, mode, blob)` over it. |
 | `_parse_diagnostics` | One row per file the parse projects that did not parse cleanly — `path TEXT PRIMARY KEY` (the `_tree` path), `blob_hash BLOB NOT NULL` (the bytes described), `projected INTEGER NOT NULL` (`1`: projected as tree-sitter parsed it, error nodes included; `0`: stored with no projection rows — a NUL byte in the first 8 KiB or larger than `MAX_PARSE_FILE_SIZE`), `start_byte`, `end_byte`, `start_row` (0-based), `start_col` (the first `ERROR`/`MISSING` node; NULL when not projected), `message TEXT NOT NULL`. A function of the bytes and the grammar: a proposal and a cold parse of one tree write the same rows, and a file whose next version parses cleanly loses its row in the same transaction. |
 
-**CDC derived chunk cache** (per `rs/ll-open/fs/src/chunked.rs:83-121`, activated by `daemon --cdc` / `leyline cdc`):
+**CDC derived chunk cache** (per `rs/ll-open/fs/src/chunk_pool.rs` and `rs/ll-open/fs/src/blob_chunked.rs`, activated by `daemon --cdc` / `leyline cdc`):
 
 These tables are **private and derived**. They are not part of the SQL projection
 ABI, no consumer reads them (mache reads none of them), and changes to them do
-not bump `leyline-schema`. `nodes.record` stays authoritative; a missing or stale
-manifest falls back to it (`chunked.rs:936-946`, freshness gate `:789`).
+not bump `leyline-schema`. `source_blobs` stays authoritative; the manifests index
+its whole-file rows at or above the 8 KiB chunking floor.
 
 | Table | Purpose |
 |-------|---------|
-| `content_chunks` | Content-defined chunks keyed by blob hash, 8–128 KiB (`rs/ll-open/cdc/src/lib.rs:29-40`). Reads verify σ before returning and fail closed on mismatch (`chunked.rs:166-183`). |
-| `content_manifest` | Per-node chunk sequence, keyed `(node_id, seq)`. **Has no root** — it is a lookup index, not an identity domain. ADR-0032 §D3's `manifestRoot` is proposed, not implemented. |
-| `content_manifest_meta` | Freshness witness per node — the basis a manifest was built against, so a stale manifest is refused rather than trusted. |
+| `content_chunks` | Content-defined chunks keyed by blob hash, 8–128 KiB (`rs/ll-open/cdc/src/lib.rs:29-40`). Reads verify σ before returning and fail closed on mismatch (`chunk_pool.rs`). |
+| `blob_manifest` | Per-blob chunk sequence, keyed `(blob_hash, seq)`. No freshness witness: `source_blobs` rows are immutable, so a manifest's existence is its freshness. **Has no root** — it is a lookup index, not an identity domain. ADR-0032 §D3's `manifestRoot` is proposed, not implemented. |
+
+The per-node `nodes` target and its `content_manifest`, `content_manifest_meta`
+and `content_generation` tables were removed in `ley-line-open-afa952`. Nothing
+reads those tables in a database that still carries them, and `leyline cdc gc`
+collects the chunks only they referenced.
 
 **Daemon checkout** (bead `ley-line-open-60f39f`, `rs/ll-open/cli-lib/src/checkout.rs`):
 
@@ -316,7 +334,7 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` (views) | `projection-v10` `node_hash`-rendering compatibility views (base) |
 | `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
-| `content_chunks` / `content_manifest` / `content_manifest_meta` | CDC derived chunk cache — private, not part of the SQL projection ABI |
+| `content_chunks` / `blob_manifest` | CDC derived chunk cache — private, not part of the SQL projection ABI |
 | `_checkout*` | daemon checkout of its `--source` directory — private, not part of the SQL projection ABI |
 
 ## Composition Model
@@ -420,6 +438,6 @@ skip to a pass.
    for which parse run produced a set of segments and must not claim to name
    the same thing as `current_root`.
 6. **Private derived tables are not ABI**: the CDC tables (`content_chunks`,
-   `content_manifest`, `content_manifest_meta`) are a derived cache. They may
-   change shape without a `leyline-schema` bump, no consumer may depend on
-   them, and `nodes.record` remains authoritative for their contents.
+   `blob_manifest`) are a derived cache. They may change shape without a
+   `leyline-schema` bump, no consumer may depend on them, and `source_blobs`
+   remains authoritative for their contents.

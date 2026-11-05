@@ -141,7 +141,8 @@ write-temp-then-rename case above, which reaches the store as one proposal.
 
 A proposal may carry restriction-addressed keys (ADR-0031) for cross-file facts its author relied
 on; the writer refuses if any changed. The only key family today is call-target resolution
-(`sheaf/src/restriction_cache.rs:197-250`, test-only, not persisted, no scheme tag), which catches a
+(`leyline-cache`, `restriction_for_call_target`: scheme-tagged `leyline/restriction/call-target/token-eq/v1`,
+`parserId`-bound, not persisted, no daemon caller), which catches a
 rename of a called function and not a signature or body change. P3 ships only after ADR-0031 is
 accepted with persisted, scheme-tagged keys, and claims per key family only what it covers.
 

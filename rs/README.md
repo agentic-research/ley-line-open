@@ -23,7 +23,8 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | [`leyline-ts`](ll-open/ts/) | Tree-sitter AST projection + bidirectional splice; κ CFG-kind vocabulary + CFG builder (T1.b3, [`analysis-substrate`](../docs/decades/analysis-substrate.md) decade) |
 | [`leyline-lsp`](ll-open/lsp/) | LSP client — spawns language servers, projects symbols + diagnostics; emits `BindingRecord` capnp event log |
 | [`leyline-hdc`](ll-open/hdc/) | Hyperdimensional computing — per-scope hypervectors for structural code search |
-| [`leyline-sheaf`](ll-open/sheaf/) | Čech cohomology engine — sheaf cache + coboundary operators + structural invalidation. **Not one risk profile** — see [`sheaf/README.md`](ll-open/sheaf/README.md) for the 3-way live/diagnostic/gated split |
+| [`leyline-sheaf`](ll-open/sheaf/) | Čech cohomology engine — sheaf cache + coboundary operators + structural invalidation. **Not one risk profile** — see [`sheaf/README.md`](ll-open/sheaf/README.md) for the live/diagnostic split |
+| [`leyline-cache`](ll-open/cache/) | Restriction-addressed derived-view cache (ADR-0031): a review value keyed by a `PartitionSpec` fold over its input-closure rows, with `parserId` bound; one `ReviewCache` under pluggable key strategies |
 | [`leyline-cdc`](ll-open/cdc/) | Content-defined chunking (GearHash, xet-compatible params) over the Σ substrate — chunk-level dedup for the mount storage path |
 | [`leyline-envelope`](ll-open/envelope/) | DSSE envelope + in-toto Statement v1 attestation over `leyline-sign`'s root signer |
 | [`leyline-runtime`](ll-open/runtime/) | Capability-resolved execution lifecycle + isolation backends (`execution/v1`) — authorization, backends (native/libkrun), confinement (ADR-0035) |
@@ -59,11 +60,12 @@ graph TD
         ffi[leyline-ffi-helpers]
     end
 
-    subgraph Sheaf["Sheaf — 3 risk profiles in 1 crate, see sheaf/README.md"]
+    subgraph Sheaf["Sheaf — 2 risk profiles in 1 crate, see sheaf/README.md"]
         sheafcache["cache.rs — live, correctness-critical"]
         sheafcomplex["complex.rs — live, diagnostic-only"]
-        sheafgated["restriction_cache.rs — proven, gated (ADR-0031)"]
     end
+
+    restrictioncache["leyline-cache — restriction-addressed review cache (ADR-0031), no daemon caller yet"]
 
     subgraph DaemonShell["Daemon shell — orchestration"]
         clilib[leyline-cli-lib]

@@ -460,7 +460,7 @@ pub fn tool_registry() -> Vec<McpTool> {
                             "type": "object",
                             "properties": {
                                 "id":   {"type": "integer"},
-                                "hash": {"type": "string", "description": "Hex-encoded 32-byte content hash."},
+                                "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The region's content hash, 64 lowercase hex digits (the leyline/sheaf-region/v1 fold over its members' node_hash). Omit when the content is unknown: the region then counts as changed. Malformed or empty is refused."},
                                 "data": {"type": "array", "items": {"type": "number"}, "description": "Optional f32 stalk vector for δ⁰ mode."}
                             },
                             "required": ["id"]
@@ -473,13 +473,13 @@ pub fn tool_registry() -> Vec<McpTool> {
                             "properties": {
                                 "a": {"type": "integer"},
                                 "b": {"type": "integer"},
-                                "boundary_hash":  {"type": "string"},
+                                "boundary_hash":  {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "64 lowercase hex digits: the XOR of the two regions' hashes."},
                                 "co_change_rate": {"type": "number"},
                                 "revert_rate":    {"type": "number"},
                                 "weights":        {"type": "array", "items": {"type": "number"}},
                                 "agreement_dim":  {"type": "integer", "description": "Opt-in to δ⁰ mode: project first N coords. 0 = heuristic only."}
                             },
-                            "required": ["a", "b"]
+                            "required": ["a", "b", "boundary_hash"]
                         }
                     },
                     "node_stalk_dim": {"type": "integer", "description": "Stalk dimension for δ⁰ mode. 0 = heuristic only."}
@@ -499,7 +499,7 @@ pub fn tool_registry() -> Vec<McpTool> {
                             "type": "object",
                             "properties": {
                                 "id":   {"type": "integer"},
-                                "hash": {"type": "string"},
+                                "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The region's new content hash, 64 lowercase hex digits. Omit when the content is unknown: the region counts as changed and its boundaries fire. Malformed or empty is refused."},
                                 "data": {"type": "array", "items": {"type": "number"}}
                             },
                             "required": ["id"]
@@ -978,7 +978,7 @@ async fn handle_post(State(ctx): State<Arc<DaemonContext>>, body: String) -> Res
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "leyline", "version": env!("CARGO_PKG_VERSION")}
+                "serverInfo": {"name": "leyline", "version": super::version::BINARY_VERSION}
             }),
         ),
         leyline_mcp_protocol_schema::METHOD_TOOLS_LIST => handle_tools_list(id),
@@ -1087,6 +1087,26 @@ fn type_of(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bead `ley-line-open-5139a3`: MCP `initialize` names the build's own
+    /// version, the one `leyline --version` prints.
+    #[tokio::test]
+    async fn initialize_reports_the_builds_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).to_string();
+        let response = handle_post(State(ctx), body).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            reply["result"]["serverInfo"]["version"],
+            super::super::version::BINARY_VERSION,
+            "{reply}"
+        );
+        assert_eq!(reply["result"]["serverInfo"]["name"], "leyline", "{reply}");
+    }
 
     #[test]
     fn jsonrpc_response_serialize_skips_none_fields() {

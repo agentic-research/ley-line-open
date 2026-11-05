@@ -22,7 +22,7 @@ fn release_docs_pin_the_private_derived_ownership_contract() {
     // worse than no gate; these match on whitespace-normalized text so the
     // paragraph can be rewrapped or reworded without weakening the contract.
     for claim in [
-        "`content_chunks`, `content_manifest`, and `content_manifest_meta` tables",
+        "`content_chunks` and `blob_manifest` tables",
         "are private derived indexes",
         "do not bump `leyline-schema`",
     ] {
@@ -32,7 +32,8 @@ fn release_docs_pin_the_private_derived_ownership_contract() {
         );
     }
     // The authoritative-record claim is the load-bearing half — CDC may never
-    // be described as replacing `nodes.record` (ADR-0033 D1).
+    // be described as replacing the authoritative `source_blobs` bytes
+    // (ADR-0033 D1).
     assert!(
         normalized_readme.contains("never replace the authoritative record"),
         "README must state that the private indexes never replace the authoritative record"

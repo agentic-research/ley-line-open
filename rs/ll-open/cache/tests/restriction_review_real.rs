@@ -1,9 +1,9 @@
 //! Restriction-addressed review cache over LLO's REAL fact substrate —
-//! thin driver over `leyline_sheaf::restriction_cache` (bead
+//! thin driver over `leyline_cache::restriction` (bead
 //! `ley-line-open-054048`, was `f38a86`).
 //!
 //! The restriction / review-result / oracle / substrate logic now lives in
-//! the crate's `restriction_cache` module (parser-independent, ships in
+//! the crate's `restriction` module (parser-independent, ships in
 //! production); the tree-sitter extraction that populates it lives in
 //! `tests/common` (dev/bench-shared). This file keeps only the FIXTURES
 //! (real Rust, before → after over a two-file corpus), the evaluation
@@ -30,7 +30,7 @@
 mod common;
 
 use common::{ast_shape_hash, build_substrate};
-use leyline_sheaf::restriction_cache::{
+use leyline_cache::restriction::{
     ContainerKeying, FactSubstrate, FixtureResult, Policy, restriction_for_call_target,
     review_call_targets, stats, whole_object_hash,
 };

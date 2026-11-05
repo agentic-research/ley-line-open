@@ -110,9 +110,8 @@ impl EnrichmentPass for FailingPass {
 }
 
 /// Fresh arena + controller. Matches the shape used by the gap 1 test
-/// so `read_root_hex` finds a well-formed controller and returns a
-/// deterministic hex root (all-zeros sentinel for a fresh controller
-/// per `ops::read_root_hex_is_zero_sentinel_for_fresh_controller`).
+/// so `read_root_hex` finds a well-formed controller. A fresh controller
+/// has published nothing (`ops::read_root_hex_is_none_for_fresh_controller`).
 fn fresh_arena(dir: &Path) -> PathBuf {
     use leyline_core::{Controller, create_arena};
     let arena_path = dir.join("test.arena");
@@ -378,25 +377,20 @@ async fn watcher_emits_sheaf_invalidate_with_region_payload() {
         "`changed_files` must round-trip the input"
     );
 
-    // Pin `current_root` is present and hex-shaped. The fresh
-    // controller returns the all-zeros sentinel per
-    // `read_root_hex_is_zero_sentinel_for_fresh_controller` in
-    // ops.rs. Anything non-empty proves the wire reached
-    // `read_root_hex` successfully.
-    let root_hex = payload
-        .get("current_root")
-        .and_then(|v| v.as_str())
-        .expect("`current_root` must be a string");
+    // Pin the root absence rule (bead `ley-line-open-80f037`): the fresh
+    // controller has published nothing, so the event says
+    // `root_published: false` and omits `current_root`. No 64-zero or
+    // empty stand-in.
     assert_eq!(
-        root_hex.len(),
-        64,
-        "`current_root` must be a 64-char hex string; got {} chars: {root_hex:?}",
-        root_hex.len()
+        payload.get("root_published"),
+        Some(&serde_json::Value::Bool(false)),
+        "a fresh controller publishes no root: {payload}"
     );
     assert!(
-        root_hex.chars().all(|c| c.is_ascii_hexdigit()),
-        "`current_root` must be lowercase hex; got {root_hex:?}"
+        payload.get("current_root").is_none(),
+        "`current_root` is omitted when nothing is published: {payload}"
     );
+    assert!(payload.get("root_error").is_none(), "{payload}");
 
     // Pin generation advance: `bump_generation()` must move the
     // counter strictly forward. Quoted-string encoding matches the

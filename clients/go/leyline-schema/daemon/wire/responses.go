@@ -49,7 +49,7 @@ type StatusResponse struct {
 	ArenaPath   *string `json:"arena_path"`
 	ArenaSize   *uint64 `json:"arena_size,string"`
 	Phase       *string `json:"phase"`
-	CurrentRoot *string `json:"current_root"`
+	CurrentRoot *string `json:"current_root,omitempty"`
 	// Enrichment is the legacy JSON-encoded enrichment-status string
 	// (pre-b0ea2e). The daemon no longer emits it as of v0.4.x; the
 	// typed shape lives in [StatusResponse.EnrichmentTyped]. Kept here
@@ -65,19 +65,30 @@ type StatusResponse struct {
 	// are relative to. Nil when the daemon runs without `--source`, which
 	// leaves a client no tree to propose into. Bead ley-line-open-246526.
 	SourceRoot *string `json:"source_root,omitempty"`
+	// RootPublished says whether the controller names a published arena
+	// root, and is always present. The root absence rule (daemon.capnp,
+	// StatusResponse.rootPublished; bead ley-line-open-80f037): CurrentRoot
+	// is non-nil exactly when RootPublished is true. The daemon never sends
+	// a zero or empty current_root.
+	RootPublished *bool `json:"root_published"`
 }
 
-// FlushResponse is the wire shape of the `flush` op response.
+// FlushResponse is the wire shape of the `flush` op response. CurrentRoot
+// follows the root absence rule on [StatusResponse.RootPublished].
 type FlushResponse struct {
-	OK          *bool   `json:"ok"`
-	CurrentRoot *string `json:"current_root"`
+	OK            *bool   `json:"ok"`
+	CurrentRoot   *string `json:"current_root,omitempty"`
+	RootPublished *bool   `json:"root_published"`
 }
 
 // SnapshotResponse is the wire shape of the `snapshot` op response.
+// CurrentRoot follows the root absence rule on
+// [StatusResponse.RootPublished].
 type SnapshotResponse struct {
-	OK          *bool   `json:"ok"`
-	Generation  *uint64 `json:"generation,string"`
-	CurrentRoot *string `json:"current_root"`
+	OK            *bool   `json:"ok"`
+	Generation    *uint64 `json:"generation,string"`
+	CurrentRoot   *string `json:"current_root,omitempty"`
+	RootPublished *bool   `json:"root_published"`
 }
 
 // Node is one row in the daemon's tree / per-node responses.

@@ -1,0 +1,35 @@
+[package]
+name = "leyline-cache"
+version = "0.25.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Restriction-addressed derived-view cache (ADR-0031): a review result keyed by a tagged fold over its input closure"
+repository = "https://github.com/agentic-research/ley-line-open"
+
+[dependencies]
+# σ and the ADR-0032 D2 PartitionSpec fold. The restriction key is an address
+# at a composition boundary, so it hashes through the substrate's BLAKE3 lock
+# and nothing else (bead `ley-line-open-b61cd6`, ADR-0032 D5).
+leyline-core = { path = "../../ll-core/core", default-features = false }
+# The keyed row-leaf construction (`blake3::Hasher::new_derive_key`). The same
+# crate leyline-core already links; no second hash function.
+blake3 = { workspace = true }
+
+[dev-dependencies]
+# Injectivity of the restriction key over row sets (ADR-0032 D2), and its
+# falsification on the pre-754aa1 separator-join key.
+proptest = "1.8"
+# The fact extraction that stands in for the daemon's node_defs / node_refs /
+# _imports tables, shared by the tests and the git-replay bench. Dev/bench
+# only: production `leyline-cache` stays parser-independent.
+leyline-ts = { path = "../ts", features = ["rust"] }
+tree-sitter = { workspace = true }
+# Stand-in node_hash for the stable container identity and the AstShape
+# baseline policy, carried over unchanged from the sheaf-era tests.
+sha2 = "0.11"
+# Shared wall-clock sampling for the perf gate (min-of-N, interleaved arms).
+leyline-perf-sample = { path = "../perf-sample" }
+
+[[bench]]
+name = "restriction_git_replay"
+harness = false

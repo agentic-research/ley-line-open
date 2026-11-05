@@ -133,7 +133,7 @@ async fn sheaf_invalidate_returns_non_empty_cascade_over_uds() {
     // δ⁰ baseline is zero on this edge.
     let topology = uds_call(
         &sock,
-        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
     )
     .await;
     assert_eq!(
@@ -154,7 +154,7 @@ async fn sheaf_invalidate_returns_non_empty_cascade_over_uds() {
     // because no daemon op populates `entries`.
     let invalidate = uds_call(
         &sock,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee","data":[99.0,0.5,42.0,7.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee00000000000000000000000000000000000000000000000000000000000000","data":[99.0,0.5,42.0,7.0]}]}"#,
     )
     .await;
 
@@ -217,7 +217,7 @@ async fn sheaf_invalidate_heuristic_mode_non_empty_cascade_over_uds() {
     // Heuristic-only topology: hashes only, no f32 data, no agreement_dim.
     let topology = uds_call(
         &sock,
-        r#"{"op":"sheaf_set_topology","regions":[{"id":0,"hash":"aa"},{"id":1,"hash":"bb"}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0]}]}"#,
+        r#"{"op":"sheaf_set_topology","regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000"},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000"}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0]}]}"#,
     )
     .await;
     assert_eq!(
@@ -229,7 +229,7 @@ async fn sheaf_invalidate_heuristic_mode_non_empty_cascade_over_uds() {
     // stored boundary_hash, so the cascade must include region 1.
     let invalidate = uds_call(
         &sock,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff"}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff00000000000000000000000000000000000000000000000000000000000000"}]}"#,
     )
     .await;
     let invalidated: Vec<u32> = invalidate["invalidated"]
@@ -283,7 +283,7 @@ async fn update_topology_over_uds_returns_affected_subset_not_whole_graph() {
             regions.push(',');
         }
         regions.push_str(&format!(
-            r#"{{"id":{id},"hash":"{id:02x}","data":[1.0,0.5,{id}.0,0.0]}}"#
+            r#"{{"id":{id},"hash":"{id:02x}00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,{id}.0,0.0]}}"#
         ));
     }
     regions.push(']');
@@ -294,7 +294,7 @@ async fn update_topology_over_uds_returns_affected_subset_not_whole_graph() {
             restrictions.push(',');
         }
         restrictions.push_str(&format!(
-            r#"{{"a":0,"b":{leaf},"boundary_hash":"{:02x}","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}}"#,
+            r#"{{"a":0,"b":{leaf},"boundary_hash":"{:02x}00000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}}"#,
             0u8 ^ (leaf as u8)
         ));
     }
@@ -427,7 +427,7 @@ async fn sheaf_reap_observes_drift_over_uds() {
     // section.
     let topology = uds_call(
         &sock,
-        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
     )
     .await;
     assert_eq!(
@@ -464,7 +464,7 @@ async fn sheaf_reap_observes_drift_over_uds() {
     // designed to detect.
     let invalidate = uds_call(
         &sock,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee","data":[99.0,0.5,42.0,7.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee00000000000000000000000000000000000000000000000000000000000000","data":[99.0,0.5,42.0,7.0]}]}"#,
     )
     .await;
     assert_eq!(
@@ -534,7 +534,7 @@ async fn sheaf_invalidate_prior_generation_continuity_over_uds() {
     // observing that the first invalidate's prior_generation is 0.
     let topology = uds_call(
         &sock,
-        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
     )
     .await;
     assert_eq!(
@@ -547,7 +547,7 @@ async fn sheaf_invalidate_prior_generation_continuity_over_uds() {
     let mut prev_gen: Option<u64> = None;
     for i in 0..3 {
         let body = format!(
-            r#"{{"op":"sheaf_invalidate","regions":[0],"stalks":[{{"id":0,"hash":"{i:02x}","data":[{},0.5,42.0,7.0]}}]}}"#,
+            r#"{{"op":"sheaf_invalidate","regions":[0],"stalks":[{{"id":0,"hash":"{i:02x}00000000000000000000000000000000000000000000000000000000000000","data":[{},0.5,42.0,7.0]}}]}}"#,
             (i + 1) as f32 * 10.0,
         );
         let resp = uds_call(&sock, &body).await;
@@ -601,7 +601,7 @@ async fn sheaf_update_topology_prior_generation_continuity_over_uds() {
 
     let topology = uds_call(
         &sock,
-        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
     )
     .await;
     assert_eq!(
@@ -612,7 +612,7 @@ async fn sheaf_update_topology_prior_generation_continuity_over_uds() {
     // Step 1: invalidate. Snapshot its generation.
     let inv = uds_call(
         &sock,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"11","data":[2.0,0.5,42.0,7.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"1100000000000000000000000000000000000000000000000000000000000000","data":[2.0,0.5,42.0,7.0]}]}"#,
     )
     .await;
     let after_invalidate_gen = parse_u64_field(&inv["generation"], "generation", &inv);
@@ -628,7 +628,7 @@ async fn sheaf_update_topology_prior_generation_continuity_over_uds() {
     // prior_generation == after_invalidate_gen (continuity across ops).
     let upd = uds_call(
         &sock,
-        r#"{"op":"sheaf_update_topology","node_stalk_dim":4,"delta":{"added_regions":[{"id":2,"hash":"cc","data":[1.0,0.5,0.0,0.0]}],"removed_regions":[],"added_edges":[{"a":1,"b":2,"boundary_hash":"22","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}],"removed_edges":[],"updated_stalks":[]}}"#,
+        r#"{"op":"sheaf_update_topology","node_stalk_dim":4,"delta":{"added_regions":[{"id":2,"hash":"cc00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]}],"removed_regions":[],"added_edges":[{"a":1,"b":2,"boundary_hash":"2200000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}],"removed_edges":[],"updated_stalks":[]}}"#,
     )
     .await;
     assert_eq!(upd["ok"], true, "update_topology must succeed: {upd}");

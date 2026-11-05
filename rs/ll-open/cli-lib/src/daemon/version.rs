@@ -8,8 +8,10 @@
 //!
 //! # Discipline
 //!
-//! `BINARY_VERSION` comes from `CARGO_PKG_VERSION` — bumps automatically
-//! every release. `BUILD_DATE` comes from `$LLO_BUILD_DATE` if set in
+//! `RELEASE_VERSION` comes from `CARGO_PKG_VERSION` — bumps automatically
+//! every release — and `BINARY_VERSION` is it plus a `-dev+<shortsha>`
+//! suffix on every build that is not the tagged release (bead
+//! `ley-line-open-5139a3`). `BUILD_DATE` comes from `$LLO_BUILD_DATE` if set in
 //! the build environment, otherwise `"unspecified"`. The other three
 //! constants are hand-pinned here — there is no source of truth for
 //! "minimum compatible schema-client version" or "current wire-format
@@ -30,16 +32,28 @@
 //! These are the *only* hand-maintained version facts; the rest of
 //! the substrate's compatibility surface (cbea02) derives from them.
 
-/// The daemon binary's version. Derived from `CARGO_PKG_VERSION` at
-/// compile time — no separate source of truth to drift against.
-pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version this build reports on every surface: `leyline --version`,
+/// the `leyline_version` op's `binary_version`, MCP `serverInfo`, the
+/// `leyline self` user agent and the arena owner record. A release build
+/// (`LEYLINE_RELEASE_VERSION` set by `release.yml` from the tag) reports the
+/// bare [`RELEASE_VERSION`]; every other build reports
+/// `X.Y.Z-dev+<shortsha>[.dirty]`, so an unreleased build is never mistaken
+/// for the release (bead `ley-line-open-5139a3`). Computed by `build.rs`
+/// from `src/build_version.rs`, from inputs only, never the clock.
+pub const BINARY_VERSION: &str = env!("LEYLINE_BUILD_VERSION");
+
+/// The release line this build belongs to: the crate version
+/// (`CARGO_PKG_VERSION`), without a build suffix. Committed artifacts that
+/// must not vary per commit (`compatibility.json`, `server.json`) and
+/// version arithmetic (`leyline self update`'s downgrade check) use this.
+pub const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The public Rust/Go schema-client version this daemon's wire shapes target.
 /// This is intentionally independent from `BINARY_VERSION`, even though the
 /// v0.11.0 release advances both. Binary-only releases leave this literal
 /// unchanged; a public consumer-contract release requires a matching nested
 /// Go-module tag.
-pub const SCHEMA_VERSION: &str = "0.24.0";
+pub const SCHEMA_VERSION: &str = "0.25.0";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions

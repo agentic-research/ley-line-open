@@ -33,6 +33,8 @@ use anyhow::{Context, Result, bail};
 use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec};
 use rusqlite::Connection;
 
+pub use crate::tree::GitMode;
+
 /// Scheme tag of the tree-root fold. Protocol-visible: changing the entry
 /// shape, the ordering rule or the params layout is a `v2`, not an edit.
 pub const TREE_ROOT_SCHEME: &str = "leyline/tree-root/v1";
@@ -128,9 +130,10 @@ impl ParserInputs {
 pub struct TreeLeaf {
     /// The path relative to the tree root.
     pub path: String,
-    /// The entry's git mode (`0o100644`, `0o100755`, `0o120000`, or
-    /// `0o040000` for an empty directory).
-    pub mode: u32,
+    /// The entry's git mode; [`GitMode::Directory`] for an empty directory.
+    /// A mode git does not store is unrepresentable, so it cannot fold
+    /// (bead `ley-line-open-80f037` F8).
+    pub mode: GitMode,
     /// The file's blob hash; BLAKE3 of no bytes for an empty directory.
     pub content: Hash,
 }
@@ -140,7 +143,7 @@ impl TreeLeaf {
     pub fn regular(path: impl Into<String>, content: Hash) -> Self {
         TreeLeaf {
             path: path.into(),
-            mode: 0o100644,
+            mode: GitMode::Regular,
             content,
         }
     }
@@ -148,8 +151,11 @@ impl TreeLeaf {
 
 /// `b` of a leaf's content entry: `0` for a regular file, so every tree a
 /// pre-ADR-0045 producer folded keeps its root, and the git mode otherwise.
-fn mode_tag(mode: u32) -> u64 {
-    if mode == 0o100644 { 0 } else { u64::from(mode) }
+fn mode_tag(mode: GitMode) -> u64 {
+    match mode {
+        GitMode::Regular => 0,
+        other => u64::from(other.git()),
+    }
 }
 
 /// `treeRoot` over an explicit leaf set. Pure, so a receiver holding only a
@@ -191,7 +197,7 @@ pub fn leaves_of(
         match entry {
             E::File { mode, blob } => leaves.push(TreeLeaf {
                 path: path.clone(),
-                mode: mode.git(),
+                mode: (*mode).into(),
                 content: *blob,
             }),
             E::Dir => {
@@ -203,7 +209,7 @@ pub fn leaves_of(
                 if empty {
                     leaves.push(TreeLeaf {
                         path: path.clone(),
-                        mode: crate::tree::DIRECTORY_MODE,
+                        mode: GitMode::Directory,
                         content: b"".hash(),
                     });
                 }
@@ -335,9 +341,10 @@ pub fn verify_with(db_path: &Path, policy: &crate::head_claim::HeadPolicy) -> Re
         crate::head_claim::Reader::VerifyHead,
         policy,
     )?;
-    let stamped_tree = hash_field(h.get_tree_root().ok().map(|x| x.get_bytes()))?;
-    let stamped_parser = hash_field(h.get_parser_id().ok().map(|x| x.get_bytes()))?;
-    let (Some(stamped_tree), Some(stamped_parser)) = (stamped_tree, stamped_parser) else {
+    // A half-stamped head is malformed, not pre-ADR-0040 (bead 80f037 F3).
+    let Some((stamped_tree, stamped_parser)) = crate::head_claim::stamp_of(h)
+        .with_context(|| format!("head {} is malformed", head_path.display()))?
+    else {
         return Ok(Verification::NotStamped);
     };
 
@@ -621,17 +628,17 @@ mod tests {
         let leaves = [
             TreeLeaf {
                 path: "run.sh".into(),
-                mode: 0o100755,
+                mode: GitMode::Executable,
                 content: Hash::from_bytes([1; 32]),
             },
             TreeLeaf {
                 path: "link".into(),
-                mode: 0o120000,
+                mode: GitMode::Symlink,
                 content: b"run.sh".hash(),
             },
             TreeLeaf {
                 path: "empty".into(),
-                mode: 0o040000,
+                mode: GitMode::Directory,
                 content: b"".hash(),
             },
         ];
@@ -689,7 +696,7 @@ mod tests {
             vec![
                 TreeLeaf {
                     path: "a-c".into(),
-                    mode: 0o040000,
+                    mode: GitMode::Directory,
                     content: b"".hash(),
                 },
                 TreeLeaf::regular("a/b.go", h(1)),
@@ -709,5 +716,167 @@ mod tests {
             ),
             "directories with files beneath them are not leaves"
         );
+    }
+
+    /// Bead `ley-line-open-80f037` F8: a leaf's mode is a [`GitMode`], so
+    /// the fold sees only modes git stores. With a bare `u32`, mode `0`
+    /// folded exactly as a regular file. `GitMode::from_git` is the one
+    /// parse from the integer, and the `_tree` read goes through it.
+    #[test]
+    fn leaf_modes_are_parsed_git_modes() {
+        for (int, mode) in [
+            (0o100644, GitMode::Regular),
+            (0o100755, GitMode::Executable),
+            (0o120000, GitMode::Symlink),
+            (0o040000, GitMode::Directory),
+        ] {
+            assert_eq!(GitMode::from_git(int), Some(mode));
+            assert_eq!(mode.git(), int);
+        }
+        for bogus in [0, 0o100664, 0o160000, 0o644, u32::MAX] {
+            assert_eq!(GitMode::from_git(bogus), None, "{bogus:o}");
+        }
+        let tags: std::collections::BTreeSet<u64> = [
+            GitMode::Regular,
+            GitMode::Executable,
+            GitMode::Symlink,
+            GitMode::Directory,
+        ]
+        .into_iter()
+        .map(mode_tag)
+        .collect();
+        assert_eq!(tags.len(), 4, "every mode folds to its own tag");
+    }
+
+    /// The fold laws of the module header as for-all properties (bead
+    /// `ley-line-open-80f037` F10). Paths are drawn from an alphabet holding
+    /// `/`, the unit separator 0x1f and newline, and are short enough that
+    /// shared prefixes and one-byte neighbours are common.
+    mod laws {
+        use super::*;
+        use proptest::prelude::*;
+
+        const MODES: [GitMode; 4] = [
+            GitMode::Regular,
+            GitMode::Executable,
+            GitMode::Symlink,
+            GitMode::Directory,
+        ];
+
+        fn path() -> impl Strategy<Value = String> {
+            "[ab/\u{1f}\n]{1,5}"
+        }
+
+        /// A leaf set with distinct paths, as a manifest has.
+        fn leaves() -> impl Strategy<Value = Vec<TreeLeaf>> {
+            proptest::collection::btree_map(path(), (0usize..4, 0u8..3), 0..6).prop_map(|m| {
+                m.into_iter()
+                    .map(|(path, (mode, blob))| TreeLeaf {
+                        path,
+                        mode: MODES[mode],
+                        content: Hash::from_bytes([blob; 32]),
+                    })
+                    .collect()
+            })
+        }
+
+        fn non_empty_leaves() -> impl Strategy<Value = Vec<TreeLeaf>> {
+            leaves().prop_filter("one leaf to change", |l| !l.is_empty())
+        }
+
+        proptest! {
+            /// Discovery order is not identity: every permutation of a leaf
+            /// set folds to one root.
+            #[test]
+            fn tree_root_is_invariant_under_permutation(
+                l in leaves().prop_flat_map(|l| (Just(l.clone()), Just(l).prop_shuffle())),
+            ) {
+                let p = inputs().parser_id();
+                prop_assert_eq!(tree_root_of(&l.0, p), tree_root_of(&l.1, p));
+            }
+
+            /// One changed path byte moves the root.
+            #[test]
+            fn one_path_byte_moves_the_tree_root(
+                l in non_empty_leaves(),
+                which in any::<prop::sample::Index>(),
+                at in any::<prop::sample::Index>(),
+                byte in prop::sample::select(vec![b'a', b'b', b'/', 0x1f, b'\n']),
+            ) {
+                let p = inputs().parser_id();
+                let i = which.index(l.len());
+                let mut bytes = l[i].path.clone().into_bytes();
+                let j = at.index(bytes.len());
+                prop_assume!(bytes[j] != byte);
+                bytes[j] = byte;
+                let moved = String::from_utf8(bytes).unwrap();
+                prop_assume!(l.iter().all(|x| x.path != moved));
+                let mut changed = l.clone();
+                changed[i].path = moved;
+                prop_assert_ne!(tree_root_of(&l, p), tree_root_of(&changed, p));
+            }
+
+            /// One changed content byte moves the root.
+            #[test]
+            fn one_content_byte_moves_the_tree_root(
+                l in non_empty_leaves(),
+                which in any::<prop::sample::Index>(),
+                at in 0usize..32,
+                flip in 1u8..=255,
+            ) {
+                let p = inputs().parser_id();
+                let i = which.index(l.len());
+                let mut bytes = *l[i].content.as_bytes();
+                bytes[at] ^= flip;
+                let mut changed = l.clone();
+                changed[i].content = Hash::from_bytes(bytes);
+                prop_assert_ne!(tree_root_of(&l, p), tree_root_of(&changed, p));
+            }
+
+            /// One changed mode moves the root.
+            #[test]
+            fn one_mode_moves_the_tree_root(
+                l in non_empty_leaves(),
+                which in any::<prop::sample::Index>(),
+                to in 0usize..4,
+            ) {
+                let p = inputs().parser_id();
+                let i = which.index(l.len());
+                prop_assume!(l[i].mode != MODES[to]);
+                let mut changed = l.clone();
+                changed[i].mode = MODES[to];
+                prop_assert_ne!(tree_root_of(&l, p), tree_root_of(&changed, p));
+            }
+
+            /// Path boundaries are committed: two paths whose concatenation
+            /// is the same string fold differently when split differently,
+            /// including a split that turns `a/b` into the two leaves `a`
+            /// and `b`.
+            #[test]
+            fn path_boundaries_are_committed(
+                whole in "[ab/\u{1f}\n]{2,8}",
+                x in any::<prop::sample::Index>(),
+                y in any::<prop::sample::Index>(),
+            ) {
+                let p = inputs().parser_id();
+                let (i, j) = (1 + x.index(whole.len() - 1), 1 + y.index(whole.len() - 1));
+                prop_assume!(i != j);
+                let split = |k: usize| {
+                    let (a, b) = whole.split_at(k);
+                    vec![leaf(a, 1), leaf(b, 1)]
+                };
+                let (si, sj) = (split(i), split(j));
+                prop_assume!(si[0].path != si[1].path && sj[0].path != sj[1].path);
+                // `uv == vu` (e.g. "aaa") splits into one set two ways.
+                let set = |s: &[TreeLeaf]| {
+                    let mut v: Vec<&str> = s.iter().map(|x| x.path.as_str()).collect();
+                    v.sort_unstable();
+                    v.join("\0")
+                };
+                prop_assume!(set(&si) != set(&sj));
+                prop_assert_ne!(tree_root_of(&si, p), tree_root_of(&sj, p));
+                prop_assert_ne!(tree_root_of(&[leaf(&whole, 1)], p), tree_root_of(&si, p));
+            }
+        }
     }
 }

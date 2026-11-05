@@ -121,8 +121,7 @@ pub fn file_nid_range(file_id: i64) -> (i64, i64) {
 /// load-bearing:
 ///
 /// - `files.file_id` feeds nids; deleting a row would let SQLite reuse the
-///   rowid and re-bind a dead file's nid range to an unrelated new file
-///   (the exact reuse hazard `content_manifest` invalidation documents).
+///   rowid and re-bind a dead file's nid range to an unrelated new file.
 ///   A deleted file's row simply goes stale; a re-created path re-binds to
 ///   its old `file_id`.
 /// - Renaming a directory is `UPDATE dirs SET name_id = ?` — ONE row for a
@@ -131,6 +130,10 @@ pub fn file_nid_range(file_id: i64) -> (i64, i64) {
 /// - `dirs.dir_id = 1` is the tree root (name "", parent NULL). The CHECK
 ///   pins root uniqueness structurally: `UNIQUE(parent_dir_id, name_id)`
 ///   cannot, because SQLite treats NULLs as distinct in UNIQUE indexes.
+///
+/// The append-only rule is enforced by the database, not by writer
+/// discipline (bead `ley-line-open-80f037` F9): [`INTERN_GUARDS_DDL`]
+/// refuses every DELETE and every UPDATE that changes a row's id.
 pub const INTERN_TABLES_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS names (
     name_id INTEGER PRIMARY KEY,
@@ -155,6 +158,38 @@ CREATE TABLE IF NOT EXISTS files (
     name_id INTEGER NOT NULL,
     UNIQUE(dir_id, name_id)
 );";
+
+/// Triggers that make the interning tables append-only (bead
+/// `ley-line-open-80f037` F9). A DELETE would let SQLite hand the freed
+/// rowid to the next INSERT and so re-bind a dead file's nid range; an
+/// id-changing UPDATE re-binds it directly. Both abort. An UPDATE that keeps
+/// the id (a rename: `UPDATE dirs SET name_id = ?`) is allowed. Rows removed
+/// by `INSERT OR REPLACE` fire DELETE triggers only under
+/// `recursive_triggers`; no writer replaces into these tables (they intern
+/// with `INSERT OR IGNORE`). Same rung as the CDC generation triggers.
+/// Idempotent, and applied by [`create_nodes_table`], so an arena created
+/// before the guards gains them on its next schema pass.
+pub const INTERN_GUARDS_DDL: &str = "\
+CREATE TRIGGER IF NOT EXISTS names_append_only_delete BEFORE DELETE ON names
+BEGIN SELECT RAISE(ABORT, 'names is append-only: rows are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS names_append_only_update BEFORE UPDATE OF name_id ON names
+WHEN NEW.name_id IS NOT OLD.name_id
+BEGIN SELECT RAISE(ABORT, 'names is append-only: name_id never changes'); END;
+CREATE TRIGGER IF NOT EXISTS kinds_append_only_delete BEFORE DELETE ON kinds
+BEGIN SELECT RAISE(ABORT, 'kinds is append-only: rows are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS kinds_append_only_update BEFORE UPDATE OF kind_id ON kinds
+WHEN NEW.kind_id IS NOT OLD.kind_id
+BEGIN SELECT RAISE(ABORT, 'kinds is append-only: kind_id never changes'); END;
+CREATE TRIGGER IF NOT EXISTS dirs_append_only_delete BEFORE DELETE ON dirs
+BEGIN SELECT RAISE(ABORT, 'dirs is append-only: rows are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS dirs_append_only_update BEFORE UPDATE OF dir_id ON dirs
+WHEN NEW.dir_id IS NOT OLD.dir_id
+BEGIN SELECT RAISE(ABORT, 'dirs is append-only: dir_id never changes'); END;
+CREATE TRIGGER IF NOT EXISTS files_append_only_delete BEFORE DELETE ON files
+BEGIN SELECT RAISE(ABORT, 'files is append-only: rows are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS files_append_only_update BEFORE UPDATE OF file_id ON files
+WHEN NEW.file_id IS NOT OLD.file_id
+BEGIN SELECT RAISE(ABORT, 'files is append-only: file_id never changes'); END;";
 
 /// The `nodes` table DDL (table only, no indexes).
 ///
@@ -262,6 +297,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
 /// clock. Seeds the root directory.
 pub fn create_nodes_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(INTERN_TABLES_DDL)?;
+    conn.execute_batch(INTERN_GUARDS_DDL)?;
     conn.execute_batch(NODES_TABLE_DDL)?;
     ensure_root_dir(conn)?;
     Ok(())
@@ -954,6 +990,63 @@ mod tests {
         conn
     }
 
+    /// `nodes.record` stores numeric-looking tokens verbatim: a leading-zero
+    /// literal, a markdown ordered-list marker and an identifier all read
+    /// back as TEXT with their exact bytes. A NUMERIC-affinity column type
+    /// (`record JSON`) coerced the first two (bead `ley-line-open-f7966d`).
+    #[test]
+    fn nodes_record_stores_numeric_tokens_verbatim() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_nodes_table(&conn).unwrap();
+        let mut nids = Vec::new();
+        for (file, ordinal, record) in [
+            ("a.rs", 1, "main"),
+            ("a.rs", 2, "007"),
+            ("README.md", 1, "1. "),
+        ] {
+            let file_id = ensure_file_id(&conn, file).unwrap();
+            ensure_dir_nodes(&conn, file, 7).unwrap();
+            let nid = file_nid(file_id, ordinal);
+            insert_node(
+                &conn,
+                nid,
+                Some(file_nid(file_id, 0)),
+                None,
+                None,
+                0,
+                ordinal,
+                record.len() as i64,
+                7,
+                record,
+            )
+            .unwrap();
+            nids.push((nid, record));
+        }
+
+        let coerced: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE typeof(record) <> 'text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(coerced, 0, "every record must read back as text");
+        for (nid, expected) in nids {
+            let stored: Vec<u8> = conn
+                .query_row(
+                    "SELECT CAST(record AS BLOB) FROM nodes WHERE nid = ?1",
+                    [nid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored,
+                expected.as_bytes(),
+                "nid {nid} round-trips verbatim"
+            );
+        }
+    }
+
     // ── nid scheme ─────────────────────────────────────────────────────
 
     #[test]
@@ -1071,6 +1164,48 @@ mod tests {
     }
 
     // ── schema + interning ─────────────────────────────────────────────
+
+    /// Bead `ley-line-open-80f037` F9: the interning tables are append-only
+    /// in the database, not only in prose. A DELETE, or an UPDATE that
+    /// changes a row's id, is refused, so no writer can let SQLite reuse a
+    /// `file_id` and re-bind a dead file's nid range. A directory rename,
+    /// which keeps the id, still works.
+    #[test]
+    fn interning_tables_refuse_delete_and_renumbering() {
+        let conn = mem();
+        let fid = ensure_file_id(&conn, "src/a.go").unwrap();
+        intern_kind(&conn, "go", "identifier").unwrap();
+        for (table, id) in [
+            ("names", "name_id"),
+            ("kinds", "kind_id"),
+            ("dirs", "dir_id"),
+            ("files", "file_id"),
+        ] {
+            let del = conn
+                .execute(&format!("DELETE FROM {table}"), [])
+                .expect_err("DELETE must be refused");
+            assert!(del.to_string().contains("append-only"), "{table}: {del}");
+            let renumber = conn
+                .execute(&format!("UPDATE {table} SET {id} = {id} + 1000"), [])
+                .expect_err("an id-changing UPDATE must be refused");
+            assert!(
+                renumber.to_string().contains("append-only"),
+                "{table}: {renumber}"
+            );
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert!(rows > 0, "{table} lost rows");
+        }
+        // Same-id UPDATE (a rename) is the documented one-row operation.
+        let new_name = intern_name(&conn, "b.go").unwrap();
+        conn.execute(
+            "UPDATE files SET name_id = ?1 WHERE file_id = ?2",
+            [new_name, fid],
+        )
+        .unwrap();
+        assert_eq!(ensure_file_id(&conn, "src/b.go").unwrap(), fid);
+    }
 
     #[test]
     fn create_schema_is_idempotent() {

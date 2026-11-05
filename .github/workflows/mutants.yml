@@ -115,7 +115,7 @@ jobs:
             echo "shards=[0,1,2,3]" >> "$GITHUB_OUTPUT"
           fi
           if [ "$BASE_REF" = "main" ] && printf '%s\n' "$changed" | grep -qE \
-            '^(rs/ll-open/cdc/.*\.rs$|rs/ll-open/fs/src/(chunked|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
+            '^(rs/ll-open/cdc/.*\.rs$|rs/ll-open/fs/src/(blob_chunked|chunk_pool|gc)\.rs|rs/ll-core/core/src/partition\.rs|Taskfile\.yml|tools/mutants_diff\.sh|\.github/workflows/mutants\.yml)'; then
             echo "allowlist=true" >> "$GITHUB_OUTPUT"
           elif [ "$BASE_REF" != "main" ]; then
             echo "allowlist=false" >> "$GITHUB_OUTPUT"

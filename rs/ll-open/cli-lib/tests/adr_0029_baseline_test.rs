@@ -504,7 +504,7 @@ fn format_baseline_json(
         captured_at = today_iso(),
         sha = head_sha(),
         hardware = uname_srm(),
-        version = env!("CARGO_PKG_VERSION"),
+        version = leyline_cli_lib::daemon::version::BINARY_VERSION,
         p50 = f1.p50_ms,
         p99 = f1.p99_ms,
         iters = f1.iterations,

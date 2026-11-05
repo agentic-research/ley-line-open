@@ -1,6 +1,6 @@
 [package]
 name = "leyline-core"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 description = "Σ substrate core for ley-line: BLAKE3 content addressing, the BlobStore contract, arena layout and mmap primitives, and the incremental outboard hash tree"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -27,3 +27,5 @@ interrupt = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Fold-law properties over `PartitionSpec::address` (bead ley-line-open-80f037 F10).
+proptest = "1.8"

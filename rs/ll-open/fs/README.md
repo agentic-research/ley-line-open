@@ -16,7 +16,7 @@ NFS adapters, serving the store's files (`_tree`), not this tree.
 ## Feature flags
 
 - `validate` (default) — the syntax-error report the daemon's `validate` op uses.
-- `cdc` — chunk-backed content storage: range reads touch only overlapping chunks; transactional GC.
+- `cdc` — chunk-backed storage for whole-file `source_blobs` (the one CDC target, ADR-0033): range reads touch only overlapping chunks; transactional GC. The graph's own reads always serve `nodes.record`; the per-node `nodes` target was removed in `ley-line-open-afa952`.
 - `verify` — verify-on-fault arena serving (not shipping; bead `ley-line-open-b6a4dd`).
 
 The `VectorIndex` sidecar previously lived here under a `vec` feature; it's now part of `leyline-cli-lib`'s daemon module so vectors live next to the `EmbeddingPass` framework that produces them.

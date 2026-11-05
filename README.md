@@ -53,11 +53,12 @@ development, see [GETTING-STARTED.md](GETTING-STARTED.md).
   serialized byte image (`current_root`). That hash is authoritative for byte
   integrity only — it says nothing about logical content. The generalized
   arena↔consumer Cap'n Proto handoff is tracked by `ley-line-open-50be73`.
-- CDC is an explicit, derived read optimization. `nodes.record` remains
-  authoritative; activate and collect CDC manifests with `leyline cdc`.
-- The `content_chunks`, `content_manifest`, and `content_manifest_meta` tables
-  are private derived indexes. They never replace the authoritative record, no
-  consumer reads them, and changes to them do not bump `leyline-schema`.
+- CDC is an explicit, derived storage index over whole-file `source_blobs`.
+  `source_blobs` remains authoritative; activate and collect CDC manifests with
+  `leyline cdc`.
+- The `content_chunks` and `blob_manifest` tables are private derived indexes.
+  They never replace the authoritative record, no consumer reads them, and
+  changes to them do not bump `leyline-schema`.
 
 Which identity is authoritative for what is settled by
 [ADR-0032](docs/adr/0032-declared-decompositions.md) §D4 and applied in
@@ -107,7 +108,7 @@ The execution/v1 API is exposed through the runtime crate, the explicit
 registry. Its schema version
 (`cloister/execution/v1`) is deliberately independent of the repository and
 crate release version; consumers must negotiate API compatibility rather than
-infer it from `v0.24.0`. The ordinary open `leyline daemon` command remains a
+infer it from `v0.25.0`. The ordinary open `leyline daemon` command remains a
 substrate daemon with no execution backend; an embedding application must opt
 into `run_execution_daemon` after constructing a trusted resolver/backend
 handler. The service currently proves schema binding,
@@ -195,9 +196,9 @@ tests. The Taskfile fixture gate rejects Rust diffs that enumerate no mutants,
 focused scopes that run no matching slice, and baseline suites that cannot run
 inside cargo-mutants' scratch tree.
 
-The current release is `v0.24.0`. It publishes platform binaries, FFI
+The current release is `v0.25.0`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
-`clients/go/leyline-schema/v0.24.0`. See
+`clients/go/leyline-schema/v0.25.0`. See
 [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
 for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 
@@ -217,7 +218,7 @@ them per platform, so consuming one is a download rather than a Rust build:
 ```bash
 # capnp resolves `-o<plugin>` by PATH-searching `capnpc-<plugin>`, so the
 # schema-bridge assets must be installed under their unsuffixed names.
-curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.24.0/capnpc-schema-bridge-zod-darwin-arm64
+curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.25.0/capnpc-schema-bridge-zod-darwin-arm64
 install -m 0755 capnpc-schema-bridge-zod-darwin-arm64 ~/.local/bin/capnpc-schema-bridge-zod
 ```
 
@@ -235,18 +236,18 @@ dependency and build a build-tool from source — which meant a fix could be
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged
-`localhost/leyline:v0.24.0`. It uses
+`localhost/leyline:v0.25.0`. It uses
 `cargo zigbuild` for the static musl binary
 and `cgr.dev/chainguard/static:latest` as the runtime base.
 
 Pushing a `v*` tag publishes the multi-arch image (linux/amd64 + linux/arm64)
-to `ghcr.io/agentic-research/ley-line-open:v0.24.0`, with a
+to `ghcr.io/agentic-research/ley-line-open:v0.25.0`, with a
 [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 recorded against the pushed digest:
 
 ```bash
-docker pull ghcr.io/agentic-research/ley-line-open:v0.24.0
-gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.24.0 \
+docker pull ghcr.io/agentic-research/ley-line-open:v0.25.0
+gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.25.0 \
   --repo agentic-research/ley-line-open
 ```
 

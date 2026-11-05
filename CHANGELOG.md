@@ -14,6 +14,249 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.25.0] — 2026-11-05
+
+**A correctness release for daemon clients. The projection is unchanged
+(`projection-v10`), so arenas carry over.** Absence is now stated, never
+encoded as zero:
+- `current_root` is omitted when nothing is published, with `root_published`
+  on every response that carries a root and on the `daemon.sheaf.invalidate`
+  event;
+- arena-local nids no longer reach the wire;
+- sheaf stalk hashes are parsed strictly, and an omitted hash is an explicit
+  "changed" that always fires the cascade;
+- a content-derived region hash (`leyline/sheaf-region/v1`) is specified, with
+  Go vectors.
+
+Clients that read 64 zeros as "no root", send empty or short stalk hashes, or
+read the LSP rows' `nid` key must update (mache: `mache-997b7f`,
+`mache-1c7038`).
+
+New:
+- the `leyline-cache` crate (the restriction-addressed cache, now with a
+  lawful key);
+- ADR-0047, the Σ amendment, which accepts the identity migrations to come
+  (no identity moves in this release);
+- builds that are not this tag report `0.25.0-dev+<sha>`.
+
+The CDC `nodes` target is removed; `source-blobs` is unchanged.
+`SCHEMA_VERSION` is 0.25.0, with the Go module tagged
+`clients/go/leyline-schema/v0.25.0`.
+
+### Breaking
+
+- **Sheaf stalk hashes are parsed strictly, an omitted hash is an explicit
+  "changed", and region hashes have a content-derived contract** (bead
+  `ley-line-open-1c5d28`).
+  - Breaking: `sheaf_set_topology`, `sheaf_update_topology` and
+    `sheaf_invalidate` refuse a `hash` or `boundary_hash` that is not exactly
+    64 lowercase hex digits, `""` included, with a typed `WireHashError`,
+    and apply none of the request. The old parser zero-padded short input,
+    truncated long input and skipped non-hex pairs, so `""`, `"aa"` and
+    `"zz"` all became hashes. `boundary_hash` is now required.
+  - Fixed: an omitted `hash` (or `null`) marks the region
+    `StalkDigest::Changed`. Every boundary it touches fires before the XOR
+    pre-filter or δ⁰ is consulted, so the cascade proceeds through it and
+    nothing under-evicts. It used to become the all-zero hash, which fired
+    the XOR only by accident. mache's current omit-the-hash `Invalidate`
+    keeps its eviction behavior; in δ⁰ mode it now also fires the region's
+    edges, since its stalk data was not refreshed either.
+  - Added: the region-hash contract, `leyline/sheaf-region/v1`: a region's
+    hash is the `PartitionSpec` `RowSet` fold over its members' `node_hash`
+    values with `parserId` as params, and an edge's `boundary_hash` is the
+    XOR of its two regions' hashes. Rust: `leyline_sheaf::region::{
+    region_hash, boundary_hash, REGION_SCHEME}`; vectors with full
+    preimages: `clients/go/leyline-schema/vectors/sheaf-region-v1.json`.
+    Documented in `daemon.capnp` and the sheaf README.
+  - `leyline_sheaf::cache::StalkHash` now has one method,
+    `digest() -> StalkDigest` (`Hash([u8; 32])` or `Changed`), replacing
+    `merkle_root() -> [u8; 32]`; `StalkDigest` implements it, and the
+    daemon's `HashStalk` is gone (`SheafCache<StalkDigest, ()>`).
+
+- **Arena-local nids no longer reach the daemon wire, and `TreeLeaf.mode`
+  is a `GitMode`** (bead `ley-line-open-80f037`, findings F3 and F8).
+  - `lsp_symbols` and `lsp_diagnostics` rows no longer carry `nid`. Each
+    row carries the display `node_id` it already had; `nid` was the row's
+    key inside one arena and named nothing outside it.
+  - `find_callers`, `find_defs`, `find_callees`, `get_refs_map`,
+    `get_defs_map`, `lsp_hover`, `lsp_symbols` and `lsp_diagnostics` render a node with no
+    tree path as `{source_id}#inj@{ordinal}` as before, and now refuse a
+    node whose file has no `_source` row instead of emitting its decimal
+    nid as `node_id`. `lsp_hover` also propagates a path-render error it
+    used to swallow. mache reads `node_id` as a path and never parsed the
+    decimal form.
+  - `leyline_cli_lib::tree_root::TreeLeaf.mode` is
+    `leyline_cli_lib::tree::GitMode` (`Regular`, `Executable`, `Symlink`,
+    `Directory`) instead of `u32`; `GitMode::from_git` is the one parse
+    from the integer, and the `_tree` and checkout-index reads go through
+    it. A mode git does not store can no longer reach the fold, where mode
+    `0` folded exactly as a regular file. The SQL column `_tree.mode` is
+    unchanged.
+
+- **`current_root` is omitted when no root is published, on every daemon
+  wire site, and a controller read error is never sent as a root** (bead
+  `ley-line-open-80f037`). One rule, documented on
+  `StatusResponse.rootPublished` in `daemon.capnp`, now governs the
+  `status`, `reparse`, `snapshot`, `flush`, `enrich` and `load` responses
+  and the `daemon.sheaf.invalidate` event: `root_published` is always
+  present, and `current_root` is present exactly when it is `true`.
+  - Breaking: `current_root` used to be 64 zero hex digits before the first
+    publish (and after `--reset-arena`). The key is now absent instead. A
+    consumer that read the zero spelling as "no root" tests
+    `root_published` or the key's absence.
+  - Breaking: the `daemon.sheaf.invalidate` event used to send `""` as
+    `current_root` when the controller could not be read. The watcher's
+    event now carries `root_error` (text) in place of `root_published` and
+    `current_root`, and still delivers the invalidation. The consumer-driven
+    `sheaf_invalidate` op reads the root before it touches the cache and
+    fails with the controller error, leaving the cache unchanged and
+    emitting nothing.
+  - Additive: `rootPublished` on `ReparseResponse @9`, `SnapshotResponse
+    @3`, `FlushResponse @2`, `EnrichResponse @4` and `LoadResponse @3`. Go:
+    `FlushResponse.RootPublished`, `SnapshotResponse.RootPublished`, and
+    `SheafInvalidatePayload.{Scope, ChangedFiles, RootPublished,
+    CurrentRoot, RootError}`; `DecodeEvent` now types the
+    `daemon.sheaf.invalidate` topic as well as `sheaf.invalidate`.
+  - `ops::read_root_hex` returns `Option<String>` (`None` = unpublished).
+
+### Added
+
+- **ADR-0047: the Σ amendment** (bead `ley-line-open-619a99`). σ is indexed by
+  construction: one value has one address per construction, each construction
+  other than plain BLAKE3 over bytes is keyed, and addresses from different
+  constructions are never compared. The ADR adds `verify(Ref, Witness)`, four
+  edge kinds (Derives, Contains, Attests, Locates), a conformance table of every
+  shipped identity, the never-filed axiom falsification suite, and four
+  accepted identity migrations (keyed `node_hash` and `run_id`, a parser-free
+  Merkle `storeRoot` replacing `treeRoot`, `lang`/`raw_kind` per occurrence,
+  blob address unchanged under chunks-primary). Documentation only; no
+  identity moves in this release.
+
+- **`leyline-cache`: the restriction-addressed review cache, restored with a
+  lawful key** (bead `ley-line-open-754aa1`, ADR-0031 amendment). The
+  restriction cache moves from `leyline-sheaf` (`leyline_sheaf::restriction_cache`
+  in v0.24.0) to a new crate, `rs/ll-open/cache`, that depends on
+  `leyline-core` and `blake3` only; import it from `leyline_cache` now. Its key is now a
+  `PartitionSpec` `RowSet` fold over the review's input-closure rows: each
+  row is a `derive_key("leyline/restriction/v1")` address over
+  length-prefixed fields, the row kind is the entry's framing, the family
+  and resolution rule are the scheme
+  (`leyline/restriction/call-target/token-eq/v1`,
+  `leyline/restriction/public-api/token-eq/v1`), and `parserId` is the
+  params. The old key joined fields with U+001F and rows with a newline,
+  both of which POSIX paths can hold, and bound no `parserId` (finding
+  `80f037` F5); a proptest property shows distinct row sets get distinct
+  keys under the new construction and is falsified on a test-only copy of
+  the old one. `FactSubstrate::from_rows` takes the `parserId` the rows were
+  extracted under, and restriction keys and `whole_object_hash` return a
+  `Hash`. `leyline_cache::strategy` adds one `ReviewCache` under pluggable
+  `KeyStrategy`s (`NoCache`, `WholeInput`, `RestrictionKey`), the interface
+  the daemon wiring (`ley-line-open-69305e`) calls. `task cache:ablation`
+  replays recent git history through those arms and through `SheafCache` in
+  heuristic and δ⁰ modes. On 60 commits the restriction key hits 94.0% of
+  10,464 lookups (an oracle ceiling of 94.26%: 601 answers changed) with 0
+  false skips, and the whole-input key hits 0%; the `SheafCache` numbers are
+  in its own entry below. A closure-mutation test drops each closure row in
+  turn and shows the cache going unsound, which is the evidence the closure
+  is complete. The hit rate was measured with a test-layer container
+  identity on a narrow review family; `ley-line-open-1b4dee` reruns it on
+  production identities and more families.
+
+### Changed
+
+- **A build that is not the tagged release reports `X.Y.Z-dev+<shortsha>`,
+  so it can no longer pass for the release** (bead `ley-line-open-5139a3`).
+  `leyline --version`, the `leyline_version` op's `binary_version`, MCP
+  `serverInfo.version`, the `leyline self` user agent and the arena owner
+  record's `leyline_version` all carry `daemon::version::BINARY_VERSION`.
+  It is the bare crate version only when `LEYLINE_RELEASE_VERSION` names it,
+  which `release.yml` sets from the pushed tag for the binary and image
+  builds; a value naming another version fails the build. Every other build
+  appends `-dev+<12-hex shortsha>`, plus `.dirty` when tracked files differ
+  from `HEAD`, or `-dev+unknown` without git. The suffix comes from git and
+  that variable, never the clock, so one revision reports one version.
+  - `daemon::version::RELEASE_VERSION` is the bare release line;
+    `compatibility.json`, `server.json` and `leyline self update`'s
+    downgrade check use it, so the committed artifacts do not vary per
+    commit.
+  - `tools/cli_smoke.sh` requires the dev form when `EXPECT_VERSION` is
+    unset (the `ci` and dry-run smokes) and the exact bare version when it
+    is set; `release.yml` sets it to the tag.
+  - A consumer pinning an exact version (mache's `leyline --version` check)
+    now sees a dev build as unequal to the release.
+
+- **`SheafCache` is documented and tested as advisory: a region it keeps is
+  a candidate for reuse, not a valid value** (bead `ley-line-open-f04610`).
+  On the 60-commit `task cache:ablation` replay (10,751 lookups, 617 changed
+  values) the heuristic mode kept 154 stale values at a 67.9% hit rate, the
+  δ⁰ mode kept 201 at 79.3%, and `leyline-cache`'s `RestrictionKey` kept 0
+  at 94.0%. Every stale value belongs to a function whose bytes did not
+  change and whose value moved through a fact no region owns: a def of a
+  called token elsewhere in the corpus, or an import edit. No shipped
+  consumer serves a value on the cache's say-so: the daemon's cache holds
+  `()`, `sheaf_invalidate` returns regions to recompute, and mache only
+  widens its own evictions with the list. The `sheaf_restriction_replay`
+  bench's δ⁰ arm now builds stalks with an interface digest in the
+  agreement coordinates and a body digest in the projected-away ones, the
+  layout mache pushes; its first version derived every coordinate from a
+  byte hash and could not separate the two modes. A regression test shrunk
+  from the replay pins one stale keep and the restriction key's recompute of
+  it, and asserts the advisory statement in the `cache` module doc and the
+  sheaf README.
+
+### Fixed
+
+- **Identity hardening: absence is stated, not encoded as zero, and the
+  fold laws are checked as properties** (bead `ley-line-open-80f037`,
+  findings F3, F8, F9 and F10 of `ley-line-open-619a99`).
+  - `status` adds `root_published` (`StatusResponse.rootPublished @12`,
+    additive; Go `StatusResponse.RootPublished`). While it is `false`,
+    `current_root` is the 64-zero sentinel of the control block, which
+    `daemon.capnp` now documents. `Controller::published_root()` returns
+    `None` for that sentinel, and the daemon's freshness check uses it.
+  - `leyline daemon --reset-arena` fails if it cannot open the controller
+    or zero its root. It used to discard the error and could then warm-start
+    from the root it was asked to reset.
+  - A head that stamps only one of `treeRoot` and `parserId` is malformed:
+    `verify-head` and the chaining parse refuse it instead of reading it as
+    a pre-ADR-0040 head, and the head writer refuses to produce one.
+  - The interning tables (`names`, `kinds`, `dirs`, `files`) are
+    append-only in the database: triggers abort any DELETE and any UPDATE
+    that changes a row's id, so a `file_id` can no longer be reused to
+    re-bind a dead file's nid range. A rename (same id) still works. Arenas
+    gain the triggers on their next schema pass.
+  - proptest properties cover `PartitionSpec` injectivity (ordered domain)
+    and set canonicality (set domains), and `treeRoot` permutation
+    invariance and sensitivity to one path byte, one content byte, one mode
+    and one path boundary, over paths holding `/`, 0x1f and newline.
+  - The malformed-`parentHash`-as-ZERO read (F3, first site) was already
+    closed by the v2 head claim (`ley-line-open-b68fa6`), whose test
+    `a_malformed_hash_field_is_an_error` covers it.
+
+### Removed
+
+- **The CDC `nodes` target** (bead `ley-line-open-afa952`). CDC indexes
+  `source_blobs` only. The per-node target measured +21% database size for
+  1.9 MB of dedup on a real mache projection (bead `ley-line-open-baa57f`:
+  every leaf sat below the 8 KiB chunking floor). Removed with it:
+  `leyline_fs::chunked` (`content_manifest`, `content_manifest_meta`,
+  `content_generation`, the `nodes` generation triggers,
+  `WITNESS_FRESH_PREDICATE`, chunked graph reads and incremental write
+  refresh), `activate_chunked_content*`, `ActivationReport`,
+  `ActivationProgress`, `cmd_daemon::CdcActivationReport`,
+  `cmd_cdc::*_source_blobs*` (the source_blobs functions now carry the plain
+  names), `cdc enable --target`, the execution daemon's `--cdc-target`, the
+  `nodes` value of the daemon's `--cdc-target` (now default `source-blobs`;
+  `nodes` is refused), `BlobActivationReport::stranded_nodes_manifest_rows`
+  and `GcReport::reaped_manifest_rows`/`reaped_manifest_nodes`, and the
+  `cdc_storage_bound` and `cdc_churn` examples. `DaemonOptions::cdc` is a
+  `bool`. `leyline cdc enable --db x.db` now activates `source_blobs`; mache's
+  `daemon --cdc --cdc-target source-blobs` spawn is unchanged.
+  `SqliteGraphAdapter` reads always serve `nodes.record`. A database activated
+  under the old target keeps its node-manifest tables; nothing reads them,
+  `leyline cdc gc` collects the chunks only they referenced, and
+  `daemon --reset-arena` rebuilds without them.
+
 ## [0.24.0] — 2026-11-04
 
 **Upgrade if you sign heads; reparse every arena.** A signed head now attests

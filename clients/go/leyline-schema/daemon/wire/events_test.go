@@ -58,6 +58,47 @@ func TestDecodeEvent_SheafInvalidate(t *testing.T) {
 	}
 }
 
+// TestDecodeEvent_DaemonSheafInvalidateRootStates pins the root absence
+// rule (bead ley-line-open-80f037) on the topic both emit paths use: a
+// root, no root (current_root omitted), and an unreadable controller.
+func TestDecodeEvent_DaemonSheafInvalidateRootStates(t *testing.T) {
+	root := "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+	cases := []struct {
+		name, data           string
+		published            *bool
+		currentRoot, rootErr *string
+	}{
+		{"published", `{"invalidated":[1],"count":1,"scope":"changed-only","changed_files":[],"root_published":true,"current_root":"` + root + `","generation":"2","prior_generation":"1","timestamp_ms":"0"}`, ptr(true), &root, nil},
+		{"unpublished", `{"invalidated":[1],"count":1,"scope":"all-known","changed_files":["a.rs"],"root_published":false,"generation":"2","prior_generation":"1","timestamp_ms":"0"}`, ptr(false), nil, nil},
+		{"unreadable", `{"invalidated":[1],"count":1,"scope":"all-known","changed_files":["a.rs"],"root_error":"open controller: boom","generation":"2","prior_generation":"1","timestamp_ms":"0"}`, nil, nil, ptr("open controller: boom")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			line := []byte(`{"event":true,"seq":1,"topic":"daemon.sheaf.invalidate","source":"leyline","data":` + c.data + `}`)
+			_, payload, err := DecodeEvent(line)
+			if err != nil {
+				t.Fatalf("DecodeEvent: %v", err)
+			}
+			p, ok := payload.(SheafInvalidatePayload)
+			if !ok {
+				t.Fatalf("payload must be SheafInvalidatePayload, got %T", payload)
+			}
+			if !eqPtr(p.RootPublished, c.published) || !eqPtr(p.CurrentRoot, c.currentRoot) || !eqPtr(p.RootError, c.rootErr) {
+				t.Errorf("root state: got published=%v root=%v err=%v", p.RootPublished, p.CurrentRoot, p.RootError)
+			}
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func eqPtr[T comparable](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 func TestDecodeEvent_SheafInvalidate_NumericSeq(t *testing.T) {
 	line := []byte(`{"event":true,"seq":6,"topic":"sheaf.invalidate","source":"leyline","data":{"invalidated":[1],"count":1,"generation":"2","prior_generation":"1"}}`)
 

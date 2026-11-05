@@ -1,6 +1,6 @@
 [package]
 name = "leyline-sheaf"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Čech cohomology engine: sheaf cache, coboundary operators, structural invalidation"
@@ -28,6 +28,12 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+# The region-hash vector test re-derives each address from its published
+# preimage with an independent BLAKE3 call, and reads the JSON vector file
+# Go consumers code against (bead ley-line-open-1c5d28).
+blake3 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 sha2 = "0.11"
 # Only tests wrap `Arc<Mutex<...>>` around CellComplex — production
 # ships single-threaded. Kept as a dev-dep so leyline-sheaf's
@@ -51,11 +57,16 @@ tree-sitter = { workspace = true }
 # Shared wall-clock sampling for the perf gates (min-of-N, interleaved
 # arms) — the technique lives in one place; see that crate's docs.
 leyline-perf-sample = { path = "../perf-sample" }
+# The `sheaf_restriction_replay` bench measures SheafCache against the
+# restriction key on leyline-cache's replay driver (bead
+# ley-line-open-754aa1). Dev-dep only, and one-way: leyline-cache depends
+# on nothing in this crate.
+leyline-cache = { path = "../cache" }
 
 [[bench]]
 name = "git_replay_invalidation"
 harness = false
 
 [[bench]]
-name = "restriction_git_replay"
+name = "sheaf_restriction_replay"
 harness = false

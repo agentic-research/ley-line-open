@@ -128,7 +128,7 @@ type statusResponse struct {
 	ArenaPath   *string `json:"arena_path"`
 	ArenaSize   *uint64 `json:"arena_size,string"`
 	Phase       *string `json:"phase"`
-	CurrentRoot *string `json:"current_root"`
+	CurrentRoot *string `json:"current_root,omitempty"`
 	// b0ea2e reshape: legacy `enrichment :Text` (JSON-encoded string)
 	// is no longer emitted by the daemon — the typed shape rides in
 	// `enrichment_typed` below. Field kept here as `omitempty` for
@@ -140,17 +140,22 @@ type statusResponse struct {
 	Error           *string           `json:"error,omitempty"`
 	// Bead ley-line-open-246526: the canonical --source directory.
 	SourceRoot *string `json:"source_root,omitempty"`
+	// Bead ley-line-open-80f037: whether a root has been published;
+	// current_root is present exactly when it is true.
+	RootPublished *bool `json:"root_published"`
 }
 
 type flushResponse struct {
-	OK          *bool   `json:"ok"`
-	CurrentRoot *string `json:"current_root"`
+	OK            *bool   `json:"ok"`
+	CurrentRoot   *string `json:"current_root,omitempty"`
+	RootPublished *bool   `json:"root_published"`
 }
 
 type snapshotResponse struct {
-	OK          *bool   `json:"ok"`
-	Generation  *uint64 `json:"generation,string"`
-	CurrentRoot *string `json:"current_root"`
+	OK            *bool   `json:"ok"`
+	Generation    *uint64 `json:"generation,string"`
+	CurrentRoot   *string `json:"current_root,omitempty"`
+	RootPublished *bool   `json:"root_published"`
 }
 
 type node struct {

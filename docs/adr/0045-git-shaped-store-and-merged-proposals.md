@@ -229,6 +229,16 @@ then renamed over the target), creates an empty directory, and removes a directo
 removed (when it is empty on disk; otherwise the path is reported, not forced). A file the
 store deleted is removed and its directory is left in place (T1).
 
+**What a watcher of the checkout sees.** An accepted proposal lands by stage-then-rename: the
+file's bytes (or the symlink) are written to a hidden sibling (`checkout::staging_path`,
+`rs/ll-open/cli-lib/src/checkout.rs:188`), ordered to disk, and renamed over the target
+(`crate::durable::rename`, `checkout.rs:575`, and `:640` for a symlink). The target path
+never holds a partial file, but it is replaced, not written in place, so a file-system watcher
+of the `--source` tree reports the event as a `Rename` or `Remove` on a path that still exists
+and now holds the new bytes (macOS fsnotify/kqueue does exactly this; mache hit it as
+`mache-7eb099`). A watcher must treat `Rename` or `Remove` on a path that still exists as a
+change to that path, and ignore the hidden staging sibling (bead `ley-line-open-514d0a`).
+
 ### T8 — The host mount is storefs
 
 Beads `ley-line-open-53d701`, `ley-line-open-3e73dc`. The host's FUSE and NFS mounts serve the

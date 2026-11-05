@@ -48,7 +48,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkHash};
+use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkDigest, StalkHash};
 use leyline_sheaf::complex::{CellComplex, RestrictionMap};
 use sha2::{Digest, Sha256};
 
@@ -63,9 +63,15 @@ struct FileStalk {
     content_hash: [u8; 32],
 }
 
-impl StalkHash for FileStalk {
+impl FileStalk {
     fn merkle_root(&self) -> [u8; 32] {
         self.content_hash
+    }
+}
+
+impl StalkHash for FileStalk {
+    fn digest(&self) -> StalkDigest {
+        StalkDigest::Hash(self.merkle_root())
     }
 }
 

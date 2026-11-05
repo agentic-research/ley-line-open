@@ -138,13 +138,9 @@ pub struct DaemonConfig {
 /// behavior is added.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaemonOptions {
-    /// Activate/resume the private CDC index before the first arena snapshot,
-    /// over the named target. `None` leaves CDC inactive.
-    ///
-    /// One field rather than a `bool` plus a target, so "enabled but no
-    /// target" and "target but not enabled" are unrepresentable instead of
-    /// merely unreachable.
-    pub cdc: Option<crate::CdcTarget>,
+    /// Activate/resume the private CDC index over `source_blobs` before the
+    /// first arena snapshot.
+    pub cdc: bool,
     /// Auto-discovery symlink this daemon publishes. The execution entry
     /// points force their own name so an execution daemon cannot silently
     /// take over `~/.mache/default.sock` from a running substrate daemon.
@@ -426,52 +422,27 @@ pub async fn run_daemon_with_options(
                 return Err(error);
             }
         };
-        match report {
-            // `stranded_source_blobs_manifest_rows` is not padding either. A
-            // switch FROM `source_blobs` TO `nodes` on the same long-lived
-            // arena leaves the `source_blobs` index behind: normal GC cannot
-            // reclaim it (those rows are still fresh, not dead), so silence
-            // here reads as "nothing left over" when the arena is actually
-            // carrying two indexes (`ley-line-open-1869d0`).
-            Some(CdcActivationReport::Nodes(report)) => eprintln!(
-                "CDC activation (nodes): eligible={} populated={} already_fresh={} \
-                 source_bytes={} stranded_source_blobs_manifest_rows={}",
-                report.eligible_nodes,
-                report.populated_nodes,
-                report.already_fresh_nodes,
-                report.processed_source_bytes,
-                report.stranded_source_blobs_manifest_rows,
-            ),
-            // `skipped_sub_floor` is not padding. A `source_blobs` run over a
-            // corpus of small rows legitimately populates nothing, and without
-            // this count that outcome is indistinguishable from a silent
-            // no-op. It is the number that explains a disappointing result:
-            // 395,173 of 395,173 nodes fell below the chunking floor on a real
-            // mache projection (`ley-line-open-baa57f`). `stranded_nodes_manifest_rows`
-            // is the mirror of the nodes-branch count above, same reasoning.
-            Some(CdcActivationReport::SourceBlobs(report)) => eprintln!(
+        // `skipped_sub_floor` is not padding. A `source_blobs` run over a
+        // corpus of small rows legitimately populates nothing, and without
+        // this count that outcome is indistinguishable from a silent no-op.
+        if let Some(report) = report {
+            eprintln!(
                 "CDC activation (source-blobs): eligible={} populated={} \
-                 already_fresh={} skipped_sub_floor={} source_bytes={} \
-                 stranded_nodes_manifest_rows={}",
+                 already_fresh={} skipped_sub_floor={} source_bytes={}",
                 report.eligible_blobs,
                 report.populated_blobs,
                 report.already_fresh_blobs,
                 report.skipped_sub_floor_blobs,
                 report.processed_source_bytes,
-                report.stranded_nodes_manifest_rows,
-            ),
-            None => {}
+            );
         }
     }
     #[cfg(not(feature = "cdc"))]
     {
-        if let Some(target) = options.cdc {
+        if options.cdc {
             state.write().phase =
                 DaemonPhase::Error("CDC activation unavailable in this build".into());
-            anyhow::bail!(
-                "daemon --cdc --cdc-target {target} requires the 'cdc' feature \
-                 (compile with --features cdc)"
-            );
+            anyhow::bail!("daemon --cdc requires the 'cdc' feature (compile with --features cdc)");
         }
         snapshot_to_arena(&live_conn, &ctrl_path)?;
     }
@@ -956,7 +927,7 @@ fn unlink_live_db(live_db_path: &Path) {
 /// treated as fresh — cold-start is the safe fallback in every case.
 fn controller_is_fresh(ctrl_path: &Path) -> bool {
     match leyline_core::Controller::open_or_create(ctrl_path) {
-        Ok(c) => c.current_root() == [0u8; 32],
+        Ok(c) => c.published_root().is_none(),
         Err(_) => true,
     }
 }
@@ -1012,11 +983,16 @@ fn init_living_db(
         // the flag's whole job is to run regardless of prior state.
         // Reading them back from the controller we just opened is
         // exactly `setup_arena`'s own stamp, not a guess.
-        if let Ok(mut c) = leyline_core::Controller::open_or_create(ctrl_path) {
-            let arena_path = c.arena_path();
-            let arena_size = c.arena_size();
-            let _ = c.set_arena_with_root(&arena_path, arena_size, [0u8; 32]);
-        }
+        //
+        // A failure here is fatal (bead `ley-line-open-80f037` F3): a reset
+        // that did not zero the root has not reset anything, and the
+        // freshness checks below would then read the old root.
+        let mut c = leyline_core::Controller::open_or_create(ctrl_path)
+            .context("--reset-arena: open the controller to zero its root")?;
+        let arena_path = c.arena_path();
+        let arena_size = c.arena_size();
+        c.set_arena_with_root(&arena_path, arena_size, [0u8; 32])
+            .context("--reset-arena: zero the controller's root")?;
     }
 
     // Truly fresh controller → discard any orphan `.live.db` before
@@ -1511,31 +1487,9 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
     Ok(())
 }
 
-/// One activation result, tagged by the target that produced it.
-///
-/// The two targets report genuinely different quantities — `nodes` counts
-/// rows it populated, `source_blobs` additionally counts rows it declined to
-/// chunk — so they cannot share a struct without one target's fields being
-/// dead weight in the other's reports.
-#[cfg(feature = "cdc")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CdcActivationReport {
-    /// Construct-granular `nodes` activation.
-    Nodes(leyline_fs::activation::ActivationReport),
-    /// Whole-file `source_blobs` activation.
-    SourceBlobs(leyline_fs::activation::BlobActivationReport),
-}
-
-/// Optionally activate CDC over the requested target, then atomically publish
-/// the exact resulting database generation to the arena.
-///
-/// `target` is `None` when CDC is disabled. Carrying the target here rather
-/// than a bare `enabled: bool` is the whole point of `ley-line-open-c3d746`:
-/// the daemon previously hardcoded `activate_chunked_content`, so the
-/// `--target source-blobs` selector existed only on the standalone
-/// `leyline cdc enable` CLI and was unreachable from the daemon path that
-/// mache actually spawns. A bool has nowhere to put the answer, so the
-/// selector could not be plumbed without changing this signature.
+/// Optionally activate CDC over `source_blobs`, then atomically publish the
+/// exact resulting database generation to the arena. `None` when `cdc` is
+/// false.
 ///
 /// Activation failure leaves the previously published root intact.
 /// Successful activation and the disabled path both publish exactly once.
@@ -1543,19 +1497,18 @@ pub enum CdcActivationReport {
 pub fn activate_cdc_and_snapshot(
     conn: &rusqlite::Connection,
     ctrl_path: &Path,
-    target: Option<crate::CdcTarget>,
-) -> Result<Option<CdcActivationReport>> {
-    let options = leyline_fs::activation::ActivationOptions::default();
-    let report = match target {
-        Some(crate::CdcTarget::Nodes) => Some(CdcActivationReport::Nodes(
-            leyline_fs::activation::activate_chunked_content(conn, options)
-                .context("activate CDC `nodes` target in daemon living database")?,
-        )),
-        Some(crate::CdcTarget::SourceBlobs) => Some(CdcActivationReport::SourceBlobs(
-            leyline_fs::activation::activate_chunked_source_blobs(conn, options)
-                .context("activate CDC `source_blobs` target in daemon living database")?,
-        )),
-        None => None,
+    cdc: bool,
+) -> Result<Option<leyline_fs::activation::BlobActivationReport>> {
+    let report = if cdc {
+        Some(
+            leyline_fs::activation::activate_chunked_source_blobs(
+                conn,
+                leyline_fs::activation::ActivationOptions::default(),
+            )
+            .context("activate CDC `source_blobs` target in daemon living database")?,
+        )
+    } else {
+        None
     };
     snapshot_to_arena(conn, ctrl_path)?;
     Ok(report)
@@ -1959,10 +1912,11 @@ pub fn run_watcher_enrichment(
 ///   `"all-known"` (coarse fallback). See above.
 /// - `changed_files`: files whose reparse + enrichment triggered this
 ///   invalidate.
-/// - `current_root`: 64-char hex root from the substrate controller
-///   (matches the wire format of every state-changing op response,
-///   paired with mache's `mache-36d961` epic). Empty string if the
-///   controller read fails — best-effort, degrades honestly.
+/// - `root_published` / `current_root`: the substrate root under the
+///   daemon's root absence rule, as on every state-changing op response
+///   (`StatusResponse.rootPublished` in `daemon.capnp`). When the
+///   controller cannot be read, `root_error` replaces both (bead
+///   `ley-line-open-80f037`).
 /// - `generation`: quoted u64 — the cache generation after the emit.
 ///   Bumped via [`leyline_sheaf::SheafCache::bump_generation`] so
 ///   consumers see strict monotonicity across watcher-driven +
@@ -1982,10 +1936,9 @@ pub fn run_watcher_enrichment(
 ///
 /// # Best-effort
 ///
-/// Any failure inside this helper (currently only `read_root_hex` can
-/// fail) logs at warn and degrades the payload field rather than
-/// aborting the emit. The consumer still gets the region set +
-/// generation advance.
+/// The one failure inside this helper, a controller read, logs at warn and
+/// is reported as `root_error` rather than aborting the emit. The consumer
+/// still gets the region set + generation advance.
 ///
 /// Exposed to integration tests so the wire has a direct entry point
 /// that doesn't require spinning up the full git-poll loop.
@@ -2045,13 +1998,14 @@ pub fn emit_watcher_sheaf_invalidate(
     // `daemon::sheaf_ablation` for the wire format + rationale.
     crate::daemon::sheaf_ablation::log_event(&invalidated, &all_known, changed_files, scope);
 
-    let current_root = match crate::daemon::ops::read_root_hex(&ctx.ctrl_path) {
-        Ok(hex) => hex,
-        Err(e) => {
-            log::warn!("emit_watcher_sheaf_invalidate: read_root_hex failed: {e:#}");
-            String::new()
-        }
-    };
+    // The root under the daemon's absence rule. A controller read error
+    // still emits the invalidation (dropping it would under-evict) and
+    // carries `root_error`, never an empty or zero root (bead
+    // `ley-line-open-80f037`).
+    let root = crate::daemon::sheaf_ops::EventRoot::read(&ctx.ctrl_path);
+    if let crate::daemon::sheaf_ops::EventRoot::Unreadable(e) = &root {
+        log::warn!("emit_watcher_sheaf_invalidate: controller read failed: {e}");
+    }
 
     // Route through the shared `SheafState::emit_invalidate` helper
     // (bead ley-line-open-2191e1) — consumer + watcher paths share
@@ -2060,7 +2014,7 @@ pub fn emit_watcher_sheaf_invalidate(
         invalidated,
         scope,
         changed_files,
-        current_root,
+        &root,
         generation,
         prior_generation,
     );
@@ -2631,6 +2585,26 @@ mod tests {
             !dir.path().join("cleanup.live.db-shm").exists(),
             "-shm sidecar must be gone",
         );
+    }
+
+    /// Bead `ley-line-open-80f037` F3(c): `--reset-arena` promises a cold
+    /// start. When the controller cannot be opened to zero its root, the
+    /// reset did not happen, so starting anyway would serve whatever the
+    /// controller still names. The failure is an error, not a skipped step.
+    #[test]
+    fn init_living_db_reset_refuses_when_the_controller_cannot_be_zeroed() {
+        let dir = TempDir::new().unwrap();
+        let ctrl = dir.path().join("corrupt.ctrl");
+        // A control file whose magic is not ours: `open_or_create` refuses it.
+        std::fs::write(&ctrl, vec![0xFFu8; 4096]).unwrap();
+        let live_db = live_db_path_for(&ctrl);
+
+        let err = init_living_db(&ctrl, &live_db, None, None, true)
+            .map(|_| ())
+            .expect_err("a reset that could not zero the controller must not start");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--reset-arena"), "{msg}");
+        assert!(msg.contains("invalid control block magic"), "{msg}");
     }
 
     #[test]
@@ -3939,7 +3913,7 @@ mod tests {
             rejected_execution_config(&tmp.path().join("execution-options.arena")),
             Arc::clone(&handler),
             DaemonOptions {
-                cdc: Some(crate::CdcTarget::Nodes),
+                cdc: true,
                 ..DaemonOptions::default()
             },
         )
@@ -4196,7 +4170,7 @@ mod execution_discovery_tests {
     #[test]
     fn execution_daemon_cannot_be_configured_onto_the_substrate_socket_name() {
         let caller = DaemonOptions {
-            cdc: Some(crate::CdcTarget::SourceBlobs),
+            cdc: true,
             discovery: SocketDiscovery::Substrate,
             host_mount: None,
         };
@@ -4206,13 +4180,60 @@ mod execution_discovery_tests {
             SocketDiscovery::Execution,
             "the execution surface must never publish default.sock"
         );
-        // Deliberately the non-default target: a `bool` field would have
-        // survived this assertion even if the override dropped the caller's
-        // CHOICE of target, which is exactly the bug c3d746 fixed.
-        assert_eq!(
-            effective.cdc,
-            Some(crate::CdcTarget::SourceBlobs),
-            "unrelated caller options must survive, target included"
+        // Deliberately the non-default value: the override must keep the
+        // caller's unrelated options.
+        assert!(effective.cdc, "unrelated caller options must survive");
+    }
+
+    /// Bead `ley-line-open-80f037`: the watcher's `daemon.sheaf.invalidate`
+    /// states the root under the absence rule, and an unreadable controller
+    /// still delivers the invalidation, with `root_error` instead of `""`.
+    #[cfg(feature = "sheaf")]
+    #[tokio::test]
+    async fn the_watcher_invalidate_states_the_root_and_reports_a_read_error() {
+        use crate::cmd_daemon::emit_watcher_sheaf_invalidate;
+        use crate::daemon::events::OverflowPolicy;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        ctx.sheaf.set_emitter(ctx.router.emitter());
+        let (_id, mut rx, _replay, _gap) = ctx
+            .router
+            .subscribe(
+                &["daemon.sheaf.*".to_string()],
+                None,
+                0,
+                OverflowPolicy::DropOldest,
+                8,
+            )
+            .await;
+        let mut next = async || {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an invalidate event")
+                .expect("the bus is open")
+                .data
+        };
+
+        let files = vec!["a.rs".to_string()];
+        emit_watcher_sheaf_invalidate(&ctx, &files, &ctx.router.emitter());
+        let fresh = next().await;
+        assert_eq!(fresh["root_published"], false, "{fresh}");
+        assert!(fresh.get("current_root").is_none(), "{fresh}");
+        assert_eq!(fresh["changed_files"], serde_json::json!(["a.rs"]));
+
+        // A directory where the control file was: the controller cannot be
+        // opened, and the event says so instead of guessing a root.
+        std::fs::remove_file(&ctx.ctrl_path).unwrap();
+        std::fs::create_dir(&ctx.ctrl_path).unwrap();
+        emit_watcher_sheaf_invalidate(&ctx, &files, &ctx.router.emitter());
+        let unreadable = next().await;
+        assert!(
+            unreadable["root_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("open controller")),
+            "{unreadable}"
         );
+        assert!(unreadable.get("root_published").is_none(), "{unreadable}");
+        assert!(unreadable.get("current_root").is_none(), "{unreadable}");
     }
 }

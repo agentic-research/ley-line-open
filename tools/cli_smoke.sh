@@ -13,7 +13,11 @@
 #   --mount  also mount the daemon's store and write through it (BIN must
 #            be built with the `mount` feature; NFS on macOS, FUSE on Linux)
 # Env:
-#   EXPECT_VERSION  if set, `BIN --version` must report exactly this
+#   EXPECT_VERSION  if set (`X.Y.Z` or the tag `vX.Y.Z`), `BIN --version`
+#                   must report exactly that bare version: the tagged release
+#                   build. Unset, BIN must be a non-tag build, whose version
+#                   is `X.Y.Z-dev+<shortsha>[.dirty]` and so differs from the
+#                   tag form (bead ley-line-open-5139a3).
 #   DEADLINE        seconds any one wait may take (default 30)
 set -eu
 
@@ -148,8 +152,14 @@ case $version in
 leyline\ [0-9]*) ;;
 *) fail "--version printed '$version'" ;;
 esac
+reported=$(echo "$version" | cut -d' ' -f2)
 if [ -n "${EXPECT_VERSION:-}" ]; then
-    expect_eq "$(echo "$version" | cut -d' ' -f2)" "$EXPECT_VERSION" "--version"
+    expect_eq "$reported" "${EXPECT_VERSION#v}" "--version"
+else
+    case $reported in
+    [0-9]*.[0-9]*.[0-9]*-dev+?*) ;;
+    *) fail "--version printed '$reported': a non-tag build must report X.Y.Z-dev+<shortsha> (set EXPECT_VERSION to smoke a release binary)" ;;
+    esac
 fi
 step "$version"
 

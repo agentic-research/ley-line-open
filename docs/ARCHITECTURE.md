@@ -8,7 +8,7 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 
 | Field | Value |
 |---|---|
-| LLO version | v0.24.0 |
+| LLO version | v0.25.0 |
 | Last verified | 2026-07-27 (status row and roadmap pointer updated 2026-10-23) |
 | Direction | [ROADMAP.md](ROADMAP.md): v1.0 is single host, portable (epic `ley-line-open-b2e687`); integration carries the 0.21.0 cycle |
 | Authority model | [ADR-0032](adr/0032-declared-decompositions.md) §D4 — see [Authority model](#authority-model) |
@@ -113,7 +113,8 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-ts` | Tree-sitter AST projection + bidirectional splice | `parse`, `splice` |
 | `leyline-lsp` | LSP client for ingesting language-server analysis into SQLite | `LspClient`, `document_symbols`, `hover` |
 | `leyline-hdc` | Hyperdimensional computing — D=8192 hypervectors via bundle composition + seeded leaves; popcount-Hamming distance (ADR-0024) | `EncoderNode`, `encode_fresh`, `Hypervector` |
-| `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020). **3 sub-components, 3 risk profiles** — see [`sheaf/README.md`](../rs/ll-open/sheaf/README.md) | `CellComplex`, `SheafCache` |
+| `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020). **2 live sub-components, 2 risk profiles** — see [`sheaf/README.md`](../rs/ll-open/sheaf/README.md) | `CellComplex`, `SheafCache` |
+| `leyline-cache` | Restriction-addressed derived-view cache (ADR-0031). The key is a `PartitionSpec` `RowSet` fold over the review's input-closure rows with `parserId` in params; it changes under any edit inside the closure and holds under edits outside it. No daemon caller yet (`ley-line-open-69305e`) | `restriction_for_call_target`, `ReviewCache`, `KeyStrategy` |
 | `leyline-cdc` | Content-defined chunking (GearHash, xet-compatible params), 8–128 KiB bounds (`cdc/src/lib.rs:29-40`). Produces blob hashes; produces **no** root | `chunk_into`, `read_range` |
 | `leyline-fs` | Filesystem presentation — mounts arena as FUSE or NFS; optional CDC-derived chunk manifests for bounded range reads. **Externally pinned** — cloister depends on this crate directly | `SqliteGraph`, `SqliteGraphAdapter`, `activate_chunked_content` |
 | `leyline-envelope` | DSSE envelope + in-toto Statement v1 attestation over `leyline-sign`'s root signer; byte-compatible hoist of rosary's `dsse.rs` | `Envelope`, `Statement`, `sign_payload`, `verify_payload` |
@@ -226,17 +227,18 @@ LLO's daemon runs a **living SQLite database in memory** with an **arena snapsho
 1. **Parse phase**: `leyline-ts` walks tree-sitter ASTs into the in-memory db.
 2. **Enrichment phase**: each registered pass (LSP → `_lsp*` tables; HDC → `_hdc*` tables; etc.) writes sidecar rows.
 3. **Optional CDC activation**: `daemon --cdc` resumably builds private chunk
-   manifests from authoritative readable `nodes.record` leaves before the
-   first snapshot. Missing or stale manifests fall back to the authoritative
-   record (`rs/ll-open/fs/src/chunked.rs:936-946`, freshness gate at `:789`);
-   no schema-client or wire contract changes. Chunk reads verify σ before
-   returning and fail closed on mismatch rather than silently re-reading
-   `nodes.record` (`rs/ll-open/fs/src/chunked.rs:166-183`). The manifest is
-   keyed by `(node_id, seq)` and **has no root** — see the authority model
-   above. Long-lived writable projections run explicit `leyline cdc gc` off
-   the hot path; one IMMEDIATE transaction deletes only chunk rows unreachable
-   from every manifest and reports rows and bytes before, unreachable, deleted,
-   and remaining.
+   manifests over the whole-file `source_blobs` rows at or above the 8 KiB
+   chunking floor before the first snapshot (`rs/ll-open/fs/src/activation.rs`).
+   No schema-client or wire contract changes. Rows are content-addressed and
+   immutable, so a manifest needs no freshness witness: its existence is its
+   freshness (`rs/ll-open/fs/src/blob_chunked.rs`). Chunk reads verify σ before
+   returning and fail closed on mismatch (`rs/ll-open/fs/src/chunk_pool.rs`).
+   The manifest is keyed by `(blob_hash, seq)` and **has no root** — see the
+   authority model above. Long-lived projections run explicit `leyline cdc gc`
+   off the hot path; one IMMEDIATE transaction reaps manifests whose
+   `source_blobs` row is gone, deletes only chunk rows unreachable from every
+   manifest, and reports rows and bytes before, unreachable, deleted, and
+   remaining.
 4. **Snapshot**: serialize current db state → arena buffer → BLAKE3-hash → advance `current_root` on the controller's generation counter.
 5. **Readers**: mmap the arena to validate the active serialized bytes, then
    `deserialize_read_exact` copies the verified slice into SQLite-owned memory;
@@ -380,6 +382,7 @@ Architectural decisions that shape LLO today:
 | [ADR-0043](adr/0043-one-store-refs-and-checkouts.md) | One store — branches are refs, worktrees are checkouts with an index, git is read and written natively (no subprocess); closes the restart that reverted proposals (`60f39f`) | Accepted — built in phases; phase 0 (single checkout) is #459 |
 | [ADR-0044](adr/0044-userspace-data-plane.md) | Agents see a filesystem served from userspace — the agent runs in a libkrun microVM and its working tree is a virtio-fs share whose backend is LLO (reads from the store, writes as proposals, refusals as errno); host NFS/FUSE mounts are compatibility | Accepted — LLO carries a libkrun patch; phases A–C |
 | [ADR-0045](adr/0045-git-shaped-store-and-merged-proposals.md) | The store is a git-shaped tree — every path holds any bytes with a git mode, directories are entries, `treeRoot` covers both; parsing is a projection and an unparseable file is stored with a diagnostic; a proposal whose base moved merges three ways (`gix-merge`) and overlapping hunks refuse with their ranges; amends ADR-0042 and ADR-0044; T8: the host mount is storefs | Accepted — phases 1–6 (store, proposals, wire, storefs, host mount) |
+| [ADR-0047](adr/0047-sigma-amendment-constructions-witnesses-edges.md) | Σ amendment — σ is indexed by construction (one value, one address per construction; three laws), `verify(Ref, Witness)`, four edge kinds (Derives, Contains, Attests, Locates), a conformance table of every shipped identity, and four identity migrations: keyed `node_hash`/`run_id`, a parser-free Merkle `storeRoot` replacing `treeRoot`, `lang`/`raw_kind` per occurrence, blob address stays σ over bytes | Accepted (owner, 2026-11-04) — no implementation yet; sequence M0–M4 |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
 
@@ -393,9 +396,9 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 | `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
 | `leyline` binary (NFS mount, no libfuse) | `task build:mount` / `task release:mount` — `--features mount`. Mounts with `--backend nfs`; links no libfuse and needs no `PKG_CONFIG_PATH`; refuses `--backend fuse` naming the `fuse` feature |
 | `leyline` binary (everything including both mount backends) | `task install:full+mount` — `--features full` (`mount` + `fuse`). The FUSE backend requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at build time and at runtime |
-| Distroless OCI image | `task image` — produces `localhost/leyline:v0.24.0` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.24.0` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
+| Distroless OCI image | `task image` — produces `localhost/leyline:v0.25.0` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.25.0` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
 | FFI staticlibs + header | `task release:fs-static:target` — builds the mache-facing `leyline-fs` staticlib with explicit CDC support and publishes it as a verified GitHub release artifact (linux amd64/arm64 + darwin arm64; macOS amd64 staticlib currently absent) |
-| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.24.0 is its tested compatibility point |
+| Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.25.0 is its tested compatibility point |
 
 Release flow is on-tag-push: `task readme:version-check` gates README version-pin drift in CI (mirroring the `compat:check` + `gen:server-json:check` pattern). See [README.md § Install and build](../README.md#install-and-build) for the recommended install path per user type.
 

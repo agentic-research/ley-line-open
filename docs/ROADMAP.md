@@ -69,6 +69,12 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 - `bf80bd` — collapse the worker-to-daemon hop on the share's hot path.
 
 **Then**
+- `619a99` — ADR-0047's identity migrations, before the contract freeze because
+  each moves a wire or projection identity: M1 parser-free Merkle `storeRoot`
+  (head digest v3, projection-v11), M2 keyed `node_hash` with `lang`/`raw_kind`
+  per occurrence (merkle-ast-v3, projection-v12), M3 run-id v2, M4 rooted blob
+  manifests. Each is one versioned bump; its mache or cloister issue is filed
+  before its PR merges.
 - `b70e44`, `10075e` — the contract freeze, after the ADR status decisions.
 - `cf8fdb` — the git conformance suite.
 - `c3e8c6` — publish the crates in dependency order (unblocks `395e43`).

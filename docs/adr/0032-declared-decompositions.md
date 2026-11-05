@@ -34,7 +34,7 @@ Five identities, each correct, each answering a different question, none declari
 |---|---|---|---|---|
 | 1 | `Controller.current_root` | none — whole serialized SQLite buffer | is this byte image intact? | BLAKE3 |
 | 2 | `Head.rootHash` | per-capnp-segment, concatenated `source‖ast‖bindings` | did this parse run produce these segments? | BLAKE3 |
-| 3 | CDC chunk + `content_manifest` | content-defined, 8–128 KiB | which regions changed? | BLAKE3 |
+| 3 | CDC chunk + manifest (`content_manifest` then; `blob_manifest` since `ley-line-open-afa952`) | content-defined, 8–128 KiB | which regions changed? | BLAKE3 |
 | 4 | ADR-0031 restriction key | logical row-set spanning objects | is this derived view still valid? | **SHA-256** |
 | 5 | ADR-014 sheaf-block / `hierarchy_id` | structural, restriction lattice | what recovers independently on the wire? | BLAKE3 |
 

@@ -400,7 +400,7 @@ async fn sheaf_invalidate_event_reaches_uds_subscriber() {
     // sheaf.* entries to replay).
     let mut ops = UdsConn::connect(&sock).await;
     ops.send(
-        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":1,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":2,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":1,"b":2,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":1,"hash":"aa00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]},{"id":2,"hash":"bb00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":1,"b":2,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
     )
     .await;
     let _topology_resp = ops
@@ -409,7 +409,7 @@ async fn sheaf_invalidate_event_reaches_uds_subscriber() {
         .expect("set_topology response timed out");
 
     ops.send(
-        r#"{"op":"sheaf_invalidate","regions":[1],"stalks":[{"id":1,"hash":"aa-mutated","data":[2.0,0.5,0.0,0.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[1],"stalks":[{"id":1,"hash":"aaed000000000000000000000000000000000000000000000000000000000000","data":[2.0,0.5,0.0,0.0]}]}"#,
     )
     .await;
     let _invalidate_resp = ops

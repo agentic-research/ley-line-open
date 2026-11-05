@@ -46,7 +46,7 @@
 //! content address moved — exactly the false-negative Rung 3 must survive.
 
 use leyline_cli_lib::cmd_parse;
-use leyline_sheaf::cache::StalkHash;
+use leyline_sheaf::cache::{StalkDigest, StalkHash};
 use leyline_sheaf::complex::{CellComplex, RestrictionMap};
 use leyline_sheaf::topology::RegionId;
 use leyline_sheaf::{RestrictionEdge, SheafCache};
@@ -170,8 +170,8 @@ fn content_hash(db_path: &Path) -> Vec<u8> {
 #[derive(Clone)]
 struct HashStalk([u8; 32]);
 impl StalkHash for HashStalk {
-    fn merkle_root(&self) -> [u8; 32] {
-        self.0
+    fn digest(&self) -> StalkDigest {
+        StalkDigest::Hash(self.0)
     }
 }
 

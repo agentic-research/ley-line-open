@@ -1,5 +1,5 @@
 {
-  "$comment": "Known-answer vectors for every Σ construction LLO ships (ADR-0047 §5, (DET); bead ley-line-open-10d71a). Each case pins its inputs and, where the construction hashes an encoding, the exact preimage bytes, so a second implementation checks its framing and its hash independently. Consumed by Rust tests in leyline-core (sigmaBytes, partition, headDigest), leyline-cli-lib (parserId, treeRoot, astNode) and leyline-cache (restrictionKey); run_id is pinned by ../../execution/v1/test-vectors/run-id.json. A changed value is an identity migration that needs a version bump, never an edit.",
+  "$comment": "Known-answer vectors for every Σ construction LLO ships (ADR-0047 §5, (DET); bead ley-line-open-10d71a). Each case pins its inputs and, where the construction hashes an encoding, the exact preimage bytes, so a second implementation checks its framing and its hash independently. deriveKey pins the keyed primitive every keyed construction is built on, BLAKE3 derive_key(context, input), with cases taken from BLAKE3's own test_vectors.json (input byte i is i mod 251, first 32 output bytes); it is a primitive, not a construction, and no address in this file moves. Consumed by Rust tests in leyline-core (sigmaBytes, deriveKey, partition, headDigest), leyline-cas-ffi (deriveKey, through the C ABI), leyline-cli-lib (parserId, treeRoot, astNode) and leyline-cache (restrictionKey); run_id is pinned by ../../execution/v1/test-vectors/run-id.json. A changed value is an identity migration that needs a version bump, never an edit.",
   "constructionSet": "leyline/sigma/v1",
   "hash": "blake3-256",
   "sigmaBytes": [
@@ -18,6 +18,50 @@
       "len": 131073,
       "name": "max-chunk-plus-one-ff",
       "repeatByte": "ff"
+    }
+  ],
+  "deriveKey": [
+    {
+      "name": "blake3-test-vectors-len-0",
+      "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+      "inputLen": 0,
+      "key": "2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d"
+    },
+    {
+      "name": "blake3-test-vectors-len-1",
+      "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+      "inputLen": 1,
+      "key": "b3e2e340a117a499c6cf2398a19ee0d29cca2bb7404c73063382693bf66cb06c"
+    },
+    {
+      "name": "blake3-test-vectors-len-1023",
+      "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+      "inputLen": 1023,
+      "key": "74a16c1c3d44368a86e1ca6df64be6a2f64cce8f09220787450722d85725dea5"
+    },
+    {
+      "name": "blake3-test-vectors-len-1024",
+      "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+      "inputLen": 1024,
+      "key": "7356cd7720d5b66b6d0697eb3177d9f8d73a4a5c5e968896eb6a689684302706"
+    },
+    {
+      "name": "blake3-test-vectors-len-1025",
+      "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+      "inputLen": 1025,
+      "key": "effaa245f065fbf82ac186839a249707c3bddf6d3fdda22d1b95a3c970379bcb"
+    },
+    {
+      "name": "blake3-test-vectors-len-2048",
+      "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+      "inputLen": 2048,
+      "key": "7b2945cb4fef70885cc5d78a87bf6f6207dd901ff239201351ffac04e1088a23"
+    },
+    {
+      "name": "blake3-test-vectors-len-3072",
+      "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+      "inputLen": 3072,
+      "key": "050df97f8c2ead654d9bb3ab8c9178edcd902a32f8495949feadcc1e0480c46b"
     }
   ],
   "partition": [

@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use leyline_schema::create_schema;
+use leyline_schema::{DirId, FileId, Nid, create_schema};
 
 use crate::protocol::{
     self, CompletionItem, Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover, Location,
@@ -131,19 +131,19 @@ pub fn create_lsp_schema(conn: &Connection) -> Result<()> {
 /// presentation row. Returns the node's `dir_id` (its nid is the negation).
 fn standalone_node(
     conn: &Connection,
-    parent_dir_id: i64,
+    parent_dir_id: DirId,
     name: &str,
     kind: i32,
     size: i64,
     mtime: i64,
     record: &str,
-) -> Result<i64> {
+) -> Result<DirId> {
     let name_id = leyline_schema::intern_name(conn, name)?;
     conn.execute(
         "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
         params![parent_dir_id, name_id],
     )?;
-    let dir_id: i64 = conn.query_row(
+    let dir_id: DirId = conn.query_row(
         "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
         params![parent_dir_id, name_id],
         |r| r.get(0),
@@ -165,15 +165,20 @@ fn standalone_node(
 }
 
 /// Intern a whole `/`-separated standalone path (creating links as needed)
-/// and return the leaf's nid. Container links created along the way get
-/// kind=1 and an empty record.
-fn standalone_chain(conn: &Connection, path: &str, mtime: i64) -> Result<i64> {
-    let mut cur: i64 = 1; // root
+/// and return the leaf's `dir_id`. Container links created along the way
+/// get kind=1 and an empty record.
+fn standalone_chain_dir(conn: &Connection, path: &str, mtime: i64) -> Result<DirId> {
+    let mut cur = DirId::ROOT;
     ensure_root_node(conn, mtime)?;
     for comp in path.split('/') {
         cur = standalone_node(conn, cur, comp, 1, 0, mtime, "")?;
     }
-    Ok(leyline_schema::dir_nid(cur))
+    Ok(cur)
+}
+
+/// [`standalone_chain_dir`], returning the leaf's nid.
+fn standalone_chain(conn: &Connection, path: &str, mtime: i64) -> Result<Nid> {
+    standalone_chain_dir(conn, path, mtime).map(leyline_schema::dir_nid)
 }
 
 /// Make sure the root directory's presentation row exists.
@@ -221,7 +226,7 @@ pub fn project_lsp_into(
     ensure_root_node(conn, mtime)?;
 
     // /symbols — document symbol hierarchy
-    let symbols_dir = standalone_node(conn, 1, "symbols", 1, 0, mtime, "")?;
+    let symbols_dir = standalone_node(conn, DirId::ROOT, "symbols", 1, 0, mtime, "")?;
     let collected = walk_symbols(conn, symbols, symbols_dir, mtime)?;
 
     // ASSERT THE MECHANISM FIRED (bead `ley-line-open-2607d2`).
@@ -259,7 +264,7 @@ pub fn project_lsp_into(
 
     // /diagnostics — flat list keyed by severity + index
     if !diagnostics.is_empty() {
-        let diags_dir = standalone_node(conn, 1, "diagnostics", 1, 0, mtime, "")?;
+        let diags_dir = standalone_node(conn, DirId::ROOT, "diagnostics", 1, 0, mtime, "")?;
 
         for severity_label in &["error", "warning", "info", "hint"] {
             let severity_val = match *severity_label {
@@ -399,7 +404,7 @@ pub fn merge_lsp_into_ast(
 /// queried `definition` for); avoids re-extracting from source bytes.
 pub fn project_definitions(
     conn: &Connection,
-    nid: i64,
+    nid: Nid,
     def_token: &str,
     locations: &[Location],
 ) -> Result<usize> {
@@ -766,7 +771,7 @@ fn extract_token_at_range(source: &str, range: &protocol::Range) -> Option<Strin
 /// JOIN at query time.
 /// The interned file id behind a `_source.path` (the absolute path the
 /// parser recorded), or `None` when the projection does not hold the file.
-fn file_id_for_path(conn: &Connection, abs_path: &str) -> Option<i64> {
+fn file_id_for_path(conn: &Connection, abs_path: &str) -> Option<FileId> {
     conn.query_row(
         "SELECT file_id FROM _source WHERE path = ?1 LIMIT 1",
         [abs_path],
@@ -794,7 +799,13 @@ pub fn source_id_for_path(conn: &Connection, abs_path: &str) -> Option<String> {
 /// node goes through it, so every lookup is scoped by the file's nid
 /// range — a PRIMARY KEY range SEARCH under projection-v5 — and none can
 /// answer another file's node at the same row and column.
-fn ast_node_at(conn: &Connection, file_id: i64, row: i64, col: i64, kinds: &[&str]) -> Option<i64> {
+fn ast_node_at(
+    conn: &Connection,
+    file_id: FileId,
+    row: i64,
+    col: i64,
+    kinds: &[&str],
+) -> Option<Nid> {
     let (lo, hi) = leyline_schema::file_nid_range(file_id);
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
         vec![Box::new(lo), Box::new(hi), Box::new(row), Box::new(col)];
@@ -849,7 +860,7 @@ fn lookup_referrer_node_id(
 }
 
 /// Project hover result into `_lsp_hover` table.
-pub fn project_hover(conn: &Connection, nid: i64, hover: &Hover) -> Result<()> {
+pub fn project_hover(conn: &Connection, nid: Nid, hover: &Hover) -> Result<()> {
     conn.execute_batch(LSP_HOVER_DDL)?;
     let text = protocol::hover_to_plaintext(hover);
     conn.execute(
@@ -860,7 +871,7 @@ pub fn project_hover(conn: &Connection, nid: i64, hover: &Hover) -> Result<()> {
 }
 
 /// Project completion items into `_lsp_completions` table.
-pub fn project_completions(conn: &Connection, nid: i64, items: &[CompletionItem]) -> Result<usize> {
+pub fn project_completions(conn: &Connection, nid: Nid, items: &[CompletionItem]) -> Result<usize> {
     conn.execute_batch(LSP_COMPLETIONS_DDL)?;
     let mut count = 0;
     for item in items {
@@ -893,8 +904,7 @@ pub fn project_definitions_into_nodes(
     // errors (missing schema, locked db, type mismatch) MUST propagate —
     // silently swallowing them would let children land under a missing
     // parent dir, producing orphans downstream walks can't navigate to.
-    let parent_nid = standalone_chain(conn, &format!("definitions/{node_id}"), mtime)?;
-    let parent_dir = -parent_nid;
+    let parent_dir = standalone_chain_dir(conn, &format!("definitions/{node_id}"), mtime)?;
 
     for (i, loc) in locations.iter().enumerate() {
         let record = serde_json::json!({
@@ -928,8 +938,7 @@ pub fn project_references_into_nodes(
         return Ok(());
     }
     // See the matching explanation in project_definitions_into_nodes.
-    let parent_nid = standalone_chain(conn, &format!("references/{node_id}"), mtime)?;
-    let parent_dir = -parent_nid;
+    let parent_dir = standalone_chain_dir(conn, &format!("references/{node_id}"), mtime)?;
 
     for (i, loc) in locations.iter().enumerate() {
         let record = serde_json::json!({
@@ -1174,7 +1183,7 @@ fn sanitize_delta(detail: &str) -> String {
 fn walk_symbols(
     conn: &Connection,
     syms: &[DocumentSymbol],
-    parent_dir_id: i64,
+    parent_dir_id: DirId,
     mtime: i64,
 ) -> Result<usize> {
     let names = sibling_names(syms);
@@ -1188,7 +1197,7 @@ fn walk_symbols(
 fn walk_symbol(
     conn: &Connection,
     sym: &DocumentSymbol,
-    parent_dir_id: i64,
+    parent_dir_id: DirId,
     name: &str,
     mtime: i64,
 ) -> Result<usize> {
@@ -1243,7 +1252,7 @@ fn walk_symbol(
 fn merge_symbol(
     conn: &Connection,
     sym: &DocumentSymbol,
-    file_id: Option<i64>,
+    file_id: Option<FileId>,
     diagnostics: &[Diagnostic],
 ) -> Result<usize> {
     let kind_name = protocol::symbol_kind_name(sym.kind);
@@ -1255,7 +1264,7 @@ fn merge_symbol(
     // by file, because every Go file has `package main` at 0:0 and most
     // have `func main` at row 2 (bead ley-line-open-2b7066). `None` means
     // the db has no AST at all.
-    let ast_nid: Option<i64> = file_id.and_then(|file_id| {
+    let ast_nid: Option<Nid> = file_id.and_then(|file_id| {
         ast_node_at(
             conn,
             file_id,
@@ -1334,13 +1343,16 @@ mod tests {
     use leyline_schema::insert_node;
     use std::str::FromStr;
 
+    /// The root directory's nid (`dir_nid(DirId::ROOT)`, i.e. -1).
+    const ROOT_NID: Nid = Nid::from_raw(-1);
+
     use crate::protocol::{Position, Range, SymbolKind, Uri};
 
     use std::io::Cursor;
 
     /// Resolve a rendered display path to its nid — the projection-v5 read
     /// boundary the daemon and mache use.
-    fn resolve(conn: &Connection, path: &str) -> i64 {
+    fn resolve(conn: &Connection, path: &str) -> Nid {
         leyline_schema::resolve_path(conn, path)
             .unwrap()
             .unwrap_or_else(|| panic!("path must resolve: {path:?}"))
@@ -1704,7 +1716,19 @@ mod tests {
         let fn_nid = base + 1;
         let k_fn = leyline_schema::intern_kind(&conn, "python", "function_definition").unwrap();
         let name_id = leyline_schema::intern_name(&conn, "test.py").unwrap();
-        insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        insert_node(
+            &conn,
+            base,
+            Some(ROOT_NID),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
         insert_node(&conn, fn_nid, Some(base), None, Some(k_fn), 1, 0, 0, 0, "").unwrap();
         conn.execute(
             "INSERT INTO _ast VALUES (?1, ?2, 100, 500, 5, 0, 20, 0)",
@@ -1724,7 +1748,7 @@ mod tests {
         let matched = merge_lsp_into_ast(&symbols, &diags, &conn, "test.py").unwrap();
         assert_eq!(matched, 1);
 
-        let (nid, kind): (i64, String) = conn
+        let (nid, kind): (Nid, String) = conn
             .query_row(
                 "SELECT nid, symbol_kind FROM _lsp WHERE symbol_kind = 'function'",
                 [],
@@ -1778,7 +1802,19 @@ mod tests {
             let file_id = leyline_schema::ensure_file_id(&conn, rel).unwrap();
             let base = leyline_schema::file_nid(file_id, 0);
             let name_id = leyline_schema::intern_name(&conn, rel).unwrap();
-            insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+            insert_node(
+                &conn,
+                base,
+                Some(ROOT_NID),
+                Some(name_id),
+                None,
+                1,
+                0,
+                0,
+                0,
+                "",
+            )
+            .unwrap();
             insert_node(
                 &conn,
                 base + 1,
@@ -1819,7 +1855,7 @@ mod tests {
         let matched = merge_lsp_into_ast(&symbols, &[], &conn, "b.go").unwrap();
         assert_eq!(matched, 1);
 
-        let nids: Vec<i64> = {
+        let nids: Vec<Nid> = {
             let mut stmt = conn.prepare("SELECT nid FROM _lsp ORDER BY nid").unwrap();
             stmt.query_map([], |r| r.get(0))
                 .unwrap()
@@ -1852,8 +1888,14 @@ mod tests {
              INSERT INTO _source VALUES ('src/b.go', 'go', '/w/src/b.go', 9);",
         )
         .unwrap();
-        assert_eq!(file_id_for_path(&conn, "/w/src/a.go"), Some(7));
-        assert_eq!(file_id_for_path(&conn, "/w/src/b.go"), Some(9));
+        assert_eq!(
+            file_id_for_path(&conn, "/w/src/a.go"),
+            Some(FileId::from_raw(7))
+        );
+        assert_eq!(
+            file_id_for_path(&conn, "/w/src/b.go"),
+            Some(FileId::from_raw(9))
+        );
         assert_eq!(file_id_for_path(&conn, "/w/src/c.go"), None);
         assert_eq!(
             source_id_for_path(&conn, "/w/src/a.go").as_deref(),
@@ -1890,7 +1932,19 @@ mod tests {
         let k_class = leyline_schema::intern_kind(&conn, "python", "class_definition").unwrap();
         let k_fn = leyline_schema::intern_kind(&conn, "python", "function_definition").unwrap();
         let name_id = leyline_schema::intern_name(&conn, "test.py").unwrap();
-        insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        insert_node(
+            &conn,
+            base,
+            Some(ROOT_NID),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
         insert_node(
             &conn,
             base + 1,
@@ -1935,7 +1989,7 @@ mod tests {
         )];
         let matched = merge_lsp_into_ast(&symbols, &[], &conn, "test.py").unwrap();
         assert_eq!(matched, 2, "the parent and its child both matched");
-        let rows: Vec<(i64, String)> = {
+        let rows: Vec<(Nid, String)> = {
             let mut stmt = conn
                 .prepare("SELECT nid, symbol_kind FROM _lsp ORDER BY nid")
                 .unwrap();
@@ -1953,6 +2007,45 @@ mod tests {
         );
     }
 
+    /// The standalone `/definitions/{node_id}/{i}` and
+    /// `/references/{node_id}/{i}` trees: one leaf per location, under the
+    /// interned `dirs` chain, carrying the location as its record. No
+    /// locations, no tree.
+    #[test]
+    fn locations_project_into_standalone_trees() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let locs = vec![
+            make_location("file:///src/lib.rs", 10, 4),
+            make_location("file:///src/util.rs", 42, 0),
+        ];
+        project_definitions_into_nodes(&conn, "main", &locs, 7).unwrap();
+        project_references_into_nodes(&conn, "main", &locs[1..], 7).unwrap();
+        project_references_into_nodes(&conn, "unused", &[], 7).unwrap();
+
+        let record_at = |path: &str| -> Option<String> {
+            let nid = leyline_schema::resolve_path(&conn, path).unwrap()?;
+            conn.query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+                r.get(0)
+            })
+            .ok()
+        };
+        for (path, uri) in [
+            ("definitions/main/0", "file:///src/lib.rs"),
+            ("definitions/main/1", "file:///src/util.rs"),
+            ("references/main/0", "file:///src/util.rs"),
+        ] {
+            let record = record_at(path).unwrap_or_else(|| panic!("{path} must exist"));
+            assert!(record.contains(uri), "{path}: {record}");
+        }
+        assert_eq!(record_at("references/main/1"), None);
+        assert_eq!(
+            leyline_schema::resolve_path(&conn, "references/unused").unwrap(),
+            None,
+            "no locations, no tree"
+        );
+    }
+
     #[test]
     fn project_definitions_table() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1961,7 +2054,7 @@ mod tests {
             make_location("file:///src/util.rs", 42, 0),
         ];
 
-        let my_func_nid = 4242;
+        let my_func_nid = Nid::from_raw(4242);
         let count = project_definitions(&conn, my_func_nid, "my_func", &locs).unwrap();
         assert_eq!(count, 2);
 
@@ -2170,7 +2263,19 @@ mod tests {
             [file_id],
         )
         .unwrap();
-        insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        insert_node(
+            &conn,
+            base,
+            Some(ROOT_NID),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
         insert_node(
             &conn,
             base + 1,
@@ -2388,7 +2493,7 @@ mod tests {
     /// construct node of `kind` (ordinal 1) and one `identifier` inside it
     /// (ordinal 2), spans matching the pre-v5 fixture. Returns
     /// `(base_nid, construct_nid)`.
-    fn v5_single_construct_fixture(conn: &Connection, kind: &str) -> (i64, i64) {
+    fn v5_single_construct_fixture(conn: &Connection, kind: &str) -> (Nid, Nid) {
         leyline_schema::create_schema(conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, path TEXT, file_id INTEGER UNIQUE);
@@ -2415,7 +2520,19 @@ mod tests {
             [file_id],
         )
         .unwrap();
-        insert_node(conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        insert_node(
+            conn,
+            base,
+            Some(ROOT_NID),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
         insert_node(
             conn,
             base + 1,
@@ -2489,7 +2606,19 @@ mod tests {
             [file_id],
         )
         .unwrap();
-        insert_node(&conn, base, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        insert_node(
+            &conn,
+            base,
+            Some(ROOT_NID),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
         insert_node(
             &conn,
             base + 1,
@@ -2685,7 +2814,7 @@ mod tests {
             range: None,
         };
 
-        project_hover(&conn, 77, &hover).unwrap();
+        project_hover(&conn, Nid::from_raw(77), &hover).unwrap();
 
         let text: String = conn
             .query_row(
@@ -2715,7 +2844,7 @@ mod tests {
             },
         ];
 
-        let count = project_completions(&conn, 105, &items).unwrap();
+        let count = project_completions(&conn, Nid::from_raw(105), &items).unwrap();
         assert_eq!(count, 2);
 
         let rows: i64 = conn

@@ -13,6 +13,7 @@ executable: the same file is read by Rust tests on every CI host.
 | Key | Construction | Code | Consumed by |
 |---|---|---|---|
 | `sigmaBytes` | σ_bytes = BLAKE3(bytes): blobs, CDC chunks, arena images | `leyline-core` `substrate.rs` | `leyline-core` `tests/sigma_axioms.rs` |
+| `deriveKey` | the keyed primitive, BLAKE3 `derive_key(context, input)`; cases from BLAKE3's own `test_vectors.json` (input byte `i` is `i mod 251`, first 32 output bytes). A primitive, not a construction: no address moves | `leyline-core` `substrate::derive_key` | `leyline-core` `tests/sigma_axioms.rs`; `leyline-cas-ffi` `leyline_derive_key` (C ABI, and the wasm build cloister loads; bead `ley-line-open-12e252`) |
 | `partition` | `PartitionSpec` fold, `derive_key("leyline partition fold v1", …)` | `leyline-core` `partition.rs` | same |
 | `headDigest` | head digest v2, `derive_key("leyline head digest v2", …)` | `leyline-core` `head_digest.rs` | same |
 | `parserId` | `RowSet` fold `leyline/parser-id/v1` | `leyline-cli-lib` `tree_root.rs` | `leyline-cli-lib` `tests/sigma_axioms.rs` |

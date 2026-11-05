@@ -206,7 +206,7 @@ impl EnrichmentPass for EmbeddingPass {
         let mut files_processed = 0u64;
         let mut items_added = 0u64;
 
-        let mut rows_buf: Vec<(i64, String)> = Vec::new();
+        let mut rows_buf: Vec<(leyline_schema::Nid, String)> = Vec::new();
         match changed_files {
             Some(files) if !files.is_empty() => {
                 let mut stmt = conn.prepare_cached(&format!("{base} AND nid BETWEEN ?1 AND ?2"))?;
@@ -216,7 +216,7 @@ impl EnrichmentPass for EmbeddingPass {
                     };
                     let (lo, hi) = leyline_ts::schema::file_nid_range(fid);
                     let rows = stmt.query_map(rusqlite::params![lo, hi], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                        Ok((r.get(0)?, r.get::<_, String>(1)?))
                     })?;
                     for row in rows {
                         rows_buf.push(row?);
@@ -225,8 +225,7 @@ impl EnrichmentPass for EmbeddingPass {
             }
             _ => {
                 let mut stmt = conn.prepare(base)?;
-                let rows =
-                    stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?;
                 for row in rows {
                     rows_buf.push(row?);
                 }

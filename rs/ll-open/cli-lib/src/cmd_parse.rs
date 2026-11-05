@@ -250,7 +250,7 @@ const BULK_BATCH_ROWS: usize = 3000;
 /// The ceiling lives in `leyline_schema` so there is one value for every
 /// crate that sizes an `IN (...)` list or a multi-row INSERT (bead
 /// `ley-line-open-35fc5e`).
-use leyline_schema::SQLITE_MAX_BOUND_PARAMS;
+use leyline_schema::{ContentId, DirId, FileId, KindId, NameId, Nid, SQLITE_MAX_BOUND_PARAMS};
 
 /// Rows per multi-row INSERT for a table of `cols` columns.
 ///
@@ -463,7 +463,7 @@ batch_table! {
     NodeBatch, NodeRow,
     "INSERT OR IGNORE INTO nodes (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record) VALUES ",
     9,
-    push_fn: (nid: i64, parent_nid: Option<i64>, name_id: Option<i64>, kind_id: Option<i64>, kind: i32, ord: i64, size: i64, mtime: i64, record: String),
+    push_fn: (nid: Nid, parent_nid: Option<Nid>, name_id: Option<NameId>, kind_id: Option<KindId>, kind: i32, ord: i64, size: i64, mtime: i64, record: String),
     push_body: { NodeRow { nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
@@ -500,7 +500,7 @@ batch_table! {
     AstBatch, AstRow,
     "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) VALUES ",
     9,
-    push_fn: (nid: i64, kind_id: i64, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, content_id: i64),
+    push_fn: (nid: Nid, kind_id: KindId, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, content_id: ContentId),
     push_body: { AstRow { nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
@@ -525,7 +525,7 @@ batch_table! {
     SourceBatch, SourceRow,
     "INSERT INTO _source (id, language, path, content_hash, file_id) VALUES ",
     5,
-    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>, file_id: i64),
+    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>, file_id: FileId),
     push_body: { SourceRow { id, language, path, content_hash, file_id } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
@@ -551,7 +551,7 @@ batch_table! {
     "INSERT INTO node_content (content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity) VALUES ",
     8,
     push_fn: (
-        content_id: i64, node_hash: Vec<u8>, node_tag: i64, kind: String, raw_kind: String,
+        content_id: ContentId, node_hash: Vec<u8>, node_tag: i64, kind: String, raw_kind: String,
         lang: String, token: Option<String>, arity: i64
     ),
     push_body: { NodeContentRow { content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity } },
@@ -581,7 +581,7 @@ batch_table! {
     NodeEdgeBatch, NodeEdgeRow,
     "INSERT OR IGNORE INTO node_edge (parent_id, ordinal, child_id, field) VALUES ",
     4,
-    push_fn: (parent_id: i64, ordinal: i64, child_id: i64, field: Option<String>),
+    push_fn: (parent_id: ContentId, ordinal: i64, child_id: ContentId, field: Option<String>),
     push_body: { NodeEdgeRow { parent_id, ordinal, child_id, field } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
@@ -617,7 +617,7 @@ batch_table! {
     RefBatch, RefRow,
     "",
     12,
-    push_fn: (token: String, nid: i64, content_id: Option<i64>, container_nid: Option<i64>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
+    push_fn: (token: String, nid: Nid, content_id: Option<ContentId>, container_nid: Option<Nid>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
     push_body: { RefRow { token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
@@ -674,9 +674,9 @@ batch_table! {
     12,
     push_fn: (
         token: String,
-        nid: i64,
-        content_id: Option<i64>,
-        container_nid: Option<i64>,
+        nid: Nid,
+        content_id: Option<ContentId>,
+        container_nid: Option<Nid>,
         canonical_kind: Option<&'static str>,
         node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>
     ),
@@ -1767,7 +1767,7 @@ fn parse_into_conn_with(
     // are 2.7x faster than it (bead comment, 771k edges). A hash an earlier
     // pass stored is looked up once by its `node_hash` index — never on a
     // cold parse, whose arena starts empty.
-    let mut content_ids: HashMap<[u8; 32], i64> = HashMap::with_capacity(200_000);
+    let mut content_ids: HashMap<[u8; 32], ContentId> = HashMap::with_capacity(200_000);
     let mut next_content_id: i64 = conn.query_row(
         "SELECT COALESCE(MAX(content_id), 0) + 1 FROM node_content",
         [],
@@ -1782,12 +1782,12 @@ fn parse_into_conn_with(
     // Parents whose edges this pass has already buffered. A parent's edge
     // set is a function of its hash, emitted whole by the first file that
     // folds it; `INSERT OR IGNORE` covers a parent an earlier pass wrote.
-    let mut edges_written: HashSet<i64> = HashSet::with_capacity(200_000);
+    let mut edges_written: HashSet<ContentId> = HashSet::with_capacity(200_000);
 
     // rel-path → leaf dir_id memo, so each file's dir chain hits SQL once.
-    let mut dir_cache: HashMap<String, i64> = HashMap::new();
+    let mut dir_cache: HashMap<String, DirId> = HashMap::new();
     // (lang, raw_kind) → kind_id memo for the interning below.
-    let mut kind_cache: HashMap<(String, String), i64> = HashMap::new();
+    let mut kind_cache: HashMap<(String, String), KindId> = HashMap::new();
     let mut changed_files: Vec<String> = Vec::new();
 
     // Buffer-fill and flush time, accumulated per chunk for the
@@ -1852,14 +1852,15 @@ fn parse_into_conn_with(
                         pf.rel,
                         total_ordinals,
                     );
-                    let mut nid_by_id: HashMap<&str, i64> = HashMap::with_capacity(total_ordinals);
+                    // `base` is ordinal 0, so `base + k` is `file_nid(file_id, k)`.
+                    let mut nid_by_id: HashMap<&str, Nid> = HashMap::with_capacity(total_ordinals);
                     for (i, a) in pf.ast_entries.iter().enumerate() {
-                        nid_by_id.insert(a.node_id.as_str(), base | i as i64);
+                        nid_by_id.insert(a.node_id.as_str(), base + i as i64);
                     }
                     for (j, (id, _)) in pf.injected_hashes.iter().enumerate() {
                         nid_by_id
                             .entry(id.as_str())
-                            .or_insert(base | injected_ordinal(pf.ast_entries.len(), j) as i64);
+                            .or_insert(base + injected_ordinal(pf.ast_entries.len(), j) as i64);
                     }
 
                     // parent_nid + sibling ord per entry, derived from the
@@ -1867,8 +1868,8 @@ fn parse_into_conn_with(
                     // children in pre-order, siblings keep source order).
                     // The per-kind display rank derives from `ord` at read
                     // time, reproducing the pre-v5 `{kind}[_{idx}]` names.
-                    let mut sib_next: HashMap<i64, i64> = HashMap::new();
-                    let mut placement: HashMap<&str, (i64, i64)> =
+                    let mut sib_next: HashMap<Nid, i64> = HashMap::new();
+                    let mut placement: HashMap<&str, (Nid, i64)> =
                         HashMap::with_capacity(pf.ast_entries.len());
                     for a in pf.ast_entries.iter().skip(1) {
                         let parent_str = a
@@ -1942,7 +1943,7 @@ fn parse_into_conn_with(
                             conn.prepare_cached(
                                 "SELECT content_id FROM node_content WHERE node_hash = ?1",
                             )?
-                            .query_row([&c.node_hash[..]], |r| r.get::<_, i64>(0))
+                            .query_row([&c.node_hash[..]], |r| r.get::<_, ContentId>(0))
                             .optional()?
                         } else {
                             None
@@ -1950,7 +1951,7 @@ fn parse_into_conn_with(
                         let id = match stored {
                             Some(id) => id,
                             None => {
-                                let id = next_content_id;
+                                let id = ContentId::from_raw(next_content_id);
                                 next_content_id += 1;
                                 content_buf.push(
                                     id,
@@ -1971,7 +1972,7 @@ fn parse_into_conn_with(
                     // (v9), `_ast`/`node_defs`/`node_refs` occurrences (v10,
                     // bead `ley-line-open-738dd9`) — resolves here. A miss is
                     // a fold that named a subtree it did not emit: loud.
-                    let id_of = |h: &[u8; 32]| -> Result<i64> {
+                    let id_of = |h: &[u8; 32]| -> Result<ContentId> {
                         content_ids.get(h).copied().with_context(|| {
                             format!(
                                 "node_hash {} has no node_content row in {}",
@@ -1980,7 +1981,7 @@ fn parse_into_conn_with(
                             )
                         })
                     };
-                    let mut parents_here: Vec<i64> = Vec::new();
+                    let mut parents_here: Vec<ContentId> = Vec::new();
                     for c in pf.node_children {
                         let parent_id = id_of(&c.parent_hash)?;
                         if edges_written.contains(&parent_id) {
@@ -2029,7 +2030,7 @@ fn parse_into_conn_with(
 
                     // Interning memo for this file's kinds.
                     let lang = pf.language.clone();
-                    let mut kind_id_of = |conn: &Connection, raw_kind: &str| -> Result<i64> {
+                    let mut kind_id_of = |conn: &Connection, raw_kind: &str| -> Result<KindId> {
                         if let Some(k) = kind_cache.get(&(lang.clone(), raw_kind.to_string())) {
                             return Ok(*k);
                         }
@@ -2100,7 +2101,7 @@ fn parse_into_conn_with(
                     for (ordinal, a) in pf.ast_entries.iter().enumerate() {
                         let kind_id = kind_id_of(conn, &a.node_kind)?;
                         ast_buf.push(
-                            base | ordinal as i64,
+                            base + ordinal as i64,
                             kind_id,
                             a.start_byte as i64,
                             a.end_byte as i64,
@@ -2116,7 +2117,7 @@ fn parse_into_conn_with(
                     // correlation ids to nids here, where the file's ordinal
                     // assignment is in hand. Injected ids resolve through
                     // the same map (they own the post-`_ast` ordinals).
-                    let nid_of = |id: &str| -> Result<i64> {
+                    let nid_of = |id: &str| -> Result<Nid> {
                         nid_by_id
                             .get(id)
                             .copied()
@@ -4574,7 +4575,7 @@ mod tests {
         conn.execute(
             "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) \
              VALUES (?1, 1, 0, 0, 0, 0, 0, 0, NULL)",
-            [leyline_schema::file_nid(2, 0)],
+            [leyline_schema::file_nid(FileId::from_raw(2), 0)],
         )
         .unwrap();
         std::fs::write(root.join("b.go"), b"package m\nfunc B() {}\n").unwrap();
@@ -4672,7 +4673,10 @@ mod tests {
         let doomed_nid = leyline_ts::schema::resolve_path(&conn, "doomed")
             .unwrap()
             .expect("doomed/ dir row must exist after cold parse");
-        assert!(doomed_nid < 0, "a directory resolves to a negative nid");
+        assert!(
+            leyline_schema::nid_dir_id(doomed_nid).is_some(),
+            "a directory resolves to a negative nid"
+        );
 
         // Remove the file AND its parent dir from disk, then reparse.
         std::fs::remove_file(root.join("doomed/a.go")).unwrap();

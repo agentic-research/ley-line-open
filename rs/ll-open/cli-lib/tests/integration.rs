@@ -490,7 +490,7 @@ fn test_inspect_node_lookup() {
     leyline_schema::insert_node(
         &source_conn,
         leyline_schema::file_nid(file_id, 0),
-        Some(leyline_schema::dir_nid(1)),
+        Some(leyline_schema::dir_nid(leyline_schema::DirId::ROOT)),
         Some(name_id),
         None,
         0,
@@ -1931,7 +1931,7 @@ async fn test_incremental_deletion_cleans_lsp_orphans() {
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
 
-    let count_in_range = |table: &str, lo: i64, hi: i64| -> i64 {
+    let count_in_range = |table: &str, lo: leyline_schema::Nid, hi: leyline_schema::Nid| -> i64 {
         conn.query_row(
             &format!("SELECT COUNT(*) FROM {table} WHERE nid BETWEEN ?1 AND ?2"),
             [lo, hi],
@@ -2227,7 +2227,7 @@ async fn test_embed_queue_drainer_refreshes_index() {
         leyline_schema::insert_node(
             &w,
             leyline_schema::file_nid(file_id, 0),
-            Some(leyline_schema::dir_nid(1)),
+            Some(leyline_schema::dir_nid(leyline_schema::DirId::ROOT)),
             Some(name_id),
             None,
             0,
@@ -2472,12 +2472,12 @@ fn test_scoped_reparse_preserves_sibling_dir_nodes() {
     // resolving it to a nid first. `dirs`/`files` are append-only, so
     // resolution survives a sweep that removes the presentation row —
     // which is exactly what makes the count below the real assertion.
-    let nid_of = |rel: &str| -> i64 {
+    let nid_of = |rel: &str| -> leyline_schema::Nid {
         leyline_ts::schema::resolve_path(&conn, rel)
             .unwrap()
             .unwrap_or_else(|| panic!("{rel} must be interned by the cold parse"))
     };
-    let rows_at = |nid: i64, extra: &str| -> i64 {
+    let rows_at = |nid: leyline_schema::Nid, extra: &str| -> i64 {
         conn.query_row(
             &format!("SELECT COUNT(*) FROM nodes WHERE nid = ?1 {extra}"),
             [nid],

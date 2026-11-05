@@ -24,7 +24,7 @@ fn create_test_arena(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     leyline_schema::insert_node(
         &source,
         leyline_schema::dir_nid(dir_id),
-        Some(leyline_schema::dir_nid(1)),
+        Some(leyline_schema::dir_nid(leyline_schema::DirId::ROOT)),
         Some(dir_name),
         None,
         1,

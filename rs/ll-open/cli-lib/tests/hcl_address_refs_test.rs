@@ -101,7 +101,7 @@ terraform {
     );
     for (token, nid, container_nid, node_kind) in rows {
         assert!(
-            (lo..=hi).contains(&nid),
+            (lo.get()..=hi.get()).contains(&nid),
             "{token}: node_refs.nid must live in main.tf's nid range"
         );
         assert_eq!(container_nid, None);

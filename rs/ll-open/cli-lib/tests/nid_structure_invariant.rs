@@ -118,7 +118,7 @@ fn assert_projection_holds(conn: &Connection, what: &str) {
     );
 
     // 4. Display round-trip over every row.
-    let nids: Vec<i64> = {
+    let nids: Vec<leyline_schema::Nid> = {
         let mut stmt = conn.prepare("SELECT nid FROM nodes").unwrap();
         let v = stmt
             .query_map([], |r| r.get(0))

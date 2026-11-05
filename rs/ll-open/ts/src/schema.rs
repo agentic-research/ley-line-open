@@ -4,9 +4,10 @@
 //! AST-specific tables (`_source`, `_ast`) that enable bidirectional splicing.
 
 pub use leyline_schema::{
-    NODES_INDEXES_DDL, NODES_TABLE_DDL, create_nodes_indexes, create_nodes_table, create_schema,
-    dir_nid, ensure_dir_nodes, ensure_file_id, file_nid, file_nid_range, insert_node, intern_kind,
-    intern_name, lookup_file_id, nid_file_id, nid_ordinal, node_path, resolve_path,
+    ContentId, DirId, FileId, KindId, NODES_INDEXES_DDL, NODES_TABLE_DDL, NameId, Nid,
+    create_nodes_indexes, create_nodes_table, create_schema, dir_nid, ensure_dir_nodes,
+    ensure_file_id, file_nid, file_nid_range, insert_node, intern_kind, intern_name,
+    lookup_file_id, nid_file_id, nid_ordinal, node_path, resolve_path,
 };
 
 use anyhow::Result;
@@ -123,7 +124,7 @@ pub fn insert_source(
     id: &str,
     language: &str,
     content: &[u8],
-    file_id: i64,
+    file_id: FileId,
 ) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO _source (id, language, content, file_id) VALUES (?1, ?2, ?3, ?4)",
@@ -139,7 +140,7 @@ pub fn insert_source_ref(
     id: &str,
     language: &str,
     path: &str,
-    file_id: i64,
+    file_id: FileId,
 ) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO _source (id, language, path, file_id) VALUES (?1, ?2, ?3, ?4)",
@@ -152,15 +153,15 @@ pub fn insert_source_ref(
 #[allow(clippy::too_many_arguments)]
 pub fn insert_ast(
     conn: &Connection,
-    nid: i64,
-    kind_id: i64,
+    nid: Nid,
+    kind_id: KindId,
     start_byte: usize,
     end_byte: usize,
     start_row: usize,
     start_col: usize,
     end_row: usize,
     end_col: usize,
-    content_id: Option<i64>,
+    content_id: Option<ContentId>,
 ) -> Result<()> {
     // rusqlite 0.39 dropped the blanket `ToSql for usize` — bind through
     // `i64` instead. Tree-sitter byte/row/col indices fit comfortably in
@@ -585,8 +586,8 @@ pub fn create_refs_indexes(conn: &Connection) -> Result<()> {
 pub fn insert_ref(
     conn: &Connection,
     token: &str,
-    nid: i64,
-    container_nid: Option<i64>,
+    nid: Nid,
+    container_nid: Option<Nid>,
     qualifier: Option<&str>,
 ) -> Result<()> {
     conn.execute(
@@ -611,8 +612,8 @@ pub fn insert_ref(
 pub fn insert_def(
     conn: &Connection,
     token: &str,
-    nid: i64,
-    container_nid: Option<i64>,
+    nid: Nid,
+    container_nid: Option<Nid>,
     canonical_kind: Option<&str>,
 ) -> Result<()> {
     conn.execute(
@@ -1210,7 +1211,7 @@ mod tests {
 
     /// Mint a minimal two-row file (file node + one leaf) plus a ref and a
     /// def, the v5 way. Returns the file's nid range.
-    fn mint_file(conn: &Connection, rel: &str, token: &str) -> (i64, i64) {
+    fn mint_file(conn: &Connection, rel: &str, token: &str) -> (Nid, Nid) {
         let file_id = ensure_file_id(conn, rel).unwrap();
         let dir_id = ensure_dir_nodes(conn, rel, 1).unwrap();
         let base = file_nid(file_id, 0);
@@ -1243,7 +1244,7 @@ mod tests {
         file_nid_range(file_id)
     }
 
-    fn rows_in_range(conn: &Connection, table: &str, key: &str, lo: i64, hi: i64) -> i64 {
+    fn rows_in_range(conn: &Connection, table: &str, key: &str, lo: Nid, hi: Nid) -> i64 {
         conn.query_row(
             &format!("SELECT COUNT(*) FROM {table} WHERE {key} BETWEEN ?1 AND ?2"),
             params![lo, hi],
@@ -1898,15 +1899,16 @@ mod tests {
         // Two content rows, so a join on the wrong id renders the wrong hash.
         insert_test_node_content(&conn, &[0x11u8; 32]);
         insert_test_node_content(&conn, &[0x22u8; 32]);
-        let id: i64 = conn
+        let id: ContentId = conn
             .query_row(
                 "SELECT content_id FROM node_content WHERE node_hash = ?1",
                 params![&[0x22u8; 32][..]],
                 |r| r.get(0),
             )
             .unwrap();
-        insert_ast(&conn, 7, 1, 0, 1, 0, 0, 0, 1, Some(id)).unwrap();
-        insert_ast(&conn, 8, 1, 0, 1, 0, 0, 0, 1, None).unwrap();
+        let kind = KindId::from_raw(1);
+        insert_ast(&conn, Nid::from_raw(7), kind, 0, 1, 0, 0, 0, 1, Some(id)).unwrap();
+        insert_ast(&conn, Nid::from_raw(8), kind, 0, 1, 0, 0, 0, 1, None).unwrap();
         conn.execute(
             "INSERT INTO node_refs (token, nid, content_id) VALUES ('r', 7, ?1)",
             params![id],
@@ -2183,7 +2185,8 @@ mod tests {
         // and an `_ast` row through exactly these tables.
         let file_id = ensure_file_id(&conn, "main.go").unwrap();
         insert_source(&conn, "main.go", "go", b"package main\n", file_id).unwrap();
-        insert_ast(&conn, file_nid(file_id, 0), 1, 0, 13, 0, 0, 1, 0, None).unwrap();
+        let kind = intern_kind(&conn, "go", "source_file").unwrap();
+        insert_ast(&conn, file_nid(file_id, 0), kind, 0, 13, 0, 0, 1, 0, None).unwrap();
 
         // Idempotent — `cmd_parse` calls it once per invocation on a
         // possibly-existing arena.
@@ -2195,7 +2198,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_tables(&conn).unwrap();
 
-        insert_source_ref(&conn, "pkg/main.go", "go", "/repo/pkg/main.go", 7).unwrap();
+        let seven = FileId::from_raw(7);
+        insert_source_ref(&conn, "pkg/main.go", "go", "/repo/pkg/main.go", seven).unwrap();
 
         let (id, language, path, content, file_id): (
             String,
@@ -2223,7 +2227,7 @@ mod tests {
         );
 
         // INSERT OR REPLACE: re-registering the same id updates in place.
-        insert_source_ref(&conn, "pkg/main.go", "go", "/elsewhere/main.go", 7).unwrap();
+        insert_source_ref(&conn, "pkg/main.go", "go", "/elsewhere/main.go", seven).unwrap();
         let (n, path): (i64, Option<String>) = conn
             .query_row("SELECT COUNT(*), MAX(path) FROM _source", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))

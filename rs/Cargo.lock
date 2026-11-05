@@ -4629,6 +4629,8 @@ dependencies = [
  "blake3",
  "leyline-core",
  "leyline-ffi-helpers",
+ "serde_json",
+ "tempfile",
  "wasmparser 0.254.0",
 ]
 
@@ -4916,6 +4918,7 @@ version = "0.25.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use leyline_core::mmap::{mmap_read, mmap_write};
 use leyline_core::{ArenaHeader, ContentAddressed, Controller};
+use leyline_schema::{DirId, FileId, Nid};
 
 use crate::SqliteGraph;
 use rusqlite::Connection;
@@ -180,7 +181,7 @@ impl SqliteGraphAdapter {
     }
 
     /// `nid`'s stored record as bytes; empty when it has none.
-    fn record_bytes(conn: &Connection, nid: i64) -> Vec<u8> {
+    fn record_bytes(conn: &Connection, nid: Nid) -> Vec<u8> {
         conn.query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |row| {
             row.get::<_, Option<String>>(0)
         })
@@ -399,7 +400,7 @@ impl SqliteGraphAdapter {
     /// deliberately NOT deleted: those tables are append-only, and reusing a
     /// `file_id` would re-bind a dead file's whole nid range to an unrelated
     /// path. A vacated row simply goes stale.
-    fn delete_subtree(conn: &rusqlite::Connection, nid: i64) -> Result<()> {
+    fn delete_subtree(conn: &rusqlite::Connection, nid: Nid) -> Result<()> {
         if let Some(dir_id) = leyline_schema::nid_dir_id(nid) {
             // Every file interned under this directory or any below it goes
             // through the one owner of a file's rows — `_ast`, `node_refs`,
@@ -410,7 +411,7 @@ impl SqliteGraphAdapter {
                      SELECT ?1 \
                      UNION ALL \
                      SELECT d.dir_id FROM dirs d JOIN sub s ON d.parent_dir_id = s.dir_id)";
-            let file_ids: Vec<i64> = {
+            let file_ids: Vec<FileId> = {
                 let mut stmt = conn.prepare(&format!(
                     "{DESCENDANT_DIRS} SELECT f.file_id FROM files f JOIN sub s ON f.dir_id = s.dir_id"
                 ))?;
@@ -617,7 +618,7 @@ impl Graph for SqliteGraphAdapter {
                     "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
                     rusqlite::params![parent_dir_id, name_id],
                 )?;
-                let dir_id: i64 = conn.query_row(
+                let dir_id: DirId = conn.query_row(
                     "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
                     rusqlite::params![parent_dir_id, name_id],
                     |r| r.get(0),
@@ -716,7 +717,7 @@ impl SqliteGraphAdapter {
     fn move_rows(
         conn: &Connection,
         id: &str,
-        old_nid: i64,
+        old_nid: Nid,
         new_id: &str,
         new_name: &str,
     ) -> Result<()> {
@@ -1190,7 +1191,7 @@ pub(crate) mod fixtures {
     /// The nid a display path resolves to. Tests that reach past the [`Graph`]
     /// trait into nid-keyed tables translate here, exactly as the trait
     /// methods do.
-    pub(crate) fn nid_of(conn: &Connection, path: &str) -> i64 {
+    pub(crate) fn nid_of(conn: &Connection, path: &str) -> Nid {
         leyline_schema::resolve_path(conn, path)
             .unwrap()
             .unwrap_or_else(|| panic!("fixture path {path:?} must resolve"))
@@ -1202,7 +1203,7 @@ pub(crate) mod fixtures {
     /// The projection-v5 shape of what a fixture used to write as one
     /// `INSERT INTO nodes (id, name, ...)`: a node's PATH is no longer stored,
     /// so a fixture has to intern the components that render it.
-    pub(crate) fn put_dir(conn: &Connection, path: &str, mtime: i64) -> Result<i64> {
+    pub(crate) fn put_dir(conn: &Connection, path: &str, mtime: i64) -> Result<Nid> {
         let name = path.rsplit('/').next().unwrap_or(path);
         let name_id = leyline_schema::intern_name(conn, name)?;
         let parent_dir_id = leyline_schema::ensure_dir_nodes(conn, path, mtime)?;
@@ -1210,7 +1211,7 @@ pub(crate) mod fixtures {
             "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
             rusqlite::params![parent_dir_id, name_id],
         )?;
-        let dir_id: i64 = conn.query_row(
+        let dir_id: DirId = conn.query_row(
             "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
             rusqlite::params![parent_dir_id, name_id],
             |r| r.get(0),
@@ -1231,7 +1232,7 @@ pub(crate) mod fixtures {
         path: &str,
         mtime: i64,
         record: Option<&str>,
-    ) -> Result<i64> {
+    ) -> Result<Nid> {
         let name = path.rsplit('/').next().unwrap_or(path);
         let name_id = leyline_schema::intern_name(conn, name)?;
         let parent_dir_id = leyline_schema::ensure_dir_nodes(conn, path, mtime)?;
@@ -2009,7 +2010,7 @@ mod tests {
     }
 
     /// Does a `nodes` row still exist for this nid?
-    fn node_row_present(conn: &Connection, nid: i64) -> bool {
+    fn node_row_present(conn: &Connection, nid: Nid) -> bool {
         conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE nid = ?1",
             rusqlite::params![nid],
@@ -2020,7 +2021,7 @@ mod tests {
     }
 
     /// An AST `nodes` row that exists only to be walked by `parent_nid`.
-    fn put_ast_node(conn: &Connection, nid: i64, parent_nid: Option<i64>) {
+    fn put_ast_node(conn: &Connection, nid: Nid, parent_nid: Option<Nid>) {
         conn.execute(
             "INSERT INTO nodes (nid, parent_nid, kind, ord, size, mtime, record) \
              VALUES (?1, ?2, 0, 0, 0, 0, NULL)",
@@ -2046,7 +2047,7 @@ mod tests {
     /// caller asked to remove one node inside it.
     #[test]
     fn delete_subtree_splits_a_file_root_from_an_interior_node() -> Result<()> {
-        let fixture = || -> Result<(Connection, i64, i64, i64, i64, i64)> {
+        let fixture = || -> Result<(Connection, Nid, Nid, Nid, Nid, Nid)> {
             let conn = Connection::open_in_memory()?;
             create_schema(&conn)?;
             let root = put_file(&conn, "a.rs", 100, Some("alpha"))?;

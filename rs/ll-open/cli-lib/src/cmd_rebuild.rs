@@ -305,7 +305,7 @@ mod tests {
                 return (None, format!("dir:{}", self.dirs[&-n]));
             }
             let fid = n >> 24;
-            let ord = n - leyline_schema::file_nid(fid, 0);
+            let ord = n - leyline_schema::file_nid(leyline_schema::FileId::from_raw(fid), 0).get();
             let rel = self.files[&fid].clone();
             (Some(rel.clone()), format!("{rel}#{ord}"))
         }
@@ -492,13 +492,13 @@ mod tests {
     /// it, and the `node_content` / `node_child` rows its occurrences reach.
     fn file_image(conn: &Connection, rel: &str) -> Vec<String> {
         let rows = logical(conn);
-        let fid: i64 = conn
+        let fid: leyline_schema::FileId = conn
             .query_row("SELECT file_id FROM _source WHERE id = ?1", [rel], |r| {
                 r.get(0)
             })
             .unwrap();
         let (lo, hi) = leyline_schema::file_nid_range(fid);
-        let hashes: BTreeSet<String> = reachable_hashes(conn, OCCURRENCES, lo, hi)
+        let hashes: BTreeSet<String> = reachable_hashes(conn, OCCURRENCES, lo.get(), hi.get())
             .into_iter()
             .map(hex::encode)
             .collect();

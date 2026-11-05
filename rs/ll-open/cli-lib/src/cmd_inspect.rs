@@ -94,7 +94,7 @@ fn lookup_node(conn: &Connection, id: &str) -> Result<String> {
     let mut stmt = conn.prepare("SELECT parent_nid, kind, size FROM nodes WHERE nid = ?1")?;
 
     let exists = stmt.query_row([nid], |row| {
-        let parent_nid: Option<i64> = row.get(0)?;
+        let parent_nid: Option<leyline_schema::Nid> = row.get(0)?;
         let kind: i64 = row.get(1)?;
         let size: i64 = row.get(2)?;
         Ok((parent_nid, kind, size))
@@ -219,7 +219,20 @@ mod tests {
         // Insert one known node so the table exists but the queried
         // id doesn't match.
         let name_id = leyline_schema::intern_name(&conn, "real_node").unwrap();
-        insert_node(&conn, 42, Some(-1), Some(name_id), None, 1, 0, 0, 0, "").unwrap();
+        let root = leyline_schema::dir_nid(leyline_schema::DirId::ROOT);
+        insert_node(
+            &conn,
+            leyline_schema::Nid::from_raw(42),
+            Some(root),
+            Some(name_id),
+            None,
+            1,
+            0,
+            0,
+            0,
+            "",
+        )
+        .unwrap();
 
         let err = lookup_node(&conn, "missing_id").expect_err("must error on missing id");
         let msg = format!("{err:#}");

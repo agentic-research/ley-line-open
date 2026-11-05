@@ -122,8 +122,10 @@ emits a raw `nid` as `node_id`, 80f037 F3).
 `Ref<D: Construction>` is a `repr(transparent)` newtype over the 32-byte address with D as a
 phantom; it is minted only beside its fold (no public `from_bytes`, no `ZERO`; absence is
 `Option`), and no `From` exists between constructions. Arena-local ids are newtypes (`Nid`,
-`FileId`, `NameId`, `KindId`, `ContentId`) with SQL impls and no serde or Cap'n Proto impls; a
-`Loc<V, K>` pairs one with a `Ref<V>`. `kid` stays outside Σ (SHA-256 of canonical SPKI, a
+`FileId`, `DirId`, `NameId`, `KindId`, `ContentId`) with SQL impls and no serde or Cap'n Proto
+impls. They live in `leyline-schema` (`rs/ll-core/schema/src/locator.rs`), which owns the nid
+encoding and is Apache-2.0 and so cannot depend on AGPL `leyline-core`. A `Loc<V, K>` will pair
+one with a `Ref<V>`; it is not built yet. `kid` stays outside Σ (SHA-256 of canonical SPKI, a
 key's name). Cap'n Proto does not gain a construction-tag field beside a digest (a label
 adjacent to a digest is the unbound label ADR-0032 D2 forbids); new identity fields get
 distinct struct types, existing `Common.Hash` ordinals stay put (ADR-0014) behind typed
@@ -319,7 +321,7 @@ merges.
 
 | Step | Contents | Bump | Identities moved |
 |---|---|---|---|
-| M0 | `Ref<D>`, `Witness<D>`, `verify`, locator newtypes in `leyline-core`; the law tests that hold today (§1.3) and the axiom suite (§5); cas-ffi derive-key export | none (additive) | none |
+| M0 | `Ref<D>`, `Witness<D>`, `verify`, locator newtypes in `leyline-schema`; the law tests that hold today (§1.3) and the axiom suite (§5); cas-ffi derive-key export | none (additive) | none |
 | M1 | D-ii: `storeRoot` (`store-tree/v1`), head digest v3, wire `store_root`, `derived_from` v2 | `projection-v11`, head digest v3, release | `treeRoot` removed, `storeRoot` added |
 | M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin; `9c1af2`'s R3 rides along | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
 | M3 | D-i `run_id` v2 | run-id vector v2, release | `run_id` |

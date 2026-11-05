@@ -40,7 +40,7 @@ fn wasm_export_surface_is_exact() {
     // gate must move only when the exported surface deliberately changes.
     assert_eq!(
         funcs,
-        ["leyline_hash_bytes"],
+        ["leyline_derive_key", "leyline_hash_bytes"],
         "exported function surface drifted in {path}"
     );
     // Linear memory must be exported — the caller-provided input/output

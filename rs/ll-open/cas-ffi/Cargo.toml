@@ -30,3 +30,9 @@ blake3 = { workspace = true }
 # ley-line-open-a2099a): tests/wasm_export_surface.rs parses the real
 # export section of the built artifact, run via `task cas-ffi:wasm:verify`.
 wasmparser = { workspace = true }
+# `leyline_derive_key` is checked against the Σ `deriveKey` vectors
+# (`schema-spec/sigma/v1/test-vectors/constructions.json`, bead
+# ley-line-open-12e252).
+serde_json = { workspace = true }
+# tests/c_header.rs compiles a probe against include/leyline_cas_ffi.h.
+tempfile = { workspace = true }

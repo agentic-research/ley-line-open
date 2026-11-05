@@ -285,8 +285,20 @@ mod tests {
         assert_eq!(a.cmp(&b), a.as_hash().cmp(b.as_hash()));
         assert_eq!(a.partial_cmp(&b), Some(a.as_hash().cmp(b.as_hash())));
         assert_eq!(a.clone(), a);
+        assert_ne!(a, b, "refs of distinct values differ");
+        assert!(a != b && a == a);
         let set: HashSet<Ref<Blob>> = [a, a, b].into_iter().collect();
         assert_eq!(set.len(), 2);
+        // `Hash` hashes the address, exactly as the bare `Hash` does.
+        let digest = |h: &dyn Fn(&mut std::collections::hash_map::DefaultHasher)| {
+            use std::hash::Hasher;
+            let mut s = std::collections::hash_map::DefaultHasher::new();
+            h(&mut s);
+            s.finish()
+        };
+        use std::hash::Hash as _;
+        assert_eq!(digest(&|s| a.hash(s)), digest(&|s| a.as_hash().hash(s)));
+        assert_ne!(digest(&|s| a.hash(s)), digest(&|s| b.hash(s)));
     }
 
     #[test]

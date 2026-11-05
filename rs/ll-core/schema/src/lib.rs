@@ -1155,6 +1155,73 @@ mod tests {
         assert_eq!(imports_of(&conn, "b.go"), 0);
     }
 
+    /// A directory rename re-spells the rel-path columns of every file
+    /// beneath it, and only those.
+    #[test]
+    fn refresh_source_paths_under_dir_follows_a_directory_rename() {
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE _source (id TEXT PRIMARY KEY, file_id INTEGER);
+             CREATE TABLE _imports (alias TEXT, path TEXT, source_id TEXT);",
+        )
+        .unwrap();
+        for rel in ["a/x.go", "c/y.go"] {
+            let fid = ensure_file_id(&conn, rel).unwrap();
+            let dir = ensure_dir_nodes(&conn, rel, 1).unwrap();
+            let name = intern_name(&conn, rel.rsplit_once('/').unwrap().1).unwrap();
+            let parent = Some(dir_nid(dir));
+            insert_node(
+                &conn,
+                file_nid(fid, 0),
+                parent,
+                Some(name),
+                None,
+                0,
+                0,
+                0,
+                1,
+                "",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _source (id, file_id) VALUES (?1, ?2)",
+                params![rel, fid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _imports (alias, path, source_id) VALUES ('f', 'fmt', ?1)",
+                [rel],
+            )
+            .unwrap();
+        }
+        let a = intern_dir_chain(&conn, "a").unwrap();
+        let b = intern_name(&conn, "b").unwrap();
+        conn.execute(
+            "UPDATE dirs SET name_id = ?1 WHERE dir_id = ?2",
+            params![b, a],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE nodes SET name_id = ?1 WHERE nid = ?2",
+            params![b, dir_nid(a)],
+        )
+        .unwrap();
+
+        refresh_source_paths_under_dir(&conn, a).unwrap();
+
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM _source ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, ["b/x.go", "c/y.go"]);
+        assert_eq!(imports_of(&conn, "b/x.go"), 1);
+        assert_eq!(imports_of(&conn, "a/x.go"), 0);
+        assert_eq!(imports_of(&conn, "c/y.go"), 1, "a sibling dir is untouched");
+    }
+
     #[test]
     fn nid_scheme_round_trips_and_partitions() {
         let (f3, f4) = (FileId::from_raw(3), FileId::from_raw(4));
@@ -1173,6 +1240,10 @@ mod tests {
         assert_eq!(nid_dir_id(d), Some(DirId::from_raw(7)));
         assert_eq!(nid_file_id(d), None);
         assert_eq!(nid_ordinal(d), None);
+        // Zero is the non-negative side: never a directory.
+        let zero = Nid::from_raw(0);
+        assert_eq!(nid_dir_id(zero), None);
+        assert_eq!(nid_file_id(zero), Some(FileId::from_raw(0)));
 
         // The range of file f ends exactly one below file f+1's base —
         // an off-by-one here is the failure F4d's trap exists to catch.

@@ -165,16 +165,20 @@ fn standalone_node(
 }
 
 /// Intern a whole `/`-separated standalone path (creating links as needed)
-/// and return the leaf's `dir_id` (its nid is [`leyline_schema::dir_nid`]
-/// of it). Container links created along the way get kind=1 and an empty
-/// record.
-fn standalone_chain(conn: &Connection, path: &str, mtime: i64) -> Result<DirId> {
+/// and return the leaf's `dir_id`. Container links created along the way
+/// get kind=1 and an empty record.
+fn standalone_chain_dir(conn: &Connection, path: &str, mtime: i64) -> Result<DirId> {
     let mut cur = DirId::ROOT;
     ensure_root_node(conn, mtime)?;
     for comp in path.split('/') {
         cur = standalone_node(conn, cur, comp, 1, 0, mtime, "")?;
     }
     Ok(cur)
+}
+
+/// [`standalone_chain_dir`], returning the leaf's nid.
+fn standalone_chain(conn: &Connection, path: &str, mtime: i64) -> Result<Nid> {
+    standalone_chain_dir(conn, path, mtime).map(leyline_schema::dir_nid)
 }
 
 /// Make sure the root directory's presentation row exists.
@@ -357,11 +361,7 @@ pub fn merge_lsp_into_ast(
     for diag in diagnostics {
         let line = diag.range.start.line;
         let col = diag.range.start.character;
-        let diag_nid = leyline_schema::dir_nid(standalone_chain(
-            conn,
-            &format!("_diag/L{line}C{col}"),
-            mtime,
-        )?);
+        let diag_nid = standalone_chain(conn, &format!("_diag/L{line}C{col}"), mtime)?;
 
         let already_exists: bool = conn
             .query_row(
@@ -904,7 +904,7 @@ pub fn project_definitions_into_nodes(
     // errors (missing schema, locked db, type mismatch) MUST propagate —
     // silently swallowing them would let children land under a missing
     // parent dir, producing orphans downstream walks can't navigate to.
-    let parent_dir = standalone_chain(conn, &format!("definitions/{node_id}"), mtime)?;
+    let parent_dir = standalone_chain_dir(conn, &format!("definitions/{node_id}"), mtime)?;
 
     for (i, loc) in locations.iter().enumerate() {
         let record = serde_json::json!({
@@ -938,7 +938,7 @@ pub fn project_references_into_nodes(
         return Ok(());
     }
     // See the matching explanation in project_definitions_into_nodes.
-    let parent_dir = standalone_chain(conn, &format!("references/{node_id}"), mtime)?;
+    let parent_dir = standalone_chain_dir(conn, &format!("references/{node_id}"), mtime)?;
 
     for (i, loc) in locations.iter().enumerate() {
         let record = serde_json::json!({
@@ -1033,7 +1033,7 @@ pub async fn enrich_symbols(
         // standalone tree was projected first, which preserves the pre-v5
         // behaviour of `_lsp_defs`/`_lsp_hover` keys being standalone-space
         // addresses in every mode.
-        let pos_nid = leyline_schema::dir_nid(standalone_chain(conn, &pos.node_id, mtime)?);
+        let pos_nid = standalone_chain(conn, &pos.node_id, mtime)?;
 
         // Definition — pass the symbol's textual name as `def_token`.
         match client.definition(file_uri, pos.line, pos.character).await {
@@ -1294,8 +1294,7 @@ fn merge_symbol(
                     sym.range.start.line, sym.range.start.character
                 ),
                 mtime,
-            )
-            .map(leyline_schema::dir_nid)?
+            )?
         }
     };
 
@@ -2005,6 +2004,45 @@ mod tests {
                 (base + 1, "class".to_string()),
                 (base + 2, "method".to_string())
             ]
+        );
+    }
+
+    /// The standalone `/definitions/{node_id}/{i}` and
+    /// `/references/{node_id}/{i}` trees: one leaf per location, under the
+    /// interned `dirs` chain, carrying the location as its record. No
+    /// locations, no tree.
+    #[test]
+    fn locations_project_into_standalone_trees() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let locs = vec![
+            make_location("file:///src/lib.rs", 10, 4),
+            make_location("file:///src/util.rs", 42, 0),
+        ];
+        project_definitions_into_nodes(&conn, "main", &locs, 7).unwrap();
+        project_references_into_nodes(&conn, "main", &locs[1..], 7).unwrap();
+        project_references_into_nodes(&conn, "unused", &[], 7).unwrap();
+
+        let record_at = |path: &str| -> Option<String> {
+            let nid = leyline_schema::resolve_path(&conn, path).unwrap()?;
+            conn.query_row("SELECT record FROM nodes WHERE nid = ?1", [nid], |r| {
+                r.get(0)
+            })
+            .ok()
+        };
+        for (path, uri) in [
+            ("definitions/main/0", "file:///src/lib.rs"),
+            ("definitions/main/1", "file:///src/util.rs"),
+            ("references/main/0", "file:///src/util.rs"),
+        ] {
+            let record = record_at(path).unwrap_or_else(|| panic!("{path} must exist"));
+            assert!(record.contains(uri), "{path}: {record}");
+        }
+        assert_eq!(record_at("references/main/1"), None);
+        assert_eq!(
+            leyline_schema::resolve_path(&conn, "references/unused").unwrap(),
+            None,
+            "no locations, no tree"
         );
     }
 

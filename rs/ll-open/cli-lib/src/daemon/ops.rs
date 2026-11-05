@@ -27,27 +27,16 @@ use super::{DaemonContext, DaemonPhase};
 // Public dispatch
 // ---------------------------------------------------------------------------
 
-/// Names of ops that mutate the daemon's state and should emit a
-/// `daemon.<op>` event after completion. Lives next to the dispatch
-/// table so a new mutating op gets a one-stop checklist (add a match
-/// arm in `handle_base_op` AND list the name here).
-///
-/// Single source of truth — `daemon::socket` reads this via
-/// `is_state_changing()` rather than maintaining a parallel list.
-pub(crate) const STATE_CHANGING_OPS: &[&str] =
-    &["load", "reparse", "snapshot", "enrich", "propose"];
-
-/// Whether an op name belongs to `STATE_CHANGING_OPS`. Used by the UDS
-/// dispatch loop to decide if the op deserves a follow-up event.
-pub(crate) fn is_state_changing(op: &str) -> bool {
-    STATE_CHANGING_OPS.contains(&op)
-}
+// Events: an op emits `daemon.<op>` exactly when it changed state, decided
+// at the write boundaries it crossed (`DaemonContext::with_write`,
+// `DaemonContext::with_publish`) and reported once by
+// `DaemonContext::observe_op` around `dispatch_typed`, the one dispatch
+// every transport shares (bead `ley-line-open-851f00`). There is no list of
+// "mutating" ops to keep in step with the handlers.
 
 /// Test-only thin wrapper over [`BASE_OP_NAMES`]. Existing drift tests
-/// iterate `base_op_names()` against `STATE_CHANGING_OPS` and
-/// `mcp::tool_registry`; they continue to work unchanged after
-/// b632ee's SoT collapse — they now read from `BASE_OP_NAMES` via this
-/// alias.
+/// iterate `base_op_names()` against `mcp::tool_registry`; they read from
+/// `BASE_OP_NAMES` via this alias (b632ee's SoT collapse).
 ///
 /// If you add a new op, see the checklist on `BASE_OP_NAMES` in
 /// `wire.rs` — this function does NOT need updating.
@@ -92,7 +81,7 @@ pub fn handle_base_op_value(
     }
     let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_value(parsed);
     Some(match typed_result {
-        Ok(typed) => dispatch_typed(ctx, typed),
+        Ok(typed) => ctx.observe_op(&op, || dispatch_typed(ctx, typed)),
         Err(e) => build_error_response(&format!("{op}: {e}"))
             .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}"))),
     })
@@ -510,7 +499,7 @@ macro_rules! set_root_fields {
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
     // The daemon's one publish path: a pool read transaction under the
     // single-publisher lock, off the writer (bead `ley-line-open-8c8ded`).
-    crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path)
+    ctx.with_publish(|| crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -607,13 +596,13 @@ fn op_load(ctx: &DaemonContext, db_b64: &str) -> Result<String> {
     let db_bytes = base64::engine::general_purpose::STANDARD
         .decode(db_b64)
         .context("invalid base64 in \"db\" field")?;
-    {
+    ctx.with_publish(|| {
         // The arena has one writer at a time: a load writes the inactive
         // buffer the daemon's publisher also writes (bead
         // `ley-line-open-8c8ded`).
         let _publisher = ctx.live_db.publish_lock.lock();
-        crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
-    }
+        crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)
+    })?;
     let current_root = read_root_hex(ctrl_path)?;
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::load_response::Builder = builder.init_root();
@@ -1506,7 +1495,7 @@ fn wire_ref_of(conn: &Connection, nid: i64) -> Result<WireRef> {
 /// find_callers, so mache's `udsGraph.GetCallees(id)` can mirror its
 /// existing `GetCallers(token)` JSON parsing.
 ///
-/// Read-only — does NOT belong in STATE_CHANGING_OPS.
+/// Read-only.
 fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
     ctx.with_read(|conn| {
         // DISTINCT — a node referencing the same token from multiple sites
@@ -1881,16 +1870,21 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
 
         eprintln!("lazy enrich (bg): triggering LSP for {file_owned}");
 
-        let guard = ctx_owned.live_db.writer.lock();
-        let result = crate::daemon::enrichment::run_pass(
-            &ctx_owned.enrichment_passes,
-            "lsp",
-            &guard,
-            &source_dir,
-            Some(std::slice::from_ref(&file_owned)),
-            Some(&ctx_owned.state),
-        );
-        drop(guard);
+        // The enrichment a read queued is a write of its own: it runs as an
+        // `enrich` op, so the `_lsp` rows it lands emit `daemon.enrich`
+        // like an explicit `enrich` does (bead `ley-line-open-851f00`).
+        let result = ctx_owned.observe_op("enrich", || {
+            ctx_owned.with_write(|conn| {
+                crate::daemon::enrichment::run_pass(
+                    &ctx_owned.enrichment_passes,
+                    "lsp",
+                    conn,
+                    &source_dir,
+                    Some(std::slice::from_ref(&file_owned)),
+                    Some(&ctx_owned.state),
+                )
+            })
+        });
 
         match result {
             Ok(stats) => {
@@ -2217,8 +2211,8 @@ fn op_text_search(ctx: &DaemonContext, query: &str, k: u32) -> Result<String> {
 
 /// `{"op":"leyline_version"}` — returns the daemon's runtime version
 /// and wire-format identity from the constants in
-/// [`crate::daemon::version`]. Takes no arguments. Read-only — NOT in
-/// `STATE_CHANGING_OPS`. Idempotent.
+/// [`crate::daemon::version`]. Takes no arguments. Read-only and
+/// idempotent.
 ///
 /// Builds the response through capnp + capnp_json so the wire shape
 /// matches the rest of the op surface (`$Json.name(...)` annotations
@@ -2249,8 +2243,7 @@ fn op_leyline_version() -> Result<String> {
 
 /// `{"op":"validate", "content":"...", "language":"go"}` — runs the
 /// `leyline-fs::validate` tree-sitter validator on caller-supplied
-/// content without persisting anything. Read-only — NOT in
-/// `STATE_CHANGING_OPS`.
+/// content without persisting anything. Read-only.
 ///
 /// Returns `{ ok: bool, errors: [{row, col, byte_start, byte_end,
 /// message}], diagnostics: [{line, col, message}] }`:
@@ -2494,9 +2487,9 @@ fn op_hdc_search(ctx: &std::sync::Arc<DaemonContext>, req: &HdcSearchRequest) ->
 
 /// `{"op":"hdc_calibrate", "sample_size":1000}` — recomputes median +
 /// MAD over `_hdc` row distances per layer; writes to `_hdc_baseline`.
-/// Returns `{ok, layers_calibrated: N}`. Read-only with respect to the
-/// projected db — only touches HDC sidecar tables, so NOT in
-/// `STATE_CHANGING_OPS`.
+/// Returns `{ok, layers_calibrated: N}`. It writes: it installs the HDC
+/// tables when absent and replaces `_hdc_baseline`'s rows, so a call that
+/// changes either emits `daemon.hdc_calibrate` (bead `ley-line-open-851f00`).
 #[cfg(feature = "hdc")]
 fn op_hdc_calibrate(
     ctx: &std::sync::Arc<DaemonContext>,
@@ -2543,7 +2536,7 @@ fn op_hdc_density(ctx: &std::sync::Arc<DaemonContext>, req: &HdcDensityRequest) 
 // primitives stay as-is; this op delegates to the same SQL paths and
 // joins the results into the bundle shape ADR-0016 §2 commits to.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// One definition row in the bundle. Carries enough location info
@@ -2929,7 +2922,7 @@ fn classify_node_kind(node_kind: &str) -> &'static str {
 // enclosing definition's token → (symbol_id, kind). The caller can
 // then feed `symbol_id` into `inspect_symbol` and get the full bundle.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// `{"op":"at_position", "file":"...", "line":N, "col":N}` —
@@ -3012,7 +3005,7 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
 //   neighborhood_query == 1`): the entire neighborhood is built
 //   inside one `with_live_db` closure and serialized once.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// Cap on `depth` regardless of caller input — ADR-0016 §5 says max 4.
@@ -3228,7 +3221,7 @@ fn query_caller_tokens(conn: &Connection, focal_token: &str) -> Result<Vec<Strin
 // framer). v1 satisfies the §6 line-delimited shape; it does NOT
 // gate, which requires true streaming.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// `{"op":"search_symbols", "pattern":"Send*", "limit":100, "kind":"function"?}`
@@ -3332,7 +3325,7 @@ fn op_search_symbols(
 //   disagrees with source_0; a fully-pairwise variant is a follow-up
 //   if the agent surface ever needs the dense matrix.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// One observation row decoded for agreement scoring: the source name
@@ -3776,80 +3769,6 @@ mod tests {
         assert!(NID_FOR_FILE.contains("?1"));
         assert!(NID_FOR_FILE.contains("?2"));
         assert!(NID_FOR_FILE.starts_with("nid"));
-    }
-
-    #[test]
-    fn state_changing_ops_pin_known_set() {
-        // Bidirectional drift guard: the canonical set must be exactly
-        // the hardcoded list, in some order. Iterating the hardcoded
-        // list (the previous form) only caught *removal* — adding a
-        // new op to STATE_CHANGING_OPS without updating the test
-        // would silently pass and a state-changing op would silently
-        // emit no event. Equality assertion fails in both directions.
-        // (Caught by iter-35 adversarial review.)
-        let mut actual: Vec<&str> = STATE_CHANGING_OPS.to_vec();
-        actual.sort();
-        let expected: Vec<&str> = {
-            let mut v = vec!["load", "reparse", "snapshot", "enrich", "propose"];
-            v.sort();
-            v
-        };
-        assert_eq!(
-            actual, expected,
-            "STATE_CHANGING_OPS drift detected — update the hardcoded list \
-             (and the matching test) when adding/removing mutating ops",
-        );
-    }
-
-    #[test]
-    fn state_changing_ops_excludes_pure_reads() {
-        // The query/observation ops must NOT trigger an event emission.
-        // When a new read-only op is added to `handle_base_op`, list it
-        // here so a future accidental promotion into STATE_CHANGING_OPS
-        // is caught by this guard.
-        for op in [
-            "status",
-            "query",
-            "list_children",
-            "read_content",
-            "read_source",
-            "find_callers",
-            "find_callees",
-            "find_defs",
-            "get_node",
-            "get_db_path",
-            "lsp_hover",
-            "lsp_defs",
-            "lsp_refs",
-            "lsp_symbols",
-            "lsp_diagnostics",
-            #[cfg(feature = "validate")]
-            "validate",
-            #[cfg(feature = "hdc")]
-            "hdc_search",
-            #[cfg(feature = "hdc")]
-            "hdc_calibrate",
-            #[cfg(feature = "hdc")]
-            "hdc_density",
-            "inspect_symbol",
-            "at_position",
-            "inspect_neighborhood",
-            "search_symbols",
-            "agreement",
-        ] {
-            assert!(
-                !is_state_changing(op),
-                "read-only op `{op}` should not be state-changing",
-            );
-        }
-    }
-
-    #[test]
-    fn state_changing_ops_unknown_returns_false() {
-        // Defensive: an op that doesn't exist in the dispatch table must
-        // not be called state-changing (avoids spurious events).
-        assert!(!is_state_changing("nonexistent_op"));
-        assert!(!is_state_changing(""));
     }
 
     /// Mirror `_ast` spans onto the occurrence rows, the way a real parse does
@@ -6173,20 +6092,6 @@ mod tests {
             let body = lsp_rows_response(key, vec![], false);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(v.get(key).is_some(), "expected key `{key}` in {body}",);
-        }
-    }
-
-    #[test]
-    fn state_changing_ops_subset_of_canonical_names() {
-        // Mutating ops must be a subset of the canonical dispatch list.
-        // Catches the case where someone retires an op from `handle_base_op`
-        // but forgets to remove it from `STATE_CHANGING_OPS`.
-        let canonical: std::collections::HashSet<&str> = base_op_names().into_iter().collect();
-        for name in STATE_CHANGING_OPS {
-            assert!(
-                canonical.contains(name),
-                "STATE_CHANGING_OPS contains `{name}` but base_op_names() does not",
-            );
         }
     }
 
@@ -8622,5 +8527,242 @@ mod tests {
         let miss = parse_op_json(&op_get_node(&ctx, "nope.rs").unwrap(), "op_get_node");
         assert_eq!(miss["ok"], json!(false), "got {miss}");
         assert_eq!(miss["error"], json!("node 'nope.rs' not found"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bead `ley-line-open-851f00`: every write path emits exactly one event
+    // per real change, over the socket AND over MCP; a read emits none.
+    // -----------------------------------------------------------------------
+
+    /// An enrichment pass named `lsp` (the pass lazy enrichment runs) that
+    /// adds one row per run, so every run is a real change.
+    struct RowPass;
+
+    impl crate::daemon::enrichment::EnrichmentPass for RowPass {
+        fn name(&self) -> &str {
+            "lsp"
+        }
+        fn reads(&self) -> &[&str] {
+            &[]
+        }
+        fn writes(&self) -> &[&str] {
+            &["_row_pass"]
+        }
+        fn run(
+            &self,
+            conn: &Connection,
+            _source_dir: &std::path::Path,
+            _changed_files: Option<&[String]>,
+        ) -> Result<crate::daemon::enrichment::EnrichmentStats> {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS _row_pass (n INTEGER); \
+                 INSERT INTO _row_pass VALUES (1)",
+            )?;
+            Ok(crate::daemon::enrichment::EnrichmentStats {
+                pass_name: "lsp".into(),
+                files_processed: 1,
+                items_added: 1,
+                duration_ms: 0,
+                skipped: vec![],
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Transport {
+        Socket,
+        Mcp,
+    }
+
+    /// One request through `transport`'s own dispatch entry point.
+    async fn request(
+        ctx: &std::sync::Arc<DaemonContext>,
+        transport: Transport,
+        req: serde_json::Value,
+    ) -> serde_json::Value {
+        let op = req["op"].as_str().unwrap().to_string();
+        let mut args = req.clone();
+        args.as_object_mut().unwrap().remove("op");
+        match transport {
+            Transport::Socket => {
+                let mut conn = crate::daemon::events::ConnectionState::new(ctx.router.clone());
+                let out = crate::daemon::socket::dispatch(ctx, &mut conn, &op, &args).await;
+                serde_json::from_str(&out).unwrap()
+            }
+            Transport::Mcp => {
+                let reply = crate::daemon::mcp::handle_tools_call(
+                    ctx,
+                    &crate::daemon::mcp::McpGrant::all(),
+                    json!(1),
+                    &json!({"name": op, "arguments": args}),
+                );
+                let reply = serde_json::to_value(&reply).unwrap();
+                match reply["result"]["content"][0]["text"].as_str() {
+                    Some(text) => serde_json::from_str(text).unwrap(),
+                    None => reply,
+                }
+            }
+        }
+    }
+
+    /// The `daemon.*` topics emitted while `req` runs, and the response. A
+    /// fence event emitted after the request bounds the window: the bus
+    /// delivers in emit order, so every event the request caused precedes it.
+    async fn events_of(
+        ctx: &std::sync::Arc<DaemonContext>,
+        transport: Transport,
+        req: serde_json::Value,
+    ) -> (Vec<String>, serde_json::Value) {
+        let (_id, mut rx, _replay, _gap) = ctx
+            .router
+            .subscribe(
+                &["daemon.**".to_string(), "test.fence".to_string()],
+                None,
+                u64::MAX,
+                crate::daemon::events::OverflowPolicy::DropOldest,
+                256,
+            )
+            .await;
+        let response = request(ctx, transport, req).await;
+        // Lazy enrichment writes from the blocking pool after the request
+        // returns; its write is part of what the request caused.
+        while !ctx.enrich_inflight.lock().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        ctx.router.emitter().emit("test.fence", "test", json!({}));
+        let mut topics = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the fence arrives")
+                .expect("the bus stays open");
+            if ev.topic == "test.fence" {
+                return (topics, response);
+            }
+            assert_eq!(
+                ev.data["op"],
+                ev.topic.trim_start_matches("daemon."),
+                "{ev:?}"
+            );
+            topics.push(ev.topic);
+        }
+    }
+
+    /// The table of requests and the exact events each must emit. Run in
+    /// order against one daemon: a step's expectation depends on what the
+    /// steps before it changed.
+    async fn assert_every_write_emits_once(transport: Transport) {
+        let (dir, ctx) = setup_full(
+            Arc::new(crate::daemon::NoExt),
+            true,
+            vec![Box::new(RowPass)],
+        );
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.go"), PROPOSE_A).unwrap();
+
+        let mut steps: Vec<(serde_json::Value, Vec<&str>)> = vec![
+            (json!({"op": "status"}), vec![]),
+            (json!({"op": "query", "sql": "SELECT 1 AS one"}), vec![]),
+            // A parse and the publish after it: one change, one event.
+            (
+                json!({"op": "reparse", "source": src.to_string_lossy()}),
+                vec!["daemon.reparse"],
+            ),
+            (json!({"op": "list_children", "id": ""}), vec![]),
+            // Nothing changed since the reparse published.
+            (json!({"op": "snapshot"}), vec![]),
+            (
+                json!({"op": "query", "sql": "CREATE TABLE scratch_q (x)"}),
+                vec!["daemon.query"],
+            ),
+            (
+                json!({"op": "query", "sql": "INSERT INTO scratch_q VALUES (1)"}),
+                vec!["daemon.query"],
+            ),
+            (
+                json!({"op": "query", "sql": "SELECT x FROM scratch_q"}),
+                vec![],
+            ),
+            (json!({"op": "snapshot"}), vec!["daemon.snapshot"]),
+            (json!({"op": "snapshot"}), vec![]),
+            (
+                json!({"op": "enrich", "pass": "lsp"}),
+                vec!["daemon.enrich"],
+            ),
+            // A refused proposal writes nothing.
+            (
+                json!({"op": "propose", "writes": [
+                    {"path": "c.go", "base": crate::source_write::BASE_ABSENT, "content": PROPOSE_B},
+                ]}),
+                vec![],
+            ),
+            (
+                json!({"op": "propose", "writes": [
+                    {"path": "c.go", "base": crate::source_write::BASE_ABSENT,
+                     "kind": "create", "content": PROPOSE_B},
+                ]}),
+                vec!["daemon.propose"],
+            ),
+        ];
+        // The hover answers from the read path; the lazy enrichment it
+        // queues (no `_lsp` rows for `a.go`) is its own write and its own
+        // event.
+        #[cfg(feature = "lsp")]
+        {
+            // Installed outside any op, so no event.
+            ctx.with_write(leyline_lsp::project::create_lsp_schema)
+                .unwrap();
+            steps.push((
+                json!({"op": "lsp_hover", "file": "a.go", "line": 0, "col": 0}),
+                vec!["daemon.enrich"],
+            ));
+        }
+        #[cfg(feature = "hdc")]
+        steps.extend([
+            // The first call installs the HDC tables; the second finds them.
+            (json!({"op": "hdc_calibrate"}), vec!["daemon.hdc_calibrate"]),
+            (json!({"op": "hdc_calibrate"}), vec![]),
+        ]);
+        #[cfg(feature = "sheaf")]
+        steps.extend([
+            // The first call installs the observation schema; the second
+            // only reads.
+            (
+                json!({"op": "agreement", "token": "A", "payload_kind": "k"}),
+                vec!["daemon.agreement"],
+            ),
+            (
+                json!({"op": "agreement", "token": "A", "payload_kind": "k"}),
+                vec![],
+            ),
+        ]);
+        // `load` replaces the arena. It is a socket op; MCP refuses it
+        // unadvertised (bead `ley-line-open-851a65`), so it changes nothing.
+        steps.push((
+            json!({"op": "load", "db": ""}),
+            match transport {
+                Transport::Socket => vec!["daemon.load"],
+                Transport::Mcp => vec![],
+            },
+        ));
+
+        for (req, expected) in steps {
+            let (topics, response) = events_of(&ctx, transport, req.clone()).await;
+            assert_eq!(
+                topics, expected,
+                "{transport:?} {req} emitted {topics:?}; response {response}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_socket_write_emits_exactly_one_event() {
+        assert_every_write_emits_once(Transport::Socket).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_mcp_write_emits_exactly_one_event() {
+        assert_every_write_emits_once(Transport::Mcp).await;
     }
 }

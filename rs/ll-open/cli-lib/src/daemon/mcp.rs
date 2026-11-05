@@ -759,7 +759,7 @@ struct JsonRpcRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonRpcResponse {
+pub(crate) struct JsonRpcResponse {
     jsonrpc: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<Value>,
@@ -1148,7 +1148,7 @@ fn handle_tools_list(grant: &McpGrant, id: Value) -> JsonRpcResponse {
 /// Only an advertised tool inside `grant` is dispatched (bead
 /// `ley-line-open-851a65`). The check runs before the arguments are read,
 /// so a refused call never reaches the daemon.
-fn handle_tools_call(
+pub(crate) fn handle_tools_call(
     ctx: &std::sync::Arc<DaemonContext>,
     grant: &McpGrant,
     id: Value,

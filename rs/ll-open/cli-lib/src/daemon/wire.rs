@@ -281,7 +281,7 @@ pub enum BaseRequest {
     /// Tree-sitter syntactic validation (ley-line-open-fa8638; full
     /// ERROR/MISSING enumeration per ley-line-open-736800).
     /// Mirrors mache's `writeback/validate.go` over the UDS so mache can
-    /// drop its CGO tree-sitter link. Read-only (NOT in STATE_CHANGING_OPS).
+    /// drop its CGO tree-sitter link. Read-only.
     #[cfg(feature = "validate")]
     Validate(ValidateRequest),
     /// HDC structural-similarity search (ley-line-open-c32596).

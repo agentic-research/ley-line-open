@@ -269,12 +269,149 @@ impl DaemonContext {
     /// held under a `!Send` guard for the closure's lifetime — do NOT
     /// `.await` inside the closure. If the work needs to await, drop
     /// the guard first, do the await, then reacquire.
+    ///
+    /// This is the live db's write boundary for events (bead
+    /// `ley-line-open-851f00`): the writer's row-change count and schema
+    /// version are read before and after `f`, and a difference marks the
+    /// enclosing [`DaemonContext::observe_op`] as changed. Whether a closure
+    /// wrote is what happened on the connection, not what the op is called.
     pub fn with_write<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T>,
     {
         let guard = self.live_db.writer.lock();
-        f(&guard)
+        let before = WriteMark::of(&guard);
+        let out = f(&guard);
+        if WriteMark::of(&guard).differs_from(before) {
+            op_scope::note_change();
+        }
+        out
+    }
+
+    /// The arena's publish boundary for events (bead
+    /// `ley-line-open-851f00`): run `publish`, which may replace the
+    /// published arena, and mark the enclosing
+    /// [`DaemonContext::observe_op`] as changed when the published root
+    /// (`Controller.current_root`) moved. A publish of the bytes already
+    /// published changes nothing a reader sees.
+    pub(crate) fn with_publish<T>(&self, publish: impl FnOnce() -> Result<T>) -> Result<T> {
+        let before = published_root(&self.ctrl_path);
+        let out = publish();
+        if root_moved(before, published_root(&self.ctrl_path)) {
+            op_scope::note_change();
+        }
+        out
+    }
+
+    /// Run one daemon op and emit exactly one `daemon.<op>` event,
+    /// `{"op": <op>}`, when a write boundary it crossed
+    /// ([`DaemonContext::with_write`], [`DaemonContext::with_publish`])
+    /// changed state; an op that changed nothing emits nothing (bead
+    /// `ley-line-open-851f00`). Every transport's op dispatch runs through
+    /// here, so the socket and MCP emit the same events.
+    ///
+    /// An op run inside another's scope folds its change into the outer op,
+    /// which emits once. The scope is per thread: a write the op hands to
+    /// another thread is that thread's own op (lazy enrichment observes
+    /// itself as `enrich`).
+    pub(crate) fn observe_op<T>(&self, op: &str, run: impl FnOnce() -> T) -> T {
+        let scope = op_scope::Scope::enter();
+        let out = run();
+        if scope.exit() {
+            self.router.emitter().emit(
+                &format!("daemon.{op}"),
+                "leyline",
+                serde_json::json!({"op": op}),
+            );
+        }
+        out
+    }
+}
+
+/// What the live db's writer connection looks like to an observer of
+/// changes: SQLite's row-change counter (INSERT/UPDATE/DELETE) and the
+/// schema cookie (DDL). `None` when the schema cookie cannot be read; an
+/// unreadable mark counts as a change, since a missed event leaves a
+/// subscriber stale and a spurious one costs a re-read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WriteMark(Option<(u64, i64)>);
+
+impl WriteMark {
+    fn of(conn: &rusqlite::Connection) -> Self {
+        let schema = conn.pragma_query_value(None, "schema_version", |r| r.get::<_, i64>(0));
+        Self(schema.ok().map(|s| (conn.total_changes(), s)))
+    }
+
+    fn differs_from(self, before: Self) -> bool {
+        // Exactly one unreadable side already differs; both unreadable is
+        // the case the `is_none` covers.
+        self.0.is_none() || self != before
+    }
+}
+
+/// Whether a publish moved the published root. An unreadable controller on
+/// either side counts as a move, for the reason [`WriteMark`] gives.
+fn root_moved(before: Option<Option<[u8; 32]>>, after: Option<Option<[u8; 32]>>) -> bool {
+    // As in `WriteMark::differs_from`: one unreadable side already differs.
+    before.is_none() || before != after
+}
+
+/// The controller's published root, `Some(None)` before any publish, and
+/// `None` when the controller cannot be read.
+fn published_root(ctrl_path: &std::path::Path) -> Option<Option<[u8; 32]>> {
+    leyline_core::Controller::open_or_create(ctrl_path)
+        .ok()
+        .map(|c| c.published_root())
+}
+
+/// The per-thread record of whether the running op changed state.
+mod op_scope {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `None` outside any op; `Some(changed)` inside one.
+        static CHANGED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Mark the running op, if any, as changed.
+    pub(super) fn note_change() {
+        CHANGED.with(|c| {
+            if c.get().is_some() {
+                c.set(Some(true));
+            }
+        });
+    }
+
+    /// One op's scope. Dropping it (an unwinding op included) restores the
+    /// enclosing scope and folds this op's change into it.
+    pub(super) struct Scope {
+        outer: Option<bool>,
+    }
+
+    impl Scope {
+        pub(super) fn enter() -> Self {
+            Self {
+                outer: CHANGED.with(|c| c.replace(Some(false))),
+            }
+        }
+
+        /// Leave the scope. True when this op changed state and is the
+        /// outermost, so it is the one that reports the change.
+        pub(super) fn exit(self) -> bool {
+            let changed = CHANGED.with(|c| c.get()) == Some(true);
+            let outermost = self.outer.is_none();
+            drop(self);
+            changed && outermost
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CHANGED.with(|c| {
+                let inner = c.get() == Some(true);
+                c.set(self.outer.map(|outer| outer || inner));
+            });
+        }
     }
 }
 
@@ -326,6 +463,151 @@ mod tests {
         // bare tag — the message is exposed elsewhere in op_status.
         assert_eq!(DaemonPhase::Error("oops".into()).as_str(), "error");
         assert_eq!(DaemonPhase::Error(String::new()).as_str(), "error");
+    }
+
+    /// The `daemon.*` topics `run` emits, fenced by a later event.
+    async fn topics_of(ctx: &Arc<DaemonContext>, run: impl FnOnce()) -> Vec<String> {
+        let (_id, mut rx, _replay, _gap) = ctx
+            .router
+            .subscribe(
+                &["daemon.**".to_string(), "test.fence".to_string()],
+                None,
+                u64::MAX,
+                events::OverflowPolicy::DropOldest,
+                64,
+            )
+            .await;
+        run();
+        ctx.router
+            .emitter()
+            .emit("test.fence", "test", serde_json::json!({}));
+        let mut topics = Vec::new();
+        loop {
+            let ev = rx.recv().await.unwrap();
+            if ev.topic == "test.fence" {
+                return topics;
+            }
+            topics.push(ev.topic);
+        }
+    }
+
+    /// Bead `ley-line-open-851f00`: an op emits once however many write
+    /// boundaries it crosses, and only when one of them changed state.
+    #[tokio::test]
+    async fn observe_op_emits_once_per_changing_op() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = socket::tests::test_context(dir.path());
+        let write = |sql: &'static str| {
+            ctx.with_write(|c| Ok(c.execute_batch(sql)?)).unwrap();
+        };
+
+        // Two changing writes and a nested op: one event, the outer op's.
+        let topics = topics_of(&ctx, || {
+            ctx.observe_op("outer", || {
+                write("CREATE TABLE t (x)");
+                ctx.observe_op("inner", || write("INSERT INTO t VALUES (1)"));
+                write("INSERT INTO t VALUES (2)");
+            })
+        })
+        .await;
+        assert_eq!(topics, ["daemon.outer"]);
+
+        // A nested op that changes state reports through the outer one.
+        let topics = topics_of(&ctx, || {
+            ctx.observe_op("outer", || {
+                ctx.observe_op("inner", || write("INSERT INTO t VALUES (3)"))
+            })
+        })
+        .await;
+        assert_eq!(topics, ["daemon.outer"]);
+
+        // Reads, and writes that change no row, emit nothing.
+        let topics = topics_of(&ctx, || {
+            ctx.observe_op("reader", || {
+                write("DELETE FROM t WHERE x = 99");
+                ctx.with_read(|c| {
+                    Ok(c.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))?)
+                })
+                .unwrap();
+            })
+        })
+        .await;
+        assert!(topics.is_empty(), "{topics:?}");
+
+        // A write outside any op is the caller's to report.
+        let topics = topics_of(&ctx, || write("INSERT INTO t VALUES (4)")).await;
+        assert!(topics.is_empty(), "{topics:?}");
+
+        // A publish that moves the published root is a change.
+        let topics = topics_of(&ctx, || {
+            ctx.observe_op("publish", || {
+                ctx.with_publish(|| {
+                    crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path)
+                })
+                .unwrap()
+            })
+        })
+        .await;
+        assert_eq!(topics, ["daemon.publish"]);
+        // The same bytes again move nothing.
+        let topics = topics_of(&ctx, || {
+            ctx.observe_op("publish", || {
+                ctx.with_publish(|| {
+                    crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path)
+                })
+                .unwrap()
+            })
+        })
+        .await;
+        assert!(topics.is_empty(), "{topics:?}");
+    }
+
+    /// An unreadable side of either boundary's comparison counts as a
+    /// change: a spurious event costs a re-read, a missed one a stale view.
+    #[test]
+    fn an_unreadable_mark_counts_as_a_change() {
+        let mark = |m: Option<(u64, i64)>| WriteMark(m);
+        assert!(!mark(Some((3, 1))).differs_from(mark(Some((3, 1)))));
+        assert!(mark(Some((4, 1))).differs_from(mark(Some((3, 1)))));
+        assert!(mark(Some((3, 2))).differs_from(mark(Some((3, 1)))));
+        assert!(mark(None).differs_from(mark(Some((3, 1)))));
+        assert!(mark(Some((3, 1))).differs_from(mark(None)));
+        assert!(mark(None).differs_from(mark(None)));
+
+        let root = Some(Some([7u8; 32]));
+        assert!(!root_moved(root, root));
+        assert!(!root_moved(Some(None), Some(None)));
+        assert!(root_moved(Some(None), root));
+        assert!(root_moved(root, Some(Some([8u8; 32]))));
+        assert!(root_moved(None, root));
+        assert!(root_moved(root, None));
+        assert!(root_moved(None, None));
+    }
+
+    /// An op that unwinds leaves no scope behind: the next op on the thread
+    /// is outermost again and reports its own change.
+    #[tokio::test]
+    async fn an_unwinding_op_restores_the_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = socket::tests::test_context(dir.path());
+        ctx.with_write(|c| Ok(c.execute_batch("CREATE TABLE t (x)")?))
+            .unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.observe_op("boom", || -> () {
+                ctx.with_write(|c| Ok(c.execute_batch("INSERT INTO t VALUES (1)")?))
+                    .unwrap();
+                panic!("op failed");
+            })
+        }));
+        assert!(unwound.is_err());
+        let topics = topics_of(&ctx, || {
+            ctx.observe_op("after", || {
+                ctx.with_write(|c| Ok(c.execute_batch("INSERT INTO t VALUES (2)")?))
+                    .unwrap()
+            })
+        })
+        .await;
+        assert_eq!(topics, ["daemon.after"]);
     }
 
     #[test]

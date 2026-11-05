@@ -11,7 +11,6 @@ use tokio::net::UnixListener;
 use crate::daemon::DaemonContext;
 use crate::daemon::events::ConnectionState;
 use crate::daemon::ops;
-use crate::daemon::ops::is_state_changing;
 
 /// `rm -f` semantics: remove `path` if present, log a warning when
 /// removal fails for any reason other than "file does not exist". Both
@@ -391,7 +390,7 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
 /// 3. Extension async -> ctx.ext.handle_op_async()
 /// 4. Extension sync -> ctx.ext.handle_op()
 /// 5. Unknown -> error
-async fn dispatch(
+pub(crate) async fn dispatch(
     ctx: &Arc<DaemonContext>,
     conn_state: &mut ConnectionState,
     op: &str,
@@ -421,12 +420,9 @@ async fn dispatch(
         }
         v
     };
+    // `handle_base_op_value` emits the op's `daemon.<op>` event itself, when
+    // the op changed state, for every transport (bead `ley-line-open-851f00`).
     if let Some(response) = ops::handle_base_op_value(ctx, combined) {
-        // Emit event for state-changing ops.
-        if is_state_changing(op) {
-            let emitter = conn_state.emitter();
-            emitter.emit(&format!("daemon.{op}"), "leyline", json!({"op": op}));
-        }
         return response;
     }
 

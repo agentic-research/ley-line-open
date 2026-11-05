@@ -190,6 +190,12 @@ columns exist. Its measured dependencies, as of `mache-93e84b`:
   On the event, an unreadable controller sends `root_error` in place of both
   (bead `ley-line-open-80f037`; the rule is on `StatusResponse.rootPublished`
   in `daemon.capnp`).
+- A watcher of the daemon's `--source` checkout must treat `Rename` or
+  `Remove` on a path that still exists as a change to that path: an accepted
+  proposal lands by stage-then-rename (a hidden staging sibling renamed over
+  the target, `rs/ll-open/cli-lib/src/checkout.rs:188` and `:575`), which
+  fsnotify/kqueue reports as a rename or remove of the target (ADR-0045 T7,
+  bead `ley-line-open-514d0a`).
 
 ## Layer Ownership
 

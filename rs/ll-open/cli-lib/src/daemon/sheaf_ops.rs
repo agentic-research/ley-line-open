@@ -57,6 +57,12 @@ impl StalkHash for HashStalk {
 /// Shared sheaf cache state for the daemon. Lives on [`DaemonContext`]
 /// as a `&'static` borrow via `Arc<SheafState>`.
 pub struct SheafState {
+    /// The value type is `()` on purpose: `SheafCache` is advisory (its
+    /// module doc, bead `ley-line-open-f04610` — 154 stale values kept in a
+    /// 60-commit replay), so the daemon holds no derived value it could
+    /// serve on the cache's say-so. `sheaf_invalidate` / `sheaf_reap` return
+    /// regions to recompute; a consumer must not read the absence of a
+    /// region as "still valid".
     cache: Mutex<SheafCache<HashStalk, ()>>,
     /// Tracks co-change patterns for restriction weight learning.
     tracker: Mutex<CoChangeTracker>,

@@ -17,6 +17,22 @@ The list returned by `SheafCache::on_change` always contains:
 
 It is a structural answer about the sheaf section, not a per-cache eviction list. UDS / MCP consumers get the same answer in-process callers do and own their own eviction policy on top of it.
 
+## `SheafCache` is advisory
+
+`SheafCache` is advisory: a region it keeps is a candidate for reuse, not a valid value, and its keep decision must not gate reuse. Validity belongs to a key over the facts the derived value reads, such as `leyline-cache`'s `RestrictionKey` (ADR-0031).
+
+`task cache:ablation` (the `sheaf_restriction_replay` bench) replays 60 commits ending at e4690505: 10,751 call-target review lookups, 617 of them with a changed value (bead `ley-line-open-f04610`).
+
+| arm | hit rate | false skips (stale value served) | false misses |
+|---|---|---|---|
+| `RestrictionKey` (`leyline-cache`) | 94.0% | 0 | 32 |
+| `SheafCache`, heuristic | 67.9% | 154 | 2,990 |
+| `SheafCache`, δ⁰ (interface digest in the agreement coordinates) | 79.3% | 201 | 1,808 |
+
+Every false skip is a region whose own bytes did not change and whose value moved through a fact outside them: a def of a called token appearing or disappearing elsewhere in the corpus, or an import edit in the same file. The restriction graph holds no edge to either fact, so neither mode can see it. δ⁰ prunes the heuristic's over-reach (1,182 fewer false misses) and with it the 47 regions the over-reach had evicted by coincidence. `tests/sheaf_cache_advisory.rs` pins one such case, shrunk from the replay, and asserts this paragraph's first sentence in both this README and the `cache` module doc.
+
+No shipped consumer serves a value because `SheafCache` kept it. The daemon's cache is `SheafCache<HashStalk, ()>` and holds no derived value; `sheaf_invalidate` returns regions to recompute; mache evicts per-node content for the returned regions on top of the edited file's nodes it re-ingests, so an unlisted region keeps only content derived from its own unchanged bytes. The cascade is an eviction hint: it can widen an eviction, never justify a reuse.
+
 ## Mathematical foundation
 
 A **sheaf** assigns data (stalks) to topological regions and enforces consistency across boundaries via restriction maps. The coboundary operator δ⁰: C⁰ → C¹ measures disagreement between adjacent stalks; the defect `‖δ⁰(stalks)‖²` is a real H⁰ distance metric — the load-bearing "sheaf-derived" quantity this crate exports. Entries in `ker(δ⁰)` — the zeroth cohomology group H⁰ — are globally consistent.
@@ -41,7 +57,7 @@ The δ⁰-driven invalidation path is implemented but not yet the production wir
 
 | Module | Status | Wired into the daemon? |
 |---|---|---|
-| `cache.rs` / `merkle.rs` — the hash-gated invalidation BFS | **Load-bearing, live** (ADR-0030 addendum) | Yes — `daemon/sheaf_ops.rs` consumes `SheafCache::on_change`/`reap` directly |
+| `cache.rs` / `merkle.rs` — the hash-gated invalidation BFS | **Live, advisory** (ADR-0030 addendum; see "`SheafCache` is advisory" above) | Yes — `daemon/sheaf_ops.rs` consumes `SheafCache::on_change`/`reap` directly, as eviction hints over a `()`-valued cache |
 | `complex.rs` — δ⁰/Čech cohomology, weighted restriction maps | **Live but diagnostic-only** (ADR-0030 verdict: NO-GO on using it for invalidation) | Yes, but only feeds the health metric + `agreement`/`h0_dimension` ops — confirmed off the invalidation path; `RestrictionMap::compose`/`weighted`/`new` have zero non-test callers |
 | `restriction_review.rs` — the ADR-0031 toy comparison | **Experiment only** | No — exercised by `tests/restriction_review_toy.rs` |
 

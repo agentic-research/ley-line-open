@@ -1,5 +1,43 @@
 //! Sheaf cache: structurally-aware cache invalidation, heuristic proxy for δ⁰.
 //!
+//! ## Advisory: a kept region is a candidate, not a valid value
+//!
+//! `SheafCache` is advisory: a region it keeps is a candidate for reuse, not
+//! a valid value, and its keep decision must not gate reuse. Validity belongs
+//! to a key over the facts the derived value reads, such as `leyline-cache`'s
+//! `RestrictionKey` (ADR-0031).
+//!
+//! Measured by `task cache:ablation` (the `sheaf_restriction_replay` bench,
+//! 60 commits ending at e4690505, 10,751 call-target review lookups, 617 of
+//! them with a changed value; bead `ley-line-open-f04610`):
+//!
+//! | arm | hit rate | false skips (stale value served) | false misses |
+//! |---|---|---|---|
+//! | `RestrictionKey` (`leyline-cache`) | 94.0% | 0 | 32 |
+//! | `SheafCache`, heuristic | 67.9% | 154 | 2,990 |
+//! | `SheafCache`, δ⁰ (interface digest in the agreement coordinates) | 79.3% | 201 | 1,808 |
+//!
+//! Every false skip is a region whose own bytes did not change and whose
+//! value moved through a fact outside them: a def of a called token appearing
+//! or disappearing elsewhere in the corpus (a def that is no region, so no
+//! restriction edge reaches it), or an import edit in the same file. No
+//! restriction-graph cascade can see those facts, in either mode: δ⁰ prunes
+//! the heuristic's over-reach (1,182 fewer false misses) and loses the 47
+//! regions the over-reach had evicted by coincidence. `tests/sheaf_cache_advisory.rs`
+//! pins one such case, shrunk from the replay.
+//!
+//! No shipped consumer serves a value because this cache kept it. The daemon
+//! instantiates `SheafCache<HashStalk, ()>` (`cli-lib/src/daemon/sheaf_ops.rs`),
+//! so it holds no derived value to serve; `sheaf_invalidate` returns the
+//! cascade as a list of regions to recompute; the watcher's
+//! `daemon.sheaf.invalidate` emit maps changed files to regions by label and
+//! never calls [`SheafCache::on_change`]. mache evicts per-node content
+//! caches for the returned regions in addition to the nodes of the edited
+//! file it has already re-ingested, so a region absent from the list keeps
+//! only content derived from its own unchanged bytes. [`SheafCache::get`]
+//! exists for in-process experiments such as the bench; nothing in the
+//! workspace serves its answer.
+//!
 //! ## What this cache actually does
 //!
 //! Invalidation is driven by **XOR of endpoint Merkle roots** compared against

@@ -26,10 +26,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use leyline_cli_lib::cmd_parse;
+use leyline_cli_lib::cmd_parse::{AstNode, AstNodeWitness};
 use leyline_cli_lib::tree_root::{
-    DerivedFrom, GitMode, ParserInputs, TREE_ROOT_SCHEME, TreeLeaf, tree_root_of,
+    DerivedFrom, GitMode, Parser, ParserInputs, TREE_ROOT_SCHEME, TreeLeaf, TreeRoot, TreeWitness,
+    tree_root_of, tree_root_ref_of,
 };
-use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec};
+use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec, Ref};
 use proptest::prelude::*;
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -135,16 +137,44 @@ fn leaf_preimage(kind: &str, token: &str) -> Vec<u8> {
     p
 }
 
-/// `enc(x)` of a `node_hash` internal node.
-fn internal_preimage(kind: &str, children: &[Vec<u8>]) -> Vec<u8> {
-    let mut p = b"llo/ast/v1\0\x01".to_vec();
-    uvarint(&mut p, kind.len() as u64);
-    p.extend_from_slice(kind.as_bytes());
-    uvarint(&mut p, children.len() as u64);
-    for c in children {
-        p.extend_from_slice(c);
+/// The stored `node_hash` as a `Ref<AstNode>`, when the row re-derives it
+/// from its witness: a leaf from its kind and token, an internal node from
+/// its kind and its `node_edge` children, each of which is verified the same
+/// way first. `None` when any row on the way does not re-derive.
+fn verify_node(
+    hash: &[u8],
+    rows: &BTreeMap<Vec<u8>, NodeRow>,
+    kids: &HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    memo: &mut HashMap<Vec<u8>, Option<Ref<AstNode>>>,
+) -> Option<Ref<AstNode>> {
+    if let Some(done) = memo.get(hash) {
+        return *done;
     }
-    p
+    let (tag, kind, _, _, token, arity) = rows.get(hash)?;
+    let claimed = Hash::from_bytes(hash.try_into().ok()?);
+    let verified = if *tag == 0 {
+        let token = token.as_deref().unwrap_or("");
+        Ref::verified(claimed, AstNodeWitness::Leaf { kind, token })
+    } else {
+        let edges = kids.get(hash).cloned().unwrap_or_default();
+        let children: Option<Vec<Ref<AstNode>>> = edges
+            .iter()
+            .map(|c| verify_node(c, rows, kids, memo))
+            .collect();
+        children
+            .filter(|c| c.len() as i64 == *arity)
+            .and_then(|children| {
+                Ref::verified(
+                    claimed,
+                    AstNodeWitness::Internal {
+                        kind,
+                        children: &children,
+                    },
+                )
+            })
+    };
+    memo.insert(hash.to_vec(), verified);
+    verified
 }
 
 /// A Go and a Rust file with nested bodies, so trees have real depth.
@@ -287,6 +317,7 @@ fn ca_tampered_payload_is_refused() {
 #[test]
 fn det_known_answer_vectors() {
     let v = vectors();
+    let mut parsers: Vec<Ref<Parser>> = Vec::new();
     for case in cases(&v, "parserId") {
         let inputs = ParserInputs {
             ir_schema_version: case["irSchemaVersion"].as_str().unwrap().into(),
@@ -306,6 +337,10 @@ fn det_known_answer_vectors() {
             hash_of(&case["address"]),
             "parserId drifted"
         );
+        let typed = Ref::<Parser>::verified(hash_of(&case["address"]), &inputs)
+            .expect("the typed parserId names the pinned value");
+        assert_eq!(typed, inputs.parser_ref());
+        parsers.push(typed);
     }
     for case in cases(&v, "treeRoot") {
         assert_eq!(case["scheme"].as_str(), Some(TREE_ROOT_SCHEME));
@@ -328,6 +363,23 @@ fn det_known_answer_vectors() {
             case["name"]
         );
         assert_eq!(address, documented_tree_root(&leaves, pid));
+        // Typed: the case's parserId is a pinned parserId case, so its
+        // `Ref<Parser>` comes from that case's inputs, never from the hex.
+        let parser = *parsers
+            .iter()
+            .find(|p| *p.as_hash() == pid)
+            .expect("treeRoot cases fold under a pinned parserId");
+        assert_eq!(*tree_root_ref_of(&leaves, parser).as_hash(), address);
+        assert!(
+            Ref::<TreeRoot>::verified(
+                address,
+                TreeWitness {
+                    leaves: &leaves,
+                    parser
+                }
+            )
+            .is_some()
+        );
     }
 }
 
@@ -531,20 +583,15 @@ proptest! {
                 prop_assert_eq!(&*seen, &bytes, "a source blob was rebound");
             }
             let kids = children(&conn);
-            for (hash, row) in node_rows(&conn) {
-                let (tag, kind, _, _, token, arity) = &row;
-                let preimage = match tag {
-                    0 => leaf_preimage(kind, token.as_deref().unwrap_or("")),
-                    _ => {
-                        let c = kids.get(&hash).cloned().unwrap_or_default();
-                        prop_assert_eq!(c.len() as i64, *arity, "an internal row's edges are its arity");
-                        internal_preimage(kind, &c)
-                    }
-                };
-                let sigma = preimage.as_slice().hash();
-                prop_assert_eq!(sigma.as_bytes().as_slice(), hash.as_slice(), "node row does not re-derive its address");
-                let seen = first_nodes.entry(hash).or_insert_with(|| row.clone());
-                prop_assert_eq!(&*seen, &row, "a node_content row was rebound");
+            let rows = node_rows(&conn);
+            let mut memo = HashMap::new();
+            for (hash, row) in &rows {
+                prop_assert!(
+                    verify_node(hash, &rows, &kids, &mut memo).is_some(),
+                    "a node_content row does not re-derive its address from its witness"
+                );
+                let seen = first_nodes.entry(hash.clone()).or_insert_with(|| row.clone());
+                prop_assert_eq!(&*seen, row, "a node_content row was rebound");
             }
         }
     }
@@ -799,6 +846,14 @@ fn crafted_preimage_does_not_alias_across_constructions_measured() {
     let aliases = crafted_aliases();
     let fixed = leaf_preimage("fn", "fn");
     assert_eq!(fixed.len(), 18, "the 73add7 file is 18 bytes");
+    // The types already refuse to compare a `Ref<AstNode>` with a
+    // `Ref<Blob>` (law (b)); the bytes do not separate them (law (c)).
+    let node = Ref::<AstNode>::derive(AstNodeWitness::Leaf {
+        kind: "fn",
+        token: "fn",
+    });
+    let blob = Ref::<leyline_core::construction::Blob>::derive(&fixed);
+    assert_eq!(node.as_hash(), blob.as_hash());
     eprintln!(
         "crafted_preimage_does_not_alias_across_constructions: {} blob/node aliases: RED until 73add7",
         aliases.len()

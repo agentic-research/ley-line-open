@@ -31,7 +31,8 @@ use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 use crate::source_write::Grant;
-use crate::tree_root::{DerivedFrom, ParserInputs};
+use crate::tree_root::{DerivedFrom, Parser, ParserInputs};
+use leyline_core::Ref;
 
 /// What a rebuild produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,17 +52,18 @@ pub fn rebuild(from: &Connection, into: &Connection, grant: &Grant) -> Result<Re
     )?;
     let trusted = crate::cmd_parse::trusted_query_hashes_from_env();
     let query_set = leyline_ts::query_engine::resolve_query_set(from, &trusted)?.query_set;
-    let parser_id = ParserInputs::current(&query_set).parser_id();
-    if parser_id != stamp.parser_id {
+    let inputs = ParserInputs::current(&query_set);
+    let Some(parser) = Ref::<Parser>::verified(stamp.parser_id, &inputs) else {
         bail!(
             "refusing to rebuild: the arena was derived under parserId {}, this binary \
-             derives under {parser_id}; a rebuild here would not reproduce it. Reparse \
+             derives under {}; a rebuild here would not reproduce it. Reparse \
              the source tree with this binary instead.",
-            stamp.parser_id
+            stamp.parser_id,
+            inputs.parser_ref()
         );
-    }
-    let recomputed = crate::tree_root::tree_root(from, stamp.parser_id)?;
-    if recomputed != stamp.tree_root {
+    };
+    let recomputed = crate::tree_root::tree_root_ref(from, parser)?;
+    if *recomputed.as_hash() != stamp.tree_root {
         bail!(
             "refusing to rebuild: the arena's _tree manifest folds to treeRoot {recomputed}, \
              but derived_from names {}",
@@ -86,16 +88,12 @@ pub fn rebuild(from: &Connection, into: &Connection, grant: &Grant) -> Result<Re
     for (path, entry) in &manifest {
         match entry {
             crate::tree::Entry::File { mode, blob } if grant.covers(path) => {
-                use leyline_core::ContentAddressed;
-                let bytes = crate::tree::blob_bytes(from, *blob)?.with_context(|| {
-                    format!("refusing to rebuild '{path}': the store holds no such blob {blob}")
-                })?;
-                let actual = bytes.hash();
-                if actual != *blob {
-                    bail!(
-                        "refusing to rebuild '{path}': its stored bytes hash to {actual}, not {blob}"
-                    );
-                }
+                // `blob_bytes` verifies the bytes against the blob hash.
+                let bytes = crate::tree::blob_bytes(from, *blob)
+                    .with_context(|| format!("refusing to rebuild '{path}'"))?
+                    .with_context(|| {
+                        format!("refusing to rebuild '{path}': the store holds no such blob {blob}")
+                    })?;
                 files.insert(path.clone(), bytes);
                 edits.modes.insert(path.clone(), *mode);
             }

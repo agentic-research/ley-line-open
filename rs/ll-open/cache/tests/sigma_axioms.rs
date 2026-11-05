@@ -2,8 +2,10 @@
 //! bead `ley-line-open-10d71a`): the restriction key's known-answer
 //! vectors. Its law (a) property is `restriction.rs`'s `key_tests`.
 
-use leyline_cache::restriction::{Provenance, ROW_CONTEXT, Row, RowKind, restriction_key};
-use leyline_core::Hash;
+use leyline_cache::restriction::{
+    Provenance, ROW_CONTEXT, Restriction, RestrictionWitness, Row, RowKind, restriction_key,
+};
+use leyline_core::{Hash, Ref};
 use serde_json::Value;
 
 fn unhex(v: &Value) -> Vec<u8> {
@@ -79,6 +81,12 @@ fn det_known_answer_vectors() {
             hash_of(&case["parserId"]),
             &rows,
         );
+        let typed = Ref::<Restriction>::derive(RestrictionWitness {
+            scheme: case["scheme"].as_str().unwrap(),
+            parser_id: hash_of(&case["parserId"]),
+            rows: &rows,
+        });
+        assert_eq!(*typed.as_hash(), key, "the typed key names the same value");
         assert_eq!(
             key,
             hash_of(&case["address"]),

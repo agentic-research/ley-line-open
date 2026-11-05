@@ -336,8 +336,9 @@ pub fn blob_bytes(conn: &Connection, blob: Hash) -> Result<Option<Vec<u8>>> {
         .optional()?;
     if let Some(bytes) = &bytes {
         use leyline_core::ContentAddressed;
-        if bytes.as_slice().hash() != blob {
-            bail!("source blob {blob}: stored bytes do not hash to the address");
+        let actual = bytes.as_slice().hash();
+        if actual != blob {
+            bail!("source blob {blob}: its stored bytes hash to {actual}, not to its address");
         }
     }
     Ok(bytes)

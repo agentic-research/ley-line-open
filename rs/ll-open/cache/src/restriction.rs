@@ -215,6 +215,28 @@ pub fn restriction_key(scheme: &str, parser_id: Hash, rows: &[Row]) -> Hash {
     .address(&entries)
 }
 
+/// The restriction-key construction (ADR-0031 as amended, ADR-0047 §3: the
+/// first shipped lawful `Ref<Restriction>`). Its fold is
+/// [`restriction_key`]; nothing moves.
+pub enum Restriction {}
+
+/// What a restriction key is a function of: the family's scheme, the parser
+/// identity the facts were extracted under, and the closure's rows.
+#[derive(Clone, Copy, Debug)]
+pub struct RestrictionWitness<'w> {
+    pub scheme: &'w str,
+    pub parser_id: Hash,
+    pub rows: &'w [Row],
+}
+
+impl leyline_core::Construction for Restriction {
+    const NAME: &'static str = "restriction";
+    type Witness<'w> = RestrictionWitness<'w>;
+    fn fold(w: RestrictionWitness<'_>) -> Hash {
+        restriction_key(w.scheme, w.parser_id, w.rows)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fact substrate: the node_defs / node_refs / _imports rows the live
 // pipeline emits. Parser-independent — a production consumer fills these

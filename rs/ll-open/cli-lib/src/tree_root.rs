@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec};
+use leyline_core::{Construction, ContentAddressed, Domain, Entry, Hash, PartitionSpec, Ref};
 use rusqlite::Connection;
 
 pub use crate::tree::GitMode;
@@ -85,6 +85,11 @@ impl ParserInputs {
                 .map(|l| (l.name().to_string(), l.grammar_digest()))
                 .collect(),
         }
+    }
+
+    /// `parserId` as a [`Ref<Parser>`]: the same fold, typed.
+    pub fn parser_ref(&self) -> Ref<Parser> {
+        Ref::derive(self)
     }
 
     /// `parserId`: the tagged fold over the inputs.
@@ -232,6 +237,49 @@ pub fn tree_root(conn: &Connection, parser_id: Hash) -> Result<Hash> {
     Ok(tree_root_of(&tree_leaves(conn)?, parser_id))
 }
 
+/// The `parserId` construction (`leyline/parser-id/v1`): its witness is the
+/// [`ParserInputs`] (ADR-0047 §2.1).
+pub enum Parser {}
+
+impl Construction for Parser {
+    const NAME: &'static str = "parser-id";
+    type Witness<'w> = &'w ParserInputs;
+    fn fold(inputs: &ParserInputs) -> Hash {
+        inputs.parser_id()
+    }
+}
+
+/// What `treeRoot` is a function of: the manifest's leaves and the parser
+/// identity they were folded under.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeWitness<'w> {
+    pub leaves: &'w [TreeLeaf],
+    pub parser: Ref<Parser>,
+}
+
+/// The `treeRoot` construction (`leyline/tree-root/v1`, ADR-0040 D1). Its
+/// parser is a `Ref<Parser>`, so a blob hash or an arena root cannot stand
+/// in for it (ADR-0047 law (b)).
+pub enum TreeRoot {}
+
+impl Construction for TreeRoot {
+    const NAME: &'static str = "tree-root";
+    type Witness<'w> = TreeWitness<'w>;
+    fn fold(w: TreeWitness<'_>) -> Hash {
+        tree_root_of(w.leaves, *w.parser.as_hash())
+    }
+}
+
+/// [`tree_root_of`], typed: the leaves' `treeRoot` under `parser`.
+pub fn tree_root_ref_of(leaves: &[TreeLeaf], parser: Ref<Parser>) -> Ref<TreeRoot> {
+    Ref::derive(TreeWitness { leaves, parser })
+}
+
+/// [`tree_root`], typed: the arena's `treeRoot` under `parser`.
+pub fn tree_root_ref(conn: &Connection, parser: Ref<Parser>) -> Result<Ref<TreeRoot>> {
+    Ok(tree_root_ref_of(&tree_leaves(conn)?, parser))
+}
+
 /// The `_meta` key [`DerivedFrom`] is stored under.
 pub const DERIVED_FROM_KEY: &str = "derived_from";
 
@@ -352,18 +400,24 @@ pub fn verify_with(db_path: &Path, policy: &crate::head_claim::HeadPolicy) -> Re
         .with_context(|| format!("open {} read-only", db_path.display()))?;
     let trusted = crate::cmd_parse::trusted_query_hashes_from_env();
     let resolution = leyline_ts::query_engine::resolve_query_set(&conn, &trusted)?;
-    let recomputed_parser = ParserInputs::current(&resolution.query_set).parser_id();
-    if recomputed_parser != stamped_parser {
+    // The stamps become typed only by re-derivation from their witnesses
+    // (ADR-0047 §2.3): this binary's parser inputs, then the arena's leaves.
+    let inputs = ParserInputs::current(&resolution.query_set);
+    let Some(parser) = Ref::<Parser>::verified(stamped_parser, &inputs) else {
         return Ok(Verification::ParserIdMismatch {
             stamped: stamped_parser,
-            recomputed: recomputed_parser,
+            recomputed: *inputs.parser_ref().as_hash(),
         });
-    }
-    let recomputed_tree = tree_root(&conn, stamped_parser)?;
-    if recomputed_tree != stamped_tree {
+    };
+    let leaves = tree_leaves(&conn)?;
+    let witness = TreeWitness {
+        leaves: &leaves,
+        parser,
+    };
+    if Ref::<TreeRoot>::verified(stamped_tree, witness).is_none() {
         return Ok(Verification::TreeRootMismatch {
             stamped: stamped_tree,
-            recomputed: recomputed_tree,
+            recomputed: *Ref::<TreeRoot>::derive(witness).as_hash(),
         });
     }
     Ok(Verification::Valid {

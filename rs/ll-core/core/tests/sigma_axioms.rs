@@ -18,6 +18,8 @@
 
 use std::path::PathBuf;
 
+use leyline_core::Ref;
+use leyline_core::construction::{ArenaImage, Blob, Chunk, HeadDigest};
 use leyline_core::head_digest::HEAD_DIGEST_CONTEXT;
 use leyline_core::partition::PARTITION_CONTEXT;
 use leyline_core::{
@@ -44,7 +46,7 @@ fn vectors() -> Value {
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "odd-length hex {s:?}");
+    assert!(s.len().is_multiple_of(2), "odd-length hex {s:?}");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
@@ -202,6 +204,11 @@ fn det_known_answer_vectors() {
             "σ_bytes drifted for {}",
             case["name"]
         );
+        // The typed constructions over σ_bytes name the same bytes.
+        let pinned = hash_of(&case["address"]);
+        assert_eq!(*Ref::<Blob>::derive(&input).as_hash(), pinned);
+        assert_eq!(*Ref::<Chunk>::derive(&input).as_hash(), pinned);
+        assert_eq!(*Ref::<ArenaImage>::derive(&input).as_hash(), pinned);
     }
 
     for case in cases(&v, "partition") {
@@ -229,7 +236,13 @@ fn det_known_answer_vectors() {
     }
 
     for case in cases(&v, "headDigest") {
-        let digest = head_digest(&head_case(case));
+        let claim = head_case(case);
+        let digest = head_digest(&claim);
+        assert_eq!(
+            Ref::<HeadDigest>::verified(hash_of(&case["digest"]), &claim),
+            Some(Ref::<HeadDigest>::derive(&claim)),
+            "the typed head digest names the pinned value"
+        );
         let preimage = head_preimage(case);
         assert_eq!(hex(&preimage), case["preimageHex"].as_str().unwrap());
         assert_eq!(

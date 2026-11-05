@@ -145,12 +145,6 @@ type statusResponse struct {
 	RootPublished *bool `json:"root_published"`
 }
 
-type flushResponse struct {
-	OK            *bool   `json:"ok"`
-	CurrentRoot   *string `json:"current_root,omitempty"`
-	RootPublished *bool   `json:"root_published"`
-}
-
 type snapshotResponse struct {
 	OK            *bool   `json:"ok"`
 	Generation    *uint64 `json:"generation,string"`
@@ -259,31 +253,6 @@ type findCalleesResponse struct {
 	Callees []ref `json:"callees"`
 }
 
-type tokenMapEntry struct {
-	Token   *string  `json:"token"`
-	NodeIDs []string `json:"node_ids"`
-}
-
-type getRefsMapResponse struct {
-	OK      *bool           `json:"ok"`
-	Entries []tokenMapEntry `json:"entries"`
-}
-
-type getDefsMapResponse struct {
-	OK      *bool           `json:"ok"`
-	Entries []tokenMapEntry `json:"entries"`
-}
-
-type schemaTier struct {
-	Name   *string  `json:"name"`
-	Crates []string `json:"crates"`
-}
-
-type getSchemaResponse struct {
-	OK    *bool        `json:"ok"`
-	Tiers []schemaTier `json:"tiers"`
-}
-
 type getDbPathResponse struct {
 	OK           *bool   `json:"ok"`
 	DBPath       *string `json:"db_path"`
@@ -320,12 +289,6 @@ type sheafDefectResponse struct {
 	Generation *uint64  `json:"generation,string"`
 	Valid      *uint32  `json:"valid"`
 	Total      *uint32  `json:"total"`
-}
-
-type sheafStalksResponse struct {
-	Generation *uint64 `json:"generation,string"`
-	Valid      *uint32 `json:"valid"`
-	Total      *uint32 `json:"total"`
 }
 
 type sheafStatusResponse struct {
@@ -366,8 +329,6 @@ func decoderFor(name string) func([]byte) error {
 			var w wire.StatusResponse
 			return strictUnmarshal(b, &w)
 		}
-	case "FlushResponse":
-		return func(b []byte) error { var v flushResponse; return strictUnmarshal(b, &v) }
 	case "SnapshotResponse":
 		return func(b []byte) error { var v snapshotResponse; return strictUnmarshal(b, &v) }
 	case "ReadContentResponse":
@@ -400,12 +361,6 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v findDefsResponse; return strictUnmarshal(b, &v) }
 	case "FindCalleesResponse":
 		return func(b []byte) error { var v findCalleesResponse; return strictUnmarshal(b, &v) }
-	case "GetRefsMapResponse":
-		return func(b []byte) error { var v getRefsMapResponse; return strictUnmarshal(b, &v) }
-	case "GetDefsMapResponse":
-		return func(b []byte) error { var v getDefsMapResponse; return strictUnmarshal(b, &v) }
-	case "GetSchemaResponse":
-		return func(b []byte) error { var v getSchemaResponse; return strictUnmarshal(b, &v) }
 	case "GetDbPathResponse":
 		return func(b []byte) error { var v getDbPathResponse; return strictUnmarshal(b, &v) }
 	case "QueryResponse":
@@ -416,8 +371,6 @@ func decoderFor(name string) func([]byte) error {
 		return func(b []byte) error { var v sheafInvalidateResponse; return strictUnmarshal(b, &v) }
 	case "SheafDefectResponse":
 		return func(b []byte) error { var v sheafDefectResponse; return strictUnmarshal(b, &v) }
-	case "SheafStalksResponse":
-		return func(b []byte) error { var v sheafStalksResponse; return strictUnmarshal(b, &v) }
 	case "SheafStatusResponse":
 		return func(b []byte) error { var v sheafStatusResponse; return strictUnmarshal(b, &v) }
 	case "SheafLearnedWeightsResponse":

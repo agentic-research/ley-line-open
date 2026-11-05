@@ -28,10 +28,9 @@
 //!   `execution_contract::OP_NAMES`.
 //! - `LspPosition` / `LspFile`: small typed-args structs the LSP ops
 //!   consume.
-//! - `Ref` / `TokenMapEntry`: intermediate data types used inside
-//!   `ops.rs` while building capnp List populations. Not serde-
-//!   serialized today (no `to_wire` callers); kept as plain data
-//!   structs.
+//! - `Ref`: an intermediate data type used inside `ops.rs` while
+//!   building capnp List populations. Not serde-serialized (no
+//!   `to_wire` callers); kept as a plain data struct.
 //!
 //! Beads:
 //! - `ley-line-open-b0ea2e` (the wire.rs codegen / capnp-json adoption thread)
@@ -76,13 +75,11 @@ use super::execution_contract;
 /// conditionally. Consumers want [`BASE_OP_NAMES`], not this.
 const NATIVE_OP_NAMES: &[&str] = &[
     "status",
-    "flush",
     "load",
     "query",
     "reparse",
     "snapshot",
     "enrich",
-    "list_roots",
     "list_children",
     "read_content",
     "read_source",
@@ -91,9 +88,6 @@ const NATIVE_OP_NAMES: &[&str] = &[
     "find_callees",
     "find_defs",
     "get_node",
-    "get_refs_map",
-    "get_defs_map",
-    "get_schema",
     "get_db_path",
     "lsp_hover",
     "lsp_defs",
@@ -108,8 +102,6 @@ const NATIVE_OP_NAMES: &[&str] = &[
     "sheaf_invalidate",
     #[cfg(feature = "sheaf")]
     "sheaf_defect",
-    #[cfg(feature = "sheaf")]
-    "sheaf_stalks",
     #[cfg(feature = "sheaf")]
     "sheaf_status",
     #[cfg(feature = "sheaf")]
@@ -186,7 +178,6 @@ pub const BASE_OP_NAMES: &[&str] = &BASE_OP_NAMES_STORAGE;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum BaseRequest {
     Status,
-    Flush,
     Load {
         /// Base64-encoded .db bytes.
         db: String,
@@ -210,7 +201,6 @@ pub enum BaseRequest {
         #[serde(default)]
         files: Option<Vec<String>>,
     },
-    ListRoots,
     ListChildren {
         #[serde(default)]
         id: Option<String>,
@@ -236,9 +226,6 @@ pub enum BaseRequest {
     GetNode {
         id: String,
     },
-    GetRefsMap,
-    GetDefsMap,
-    GetSchema,
     GetDbPath,
     LspHover(LspPosition),
     LspDefs(LspPosition),
@@ -283,8 +270,6 @@ pub enum BaseRequest {
     #[cfg(feature = "sheaf")]
     SheafDefect,
     #[cfg(feature = "sheaf")]
-    SheafStalks,
-    #[cfg(feature = "sheaf")]
     SheafStatus,
     #[cfg(feature = "sheaf")]
     SheafLearnedWeights,
@@ -296,7 +281,7 @@ pub enum BaseRequest {
     /// Tree-sitter syntactic validation (ley-line-open-fa8638; full
     /// ERROR/MISSING enumeration per ley-line-open-736800).
     /// Mirrors mache's `writeback/validate.go` over the UDS so mache can
-    /// drop its CGO tree-sitter link. Read-only (NOT in STATE_CHANGING_OPS).
+    /// drop its CGO tree-sitter link. Read-only.
     #[cfg(feature = "validate")]
     Validate(ValidateRequest),
     /// HDC structural-similarity search (ley-line-open-c32596).
@@ -719,13 +704,4 @@ pub enum WriteKind {
 pub struct Ref {
     pub node_id: String,
     pub source_id: String,
-}
-
-/// Bulk token-map entry — one token plus the list of nodes it
-/// references (or defines). Used by op_get_token_map's intermediate
-/// Vec before the capnp List(TokenMapEntry) population.
-#[derive(Debug, Clone)]
-pub struct TokenMapEntry {
-    pub token: String,
-    pub node_ids: Vec<String>,
 }

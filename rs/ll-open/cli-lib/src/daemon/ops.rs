@@ -17,7 +17,7 @@ use super::wire::ValidateRequest;
 use super::wire::{
     BASE_OP_NAMES, BaseRequest, InspectNeighborhoodRequest, InspectSymbolRequest, LspFile,
     LspPosition, ProposeRequest, ProposedWriteInput, ReadSourceRequest, Ref as WireRef,
-    SearchSymbolsRequest, TokenMapEntry, WriteKind,
+    SearchSymbolsRequest, WriteKind,
 };
 #[cfg(feature = "hdc")]
 use super::wire::{HdcCalibrateRequest, HdcDensityRequest, HdcSearchRequest};
@@ -27,27 +27,16 @@ use super::{DaemonContext, DaemonPhase};
 // Public dispatch
 // ---------------------------------------------------------------------------
 
-/// Names of ops that mutate the daemon's state and should emit a
-/// `daemon.<op>` event after completion. Lives next to the dispatch
-/// table so a new mutating op gets a one-stop checklist (add a match
-/// arm in `handle_base_op` AND list the name here).
-///
-/// Single source of truth — `daemon::socket` reads this via
-/// `is_state_changing()` rather than maintaining a parallel list.
-pub(crate) const STATE_CHANGING_OPS: &[&str] =
-    &["load", "reparse", "flush", "snapshot", "enrich", "propose"];
-
-/// Whether an op name belongs to `STATE_CHANGING_OPS`. Used by the UDS
-/// dispatch loop to decide if the op deserves a follow-up event.
-pub(crate) fn is_state_changing(op: &str) -> bool {
-    STATE_CHANGING_OPS.contains(&op)
-}
+// Events: an op emits `daemon.<op>` exactly when it changed state, decided
+// at the write boundaries it crossed (`DaemonContext::with_write`,
+// `DaemonContext::with_publish`) and reported once by
+// `DaemonContext::observe_op` around `dispatch_typed`, the one dispatch
+// every transport shares (bead `ley-line-open-851f00`). There is no list of
+// "mutating" ops to keep in step with the handlers.
 
 /// Test-only thin wrapper over [`BASE_OP_NAMES`]. Existing drift tests
-/// iterate `base_op_names()` against `STATE_CHANGING_OPS` and
-/// `mcp::tool_registry`; they continue to work unchanged after
-/// b632ee's SoT collapse — they now read from `BASE_OP_NAMES` via this
-/// alias.
+/// iterate `base_op_names()` against `mcp::tool_registry`; they read from
+/// `BASE_OP_NAMES` via this alias (b632ee's SoT collapse).
 ///
 /// If you add a new op, see the checklist on `BASE_OP_NAMES` in
 /// `wire.rs` — this function does NOT need updating.
@@ -92,7 +81,7 @@ pub fn handle_base_op_value(
     }
     let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_value(parsed);
     Some(match typed_result {
-        Ok(typed) => dispatch_typed(ctx, typed),
+        Ok(typed) => ctx.observe_op(&op, || dispatch_typed(ctx, typed)),
         Err(e) => build_error_response(&format!("{op}: {e}"))
             .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}"))),
     })
@@ -123,7 +112,6 @@ fn is_known_base_op(op: &str) -> bool {
 fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> String {
     let result: Result<String> = match req {
         BaseRequest::Status => op_status(ctx),
-        BaseRequest::Flush => op_flush(&ctx.ctrl_path),
         BaseRequest::Load { db } => op_load(ctx, &db),
         BaseRequest::Query { sql, limit } => op_query(ctx, &sql, limit),
         BaseRequest::Reparse {
@@ -133,7 +121,6 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         } => op_reparse(ctx, source.as_deref(), lang.as_deref(), files.as_deref()),
         BaseRequest::Snapshot => op_snapshot(ctx),
         BaseRequest::Enrich { pass, files } => op_enrich(ctx, &pass, files.as_deref()),
-        BaseRequest::ListRoots => op_list_children(ctx, ""),
         BaseRequest::ListChildren { id } => op_list_children(ctx, id.as_deref().unwrap_or("")),
         BaseRequest::ReadContent { id } => op_read_content(ctx, &id),
         BaseRequest::ReadSource(r) => op_read_source(ctx, &r),
@@ -142,9 +129,6 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         BaseRequest::FindCallees { id } => op_find_callees(ctx, &id),
         BaseRequest::FindDefs { token } => op_find_defs(ctx, &token),
         BaseRequest::GetNode { id } => op_get_node(ctx, &id),
-        BaseRequest::GetRefsMap => op_get_token_map(ctx, "node_refs", TokenMapOp::Refs),
-        BaseRequest::GetDefsMap => op_get_token_map(ctx, "node_defs", TokenMapOp::Defs),
-        BaseRequest::GetSchema => op_get_schema(),
         BaseRequest::GetDbPath => op_get_db_path(&ctx.ctrl_path),
         BaseRequest::LspHover(p) => op_lsp_hover(ctx, &p),
         BaseRequest::LspDefs(p) => op_lsp_defs(ctx, &p),
@@ -177,8 +161,6 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         }
         #[cfg(feature = "sheaf")]
         BaseRequest::SheafDefect => super::sheaf_ops::op_sheaf_defect(&ctx.sheaf),
-        #[cfg(feature = "sheaf")]
-        BaseRequest::SheafStalks => super::sheaf_ops::op_sheaf_stalks(&ctx.sheaf),
         #[cfg(feature = "sheaf")]
         BaseRequest::SheafStatus => super::sheaf_ops::op_sheaf_status(&ctx.sheaf),
         #[cfg(feature = "sheaf")]
@@ -517,7 +499,7 @@ macro_rules! set_root_fields {
 fn snapshot_living_db(ctx: &DaemonContext) -> Result<()> {
     // The daemon's one publish path: a pool read transaction under the
     // single-publisher lock, off the writer (bead `ley-line-open-8c8ded`).
-    crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path)
+    ctx.with_publish(|| crate::cmd_daemon::publish_living_db(&ctx.live_db, &ctx.ctrl_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -608,31 +590,19 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     Ok(capnp_json::to_json(reader)?)
 }
 
-fn op_flush(ctrl_path: &Path) -> Result<String> {
-    let current_root = read_root_hex(ctrl_path)?;
-    let mut builder = capnp::message::Builder::new_default();
-    let mut root: leyline_public_schema::daemon_capnp::flush_response::Builder =
-        builder.init_root();
-    root.set_ok(true);
-    set_root_fields!(root, &current_root);
-    let reader = builder
-        .get_root_as_reader::<leyline_public_schema::daemon_capnp::flush_response::Reader>()?;
-    Ok(capnp_json::to_json(reader)?)
-}
-
 fn op_load(ctx: &DaemonContext, db_b64: &str) -> Result<String> {
     use base64::Engine;
     let ctrl_path = ctx.ctrl_path.as_path();
     let db_bytes = base64::engine::general_purpose::STANDARD
         .decode(db_b64)
         .context("invalid base64 in \"db\" field")?;
-    {
+    ctx.with_publish(|| {
         // The arena has one writer at a time: a load writes the inactive
         // buffer the daemon's publisher also writes (bead
         // `ley-line-open-8c8ded`).
         let _publisher = ctx.live_db.publish_lock.lock();
-        crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)?;
-    }
+        crate::cmd_load::load_into_arena(ctrl_path, &db_bytes)
+    })?;
     let current_root = read_root_hex(ctrl_path)?;
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::load_response::Builder = builder.init_root();
@@ -958,8 +928,10 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
     // was a misclass hidden by the shared `Mutex<Connection>`. The
     // destructive-SQL foot-gun documented at
     // `test_op_query_destructive_runs_today_pin_for_6213d4` continues
-    // to work (that's the whole point of the pin — 6213d4 will lock
-    // this down as an *intentional* change).
+    // to work. Over MCP the tool is therefore its own Cloister group,
+    // `sql`, not part of the read-side `query` group (bead
+    // `ley-line-open-851a65`); a read-only `query` is
+    // `ley-line-open-b7e9a3`.
     ctx.with_write(|conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
         let col_count = stmt.column_count();
@@ -1009,7 +981,7 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
 fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
     // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`) — read-path
     // profile timer. This op backs mache's "get_overview" surface
-    // (`list_roots` when id="", `list_children` otherwise); wrapping
+    // (the roots when id="", a node's children otherwise); wrapping
     // it captures the whole row-projected read time that Phase 2.x
     // must beat by ≥2× per §9.2.4.
     let _prof = ReadProfileTimer::new("list_children");
@@ -1523,7 +1495,7 @@ fn wire_ref_of(conn: &Connection, nid: i64) -> Result<WireRef> {
 /// find_callers, so mache's `udsGraph.GetCallees(id)` can mirror its
 /// existing `GetCallers(token)` JSON parsing.
 ///
-/// Read-only — does NOT belong in STATE_CHANGING_OPS.
+/// Read-only.
 fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
     ctx.with_read(|conn| {
         // DISTINCT — a node referencing the same token from multiple sites
@@ -1561,226 +1533,14 @@ fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
     })
 }
 
-/// Bulk-export a `(token → [node_id])` index — the full contents of
-/// `node_refs` (refs map) or `node_defs` (defs map), grouped by token.
-///
-/// Used by mache's `RefsMap()` / `DefsMap()` for graph-wide analysis
-/// (Louvain community detection, impact-analysis BFS seeds, architecture
-/// diagrams). The per-token `find_callers` / `find_defs` ops are unsuited
-/// to bulk consumers because iterating them across every token would be
-/// thousands of round-trips.
-///
-/// `source_id` is intentionally NOT included in the response — bulk
-/// consumers want the (token → nodes) map for graph topology; the
-/// per-token lookups still expose source_id when needed. Keeps the
-/// response compact for large indexes.
-///
-/// Read-only — NOT in STATE_CHANGING_OPS.
-fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<String> {
-    ctx.with_read(|conn| {
-        // DISTINCT — `node_refs` / `node_defs` have no uniqueness constraint
-        // on (token, node_id), so the same node referencing/defining a token
-        // from multiple sites would emit duplicate node_ids without this.
-        // Downstream graph-wide consumers (community detection, architecture
-        // diagrams) expect each (token → node_id) edge once.
-        //
-        // projection-v5: the wire keeps display paths, rendered here in
-        // Rust once per distinct nid through a memoised ancestor walk
-        // (bead `ley-line-open-c6be90`). The recursive `v_node_path` view
-        // is NOT joined: SQLite cannot push `p.nid = t.nid` into a
-        // recursive anchor, so that join rendered and materialised the path
-        // of every node in the arena for any export, however small. An
-        // occurrence with no `nodes` row (an injected subtree) keeps an
-        // EXPLICIT file-anchored address — mirror of `wire_ref_of`.
-        let sql = format!("SELECT DISTINCT token, nid FROM {table} ORDER BY 1, 2");
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        let mut paths = leyline_schema::PathRenderer::new();
-        let mut source_ids: std::collections::HashMap<i64, Option<String>> =
-            std::collections::HashMap::new();
-        let mut render = |conn: &Connection, nid: i64| -> Result<String> {
-            if let Some(path) = paths.path(conn, nid)? {
-                return Ok(path);
-            }
-            let file_id = leyline_schema::nid_file_id(nid);
-            let source_id = match file_id {
-                Some(fid) => match source_ids.entry(fid) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-                    std::collections::hash_map::Entry::Vacant(e) => e
-                        .insert(query_row_opt(
-                            conn,
-                            "SELECT id FROM _source WHERE file_id = ?1",
-                            [fid],
-                            |r| r.get::<_, String>(0),
-                        )?)
-                        .clone(),
-                },
-                None => None,
-            };
-            unpathed_node_id(nid, source_id.as_deref())
-        };
-
-        // Group by token in a single linear pass — the ORDER BY token
-        // above means same-token rows are contiguous — and order each
-        // token's paths, which is the order the SQL used to hand back.
-        let mut entries: Vec<TokenMapEntry> = Vec::new();
-        let mut current_token: Option<String> = None;
-        let mut current_node_ids: Vec<String> = Vec::new();
-        let flush = |token: String, mut ids: Vec<String>, entries: &mut Vec<TokenMapEntry>| {
-            ids.sort_unstable();
-            entries.push(TokenMapEntry {
-                token,
-                node_ids: ids,
-            });
-        };
-        for row in rows {
-            let (token, nid) = row?;
-            if Some(&token) != current_token.as_ref() {
-                if let Some(tok) = current_token.take() {
-                    flush(tok, std::mem::take(&mut current_node_ids), &mut entries);
-                }
-                current_token = Some(token);
-            }
-            current_node_ids.push(render(conn, nid)?);
-        }
-        if let Some(tok) = current_token {
-            flush(tok, current_node_ids, &mut entries);
-        }
-
-        // Build + emit JSON inside the matching branch so the
-        // Builder/Reader types stay consistent. The two responses
-        // share a layout today, but reading back as one type and
-        // having built as the other is brittle — future schema
-        // divergence would silently mis-encode without surfacing
-        // a Rust type error. Per Copilot review on PR #12.
-        match op {
-            TokenMapOp::Refs => {
-                let mut builder = capnp::message::Builder::new_default();
-                {
-                    let mut root:
-                        leyline_public_schema::daemon_capnp::get_refs_map_response::Builder =
-                        builder.init_root();
-                    root.set_ok(true);
-                    set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
-                }
-                let reader = builder.get_root_as_reader::<
-                    leyline_public_schema::daemon_capnp::get_refs_map_response::Reader,
-                >()?;
-                Ok(capnp_json::to_json(reader)?)
-            }
-            TokenMapOp::Defs => {
-                let mut builder = capnp::message::Builder::new_default();
-                {
-                    let mut root:
-                        leyline_public_schema::daemon_capnp::get_defs_map_response::Builder =
-                        builder.init_root();
-                    root.set_ok(true);
-                    set_token_map_entries(root.init_entries(entries.len() as u32), &entries);
-                }
-                let reader = builder.get_root_as_reader::<
-                    leyline_public_schema::daemon_capnp::get_defs_map_response::Reader,
-                >()?;
-                Ok(capnp_json::to_json(reader)?)
-            }
-        }
-    })
-}
-
-/// Populate a capnp `List(TokenMapEntry)` from a slice of TokenMapEntry rows.
-/// Shared by `op_get_token_map`'s Refs and Defs branches.
-fn set_token_map_entries(
-    mut list: capnp::struct_list::Builder<
-        '_,
-        leyline_public_schema::daemon_capnp::token_map_entry::Owned,
-    >,
-    entries: &[TokenMapEntry],
-) {
-    for (i, e) in entries.iter().enumerate() {
-        let mut entry = list.reborrow().get(i as u32);
-        entry.set_token(&e.token);
-        let mut ids = entry.init_node_ids(e.node_ids.len() as u32);
-        for (j, nid) in e.node_ids.iter().enumerate() {
-            ids.set(j as u32, nid);
-        }
-    }
-}
-
-/// Which bulk-export op we're serving — pinpoints the response variant.
-#[derive(Copy, Clone)]
-enum TokenMapOp {
-    Refs,
-    Defs,
-}
-
-/// Export LLO's tier topology — the schema layer ownership map mache's
-/// `serve_diagram.go` consumes for cross-tier dependency diagrams.
-///
-/// The tier→crate map is currently HARDCODED here. The real SSOT is the
-/// `rs/ll-core/` vs `rs/ll-open/` workspace layout (each subdirectory's
-/// member crates per `rs/Cargo.toml`). Keeping this hardcoded means a
-/// new crate added to either tier requires touching this function too.
-/// TODO: derive from `cargo metadata --no-deps --format-version 1` at
-/// daemon startup so workspace truth is the single source. Tracked
-/// implicitly under bead cc0305 follow-up.
-///
-/// `docs/TABLE_CONTRACT.md` describes table-ownership (which enrichment
-/// pass writes which table) — NOT crate→tier maps. Don't conflate the
-/// two.
-///
-/// If extension layers register additional tiers via `DaemonExt`,
-/// future work expands this; today only the LLO built-in tiers are
-/// exposed. Read-only — does NOT belong in STATE_CHANGING_OPS.
-fn op_get_schema() -> Result<String> {
-    let tiers: &[(&str, &[&str])] = &[
-        (
-            "ll-core",
-            &[
-                "leyline-core",
-                "leyline-schema",
-                "leyline-public-schema",
-                "leyline-schema-capnp",
-            ],
-        ),
-        (
-            "ll-open",
-            &[
-                "leyline-fs",
-                "leyline-ts",
-                "leyline-lsp",
-                "leyline-hdc",
-                "leyline-cli-lib",
-                "leyline-cli",
-                "leyline-vcs",
-                "leyline-sign",
-            ],
-        ),
-    ];
-    let mut builder = capnp::message::Builder::new_default();
-    let mut root: leyline_public_schema::daemon_capnp::get_schema_response::Builder =
-        builder.init_root();
-    root.set_ok(true);
-    let mut tiers_b = root.init_tiers(tiers.len() as u32);
-    for (i, (name, crates)) in tiers.iter().enumerate() {
-        let mut tier = tiers_b.reborrow().get(i as u32);
-        tier.set_name(name);
-        let mut crates_b = tier.init_crates(crates.len() as u32);
-        for (j, c) in crates.iter().enumerate() {
-            crates_b.set(j as u32, c);
-        }
-    }
-    let reader = builder
-        .get_root_as_reader::<leyline_public_schema::daemon_capnp::get_schema_response::Reader>()?;
-    Ok(capnp_json::to_json(reader)?)
-}
-
 /// Export the daemon's filesystem paths — the .db location + sibling
 /// capnp segment files. mache decodes only `bindings.capnp` from these
 /// (`internal/lsp/binding_log.go`); it reads neither `ast.capnp` nor
 /// `source.capnp`, which it reaps as cache (ADR-0040 D5). Strictly
 /// opt-in; the daemon's normal ops are unaffected.
+///
+/// No caller exists today. Kept: planned consumer, mache's `udsGraph`
+/// `DBPath()` fast path (open bead `ley-line-open-cc386f`).
 fn op_get_db_path(ctrl_path: &Path) -> Result<String> {
     let ctrl_str = ctrl_path.to_string_lossy().to_string();
     // The .db path is the ctrl_path with .ctrl swapped for .db (mache's
@@ -2110,16 +1870,21 @@ fn try_enrich_file(ctx: &std::sync::Arc<DaemonContext>, file: &str) -> bool {
 
         eprintln!("lazy enrich (bg): triggering LSP for {file_owned}");
 
-        let guard = ctx_owned.live_db.writer.lock();
-        let result = crate::daemon::enrichment::run_pass(
-            &ctx_owned.enrichment_passes,
-            "lsp",
-            &guard,
-            &source_dir,
-            Some(std::slice::from_ref(&file_owned)),
-            Some(&ctx_owned.state),
-        );
-        drop(guard);
+        // The enrichment a read queued is a write of its own: it runs as an
+        // `enrich` op, so the `_lsp` rows it lands emit `daemon.enrich`
+        // like an explicit `enrich` does (bead `ley-line-open-851f00`).
+        let result = ctx_owned.observe_op("enrich", || {
+            ctx_owned.with_write(|conn| {
+                crate::daemon::enrichment::run_pass(
+                    &ctx_owned.enrichment_passes,
+                    "lsp",
+                    conn,
+                    &source_dir,
+                    Some(std::slice::from_ref(&file_owned)),
+                    Some(&ctx_owned.state),
+                )
+            })
+        });
 
         match result {
             Ok(stats) => {
@@ -2446,8 +2211,8 @@ fn op_text_search(ctx: &DaemonContext, query: &str, k: u32) -> Result<String> {
 
 /// `{"op":"leyline_version"}` — returns the daemon's runtime version
 /// and wire-format identity from the constants in
-/// [`crate::daemon::version`]. Takes no arguments. Read-only — NOT in
-/// `STATE_CHANGING_OPS`. Idempotent.
+/// [`crate::daemon::version`]. Takes no arguments. Read-only and
+/// idempotent.
 ///
 /// Builds the response through capnp + capnp_json so the wire shape
 /// matches the rest of the op surface (`$Json.name(...)` annotations
@@ -2478,8 +2243,7 @@ fn op_leyline_version() -> Result<String> {
 
 /// `{"op":"validate", "content":"...", "language":"go"}` — runs the
 /// `leyline-fs::validate` tree-sitter validator on caller-supplied
-/// content without persisting anything. Read-only — NOT in
-/// `STATE_CHANGING_OPS`.
+/// content without persisting anything. Read-only.
 ///
 /// Returns `{ ok: bool, errors: [{row, col, byte_start, byte_end,
 /// message}], diagnostics: [{line, col, message}] }`:
@@ -2723,9 +2487,9 @@ fn op_hdc_search(ctx: &std::sync::Arc<DaemonContext>, req: &HdcSearchRequest) ->
 
 /// `{"op":"hdc_calibrate", "sample_size":1000}` — recomputes median +
 /// MAD over `_hdc` row distances per layer; writes to `_hdc_baseline`.
-/// Returns `{ok, layers_calibrated: N}`. Read-only with respect to the
-/// projected db — only touches HDC sidecar tables, so NOT in
-/// `STATE_CHANGING_OPS`.
+/// Returns `{ok, layers_calibrated: N}`. It writes: it installs the HDC
+/// tables when absent and replaces `_hdc_baseline`'s rows, so a call that
+/// changes either emits `daemon.hdc_calibrate` (bead `ley-line-open-851f00`).
 #[cfg(feature = "hdc")]
 fn op_hdc_calibrate(
     ctx: &std::sync::Arc<DaemonContext>,
@@ -2772,7 +2536,7 @@ fn op_hdc_density(ctx: &std::sync::Arc<DaemonContext>, req: &HdcDensityRequest) 
 // primitives stay as-is; this op delegates to the same SQL paths and
 // joins the results into the bundle shape ADR-0016 §2 commits to.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// One definition row in the bundle. Carries enough location info
@@ -3158,7 +2922,7 @@ fn classify_node_kind(node_kind: &str) -> &'static str {
 // enclosing definition's token → (symbol_id, kind). The caller can
 // then feed `symbol_id` into `inspect_symbol` and get the full bundle.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// `{"op":"at_position", "file":"...", "line":N, "col":N}` —
@@ -3241,7 +3005,7 @@ fn op_at_position(ctx: &std::sync::Arc<DaemonContext>, p: &LspPosition) -> Resul
 //   neighborhood_query == 1`): the entire neighborhood is built
 //   inside one `with_live_db` closure and serialized once.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// Cap on `depth` regardless of caller input — ADR-0016 §5 says max 4.
@@ -3457,7 +3221,7 @@ fn query_caller_tokens(conn: &Connection, focal_token: &str) -> Result<Vec<Strin
 // framer). v1 satisfies the §6 line-delimited shape; it does NOT
 // gate, which requires true streaming.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// `{"op":"search_symbols", "pattern":"Send*", "limit":100, "kind":"function"?}`
@@ -3561,7 +3325,7 @@ fn op_search_symbols(
 //   disagrees with source_0; a fully-pairwise variant is a follow-up
 //   if the agent surface ever needs the dense matrix.
 //
-// Read-only — NOT in STATE_CHANGING_OPS.
+// Read-only.
 // ---------------------------------------------------------------------------
 
 /// One observation row decoded for agreement scoring: the source name
@@ -4005,84 +3769,6 @@ mod tests {
         assert!(NID_FOR_FILE.contains("?1"));
         assert!(NID_FOR_FILE.contains("?2"));
         assert!(NID_FOR_FILE.starts_with("nid"));
-    }
-
-    #[test]
-    fn state_changing_ops_pin_known_set() {
-        // Bidirectional drift guard: the canonical set must be exactly
-        // the hardcoded list, in some order. Iterating the hardcoded
-        // list (the previous form) only caught *removal* — adding a
-        // new op to STATE_CHANGING_OPS without updating the test
-        // would silently pass and a state-changing op would silently
-        // emit no event. Equality assertion fails in both directions.
-        // (Caught by iter-35 adversarial review.)
-        let mut actual: Vec<&str> = STATE_CHANGING_OPS.to_vec();
-        actual.sort();
-        let expected: Vec<&str> = {
-            let mut v = vec!["load", "reparse", "flush", "snapshot", "enrich", "propose"];
-            v.sort();
-            v
-        };
-        assert_eq!(
-            actual, expected,
-            "STATE_CHANGING_OPS drift detected — update the hardcoded list \
-             (and the matching test) when adding/removing mutating ops",
-        );
-    }
-
-    #[test]
-    fn state_changing_ops_excludes_pure_reads() {
-        // The query/observation ops must NOT trigger an event emission.
-        // When a new read-only op is added to `handle_base_op`, list it
-        // here so a future accidental promotion into STATE_CHANGING_OPS
-        // is caught by this guard.
-        for op in [
-            "status",
-            "query",
-            "list_children",
-            "list_roots",
-            "read_content",
-            "read_source",
-            "find_callers",
-            "find_callees",
-            "find_defs",
-            "get_node",
-            "get_refs_map",
-            "get_defs_map",
-            "get_schema",
-            "get_db_path",
-            "lsp_hover",
-            "lsp_defs",
-            "lsp_refs",
-            "lsp_symbols",
-            "lsp_diagnostics",
-            #[cfg(feature = "validate")]
-            "validate",
-            #[cfg(feature = "hdc")]
-            "hdc_search",
-            #[cfg(feature = "hdc")]
-            "hdc_calibrate",
-            #[cfg(feature = "hdc")]
-            "hdc_density",
-            "inspect_symbol",
-            "at_position",
-            "inspect_neighborhood",
-            "search_symbols",
-            "agreement",
-        ] {
-            assert!(
-                !is_state_changing(op),
-                "read-only op `{op}` should not be state-changing",
-            );
-        }
-    }
-
-    #[test]
-    fn state_changing_ops_unknown_returns_false() {
-        // Defensive: an op that doesn't exist in the dispatch table must
-        // not be called state-changing (avoids spurious events).
-        assert!(!is_state_changing("nonexistent_op"));
-        assert!(!is_state_changing(""));
     }
 
     /// Mirror `_ast` spans onto the occurrence rows, the way a real parse does
@@ -5864,19 +5550,44 @@ mod tests {
     // block.
 
     #[tokio::test]
-    async fn test_op_flush_returns_ok() {
-        let (_dir, ctx) = setup();
-        let result = handle_base_op_legacy(&ctx, "flush", &json!({}));
-        assert!(result.is_some());
-        let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(parsed["ok"], true);
-    }
-
-    #[tokio::test]
     async fn test_unknown_op_returns_none() {
         let (_dir, ctx) = setup();
         assert!(handle_base_op_legacy(&ctx, "nonexistent", &json!({})).is_none());
     }
+
+    /// Bead `ley-line-open-8523ee`: the ops removed as dead (no caller in
+    /// LLO, mache or ley-line) are unknown to the dispatcher, so the wire
+    /// refuses them as it refuses any unknown op, and nothing advertises
+    /// them over MCP.
+    #[tokio::test]
+    async fn removed_dead_ops_are_refused_on_the_wire() {
+        let (_dir, ctx) = setup();
+        let registry: Vec<&str> = super::super::mcp::tool_registry()
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        for op in REMOVED_DEAD_OPS {
+            assert!(
+                !BASE_OP_NAMES.contains(op),
+                "`{op}` is still a canonical op name"
+            );
+            assert!(!registry.contains(op), "`{op}` is still an MCP tool");
+            assert!(
+                handle_base_op_legacy(&ctx, op, &json!({})).is_none(),
+                "`{op}` still dispatches"
+            );
+        }
+    }
+
+    /// The ops bead `ley-line-open-8523ee` removed.
+    const REMOVED_DEAD_OPS: &[&str] = &[
+        "flush",
+        "list_roots",
+        "sheaf_stalks",
+        "get_schema",
+        "get_refs_map",
+        "get_defs_map",
+    ];
 
     #[tokio::test]
     async fn handle_base_op_dispatches_every_canonical_name() {
@@ -5922,10 +5633,10 @@ mod tests {
     #[tokio::test]
     async fn root_carrying_responses_state_absence_like_status() {
         let (_dir, ctx) = setup();
-        let flush = call(&ctx, json!({"op": "flush"}));
-        assert_eq!(flush["ok"], true, "{flush}");
-        assert_eq!(flush["root_published"], false, "{flush}");
-        assert!(flush.get("current_root").is_none(), "{flush}");
+        let status = call(&ctx, json!({"op": "status"}));
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["root_published"], false, "{status}");
+        assert!(status.get("current_root").is_none(), "{status}");
 
         let snap = call(&ctx, json!({"op": "snapshot"}));
         assert_eq!(snap["ok"], true, "{snap}");
@@ -5936,9 +5647,9 @@ mod tests {
             .expect("snapshot published a root");
         assert_eq!(snap["current_root"], hex::encode(published), "{snap}");
 
-        let flush = call(&ctx, json!({"op": "flush"}));
-        assert_eq!(flush["root_published"], true, "{flush}");
-        assert_eq!(flush["current_root"], hex::encode(published), "{flush}");
+        let status = call(&ctx, json!({"op": "status"}));
+        assert_eq!(status["root_published"], true, "{status}");
+        assert_eq!(status["current_root"], hex::encode(published), "{status}");
     }
 
     #[test]
@@ -6381,20 +6092,6 @@ mod tests {
             let body = lsp_rows_response(key, vec![], false);
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(v.get(key).is_some(), "expected key `{key}` in {body}",);
-        }
-    }
-
-    #[test]
-    fn state_changing_ops_subset_of_canonical_names() {
-        // Mutating ops must be a subset of the canonical dispatch list.
-        // Catches the case where someone retires an op from `handle_base_op`
-        // but forgets to remove it from `STATE_CHANGING_OPS`.
-        let canonical: std::collections::HashSet<&str> = base_op_names().into_iter().collect();
-        for name in STATE_CHANGING_OPS {
-            assert!(
-                canonical.contains(name),
-                "STATE_CHANGING_OPS contains `{name}` but base_op_names() does not",
-            );
         }
     }
 
@@ -8801,143 +8498,6 @@ mod tests {
         assert_eq!(miss["callees"], json!([]), "got {miss}");
     }
 
-    /// Measurement for bead ley-line-open-c6be90, not a gate: parse a
-    /// synthetic Go corpus of `LEYLINE_TOKEN_MAP_COPIES` × 4 files into the
-    /// live db and time one refs-map export, reporting wall time and the
-    /// SQLite memory high-water mark. Run with
-    /// `LEYLINE_TOKEN_MAP_COPIES=125 cargo test -p leyline-cli-lib --lib
-    /// token_map_export_cost -- --ignored --nocapture` (500 files) and
-    /// `=1250` (5 000 files); the numbers are recorded on the bead.
-    #[tokio::test]
-    #[ignore = "measurement, not a gate; needs LEYLINE_TOKEN_MAP_COPIES"]
-    async fn token_map_export_cost() {
-        let copies: usize = std::env::var("LEYLINE_TOKEN_MAP_COPIES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(125);
-        let seed_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/topology/handcrafted/go");
-        let corpus = TempDir::new().unwrap();
-        let seeds: Vec<std::path::PathBuf> = std::fs::read_dir(&seed_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("go"))
-            .collect();
-        for i in 0..copies {
-            let pkg = corpus.path().join(format!("pkg_{i:04}"));
-            std::fs::create_dir(&pkg).unwrap();
-            for s in &seeds {
-                std::fs::copy(s, pkg.join(s.file_name().unwrap())).unwrap();
-            }
-        }
-        let (_dir, ctx) = setup();
-        {
-            let live = ctx.live_db.writer.lock();
-            crate::cmd_parse::parse_into_conn(&live, corpus.path(), Some("go"), None)
-                .expect("parse corpus");
-        }
-        let (files, refs): (i64, i64) = ctx
-            .with_read(|conn| {
-                Ok((
-                    conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?,
-                    conn.query_row("SELECT COUNT(*) FROM node_refs", [], |r| r.get(0))?,
-                ))
-            })
-            .unwrap();
-        // Reset the high-water mark so the export's own allocation shows.
-        unsafe {
-            let mut cur = 0i64;
-            let mut hi = 0i64;
-            rusqlite::ffi::sqlite3_status64(
-                rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
-                &mut cur,
-                &mut hi,
-                1,
-            );
-        }
-        let t0 = std::time::Instant::now();
-        let body = op_get_token_map(&ctx, "node_refs", TokenMapOp::Refs).unwrap();
-        let wall = t0.elapsed();
-        let mut cur = 0i64;
-        let mut hi = 0i64;
-        unsafe {
-            rusqlite::ffi::sqlite3_status64(
-                rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
-                &mut cur,
-                &mut hi,
-                0,
-            );
-        }
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        eprintln!(
-            "token_map_export_cost: files={files} node_refs={refs} entries={} wall={wall:?} sqlite_highwater={hi} bytes",
-            v["entries"].as_array().map(|a| a.len()).unwrap_or(0)
-        );
-    }
-
-    #[tokio::test]
-    async fn op_get_token_map_groups_rendered_paths_under_each_token() {
-        // Bulk export: one entry per distinct token, node paths grouped
-        // and ordered under it. Both response variants (Refs / Defs) are
-        // exercised — they are separately-built capnp messages.
-        let (_dir, ctx) = setup();
-        {
-            let live = ctx.live_db.writer.lock();
-            let a = seed_node(&live, "a.go", "identifier", (0, 6, 1, 0, 1, 6));
-            let b = seed_node(&live, "b.go", "identifier", (0, 6, 1, 0, 1, 6));
-            // An injected occurrence: a fact-row key whose ordinal lies
-            // past `a.go`'s `_ast` count, so there is no `nodes` row and
-            // the COALESCE must fall to the file-anchored injected form.
-            let injected = leyline_schema::file_nid(leyline_schema::nid_file_id(a).unwrap(), 500);
-            live.execute(
-                "INSERT INTO node_refs (token, nid) VALUES \
-                 ('alpha', ?1), ('alpha', ?2), ('alpha', ?3), ('beta', ?1)",
-                rusqlite::params![a, b, injected],
-            )
-            .unwrap();
-            live.execute(
-                "INSERT INTO node_defs (token, nid) VALUES ('gamma', ?1)",
-                rusqlite::params![b],
-            )
-            .unwrap();
-        }
-
-        let refs = parse_op_json(
-            &op_get_token_map(&ctx, "node_refs", TokenMapOp::Refs).unwrap(),
-            "op_get_token_map",
-        );
-        assert_eq!(refs["ok"], json!(true), "got {refs}");
-        let entries = refs["entries"].as_array().expect("entries array");
-        assert_eq!(
-            entries.len(),
-            2,
-            "one entry per distinct token; got {entries:?}",
-        );
-        assert_eq!(entries[0]["token"], json!("alpha"));
-        assert_eq!(
-            entries[0]["node_ids"],
-            json!(["a.go#inj@500", "a.go/identifier", "b.go/identifier"]),
-            "paths grouped + ordered, with the injected occurrence carrying \
-             its explicit file-anchored address; got {entries:?}",
-        );
-        assert_eq!(entries[1]["token"], json!("beta"));
-        assert_eq!(entries[1]["node_ids"], json!(["a.go/identifier"]));
-
-        // The Defs branch builds a different capnp response type over the
-        // same grouping — it must read back the defs table, not the refs.
-        let defs = parse_op_json(
-            &op_get_token_map(&ctx, "node_defs", TokenMapOp::Defs).unwrap(),
-            "op_get_token_map",
-        );
-        assert_eq!(defs["ok"], json!(true), "got {defs}");
-        assert_eq!(
-            defs["entries"],
-            json!([{"token": "gamma", "node_ids": ["b.go/identifier"]}]),
-            "got {defs}",
-        );
-    }
-
     #[tokio::test]
     async fn op_get_node_returns_the_addressed_nodes_fields() {
         // The node payload IS the answer, including the `record` blob
@@ -8967,5 +8527,242 @@ mod tests {
         let miss = parse_op_json(&op_get_node(&ctx, "nope.rs").unwrap(), "op_get_node");
         assert_eq!(miss["ok"], json!(false), "got {miss}");
         assert_eq!(miss["error"], json!("node 'nope.rs' not found"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bead `ley-line-open-851f00`: every write path emits exactly one event
+    // per real change, over the socket AND over MCP; a read emits none.
+    // -----------------------------------------------------------------------
+
+    /// An enrichment pass named `lsp` (the pass lazy enrichment runs) that
+    /// adds one row per run, so every run is a real change.
+    struct RowPass;
+
+    impl crate::daemon::enrichment::EnrichmentPass for RowPass {
+        fn name(&self) -> &str {
+            "lsp"
+        }
+        fn reads(&self) -> &[&str] {
+            &[]
+        }
+        fn writes(&self) -> &[&str] {
+            &["_row_pass"]
+        }
+        fn run(
+            &self,
+            conn: &Connection,
+            _source_dir: &std::path::Path,
+            _changed_files: Option<&[String]>,
+        ) -> Result<crate::daemon::enrichment::EnrichmentStats> {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS _row_pass (n INTEGER); \
+                 INSERT INTO _row_pass VALUES (1)",
+            )?;
+            Ok(crate::daemon::enrichment::EnrichmentStats {
+                pass_name: "lsp".into(),
+                files_processed: 1,
+                items_added: 1,
+                duration_ms: 0,
+                skipped: vec![],
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Transport {
+        Socket,
+        Mcp,
+    }
+
+    /// One request through `transport`'s own dispatch entry point.
+    async fn request(
+        ctx: &std::sync::Arc<DaemonContext>,
+        transport: Transport,
+        req: serde_json::Value,
+    ) -> serde_json::Value {
+        let op = req["op"].as_str().unwrap().to_string();
+        let mut args = req.clone();
+        args.as_object_mut().unwrap().remove("op");
+        match transport {
+            Transport::Socket => {
+                let mut conn = crate::daemon::events::ConnectionState::new(ctx.router.clone());
+                let out = crate::daemon::socket::dispatch(ctx, &mut conn, &op, &args).await;
+                serde_json::from_str(&out).unwrap()
+            }
+            Transport::Mcp => {
+                let reply = crate::daemon::mcp::handle_tools_call(
+                    ctx,
+                    &crate::daemon::mcp::McpGrant::all(),
+                    json!(1),
+                    &json!({"name": op, "arguments": args}),
+                );
+                let reply = serde_json::to_value(&reply).unwrap();
+                match reply["result"]["content"][0]["text"].as_str() {
+                    Some(text) => serde_json::from_str(text).unwrap(),
+                    None => reply,
+                }
+            }
+        }
+    }
+
+    /// The `daemon.*` topics emitted while `req` runs, and the response. A
+    /// fence event emitted after the request bounds the window: the bus
+    /// delivers in emit order, so every event the request caused precedes it.
+    async fn events_of(
+        ctx: &std::sync::Arc<DaemonContext>,
+        transport: Transport,
+        req: serde_json::Value,
+    ) -> (Vec<String>, serde_json::Value) {
+        let (_id, mut rx, _replay, _gap) = ctx
+            .router
+            .subscribe(
+                &["daemon.**".to_string(), "test.fence".to_string()],
+                None,
+                u64::MAX,
+                crate::daemon::events::OverflowPolicy::DropOldest,
+                256,
+            )
+            .await;
+        let response = request(ctx, transport, req).await;
+        // Lazy enrichment writes from the blocking pool after the request
+        // returns; its write is part of what the request caused.
+        while !ctx.enrich_inflight.lock().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        ctx.router.emitter().emit("test.fence", "test", json!({}));
+        let mut topics = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the fence arrives")
+                .expect("the bus stays open");
+            if ev.topic == "test.fence" {
+                return (topics, response);
+            }
+            assert_eq!(
+                ev.data["op"],
+                ev.topic.trim_start_matches("daemon."),
+                "{ev:?}"
+            );
+            topics.push(ev.topic);
+        }
+    }
+
+    /// The table of requests and the exact events each must emit. Run in
+    /// order against one daemon: a step's expectation depends on what the
+    /// steps before it changed.
+    async fn assert_every_write_emits_once(transport: Transport) {
+        let (dir, ctx) = setup_full(
+            Arc::new(crate::daemon::NoExt),
+            true,
+            vec![Box::new(RowPass)],
+        );
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.go"), PROPOSE_A).unwrap();
+
+        let mut steps: Vec<(serde_json::Value, Vec<&str>)> = vec![
+            (json!({"op": "status"}), vec![]),
+            (json!({"op": "query", "sql": "SELECT 1 AS one"}), vec![]),
+            // A parse and the publish after it: one change, one event.
+            (
+                json!({"op": "reparse", "source": src.to_string_lossy()}),
+                vec!["daemon.reparse"],
+            ),
+            (json!({"op": "list_children", "id": ""}), vec![]),
+            // Nothing changed since the reparse published.
+            (json!({"op": "snapshot"}), vec![]),
+            (
+                json!({"op": "query", "sql": "CREATE TABLE scratch_q (x)"}),
+                vec!["daemon.query"],
+            ),
+            (
+                json!({"op": "query", "sql": "INSERT INTO scratch_q VALUES (1)"}),
+                vec!["daemon.query"],
+            ),
+            (
+                json!({"op": "query", "sql": "SELECT x FROM scratch_q"}),
+                vec![],
+            ),
+            (json!({"op": "snapshot"}), vec!["daemon.snapshot"]),
+            (json!({"op": "snapshot"}), vec![]),
+            (
+                json!({"op": "enrich", "pass": "lsp"}),
+                vec!["daemon.enrich"],
+            ),
+            // A refused proposal writes nothing.
+            (
+                json!({"op": "propose", "writes": [
+                    {"path": "c.go", "base": crate::source_write::BASE_ABSENT, "content": PROPOSE_B},
+                ]}),
+                vec![],
+            ),
+            (
+                json!({"op": "propose", "writes": [
+                    {"path": "c.go", "base": crate::source_write::BASE_ABSENT,
+                     "kind": "create", "content": PROPOSE_B},
+                ]}),
+                vec!["daemon.propose"],
+            ),
+        ];
+        // The hover answers from the read path; the lazy enrichment it
+        // queues (no `_lsp` rows for `a.go`) is its own write and its own
+        // event.
+        #[cfg(feature = "lsp")]
+        {
+            // Installed outside any op, so no event.
+            ctx.with_write(leyline_lsp::project::create_lsp_schema)
+                .unwrap();
+            steps.push((
+                json!({"op": "lsp_hover", "file": "a.go", "line": 0, "col": 0}),
+                vec!["daemon.enrich"],
+            ));
+        }
+        #[cfg(feature = "hdc")]
+        steps.extend([
+            // The first call installs the HDC tables; the second finds them.
+            (json!({"op": "hdc_calibrate"}), vec!["daemon.hdc_calibrate"]),
+            (json!({"op": "hdc_calibrate"}), vec![]),
+        ]);
+        #[cfg(feature = "sheaf")]
+        steps.extend([
+            // The first call installs the observation schema; the second
+            // only reads.
+            (
+                json!({"op": "agreement", "token": "A", "payload_kind": "k"}),
+                vec!["daemon.agreement"],
+            ),
+            (
+                json!({"op": "agreement", "token": "A", "payload_kind": "k"}),
+                vec![],
+            ),
+        ]);
+        // `load` replaces the arena. It is a socket op; MCP refuses it
+        // unadvertised (bead `ley-line-open-851a65`), so it changes nothing.
+        steps.push((
+            json!({"op": "load", "db": ""}),
+            match transport {
+                Transport::Socket => vec!["daemon.load"],
+                Transport::Mcp => vec![],
+            },
+        ));
+
+        for (req, expected) in steps {
+            let (topics, response) = events_of(&ctx, transport, req.clone()).await;
+            assert_eq!(
+                topics, expected,
+                "{transport:?} {req} emitted {topics:?}; response {response}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_socket_write_emits_exactly_one_event() {
+        assert_every_write_emits_once(Transport::Socket).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_mcp_write_emits_exactly_one_event() {
+        assert_every_write_emits_once(Transport::Mcp).await;
     }
 }

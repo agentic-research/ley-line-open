@@ -57,25 +57,27 @@
             "sheaf_set_topology",
             "sheaf_invalidate",
             "sheaf_defect",
-            "sheaf_stalks",
             "sheaf_status",
             "sheaf_learned_weights"
+          ]
+        },
+        {
+          "name": "sql",
+          "advertisedPrefix": "",
+          "upstreamNames": [
+            "query"
           ]
         },
         {
           "name": "query",
           "advertisedPrefix": "",
           "upstreamNames": [
-            "query",
             "list_children",
             "read_content",
             "read_source",
             "find_callers",
             "find_defs",
             "find_callees",
-            "get_refs_map",
-            "get_defs_map",
-            "get_schema",
             "get_db_path",
             "get_node",
             "inspect_symbol",

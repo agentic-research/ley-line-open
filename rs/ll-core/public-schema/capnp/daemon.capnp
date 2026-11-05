@@ -148,7 +148,7 @@ struct StatusResponse {
   #
   # THE ROOT ABSENCE RULE (bead `ley-line-open-80f037`), one rule for every
   # message on the daemon wire that carries `current_root`: the `status`,
-  # `reparse`, `snapshot`, `flush`, `enrich` and `load` responses, and the
+  # `reparse`, `snapshot`, `enrich` and `load` responses, and the
   # `daemon.sheaf.invalidate` event.
   #   * `root_published` is always present.
   #   * `current_root` is present exactly when `root_published` is `true`,
@@ -197,15 +197,9 @@ struct SnapshotResponse {
   rootPublished @3 :Bool  $Json.name("root_published");
 }
 
-struct FlushRequest {}
-
-struct FlushResponse {
-  ok          @0 :Bool;
-  currentRoot @1 :Text  $Json.name("current_root");
-  # The root absence rule on `StatusResponse.rootPublished` governs
-  # `currentRoot`. Additive (bead `ley-line-open-80f037`).
-  rootPublished @2 :Bool  $Json.name("root_published");
-}
+# `FlushRequest` / `FlushResponse` were removed with the `flush` op: it
+# read `current_root`, which `status` already returns, and changed
+# nothing (bead `ley-line-open-8523ee`).
 
 # `leyline_version` op response (bead ley-line-open-cb8960).
 #
@@ -536,41 +530,10 @@ struct FindCalleesResponse {
   callees @1 :List(Ref);
 }
 
-struct TokenMapEntry {
-  # One token → many node_ids. Used by both refs map and defs map bulk
-  # responses. source_id is intentionally omitted — bulk consumers want
-  # graph topology; per-token find_callers/find_defs still expose it.
-  token   @0 :Text;
-  nodeIds @1 :List(Text)  $Json.name("node_ids");
-}
-
-struct GetRefsMapRequest {}
-
-struct GetRefsMapResponse {
-  ok      @0 :Bool;
-  entries @1 :List(TokenMapEntry);
-}
-
-struct GetDefsMapRequest {}
-
-struct GetDefsMapResponse {
-  ok      @0 :Bool;
-  entries @1 :List(TokenMapEntry);
-}
-
-struct SchemaTier {
-  # One tier in LLO's layer-ownership topology (ll-core / ll-open / future
-  # extension-defined names). See docs/TABLE_CONTRACT.md "Layer Ownership".
-  name   @0 :Text;
-  crates @1 :List(Text);
-}
-
-struct GetSchemaRequest {}
-
-struct GetSchemaResponse {
-  ok    @0 :Bool;
-  tiers @1 :List(SchemaTier);
-}
+# The `get_refs_map`, `get_defs_map` and `get_schema` ops and their
+# structs (`TokenMapEntry`, `GetRefsMap*`, `GetDefsMap*`, `SchemaTier`,
+# `GetSchema*`) were removed with no caller in LLO, mache or
+# ley-line (bead `ley-line-open-8523ee`).
 
 struct GetDbPathRequest {}
 
@@ -754,11 +717,9 @@ struct SheafDefectResponse {
   total      @3 :UInt32;
 }
 
-struct SheafStalksResponse {
-  generation @0 :UInt64;
-  valid      @1 :UInt32;
-  total      @2 :UInt32;
-}
+# `SheafStalksResponse` was removed with the `sheaf_stalks` op: its
+# fields are a strict subset of `SheafStatusResponse` (bead
+# `ley-line-open-8523ee`).
 
 struct SheafStatusResponse {
   generation   @0 :UInt64;

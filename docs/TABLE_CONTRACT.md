@@ -183,7 +183,7 @@ columns exist. Its measured dependencies, as of `mache-93e84b`:
   a conformance test, so any column change here surfaces there as drift at
   whatever release mache re-pins to.
 - `current_root` on the daemon wire (the `status`, `reparse`, `snapshot`,
-  `flush`, `enrich` and `load` responses and the `daemon.sheaf.invalidate`
+  `enrich` and `load` responses and the `daemon.sheaf.invalidate`
   event) follows one absence rule: `root_published` is always present, and
   `current_root` is present exactly when it is `true`. When nothing is
   published the key is omitted; no zero or empty spelling stands in for it.

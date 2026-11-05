@@ -90,8 +90,7 @@ fn head_schema_describes_the_tree_root_the_code_computes() {
 
     // Tie the description to the code it describes.
     assert!(
-        src.contains("GitMode::Regular => 0,")
-            && src.contains("other => u64::from(other.git()),"),
+        src.contains("GitMode::Regular => 0,") && src.contains("other => u64::from(other.git()),"),
         "tree_root.rs's mode tag changed; update head.capnp's treeRoot description with it"
     );
     assert!(

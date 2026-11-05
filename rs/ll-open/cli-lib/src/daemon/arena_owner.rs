@@ -141,7 +141,7 @@ pub fn try_acquire(arena: &Path, source_root: &str) -> Result<OwnerGuard> {
     // Either absent, malformed, or the holder is dead. Take over.
     let sentinel = OwnerSentinel {
         pid: std::process::id(),
-        leyline_version: env!("CARGO_PKG_VERSION").to_string(),
+        leyline_version: super::version::BINARY_VERSION.to_string(),
         source_root: source_root.to_string(),
         started_at_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -210,7 +210,13 @@ mod tests {
         let sentinel = read_sentinel(&arena).unwrap().unwrap();
         assert_eq!(sentinel.pid, std::process::id());
         assert_eq!(sentinel.source_root, "/repos/foo");
-        assert_eq!(sentinel.leyline_version, env!("CARGO_PKG_VERSION"));
+        // The build's own version, so two owners of one release line built
+        // from different commits are told apart (bead
+        // `ley-line-open-5139a3`).
+        assert_eq!(
+            sentinel.leyline_version,
+            crate::daemon::version::BINARY_VERSION
+        );
 
         drop(guard);
         // Guard drop unlinks the sentinel.

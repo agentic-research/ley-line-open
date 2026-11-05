@@ -55,8 +55,10 @@ struct CompatibilityDoc {
     #[serde(rename = "$schema_version")]
     schema_version_doc: u32,
 
-    /// Daemon binary version. Equals `version::BINARY_VERSION` (which
-    /// equals `CARGO_PKG_VERSION` of `leyline-cli-lib` at build time).
+    /// Daemon release line. Equals `version::RELEASE_VERSION` (which
+    /// equals `CARGO_PKG_VERSION` of `leyline-cli-lib` at build time), not
+    /// the build's dev-suffixed `BINARY_VERSION`: this file is committed and
+    /// must not vary per commit (bead `ley-line-open-5139a3`).
     binary_version: &'static str,
 
     /// Independently released schema-client version this daemon targets;
@@ -89,7 +91,7 @@ struct CompatibilityDoc {
 fn main() -> anyhow::Result<()> {
     let doc = CompatibilityDoc {
         schema_version_doc: COMPAT_DOC_SCHEMA_VERSION,
-        binary_version: version::BINARY_VERSION,
+        binary_version: version::RELEASE_VERSION,
         schema_version: version::SCHEMA_VERSION,
         wire_format_major: version::WIRE_FORMAT_MAJOR,
         compat_min_schema_version: version::COMPAT_MIN_SCHEMA_VERSION,

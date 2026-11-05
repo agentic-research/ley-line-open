@@ -325,7 +325,9 @@ async fn main() -> Result<()> {
     let version: &'static str = Box::leak(
         format!(
             "{} ({})",
-            env!("CARGO_PKG_VERSION"),
+            // Bare `X.Y.Z` only on the tagged release build; every other
+            // build is `X.Y.Z-dev+<shortsha>[.dirty]` (ley-line-open-5139a3).
+            leyline_cli_lib::daemon::version::BINARY_VERSION,
             leyline_cli_lib::EDITION
         )
         .into_boxed_str(),

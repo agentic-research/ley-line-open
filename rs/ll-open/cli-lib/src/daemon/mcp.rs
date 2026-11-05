@@ -978,7 +978,7 @@ async fn handle_post(State(ctx): State<Arc<DaemonContext>>, body: String) -> Res
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "leyline", "version": env!("CARGO_PKG_VERSION")}
+                "serverInfo": {"name": "leyline", "version": super::version::BINARY_VERSION}
             }),
         ),
         leyline_mcp_protocol_schema::METHOD_TOOLS_LIST => handle_tools_list(id),
@@ -1087,6 +1087,26 @@ fn type_of(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bead `ley-line-open-5139a3`: MCP `initialize` names the build's own
+    /// version, the one `leyline --version` prints.
+    #[tokio::test]
+    async fn initialize_reports_the_builds_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).to_string();
+        let response = handle_post(State(ctx), body).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            reply["result"]["serverInfo"]["version"],
+            super::super::version::BINARY_VERSION,
+            "{reply}"
+        );
+        assert_eq!(reply["result"]["serverInfo"]["name"], "leyline", "{reply}");
+    }
 
     #[test]
     fn jsonrpc_response_serialize_skips_none_fields() {

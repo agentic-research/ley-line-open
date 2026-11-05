@@ -373,9 +373,12 @@ fn print_json(results: &[ShapeResult]) {
     println!("{{");
     println!("  \"captured_at\": \"{}\",", today_iso());
     println!("  \"hardware\": \"{}\",", hardware_string());
-    // Read from the workspace Cargo.toml at compile time — same
-    // technique cmd_daemon uses for the version wire.
-    println!("  \"leyline_version\": \"{}\",", env!("CARGO_PKG_VERSION"));
+    // The build's version, as the daemon reports it (dev builds carry
+    // `-dev+<shortsha>`, bead ley-line-open-5139a3).
+    println!(
+        "  \"leyline_version\": \"{}\",",
+        leyline_cli_lib::daemon::version::BINARY_VERSION
+    );
     println!("  \"read_path\": \"row-projected (_ast)\",");
     println!("  \"measurements\": {{");
     let last_idx = results.len().saturating_sub(1);

@@ -48,6 +48,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    env:
+      # The pushed tag (`vX.Y.Z`). leyline-cli-lib's build script reports the
+      # bare crate version only when this names it, and fails the build when
+      # it names another version; every build without it reports
+      # `X.Y.Z-dev+<shortsha>` (bead ley-line-open-5139a3).
+      LEYLINE_RELEASE_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -171,6 +177,8 @@ jobs:
         if: matrix.target != 'x86_64-apple-darwin'
         env:
           BUILD_TARGET: ${{ matrix.target }}
+          # The tagged build must print exactly the bare version.
+          EXPECT_VERSION: ${{ github.ref_name }}
         run: task cli-lib:smoke:bin BIN="rs/target/$BUILD_TARGET/release/leyline"
 
       # ---- FFI staticlib (consumed by mache's release build) ----
@@ -345,6 +353,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # Same rule as the build job: the image's binary is the tagged
+      # release, so it reports the bare version (bead ley-line-open-5139a3).
+      LEYLINE_RELEASE_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:

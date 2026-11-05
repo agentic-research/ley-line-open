@@ -221,7 +221,11 @@ struct FlushResponse {
 struct LeylineVersionResponse {
   ok               @0 :Bool;
 
-  # CARGO_PKG_VERSION of the daemon binary. e.g. "0.4.4".
+  # The daemon build's version, as `leyline --version` prints it: the bare
+  # crate version (e.g. "0.24.0") on a tagged release build only, and
+  # "X.Y.Z-dev+<shortsha>[.dirty]" on every other build, so an unreleased
+  # build is never taken for the release (bead `ley-line-open-5139a3`).
+  # `compatibility.json`'s `binary_version` is the bare release line.
   binaryVersion    @1 :Text   $Json.name("binary_version");
 
   # Schema-client version this daemon ships against. Tracks the

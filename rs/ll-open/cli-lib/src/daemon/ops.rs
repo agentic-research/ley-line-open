@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use leyline_core::Controller;
+use leyline_schema::Nid;
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -325,7 +326,7 @@ const NID_FOR_FILE: &str = "nid BETWEEN ?1 AND ?2";
 /// The nid range of `file` (a rel path), or `None` when the arena has never
 /// interned it — in which case it owns no rows and per-file queries answer
 /// empty.
-fn file_range_params(conn: &Connection, file: &str) -> Result<Option<(i64, i64)>> {
+fn file_range_params(conn: &Connection, file: &str) -> Result<Option<(Nid, Nid)>> {
     // A lookup that cannot run is an error, not "the file owns no rows" —
     // folding it into `None` made a broken connection indistinguishable from
     // an unknown file (bead `ley-line-open-af4539`).
@@ -395,7 +396,7 @@ fn lsp_5col_position_rows(
 
 fn lsp_5col_position_rows_by_nid(
     conn: &Connection,
-    nid: i64,
+    nid: Nid,
     table: &str,
     col_prefix: &str,
 ) -> Result<Vec<serde_json::Value>> {
@@ -1413,7 +1414,7 @@ fn query_token_refs(conn: &Connection, token: &str, table: &str) -> Result<Vec<W
     // token-map export can amortize.
     let sql = format!("SELECT nid FROM {table} WHERE token = ?1");
     let mut stmt = conn.prepare_cached(&sql)?;
-    let nids: Vec<i64> = stmt
+    let nids: Vec<Nid> = stmt
         .query_map([token], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     nids.into_iter().map(|nid| wire_ref_of(conn, nid)).collect()
@@ -1425,7 +1426,7 @@ fn query_token_refs(conn: &Connection, token: &str, table: &str) -> Result<Vec<W
 /// (TABLE_CONTRACT; ADR-0034 D6) and never goes on the wire, so the row is
 /// refused rather than rendered as that nid (bead `ley-line-open-80f037`
 /// F3). The refusal does not quote the nid either.
-fn unpathed_node_id(nid: i64, source_id: Option<&str>) -> Result<String> {
+fn unpathed_node_id(nid: Nid, source_id: Option<&str>) -> Result<String> {
     match source_id {
         Some(sid) => Ok(format!(
             "{sid}#inj@{}",
@@ -1439,7 +1440,7 @@ fn unpathed_node_id(nid: i64, source_id: Option<&str>) -> Result<String> {
 }
 
 /// The `_source.id` of the file that owns `nid`, if it has one.
-fn source_id_of(conn: &Connection, nid: i64) -> Result<Option<String>> {
+fn source_id_of(conn: &Connection, nid: Nid) -> Result<Option<String>> {
     leyline_schema::nid_file_id(nid)
         .map(|fid| {
             query_row_opt(
@@ -1454,7 +1455,7 @@ fn source_id_of(conn: &Connection, nid: i64) -> Result<Option<String>> {
 }
 
 /// The display `node_id` of `nid`: its tree path, else [`unpathed_node_id`].
-fn node_id_of(conn: &Connection, nid: i64) -> Result<String> {
+fn node_id_of(conn: &Connection, nid: Nid) -> Result<String> {
     match leyline_schema::node_path(conn, nid)? {
         Some(path) => Ok(path),
         None => unpathed_node_id(nid, source_id_of(conn, nid)?.as_deref()),
@@ -1464,7 +1465,7 @@ fn node_id_of(conn: &Connection, nid: i64) -> Result<String> {
 /// Render one nid to the wire's `(node_id, source_id)` display pair. An
 /// injected-node nid (no `nodes` row) renders in the file-anchored injected
 /// form; a nid with no anchor at all is refused ([`unpathed_node_id`]).
-fn wire_ref_of(conn: &Connection, nid: i64) -> Result<WireRef> {
+fn wire_ref_of(conn: &Connection, nid: Nid) -> Result<WireRef> {
     // A real render failure (SQL error) PROPAGATES — silently degrading to
     // a fallback would produce well-formed wrong output with no error
     // signal (seam-audit F3).
@@ -1512,7 +1513,7 @@ fn op_find_callees(ctx: &DaemonContext, id: &str) -> Result<String> {
                     JOIN node_defs d ON r.token = d.token \
                     WHERE r.nid = ?1";
                 let mut stmt = conn.prepare_cached(sql)?;
-                let nids: Vec<i64> = stmt
+                let nids: Vec<Nid> = stmt
                     .query_map([nid], |row| row.get(0))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 nids.into_iter()
@@ -1632,7 +1633,7 @@ fn find_node_at_position(
     file: &str,
     line: u32,
     col: u32,
-) -> Result<Option<i64>> {
+) -> Result<Option<Nid>> {
     let Some((lo, hi)) = file_range_params(conn, file)? else {
         return Ok(None);
     };
@@ -1647,7 +1648,7 @@ fn find_node_at_position(
          ORDER BY (end_byte - start_byte) ASC, nid ASC \
          LIMIT 1",
         rusqlite::params![lo, hi, line, col],
-        |row| row.get::<_, i64>(0),
+        |row| row.get::<_, Nid>(0),
     )
 }
 
@@ -2108,6 +2109,10 @@ where
         if let Some(obj) = v.as_object_mut()
             && let Some(nid) = obj.remove("nid").and_then(|n| n.as_i64())
         {
+            // The mapper carried the row key as a bare integer only so it
+            // could ride in this `Value`; it re-enters the locator type here
+            // and leaves as a display path.
+            let nid = Nid::from_raw(nid);
             obj.insert("node_id".to_string(), json!(node_id_of(conn, nid)?));
         }
     }
@@ -2761,7 +2766,7 @@ fn query_definitions(conn: &Connection, token: &str) -> Result<Vec<DefRow>> {
         WHERE d.token = ?1";
     let mut stmt = conn.prepare_cached(sql)?;
     type RawDefRow = (
-        i64,
+        Nid,
         Option<String>,
         Option<i32>,
         Option<i32>,
@@ -2818,7 +2823,7 @@ fn query_callees(conn: &Connection, node_id: &str) -> Result<Vec<WireRef>> {
         JOIN node_defs d ON r.token = d.token \
         WHERE r.nid = ?1";
     let mut stmt = conn.prepare_cached(sql)?;
-    let nids: Vec<i64> = stmt
+    let nids: Vec<Nid> = stmt
         .query_map([nid], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     nids.into_iter().map(|n| wire_ref_of(conn, n)).collect()
@@ -3254,11 +3259,11 @@ fn op_search_symbols(
         let rows = stmt.query_map(rusqlite::params![&req.pattern, limit], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
+                row.get::<_, Nid>(1)?,
                 row.get::<_, Option<String>>(2)?.unwrap_or_default(),
             ))
         })?;
-        let rows: Vec<(String, i64, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows: Vec<(String, Nid, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
         // Buffer one NDJSON line per matched row. The kind filter
         // is applied row-side (cheaper than another SQL predicate
@@ -3809,7 +3814,7 @@ mod tests {
         rel: &str,
         kind: &str,
         span: (i64, i64, i64, i64, i64, i64),
-    ) -> i64 {
+    ) -> Nid {
         let fid = leyline_schema::ensure_file_id(conn, rel).unwrap();
         let dir = leyline_schema::ensure_dir_nodes(conn, rel, 0).unwrap();
         let base = leyline_schema::file_nid(fid, 0);
@@ -3881,7 +3886,7 @@ mod tests {
     /// Mint file `rel` with one AST child of raw kind `kind` (ordinal 1) in
     /// a projection-v5 arena, wiring `_source.file_id` (creating `_source`
     /// if absent) so wire rendering resolves. Returns `(base, child_nid)`.
-    fn mint_test_file(conn: &Connection, rel: &str, kind: &str) -> (i64, i64) {
+    fn mint_test_file(conn: &Connection, rel: &str, kind: &str) -> (Nid, Nid) {
         leyline_schema::create_schema(conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _source (
@@ -5749,7 +5754,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         leyline_schema::create_schema(&conn).unwrap();
         let root_name = leyline_schema::intern_name(&conn, "").unwrap();
-        leyline_schema::insert_node(&conn, -1, None, Some(root_name), None, 1, 0, 0, 0, "")
+        let root = leyline_schema::dir_nid(leyline_schema::DirId::ROOT);
+        leyline_schema::insert_node(&conn, root, None, Some(root_name), None, 1, 0, 0, 0, "")
             .unwrap();
         let mk = |name: &str, record: &str| {
             let name_id = leyline_schema::intern_name(&conn, name).unwrap();
@@ -5758,7 +5764,7 @@ mod tests {
                 [name_id],
             )
             .unwrap();
-            let dir_id: i64 = conn
+            let dir_id: leyline_schema::DirId = conn
                 .query_row(
                     "SELECT dir_id FROM dirs WHERE parent_dir_id = 1 AND name_id = ?1",
                     [name_id],
@@ -5767,8 +5773,8 @@ mod tests {
                 .unwrap();
             leyline_schema::insert_node(
                 &conn,
-                -dir_id,
-                Some(-1),
+                leyline_schema::dir_nid(dir_id),
+                Some(root),
                 Some(name_id),
                 None,
                 1,
@@ -5934,7 +5940,7 @@ mod tests {
     /// Open an in-memory conn with the interning tables plus a minimal
     /// `_lsp(nid, foo)` table, and two interned files. Returns the conn and
     /// the base nids of `src/lib.rs` / `src/other.rs`.
-    fn lsp_test_conn() -> (Connection, i64, i64) {
+    fn lsp_test_conn() -> (Connection, Nid, Nid) {
         let conn = Connection::open_in_memory().unwrap();
         leyline_schema::create_schema(&conn).unwrap();
         conn.execute_batch(
@@ -7867,7 +7873,7 @@ mod tests {
     /// strictly inside it at row 3, cols 4..14. Position (3, 8) lies in
     /// BOTH spans, so smallest-span-wins resolution must pick the
     /// identifier. Returns `(conn, outer_nid, inner_nid)`.
-    fn nested_ast_fixture() -> (Connection, i64, i64) {
+    fn nested_ast_fixture() -> (Connection, Nid, Nid) {
         let conn = Connection::open_in_memory().unwrap();
         leyline_ts::schema::create_ast_schema(&conn).unwrap();
         let outer = seed_node(
@@ -7909,7 +7915,7 @@ mod tests {
         // row, so no anchor. It is refused, NOT rendered as a `#inj@`
         // address with an empty source, and NOT as its arena-local decimal
         // nid (bead `ley-line-open-80f037` F3).
-        let orphan = leyline_schema::file_nid(4242, 7);
+        let orphan = leyline_schema::file_nid(leyline_schema::FileId::from_raw(4242), 7);
         assert!(wire_ref_of(&conn, orphan).is_err());
 
         // Control: a nid that DOES have a `nodes` row renders its path.
@@ -7927,7 +7933,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let (base, _child) = mint_test_file(&conn, "a.go", "x");
 
-        let orphan = leyline_schema::file_nid(4242, 7);
+        let orphan = leyline_schema::file_nid(leyline_schema::FileId::from_raw(4242), 7);
         let err = wire_ref_of(&conn, orphan)
             .map(|r| r.node_id)
             .expect_err("an unanchored nid has no wire address");
@@ -7974,7 +7980,7 @@ mod tests {
         // A v5 nid is `(file_id << 24) | ordinal`, so a real hit can never
         // be one of the degenerate small constants.
         assert!(
-            hit.unwrap() > leyline_schema::NID_ORDINAL_MASK,
+            hit.unwrap().get() > leyline_schema::NID_ORDINAL_MASK,
             "seeded nid must be a real file-scoped nid, got {hit:?}",
         );
 
@@ -8371,7 +8377,7 @@ mod tests {
     /// AST child) and `src/other.rs`, stamping the AST child with a
     /// distinctive `kind` / `size` / `record` so a node lookup has real
     /// content to hand back. Returns the AST child's nid.
-    fn seed_two_file_tree(ctx: &std::sync::Arc<DaemonContext>) -> i64 {
+    fn seed_two_file_tree(ctx: &std::sync::Arc<DaemonContext>) -> Nid {
         let live = ctx.live_db.writer.lock();
         let (_base, decl) = mint_test_file(&live, "src/lib.rs", "function_declaration");
         mint_test_file(&live, "src/other.rs", "type_declaration");

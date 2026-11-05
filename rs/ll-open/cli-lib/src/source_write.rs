@@ -982,7 +982,7 @@ mod tests {
         }
     }
 
-    fn file_id(conn: &Connection, rel: &str) -> i64 {
+    fn file_id(conn: &Connection, rel: &str) -> leyline_schema::FileId {
         conn.query_row("SELECT file_id FROM _source WHERE id = ?1", [rel], |r| {
             r.get(0)
         })
@@ -1000,7 +1000,13 @@ mod tests {
         refs: Vec<(String, i64, Option<Vec<u8>>)>,
     }
 
-    fn rows<T, F>(conn: &Connection, sql: &str, lo: i64, hi: i64, f: F) -> Vec<T>
+    fn rows<T, F>(
+        conn: &Connection,
+        sql: &str,
+        lo: leyline_schema::Nid,
+        hi: leyline_schema::Nid,
+        f: F,
+    ) -> Vec<T>
     where
         F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     {
@@ -1017,7 +1023,7 @@ mod tests {
     fn image(conn: &Connection, rel: &str) -> FileImage {
         let fid = file_id(conn, rel);
         let (lo, hi) = leyline_schema::file_nid_range(fid);
-        let mask = leyline_schema::file_nid(1, 0) - 1;
+        let mask = leyline_schema::NID_ORDINAL_MASK;
         let ast = rows(
             conn,
             "SELECT a.nid, k.raw_kind, a.start_byte, a.end_byte, a.start_row, a.start_col, \
@@ -1746,7 +1752,7 @@ mod tests {
     }
 
     /// Rows a file's `file_id` still owns anywhere in the projection.
-    fn rows_of_file_id(conn: &Connection, fid: i64) -> i64 {
+    fn rows_of_file_id(conn: &Connection, fid: leyline_schema::FileId) -> i64 {
         let (lo, hi) = leyline_schema::file_nid_range(fid);
         let count = |sql: &str| -> i64 { conn.query_row(sql, [lo, hi], |r| r.get(0)).unwrap() };
         count("SELECT count(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2")
@@ -1777,7 +1783,7 @@ mod tests {
         let cold = arena(&[("a.go", A), ("b.go", B), ("sub/c.go", C)]);
         assert_eq!(image(&a.conn, "sub/c.go"), image(&cold.conn, "sub/c.go"));
         assert_eq!(image(&a.conn, "a.go"), image(&cold.conn, "a.go"));
-        let ids: BTreeSet<i64> = ["a.go", "b.go", "sub/c.go"]
+        let ids: BTreeSet<leyline_schema::FileId> = ["a.go", "b.go", "sub/c.go"]
             .iter()
             .map(|p| file_id(&a.conn, p))
             .collect();

@@ -10,7 +10,11 @@
 //!
 //! ## Scope
 //!
-//! v0.1 exposes one FFI function: `leyline_hash_bytes`. SHA-256 is
+//! Two FFI functions, declared in `include/leyline_cas_ffi.h`:
+//! `leyline_hash_bytes` (σ_bytes, plain BLAKE3) and `leyline_derive_key`
+//! (BLAKE3 `derive_key(context, input)`, the keyed primitive under every
+//! keyed construction; bead `ley-line-open-12e252`, the prerequisite of
+//! run-id v2 in ADR-0047 D-i). Both delegate to `leyline-core`. SHA-256 is
 //! intentionally NOT here — Web Crypto / OpenSSL / etc. are
 //! hardware-accelerated everywhere this FFI runs; pulling SHA-256
 //! through wasm32 would be slower without buying any substrate

@@ -9,3 +9,8 @@ license = "Apache-2.0"
 [dependencies]
 rusqlite = { workspace = true, features = ["bundled", "serialize"] }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+# The locator compile-fail doc tests (`src/locator.rs`, bead
+# ley-line-open-12e252) show that no locator serializes onto a serde wire.
+serde_json = { workspace = true }

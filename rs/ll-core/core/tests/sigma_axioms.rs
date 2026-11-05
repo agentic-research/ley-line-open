@@ -255,6 +255,45 @@ fn det_known_answer_vectors() {
     }
 }
 
+/// The input of a `deriveKey` case: BLAKE3's test-vector pattern, byte `i`
+/// is `i mod 251`, for `inputLen` bytes.
+fn derive_key_input(case: &Value) -> Vec<u8> {
+    let len = case["inputLen"].as_u64().expect("inputLen") as usize;
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// (DET) for the keyed primitive: `substrate::derive_key`, the one
+/// `derive_key` entry point non-Rust consumers reach through
+/// `leyline-cas-ffi` (ADR-0047 D-i, the M3 prerequisite; bead
+/// `ley-line-open-12e252`), reproduces BLAKE3's own published vectors, and
+/// is not σ_bytes of the same input (the keyed mode's domain flags differ).
+#[test]
+fn derive_key_reproduces_blake3_test_vectors() {
+    let v = vectors();
+    for case in cases(&v, "deriveKey") {
+        let context = case["context"].as_str().expect("context");
+        let input = derive_key_input(case);
+        let key = leyline_core::substrate::derive_key(context, &input);
+        assert_eq!(
+            hex(key.as_bytes()),
+            case["key"].as_str().unwrap(),
+            "derive_key drifted for {}",
+            case["name"]
+        );
+        assert_eq!(
+            key,
+            derive_key(context, &input),
+            "agrees with the reference hasher"
+        );
+        assert_ne!(
+            key,
+            input.as_slice().hash(),
+            "derive_key is not σ_bytes for {}",
+            case["name"]
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Construction laws (ADR-0047 §1.2) — the slices core owns
 // ---------------------------------------------------------------------------

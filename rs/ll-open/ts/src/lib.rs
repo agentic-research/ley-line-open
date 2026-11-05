@@ -186,7 +186,9 @@ mod tests {
 
         // The root renders as "" and the derived display path round-trips.
         assert_eq!(
-            leyline_schema::node_path(&conn, -1).unwrap().unwrap(),
+            leyline_schema::node_path(&conn, leyline_schema::dir_nid(leyline_schema::DirId::ROOT))
+                .unwrap()
+                .unwrap(),
             "",
             "root dir must render as the empty path"
         );

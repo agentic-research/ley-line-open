@@ -102,7 +102,7 @@ fn source_hash(conn: &Connection, path: &str) -> Option<Hash> {
     bytes.map(|b| Hash::from_bytes(b.try_into().expect("a 32-byte content hash")))
 }
 
-fn file_id(conn: &Connection, path: &str) -> i64 {
+fn file_id(conn: &Connection, path: &str) -> leyline_schema::FileId {
     conn.query_row("SELECT file_id FROM _source WHERE id = ?1", [path], |r| {
         r.get(0)
     })
@@ -116,7 +116,7 @@ type AstRow = (i64, String, i64, i64, Option<Vec<u8>>);
 /// every nid (ADR-0040 F5): what a cold parse and a write must agree on.
 fn ast_rows(conn: &Connection, path: &str) -> Vec<AstRow> {
     let (lo, hi) = leyline_schema::file_nid_range(file_id(conn, path));
-    let mask = leyline_schema::file_nid(1, 0) - 1;
+    let mask = leyline_schema::NID_ORDINAL_MASK;
     let mut stmt = conn
         .prepare(
             "SELECT a.nid, k.raw_kind, a.start_byte, a.end_byte, a.node_hash \

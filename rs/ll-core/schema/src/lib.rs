@@ -41,6 +41,9 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
+mod locator;
+pub use locator::*;
+
 // ---------------------------------------------------------------------------
 // nid scheme
 // ---------------------------------------------------------------------------
@@ -68,34 +71,39 @@ pub const SQLITE_MAX_BOUND_PARAMS: usize = 32_766;
 /// The nid of `ordinal` within `file_id`'s range. `ordinal` 0 is the file's
 /// own node (the AST root).
 #[inline]
-pub fn file_nid(file_id: i64, ordinal: i64) -> i64 {
+pub fn file_nid(file_id: FileId, ordinal: i64) -> Nid {
+    let file_id = file_id.get();
     debug_assert!(file_id > 0, "file_id is 1-based (files.file_id rowid)");
     debug_assert!((0..=NID_ORDINAL_MASK).contains(&ordinal));
-    (file_id << NID_ORDINAL_BITS) | ordinal
+    Nid::from_raw((file_id << NID_ORDINAL_BITS) | ordinal)
 }
 
 /// The nid of a directory: dirs live in negative space.
 #[inline]
-pub fn dir_nid(dir_id: i64) -> i64 {
+pub fn dir_nid(dir_id: DirId) -> Nid {
+    let dir_id = dir_id.get();
     debug_assert!(dir_id > 0, "dir_id is 1-based (dirs.dir_id rowid)");
-    -dir_id
+    Nid::from_raw(-dir_id)
 }
 
 /// Inverse of [`dir_nid`]: `Some(dir_id)` when `nid` names a directory.
 #[inline]
-pub fn nid_dir_id(nid: i64) -> Option<i64> {
-    (nid < 0).then_some(-nid)
+pub fn nid_dir_id(nid: Nid) -> Option<DirId> {
+    let nid = nid.get();
+    (nid < 0).then_some(DirId::from_raw(-nid))
 }
 
 /// The `file_id` a non-negative nid belongs to (`None` for dir nids).
 #[inline]
-pub fn nid_file_id(nid: i64) -> Option<i64> {
-    (nid >= 0).then_some(nid >> NID_ORDINAL_BITS)
+pub fn nid_file_id(nid: Nid) -> Option<FileId> {
+    let nid = nid.get();
+    (nid >= 0).then_some(FileId::from_raw(nid >> NID_ORDINAL_BITS))
 }
 
 /// The within-file ordinal of a non-negative nid (`None` for dir nids).
 #[inline]
-pub fn nid_ordinal(nid: i64) -> Option<i64> {
+pub fn nid_ordinal(nid: Nid) -> Option<i64> {
+    let nid = nid.get();
     (nid >= 0).then_some(nid & NID_ORDINAL_MASK)
 }
 
@@ -106,9 +114,9 @@ pub fn nid_ordinal(nid: i64) -> Option<i64> {
 /// `case_sensitive_like`, non-literal prefix) and its unanchored-`%`
 /// over-match hazard.
 #[inline]
-pub fn file_nid_range(file_id: i64) -> (i64, i64) {
-    let lo = file_id << NID_ORDINAL_BITS;
-    (lo, lo | NID_ORDINAL_MASK)
+pub fn file_nid_range(file_id: FileId) -> (Nid, Nid) {
+    let lo = file_id.get() << NID_ORDINAL_BITS;
+    (Nid::from_raw(lo), Nid::from_raw(lo | NID_ORDINAL_MASK))
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +337,7 @@ fn ensure_root_dir(conn: &Connection) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Intern a path component (dir or file name). Returns its stable `name_id`.
-pub fn intern_name(conn: &Connection, text: &str) -> Result<i64> {
+pub fn intern_name(conn: &Connection, text: &str) -> Result<NameId> {
     conn.execute("INSERT OR IGNORE INTO names (text) VALUES (?1)", [text])?;
     conn.query_row("SELECT name_id FROM names WHERE text = ?1", [text], |r| {
         r.get(0)
@@ -339,7 +347,7 @@ pub fn intern_name(conn: &Connection, text: &str) -> Result<i64> {
 
 /// Intern a tree-sitter kind under its language. Returns its stable
 /// `kind_id`.
-pub fn intern_kind(conn: &Connection, lang: &str, raw_kind: &str) -> Result<i64> {
+pub fn intern_kind(conn: &Connection, lang: &str, raw_kind: &str) -> Result<KindId> {
     conn.execute(
         "INSERT OR IGNORE INTO kinds (lang, raw_kind) VALUES (?1, ?2)",
         params![lang, raw_kind],
@@ -355,8 +363,8 @@ pub fn intern_kind(conn: &Connection, lang: &str, raw_kind: &str) -> Result<i64>
 /// Intern the directory chain of `dir_path` (e.g. `"a/b/c"`; `""` is the
 /// root) and return the leaf `dir_id`. Creates missing links; existing
 /// links keep their ids.
-pub fn intern_dir_chain(conn: &Connection, dir_path: &str) -> Result<i64> {
-    let mut cur: i64 = 1; // root
+pub fn intern_dir_chain(conn: &Connection, dir_path: &str) -> Result<DirId> {
+    let mut cur = DirId::ROOT;
     if dir_path.is_empty() {
         return Ok(cur);
     }
@@ -380,7 +388,7 @@ pub fn intern_dir_chain(conn: &Connection, dir_path: &str) -> Result<i64> {
 /// Look up or create the `file_id` for `rel_path` (a `/`-separated path
 /// relative to the tree root). Append-only: a path parses to the same
 /// `file_id` for the life of the arena, and ids are never reused.
-pub fn ensure_file_id(conn: &Connection, rel_path: &str) -> Result<i64> {
+pub fn ensure_file_id(conn: &Connection, rel_path: &str) -> Result<FileId> {
     let (dir_path, file_name) = match rel_path.rsplit_once('/') {
         Some((d, f)) => (d, f),
         None => ("", rel_path),
@@ -403,15 +411,15 @@ pub fn ensure_file_id(conn: &Connection, rel_path: &str) -> Result<i64> {
 /// presentation row exists in `nodes` for the root and every link (negative
 /// nids, `INSERT OR IGNORE` so an existing dir row keeps its mtime).
 /// Returns the leaf `dir_id` — the file node's parent is `dir_nid` of it.
-pub fn ensure_dir_nodes(conn: &Connection, file_rel_path: &str, mtime: i64) -> Result<i64> {
+pub fn ensure_dir_nodes(conn: &Connection, file_rel_path: &str, mtime: i64) -> Result<DirId> {
     let dir_path = file_rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let root_name = intern_name(conn, "")?;
     conn.execute(
         "INSERT OR IGNORE INTO nodes (nid, parent_nid, name_id, kind, ord, mtime, record) \
          VALUES (?1, NULL, ?2, 1, 0, ?3, '')",
-        params![dir_nid(1), root_name, mtime],
+        params![dir_nid(DirId::ROOT), root_name, mtime],
     )?;
-    let mut cur: i64 = 1;
+    let mut cur = DirId::ROOT;
     if dir_path.is_empty() {
         return Ok(cur);
     }
@@ -421,7 +429,7 @@ pub fn ensure_dir_nodes(conn: &Connection, file_rel_path: &str, mtime: i64) -> R
             "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
             params![cur, name_id],
         )?;
-        let next: i64 = conn
+        let next: DirId = conn
             .query_row(
                 "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
                 params![cur, name_id],
@@ -439,15 +447,15 @@ pub fn ensure_dir_nodes(conn: &Connection, file_rel_path: &str, mtime: i64) -> R
 }
 
 /// The `file_id` of `rel_path`, if the arena has ever parsed it.
-pub fn lookup_file_id(conn: &Connection, rel_path: &str) -> Result<Option<i64>> {
+pub fn lookup_file_id(conn: &Connection, rel_path: &str) -> Result<Option<FileId>> {
     let (dir_path, file_name) = match rel_path.rsplit_once('/') {
         Some((d, f)) => (d, f),
         None => ("", rel_path),
     };
-    let mut cur: i64 = 1;
+    let mut cur = DirId::ROOT;
     if !dir_path.is_empty() {
         for comp in dir_path.split('/') {
-            let next: Option<i64> = conn
+            let next: Option<DirId> = conn
                 .query_row(
                     "SELECT d.dir_id FROM dirs d JOIN names n ON n.name_id = d.name_id \
                      WHERE d.parent_dir_id = ?1 AND n.text = ?2",
@@ -483,10 +491,10 @@ pub fn lookup_file_id(conn: &Connection, rel_path: &str) -> Result<Option<i64>> 
 #[allow(clippy::too_many_arguments)]
 pub fn insert_node(
     conn: &Connection,
-    nid: i64,
-    parent_nid: Option<i64>,
-    name_id: Option<i64>,
-    kind_id: Option<i64>,
+    nid: Nid,
+    parent_nid: Option<Nid>,
+    name_id: Option<NameId>,
+    kind_id: Option<KindId>,
     kind: i32,
     ord: i64,
     size: i64,
@@ -509,8 +517,8 @@ pub fn insert_node(
 /// `{raw_kind}[_{k}]` for AST rows (`needs_suffix` parity with the pre-v5
 /// writer: suffixed iff the parent has >1 child of this kind; `k` is the
 /// rank among same-kind siblings ordered by `ord`, 0-based).
-fn node_display_name(conn: &Connection, nid: i64) -> Result<Option<String>> {
-    type NodeNameRow = (Option<i64>, Option<i64>, Option<i64>, i64);
+fn node_display_name(conn: &Connection, nid: Nid) -> Result<Option<String>> {
+    type NodeNameRow = (Option<Nid>, Option<NameId>, Option<KindId>, i64);
     // Every statement here is prepared through the connection's statement
     // cache: a FUSE op resolves a path segment by segment and renders names
     // hop by hop, so an uncached prepare per call compiled 10-15 statements
@@ -561,7 +569,7 @@ fn node_display_name(conn: &Connection, nid: i64) -> Result<Option<String>> {
 /// (bead `ley-line-open-c6be90`).
 #[derive(Default)]
 pub struct PathRenderer {
-    paths: std::collections::HashMap<i64, Option<String>>,
+    paths: std::collections::HashMap<Nid, Option<String>>,
 }
 
 impl PathRenderer {
@@ -571,7 +579,7 @@ impl PathRenderer {
 
     /// The display path of `nid`, or `None` when `nid` (or an ancestor) has
     /// no `nodes` row. Memoised for every nid it visits.
-    pub fn path(&mut self, conn: &Connection, nid: i64) -> Result<Option<String>> {
+    pub fn path(&mut self, conn: &Connection, nid: Nid) -> Result<Option<String>> {
         if let Some(hit) = self.paths.get(&nid) {
             return Ok(hit.clone());
         }
@@ -579,9 +587,9 @@ impl PathRenderer {
             self.paths.insert(nid, None);
             return Ok(None);
         };
-        let parent: Option<i64> = conn
+        let parent: Option<Nid> = conn
             .prepare_cached("SELECT parent_nid FROM nodes WHERE nid = ?1")?
-            .query_row([nid], |r| r.get::<_, Option<i64>>(0))
+            .query_row([nid], |r| r.get::<_, Option<Nid>>(0))
             .optional()?
             .flatten();
         // Only the root directory has an empty name, and it has no parent,
@@ -601,7 +609,7 @@ impl PathRenderer {
 
 /// Render a nid's full display path (`""` for the root directory), walking
 /// `parent_nid` upward. Point-lookup counterpart of [`V_NODE_PATH_DDL`].
-pub fn node_path(conn: &Connection, nid: i64) -> Result<Option<String>> {
+pub fn node_path(conn: &Connection, nid: Nid) -> Result<Option<String>> {
     let mut segments: Vec<String> = Vec::new();
     let mut cursor = Some(nid);
     while let Some(cur) = cursor {
@@ -614,7 +622,7 @@ pub fn node_path(conn: &Connection, nid: i64) -> Result<Option<String>> {
         }
         cursor = conn
             .prepare_cached("SELECT parent_nid FROM nodes WHERE nid = ?1")?
-            .query_row([cur], |r| r.get::<_, Option<i64>>(0))
+            .query_row([cur], |r| r.get::<_, Option<Nid>>(0))
             .optional()?
             .flatten();
     }
@@ -629,20 +637,20 @@ pub fn node_path(conn: &Connection, nid: i64) -> Result<Option<String>> {
 /// segment the singleton form is tried first (a segment that IS a raw kind
 /// with exactly one such child); otherwise the trailing `_{k}` splits off as
 /// the same-kind rank. `""` resolves to the root directory's nid.
-pub fn resolve_path(conn: &Connection, path: &str) -> Result<Option<i64>> {
+pub fn resolve_path(conn: &Connection, path: &str) -> Result<Option<Nid>> {
     if path.is_empty() {
-        return Ok(Some(dir_nid(1)));
+        return Ok(Some(dir_nid(DirId::ROOT)));
     }
     // Longest filesystem prefix: descend dirs while components match; at
     // each level, a matching file switches the walk into nid space.
     let comps: Vec<&str> = path.split('/').collect();
-    let mut dir_id: i64 = 1;
+    let mut dir_id = DirId::ROOT;
     let mut i = 0;
-    let mut node: Option<i64> = None;
+    let mut node: Option<Nid> = None;
     while i < comps.len() {
         let comp = comps[i];
         // A file at the current level?
-        let file: Option<i64> = conn
+        let file: Option<FileId> = conn
             .prepare_cached(
                 "SELECT f.file_id FROM files f JOIN names n ON n.name_id = f.name_id \
                  WHERE f.dir_id = ?1 AND n.text = ?2",
@@ -655,7 +663,7 @@ pub fn resolve_path(conn: &Connection, path: &str) -> Result<Option<i64>> {
             break;
         }
         // A subdirectory?
-        let sub: Option<i64> = conn
+        let sub: Option<DirId> = conn
             .prepare_cached(
                 "SELECT d.dir_id FROM dirs d JOIN names n ON n.name_id = d.name_id \
                  WHERE d.parent_dir_id = ?1 AND n.text = ?2",
@@ -687,11 +695,11 @@ pub fn resolve_path(conn: &Connection, path: &str) -> Result<Option<i64>> {
 }
 
 /// Resolve one `{raw_kind}[_{k}]` segment under `parent_nid`.
-fn resolve_ast_segment(conn: &Connection, parent_nid: i64, segment: &str) -> Result<Option<i64>> {
+fn resolve_ast_segment(conn: &Connection, parent_nid: Nid, segment: &str) -> Result<Option<Nid>> {
     // Singleton form: the segment is a raw kind with EXACTLY one such child
     // (the writer only renders the bare kind in that case — a bare kind with
     // multiple children cannot be a rendered name, so it is not a match).
-    let singleton: Option<i64> = conn
+    let singleton: Option<Nid> = conn
         .prepare_cached(
             "SELECT CASE WHEN COUNT(*) = 1 THEN MIN(n.nid) END \
              FROM nodes n JOIN kinds k ON k.kind_id = n.kind_id \
@@ -846,7 +854,7 @@ pub fn delete_file_rows(conn: &Connection, rel_path: &str) -> Result<()> {
 /// subtree). The rel path the path-keyed tables need is read from
 /// `_source`, falling back to the tree; a file with neither owns no
 /// path-keyed rows.
-pub fn delete_file_rows_by_id(conn: &Connection, file_id: i64) -> Result<()> {
+pub fn delete_file_rows_by_id(conn: &Connection, file_id: FileId) -> Result<()> {
     let rel_path = match source_rel_path(conn, file_id)? {
         Some(p) => Some(p),
         None => node_path(conn, file_nid(file_id, 0))?,
@@ -856,7 +864,7 @@ pub fn delete_file_rows_by_id(conn: &Connection, file_id: i64) -> Result<()> {
 
 /// The rel path `_source` records for `file_id`, or `None` when the arena
 /// has no `_source` table (a `nodes`-only mount fixture) or no row.
-fn source_rel_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
+fn source_rel_path(conn: &Connection, file_id: FileId) -> Result<Option<String>> {
     if !table_exists(conn, "_source")? {
         return Ok(None);
     }
@@ -869,7 +877,11 @@ fn source_rel_path(conn: &Connection, file_id: i64) -> Result<Option<String>> {
         .optional()?)
 }
 
-fn delete_file_rows_keyed(conn: &Connection, file_id: Option<i64>, rel_path: &str) -> Result<()> {
+fn delete_file_rows_keyed(
+    conn: &Connection,
+    file_id: Option<FileId>,
+    rel_path: &str,
+) -> Result<()> {
     for t in present_file_keyed_tables(conn)? {
         match (t.key, file_id) {
             (FileKey::NidRange { .. }, Some(file_id)) => {
@@ -897,7 +909,7 @@ fn delete_file_rows_keyed(conn: &Connection, file_id: Option<i64>, rel_path: &st
 /// to the same ordinal in the new range; `file_id` and rel-path columns
 /// are rewritten. The file node's own `parent_nid`/`name_id` are the
 /// caller's (the mount knows the destination directory).
-pub fn move_file_rows(conn: &Connection, old_rel: &str, new_rel: &str) -> Result<i64> {
+pub fn move_file_rows(conn: &Connection, old_rel: &str, new_rel: &str) -> Result<FileId> {
     let old_file_id = lookup_file_id(conn, old_rel)?
         .with_context(|| format!("move of a file the arena never interned: {old_rel}"))?;
     let new_file_id = ensure_file_id(conn, new_rel)?;
@@ -937,7 +949,7 @@ pub fn move_file_rows(conn: &Connection, old_rel: &str, new_rel: &str) -> Result
 /// rel-path columns of every file beneath it to the path the tree now
 /// spells. Node rows need nothing: a file's nid range is its `file_id`,
 /// which a directory move does not change.
-pub fn refresh_source_paths_under_dir(conn: &Connection, dir_id: i64) -> Result<()> {
+pub fn refresh_source_paths_under_dir(conn: &Connection, dir_id: DirId) -> Result<()> {
     if !table_exists(conn, "_source")? {
         // A nodes-only arena (mount fixtures, pre-parse live dbs) has no
         // rel-path columns to keep in step.
@@ -950,7 +962,7 @@ pub fn refresh_source_paths_under_dir(conn: &Connection, dir_id: i64) -> Result<
              SELECT d.dir_id FROM dirs d JOIN sub s ON d.parent_dir_id = s.dir_id) \
          SELECT f.file_id FROM files f JOIN sub s ON f.dir_id = s.dir_id",
     )?;
-    let file_ids: Vec<i64> = stmt
+    let file_ids: Vec<FileId> = stmt
         .query_map([dir_id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let path_tables: Vec<&FileKeyedTable> = present_file_keyed_tables(conn)?
@@ -1075,7 +1087,7 @@ mod tests {
     /// A file-keyed fixture: `_ast` (nid-keyed) and `_imports` (path-keyed)
     /// rows for `a.go` and `b.go`, the two key shapes `FILE_KEYED_TABLES`
     /// knows.
-    fn file_keyed_fixture() -> (Connection, i64, i64) {
+    fn file_keyed_fixture() -> (Connection, FileId, FileId) {
         let conn = mem();
         conn.execute_batch(
             "CREATE TABLE _ast (nid INTEGER PRIMARY KEY);
@@ -1098,7 +1110,7 @@ mod tests {
         (conn, a, b)
     }
 
-    fn ast_rows_of(conn: &Connection, fid: i64) -> i64 {
+    fn ast_rows_of(conn: &Connection, fid: FileId) -> i64 {
         let (lo, hi) = file_nid_range(fid);
         conn.query_row(
             "SELECT count(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2",
@@ -1145,22 +1157,29 @@ mod tests {
 
     #[test]
     fn nid_scheme_round_trips_and_partitions() {
-        let nid = file_nid(3, 41);
-        assert_eq!(nid_file_id(nid), Some(3));
+        let (f3, f4) = (FileId::from_raw(3), FileId::from_raw(4));
+        let nid = file_nid(f3, 41);
+        assert_eq!(
+            nid.get(),
+            (3 << NID_ORDINAL_BITS) | 41,
+            "encoding unchanged"
+        );
+        assert_eq!(nid_file_id(nid), Some(f3));
         assert_eq!(nid_ordinal(nid), Some(41));
         assert_eq!(nid_dir_id(nid), None);
 
-        let d = dir_nid(7);
-        assert!(d < 0);
-        assert_eq!(nid_dir_id(d), Some(7));
+        let d = dir_nid(DirId::from_raw(7));
+        assert_eq!(d.get(), -7, "dirs live in negative space");
+        assert_eq!(nid_dir_id(d), Some(DirId::from_raw(7)));
         assert_eq!(nid_file_id(d), None);
+        assert_eq!(nid_ordinal(d), None);
 
         // The range of file f ends exactly one below file f+1's base —
         // an off-by-one here is the failure F4d's trap exists to catch.
-        let (lo, hi) = file_nid_range(3);
-        assert_eq!(lo, file_nid(3, 0));
-        assert_eq!(hi, file_nid(3, NID_ORDINAL_MASK));
-        assert_eq!(hi + 1, file_nid(4, 0));
+        let (lo, hi) = file_nid_range(f3);
+        assert_eq!(lo, file_nid(f3, 0));
+        assert_eq!(hi, file_nid(f3, NID_ORDINAL_MASK));
+        assert_eq!(hi.get() + 1, file_nid(f4, 0).get());
     }
 
     // ── schema + interning ─────────────────────────────────────────────
@@ -1201,7 +1220,7 @@ mod tests {
         let new_name = intern_name(&conn, "b.go").unwrap();
         conn.execute(
             "UPDATE files SET name_id = ?1 WHERE file_id = ?2",
-            [new_name, fid],
+            params![new_name, fid],
         )
         .unwrap();
         assert_eq!(ensure_file_id(&conn, "src/b.go").unwrap(), fid);
@@ -1283,7 +1302,7 @@ mod tests {
     ///     identifier              ord 0        nid  base+2   (two identifiers → _0)
     ///     identifier              ord 1        nid  base+3   (→ _1)
     /// ```
-    fn display_fixture() -> (Connection, i64) {
+    fn display_fixture() -> (Connection, Nid) {
         let conn = mem();
         let file_id = ensure_file_id(&conn, "src/a.go").unwrap();
         let base = file_nid(file_id, 0);
@@ -1297,7 +1316,7 @@ mod tests {
         let root_name = intern_name(&conn, "").unwrap();
         insert_node(
             &conn,
-            dir_nid(1),
+            dir_nid(DirId::ROOT),
             None,
             Some(root_name),
             None,
@@ -1311,7 +1330,7 @@ mod tests {
         insert_node(
             &conn,
             dir_nid(dir_src),
-            Some(dir_nid(1)),
+            Some(dir_nid(DirId::ROOT)),
             Some(n_src),
             None,
             1,
@@ -1379,7 +1398,7 @@ mod tests {
     #[test]
     fn node_path_renders_the_pre_v5_display_scheme() {
         let (conn, base) = display_fixture();
-        assert_eq!(node_path(&conn, dir_nid(1)).unwrap().unwrap(), "");
+        assert_eq!(node_path(&conn, dir_nid(DirId::ROOT)).unwrap().unwrap(), "");
         assert_eq!(node_path(&conn, base).unwrap().unwrap(), "src/a.go");
         assert_eq!(
             node_path(&conn, base + 1).unwrap().unwrap(),
@@ -1403,7 +1422,7 @@ mod tests {
     #[test]
     fn path_renderer_matches_node_path_for_every_row() {
         let (conn, _) = display_fixture();
-        let mut nids: Vec<i64> = {
+        let mut nids: Vec<Nid> = {
             let mut stmt = conn.prepare("SELECT nid FROM nodes").unwrap();
             stmt.query_map([], |r| r.get(0))
                 .unwrap()
@@ -1424,7 +1443,7 @@ mod tests {
                 );
             }
         }
-        let ghost = file_nid(1, 999_999);
+        let ghost = file_nid(FileId::from_raw(1), 999_999);
         assert_eq!(renderer.path(&conn, ghost).unwrap(), None);
         assert_eq!(
             renderer.path(&conn, nids[0]).unwrap(),
@@ -1462,7 +1481,7 @@ mod tests {
     #[test]
     fn resolve_path_inverts_node_path_for_every_row() {
         let (conn, _) = display_fixture();
-        let nids: Vec<i64> = {
+        let nids: Vec<Nid> = {
             let mut stmt = conn.prepare("SELECT nid FROM nodes").unwrap();
             let v = stmt
                 .query_map([], |r| r.get(0))
@@ -1499,7 +1518,7 @@ mod tests {
     fn v_node_path_matches_the_rust_renderer_for_every_row() {
         let (conn, _) = display_fixture();
         let mut stmt = conn.prepare("SELECT nid, path FROM v_node_path").unwrap();
-        let rows: Vec<(i64, String)> = stmt
+        let rows: Vec<(Nid, String)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
             .map(|r| r.unwrap())
@@ -1578,7 +1597,7 @@ mod tests {
         let root_name = intern_name(&conn, "").unwrap();
         insert_node(
             &conn,
-            dir_nid(1),
+            dir_nid(DirId::ROOT),
             None,
             Some(root_name),
             None,
@@ -1592,7 +1611,7 @@ mod tests {
         insert_node(
             &conn,
             dir_nid(dir_id),
-            Some(dir_nid(1)),
+            Some(dir_nid(DirId::ROOT)),
             Some(n_big),
             None,
             1,
@@ -1700,8 +1719,9 @@ mod tests {
     #[test]
     fn insert_node_upserts_in_place() {
         let conn = mem();
-        insert_node(&conn, 42, None, None, Some(1), 0, 0, 1, 100, "a").unwrap();
-        insert_node(&conn, 42, None, None, Some(1), 0, 0, 9, 200, "b").unwrap();
+        let (nid, kind) = (Nid::from_raw(42), Some(KindId::from_raw(1)));
+        insert_node(&conn, nid, None, None, kind, 0, 0, 1, 100, "a").unwrap();
+        insert_node(&conn, nid, None, None, kind, 0, 0, 9, 200, "b").unwrap();
         let (size, mtime, record): (i64, i64, String) = conn
             .query_row(
                 "SELECT size, mtime, record FROM nodes WHERE nid = 42",

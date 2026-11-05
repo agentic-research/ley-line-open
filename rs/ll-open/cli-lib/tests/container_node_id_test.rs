@@ -126,7 +126,7 @@ func f(x int) int {
         .expect("main.go must be interned");
     let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
     assert!(
-        (lo..=hi).contains(&nids[0]),
+        (lo.get()..=hi.get()).contains(&nids[0]),
         "container_nid {} must live in main.go's nid range [{lo}, {hi}]",
         nids[0],
     );

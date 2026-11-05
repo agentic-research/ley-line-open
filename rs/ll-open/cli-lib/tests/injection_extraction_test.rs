@@ -115,7 +115,7 @@ struct DefRow {
     token: String,
     /// The def site's nid. Injected rows have no `_ast`/`nodes` row, so
     /// this is the only handle on them.
-    nid: i64,
+    nid: leyline_schema::Nid,
     /// Rel path of the host file (`_source.id` via `nid >> 24`).
     file: String,
     /// Container rendered as its display path, `None` for a NULL container.
@@ -190,7 +190,7 @@ const LITERAL_NODE_PATH: &str = "app.go/function_declaration_0/block/statement_l
 
 /// The count of `_ast` rows in `file_id`'s range — the first ordinal an
 /// injected node can occupy.
-fn ast_count(conn: &Connection, file_id: i64) -> i64 {
+fn ast_count(conn: &Connection, file_id: leyline_schema::FileId) -> i64 {
     let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
     conn.query_row(
         "SELECT COUNT(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2",
@@ -254,8 +254,8 @@ fn inj_sql_create_table_def_lands_on_host_file() {
         .unwrap()
         .expect("app.go must be interned");
     assert_eq!(
-        users.nid >> 24,
-        file_id,
+        leyline_ts::schema::nid_file_id(users.nid),
+        Some(file_id),
         "injected def's nid must be in app.go's range"
     );
     assert!(

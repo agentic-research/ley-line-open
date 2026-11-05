@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use tree_sitter::{Language, Parser, TreeCursor};
 
 use crate::schema::{
-    create_ast_schema, ensure_dir_nodes, ensure_file_id, file_nid, insert_ast, insert_node,
+    Nid, create_ast_schema, ensure_dir_nodes, ensure_file_id, file_nid, insert_ast, insert_node,
     insert_source, intern_kind,
 };
 
@@ -112,8 +112,8 @@ pub fn project_ast(content: &[u8], language: Language, conn: &Connection) -> Res
 fn walk_children(
     content: &[u8],
     cursor: &mut TreeCursor,
-    base: i64,
-    parent_nid: i64,
+    base: Nid,
+    parent_nid: Nid,
     next_ordinal: &mut i64,
     mtime: i64,
     conn: &Connection,
@@ -144,7 +144,8 @@ fn walk_children(
             "file exceeds the 24-bit per-file ordinal space ({} nodes)",
             leyline_schema::NID_ORDINAL_MASK + 1
         );
-        let nid = base | ordinal;
+        // `base` is ordinal 0 of the file's range.
+        let nid = base + ordinal;
         let kind_id = intern_kind(conn, language_name, child.kind())?;
 
         let has_named_children = has_named_child(child);
@@ -661,7 +662,7 @@ mod tests {
         let file_id = crate::schema::lookup_file_id(&conn, "a.html")
             .unwrap()
             .expect("a.html must be interned");
-        assert_eq!(file_id, 1, "the first interned file takes file_id 1");
+        assert_eq!(file_id.get(), 1, "the first interned file takes file_id 1");
 
         let mut stmt = conn.prepare("SELECT nid FROM _ast ORDER BY nid").unwrap();
         let nids: Vec<i64> = stmt
@@ -690,7 +691,7 @@ mod tests {
         let b_file_id = crate::schema::lookup_file_id(&conn, "b.html")
             .unwrap()
             .expect("b.html must be interned");
-        assert_eq!(b_file_id, 2);
+        assert_eq!(b_file_id.get(), 2);
         let b_min: i64 = conn
             .query_row("SELECT MIN(nid) FROM _ast WHERE nid >= 33554432", [], |r| {
                 r.get(0)

@@ -17,9 +17,13 @@
 //! | R      | [`RootPointer`]                  | Atomic root pointer             |
 //! | S      | [`RootSigner`]                   | Signature scheme over roots     |
 //!
-//! The substrate axioms are documented per-item below. The follow-up
-//! "axiom → executable falsification" bead (formerly tracked as T1.3)
-//! is not yet filed in rsry — file before scheduling that work.
+//! The substrate axioms are documented per-item below. Their executable
+//! falsification (decade T1.3) is the Σ axiom suite of ADR-0047 §5, bead
+//! `ley-line-open-10d71a`: `tests/sigma_axioms.rs` in this crate and in
+//! `leyline-fs`, `leyline-cli-lib`, `leyline-cache` and `leyline-runtime`,
+//! plus `control.rs`'s `im_sigkill_mid_publish_never_exposes_torn_root`,
+//! over the known-answer vectors in
+//! `ll-core/schema-spec/sigma/v1/test-vectors/constructions.json`.
 //!
 //! Decade: `ley-line-open-9d30ac`
 

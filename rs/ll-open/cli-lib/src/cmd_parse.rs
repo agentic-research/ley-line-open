@@ -4270,6 +4270,51 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Σ (DET), ADR-0047 §5 `det_known_answer_vectors`, the `node_hash` slice
+    /// (bead `ley-line-open-10d71a`): the private leaf and internal folds
+    /// reproduce the `astNode` cases of
+    /// `schema-spec/sigma/v1/test-vectors/constructions.json`, and each
+    /// pinned address is σ of its pinned preimage. That last equality is
+    /// law (c)'s known violation (`73add7`): it is what M2's keyed
+    /// `merkle-ast-v3` construction changes, together with these vectors.
+    #[test]
+    fn det_known_answer_vectors() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ll-core/schema-spec/sigma/v1/test-vectors/constructions.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let cases = v["astNode"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        let unhex = |s: &serde_json::Value| hex::decode(s.as_str().unwrap()).unwrap();
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let address = match case["tag"].as_str().unwrap() {
+                "leaf" => hash_leaf(kind, case["token"].as_str().unwrap()),
+                "internal" => {
+                    let children: Vec<[u8; 32]> = case["children"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| unhex(c).try_into().unwrap())
+                        .collect();
+                    hash_internal(kind, &children)
+                }
+                other => panic!("unknown tag {other}"),
+            };
+            assert_eq!(
+                address.to_vec(),
+                unhex(&case["address"]),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                unhex(&case["preimageHex"]).as_slice().hash().as_bytes(),
+                &address,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
     #[test]
     fn collect_files_skips_known_bloat_dirs() {
         // Scale-problem pin. The skip-list keeps registry-repo walks

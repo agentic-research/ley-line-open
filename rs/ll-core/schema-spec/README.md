@@ -35,6 +35,10 @@ that any second implementation can conform to.
 - **`execution/v1/`** — execution intent, resolved grant, lifecycle, errors,
   receipts, and operation annotations. The same `execution.capnp` generates
   Rust wire types, JSON Schema, and self-contained MCP tool definitions.
+- **`sigma/v1/`** — known-answer vectors for every shipped Σ construction
+  (σ_bytes, the partition fold, the head digest, `parserId`, `treeRoot`,
+  `node_hash`, the restriction key), with pinned preimages, read by the Σ
+  axiom suite (ADR-0047 §5).
 
 ## Conformance vectors and `VECTORS.sha256`
 
@@ -45,6 +49,7 @@ These spec dirs pin their vector bundles with a `VECTORS.sha256` file:
 - `confinement/v1/VECTORS.sha256` — canonical `ConfinementManifest` vector
 - `leyline-net/v1/test-vectors/VECTORS.sha256` — 24 frame vectors + digests.json + fixtures.capnp
 - `execution/v1/VECTORS.sha256` — canonical intent/grant/receipt carrier vector
+- `sigma/v1/VECTORS.sha256` — the Σ construction known-answer vectors
 
 The crate's `verify_vectors_sha256` test walks every listed file and re-hashes
 every listed vector, asserting SHA-256 equality. Any drift between the

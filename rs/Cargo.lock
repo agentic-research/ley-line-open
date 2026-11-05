@@ -4617,6 +4617,7 @@ dependencies = [
  "leyline-perf-sample",
  "leyline-ts",
  "proptest",
+ "serde_json",
  "sha2 0.11.0",
  "tree-sitter",
 ]
@@ -4746,6 +4747,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -4785,6 +4787,7 @@ dependencies = [
  "log",
  "memmap2",
  "parking_lot",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",

@@ -420,6 +420,19 @@ impl Controller {
         self.snapshot().root
     }
 
+    /// The published root, or `None` when nothing has been published.
+    ///
+    /// [`Self::current_root`] spells "nothing published" as the zero
+    /// sentinel, which the control-block layout fixes (mache reads the same
+    /// 32 bytes). Code that needs to know whether a root exists asks this
+    /// instead of comparing against `[0u8; 32]` (bead
+    /// `ley-line-open-80f037` F3). Σ never produces the all-zero value for
+    /// real bytes (`substrate::Hash::ZERO`), so the mapping loses nothing.
+    pub fn published_root(&self) -> Option<[u8; 32]> {
+        let root = self.current_root();
+        (root != [0u8; 32]).then_some(root)
+    }
+
     /// **Test-only, unfenced root setter** (gated `#[cfg(test)]`).
     /// Production code uses [`Self::set_arena_with_root`], which
     /// writes under the Release-store of the sync counter so polling
@@ -1058,6 +1071,21 @@ mod tests {
             [0u8; 32],
             "fresh control file must have zero current_root (sentinel)",
         );
+    }
+
+    /// Bead `ley-line-open-80f037` F3: the zero sentinel reads as `None`, and
+    /// any published root reads as itself.
+    #[test]
+    fn published_root_is_none_until_a_root_is_published() {
+        let dir = tempdir().unwrap();
+        let mut ctrl = Controller::open_or_create(&dir.path().join("p.ctrl")).unwrap();
+        assert_eq!(ctrl.published_root(), None);
+        ctrl.set_arena_with_root("/tmp/a.arena", 4096, [0x5A; 32])
+            .unwrap();
+        assert_eq!(ctrl.published_root(), Some([0x5A; 32]));
+        ctrl.set_arena_with_root("/tmp/a.arena", 4096, [0u8; 32])
+            .unwrap();
+        assert_eq!(ctrl.published_root(), None, "a reset reads as unpublished");
     }
 
     #[test]

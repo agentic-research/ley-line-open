@@ -756,4 +756,71 @@ mod tests {
             );
         }
     }
+
+    /// The fold laws of the module header as for-all properties (bead
+    /// `ley-line-open-80f037` F10). The examples above pin chosen inputs;
+    /// these quantify over entry lists drawn from a small alphabet, so equal
+    /// addresses, equal framings and prefix-sharing lists occur often.
+    mod laws {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn entry() -> impl Strategy<Value = Entry> {
+            (0u8..3, 0u64..3, 0u64..3).prop_map(|(addr, a, b)| Entry {
+                addr: h(addr),
+                a,
+                b,
+            })
+        }
+
+        fn entries() -> impl Strategy<Value = Vec<Entry>> {
+            proptest::collection::vec(entry(), 0..6)
+        }
+
+        fn sorted(e: &[Entry]) -> Vec<(Hash, u64, u64)> {
+            let mut v: Vec<_> = e.iter().map(|x| (x.addr, x.a, x.b)).collect();
+            v.sort_unstable();
+            v
+        }
+
+        proptest! {
+            /// Injectivity of the ordered domain: two different entry lists
+            /// never share an address.
+            #[test]
+            fn ordered_entry_lists_are_injective(e in entries(), f in entries()) {
+                prop_assume!(e != f);
+                let s = spec(Domain::ByteStream);
+                prop_assert_ne!(s.address(&e), s.address(&f));
+            }
+
+            /// Set canonicality: in a set domain two entry lists share an
+            /// address exactly when they are the same multiset.
+            #[test]
+            fn set_addresses_are_equal_exactly_for_equal_multisets(
+                e in entries(),
+                f in entries(),
+            ) {
+                for domain in [Domain::ChunkSet, Domain::RowSet] {
+                    let s = spec(domain);
+                    prop_assert_eq!(
+                        s.address(&e) == s.address(&f),
+                        sorted(&e) == sorted(&f),
+                        "{:?}", domain
+                    );
+                }
+            }
+
+            /// A set domain erases enumeration order and nothing else.
+            #[test]
+            fn set_addresses_ignore_enumeration_order(
+                e in entries().prop_flat_map(|e| (Just(e.clone()), Just(e).prop_shuffle())),
+            ) {
+                let (e, shuffled) = e;
+                for domain in [Domain::ChunkSet, Domain::RowSet] {
+                    let s = spec(domain);
+                    prop_assert_eq!(s.address(&e), s.address(&shuffled), "{:?}", domain);
+                }
+            }
+        }
+    }
 }

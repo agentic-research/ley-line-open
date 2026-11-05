@@ -16,19 +16,34 @@ use leyline_core::{Hash, HeadClaim};
 use leyline_schema_capnp::head_capnp::head;
 use leyline_sign::root_signer::{HeadVerdict, VerifyingKey, verify_head};
 
+/// The head's ADR-0040 stamp: `(treeRoot, parserId)`.
+///
+/// `Ok(None)` when the head stamps neither (a head written before ADR-0040,
+/// or one whose fields were cleared). A head stamps both or neither, so one
+/// without the other is malformed and an error (bead `ley-line-open-80f037`
+/// F3), as is a hash field that is present but not 32 bytes.
+pub fn stamp_of(h: head::Reader<'_>) -> Result<Option<(Hash, Hash)>> {
+    let tree = crate::tree_root::hash_field(h.get_tree_root().ok().map(|x| x.get_bytes()))?;
+    let parser = crate::tree_root::hash_field(h.get_parser_id().ok().map(|x| x.get_bytes()))?;
+    match (tree, parser) {
+        (Some(tree), Some(parser)) => Ok(Some((tree, parser))),
+        (None, None) => Ok(None),
+        (Some(_), None) => bail!("head is half-stamped: it carries treeRoot but no parserId"),
+        (None, Some(_)) => bail!("head is half-stamped: it carries parserId but no treeRoot"),
+    }
+}
+
 /// Read the claim a signature over `h` would attest.
 ///
-/// `Ok(None)` when the head does not stamp `treeRoot` and `parserId` (a head
-/// written before ADR-0040, or one whose fields were cleared): such a head
-/// has no v2 claim. A malformed hash field — present but not 32 bytes, or a
-/// present all-zero `parentDigest` — is an error, never a default.
+/// `Ok(None)` when the head does not stamp `treeRoot` and `parserId` (see
+/// [`stamp_of`]): such a head has no v2 claim. A malformed hash field —
+/// present but not 32 bytes, or a present all-zero `parentDigest` — and a
+/// half-stamped head are errors, never a default.
 pub fn claim_of(h: head::Reader<'_>) -> Result<Option<HeadClaim>> {
     let root = required_hash(h.get_root_hash().map(|x| x.get_bytes()), "rootHash")?;
     let parent = required_hash(h.get_parent_hash().map(|x| x.get_bytes()), "parentHash")?;
     let parent_digest = optional_digest(h.get_parent_digest().ok().map(|x| x.get_bytes()))?;
-    let tree = crate::tree_root::hash_field(h.get_tree_root().ok().map(|x| x.get_bytes()))?;
-    let parser = crate::tree_root::hash_field(h.get_parser_id().ok().map(|x| x.get_bytes()))?;
-    let (Some(tree), Some(parser)) = (tree, parser) else {
+    let Some((tree, parser)) = stamp_of(h)? else {
         return Ok(None);
     };
     Ok(HeadClaim::new(
@@ -253,7 +268,10 @@ mod tests {
             digest_of(msg.get_root().unwrap()).unwrap(),
             Some(leyline_core::head_digest(&want(None).unwrap()))
         );
-        let bytes = build(|h| h.reborrow().init_tree_root().set_bytes(&[]));
+        let bytes = build(|h| {
+            h.reborrow().init_tree_root().set_bytes(&[]);
+            h.reborrow().init_parser_id().set_bytes(&[]);
+        });
         let msg = capnp::serialize::read_message(&mut &bytes[..], Default::default()).unwrap();
         assert_eq!(digest_of(msg.get_root().unwrap()).unwrap(), None);
     }
@@ -262,10 +280,32 @@ mod tests {
     /// then refuses any signature on them.
     #[test]
     fn an_unstamped_head_has_no_claim() {
-        let no_tree = build(|h| h.reborrow().init_tree_root().set_bytes(&[]));
-        assert_eq!(claim_from(&no_tree).unwrap(), None);
-        let zero_parser = build(|h| h.reborrow().init_parser_id().set_bytes(&[0u8; 32]));
-        assert_eq!(claim_from(&zero_parser).unwrap(), None);
+        let unset = build(|h| {
+            h.reborrow().init_tree_root().set_bytes(&[]);
+            h.reborrow().init_parser_id().set_bytes(&[]);
+        });
+        assert_eq!(claim_from(&unset).unwrap(), None);
+        let zero = build(|h| {
+            h.reborrow().init_tree_root().set_bytes(&[0u8; 32]);
+            h.reborrow().init_parser_id().set_bytes(&[0u8; 32]);
+        });
+        assert_eq!(claim_from(&zero).unwrap(), None);
+    }
+
+    /// Bead `ley-line-open-80f037` F3(d): a head stamps both `treeRoot` and
+    /// `parserId` or neither. One without the other is a malformed head, not
+    /// one written before ADR-0040.
+    #[test]
+    fn a_half_stamped_head_is_malformed() {
+        for half in [
+            build(|h| h.reborrow().init_tree_root().set_bytes(&[])),
+            build(|h| h.reborrow().init_parser_id().set_bytes(&[0u8; 32])),
+        ] {
+            let err = claim_from(&half)
+                .expect_err("half-stamped head")
+                .to_string();
+            assert!(err.contains("half-stamped"), "{err}");
+        }
     }
 
     /// A malformed hash is an error, not a silent ZERO.

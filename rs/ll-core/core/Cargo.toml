@@ -27,3 +27,5 @@ interrupt = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Fold-law properties over `PartitionSpec::address` (bead ley-line-open-80f037 F10).
+proptest = "1.8"

@@ -65,6 +65,12 @@ type StatusResponse struct {
 	// are relative to. Nil when the daemon runs without `--source`, which
 	// leaves a client no tree to propose into. Bead ley-line-open-246526.
 	SourceRoot *string `json:"source_root,omitempty"`
+	// RootPublished says whether the controller names a published arena
+	// root. While it is false, CurrentRoot is 64 zero hex digits, the
+	// control block's "nothing published" sentinel and never the BLAKE3 of
+	// an arena; test this field rather than that spelling. Bead
+	// ley-line-open-80f037.
+	RootPublished *bool `json:"root_published"`
 }
 
 // FlushResponse is the wire shape of the `flush` op response.

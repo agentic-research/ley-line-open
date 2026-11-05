@@ -82,6 +82,62 @@ impl Mode {
     }
 }
 
+/// Every git mode the store holds: a file's [`Mode`] or a directory. The
+/// `_tree.mode` integer is parsed into this once, at the read
+/// ([`entries`], [`entry`]); a value git does not store has no
+/// representation (bead `ley-line-open-80f037` F8).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum GitMode {
+    /// `0o100644`.
+    Regular,
+    /// `0o100755`.
+    Executable,
+    /// `0o120000`.
+    Symlink,
+    /// `0o040000`.
+    Directory,
+}
+
+impl GitMode {
+    /// The git mode as an integer.
+    pub fn git(self) -> u32 {
+        match self {
+            GitMode::Regular => Mode::Regular.git(),
+            GitMode::Executable => Mode::Executable.git(),
+            GitMode::Symlink => Mode::Symlink.git(),
+            GitMode::Directory => DIRECTORY_MODE,
+        }
+    }
+
+    /// Parse a git mode integer; `None` for anything git does not store.
+    pub fn from_git(mode: u32) -> Option<GitMode> {
+        if mode == DIRECTORY_MODE {
+            return Some(GitMode::Directory);
+        }
+        Mode::from_git(mode).map(GitMode::from)
+    }
+
+    /// The file mode; `None` for a directory.
+    pub fn file_mode(self) -> Option<Mode> {
+        match self {
+            GitMode::Regular => Some(Mode::Regular),
+            GitMode::Executable => Some(Mode::Executable),
+            GitMode::Symlink => Some(Mode::Symlink),
+            GitMode::Directory => None,
+        }
+    }
+}
+
+impl From<Mode> for GitMode {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Regular => GitMode::Regular,
+            Mode::Executable => GitMode::Executable,
+            Mode::Symlink => GitMode::Symlink,
+        }
+    }
+}
+
 /// What the store holds at a path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Entry {
@@ -91,11 +147,16 @@ pub enum Entry {
 
 impl Entry {
     /// The entry's git mode.
-    pub fn git_mode(self) -> u32 {
+    pub fn mode(self) -> GitMode {
         match self {
-            Entry::File { mode, .. } => mode.git(),
-            Entry::Dir => DIRECTORY_MODE,
+            Entry::File { mode, .. } => mode.into(),
+            Entry::Dir => GitMode::Directory,
         }
+    }
+
+    /// The entry's git mode as an integer.
+    pub fn git_mode(self) -> u32 {
+        self.mode().git()
     }
 
     /// The file's blob; `None` for a directory.
@@ -119,11 +180,11 @@ pub fn exists(conn: &Connection) -> bool {
 }
 
 fn decode(path: &str, mode: u32, blob: Option<Vec<u8>>) -> Result<Entry> {
-    if mode == DIRECTORY_MODE {
-        return Ok(Entry::Dir);
-    }
-    let Some(mode) = Mode::from_git(mode) else {
+    let Some(git) = GitMode::from_git(mode) else {
         bail!("_tree entry {path:?} has mode {mode:o}, which git does not store");
+    };
+    let Some(mode) = git.file_mode() else {
+        return Ok(Entry::Dir);
     };
     let Some(bytes) = blob else {
         bail!("_tree file entry {path:?} has no blob_hash");
@@ -363,7 +424,17 @@ mod tests {
         for m in [Mode::Regular, Mode::Executable, Mode::Symlink] {
             assert_eq!(Mode::from_octal(&m.octal()), Some(m));
             assert_eq!(Mode::from_git(m.git()), Some(m));
+            // Bead 80f037 F8: a file mode is a GitMode and back.
+            assert_eq!(GitMode::from(m).file_mode(), Some(m));
+            assert_eq!(GitMode::from(m).git(), m.git());
+            let file = Entry::File {
+                mode: m,
+                blob: Hash::ZERO,
+            };
+            assert_eq!(file.mode(), GitMode::from(m));
         }
+        assert_eq!(GitMode::Directory.file_mode(), None);
+        assert_eq!(Entry::Dir.mode(), GitMode::Directory);
         assert_eq!(
             Mode::from_octal("040000"),
             None,

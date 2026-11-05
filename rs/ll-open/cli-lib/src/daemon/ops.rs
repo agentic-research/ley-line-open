@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use leyline_core::Controller;
 use rusqlite::Connection;
 use serde_json::json;
@@ -480,6 +480,11 @@ fn promote_touched(ctx: &DaemonContext, ids: &[&str]) {
 /// controller path is broken. Wire-format key is `"current_root":
 /// "<hex>"` (paired with mache `mache-36d961` epic).
 ///
+/// Before the first publish this is the 64-zero sentinel, never the BLAKE3
+/// of an arena. `status` states which case holds in `root_published` (bead
+/// `ley-line-open-80f037` F3); see `StatusResponse.rootPublished` in
+/// `daemon.capnp`.
+///
 /// `pub(crate)` since sheaf gap 3 (bead `ley-line-open-3b3476`): the
 /// watcher-driven `daemon.sheaf.invalidate` emit in `cmd_daemon.rs`
 /// needs the current root as a cache-invalidation key on its payload.
@@ -537,16 +542,12 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     let mut entries: Vec<(&String, &super::PassStatus)> = state.enrichment.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    // T2.4 wire format: BLAKE3 of arena bytes as 64-char hex.
-    let current_root_hex = {
-        let root = ctrl.current_root();
-        let mut s = String::with_capacity(64);
-        use std::fmt::Write;
-        for b in &root {
-            let _ = write!(s, "{b:02x}");
-        }
-        s
-    };
+    // T2.4 wire format: BLAKE3 of arena bytes as 64-char hex. Read once, so
+    // `current_root` and `root_published` describe the same snapshot; the
+    // zero sentinel's spelling stays for consumers pinned to it (bead
+    // `ley-line-open-80f037` F3).
+    let published = ctrl.published_root();
+    let current_root_hex = hex::encode(published.unwrap_or([0u8; 32]));
 
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::status_response::Builder =
@@ -554,6 +555,7 @@ fn op_status(ctx: &DaemonContext) -> Result<String> {
     root.set_ok(true);
     root.set_phase(state.phase.as_str());
     root.set_current_root(&current_root_hex);
+    root.set_root_published(published.is_some());
     root.set_arena_path(ctrl.arena_path());
     root.set_arena_size(ctrl.arena_size());
     // Legacy `enrichment @6 :Text` field deliberately left unset —
@@ -1443,14 +1445,28 @@ fn query_token_refs(conn: &Connection, token: &str, table: &str) -> Result<Vec<W
     nids.into_iter().map(|nid| wire_ref_of(conn, nid)).collect()
 }
 
-/// Render one nid to the wire's `(node_id, source_id)` display pair. An
-/// injected-node nid (no `nodes` row) renders as its decimal value — it
-/// never had a resolvable tree address, only a fact-row key.
-fn wire_ref_of(conn: &Connection, nid: i64) -> Result<WireRef> {
-    // A real render failure (SQL error) PROPAGATES — silently degrading to
-    // a fallback would produce well-formed wrong output with no error
-    // signal (seam-audit F3).
-    let source_id = leyline_schema::nid_file_id(nid)
+/// The wire address of a node that has no tree path: the file-anchored
+/// injected form `{source_id}#inj@{ordinal}`. A node whose file has no
+/// `_source` row has no address a consumer can use. Its nid is arena-local
+/// (TABLE_CONTRACT; ADR-0034 D6) and never goes on the wire, so the row is
+/// refused rather than rendered as that nid (bead `ley-line-open-80f037`
+/// F3). The refusal does not quote the nid either.
+fn unpathed_node_id(nid: i64, source_id: Option<&str>) -> Result<String> {
+    match source_id {
+        Some(sid) => Ok(format!(
+            "{sid}#inj@{}",
+            leyline_schema::nid_ordinal(nid).unwrap_or_default()
+        )),
+        None => bail!(
+            "a fact row names a node with no display address (no tree path, and its \
+             file has no _source row); the arena-local nid is not emitted"
+        ),
+    }
+}
+
+/// The `_source.id` of the file that owns `nid`, if it has one.
+fn source_id_of(conn: &Connection, nid: i64) -> Result<Option<String>> {
+    leyline_schema::nid_file_id(nid)
         .map(|fid| {
             query_row_opt(
                 conn,
@@ -1459,27 +1475,40 @@ fn wire_ref_of(conn: &Connection, nid: i64) -> Result<WireRef> {
                 |r| r.get::<_, String>(0),
             )
         })
-        .transpose()?
-        .flatten()
-        .unwrap_or_default();
+        .transpose()
+        .map(Option::flatten)
+}
+
+/// The display `node_id` of `nid`: its tree path, else [`unpathed_node_id`].
+fn node_id_of(conn: &Connection, nid: i64) -> Result<String> {
+    match leyline_schema::node_path(conn, nid)? {
+        Some(path) => Ok(path),
+        None => unpathed_node_id(nid, source_id_of(conn, nid)?.as_deref()),
+    }
+}
+
+/// Render one nid to the wire's `(node_id, source_id)` display pair. An
+/// injected-node nid (no `nodes` row) renders in the file-anchored injected
+/// form; a nid with no anchor at all is refused ([`unpathed_node_id`]).
+fn wire_ref_of(conn: &Connection, nid: i64) -> Result<WireRef> {
+    // A real render failure (SQL error) PROPAGATES — silently degrading to
+    // a fallback would produce well-formed wrong output with no error
+    // signal (seam-audit F3).
+    let source_id = source_id_of(conn, nid)?;
     // The legitimate no-row case is an injected-subtree occurrence (its
     // ordinal lies past the host file's `_ast` count; it never had a
     // resolvable tree address). Render it as an EXPLICIT file-anchored
     // injected form — never a bare integer, which would share the display
     // namespace with a file literally named that digit string and be
-    // indistinguishable as injected (seam-audit COMMENT-2). Bare decimal
-    // survives only for a nid whose file was never interned at all.
+    // indistinguishable as injected (seam-audit COMMENT-2).
     let node_id = match leyline_schema::node_path(conn, nid)? {
         Some(path) => path,
-        None if !source_id.is_empty() => {
-            format!(
-                "{source_id}#inj@{}",
-                leyline_schema::nid_ordinal(nid).unwrap_or_default()
-            )
-        }
-        None => nid.to_string(),
+        None => unpathed_node_id(nid, source_id.as_deref())?,
     };
-    Ok(WireRef { node_id, source_id })
+    Ok(WireRef {
+        node_id,
+        source_id: source_id.unwrap_or_default(),
+    })
 }
 
 /// Find callees of a node — the definitions of every token the node references.
@@ -1589,13 +1618,7 @@ fn op_get_token_map(ctx: &DaemonContext, table: &str, op: TokenMapOp) -> Result<
                 },
                 None => None,
             };
-            Ok(match source_id {
-                Some(sid) => format!(
-                    "{sid}#inj@{}",
-                    leyline_schema::nid_ordinal(nid).unwrap_or_default()
-                ),
-                None => nid.to_string(),
-            })
+            unpathed_node_id(nid, source_id.as_deref())
         };
 
         // Group by token in a single linear pass — the ORDER BY token
@@ -2211,14 +2234,11 @@ fn lsp_hover_query(
         [nid],
         |row| row.get::<_, String>(0),
     )?;
-    // The response's node_id stays a display path (wire contract).
-    Ok(hover.map(|text| {
-        let path = leyline_schema::node_path(conn, nid)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| nid.to_string());
-        (text, path)
-    }))
+    // The response's node_id stays a display path (wire contract). A render
+    // failure propagates; the arena-local nid is never the fallback.
+    hover
+        .map(|text| Ok((text, node_id_of(conn, nid)?)))
+        .transpose()
 }
 
 /// Go-to-definition at a position. Auto-enriches if no data exists.
@@ -2313,14 +2333,15 @@ where
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // Wire contract: consumers address nodes by display path, and EVERY row
     // carries `node_id` (seam-audit F2 — v4 always had one; a strict decoder
-    // may reject its absence). An unrenderable nid falls back to its decimal
-    // form, matching `wire_ref_of`; a real render failure propagates.
+    // may reject its absence). The mapper's `nid` is the row's key inside
+    // the arena and is replaced by `node_id`, never emitted (bead
+    // `ley-line-open-80f037` F3). Rendering matches `wire_ref_of`; a render
+    // failure propagates.
     for v in &mut rows {
-        if let Some(nid) = v.get("nid").and_then(|n| n.as_i64()) {
-            let path = leyline_schema::node_path(conn, nid)?.unwrap_or_else(|| nid.to_string());
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("node_id".to_string(), json!(path));
-            }
+        if let Some(obj) = v.as_object_mut()
+            && let Some(nid) = obj.remove("nid").and_then(|n| n.as_i64())
+        {
+            obj.insert("node_id".to_string(), json!(node_id_of(conn, nid)?));
         }
     }
     Ok(rows)
@@ -5408,6 +5429,29 @@ mod tests {
         assert_eq!(parsed["current_root"], "0".repeat(64));
     }
 
+    /// Bead `ley-line-open-80f037` F3(b): whether a root has been published
+    /// is stated by `root_published`, not inferred from 64 zero hex digits.
+    /// `current_root` keeps its zero spelling for consumers pinned to it.
+    #[tokio::test]
+    async fn op_status_states_whether_a_root_is_published() {
+        let (_dir, ctx) = setup();
+        let status = |ctx: &std::sync::Arc<DaemonContext>| -> serde_json::Value {
+            serde_json::from_str(&handle_base_op_legacy(ctx, "status", &json!({})).unwrap())
+                .unwrap()
+        };
+        let fresh = status(&ctx);
+        assert_eq!(fresh["root_published"], false, "{fresh}");
+        assert_eq!(fresh["current_root"], "0".repeat(64), "{fresh}");
+
+        let mut ctrl = Controller::open_or_create(&ctx.ctrl_path).unwrap();
+        let (path, size) = (ctrl.arena_path(), ctrl.arena_size());
+        ctrl.set_arena_with_root(&path, size, [0xAB; 32]).unwrap();
+        drop(ctrl);
+        let published = status(&ctx);
+        assert_eq!(published["root_published"], true, "{published}");
+        assert_eq!(published["current_root"], "ab".repeat(32), "{published}");
+    }
+
     #[tokio::test]
     async fn op_reparse_errors_when_source_neither_field_nor_ctx() {
         // op_reparse pulls `source` from req or falls back to
@@ -5633,6 +5677,7 @@ mod tests {
             "ok",
             "phase",
             "current_root",
+            "root_published",
             "arena_path",
             "arena_size",
             "enrichment_typed",
@@ -6074,10 +6119,20 @@ mod tests {
     fn lsp_test_conn() -> (Connection, i64, i64) {
         let conn = Connection::open_in_memory().unwrap();
         leyline_schema::create_schema(&conn).unwrap();
-        conn.execute_batch("CREATE TABLE _lsp (nid INTEGER, foo TEXT);")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _lsp (nid INTEGER, foo TEXT);
+             CREATE TABLE _source (id TEXT PRIMARY KEY, language TEXT, file_id INTEGER UNIQUE);",
+        )
+        .unwrap();
         let lib = leyline_schema::ensure_file_id(&conn, "src/lib.rs").unwrap();
         let other = leyline_schema::ensure_file_id(&conn, "src/other.rs").unwrap();
+        // Each file owns a `_source` row, so its fact rows have a wire
+        // address even without `nodes` rows (bead `ley-line-open-80f037`).
+        conn.execute(
+            "INSERT INTO _source VALUES ('src/lib.rs', 'rust', ?1), ('src/other.rs', 'rust', ?2)",
+            [lib, other],
+        )
+        .unwrap();
         (
             conn,
             leyline_schema::file_nid(lib, 0),
@@ -8047,24 +8102,54 @@ mod tests {
         assert_eq!(owned.source_id, "a.go");
 
         // A nid in a file_id range that was never interned: no `_source`
-        // row, so no anchor — bare decimal.
+        // row, so no anchor. It is refused, NOT rendered as a `#inj@`
+        // address with an empty source, and NOT as its arena-local decimal
+        // nid (bead `ley-line-open-80f037` F3).
         let orphan = leyline_schema::file_nid(4242, 7);
-        let unowned = wire_ref_of(&conn, orphan).unwrap();
-        assert_eq!(
-            unowned.node_id,
-            orphan.to_string(),
-            "a nid whose file was never interned must render as its decimal \
-             value, NOT as a `#inj@` address with an empty source",
-        );
-        assert!(
-            unowned.source_id.is_empty(),
-            "no _source row ⟹ empty source_id, got {:?}",
-            unowned.source_id,
-        );
+        assert!(wire_ref_of(&conn, orphan).is_err());
 
         // Control: a nid that DOES have a `nodes` row renders its path.
         let real = wire_ref_of(&conn, base + 1).unwrap();
         assert_eq!(real.node_id, "a.go/x");
+    }
+
+    /// Bead `ley-line-open-80f037` F3(e): a nid is arena-local
+    /// (TABLE_CONTRACT; ADR-0034 D6) and never goes on the wire. A fact row
+    /// whose node has neither a tree path nor a `_source` anchor is refused
+    /// rather than rendered as its decimal nid, and LSP rows carry the
+    /// display `node_id` in place of the raw `nid`.
+    #[test]
+    fn an_arena_local_nid_never_reaches_the_wire() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (base, _child) = mint_test_file(&conn, "a.go", "x");
+
+        let orphan = leyline_schema::file_nid(4242, 7);
+        let err = wire_ref_of(&conn, orphan)
+            .map(|r| r.node_id)
+            .expect_err("an unanchored nid has no wire address");
+        assert!(format!("{err:#}").contains("no display address"), "{err:#}");
+
+        conn.execute_batch("CREATE TABLE _lsp (nid INTEGER, foo TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO _lsp VALUES (?1, 'tree'), (?2, 'injected')",
+            rusqlite::params![base + 1, base + 500],
+        )
+        .unwrap();
+        let sql = format!("SELECT nid, foo FROM _lsp WHERE {NID_FOR_FILE}");
+        let rows = query_lsp_rows_for_file(&conn, "a.go", "_lsp", &sql, |row| {
+            Ok(json!({"nid": row.get::<_, i64>(0)?, "foo": row.get::<_, String>(1)?}))
+        })
+        .unwrap();
+        let mut ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r["node_id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["a.go#inj@500", "a.go/x"], "{rows:?}");
+        for r in &rows {
+            assert!(r.get("nid").is_none(), "raw nid on the wire: {r}");
+        }
     }
 
     #[test]

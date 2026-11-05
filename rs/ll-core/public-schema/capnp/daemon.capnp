@@ -145,12 +145,24 @@ struct StatusResponse {
   sourceRoot        @11 :Text  $Json.name("source_root");
   # Whether the controller names a published arena root. `false` before the
   # daemon's first publish, and after `--reset-arena` until the next one.
-  # While it is `false`, `current_root` above is 64 zero hex digits: that
-  # spelling is the "nothing published" sentinel of the control-block
-  # layout, never the BLAKE3 of any arena, and consumers test this field
-  # instead of comparing against it. Every `current_root` on the daemon
-  # wire, including the sheaf invalidate event's, uses the same sentinel
-  # spelling. Additive (bead `ley-line-open-80f037` F3).
+  #
+  # THE ROOT ABSENCE RULE (bead `ley-line-open-80f037`), one rule for every
+  # message on the daemon wire that carries `current_root`: the `status`,
+  # `reparse`, `snapshot`, `flush`, `enrich` and `load` responses, and the
+  # `daemon.sheaf.invalidate` event.
+  #   * `root_published` is always present.
+  #   * `current_root` is present exactly when `root_published` is `true`,
+  #     and is then the BLAKE3 of the published arena image as 64 lowercase
+  #     hex digits (`Controller.current_root`).
+  #   * When nothing is published, `current_root` is OMITTED. No zero, empty
+  #     or placeholder spelling stands in for it; 64 zero hex digits never
+  #     appear on the wire.
+  #   * A controller read error is an error, never a root: a response fails
+  #     with the daemon's error envelope, and the sheaf event carries
+  #     `root_error` (text) in place of both `root_published` and
+  #     `current_root` (see the sheaf section below).
+  # `rootPublished @12` was additive in 80f037; omitting `current_root`
+  # instead of sending the zero sentinel is a breaking change of that bead.
   rootPublished     @12 :Bool  $Json.name("root_published");
 }
 
@@ -171,12 +183,18 @@ struct ReparseResponse {
   deleted      @6 :UInt64;
   errors       @7 :UInt64;
   changedFiles @8 :List(Text)  $Json.name("changed_files");
+  # The root absence rule on `StatusResponse.rootPublished` governs
+  # `currentRoot`. Additive (bead `ley-line-open-80f037`).
+  rootPublished @9 :Bool  $Json.name("root_published");
 }
 
 struct SnapshotResponse {
   ok          @0 :Bool;
   generation  @1 :UInt64;
   currentRoot @2 :Text  $Json.name("current_root");
+  # The root absence rule on `StatusResponse.rootPublished` governs
+  # `currentRoot`. Additive (bead `ley-line-open-80f037`).
+  rootPublished @3 :Bool  $Json.name("root_published");
 }
 
 struct FlushRequest {}
@@ -184,6 +202,9 @@ struct FlushRequest {}
 struct FlushResponse {
   ok          @0 :Bool;
   currentRoot @1 :Text  $Json.name("current_root");
+  # The root absence rule on `StatusResponse.rootPublished` governs
+  # `currentRoot`. Additive (bead `ley-line-open-80f037`).
+  rootPublished @2 :Bool  $Json.name("root_published");
 }
 
 # `leyline_version` op response (bead ley-line-open-cb8960).
@@ -248,6 +269,9 @@ struct EnrichResponse {
   generation  @1 :UInt64;
   passes      @2 :List(EnrichmentStats);
   currentRoot @3 :Text  $Json.name("current_root");
+  # The root absence rule on `StatusResponse.rootPublished` governs
+  # `currentRoot`. Additive (bead `ley-line-open-80f037`).
+  rootPublished @4 :Bool  $Json.name("root_published");
 }
 
 struct LoadRequest {
@@ -258,6 +282,9 @@ struct LoadResponse {
   ok          @0 :Bool;
   generation  @1 :UInt64;
   currentRoot @2 :Text  $Json.name("current_root");
+  # The root absence rule on `StatusResponse.rootPublished` governs
+  # `currentRoot`. Additive (bead `ley-line-open-80f037`).
+  rootPublished @3 :Bool  $Json.name("root_published");
 }
 
 struct QueryRequest {
@@ -671,6 +698,27 @@ struct SheafInvalidateResponse {
   # On the first ever invalidate, equals 0 (the cache's initial gen).
   priorGeneration @3 :UInt64  $Json.name("prior_generation");
 }
+
+# `daemon.sheaf.invalidate` event payload (the `data` of an `Event`). Emitted
+# by `sheaf_invalidate` (consumer-driven) and by the source watcher. JSON:
+#   invalidated       [UInt32]  region ids the cascade touched
+#   count             UInt32    length of `invalidated`
+#   scope             Text      "changed-only" | "all-known"
+#   changed_files     [Text]    file scope (empty when consumer-driven)
+#   root_published    Bool      see the root absence rule on
+#                               `StatusResponse.rootPublished`
+#   current_root      Text      present exactly when `root_published` is true
+#   root_error        Text      present only when the controller could not be
+#                               read; then `root_published` and `current_root`
+#                               are both absent. Watcher emits only: the
+#                               consumer-driven op reads the root before it
+#                               touches the cache and fails instead.
+#   generation        UInt64 as a JSON string
+#   prior_generation  UInt64 as a JSON string
+#   timestamp_ms      Int64 as a JSON string
+# A consumer reads exactly one of three states: a root (`root_published:
+# true` + `current_root`), no root (`root_published: false`), or an unknown
+# root (`root_error`). Bead `ley-line-open-80f037`.
 
 struct SheafDefectResponse {
   defect     @0 :Float64;

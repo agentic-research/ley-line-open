@@ -287,7 +287,9 @@ impl SheafState {
     ///   or `"all-known"` (evict everything; the payload is a snapshot)
     /// - `changed_files`: `&[String]` — file scope that drove the invalidation
     ///   (empty for consumer-driven; populated for watcher-driven)
-    /// - `current_root`: `String` — Σ root hex at emit time
+    /// - `root_published` / `current_root` / `root_error`: the Σ root at
+    ///   emit time under the daemon's root absence rule ([`EventRoot`],
+    ///   bead `ley-line-open-80f037`)
     /// - `generation` / `prior_generation`: `u64` as JSON strings (capnp_json
     ///   convention; JS Number safe-integer ceiling)
     /// - `timestamp_ms`: `i64` as JSON string
@@ -301,25 +303,93 @@ impl SheafState {
         invalidated: Vec<u32>,
         scope: &str,
         changed_files: &[String],
-        current_root: String,
+        root: &EventRoot,
         generation: u64,
         prior_generation: u64,
     ) {
-        let count = invalidated.len() as u32;
         self.emit(
             "daemon.sheaf.invalidate",
-            serde_json::json!({
-                "invalidated": invalidated,
-                "count": count,
-                "scope": scope,
-                "changed_files": changed_files,
-                "current_root": current_root,
-                "generation": generation.to_string(),
-                "prior_generation": prior_generation.to_string(),
-                "timestamp_ms": super::now_ms().to_string(),
-            }),
+            invalidate_payload(
+                invalidated,
+                scope,
+                changed_files,
+                root,
+                generation,
+                prior_generation,
+            ),
         );
     }
+}
+
+/// The Σ root a `daemon.sheaf.invalidate` event reports: the daemon's root
+/// absence rule (`StatusResponse.rootPublished` in `daemon.capnp`, bead
+/// `ley-line-open-80f037`) plus the one state a response never needs, a
+/// root that could not be read. An event has no caller to fail, so the
+/// read error rides on the wire as `root_error` instead of a guessed root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EventRoot {
+    /// A root is published: `root_published: true` and `current_root`.
+    Published(String),
+    /// Nothing is published: `root_published: false`, no `current_root`.
+    Unpublished,
+    /// The controller could not be read: `root_error` only.
+    Unreadable(String),
+}
+
+impl EventRoot {
+    /// The root as [`super::ops::read_root_hex`] reports it.
+    pub fn read(ctrl_path: &Path) -> Self {
+        match super::ops::read_root_hex(ctrl_path) {
+            Ok(root) => Self::from(root),
+            Err(e) => Self::Unreadable(format!("{e:#}")),
+        }
+    }
+
+    fn write_into(&self, payload: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            Self::Published(hex) => {
+                payload.insert("root_published".into(), true.into());
+                payload.insert("current_root".into(), hex.clone().into());
+            }
+            Self::Unpublished => {
+                payload.insert("root_published".into(), false.into());
+            }
+            Self::Unreadable(error) => {
+                payload.insert("root_error".into(), error.clone().into());
+            }
+        }
+    }
+}
+
+impl From<Option<String>> for EventRoot {
+    fn from(root: Option<String>) -> Self {
+        root.map_or(Self::Unpublished, Self::Published)
+    }
+}
+
+/// The `daemon.sheaf.invalidate` payload documented in `daemon.capnp`.
+fn invalidate_payload(
+    invalidated: Vec<u32>,
+    scope: &str,
+    changed_files: &[String],
+    root: &EventRoot,
+    generation: u64,
+    prior_generation: u64,
+) -> serde_json::Value {
+    let count = invalidated.len() as u32;
+    let mut payload = serde_json::Map::new();
+    payload.insert("invalidated".into(), invalidated.into());
+    payload.insert("count".into(), count.into());
+    payload.insert("scope".into(), scope.into());
+    payload.insert("changed_files".into(), changed_files.into());
+    root.write_into(&mut payload);
+    payload.insert("generation".into(), generation.to_string().into());
+    payload.insert(
+        "prior_generation".into(),
+        prior_generation.to_string().into(),
+    );
+    payload.insert("timestamp_ms".into(), super::now_ms().to_string().into());
+    serde_json::Value::Object(payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +633,11 @@ pub fn op_sheaf_invalidate(
     regions: &[u32],
     stalks: &[SheafStalkInput],
 ) -> Result<String> {
+    // The root the event reports, read before the cache is touched: a
+    // controller that cannot be read fails the op with nothing mutated and
+    // nothing emitted, rather than emitting a guessed root (bead
+    // `ley-line-open-80f037`).
+    let root = EventRoot::from(super::ops::read_root_hex(ctrl_path)?);
     let mut cache = state.cache.lock();
 
     for s in stalks {
@@ -600,16 +675,12 @@ pub fn op_sheaf_invalidate(
     // - `changed_files`: empty — this op isn't tied to filesystem
     //   changes; a consumer decided which regions to invalidate on
     //   its own reasoning.
-    // - `current_root`: whatever the substrate root is at emit time.
-    let current_root = super::ops::read_root_hex(ctrl_path).unwrap_or_else(|e| {
-        log::warn!("op_sheaf_invalidate: read_root_hex failed: {e:#}");
-        String::new()
-    });
+    // - the root: read at the top of this op, under the absence rule.
     state.emit_invalidate(
         invalidated.clone(),
         "changed-only",
         &[],
-        current_root,
+        &root,
         generation,
         prior_generation,
     );
@@ -1100,6 +1171,65 @@ mod tests {
             invalidated.contains(&1),
             "region 1 must cascade-invalidate; got {invalidated:?}"
         );
+    }
+
+    /// Bead `ley-line-open-80f037`: the invalidate event states the root
+    /// under the absence rule. Exactly one of three shapes, and never a
+    /// zero or empty `current_root`.
+    #[test]
+    fn invalidate_event_states_root_absence() {
+        let payload =
+            |root: EventRoot| invalidate_payload(vec![1], "changed-only", &[], &root, 2, 1);
+
+        let published = payload(EventRoot::Published("ab".repeat(32)));
+        assert_eq!(published["root_published"], true, "{published}");
+        assert_eq!(published["current_root"], "ab".repeat(32), "{published}");
+        assert!(published.get("root_error").is_none(), "{published}");
+
+        let unpublished = payload(EventRoot::Unpublished);
+        assert_eq!(unpublished["root_published"], false, "{unpublished}");
+        assert!(unpublished.get("current_root").is_none(), "{unpublished}");
+        assert!(unpublished.get("root_error").is_none(), "{unpublished}");
+
+        let unreadable = payload(EventRoot::Unreadable("open controller: boom".into()));
+        assert_eq!(
+            unreadable["root_error"], "open controller: boom",
+            "{unreadable}"
+        );
+        assert!(unreadable.get("root_published").is_none(), "{unreadable}");
+        assert!(unreadable.get("current_root").is_none(), "{unreadable}");
+
+        assert_eq!(
+            EventRoot::from(None::<String>),
+            EventRoot::Unpublished,
+            "an unpublished controller is Unpublished"
+        );
+        assert_eq!(
+            EventRoot::read(Path::new("/dev/null/not-a-directory/ctrl")),
+            EventRoot::Unreadable(format!(
+                "{:#}",
+                super::super::ops::read_root_hex(Path::new("/dev/null/not-a-directory/ctrl"))
+                    .unwrap_err()
+            )),
+        );
+    }
+
+    /// Bead `ley-line-open-80f037`: `sheaf_invalidate` reads the root before
+    /// it touches the cache, so an unreadable controller fails the op with
+    /// the cache unchanged and no event, instead of emitting `""`.
+    #[test]
+    fn sheaf_invalidate_fails_on_an_unreadable_controller_without_mutating() {
+        let state = SheafState::new();
+        let generation_before = state.cache.lock().generation();
+        let err = op_sheaf_invalidate(
+            &state,
+            Path::new("/dev/null/not-a-directory/ctrl"),
+            &[0],
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("open controller"), "{err:#}");
+        assert_eq!(state.cache.lock().generation(), generation_before);
     }
 
     #[test]

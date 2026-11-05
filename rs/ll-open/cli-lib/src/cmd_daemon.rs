@@ -1912,10 +1912,11 @@ pub fn run_watcher_enrichment(
 ///   `"all-known"` (coarse fallback). See above.
 /// - `changed_files`: files whose reparse + enrichment triggered this
 ///   invalidate.
-/// - `current_root`: 64-char hex root from the substrate controller
-///   (matches the wire format of every state-changing op response,
-///   paired with mache's `mache-36d961` epic). Empty string if the
-///   controller read fails — best-effort, degrades honestly.
+/// - `root_published` / `current_root`: the substrate root under the
+///   daemon's root absence rule, as on every state-changing op response
+///   (`StatusResponse.rootPublished` in `daemon.capnp`). When the
+///   controller cannot be read, `root_error` replaces both (bead
+///   `ley-line-open-80f037`).
 /// - `generation`: quoted u64 — the cache generation after the emit.
 ///   Bumped via [`leyline_sheaf::SheafCache::bump_generation`] so
 ///   consumers see strict monotonicity across watcher-driven +
@@ -1935,10 +1936,9 @@ pub fn run_watcher_enrichment(
 ///
 /// # Best-effort
 ///
-/// Any failure inside this helper (currently only `read_root_hex` can
-/// fail) logs at warn and degrades the payload field rather than
-/// aborting the emit. The consumer still gets the region set +
-/// generation advance.
+/// The one failure inside this helper, a controller read, logs at warn and
+/// is reported as `root_error` rather than aborting the emit. The consumer
+/// still gets the region set + generation advance.
 ///
 /// Exposed to integration tests so the wire has a direct entry point
 /// that doesn't require spinning up the full git-poll loop.
@@ -1998,13 +1998,14 @@ pub fn emit_watcher_sheaf_invalidate(
     // `daemon::sheaf_ablation` for the wire format + rationale.
     crate::daemon::sheaf_ablation::log_event(&invalidated, &all_known, changed_files, scope);
 
-    let current_root = match crate::daemon::ops::read_root_hex(&ctx.ctrl_path) {
-        Ok(hex) => hex,
-        Err(e) => {
-            log::warn!("emit_watcher_sheaf_invalidate: read_root_hex failed: {e:#}");
-            String::new()
-        }
-    };
+    // The root under the daemon's absence rule. A controller read error
+    // still emits the invalidation (dropping it would under-evict) and
+    // carries `root_error`, never an empty or zero root (bead
+    // `ley-line-open-80f037`).
+    let root = crate::daemon::sheaf_ops::EventRoot::read(&ctx.ctrl_path);
+    if let crate::daemon::sheaf_ops::EventRoot::Unreadable(e) = &root {
+        log::warn!("emit_watcher_sheaf_invalidate: controller read failed: {e}");
+    }
 
     // Route through the shared `SheafState::emit_invalidate` helper
     // (bead ley-line-open-2191e1) — consumer + watcher paths share
@@ -2013,7 +2014,7 @@ pub fn emit_watcher_sheaf_invalidate(
         invalidated,
         scope,
         changed_files,
-        current_root,
+        &root,
         generation,
         prior_generation,
     );
@@ -4182,5 +4183,57 @@ mod execution_discovery_tests {
         // Deliberately the non-default value: the override must keep the
         // caller's unrelated options.
         assert!(effective.cdc, "unrelated caller options must survive");
+    }
+
+    /// Bead `ley-line-open-80f037`: the watcher's `daemon.sheaf.invalidate`
+    /// states the root under the absence rule, and an unreadable controller
+    /// still delivers the invalidation, with `root_error` instead of `""`.
+    #[cfg(feature = "sheaf")]
+    #[tokio::test]
+    async fn the_watcher_invalidate_states_the_root_and_reports_a_read_error() {
+        use crate::cmd_daemon::emit_watcher_sheaf_invalidate;
+        use crate::daemon::events::OverflowPolicy;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        ctx.sheaf.set_emitter(ctx.router.emitter());
+        let (_id, mut rx, _replay, _gap) = ctx
+            .router
+            .subscribe(
+                &["daemon.sheaf.*".to_string()],
+                None,
+                0,
+                OverflowPolicy::DropOldest,
+                8,
+            )
+            .await;
+        let mut next = async || {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an invalidate event")
+                .expect("the bus is open")
+                .data
+        };
+
+        let files = vec!["a.rs".to_string()];
+        emit_watcher_sheaf_invalidate(&ctx, &files, &ctx.router.emitter());
+        let fresh = next().await;
+        assert_eq!(fresh["root_published"], false, "{fresh}");
+        assert!(fresh.get("current_root").is_none(), "{fresh}");
+        assert_eq!(fresh["changed_files"], serde_json::json!(["a.rs"]));
+
+        // A directory where the control file was: the controller cannot be
+        // opened, and the event says so instead of guessing a root.
+        std::fs::remove_file(&ctx.ctrl_path).unwrap();
+        std::fs::create_dir(&ctx.ctrl_path).unwrap();
+        emit_watcher_sheaf_invalidate(&ctx, &files, &ctx.router.emitter());
+        let unreadable = next().await;
+        assert!(
+            unreadable["root_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("open controller")),
+            "{unreadable}"
+        );
+        assert!(unreadable.get("root_published").is_none(), "{unreadable}");
+        assert!(unreadable.get("current_root").is_none(), "{unreadable}");
     }
 }

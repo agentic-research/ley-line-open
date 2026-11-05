@@ -639,8 +639,10 @@ async fn test_daemon_socket_status_op() {
 
     let parsed = uds_round_trip(&sock_path, r#"{"op":"status"}"#).await;
     assert_eq!(parsed["ok"], true);
-    // T2.4: status emits `current_root` (hex). Fresh ctrl → zero sentinel.
-    assert_eq!(parsed["current_root"], "0".repeat(64));
+    // Bead `ley-line-open-80f037`: a fresh controller has published
+    // nothing, so `current_root` is omitted and `root_published` is false.
+    assert!(parsed.get("current_root").is_none(), "{parsed}");
+    assert_eq!(parsed["root_published"], false, "{parsed}");
 }
 
 #[tokio::test]
@@ -3254,12 +3256,16 @@ async fn test_op_reparse_snapshot_race_publishes_well_formed_root() {
     }
 
     // T2.4: collect `current_root` hex strings from reparse + snapshot
-    // responses. Each response surfaces the controller's current root —
-    // a 64-char hex BLAKE3, or the zero sentinel if no snapshot has yet
-    // landed. With idempotent root semantics (same bytes → same root),
-    // unchanged dbs collapse to one root rather than 6 distinct ints.
-    // Race-safety assertion: every response is well-formed hex AND at
-    // least one snapshot completed and published a non-zero root.
+    // responses. Both ops publish before replying, so every response
+    // carries `root_published: true` and the 64-char hex BLAKE3 (bead
+    // `ley-line-open-80f037`: no zero sentinel). With idempotent root
+    // semantics (same bytes → same root), unchanged dbs collapse to one
+    // root rather than 6 distinct ints.
+    for r in &outcome {
+        if r.get("current_root").is_some() {
+            assert_eq!(r["root_published"], true, "{r}");
+        }
+    }
     let roots: Vec<String> = outcome
         .iter()
         .filter_map(|r| {

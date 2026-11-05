@@ -114,9 +114,26 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 // quoted-string JSON values (capnp_json u64 convention). Consumers
 // reading the response of `sheaf_invalidate` ([SheafInvalidateResponse])
 // AND this event payload see the same encoding.
+//
+// The same payload rides the `daemon.sheaf.invalidate` topic, which both the
+// consumer-driven op and the source watcher emit. Its root follows the
+// daemon's root absence rule (daemon.capnp, bead ley-line-open-80f037).
+// Exactly one of three states holds:
+//
+//   - a root: RootPublished is true and CurrentRoot is its 64-hex BLAKE3;
+//   - no root: RootPublished is false and CurrentRoot is nil;
+//   - unknown: the controller could not be read; RootError is set and
+//     RootPublished and CurrentRoot are both nil.
+//
+// The daemon never sends a zero or empty current_root.
 type SheafInvalidatePayload struct {
 	Invalidated     []uint32 `json:"invalidated"`
 	Count           *uint32  `json:"count"`
+	Scope           *string  `json:"scope,omitempty"`
+	ChangedFiles    []string `json:"changed_files,omitempty"`
+	RootPublished   *bool    `json:"root_published,omitempty"`
+	CurrentRoot     *string  `json:"current_root,omitempty"`
+	RootError       *string  `json:"root_error,omitempty"`
 	Generation      *uint64  `json:"generation,string"`
 	PriorGeneration *uint64  `json:"prior_generation,string"`
 }
@@ -227,7 +244,7 @@ func DecodeEvent(b []byte) (Event, any, error) {
 // forward the blob as-is.
 func decodePayload(topic string, data json.RawMessage) (any, error) {
 	switch topic {
-	case "sheaf.invalidate":
+	case "sheaf.invalidate", "daemon.sheaf.invalidate":
 		var p SheafInvalidatePayload
 		if err := json.Unmarshal(data, &p); err != nil {
 			return nil, err

@@ -4744,6 +4744,7 @@ dependencies = [
  "libc",
  "memmap2",
  "parking_lot",
+ "proptest",
  "serde",
  "tempfile",
 ]

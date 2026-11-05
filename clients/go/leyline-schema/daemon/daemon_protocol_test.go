@@ -140,6 +140,8 @@ type statusResponse struct {
 	Error           *string           `json:"error,omitempty"`
 	// Bead ley-line-open-246526: the canonical --source directory.
 	SourceRoot *string `json:"source_root,omitempty"`
+	// Bead ley-line-open-80f037: whether a root has been published.
+	RootPublished *bool `json:"root_published"`
 }
 
 type flushResponse struct {

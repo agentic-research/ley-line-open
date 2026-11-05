@@ -143,6 +143,15 @@ struct StatusResponse {
   # the JSON) when the daemon runs without `--source`. Bead
   # `ley-line-open-246526`.
   sourceRoot        @11 :Text  $Json.name("source_root");
+  # Whether the controller names a published arena root. `false` before the
+  # daemon's first publish, and after `--reset-arena` until the next one.
+  # While it is `false`, `current_root` above is 64 zero hex digits: that
+  # spelling is the "nothing published" sentinel of the control-block
+  # layout, never the BLAKE3 of any arena, and consumers test this field
+  # instead of comparing against it. Every `current_root` on the daemon
+  # wire, including the sheaf invalidate event's, uses the same sentinel
+  # spelling. Additive (bead `ley-line-open-80f037` F3).
+  rootPublished     @12 :Bool  $Json.name("root_published");
 }
 
 struct ReparseRequest {

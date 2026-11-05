@@ -927,7 +927,7 @@ fn unlink_live_db(live_db_path: &Path) {
 /// treated as fresh — cold-start is the safe fallback in every case.
 fn controller_is_fresh(ctrl_path: &Path) -> bool {
     match leyline_core::Controller::open_or_create(ctrl_path) {
-        Ok(c) => c.current_root() == [0u8; 32],
+        Ok(c) => c.published_root().is_none(),
         Err(_) => true,
     }
 }
@@ -983,11 +983,16 @@ fn init_living_db(
         // the flag's whole job is to run regardless of prior state.
         // Reading them back from the controller we just opened is
         // exactly `setup_arena`'s own stamp, not a guess.
-        if let Ok(mut c) = leyline_core::Controller::open_or_create(ctrl_path) {
-            let arena_path = c.arena_path();
-            let arena_size = c.arena_size();
-            let _ = c.set_arena_with_root(&arena_path, arena_size, [0u8; 32]);
-        }
+        //
+        // A failure here is fatal (bead `ley-line-open-80f037` F3): a reset
+        // that did not zero the root has not reset anything, and the
+        // freshness checks below would then read the old root.
+        let mut c = leyline_core::Controller::open_or_create(ctrl_path)
+            .context("--reset-arena: open the controller to zero its root")?;
+        let arena_path = c.arena_path();
+        let arena_size = c.arena_size();
+        c.set_arena_with_root(&arena_path, arena_size, [0u8; 32])
+            .context("--reset-arena: zero the controller's root")?;
     }
 
     // Truly fresh controller → discard any orphan `.live.db` before
@@ -2579,6 +2584,26 @@ mod tests {
             !dir.path().join("cleanup.live.db-shm").exists(),
             "-shm sidecar must be gone",
         );
+    }
+
+    /// Bead `ley-line-open-80f037` F3(c): `--reset-arena` promises a cold
+    /// start. When the controller cannot be opened to zero its root, the
+    /// reset did not happen, so starting anyway would serve whatever the
+    /// controller still names. The failure is an error, not a skipped step.
+    #[test]
+    fn init_living_db_reset_refuses_when_the_controller_cannot_be_zeroed() {
+        let dir = TempDir::new().unwrap();
+        let ctrl = dir.path().join("corrupt.ctrl");
+        // A control file whose magic is not ours: `open_or_create` refuses it.
+        std::fs::write(&ctrl, vec![0xFFu8; 4096]).unwrap();
+        let live_db = live_db_path_for(&ctrl);
+
+        let err = init_living_db(&ctrl, &live_db, None, None, true)
+            .map(|_| ())
+            .expect_err("a reset that could not zero the controller must not start");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--reset-arena"), "{msg}");
+        assert!(msg.contains("invalid control block magic"), "{msg}");
     }
 
     #[test]

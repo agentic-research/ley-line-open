@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use leyline_cli_lib::tree::{DIRECTORY_MODE, Entry, Mode};
+use leyline_cli_lib::tree::{Entry, GitMode, Mode};
 use leyline_cli_lib::tree_root::{TreeLeaf, leaves_of, tree_root_of};
 use leyline_core::{ContentAddressed, Hash};
 
@@ -31,7 +31,7 @@ fn an_empty_file_and_an_empty_directory_at_one_path_fold_differently() {
         dir_leaves,
         vec![TreeLeaf {
             path: "p".into(),
-            mode: DIRECTORY_MODE,
+            mode: GitMode::Directory,
             content: empty(),
         }]
     );
@@ -50,7 +50,7 @@ fn an_empty_file_and_an_empty_directory_at_one_path_fold_differently() {
     let exec = tree_root_of(
         &[TreeLeaf {
             path: "p".into(),
-            mode: 0o100755,
+            mode: GitMode::Executable,
             content: empty(),
         }],
         parser,

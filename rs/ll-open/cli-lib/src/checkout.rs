@@ -812,13 +812,10 @@ fn index_entries(conn: &Connection) -> Result<HashMap<String, Entry>> {
     let mut out = HashMap::new();
     for row in rows {
         let (path, blob, mode) = row?;
-        let entry = if mode == crate::tree::DIRECTORY_MODE {
-            Some(Entry::Dir)
-        } else {
-            Mode::from_git(mode)
-                .zip(to_hash(blob))
-                .map(|(mode, blob)| Entry::File { mode, blob })
-        };
+        let entry = crate::tree::GitMode::from_git(mode).and_then(|git| match git.file_mode() {
+            None => Some(Entry::Dir),
+            Some(mode) => to_hash(blob).map(|blob| Entry::File { mode, blob }),
+        });
         if let Some(entry) = entry {
             out.insert(path, entry);
         }

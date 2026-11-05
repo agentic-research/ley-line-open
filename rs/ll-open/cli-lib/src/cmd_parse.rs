@@ -2967,6 +2967,13 @@ fn write_head_for_path(
     tree_root: leyline_core::Hash,
     parser_id: leyline_core::Hash,
 ) -> Result<()> {
+    // Readers refuse a half-stamped head (bead `ley-line-open-80f037` F3), so
+    // the writer never produces one: the next parse could not chain onto it.
+    if (tree_root == leyline_core::Hash::ZERO) != (parser_id == leyline_core::Hash::ZERO) {
+        bail!(
+            "refusing to write a half-stamped head: treeRoot and parserId are stamped together or not at all"
+        );
+    }
     let (root, segment_bytes) = hash_segment_files(db_path)?;
     let head_path = head_path_for(db_path);
     let (parent, generation, parent_digest) =
@@ -6232,6 +6239,55 @@ mod tests {
         assert!(err.contains("no treeRoot"), "{err}");
     }
 
+    /// Bead `ley-line-open-80f037` F3(d): the writer never produces the
+    /// half-stamped head the readers refuse, signed or not.
+    #[test]
+    #[serial_test::serial(env_leyline_head_keys)]
+    fn an_unsigned_head_is_never_written_half_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, tree, parser) in [
+            ("no_tree.db", leyline_core::Hash::ZERO, TEST_PARSER_ID),
+            ("no_parser.db", TEST_TREE_ROOT, leyline_core::Hash::ZERO),
+        ] {
+            let db = dir.path().join(name);
+            std::fs::write(&db, b"").unwrap();
+            let err = write_head_for_path(&db, 0, tree, parser).expect_err("half-stamped");
+            assert!(format!("{err:#}").contains("half-stamped"), "{err:#}");
+            assert!(!head_path_for(&db).exists(), "{name}: no head is written");
+        }
+    }
+
+    /// Bead `ley-line-open-80f037` F3(d): a head carrying `treeRoot` without
+    /// `parserId` is malformed. `verify-head` refuses it instead of calling
+    /// it a pre-ADR-0040 head.
+    #[test]
+    fn verify_refuses_a_half_stamped_head() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n").unwrap();
+        let db = td.path().join("out.db");
+        parse_dir(&db, &src, None);
+        use leyline_schema_capnp::head_capnp::head;
+        let mut src_msg = capnp::message::Builder::new_default();
+        {
+            let mut h: head::Builder = src_msg.init_root();
+            h.set_generation(1);
+            h.reborrow().init_root_hash().set_bytes(&[7u8; 32]);
+            h.reborrow().init_parent_hash().set_bytes(&[0u8; 32]);
+            h.reborrow().init_tree_root().set_bytes(&[9u8; 32]);
+        }
+        let mut f = std::fs::File::create(head_path_for(&db)).unwrap();
+        leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(
+            &src_msg, &mut f,
+        )
+        .unwrap();
+        let err = crate::tree_root::verify_with(&db, &crate::head_claim::HeadPolicy::default())
+            .expect_err("a half-stamped head is malformed");
+        let err = format!("{err:#}");
+        assert!(err.contains("half-stamped"), "{err}");
+    }
+
     /// The env wrapper reads `LLO_TRUSTED_QUERY_HASHES` and nothing else.
     /// The process environment is global, so the variable is set under a
     /// lock and restored; no other test in this binary sets it.
@@ -6531,7 +6587,7 @@ mod tests {
             &db,
             7,
             leyline_core::Hash::from_bytes([1u8; 32]),
-            leyline_core::Hash::ZERO,
+            leyline_core::Hash::from_bytes([2u8; 32]),
         )
         .unwrap();
 
@@ -6577,7 +6633,7 @@ mod tests {
             &db,
             7,
             leyline_core::Hash::from_bytes([1u8; 32]),
-            leyline_core::Hash::ZERO,
+            leyline_core::Hash::from_bytes([2u8; 32]),
         );
         std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o755)).unwrap();
 

@@ -20,7 +20,7 @@
 //! | 4 | Defect monotonically decreases on enrichment convergence | follow-up | deferred |
 //! | 5 | `get_sheaf_status` MCP tool surfaces defect | follow-up (a46a5c) | deferred |
 
-use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkHash};
+use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkDigest, StalkHash};
 use leyline_sheaf::complex::{CellComplex, RestrictionMap};
 use sha2::Digest;
 
@@ -164,9 +164,15 @@ fn claim_1_defect_sums_over_edges() {
 #[derive(Clone)]
 struct TestStalk([u8; 32]);
 
-impl StalkHash for TestStalk {
+impl TestStalk {
     fn merkle_root(&self) -> [u8; 32] {
         self.0
+    }
+}
+
+impl StalkHash for TestStalk {
+    fn digest(&self) -> StalkDigest {
+        StalkDigest::Hash(self.merkle_root())
     }
 }
 
@@ -370,13 +376,19 @@ struct F32Stalk {
     data: Vec<f32>,
 }
 
-impl StalkHash for F32Stalk {
+impl F32Stalk {
     fn merkle_root(&self) -> [u8; 32] {
         let mut hasher = sha2::Sha256::new();
         for v in &self.data {
             hasher.update(v.to_le_bytes());
         }
         hasher.finalize().into()
+    }
+}
+
+impl StalkHash for F32Stalk {
+    fn digest(&self) -> StalkDigest {
+        StalkDigest::Hash(self.merkle_root())
     }
 }
 

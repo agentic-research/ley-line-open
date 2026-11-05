@@ -3692,7 +3692,7 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     // (zero) initial defect on the shared subspace.
     let topology_resp = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
+        r#"{"op":"sheaf_set_topology","node_stalk_dim":4,"regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,0.0,0.0]},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,9.0,9.0]}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0],"agreement_dim":2}]}"#,
     )
     .await;
     assert_eq!(
@@ -3713,7 +3713,7 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     // cascade must NOT include region 1, only the changed region 0.
     let invalidate_resp = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff","data":[1.0,0.5,42.0,7.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ff00000000000000000000000000000000000000000000000000000000000000","data":[1.0,0.5,42.0,7.0]}]}"#,
     )
     .await;
     let invalidated: Vec<u32> = invalidate_resp["invalidated"]
@@ -3736,7 +3736,7 @@ async fn e2e_sheaf_ops_drive_delta_zero_mode_over_real_uds() {
     // in-process cache has entries for these regions.
     let invalidate_resp2 = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee","data":[99.0,0.5,42.0,7.0]}]}"#,
+        r#"{"op":"sheaf_invalidate","regions":[0],"stalks":[{"id":0,"hash":"ee00000000000000000000000000000000000000000000000000000000000000","data":[99.0,0.5,42.0,7.0]}]}"#,
     )
     .await;
     let invalidated2: Vec<u32> = invalidate_resp2["invalidated"]
@@ -3788,7 +3788,7 @@ async fn e2e_sheaf_set_topology_heuristic_only_keeps_working() {
 
     let resp = uds_round_trip(
         &sock_path,
-        r#"{"op":"sheaf_set_topology","regions":[{"id":0,"hash":"aa"},{"id":1,"hash":"bb"}],"restrictions":[{"a":0,"b":1,"boundary_hash":"11","co_change_rate":0.5,"weights":[1.0]}]}"#,
+        r#"{"op":"sheaf_set_topology","regions":[{"id":0,"hash":"aa00000000000000000000000000000000000000000000000000000000000000"},{"id":1,"hash":"bb00000000000000000000000000000000000000000000000000000000000000"}],"restrictions":[{"a":0,"b":1,"boundary_hash":"1100000000000000000000000000000000000000000000000000000000000000","co_change_rate":0.5,"weights":[1.0]}]}"#,
     )
     .await;
     assert_eq!(resp["ok"], true);

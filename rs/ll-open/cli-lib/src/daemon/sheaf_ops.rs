@@ -24,7 +24,7 @@ use std::path::Path;
 use anyhow::Result;
 use leyline_public_schema::daemon_capnp;
 use leyline_sheaf::CoChangeTracker;
-use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkHash};
+use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkDigest};
 use leyline_sheaf::complex::{CellComplex, RestrictionMap};
 
 use super::events::EventEmitter;
@@ -44,14 +44,92 @@ const EDGE_ID_BASE: u32 = 1_000_000;
 // State
 // ---------------------------------------------------------------------------
 
-/// Stalk backed by a raw 32-byte hash (Merkle root, xxh64 padded, etc.).
-#[derive(Clone)]
-pub struct HashStalk(pub [u8; 32]);
+/// Why a hash on the sheaf wire was refused (bead `ley-line-open-1c5d28`).
+///
+/// A wire hash is exactly 64 lowercase hex digits. Nothing is zero-padded,
+/// truncated or skipped, and `""` is malformed: absence is spelled by
+/// omitting the field, never by an empty or zero value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WireHashError {
+    /// The field is not 64 characters long.
+    WrongLength { field: &'static str, len: usize },
+    /// The character at byte offset `at` is not a lowercase hex digit.
+    NotLowercaseHex { field: &'static str, at: usize },
+    /// The field is required and was omitted.
+    Missing { field: &'static str },
+}
 
-impl StalkHash for HashStalk {
-    fn merkle_root(&self) -> [u8; 32] {
-        self.0
+impl std::fmt::Display for WireHashError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongLength { field, len } => write!(
+                f,
+                "{field}: expected 64 lowercase hex digits, got {len} characters"
+            ),
+            Self::NotLowercaseHex { field, at } => {
+                write!(f, "{field}: not a lowercase hex digit at offset {at}")
+            }
+            Self::Missing { field } => write!(f, "{field}: required"),
+        }
     }
+}
+
+impl std::error::Error for WireHashError {}
+
+/// Parse one wire hash: exactly 64 lowercase hex digits.
+fn parse_hash(field: &'static str, hex: &str) -> Result<[u8; 32], WireHashError> {
+    if hex.len() != 64 {
+        return Err(WireHashError::WrongLength {
+            field,
+            len: hex.len(),
+        });
+    }
+    if let Some(at) = hex
+        .bytes()
+        .position(|c| !matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(WireHashError::NotLowercaseHex { field, at });
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hex, &mut out).expect("64 lowercase hex digits decode");
+    Ok(out)
+}
+
+/// A region's stalk from the wire: an omitted `hash` is an explicit
+/// [`StalkDigest::Changed`] (content unknown, so every boundary of the
+/// region fires), a present one must parse.
+fn stalk_digest(hash: Option<&str>) -> Result<StalkDigest, WireHashError> {
+    match hash {
+        None => Ok(StalkDigest::Changed),
+        Some(hex) => parse_hash("hash", hex).map(StalkDigest::Hash),
+    }
+}
+
+/// An edge's `boundary_hash` from the wire: required, and must parse.
+fn boundary_hash(hash: Option<&str>) -> Result<[u8; 32], WireHashError> {
+    parse_hash(
+        "boundary_hash",
+        hash.ok_or(WireHashError::Missing {
+            field: "boundary_hash",
+        })?,
+    )
+}
+
+/// The region stalks of a request, all parsed before any is applied, so a
+/// refused hash leaves the cache exactly as it was.
+fn parse_stalks(stalks: &[SheafStalkInput]) -> Result<Vec<StalkDigest>, WireHashError> {
+    stalks
+        .iter()
+        .map(|s| stalk_digest(s.hash.as_deref()))
+        .collect()
+}
+
+/// The boundary hashes of a request's edges, parsed before any is applied.
+fn parse_boundaries(edges: &[SheafRestrictionInput]) -> Result<Vec<[u8; 32]>, WireHashError> {
+    edges
+        .iter()
+        .map(|e| boundary_hash(e.boundary_hash.as_deref()))
+        .collect()
 }
 
 /// Shared sheaf cache state for the daemon. Lives on [`DaemonContext`]
@@ -63,7 +141,7 @@ pub struct SheafState {
     /// serve on the cache's say-so. `sheaf_invalidate` / `sheaf_reap` return
     /// regions to recompute; a consumer must not read the absence of a
     /// region as "still valid".
-    cache: Mutex<SheafCache<HashStalk, ()>>,
+    cache: Mutex<SheafCache<StalkDigest, ()>>,
     /// Tracks co-change patterns for restriction weight learning.
     tracker: Mutex<CoChangeTracker>,
     /// Current restriction edges (needed for tracker observation;
@@ -118,7 +196,7 @@ impl SheafState {
     /// reparse / enrich pipelines (and e2e integration tests) can
     /// `put` cache entries directly; the `sheaf_*` UDS ops only
     /// manage topology + invalidation, not entry population.
-    pub fn cache(&self) -> &Mutex<SheafCache<HashStalk, ()>> {
+    pub fn cache(&self) -> &Mutex<SheafCache<StalkDigest, ()>> {
         &self.cache
     }
 
@@ -399,8 +477,14 @@ fn invalidate_payload(
 #[derive(serde::Deserialize, Debug, Default)]
 pub struct SheafStalkInput {
     pub id: u32,
+    /// The region's content hash, 64 lowercase hex digits. Omitted (or
+    /// `null`) means the region's content is unknown: the stalk is
+    /// [`StalkDigest::Changed`] and every boundary it touches fires. A
+    /// present but malformed value, `""` included, is refused (bead
+    /// `ley-line-open-1c5d28`). The region-hash contract that makes a
+    /// present hash comparable across calls is [`leyline_sheaf::region`].
     #[serde(default)]
-    pub hash: String,
+    pub hash: Option<String>,
     /// Optional f32 stalk vector — when non-empty AND the request's
     /// `node_stalk_dim` is > 0, the handler pushes it into the backing
     /// `CellComplex` so `detect_violations` sees the latest section.
@@ -412,8 +496,11 @@ pub struct SheafStalkInput {
 pub struct SheafRestrictionInput {
     pub a: u32,
     pub b: u32,
+    /// Required, 64 lowercase hex digits: the XOR of the two regions'
+    /// hashes at topology time ([`leyline_sheaf::region::boundary_hash`]).
+    /// Omitted or malformed is refused (bead `ley-line-open-1c5d28`).
     #[serde(default)]
-    pub boundary_hash: String,
+    pub boundary_hash: Option<String>,
     #[serde(default)]
     pub co_change_rate: f64,
     #[serde(default)]
@@ -481,6 +568,10 @@ pub fn op_sheaf_set_topology(
     restrictions: &[SheafRestrictionInput],
     node_stalk_dim: u32,
 ) -> Result<String> {
+    // Every hash is parsed before the cache is touched: a refused hash
+    // leaves the installed topology as it was (bead `ley-line-open-1c5d28`).
+    let digests = parse_stalks(regions)?;
+    let boundaries = parse_boundaries(restrictions)?;
     let mut cache = state.cache.lock();
 
     // Try to engage δ⁰ mode: every region must carry f32 data of the
@@ -518,8 +609,8 @@ pub fn op_sheaf_set_topology(
     };
 
     let mut region_count = 0u32;
-    for r in regions {
-        cache.set_stalk(r.id, HashStalk(parse_hash(&r.hash)));
+    for (r, digest) in regions.iter().zip(digests) {
+        cache.set_stalk(r.id, digest);
         if let Some(cx) = complex_opt.as_mut() {
             cx.add_node(r.id, r.data.clone());
         }
@@ -531,7 +622,7 @@ pub fn op_sheaf_set_topology(
     // EDGE_ID_BASE so no wire region id below the partition floor can
     // collide (the prior base of 100 collided with region ids ≥ 100).
     let mut edge_id_seq = EDGE_ID_BASE;
-    for r in restrictions {
+    for (r, boundary_hash) in restrictions.iter().zip(boundaries) {
         let weights = if r.weights.is_empty() {
             vec![1.0]
         } else {
@@ -542,7 +633,7 @@ pub fn op_sheaf_set_topology(
             r.b,
             RestrictionEdge {
                 weights,
-                boundary_hash: parse_hash(&r.boundary_hash),
+                boundary_hash,
                 co_change_rate: r.co_change_rate,
                 revert_rate: r.revert_rate,
             },
@@ -627,21 +718,27 @@ pub fn op_sheaf_set_topology(
 /// complex via `set_stalk_value` so the next `on_change` consults the
 /// real per-edge δ⁰. Hash-only updates still feed the XOR pre-filter
 /// but won't move the δ⁰ baseline.
+///
+/// A stalk without a `hash` marks its region [`StalkDigest::Changed`]: its
+/// content is unknown, so its boundaries fire and the cascade proceeds
+/// through it (bead `ley-line-open-1c5d28`). It stays `Changed` until a
+/// later call or topology supplies a hash.
 pub fn op_sheaf_invalidate(
     state: &SheafState,
     ctrl_path: &Path,
     regions: &[u32],
     stalks: &[SheafStalkInput],
 ) -> Result<String> {
-    // The root the event reports, read before the cache is touched: a
-    // controller that cannot be read fails the op with nothing mutated and
-    // nothing emitted, rather than emitting a guessed root (bead
-    // `ley-line-open-80f037`).
+    // Every hash is parsed, and the root the event reports is read, before
+    // the cache is touched: a refused hash or an unreadable controller fails
+    // the op with nothing mutated and nothing emitted (beads
+    // `ley-line-open-1c5d28`, `ley-line-open-80f037`).
+    let digests = parse_stalks(stalks)?;
     let root = EventRoot::from(super::ops::read_root_hex(ctrl_path)?);
     let mut cache = state.cache.lock();
 
-    for s in stalks {
-        cache.set_stalk(s.id, HashStalk(parse_hash(&s.hash)));
+    for (s, digest) in stalks.iter().zip(digests) {
+        cache.set_stalk(s.id, digest);
         if !s.data.is_empty() {
             cache.set_stalk_value(s.id, s.data.clone());
         }
@@ -823,6 +920,10 @@ pub fn op_sheaf_update_topology(
     delta: &TopologyDeltaInput,
     node_stalk_dim: u32,
 ) -> Result<String> {
+    // Parsed before the cache is touched, so a refused hash applies none of
+    // the delta (bead `ley-line-open-1c5d28`).
+    let added_digests = parse_stalks(&delta.added_regions)?;
+    let added_boundaries = parse_boundaries(&delta.added_edges)?;
     let mut cache = state.cache.lock();
 
     // 1. Build the touched-region set from the delta itself, then expand to
@@ -864,10 +965,10 @@ pub fn op_sheaf_update_topology(
     for &rid in &delta.removed_regions {
         cache.drop_region(rid);
     }
-    for r in &delta.added_regions {
-        cache.set_stalk(r.id, HashStalk(parse_hash(&r.hash)));
+    for (r, digest) in delta.added_regions.iter().zip(added_digests) {
+        cache.set_stalk(r.id, digest);
     }
-    for e in &delta.added_edges {
+    for (e, boundary_hash) in delta.added_edges.iter().zip(added_boundaries) {
         let weights = if e.weights.is_empty() {
             vec![1.0]
         } else {
@@ -878,7 +979,7 @@ pub fn op_sheaf_update_topology(
             e.b,
             RestrictionEdge {
                 weights,
-                boundary_hash: parse_hash(&e.boundary_hash),
+                boundary_hash,
                 co_change_rate: e.co_change_rate,
                 revert_rate: e.revert_rate,
             },
@@ -1046,33 +1147,19 @@ pub fn op_sheaf_update_topology(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a hex string into a 32-byte hash, zero-padding if short and
-/// truncating if long. Invalid hex chars produce zero bytes — matches
-/// the lenient behaviour of the private reference implementation.
-fn parse_hash(hex: &str) -> [u8; 32] {
-    let mut hash = [0u8; 32];
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| {
-            hex.get(i..i + 2)
-                .and_then(|s| u8::from_str_radix(s, 16).ok())
-        })
-        .collect();
-    let len = bytes.len().min(32);
-    hash[..len].copy_from_slice(&bytes[..len]);
-    hash
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A well-formed wire hash whose first byte is `b`, the rest zero.
+    fn hx(b: u8) -> String {
+        let mut h = [0u8; 32];
+        h[0] = b;
+        hex::encode(h)
+    }
 
     fn parse_response(json: &str) -> serde_json::Value {
         serde_json::from_str(json).expect("response must be valid JSON")
@@ -1086,17 +1173,17 @@ mod tests {
         let regions = vec![
             SheafStalkInput {
                 id: 0,
-                hash: "aa".into(),
+                hash: Some(hx(0xaa)),
                 data: vec![],
             },
             SheafStalkInput {
                 id: 1,
-                hash: "bb".into(),
+                hash: Some(hx(0xbb)),
                 data: vec![],
             },
             SheafStalkInput {
                 id: 2,
-                hash: "cc".into(),
+                hash: Some(hx(0xcc)),
                 data: vec![],
             },
         ];
@@ -1104,7 +1191,7 @@ mod tests {
             SheafRestrictionInput {
                 a: 0,
                 b: 1,
-                boundary_hash: format!("{:02x}", 0xaa ^ 0xbb),
+                boundary_hash: Some(hx(0xaa ^ 0xbb)),
                 co_change_rate: 0.5,
                 revert_rate: 0.0,
                 weights: vec![1.0],
@@ -1113,7 +1200,7 @@ mod tests {
             SheafRestrictionInput {
                 a: 1,
                 b: 2,
-                boundary_hash: format!("{:02x}", 0xbb ^ 0xcc),
+                boundary_hash: Some(hx(0xbb ^ 0xcc)),
                 co_change_rate: 0.5,
                 revert_rate: 0.0,
                 weights: vec![1.0],
@@ -1139,7 +1226,7 @@ mod tests {
         // Mutate region 0's stalk so the 0↔1 boundary check fails.
         let new_stalks = vec![SheafStalkInput {
             id: 0,
-            hash: "ff".into(),
+            hash: Some(hx(0xff)),
             data: vec![],
         }];
         let resp = op_sheaf_invalidate(
@@ -1261,19 +1348,340 @@ mod tests {
         assert!(resp["weights"].as_array().unwrap().is_empty());
     }
 
+    /// Bead `ley-line-open-1c5d28`, inverting the old
+    /// `parse_hash_lenient_short_zero_pads` / `_long_truncates`: a wire hash
+    /// is exactly 64 lowercase hex digits. Short, long, empty, non-hex and
+    /// uppercase input is refused with a typed error, never padded,
+    /// truncated or zeroed.
     #[test]
-    fn parse_hash_lenient_short_zero_pads() {
-        // Single byte "aa" parses to [0xaa, 0, 0, ...].
-        let h = parse_hash("aa");
-        assert_eq!(h[0], 0xaa);
-        assert!(h[1..].iter().all(|&b| b == 0));
+    fn parse_hash_refuses_everything_but_64_lowercase_hex_digits() {
+        assert_eq!(parse_hash("hash", &hx(0xaa)).unwrap()[0], 0xaa);
+        for (input, want) in [
+            (
+                "aa".to_string(),
+                WireHashError::WrongLength {
+                    field: "hash",
+                    len: 2,
+                },
+            ),
+            (
+                String::new(),
+                WireHashError::WrongLength {
+                    field: "hash",
+                    len: 0,
+                },
+            ),
+            (
+                "ff".repeat(33),
+                WireHashError::WrongLength {
+                    field: "hash",
+                    len: 66,
+                },
+            ),
+            (
+                format!("zz{}", "0".repeat(62)),
+                WireHashError::NotLowercaseHex {
+                    field: "hash",
+                    at: 0,
+                },
+            ),
+            (
+                format!("0A{}", "0".repeat(62)),
+                WireHashError::NotLowercaseHex {
+                    field: "hash",
+                    at: 1,
+                },
+            ),
+            (
+                format!("{}é", "0".repeat(62)),
+                WireHashError::NotLowercaseHex {
+                    field: "hash",
+                    at: 62,
+                },
+            ),
+        ] {
+            assert_eq!(parse_hash("hash", &input), Err(want), "{input:?}");
+        }
+        assert_eq!(stalk_digest(None), Ok(StalkDigest::Changed));
+        assert_eq!(
+            stalk_digest(Some(&hx(1))),
+            Ok(StalkDigest::Hash(parse_hash("hash", &hx(1)).unwrap()))
+        );
+        assert_eq!(
+            boundary_hash(None),
+            Err(WireHashError::Missing {
+                field: "boundary_hash"
+            })
+        );
+        assert_eq!(
+            boundary_hash(Some("")),
+            Err(WireHashError::WrongLength {
+                field: "boundary_hash",
+                len: 0
+            })
+        );
     }
 
+    /// The refusal names the field and what was wrong, on the wire.
     #[test]
-    fn parse_hash_lenient_long_truncates() {
-        // 33 bytes of "ff" — must truncate to 32.
-        let h = parse_hash(&"ff".repeat(33));
-        assert!(h.iter().all(|&b| b == 0xff));
+    fn a_wire_hash_error_names_the_field_and_the_fault() {
+        assert_eq!(
+            WireHashError::WrongLength {
+                field: "hash",
+                len: 2
+            }
+            .to_string(),
+            "hash: expected 64 lowercase hex digits, got 2 characters"
+        );
+        assert_eq!(
+            WireHashError::NotLowercaseHex {
+                field: "boundary_hash",
+                at: 3
+            }
+            .to_string(),
+            "boundary_hash: not a lowercase hex digit at offset 3"
+        );
+        assert_eq!(
+            WireHashError::Missing {
+                field: "boundary_hash"
+            }
+            .to_string(),
+            "boundary_hash: required"
+        );
+    }
+
+    /// Bead `ley-line-open-1c5d28`: `sheaf_update_topology` parses every
+    /// added hash before it applies any of the delta; a well-formed delta
+    /// applies, and an omitted region hash lands as Changed.
+    #[test]
+    fn update_topology_refuses_a_malformed_delta_and_applies_a_good_one() {
+        let state = SheafState::new();
+        consistent_chain(&state, [hx(1), hx(2), hx(3)]);
+        let generation = state.cache.lock().generation();
+        let bad = TopologyDeltaInput {
+            added_regions: vec![SheafStalkInput {
+                id: 3,
+                hash: Some("aa".into()),
+                data: vec![],
+            }],
+            ..Default::default()
+        };
+        let err = op_sheaf_update_topology(&state, &bad, 0).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<WireHashError>(),
+            Some(&WireHashError::WrongLength {
+                field: "hash",
+                len: 2
+            })
+        );
+        let bad_edge = TopologyDeltaInput {
+            added_edges: vec![SheafRestrictionInput {
+                a: 2,
+                b: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(op_sheaf_update_topology(&state, &bad_edge, 0).is_err());
+        assert_eq!(
+            state.cache.lock().generation(),
+            generation,
+            "nothing applied"
+        );
+        assert_eq!(state.cache.lock().total_count(), 3);
+
+        let good = TopologyDeltaInput {
+            added_regions: vec![SheafStalkInput {
+                id: 3,
+                hash: None,
+                data: vec![],
+            }],
+            added_edges: vec![SheafRestrictionInput {
+                a: 2,
+                b: 3,
+                boundary_hash: Some(hx(3)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let r = parse_response(&op_sheaf_update_topology(&state, &good, 0).unwrap());
+        assert_eq!(r["ok"], true, "{r}");
+        // Region 2 keeps its hash, so 1 — 2 holds; region 3 was added
+        // without a hash, so it is Changed and the 2 — 3 edge fires.
+        assert_eq!(
+            invalidate(&state, 2, Some(hx(3))).unwrap(),
+            vec![2, 3],
+            "an omitted hash lands as Changed"
+        );
+    }
+
+    /// The wire spelling: an omitted or `null` hash is `None` (Changed); `""`
+    /// is a present, malformed hash.
+    #[test]
+    fn an_omitted_hash_deserializes_as_absent_and_an_empty_one_as_present() {
+        let omitted: SheafStalkInput =
+            serde_json::from_value(serde_json::json!({"id": 1})).unwrap();
+        assert_eq!(omitted.hash, None);
+        let null: SheafStalkInput =
+            serde_json::from_value(serde_json::json!({"id": 1, "hash": null})).unwrap();
+        assert_eq!(null.hash, None);
+        let empty: SheafStalkInput =
+            serde_json::from_value(serde_json::json!({"id": 1, "hash": ""})).unwrap();
+        assert_eq!(empty.hash.as_deref(), Some(""));
+    }
+
+    /// A chain 0 — 1 — 2 whose boundaries hold, every region cached.
+    fn consistent_chain(state: &SheafState, hashes: [String; 3]) {
+        let regions: Vec<SheafStalkInput> = hashes
+            .iter()
+            .enumerate()
+            .map(|(id, h)| SheafStalkInput {
+                id: id as u32,
+                hash: Some(h.clone()),
+                data: vec![],
+            })
+            .collect();
+        let xor = |a: &str, b: &str| -> String {
+            let (a, b) = (hex::decode(a).unwrap(), hex::decode(b).unwrap());
+            hex::encode(a.iter().zip(&b).map(|(x, y)| x ^ y).collect::<Vec<u8>>())
+        };
+        let restrictions: Vec<SheafRestrictionInput> = [(0, 1), (1, 2)]
+            .into_iter()
+            .map(|(a, b)| SheafRestrictionInput {
+                a,
+                b,
+                boundary_hash: Some(xor(&hashes[a as usize], &hashes[b as usize])),
+                co_change_rate: 0.5,
+                weights: vec![1.0],
+                ..Default::default()
+            })
+            .collect();
+        op_sheaf_set_topology(state, &regions, &restrictions, 0).unwrap();
+        let mut cache = state.cache.lock();
+        for id in 0..3 {
+            cache.put(id, ());
+        }
+    }
+
+    fn invalidate(state: &SheafState, region: u32, hash: Option<String>) -> Result<Vec<u32>> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stalks = [SheafStalkInput {
+            id: region,
+            hash,
+            data: vec![],
+        }];
+        let resp = op_sheaf_invalidate(state, &dir.path().join("ctrl"), &[region], &stalks)?;
+        let mut out: Vec<u32> = parse_response(&resp)["invalidated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Bead `ley-line-open-1c5d28` (d): a malformed stalk hash is refused
+    /// with the typed error, and the cache is left exactly as it was.
+    #[test]
+    fn a_malformed_stalk_hash_is_refused_and_changes_nothing() {
+        let state = SheafState::new();
+        consistent_chain(&state, [hx(1), hx(2), hx(3)]);
+        let generation = state.cache.lock().generation();
+        for bad in ["", "aa", "zz"] {
+            let err = invalidate(&state, 1, Some(bad.to_string())).unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref::<WireHashError>(),
+                    Some(WireHashError::WrongLength { .. })
+                ),
+                "{bad:?}: {err:#}"
+            );
+        }
+        assert_eq!(state.cache.lock().generation(), generation);
+        assert_eq!(
+            state.cache.lock().valid_count(),
+            3,
+            "nothing was invalidated"
+        );
+        assert_eq!(
+            invalidate(&state, 1, Some(hx(2))).unwrap(),
+            vec![1],
+            "stalk 1 kept"
+        );
+
+        let refused = op_sheaf_set_topology(
+            &SheafState::new(),
+            &[SheafStalkInput {
+                id: 0,
+                hash: Some(hx(1)),
+                data: vec![],
+            }],
+            &[SheafRestrictionInput {
+                a: 0,
+                b: 1,
+                boundary_hash: None,
+                ..Default::default()
+            }],
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<WireHashError>(),
+            Some(&WireHashError::Missing {
+                field: "boundary_hash"
+            })
+        );
+    }
+
+    /// Bead `ley-line-open-1c5d28` (d): an omitted hash is an explicit
+    /// Changed, so the cascade fires on both of region 1's edges although
+    /// the stored hashes would still XOR to every boundary. The old wire
+    /// reached the same cascade only because "" became the zero hash.
+    #[test]
+    fn an_omitted_stalk_hash_fires_the_cascade() {
+        let state = SheafState::new();
+        consistent_chain(&state, [hx(1), hx(2), hx(3)]);
+        assert_eq!(invalidate(&state, 1, None).unwrap(), vec![0, 1, 2]);
+    }
+
+    /// Bead `ley-line-open-1c5d28` (d), with region hashes built by the
+    /// region-hash contract: an unchanged content-derived hash (members
+    /// re-enumerated in another order) cascades nowhere, and a changed
+    /// member `node_hash` fires the region's boundaries.
+    #[test]
+    fn content_derived_region_hashes_cascade_exactly_when_a_member_moves() {
+        use leyline_core::Hash;
+        use leyline_sheaf::region::region_hash;
+        let parser = Hash::from_bytes([0x5a; 32]);
+        let n = |b: u8| Hash::from_bytes([b; 32]);
+        let region = |members: &[Hash]| hex::encode(region_hash(parser, members).as_bytes());
+        let chain = || {
+            let state = SheafState::new();
+            consistent_chain(
+                &state,
+                [
+                    region(&[n(1), n(2)]),
+                    region(&[n(3), n(4)]),
+                    region(&[n(5)]),
+                ],
+            );
+            state
+        };
+
+        let state = chain();
+        assert_eq!(
+            invalidate(&state, 1, Some(region(&[n(4), n(3)]))).unwrap(),
+            vec![1],
+            "unchanged content: no cascade from region 1"
+        );
+
+        let state = chain();
+        assert_eq!(
+            invalidate(&state, 1, Some(region(&[n(3), n(9)]))).unwrap(),
+            vec![0, 1, 2],
+            "a changed member node_hash fires both of region 1's boundaries"
+        );
     }
 
     #[test]
@@ -1285,19 +1693,19 @@ mod tests {
         let regions = vec![
             SheafStalkInput {
                 id: 0,
-                hash: "aa".into(),
+                hash: Some(hx(0xaa)),
                 data: vec![1.0, 0.5, 0.0, 0.0],
             },
             SheafStalkInput {
                 id: 1,
-                hash: "bb".into(),
+                hash: Some(hx(0xbb)),
                 data: vec![1.0, 0.5, 9.0, 9.0],
             },
         ];
         let restrictions = vec![SheafRestrictionInput {
             a: 0,
             b: 1,
-            boundary_hash: format!("{:02x}", 0xaa ^ 0xbb),
+            boundary_hash: Some(hx(0xaa ^ 0xbb)),
             co_change_rate: 0.5,
             revert_rate: 0.0,
             weights: vec![1.0],
@@ -1326,20 +1734,20 @@ mod tests {
         let regions = vec![
             SheafStalkInput {
                 id: 0,
-                hash: "aa".into(),
+                hash: Some(hx(0xaa)),
                 data: vec![1.0],
             },
             SheafStalkInput {
                 // Collides with the edge id space (≥ EDGE_ID_BASE).
                 id: EDGE_ID_BASE + 7,
-                hash: "bb".into(),
+                hash: Some(hx(0xbb)),
                 data: vec![2.0],
             },
         ];
         let restrictions = vec![SheafRestrictionInput {
             a: 0,
             b: EDGE_ID_BASE + 7,
-            boundary_hash: format!("{:02x}", 0xaa ^ 0xbb),
+            boundary_hash: Some(hx(0xaa ^ 0xbb)),
             co_change_rate: 0.5,
             revert_rate: 0.0,
             weights: vec![1.0],
@@ -1514,19 +1922,19 @@ mod tests {
         let regions = vec![
             SheafStalkInput {
                 id: 100,
-                hash: "aa".into(),
+                hash: Some(hx(0xaa)),
                 data: vec![],
             },
             SheafStalkInput {
                 id: 200,
-                hash: "bb".into(),
+                hash: Some(hx(0xbb)),
                 data: vec![],
             },
         ];
         let restrictions = vec![SheafRestrictionInput {
             a: 100,
             b: 200,
-            boundary_hash: "cc".into(),
+            boundary_hash: Some(hx(0xcc)),
             co_change_rate: 0.5,
             revert_rate: 0.0,
             weights: vec![1.0],
@@ -1556,19 +1964,19 @@ mod tests {
         let regions = vec![
             SheafStalkInput {
                 id: 0,
-                hash: "aa".into(),
+                hash: Some(hx(0xaa)),
                 data: vec![1.0, 0.5, 0.0, 0.0],
             },
             SheafStalkInput {
                 id: 1,
-                hash: "bb".into(),
+                hash: Some(hx(0xbb)),
                 data: vec![1.0, 0.5, 9.0, 9.0],
             },
         ];
         let restrictions = vec![SheafRestrictionInput {
             a: 0,
             b: 1,
-            boundary_hash: format!("{:02x}", 0xaa ^ 0xbb),
+            boundary_hash: Some(hx(0xaa ^ 0xbb)),
             co_change_rate: 0.5,
             revert_rate: 0.0,
             weights: vec![1.0],
@@ -1584,7 +1992,7 @@ mod tests {
         // Change coord [2] only (private dim) — projection unchanged.
         let new_stalks = vec![SheafStalkInput {
             id: 0,
-            hash: "ff".into(),
+            hash: Some(hx(0xff)),
             data: vec![1.0, 0.5, 42.0, 0.0],
         }];
         let resp = op_sheaf_invalidate(
@@ -1610,7 +2018,7 @@ mod tests {
         // Now change coord [0] (agreement dim) — projection moves.
         let new_stalks_real = vec![SheafStalkInput {
             id: 0,
-            hash: "ee".into(),
+            hash: Some(hx(0xee)),
             data: vec![99.0, 0.5, 42.0, 0.0],
         }];
         // Re-mark region 1 valid before the second test.

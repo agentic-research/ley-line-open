@@ -460,7 +460,7 @@ pub fn tool_registry() -> Vec<McpTool> {
                             "type": "object",
                             "properties": {
                                 "id":   {"type": "integer"},
-                                "hash": {"type": "string", "description": "Hex-encoded 32-byte content hash."},
+                                "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The region's content hash, 64 lowercase hex digits (the leyline/sheaf-region/v1 fold over its members' node_hash). Omit when the content is unknown: the region then counts as changed. Malformed or empty is refused."},
                                 "data": {"type": "array", "items": {"type": "number"}, "description": "Optional f32 stalk vector for δ⁰ mode."}
                             },
                             "required": ["id"]
@@ -473,13 +473,13 @@ pub fn tool_registry() -> Vec<McpTool> {
                             "properties": {
                                 "a": {"type": "integer"},
                                 "b": {"type": "integer"},
-                                "boundary_hash":  {"type": "string"},
+                                "boundary_hash":  {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "64 lowercase hex digits: the XOR of the two regions' hashes."},
                                 "co_change_rate": {"type": "number"},
                                 "revert_rate":    {"type": "number"},
                                 "weights":        {"type": "array", "items": {"type": "number"}},
                                 "agreement_dim":  {"type": "integer", "description": "Opt-in to δ⁰ mode: project first N coords. 0 = heuristic only."}
                             },
-                            "required": ["a", "b"]
+                            "required": ["a", "b", "boundary_hash"]
                         }
                     },
                     "node_stalk_dim": {"type": "integer", "description": "Stalk dimension for δ⁰ mode. 0 = heuristic only."}
@@ -499,7 +499,7 @@ pub fn tool_registry() -> Vec<McpTool> {
                             "type": "object",
                             "properties": {
                                 "id":   {"type": "integer"},
-                                "hash": {"type": "string"},
+                                "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The region's new content hash, 64 lowercase hex digits. Omit when the content is unknown: the region counts as changed and its boundaries fire. Malformed or empty is refused."},
                                 "data": {"type": "array", "items": {"type": "number"}}
                             },
                             "required": ["id"]

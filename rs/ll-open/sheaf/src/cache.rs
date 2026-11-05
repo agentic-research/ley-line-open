@@ -27,7 +27,7 @@
 //! pins one such case, shrunk from the replay.
 //!
 //! No shipped consumer serves a value because this cache kept it. The daemon
-//! instantiates `SheafCache<HashStalk, ()>` (`cli-lib/src/daemon/sheaf_ops.rs`),
+//! instantiates `SheafCache<StalkDigest, ()>` (`cli-lib/src/daemon/sheaf_ops.rs`),
 //! so it holds no derived value to serve; `sheaf_invalidate` returns the
 //! cascade as a list of regions to recompute; the watcher's
 //! `daemon.sheaf.invalidate` emit maps changed files to regions by label and
@@ -151,10 +151,33 @@ const HEURISTIC_CASCADE_DEPTH: u32 = 3;
 /// `ley-line-open-4f3f6e` (math-friend audit P4).
 const DELTA0_EPS: f32 = 1e-4;
 
-/// A content hash summarizing a region's current state.
+/// What a region's stalk says about its content (bead `ley-line-open-1c5d28`).
+///
+/// `Changed` is an explicit state, never a coincidental hash: a region whose
+/// content is unknown is reported as changed, and every boundary check on its
+/// edges says "changed" without consulting the XOR pre-filter or δ⁰, so the
+/// cascade proceeds through it and nothing under-evicts. Before this type, an
+/// absent hash became the all-zero hash, which forced the XOR to fire only by
+/// accident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StalkDigest {
+    /// The region's content hash (Merkle root or another content address).
+    Hash([u8; 32]),
+    /// The region's content is not known; treat every boundary as changed.
+    Changed,
+}
+
+/// A content summary of a region's current state.
 pub trait StalkHash {
-    /// Compute the Merkle root (or content hash) for this region.
-    fn merkle_root(&self) -> [u8; 32];
+    /// The region's content hash, or [`StalkDigest::Changed`] when unknown.
+    fn digest(&self) -> StalkDigest;
+}
+
+/// A digest is its own stalk: the daemon's cache stores one per region.
+impl StalkHash for StalkDigest {
+    fn digest(&self) -> StalkDigest {
+        *self
+    }
 }
 
 /// An edge in the restriction map between two regions.
@@ -585,12 +608,20 @@ impl<S: StalkHash, V> SheafCache<S, V> {
     /// called `refresh_baseline`), the check falls back to the prior
     /// behaviour — "current norm exceeds eps" — which over-evicts on
     /// initially-non-consistent sections.
+    ///
+    /// A stalk whose digest is [`StalkDigest::Changed`] answers "changed" for
+    /// every edge it touches before either stage runs: its content is unknown,
+    /// so neither the XOR nor δ⁰ (whose stalk data was not refreshed either)
+    /// can vouch for the boundary (bead `ley-line-open-1c5d28`).
     fn check_boundary_changed(&self, a: RegionId, b: RegionId, edge: &RestrictionEdge) -> bool {
-        let hash_a = self.stalks.get(&a).map(|s| s.merkle_root());
-        let hash_b = self.stalks.get(&b).map(|s| s.merkle_root());
+        let hash_a = self.stalks.get(&a).map(|s| s.digest());
+        let hash_b = self.stalks.get(&b).map(|s| s.digest());
+        if hash_a == Some(StalkDigest::Changed) || hash_b == Some(StalkDigest::Changed) {
+            return true;
+        }
 
         let xor_changed = match (hash_a, hash_b) {
-            (Some(ha), Some(hb)) => {
+            (Some(StalkDigest::Hash(ha)), Some(StalkDigest::Hash(hb))) => {
                 let mut boundary = [0u8; 32];
                 for i in 0..32 {
                     boundary[i] = ha[i] ^ hb[i];
@@ -627,18 +658,25 @@ impl<S: StalkHash, V> SheafCache<S, V> {
             if a >= b {
                 continue;
             }
-            let ha = self.stalks.get(&a).map(|s| s.merkle_root());
-            let hb = self.stalks.get(&b).map(|s| s.merkle_root());
+            let ha = self.stalks.get(&a).map(|s| s.digest());
+            let hb = self.stalks.get(&b).map(|s| s.digest());
 
-            if let (Some(ha), Some(hb)) = (ha, hb) {
-                let mut boundary = [0u8; 32];
-                for i in 0..32 {
-                    boundary[i] = ha[i] ^ hb[i];
+            // An unknown (`Changed`) side cannot vouch for its boundary, so
+            // it counts as a disagreement, as the cascade treats it.
+            let disagrees = match (ha, hb) {
+                (Some(StalkDigest::Hash(ha)), Some(StalkDigest::Hash(hb))) => {
+                    let mut boundary = [0u8; 32];
+                    for i in 0..32 {
+                        boundary[i] = ha[i] ^ hb[i];
+                    }
+                    boundary != edge.boundary_hash
                 }
-                if boundary != edge.boundary_hash {
-                    // Weight by co-change rate (tighter coupling = larger defect)
-                    total += 1.0 - edge.co_change_rate;
-                }
+                (Some(_), Some(_)) => true,
+                _ => false,
+            };
+            if disagrees {
+                // Weight by co-change rate (tighter coupling = larger defect)
+                total += 1.0 - edge.co_change_rate;
             }
         }
         total
@@ -814,8 +852,8 @@ mod tests {
     struct TestStalk([u8; 32]);
 
     impl StalkHash for TestStalk {
-        fn merkle_root(&self) -> [u8; 32] {
-            self.0
+        fn digest(&self) -> StalkDigest {
+            StalkDigest::Hash(self.0)
         }
     }
 
@@ -823,6 +861,112 @@ mod tests {
         let mut h = [0u8; 32];
         h[0] = b;
         h
+    }
+
+    /// A chain 0 — 1 — 2 whose boundary hashes all hold, every entry cached.
+    fn consistent_chain() -> SheafCache<StalkDigest, String> {
+        let mut cache: SheafCache<StalkDigest, String> = SheafCache::new();
+        for (region, byte) in [(0, 1u8), (1, 2), (2, 3)] {
+            cache.set_stalk(region, StalkDigest::Hash(hash_from_byte(byte)));
+            cache.put(region, format!("v{region}"));
+        }
+        for (a, b, xor) in [(0, 1, 1u8 ^ 2), (1, 2, 2 ^ 3)] {
+            cache.set_restriction(
+                a,
+                b,
+                RestrictionEdge {
+                    weights: vec![1.0],
+                    boundary_hash: hash_from_byte(xor),
+                    co_change_rate: 0.5,
+                    revert_rate: 0.0,
+                },
+            );
+        }
+        cache
+    }
+
+    /// Bead `ley-line-open-1c5d28`: an unchanged content hash on every side
+    /// holds the boundary, so the cascade stops at the changed region.
+    #[test]
+    fn unchanged_hashes_stop_the_cascade() {
+        let mut cache = consistent_chain();
+        assert_eq!(cache.on_change(&[1]), vec![1]);
+        assert!(cache.get(&0).is_some() && cache.get(&2).is_some());
+    }
+
+    /// Bead `ley-line-open-1c5d28`: a `Changed` stalk fires every boundary it
+    /// touches although the stored hashes would still XOR to the edge's
+    /// boundary hash, so a region of unknown content never stops a cascade.
+    #[test]
+    fn a_changed_stalk_fires_its_boundaries() {
+        let mut cache = consistent_chain();
+        cache.set_stalk(1, StalkDigest::Changed);
+        let mut invalidated = cache.on_change(&[1]);
+        invalidated.sort();
+        assert_eq!(invalidated, vec![0, 1, 2]);
+
+        let mut cache = consistent_chain();
+        cache.set_stalk(0, StalkDigest::Changed);
+        let mut invalidated = cache.on_change(&[0]);
+        invalidated.sort();
+        assert_eq!(invalidated, vec![0, 1], "0's edge fires; 1 — 2 holds");
+        assert!(cache.get(&2).is_some());
+    }
+
+    /// Bead `ley-line-open-1c5d28`: in δ⁰ mode a `Changed` stalk fires its
+    /// edges before δ⁰ is consulted. The section did not move (no new stalk
+    /// data), so δ⁰ alone would hold the boundary; unknown content must not.
+    #[test]
+    fn a_changed_stalk_fires_its_boundaries_in_delta_zero_mode() {
+        use crate::complex::{CellComplex, RestrictionMap};
+
+        let mut cx = CellComplex::new(1);
+        cx.add_node(0, vec![0.0]);
+        cx.add_node(1, vec![1.0]);
+        cx.add_edge(
+            100,
+            0,
+            1,
+            1,
+            Some("t".into()),
+            RestrictionMap::identity(1),
+            RestrictionMap::identity(1),
+            false,
+        );
+        let mut cache: SheafCache<StalkDigest, String> = SheafCache::new().with_complex(cx);
+        cache.set_stalk(0, StalkDigest::Hash(hash_from_byte(1)));
+        cache.set_stalk(1, StalkDigest::Hash(hash_from_byte(9)));
+        cache.set_restriction(
+            0,
+            1,
+            RestrictionEdge {
+                weights: vec![1.0],
+                boundary_hash: hash_from_byte(1 ^ 2),
+                co_change_rate: 0.5,
+                revert_rate: 0.0,
+            },
+        );
+        cache.put(0, "a".into());
+        cache.put(1, "b".into());
+        cache.refresh_baseline();
+
+        // Control: the XOR fires (9 ≠ 2) but δ⁰ sits at its baseline.
+        assert_eq!(cache.on_change(&[1]), vec![1], "δ⁰ holds the boundary");
+        cache.put(1, "b".into());
+
+        cache.set_stalk(1, StalkDigest::Changed);
+        let mut invalidated = cache.on_change(&[1]);
+        invalidated.sort();
+        assert_eq!(invalidated, vec![0, 1]);
+    }
+
+    /// An unknown side counts as a boundary disagreement in the defect.
+    #[test]
+    fn a_changed_stalk_counts_in_the_defect() {
+        let mut cache = consistent_chain();
+        assert_eq!(cache.defect(), 0.0);
+        cache.set_stalk(1, StalkDigest::Changed);
+        assert_eq!(cache.defect(), 1.0, "both of 1's edges, each 1 − 0.5");
     }
 
     #[test]

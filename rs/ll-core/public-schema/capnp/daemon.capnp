@@ -627,6 +627,29 @@ struct ErrorResponse {
 # `hash` field is hex-encoded over the wire so consumers don't have
 # to JSON-encode a 32-byte byte array.
 #
+# STALK HASH RULES (bead `ley-line-open-1c5d28`):
+#   * A present `hash` is exactly 64 lowercase hex digits. Anything else,
+#     `""` included, is refused with an error and the request changes
+#     nothing; nothing is zero-padded or truncated.
+#   * An OMITTED `hash` (or JSON `null`) means the region's content is
+#     unknown: the stalk is CHANGED, every boundary it touches fires, and
+#     the cascade proceeds through it (no under-eviction). It stays changed
+#     until a later `sheaf_invalidate` or topology supplies a hash.
+#   * REGION-HASH CONTRACT. For the XOR pre-filter to stop a cascade only
+#     when content held, a region's hash must be content-derived and
+#     computed identically at topology time and at invalidate time:
+#       regionHash(R) = PartitionSpec{RowSet, scheme
+#         "leyline/sheaf-region/v1", params = parserId (32 bytes),
+#         canon_version 1}.address({(node_hash(m), 0, 0) : m in members(R)})
+#     i.e. a BLAKE3 derive_key("leyline partition fold v1") fold over the
+#     members' node_hash multiset, members sorted, parserId bound. A hash
+#     of member names or ids is not content-derived and under-evicts.
+#     Rust: `leyline_sheaf::region::region_hash`; vectors:
+#     `clients/go/leyline-schema/vectors/sheaf-region-v1.json`.
+#   * `SheafRestriction.boundaryHash` is required, under the same 64-hex
+#     rule, and is `regionHash(a) XOR regionHash(b)` at topology time
+#     (`leyline_sheaf::region::boundary_hash`).
+#
 # `data` is optional: when non-empty AND the request's `nodeStalkDim`
 # is > 0, the cache pushes it into the attached `CellComplex` via
 # `set_stalk_value` so `detect_violations` sees the latest section

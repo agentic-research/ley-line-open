@@ -31,7 +31,25 @@ It is a structural answer about the sheaf section, not a per-cache eviction list
 
 Every false skip is a region whose own bytes did not change and whose value moved through a fact outside them: a def of a called token appearing or disappearing elsewhere in the corpus, or an import edit in the same file. The restriction graph holds no edge to either fact, so neither mode can see it. δ⁰ prunes the heuristic's over-reach (1,182 fewer false misses) and with it the 47 regions the over-reach had evicted by coincidence. `tests/sheaf_cache_advisory.rs` pins one such case, shrunk from the replay, and asserts this paragraph's first sentence in both this README and the `cache` module doc.
 
-No shipped consumer serves a value because `SheafCache` kept it. The daemon's cache is `SheafCache<HashStalk, ()>` and holds no derived value; `sheaf_invalidate` returns regions to recompute; mache evicts per-node content for the returned regions on top of the edited file's nodes it re-ingests, so an unlisted region keeps only content derived from its own unchanged bytes. The cascade is an eviction hint: it can widen an eviction, never justify a reuse.
+No shipped consumer serves a value because `SheafCache` kept it. The daemon's cache is `SheafCache<StalkDigest, ()>` and holds no derived value; `sheaf_invalidate` returns regions to recompute; mache evicts per-node content for the returned regions on top of the edited file's nodes it re-ingests, so an unlisted region keeps only content derived from its own unchanged bytes. The cascade is an eviction hint: it can widen an eviction, never justify a reuse.
+
+## Stalk hashes and the region-hash contract
+
+The XOR pre-filter on each restriction edge stops a cascade when `hash(a) ⊕ hash(b)` still equals the edge's `boundary_hash`. That is sound only when a region's hash moves whenever its content moves (bead `ley-line-open-1c5d28`):
+
+- A stalk is a `StalkDigest`: `Hash([u8; 32])` or `Changed`. `Changed` means the region's content is unknown. Every boundary it touches fires before the XOR or δ⁰ is consulted, and it counts as a disagreement in `defect()`. The daemon stores a stalk as `Changed` when a `sheaf_*` request omits its `hash`.
+- On the wire a present hash is exactly 64 lowercase hex digits. The daemon refuses anything else, `""` included, with `WireHashError` and changes nothing. `boundary_hash` is required under the same rule.
+- A region's hash is a keyed fold over its members' `node_hash` values (`region::region_hash`):
+
+  ```text
+  regionHash(R) = PartitionSpec{ RowSet, scheme "leyline/sheaf-region/v1",
+                                 params = parserId, canon_version 1 }
+                  .address({ (node_hash(m), 0, 0) : m ∈ members(R) })
+  boundaryHash(a, b) = regionHash(a) ⊕ regionHash(b)
+  ```
+
+  Under ADR-0047 `node_hash` is content-keyed, so an equal fold means equal member content. Members are a multiset: order is erased and a duplicate counts. `parserId` is bound, so hashes from two extraction epochs never compare equal. A consumer computes it identically at topology time and at invalidate time. A hash over member names or ids is not content-derived: after an edit it still XORs to the boundary and stops the cascade (under-eviction).
+- Vectors for other runtimes, with every preimage byte: [`clients/go/leyline-schema/vectors/sheaf-region-v1.json`](../../../clients/go/leyline-schema/vectors/sheaf-region-v1.json), pinned by `region::tests::the_published_vectors_match`.
 
 ## Mathematical foundation
 

@@ -313,8 +313,8 @@ DIFF
 : > "$log"
 PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
   "$repo_root/tools/mutants_diff.sh" "$fixture_dir/generic-multi.diff" generic
-assert_call "mutants .* -C --lib .*--file ll-core/core/\*\* --features interrupt( |\$)" \
-    'leyline-core is mutated alone, with its own feature'
+assert_call "mutants .* -C --lib .*--file ll-core/core/\*\* --features interrupt,sqlite( |\$)" \
+    'leyline-core is mutated alone, with both of its features'
 assert_call "mutants .* -C --lib .*--file ll-open/sign/\*\* --features root-signer( |\$)" \
     'leyline-sign is mutated alone, with its own feature'
 assert_call "mutants .* -C --lib .*--file ll-open/ts/\*\* --features hcl,pyproject( |\$)" \

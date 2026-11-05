@@ -594,8 +594,8 @@ fn decide_one(conn: &Connection, w: Proposed) -> Result<Decided> {
                 return Ok(stale(Some(expected), Some(theirs), &path));
             }
             let (Some(base), Some(current)) = (
-                crate::tree::blob_bytes(conn, expected)?,
-                crate::tree::blob_bytes(conn, theirs)?,
+                crate::tree::blob_bytes_at(conn, &path, expected)?,
+                crate::tree::blob_bytes_at(conn, &path, theirs)?,
             ) else {
                 return Ok(stale(Some(expected), Some(theirs), &path));
             };
@@ -834,7 +834,7 @@ pub fn rename_dir(conn: &Connection, from: &str, to: &str) -> Result<Vec<Propose
                 writes.push(Proposed::mkdir(moved_to));
             }
             Entry::File { mode, blob } => {
-                let bytes = crate::tree::blob_bytes(conn, blob)?.with_context(|| {
+                let bytes = crate::tree::blob_bytes_at(conn, &path, blob)?.with_context(|| {
                     format!("rename of '{path}': the store holds no blob {blob}")
                 })?;
                 writes.push(Proposed::delete(path, Base::Blob(blob)));
@@ -864,7 +864,7 @@ pub fn rename(conn: &Connection, from: &str, to: &str) -> Result<Vec<Proposed>> 
                 Some(Entry::File { blob, .. }) => Base::Blob(blob),
                 None => Base::Absent,
             };
-            let bytes = crate::tree::blob_bytes(conn, blob)?
+            let bytes = crate::tree::blob_bytes_at(conn, from, blob)?
                 .with_context(|| format!("rename of '{from}': the store holds no blob {blob}"))?;
             Ok(vec![
                 Proposed::delete(from, Base::Blob(blob)),
@@ -1105,14 +1105,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, expected.as_bytes().to_vec());
-        let blob: Vec<u8> = a
-            .conn
-            .query_row(
-                "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                [&stored],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let blob = crate::tree::blob_bytes(&a.conn, expected).unwrap().unwrap();
         assert_eq!(blob, A2.as_bytes());
         assert_eq!(
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
@@ -1325,13 +1318,8 @@ mod tests {
             .post_commit_error
             .expect("the failed head write is reported");
         assert!(problem.contains("head"), "{problem}");
-        let stored: Vec<u8> = a
-            .conn
-            .query_row(
-                "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                [A2.as_bytes().hash().as_bytes().to_vec()],
-                |r| r.get(0),
-            )
+        let stored = crate::tree::blob_bytes(&a.conn, A2.as_bytes().hash())
+            .unwrap()
             .unwrap();
         assert_eq!(stored, A2.as_bytes());
 
@@ -1681,6 +1669,44 @@ mod tests {
 
         check(&a.conn, &Grant::Whole, vec![proposed("b.go", blob(B), B2)]).unwrap();
         assert!(whole_image(&a.conn) == before, "a check lands nothing");
+    }
+
+    /// Bead `ley-line-open-12d305`: a proposal against a moved base reads
+    /// the base's bytes to merge. A base blob whose bytes were changed under
+    /// its key is refused with a typed error naming the path and the blob,
+    /// and nothing lands.
+    #[test]
+    fn a_tampered_merge_base_is_refused_naming_the_path_and_blob() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
+        let base = A.as_bytes().hash();
+        a.conn
+            .execute(
+                "UPDATE source_blobs SET blob_bytes = ?1 WHERE blob_hash = ?2",
+                rusqlite::params![B.as_bytes(), base.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let before = whole_image(&a.conn);
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", Base::Blob(base), B2)],
+        )
+        .unwrap_err();
+        let tampered = err
+            .downcast_ref::<leyline_core::source_blob::SourceBlobError>()
+            .expect("a typed source-blob refusal");
+        assert_eq!(tampered.path.as_deref(), Some("a.go"));
+        assert_eq!(tampered.blob, base);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("a.go") && msg.contains(&base.to_string()),
+            "{msg}"
+        );
+        assert!(
+            whole_image(&a.conn) == before,
+            "a refused proposal lands nothing"
+        );
     }
 
     /// The written bytes, not the disk's, are what the arena holds: the

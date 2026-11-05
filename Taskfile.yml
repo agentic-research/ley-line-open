@@ -1054,6 +1054,19 @@ tasks:
     cmds:
       - tools/lint_blake3.sh
 
+  # Σ axiom CA as verify-on-read (bead ley-line-open-12d305): every
+  # production read of `source_blobs.blob_bytes` goes through the one
+  # verifying accessor, `leyline_core::source_blob`.
+  lint:source-blob-reads:
+    desc: No production SELECT of source_blobs.blob_bytes outside leyline_core::source_blob
+    cmds:
+      - sh tools/lint_source_blob_reads.sh .
+
+  lint:source-blob-reads:fixture-test:
+    desc: Prove the source-blob read gate fails on single-line, multi-line, JOIN, blob_open and cfg(test)-adjacent raw reads
+    cmds:
+      - sh tools/test_lint_source_blob_reads.sh
+
   taskfile:anchors:fixture-test:
     desc: |
       Prove every included Taskfile's `dir:` resolves to the cargo workspace
@@ -1726,6 +1739,8 @@ tasks:
       - task: release:version-check
       - task: release:crates:fixture-test
       - task: lint:blake3
+      - task: lint:source-blob-reads:fixture-test
+      - task: lint:source-blob-reads
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims
       - task: lint:mutants-cfg-coverage

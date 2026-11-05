@@ -35,7 +35,7 @@ verify = []
 
 [dependencies]
 parking_lot = { workspace = true }
-leyline-core = { path = "../../ll-core/core", version = "0.25.0" }
+leyline-core = { path = "../../ll-core/core", version = "0.25.0", features = ["sqlite"] }
 # Shared C-boundary helpers (bead `ley-line-open-85fb1f` PR 2).
 leyline-ffi-helpers = { path = "../../ll-core/ffi-helpers", version = "0.25.0" }
 leyline-schema = { path = "../../ll-core/schema", version = "0.25.0" }

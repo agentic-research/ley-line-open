@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result, ensure};
 use leyline_core::Hash;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -343,19 +343,16 @@ fn activate_blob_in_tx(tx: &Transaction<'_>, blob_hash: &[u8]) -> Result<BlobAct
     if has_blob_chunked(tx, blob_hash).context("check blob CDC completeness")? {
         return Ok(BlobActivation::AlreadyFresh);
     }
-    let bytes: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-            params![blob_hash.as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .optional()
+    // The one verifying reader of `source_blobs` (bead
+    // `ley-line-open-12d305`): a row whose bytes do not hash to its key is
+    // refused here, before the store sees it.
+    let bytes = leyline_core::source_blob::read(tx, blob_hash)
         .with_context(|| format!("read authoritative bytes for blob {blob_hash}"))?;
     let Some(bytes) = bytes else {
         return Ok(BlobActivation::Gone);
     };
-    // The content-address integrity check lives in the store: a row whose
-    // bytes do not hash to its key is refused, never manifested.
+    // The store re-checks the content address: it refuses bytes that do
+    // not hash to the key it is handed, never manifesting them.
     store_blob_chunked_in_transaction(tx, blob_hash, &bytes)
         .with_context(|| format!("activate CDC for blob {blob_hash}"))?;
     // Liveness, not paranoia: the convergence loop repairs whatever this

@@ -15,6 +15,10 @@ serde = { workspace = true, features = ["derive"] }
 # T2.2: BLAKE3 for σ(arena buffer) computed at snapshot time. Locked
 # to BLAKE3 per Σ §3.4 (decade write-up 2026-merkle-cas-substrate.md).
 blake3 = { workspace = true }
+# The one verify-on-read reader of `source_blobs` (`source_blob`, bead
+# ley-line-open-12d305), behind `sqlite` so crates without SQLite do not
+# link it.
+rusqlite = { workspace = true, optional = true }
 
 # statvfs: a grown arena is refused when the filesystem cannot hold it
 # (bead ley-line-open-8c8ded).
@@ -24,6 +28,7 @@ libc = { workspace = true }
 [features]
 default = []
 interrupt = []
+sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

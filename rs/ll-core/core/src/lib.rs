@@ -8,6 +8,8 @@ pub mod layout;
 pub mod mmap;
 pub mod outboard;
 pub mod partition;
+#[cfg(feature = "sqlite")]
+pub mod source_blob;
 pub mod substrate;
 
 pub use blob_store::{FsBlobStore, MemBlobStore};

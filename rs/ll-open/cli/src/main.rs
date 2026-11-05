@@ -287,6 +287,15 @@ enum Cmd {
         #[arg(long)]
         mcp_uds: Option<std::path::PathBuf>,
 
+        /// Grant the MCP listeners' callers only these Cloister groups,
+        /// comma-separated (the `_meta.art.cloister/v1.groups[].name`s in
+        /// `server.json`, e.g. `query,lsp`). Default: every group. A
+        /// `tools/call` for a tool outside the grant is refused, and
+        /// `tools/list` lists only the granted tools; a name no group has
+        /// refuses startup. Bead `ley-line-open-851a65`.
+        #[arg(long, value_delimiter = ',')]
+        mcp_groups: Option<Vec<String>>,
+
         /// Drop any existing live-db + zero the controller so this
         /// daemon starts with a cold parse against `--source`,
         /// regardless of what the arena's prior owner left behind.
@@ -435,6 +444,7 @@ async fn main() -> Result<()> {
                 mcp_allow_public: false,
                 mcp_no_auth: false,
                 mcp_uds: None,
+                mcp_groups: None,
                 reset_arena: false,
             };
             match backend_kind {
@@ -555,6 +565,7 @@ async fn main() -> Result<()> {
             mcp_allow_public,
             mcp_no_auth,
             mcp_uds,
+            mcp_groups,
             reset_arena,
             cdc,
             cdc_target: leyline_cli_lib::CdcTarget::SourceBlobs,
@@ -588,6 +599,7 @@ async fn main() -> Result<()> {
                 mcp_allow_public,
                 mcp_no_auth,
                 mcp_uds,
+                mcp_groups,
                 reset_arena,
             };
             leyline_cli_lib::cmd_daemon::run_daemon_with_options(

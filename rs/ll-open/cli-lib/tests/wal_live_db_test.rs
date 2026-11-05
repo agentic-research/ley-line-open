@@ -57,6 +57,7 @@ fn wal_test_config(arena: &Path, source: Option<&Path>, timeout_s: u64) -> Daemo
         mcp_allow_public: false,
         mcp_no_auth: true,
         mcp_uds: None,
+        mcp_groups: None,
         reset_arena: false,
     }
 }

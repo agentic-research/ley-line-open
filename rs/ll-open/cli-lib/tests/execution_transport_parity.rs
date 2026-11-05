@@ -164,8 +164,13 @@ impl Surfaces {
         .expect("bind the execution control socket");
         let mcp = dir.path().join("mcp.sock");
         let token = "c".repeat(64);
-        leyline_cli_lib::daemon::mcp::spawn_uds(ctx, mcp.clone(), Some(Arc::new(token.clone())))
-            .expect("bind the MCP socket");
+        leyline_cli_lib::daemon::mcp::spawn_uds(
+            ctx,
+            mcp.clone(),
+            Some(Arc::new(token.clone())),
+            leyline_cli_lib::daemon::mcp::McpGrant::all(),
+        )
+        .expect("bind the MCP socket");
         let files = dir.path().join("cli");
         std::fs::create_dir(&files).expect("CLI input directory");
         Self {

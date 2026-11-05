@@ -832,8 +832,14 @@ async fn test_mcp_http_tools_list_and_status_call() {
     // ADR-0022: integration test uses the no-auth path (`token: None`)
     // so it exercises the JSON-RPC handler surface, not the auth gate.
     // Auth-gate semantics are pinned in `daemon::auth::tests`.
-    let handle =
-        leyline_cli_lib::daemon::mcp::spawn(ctx, None, port, None).expect("spawn MCP HTTP");
+    let handle = leyline_cli_lib::daemon::mcp::spawn(
+        ctx,
+        None,
+        port,
+        None,
+        leyline_cli_lib::daemon::mcp::McpGrant::all(),
+    )
+    .expect("spawn MCP HTTP");
 
     // Wait for the HTTP listener to accept connections. Same discipline
     // as `spawn_test_socket` for UDS — a fixed sleep races on overloaded

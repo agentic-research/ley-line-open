@@ -77,8 +77,13 @@ fn mcp_tools_list_completes_over_uds_with_the_token_gate_enabled() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     let ctx = common::daemon_context(tmp.path());
-    leyline_cli_lib::daemon::mcp::spawn_uds(ctx, sock.clone(), Some(Arc::new(token.clone())))
-        .expect("spawn MCP over uds");
+    leyline_cli_lib::daemon::mcp::spawn_uds(
+        ctx,
+        sock.clone(),
+        Some(Arc::new(token.clone())),
+        leyline_cli_lib::daemon::mcp::McpGrant::all(),
+    )
+    .expect("spawn MCP over uds");
 
     // Poll the real condition rather than sleeping a fixed interval — a
     // wall-clock sleep as a stop condition races the scheduler and flakes under
@@ -109,4 +114,75 @@ fn mcp_tools_list_completes_over_uds_with_the_token_gate_enabled() {
         body.contains("\"tools\""),
         "tools/list must return a tools array over UDS; got {body}",
     );
+}
+
+/// Bead `ley-line-open-851a65`, end to end through the router a listener
+/// actually serves: a listener granted only `query` refuses `load` (a daemon
+/// op MCP does not advertise), `propose` (group `write`) and raw SQL (group
+/// `sql`), lists only the `query` group's tools, and answers them.
+#[test]
+fn a_listener_serves_only_its_granted_groups() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock: PathBuf = tmp.path().join("llo-mcp.sock");
+    let token = "b".repeat(64);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let ctx = common::daemon_context(tmp.path());
+    leyline_cli_lib::daemon::mcp::spawn_uds(
+        ctx,
+        sock.clone(),
+        Some(Arc::new(token.clone())),
+        leyline_cli_lib::daemon::mcp::McpGrant::groups(&["query"]).unwrap(),
+    )
+    .expect("spawn MCP over uds");
+    drop(common::wait_for_uds(&sock, 10_000));
+
+    let call = |name: &str, args: &str| -> serde_json::Value {
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+        );
+        let (code, body) = post_over_uds(&sock, &req, Some(&token));
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    };
+
+    let load = call("load", r#"{"db":""}"#);
+    assert_eq!(
+        load["error"]["code"],
+        leyline_cli_lib::daemon::mcp::TOOL_NOT_ADVERTISED,
+        "{load}"
+    );
+    let propose = call("propose", r#"{"writes":[]}"#);
+    assert_eq!(
+        propose["error"]["code"],
+        leyline_cli_lib::daemon::mcp::TOOL_NOT_GRANTED,
+        "{propose}"
+    );
+    assert_eq!(propose["error"]["data"]["group"], "write", "{propose}");
+    // Raw SQL runs on the writer, so it is group `sql`, not `query`: a
+    // read-side grant cannot drop a table.
+    let drop = call("query", r#"{"sql":"DROP TABLE IF EXISTS nodes"}"#);
+    assert_eq!(drop["error"]["data"]["group"], "sql", "{drop}");
+    // Dispatched: the empty test db has no tree, so the op itself errors.
+    let listed = call("list_children", r#"{"id":""}"#);
+    assert!(listed.get("result").is_some(), "{listed}");
+
+    let (_, body) = post_over_uds(
+        &sock,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        Some(&token),
+    );
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    let query_group = leyline_cli_lib::daemon::mcp::cloister_groups()
+        .into_iter()
+        .find(|g| g.name == "query")
+        .unwrap();
+    assert_eq!(names, query_group.upstream_names, "{body}");
 }

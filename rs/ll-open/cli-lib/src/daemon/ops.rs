@@ -939,8 +939,10 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
     // was a misclass hidden by the shared `Mutex<Connection>`. The
     // destructive-SQL foot-gun documented at
     // `test_op_query_destructive_runs_today_pin_for_6213d4` continues
-    // to work (that's the whole point of the pin — 6213d4 will lock
-    // this down as an *intentional* change).
+    // to work. Over MCP the tool is therefore its own Cloister group,
+    // `sql`, not part of the read-side `query` group (bead
+    // `ley-line-open-851a65`); a read-only `query` is
+    // `ley-line-open-b7e9a3`.
     ctx.with_write(|conn| {
         let mut stmt = conn.prepare(sql).context("prepare SQL")?;
         let col_count = stmt.column_count();

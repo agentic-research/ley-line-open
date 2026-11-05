@@ -62,10 +62,16 @@
           ]
         },
         {
+          "name": "sql",
+          "advertisedPrefix": "",
+          "upstreamNames": [
+            "query"
+          ]
+        },
+        {
           "name": "query",
           "advertisedPrefix": "",
           "upstreamNames": [
-            "query",
             "list_children",
             "read_content",
             "read_source",

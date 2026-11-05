@@ -261,6 +261,23 @@ mod tests {
         assert!(msg.contains(&hex_of(&h)), "the error names the hash: {msg}");
     }
 
+    /// An arena with no `source_blobs` table holds no blob for the hash:
+    /// the refusal says so, rather than surfacing a failed read.
+    #[test]
+    fn source_bytes_without_a_source_blobs_table_holds_no_such_blob() {
+        let h = hash_of(b"package a\n");
+        let conn = blob_arena(&h, None);
+        conn.execute_batch("DROP TABLE source_blobs").unwrap();
+        let err = source_bytes(&conn, 7).unwrap_err();
+        assert!(
+            err.downcast_ref::<leyline_core::source_blob::SourceBlobError>()
+                .is_none(),
+            "{err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("holds no such blob"), "{msg}");
+    }
+
     #[test]
     fn source_bytes_refuses_a_blob_that_does_not_hash_to_its_key() {
         let key = hash_of(b"package a\n");

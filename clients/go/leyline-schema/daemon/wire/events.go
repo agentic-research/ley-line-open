@@ -281,8 +281,8 @@ func decodePayload(topic string, data json.RawMessage) (any, error) {
 		}
 		return p, nil
 	default:
-		// Generic daemon.<op> topics (load, reparse, flush, snapshot,
-		// enrich — see ops.rs::STATE_CHANGING_OPS): they all carry
+		// Generic daemon.<op> topics (load, reparse, snapshot, enrich,
+		// propose — see ops.rs::STATE_CHANGING_OPS): they all carry
 		// {op: NAME}. Treat any `daemon.*` not matched above as that
 		// shape; truly unknown topics fall through to the raw message.
 		if len(topic) > len("daemon.") && topic[:len("daemon.")] == "daemon." {

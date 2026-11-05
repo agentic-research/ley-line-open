@@ -284,21 +284,6 @@ pub fn tool_registry() -> Vec<McpTool> {
             }),
         },
         McpTool {
-            name: "get_refs_map",
-            description: "Bulk export the full (token → [node_id]) refs index from node_refs. For graph-wide consumers (community detection, architecture diagrams).",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        },
-        McpTool {
-            name: "get_defs_map",
-            description: "Bulk export the full (token → [node_id]) defs index from node_defs. For graph-wide consumers (impact analysis, find_definition).",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        },
-        McpTool {
-            name: "get_schema",
-            description: "Export LLO's tier topology — the layer ownership map of ll-core/ll-open crates. Used by mache's diagram/architecture handlers.",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        },
-        McpTool {
             name: "get_db_path",
             description: "Export the daemon's filesystem paths (.db + sibling capnp segment files). Used by mache for optional capnp readthrough fast-paths; falling back to UDS query ops is always safe.",
             schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
@@ -515,11 +500,6 @@ pub fn tool_registry() -> Vec<McpTool> {
             schema: json!({"type": "object", "properties": {}}),
         },
         McpTool {
-            name: "sheaf_stalks",
-            description: "Cache validity counts (generation + valid + total).",
-            schema: json!({"type": "object", "properties": {}}),
-        },
-        McpTool {
             name: "sheaf_status",
             description: "Combined cache health snapshot: generation, valid, total, defect, tracked_edges (co-change tracker).",
             schema: json!({"type": "object", "properties": {}}),
@@ -650,7 +630,6 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "sheaf_set_topology",
                 "sheaf_invalidate",
                 "sheaf_defect",
-                "sheaf_stalks",
                 "sheaf_status",
                 "sheaf_learned_weights",
             ],
@@ -668,9 +647,6 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "find_callers",
                 "find_defs",
                 "find_callees",
-                "get_refs_map",
-                "get_defs_map",
-                "get_schema",
                 "get_db_path",
                 "get_node",
                 "inspect_symbol",

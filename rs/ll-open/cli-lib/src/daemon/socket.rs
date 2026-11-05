@@ -387,7 +387,7 @@ async fn handle_connection(ctx: Arc<DaemonContext>, stream: tokio::net::UnixStre
 
 /// Dispatch an op through the chain:
 /// 1. Event ops (subscribe, unsubscribe, emit) -> ConnectionState
-/// 2. Base ops (status, flush, load, query, reparse) -> ops::handle_base_op()
+/// 2. Base ops (status, load, query, reparse, ...) -> ops::handle_base_op()
 /// 3. Extension async -> ctx.ext.handle_op_async()
 /// 4. Extension sync -> ctx.ext.handle_op()
 /// 5. Unknown -> error

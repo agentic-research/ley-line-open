@@ -9,7 +9,6 @@
 //! - `sheaf_set_topology` — set community structure (regions + restriction edges)
 //! - `sheaf_invalidate` — report changed regions, get structurally affected neighbors
 //! - `sheaf_defect` — total boundary disagreement metric
-//! - `sheaf_stalks` — per-region stalk counts
 //! - `sheaf_status` — cache statistics (valid/total entries, generation, defect)
 //! - `sheaf_learned_weights` — co-change-learned per-edge coupling rates
 //!
@@ -808,19 +807,6 @@ pub fn op_sheaf_defect(state: &SheafState) -> Result<String> {
     Ok(capnp_json::to_json(reader)?)
 }
 
-/// Per-region cache validity counts (does not enumerate every region
-/// hash — that's intentionally bounded to keep response size predictable).
-pub fn op_sheaf_stalks(state: &SheafState) -> Result<String> {
-    let cache = state.cache.lock();
-    let mut builder = capnp::message::Builder::new_default();
-    let mut root: daemon_capnp::sheaf_stalks_response::Builder = builder.init_root();
-    root.set_generation(cache.generation());
-    root.set_valid(cache.valid_count() as u32);
-    root.set_total(cache.total_count() as u32);
-    let reader = builder.get_root_as_reader::<daemon_capnp::sheaf_stalks_response::Reader>()?;
-    Ok(capnp_json::to_json(reader)?)
-}
-
 /// Combined cache health snapshot — defect, generation, validity, and
 /// tracked-edge count for the co-change weight learner.
 pub fn op_sheaf_status(state: &SheafState) -> Result<String> {
@@ -1320,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn defect_status_stalks_responses_have_typed_fields() {
+    fn defect_status_responses_have_typed_fields() {
         let state = SheafState::new();
         // Empty cache — all metrics should be zero / well-defined.
         let defect = parse_response(&op_sheaf_defect(&state).unwrap());
@@ -1333,10 +1319,6 @@ mod tests {
         assert_eq!(status["total"], 0);
         assert_eq!(status["defect"], 0.0);
         assert_eq!(status["tracked_edges"], 0);
-
-        let stalks = parse_response(&op_sheaf_stalks(&state).unwrap());
-        assert_eq!(stalks["valid"], 0);
-        assert_eq!(stalks["total"], 0);
     }
 
     #[test]

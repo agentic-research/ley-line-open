@@ -3406,7 +3406,7 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
         // Those fixtures OPT INTO this behavior by setting
         // `response_required_keys: ["ok"]` exactly — the only required key
         // in the error branch. For fixtures with a richer required-key set
-        // (like list_roots requiring "children"), an unexpected ok=false
+        // (like list_children requiring "children"), an unexpected ok=false
         // is a real failure: the handler should have returned the success
         // shape and didn't. Don't paper over it.
         let opt_in_error_branch = required_keys.len() == 1

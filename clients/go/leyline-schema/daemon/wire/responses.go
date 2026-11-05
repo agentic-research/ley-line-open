@@ -73,14 +73,6 @@ type StatusResponse struct {
 	RootPublished *bool `json:"root_published"`
 }
 
-// FlushResponse is the wire shape of the `flush` op response. CurrentRoot
-// follows the root absence rule on [StatusResponse.RootPublished].
-type FlushResponse struct {
-	OK            *bool   `json:"ok"`
-	CurrentRoot   *string `json:"current_root,omitempty"`
-	RootPublished *bool   `json:"root_published"`
-}
-
 // SnapshotResponse is the wire shape of the `snapshot` op response.
 // CurrentRoot follows the root absence rule on
 // [StatusResponse.RootPublished].
@@ -311,36 +303,6 @@ type FindCalleesResponse struct {
 	Callees []Ref `json:"callees"`
 }
 
-// TokenMapEntry is one (token, node_ids) pair in a refs-map / defs-map response.
-type TokenMapEntry struct {
-	Token   *string  `json:"token"`
-	NodeIDs []string `json:"node_ids"`
-}
-
-// GetRefsMapResponse is the wire shape of the `get_refs_map` op response.
-type GetRefsMapResponse struct {
-	OK      *bool           `json:"ok"`
-	Entries []TokenMapEntry `json:"entries"`
-}
-
-// GetDefsMapResponse is the wire shape of the `get_defs_map` op response.
-type GetDefsMapResponse struct {
-	OK      *bool           `json:"ok"`
-	Entries []TokenMapEntry `json:"entries"`
-}
-
-// SchemaTier is one entry in the `get_schema` op response.
-type SchemaTier struct {
-	Name   *string  `json:"name"`
-	Crates []string `json:"crates"`
-}
-
-// GetSchemaResponse is the wire shape of the `get_schema` op response.
-type GetSchemaResponse struct {
-	OK    *bool        `json:"ok"`
-	Tiers []SchemaTier `json:"tiers"`
-}
-
 // GetDbPathResponse is the wire shape of the `get_db_path` op response.
 type GetDbPathResponse struct {
 	OK           *bool   `json:"ok"`
@@ -391,13 +353,6 @@ type SheafDefectResponse struct {
 	Generation *uint64  `json:"generation,string"`
 	Valid      *uint32  `json:"valid"`
 	Total      *uint32  `json:"total"`
-}
-
-// SheafStalksResponse is the wire shape of the `sheaf_stalks` op response.
-type SheafStalksResponse struct {
-	Generation *uint64 `json:"generation,string"`
-	Valid      *uint32 `json:"valid"`
-	Total      *uint32 `json:"total"`
 }
 
 // SheafStatusResponse is the wire shape of the `sheaf_status` op response.

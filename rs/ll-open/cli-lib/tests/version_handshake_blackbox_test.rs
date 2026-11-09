@@ -159,13 +159,15 @@ async fn version_op_returns_known_shape() {
     // marker lives in `_meta.ir_schema_version` inside a projection, readable
     // only by someone who already has one open. v0.11.0 crossed
     // merkle-ast-v1 -> merkle-ast-v2 with no way for mache — which pins an
-    // older release and memoizes on node_hash — to detect it.
+    // older release and memoizes on node_hash — to detect it. ADR-0047 M2
+    // (merkle-ast-v3) moved every node_hash under the same wire major; this
+    // field is how a consumer learns it.
     let ir = resp
         .get("ir_schema_version")
         .and_then(|v| v.as_str())
         .expect("ir_schema_version must be a string on the version handshake");
     assert_eq!(
-        ir, "merkle-ast-v2",
+        ir, "merkle-ast-v3",
         "the handshake must publish the address lineage this binary produces",
     );
 

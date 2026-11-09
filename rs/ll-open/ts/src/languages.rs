@@ -870,6 +870,36 @@ impl TsLanguage {
 mod grammar_identity_tests {
     use super::*;
 
+    /// κ maps no anonymous kind, in any grammar (ADR-0047 D-iii, bead
+    /// `ley-line-open-b5d354`). An anonymous token has no `_ast` occurrence
+    /// row, so from projection-v12 its grammar kind is read from
+    /// `node_content.kind`; that is sound only while `canonical_kind` is the
+    /// identity on every anonymous kind. Mapping one (say a keyword spelled
+    /// `parameter`) fails here instead of silently losing a grammar kind.
+    #[test]
+    fn kappa_maps_no_anonymous_kind() {
+        let mut checked = 0usize;
+        for lang in TsLanguage::all() {
+            let grammar = lang.ts_language();
+            for id in 0..grammar.node_kind_count() as u16 {
+                if grammar.node_kind_is_named(id) {
+                    continue;
+                }
+                let Some(kind) = grammar.node_kind_for_id(id) else {
+                    continue;
+                };
+                checked += 1;
+                assert_eq!(
+                    lang.canonical_kind(kind),
+                    None,
+                    "{}: κ maps the anonymous kind {kind:?}",
+                    lang.name()
+                );
+            }
+        }
+        assert!(checked > 100, "only {checked} anonymous kinds were checked");
+    }
+
     /// `all()` is the enum spelled out once more. Every member round-trips
     /// through its own name, no member appears twice, and every language the
     /// detection registry can name is a member — so a variant added without a

@@ -1,5 +1,5 @@
 {
-  "$comment": "Known-answer vectors for every Σ construction LLO ships (ADR-0047 §5, (DET); bead ley-line-open-10d71a). Each case pins its inputs and, where the construction hashes an encoding, the exact preimage bytes, so a second implementation checks its framing and its hash independently. deriveKey pins the keyed primitive every keyed construction is built on, BLAKE3 derive_key(context, input), with cases taken from BLAKE3's own test_vectors.json (input byte i is i mod 251, first 32 output bytes); it is a primitive, not a construction, and no address in this file moves. Consumed by Rust tests in leyline-core (sigmaBytes, deriveKey, partition, headDigest), leyline-cas-ffi (deriveKey, through the C ABI), leyline-cli-lib (parserId, storeRoot, astNode), the Go module clients/go/leyline-schema (storeRoot, headDigest; package sigma) and leyline-cache (restrictionKey); run_id is pinned by ../../execution/v1/test-vectors/run-id.json. A changed value is an identity migration that needs a version bump, never an edit.",
+  "$comment": "Known-answer vectors for every Σ construction LLO ships (ADR-0047 §5, (DET); bead ley-line-open-10d71a). Each case pins its inputs and, where the construction hashes an encoding, the exact preimage bytes, so a second implementation checks its framing and its hash independently. deriveKey pins the keyed primitive every keyed construction is built on, BLAKE3 derive_key(context, input), with cases taken from BLAKE3's own test_vectors.json (input byte i is i mod 251, first 32 output bytes); it is a primitive, not a construction, and no address in this file moves. Consumed by Rust tests in leyline-core (sigmaBytes, deriveKey, partition, headDigest), leyline-cas-ffi (deriveKey, through the C ABI), leyline-cli-lib (parserId, storeRoot, astNode), the Go module clients/go/leyline-schema (partition, storeRoot, headDigest, astNode; package sigma) and leyline-cache (restrictionKey); run_id is pinned by ../../execution/v1/test-vectors/run-id.json. A changed value is an identity migration that needs a version bump, never an edit.",
   "constructionSet": "leyline/sigma/v1",
   "hash": "blake3-256",
   "sigmaBytes": [
@@ -323,30 +323,42 @@
   "astNode": [
     {
       "name": "leaf-fn-73add7",
+      "context": "leyline/ast-node/v3",
       "tag": "leaf",
       "kind": "fn",
       "token": "fn",
-      "preimageHex": "6c6c6f2f6173742f7631000002666e02666e",
-      "address": "48a1b7c4106f797a124a6804a620347194ddd1194ef7851612ef1e0799c8b8bd"
+      "preimageHex": "0002666e02666e",
+      "address": "814fca91f7de97e8e975b983d82b8c371ee58e087d321c93997f394acfd58a92"
     },
     {
       "name": "leaf-identifier",
+      "context": "leyline/ast-node/v3",
       "tag": "leaf",
       "kind": "identifier",
       "token": "main",
-      "preimageHex": "6c6c6f2f6173742f763100000a6964656e746966696572046d61696e",
-      "address": "ae3b28228438e1e4efa287ec838c779a6a42088e64e491522e7ecb252d93f677"
+      "preimageHex": "000a6964656e746966696572046d61696e",
+      "address": "b80613f16bbf5f55c4c75f801ee829d3349a2850e6d576688413d4c46573a77c"
+    },
+    {
+      "name": "leaf-nul-and-multibyte-length",
+      "context": "leyline/ast-node/v3",
+      "tag": "leaf",
+      "kind": "string_content",
+      "token": "a\u0000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "preimageHex": "000e737472696e675f636f6e74656e74ca0161006262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262",
+      "address": "098cf0063f8decc102816948124248f0d2e2c141a047b21d29ebe3db652cd2f9"
     },
     {
       "name": "internal-function-item",
+      "context": "leyline/ast-node/v3",
       "tag": "internal",
       "kind": "function_item",
       "children": [
-        "48a1b7c4106f797a124a6804a620347194ddd1194ef7851612ef1e0799c8b8bd",
-        "ae3b28228438e1e4efa287ec838c779a6a42088e64e491522e7ecb252d93f677"
+        "814fca91f7de97e8e975b983d82b8c371ee58e087d321c93997f394acfd58a92",
+        "b80613f16bbf5f55c4c75f801ee829d3349a2850e6d576688413d4c46573a77c"
       ],
-      "preimageHex": "6c6c6f2f6173742f763100010d66756e6374696f6e5f6974656d0248a1b7c4106f797a124a6804a620347194ddd1194ef7851612ef1e0799c8b8bdae3b28228438e1e4efa287ec838c779a6a42088e64e491522e7ecb252d93f677",
-      "address": "218d860b68d07098c10f16a1c6646ea8194a93e7bc90215247374b70ab6c6671"
+      "preimageHex": "010d66756e6374696f6e5f6974656d02814fca91f7de97e8e975b983d82b8c371ee58e087d321c93997f394acfd58a92b80613f16bbf5f55c4c75f801ee829d3349a2850e6d576688413d4c46573a77c",
+      "address": "c134c900053790dd39f9dba1ee35237cea2dbc937e516fbd05aabcd4181d4a77"
     }
   ],
   "restrictionKey": [

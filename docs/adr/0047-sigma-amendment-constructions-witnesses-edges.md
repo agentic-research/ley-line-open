@@ -2,8 +2,10 @@
 
 **Status:** Accepted (owner, 2026-11-04). Decisions D-i to D-iv below take the recommended
 option; the alternatives and their costs are kept as the record. Implementation: M0 shipped
-(`ley-line-open-10d71a`); M1 (D-ii) is implemented by `ley-line-open-73c6ee`; M2–M4 are proposed.
-Sections that describe shipped code before M1 say so; §3 records the conformance after M1.
+(`ley-line-open-10d71a`); M1 (D-ii) is implemented by `ley-line-open-73c6ee`; M2 (D-i for
+`node_hash`, and D-iii) is implemented by `ley-line-open-73add7` and `ley-line-open-b5d354`;
+M3–M4 are proposed. Sections that describe shipped code before M1 say so; §3 records the
+conformance after M2.
 **Bead:** `ley-line-open-619a99`
 **Amends:** the Σ decade (`docs/decades/2026-merkle-cas-substrate.md` §1.1–§1.3, typed in
 `rs/ll-core/core/src/substrate.rs`); ADR-0032 D2 (generalised from "every address is a tagged
@@ -78,9 +80,9 @@ probability. Enforced by keying every construction except `σ_bytes`.
 
 | Law | Test (to add) | Fails today? |
 |---|---|---|
-| (a) | `construction_equality_is_value_equality`: for every registered construction, a proptest that distinct values under `≡_D` give distinct addresses and that every presentation of one value (enumeration order for sets; location, run and arena for content) gives one address; plus a known-answer vector per construction (§5, (DET)). The restriction key's `key_tests::injectivity` (`rs/ll-open/cache/src/restriction.rs`) is the model. | `node_content` rows fail (a): `lang` and `raw_kind` are not functions of `node_hash` (D-iii). The hashes themselves pass. |
+| (a) | `construction_equality_is_value_equality`: for every registered construction, a proptest that distinct values under `≡_D` give distinct addresses and that every presentation of one value (enumeration order for sets; location, run and arena for content) gives one address; plus a known-answer vector per construction (§5, (DET)). The restriction key's `key_tests::injectivity` (`rs/ll-open/cache/src/restriction.rs`) is the model. | `node_content` rows failed (a) until M2: `lang` and `raw_kind` were not functions of `node_hash` (D-iii). Projection-v12 drops them; `a_write_leaves_no_stale_language_on_a_shared_node` and the rebuild gate (`cmd_rebuild.rs`, no exclusion) pass. |
 | (b) | `ref_of_one_construction_does_not_compare_with_another`: a `trybuild` compile-fail test that `Ref<Blob> == Ref<AstNode>`, `Ref<Tree> → Ref<ArenaImage>` and any `From<Ref<A>> for Ref<B>` do not compile; plus a test that a `Loc` does not serialize without its version. | Not representable yet: one `Hash` carries every construction (`substrate.rs:58`). |
-| (c) | `crafted_preimage_does_not_alias_across_constructions`: for every keyed construction D, `σ_bytes(enc_D(x)) ≠ σ_D(x)` on sampled x; includes the `ley-line-open-73add7` reproduction (an 18-byte file whose `blob_hash` equals the `node_hash` of the Rust leaf `fn`) as a fixed case. | Yes, for `node_hash` and `run_id` (D-i). |
+| (c) | `crafted_preimage_does_not_alias_across_constructions`: for every keyed construction D, `σ_bytes(enc_D(x)) ≠ σ_D(x)` on sampled x; includes the `ley-line-open-73add7` reproduction (an 18-byte file whose `blob_hash` equals the `node_hash` of the Rust leaf `fn`) as a fixed case. | Yes, for `run_id` (D-i, M3). `node_hash` passes since M2 (merkle-ast-v3): `crafted_preimage_does_not_alias_across_constructions` (`rs/ll-open/cli-lib/tests/sigma_axioms.rs`) runs in every `task ci`. |
 
 ## 2. Witnesses, `verify`, and the four edge kinds
 
@@ -136,7 +138,8 @@ accessors.
 ## 3. Conformance: every shipped identity against the laws
 
 Line citations are at `e4690505` (before M1). The `parserId`, head digest and store-identity rows
-are updated for M1 (`73c6ee`); `tree_root.rs` became `store_root.rs`.
+are updated for M1 (`73c6ee`); `tree_root.rs` became `store_root.rs`. The `node_hash` row is
+updated for M2 (`73add7`, `b5d354`).
 
 | Identity | Construction (code) | (a) | (c) | Other | Verdict |
 |---|---|---|---|---|---|
@@ -150,18 +153,18 @@ are updated for M1 (`73c6ee`); `tree_root.rs` became `store_root.rs`.
 | `Head.rootHash` | keyed fold `leyline/segment-root/v1` (`rs/ll-open/cli-lib/src/cmd_parse.rs:2644,2725`) | yes, over segments | yes | a run receipt, not a store identity (carries absolute paths and mtimes) | **Complies** |
 | head digest v3 | own context `leyline head digest v3` (`head_digest.rs`, `HEAD_DIGEST_CONTEXT`) | yes | yes | binds `storeRoot` and `parserId` separately, and `parentDigest`; a head carrying `retiredTreeRoot` is refused as v2 (`HeadFormatError::RetiredDigestV2`) | **Complies** (v2, which bound `treeRoot`, removed by M1) |
 | restriction key | keyed `RowSet` fold, rows under `derive_key("leyline/restriction/v1")`, `parserId` in params (`rs/ll-open/cache/src/restriction.rs:87-103,200-214`) | yes (proptest) | yes | whole-object arm passes `Hash::ZERO` as params (`restriction.rs:740`): lawful (a distinct construction), but a sentinel where `Option` belongs | **Complies**: first shipped lawful `Ref<Restriction>` |
-| `node_hash` | plain σ over `"llo/ast/v1" ‖ 0x00 ‖ tag ‖ …` (`cmd_parse.rs:3270,3297-3325`) | hash yes; `node_content` row no (`lang`, `raw_kind`, `rs/ll-open/cli-lib/src/cmd_rebuild.rs:368`) | **no**: prefix-in-preimage, reproduced collision (`73add7`) | — | **Violates (c)** → D-i; row violates (a) → D-iii |
+| `node_hash` | merkle-ast-v3: `derive_key("leyline/ast-node/v3", tag ‖ …)` (`cmd_parse.rs`, `hash_leaf`/`hash_internal`, `NODE_HASH_CONTEXT`); merkle-ast-v2 was plain σ over `"llo/ast/v1" ‖ 0x00 ‖ tag ‖ …` | yes; the `node_content` row too since projection-v12 dropped `lang` and `raw_kind` (D-iii) | yes (M2; the `73add7` collision is a fixed case of the law (c) test) | known-answer vectors `astNode` checked in Rust and Go | **Complies** (M2). Was: violates (c) and the row violates (a) |
 | `run_id` | plain σ over `"cloister/execution/v1/run-id" ‖ 0x00 ‖ …` (`authorization.rs:864,912-925`) | yes | **no**: prefix-in-preimage | pinned cross-repo by `execution/v1/test-vectors/run-id.json` | **Violates (c)** → D-i |
 | `Head.storeRoot` | directory Merkle tree, one keyed `RowSet` fold `leyline/store-tree/v1` per directory, params empty (`store_root.rs`, `StoreTree::root`) | yes (proptests in `store_root.rs`; known-answer vectors per node) | yes | parameter independent (no parser input); one edit refolds the nodes on its path (240 entries for the 50,000-file fixture, bound 300) | **Complies** (M1). It replaced `Head.treeRoot` (`leyline/tree-root/v1`, `params = parserId`, flat over 2n entries), which violated parameter independence and Σ §1.3 and is removed |
 | blob manifest | rootless rows keyed by `blob_hash` (`rs/ll-open/fs/src/blob_chunked.rs:53-64`) | — | — | no address; sub-floor blobs never enter the pool (619a99 F3: 572 of 954 blobs on `rs/`) | **Not an identity yet** → D-iv |
 | locators (`nid`, `content_id`, interned ids) | arena-local integers (`rs/ll-core/schema/src/lib.rs:86-98,138-143`) | n/a | n/a | one bare-`nid` wire leak (`daemon/ops.rs:1480`) | **Complies except the leak** (80f037) |
 
-**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after M1;
-`node_hash` and `run_id` violate construction separation (both prefix-in-preimage); `treeRoot`
-violated parameter independence and §1.3 (parser in params, flat fold) until M1 replaced it with
-`storeRoot`; `node_content`'s `lang`/`raw_kind` violate (a); the
-blob manifest has no address; one locator leaks bare onto the wire. Plain `blob_hash` is the
-single unkeyed base case and stays so.
+**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after M1, 12 after M2;
+`run_id` violates construction separation (prefix-in-preimage) until M3, as `node_hash` did until
+M2; `treeRoot` violated parameter independence and §1.3 (parser in params, flat fold) until M1
+replaced it with `storeRoot`; `node_content`'s `lang`/`raw_kind` violated (a) until M2 removed
+them; the blob manifest has no address; one locator leaks bare onto the wire. Plain `blob_hash`
+is the single unkeyed base case and stays so.
 
 ## 4. Decisions
 
@@ -195,7 +198,12 @@ bound to an old `run_id` stops verifying (fail closed, since verifiers recompute
   `merkle-ast-v2 → merkle-ast-v3` (`rs/ll-open/cli-lib/src/daemon/version.rs:72`), which mache
   already records (`mache/cmd/build_meta.go:60-75`). Old artifact: an arena whose
   `_meta.ir_schema_version` is `merkle-ast-v2` fails `leyline rebuild`'s `parserId` check and
-  the incremental guard, and is re-parsed cold; nothing converts old hashes.
+  the incremental guard, and is re-parsed cold; nothing converts old hashes. As shipped (M2),
+  the shared `projection-v12` bump refuses a v11 arena at parse open before either check runs.
+  On the wire `node_hash` appears as hex in `validate`'s `emit_ast` rows and behind sheaf region
+  hashes (whose fold binds `parserId`); its type and framing do not change, so the wire format
+  major stays 2. The version handshake's `ir_schema_version` (`merkle-ast-v3`) names the lineage,
+  and a v2 value compared with a v3 value is unequal, never a false match.
 - `run_id` — moves: every derived run identity and the pinned vector. Construction:
   `derive_key("cloister/execution/v1/run-id/v2", u64le|spec| ‖ spec ‖ u64le|grant| ‖ grant ‖
   u64le|replay| ‖ replay)`, rendered `run-v2-<64 hex>`. Bump: the vector file gains the v2
@@ -280,7 +288,12 @@ exclusion is deleted and the gate compares every column (`b5d354`'s acceptance).
 storage cut of `ley-line-open-9c1af2` comes with it. Precondition the implementation proves: a
 consumer reading a child's raw kind reads it from the child occurrence, and for content rows
 no occurrence reaches, the raw kind is recoverable or not needed (test: a re-parse reproduces
-every per-occurrence `(lang, raw_kind)`).
+every per-occurrence `(lang, raw_kind)`). As shipped (M2): named nodes keep both through
+`_ast.kind_id → kinds`, and the rebuild gate compares those per occurrence; an anonymous token
+has no `_ast` row, and its raw kind is its `node_content.kind` because κ maps no anonymous kind
+in any grammar (`kappa_maps_no_anonymous_kind`, `rs/ll-open/ts/src/languages.rs`). Injected
+subtrees have no `_ast` row either; their language and grammar kind are no longer in the
+projection, and no shipped reader needed them (`ley-line-open-cc5c55`).
 
 **Versioning and migration.** Moves: two `node_content` columns (`schema.rs:404-411`). Does not
 move: any hash or root. Bump: one projection version, shared with D-i's `node_hash` v3 (§4.6).
@@ -341,13 +354,15 @@ merges.
 |---|---|---|---|
 | M0 | `Ref<D>`, `Witness<D>`, `verify`, locator newtypes in `leyline-schema`; the law tests that hold today (§1.3) and the axiom suite (§5); cas-ffi derive-key export | none (additive) | none |
 | M1 | D-ii: `storeRoot` (`store-tree/v1`), head digest v3, wire `store_root`, `derived_from` v2 — **implemented** (`73c6ee`) | `projection-v11`, head digest v3, release | `treeRoot` removed, `storeRoot` added |
-| M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin; `9c1af2`'s R3 rides along | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
+| M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin; `9c1af2`'s R3 rides along — **implemented** (`73add7`, `b5d354`); wire format major unchanged (2) | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
 | M3 | D-i `run_id` v2 | run-id vector v2, release | `run_id` |
 | M4 | D-iv: rooted blob manifests, one-chunk sub-floor manifests | `projection-v13` | none moved; manifest address added |
 
 M1 precedes M2 so that the `IR_SCHEMA_VERSION` bump in M2 does not rename the store. M3 is
 independent of M1/M2 and may run in parallel with them. Law (c)'s test lands green at the end
-of M3; until then it carries the two known failures as named cases that M2 and M3 close.
+of M3; until then it carries the two known failures as named cases that M2 and M3 close. M2
+closed the `node_hash` case (`leyline-cli-lib`'s test runs green); `run_id`'s, in
+`leyline-runtime`, waits for M3.
 
 ## 5. The axiom-falsification suite
 

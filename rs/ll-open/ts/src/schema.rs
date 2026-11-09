@@ -398,17 +398,19 @@ CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 /// `node_edge` (v9) and of `_ast`/`node_defs`/`node_refs` (projection-v10,
 /// bead `ley-line-open-738dd9`). It is NOT an identity: two arenas number the
 /// same subtree differently, and nothing outside this database may cite it.
-/// `kind` is the hashed canonical κ kind; `raw_kind` is the grammar kind (a
-/// content column, NOT hashed). `token` is the terminal UTF-8 text for
-/// leaves (NULL for internal nodes); `arity` is the child count.
+/// `kind` is the hashed canonical κ kind; `token` is the terminal UTF-8 text
+/// for leaves (NULL for internal nodes); `arity` is the child count. Every
+/// column is a function of `node_hash` (projection-v12, ADR-0047 D-iii, bead
+/// `ley-line-open-b5d354`): the grammar kind and language, which the hash
+/// does not determine, are occurrence facts read through `_ast.kind_id →
+/// kinds(lang, raw_kind)`. An anonymous token has no `_ast` row; its grammar
+/// kind is its `kind`, because κ maps no anonymous kind.
 pub const NODE_CONTENT_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_content (
     content_id INTEGER PRIMARY KEY,
     node_hash  BLOB    NOT NULL UNIQUE,
     node_tag   INTEGER NOT NULL,
     kind       TEXT    NOT NULL,
-    raw_kind   TEXT    NOT NULL,
-    lang       TEXT    NOT NULL,
     token      TEXT,
     arity      INTEGER NOT NULL
 );";
@@ -1556,8 +1558,8 @@ mod tests {
     /// that the FK resolves.
     fn insert_test_node_content(conn: &Connection, node_hash: &[u8]) {
         conn.execute(
-            "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, raw_kind, lang, token, arity) \
-             VALUES (?1, 1, 'function', 'function_declaration', 'go', NULL, 0)",
+            "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, token, arity) \
+             VALUES (?1, 1, 'function', NULL, 0)",
             rusqlite::params![node_hash],
         )
         .unwrap();

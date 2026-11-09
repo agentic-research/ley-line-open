@@ -47,6 +47,10 @@ pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 ///   the κ `function` it lacked, so every Rust trait signature's `node_hash`
 ///   moved. Nothing else changed: the fold, the `llo/ast/v1` domain tag, and
 ///   every other kind are untouched.
+/// - `merkle-ast-v3` — ADR-0047 D-i (bead `ley-line-open-73add7`): the same
+///   fields, keyed with `derive_key("leyline/ast-node/v3", …)` instead of
+///   plain σ behind the in-band `llo/ast/v1 ‖ 0x00` prefix. Every `node_hash`
+///   moved; the tree each one names did not.
 pub use crate::daemon::version::IR_SCHEMA_VERSION;
 use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
@@ -92,12 +96,12 @@ struct AstEntry {
 }
 
 /// A `node_content` row — one per UNIQUE subtree (deduped by `node_hash`).
+/// Every column is a function of `node_hash` (projection-v12, ADR-0047
+/// D-iii): the grammar kind and language are occurrence facts, on `_ast`.
 struct ContentRow {
     node_hash: [u8; 32],
     node_tag: u8,
     kind: String,
-    raw_kind: String,
-    lang: String,
     token: Option<String>,
     arity: usize,
 }
@@ -548,22 +552,20 @@ batch_table! {
     // emits a hash it has checked is new to the arena, so a conflict on
     // either key is a writer bug and must fail the pass, not be ignored.
     NodeContentBatch, NodeContentRow,
-    "INSERT INTO node_content (content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity) VALUES ",
-    8,
+    "INSERT INTO node_content (content_id, node_hash, node_tag, kind, token, arity) VALUES ",
+    6,
     push_fn: (
-        content_id: ContentId, node_hash: Vec<u8>, node_tag: i64, kind: String, raw_kind: String,
-        lang: String, token: Option<String>, arity: i64
+        content_id: ContentId, node_hash: Vec<u8>, node_tag: i64, kind: String,
+        token: Option<String>, arity: i64
     ),
-    push_body: { NodeContentRow { content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity } },
+    push_body: { NodeContentRow { content_id, node_hash, node_tag, kind, token, arity } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 8);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
         for r in chunk {
             out.push(&r.content_id);
             out.push(&r.node_hash);
             out.push(&r.node_tag);
             out.push(&r.kind);
-            out.push(&r.raw_kind);
-            out.push(&r.lang);
             out.push(&r.token);
             out.push(&r.arity);
         }
@@ -1958,8 +1960,6 @@ fn parse_into_conn_with(
                                     c.node_hash.to_vec(),
                                     c.node_tag as i64,
                                     c.kind,
-                                    c.raw_kind,
-                                    c.lang,
                                     c.token,
                                     c.arity as i64,
                                 );
@@ -3283,9 +3283,19 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 // like `+`/`-`, keywords, punctuation) ARE folded, which is what
 // distinguishes `a+b` from `a-b`; comments/`extra` nodes are excluded, so a
 // comment-only edit leaves every enclosing hash unchanged.
+//
+// merkle-ast-v3 (ADR-0047 D-i, step M2, bead `ley-line-open-73add7`): the
+// encoding is keyed with BLAKE3 `derive_key` under [`NODE_HASH_CONTEXT`].
+// merkle-ast-v2 hashed the same fields as plain σ behind an in-band
+// `llo/ast/v1 ‖ 0x00` prefix, so a file whose bytes were that preimage had a
+// `blob_hash` equal to the node's `node_hash` (law (c)). Derive-key mode
+// hashes under different domain flags from plain mode, so no `blob_hash`
+// reaches a `node_hash`.
 
-/// Domain/version tag for the merkle-AST preimage (git-object style).
-const NODE_HASH_DOMAIN: &[u8] = b"llo/ast/v1";
+/// The derive-key context of `node_hash` (merkle-ast-v3), owned by this
+/// construction alone. Pinned by the `astNode` cases of
+/// `schema-spec/sigma/v1/test-vectors/constructions.json`.
+const NODE_HASH_CONTEXT: &str = "leyline/ast-node/v3";
 /// Node-tag byte: leaf (terminal) node.
 const NODE_TAG_LEAF: u8 = 0x00;
 /// Node-tag byte: internal (n-ary) node.
@@ -3308,30 +3318,26 @@ fn write_uvarint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// Merkle-AST hash of a terminal node: `domain ‖ 0x00 ‖ leaf_tag ‖
-/// uvarint(len(kind)) ‖ kind ‖ uvarint(len(token)) ‖ token`. Hashed via the
-/// locked σ surface (`ContentAddressed::hash`), never `blake3::hash`
+/// Merkle-AST hash of a terminal node: `derive_key(NODE_HASH_CONTEXT,
+/// leaf_tag ‖ uvarint(len(kind)) ‖ kind ‖ uvarint(len(token)) ‖ token)`.
+/// Keyed through `leyline_core::substrate::derive_key`, never `blake3`
 /// directly (the `lint:blake3` gate).
 fn hash_leaf(kind: &str, token: &str) -> [u8; 32] {
-    let mut p = Vec::with_capacity(NODE_HASH_DOMAIN.len() + 6 + kind.len() + token.len());
-    p.extend_from_slice(NODE_HASH_DOMAIN);
-    p.push(0x00);
+    let mut p = Vec::with_capacity(5 + kind.len() + token.len());
     p.push(NODE_TAG_LEAF);
     write_uvarint(&mut p, kind.len() as u64);
     p.extend_from_slice(kind.as_bytes());
     write_uvarint(&mut p, token.len() as u64);
     p.extend_from_slice(token.as_bytes());
-    *p.hash().as_bytes()
+    *leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &p).as_bytes()
 }
 
-/// Merkle-AST hash of an internal node: `domain ‖ 0x00 ‖ internal_tag ‖
-/// uvarint(len(kind)) ‖ kind ‖ uvarint(child_count) ‖ child_hash[0..n]`
-/// (32 bytes each, SOURCE ORDER). Same σ surface as [`hash_leaf`].
+/// Merkle-AST hash of an internal node: `derive_key(NODE_HASH_CONTEXT,
+/// internal_tag ‖ uvarint(len(kind)) ‖ kind ‖ uvarint(child_count) ‖
+/// child_hash[0..n])` (32 bytes each, SOURCE ORDER). Same keyed primitive as
+/// [`hash_leaf`].
 fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
-    let mut p =
-        Vec::with_capacity(NODE_HASH_DOMAIN.len() + 6 + kind.len() + child_hashes.len() * 32);
-    p.extend_from_slice(NODE_HASH_DOMAIN);
-    p.push(0x00);
+    let mut p = Vec::with_capacity(5 + kind.len() + child_hashes.len() * 32);
     p.push(NODE_TAG_INTERNAL);
     write_uvarint(&mut p, kind.len() as u64);
     p.extend_from_slice(kind.as_bytes());
@@ -3339,14 +3345,14 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
     for h in child_hashes {
         p.extend_from_slice(h);
     }
-    *p.hash().as_bytes()
+    *leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &p).as_bytes()
 }
 
-/// The `node_hash` construction (`merkle-ast-v2`, ADR-0027), typed
-/// (ADR-0047 §2.3). Its fold is [`hash_leaf`] / [`hash_internal`]; nothing
-/// moves. A `Ref<AstNode>` does not compare with a `Ref<Blob>`, though today
-/// the two can share bytes: `node_hash` is plain σ over an in-band-prefixed
-/// preimage, which ADR-0047 M2 (`ley-line-open-73add7`) keys.
+/// The `node_hash` construction (`merkle-ast-v3`, ADR-0027 as keyed by
+/// ADR-0047 D-i), typed (ADR-0047 §2.3). Its fold is [`hash_leaf`] /
+/// [`hash_internal`] under `derive_key("leyline/ast-node/v3", …)`, so a
+/// `Ref<AstNode>` neither compares with a `Ref<Blob>` (law (b)) nor shares
+/// its bytes with one (law (c)).
 pub enum AstNode {}
 
 /// What a `node_hash` is a function of: a leaf's canonical kind and token,
@@ -3463,7 +3469,6 @@ pub(crate) fn parse_file_pure(
 
     let root = tree.root_node();
     let syntax_error = first_syntax_error(root);
-    let lang_name = language.name();
 
     let mut nodes = Vec::new();
     let mut ast_entries = Vec::new();
@@ -3528,7 +3533,6 @@ pub(crate) fn parse_file_pure(
         source_id,
         source_id,
         language,
-        lang_name,
         // Bead ley-line-open-6e798d: root has no enclosing function/method.
         None,
         injections_on,
@@ -3765,7 +3769,6 @@ fn fold_children(
     node_id: &str,
     source_id: &str,
     language: TsLanguage,
-    lang_name: &str,
     // Bead `ley-line-open-6e798d`: node_id of the nearest enclosing κ
     // `function`/`method` ancestor. `None` at top level. When we descend
     // into a child whose κ canonical kind is `function`/`method`, we
@@ -3941,7 +3944,6 @@ fn fold_children(
                 &id,
                 source_id,
                 language,
-                lang_name,
                 child_container,
                 injections_on,
                 seen,
@@ -3967,7 +3969,6 @@ fn fold_children(
                 "",
                 source_id,
                 language,
-                lang_name,
                 container_node_id,
                 injections_on,
                 seen,
@@ -3995,8 +3996,6 @@ fn fold_children(
                 node_hash: h,
                 node_tag: NODE_TAG_LEAF,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: Some(token.to_string()),
                 arity: 0,
             });
@@ -4009,8 +4008,6 @@ fn fold_children(
                 node_hash: h,
                 node_tag: NODE_TAG_INTERNAL,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: None,
                 arity: child_hashes.len(),
             });
@@ -4037,8 +4034,7 @@ fn fold_children(
 /// The injected subtree gets its OWN content-addressed root: its
 /// hashes are computed by the same [`hash_leaf`]/[`hash_internal`]
 /// fold — over the INJECTED grammar's kinds — and land as
-/// `node_content`/`node_child` rows (`lang` = the injected language),
-/// so a standalone file with the same statement bytes dedups to the
+/// `node_content`/`node_child` rows, so a standalone file with the same statement bytes dedups to the
 /// same rows. Nothing here touches the HOST fold's preimages,
 /// `_ast`/`nodes` occurrence rows, or the pointer/capnp stores — host
 /// structural identity is independent of the injected grammar's
@@ -4221,7 +4217,6 @@ fn fold_injected_node(
 
     let raw_kind = node.kind();
     let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
-    let lang_name = language.name();
     if children.is_empty() {
         let token = node.utf8_text(content).unwrap_or("");
         let h = hash_leaf(canonical, token);
@@ -4230,8 +4225,6 @@ fn fold_injected_node(
                 node_hash: h,
                 node_tag: NODE_TAG_LEAF,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: Some(token.to_string()),
                 arity: 0,
             });
@@ -4244,8 +4237,6 @@ fn fold_injected_node(
                 node_hash: h,
                 node_tag: NODE_TAG_INTERNAL,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: None,
                 arity: child_hashes.len(),
             });
@@ -4323,9 +4314,10 @@ mod tests {
     /// (bead `ley-line-open-10d71a`): the private leaf and internal folds
     /// reproduce the `astNode` cases of
     /// `schema-spec/sigma/v1/test-vectors/constructions.json`, and each
-    /// pinned address is σ of its pinned preimage. That last equality is
-    /// law (c)'s known violation (`73add7`): it is what M2's keyed
-    /// `merkle-ast-v3` construction changes, together with these vectors.
+    /// pinned address is `derive_key("leyline/ast-node/v3", preimage)` and
+    /// not σ of any byte string a file could hold (merkle-ast-v3, ADR-0047
+    /// M2, bead `ley-line-open-73add7`). The Go module checks the same cases
+    /// (`task schema:go-sigma-vectors`).
     #[test]
     fn det_known_answer_vectors() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4389,12 +4381,21 @@ mod tests {
                 case["name"]
             );
             assert_eq!(typed.as_hash().as_bytes(), &address, "{}", case["name"]);
+            // The address is the keyed digest of the pinned encoding, under
+            // the pinned context (merkle-ast-v3, ADR-0047 D-i) ...
+            let preimage = unhex(&case["preimageHex"]);
+            assert_eq!(case["context"].as_str(), Some(NODE_HASH_CONTEXT));
             assert_eq!(
-                unhex(&case["preimageHex"]).as_slice().hash().as_bytes(),
+                leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &preimage).as_bytes(),
                 &address,
                 "{}",
                 case["name"]
             );
+            // ... and no plain σ reaches it, with or without merkle-ast-v2's
+            // in-band prefix: law (c), the `73add7` collision.
+            let legacy = [b"llo/ast/v1\0".as_slice(), &preimage].concat();
+            assert_ne!(preimage.as_slice().hash().as_bytes(), &address);
+            assert_ne!(legacy.as_slice().hash().as_bytes(), &address);
         }
     }
 
@@ -5332,7 +5333,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v11",
+            "projection-v12",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5345,20 +5346,21 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v11"),
+            Some("projection-v12"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
 
-    /// projection-v11 (ADR-0047 M1, bead `ley-line-open-73c6ee`): an arena
-    /// that still carries the v10 label is refused at open — its
-    /// `derived_from` names a parser-qualified `treeRoot` where this writer
-    /// stamps a parser-free `storeRoot`. The v9 label is refused the same way
-    /// (projection-v10, bead `ley-line-open-738dd9`: a `node_hash` column
-    /// where this writer inserts `content_id`).
+    /// projection-v12 (ADR-0047 M2, beads `ley-line-open-73add7` and
+    /// `ley-line-open-b5d354`): an arena that still carries the v11 label is
+    /// refused at open — its `node_content` holds merkle-ast-v2 addresses and
+    /// the `lang`/`raw_kind` columns this writer no longer inserts. v10 (a
+    /// parser-qualified `treeRoot` in `derived_from`, ADR-0047 M1) and v9 (a
+    /// `node_hash` column where this writer inserts `content_id`) are refused
+    /// the same way.
     #[test]
-    fn projection_v9_and_v10_arenas_are_refused_at_open() {
-        for old in ["projection-v9", "projection-v10"] {
+    fn projection_v9_to_v11_arenas_are_refused_at_open() {
+        for old in ["projection-v9", "projection-v10", "projection-v11"] {
             let td = TempDir::new().unwrap();
             std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
             let conn = Connection::open_in_memory().unwrap();
@@ -5368,7 +5370,7 @@ mod tests {
                 .expect_err("an older projection arena must be refused");
             let msg = format!("{err:#}");
             assert!(
-                msg.contains(old) && msg.contains("projection-v11"),
+                msg.contains(old) && msg.contains("projection-v12"),
                 "the refusal must name both versions; got: {msg}",
             );
         }
@@ -5464,7 +5466,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v11"),
+            msg.contains("projection-v4") && msg.contains("projection-v12"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(

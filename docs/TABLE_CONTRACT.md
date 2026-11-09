@@ -117,6 +117,41 @@ Two rules, both measured on a 460-file Rust arena at `projection-v5`:
    different fields would have a higher rate. Measure before relying on it as a
    general per-node lookup.
 
+### A fielded child's grammar kind at `projection-v12`
+
+`node_content` holds the κ `kind`, not the grammar kind or the language
+(ADR-0047 D-iii): the same subtree appears in several files and languages, and
+a content row cannot say which. Read a child's grammar kind from its
+occurrence. A named child of the parent occurrence `:nid` is the `nodes` row
+under it whose `_ast.content_id` is the edge's `child_id`; an anonymous child
+(an operator, keyword or punctuation token) has no occurrence row, and its
+grammar kind is its content row's `kind`, because κ maps no anonymous kind in
+any grammar (`kappa_maps_no_anonymous_kind`, `rs/ll-open/ts/src/languages.rs`):
+
+```sql
+SELECT e.field,
+       COALESCE((SELECT k.raw_kind
+                   FROM nodes n
+                   JOIN _ast ca ON ca.nid = n.nid
+                   JOIN kinds k ON k.kind_id = ca.kind_id
+                  WHERE n.parent_nid = :nid AND ca.content_id = e.child_id
+                  LIMIT 1),
+                c.kind) AS child_raw_kind
+  FROM node_edge e
+  JOIN node_content c ON c.content_id = e.child_id
+ WHERE e.parent_id = :parent_content_id AND e.field IS NOT NULL AND e.field != ''
+ ORDER BY e.ordinal;
+```
+
+`:parent_content_id` is the parent's `_ast.content_id`. Two named siblings with
+the same `content_id` are the same subtree, so either one's kind serves; the
+`LIMIT 1` picks one. `a_fielded_childs_grammar_kind_is_read_from_its_occurrence`
+(`rs/ll-open/cli-lib/tests/ir_producer.rs`) checks this query against
+tree-sitter on every fielded edge of a Rust, Go and Python tree, including
+children whose κ kind differs (`parameters` → `parameter`). Injected subtrees
+have no occurrence rows, so their grammar kind and language are not in the
+projection (`ley-line-open-cc5c55`).
+
 ### Reading `node_hash` at `projection-v10`
 
 As of `projection-v10` (bead `ley-line-open-738dd9`) `_ast`, `node_refs` and
@@ -230,7 +265,7 @@ the projection is derived-only, so no in-place migration exists.
 
 | Table | Purpose |
 |-------|---------|
-| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes — the identity, stored once per subtree; the FK target of `_cfg`, while `node_edge` (v9) and `_ast`/`node_defs`/`node_refs` (v10) reference `content_id`), `node_tag`, `kind`, `raw_kind`, `lang`, `token`, `arity`. Byte-identical subtrees dedup cross-file to one row. |
+| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes, keyed under `derive_key("leyline/ast-node/v3", …)` since merkle-ast-v3 — the identity, stored once per subtree; the FK target of `_cfg`, while `node_edge` (v9) and `_ast`/`node_defs`/`node_refs` (v10) reference `content_id`), `node_tag`, `kind`, `token`, `arity`. Every column is a function of `node_hash`: `raw_kind` and `lang` left at `projection-v12` (ADR-0047 D-iii, bead `ley-line-open-b5d354`) because the hash does not determine them, so the row held whichever file's occurrence landed first. Read them per occurrence through `_ast.kind_id → kinds`; see "A fielded child's grammar kind at `projection-v12`" below. Byte-identical subtrees dedup cross-file to one row. |
 | `node_edge` | Git-tree object, interned (`projection-v9`, bead `ley-line-open-9b7d28`): `(parent_id, ordinal) PRIMARY KEY → child_id, field`, `WITHOUT ROWID`. Both endpoints REFERENCE `node_content(content_id)` (FK-enforced). One row per child of each unique parent, anonymous tokens included. A node's preimage is recoverable by one join: `ORDER BY ordinal`, map ids to `node_hash`, refold. |
 | `node_child` | **A read-only VIEW** (`projection-v9`) with the v8 table's columns — `parent_hash`, `ordinal`, `child_hash`, `field` — over `node_edge ⋈ node_content ×2`. Every v8 read (`WHERE parent_hash = ?`, `JOIN node_content c ON c.node_hash = nc.child_hash`, `ORDER BY ordinal`) runs unchanged, and an inner join or `IN` filter on `parent_hash` plans as two index probes. **Do not put it on the right of a `LEFT JOIN`:** SQLite cannot flatten a join view there and materializes all of it (kibana slice, one file: 7.7 s through the view, 0.11 s against `node_edge`). Write `LEFT JOIN node_edge e ON e.parent_id = a.content_id LEFT JOIN node_content cc ON cc.content_id = e.child_id` instead (`projection-v10`: `_ast` holds the parent's `content_id` itself; at v9 it took `LEFT JOIN node_content pc ON pc.node_hash = a.node_hash` first). A write to the view fails; the writer is `node_edge`. |
 | `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` | **Read-only VIEWs** (`projection-v10`, bead `ley-line-open-738dd9`) with the v9 column sets of `_ast`, `node_refs` and `node_defs` — `node_hash` in place of `content_id`, rendered by `LEFT JOIN node_content ON content_id`. `content_id` is not a column of any of them. Same planning caveat as `node_child`: on the right of a `LEFT JOIN` they materialize; join the base table instead. Not named `v_ast` because mache installs a TEMP `v_ast` with its own vocabulary on every connection, and a TEMP view shadows a main-schema one. |

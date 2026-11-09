@@ -248,9 +248,10 @@ struct LeylineVersionResponse {
   buildDate        @5 :Text   $Json.name("build_date");
 
   # The node_hash ADDRESS LINEAGE this daemon's parse produces, e.g.
-  # "merkle-ast-v2". node_hash's preimage carries the canonical kappa kind, so
+  # "merkle-ast-v3". node_hash's preimage carries the canonical kappa kind, so
   # a kappa-map or grammar change rewrites addresses for byte-identical
-  # sources. Consumers that MEMOIZE on node_hash compare this against the
+  # sources, as does a change of construction (merkle-ast-v3 keyed the fold,
+  # ADR-0047 D-i). Consumers that MEMOIZE on node_hash compare this against the
   # lineage they cached under; a mismatch means those addresses are not
   # comparable. Additive field — per the wireFormatMajor note above, additions
   # inside the same major are non-breaking.

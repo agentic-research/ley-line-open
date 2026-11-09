@@ -27,7 +27,7 @@
 //!   "wire_format_major": 1,
 //!   "compat_min_schema_version": "0.4.1",
 //!   "build_date": "unspecified",
-//!   "ir_schema_version": "merkle-ast-v2"
+//!   "ir_schema_version": "merkle-ast-v3"
 //! }
 //! ```
 //!
@@ -78,7 +78,7 @@ struct CompatibilityDoc {
     build_date: &'static str,
 
     /// The `node_hash` address lineage this binary produces, e.g.
-    /// `"merkle-ast-v2"`. See `version::IR_SCHEMA_VERSION`.
+    /// `"merkle-ast-v3"`. See `version::IR_SCHEMA_VERSION`.
     ///
     /// Distinct from every other field here: the others describe the WIRE and
     /// the BINARY, this one describes the ADDRESSES the parse emits. A

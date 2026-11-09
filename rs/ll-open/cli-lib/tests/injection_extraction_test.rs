@@ -407,8 +407,8 @@ fn inj_own_ca_root_dedups_with_standalone_sql() {
     // equals the node_hash the SAME statement bytes produce in a
     // standalone .sql file — the merkle fold is span-free and
     // grammar-scoped, so content addressing crosses the host boundary.
-    // The hash also resolves in node_content with lang='sql' (the
-    // node_defs.node_hash → node_content FK made loud).
+    // The hash also resolves in node_content (the node_defs.content_id →
+    // node_content FK made loud).
     let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let go_repo = go_fixture();
     let db_dir = TempDir::new().unwrap();
@@ -437,15 +437,18 @@ fn inj_own_ca_root_dedups_with_standalone_sql() {
         "identical SQL bytes must content-address identically whether injected or standalone"
     );
 
+    // The row is the κ tree's: `create_table` is κ `type` (projection-v12
+    // keeps only what `node_hash` determines; the SQL grammar kind would be
+    // an occurrence fact, and an injected node has no `_ast` occurrence).
     let conn = Connection::open(&host_db).unwrap();
-    let (lang, raw_kind): (String, String) = conn
+    let kind: String = conn
         .query_row(
-            "SELECT lang, raw_kind FROM node_content WHERE lower(hex(node_hash)) = ?1",
+            "SELECT kind FROM node_content WHERE lower(hex(node_hash)) = ?1",
             [&host_hash],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .expect("injected def's node_hash must resolve in node_content (own CA root)");
-    assert_eq!((lang.as_str(), raw_kind.as_str()), ("sql", "create_table"));
+    assert_eq!(kind, "type");
 }
 
 #[test]

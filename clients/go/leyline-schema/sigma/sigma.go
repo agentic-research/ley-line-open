@@ -1,10 +1,12 @@
 // Package sigma is a Go implementation of the LLO Σ constructions a
 // consumer verifies: the PartitionSpec fold (ADR-0032 D2), the store
-// identity storeRoot (`leyline/store-tree/v1`, ADR-0047 D-ii) and the head
-// digest v3 a signed Head commits to.
+// identity storeRoot (`leyline/store-tree/v1`, ADR-0047 D-ii), the head
+// digest v3 a signed Head commits to, and node_hash v3
+// (`leyline/ast-node/v3`, ADR-0047 D-i).
 //
 // The Rust implementations are normative (`leyline-core` partition.rs and
-// head_digest.rs, `leyline-cli-lib` store_root.rs). This package is checked
+// head_digest.rs, `leyline-cli-lib` store_root.rs and cmd_parse.rs). This
+// package is checked
 // against the same known-answer vectors,
 // rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json, so a Go
 // consumer recomputes a storeRoot from a manifest, or a head digest from a
@@ -210,6 +212,54 @@ func StoreRoot(leaves []StoreLeaf) (Hash, []StoreNode, error) {
 	}
 	r := fold("", root)
 	return r, nodes, nil
+}
+
+// AstNodeContext is the derive-key context of node_hash v3, the
+// merkle-ast-v3 lineage (ADR-0047 D-i, step M2). merkle-ast-v2 hashed the
+// same fields as plain BLAKE3 behind an in-band "llo/ast/v1\x00" prefix, so a
+// file holding those bytes had a blob hash equal to a node_hash; under the
+// keyed construction no plain BLAKE3 digest reaches a node_hash.
+const AstNodeContext = "leyline/ast-node/v3"
+
+// Node tags of the node_hash encoding.
+const (
+	AstNodeLeaf     byte = 0x00
+	AstNodeInternal byte = 0x01
+)
+
+// AstLeafPreimage is the encoding node_hash v3 keys for a leaf:
+// 0x00 ‖ uvarint|kind| ‖ kind ‖ uvarint|token| ‖ token, with kind the
+// canonical (κ) kind and the uvarints unsigned LEB128.
+func AstLeafPreimage(kind, token string) []byte {
+	p := []byte{AstNodeLeaf}
+	p = binary.AppendUvarint(p, uint64(len(kind)))
+	p = append(p, kind...)
+	p = binary.AppendUvarint(p, uint64(len(token)))
+	return append(p, token...)
+}
+
+// AstInternalPreimage is the encoding node_hash v3 keys for an internal
+// node: 0x01 ‖ uvarint|kind| ‖ kind ‖ uvarint n ‖ child node_hash × n, the
+// non-extra children in source order.
+func AstInternalPreimage(kind string, children []Hash) []byte {
+	p := []byte{AstNodeInternal}
+	p = binary.AppendUvarint(p, uint64(len(kind)))
+	p = append(p, kind...)
+	p = binary.AppendUvarint(p, uint64(len(children)))
+	for _, c := range children {
+		p = append(p, c[:]...)
+	}
+	return p
+}
+
+// AstLeafHash is a leaf's node_hash v3.
+func AstLeafHash(kind, token string) Hash {
+	return deriveKey(AstNodeContext, AstLeafPreimage(kind, token))
+}
+
+// AstInternalHash is an internal node's node_hash v3.
+func AstInternalHash(kind string, children []Hash) Hash {
+	return deriveKey(AstNodeContext, AstInternalPreimage(kind, children))
 }
 
 // HeadClaim is every identity a signed Head attests.

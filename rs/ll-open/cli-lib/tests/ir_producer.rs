@@ -590,15 +590,17 @@ fn rust_defs_refs_and_unbound_flow_through_merkle() {
     .unwrap();
     let conn = cold_parse_rust(dir.path());
 
-    // κ collapses Rust's function_item → function on the content row; raw_kind
-    // is retained.
+    // κ collapses Rust's function_item → function on the content row; the
+    // raw grammar kind is retained per occurrence, through `_ast.kind_id →
+    // kinds` (projection-v12: `node_content` holds only what `node_hash`
+    // determines).
     let lib_rs = leyline_ts::schema::lookup_file_id(&conn, "lib.rs")
         .unwrap()
         .expect("lib.rs must be interned");
     let (lo, hi) = leyline_ts::schema::file_nid_range(lib_rs);
     let (kind, raw_kind): (String, String) = conn
         .query_row(
-            "SELECT c.kind, c.raw_kind FROM _ast a \
+            "SELECT c.kind, k.raw_kind FROM _ast a \
              JOIN node_content c ON c.content_id = a.content_id \
              JOIN kinds k ON k.kind_id = a.kind_id \
              WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind = 'function_item'",
@@ -683,10 +685,12 @@ fn impl_item_trait_and_type_children_are_separable_only_by_field() {
         .expect("the impl_item node must exist");
 
     // The contract's join (parent_hash → node_child.field), plus the child's
-    // content so the assertion names what was recovered.
+    // content so the assertion names what was recovered. `kind` is the κ
+    // kind, which is the grammar kind for `type_identifier` (κ does not map
+    // it); `node_content` holds no grammar kind of its own (projection-v12).
     let mut stmt = conn
         .prepare(
-            "SELECT nc.field, c.raw_kind, c.token FROM node_child nc \
+            "SELECT nc.field, c.kind, c.token FROM node_child nc \
              JOIN node_content c ON c.node_hash = nc.child_hash \
              WHERE nc.parent_hash = ?1 AND nc.field IN ('trait', 'type') \
              ORDER BY nc.ordinal",
@@ -715,13 +719,13 @@ fn impl_item_trait_and_type_children_are_separable_only_by_field() {
          and the trait row names the trait"
     );
 
-    // Why the column exists: both children share a raw_kind, so a kind filter
+    // Why the column exists: both children share a kind, so a kind filter
     // returns two rows it cannot tell apart.
     let same_kind: i64 = conn
         .query_row(
             "SELECT count(*) FROM node_child nc \
              JOIN node_content c ON c.node_hash = nc.child_hash \
-             WHERE nc.parent_hash = ?1 AND c.raw_kind = 'type_identifier'",
+             WHERE nc.parent_hash = ?1 AND c.kind = 'type_identifier'",
             [&impl_hash],
             |r| r.get(0),
         )
@@ -729,5 +733,142 @@ fn impl_item_trait_and_type_children_are_separable_only_by_field() {
     assert_eq!(
         same_kind, 2,
         "both impl_item children are type_identifier; only field separates them"
+    );
+}
+
+// ── 7. a fielded child's grammar kind, per occurrence (projection-v12) ────
+//
+// ADR-0047 D-iii (bead `ley-line-open-b5d354`) took `raw_kind` off
+// `node_content`, so a reader that wants a fielded child's GRAMMAR kind (mache's
+// `field_<f>_type`) can no longer read it off the child's content row. The
+// TABLE_CONTRACT recipe reads it from the child's occurrence: the named child of
+// the parent occurrence whose `_ast.content_id` is the edge's `child_id`, and,
+// for an anonymous child (no occurrence row), the content row's `kind`, which
+// is the grammar kind because κ maps no anonymous kind. This pins the recipe
+// against tree-sitter itself on every fielded edge of a Rust, Go and Python
+// tree, including children whose κ kind differs from their grammar kind
+// (`parameters` → κ `parameter`).
+
+/// The TABLE_CONTRACT recipe: `(field, grammar kind)` of each fielded child of
+/// the parent occurrence `nid`, whose subtree is `content_id`, in source order.
+const FIELDED_CHILD_KINDS: &str = "\
+SELECT e.field,
+       COALESCE((SELECT k.raw_kind
+                   FROM nodes n
+                   JOIN _ast ca ON ca.nid = n.nid
+                   JOIN kinds k ON k.kind_id = ca.kind_id
+                  WHERE n.parent_nid = ?1 AND ca.content_id = e.child_id
+                  LIMIT 1),
+                c.kind)
+  FROM node_edge e
+  JOIN node_content c ON c.content_id = e.child_id
+ WHERE e.parent_id = ?2 AND e.field IS NOT NULL AND e.field != ''
+ ORDER BY e.ordinal";
+
+#[test]
+fn a_fielded_childs_grammar_kind_is_read_from_its_occurrence() {
+    use leyline_ts::languages::TsLanguage;
+    let dir = TempDir::new().unwrap();
+    let files: &[(&str, &str)] = &[
+        (
+            "lib.rs",
+            "trait Greet { fn hi(&self, n: u8) -> u8; }\nstruct Robot;\n\
+             impl Greet for Robot {\n    fn hi(&self, n: u8) -> u8 { let x = n + 1; x * 2 }\n}\n",
+        ),
+        (
+            "main.go",
+            "package main\n\ntype T struct{ A int }\n\nfunc (t T) M(a, b int) (int, error) {\n\
+             \tif a > b {\n\t\treturn a - b, nil\n\t}\n\treturn t.A, nil\n}\n",
+        ),
+        (
+            "m.py",
+            "class C:\n    def f(self, a, b=2):\n        return a if a > b else -b\n",
+        ),
+    ];
+    for (rel, text) in files {
+        fs::write(dir.path().join(rel), text).unwrap();
+    }
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, dir.path(), None, None).unwrap();
+
+    let mut checked = 0usize;
+    let mut kappa_differs = 0usize;
+    for (rel, text) in files {
+        let ext = rel.rsplit('.').next().unwrap();
+        let lang = TsLanguage::from_extension(ext).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang.ts_language()).unwrap();
+        let tree = parser.parse(text.as_bytes(), None).unwrap();
+        let file_id = leyline_ts::schema::lookup_file_id(&conn, rel)
+            .unwrap()
+            .unwrap();
+        let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
+
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let mut expected: Vec<(String, String)> = Vec::new();
+            let mut cur = node.walk();
+            if cur.goto_first_child() {
+                loop {
+                    let ch = cur.node();
+                    if !ch.is_extra() {
+                        if let Some(field) = cur.field_name() {
+                            expected.push((field.to_string(), ch.kind().to_string()));
+                        }
+                        if ch.is_named() {
+                            stack.push(ch);
+                        }
+                    }
+                    if !cur.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            if expected.is_empty() {
+                continue;
+            }
+            // The parent occurrence: the one `_ast` row of this span and kind.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT a.nid, a.content_id FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                     WHERE a.nid BETWEEN ?1 AND ?2 AND a.start_byte = ?3 AND a.end_byte = ?4 \
+                       AND k.raw_kind = ?5",
+                )
+                .unwrap();
+            let parents: Vec<(i64, i64)> = stmt
+                .query_map(
+                    rusqlite::params![
+                        lo.get(),
+                        hi.get(),
+                        node.start_byte() as i64,
+                        node.end_byte() as i64,
+                        node.kind()
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(parents.len(), 1, "{rel}: one occurrence of {}", node.kind());
+            let (nid, content_id) = parents[0];
+            let got: Vec<(String, String)> = conn
+                .prepare(FIELDED_CHILD_KINDS)
+                .unwrap()
+                .query_map([nid, content_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(got, expected, "{rel}: fielded children of {}", node.kind());
+            checked += expected.len();
+            kappa_differs += expected
+                .iter()
+                .filter(|(_, k)| lang.canonical_kind(k).is_some_and(|c| c != k))
+                .count();
+        }
+    }
+    assert!(checked > 40, "only {checked} fielded children checked");
+    assert!(
+        kappa_differs > 0,
+        "the fixture must hold a fielded child whose κ kind is not its grammar kind"
     );
 }

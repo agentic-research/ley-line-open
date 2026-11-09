@@ -125,8 +125,10 @@ a content row cannot say which. Read a child's grammar kind from its
 occurrence. A named child of the parent occurrence `:nid` is the `nodes` row
 under it whose `_ast.content_id` is the edge's `child_id`; an anonymous child
 (an operator, keyword or punctuation token) has no occurrence row, and its
-grammar kind is its content row's `kind`, because κ maps no anonymous kind in
-any grammar (`kappa_maps_no_anonymous_kind`, `rs/ll-open/ts/src/languages.rs`):
+grammar kind is its content row's `kind`, because the merkle-ast-v3 fold
+applies κ to named nodes only (`an_anonymous_tokens_kind_is_its_grammar_kind`,
+`rs/ll-open/cli-lib/tests/ir_producer.rs`; JavaScript's `class` keyword was
+stored as κ `type` before v3):
 
 ```sql
 SELECT e.field,
@@ -135,6 +137,7 @@ SELECT e.field,
                    JOIN _ast ca ON ca.nid = n.nid
                    JOIN kinds k ON k.kind_id = ca.kind_id
                   WHERE n.parent_nid = :nid AND ca.content_id = e.child_id
+                  ORDER BY n.ord
                   LIMIT 1),
                 c.kind) AS child_raw_kind
   FROM node_edge e
@@ -144,8 +147,12 @@ SELECT e.field,
 ```
 
 `:parent_content_id` is the parent's `_ast.content_id`. Two named siblings with
-the same `content_id` are the same subtree, so either one's kind serves; the
-`LIMIT 1` picks one. `a_fielded_childs_grammar_kind_is_read_from_its_occurrence`
+the same `content_id` are the same κ tree, not necessarily the same grammar
+kind: κ maps several grammar kinds to one. The query then returns the first
+sibling's grammar kind for both. No case is known: every κ collapse class
+checked differs in an anonymous keyword child (`struct` against `union`,
+`const` against `static`), so its members never share a `content_id`; no test
+pins that. `a_fielded_childs_grammar_kind_is_read_from_its_occurrence`
 (`rs/ll-open/cli-lib/tests/ir_producer.rs`) checks this query against
 tree-sitter on every fielded edge of a Rust, Go and Python tree, including
 children whose κ kind differs (`parameters` → `parameter`). Injected subtrees
@@ -326,7 +333,7 @@ directory, not assumed from the platform.
 
 | Table | Purpose |
 |-------|---------|
-| `_cfg` | Intra-procedural CFG basic blocks — `(node_hash, block_id) PRIMARY KEY`, `block_kind TEXT` (one of `CFG_CANONICAL_KINDS`), `complexity INTEGER` nullable. Node_hash FK to `node_content`. Reflow-invariant identity via merkle-AST. |
+| `_cfg` | Intra-procedural CFG basic blocks — `(node_hash, block_id) PRIMARY KEY`, `block_kind TEXT` (one of `CFG_CANONICAL_KINDS`), `complexity INTEGER` nullable. Node_hash FK to `node_content`. The key is reflow-invariant, but it is not a `node_hash`: `emit_cfg_for_source` keys a body by a plain-BLAKE3 stub fold and inserts a `node_content` row for it, which does not re-derive under merkle-ast-v3 (`ley-line-open-cc7855`). The parse writes no `_cfg` rows. |
 | `_cfg_edge` | Directed edges between CFG blocks. Composite FK on both endpoints referencing `_cfg(node_hash, block_id)`. `edge_kind TEXT` (free-form in v0.7.2; T3 taint will canonicalize). |
 
 Population TODO (bead `ley-line-open-a0fadd`): T1.b3-followup wires `cfg::emit_cfg_for_source` into `cmd_parse`'s rayon-worker + batched-insert plumbing so `_cfg` populates on parse. Until then, schema is present but empty on parse output; `_cfg` is only populated by consumers calling `leyline_ts::cfg::emit_cfg_for_source` directly.

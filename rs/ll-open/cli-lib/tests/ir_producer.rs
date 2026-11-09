@@ -744,10 +744,42 @@ fn impl_item_trait_and_type_children_are_separable_only_by_field() {
 // TABLE_CONTRACT recipe reads it from the child's occurrence: the named child of
 // the parent occurrence whose `_ast.content_id` is the edge's `child_id`, and,
 // for an anonymous child (no occurrence row), the content row's `kind`, which
-// is the grammar kind because κ maps no anonymous kind. This pins the recipe
+// is the grammar kind because the fold applies κ to named nodes only. This pins the recipe
 // against tree-sitter itself on every fielded edge of a Rust, Go and Python
 // tree, including children whose κ kind differs from their grammar kind
 // (`parameters` → κ `parameter`).
+
+/// An anonymous token's content row carries its grammar kind (merkle-ast-v3):
+/// the fold applies κ to named nodes only. JavaScript's `class` keyword is an
+/// anonymous token whose spelling κ maps (the named `class` expression is κ
+/// `type`); before v3 its leaf row said `kind = 'type'`, and with no `_ast`
+/// row the keyword's grammar kind was nowhere in the projection.
+#[test]
+fn an_anonymous_tokens_kind_is_its_grammar_kind() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.js"), b"class A { m() { return 1; } }\n").unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    leyline_cli_lib::cmd_parse::parse_into_conn(&conn, dir.path(), None, None).unwrap();
+    let kinds: Vec<String> = conn
+        .prepare("SELECT kind FROM node_content WHERE node_tag = 0 AND token = 'class'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(kinds, vec!["class".to_string()]);
+    // The named declaration keeps its κ kind.
+    let named: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM _ast a JOIN node_content c ON c.content_id = a.content_id \
+             JOIN kinds k ON k.kind_id = a.kind_id \
+             WHERE k.raw_kind = 'class_declaration' AND c.kind = 'type'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(named, 1);
+}
 
 /// The TABLE_CONTRACT recipe: `(field, grammar kind)` of each fielded child of
 /// the parent occurrence `nid`, whose subtree is `content_id`, in source order.
@@ -758,6 +790,7 @@ SELECT e.field,
                    JOIN _ast ca ON ca.nid = n.nid
                    JOIN kinds k ON k.kind_id = ca.kind_id
                   WHERE n.parent_nid = ?1 AND ca.content_id = e.child_id
+                  ORDER BY n.ord
                   LIMIT 1),
                 c.kind)
   FROM node_edge e
@@ -783,6 +816,10 @@ fn a_fielded_childs_grammar_kind_is_read_from_its_occurrence() {
         (
             "m.py",
             "class C:\n    def f(self, a, b=2):\n        return a if a > b else -b\n",
+        ),
+        (
+            "a.js",
+            "class A extends B { m(x) { return x + 1; } }\nconst f = class { };\n",
         ),
     ];
     for (rel, text) in files {

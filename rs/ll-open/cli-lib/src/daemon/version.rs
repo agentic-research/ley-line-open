@@ -93,9 +93,10 @@ pub const SCHEMA_VERSION: &str = "0.25.0";
 /// the fold with `derive_key("leyline/ast-node/v3", …)`; every `node_hash`
 /// moved from its v2 value. The wire carries `node_hash` with the same type
 /// and framing (hex in `validate`'s `emit_ast` rows, member hashes behind a
-/// sheaf region hash), so [`WIRE_FORMAT_MAJOR`] stays 2: this field, which
-/// the handshake sends before any `node_hash`, is the lineage signal, and a v2
-/// value compared with a v3 one is unequal, never a false match.
+/// sheaf region hash), so [`WIRE_FORMAT_MAJOR`] stays 2: this field, on the
+/// version handshake, is the lineage signal for a client that reads it (the
+/// daemon does not require the handshake first), and a v2 value compared
+/// with a v3 one is unequal, never a false match.
 ///
 /// Bump lives in `cmd_parse::IR_SCHEMA_VERSION`, which re-exports this.
 pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v3";
@@ -214,7 +215,8 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v3";
 ///   occurrence landed first and a write left the replaced file's value
 ///   behind. Each occurrence keeps its own through `_ast.kind_id → kinds(lang,
 ///   raw_kind)`; an anonymous token has no occurrence row, and its grammar
-///   kind is its canonical `kind` (κ maps no anonymous kind). Every
+///   kind is its `kind`, because the merkle-ast-v3 fold applies κ to named
+///   nodes only (an anonymous token hashes its grammar kind). Every
 ///   `node_hash` moves to merkle-ast-v3 (`IR_SCHEMA_VERSION`), and with it
 ///   `parserId`; `storeRoot` and `Head.rootHash` do not move. A v11 arena is
 ///   refused at parse open.

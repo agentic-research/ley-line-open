@@ -194,7 +194,9 @@ bound to an old `run_id` stops verifying (fail closed, since verifiers recompute
   `derived_from` stamp. Does not move: `Head.rootHash` (no AST segment field carries a node
   hash, `rs/ll-core/schema-capnp/schemas/ast.capnp:29-43`), and after D-ii lands, `storeRoot`.
   Construction: `derive_key("leyline/ast-node/v3", tag ‖ uvarint|kind| ‖ kind ‖ …)`, the
-  current preimage without the in-band prefix. Bump: `IR_SCHEMA_VERSION`
+  current preimage without the in-band prefix. As shipped (M2) the fold also applies κ to named
+  nodes only, so an anonymous token's `kind` is its grammar kind (D-iii needs it: such a token has
+  no occurrence row). Bump: `IR_SCHEMA_VERSION`
   `merkle-ast-v2 → merkle-ast-v3` (`rs/ll-open/cli-lib/src/daemon/version.rs:72`), which mache
   already records (`mache/cmd/build_meta.go:60-75`). Old artifact: an arena whose
   `_meta.ir_schema_version` is `merkle-ast-v2` fails `leyline rebuild`'s `parserId` check and
@@ -284,14 +286,18 @@ they cannot be columns of its content row. (A) changes what the address means to
 storage defect; (C) keeps a row that is not a function of its key.
 
 **Consequences.** `node_content` becomes a function of `node_hash`; `cmd_rebuild.rs:368`'s
-exclusion is deleted and the gate compares every column (`b5d354`'s acceptance). The `R3`
-storage cut of `ley-line-open-9c1af2` comes with it. Precondition the implementation proves: a
+exclusion is deleted and the gate compares every column (`b5d354`'s acceptance). The
+`lang`/`raw_kind` half of `ley-line-open-9c1af2`'s `R3` storage cut comes with it; `kind` stays
+TEXT, and 9c1af2 keeps its measurement. Precondition the implementation proves: a
 consumer reading a child's raw kind reads it from the child occurrence, and for content rows
 no occurrence reaches, the raw kind is recoverable or not needed (test: a re-parse reproduces
 every per-occurrence `(lang, raw_kind)`). As shipped (M2): named nodes keep both through
 `_ast.kind_id → kinds`, and the rebuild gate compares those per occurrence; an anonymous token
-has no `_ast` row, and its raw kind is its `node_content.kind` because κ maps no anonymous kind
-in any grammar (`kappa_maps_no_anonymous_kind`, `rs/ll-open/ts/src/languages.rs`). Injected
+has no `_ast` row, and its raw kind is its `node_content.kind` because the merkle-ast-v3 fold
+applies κ to named nodes only. Before v3 it applied κ to every node, and JavaScript's and
+TypeScript's anonymous `class` keyword was stored as κ `type`, its grammar kind nowhere in
+the projection (`an_anonymous_tokens_kind_is_its_grammar_kind`,
+`rs/ll-open/cli-lib/tests/ir_producer.rs`). Injected
 subtrees have no `_ast` row either; their language and grammar kind are no longer in the
 projection, and no shipped reader needed them (`ley-line-open-cc5c55`).
 
@@ -354,7 +360,7 @@ merges.
 |---|---|---|---|
 | M0 | `Ref<D>`, `Witness<D>`, `verify`, locator newtypes in `leyline-schema`; the law tests that hold today (§1.3) and the axiom suite (§5); cas-ffi derive-key export | none (additive) | none |
 | M1 | D-ii: `storeRoot` (`store-tree/v1`), head digest v3, wire `store_root`, `derived_from` v2 — **implemented** (`73c6ee`) | `projection-v11`, head digest v3, release | `treeRoot` removed, `storeRoot` added |
-| M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin; `9c1af2`'s R3 rides along — **implemented** (`73add7`, `b5d354`); wire format major unchanged (2) | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
+| M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin — **implemented** (`73add7`, `b5d354`); wire format major unchanged (2). Of `9c1af2`'s R3, the `lang`/`raw_kind` half lands here (its option (b)); `node_content.kind` stays TEXT and the dbstat measurement is still open on `9c1af2` | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
 | M3 | D-i `run_id` v2 | run-id vector v2, release | `run_id` |
 | M4 | D-iv: rooted blob manifests, one-chunk sub-floor manifests | `projection-v13` | none moved; manifest address added |
 

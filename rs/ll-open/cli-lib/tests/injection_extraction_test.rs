@@ -30,7 +30,9 @@
 //! 4. **Own-CA-root dedup.** The injected `create_table` subtree's
 //!    `node_hash` equals the hash the SAME statement bytes produce in
 //!    a standalone `.sql` file (the merkle fold is span-free), and the
-//!    hash resolves in `node_content` with `lang = 'sql'`.
+//!    hash resolves in `node_content` (κ kind `type`; projection-v12 keeps
+//!    no language on the content row, and an injected node has no
+//!    occurrence row to carry one, `ley-line-open-cc5c55`).
 
 use leyline_cli_lib::cmd_parse;
 use rusqlite::Connection;

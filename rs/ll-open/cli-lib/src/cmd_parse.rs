@@ -49,8 +49,10 @@ pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 ///   every other kind are untouched.
 /// - `merkle-ast-v3` — ADR-0047 D-i (bead `ley-line-open-73add7`): the same
 ///   fields, keyed with `derive_key("leyline/ast-node/v3", …)` instead of
-///   plain σ behind the in-band `llo/ast/v1 ‖ 0x00` prefix. Every `node_hash`
-///   moved; the tree each one names did not.
+///   plain σ behind the in-band `llo/ast/v1 ‖ 0x00` prefix, and κ applied
+///   to named nodes only (an anonymous token folds its grammar kind; before
+///   v3, JavaScript's `class` keyword folded κ `type`). Every `node_hash`
+///   moved.
 pub use crate::daemon::version::IR_SCHEMA_VERSION;
 use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
@@ -3348,6 +3350,23 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
     *leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &p).as_bytes()
 }
 
+/// The kind a node's `node_hash` folds and its `node_content.kind` stores:
+/// the canonical κ kind of a NAMED node, and the grammar kind of an
+/// anonymous token, verbatim (merkle-ast-v3). κ is a vocabulary for
+/// constructs; an anonymous token is a keyword, operator or punctuation
+/// whose spelling can collide with a construct's name (JavaScript's `class`
+/// keyword against the `class` expression, which κ maps to `type`). An
+/// anonymous token has no `_ast` occurrence row, so its content row is the
+/// only place its grammar kind is kept (ADR-0047 D-iii).
+fn hashed_kind(language: TsLanguage, node: tree_sitter::Node<'_>) -> &'static str {
+    let raw = node.kind();
+    if node.is_named() {
+        language.canonical_kind(raw).unwrap_or(raw)
+    } else {
+        raw
+    }
+}
+
 /// The `node_hash` construction (`merkle-ast-v3`, ADR-0027 as keyed by
 /// ADR-0047 D-i), typed (ADR-0047 §2.3). Its fold is [`hash_leaf`] /
 /// [`hash_internal`] under `derive_key("leyline/ast-node/v3", …)`, so a
@@ -3985,8 +4004,7 @@ fn fold_children(
     }
 
     // Compute this node's content address and emit its deduped content rows.
-    let raw_kind = node.kind();
-    let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
+    let canonical = hashed_kind(language, node);
     if children.is_empty() {
         // Leaf: hash the terminal token verbatim (length-prefixed, NUL-safe).
         let token = node.utf8_text(content).unwrap_or("");
@@ -4215,8 +4233,7 @@ fn fold_injected_node(
         }
     }
 
-    let raw_kind = node.kind();
-    let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
+    let canonical = hashed_kind(language, node);
     if children.is_empty() {
         let token = node.utf8_text(content).unwrap_or("");
         let h = hash_leaf(canonical, token);

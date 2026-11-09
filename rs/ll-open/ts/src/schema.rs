@@ -404,7 +404,8 @@ CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 /// `ley-line-open-b5d354`): the grammar kind and language, which the hash
 /// does not determine, are occurrence facts read through `_ast.kind_id →
 /// kinds(lang, raw_kind)`. An anonymous token has no `_ast` row; its grammar
-/// kind is its `kind`, because κ maps no anonymous kind.
+/// kind is its `kind`, because the merkle-ast-v3 fold applies κ to named
+/// nodes only.
 pub const NODE_CONTENT_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_content (
     content_id INTEGER PRIMARY KEY,

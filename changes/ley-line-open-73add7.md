@@ -7,8 +7,10 @@ Section: Breaking
   `llo/ast/v1\0\0\x02fn\x02fn` named the Rust leaf `fn`). merkle-ast-v3 keys
   the same fields, without the prefix, under
   `derive_key("leyline/ast-node/v3", …)`, a different BLAKE3 mode from plain
-  hashing, so no `blob_hash` reaches a `node_hash`. The tree each hash names
-  is unchanged; every value moves.
+  hashing, so no `blob_hash` reaches a `node_hash`. The fold also applies κ
+  to named nodes only: an anonymous token hashes and stores its grammar kind
+  (JavaScript's and TypeScript's `class` keyword had been stored as κ
+  `type`). Every value moves.
   - **What moves:** `node_content.node_hash`, the `v_ast_hash`,
     `v_node_defs_hash` and `v_node_refs_hash` views, `parserId` (it folds
     `IR_SCHEMA_VERSION`, now `merkle-ast-v3`) and the `_meta.derived_from`

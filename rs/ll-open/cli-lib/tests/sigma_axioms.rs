@@ -158,9 +158,17 @@ fn verify_node(
     }
     let (tag, kind, token, arity) = rows.get(hash)?;
     let claimed = Hash::from_bytes(hash.try_into().ok()?);
+    // Every column is part of the witness: a leaf has a token and no
+    // children, an internal node no token and `arity` children.
     let verified = if *tag == 0 {
-        let token = token.as_deref().unwrap_or("");
-        Ref::verified(claimed, AstNodeWitness::Leaf { kind, token })
+        match token.as_deref() {
+            Some(token) if *arity == 0 => {
+                Ref::verified(claimed, AstNodeWitness::Leaf { kind, token })
+            }
+            _ => None,
+        }
+    } else if *tag != 1 || token.is_some() {
+        None
     } else {
         let edges = kids.get(hash).cloned().unwrap_or_default();
         let children: Option<Vec<Ref<AstNode>>> = edges
@@ -707,6 +715,42 @@ proptest! {
                 prop_assert_eq!(&*seen, row, "a node_content row was rebound");
             }
         }
+    }
+}
+
+/// `verify_node` checks every `node_content` column, not just the hashed
+/// ones (projection-v12: every column is a function of `node_hash`). A row
+/// whose `arity` or `token` disagrees with its tag is refused, so the
+/// (IM) test above cannot pass a row that is not its key's function.
+#[test]
+fn verify_node_refuses_a_row_whose_columns_disagree_with_its_key() {
+    let src = TempDir::new().unwrap();
+    write_tree(src.path(), &fixture_files());
+    let conn = Connection::open_in_memory().unwrap();
+    cmd_parse::parse_into_conn(&conn, src.path(), None, None).unwrap();
+    let all_verify = |conn: &Connection| {
+        let (rows, kids) = (node_rows(conn), children(conn));
+        let mut memo = HashMap::new();
+        rows.keys()
+            .all(|h| verify_node(h, &rows, &kids, &mut memo).is_some())
+    };
+    assert!(all_verify(&conn), "a fresh parse verifies");
+    for (mutate, undo) in [
+        (
+            "UPDATE node_content SET arity = 7 WHERE content_id = \
+             (SELECT min(content_id) FROM node_content WHERE node_tag = 0)",
+            "UPDATE node_content SET arity = 0 WHERE node_tag = 0",
+        ),
+        (
+            "UPDATE node_content SET token = 'x' WHERE content_id = \
+             (SELECT min(content_id) FROM node_content WHERE node_tag = 1)",
+            "UPDATE node_content SET token = NULL WHERE node_tag = 1",
+        ),
+    ] {
+        conn.execute(mutate, []).unwrap();
+        assert!(!all_verify(&conn), "`{mutate}` still verifies");
+        conn.execute(undo, []).unwrap();
+        assert!(all_verify(&conn));
     }
 }
 

@@ -248,6 +248,9 @@ fn vacuum_into_is_refused() {
         "vacuum",
     );
     assert_refused(&d, "VACUUM", "not_a_query", "vacuum");
+    // A refusal that names nothing carries no `subject`.
+    let refusal = &d.over_socket("VACUUM")["refusal"];
+    assert!(refusal.get("subject").is_none(), "{refusal}");
     assert_no_host_file(&host);
 }
 

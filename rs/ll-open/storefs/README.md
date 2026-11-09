@@ -325,8 +325,8 @@ daemon's libkrun backend hands the worker):
 workspace it opens a `StoreShare` over a `StoreFs` on the daemon's own
 `DaemonContext` (so the share and the socket propose on one writer, and a
 landed share proposal reaches the checkout and the arena as a socket
-proposal does), when the store's `treeRoot` (ADR-0040 D1) is the grant's
-`graphRoot`, scoped by `scope_for(operations)`: `read`/`list` see the whole
+proposal does), when the store's `storeRoot` (ADR-0047 D-ii, the parser-free directory Merkle
+root of `_tree`) is the grant's `graphRoot` (`blake3-256:<storeRoot>`), scoped by `scope_for(operations)`: `read`/`list` see the whole
 tree, `mutate`/`commit` propose anywhere in it, `query` neither.
 `expectedGeneration` is carried and not consulted: it names ADR-0041's S1
 commit sequence `(epoch, seq)`, which is not implemented; the `graphRoot`

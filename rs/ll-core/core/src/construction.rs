@@ -219,7 +219,7 @@ impl Construction for ArenaImage {
     }
 }
 
-/// The head digest v2 a signed `Head` commits to ([`head_digest`]).
+/// The head digest v3 a signed `Head` commits to ([`head_digest`]).
 pub enum HeadDigest {}
 
 impl Construction for HeadDigest {

@@ -429,7 +429,8 @@ pub struct WorkspaceGrant {
     /// Carried and not checked. ADR-0041 S1 defines it as the commit `seq`
     /// within the grant's epoch, which no store implements yet; a share is
     /// pinned by `graph_root` instead (it opens only when the store's
-    /// `treeRoot` is the grant's `graphRoot`, ADR-0044 phase C).
+    /// `storeRoot` is the grant's `graphRoot`, ADR-0044 phase C; ADR-0047
+    /// D-ii).
     pub expected_generation: u64,
     /// Exactly the operations permitted.
     pub operations: Vec<WorkspaceOperation>,

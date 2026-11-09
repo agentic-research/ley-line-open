@@ -4,7 +4,7 @@
 //! mode (regular, executable, symlink whose blob is its target), or a
 //! directory. The directory set is closed under parents. `_source` is the
 //! projection's registry of the files the parse projects; `_tree` is what
-//! the store holds, and `treeRoot` folds it ([`crate::tree_root`]).
+//! the store holds, and `storeRoot` folds it ([`crate::store_root`]).
 //!
 //! `mtime` and `size` are the walk's stat cache, as `nodes.mtime`/`size`
 //! are for projected files: a file whose stat matches is not read again.

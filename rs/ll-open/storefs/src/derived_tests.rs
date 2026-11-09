@@ -49,11 +49,11 @@ fn tree_paths(f: &Fixture) -> Vec<String> {
         .unwrap()
 }
 
-fn tree_root(f: &Fixture) -> Option<String> {
+fn store_root(f: &Fixture) -> Option<String> {
     f.fs.store()
         .with_read(|conn| {
-            Ok(leyline_cli_lib::tree_root::DerivedFrom::read(conn)?
-                .map(|d| d.tree_root.to_string()))
+            Ok(leyline_cli_lib::store_root::DerivedFrom::read(conn)?
+                .map(|d| d.store_root.to_string()))
         })
         .unwrap()
 }
@@ -100,7 +100,7 @@ fn scratch(f: &Fixture) -> std::path::PathBuf {
 #[test]
 fn build_output_under_target_and_node_modules_is_never_a_proposal() {
     let (f, _parent) = derived_fixture(64 * MIB);
-    let root_before = tree_root(&f);
+    let root_before = store_root(&f);
     let tree_before = tree_paths(&f);
     count_passes(&f);
 
@@ -111,7 +111,7 @@ fn build_output_under_target_and_node_modules_is_never_a_proposal() {
 
     assert_eq!(passes(&f), 0, "no proposal landed");
     assert_eq!(tree_paths(&f), tree_before, "the store holds no new entry");
-    assert_eq!(tree_root(&f), root_before);
+    assert_eq!(store_root(&f), root_before);
     assert_eq!(
         on_disk(&f, "target/debug/app"),
         None,

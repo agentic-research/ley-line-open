@@ -7,7 +7,7 @@ refusals, the NFS mount bases of `6116c9`), ADR-0044 (V2 refusal errnos, V3 "Rea
 WRITE-time `ESTALE`, V4 the host mount's write rules)
 **Related:**
 
-- ADR-0040 D1 (`treeRoot`, `parserId`), D3 (one write path), D6 (`derived_from`, `leyline rebuild`)
+- ADR-0040 D1 (`treeRoot`, `parserId`; `treeRoot` retired by ADR-0047 M1 for `storeRoot`), D3 (one write path), D6 (`derived_from`, `leyline rebuild`)
 - ADR-0043 (one store; R3 checkouts and their index; R4 gix for git interop)
 - `ley-line-open-e650d7` / #466 (WRITE-time `ESTALE`, reversed here),
   `ley-line-open-e6780e` (build outputs excluded from the walk)
@@ -73,6 +73,14 @@ The store holds bytes of any size; `MAX_PARSE_FILE_SIZE` limits projection only.
 
 ### T2 — `treeRoot` folds the manifest: mode and directories are identity
 
+**Amended by ADR-0047 M1 (`ley-line-open-73c6ee`).** The flat `leyline/tree-root/v1` fold below
+is retired. The manifest's identity is `storeRoot`, the parser-free directory Merkle
+`leyline/store-tree/v1`: each directory node folds its children in name-byte order, child `i`
+as `(BLAKE3(name), 2i, |name|)` and `(child, 2i+1, git mode)` — the full git mode for every
+child, `0o100644` included, and `0o040000` for a subdirectory whose `child` is its node address;
+an empty directory is the fold of no entries; params are empty. Modes and empty directories stay
+identity, as this section decided. The text below is the record of T2 as shipped in v0.21.
+
 `treeRoot` (ADR-0040 D1, scheme `leyline/tree-root/v1`) names the manifest's bytes: the set of
 `(path, mode, blob)` entries of `_tree`. The fold:
 
@@ -97,7 +105,7 @@ pre-ADR producer computed is still the root of the tree it computed it over. A p
 over a post-ADR arena recomputes from `_source` alone and reports `TreeRootMismatch` for such a
 tree: it fails closed.
 
-`Head.treeRoot` therefore names the manifest's bytes, not `_source`'s. It is not
+`Head.treeRoot` (now `Head.storeRoot`) therefore names the manifest's bytes, not `_source`'s. It is not
 `Controller.current_root` (the serialized SQLite image), not `Head.rootHash` (one parse run's
 segments), and not a blob hash (AGENTS.md "Identity and Authority Vocabulary").
 
@@ -324,7 +332,7 @@ revalidates every open.
 ### T9 — Derived paths are never proposals
 
 Bead `ley-line-open-39998b`. A path is **authored** or **derived**. Authored paths are what T1–T8
-describe: every change is a proposal, merged, durable, in `_tree`, `treeRoot` and the checkout.
+describe: every change is a proposal, merged, durable, in `_tree`, `storeRoot` and the checkout.
 Derived paths are build output and tool state: `cargo build`'s `target/`, `npm install`'s
 `node_modules/`, a virtualenv, `.git/`. They are regenerated, never merged, and written in volume
 (a build writes thousands of files; at T8's ~47 ms a proposal, ten thousand take eight minutes),
@@ -395,7 +403,8 @@ entries and the scratch entries under the same directory; a name both hold lists
   over it see what tree-sitter recovered.
 - `treeRoot` moves for trees holding non-projected files, executables, symlinks or empty
   directories. A cloister grant whose `graphRoot` was computed before this ADR over such a tree
-  no longer matches; grants are re-derived from the daemon's `read_source` `tree_root`.
+  no longer matches; grants are re-derived from the daemon's `read_source` `tree_root` (since
+  ADR-0047 M1, `store_root`; the grant's `graphRoot` is `blake3-256:<storeRoot>`).
 - mache reads `projection-v7`: two new tables; `_source` is unchanged in shape. A consumer that
   listed "every file" from `_source` now lists the projected files; `_tree` lists every entry.
 - The daemon wire (`daemon.capnp`) changes; see the CHANGELOG entry for bead `bb8aa6`.
@@ -420,7 +429,7 @@ rules and removed that mode, `Refusal::Syntax`, `Refusal::NoLanguage` and `can_h
 
 | # | Claim | Test |
 |---|---|---|
-| M1 | the fold is the declared fold, and default trees keep their root | `tree_root_is_the_declared_fold`, `a_default_tree_folds_as_before_modes_and_dirs`, `modes_and_empty_dirs_move_the_tree_root` |
+| M1 | the fold is the declared fold, and default trees keep their root | `tree_root_is_the_declared_fold`, `a_default_tree_folds_as_before_modes_and_dirs`, `modes_and_empty_dirs_move_the_tree_root` (removed with `tree-root/v1` by ADR-0047 M1; the `store-tree/v1` equivalents are `store_root_is_the_declared_directory_fold`, `a_manifest_folds_its_files_and_empty_directories`, `modes_and_empty_dirs_move_the_store_root`) |
 | M2 | the store holds every walked file, mode, symlink and empty directory | `a_cold_parse_stores_every_file_with_its_mode` (cli-lib `cmd_parse`) |
 | M3 | an unparseable file is stored with a diagnostic | `an_unparseable_write_lands_with_a_diagnostic`, `a_binary_file_is_stored_unprojected_with_a_diagnostic` |
 | M4 | disjoint edits merge; overlapping edits refuse with ranges | `a_moved_base_with_disjoint_edits_lands_the_merge`, `overlapping_edits_refuse_stale_with_conflict_ranges`, `binary_files_never_merge` |

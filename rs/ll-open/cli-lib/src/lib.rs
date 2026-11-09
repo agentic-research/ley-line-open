@@ -29,10 +29,10 @@ pub mod head_claim;
 pub mod lifecycle;
 pub mod merge;
 pub mod source_write;
+pub mod store_root;
 #[cfg(feature = "sheaf")]
 pub mod topology_pass;
 pub mod tree;
-pub mod tree_root;
 pub mod walk;
 
 use std::path::PathBuf;
@@ -192,9 +192,10 @@ pub enum Commands {
         query: Option<String>,
     },
 
-    /// Recompute `treeRoot` and `parserId` from a parsed .db and compare them
-    /// to its sibling head.capnp (ADR-0040 D1). Exits non-zero on mismatch,
-    /// on a head written before the fields existed, or on an unreadable head.
+    /// Recompute `storeRoot` and `parserId` from a parsed .db and compare
+    /// them to its sibling head.capnp (ADR-0047 D-ii). Exits non-zero on
+    /// mismatch, on a head that stamps neither, on a head digest v2 head
+    /// (refused by version), or on an unreadable head.
     VerifyHead {
         /// Path to the parsed SQLite database (the head is `<db>.head.capnp`
         /// beside it).
@@ -374,7 +375,7 @@ pub async fn run(cmd: Commands) -> Result<()> {
             control_path,
             query,
         } => cmd_inspect::cmd_inspect(&id, &arena, control_path.as_deref(), query.as_deref()),
-        Commands::VerifyHead { db } => tree_root::cmd_verify_head(&db),
+        Commands::VerifyHead { db } => store_root::cmd_verify_head(&db),
         Commands::Rebuild { from, into, paths } => cmd_rebuild::cmd_rebuild(&from, &into, paths),
         Commands::Load { db, control } => cmd_load::cmd_load(&db, &control),
         Commands::Cdc { command } => {

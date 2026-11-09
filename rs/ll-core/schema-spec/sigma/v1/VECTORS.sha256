@@ -1,3 +1,3 @@
 # sigma/v1 construction known-answer vectors (ADR-0047 §5, bead ley-line-open-10d71a).
 # Verified by `cargo test -p leyline-schema-spec`.
-0b7e5879ec10847f23f3f47246d02ba33f01a95b152effb896af92a6c9dbf409  test-vectors/constructions.json
+928f88660eda6a23f5f209a93579c9a011652c9a21b3ee681fe980f039a1dba6  test-vectors/constructions.json

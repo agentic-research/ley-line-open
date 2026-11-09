@@ -220,7 +220,7 @@ corpus, 10,464 function lookups, 601 of them with a changed review value):
 | arm | hit rate | false skips | false misses | key time | e2e time |
 |---|---|---|---|---|---|
 | no cache | 0.0% | 0 | 9,863 | 0.25 ms | 99.4 ms |
-| whole-input `(treeRoot, parserId, target)` | 0.0% | 0 | 9,863 | 6.5 ms | 106.3 ms |
+| whole-input `(storeRoot, parserId, target)` | 0.0% | 0 | 9,863 | 6.5 ms | 106.3 ms |
 | restriction | 94.0% | **0** | 32 | 73.9 ms | 85.9 ms |
 | `SheafCache`, heuristic (depth 3) | 68.1% | 154 | 2,889 | 39.5 ms | 87.2 ms |
 | `SheafCache`, δ⁰ | 68.1% | 154 | 2,888 | 45.5 ms | 93.6 ms |

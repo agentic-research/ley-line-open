@@ -199,7 +199,7 @@ pub fn tool_registry() -> Vec<McpTool> {
                           the store holds, parsed or not). Returns its content (a symlink's \
                           target), `blob_hash` (pass it as the `base` of a later `propose`), \
                           its git `mode` (`100644`, `100755` or `120000`) and the arena's \
-                          `tree_root`.",
+                          `store_root`.",
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},

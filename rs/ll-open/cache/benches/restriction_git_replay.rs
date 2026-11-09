@@ -16,13 +16,13 @@
 //! | arm | key |
 //! |---|---|
 //! | `no-cache` | none: every lookup recomputes |
-//! | `whole-input` | `whole_input_key(treeRoot, parserId, target)` |
+//! | `whole-input` | `whole_input_key(storeRoot, parserId, target)` |
 //! | `restriction` | `restriction_for_call_target`: the closure-row fold |
 //!
-//! `treeRoot` here is `whole_object_hash` of the step's corpus, a `RowSet`
-//! fold over `(path, σ(bytes))`: the same information a `Head.treeRoot` over
-//! those files carries, and the tightest whole-input key, so the comparison
-//! favours the whole-input arm.
+//! The store key here is `whole_object_hash` of the step's corpus, a flat
+//! `RowSet` fold over `(path, σ(bytes))`: a different construction from
+//! `Head.storeRoot` (no modes, no directories), standing in for it as the
+//! tightest whole-input key, so the comparison favours the whole-input arm.
 //!
 //! # Method
 //!

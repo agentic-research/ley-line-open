@@ -1,6 +1,9 @@
 # ADR-0041 — Publication: immutable snapshots of whole proposals, one producer, `current_root` retired
 
 **Status:** Proposed (2026-10-12)
+**Amended by:** ADR-0047 M1 (`ley-line-open-73c6ee`): the store identity this ADR names is the
+parser-free `storeRoot` (`leyline/store-tree/v1`), which replaced `treeRoot`; S6's transport
+unit is named by `storeRoot` alone.
 **Bead:** `ley-line-open-d70f99` (ADR-0040 D7)
 **Related:**
 
@@ -131,16 +134,16 @@ The writer keeps `live.db` in WAL. To publish, between proposals:
 1. make a **fresh** work directory per attempt (`mkdtemp`) on the same volume as `live.db`; at
    daemon start, delete leftover work directories and every snapshot newer than the control block's
    published one;
-2. under the write lock: record `(treeRoot, commit)` from `live.db`; clone `live.db`, and
+2. under the write lock: record `(storeRoot, commit)` from `live.db`; clone `live.db`, and
    `live.db-wal` if it exists, into the work directory (`clonefile` on APFS, `FICLONE` where the
    filesystem reflinks); never clone `-shm`; if `live.db-wal` is absent, assert no `-wal` is in the
    work directory; release the lock. Without reflink, begin a read transaction on a pool connection
    under the lock, release, and `sqlite3_backup` from it, so the writer is not stalled for an
    O(size) copy;
 3. open the clone alone; `PRAGMA wal_checkpoint(TRUNCATE)` must report `busy = 0`;
-   `journal_mode=DELETE`; stamp `_meta.publication = (epoch, seq)`; recompute the `_source` fold and
-   refuse to publish unless it equals the clone's `derived_from` and the `treeRoot` recorded in step
-   2; close; fsync;
+   `journal_mode=DELETE`; stamp `_meta.publication = (epoch, seq)`; recompute the `_tree` store
+   root and refuse to publish unless it equals the clone's `derived_from` and the `storeRoot`
+   recorded in step 2; close; fsync;
 4. rename to `<ctrl dir>/snapshots/<epoch>-<seq>.db` (same volume; `EXDEV` is a configuration
    error); fsync the directory;
 5. publish in control block v4 (S4).
@@ -170,7 +173,7 @@ image hash.
 
 The reader **selection check**, replacing T2.3: read v4 under the seqlock; open the snapshot it
 names; refuse unless `_meta.publication` equals the published `(epoch, seq)` and
-`_meta.derived_from` equals the published `(treeRoot, parserId, projection_schema_version)`.
+`_meta.derived_from` equals the published `(storeRoot, parserId, projection_schema_version)`.
 
 This proves the reader opened the snapshot the control block names. It does not prove the bytes are
 intact or that the rows derive from the tree: the publisher writes both stamps into the file the
@@ -183,7 +186,7 @@ Removed with `current_root`, in the release that ships v4:
 
 | Consumer | Replacement |
 |---|---|
-| daemon wire `current_root` (`StatusResponse`, `ReparseResponse`, `SnapshotResponse`, `FlushResponse`, `EnrichResponse`, `LoadResponse`) | `treeRoot` and `(epoch, seq)` |
+| daemon wire `current_root` (`StatusResponse`, `ReparseResponse`, `SnapshotResponse`, `FlushResponse`, `EnrichResponse`, `LoadResponse`) | `storeRoot`, `parserId` and `(epoch, seq)`: a published arena is a parser-derived image, so a reader that selects one by `storeRoot` also checks `parserId` (ADR-0047 law C7 keeps the parser out of `storeRoot`, not out of the selection) |
 | sheaf invalidation payloads | `(epoch, seq)` |
 | vcs root watcher | `(epoch, seq)` (moves on enrichment, as `current_root` did) |
 | outboard tree and `VerifiedArena` | removed with the arena; `--verify` |
@@ -191,9 +194,9 @@ Removed with `current_root`, in the release that ships v4:
 | `ARCHITECTURE.md`, `TABLE_CONTRACT.md` | rewritten with the cutover |
 
 **Receipts.** A `DigestRef` keeps naming a hash function (`blake3-256`, as `read_digest` requires);
-the domain of a root travels in a separate `rootDomain` field, whose value for a tree root is
-`leyline/tree-root/v1`, the scheme tag already folded into the digest. `treeRoot` is parameterised by
-`parserId`, so a receipt records both. `RunReceipt` gains, per proposal a run made, `appliedTo`,
+the domain of a root travels in a separate `rootDomain` field, whose value for a store root is
+`leyline/store-tree/v1`, the scheme tag already folded into every directory node. `storeRoot` takes
+no parser input (ADR-0047 M1); a receipt that cites a derivation records `parserId` beside it. `RunReceipt` gains, per proposal a run made, `appliedTo`,
 `resultRoot` and `proposalDigest`, so a verifier can tell the run's change from proposals that
 interleaved.
 
@@ -207,7 +210,7 @@ interleaved.
 | 16 | `snapshot_path` [512] | |
 | 528 | `epoch` [16] | |
 | 544 | `seq` u64 | 0 = nothing published |
-| 552 | `tree_root` [32] | |
+| 552 | `store_root` [32] | `storeRoot` (ADR-0047 M1) |
 | 584 | `parser_id` [32] | |
 | 616 | `projection_schema_version` [32] | NUL-padded text |
 | 1024-1064 | interrupt fields | moved, unchanged |
@@ -231,10 +234,12 @@ warm-start fallback is removed with the arena.
 
 ### S6 — Transport carries what proposals carry
 
-ADR-0040 D2 makes the sub-manifest plus its source blobs the transport unit. `treeRoot` folds in
-`parserId`, so the unit is named by the pair `(treeRoot, parserId)` and the pair travels with it; a
-receiver verifies the received blobs against the sub-manifest's per-path blob hashes, which do not
-depend on the parser, and recomputes `treeRoot` only under the sender's `parserId`. Receiving one is
+ADR-0040 D2 makes the sub-manifest plus its source blobs the transport unit. Amended by ADR-0047
+M1: the unit is named by `storeRoot` alone, the directory node address of the sub-manifest, which
+takes no parser input. A receiver verifies the received blobs against the sub-manifest's per-path
+blob hashes and recomputes `storeRoot` from them without the sender's parser; a directory node on
+a path is a Contains witness for that path. (Before M1, `treeRoot` folded `parserId`, so the unit
+was named by the pair and recomputable only under the sender's parser.) Receiving one is
 a proposal whose bases are the receiver's current state of those paths; the
 receiver re-parses (ADR-0040 F5). Fetching derived rows instead is deferred: today's rows carry the
 source path and arena-local interned ids, so `(sourceHash, parserId) → outputHash` is not a function;
@@ -248,7 +253,7 @@ ______________________________________________________________________
 
 | # | Claim | Test |
 |---|---|---|
-| H1 | snapshots are immutable and selected exactly | an open reader of an unlinked snapshot reads identical bytes; a polling reader only opens snapshots whose stamps match the control block; two snapshots at one `treeRoot` are told apart; a reader racing an unlink re-reads |
+| H1 | snapshots are immutable and selected exactly | an open reader of an unlinked snapshot reads identical bytes; a polling reader only opens snapshots whose stamps match the control block; two snapshots at one `storeRoot` are told apart; a reader racing an unlink re-reads |
 | H2 | a work directory cannot pair stale WAL | crash after cloning `live.db` and before its WAL; the next snapshot equals `VACUUM INTO` of `live.db` row for row |
 | H3 | no header-versus-root window | concurrent fresh readers during 1,000 publishes never refuse (`1eefe3`) |
 | H4 | growth is not an event | a snapshot ten times larger publishes with no reader refusal |

@@ -472,6 +472,14 @@ tasks:
     cmds:
       - tools/test_go_schema_consumer.sh
 
+  schema:go-sigma-vectors:
+    desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec) the Rust tests check (73c6ee)
+    dir: clients/go/leyline-schema
+    env:
+      GOWORK: "off"
+    cmds:
+      - go test -count=1 ./sigma/
+
   schema:execution-asset-consumer-test:
     desc: Compile the execution/v1 schema release assets standalone to zod RunSpec/RunGrant/RunReceipt (6d811a)
     cmds:
@@ -1734,6 +1742,7 @@ tasks:
       - task: release:retry:fixture-test
       - task: release:hypervisor:fixture-test
       - task: schema:consumer-fixture-test
+      - task: schema:go-sigma-vectors
       - task: schema:execution-asset-consumer-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check

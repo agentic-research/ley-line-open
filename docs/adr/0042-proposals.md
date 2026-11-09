@@ -39,7 +39,7 @@ ______________________________________________________________________
 ### P1 — A proposal is the unit of change, and one SQLite transaction
 
 ```
-propose(grant, writes) -> Accepted { blobs, tree_root, post_commit_error } | Refused(Refusal)
+propose(grant, writes) -> Accepted { blobs, store_root, post_commit_error } | Refused(Refusal)
 
 writes = [ Proposed { path, base, bytes } ]
 base   = Any | Blob(hash of the bytes the author read)
@@ -75,7 +75,7 @@ synced (`synchronous=FULL`). D3's `write(grant, path, bytes)` is the one-file `B
   ambiguity is refused. The locator rule needs its own specification and tests before node bases
   ship.
 - **Coarse** (not implemented) — a proposal naming no finer base is refused unless the current
-  `treeRoot` equals the grant's `graphRoot`. `expectedGeneration` is defined by ADR-0041's per-
+  `storeRoot` equals the grant's `graphRoot`. `expectedGeneration` is defined by ADR-0041's per-
   proposal `(epoch, seq)`.
 
 There is no merge: a conflict is refused and named; resolving it is the proposer's job.
@@ -109,8 +109,9 @@ delete  = Delete against Any | Blob   refused stale when the file moved or is go
 - **One transaction.** Deleted files' rows leave in the projection's transaction, through the
   sweep the incremental parse already runs for a file gone from disk (`delete_file_rows`); a
   deleted file is out of the pass's tree whether or not the directory still holds it. A created
-  file is parsed as a cold parse parses it and gets a `file_id` of its own. `treeRoot` is folded
-  from the committed `_source` set, so it covers creates and deletes, and equals the cold parse's
+  file is parsed as a cold parse parses it and gets a `file_id` of its own. The store root is
+  folded from the committed manifest (`storeRoot` over `_tree` since ADR-0047 M1; `treeRoot` over
+  `_source` when this was written), so it covers creates and deletes, and equals the cold parse's
   root of the resulting tree.
 - **What the store can hold.** The store holds files in languages the parse projects. A create
   is refused before anything changes when its path is not a plain relative path
@@ -149,7 +150,8 @@ accepted with persisted, scheme-tagged keys, and claims per key family only what
 ### P4 — How a proposal begins and ends
 
 - **Explicit, over the daemon** (implemented) — `read_source {path}` returns content, `blob_hash`
-  (the file's `_source.content_hash`, the value `propose` compares) and `tree_root`;
+  (the file's `_source.content_hash`, the value `propose` compares) and `store_root` (`tree_root` before ADR-0047 M1, retired and
+  never sent);
   `propose {writes: [{path, base, content, kind}]}` requires `base`: a `blob_hash`, `any` for no
   check, or `absent` for a create (`kind` is `replace` by default, `create` or `delete`; P1a). A refusal answers `refusal {reason, path, moved}`; on moved bases `reason` is `stale` and
   `moved` lists every `{path, expected, current}`. An applied proposal answers `ok` and, when a

@@ -151,7 +151,7 @@ fn head_case(case: &Value) -> HeadClaim {
         hash_of(&case["rootHash"]),
         hash_of(&case["parentHash"]),
         opt_hash(&case["parentDigest"]),
-        hash_of(&case["treeRoot"]),
+        hash_of(&case["storeRoot"]),
         hash_of(&case["parserId"]),
     )
     .expect("vector claims are well-formed")
@@ -164,7 +164,7 @@ fn head_preimage(case: &Value) -> Vec<u8> {
         .expect("generation")
         .to_le_bytes()
         .to_vec();
-    for k in ["rootHash", "parentHash", "treeRoot", "parserId"] {
+    for k in ["rootHash", "parentHash", "storeRoot", "parserId"] {
         p.extend_from_slice(hash_of(&case[k]).as_bytes());
     }
     match opt_hash(&case["parentDigest"]) {
@@ -238,6 +238,13 @@ fn det_known_answer_vectors() {
     for case in cases(&v, "headDigest") {
         let claim = head_case(case);
         let digest = head_digest(&claim);
+        // The case names its digest version, so a v2/v3 skew reads as one.
+        assert_eq!(
+            case["context"].as_str(),
+            Some(HEAD_DIGEST_CONTEXT),
+            "headDigest case {} pins another digest version",
+            case["name"]
+        );
         assert_eq!(
             Ref::<HeadDigest>::verified(hash_of(&case["digest"]), &claim),
             Some(Ref::<HeadDigest>::derive(&claim)),
@@ -326,8 +333,8 @@ proptest! {
     /// one byte string one address (presentation — `Vec`, slice — is erased).
     /// The `PartitionSpec` slice of law (a) is `partition.rs`'s
     /// `ordered_entry_lists_are_injective` and
-    /// `set_addresses_are_equal_exactly_for_equal_multisets`; `treeRoot`'s is
-    /// `tree_root.rs`'s fold-law proptests.
+    /// `set_addresses_are_equal_exactly_for_equal_multisets`; `storeRoot`'s is
+    /// `store_root.rs`'s fold-law proptests.
     #[test]
     fn construction_equality_is_value_equality(
         x in proptest::collection::vec(any::<u8>(), 0..256),

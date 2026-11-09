@@ -36,7 +36,7 @@ that any second implementation can conform to.
   receipts, and operation annotations. The same `execution.capnp` generates
   Rust wire types, JSON Schema, and self-contained MCP tool definitions.
 - **`sigma/v1/`** — known-answer vectors for every shipped Σ construction
-  (σ_bytes, the partition fold, the head digest, `parserId`, `treeRoot`,
+  (σ_bytes, the partition fold, head digest v3, `parserId`, `storeRoot`,
   `node_hash`, the restriction key), with pinned preimages, read by the Σ
   axiom suite (ADR-0047 §5).
 

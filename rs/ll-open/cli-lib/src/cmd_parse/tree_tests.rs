@@ -47,7 +47,7 @@ fn stored_bytes(conn: &Connection, blob: Hash) -> Vec<u8> {
 
 /// M2: a cold parse records every walked file with its git mode, every
 /// symlink with its target as its blob, and every directory; only the
-/// files the parse knows are projected; `treeRoot` folds the manifest.
+/// files the parse knows are projected; `storeRoot` folds the manifest.
 #[cfg(unix)]
 #[test]
 fn a_cold_parse_stores_every_file_with_its_mode() {
@@ -93,15 +93,9 @@ fn a_cold_parse_stores_every_file_with_its_mode() {
         projected(&conn),
         ["README.md", "a.go", "run.sh", "sub/b.go"]
     );
-    let parser_id = crate::tree_root::ParserInputs::current(
-        &leyline_ts::query_engine::resolve_query_set(&conn, &Default::default())
-            .unwrap()
-            .query_set,
-    )
-    .parser_id();
     assert_eq!(
-        result.tree_root,
-        crate::tree_root::tree_root_of(&crate::tree_root::leaves_of(&expected), parser_id)
+        result.store_root,
+        crate::store_root::store_root_of(&crate::store_root::leaves_of(&expected)).unwrap()
     );
 }
 

@@ -71,7 +71,8 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 **Then**
 - `619a99` — ADR-0047's identity migrations, before the contract freeze because
   each moves a wire or projection identity: M1 parser-free Merkle `storeRoot`
-  (head digest v3, projection-v11), M2 keyed `node_hash` with `lang`/`raw_kind`
+  (head digest v3, projection-v11; implemented by `73c6ee`, mache adopts it in
+  `mache-107423`), M2 keyed `node_hash` with `lang`/`raw_kind`
   per occurrence (merkle-ast-v3, projection-v12), M3 run-id v2, M4 rooted blob
   manifests. Each is one versioned bump; its mache or cloister issue is filed
   before its PR merges.
@@ -116,7 +117,7 @@ Native filesystems are among the most optimized code there is, and every cost
 LLO has paid sits where it deviates from them: no page cache, one flush per
 write instead of a group-committed journal, semantic work on the write path,
 O(volume) work on a write, build output through the store. The direction
-(`d4f424`) is a control plane (the store of record: `treeRoot`, proposals,
+(`d4f424`) is a control plane (the store of record: `storeRoot`, proposals,
 merge, grants, projection) over several data planes that hold or serve the same
 bytes, each with its own identity domain and an adapter that turns its writes
 into proposals:

@@ -10,9 +10,10 @@
 //! It refuses rather than guess:
 //!
 //! - an arena with no `derived_from` (parsed before D6) has no stated
-//!   derivation to reproduce;
+//!   derivation to reproduce, and one whose `derived_from` is the retired
+//!   v1 value (`storeRoot` first, before ADR-0047 M1) is refused by version;
 //! - an arena whose `_tree` manifest no longer folds to its stamped
-//!   `treeRoot` is not the tree the stamp names;
+//!   `storeRoot` is not the store the stamp names;
 //! - a stamped `parserId` other than this binary's (against the arena's own
 //!   query overrides) is a different derivation. Rebuilding under it would
 //!   produce an arena that is not a reproduction, so it is refused; reparse
@@ -21,8 +22,9 @@
 //!   its `_tree.blob_hash`, fails the whole rebuild. A file that does not
 //!   parse is rebuilt as the parse stores it: with a diagnostic.
 //!
-//! A whole-arena rebuild must land the stamped `treeRoot`; a rebuild of a
-//! sub-manifest (`--path`, ADR-0040 F5) lands the `treeRoot` of that subset.
+//! A whole-arena rebuild must land the stamped `storeRoot`; a rebuild of a
+//! sub-manifest (`--path`, ADR-0040 F5) lands the `storeRoot` of that
+//! subset.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,7 +33,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 use crate::source_write::Grant;
-use crate::tree_root::{DerivedFrom, Parser, ParserInputs};
+use crate::store_root::{DerivedFrom, Parser, ParserInputs, StoreRoot};
 use leyline_core::Ref;
 
 /// What a rebuild produced.
@@ -50,24 +52,25 @@ pub fn rebuild(from: &Connection, into: &Connection, grant: &Grant) -> Result<Re
         "refusing to rebuild: the arena records no derived_from (it was parsed \
          before ADR-0040 D6); reparse it with this binary first",
     )?;
+    let tree = crate::store_root::store_tree(from)?;
+    if Ref::<StoreRoot>::verified(stamp.store_root, &tree).is_none() {
+        bail!(
+            "refusing to rebuild: the arena's _tree manifest folds to storeRoot {}, \
+             but derived_from names {}",
+            tree.root(),
+            stamp.store_root
+        );
+    }
     let trusted = crate::cmd_parse::trusted_query_hashes_from_env();
     let query_set = leyline_ts::query_engine::resolve_query_set(from, &trusted)?.query_set;
     let inputs = ParserInputs::current(&query_set);
-    let Some(parser) = Ref::<Parser>::verified(stamp.parser_id, &inputs) else {
+    if Ref::<Parser>::verified(stamp.parser_id, &inputs).is_none() {
         bail!(
             "refusing to rebuild: the arena was derived under parserId {}, this binary \
              derives under {}; a rebuild here would not reproduce it. Reparse \
              the source tree with this binary instead.",
             stamp.parser_id,
             inputs.parser_ref()
-        );
-    };
-    let recomputed = crate::tree_root::tree_root_ref(from, parser)?;
-    if *recomputed.as_hash() != stamp.tree_root {
-        bail!(
-            "refusing to rebuild: the arena's _tree manifest folds to treeRoot {recomputed}, \
-             but derived_from names {}",
-            stamp.tree_root
         );
     }
     let source_root = leyline_ts::schema::get_meta(from, "source_root")?
@@ -117,11 +120,11 @@ pub fn rebuild(from: &Connection, into: &Connection, grant: &Grant) -> Result<Re
     crate::cmd_parse::parse_tree_from_memory(into, Path::new(&source_root), &files, &edits)?;
     let derived_from = DerivedFrom::read(into)?
         .context("the rebuilt arena records no derived_from; the parse did not stamp it")?;
-    if *grant == Grant::Whole && derived_from.tree_root != stamp.tree_root {
+    if *grant == Grant::Whole && derived_from.store_root != stamp.store_root {
         bail!(
-            "rebuild landed treeRoot {}, but the arena it was rebuilt from names {}",
-            derived_from.tree_root,
-            stamp.tree_root
+            "rebuild landed storeRoot {}, but the arena it was rebuilt from names {}",
+            derived_from.store_root,
+            stamp.store_root
         );
     }
     Ok(Rebuilt {
@@ -182,10 +185,10 @@ pub fn cmd_rebuild(from: &Path, into: &Path, paths: Vec<String>) -> Result<()> {
     };
     let rebuilt = rebuild(&src, &dst, &grant)?;
     println!(
-        "{} files rebuilt -> {} treeRoot={} parserId={}",
+        "{} files rebuilt -> {} storeRoot={} parserId={}",
         rebuilt.files,
         into.display(),
-        rebuilt.derived_from.tree_root,
+        rebuilt.derived_from.store_root,
         rebuilt.derived_from.parser_id
     );
     Ok(())
@@ -538,7 +541,7 @@ mod tests {
     }
 
     /// F3 in its stated form: cold parse, writes through D3, rebuild into a
-    /// fresh arena; the logical row sets, `treeRoot` and `derived_from`
+    /// fresh arena; the logical row sets, `storeRoot` and `derived_from`
     /// agree.
     #[test]
     fn a_rebuild_after_writes_reproduces_the_written_arena() {
@@ -552,7 +555,7 @@ mod tests {
         )
         .unwrap();
         let (into, r) = rebuilt(&a.conn, &Grant::Whole);
-        assert_eq!(r.derived_from.tree_root, w.tree_root);
+        assert_eq!(r.derived_from.store_root, w.store_root);
         assert_same_rows(&logical(&into), &logical(&a.conn));
         assert_eq!(
             DerivedFrom::read(&into).unwrap(),
@@ -581,12 +584,12 @@ mod tests {
         assert_eq!(image, file_image(&a.conn, "sub/deep/r.rs"));
         // The subset's own tree root, not the whole arena's.
         assert_ne!(
-            r.derived_from.tree_root,
-            DerivedFrom::read(&a.conn).unwrap().unwrap().tree_root
+            r.derived_from.store_root,
+            DerivedFrom::read(&a.conn).unwrap().unwrap().store_root
         );
         assert_eq!(
-            r.derived_from.tree_root,
-            crate::tree_root::tree_root(&into, r.derived_from.parser_id).unwrap()
+            r.derived_from.store_root,
+            crate::store_root::store_root(&into).unwrap()
         );
     }
 
@@ -599,13 +602,13 @@ mod tests {
             stamp.projection_schema_version,
             crate::daemon::version::PROJECTION_SCHEMA_VERSION
         );
-        match crate::tree_root::verify(&a.db).unwrap() {
-            crate::tree_root::Verification::Valid {
-                tree_root,
+        match crate::store_root::verify(&a.db).unwrap() {
+            crate::store_root::Verification::Valid {
+                store_root,
                 parser_id,
                 ..
             } => {
-                assert_eq!(stamp.tree_root, tree_root);
+                assert_eq!(stamp.store_root, store_root);
                 assert_eq!(stamp.parser_id, parser_id);
             }
             other => panic!("head does not verify: {other:?}"),
@@ -613,16 +616,16 @@ mod tests {
         // A write restamps it with the tree the head now names.
         let w = write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
         assert_eq!(
-            DerivedFrom::read(&a.conn).unwrap().unwrap().tree_root,
-            w.tree_root
+            DerivedFrom::read(&a.conn).unwrap().unwrap().store_root,
+            w.store_root
         );
-        assert_ne!(w.tree_root, stamp.tree_root);
+        assert_ne!(w.store_root, stamp.store_root);
     }
 
     #[test]
     fn derived_from_round_trips_and_rejects_malformed_values() {
         let d = DerivedFrom {
-            tree_root: leyline_core::Hash::from_bytes([7; 32]),
+            store_root: leyline_core::Hash::from_bytes([7; 32]),
             parser_id: leyline_core::Hash::from_bytes([9; 32]),
             projection_schema_version: "projection-v6".into(),
         };
@@ -630,17 +633,34 @@ mod tests {
         let hex7 = "07".repeat(32);
         for bad in [
             String::new(),
-            format!("{hex7} {hex7}"),
-            format!("{hex7} {hex7} v extra"),
-            format!("{} {hex7} v", "07".repeat(31)),
-            format!("{hex7} zz{} v", "07".repeat(31)),
+            format!("v2 {hex7} {hex7}"),
+            format!("v2 {hex7} {hex7} v extra"),
+            format!("v2 {} {hex7} v", "07".repeat(31)),
+            format!("v2 {hex7} zz{} v", "07".repeat(31)),
+            // The retired v1 value: three fields, treeRoot first.
+            format!("{hex7} {hex7} v"),
+            format!("v1 {hex7} {hex7} v"),
         ] {
             assert!(DerivedFrom::from_meta(&bad).is_err(), "accepted {bad:?}");
         }
     }
 
+    /// ADR-0047 M1: an arena stamped with the retired v1 `derived_from`
+    /// (parser-qualified `treeRoot` first) is refused by version, never read
+    /// as a v2 stamp.
+    #[test]
+    fn an_arena_with_a_v1_derived_from_is_refused() {
+        let a = arena(FILES);
+        let stamp = DerivedFrom::read(&a.conn).unwrap().unwrap();
+        let v1 = format!("{} {} projection-v10", stamp.store_root, stamp.parser_id);
+        leyline_ts::schema::set_meta(&a.conn, "derived_from", &v1).unwrap();
+        let into = Connection::open_in_memory().unwrap();
+        let err = rebuild(&a.conn, &into, &Grant::Whole).unwrap_err();
+        assert!(format!("{err:#}").contains("retired v1"), "{err:#}");
+    }
+
     /// ADR-0045: ring 0 carries directories. A whole rebuild reproduces an
-    /// empty directory (and so the stamped `treeRoot`); a rebuild of named
+    /// empty directory (and so the stamped `storeRoot`); a rebuild of named
     /// files carries only the directories above them.
     #[test]
     fn a_rebuild_carries_empty_directories_for_the_whole_tree_only() {
@@ -730,17 +750,17 @@ mod tests {
         );
     }
 
-    /// A `_source` set that no longer folds to the stamped `treeRoot` is not
+    /// A `_source` set that no longer folds to the stamped `storeRoot` is not
     /// the tree the stamp names.
     #[test]
     fn a_source_set_that_disagrees_with_its_stamp_is_refused() {
         let a = arena(FILES);
         let mut stamp = DerivedFrom::read(&a.conn).unwrap().unwrap();
-        stamp.tree_root = leyline_core::Hash::from_bytes([2; 32]);
+        stamp.store_root = leyline_core::Hash::from_bytes([2; 32]);
         leyline_ts::schema::set_meta(&a.conn, "derived_from", &stamp.to_meta()).unwrap();
         let into = Connection::open_in_memory().unwrap();
         let err = rebuild(&a.conn, &into, &Grant::Whole).unwrap_err();
-        assert!(format!("{err:#}").contains("folds to treeRoot"), "{err:#}");
+        assert!(format!("{err:#}").contains("folds to storeRoot"), "{err:#}");
     }
 
     #[test]
@@ -814,8 +834,8 @@ mod tests {
         assert_eq!(ids, vec!["a.go".to_string()]);
         // The rebuilt arena carries its own head, and it verifies.
         assert!(matches!(
-            crate::tree_root::verify(&out).unwrap(),
-            crate::tree_root::Verification::Valid { .. }
+            crate::store_root::verify(&out).unwrap(),
+            crate::store_root::Verification::Valid { .. }
         ));
         let err = cmd_rebuild(&a.db, &out, Vec::new()).unwrap_err();
         assert!(format!("{err:#}").contains("already exists"), "{err:#}");

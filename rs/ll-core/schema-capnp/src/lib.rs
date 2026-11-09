@@ -24,7 +24,8 @@
 //! `.source.capnp` / `.ast.capnp` / `.bindings.capnp` segments that
 //! `Head.rootHash` folds. The only production reader of the segments is that
 //! hash. The projection's own validity is its `derived_from` stamp
-//! (`treeRoot`, `parserId`, projection version; ADR-0040 D6). Deriving the
+//! (`storeRoot`, `parserId`, projection version; ADR-0040 D6, ADR-0047
+//! D-ii). Deriving the
 //! projection from the log was the Σ data-plane reframe's proposal
 //! (2026-05-08) and is not built (bead `ley-line-open-5be950`).
 

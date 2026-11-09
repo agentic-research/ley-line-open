@@ -21,6 +21,21 @@ or backend implementation name appears in the portable contract. Workspaces
 are logical Graph roots with explicit operations. A `.db` can be an immutable
 artifact, but never live storage authority.
 
+## Workspace graph root
+
+A `WorkspaceGrant.graphRoot` served by an LLO store is
+`blake3-256:<storeRoot>`: the store's parser-free directory Merkle root
+(`leyline/store-tree/v1`, ADR-0047 D-ii; construction in
+`rs/ll-core/schema-capnp/schemas/head.capnp` `storeRoot`, known-answer
+vectors in `../../sigma/v1/test-vectors/constructions.json` `storeRoot`).
+The `blake3-256:` tag names the hash algorithm only; this paragraph names
+the construction. A grant is never compared with a blob hash, an arena
+`current_root` or a run's `rootHash`. Before ADR-0047 M1 (bead
+`ley-line-open-73c6ee`) the store compared `graphRoot` with the retired
+`treeRoot`, which folded `parserId`; a grant minted against a `treeRoot`
+does not match any `storeRoot` and is refused with
+`identityPolicyMismatch` before the run starts.
+
 ## Workspace generation
 
 `WorkspaceGrant.expectedGeneration` is ADR-0041 S1's commit `seq` within the

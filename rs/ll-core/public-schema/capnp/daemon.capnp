@@ -329,12 +329,17 @@ struct ReadSourceResponse {
   # The file's `_tree.blob_hash`, 64 hex chars: the `source_blobs` key of
   # `content` and the hash `propose` compares a base against.
   blobHash @2 :Text  $Json.name("blob_hash");
-  # The arena's treeRoot (ADR-0040 D1) the file was read under, 64 hex chars.
-  treeRoot @3 :Text  $Json.name("tree_root");
+  # Retired by ADR-0047 M1 and never sent: was `tree_root`, the arena's
+  # parser-qualified treeRoot. Its ordinal is kept; read `store_root`.
+  retiredTreeRoot @3 :Text  $Json.name("retired_tree_root");
   error    @4 :Text;
   # The file's git mode, six octal digits: `100644` (regular), `100755`
   # (executable) or `120000` (symlink; `content` is its target). ADR-0045.
   mode     @5 :Text;
+  # The arena's storeRoot (ADR-0047 D-ii: the parser-free directory Merkle
+  # root `leyline/store-tree/v1` of `_tree`) the file was read under, 64 hex
+  # chars. Unset when the arena records no `derived_from`.
+  storeRoot @6 :Text  $Json.name("store_root");
 }
 
 # What one write of a proposal does at its path (ADR-0042 P1, ADR-0045 T4).
@@ -481,8 +486,9 @@ struct ProposalRefusal {
 # so nothing changed either).
 struct ProposeResponse {
   ok              @0 :Bool;
-  # The arena's treeRoot after the proposal (ok only).
-  treeRoot        @1 :Text  $Json.name("tree_root");
+  # Retired by ADR-0047 M1 and never sent: was `tree_root`, the arena's
+  # parser-qualified treeRoot. Its ordinal is kept; read `store_root`.
+  retiredTreeRoot @1 :Text  $Json.name("retired_tree_root");
   # Each written path's new blob hash (ok only).
   blobs           @2 :List(PathHash);
   # Set when the proposal was refused.
@@ -497,6 +503,9 @@ struct ProposeResponse {
   # the three-way merge with what the path held (ADR-0045 T5); what landed
   # is not the `content` sent. Unset when nothing merged.
   merged          @6 :List(Text);
+  # The arena's storeRoot after the proposal (ok only; ADR-0047 D-ii), 64
+  # hex chars. A grammar or epoch upgrade does not move it.
+  storeRoot       @7 :Text  $Json.name("store_root");
 }
 
 struct FindCallersRequest {

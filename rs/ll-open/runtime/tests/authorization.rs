@@ -1547,6 +1547,117 @@ fn a_backend_that_drops_a_granted_workspace_is_cancelled_and_refused() {
     assert_eq!(backend.cancelled.lock().unwrap().len(), 2);
 }
 
+/// A cancel that also fails does not turn the refusal into something else:
+/// the start is still `workspaceUnserved`, and the cancel's failure is named
+/// in it rather than lost. The workload may still be live, so the run is not
+/// forgotten: it is recorded `Failed` (never receipted), its run_id refuses
+/// a second start, and `cleanup` retries the cancel.
+#[test]
+fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
+    /// Its first cancel fails; later ones succeed.
+    #[derive(Clone, Default)]
+    struct Unstoppable {
+        cancels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Backend for Unstoppable {
+        fn capabilities(&self) -> BackendCapabilities {
+            CompletingBackend.capabilities()
+        }
+        fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(BackendRun {
+                backend_id: "unstoppable/1".into(),
+                channels: Vec::new(),
+            })
+        }
+        fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+            if self
+                .cancels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                Err(ExecutionError::backend("the worker would not stop"))
+            } else {
+                Ok(true)
+            }
+        }
+    }
+
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    let backend = Unstoppable::default();
+    let service = ExecutionService::new(backend.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-unstoppable")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect_err("a backend that served no share and would not stop");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("\"repo\""), "{error:?}");
+    assert!(
+        error.detail.contains("the worker would not stop"),
+        "{error:?}"
+    );
+
+    let run_id = derive_run_id(
+        &canonical_digest(&spec).expect("spec digest"),
+        "grant-01",
+        "replay-01",
+    );
+    let record = service
+        .status(&run_id)
+        .expect("status")
+        .expect("a run that may still be live stays addressable");
+    assert_eq!(record.state, leyline_runtime::RunState::Failed);
+    let states: Vec<_> = service
+        .inspect(&run_id, 0)
+        .expect("inspect")
+        .events
+        .into_iter()
+        .map(|event| event.state)
+        .collect();
+    assert_eq!(
+        states.last(),
+        Some(&leyline_runtime::RunState::Failed),
+        "{states:?}"
+    );
+    assert!(
+        service.collect(&run_id).is_err(),
+        "a refused start is never receipted"
+    );
+
+    // The same authority cannot start a second workload beside it.
+    let again = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect_err("its run_id is still held");
+    assert_eq!(
+        again.code,
+        leyline_runtime::ErrorCode::ResourceConflict,
+        "{again:?}"
+    );
+    assert_eq!(
+        backend.starts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second start never reached the backend"
+    );
+
+    // `cleanup` retries the cancel, which now succeeds.
+    let cleaned = service.cleanup(&run_id).expect("cleanup retries the cancel");
+    assert_eq!(cleaned.state, leyline_runtime::RunState::Cleaned);
+    assert_eq!(backend.cancels.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 /// The other direction of the same comparison: a share for a workspace the
 /// grant never named is authority the run was not given.
 #[test]

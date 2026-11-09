@@ -62,8 +62,11 @@ cannot serve one refuses the start before it spawns anything, with
 `workspaceUnserved` names only this refusal, so a caller that chose the
 backend class can tell "this tier serves no workspace" from the
 `unsupportedBackend` refusals (egress, an unenforceable ceiling, another
-tier's grant) without reading the message. Choosing another tier is the
-caller's policy; the runtime does not reroute a run.
+tier's grant) by code. The Rust `ExecutionError` carries it as `code`; the
+daemon, CLI and MCP replies carry it today only as the error text's prefix
+(`WorkspaceUnserved: …`), without a structured `code` or `retryable` field
+(bead `ley-line-open-e347ae`). Choosing another tier is the caller's policy;
+the runtime does not reroute a run.
 
 The service also checks the backend's answer: the workspace shares the
 backend reports holding (the `workspaceShare` channels of its evidence
@@ -71,7 +74,10 @@ document, below) must be the granted workspaces exactly, by name and
 `graphRoot`. A backend that reports a start with a granted workspace missing,
 or with a share the grant never named, has its run cancelled and the start
 refused with `workspaceUnserved`; the run is never recorded, collected or
-receipted.
+receipted. If that cancel fails, the workload may still be running, so the
+run is recorded `failed` instead of forgotten: it has no receipt, its
+`runId` refuses another start with `resourceConflict`, and `cleanup`
+retries the cancel.
 
 `workspaceUnserved` was appended to `ErrorCode` at ordinal 12 (bead
 `ley-line-open-204a94`). Before it, the same refusals were

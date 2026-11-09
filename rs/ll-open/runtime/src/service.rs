@@ -235,14 +235,47 @@ impl<B: Backend> ExecutionService<B> {
         if let Err(error) = served_exactly(&request.workspaces, &started.channels) {
             // The refusal is the answer either way; a cancel that also fails
             // is named in it rather than masking it.
-            let error = match self.backend.cancel(&request.run_id) {
-                Ok(_) => error,
-                Err(cancel) => ExecutionError {
-                    detail: format!("{}; cancelling the run also failed: {cancel}", error.detail),
-                    ..error
-                },
+            let cancel = self.backend.cancel(&request.run_id);
+            let mut state = self.state.write();
+            state.starting.remove(&request.run_id);
+            let Err(cancel) = cancel else {
+                return Err(error);
             };
-            self.state.write().starting.remove(&request.run_id);
+            // The workload may still be running. Forgetting it would leave a
+            // live run nothing can address and free its run_id for a second
+            // start. It is recorded `Failed` instead: terminal, so it is never
+            // polled or receipted (it has no receipt context), its run_id
+            // refuses another start, and `cleanup` retries the cancel.
+            let error = ExecutionError {
+                detail: format!(
+                    "{}; cancelling the run also failed, so it is recorded failed \
+                     and `cleanup` retries the cancel: {cancel}",
+                    error.detail
+                ),
+                ..error
+            };
+            let detail_digest = serde_json::to_vec(&error)
+                .ok()
+                .map(|bytes| format!("blake3-256:{}", bytes.hash()));
+            state.runs.insert(
+                request.run_id.clone(),
+                RunRecord {
+                    run_id: request.run_id.clone(),
+                    replay_key: request.replay_key.clone(),
+                    state: RunState::Failed,
+                    backend_id: started.backend_id,
+                },
+            );
+            state.events.insert(
+                request.run_id,
+                vec![
+                    event(1, RunState::Accepted),
+                    event(2, RunState::Provisioning),
+                    event(3, RunState::Ready),
+                    event(4, RunState::Running),
+                    event_with_detail(5, RunState::Failed, detail_digest),
+                ],
+            );
             return Err(error);
         }
         let record = RunRecord {

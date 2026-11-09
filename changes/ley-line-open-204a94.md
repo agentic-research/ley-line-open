@@ -11,7 +11,8 @@ Section: Security
   checks each backend's answer: a start whose reported workspace shares are
   not exactly the granted workspaces (one missing, or one the grant never
   named) is cancelled and refused with `workspaceUnserved`, and the run is
-  never recorded. A `Backend` implementation outside this repository that
+  never recorded; if the cancel fails, the run is recorded `failed` (no
+  receipt, its run_id refuses another start, `cleanup` retries the cancel). A `Backend` implementation outside this repository that
   accepts workspace grants must report a `WorkerChannel::WorkspaceShare` for
   each, or its runs are refused. A client matching `unsupportedBackend` for
   these refusals must match `workspaceUnserved` instead.

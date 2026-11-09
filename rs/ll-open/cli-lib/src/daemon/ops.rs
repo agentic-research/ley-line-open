@@ -5367,6 +5367,30 @@ mod tests {
         assert_eq!(parsed["limit"], 10);
     }
 
+    /// Bead `ley-line-open-b7e9a3`: a refused statement's wire shape. The
+    /// refusal carries a `subject` only when the action names something.
+    #[tokio::test]
+    async fn op_query_refusal_carries_a_subject_only_when_one_is_named() {
+        let (_dir, ctx) = setup();
+        let refused = |sql: &str| -> serde_json::Value {
+            let out = handle_base_op_legacy(&ctx, "query", &json!({ "sql": sql }))
+                .expect("op_query must dispatch");
+            serde_json::from_str(&out).unwrap()
+        };
+        assert_eq!(
+            refused("VACUUM"),
+            json!({
+                "ok": false,
+                "error": "query refused (not_a_query): the query op runs only a read-only SELECT, not `vacuum`",
+                "refusal": {"reason": "not_a_query", "action": "vacuum"},
+            })
+        );
+        assert_eq!(
+            refused("PRAGMA writable_schema = ON")["refusal"],
+            json!({"reason": "denied_action", "action": "pragma", "subject": "writable_schema"})
+        );
+    }
+
     #[tokio::test]
     async fn op_query_omits_truncated_when_under_limit() {
         // A query that returns fewer rows than the cap MUST NOT carry

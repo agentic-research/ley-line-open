@@ -317,11 +317,48 @@ type GetDbPathResponse struct {
 	HeadPath     *string `json:"head_path"`
 }
 
-// QueryResponse is the wire shape of the `query` op response.
+// QueryRefusalReason is why a `query` statement was refused, in its wire
+// spelling (the capnp `QueryRefusalReason` enumerant's `$Json.name`). A
+// reason this package does not name still decodes; a client must treat it
+// as a refusal.
+type QueryRefusalReason string
+
+// The QueryRefusalReason enumerants, in capnp ordinal order.
+const (
+	// QueryRefusalDeniedAction: the SQLite authorizer denied an action the
+	// statement takes; [QueryRefusal.Action] names it.
+	QueryRefusalDeniedAction QueryRefusalReason = "denied_action"
+	// QueryRefusalMultipleStatements: the SQL holds more than one
+	// statement. None of them ran.
+	QueryRefusalMultipleStatements QueryRefusalReason = "multiple_statements"
+	// QueryRefusalNotAQuery: the statement is not a read-only SELECT;
+	// [QueryRefusal.Action] is its leading keyword.
+	QueryRefusalNotAQuery QueryRefusalReason = "not_a_query"
+)
+
+// QueryRefusal is why a `query` statement was refused (LLO bead
+// ley-line-open-b7e9a3). Nothing ran and nothing changed.
+type QueryRefusal struct {
+	Reason *QueryRefusalReason `json:"reason"`
+	// Action is the refused action: an authorizer action in snake case
+	// (`insert`, `delete`, `attach`, `pragma`, `function`, ...) for
+	// denied_action, the leading keyword for not_a_query, `statement` for
+	// multiple_statements.
+	Action *string `json:"action"`
+	// Subject is what Action names (a table, pragma, function or attached
+	// file), when it names something.
+	Subject *string `json:"subject,omitempty"`
+}
+
+// QueryResponse is the wire shape of the `query` op response. `query` runs
+// one read-only SELECT: OK false with Refusal means the statement was
+// refused, OK false without it is an error running an allowed statement.
 type QueryResponse struct {
-	OK      *bool      `json:"ok"`
-	Columns []string   `json:"columns"`
-	Rows    []QueryRow `json:"rows"`
+	OK      *bool         `json:"ok"`
+	Columns []string      `json:"columns"`
+	Rows    []QueryRow    `json:"rows"`
+	Error   *string       `json:"error,omitempty"`
+	Refusal *QueryRefusal `json:"refusal,omitempty"`
 }
 
 // ── Sheaf op responses ─────────────────────────────────────────────

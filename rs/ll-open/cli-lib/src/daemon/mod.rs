@@ -29,6 +29,7 @@ pub mod sheaf_ablation;
 #[cfg(feature = "sheaf")]
 pub mod sheaf_ops;
 pub mod socket;
+pub mod sql_read_only;
 #[cfg(feature = "vec")]
 pub mod vec_index;
 pub mod version;

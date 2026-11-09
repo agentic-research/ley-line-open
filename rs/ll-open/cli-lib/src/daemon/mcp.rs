@@ -168,7 +168,7 @@ pub fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "query",
-            description: "Run an arbitrary SQL statement against the living db, on its writer: it can modify the db. Cloister group `sql`.",
+            description: "Run one read-only SELECT against the living db and return its rows. Any other statement (a write, DDL, ATTACH, VACUUM, a pragma, a second statement) is refused with a typed `refusal` and changes nothing. Cloister group `sql`.",
             schema: json!({
                 "type": "object",
                 "properties": {"sql": {"type": "string"}},
@@ -641,10 +641,11 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "sheaf_learned_weights",
             ],
         },
-        // Raw SQL: `query` runs any statement on the writer connection
-        // (DROP, DELETE, ATTACH, VACUUM INTO a host path), so it is a write
-        // grant and sits apart from the read-side `query` group (bead
-        // `ley-line-open-851a65`; read-only SQL is `ley-line-open-b7e9a3`).
+        // Raw SQL: `query` runs caller-written SQL. It is read-only (bead
+        // `ley-line-open-b7e9a3`: one SELECT, under a deny-by-default
+        // authorizer, on a `query_only` reader), but it reads any table, so
+        // it stays a grant of its own apart from the read-side `query` group
+        // (bead `ley-line-open-851a65`).
         CloisterGroupDecl {
             name: "sql",
             advertised_prefix: "",

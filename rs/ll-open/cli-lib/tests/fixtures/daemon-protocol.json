@@ -344,6 +344,23 @@
     "go_drift_skip": "Structural: schema declares rows:List(QueryRow) with positional values:List(Text); handler emits column-keyed maps. Can't be reconciled additively without changing the wire shape (would break debug consumers of `op_query`). Tracked as follow-up; this is the only op that genuinely needs a design call rather than a schema bump."
   },
 
+  "query_refused": {
+    "request": {"op": "query", "sql": "INSERT INTO nodes (id) VALUES ('x')"},
+    "response": {
+      "ok": false,
+      "error": "query refused (denied_action): the query op is read-only and does not allow `insert` on `nodes`",
+      "refusal": {
+        "reason": "denied_action",
+        "action": "insert",
+        "subject": "nodes"
+      }
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["error", "refusal"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
+  },
+
   "sheaf_set_topology": {
     "request": {
       "op": "sheaf_set_topology",

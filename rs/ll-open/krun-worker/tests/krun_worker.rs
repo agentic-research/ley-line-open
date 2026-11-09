@@ -239,7 +239,7 @@ fn a_worker_refuses_a_share_that_does_not_match_its_grant() {
         ..plain.clone()
     };
     let error = worker_failure(&two, &[WORKSPACE_SHARE_FD_ARG, "0"]);
-    assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+    assert_eq!(error.code, ErrorCode::WorkspaceUnserved);
 
     // The guest init's mount list is the worker's to set: a workload's
     // environment may not name it.

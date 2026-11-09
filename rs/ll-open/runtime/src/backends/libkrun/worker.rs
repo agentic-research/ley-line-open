@@ -80,7 +80,7 @@ fn workspace_share(
             // this purpose alone; nothing else in the worker names it.
             Ok(Some(unsafe { UnixStream::from_raw_fd(fd) }))
         }
-        (grants, _) => Err(ExecutionError::unsupported(format!(
+        (grants, _) => Err(ExecutionError::workspace_unserved(format!(
             "the microVM tier attaches one workspace as {WORKSPACE_DIR}; the run is granted {}",
             grants.len()
         ))),
@@ -706,7 +706,7 @@ mod tests {
         // Two workspaces: the tier attaches one.
         granted.workspaces.push(grant("docs"));
         let error = workspace_share(&granted, None).unwrap_err();
-        assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+        assert_eq!(error.code, ErrorCode::WorkspaceUnserved);
     }
 
     #[test]

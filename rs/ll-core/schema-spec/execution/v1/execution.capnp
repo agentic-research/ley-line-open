@@ -35,6 +35,7 @@ enum ErrorCode $Traits.doc("Stable error classification shared by every transpor
   backendFailed          @9;
   cancelled              @10;
   internal               @11;
+  workspaceUnserved      @12 $Traits.doc("The grant names a workspace the selected backend cannot serve; a backend that serves workspace shares may run it. Not retryable under the same grant.");
 }
 
 enum WorkspaceOperation $Traits.doc("Operation authorized on one logical Graph workspace.") {

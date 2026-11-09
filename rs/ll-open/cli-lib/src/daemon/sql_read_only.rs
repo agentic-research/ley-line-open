@@ -302,7 +302,13 @@ pub fn query<T>(
         }
         .into());
     }
-    run(&mut stmt).map_err(|e| denial_or(&seen, e))
+    let out = run(&mut stmt).map_err(|e| denial_or(&seen, e))?;
+    // A denial `run` swallowed (an iterator that drops a step's error) is
+    // still a refusal: the result it built may be truncated.
+    match lock(&seen).denied.take() {
+        Some(refusal) => Err(refusal.into()),
+        None => Ok(out),
+    }
 }
 
 /// What the authorizer saw while a statement was prepared and stepped.
@@ -608,6 +614,24 @@ mod tests {
             "nothing reached the host path"
         );
         assert_eq!(rows(&r, "SELECT a FROM t").unwrap().len(), 2, "t is whole");
+    }
+
+    /// A step the authorizer denied is a refusal even when `run` swallows
+    /// the step's error: the caller never gets a truncated result as success.
+    #[test]
+    fn a_denial_during_a_step_is_a_refusal_even_if_run_swallows_it() {
+        let (_dir, _w, r) = reader();
+        let err = query(
+            &r,
+            "SELECT a FROM t UNION ALL SELECT name FROM pragma_database_list",
+            |stmt| Ok(stmt.query_map([], |_| Ok(()))?.count()),
+        )
+        .expect_err("a swallowed denial must still refuse");
+        let refusal = err.downcast_ref::<Refusal>().expect("a refusal");
+        assert_eq!(
+            (refusal.action.as_str(), refusal.subject.as_str()),
+            ("pragma", "database_list")
+        );
     }
 
     /// The authorizer is gone once `query` returns: the pool connection

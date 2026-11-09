@@ -348,6 +348,25 @@ fn a_function_that_reaches_outside_the_db_is_refused() {
     );
 }
 
+/// The protocol fixture's `query_refused` body is exactly what the daemon
+/// sends, so the Go decode of that fixture checks the real wire, not a guess.
+#[test]
+fn the_protocol_fixture_refusal_is_what_the_daemon_sends() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/daemon-protocol.json");
+    let fixtures: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let fixture = &fixtures["query_refused"];
+    let d = Daemon::start();
+    d.ctx
+        .live_db
+        .writer
+        .lock()
+        .execute_batch("CREATE TABLE nodes (id TEXT)")
+        .unwrap();
+    let sql = fixture["request"]["sql"].as_str().unwrap();
+    assert_eq!(d.over_socket(sql), fixture["response"]);
+    assert_eq!(d.over_mcp(sql).0, fixture["response"]);
+}
+
 #[test]
 fn a_select_still_returns_its_rows() {
     let d = Daemon::start();

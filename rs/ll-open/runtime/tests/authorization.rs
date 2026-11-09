@@ -1653,7 +1653,9 @@ fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
     );
 
     // `cleanup` retries the cancel, which now succeeds.
-    let cleaned = service.cleanup(&run_id).expect("cleanup retries the cancel");
+    let cleaned = service
+        .cleanup(&run_id)
+        .expect("cleanup retries the cancel");
     assert_eq!(cleaned.state, leyline_runtime::RunState::Cleaned);
     assert_eq!(backend.cancels.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

@@ -60,9 +60,14 @@ pub const SCHEMA_VERSION: &str = "0.25.0";
 /// are non-breaking inside the same major.
 ///
 /// **History:**
-/// - 1: current. Includes the v0.4.3 wire shape — `data: {...}`
-///   nested under `Event`, `generation`/`prior_generation` as quoted
-///   strings per capnp_json u64 convention.
+/// - 1: the v0.4.3 wire shape — `data: {...}` nested under `Event`,
+///   `generation`/`prior_generation` as quoted strings per capnp_json u64
+///   convention.
+/// - 2: current (ADR-0047 M1, bead `ley-line-open-73c6ee`). `read_source`
+///   and `propose` answer `store_root` (the parser-free `storeRoot`) and
+///   never send `tree_root`. A major-1 client that decodes leniently would
+///   read the missing `tree_root` as "no root recorded", so the major moves
+///   and the handshake refuses it instead.
 ///
 /// A v0.4.2 daemon at wire-format major 0 would not satisfy a v0.4.3+
 /// client's expectations, even though both predate this constant — the
@@ -180,15 +185,41 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   column sets, `node_hash` included. No identity moves: `node_hash`,
 ///   `Head.rootHash` and `treeRoot` are byte-identical. A v9 arena is
 ///   refused at parse open.
+/// - `projection-v11` — the store identity is parser-free (ADR-0047 D-ii /
+///   M1, bead `ley-line-open-73c6ee`). No table or column moves; the
+///   meaning of a stamped value does: `_meta.derived_from` becomes the v2
+///   value `v2 <storeRoot> <parserId> <projection_schema_version>`, whose
+///   first component is the directory Merkle `storeRoot`
+///   (`leyline/store-tree/v1`) where v1 carried the flat, parser-qualified
+///   `treeRoot`. The head beside the arena moves to head digest v3
+///   (`Head.storeRoot @10`; `treeRoot @7` is retired and refused), and the
+///   daemon wire's `tree_root` becomes `store_root`. `node_hash` and
+///   `Head.rootHash` are byte-identical; `parserId` changes, as at every
+///   bump, because it folds this label. A v10 arena is refused at parse
+///   open, and `leyline rebuild` refuses a v1 `derived_from`.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v10";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v11";
 
-pub const WIRE_FORMAT_MAJOR: u32 = 1;
+/// Current major of the JSON wire shape; its history is documented above,
+/// beside the module's version facts. Pinned by
+/// `wire_format_major_is_pinned`.
+pub const WIRE_FORMAT_MAJOR: u32 = 2;
+
+#[cfg(test)]
+mod pin_tests {
+    /// ADR-0047 M1 retired `tree_root` from two responses: a rename on the
+    /// wire, so the major moved. Bumping or reverting it is a deliberate
+    /// edit of this literal and of the history above.
+    #[test]
+    fn wire_format_major_is_pinned() {
+        assert_eq!(super::WIRE_FORMAT_MAJOR, 2);
+    }
+}
 
 /// Earliest schema-client version compatible with this daemon binary.
 /// Consumers compare their embedded schema-client version against this

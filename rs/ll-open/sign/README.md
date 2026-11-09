@@ -6,16 +6,17 @@ primitives and a gpgsm-compatible binary for jj commit signing.
 ## Signed Σ `Head` (workstreams S1 / S2 / S3)
 
 - **`Ed25519RootSigner`** (`root_signer`, feature `root-signer`) — the one
-  concrete `RootSigner` over Σ roots. Signs the canonical v2 head digest from
+  concrete `RootSigner` over Σ roots. Signs the canonical v3 head digest from
   `leyline_core::head_digest`, which binds the whole `HeadClaim`
-  `(generation, rootHash, parentHash, parentDigest, treeRoot, parserId)` — never `rootHash`
+  `(generation, rootHash, parentHash, parentDigest, storeRoot, parserId)` — never `rootHash`
   alone, so a signature cannot be replayed at another generation, grafted onto
-  a forked chain, or cited for a tree it did not attest (bead `b68fa6`). **S1.**
+  a forked chain, or cited for a store it did not attest (bead `b68fa6`; v3 since
+  ADR-0047 M1). **S1.**
 - **`verify_head`** — verify-on-load. Takes the head's `HeadClaim` (`None` when
-  the head stamps no `treeRoot`/`parserId`) and returns a three-way verdict
+  the head stamps no `storeRoot`/`parserId`) and returns a three-way verdict
   (`Valid` / `Invalid` / `Unsigned`): a present-but-invalid signature is refused
   under every policy, and so is a signature on a head with no claim or one made
-  under the removed v1 digest; an absent one is left to caller policy so
+  under the removed v1 or v2 digest; an absent one is left to caller policy so
   existing unsigned arenas keep working. **S2.**
 - **`kid`** (`canonical_kid`, `is_canonical_kid_shape`; not feature-gated, so a
   wasm verifier can use it) — the substrate-canonical key identifier

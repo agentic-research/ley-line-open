@@ -5,11 +5,12 @@
 //! signing crate, alongside the certificate machinery (`cert_chain`) that the
 //! Signet trust root will hang off.
 //!
-//! **What gets signed.** Not a bare root — the canonical v2 head digest from
+//! **What gets signed.** Not a bare root — the canonical v3 head digest from
 //! [`leyline_core::head_digest`], which binds the whole [`HeadClaim`]:
-//! `(generation, rootHash, parentHash, parentDigest, treeRoot, parserId)`. Signing
-//! `rootHash` alone would let a signature be replayed at another generation,
-//! grafted onto a forked chain, or cited for a tree it never attested.
+//! `(generation, rootHash, parentHash, parentDigest, storeRoot, parserId)`.
+//! Signing `rootHash` alone would let a signature be replayed at another
+//! generation, grafted onto a forked chain, or cited for a store it never
+//! attested.
 //!
 //! **Scheme alignment.** Ed25519, matching the frozen `leyline-net/v1`
 //! manifest so the transport manifest and the at-rest head share one trust
@@ -121,11 +122,11 @@ pub enum HeadVerdict {
 /// existing arena or silently accept tampered ones.
 ///
 /// `claim` is the head's [`HeadClaim`], or `None` when the head does not carry
-/// every identity the v2 digest binds (an unstamped `treeRoot` or `parserId`).
-/// A signed head with no claim is [`HeadVerdict::Invalid`]: its signature
-/// cannot attest the tree, so it attests nothing. A head signed under the
-/// removed v1 digest is also `Invalid`: v1 and v2 use different derive-key
-/// contexts, so a v1 signature never verifies under v2.
+/// every identity the v3 digest binds (an unstamped `storeRoot` or
+/// `parserId`). A signed head with no claim is [`HeadVerdict::Invalid`]: its
+/// signature cannot attest the store, so it attests nothing. A head signed
+/// under the removed v1 or v2 digest is also `Invalid`: each version uses its
+/// own derive-key context, so an older signature never verifies under v3.
 pub fn verify_head(
     claim: Option<&HeadClaim>,
     signature: &[u8],
@@ -326,10 +327,10 @@ mod tests {
         signer().sign(d).expect("sign").to_bytes().to_vec()
     }
 
-    /// Bead b68fa6: treeRoot is the root signatures cite (ADR-0040 D1). A
-    /// signature over one tree must not verify a head claiming another.
+    /// Bead b68fa6, ADR-0047 D-ii: storeRoot is the root signatures cite. A
+    /// signature over one store must not verify a head claiming another.
     #[test]
-    fn verify_head_rejects_a_rewritten_tree_root() {
+    fn verify_head_rejects_a_rewritten_store_root() {
         let sig = signed(1, ROOT, [0u8; 32]);
         let forged = claim_with(1, ROOT, [0u8; 32], [0x33; 32], PARSER);
         assert_eq!(
@@ -338,7 +339,7 @@ mod tests {
         );
     }
 
-    /// Bead b68fa6: the same tree under another derivation is another claim.
+    /// Bead b68fa6: the same store under another derivation is another claim.
     #[test]
     fn verify_head_rejects_a_rewritten_parser_id() {
         let sig = signed(1, ROOT, [0u8; 32]);
@@ -349,7 +350,7 @@ mod tests {
         );
     }
 
-    /// A signed head without a stamped treeRoot/parserId has no claim, so its
+    /// A signed head without a stamped storeRoot/parserId has no claim, so its
     /// signature attests nothing: `Invalid`, never `Valid` and never
     /// `Unsigned`.
     #[test]
@@ -373,7 +374,7 @@ mod tests {
 
     /// A head signed under the removed v1 digest (generation ‖ rootHash ‖
     /// parentHash, context "leyline head digest v1") does not verify as
-    /// attesting treeRoot/parserId.
+    /// attesting storeRoot/parserId.
     #[test]
     fn verify_head_rejects_a_v1_signature() {
         let mut v1 = blake3::Hasher::new_derive_key("leyline head digest v1");
@@ -382,6 +383,31 @@ mod tests {
         v1.update(&[0u8; 32]);
         let v1_digest = Hash::from_bytes(*v1.finalize().as_bytes());
         let sig = signer().sign(v1_digest).expect("sign").to_bytes();
+        assert_eq!(
+            verify_head(
+                Some(&claim(1, ROOT, [0u8; 32])),
+                &sig,
+                b"",
+                &[signer().verifying_key()]
+            ),
+            HeadVerdict::Invalid
+        );
+    }
+
+    /// ADR-0047 M1: a signature under the removed v2 digest — the same
+    /// preimage layout, treeRoot in storeRoot's position, context "leyline
+    /// head digest v2" — does not verify as a v3 claim over the same bytes.
+    #[test]
+    fn verify_head_rejects_a_v2_signature() {
+        let mut v2 = blake3::Hasher::new_derive_key("leyline head digest v2");
+        v2.update(&1u64.to_le_bytes());
+        v2.update(&ROOT);
+        v2.update(&[0u8; 32]);
+        v2.update(&TREE);
+        v2.update(&PARSER);
+        v2.update(&[0u8]);
+        let v2_digest = Hash::from_bytes(*v2.finalize().as_bytes());
+        let sig = signer().sign(v2_digest).expect("sign").to_bytes();
         assert_eq!(
             verify_head(
                 Some(&claim(1, ROOT, [0u8; 32])),

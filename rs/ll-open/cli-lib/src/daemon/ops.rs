@@ -1080,7 +1080,7 @@ fn op_read_content(ctx: &DaemonContext, id: &str) -> Result<String> {
 }
 
 /// A whole source file by its `_source.id`, with its blob hash and the
-/// arena's `treeRoot`, read in one transaction so the three agree. The blob
+/// arena's `storeRoot`, read in one transaction so the three agree. The blob
 /// hash is the file's manifest entry's `blob_hash` (ADR-0045 T1) — the
 /// value a later `propose` compares its base against (ADR-0042 P2), not a
 /// hash recomputed here, so the two agree by construction.
@@ -1099,13 +1099,13 @@ fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String
             let bytes = crate::tree::blob_bytes(conn, blob)?.with_context(|| {
                 format!("read_source: the store holds no blob {blob} for '{path}'")
             })?;
-            let tree_root = crate::tree_root::DerivedFrom::read(conn)?.map(|d| d.tree_root);
+            let store_root = crate::store_root::DerivedFrom::read(conn)?.map(|d| d.store_root);
             let content = String::from_utf8(bytes)
                 .with_context(|| format!("read_source: '{path}' is not UTF-8"))?;
-            Ok((content, blob.to_string(), mode.octal(), tree_root))
+            Ok((content, blob.to_string(), mode.octal(), store_root))
         })();
         conn.execute_batch("COMMIT")?;
-        let (content, blob_hash, mode, tree_root) = read?;
+        let (content, blob_hash, mode, store_root) = read?;
 
         let mut builder = capnp::message::Builder::new_default();
         let mut root: leyline_public_schema::daemon_capnp::read_source_response::Builder =
@@ -1114,8 +1114,8 @@ fn op_read_source(ctx: &DaemonContext, req: &ReadSourceRequest) -> Result<String
         root.set_content(&content);
         root.set_blob_hash(blob_hash);
         root.set_mode(mode);
-        if let Some(t) = tree_root {
-            root.set_tree_root(t.to_string());
+        if let Some(t) = store_root {
+            root.set_store_root(t.to_string());
         }
         let reader = builder
             .get_root_as_reader::<leyline_public_schema::daemon_capnp::read_source_response::Reader>()?;
@@ -1264,7 +1264,7 @@ fn op_propose(ctx: &DaemonContext, req: ProposeRequest) -> Result<String> {
             // `ley-line-open-8c8ded`); `snapshot` publishes on demand.
             ctx.live_db.request_publish();
             root.set_ok(true);
-            root.set_tree_root(accepted.tree_root.to_string());
+            root.set_store_root(accepted.store_root.to_string());
             let mut blobs = root.reborrow().init_blobs(accepted.blobs.len() as u32);
             for (i, (path, hash)) in accepted.blobs.iter().enumerate() {
                 let mut b = blobs.reborrow().get(i as u32);
@@ -4078,7 +4078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_source_returns_the_file_with_its_blob_hash_and_tree_root() {
+    async fn read_source_returns_the_file_with_its_blob_hash_and_store_root() {
         let (_dir, ctx) = setup_parsed();
         let r = call(
             &ctx,
@@ -4088,10 +4088,15 @@ mod tests {
         assert_eq!(r["content"], PROPOSE_A);
         assert_eq!(r["blob_hash"], hex_hash(PROPOSE_A));
         let stamped = ctx
-            .with_read(|conn| crate::tree_root::DerivedFrom::read(conn))
+            .with_read(|conn| crate::store_root::DerivedFrom::read(conn))
             .unwrap()
             .expect("a parse stamps derived_from");
-        assert_eq!(r["tree_root"], stamped.tree_root.to_string());
+        assert_eq!(r["store_root"], stamped.store_root.to_string());
+        // ADR-0047 M1: the retired `tree_root` is never sent.
+        assert!(
+            r.get("tree_root").is_none() && r.get("retired_tree_root").is_none(),
+            "{r}"
+        );
 
         let missing = call(
             &ctx,
@@ -4124,7 +4129,12 @@ mod tests {
             serde_json::json!({"op": "read_source", "path": "a.go"}),
         );
         assert_eq!(after["content"], PROPOSE_A2);
-        assert_eq!(accepted["tree_root"], after["tree_root"]);
+        assert_eq!(accepted["store_root"], after["store_root"]);
+        assert_eq!(accepted["store_root"].as_str().map(str::len), Some(64));
+        assert!(
+            accepted.get("tree_root").is_none() && accepted.get("retired_tree_root").is_none(),
+            "{accepted}"
+        );
         let blobs = accepted["blobs"].as_array().unwrap();
         assert!(
             blobs.contains(&serde_json::json!({"path": "a.go", "blob_hash": hex_hash(PROPOSE_A2)}))
@@ -4258,10 +4268,10 @@ mod tests {
             (out, value)
         };
         let stamped = || {
-            ctx.with_read(crate::tree_root::DerivedFrom::read)
+            ctx.with_read(crate::store_root::DerivedFrom::read)
                 .unwrap()
                 .expect("a parse stamps derived_from")
-                .tree_root
+                .store_root
                 .to_string()
         };
 
@@ -4270,7 +4280,7 @@ mod tests {
         assert_eq!(r.get("content"), Some(&serde_json::json!("")), "{raw}");
         assert_eq!(r["blob_hash"], hex_hash(""));
         assert_eq!(r["mode"], "100644");
-        assert_eq!(r["tree_root"], stamped());
+        assert_eq!(r["store_root"], stamped());
 
         // A create and a replace with no bytes, against what was read.
         let accepted = call(
@@ -4290,9 +4300,9 @@ mod tests {
             let (raw, r) = read(path);
             assert_eq!(r.get("content"), Some(&serde_json::json!("")), "{raw}");
             assert_eq!(r["blob_hash"], hex_hash(""));
-            assert_eq!(r["tree_root"], accepted["tree_root"]);
+            assert_eq!(r["store_root"], accepted["store_root"]);
         }
-        assert_eq!(accepted["tree_root"], stamped());
+        assert_eq!(accepted["store_root"], stamped());
 
         // Back to bytes against the empty blob.
         let back = call(

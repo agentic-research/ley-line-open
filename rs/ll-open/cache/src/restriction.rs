@@ -746,8 +746,9 @@ pub fn review_public_api(
 
 /// Whole-object CAS address of the WHOLE CORPUS (the only per-object address
 /// that is sound for a cross-file review). Parser-free: a `RowSet` fold
-/// under [`WHOLE_OBJECT_SCHEME`] with one row `(path, σ(source))` per file,
-/// so it names the same information as a `treeRoot` over the corpus.
+/// under [`WHOLE_OBJECT_SCHEME`] with one row `(path, σ(source))` per file.
+/// A flat fold with no modes and no empty directories: a different
+/// construction from `storeRoot`, standing in for it as the whole-input key.
 pub fn whole_object_hash(corpus: &[(String, String)]) -> Hash {
     let rows: Vec<Row> = corpus
         .iter()
@@ -767,7 +768,7 @@ pub fn whole_object_hash(corpus: &[(String, String)]) -> Hash {
 /// in params. It is the tightest key a cache can build without knowing the
 /// review's closure: sound, and invalidated by every edit anywhere in the
 /// tree.
-pub fn whole_input_key(tree_root: Hash, parser_id: Hash, target: &str) -> Hash {
+pub fn whole_input_key(store_root: Hash, parser_id: Hash, target: &str) -> Hash {
     let target_row = Row::new(RowKind::Container, Provenance::Query, &[target.as_bytes()]);
     PartitionSpec {
         domain: Domain::RowSet,
@@ -777,7 +778,7 @@ pub fn whole_input_key(tree_root: Hash, parser_id: Hash, target: &str) -> Hash {
     }
     .address(&[
         Entry {
-            addr: tree_root,
+            addr: store_root,
             a: 0,
             b: 0,
         },

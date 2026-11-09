@@ -13,17 +13,33 @@ fn normalized(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `treeRoot` folds `_tree`, the store's manifest, not `_source`, which has a
-/// row only for files the parse projected (ADR-0045 T1).
+/// The prose of a comment block, line markers (`#`, `//!`) stripped, so a
+/// claim that wraps across lines still reads as one sentence.
+fn comment_prose(s: &str) -> String {
+    let lines: Vec<&str> = s
+        .lines()
+        .map(|l| {
+            let l = l.trim_start();
+            l.strip_prefix("//!")
+                .or_else(|| l.strip_prefix('#'))
+                .unwrap_or(l)
+        })
+        .collect();
+    normalized(&lines.join(" "))
+}
+
+/// `storeRoot` folds `_tree`, the store's manifest, not `_source`, which has
+/// a row only for files the parse projected (ADR-0045 T1), and folds no
+/// parser input (ADR-0047 law C7).
 #[test]
-fn tree_root_docs_name_the_table_the_fold_reads() {
-    let src = include_str!("../src/tree_root.rs");
+fn store_root_docs_name_the_table_the_fold_reads() {
+    let src = include_str!("../src/store_root.rs");
     let arch = normalized(include_str!("../../../../docs/ARCHITECTURE.md"));
 
     // The code: the fold's input is `crate::tree::entries`, the `_tree` reader.
     assert!(
         src.contains("crate::tree::entries(conn)"),
-        "tree_root.rs no longer reads _tree through tree::entries; update this test and the docs it guards"
+        "store_root.rs no longer reads _tree through tree::entries; update this test and the docs it guards"
     );
 
     let module_doc: String = src
@@ -31,79 +47,81 @@ fn tree_root_docs_name_the_table_the_fold_reads() {
         .take_while(|l| l.starts_with("//!"))
         .collect::<Vec<_>>()
         .join("\n");
-    let module_doc = normalized(&module_doc);
+    let module_doc = comment_prose(&module_doc);
     assert!(
         module_doc.contains("over every `_tree` entry"),
-        "tree_root.rs module doc must say the fold is over `_tree` entries"
+        "store_root.rs module doc must say the tree is over `_tree` entries"
     );
     assert!(
         !module_doc.contains("over every `_source` row"),
-        "tree_root.rs module doc still says the fold is over `_source` rows"
+        "store_root.rs module doc still says the fold is over `_source` rows"
     );
     assert!(
-        !src.contains("the arena's _source set folds"),
-        "the treeRoot mismatch error must name _tree, the table it recomputed"
+        module_doc.contains("no parser input"),
+        "store_root.rs module doc must say storeRoot folds no parser input"
     );
 
     assert!(
-        arch.contains("| `_tree` entries and `source_blobs`; `parserId` |"),
-        "ARCHITECTURE.md's authority row for treeRoot must name `_tree` as what it depends on"
+        arch.contains("| `_tree` entries and `source_blobs`; no parser input |"),
+        "ARCHITECTURE.md's authority row for storeRoot must name `_tree` and no parser input"
     );
     assert!(
         !arch.contains("| `_source` rows and `source_blobs`; `parserId` |"),
-        "ARCHITECTURE.md's authority row for treeRoot still names `_source` rows"
+        "ARCHITECTURE.md's authority row still names `_source` rows"
     );
 }
 
-/// head.capnp is the cross-runtime description of `treeRoot`: another runtime
-/// implements the fold from it. It must name `_tree`, the mode tag and empty
-/// directories as the code does, and must say the signature covers it, which
-/// `head_digest` does (bead b68fa6).
+/// head.capnp is the cross-runtime description of `storeRoot`: another
+/// runtime implements the fold from it. It must describe the directory
+/// nodes, the git mode in `b`, empty params and empty directories as the code
+/// does, say the signature covers it, which `head_digest` does, and say the
+/// retired `treeRoot` is refused.
 #[test]
-fn head_schema_describes_the_tree_root_the_code_computes() {
-    let schema = normalized(include_str!(
+fn head_schema_describes_the_store_root_the_code_computes() {
+    let schema = comment_prose(include_str!(
         "../../../ll-core/schema-capnp/schemas/head.capnp"
     ));
-    let src = include_str!("../src/tree_root.rs");
+    let src = include_str!("../src/store_root.rs");
     let digest = include_str!("../../../ll-core/core/src/head_digest.rs");
 
-    assert!(
-        !schema.contains("over every `_source` row"),
-        "head.capnp still describes treeRoot as a fold over `_source` rows"
-    );
     for claim in [
         "over the store's manifest `_tree`",
-        "every EMPTY directory",
-        "`modeTag` is 0 for `0o100644`",
+        "scheme `leyline/store-tree/v1`, params EMPTY, `canonVersion` 1",
+        "(BLAKE3(name bytes), 2i, byte length of the name)",
+        "(child, 2i+1, git mode of the child)",
+        "An empty directory is the fold of no entries.",
         "SIGNED: the head signature's digest (`head_digest`, context",
-        "\"leyline head digest v2\") binds `treeRoot` and `parserId` with",
+        "\"leyline head digest v3\") binds `storeRoot` and `parserId` separately",
+        "retiredTreeRoot @7",
+        "HeadFormatError::RetiredDigestV2",
     ] {
         assert!(
             schema.contains(claim),
-            "head.capnp's treeRoot description is missing: {claim}"
+            "head.capnp's storeRoot description is missing: {claim}"
         );
     }
-    assert!(
-        !schema.contains("NOT SIGNED"),
-        "head.capnp still says treeRoot is not signed"
-    );
 
-    // Tie the description to the code it describes.
-    assert!(
-        src.contains("GitMode::Regular => 0,") && src.contains("other => u64::from(other.git()),"),
-        "tree_root.rs's mode tag changed; update head.capnp's treeRoot description with it"
-    );
-    assert!(
-        src.contains("content: b\"\".hash()"),
-        "tree_root.rs no longer folds an empty directory as BLAKE3 of no bytes; update head.capnp"
-    );
-    // "SIGNED" is true only while the head digest binds treeRoot and
+    // Tie the description to the code it describes: the scheme, empty
+    // params, the git mode as `b`, the directory mode for a child directory.
+    for code in [
+        "pub const STORE_TREE_SCHEME: &str = \"leyline/store-tree/v1\";",
+        "params: Vec::new(),",
+        "b: u64::from(mode),",
+        "push_child(&mut top.entries, name, *blob, mode.git());",
+        "crate::tree::DIRECTORY_MODE,",
+    ] {
+        assert!(
+            src.contains(code),
+            "store_root.rs changed `{code}`; update head.capnp's storeRoot description with it"
+        );
+    }
+    // "SIGNED" is true only while the head digest binds storeRoot and
     // parserId. If either leaves the preimage, this fails and the schema text
     // must change with it.
     for bound in [
-        "hasher.update(tree_root.as_bytes());",
+        "hasher.update(store_root.as_bytes());",
         "hasher.update(parser_id.as_bytes());",
-        "pub const HEAD_DIGEST_CONTEXT: &str = \"leyline head digest v2\";",
+        "pub const HEAD_DIGEST_CONTEXT: &str = \"leyline head digest v3\";",
     ] {
         assert!(
             digest.contains(bound),

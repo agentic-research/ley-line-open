@@ -104,7 +104,7 @@ impl<S: KeyStrategy> KeyArm<S> {
 fn input<'a>(sub: &'a FactSubstrate, root: Hash, target: &'a str) -> ReviewInput<'a> {
     ReviewInput {
         substrate: sub,
-        tree_root: root,
+        store_root: root,
         target,
     }
 }

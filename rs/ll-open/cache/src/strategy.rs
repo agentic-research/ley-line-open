@@ -9,7 +9,7 @@
 //! | arm | key | sound | invalidated by |
 //! |---|---|---|---|
 //! | [`NoCache`] | none | trivially | everything (never stores) |
-//! | [`WholeInput`] | [`whole_input_key`]`(treeRoot, parserId, target)` | yes | any edit anywhere in the input tree |
+//! | [`WholeInput`] | [`whole_input_key`]`(storeRoot, parserId, target)` | yes | any edit anywhere in the input tree |
 //! | [`RestrictionKey`] | [`restriction_for_call_target`] | iff the closure is complete | an edit to a row the review reads |
 //!
 //! A daemon consumer (bead `ley-line-open-69305e`) holds one
@@ -26,8 +26,8 @@ use crate::restriction::{FactSubstrate, restriction_for_call_target, whole_input
 pub struct ReviewInput<'a> {
     /// The fact rows the review runs over.
     pub substrate: &'a FactSubstrate,
-    /// The input tree's root (`Head.treeRoot` in the daemon).
-    pub tree_root: Hash,
+    /// The input tree's root (`Head.storeRoot` in the daemon).
+    pub store_root: Hash,
     /// The review target: the function's container identity.
     pub target: &'a str,
 }
@@ -61,7 +61,7 @@ impl KeyStrategy for WholeInput {
     }
     fn key(&self, input: &ReviewInput<'_>, _: &mut u64) -> Option<Hash> {
         Some(whole_input_key(
-            input.tree_root,
+            input.store_root,
             input.substrate.parser_id(),
             input.target,
         ))
@@ -169,7 +169,7 @@ mod tests {
     fn input<'a>(sub: &'a FactSubstrate, root: u8) -> ReviewInput<'a> {
         ReviewInput {
             substrate: sub,
-            tree_root: h(root),
+            store_root: h(root),
             target: "F",
         }
     }

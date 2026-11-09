@@ -88,11 +88,11 @@
       "ok": true,
       "content": "fn main() {}\n",
       "blob_hash": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "mode": "100644"
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["content", "blob_hash", "tree_root", "mode", "error"],
+    "response_optional_keys": ["content", "blob_hash", "store_root", "mode", "error"],
     "go_binding": "ReadSourceResponse",
     "go_drift_skip": null
   },
@@ -124,7 +124,7 @@
       }
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -142,7 +142,7 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {
           "path": "src/main.rs",
@@ -152,7 +152,7 @@
       "merged": ["src/main.rs"]
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -169,13 +169,13 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {"path": "README.md", "blob_hash": "5e6f7a8b9c0d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d"}
       ]
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -196,7 +196,7 @@
       }
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -210,14 +210,14 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {"path": "src/main.rs", "blob_hash": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a"}
       ],
       "post_commit_error": "Σ head write after a committed parse failed; the rows are committed but the head was not advanced"
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -232,13 +232,13 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {"path": "src/lib.rs", "blob_hash": "5e6f7a8b9c0d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d"}
       ]
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -265,7 +265,7 @@
       }
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },

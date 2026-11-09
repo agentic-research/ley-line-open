@@ -30,7 +30,8 @@ repository have no representation at all: each daemon is one directory, one data
 git solves the same problem with one object store, refs, and per-worktree indexes. The index is
 the record of what was last checked out into a directory, and it is what lets git tell "the
 directory changed" from "the branch moved". LLO has the store (`source_blobs`, ADR-0028) and the
-tree (`_source` and `treeRoot`, ADR-0040). It lacks refs, checkouts and an index.
+tree (`_tree` and its store root: `treeRoot`, ADR-0040, retired by ADR-0047 M1 for the
+parser-free `storeRoot`). It lacks refs, checkouts and an index.
 
 LLO shells out to `git` today (`git rev-parse HEAD`, `git status --porcelain` in
 `cmd_daemon.rs`). It already depends on `jj-lib`, which reads git repositories natively through
@@ -46,8 +47,8 @@ by.
 
 ### R2 — A ref names a tree
 
-A ref is a row: `name → (treeRoot, parent)`. A branch is a ref. A proposal targets a ref: its bases
-are checked against that ref's tree, and on acceptance the ref advances to the new `treeRoot` with
+A ref is a row: `name → (storeRoot, parent)`. A branch is a ref. A proposal targets a ref: its bases
+are checked against that ref's tree, and on acceptance the ref advances to the new `storeRoot` with
 the old one as parent. Proposals to different refs never conflict. Publication (ADR-0041) names
 the ref a snapshot shows.
 
@@ -134,7 +135,7 @@ their ref is the open question below.
 ## Open question
 
 **Projection keying.** Either one projection per checked-out ref (simple, and a duplicate per
-branch), or rows keyed by `(treeRoot, path)` and shared across refs (one copy, and every query
+branch), or rows keyed by `(storeRoot, path)` and shared across refs (one copy, and every query
 names its ref). It decides R5's cost and is measured in phase 4 before it is chosen.
 
 ## Phases

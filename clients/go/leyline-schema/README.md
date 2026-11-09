@@ -26,6 +26,7 @@ both runtimes from the same files.
 | `source` | `rs/ll-core/schema-capnp/schemas/source.capnp` | `SourceFile` projection. Imports `common`. |
 | `daemon` | `rs/ll-core/public-schema/capnp/daemon.capnp` | UDS control-socket wire types. |
 | `daemon/wire` | Daemon JSON fixtures + Rust serde mirror | Canonical typed op responses, event envelopes, and event payloads for JSON consumers. |
+| `sigma` | `rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json` | Go implementation of the Σ constructions a consumer verifies — the `PartitionSpec` fold, `storeRoot` (`leyline/store-tree/v1`, ADR-0047 D-ii) and head digest v3 — checked against the Rust known-answer vectors. Not generated. |
 
 Import a sub-package directly:
 

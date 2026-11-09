@@ -126,12 +126,14 @@ type ReadSourceResponse struct {
 	Content *string `json:"content,omitempty"`
 	// BlobHash is the file's `_tree.blob_hash`, 64 hex chars.
 	BlobHash *string `json:"blob_hash,omitempty"`
-	// TreeRoot is the arena's treeRoot the file was read under, 64 hex chars.
-	TreeRoot *string `json:"tree_root,omitempty"`
 	Error    *string `json:"error,omitempty"`
 	// Mode is the file's git mode, six octal digits: [ModeRegular],
 	// [ModeExecutable] or [ModeSymlink].
 	Mode *string `json:"mode,omitempty"`
+	// StoreRoot is the arena's storeRoot the file was read under, 64 hex
+	// chars: the parser-free directory Merkle root `leyline/store-tree/v1`
+	// (LLO ADR-0047 D-ii). It replaced `tree_root`, which is never sent.
+	StoreRoot *string `json:"store_root,omitempty"`
 }
 
 // Git modes a [ReadSourceResponse.Mode] reports and a [ProposedWrite.Mode]
@@ -258,8 +260,9 @@ type ProposalRefusal struct {
 // beside Refusal: decide on OK and Refusal, never on whether Error is set.
 type ProposeResponse struct {
 	OK *bool `json:"ok"`
-	// TreeRoot is the arena's treeRoot after the proposal (OK only).
-	TreeRoot *string `json:"tree_root,omitempty"`
+	// StoreRoot is the arena's storeRoot after the proposal (OK only; LLO
+	// ADR-0047 D-ii). A grammar or epoch upgrade does not move it.
+	StoreRoot *string `json:"store_root,omitempty"`
 	// Blobs is each written path's new blob hash (OK only).
 	Blobs   []PathHash       `json:"blobs,omitempty"`
 	Refusal *ProposalRefusal `json:"refusal,omitempty"`

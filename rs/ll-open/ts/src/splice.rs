@@ -3,7 +3,7 @@
 //!
 //! A write to a node is `source[..start] + new_text + source[end..]`. What
 //! happens to those bytes next — the blob store, the manifest, the
-//! re-projection, `treeRoot` — is ADR-0040 D3's one write path
+//! re-projection, `storeRoot` — is ADR-0040 D3's one write path
 //! (`leyline_cli_lib::source_write::write`), which every writer calls. This
 //! module never writes the arena.
 

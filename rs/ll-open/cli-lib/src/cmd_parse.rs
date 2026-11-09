@@ -781,9 +781,9 @@ pub struct ParseResult {
     pub errors: u64,
     /// Relative paths of files that were actually parsed (not skipped).
     pub changed_files: Vec<String>,
-    /// ADR-0040 D1: the arena's `treeRoot` after this pass, folded from the
-    /// committed `_source` set.
-    pub tree_root: leyline_core::Hash,
+    /// ADR-0047 D-ii: the arena's `storeRoot` after this pass, the directory
+    /// Merkle root of the committed `_tree`.
+    pub store_root: leyline_core::Hash,
 }
 
 /// A pass whose transaction committed. The steps after `COMMIT` (moving
@@ -2332,8 +2332,8 @@ fn parse_into_conn_with(
             _ => None,
         }
     };
-    // ADR-0040 D1: the tree identity and the derivation identity, folded from
-    // `_source` inside the transaction — the whole corpus, not this run's
+    // ADR-0047 D-ii: the store identity and the derivation identity, folded
+    // from `_tree` inside the transaction — the whole store, not this run's
     // delta — on the main thread where the connection is. The head writer
     // stays pure filesystem work and just stamps them, after COMMIT.
     // ADR-0045 T1, T3: the manifest follows what this pass saw — every file
@@ -2354,10 +2354,12 @@ fn parse_into_conn_with(
             unprojected: &unprojected,
         },
     )?;
-    let parser = crate::tree_root::ParserInputs::current(&query_set).parser_ref();
-    let tree = crate::tree_root::tree_root_ref(conn, parser)?;
+    let parser = crate::store_root::ParserInputs::current(&query_set).parser_ref();
+    // Parser-free (ADR-0047 law C7): the store's name does not depend on the
+    // derivation, which the head and `derived_from` bind beside it.
+    let store = crate::store_root::store_root_ref(conn)?;
     // The stamps are wire and `_meta` fields: they carry the bare address.
-    let (parser_id, tree_root) = (*parser.as_hash(), *tree.as_hash());
+    let (parser_id, store_root) = (*parser.as_hash(), *store.as_hash());
 
     // ---- Post-sweep ----
     //
@@ -2420,13 +2422,13 @@ fn parse_into_conn_with(
         "projection_schema_version",
         crate::daemon::version::PROJECTION_SCHEMA_VERSION,
     )?;
-    // ADR-0040 D6: what this projection was derived from — the whole tree,
-    // so a scoped pass stamps it too.
+    // ADR-0040 D6 / ADR-0047 D-ii: what this projection was derived from —
+    // the whole store, so a scoped pass stamps it too.
     set_meta(
         conn,
-        crate::tree_root::DERIVED_FROM_KEY,
-        &crate::tree_root::DerivedFrom {
-            tree_root,
+        crate::store_root::DERIVED_FROM_KEY,
+        &crate::store_root::DerivedFrom {
+            store_root,
             parser_id,
             projection_schema_version: crate::daemon::version::PROJECTION_SCHEMA_VERSION
                 .to_string(),
@@ -2484,7 +2486,7 @@ fn parse_into_conn_with(
     };
     let head_handle = db_path_for_head.filter(|_| sidecars_in_place).map(|p| {
         std::thread::spawn(move || -> Result<()> {
-            write_head_for_path(&p, unbound_facts, tree_root, parser_id)
+            write_head_for_path(&p, unbound_facts, store_root, parser_id)
         })
     });
 
@@ -2551,7 +2553,7 @@ fn parse_into_conn_with(
     // A head-write failure is reported (bead `ley-line-open-0c8ee7`). It
     // used to log and return Ok: the rows are committed, so the parse
     // "worked". But the head is what names what was committed — the run
-    // receipt, and since ADR-0040 D1 the tree identity — and a parse whose
+    // receipt, and since ADR-0047 D-ii the store identity — and a parse whose
     // head could not be advanced (a corrupt existing head the chain refuses
     // to re-root over, an unwritable sidecar, a signing-key error) must say
     // so, not advertise a head that still describes the previous tree. The
@@ -2612,7 +2614,7 @@ fn parse_into_conn_with(
             deleted,
             errors: errors + oversized,
             changed_files,
-            tree_root,
+            store_root,
         },
         post_commit: combine_post_commit(post_commit),
     })
@@ -2842,8 +2844,11 @@ pub fn parse_trusted_query_hashes(raw: Option<&str>) -> std::collections::HashSe
 /// state. Returns `(parentHash, generation, parentDigest)` where
 /// parentHash is the previous root (zero if no Head exists yet),
 /// generation is the next monotonic counter value (1 if no Head exists
-/// yet), and parentDigest is the v2 digest of the previous head's claim
+/// yet), and parentDigest is the v3 digest of the previous head's claim
 /// (`None` if there is no previous head or it had no claim; bead b68fa6).
+/// A head digest v2 head is refused, typed
+/// ([`crate::head_claim::HeadFormatError::RetiredDigestV2`]): a v3 chain
+/// never extends a v2 one.
 ///
 /// Fails closed (bead `ley-line-open-0c8ee7`): only a head that does not
 /// exist starts a chain. A head that exists but cannot be read, framed or
@@ -2896,7 +2901,7 @@ fn read_head_for_chain(
     let prev_gen = h.get_generation();
 
     // S2: verify before adopting this head as chain state; the signature
-    // covers the whole v2 claim (bead b68fa6). See `head_claim`.
+    // covers the whole v3 claim (bead b68fa6). See `head_claim`.
     crate::head_claim::enforce_signature(h, head_path, crate::head_claim::Reader::Chain, policy)
         .context("refusing to chain onto the head")?;
     let prev_digest = crate::head_claim::digest_of(h)
@@ -2967,14 +2972,14 @@ fn head_signer_from_env() -> Result<Option<leyline_sign::root_signer::Ed25519Roo
 fn write_head_for_path(
     db_path: &Path,
     unbound_facts: u64,
-    tree_root: leyline_core::Hash,
+    store_root: leyline_core::Hash,
     parser_id: leyline_core::Hash,
 ) -> Result<()> {
     // Readers refuse a half-stamped head (bead `ley-line-open-80f037` F3), so
     // the writer never produces one: the next parse could not chain onto it.
-    if (tree_root == leyline_core::Hash::ZERO) != (parser_id == leyline_core::Hash::ZERO) {
+    if (store_root == leyline_core::Hash::ZERO) != (parser_id == leyline_core::Hash::ZERO) {
         bail!(
-            "refusing to write a half-stamped head: treeRoot and parserId are stamped together or not at all"
+            "refusing to write a half-stamped head: storeRoot and parserId are stamped together or not at all"
         );
     }
     let (root, segment_bytes) = hash_segment_files(db_path)?;
@@ -2993,11 +2998,13 @@ fn write_head_for_path(
         h.set_unbound_facts(unbound_facts);
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
-        // ADR-0040 D1: the tree identity and its derivation identity, computed
-        // by the caller from the committed `_source` table (see `tree_root`).
+        // ADR-0047 D-ii: the store identity and the derivation identity,
+        // computed by the caller from the committed `_tree` (see
+        // `store_root`). `retiredTreeRoot` is never set: its presence is
+        // what marks a head as v2.
         h.reborrow()
-            .init_tree_root()
-            .set_bytes(tree_root.as_bytes());
+            .init_store_root()
+            .set_bytes(store_root.as_bytes());
         h.reborrow()
             .init_parser_id()
             .set_bytes(parser_id.as_bytes());
@@ -3008,12 +3015,13 @@ fn write_head_for_path(
         }
 
         // S1: sign the head when a signing key is configured. The signature
-        // covers the v2 head digest over the whole claim — generation,
-        // rootHash, parentHash, parentDigest, treeRoot, parserId (bead
-        // b68fa6) — so it cannot be replayed at another generation, grafted
-        // onto another chain, or cited for another tree. A head without a
-        // stamped tree identity has no claim and is refused rather than
-        // signed. No key ⇒ the head is written unsigned.
+        // covers the v3 head digest over the whole claim — generation,
+        // rootHash, parentHash, parentDigest, storeRoot, parserId (bead
+        // b68fa6, ADR-0047 M1) — so it cannot be replayed at another
+        // generation, grafted onto another chain, or cited for another store
+        // or derivation. A head without a stamped store identity has no
+        // claim and is refused rather than signed. No key ⇒ the head is
+        // written unsigned.
         if let Some(signer) = head_signer_from_env()? {
             use leyline_core::RootSigner;
             let claim = leyline_core::HeadClaim::new(
@@ -3021,10 +3029,10 @@ fn write_head_for_path(
                 leyline_core::Hash::from_bytes(root),
                 leyline_core::Hash::from_bytes(parent),
                 parent_digest,
-                tree_root,
+                store_root,
                 parser_id,
             )
-            .context("refusing to sign a head without a stamped treeRoot and parserId")?;
+            .context("refusing to sign a head without a stamped storeRoot and parserId")?;
             let digest = leyline_core::head_digest(&claim);
             let sig = signer.sign(digest).context("sign head digest")?;
             let pk = signer.verifying_key();
@@ -5324,7 +5332,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v10",
+            "projection-v11",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5337,30 +5345,33 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v10"),
+            Some("projection-v11"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
 
-    /// projection-v10 (bead `ley-line-open-738dd9`): an arena that still
-    /// carries the v9 label is refused at open — its `_ast`/`node_refs`/
-    /// `node_defs` hold a `node_hash` column where this writer inserts
-    /// `content_id`, and `CREATE TABLE IF NOT EXISTS` would keep the old
-    /// shape.
+    /// projection-v11 (ADR-0047 M1, bead `ley-line-open-73c6ee`): an arena
+    /// that still carries the v10 label is refused at open — its
+    /// `derived_from` names a parser-qualified `treeRoot` where this writer
+    /// stamps a parser-free `storeRoot`. The v9 label is refused the same way
+    /// (projection-v10, bead `ley-line-open-738dd9`: a `node_hash` column
+    /// where this writer inserts `content_id`).
     #[test]
-    fn a_projection_v9_arena_is_refused_at_open() {
-        let td = TempDir::new().unwrap();
-        std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
-        set_meta(&conn, "projection_schema_version", "projection-v9").unwrap();
-        let err = parse_into_conn(&conn, td.path(), Some("go"), None)
-            .expect_err("a projection-v9 arena must be refused");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("projection-v9") && msg.contains("projection-v10"),
-            "the refusal must name both versions; got: {msg}",
-        );
+    fn projection_v9_and_v10_arenas_are_refused_at_open() {
+        for old in ["projection-v9", "projection-v10"] {
+            let td = TempDir::new().unwrap();
+            std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
+            set_meta(&conn, "projection_schema_version", old).unwrap();
+            let err = parse_into_conn(&conn, td.path(), Some("go"), None)
+                .expect_err("an older projection arena must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(old) && msg.contains("projection-v11"),
+                "the refusal must name both versions; got: {msg}",
+            );
+        }
     }
 
     /// The `node_child` edge set of each subtree, rendered by hash.
@@ -5453,7 +5464,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v10"),
+            msg.contains("projection-v4") && msg.contains("projection-v11"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(
@@ -5762,7 +5773,7 @@ mod tests {
         // SAFETY: edition-2024 env mutation, serialized against every other
         // test that touches the head signing/trust vars by the `serial` label.
         unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &hex) };
-        let wrote = write_head_for_path(&db, 0, TEST_TREE_ROOT, TEST_PARSER_ID);
+        let wrote = write_head_for_path(&db, 0, TEST_STORE_ROOT, TEST_PARSER_ID);
         unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
         wrote.expect("write signed head");
 
@@ -5790,7 +5801,7 @@ mod tests {
         );
 
         // Re-derive the digest the way a verifier would, from the head itself:
-        // the whole v2 claim, treeRoot and parserId included.
+        // the whole v3 claim, storeRoot and parserId included.
         let claim = crate::head_claim::claim_of(h)
             .unwrap()
             .expect("a signed head carries a claim");
@@ -5805,11 +5816,11 @@ mod tests {
                 ),
                 leyline_core::Hash::ZERO,
                 None,
-                TEST_TREE_ROOT,
+                TEST_STORE_ROOT,
                 TEST_PARSER_ID,
             )
             .unwrap(),
-            "the signed claim carries the stamped treeRoot and parserId"
+            "the signed claim carries the stamped storeRoot and parserId"
         );
         let digest = leyline_core::head_digest(&claim);
 
@@ -5852,8 +5863,8 @@ mod tests {
                 .init_parent_hash()
                 .set_bytes(old.get_parent_hash().unwrap().get_bytes().unwrap());
             h.reborrow()
-                .init_tree_root()
-                .set_bytes(old.get_tree_root().unwrap().get_bytes().unwrap());
+                .init_store_root()
+                .set_bytes(old.get_store_root().unwrap().get_bytes().unwrap());
             h.reborrow()
                 .init_parser_id()
                 .set_bytes(old.get_parser_id().unwrap().get_bytes().unwrap());
@@ -5878,9 +5889,9 @@ mod tests {
         });
     }
 
-    /// Stamped identities for heads the signing tests write: a v2 claim needs
+    /// Stamped identities for heads the signing tests write: a v3 claim needs
     /// both, and neither may be the unstamped ZERO.
-    const TEST_TREE_ROOT: leyline_core::Hash = leyline_core::Hash::from_bytes([0x11; 32]);
+    const TEST_STORE_ROOT: leyline_core::Hash = leyline_core::Hash::from_bytes([0x11; 32]);
     const TEST_PARSER_ID: leyline_core::Hash = leyline_core::Hash::from_bytes([0x22; 32]);
 
     /// Write a head signed by `seed` and return `(head path, trusted pk hex)`.
@@ -5895,7 +5906,7 @@ mod tests {
             .collect();
         // SAFETY: callers hold the `env_leyline_head_keys` serial label.
         unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &sk_hex) };
-        let wrote = write_head_for_path(db, 0, TEST_TREE_ROOT, TEST_PARSER_ID);
+        let wrote = write_head_for_path(db, 0, TEST_STORE_ROOT, TEST_PARSER_ID);
         unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
         wrote.expect("write signed head");
         (with_extension(db, "head.capnp"), pk_hex)
@@ -5918,21 +5929,21 @@ mod tests {
         read_head_for_chain(head_path, &trusting(pk_hex))
     }
 
-    /// Bead b68fa6 (ADR-0040 D1: treeRoot is the root signatures cite): a
-    /// signed head whose treeRoot was rewritten after signing is refused.
+    /// Bead b68fa6 (ADR-0047 D-ii: storeRoot is the root signatures cite): a
+    /// signed head whose storeRoot was rewritten after signing is refused.
     #[test]
     #[serial_test::serial(env_leyline_head_keys)]
-    fn read_head_rejects_a_rewritten_tree_root_when_trust_set_configured() {
+    fn read_head_rejects_a_rewritten_store_root_when_trust_set_configured() {
         let dir = tempfile::tempdir().unwrap();
         let (head_path, pk_hex) = write_signed_test_head(&dir.path().join("t.db"), [5u8; 32]);
         assert!(read_head_trusting(&head_path, &pk_hex).is_ok());
         rewrite_head(&head_path, |h| {
-            h.reborrow().init_tree_root().set_bytes(&[0x33; 32]);
+            h.reborrow().init_store_root().set_bytes(&[0x33; 32]);
         });
         let got = read_head_trusting(&head_path, &pk_hex);
         assert!(
             got.is_err(),
-            "a rewritten treeRoot must be refused, got {got:?}"
+            "a rewritten storeRoot must be refused, got {got:?}"
         );
     }
 
@@ -5999,7 +6010,7 @@ mod tests {
     }
 
     /// Bead b68fa6, the unstamped case: with a signing key configured, a head
-    /// without a stamped treeRoot or parserId is refused, never signed over a
+    /// without a stamped storeRoot or parserId is refused, never signed over a
     /// ZERO stand-in.
     #[test]
     #[serial_test::serial(env_leyline_head_keys)]
@@ -6008,7 +6019,7 @@ mod tests {
         let sk_hex: String = [5u8; 32].iter().map(|b| format!("{b:02x}")).collect();
         for (name, tree, parser) in [
             ("no_tree.db", leyline_core::Hash::ZERO, TEST_PARSER_ID),
-            ("no_parser.db", TEST_TREE_ROOT, leyline_core::Hash::ZERO),
+            ("no_parser.db", TEST_STORE_ROOT, leyline_core::Hash::ZERO),
         ] {
             let db = dir.path().join(name);
             std::fs::write(&db, b"").unwrap();
@@ -6018,7 +6029,7 @@ mod tests {
             unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
             let err = wrote.expect_err("an unstamped head must not be signed");
             assert!(
-                format!("{err:#}").contains("treeRoot and parserId"),
+                format!("{err:#}").contains("storeRoot and parserId"),
                 "{err:#}"
             );
             assert!(
@@ -6037,7 +6048,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (head_path, pk_hex) = write_signed_test_head(&dir.path().join("c.db"), [5u8; 32]);
         rewrite_head(&head_path, |h| {
-            h.reborrow().init_tree_root().set_bytes(&[]);
+            h.reborrow().init_store_root().set_bytes(&[]);
             h.reborrow().init_parser_id().set_bytes(&[]);
         });
         let got = read_head_trusting(&head_path, &pk_hex);
@@ -6084,7 +6095,7 @@ mod tests {
         assert!(got.is_ok(), "unsigned head must still read: {got:?}");
     }
 
-    /// Reads `(rootHash, treeRoot, parserId)` from the head beside `db`.
+    /// Reads `(rootHash, storeRoot, parserId)` from the head beside `db`.
     fn read_head_roots(db: &Path) -> ([u8; 32], [u8; 32], [u8; 32]) {
         use leyline_schema_capnp::head_capnp::head;
         let bytes = std::fs::read(head_path_for(db)).unwrap();
@@ -6099,7 +6110,7 @@ mod tests {
         };
         (
             get(h.get_root_hash().and_then(|x| x.get_bytes())),
-            get(h.get_tree_root().and_then(|x| x.get_bytes())),
+            get(h.get_store_root().and_then(|x| x.get_bytes())),
             get(h.get_parser_id().and_then(|x| x.get_bytes())),
         )
     }
@@ -6109,15 +6120,16 @@ mod tests {
         parse_into_conn(&conn, src, None, scope).unwrap();
     }
 
-    /// ADR-0040 D1, falsifier F1 (bead `ley-line-open-f2df7f`): `treeRoot`
-    /// names the tree and `rootHash` names the run. Four parses of the same
+    /// ADR-0040 D1, falsifier F1 (bead `ley-line-open-f2df7f`), carried to
+    /// ADR-0047 D-ii: `storeRoot` names the store and `rootHash` names the
+    /// run. Four parses of the same
     /// bytes — a second directory, a touched mtime, a no-op rerun, a scoped
-    /// reparse — yield one `treeRoot`; one changed byte changes it. The same
+    /// reparse — yield one `storeRoot`; one changed byte changes it. The same
     /// test records the two shipped `rootHash` facts it replaces: the run
     /// receipt moves with the directory (bead `143002`) and with the set of
     /// files a run re-parsed (bead `0c80c7`).
     #[test]
-    fn tree_root_names_the_tree_and_root_hash_names_the_run() {
+    fn store_root_names_the_store_and_root_hash_names_the_run() {
         let td = TempDir::new().unwrap();
         let write_tree = |dir: &Path| {
             std::fs::create_dir_all(dir.join("pkg")).unwrap();
@@ -6131,11 +6143,11 @@ mod tests {
         let db_a = td.path().join("a.db");
         parse_dir(&db_a, &src_a, None);
         let (root_1, tree_1, parser_1) = read_head_roots(&db_a);
-        assert_ne!(tree_1, [0u8; 32], "treeRoot must be stamped");
+        assert_ne!(tree_1, [0u8; 32], "storeRoot must be stamped");
         assert_ne!(parser_1, [0u8; 32], "parserId must be stamped");
         assert_ne!(
             tree_1, root_1,
-            "treeRoot and rootHash are different domains"
+            "storeRoot and rootHash are different domains"
         );
 
         // The same bytes in a second directory.
@@ -6146,7 +6158,7 @@ mod tests {
         let (root_2, tree_2, parser_2) = read_head_roots(&db_b);
         assert_eq!(
             tree_2, tree_1,
-            "treeRoot is the same for the same bytes elsewhere"
+            "storeRoot is the same for the same bytes elsewhere"
         );
         assert_eq!(parser_2, parser_1, "parserId is a function of the binary");
         assert_ne!(
@@ -6164,12 +6176,12 @@ mod tests {
             .unwrap();
         parse_dir(&db_a, &src_a, None);
         let (_, tree_3, _) = read_head_roots(&db_a);
-        assert_eq!(tree_3, tree_1, "a touched mtime does not move treeRoot");
+        assert_eq!(tree_3, tree_1, "a touched mtime does not move storeRoot");
 
         // A no-op rerun.
         parse_dir(&db_a, &src_a, None);
         let (root_4, tree_4, _) = read_head_roots(&db_a);
-        assert_eq!(tree_4, tree_1, "a no-op rerun does not move treeRoot");
+        assert_eq!(tree_4, tree_1, "a no-op rerun does not move storeRoot");
         assert_ne!(
             root_4, root_1,
             "rootHash of a no-op rerun covers no files (bead 0c80c7); recorded, not endorsed"
@@ -6196,15 +6208,15 @@ mod tests {
         std::fs::write(src_a.join("pkg/b.go"), b"package pkg\n\nfunc Baz() {}\n").unwrap();
         parse_dir(&db_a, &src_a, None);
         let (_, tree_7, parser_7) = read_head_roots(&db_a);
-        assert_ne!(tree_7, tree_1, "one changed byte moves treeRoot");
+        assert_ne!(tree_7, tree_1, "one changed byte moves storeRoot");
         assert_eq!(parser_7, parser_1, "the derivation did not change");
 
         // The verifier agrees with the head it just wrote, and disagrees once
-        // the manifest changes under it (ADR-0045 T2: `treeRoot` names
+        // the manifest changes under it (ADR-0045 T2: `storeRoot` names
         // `_tree`), whether a blob or only a mode moves.
         assert!(matches!(
-            crate::tree_root::verify(&db_a).unwrap(),
-            crate::tree_root::Verification::Valid { .. }
+            crate::store_root::verify(&db_a).unwrap(),
+            crate::store_root::Verification::Valid { .. }
         ));
         {
             let conn = Connection::open(&db_a).unwrap();
@@ -6212,8 +6224,8 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            crate::tree_root::verify(&db_a).unwrap(),
-            crate::tree_root::Verification::TreeRootMismatch { .. }
+            crate::store_root::verify(&db_a).unwrap(),
+            crate::store_root::Verification::StoreRootMismatch { .. }
         ));
         {
             let conn = Connection::open(&db_a).unwrap();
@@ -6224,39 +6236,42 @@ mod tests {
             .unwrap();
         }
         assert!(matches!(
-            crate::tree_root::verify(&db_a).unwrap(),
-            crate::tree_root::Verification::TreeRootMismatch { .. }
+            crate::store_root::verify(&db_a).unwrap(),
+            crate::store_root::Verification::StoreRootMismatch { .. }
         ));
     }
 
     /// Bead b68fa6: `leyline verify-head` checks the signature over the
-    /// stamped treeRoot when a trust set is configured, so a head whose
-    /// treeRoot was rewritten is refused on the signature, before (and
+    /// stamped storeRoot when a trust set is configured, so a head whose
+    /// storeRoot was rewritten is refused on the signature, before (and
     /// independently of) the comparison with the arena.
     #[test]
     #[serial_test::serial(env_leyline_head_keys)]
-    fn verify_head_checks_the_signature_over_tree_root() {
+    fn verify_head_checks_the_signature_over_store_root() {
         let td = TempDir::new().unwrap();
         let (db, pk_hex) = signed_parse(&td);
 
         let policy = trusting(&pk_hex);
-        let clean = crate::tree_root::verify_with(&db, &policy);
+        let clean = crate::store_root::verify_with(&db, &policy);
         rewrite_head(&head_path_for(&db), |h| {
-            h.reborrow().init_tree_root().set_bytes(&[0x33; 32]);
+            h.reborrow().init_store_root().set_bytes(&[0x33; 32]);
         });
-        let forged = crate::tree_root::verify_with(&db, &policy);
+        let forged = crate::store_root::verify_with(&db, &policy);
 
         assert!(
             matches!(
                 clean,
-                Ok(crate::tree_root::Verification::Valid {
+                Ok(crate::store_root::Verification::Valid {
                     signature: crate::head_claim::SignatureCheck::Verified,
                     ..
                 })
             ),
             "{clean:?}"
         );
-        let err = format!("{:#}", forged.expect_err("a rewritten treeRoot is refused"));
+        let err = format!(
+            "{:#}",
+            forged.expect_err("a rewritten storeRoot is refused")
+        );
         assert!(err.contains("failed signature verification"), "{err}");
     }
 
@@ -6284,7 +6299,7 @@ mod tests {
 
     /// Bead b68fa6 (identity review C1): a signed → unsigned downgrade. The
     /// attacker strips the signature and kid, edits the arena, and restamps
-    /// treeRoot to match. With a trust set configured, `verify-head` must not
+    /// storeRoot to match. With a trust set configured, `verify-head` must not
     /// report that head as valid, with or without
     /// `LEYLINE_HEAD_REQUIRE_SIGNATURE`.
     #[test]
@@ -6296,29 +6311,28 @@ mod tests {
             let conn = Connection::open(&db).unwrap();
             conn.execute("UPDATE _tree SET mode = 33261 WHERE path = 'a.go'", [])
                 .unwrap();
-            let (_, _, parser_id) = read_head_roots(&db);
-            crate::tree_root::tree_root(&conn, leyline_core::Hash::from_bytes(parser_id)).unwrap()
+            crate::store_root::store_root(&conn).unwrap()
         };
         rewrite_head(&head_path_for(&db), |h| {
             h.set_signature(&[]);
             h.set_signer_kid(&[]);
             h.reborrow()
-                .init_tree_root()
+                .init_store_root()
                 .set_bytes(forged_tree.as_bytes());
         });
 
-        let got = crate::tree_root::verify_with(&db, &trusting(&pk_hex));
+        let got = crate::store_root::verify_with(&db, &trusting(&pk_hex));
         let err = format!("{:#}", got.expect_err("a stripped signature is refused"));
         assert!(err.contains("unsigned"), "{err}");
 
         // With no trust set the stamp is consistent with the arena, and the
         // verdict says the signature was not checked rather than a bare valid.
         let unchecked =
-            crate::tree_root::verify_with(&db, &crate::head_claim::HeadPolicy::default());
+            crate::store_root::verify_with(&db, &crate::head_claim::HeadPolicy::default());
         assert!(
             matches!(
                 unchecked,
-                Ok(crate::tree_root::Verification::Valid {
+                Ok(crate::store_root::Verification::Valid {
                     signature: crate::head_claim::SignatureCheck::NotChecked,
                     ..
                 })
@@ -6327,18 +6341,18 @@ mod tests {
         );
     }
 
-    /// A head written before ADR-0040 carries neither field; the verifier
-    /// says so instead of calling it valid.
+    /// A head that stamps neither field; the verifier says so instead of
+    /// calling it valid.
     #[test]
-    fn verify_reports_a_head_without_tree_root_as_not_stamped() {
+    fn verify_reports_a_head_without_store_root_as_not_stamped() {
         let td = TempDir::new().unwrap();
         let src = td.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("a.go"), b"package m\n").unwrap();
         let db = td.path().join("out.db");
         parse_dir(&db, &src, None);
-        crate::tree_root::cmd_verify_head(&db).expect("a freshly parsed arena verifies");
-        // Rewrite the head with the pre-ADR-0040 field set only.
+        crate::store_root::cmd_verify_head(&db).expect("a freshly parsed arena verifies");
+        // Rewrite the head with the run-receipt fields only.
         use leyline_schema_capnp::head_capnp::head;
         let mut src_msg = capnp::message::Builder::new_default();
         {
@@ -6353,13 +6367,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            crate::tree_root::verify(&db).unwrap(),
-            crate::tree_root::Verification::NotStamped
+            crate::store_root::verify(&db).unwrap(),
+            crate::store_root::Verification::NotStamped
         );
-        let err = crate::tree_root::cmd_verify_head(&db)
+        let err = crate::store_root::cmd_verify_head(&db)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no treeRoot"), "{err}");
+        assert!(err.contains("no storeRoot"), "{err}");
     }
 
     /// Bead `ley-line-open-80f037` F3(d): the writer never produces the
@@ -6370,7 +6384,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (name, tree, parser) in [
             ("no_tree.db", leyline_core::Hash::ZERO, TEST_PARSER_ID),
-            ("no_parser.db", TEST_TREE_ROOT, leyline_core::Hash::ZERO),
+            ("no_parser.db", TEST_STORE_ROOT, leyline_core::Hash::ZERO),
         ] {
             let db = dir.path().join(name);
             std::fs::write(&db, b"").unwrap();
@@ -6380,9 +6394,9 @@ mod tests {
         }
     }
 
-    /// Bead `ley-line-open-80f037` F3(d): a head carrying `treeRoot` without
+    /// Bead `ley-line-open-80f037` F3(d): a head carrying `storeRoot` without
     /// `parserId` is malformed. `verify-head` refuses it instead of calling
-    /// it a pre-ADR-0040 head.
+    /// it unstamped.
     #[test]
     fn verify_refuses_a_half_stamped_head() {
         let td = TempDir::new().unwrap();
@@ -6398,17 +6412,66 @@ mod tests {
             h.set_generation(1);
             h.reborrow().init_root_hash().set_bytes(&[7u8; 32]);
             h.reborrow().init_parent_hash().set_bytes(&[0u8; 32]);
-            h.reborrow().init_tree_root().set_bytes(&[9u8; 32]);
+            h.reborrow().init_store_root().set_bytes(&[9u8; 32]);
         }
         let mut f = std::fs::File::create(head_path_for(&db)).unwrap();
         leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(
             &src_msg, &mut f,
         )
         .unwrap();
-        let err = crate::tree_root::verify_with(&db, &crate::head_claim::HeadPolicy::default())
+        let err = crate::store_root::verify_with(&db, &crate::head_claim::HeadPolicy::default())
             .expect_err("a half-stamped head is malformed");
         let err = format!("{err:#}");
         assert!(err.contains("half-stamped"), "{err}");
+    }
+
+    /// ADR-0047 M1: a head digest v2 head beside an arena — `treeRoot` at
+    /// ordinal 7, as v0.25 wrote it, signed or not — is refused with the
+    /// typed error by both readers: `verify-head` does not call it
+    /// unstamped, and the next parse does not chain onto it.
+    #[test]
+    fn a_v2_head_is_refused_by_verify_head_and_by_the_chain() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n").unwrap();
+        let db = td.path().join("out.db");
+        parse_dir(&db, &src, None);
+        let (_, store, parser) = read_head_roots(&db);
+        rewrite_head(&head_path_for(&db), |h| {
+            h.reborrow().init_store_root().set_bytes(&[]);
+            h.reborrow().init_retired_tree_root().set_bytes(&store);
+            h.reborrow().init_parser_id().set_bytes(&parser);
+        });
+        let typed = |err: &anyhow::Error| {
+            err.chain()
+                .find_map(|e| e.downcast_ref::<crate::head_claim::HeadFormatError>())
+                .copied()
+        };
+        let err = crate::store_root::verify_with(&db, &crate::head_claim::HeadPolicy::default())
+            .expect_err("a v2 head is refused");
+        assert_eq!(
+            typed(&err),
+            Some(crate::head_claim::HeadFormatError::RetiredDigestV2),
+            "{err:#}"
+        );
+        let err = read_head_for_chain(
+            &head_path_for(&db),
+            &crate::head_claim::HeadPolicy::default(),
+        )
+        .expect_err("a v3 chain does not extend a v2 head");
+        assert_eq!(
+            typed(&err),
+            Some(crate::head_claim::HeadFormatError::RetiredDigestV2),
+            "{err:#}"
+        );
+        let err = write_head_for_path(&db, 0, TEST_STORE_ROOT, TEST_PARSER_ID)
+            .expect_err("the writer refuses to chain onto a v2 head");
+        assert_eq!(
+            typed(&err),
+            Some(crate::head_claim::HeadFormatError::RetiredDigestV2),
+            "{err:#}"
+        );
     }
 
     /// The env wrapper reads `LLO_TRUSTED_QUERY_HASHES` and nothing else.

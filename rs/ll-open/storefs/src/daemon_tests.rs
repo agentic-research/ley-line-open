@@ -62,11 +62,11 @@ fn daemon(dir: &TempDir) -> Arc<DaemonContext> {
     })
 }
 
-fn tree_root(ctx: &DaemonContext) -> String {
+fn store_root(ctx: &DaemonContext) -> String {
     let root = Store::with_read(ctx, |conn| {
-        Ok(leyline_cli_lib::tree_root::DerivedFrom::read(conn)?
-            .expect("a parsed store has a tree root")
-            .tree_root)
+        Ok(leyline_cli_lib::store_root::DerivedFrom::read(conn)?
+            .expect("a parsed store has a store root")
+            .store_root)
     })
     .unwrap();
     format!("blake3-256:{root}")
@@ -146,7 +146,7 @@ async fn a_share_whose_granted_root_the_store_no_longer_holds_is_refused() {
     };
     assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch);
     assert!(error.detail.contains(&stale), "{error:?}");
-    assert!(error.detail.contains(&tree_root(&ctx)), "{error:?}");
+    assert!(error.detail.contains(&store_root(&ctx)), "{error:?}");
 }
 
 /// The store records no commit generation (ADR-0041 S1 is not implemented),
@@ -163,7 +163,7 @@ async fn a_share_whose_grant_claims_a_generation_the_store_cannot_verify_is_refu
     for generation in [1, 7, u64::MAX] {
         let claimed = WorkspaceGrant {
             expected_generation: generation,
-            ..grant(tree_root(&ctx), vec![WorkspaceOperation::Read])
+            ..grant(store_root(&ctx), vec![WorkspaceOperation::Read])
         };
         let error = match shares.open("run-1", &claimed) {
             Ok(_) => panic!("generation {generation} cannot be verified"),
@@ -183,7 +183,7 @@ async fn a_share_whose_grant_claims_a_generation_the_store_cannot_verify_is_refu
         shares
             .open(
                 "run-1",
-                &grant(tree_root(&ctx), vec![WorkspaceOperation::Read])
+                &grant(store_root(&ctx), vec![WorkspaceOperation::Read])
             )
             .is_ok()
     );
@@ -200,7 +200,7 @@ async fn a_granted_share_serves_the_daemons_store_and_lands_as_its_proposals_do(
         .open(
             "run-1",
             &grant(
-                tree_root(&ctx),
+                store_root(&ctx),
                 vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
             ),
         )
@@ -274,7 +274,7 @@ async fn a_share_granted_only_reads_refuses_a_write_open() {
     let share = DaemonShares::new(slot, freshness())
         .open(
             "run-1",
-            &grant(tree_root(&ctx), vec![WorkspaceOperation::Read]),
+            &grant(store_root(&ctx), vec![WorkspaceOperation::Read]),
         )
         .unwrap();
     let a = lookup_a(share.as_ref());

@@ -181,10 +181,10 @@ type readContentResponse struct {
 }
 
 type readSourceResponse struct {
-	OK       *bool   `json:"ok"`
-	Content  *string `json:"content,omitempty"`
-	BlobHash *string `json:"blob_hash,omitempty"`
-	TreeRoot *string `json:"tree_root,omitempty"`
+	OK        *bool   `json:"ok"`
+	Content   *string `json:"content,omitempty"`
+	BlobHash  *string `json:"blob_hash,omitempty"`
+	StoreRoot *string `json:"store_root,omitempty"`
 	// The entry's git mode, six octal digits (ADR-0045).
 	Mode  *string `json:"mode,omitempty"`
 	Error *string `json:"error,omitempty"`
@@ -219,7 +219,7 @@ type proposalRefusal struct {
 
 type proposeResponse struct {
 	OK              *bool            `json:"ok"`
-	TreeRoot        *string          `json:"tree_root,omitempty"`
+	StoreRoot       *string          `json:"store_root,omitempty"`
 	Blobs           []pathHash       `json:"blobs,omitempty"`
 	Merged          []string         `json:"merged,omitempty"`
 	Refusal         *proposalRefusal `json:"refusal,omitempty"`

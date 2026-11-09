@@ -288,7 +288,8 @@ answers from `StoreShare` (the storefs README "Adapter" mapping) over a `StoreFs
 `DaemonContext`: the share and the socket propose on one writer, and a landed share proposal is
 written into the checkout and published to the arena as a socket proposal is. The grant scopes
 the share (`read`/`list` see, `mutate`/`commit` propose), and the share opens only when the
-store's `treeRoot` (ADR-0040 D1, the tagged fold over `_source`) is the grant's `graphRoot` (not
+store's `storeRoot` (ADR-0047 D-ii, the parser-free directory Merkle root of `_tree`; `treeRoot`
+before ADR-0047 M1) is the grant's `graphRoot` (not
 `Controller.current_root`, not `Head.rootHash`). The guest init mounts the share at `/work`
 (libkrun patch `0005`, `KRUN_VIRTIOFS_MOUNTS`) and starts the workload there.
 
@@ -312,7 +313,7 @@ the commit `seq` within the grant's epoch, and no store implements `(epoch, seq)
 Proposed), so there is no value to compare a claim with. The daemon's share refuses a grant whose
 `expectedGeneration` is nonzero (`identityPolicyMismatch`, before the worker starts; bead
 `ley-line-open-39abfa`): a claim nothing checks is not run. Zero claims no generation, and the
-share is pinned by the `graphRoot` check: it opens only when the store's `treeRoot` is the grant's
+share is pinned by the `graphRoot` check: it opens only when the store's `storeRoot` is the grant's
 `graphRoot`. Comparing a nonzero claim with the store's `seq` lands with ADR-0041 S1.
 
 **The test.** `rs/ll-open/cli/tests/agent_in_guest.rs` runs the real `leyline execution-daemon

@@ -180,7 +180,7 @@ step "parse: 2 files, every source in source_blobs, every _ast row hashed"
 
 # --- verify-head -----------------------------------------------------------
 head1=$("$BIN" verify-head "$DB") || fail "verify-head after parse: $head1"
-case $head1 in valid\ treeRoot=*) ;; *) fail "verify-head printed '$head1'" ;; esac
+case $head1 in valid\ storeRoot=*) ;; *) fail "verify-head printed '$head1'" ;; esac
 step "verify-head: $head1"
 
 # --- splice: a good edit ---------------------------------------------------
@@ -190,7 +190,7 @@ expect_eq "$(sql "$DB" "SELECT b.blob_bytes FROM _source s JOIN source_blobs b O
     "package util" "util.go's stored bytes after the splice"
 expect_eq "$(sql "$DB" 'SELECT sum(node_hash IS NULL) FROM v_ast_hash')" 0 "_ast rows without node_hash after the splice"
 head2=$("$BIN" verify-head "$DB") || fail "verify-head after splice: $head2"
-[ "$head2" != "$head1" ] || fail "the splice did not move treeRoot"
+[ "$head2" != "$head1" ] || fail "the splice did not move storeRoot"
 step "splice: bytes stored, file re-hashed, head restamped"
 
 # --- splice: a syntax-breaking edit is stored with its diagnostic -----------
@@ -204,7 +204,7 @@ expect_eq "$(sql "$DB" "SELECT b.blob_bytes FROM _source s JOIN source_blobs b O
     "package ((" "util.go's stored bytes after the syntax-breaking splice"
 expect_eq "$(sql "$DB" "SELECT path, projected FROM _parse_diagnostics")" "util.go|1" "the syntax-breaking splice's diagnostic"
 head3=$("$BIN" verify-head "$DB") || fail "verify-head after the syntax-breaking splice: $head3"
-[ "$head3" != "$head2" ] || fail "the syntax-breaking splice did not move treeRoot"
+[ "$head3" != "$head2" ] || fail "the syntax-breaking splice did not move storeRoot"
 step "splice: a syntax-breaking edit is stored, projected, and diagnosed"
 
 # --- daemon: an over-long socket path is an error, not a panic --------------

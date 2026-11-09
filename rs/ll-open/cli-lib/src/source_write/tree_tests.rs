@@ -1,7 +1,7 @@
 //! ADR-0045 T4, T5 through `propose`: any bytes at
 //! any plain path, modes, symlinks and directories are proposals; a moved
 //! base merges three ways and overlapping hunks refuse with their ranges.
-//! Every accepted proposal lands the `treeRoot` a cold parse of the
+//! Every accepted proposal lands the `storeRoot` a cold parse of the
 //! resulting tree lands.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,14 +71,14 @@ fn store(tree: &[(&str, Node)]) -> Store {
     }
 }
 
-/// The `treeRoot` a cold parse of `tree` lands.
+/// The `storeRoot` a cold parse of `tree` lands.
 fn cold_root(tree: &[(&str, Node)]) -> Hash {
     let src = TempDir::new().unwrap();
     lay_out(src.path(), tree);
     let conn = Connection::open_in_memory().unwrap();
     crate::cmd_parse::parse_into_conn(&conn, src.path(), None, None)
         .unwrap()
-        .tree_root
+        .store_root
 }
 
 fn tree_propose(s: &Store, writes: Vec<Proposed>) -> Result<Accepted> {
@@ -130,7 +130,7 @@ fn a_create_of_any_bytes_lands_in_the_store() {
     );
     assert!(!projected(&s, "docs/notes.txt"));
     assert_eq!(
-        accepted.tree_root,
+        accepted.store_root,
         cold_root(&[
             ("a.go", Node::File(A, Mode::Regular)),
             ("docs/notes.txt", Node::File(notes, Mode::Regular)),
@@ -154,7 +154,7 @@ fn an_unparseable_write_lands_with_a_diagnostic() {
     let d = crate::tree::diagnostic(&s.conn, "a.go").unwrap().unwrap();
     assert!(d.projected && d.blob == h(half), "{d:?}");
     assert_eq!(
-        accepted.tree_root,
+        accepted.store_root,
         cold_root(&[("a.go", Node::File(half, Mode::Regular))])
     );
 }
@@ -187,7 +187,7 @@ fn a_moved_base_with_disjoint_edits_lands_the_merge() {
     assert_eq!(accepted.blobs["a.go"], h(&both));
     assert_eq!(stored_text(&s, "a.go").as_deref(), Some(both.as_str()));
     assert_eq!(
-        accepted.tree_root,
+        accepted.store_root,
         cold_root(&[("a.go", Node::File(&*both.leak(), Mode::Regular))])
     );
 }
@@ -281,12 +281,12 @@ fn deletes_and_creates_against_a_moved_path() {
     let err = tree_propose(&s, vec![Proposed::delete("a.go", Base::Blob(h(A)))]).unwrap_err();
     assert!(matches!(refused(err), Refusal::Stale(_)));
 
-    let root = crate::tree_root::DerivedFrom::read(&s.conn)
+    let root = crate::store_root::DerivedFrom::read(&s.conn)
         .unwrap()
         .unwrap()
-        .tree_root;
+        .store_root;
     let same = tree_propose(&s, vec![Proposed::create("a.go", moved.clone().into())]).unwrap();
-    assert_eq!(same.tree_root, root, "an identical create changes nothing");
+    assert_eq!(same.store_root, root, "an identical create changes nothing");
     let err = tree_propose(&s, vec![Proposed::create("a.go", A.into())]).unwrap_err();
     assert_eq!(
         refused(err),
@@ -335,7 +335,7 @@ fn modes_and_symlinks_are_proposals() {
     );
     assert!(!projected(&s, "link.go"), "a symlink is never projected");
     assert_eq!(
-        accepted.tree_root,
+        accepted.store_root,
         cold_root(&[
             ("a.go", Node::File(A, Mode::Regular)),
             ("link.go", Node::Link("a.go")),
@@ -465,7 +465,7 @@ fn mkdir_and_rmdir_are_proposals() {
         Some(Entry::Dir)
     );
     assert_eq!(
-        accepted.tree_root,
+        accepted.store_root,
         cold_root(&[
             ("a.go", Node::File(A, Mode::Regular)),
             ("empty/inner", Node::Dir),
@@ -562,7 +562,7 @@ fn mkdir_and_rmdir_are_proposals() {
     .unwrap();
     assert_eq!(crate::tree::entry(&s.conn, "sub").unwrap(), None);
     assert_eq!(
-        accepted.tree_root,
+        accepted.store_root,
         cold_root(&[("a.go", Node::File(A, Mode::Regular)), ("empty", Node::Dir)])
     );
 }
@@ -596,7 +596,7 @@ fn a_directory_rename_is_one_proposal() {
     );
     assert!(projected(&s, "lib/b.go") && !projected(&s, "pkg/b.go"));
     assert_eq!(
-        accepted.tree_root,
+        accepted.store_root,
         cold_root(&[
             ("a.go", Node::File(A, Mode::Regular)),
             ("lib/b.go", Node::File(A, Mode::Regular)),

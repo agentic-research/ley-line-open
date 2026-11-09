@@ -2,22 +2,24 @@
 //! bead `ley-line-open-10d71a`).
 //!
 //! The constructions and stores this crate owns: `source_blobs` (ρ over
-//! file bytes), `parserId`, `treeRoot`, `node_hash` and the parse that
+//! file bytes), `parserId`, `storeRoot`, `node_hash` and the parse that
 //! produces them. Tests named as ADR-0047 §5 names them; a name that also
 //! appears in `leyline-core` or `leyline-fs` is the same test over the
 //! stores those crates own.
 //!
-//! **Known RED.** Two claims fail on shipped code. Each has a strict test,
+//! **Known RED.** One claim fails on shipped code. It has a strict test,
 //! `#[ignore]`d with the bead whose PR turns it green, and a `*_measured`
 //! test that runs in every `task ci`, prints the measurement, and pins
 //! today's failing value, so the red is visible and the fix cannot land
 //! without flipping both:
 //!
-//! - `merkle_one_leaf_edit_rehashes_one_path` — `treeRoot` is one flat
-//!   fold, so one edit refolds 2n entries (ADR-0047 M1, `ley-line-open-73c6ee`);
 //! - `crafted_preimage_does_not_alias_across_constructions` — `node_hash`
 //!   is plain σ over a prefixed preimage, so a file whose bytes are a leaf's
 //!   preimage has `blob_hash == node_hash` (ADR-0047 M2, `ley-line-open-73add7`).
+//!
+//! `merkle_one_leaf_edit_rehashes_one_path` was the other until ADR-0047 M1
+//! (`ley-line-open-73c6ee`) replaced the flat `treeRoot` with the directory
+//! Merkle `storeRoot`; it now runs in every `task ci`.
 //!
 //! `run_id`'s half of law (c) is in `leyline-runtime`.
 
@@ -27,9 +29,9 @@ use std::path::{Path, PathBuf};
 
 use leyline_cli_lib::cmd_parse;
 use leyline_cli_lib::cmd_parse::{AstNode, AstNodeWitness};
-use leyline_cli_lib::tree_root::{
-    DerivedFrom, GitMode, Parser, ParserInputs, TREE_ROOT_SCHEME, TreeLeaf, TreeRoot, TreeWitness,
-    tree_root_of, tree_root_ref_of,
+use leyline_cli_lib::store_root::{
+    DerivedFrom, Mode, Parser, ParserInputs, STORE_TREE_SCHEME, StoreLeaf, StoreRoot, StoreTree,
+    store_root_of,
 };
 use leyline_core::{ContentAddressed, Domain, Entry, Hash, PartitionSpec, Ref};
 use proptest::prelude::*;
@@ -308,16 +310,18 @@ fn ca_tampered_payload_is_refused() {
 // (DET)
 // ---------------------------------------------------------------------------
 
-/// (DET) `parserId` and `treeRoot` reproduce their checked-in vectors on
-/// fixed inputs, and each `treeRoot` vector is the documented `RowSet` fold
-/// rebuilt here from its leaves (ADR-0045 T2): `(σ(path), 2i, |path|)` and
-/// `(content, 2i + 1, mode_tag)` per leaf in path-byte order, `parserId` as
-/// params. `node_hash`'s vectors are checked against its private fold in
-/// `cmd_parse.rs`'s unit tests; the core constructions in `leyline-core`.
+/// (DET) `parserId` and `storeRoot` reproduce their checked-in vectors on
+/// fixed inputs, and each `storeRoot` vector is the documented directory
+/// fold rebuilt here from its leaves by an independent recursive
+/// implementation (ADR-0047 D-ii): per directory, its children in
+/// name-byte order, `(σ(name), 2i, |name|)` and `(child, 2i + 1, git mode)`,
+/// params empty. Each case also pins its directory nodes, so a second
+/// runtime checks the nodes before the root. `node_hash`'s vectors are
+/// checked against its private fold in `cmd_parse.rs`'s unit tests; the core
+/// constructions in `leyline-core`.
 #[test]
 fn det_known_answer_vectors() {
     let v = vectors();
-    let mut parsers: Vec<Ref<Parser>> = Vec::new();
     for case in cases(&v, "parserId") {
         let inputs = ParserInputs {
             ir_schema_version: case["irSchemaVersion"].as_str().unwrap().into(),
@@ -340,85 +344,199 @@ fn det_known_answer_vectors() {
         let typed = Ref::<Parser>::verified(hash_of(&case["address"]), &inputs)
             .expect("the typed parserId names the pinned value");
         assert_eq!(typed, inputs.parser_ref());
-        parsers.push(typed);
     }
-    for case in cases(&v, "treeRoot") {
-        assert_eq!(case["scheme"].as_str(), Some(TREE_ROOT_SCHEME));
-        let pid = hash_of(&case["parserId"]);
-        let leaves: Vec<TreeLeaf> = case["leaves"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| TreeLeaf {
-                path: l["path"].as_str().unwrap().into(),
-                mode: GitMode::from_git(l["mode"].as_u64().unwrap() as u32).unwrap(),
-                content: hash_of(&l["content"]),
-            })
-            .collect();
-        let address = tree_root_of(&leaves, pid);
+    for case in cases(&v, "storeRoot") {
+        assert_eq!(case["scheme"].as_str(), Some(STORE_TREE_SCHEME));
+        assert!(
+            case.get("parserId").is_none(),
+            "storeRoot takes no parser input (law C7)"
+        );
+        let leaves = vector_leaves(case);
+        let tree = StoreTree::from_leaves(&leaves).expect("vector leaves are a tree");
+        let address = tree.root();
         assert_eq!(
             address,
             hash_of(&case["address"]),
-            "treeRoot drifted for {}",
+            "storeRoot drifted for {}",
             case["name"]
         );
-        assert_eq!(address, documented_tree_root(&leaves, pid));
-        // Typed: the case's parserId is a pinned parserId case, so its
-        // `Ref<Parser>` comes from that case's inputs, never from the hex.
-        let parser = *parsers
+        assert_eq!(address, documented_store_root(&leaves));
+        assert_eq!(store_root_of(&leaves), Ok(address));
+        // Every directory node is pinned too, by path.
+        let pinned: BTreeMap<String, (Hash, u64)> = case["nodes"]
+            .as_array()
+            .expect("nodes")
             .iter()
-            .find(|p| *p.as_hash() == pid)
-            .expect("treeRoot cases fold under a pinned parserId");
-        assert_eq!(*tree_root_ref_of(&leaves, parser).as_hash(), address);
-        assert!(
-            Ref::<TreeRoot>::verified(
-                address,
-                TreeWitness {
-                    leaves: &leaves,
-                    parser
+            .map(|n| {
+                (
+                    n["path"].as_str().unwrap().to_string(),
+                    (hash_of(&n["address"]), n["entries"].as_u64().unwrap()),
+                )
+            })
+            .collect();
+        let computed: BTreeMap<String, (Hash, u64)> = tree
+            .nodes()
+            .into_iter()
+            .map(|n| (n.path, (n.address, n.entries as u64)))
+            .collect();
+        assert_eq!(
+            computed, pinned,
+            "storeRoot nodes drifted for {}",
+            case["name"]
+        );
+        assert!(Ref::<StoreRoot>::verified(address, &tree).is_some());
+    }
+}
+
+/// A vector's leaves: `{path, mode, content}` for a file, `{path, mode:
+/// 16384}` (no content) for an empty directory.
+fn vector_leaves(case: &Value) -> Vec<StoreLeaf> {
+    case["leaves"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            let path = l["path"].as_str().unwrap().to_string();
+            let mode = l["mode"].as_u64().unwrap() as u32;
+            match Mode::from_git(mode) {
+                Some(mode) => StoreLeaf::File {
+                    path,
+                    mode,
+                    blob: hash_of(&l["content"]),
+                },
+                None => {
+                    assert_eq!(mode, 0o040000, "a leaf is a file or an empty directory");
+                    assert!(l.get("content").is_none(), "a directory has no content");
+                    StoreLeaf::EmptyDir { path }
                 }
-            )
-            .is_some()
+            }
+        })
+        .collect()
+}
+
+/// `store-tree/v1` rebuilt from its documented encoding by an independent
+/// implementation: group the leaves by first path component, recurse, and
+/// fold each directory's children in name-byte order.
+fn documented_store_root(leaves: &[StoreLeaf]) -> Hash {
+    enum Item {
+        File(u32, Hash),
+        Dir(Vec<(String, Option<(u32, Hash)>)>),
+    }
+    fn fold(items: &[(String, Option<(u32, Hash)>)]) -> Hash {
+        // `items`: (path relative to this directory, Some(file) | None for
+        // an empty directory).
+        let mut children: BTreeMap<String, Item> = BTreeMap::new();
+        for (path, leaf) in items {
+            match path.split_once('/') {
+                None => match leaf {
+                    Some((mode, blob)) => {
+                        children.insert(path.clone(), Item::File(*mode, *blob));
+                    }
+                    None => {
+                        children
+                            .entry(path.clone())
+                            .or_insert(Item::Dir(Vec::new()));
+                    }
+                },
+                Some((head, rest)) => {
+                    let entry = children
+                        .entry(head.to_string())
+                        .or_insert(Item::Dir(Vec::new()));
+                    let Item::Dir(sub) = entry else {
+                        panic!("a leaf under a file")
+                    };
+                    sub.push((rest.to_string(), *leaf));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        for (i, (name, item)) in children.iter().enumerate() {
+            let i = i as u64;
+            let (child, mode) = match item {
+                Item::File(mode, blob) => (*blob, *mode),
+                Item::Dir(sub) => (fold(sub), 0o040000),
+            };
+            entries.push(Entry {
+                addr: name.as_bytes().hash(),
+                a: 2 * i,
+                b: name.len() as u64,
+            });
+            entries.push(Entry {
+                addr: child,
+                a: 2 * i + 1,
+                b: u64::from(mode),
+            });
+        }
+        PartitionSpec {
+            domain: Domain::RowSet,
+            scheme: "leyline/store-tree/v1".to_string(),
+            params: Vec::new(),
+            canon_version: 1,
+        }
+        .address(&entries)
+    }
+    let items: Vec<(String, Option<(u32, Hash)>)> = leaves
+        .iter()
+        .map(|l| match l {
+            StoreLeaf::File { path, mode, blob } => (path.clone(), Some((mode.git(), *blob))),
+            StoreLeaf::EmptyDir { path } => (path.clone(), None),
+        })
+        .collect();
+    fold(&items)
+}
+
+/// Law C7 (ADR-0047 D-ii), end to end: one store parsed by two binaries
+/// whose `parserId`s differ lands one `storeRoot`, and two `derived_from`
+/// stamps that differ only in `parserId`. The second derivation is
+/// simulated by restamping `derived_from` under another `ParserInputs`;
+/// the store root is recomputed from the arena, which has no parser input
+/// to vary.
+#[test]
+fn store_root_is_unchanged_when_only_parser_id_changes() {
+    let src = TempDir::new().unwrap();
+    write_tree(src.path(), &fixture_files());
+    let (_out, db) = parse_cold(src.path());
+    let conn = Connection::open(&db).unwrap();
+    let stamp = DerivedFrom::read(&conn).unwrap().unwrap();
+    let mut other = ParserInputs {
+        ir_schema_version: "merkle-ast-v3".into(),
+        projection_schema_version: "projection-v12".into(),
+        extraction_epoch: "99".into(),
+        injection_epoch: "inj".into(),
+        query_set_epoch: "qse".into(),
+        grammars: vec![("rust".into(), Hash::from_bytes([9; 32]))],
+    };
+    assert_ne!(other.parser_id(), stamp.parser_id);
+    let store = leyline_cli_lib::store_root::store_root(&conn).unwrap();
+    assert_eq!(store, stamp.store_root, "the arena folds to its stamp");
+    // Every parser input moves parserId and none moves storeRoot.
+    for bump in 0..3 {
+        match bump {
+            0 => other.extraction_epoch.push('1'),
+            1 => other.grammars[0].1 = Hash::from_bytes([bump as u8; 32]),
+            _ => other.query_set_epoch.push('x'),
+        }
+        let restamped = DerivedFrom {
+            parser_id: other.parser_id(),
+            ..stamp.clone()
+        };
+        assert_ne!(restamped.parser_id, stamp.parser_id);
+        assert_eq!(restamped.store_root, store);
+        assert_eq!(
+            leyline_cli_lib::store_root::store_root(&conn).unwrap(),
+            store
         );
     }
-}
-
-fn mode_tag(mode: GitMode) -> u64 {
-    match mode {
-        GitMode::Regular => 0,
-        other => u64::from(other.git()),
-    }
-}
-
-/// `tree-root/v1` rebuilt from its documented encoding, entry by entry.
-fn documented_tree_root(leaves: &[TreeLeaf], pid: Hash) -> Hash {
-    PartitionSpec {
-        domain: Domain::RowSet,
-        scheme: TREE_ROOT_SCHEME.to_string(),
-        params: pid.as_bytes().to_vec(),
-        canon_version: 1,
-    }
-    .address(&tree_root_entries(leaves))
-}
-
-fn tree_root_entries(leaves: &[TreeLeaf]) -> Vec<Entry> {
-    let mut sorted: Vec<&TreeLeaf> = leaves.iter().collect();
-    sorted.sort_by(|x, y| x.path.as_bytes().cmp(y.path.as_bytes()));
-    let mut entries = Vec::with_capacity(2 * sorted.len());
-    for (i, l) in sorted.iter().enumerate() {
-        let i = i as u64;
-        entries.push(Entry {
-            addr: l.path.as_bytes().hash(),
-            a: 2 * i,
-            b: l.path.len() as u64,
-        });
-        entries.push(Entry {
-            addr: l.content,
-            a: 2 * i + 1,
-            b: mode_tag(l.mode),
-        });
-    }
-    entries
+    // And one stored byte moves it.
+    conn.execute(
+        "UPDATE _tree SET blob_hash = ?1 WHERE path = (SELECT min(path) FROM _tree WHERE blob_hash IS NOT NULL)",
+        params![b"changed".as_slice().hash().as_bytes().as_slice()],
+    )
+    .unwrap();
+    assert_ne!(
+        leyline_cli_lib::store_root::store_root(&conn).unwrap(),
+        store
+    );
 }
 
 /// What a parse names, for comparing two parses of one tree.
@@ -446,11 +564,10 @@ fn parse_with_threads(src: &Path, threads: usize) -> Identities {
 }
 
 /// (DET) across schedules: one parse on one rayon thread and one on eight
-/// name the same `node_hash` set, the same `treeRoot`/`parserId` stamp, and
+/// name the same `node_hash` set, the same `storeRoot`/`parserId` stamp, and
 /// the same `Head.rootHash`. Both parse one source directory, so the
 /// absolute paths and mtimes `rootHash`'s segments carry are equal and the
-/// comparison needs no masking. (ADR-0047 §5 also names `storeRoot`; it
-/// does not exist before M1, `ley-line-open-73c6ee`.)
+/// comparison needs no masking.
 #[test]
 fn det_parse_is_thread_count_invariant() {
     let src = TempDir::new().unwrap();
@@ -606,11 +723,11 @@ const N_FILES: usize = 50_000;
 
 /// `d{a}/d{b}/f{i}.rs`: 20 top directories × 50 subdirectories × 50 files,
 /// so depth 3 and fanout at most 50.
-fn store_leaves() -> Vec<TreeLeaf> {
+fn store_leaves() -> Vec<StoreLeaf> {
     (0..N_FILES)
         .map(|i| {
             let path = format!("d{:02}/d{:02}/f{i:05}.rs", i / 2500, (i / 50) % 50);
-            TreeLeaf::regular(path, format!("file {i}").as_bytes().hash())
+            StoreLeaf::regular(path, format!("file {i}").as_bytes().hash())
         })
         .collect()
 }
@@ -621,77 +738,65 @@ const FANOUT: usize = 50;
 /// Merkle store refolds at most `2 · depth · fanout` entries per edit.
 const MERKLE_BOUND: usize = 2 * DEPTH * FANOUT;
 
-/// The fold nodes the shipped `treeRoot` construction computes, each with
-/// the number of entries it folds. `tree-root/v1` is one `RowSet` fold over
-/// every leaf (`tree_root_of`): its only node is the root, with `2n`
-/// entries. That this is the shipped fold, and not a model of it, is
-/// checked: the root rebuilt here from exactly those entries equals
-/// `tree_root_of`'s.
-fn shipped_fold_nodes(leaves: &[TreeLeaf], pid: Hash) -> Vec<(Hash, usize)> {
-    let entries = tree_root_entries(leaves);
-    let root = tree_root_of(leaves, pid);
+/// The fold nodes the shipped `storeRoot` construction computes, each with
+/// the number of entries it folds: every directory node of the
+/// `store-tree/v1` tree. That these are the shipped fold's nodes, and not a
+/// model of them, is checked: the root among them equals both
+/// `store_root_of` and the independent `documented_store_root`.
+fn shipped_fold_nodes(leaves: &[StoreLeaf]) -> Vec<(Hash, usize)> {
+    let nodes = StoreTree::from_leaves(leaves).unwrap().nodes();
+    let root = nodes.iter().find(|n| n.path.is_empty()).unwrap().address;
+    assert_eq!(store_root_of(leaves), Ok(root));
     assert_eq!(
-        documented_tree_root(leaves, pid),
+        documented_store_root(leaves),
         root,
         "the node set is the shipped fold"
     );
-    vec![(root, entries.len())]
+    nodes.into_iter().map(|n| (n.address, n.entries)).collect()
 }
 
 /// Entries refolded by one leaf edit: the entry counts of every fold node
 /// whose address changed. That is the least work any implementation of the
 /// construction can do, memoized or not, since an unchanged node needs no
-/// refold and a changed one needs all of its entries.
+/// refold and a changed one needs all of its entries. Returns the cost and
+/// the roots before and after.
 fn one_leaf_edit_cost() -> (usize, Hash, Hash) {
-    let pid = Hash::from_bytes([0x5a; 32]);
     let mut leaves = store_leaves();
-    let before = shipped_fold_nodes(&leaves, pid);
-    leaves[N_FILES / 2].content = b"edited".hash();
-    let after = shipped_fold_nodes(&leaves, pid);
+    let root = |l: &[StoreLeaf]| store_root_of(l).unwrap();
+    let before = shipped_fold_nodes(&leaves);
+    let before_root = root(&leaves);
+    let StoreLeaf::File { blob, .. } = &mut leaves[N_FILES / 2] else {
+        unreachable!("store_leaves holds files")
+    };
+    *blob = b"edited".hash();
+    let after = shipped_fold_nodes(&leaves);
     let unchanged: BTreeSet<Hash> = before.iter().map(|(h, _)| *h).collect();
     let cost = after
         .iter()
         .filter(|(h, _)| !unchanged.contains(h))
         .map(|(_, n)| n)
         .sum();
-    (cost, before[0].0, after[0].0)
+    (cost, before_root, root(&leaves))
 }
 
 /// Σ §1.3 / decade F4 on the shipped store identity: one leaf edit in a
-/// 50,000-file store refolds at most `c · depth · fanout` entries.
-///
-/// RED today: `treeRoot` is one flat fold, so the edit refolds all
-/// 100,000 entries. ADR-0047 M1 (`ley-line-open-73c6ee`) replaces it with the
-/// directory-Merkle `storeRoot`; that PR points `shipped_fold_nodes` at the
-/// directory nodes and removes this `ignore`.
+/// 50,000-file store refolds at most `c · depth · fanout` entries. ADR-0047
+/// M1's closing test (`ley-line-open-73c6ee`): the flat `tree-root/v1`
+/// refolded all 100,000 entries; the directory Merkle `store-tree/v1`
+/// refolds the three nodes on the edited path (40 + 100 + 100 = 240).
 #[test]
-#[ignore = "RED until ADR-0047 M1 (73c6ee): treeRoot is one flat fold over 2n entries"]
 fn merkle_one_leaf_edit_rehashes_one_path() {
     let (cost, before, after) = one_leaf_edit_cost();
     assert_ne!(before, after, "the edit must reach the root");
+    eprintln!(
+        "merkle_one_leaf_edit_rehashes_one_path: {cost} entries refolded for one edit \
+         in {N_FILES} files (Σ §1.3 bound {MERKLE_BOUND})"
+    );
     assert!(
         cost <= MERKLE_BOUND,
         "one leaf edit refolded {cost} entries; Σ §1.3 bounds it by {MERKLE_BOUND}"
     );
-}
-
-/// The measured form of [`merkle_one_leaf_edit_rehashes_one_path`], run in
-/// every `task ci`: prints the cost and pins today's flat-fold value, 2n.
-/// M1 (`ley-line-open-73c6ee`) fails this pin and must delete it along with
-/// the strict test's `ignore`.
-#[test]
-fn merkle_one_leaf_edit_rehashes_one_path_measured() {
-    let (cost, before, after) = one_leaf_edit_cost();
-    assert_ne!(before, after);
-    eprintln!(
-        "merkle_one_leaf_edit_rehashes_one_path: {cost} entries refolded for one edit \
-         in {N_FILES} files (Σ §1.3 bound {MERKLE_BOUND}): RED until 73c6ee"
-    );
-    assert_eq!(
-        cost,
-        2 * N_FILES,
-        "the flat tree-root/v1 refolds every entry"
-    );
+    assert_eq!(cost, 2 * (20 + 50 + 50), "root, d{{a}}, d{{a}}/d{{b}}");
 }
 
 /// Longest root-to-leaf path in a `node_content` / `node_edge` DAG, in

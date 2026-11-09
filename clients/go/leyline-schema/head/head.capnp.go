@@ -15,12 +15,12 @@ type Head capnp.Struct
 const Head_TypeID = 0xbc8eed64e8f5bae7
 
 func NewHead(s *capnp.Segment) (Head, error) {
-	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 7})
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 8})
 	return Head(st), err
 }
 
 func NewRootHead(s *capnp.Segment) (Head, error) {
-	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 7})
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 24, PointerCount: 8})
 	return Head(st), err
 }
 
@@ -154,22 +154,22 @@ func (s Head) SetSignerKid(v []byte) error {
 	return capnp.Struct(s).SetData(3, v)
 }
 
-func (s Head) TreeRoot() (common.Hash, error) {
+func (s Head) RetiredTreeRoot() (common.Hash, error) {
 	p, err := capnp.Struct(s).Ptr(4)
 	return common.Hash(p.Struct()), err
 }
 
-func (s Head) HasTreeRoot() bool {
+func (s Head) HasRetiredTreeRoot() bool {
 	return capnp.Struct(s).HasPtr(4)
 }
 
-func (s Head) SetTreeRoot(v common.Hash) error {
+func (s Head) SetRetiredTreeRoot(v common.Hash) error {
 	return capnp.Struct(s).SetPtr(4, capnp.Struct(v).ToPtr())
 }
 
-// NewTreeRoot sets the treeRoot field to a newly
+// NewRetiredTreeRoot sets the retiredTreeRoot field to a newly
 // allocated common.Hash struct, preferring placement in s's segment.
-func (s Head) NewTreeRoot() (common.Hash, error) {
+func (s Head) NewRetiredTreeRoot() (common.Hash, error) {
 	ss, err := common.NewHash(capnp.Struct(s).Segment())
 	if err != nil {
 		return common.Hash{}, err
@@ -226,12 +226,36 @@ func (s Head) NewParentDigest() (common.Hash, error) {
 	return ss, err
 }
 
+func (s Head) StoreRoot() (common.Hash, error) {
+	p, err := capnp.Struct(s).Ptr(7)
+	return common.Hash(p.Struct()), err
+}
+
+func (s Head) HasStoreRoot() bool {
+	return capnp.Struct(s).HasPtr(7)
+}
+
+func (s Head) SetStoreRoot(v common.Hash) error {
+	return capnp.Struct(s).SetPtr(7, capnp.Struct(v).ToPtr())
+}
+
+// NewStoreRoot sets the storeRoot field to a newly
+// allocated common.Hash struct, preferring placement in s's segment.
+func (s Head) NewStoreRoot() (common.Hash, error) {
+	ss, err := common.NewHash(capnp.Struct(s).Segment())
+	if err != nil {
+		return common.Hash{}, err
+	}
+	err = capnp.Struct(s).SetPtr(7, capnp.Struct(ss).ToPtr())
+	return ss, err
+}
+
 // Head_List is a list of Head.
 type Head_List = capnp.StructList[Head]
 
 // NewHead creates a new list of Head.
 func NewHead_List(s *capnp.Segment, sz int32) (Head_List, error) {
-	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 7}, sz)
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 24, PointerCount: 8}, sz)
 	return capnp.StructList[Head](l), err
 }
 
@@ -248,7 +272,7 @@ func (p Head_Future) RootHash() common.Hash_Future {
 func (p Head_Future) ParentHash() common.Hash_Future {
 	return common.Hash_Future{Future: p.Future.Field(1, nil)}
 }
-func (p Head_Future) TreeRoot() common.Hash_Future {
+func (p Head_Future) RetiredTreeRoot() common.Hash_Future {
 	return common.Hash_Future{Future: p.Future.Field(4, nil)}
 }
 func (p Head_Future) ParserId() common.Hash_Future {
@@ -257,31 +281,36 @@ func (p Head_Future) ParserId() common.Hash_Future {
 func (p Head_Future) ParentDigest() common.Hash_Future {
 	return common.Hash_Future{Future: p.Future.Field(6, nil)}
 }
+func (p Head_Future) StoreRoot() common.Hash_Future {
+	return common.Hash_Future{Future: p.Future.Field(7, nil)}
+}
 
-const schema_c7c7ada1403b9f78 = "x\xda|\xcf\xbfj\x14Q\x18\x05\xf0s\xee\x9d\xd9\xdd" +
-	"Q\x96\xddpo\xa1\x90\x80\x01\x8b\x04D\x0c\x0a\xfe-" +
-	"V\x0d\xb2Q\x8bl\xc6Jl\xae\x99\xcb\xee\x08\xdeY" +
-	"f\xee\x82\xb6>\x806\xf6\xe2\x03\xf8\x02b\x1f\xf0E" +
-	"\xb4\xd0R,G\xbeAb\xa1\xa6\xfd}\x07\xbes\xc6" +
-	"?'\xc9\xce\xb0RP\xb3\xf5\xb4\xd7~\xf9\xf8\xe3k" +
-	"\xf1\xfd\xf5'\xccNS\xb7/\xde\xdd\x9c\xbc\xffpt" +
-	"\x84\xb4\xdf\x07\xcc\x06_\x99M\xf6\x81\xcb\x1b\xbc\xaap" +
-	"\xb7]xW\\<tK\x86\xe5\x8d\xa9w\x05\xf6\xc9" +
-	"\xd9\x96N\x80\x84\x80\xc9x\x1f\xc8\x07\xd4\xcc-\x15\xd7" +
-	"HK\xf15>\x06\xf2\xb1\xf8:\x15\xa9,\x15`\xce" +
-	"v|F\xf8\xbc\xc45-5`6\xf9\x0c\xc8\xcf\x89" +
-	"_\x10O\x94e\x02\x98\xed\xce\xb7\xc4\xaf\x88\xa7\xca2" +
-	"\x05\xcc\x0e\x0f\x80\xfc\x92\xf8-\xf1\x9e\xb6\xec\x01\xe6z" +
-	"\xe7\xd7\xc4w\xc5\xfb\x89\x951\xe6vWs\"\xfeP" +
-	"|\x90Z\x0e\x00\xb3\xd7\xf9T\xfc\x91x\xd6\xb3\xcc\x00" +
-	"3\xeb\xfe\xee\x8b?\xa1b[WU\x9c\xbaf\x01\x80" +
-	"\xe3\xf6\xf3\xf6\xa97\x8b\xb7\xc97\x80\x1c\x83\xed\xd2\xd5" +
-	">\xc4\xa9\x83n\x16\xff8\xcf}\xf0\xb5\x8b%t\x15" +
-	"\x98A1\x03\xdb\xc6\xcf\x9f\xfb\x10\xef`\xf42\xfa\xe6" +
-	"\x98W\xe1i\xb5\x0a\xc5=\x8c\xdca\xfc\xc3M9\x0f" +
-	".\xaej\xd0s\x08\xc5\xe1o\xf3\xf5\x83\x12,\x8e-" +
-	"\xd6\xde\x1fTU\xfco\xcf\xc6\xd7{\xc5I+vK" +
-	"\x8c\xe6\xbe\x89\x7f\x07~\x05\x00\x00\xff\xffc\\t\xf9"
+const schema_c7c7ada1403b9f78 = "x\xda|\xcf\xcdj\x14O\x14\x05\xf0s\xaa\xbb\xa7g" +
+	"\xe6\xcf0\xf9S\xb54\x0bA\x17B\x94\x88\x0a\xe2\x07" +
+	"\x0c\x1ae\xfc\x82L:\x82\x88\x82m\xba\x98n1]" +
+	"Cu\x0d\xc4\x9d\xe4\x01t\xe3^|\x00_@\xdc\x07" +
+	"|\x11]\xe8\xd2u\xcbm$nF\xb7\xbf{\xb9\xf7" +
+	"\x9c\xcd\x94\x93\xf8\xfc\xc8)\xa8\xd9\x89\xa4\xd7~\xfd\xf4" +
+	"\xf3[\xf1\xe3\xcdg\xcc\xfec\xd4\x1e\xbc\xbf:\xf9\xf0" +
+	"\xf1\xe8\x08I?\x05\xf4:\x0f\xf5I\xa6\xc0\x85u:" +
+	"\x85\x9bmi\xf3\xe2\xdc^\xbe`\xbd\xb82\xb5y\x81" +
+	"mr\xb6\x11\xc5@L@\x9f\xe6] ;\xc5\x88\xd9" +
+	"&\x15\xff'\x0d\xc5\xcf\xf21\x90m\x88_\xa6\"\x95" +
+	"\xa1\x02\xf4\xa5\x8e/\x0aOd=\xa2a\x04\xe8\xeb|" +
+	"\x01d\xd7\xc4\xa7\xe2\xb12\x8c\x01}\xab\xf3-\xf1m" +
+	"\xf1D\x19&\x80~\xc0\x1d \xbb/\xfeH\xbc\x17\x19" +
+	"\xf6\x00\xfd\xb0\xf3]\xf1g\xe2il\xa4\x8c~\xcaC" +
+	" {\"^\x8a\xf7\x13\xc3>\xa0m\x17\xbf\x10_\x88" +
+	"\x0fz\x86\x03@\xefw\x7f_\x8a\x1f\x88\x0fS\xc3!" +
+	"\xa0\x97\xdd\xfd \xfe\x9a\x8a\xadw.L\xf3\xa6\x04\xc0" +
+	"\xb5\xf6\xcb\x99\xe1\xdb\xf2]\xfc\x1d \xd7\xc0v\x91{" +
+	"[\x87i\x8e\xa8)W\x8c\xe7\xb6\xb6>\x0f\x15\"W" +
+	"s\x00\xc5\x01\xd86v\xbeo\xebp\x03\xe3W\xc16" +
+	"\xc7\xbc\xac\x9f\xbbe]\xdc\xc68\xdf\x0b\x7f\xb8\xa9\xe6" +
+	"u\x1e\x96\x1e\xb4\x1cAq\xf4\xdb\xac\xbfW\x81\xc5\xb1" +
+	"y\x1b*o\x8b]zkw\x9c\x0b\x7fI\xdbX\x7f" +
+	"\xa7\xf8W\x97\xad\x0a\xe3\xb9m\xc2\x8a\x85&8/\xb7" +
+	"\xc1\x15\xd3_\x01\x00\x00\xff\xff\x0cC\x86\xe2"
 
 func RegisterSchema(reg *schemas.Registry) {
 	reg.Register(&schemas.Schema{

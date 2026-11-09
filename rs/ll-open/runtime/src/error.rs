@@ -17,6 +17,11 @@ pub enum ErrorCode {
     BackendFailed,
     Cancelled,
     Internal,
+    /// The run is granted a workspace the selected backend cannot serve:
+    /// it has no workspace share to deliver it through, or more workspaces
+    /// than it attaches. Not retryable under the same grant; a backend that
+    /// serves workspace shares may run it (bead `ley-line-open-204a94`).
+    WorkspaceUnserved,
 }
 
 /// An execution failure safe to project through daemon, CLI, and MCP.
@@ -41,6 +46,16 @@ impl ExecutionError {
     pub(crate) fn unsupported(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::UnsupportedBackend,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
+
+    /// A granted workspace the backend cannot serve
+    /// ([`ErrorCode::WorkspaceUnserved`]).
+    pub(crate) fn workspace_unserved(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::WorkspaceUnserved,
             retryable: false,
             detail: detail.into(),
         }

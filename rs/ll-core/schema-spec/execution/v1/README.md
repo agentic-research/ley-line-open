@@ -47,6 +47,36 @@ with `identityPolicyMismatch` before the run starts, rather than running it
 against a generation nothing checked. When a store implements S1, it compares
 the claim with its `seq` instead.
 
+## Workspace delivery
+
+A run never starts without a workspace its grant names. A backend that
+cannot serve one refuses the start before it spawns anything, with
+`workspaceUnserved` (not retryable under the same grant):
+
+| tier | serves |
+| --- | --- |
+| microVM, daemon started with a source tree | one workspace, as the guest's `/work` |
+| microVM, no source tree | none |
+| native | none |
+
+`workspaceUnserved` names only this refusal, so a caller that chose the
+backend class can tell "this tier serves no workspace" from the
+`unsupportedBackend` refusals (egress, an unenforceable ceiling, another
+tier's grant) without reading the message. Choosing another tier is the
+caller's policy; the runtime does not reroute a run.
+
+The service also checks the backend's answer: the workspace shares the
+backend reports holding (the `workspaceShare` channels of its evidence
+document, below) must be the granted workspaces exactly, by name and
+`graphRoot`. A backend that reports a start with a granted workspace missing,
+or with a share the grant never named, has its run cancelled and the start
+refused with `workspaceUnserved`; the run is never recorded, collected or
+receipted.
+
+`workspaceUnserved` was appended to `ErrorCode` at ordinal 12 (bead
+`ley-line-open-204a94`). Before it, the same refusals were
+`unsupportedBackend`.
+
 ## Issuer signature
 
 `RunGrant.signature` is the only signed surface in this capability.

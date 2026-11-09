@@ -34,7 +34,12 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- Nothing in flight: `39998b` and `98d0c3` shipped (below); the next items follow.
+- `204a94` (in review) — a workspace grant no backend serves is refused
+  before spawn with its own execution/v1 code, `workspaceUnserved`, so
+  Cloister can route the run to a tier that serves workspaces; the service
+  cancels and refuses a run whose backend reports a start without serving
+  every granted workspace. The native pre-spawn refusal itself shipped in
+  #502 (`f8ebcf`).
 
 **Next**
 - `0fadab` — cut v0.21.0 from integration and hand mache the upgrade note
@@ -46,8 +51,6 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   own base, merge and `ESTALE`.
 - `483134` — `WorkspaceGrant` gains a write scope (exact paths and directory
   prefixes); storefs refuses writes outside it.
-- `204a94` — the native backend refuses a workspace-bearing run instead of
-  starting without the workspace.
 - `5c2040` — VM tests on Linux/KVM. Apple silicon is a manual release gate
   instead of CI (hosted macOS runners lack nested Hypervisor.framework):
   `task release:hypervisor:record` writes the receipt `tools/tag_release.sh`

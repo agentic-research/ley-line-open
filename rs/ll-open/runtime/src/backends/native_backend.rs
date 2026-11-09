@@ -162,9 +162,11 @@ impl Backend for NativeWorkerBackend {
         // deliver it through. Starting anyway ran the workload without the
         // workspace while the receipt named its graph root as an input; the
         // microVM tier refuses the same grant when it has no share provider
-        // (bead ley-line-open-f8ebcf).
+        // (bead ley-line-open-f8ebcf). The code is `workspaceUnserved`, not
+        // the generic `unsupportedBackend`, so a caller can route the run to
+        // a tier that serves workspaces (bead ley-line-open-204a94).
         if let Some(grant) = request.workspaces.first() {
-            return Err(ExecutionError::unsupported(format!(
+            return Err(ExecutionError::workspace_unserved(format!(
                 "the run is granted workspace {:?}, and the native tier serves no \
                  workspace shares; run it on the microVM tier",
                 grant.name

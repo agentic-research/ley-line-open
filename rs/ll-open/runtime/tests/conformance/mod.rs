@@ -732,10 +732,13 @@ pub struct GrantSpec<'a> {
     pub confinement_document: &'a str,
     pub expires_at_unix_ms: u64,
     pub allowed_egress: Vec<String>,
+    /// Each one both requested by the spec (`workspaceInputs`) and resolved
+    /// by the grant (`workspaces`).
+    pub workspaces: Vec<WorkspaceGrant>,
 }
 
 impl<'a> GrantSpec<'a> {
-    /// A grant valid for an hour from now, with no egress.
+    /// A grant valid for an hour from now, with no egress and no workspace.
     pub fn new(
         class: BackendClass,
         replay_key: &str,
@@ -750,6 +753,7 @@ impl<'a> GrantSpec<'a> {
             confinement_document,
             expires_at_unix_ms: now_unix_ms() + 3_600_000,
             allowed_egress: Vec::new(),
+            workspaces: Vec::new(),
         }
     }
 }
@@ -770,6 +774,23 @@ pub fn spec_and_grant(authority: &GrantSpec<'_>) -> (Vec<u8>, Vec<u8>) {
     let mut executable = spec.init_executable();
     executable.set_media_type("application/vnd.leyline.executable");
     set_digest(executable.init_digest(), &"c".repeat(64));
+    if !authority.workspaces.is_empty() {
+        let mut inputs = message
+            .get_root::<execution_capnp::run_spec::Builder<'_>>()
+            .expect("spec root")
+            .init_workspace_inputs(authority.workspaces.len() as u32);
+        for (index, workspace) in authority.workspaces.iter().enumerate() {
+            let mut input = inputs.reborrow().get(index as u32);
+            input.set_name(&workspace.name);
+            set_digest(
+                input.init_graph_root(),
+                workspace
+                    .graph_root
+                    .strip_prefix("blake3-256:")
+                    .expect("graphRoot prefix"),
+            );
+        }
+    }
     let mut spec_bytes = Vec::new();
     capnp::serialize::write_message(&mut spec_bytes, &message).expect("serialize spec");
 
@@ -806,6 +827,46 @@ pub fn spec_and_grant(authority: &GrantSpec<'_>) -> (Vec<u8>, Vec<u8>) {
             .init_allowed_egress(authority.allowed_egress.len() as u32);
         for (index, entry) in authority.allowed_egress.iter().enumerate() {
             egress.set(index as u32, entry);
+        }
+    }
+    if !authority.workspaces.is_empty() {
+        let mut grants = grant
+            .reborrow()
+            .init_workspaces(authority.workspaces.len() as u32);
+        for (index, workspace) in authority.workspaces.iter().enumerate() {
+            let mut entry = grants.reborrow().get(index as u32);
+            entry.set_name(&workspace.name);
+            set_digest(
+                entry.reborrow().init_graph_root(),
+                workspace
+                    .graph_root
+                    .strip_prefix("blake3-256:")
+                    .expect("graphRoot prefix"),
+            );
+            entry.set_expected_generation(workspace.expected_generation);
+            let mut operations = entry.init_operations(workspace.operations.len() as u32);
+            for (slot, operation) in workspace.operations.iter().enumerate() {
+                operations.set(
+                    slot as u32,
+                    match operation {
+                        leyline_runtime::WorkspaceOperation::Read => {
+                            execution_capnp::WorkspaceOperation::Read
+                        }
+                        leyline_runtime::WorkspaceOperation::List => {
+                            execution_capnp::WorkspaceOperation::List
+                        }
+                        leyline_runtime::WorkspaceOperation::Query => {
+                            execution_capnp::WorkspaceOperation::Query
+                        }
+                        leyline_runtime::WorkspaceOperation::Mutate => {
+                            execution_capnp::WorkspaceOperation::Mutate
+                        }
+                        leyline_runtime::WorkspaceOperation::Commit => {
+                            execution_capnp::WorkspaceOperation::Commit
+                        }
+                    },
+                );
+            }
         }
     }
     let mut capability = grant.reborrow().init_capabilities(1).get(0);
@@ -1698,15 +1759,43 @@ pub fn row_undeclared_host_access_and_the_raw_arena_are_unreachable(mut column: 
 
 /// A workspace grant is Graph authority. A backend with nothing to serve it
 /// refuses the run before spawning anything, on every tier, rather than
-/// running the workload without the workspace its receipt would claim.
+/// running the workload without the workspace its receipt would claim. The
+/// refusal is `workspaceUnserved` (bead `ley-line-open-204a94`), on the
+/// authorized execution/v1 path every transport takes and on the direct
+/// request path an embedder takes.
 pub fn row_a_workspace_grant_nothing_serves_is_refused_before_spawn(column: Column) {
     let name = column.spec.name;
+    column.provision();
+    let manifest = column.manifest(None);
+    let document = manifest.to_canonical_json().expect("document");
+    let digest = manifest.confinement_digest().expect("digest");
+    let mut authority = GrantSpec::new(column.spec.class, "unserved-grant", &digest, &document);
+    authority.workspaces = vec![workspace_grant(&"e".repeat(64))];
+    let (spec, grant) = spec_and_grant(&authority);
+    let error = column
+        .service
+        .start_authorized(
+            &spec,
+            &grant,
+            &column.policy(&digest),
+            &column.resolver(&guest_env("exit:0", None)),
+        )
+        .expect_err("an authorized workspace grant nothing serves must be refused");
+    assert_eq!(error.code, ErrorCode::WorkspaceUnserved, "{name}: {error}");
+    assert!(!error.retryable, "{name}: {error}");
+    assert!(
+        error.detail.contains("repo"),
+        "{name}: names the workspace: {error}"
+    );
+    assert_eq!(column.run_roots(), 0, "{name}: refused before spawn");
+
     let request = workspace_request(&column, "unserved", workspace_grant(&"e".repeat(64)));
     let error = column
         .service
         .start(request)
         .expect_err("a workspace grant nothing serves must be refused");
-    assert_eq!(error.code, ErrorCode::UnsupportedBackend, "{name}: {error}");
+    assert_eq!(error.code, ErrorCode::WorkspaceUnserved, "{name}: {error}");
+    assert!(!error.retryable, "{name}: {error}");
     assert!(
         error.detail.contains("repo"),
         "{name}: names the workspace: {error}"

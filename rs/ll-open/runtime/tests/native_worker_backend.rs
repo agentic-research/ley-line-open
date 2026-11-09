@@ -256,11 +256,15 @@ fn a_granted_workspace_is_refused_before_the_worker_is_spawned() {
     let error = backend
         .start(&request)
         .expect_err("a workspace grant the native tier cannot serve");
+    // Typed, not the generic `unsupportedBackend`: the code alone tells
+    // Cloister to route the run to a tier that serves workspaces (bead
+    // `ley-line-open-204a94`).
     assert_eq!(
         error.code,
-        leyline_runtime::ErrorCode::UnsupportedBackend,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
         "{error:?}"
     );
+    assert!(!error.retryable, "{error:?}");
     assert!(error.detail.contains("\"repo\""), "{error:?}");
     assert!(
         !spawned.exists(),

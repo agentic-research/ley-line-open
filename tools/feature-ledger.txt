@@ -125,6 +125,13 @@ ll-open/text-search   engine-witchcraft  not-shipping    exclude-file:ll-open/te
 # mutants=enable so its gated parser code compiles under mutation.
 ll-open/ts            hcl                ships-optin     enable  -
 
+# Grammar for Go: leyline-cli-lib enables it, the ts default set does not.
+# mutants=enable: cfg.rs's emitter recognises a function body only through a
+# grammar κ maps (`go`, `rust`, `python`), and its tests are `go`-gated, so
+# without this row ADR-0047 M2's cfg.rs diff (ley-line-open-b5d354) reported
+# three MISSED that no compiled test could reach.
+ll-open/ts            go                 ships-optin     enable  -
+
 # ley-line-open-988b93 — NOT a grammar: a 349-line dependency-graph
 # projection (pyproject.toml -> mountable /deps tree). Unwired too — nothing
 # calls project_pyproject. Dead in two ways. mutants=enable: it was the entry

@@ -99,6 +99,30 @@ REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
     "$repo_root/tools/tag_release.sh" 0.10.5 >/dev/null
 test -n "$(git -C "$work" ls-remote origin refs/tags/v0.10.5)"
 
+# A binary-only release whose schema-spec vectors drifted from the reused
+# schema tag is refused at tag time, through the same surface definition the
+# bump and the verifier read (bead ley-line-open-a4946a).
+work=$(new_fixture spec-drift)
+(
+    cd "$work"
+    git tag -a clients/go/leyline-schema/v0.10.4 -m schema
+    git push origin refs/tags/clients/go/leyline-schema/v0.10.4 >/dev/null
+    mkdir -p rs/ll-core/schema-spec/sigma/v1/test-vectors
+    printf '%s\n' '{}' > rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json
+    git add rs
+    git commit -m vector-only >/dev/null
+    git push origin main >/dev/null
+)
+record_receipt "$work"
+if drift_err=$(REPO_ROOT="$work" VERIFY_VERSION_BIN=true \
+    "$repo_root/tools/tag_release.sh" 0.10.5 2>&1 >/dev/null)
+then
+    echo "spec-drift unexpectedly succeeded" >&2
+    exit 1
+fi
+printf '%s\n' "$drift_err" | grep -q 'public schema surface differs'
+test -z "$(git -C "$work" ls-remote origin refs/tags/v0.10.5)"
+
 work=$(new_fixture partial)
 (
     cd "$work"

@@ -34,19 +34,18 @@
 //! ## What gets measured
 //!
 //! 1. **Eviction count** — strict inequality on projected-away noise.
-//! 2. **Simulated parse time** — each "parse" hashes every line of the
-//!    file content (real f32 work). Summed across the invalidated set.
-//!    δ⁰ mode strictly less total parse-time on projected-away noise.
+//! 2. **Simulated reparse work** — the source bytes each mode would
+//!    reparse, summed across its invalidated set. δ⁰ mode reparses
+//!    strictly fewer bytes on projected-away noise.
 //!
-//! The simulated parse stands in for tree-sitter's actual reparse cost;
-//! pulling leyline-ts into this crate's dev deps just to time it isn't
-//! worth the dependency. The per-file workload is proportional to file
-//! size, so the precision win is real on a realistic-shape graph.
+//! The byte count stands in for tree-sitter's reparse cost, which is
+//! linear in the source it reads. It is a deterministic count, not a
+//! wall-clock time: a timing comparison inside a correctness test fails
+//! under machine load (bead ley-line-open-40300f).
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
 
 use leyline_sheaf::cache::{RestrictionEdge, SheafCache, StalkDigest, StalkHash};
 use leyline_sheaf::complex::{CellComplex, RestrictionMap};
@@ -164,21 +163,14 @@ fn extract_crate_imports(content: &str) -> Vec<String> {
     out
 }
 
-/// Simulated parse cost: hashes every line of the file. Real work —
-/// not just `sleep` or counting — so the LLVM optimizer can't elide it.
-/// Returns elapsed micros (consumer summarises across invalidated set).
-fn simulated_parse_cost(content: &str) -> u128 {
-    let start = Instant::now();
-    let mut hasher = Sha256::new();
-    for line in content.lines() {
-        // Per-line hashing approximates the per-symbol cost a real
-        // tree-sitter pass pays. Run it twice so timing has signal even
-        // on tiny files.
-        hasher.update(line.as_bytes());
-        hasher.update(line.as_bytes());
-    }
-    let _digest: [u8; 32] = hasher.finalize().into();
-    start.elapsed().as_micros()
+/// Simulated parse cost: the bytes a reparse of this file reads. A
+/// tree-sitter reparse is linear in the source it reads, so the byte count
+/// is the work, and it is deterministic. The bench once measured this as
+/// wall-clock µs of SHA-256 over each line, and the strict δ⁰-vs-heuristic
+/// comparison then failed under machine load while the eviction counts
+/// still showed δ⁰ more precise (bead ley-line-open-40300f).
+fn simulated_parse_cost(content: &str) -> usize {
+    content.len()
 }
 
 fn boundary_xor(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
@@ -402,10 +394,9 @@ fn real_repo_bench_delta_zero_strictly_more_precise_on_projected_away_noise() {
         },
     );
     // Sum a simulated parse cost across each side's invalidated set so
-    // the bench output carries a parse-time signal, not just an eviction
-    // count. The cost is per-line SHA-256 work — real CPU time, not a
-    // sleep — proportional to file size.
-    let parse_us = |regions: &[u32]| -> u128 {
+    // the bench output carries a reparse-work signal, not just an eviction
+    // count: the source bytes each side would reparse.
+    let parse_bytes = |regions: &[u32]| -> usize {
         regions
             .iter()
             .map(|&r| {
@@ -419,14 +410,14 @@ fn real_repo_bench_delta_zero_strictly_more_precise_on_projected_away_noise() {
             })
             .sum()
     };
-    let delta_zero_us = parse_us(&delta_zero);
-    let heuristic_us = parse_us(&heuristic);
+    let delta_zero_bytes = parse_bytes(&delta_zero);
+    let heuristic_bytes = parse_bytes(&heuristic);
     eprintln!(
-        "[bench] AddBlankLines(cache.rs)  δ⁰ evictions={} ({} µs) heuristic evictions={} ({} µs) names_δ⁰={:?} names_heur={:?}",
+        "[bench] AddBlankLines(cache.rs)  δ⁰ evictions={} ({} bytes reparsed) heuristic evictions={} ({} bytes reparsed) names_δ⁰={:?} names_heur={:?}",
         delta_zero.len(),
-        delta_zero_us,
+        delta_zero_bytes,
         heuristic.len(),
-        heuristic_us,
+        heuristic_bytes,
         delta_zero.iter().map(|r| name_by_id[r]).collect::<Vec<_>>(),
         heuristic.iter().map(|r| name_by_id[r]).collect::<Vec<_>>(),
     );
@@ -442,9 +433,14 @@ fn real_repo_bench_delta_zero_strictly_more_precise_on_projected_away_noise() {
         "the edited region must always be invalidated"
     );
     assert!(
-        delta_zero_us < heuristic_us,
-        "δ⁰ simulated parse-time must be strictly less than heuristic on projected-away noise; \
-         got δ⁰={delta_zero_us}µs heuristic={heuristic_us}µs",
+        delta_zero.iter().all(|r| heuristic.contains(r)),
+        "every region δ⁰ invalidates must also be invalidated by the heuristic; \
+         got δ⁰={delta_zero:?} heuristic={heuristic:?}"
+    );
+    assert!(
+        delta_zero_bytes < heuristic_bytes,
+        "δ⁰ must reparse strictly fewer source bytes than the heuristic on projected-away noise; \
+         got δ⁰={delta_zero_bytes} heuristic={heuristic_bytes}",
     );
 
     // Scenario 2: AddExportedFn on complex.rs (region 2). complex.rs's

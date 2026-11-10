@@ -36,7 +36,6 @@ use leyline_cache::restriction::{
 };
 use std::collections::BTreeSet;
 use std::hint::black_box;
-use std::time::Instant;
 
 /// The function under review in every fixture, resolved to its container
 /// identity per the active keying via [`FactSubstrate::container_for_fn`].
@@ -601,24 +600,26 @@ fn restriction_review_verdict() {
     );
 }
 
-/// restriction_cost < review_cost — measured as substrate rows touched
-/// (deterministic, asserted at every scale) and wall time (swept over
-/// corpus sizes, because it has a crossover: the restriction pays a constant
-/// SHA-256 + buffer cost that a small enough in-memory join undercuts, while
-/// the review's row touches grow with the corpus. The wall-time assert is
-/// pinned at the largest scale, where the asymptotics dominate the
-/// constants; the small-scale inversion is printed, not hidden — it is part
-/// of the finding.)
+/// restriction_cost < review_cost, measured as substrate rows touched: a
+/// deterministic count, swept over corpus sizes. The claim is asymptotic:
+/// the restriction touches the same rows however large the corpus grows
+/// (it reads only the target's closure), while the review's row touches
+/// grow with the corpus. Both halves are asserted, so a restriction made
+/// O(n) in the corpus fails here.
+///
+/// This test once also asserted wall time at the largest corpus. A
+/// millisecond comparison inside a parallel `task ci` is a scheduling race,
+/// not a cost measurement, and it failed under load while the row counts
+/// held (bead ley-line-open-324f47).
 #[test]
 fn restriction_is_cheaper_than_review() {
     eprintln!(
-        "\n{:>9} {:>10} {:>9} {:>12} {:>12} {:>9} {:>10}",
-        "def_rows", "restr_ops", "rev_ops", "restr_time", "rev_time", "op_ratio", "time_ratio"
+        "\n{:>9} {:>10} {:>9} {:>9}",
+        "def_rows", "restr_ops", "rev_ops", "op_ratio"
     );
 
-    let scales: &[(usize, u32)] = &[(200, 2000), (2000, 500), (10000, 100)];
-    let mut last: Option<(u64, u64, std::time::Duration, std::time::Duration)> = None;
-    for &(pad, iters) in scales {
+    let mut sweep: Vec<(usize, u64, u64)> = Vec::new();
+    for pad in [200usize, 2000, 10000] {
         let sub = build_substrate(
             &corpus(MAIN_BEFORE, math_src_padded("compute_weight", false, pad)),
             ContainerKeying::Stable,
@@ -634,43 +635,39 @@ fn restriction_is_cheaper_than_review() {
         let mut review_ops = 0u64;
         black_box(review_call_targets(&sub, &score, &mut review_ops));
 
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            let mut c = 0u64;
-            black_box(restriction_for_call_target(&sub, &score, &mut c));
-        }
-        let restriction_time = t0.elapsed() / iters;
-        let t1 = Instant::now();
-        for _ in 0..iters {
-            let mut c = 0u64;
-            black_box(review_call_targets(&sub, &score, &mut c));
-        }
-        let review_time = t1.elapsed() / iters;
-
         eprintln!(
-            "{:>9} {:>10} {:>9} {:>12} {:>12} {:>8.1}x {:>9.1}x",
+            "{:>9} {:>10} {:>9} {:>8.1}x",
             sub.defs.len(),
             restriction_ops,
             review_ops,
-            format!("{restriction_time:.1?}"),
-            format!("{review_time:.1?}"),
             review_ops as f64 / restriction_ops as f64,
-            review_time.as_secs_f64() / restriction_time.as_secs_f64()
         );
 
         assert!(
             restriction_ops < review_ops,
             "restriction ({restriction_ops} rows) must touch fewer rows than review ({review_ops})"
         );
-        last = Some((restriction_ops, review_ops, restriction_time, review_time));
+        sweep.push((sub.defs.len(), restriction_ops, review_ops));
     }
 
-    let (_, _, restriction_time, review_time) = last.expect("at least one scale");
-    assert!(
-        restriction_time < review_time,
-        "at the largest corpus the restriction ({restriction_time:?}) must be cheaper in wall \
-         time than the review join ({review_time:?})"
-    );
+    for pair in sweep.windows(2) {
+        let (smaller_defs, smaller_restriction, smaller_review) = pair[0];
+        let (larger_defs, larger_restriction, larger_review) = pair[1];
+        assert!(
+            larger_defs > smaller_defs,
+            "the sweep must grow the corpus: {smaller_defs} then {larger_defs} def rows"
+        );
+        assert_eq!(
+            larger_restriction, smaller_restriction,
+            "the restriction must touch the same rows at {larger_defs} def rows as at \
+             {smaller_defs}: it reads only the target's closure"
+        );
+        assert!(
+            larger_review > smaller_review,
+            "the review's row touches must grow with the corpus: {smaller_review} at \
+             {smaller_defs} def rows, {larger_review} at {larger_defs}"
+        );
+    }
 }
 
 fn skip_word(skip: bool) -> &'static str {

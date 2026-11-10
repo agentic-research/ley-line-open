@@ -1474,7 +1474,6 @@ mod tests {
             if self.timeout_after.is_some_and(|after| self.waits > after) {
                 return Err(ureq::Error::Timeout(timeout.reason));
             }
-            std::thread::sleep(Duration::from_millis(2));
             self.buffers.input_append_buf()[0] = b'a';
             self.buffers.input_appended(1);
             self.buffers.input_consume(1);

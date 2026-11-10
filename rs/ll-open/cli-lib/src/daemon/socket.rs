@@ -87,8 +87,9 @@ fn same_entry(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// `home` is the directory holding `.mache`; `None` (no home) has no
 /// well-known names to protect. A daemon whose socket lands on
 /// `~/.mache/<name>.sock` must be `discovery`'s own surface and serve
-/// `~/.mache/<name>.arena`; anything else, such as an explicit `--arena`
-/// with the default `--control`, would bind the name and take its clients.
+/// `~/.mache/<name>.arena` through `~/.mache/<name>.ctrl`; anything else,
+/// such as an explicit `--arena` with the default `--control`, would bind
+/// the name and take its clients.
 pub fn admit_well_known(
     discovery: SocketDiscovery,
     home: Option<&std::path::Path>,
@@ -107,7 +108,12 @@ pub fn admit_well_known(
             continue;
         }
         let default_arena = mache.join(format!("{name}.arena"));
-        if kind == discovery && same_entry(arena, &default_arena) {
+        let default_ctrl = mache.join(format!("{name}.ctrl"));
+        // Both paths, not just the socket: `default.foo` also has
+        // `default.sock` as its `.sock`, and would serve that name while
+        // publishing to a control block mache never reads.
+        if kind == discovery && same_entry(arena, &default_arena) && same_entry(ctrl, &default_ctrl)
+        {
             return Ok(());
         }
         anyhow::bail!(
@@ -118,7 +124,7 @@ pub fn admit_well_known(
             ctrl.display(),
             well_known.display(),
             default_arena.display(),
-            mache.join(format!("{name}.ctrl")).display(),
+            default_ctrl.display(),
             mache.display()
         );
     }
@@ -707,6 +713,12 @@ pub(crate) mod tests {
             (
                 Substrate,
                 elsewhere.join("a.arena"),
+                mache.join("default.other"),
+            ),
+            // Even with the default arena (bead `ley-line-open-1d58bc`).
+            (
+                Substrate,
+                mache.join("default.arena"),
                 mache.join("default.other"),
             ),
         ];

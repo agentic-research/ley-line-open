@@ -150,6 +150,20 @@ fn reset_if_unheld(ctrl: &Path, arena: &Path) -> Result<()> {
     refuse_if_named_arena_is_served(ctrl, &header.arena_path, arena)?;
 
     if header.version != leyline_core::control::VERSION {
+        // The lock is on the descriptor; the rename works on the path. Tie
+        // them: the path must still name, without a symlink, the inode
+        // locked above, or the rename would replace something unchecked.
+        use std::os::unix::fs::MetadataExt;
+        let locked = block.metadata().context("stat the locked control block")?;
+        let named = std::fs::symlink_metadata(ctrl)
+            .with_context(|| format!("stat control block {}", ctrl.display()))?;
+        if (named.dev(), named.ino()) != (locked.dev(), locked.ino()) {
+            bail!(
+                "--reset-arena refused: {} is not the control block file that was locked \
+                 (a symlink, or replaced meanwhile). Pass the control block's own path.",
+                ctrl.display()
+            );
+        }
         leyline_core::control::reinitialize(ctrl)
             .with_context(|| format!("--reset-arena: reinitialise {}", ctrl.display()))?;
         eprintln!(
@@ -326,6 +340,29 @@ mod tests {
         let _own = crate::daemon::arena_lock::ArenaLock::try_acquire(&ours).unwrap();
         let _lease = ControlLease::acquire(&ctrl, &ours, true).unwrap();
         assert_eq!(version(&ctrl), leyline_core::control::VERSION);
+    }
+
+    /// A control path that is a symlink is refused rather than replaced: the
+    /// rename would swap the link, not the block it points at.
+    #[test]
+    fn a_reset_refuses_to_replace_a_symlinked_control_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("real.ctrl");
+        write_block(&target, 2, "");
+        let ctrl = dir.path().join("c.ctrl");
+        std::os::unix::fs::symlink(&target, &ctrl).unwrap();
+        let err = ControlLease::acquire(&ctrl, &dir.path().join("a.arena"), true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not the control block file"),
+            "{err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&ctrl)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(version(&target), 2);
     }
 
     /// A file that is not a control block is never overwritten by a reset.

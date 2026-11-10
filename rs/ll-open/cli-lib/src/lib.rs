@@ -163,6 +163,25 @@ pub enum RootfsCommands {
         #[arg(long, value_enum, default_value_t = SymlinkMode::Refuse)]
         symlinks: SymlinkMode,
     },
+
+    /// Make a CAS root on a case-sensitive filesystem exist and print it as
+    /// JSON (`casRoot` is the path for `--cas-root`). macOS: create (once)
+    /// and attach a grow-on-demand case-sensitive APFS sparsebundle at
+    /// `<state>/cas-volume/cas.sparsebundle`, attached at
+    /// `<state>/cas-volume/mnt`, CAS root `<state>/cas-volume/mnt/cas`.
+    /// Linux: verify `<state>/cas` is on a case-sensitive filesystem.
+    /// Refused elsewhere. Idempotent; never needs sudo.
+    ProvisionCas {
+        /// The state directory (default: `$LEYLINE_STATE_DIR`, else
+        /// `$XDG_STATE_HOME/leyline`, else `~/.local/state/leyline`).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+
+        /// Logical maximum of a volume this creates, in GiB. It grows on
+        /// demand up to it; an existing volume keeps its cap.
+        #[arg(long, default_value_t = 64)]
+        size_cap_gib: u64,
+    },
 }
 
 /// Self-management subcommands (bead ley-line-open-321ded, rustup/uv

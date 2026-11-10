@@ -2,6 +2,8 @@
 set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
+# shellcheck source=tools/release_common.sh
+. "$repo_root/tools/release_common.sh"
 cd "$repo_root"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/leyline-release-version.XXXXXX")
 trap 'rm -rf "$tmp_dir"' 0 1 2 15
@@ -57,10 +59,10 @@ schema_version=$(sed -nE \
 #   2. schema_version != version: binary-only release, reusing an
 #      ALREADY-PUBLISHED schema tag. Refuse if that tag was never actually
 #      published (a schema_version pointing nowhere is not "unchanged", it's
-#      wrong), and refuse if clients/go/leyline-schema drifted from that tag
+#      wrong), and refuse if the public schema surface drifted from that tag
 #      without SCHEMA_VERSION moving to match — the same drift
-#      tag_release.sh's own diff --quiet catches at tag time, caught here
-#      instead so a release fails fast rather than at the tag step.
+#      tag_release.sh catches at tag time, caught here instead so a release
+#      fails fast rather than at the tag step.
 if [ "$schema_version" != "$version" ]; then
     old_schema_tag="clients/go/leyline-schema/v$schema_version"
     if ! git rev-parse -q --verify "refs/tags/$old_schema_tag" >/dev/null 2>&1; then
@@ -71,25 +73,14 @@ if [ "$schema_version" != "$version" ]; then
              "$old_schema_tag is not a published tag — nothing to reuse" >&2
         exit 1
     fi
-    if ! git diff --quiet "$old_schema_tag" -- clients/go/leyline-schema; then
-        echo "SCHEMA_VERSION is unchanged at $schema_version, but" \
-             "clients/go/leyline-schema differs from $old_schema_tag — bump" \
-             "SCHEMA_VERSION to $version or revert the schema-client change" >&2
-        exit 1
-    fi
-    # The Go schema-client is not the only published schema surface: the
-    # schema-spec IDL (execution/v1 among it, shipped as release assets) and
-    # its conformance vectors are too, and carry no Go type, so the check
-    # above cannot see a change to them. A binary-only release must not
-    # republish a changed contract under the old SCHEMA_VERSION
-    # (bead ley-line-open-da36d2).
-    if ! git diff --quiet "$old_schema_tag" -- \
-        ':(glob)rs/ll-core/schema-spec/**/*.capnp' \
-        ':(glob)rs/ll-core/schema-spec/*.capnp' \
-        ':(glob)rs/ll-core/schema-spec/**/test-vectors/**'; then
-        echo "SCHEMA_VERSION is unchanged at $schema_version, but the" \
-             "rs/ll-core/schema-spec IDL or vectors differ from $old_schema_tag" \
-             "— bump SCHEMA_VERSION to $version or revert the schema change" >&2
+    # The surface is the Go schema client plus the schema-spec IDL and
+    # vectors (beads ley-line-open-da36d2, ley-line-open-a4946a); the bump
+    # script decides SCHEMA_VERSION through the same function.
+    if ! release_schema_surface_unchanged git "$old_schema_tag"; then
+        echo "SCHEMA_VERSION is unchanged at $schema_version, but the public" \
+             "schema surface (clients/go/leyline-schema, rs/ll-core/schema-spec" \
+             "IDL or vectors) differs from $old_schema_tag — bump" \
+             "SCHEMA_VERSION to $version or revert the schema change" >&2
         exit 1
     fi
 fi

@@ -54,12 +54,45 @@ pub trait Backend: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// What an active run's guest has printed so far, bounded, for the
+    /// embedder that started it. `None` when the run is not active here, or
+    /// when the backend keeps no output (the default). A finished run's
+    /// output comes with its status from [`Backend::poll_outcome`].
+    fn output(&self, _run_id: &str) -> Option<crate::GuestOutput> {
+        None
+    }
+
+    /// [`Backend::poll`] with the finished run's guest output alongside its
+    /// status, as one typed [`crate::RunOutcome`]. Like `poll`, it consumes
+    /// the completion. The default carries no output.
+    fn poll_outcome(&self, run_id: &str) -> Result<Option<crate::RunOutcome>, ExecutionError> {
+        Ok(self.poll(run_id)?.map(|status| crate::RunOutcome {
+            status,
+            output: None,
+        }))
+    }
+
     /// Cancel one active execution and release backend-owned resources.
     ///
     /// The boolean is false when the backend has no active run with this ID;
     /// transport adapters can project that as an idempotent no-op or a typed
     /// not-found result without reaching into backend internals.
     fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError>;
+}
+
+/// A storage refusal by name is the host's (unsupported, not retryable);
+/// a failed tool or filesystem call is the backend's.
+fn storage_error(error: crate::cas_volume::CasVolumeError) -> ExecutionError {
+    use crate::cas_volume::CasVolumeError;
+    let detail = format!("provision the CAS root: {error}");
+    match error {
+        CasVolumeError::UnsupportedHost { .. } | CasVolumeError::CaseInsensitive { .. } => {
+            ExecutionError::unsupported(detail)
+        }
+        CasVolumeError::Config(_) | CasVolumeError::Tool { .. } | CasVolumeError::Io { .. } => {
+            ExecutionError::backend(detail)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -79,11 +112,16 @@ struct ServiceState {
     channels: HashMap<String, Vec<crate::WorkerChannel>>,
     provisioned: bool,
     provisioned_backend: Option<String>,
+    /// The CAS root the last successful provision made exist.
+    provisioned_cas_root: Option<std::path::PathBuf>,
 }
 
 /// One lifecycle implementation used by every transport adapter.
 pub struct ExecutionService<B> {
     backend: B,
+    /// Where the backend's CAS root comes from. `provision` makes it exist
+    /// before the backend checks its readiness (bead `ley-line-open-ba86d3`).
+    storage: Option<crate::cas_volume::CasStorage>,
     state: RwLock<ServiceState>,
 }
 
@@ -91,8 +129,22 @@ impl<B: Backend> ExecutionService<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend,
+            storage: None,
             state: RwLock::new(ServiceState::default()),
         }
+    }
+
+    /// The CAS root `provision` makes exist and reports. It must be the
+    /// directory the backend was configured to read rootfs trees from.
+    pub fn with_cas_storage(mut self, storage: crate::cas_volume::CasStorage) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// The CAS root the last successful `provision` made exist; `None`
+    /// before one, or without [`with_cas_storage`](Self::with_cas_storage).
+    pub fn provisioned_cas_root(&self) -> Option<std::path::PathBuf> {
+        self.state.read().provisioned_cas_root.clone()
     }
 
     pub fn capabilities(&self) -> BackendCapabilities {
@@ -109,6 +161,19 @@ impl<B: Backend> ExecutionService<B> {
                 "provision idempotency key must not be empty",
             ));
         }
+        // A request refused for its class changes nothing: checked before
+        // storage, which may create and attach a volume.
+        if self.backend.capabilities().backend_class != backend_class {
+            return Err(ExecutionError::unsupported(
+                "requested backend class is unavailable",
+            ));
+        }
+        // Storage next, outside the state lock (creating and attaching a
+        // volume takes seconds): a backend checks its CAS root exists.
+        let cas_root = match &self.storage {
+            Some(storage) => Some(storage.provision().map_err(storage_error)?),
+            None => None,
+        };
         let capabilities = self.backend.provision()?;
         if capabilities.backend_class != backend_class {
             return Err(ExecutionError::unsupported(
@@ -118,6 +183,7 @@ impl<B: Backend> ExecutionService<B> {
         let mut state = self.state.write();
         state.provisioned = true;
         state.provisioned_backend = Some(capabilities.backend_id.clone());
+        state.provisioned_cas_root = cas_root;
         Ok(capabilities)
     }
 

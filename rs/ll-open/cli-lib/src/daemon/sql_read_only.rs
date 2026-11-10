@@ -292,6 +292,16 @@ pub fn restrict_modules(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
+/// Whether `conn` has opened its temp database. SQLite opens it lazily, the
+/// first time a statement names the temp schema; `sqlite3_db_filename`
+/// returns NULL for a schema with no open b-tree, and a name (empty for an
+/// in-memory temp database) once it is open (bead `ley-line-open-3befbc`).
+pub fn temp_is_open(conn: &Connection) -> bool {
+    // SAFETY: `conn` is open; the schema name is a NUL-terminated literal,
+    // and the returned pointer is only compared with NULL.
+    !unsafe { ffi::sqlite3_db_filename(conn.handle(), c"temp".as_ptr()) }.is_null()
+}
+
 /// Why a `query` statement was refused. On the wire it is
 /// `QueryRefusal.reason` (`daemon.capnp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +384,7 @@ pub fn query<T>(
     run: impl FnOnce(&mut Statement<'_>) -> Result<T>,
 ) -> Result<T> {
     let seen = Arc::new(Mutex::new(Seen::default()));
+    let temp_was_open = temp_is_open(conn);
     let catalog = Catalog::read(conn)?;
     // A connection that still holds a module outside the allow-list (one
     // the pool did not restrict, or one registered on it since) can reach
@@ -408,6 +419,12 @@ pub fn query<T>(
             ));
         }
     };
+    // A statement that opened the temp database read the temp schema,
+    // though SQLite never asked the authorizer about it (a `NATURAL` join
+    // with `temp.sqlite_master`). The pool discards this reader on return.
+    if !temp_was_open && temp_is_open(authorized.conn()) {
+        return Err(temp_schema_refusal().into());
+    }
     let saw_select = lock(&seen).saw_select;
     if !saw_select || !stmt.readonly() {
         return Err(Refusal {
@@ -423,6 +440,16 @@ pub fn query<T>(
     match lock(&seen).denied.take() {
         Some(refusal) => Err(refusal.into()),
         None => Ok(out),
+    }
+}
+
+/// The refusal of a statement that reached the temp schema: a read of its
+/// table, as the authorizer names it when SQLite does ask.
+fn temp_schema_refusal() -> Refusal {
+    Refusal {
+        reason: RefusalReason::DeniedAction,
+        action: "read".into(),
+        subject: TEMP_SCHEMA_TABLE.into(),
     }
 }
 

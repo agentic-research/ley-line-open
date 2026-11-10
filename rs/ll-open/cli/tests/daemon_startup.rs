@@ -551,3 +551,67 @@ fn reset_arena_refuses_a_control_block_a_live_daemon_serves() {
     let (status, log) = live.stop();
     assert!(status.success(), "{status}:\n{log}");
 }
+
+// --------------------------------------------------------------------------
+// ley-line-open-1d4003: one daemon per control block
+// --------------------------------------------------------------------------
+
+/// A second daemon on the same `--control`, on another `--arena` and without
+/// `--reset-arena`, is refused: it would publish into the arena the block
+/// names while holding only its own arena's lock, and its socket bind would
+/// unlink the first daemon's `<ctrl>.sock`. The first keeps serving on the
+/// same socket, and a long-lived reader (mache's mapper) still shares the
+/// lease with it.
+#[test]
+fn a_second_daemon_on_one_control_block_is_refused() {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let fx = Fixture::new();
+    let ctrl = fx.work("c.ctrl");
+    let first = start(fx.daemon(&[
+        "--arena".as_ref(),
+        os(&fx.work("a.arena")),
+        "--control".as_ref(),
+        os(&ctrl),
+    ]));
+    let sock = fx.work("c.sock");
+    let inode = std::fs::metadata(&sock)
+        .expect("the first daemon's socket")
+        .ino();
+    let block = std::fs::read(&ctrl).unwrap();
+    // mache's mapper holds the lease shared beside the running daemon.
+    let reader = hold_flock(&fx.work("c.ctrl.lock"), libc::LOCK_SH);
+
+    let stderr = refused(fx.daemon(&[
+        "--arena".as_ref(),
+        os(&fx.work("b.arena")),
+        "--control".as_ref(),
+        os(&ctrl),
+    ]));
+    assert!(
+        stderr.contains("another daemon serves the control block"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::metadata(&sock)
+            .expect("the socket is still there")
+            .ino(),
+        inode,
+        "the first daemon's socket was not replaced"
+    );
+    assert_eq!(
+        std::fs::read(&ctrl).unwrap(),
+        block,
+        "the block is untouched"
+    );
+    let mut stream = UnixStream::connect(&sock).expect("the first daemon still serves");
+    stream.write_all(b"{\"op\":\"leyline_version\"}\n").unwrap();
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    assert!(reply.contains("\"ok\":true"), "{reply}");
+
+    drop(reader);
+    let (status, log) = first.stop();
+    assert!(status.success(), "{status}:\n{log}");
+}

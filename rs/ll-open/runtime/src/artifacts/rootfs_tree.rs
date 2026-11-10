@@ -14,13 +14,13 @@ const MAX_SYMLINK_HOPS: usize = 40;
 /// The top-level directories libkrun's guest init mounts a kernel
 /// filesystem over before the workload runs (`mount_filesystems` in
 /// `rs/third_party/libkrun/src/init_blob/init/init.c`): devtmpfs on `/dev`
-/// (init.c:550, then devpts on `/dev/pts` at :594 and tmpfs on `/dev/shm` at
-/// :601), proc on `/proc` (:566), sysfs on `/sys` (:573, then cgroup2 on
-/// `/sys/fs/cgroup` at :580). Each mount either succeeds, is already there
-/// (`EBUSY`), or makes init exit before anything runs (:1495-1498). Nothing
+/// (init.c:559, then devpts on `/dev/pts` at :603 and tmpfs on `/dev/shm` at
+/// :610), proc on `/proc` (:575), sysfs on `/sys` (:582, then cgroup2 on
+/// `/sys/fs/cgroup` at :589). Each mount either succeeds, is already there
+/// (`EBUSY`), or makes init exit before anything runs (:1905-1908). Nothing
 /// an image holds beneath these is visible to the workload, and nothing a
 /// link names beneath them is the image's to supply. `/tmp` is not one:
-/// init mounts there only in TDX builds (:1467-1487), and then an ext4
+/// init mounts there only in TDX builds (:1877-1897), and then an ext4
 /// volume, not a kernel filesystem.
 pub(crate) const KERNEL_MOUNTED: [&str; 3] = ["dev", "proc", "sys"];
 

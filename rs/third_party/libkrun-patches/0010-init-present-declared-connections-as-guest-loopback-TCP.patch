@@ -27,6 +27,18 @@ copying bytes with read(2) and write(2) only, so no ancillary data
 crosses it. The variable is removed
 from the workload's environment.
 
+A host peer can connect to a serve channel before the workload listens:
+the connection is established by then, so the relay holds it and
+retries the workload's port, backing off from 5 ms to 200 ms, for at
+most 10 s (the MySQL client's default connect_timeout), and gives up
+early if the peer hangs up. A client's first connection then works once
+the server is up. Only "nothing listening" (ECONNREFUSED) is retried and
+bounded; a handshake a full accept queue delays is waited for as a
+blocking connect would wait. A
+workload that has not listened within the bound gets the connection
+closed, which a UNIX-socket peer on macOS sees as end-of-file: that
+socket family carries no reset.
+
 Init also installs a seccomp filter, before it starts anything, that
 refuses every datagram, raw and packet socket: AF_INET and AF_INET6
 sockets may be SOCK_STREAM with protocol 0 or IPPROTO_TCP and nothing
@@ -38,7 +50,7 @@ refuses the filter stops the guest before the workload runs.
 Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
 ---
 diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
-index 471ed65..28b9e74 100644
+index 471ed65..1f4b89d 100644
 --- a/src/init_blob/init/init.c
 +++ b/src/init_blob/init/init.c
 @@ -32,9 +32,18 @@
@@ -60,7 +72,7 @@ index 471ed65..28b9e74 100644
  #endif
  
  #include "dhcp.h"
-@@ -1431,6 +1440,407 @@ close_socket:
+@@ -1431,6 +1440,559 @@ close_socket:
      close(sockfd);
      return result;
  }
@@ -154,7 +166,10 @@ index 471ed65..28b9e74 100644
 + *   serve:<tcp port>:<vsock port>  init listens on <vsock port>; each
 + *                                  connection the host makes there is joined
 + *                                  to a new connection to 127.0.0.1:<tcp
-+ *                                  port>, where the workload listens.
++ *                                  port>, where the workload listens; a
++ *                                  connection that arrives before the
++ *                                  workload listens is held until it does,
++ *                                  within SERVE_HOLD_MS.
 + *
 + * The embedder computes the list; init derives nothing. Every listener is
 + * bound before the workload starts, so the workload can neither take a dial
@@ -286,25 +301,174 @@ index 471ed65..28b9e74 100644
 +    return 0;
 +}
 +
-+/* Open this channel's far side: the host's vsock port, or the workload. */
-+static int dial_far_side(const struct loopback_channel *channel)
++/*
++ * A host peer can connect to a serve channel before the workload listens on
++ * its port: the VMM accepts the host connection and the guest kernel
++ * completes the vsock connection whatever the workload is doing, so the
++ * connection is already established when the relay finds the workload's
++ * port refusing. Closing it then would look to the peer like a server that
++ * accepted and hung up. The relay instead holds the connection and retries
++ * the workload, so a client's first connection works once the server is up.
++ *
++ * SERVE_HOLD_MS bounds the hold: 10 s, the default connect_timeout of the
++ * MySQL client library, so a stock client that is still waiting sees the
++ * outcome no later than its own timeout would end the wait. A workload that
++ * has not listened within the bound, or that never will, gets the held
++ * connection closed. The retries back off from SERVE_RETRY_FIRST_MS,
++ * doubling, to SERVE_RETRY_MAX_MS, so the hold makes at most about 60
++ * connect attempts, and each wait is a poll(2) on the host side that ends
++ * early when the peer hangs up: nothing spins, and a peer that gave up is
++ * not held. Only ECONNREFUSED (nothing listening yet) is retried, and the
++ * bound covers only that: once something listens, a handshake its full
++ * accept queue delays is waited for as a blocking connect(2) would wait.
++ * Each connection is held in its own process, so a held connection never
++ * delays another, on this channel or any other.
++ *
++ * What the peer sees when the hold ends without a workload: the host end of
++ * a serve channel is a UNIX stream socket, and on macOS a UNIX stream peer
++ * observes only end-of-file, never a reset, however the other end closes;
++ * the vsock hop carries no reset either. So it is end-of-file, without a
++ * byte. A refusal the peer can tell apart (ECONNREFUSED at connect) needs
++ * the host socket not to listen while the workload does not, which is bead
++ * ley-line-open-b00ae3.
++ */
++#define SERVE_HOLD_MS 10000
++#define SERVE_RETRY_FIRST_MS 5
++#define SERVE_RETRY_MAX_MS 200
++
++/* glibc defines POLLRDHUP only under _GNU_SOURCE; the value is the ABI's. */
++#ifndef POLLRDHUP
++#define POLLRDHUP 0x2000
++#endif
++
++static long monotonic_ms(void)
++{
++    struct timespec now;
++
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return (long)now.tv_sec * 1000L + now.tv_nsec / 1000000L;
++}
++
++/*
++ * poll(2) until an event or `deadline` (monotonic ms). Returns poll's count,
++ * 0 at the deadline.
++ */
++static int poll_until(struct pollfd *fds, nfds_t count, long deadline)
++{
++    long left;
++    int ready;
++
++    for (;;) {
++        left = deadline - monotonic_ms();
++        if (left <= 0) {
++            return 0;
++        }
++        ready = poll(fds, count, (int)left);
++        if (ready >= 0 || errno != EINTR) {
++            return ready;
++        }
++    }
++}
++
++/*
++ * Connect to the workload's listener on 127.0.0.1:<tcp port>, holding the
++ * host connection `host` while the workload is not listening yet, within
++ * SERVE_HOLD_MS. Returns the connected socket, or -1 when the bound passes,
++ * the host side hangs up, or the connect fails for another reason.
++ */
++static int connect_workload(const struct loopback_channel *channel, int host)
 +{
 +    struct sockaddr_in inet;
++    struct pollfd fds[2];
++    long deadline = monotonic_ms() + SERVE_HOLD_MS, wait;
++    int delay = SERVE_RETRY_FIRST_MS, error, fd, flags, ready;
++    bool last = false;
++    socklen_t length;
++
++    loopback_address(&inet, channel->tcp_port);
++    for (;;) {
++        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++        if (fd < 0) {
++            return -1;
++        }
++        error = 0;
++        if (connect(fd, (struct sockaddr *)&inet, sizeof(inet)) < 0) {
++            error = errno;
++        }
++        if (error == EINPROGRESS) {
++            /*
++             * Something listens, and its handshake has not completed (a full
++             * accept queue drops the SYN). The hold bounds only the time
++             * nothing listens, so this waits as the blocking connect(2) it
++             * replaces did: until the kernel completes or abandons the
++             * handshake, or the host side hangs up.
++             */
++            fds[0].fd = fd;
++            fds[0].events = POLLOUT;
++            fds[0].revents = 0;
++            fds[1].fd = host;
++            fds[1].events = POLLRDHUP;
++            fds[1].revents = 0;
++            do {
++                ready = poll(fds, 2, -1);
++            } while (ready < 0 && errno == EINTR);
++            if (ready <= 0 || fds[1].revents != 0) {
++                close(fd);
++                return -1;
++            }
++            length = sizeof(error);
++            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0) {
++                error = errno;
++            }
++        }
++        if (error == 0) {
++            flags = fcntl(fd, F_GETFL);
++            if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
++                close(fd);
++                return -1;
++            }
++            return fd;
++        }
++        close(fd);
++        if (error != ECONNREFUSED || last) {
++            return -1;
++        }
++        /*
++         * Not listening yet: wait, unless the host side hangs up first. A
++         * wait the bound cuts short is followed by one last attempt, so a
++         * workload that listens just before the bound is still reached.
++         */
++        wait = monotonic_ms() + delay;
++        if (wait >= deadline) {
++            wait = deadline;
++            last = true;
++        }
++        fds[0].fd = host;
++        fds[0].events = POLLRDHUP;
++        fds[0].revents = 0;
++        if (poll_until(fds, 1, wait) != 0) {
++            return -1;
++        }
++        delay = delay * 2 > SERVE_RETRY_MAX_MS ? SERVE_RETRY_MAX_MS : delay * 2;
++    }
++}
++
++/*
++ * Open this channel's far side for the connection `near` accepted: the
++ * host's vsock port, or the workload.
++ */
++static int dial_far_side(const struct loopback_channel *channel, int near)
++{
 +    struct sockaddr_vm vm;
 +    int fd;
 +
 +    if (channel->serve) {
-+        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-+        loopback_address(&inet, channel->tcp_port);
-+        if (fd >= 0 && connect(fd, (struct sockaddr *)&inet, sizeof(inet)) == 0) {
-+            return fd;
-+        }
-+    } else {
-+        fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
-+        vsock_address(&vm, VMADDR_CID_HOST, channel->vsock_port);
-+        if (fd >= 0 && connect(fd, (struct sockaddr *)&vm, sizeof(vm)) == 0) {
-+            return fd;
-+        }
++        return connect_workload(channel, near);
++    }
++    fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    vsock_address(&vm, VMADDR_CID_HOST, channel->vsock_port);
++    if (fd >= 0 && connect(fd, (struct sockaddr *)&vm, sizeof(vm)) == 0) {
++        return fd;
 +    }
 +    if (fd >= 0) {
 +        close(fd);
@@ -410,7 +574,7 @@ index 471ed65..28b9e74 100644
 +                for (j = 0; j < count; j++) {
 +                    close(channels[j].listener);
 +                }
-+                far = dial_far_side(&channels[i]);
++                far = dial_far_side(&channels[i], accepted);
 +                if (far >= 0) {
 +                    join_streams(accepted, far);
 +                }
@@ -468,7 +632,7 @@ index 471ed65..28b9e74 100644
  #endif
  
  int main(int argc, char **argv)
-@@ -1586,6 +1996,21 @@ int main(int argc, char **argv)
+@@ -1586,6 +2148,21 @@ int main(int argc, char **argv)
              printf("Warning: Couldn't enable dummy interface\n");
          }
      }

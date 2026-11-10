@@ -288,6 +288,13 @@ pub enum OciImportError {
     Registry(String),
     #[error("insecure transport refused: {0}")]
     InsecureTransport(String),
+    /// A token realm or redirect that would reach a loopback, private,
+    /// link-local or otherwise non-public address (bead
+    /// `ley-line-open-b1c18d`). Refused before connecting.
+    #[error(
+        "{url} resolves to the non-public address {address}: a token realm or redirect may reach only public addresses, the registry itself, or the loopback registry the insecure opt-in names"
+    )]
+    NonPublicDestination { url: String, address: String },
     #[error("the registry redirected more than {limit} times")]
     TooManyRedirects { limit: u32 },
     #[error("the image exceeds its {limit}-byte download limit")]

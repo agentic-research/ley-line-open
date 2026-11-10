@@ -123,6 +123,16 @@ printf '%s\n' 'fn t(c: &Connection) { c.query_row("SELECT blob_bytes FROM source
     > "$scratch/test-subtree/rs/x/src/tree_tests.rs"
 expect 0 test-subtree
 
+# Build output in a separate target directory (`task release:hypervisor:record`
+# builds in rs/target-hypervisor) is not source.
+tree build-output <<'EOF'
+fn real() {}
+EOF
+mkdir -p "$scratch/build-output/rs/target-hypervisor/debug/build/x/out"
+printf '%s\n' 'fn t(c: &Connection) { c.query_row("SELECT blob_bytes FROM source_blobs", [], |r| r.get(0)); }' \
+    > "$scratch/build-output/rs/target-hypervisor/debug/build/x/out/bindgen.rs"
+expect 0 build-output
+
 tree no-accessor <<'EOF'
 fn real() {}
 EOF

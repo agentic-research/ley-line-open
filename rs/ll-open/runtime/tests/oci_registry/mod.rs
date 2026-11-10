@@ -199,12 +199,18 @@ fn handle(stream: TcpStream, state: &Mutex<State>, origin: &str) {
         Response::Stall(headers) => {
             let _ = stream.write_all(headers.as_bytes());
             let _ = stream.flush();
-            thread::sleep(Duration::from_secs(20));
+            // Hold the connection open, sending nothing more, until the
+            // client gives up and closes it (or the read timeout ends it).
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            let _ = reader.read(&mut [0; 1]);
         }
         Response::Drip(headers, bytes, gap) => {
             let _ = stream.write_all(headers.as_bytes());
             for byte in bytes {
                 let _ = stream.flush();
+                // The server side of a slow network: the delay between bytes
+                // is the behavior under test (the client's body deadline),
+                // not a wait for a condition a test could poll instead.
                 thread::sleep(gap);
                 if stream.write_all(&[byte]).is_err() {
                     return;

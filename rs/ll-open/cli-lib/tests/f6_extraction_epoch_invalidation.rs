@@ -327,7 +327,10 @@ fn f6_epoch_6_rederives_value_refs_from_epoch_5_arena() {
         let _g = EpochOverride::set("5");
         parse_pass(&db_path, repo.path());
     }
-    execute(&db_path, "DELETE FROM node_refs WHERE node_kind = 'var_spec'");
+    execute(
+        &db_path,
+        "DELETE FROM node_refs WHERE node_kind = 'var_spec'",
+    );
     assert_eq!(
         refs_snapshot(&db_path),
         vec![("helper".to_string(), 1), ("x".to_string(), 1)]

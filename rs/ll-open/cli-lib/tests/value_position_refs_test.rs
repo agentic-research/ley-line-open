@@ -57,10 +57,7 @@ fn ref_rows(conn: &Connection, rel: &str) -> Vec<(Row, bool)> {
     )
     .unwrap()
     .query_map([lo, hi], |r| {
-        Ok((
-            (r.get(0)?, r.get(1)?, r.get(2)?),
-            r.get::<_, i64>(3)? != 0,
-        ))
+        Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get::<_, i64>(3)? != 0))
     })
     .unwrap()
     .map(|r| r.unwrap())

@@ -95,6 +95,26 @@ struct AstEntry {
     /// hashes; spans/paths/node_ids are OUT). Stamped onto the `_ast`
     /// occurrence row and pointing at the deduped `node_content` row.
     node_hash: [u8; 32],
+    /// The entry's index in the fold's pre-order walk, comments included.
+    /// Sibling order (`nodes.ord`) follows it; the nid ordinal does not,
+    /// because comments take the ordinals after every code entry (bead
+    /// `ley-line-open-aa1634`, [`order_ast_entries`]).
+    pre: usize,
+    /// A comment occurrence ([`emit_comment_occurrence`]).
+    comment: bool,
+}
+
+/// Lay a file's `_ast` entries out in ordinal order: every code entry in
+/// pre-order (root first), then every comment entry in source order (bead
+/// `ley-line-open-aa1634`). Comments come after the code so that adding,
+/// editing or removing a comment moves no code `nid`, the same edit
+/// stability the file-local surrogate was chosen for (review-gate 4,
+/// `stability_matrix_gate.rs`). Injected ids take the ordinals after both.
+fn order_ast_entries(entries: Vec<AstEntry>) -> Vec<AstEntry> {
+    let (mut code, comments): (Vec<AstEntry>, Vec<AstEntry>) =
+        entries.into_iter().partition(|a| !a.comment);
+    code.extend(comments);
+    code
 }
 
 /// A `node_content` row — one per UNIQUE subtree (deduped by `node_hash`).
@@ -975,7 +995,8 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 ///
 /// projection-v5 lays a file's 24-bit ordinal space out in one order: the AST
 /// entries take `0..ast_entries` in pre-order (index == the pointer store's
-/// blob_ord), and injected-subtree ids — which carry fact rows but no
+/// blob_ord; since extraction epoch 7 the code entries in pre-order, then the
+/// comment entries, [`order_ast_entries`]), and injected-subtree ids — which carry fact rows but no
 /// `_ast`/`nodes` row — take the ordinals immediately after, in fold order.
 /// `j` therefore counts from the AST entry count, not from zero.
 fn injected_ordinal(ast_entries: usize, j: usize) -> usize {
@@ -1859,8 +1880,9 @@ fn parse_into_conn_with(
                     };
                     let base = file_nid(file_id, 0);
 
-                    // Ordinals: `ast_entries` is pre-order (root first), and
-                    // its index IS the pointer store's blob_ord — the nid's
+                    // Ordinals: `ast_entries` is pre-order (root first; code
+                    // entries, then comment entries, `order_ast_entries`),
+                    // and its index IS the pointer store's blob_ord — the nid's
                     // low 24 bits are one and the same number. Injected
                     // nodes (no `_ast`/`nodes` rows, fact rows only) take
                     // the ordinals PAST the `_ast` count, in fold order.
@@ -1887,12 +1909,17 @@ fn parse_into_conn_with(
                     // parent_nid + sibling ord per entry, derived from the
                     // ancestry-prefix id the fold builds (parents precede
                     // children in pre-order, siblings keep source order).
+                    // Walked in the fold's pre-order, comments in place, so
+                    // `ord` is the source order among code and comment
+                    // siblings alike (bead `ley-line-open-aa1634`).
                     // The per-kind display rank derives from `ord` at read
                     // time, reproducing the pre-v5 `{kind}[_{idx}]` names.
                     let mut sib_next: HashMap<Nid, i64> = HashMap::new();
                     let mut placement: HashMap<&str, (Nid, i64)> =
                         HashMap::with_capacity(pf.ast_entries.len());
-                    for a in pf.ast_entries.iter().skip(1) {
+                    let mut in_pre_order: Vec<&AstEntry> = pf.ast_entries.iter().collect();
+                    in_pre_order.sort_unstable_by_key(|a| a.pre);
+                    for a in in_pre_order.into_iter().skip(1) {
                         let parent_str = a
                             .node_id
                             .rsplit_once('/')
@@ -3587,6 +3614,8 @@ pub(crate) fn parse_file_pure(
         end_row: root.end_position().row,
         end_col: root.end_position().column,
         node_hash: [0u8; 32],
+        pre: root_idx,
+        comment: false,
     });
 
     // Fold the whole tree bottom-up. Creates the `_ast`/`nodes`/refs rows
@@ -3611,6 +3640,7 @@ pub(crate) fn parse_file_pure(
         &ctx,
     );
     ast_entries[root_idx].node_hash = root_hash;
+    let ast_entries = order_ast_entries(ast_entries);
 
     // Arena query overrides (bead `ley-line-open-e72629`): a pathological
     // override tripped its resource ceiling somewhere in this file. Drop the
@@ -3834,7 +3864,8 @@ fn is_comment_extra(node: tree_sitter::Node<'_>) -> bool {
 /// Record one comment extra as a terminal occurrence (bead
 /// `ley-line-open-aa1634`): an `_ast` row with its grammar kind and span, and
 /// a leaf `nodes` row carrying its text, in source order under the node
-/// tree-sitter attached it to.
+/// tree-sitter attached it to. Its nid ordinal comes after every code
+/// entry's ([`order_ast_entries`]), so a comment edit moves no code nid.
 ///
 /// OCCURRENCE-ONLY: the comment never enters its parent's `node_hash` fold,
 /// so a comment-only edit leaves every code `node_hash` unchanged. Its own
@@ -3881,6 +3912,8 @@ fn emit_comment_occurrence(
         end_row: comment.end_position().row,
         end_col: comment.end_position().column,
         node_hash: h,
+        pre: ast_entries.len(),
+        comment: true,
     });
     nodes.push(ParsedNode {
         id,
@@ -4016,6 +4049,8 @@ fn fold_children(
                 end_row: child.end_position().row,
                 end_col: child.end_position().column,
                 node_hash: [0u8; 32],
+                pre: entry_idx,
+                comment: false,
             });
 
             // Refs via the language-dispatched factory.

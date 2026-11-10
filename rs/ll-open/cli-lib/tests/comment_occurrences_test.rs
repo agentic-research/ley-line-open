@@ -404,6 +404,70 @@ fn a_comment_only_edit_changes_no_node_hash() {
     );
 }
 
+/// The `(nid, grammar kind)` of every non-comment occurrence.
+fn code_nids(conn: &Connection, rel: &str) -> Vec<(i64, String)> {
+    let (lo, hi) = file_range(conn, rel);
+    conn.prepare(
+        "SELECT a.nid, k.raw_kind FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id
+          WHERE a.nid BETWEEN ?1 AND ?2 AND k.raw_kind NOT LIKE '%comment%'
+          ORDER BY a.nid",
+    )
+    .unwrap()
+    .query_map([lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Comments take the ordinals after every code occurrence, so adding,
+/// editing or removing one moves no code `nid` (review-gate 4,
+/// `stability_matrix_gate.rs`), while `nodes.ord` keeps source order among
+/// code and comment siblings alike.
+#[test]
+fn a_comment_only_edit_moves_no_code_nid() {
+    let with = parse_one("p.go", GO);
+    let edited = parse_one("p.go", GO_COMMENTS_EDITED);
+    let bare = parse_one("p.go", GO_NO_COMMENTS);
+    assert_eq!(code_nids(&with, "p.go"), code_nids(&bare, "p.go"));
+    assert_eq!(code_nids(&edited, "p.go"), code_nids(&bare, "p.go"));
+    let (lo, _) = file_range(&with, "p.go");
+    let max_code = code_nids(&with, "p.go").last().unwrap().0;
+    let min_comment: i64 = with
+        .query_row(
+            "SELECT MIN(a.nid) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id
+              WHERE k.raw_kind = 'comment' AND a.nid >= ?1",
+            [lo],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(min_comment > max_code, "comments come after the code");
+    // Source order among the root's children: comment, package, comment,
+    // comment, comment, Add, E.
+    let root_children: Vec<String> = with
+        .prepare(
+            "SELECT k.raw_kind FROM nodes n JOIN _ast a ON a.nid = n.nid
+               JOIN kinds k ON k.kind_id = a.kind_id
+              WHERE n.parent_nid = ?1 ORDER BY n.ord",
+        )
+        .unwrap()
+        .query_map([lo], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        root_children,
+        [
+            "comment",
+            "package_clause",
+            "comment",
+            "comment",
+            "comment",
+            "function_declaration",
+            "function_declaration"
+        ]
+    );
+}
+
 #[test]
 fn a_code_edit_in_a_commented_file_still_changes_the_expected_hashes() {
     let before = parse_one("p.go", GO);

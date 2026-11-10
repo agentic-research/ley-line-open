@@ -214,10 +214,15 @@ no row either: injected nodes have no `_ast` rows at all.
   comment-only edit changes no code `node_hash`: only the edited comment's own
   occurrence moves. A comment adds no `node_defs`, `node_refs` or `_imports`
   row and is never probed for an injection.
-- **Locators.** Comments take ordinals in pre-order like every other
-  occurrence, so every `nid` after a file's first comment moves when an arena
-  is re-derived at epoch 7. `nid`s are locators; nothing outside the arena may
-  hold one.
+- **Locators.** A file's code occurrences keep their pre-order ordinals
+  (`nid & 0xFFFFFF`), unchanged from epoch 6; its comments take the ordinals
+  after every code occurrence, in source order, and injected ids the ordinals
+  after those. So adding, editing or removing a comment moves no code `nid`,
+  only comment `nid`s and, for injected ids, their ordinal past the `_ast`
+  count. `nodes.ord` is the source order among code and comment siblings, so
+  a code sibling after a comment has a larger `ord` than at epoch 6. Read
+  document order from `nodes.ord` or the span, never from `nid` order.
+  `nid`s are locators; nothing outside the arena may hold one.
 
 A definition's doc comment is the run of comment siblings directly before the
 definition's occurrence, with no blank line inside the run or between it and

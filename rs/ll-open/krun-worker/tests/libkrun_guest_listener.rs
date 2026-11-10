@@ -42,6 +42,14 @@
 //! §6 gets the same treatment on the channel the microVM tier delivers it by:
 //! a `bind` grant becomes a vsock port muxed to a host UNIX socket, and the host
 //! reaches the guest's vsock listener through that socket and nothing else.
+//!
+//! ## Why the datagram case (bead `ley-line-open-0026d2`)
+//!
+//! §4 lists TCP listeners, and the port map that delivers it governs libkrun's
+//! TSI stream proxy. Its datagram proxy is a separate path that never read the
+//! map, so "only declared listeners are reachable" had to be measured for UDP
+//! as well, under hijacking and a §4 grant together, which is when the VMM's
+//! profile is widest.
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -347,6 +355,341 @@ fn every_declared_guest_listener_is_reachable_and_an_undeclared_one_is_not() {
          which the grant does not declare, while ports {DECLARED_PORTS:?} were \
          declared. The port map must publish exactly the §4 list. worker \
          stderr:\n{worker_stderr}"
+    );
+}
+
+/// The declared §4 listener of the datagram case. §4 is a TCP listener list;
+/// the guest also binds UDP on the same number, so a port map consulted by
+/// number alone would show here.
+const UDP_CASE_TCP_PORT: u16 = 18090;
+/// A UDP port nothing declares.
+const UNDECLARED_UDP_PORT: u16 = 18091;
+
+/// What one host datagram to a UDP port produced.
+#[derive(Debug, PartialEq)]
+enum UdpProbe {
+    /// The host kernel answered ICMP port-unreachable: no socket on the host
+    /// holds the port at that address.
+    Refused,
+    /// A reply came back.
+    Answered(String),
+    /// Neither, within the bound: a host socket holds the port and did not
+    /// answer.
+    Silent,
+}
+
+/// Send `payload` from a socket bound on `from` to `to`, and report what came
+/// back. The socket is connected, so the host kernel hands it the ICMP
+/// port-unreachable a datagram to an unbound port produces, as a refusal on
+/// the next `recv`; that is the event this waits for. The read timeout only
+/// bounds a socket that holds the port and says nothing.
+fn probe_udp(from: IpAddr, to: SocketAddr, payload: &str) -> UdpProbe {
+    let socket = UdpSocket::bind((from, 0)).expect("probe socket");
+    socket.connect(to).expect("connect the probe");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("bound the probe");
+    socket.send(payload.as_bytes()).expect("send the probe");
+    let mut buffer = [0u8; 512];
+    match socket.recv(&mut buffer) {
+        Ok(length) => UdpProbe::Answered(String::from_utf8_lossy(&buffer[..length]).into_owned()),
+        Err(error) if error.kind() == ErrorKind::ConnectionRefused => UdpProbe::Refused,
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            UdpProbe::Silent
+        }
+        Err(error) => panic!("the UDP probe of {to} was inconclusive: {error}"),
+    }
+}
+
+/// The host UDP sockets process `pid` holds, as `lsof` names them
+/// (`127.0.0.1:51234`, `*:51234`).
+fn udp_sockets_of(pid: u32) -> Vec<String> {
+    let output = Command::new("lsof")
+        .args(["-nP", "-a", "-iUDP", "-Fn", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .expect("run lsof to list the worker's UDP sockets");
+    // lsof exits 1 when the process holds no matching file.
+    assert!(
+        output.status.success() || output.stdout.is_empty(),
+        "lsof failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The guest of the datagram case: a TCP listener on `tcp_port` (the declared
+/// control, and the channel the guest reports on), UDP sockets bound on each
+/// of `udp_ports`, and one more that sends a datagram to the host's
+/// `127.0.0.1:host_peer`. Every UDP socket records what it receives. A TCP
+/// line `await <marker>` is answered once some UDP socket has received
+/// `<marker>`, with everything received so far as `<socket>=<payload>`
+/// entries; any other line is echoed as `<port>:<line>`.
+fn udp_guest(tcp_port: u16, udp_ports: &[u16], host_peer: u16) -> String {
+    format!(
+        r#"use std::io::{{BufRead, BufReader, Write}};
+use std::net::{{TcpListener, UdpSocket}};
+use std::sync::{{Arc, Condvar, Mutex}};
+
+type Received = Arc<(Mutex<Vec<String>>, Condvar)>;
+
+fn record(received: &Received, label: String, socket: UdpSocket) {{
+    let received = received.clone();
+    std::thread::spawn(move || {{
+        let mut buffer = [0u8; 512];
+        while let Ok(length) = socket.recv(&mut buffer) {{
+            let payload = String::from_utf8_lossy(&buffer[..length]).into_owned();
+            let (list, changed) = &*received;
+            list.lock().unwrap().push(format!("{{label}}={{payload}}"));
+            changed.notify_all();
+        }}
+    }});
+}}
+
+fn main() {{
+    println!("listener-probe-start");
+    std::io::stdout().flush().unwrap();
+    let tcp = match TcpListener::bind(("0.0.0.0", {tcp_port})) {{
+        Ok(listener) => listener,
+        Err(error) => {{
+            println!("{REPORT}bind-failed: {tcp_port}: {{error}}");
+            return;
+        }}
+    }};
+    let received: Received = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let mut outcomes = String::new();
+    for port in {udp_ports:?} {{
+        match UdpSocket::bind(("0.0.0.0", port)) {{
+            Ok(socket) => {{
+                outcomes.push_str(&format!(" udp{{port}}=bound"));
+                record(&received, format!("udp{{port}}"), socket);
+            }}
+            Err(error) => outcomes.push_str(&format!(" udp{{port}}={{:?}}", error.kind())),
+        }}
+    }}
+    match UdpSocket::bind(("0.0.0.0", 0)) {{
+        Ok(client) => {{
+            match client.send_to(b"guest-hello", ("127.0.0.1", {host_peer})) {{
+                Ok(_) => outcomes.push_str(" sendto=sent"),
+                Err(error) => outcomes.push_str(&format!(" sendto={{:?}}", error.kind())),
+            }}
+            record(&received, "sendto".to_owned(), client);
+        }}
+        Err(error) => outcomes.push_str(&format!(" sendto-socket={{:?}}", error.kind())),
+    }}
+    println!("{REPORT}bound{{outcomes}}");
+    std::io::stdout().flush().unwrap();
+    for stream in tcp.incoming() {{
+        let Ok(mut stream) = stream else {{ continue }};
+        let mut line = String::new();
+        let _ = BufReader::new(&stream).read_line(&mut line);
+        let reply = match line.trim_end().strip_prefix("await ") {{
+            Some(marker) => {{
+                let (list, changed) = &*received;
+                let mut list = list.lock().unwrap();
+                while !list.iter().any(|entry| entry.ends_with(&format!("={{marker}}"))) {{
+                    list = changed.wait(list).unwrap();
+                }}
+                format!("{{}}\n", list.join(" "))
+            }}
+            None => format!("{tcp_port}:{{line}}"),
+        }};
+        let _ = stream.write_all(reply.as_bytes());
+    }}
+}}"#
+    )
+}
+
+/// The datagram path under socket hijacking (bead `ley-line-open-0026d2`).
+///
+/// Patch 0008 makes a configured port map the complete list of guest STREAM
+/// listeners. libkrun's datagram proxy never reads the map: its `listen` is a
+/// no-op, and a guest `sendto` makes the VMM bind a host UDP socket of its
+/// own (`TsiDgramProxy::sendto_addr`) and forward whatever arrives on it to
+/// the guest. Under a §4 grant the VMM's Seatbelt profile carries an
+/// unqualified `network-bind` and `network-inbound`, which cover UDP too.
+///
+/// So this case declares one TCP listener — which turns hijacking and the
+/// widened profile on, and which the host reaches as the control that the
+/// hijacked path is live in this run — and has the guest bind UDP on an
+/// undeclared port and on the declared port's number, and send one datagram
+/// to the host. Then:
+///
+/// - the host's datagrams to both fixed ports, on loopback and on the host's
+///   outbound address, must be refused by the host kernel: no host socket
+///   holds them;
+/// - for every UDP socket the worker process holds, a datagram from a host
+///   address the guest never sent to must not reach the guest. The guest
+///   reports what each of its sockets received once a marker datagram from
+///   the peer it did send to has arrived through the same host socket, and
+///   the host sent its probe first, so the report is the event that decides.
+#[test]
+fn an_undeclared_guest_udp_port_is_not_reachable_from_the_host() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    let fixture = TempDir::new().expect("fixture");
+    probe_controls(&[UDP_CASE_TCP_PORT]);
+    let fixed = [UNDECLARED_UDP_PORT, UDP_CASE_TCP_PORT];
+    let lan = host_address();
+    for port in fixed {
+        assert_eq!(
+            probe_udp(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                (Ipv4Addr::LOCALHOST, port).into(),
+                "control"
+            ),
+            UdpProbe::Refused,
+            "UDP port {port} is held on the host before the VM starts, or this host \
+             does not report ICMP port-unreachable to a connected UDP socket; either \
+             way this run could not attribute a datagram to the guest"
+        );
+    }
+    let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("host peer");
+    let peer_port = peer.local_addr().expect("peer address").port();
+
+    let manifest = base_manifest(&libkrunfw)
+        .with_port_bind(UDP_CASE_TCP_PORT, None)
+        .expect("declare a §4 listener");
+    let mut guest = Guest::boot(
+        fixture.path(),
+        &libkrunfw,
+        &udp_guest(UDP_CASE_TCP_PORT, &fixed, peer_port),
+        true,
+        Some(&manifest),
+        "listener-udp",
+    );
+    let report = guest.report.clone();
+
+    // The control: the declared TCP listener answers, so the hijacked path is
+    // live. Its reply also orders this run: the guest sent its datagram before
+    // it reported and so before it wrote this reply, and the VMM handles the
+    // guest's vsock packets in order, so by the time the reply arrives the VMM
+    // has acted on the datagram and holds whatever host socket it bound.
+    let control = connect(UDP_CASE_TCP_PORT).map(|mut stream| {
+        stream
+            .set_read_timeout(Some(REPLY_BOUND))
+            .expect("bound the reply");
+        exchange_line(&mut stream, "hello-tcp")
+    });
+
+    let mut fixed_outcomes = Vec::new();
+    for port in fixed {
+        fixed_outcomes.push((
+            Ipv4Addr::LOCALHOST,
+            port,
+            probe_udp(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                (Ipv4Addr::LOCALHOST, port).into(),
+                "fixed",
+            ),
+        ));
+        if let Some(address) = lan {
+            fixed_outcomes.push((
+                address,
+                port,
+                probe_udp(IpAddr::V4(address), (address, port).into(), "fixed-lan"),
+            ));
+        }
+    }
+
+    // Every UDP socket the VMM holds for the guest gets a datagram from a
+    // loopback address the guest never sent to and one from the host's
+    // outbound address, then a marker from the peer it did send to. The
+    // probes go first, into the same host socket, so had either been
+    // forwarded the guest would hold it before the marker; nothing here waits
+    // for a probe's fate, the guest's report after the marker decides it.
+    let held = udp_sockets_of(guest.child.id());
+    let mut unsolicited = Vec::new();
+    for socket in &held {
+        let port: u16 = socket
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .unwrap_or_else(|| panic!("lsof named a socket without a port: {socket}"));
+        let mut sources = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        sources.extend(lan.map(IpAddr::V4));
+        for source in sources {
+            let probe = UdpSocket::bind((source, 0)).expect("probe socket");
+            let target = SocketAddr::from((source, port));
+            probe
+                .send_to(format!("probe-from-{source}").as_bytes(), target)
+                .expect("send the probe");
+            unsolicited.push(format!("{source} -> {target}"));
+        }
+        peer.send_to(b"marker", (Ipv4Addr::LOCALHOST, port))
+            .expect("send the marker from the guest's peer");
+    }
+    if lan.is_none() {
+        eprintln!(
+            "NOTE: this host has no non-loopback IPv4 address, so the datagram \
+             probes came from loopback only"
+        );
+    }
+    let received = (!held.is_empty())
+        .then(|| connect(UDP_CASE_TCP_PORT))
+        .flatten()
+        .map(|mut stream| {
+            stream
+                .set_read_timeout(Some(REPLY_BOUND))
+                .expect("bound the reply");
+            exchange_line(&mut stream, "await marker")
+        });
+    let worker_stderr = guest.end_still_running();
+    eprintln!(
+        "guest: {report}\nworker UDP sockets: {held:?}\nfixed ports: {fixed_outcomes:?}\n\
+         unsolicited: {unsolicited:?}\nguest received: {received:?}"
+    );
+
+    assert_eq!(
+        control.as_deref(),
+        Some(format!("{UDP_CASE_TCP_PORT}:hello-tcp\n").as_str()),
+        "the declared TCP listener did not answer, so the hijacked path was not \
+         live in this run and nothing below was measured. worker stderr:\n{worker_stderr}"
+    );
+    for port in fixed {
+        assert!(
+            report.contains(&format!("udp{port}=bound")),
+            "the guest could not bind UDP {port}, so this run measured nothing about \
+             it. Guest said: {report}\nworker stderr:\n{worker_stderr}"
+        );
+    }
+    for (address, port, outcome) in &fixed_outcomes {
+        assert_eq!(
+            *outcome,
+            UdpProbe::Refused,
+            "SECURITY: a host socket holds UDP {address}:{port}, which the guest bound \
+             and no grant declares (§4 lists TCP listeners only). worker \
+             stderr:\n{worker_stderr}"
+        );
+    }
+    assert!(
+        !held.is_empty(),
+        "the guest sent a datagram and the VMM holds no host UDP socket for it. \
+         That is closed, but it is not the mechanism this test was written against \
+         (TsiDgramProxy::sendto_addr binds one), so the reply-path half measured \
+         nothing; re-derive this test. Guest said: {report}"
+    );
+    let received = received.unwrap_or_else(|| {
+        panic!(
+            "the declared TCP listener refused the report request. worker stderr:\n{worker_stderr}"
+        )
+    });
+    let forwarded: Vec<&str> = received
+        .split_whitespace()
+        .filter(|entry| !entry.ends_with("=marker"))
+        .collect();
+    assert!(
+        received.contains("sendto=marker") && forwarded.is_empty(),
+        "SECURITY: the guest received datagrams {forwarded:?} from host addresses it \
+         never sent to, through the host UDP socket(s) {held:?} the VMM bound for its \
+         sendto. With a port map configured that socket carries replies from the \
+         guest's peers only (LLO libkrun patch 0009). Guest received: {received}\n\
+         worker stderr:\n{worker_stderr}"
     );
 }
 
@@ -713,20 +1056,37 @@ impl Guest {
         // The guest console is the worker's stdout. A reader thread forwards
         // the guest's report the moment it is printed; the bound below only
         // turns a guest that never reports into a failure.
+        //
+        // The console is read as bytes, not as UTF-8 lines: a byte that does
+        // not decode is shown (as U+FFFD) rather than ending the read, which
+        // would report a console that printed something as one that closed
+        // with nothing (bead ley-line-open-c4480a).
         let (report_tx, report_rx) = mpsc::channel();
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
         std::thread::spawn(move || {
             let mut console = Vec::new();
-            for line in stdout.lines() {
-                let Ok(line) = line else { break };
-                if let Some(report) = line
-                    .find(REPORT)
-                    .map(|at| line[at + REPORT.len()..].trim_end().to_owned())
-                {
-                    let _ = report_tx.send(Ok(report));
-                    return;
+            let mut raw = Vec::new();
+            loop {
+                raw.clear();
+                match stdout.read_until(b'\n', &mut raw) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&raw);
+                        if matches!(line, std::borrow::Cow::Owned(_)) {
+                            eprintln!("guest console line is not UTF-8: {raw:?}");
+                        }
+                        if let Some(at) = line.find(REPORT) {
+                            let report = line[at + REPORT.len()..].trim_end().to_owned();
+                            let _ = report_tx.send(Ok(report));
+                            return;
+                        }
+                        console.push(line.trim_end().to_owned());
+                    }
+                    Err(error) => {
+                        console.push(format!("<console read failed: {error}>"));
+                        break;
+                    }
                 }
-                console.push(line);
             }
             let _ = report_tx.send(Err(console.join("\n")));
         });
@@ -785,14 +1145,17 @@ impl Guest {
         }
     }
 
-    /// End the VM and return the worker's stderr.
+    /// End the VM and return the worker's stderr, followed by how the worker
+    /// ended: killed here, or the status it had already exited with.
     fn end(&mut self) -> String {
         let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.stderr
+        let status = self.child.wait();
+        let stderr = self
+            .stderr
             .take()
             .map(|stderr| stderr.join().unwrap_or_default())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        format!("{stderr}(worker ended: {status:?})")
     }
 
     /// End the VM, failing unless it was still running: every probe above

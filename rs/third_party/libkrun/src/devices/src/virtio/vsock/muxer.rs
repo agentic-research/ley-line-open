@@ -338,6 +338,10 @@ impl VsockMuxer {
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),
+                        // A configured port map is the complete list of what
+                        // the host may reach, so a datagram socket then
+                        // carries replies only.
+                        self.host_port_map.is_some(),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map

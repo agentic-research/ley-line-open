@@ -396,7 +396,11 @@ pub fn prepare_vm<'api>(
     // guest's requested address, and only the VMM's own nono profile stood in
     // the way — which on Seatbelt a §4 grant opens for every port. With the
     // patch an unmapped listen is refused (EACCES in the guest) and a mapped
-    // one is bound on loopback (bead ley-line-open-7d4d45).
+    // one is bound on loopback (bead ley-line-open-7d4d45). The map is also
+    // what patch 0009 keys on for datagrams: with it configured, the host UDP
+    // socket a guest `sendto` makes the VMM bind forwards only replies from
+    // the peers the guest named, not every datagram that reaches it (bead
+    // ley-line-open-0026d2).
     api.set_port_map(context, &config.port_map)?;
 
     api.set_workdir(context, &config.workdir)?;

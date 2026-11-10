@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Mon, 9 Nov 2026 20:00:00 -0600
+Subject: [PATCH] devices/vsock: with a port map, a TSI datagram socket
+ carries replies only
+
+A configured port map is the complete list of guest listeners the host
+may reach (the stream half is the previous patch). The datagram proxy
+never consulted it. Its listen is a no-op, so a guest UDP bind to a
+fixed port is not published, but a guest sendto makes the proxy bind a
+host UDP socket of its own at the unspecified address and ephemeral
+port, and every datagram that arrives on it was forwarded to the guest,
+from any source, on every host interface. One sendto, even one the
+VMM's sandbox then refused to transmit, turned the guest socket into a
+listener the map does not list.
+
+With a map configured, the proxy now remembers the peers the guest
+named (each sendto destination and a connect peer, IP and port, the 64
+most recent) and forwards only datagrams whose source is one of them;
+any other datagram is read and dropped. This is the rule the kernel
+already applies to a connected UDP socket, extended to sendto. Without
+a map, every datagram is forwarded as before, and Unix-domain datagram
+sockets are unaffected either way: the map lists INET ports.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+---
+diff --git a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+index 6cf8b6fd..31822dcb 100644
+--- a/src/devices/src/virtio/vsock/muxer.rs
++++ b/src/devices/src/virtio/vsock/muxer.rs
+@@ -338,6 +338,10 @@ impl VsockMuxer {
+                         mem.clone(),
+                         queue.clone(),
+                         self.rxq.clone(),
++                        // A configured port map is the complete list of what
++                        // the host may reach, so a datagram socket then
++                        // carries replies only.
++                        self.host_port_map.is_some(),
+                     ) {
+                         Ok(proxy) => {
+                             self.proxy_map
+diff --git a/src/devices/src/virtio/vsock/tsi_dgram.rs b/src/devices/src/virtio/vsock/tsi_dgram.rs
+index de0850c3..e7232e54 100644
+--- a/src/devices/src/virtio/vsock/tsi_dgram.rs
++++ b/src/devices/src/virtio/vsock/tsi_dgram.rs
+@@ -1,5 +1,5 @@
+-use std::collections::HashMap;
+-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
++use std::collections::{HashMap, VecDeque};
++use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+ use std::num::Wrapping;
+ use std::os::fd::OwnedFd;
+ use std::os::unix::io::{AsRawFd, RawFd};
+@@ -9,7 +9,7 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
+ #[cfg(target_os = "linux")]
+ use nix::sys::socket::UnixAddr;
+ use nix::sys::socket::{
+-    bind, connect, getpeername, recv, send, sendto, socket, AddressFamily, MsgFlags, SockFlag,
++    bind, connect, getpeername, recvfrom, send, sendto, socket, AddressFamily, MsgFlags, SockFlag,
+     SockType, SockaddrIn, SockaddrLike, SockaddrStorage,
+ };
+ 
+@@ -28,6 +28,21 @@ use utils::epoll::EventSet;
+ 
+ use vm_memory::GuestMemoryMmap;
+ 
++/// How many peers a datagram proxy remembers when it admits only replies.
++/// The oldest is forgotten first.
++const MAX_PEERS: usize = 64;
++
++/// An INET or INET6 address as the peer filter compares it: the IP and the
++/// port, without IPv6 flow information or scope.
++fn peer_key(addr: &SockaddrStorage) -> Option<(IpAddr, u16)> {
++    if let Some(sin) = addr.as_sockaddr_in() {
++        Some((IpAddr::V4(sin.ip()), sin.port()))
++    } else {
++        addr.as_sockaddr_in6()
++            .map(|sin6| (IpAddr::V6(sin6.ip()), sin6.port()))
++    }
++}
++
+ pub struct TsiDgramProxy {
+     pub id: u64,
+     cid: u64,
+@@ -45,9 +60,16 @@ pub struct TsiDgramProxy {
+     tx_cnt: Wrapping<u32>,
+     peer_buf_alloc: u32,
+     peer_fwd_cnt: Wrapping<u32>,
++    /// With a configured port map, the addresses the guest named as its
++    /// peers (`sendto` destinations and a `connect` peer). Only a datagram
++    /// from one of them reaches the guest: the host socket this proxy binds
++    /// is a reply path, not a listener. `None` without a map, where every
++    /// datagram is forwarded, as before.
++    peers: Option<VecDeque<(IpAddr, u16)>>,
+ }
+ 
+ impl TsiDgramProxy {
++    #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         id: u64,
+         cid: u64,
+@@ -56,6 +78,7 @@ impl TsiDgramProxy {
+         mem: GuestMemoryMmap,
+         queue: Arc<Mutex<VirtQueue>>,
+         rxq: Arc<Mutex<MuxerRxQ>>,
++        replies_only: bool,
+     ) -> Result<Self, ProxyError> {
+         let family = match family {
+             defs::LINUX_AF_INET => AddressFamily::Inet,
+@@ -113,9 +136,34 @@ impl TsiDgramProxy {
+             tx_cnt: Wrapping(0),
+             peer_buf_alloc: 0,
+             peer_fwd_cnt: Wrapping(0),
++            peers: (replies_only && matches!(family, AddressFamily::Inet | AddressFamily::Inet6))
++                .then(VecDeque::new),
+         })
+     }
+ 
++    /// Remember `addr` as a peer the guest named, when replies are filtered.
++    fn admit_peer(&mut self, addr: &SockaddrStorage) {
++        let (Some(peers), Some(key)) = (self.peers.as_mut(), peer_key(addr)) else {
++            return;
++        };
++        if !peers.contains(&key) {
++            if peers.len() == MAX_PEERS {
++                peers.pop_front();
++            }
++            peers.push_back(key);
++        }
++    }
++
++    /// Whether a datagram from `source` may reach the guest.
++    fn admits(&self, source: Option<&SockaddrStorage>) -> bool {
++        match &self.peers {
++            None => true,
++            Some(peers) => source
++                .and_then(peer_key)
++                .is_some_and(|key| peers.contains(&key)),
++        }
++    }
++
+     fn init_pkt(&self, pkt: &mut VsockPacket) {
+         debug!(
+             "init_pkt: id={}, src_port={}, dst_port={}",
+@@ -167,18 +215,28 @@ impl TsiDgramProxy {
+             }
+             */
+ 
+-            match recv(self.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
+-                Ok(cnt) => {
+-                    debug!("recv cnt={cnt}");
+-                    if cnt > 0 {
+-                        RecvPkt::Read(cnt)
+-                    } else {
+-                        RecvPkt::Close
++            loop {
++                match recvfrom::<SockaddrStorage>(self.fd.as_raw_fd(), &mut buf[..max_len]) {
++                    Ok((cnt, source)) => {
++                        // A datagram from an address the guest never named
++                        // is dropped here, and the next one is read: the
++                        // socket is non-blocking, so an empty queue ends the
++                        // loop with EAGAIN.
++                        if !self.admits(source.as_ref()) {
++                            debug!("recv: dropping a datagram from {source:?}, not a peer the guest named");
++                            continue;
++                        }
++                        debug!("recv cnt={cnt}");
++                        break if cnt > 0 {
++                            RecvPkt::Read(cnt)
++                        } else {
++                            RecvPkt::Close
++                        };
++                    }
++                    Err(e) => {
++                        debug!("recv_pkt: recv error: {e:?}");
++                        break RecvPkt::Error;
+                     }
+-                }
+-                Err(e) => {
+-                    debug!("recv_pkt: recv error: {e:?}");
+-                    RecvPkt::Error
+                 }
+             }
+         } else {
+@@ -245,6 +303,7 @@ impl Proxy for TsiDgramProxy {
+ 
+     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+         debug!("connect: addr={}", req.addr);
++        self.admit_peer(&req.addr);
+         let res = match connect(self.fd.as_raw_fd(), &req.addr) {
+             Ok(()) => {
+                 debug!("connect: Connected");
+@@ -341,6 +400,7 @@ impl Proxy for TsiDgramProxy {
+ 
+         let mut update = ProxyUpdate::default();
+ 
++        self.admit_peer(&req.addr);
+         self.sendto_addr = Some(req.addr);
+         if !self.listening {
+             let bind_result = match self.family {

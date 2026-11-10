@@ -100,7 +100,9 @@ impl KrunWorkerBackend {
     /// printed satisfies `until`, and return it: an event-driven way for an
     /// embedder to wait for a served guest to announce itself. Returns the
     /// output seen last when the run's streams end or the timeout passes
-    /// first, and an error when `run_id` is not active.
+    /// first, and an error when `run_id` is not active. `until` runs under
+    /// the run's capture lock, so it must not call [`Backend::output`] for
+    /// the same run.
     pub fn wait_for_output(
         &self,
         run_id: &str,

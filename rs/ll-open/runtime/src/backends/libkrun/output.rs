@@ -238,7 +238,9 @@ impl OutputCapture {
     }
 
     /// Wait, at most until `deadline`, for `until` to hold of the output or
-    /// for both streams to end. Returns the output it saw last.
+    /// for both streams to end. Returns the output it saw last. `until` runs
+    /// under the capture's lock: it must not read this run's output again
+    /// (`Backend::output`), or it deadlocks and stalls the drains.
     pub fn wait(&self, until: &dyn Fn(&RunOutput) -> bool, deadline: Instant) -> RunOutput {
         let mut state = self.state.lock();
         loop {
@@ -278,13 +280,18 @@ fn parse_event(line: &[u8], failure: &mut Option<ExecutionError>) {
     if !line.starts_with(b"{") {
         return;
     }
-    if let Ok(WorkerEvent::Failed { error }) = serde_json::from_slice::<WorkerEvent>(line) {
+    if let Ok(WorkerEvent::Failed { mut error }) = serde_json::from_slice::<WorkerEvent>(line) {
+        // JSON decoding turns an escaped `\u001b` back into a raw control
+        // byte, so the decoded detail is sanitized like every guest byte.
+        error.detail = sanitize(error.detail.as_bytes());
         *failure = Some(error);
     }
 }
 
-/// `observed`, replaced by the worker's own failure when it reported one,
-/// with the run's printed output appended to the detail.
+/// `observed`, its code and `retryable` unchanged, with any reported
+/// `failed` event appended as unverified text and then the run's printed
+/// output. The section headings are framing, not authority: a guest's own
+/// bytes keep their newlines and can imitate them.
 pub fn failure_with_output(observed: ExecutionError, output: &RunOutput) -> ExecutionError {
     // The classification is always the supervisor's. A `failed` event read
     // after readiness arrived on a stream the guest also writes, so it is

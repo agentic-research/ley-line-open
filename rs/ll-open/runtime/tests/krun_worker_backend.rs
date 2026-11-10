@@ -267,6 +267,53 @@ fn a_failed_run_reports_its_terminal_event_and_what_the_guest_printed() {
     );
 }
 
+/// A reported event's detail is decoded JSON, where `\u001b` becomes a raw
+/// escape byte. It is sanitized like every other guest byte, both in the
+/// failure and in the active run's `output`.
+#[test]
+fn a_reported_event_cannot_carry_control_bytes() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let root = fixture.path().join("gate");
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        &format!(
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r _\n",
+                "printf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\n",
+                "printf '%s\\n' '{{\"type\":\"failed\",\"error\":{{\"code\":\"backend-failed\",\"retryable\":false,\"detail\":\"\\u001b[31mx\"}}}}' >&2\n",
+                "printf 'reported\\n'\n",
+                "/usr/bin/mkfifo '{gate}'\n",
+                "IFS= read -r _ < '{gate}'\n",
+                "exit 1\n",
+            ),
+            gate = root.display()
+        ),
+    );
+    let _ = ephemeral_root;
+
+    backend.start(&request()).expect("ready worker");
+    let seen = backend
+        .wait_for_output(
+            "run-backend-01",
+            &|output: &RunOutput| output.reported_failure.is_some() && !output.guest.is_empty(),
+            READY_TIMEOUT,
+        )
+        .expect("an active run");
+    let reported = seen.reported_failure.expect("the reported event");
+    assert_eq!(reported.detail, "\u{FFFD}[31mx");
+    fs::write(&root, b"go\n").expect("release the worker");
+    let BackendRunStatus::Failed(error) = backend
+        .wait_for_completion("run-backend-01")
+        .expect("worker completion")
+    else {
+        panic!("expected a failed run");
+    };
+    assert!(!error.detail.contains('\u{1b}'), "{}", error.detail);
+    assert!(error.detail.contains("\u{FFFD}[31mx"), "{}", error.detail);
+}
+
 /// A guest that prints more than the tail holds costs the tail, not what it
 /// printed: the failure keeps the last GUEST_OUTPUT_TAIL_BYTES and says how
 /// many earlier bytes it dropped.

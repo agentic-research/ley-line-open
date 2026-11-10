@@ -196,10 +196,14 @@ fn every_guest_has_a_bounded_tmpfs_tmp() {
     );
     // Nothing the guest wrote to /tmp reached the host: the rootfs volume
     // holds at most the empty mount point, and the CAS is untouched.
+    // Init created the mount point in the run's rootfs volume, so the
+    // directory exists on the host; the files went to the tmpfs over it.
     let host_tmp = run_root.join("rootfs/tmp");
     let left: Vec<_> = fs::read_dir(&host_tmp)
-        .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
-        .unwrap_or_default();
+        .expect("init created the mount point in the rootfs volume")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
     assert!(left.is_empty(), "/tmp's files reached the host: {left:?}");
     assert!(!cas.join(&rootfs).join("tmp").exists());
 }

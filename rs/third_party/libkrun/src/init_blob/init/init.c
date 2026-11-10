@@ -555,9 +555,12 @@ static int chroot_luks()
  * Its size is bounded at TMP_SIZE_PERCENT of the guest's RAM. tmpfs pages
  * count against the guest's memory, which the hypervisor bounds; the
  * kernel's default of half of RAM would let /tmp alone take half of what
- * the workload was granted. A quarter leaves the workload three quarters
- * for itself and gives a database or a build room for its scratch files. A
- * write past the bound fails with ENOSPC.
+ * the workload was granted. A quarter gives a database or a build room for
+ * its scratch files. A write past the bound fails with ENOSPC. /dev/shm
+ * keeps the kernel default, so the two together can pin three quarters of
+ * the guest's RAM; either way the guest cannot exceed what its grant sized
+ * the VM at, and the bound is a usability limit inside the guest, which
+ * the workload can remount, not a security boundary.
  *
  * TDX builds use /tmp for their root volume and keep upstream's handling.
  */
@@ -566,9 +569,19 @@ static int chroot_luks()
 static int mount_tmp(void)
 {
     char options[32];
+    struct stat existing;
 
     if (mkdir("/tmp", 01777) < 0 && errno != EEXIST) {
         perror("mkdir(/tmp)");
+        return -1;
+    }
+    /*
+     * mount(2) follows a symbolic link in its target, so a rootfs whose
+     * tmp is a link would get the tmpfs wherever the link points. Only a
+     * real directory is mounted over; anything else stops the guest.
+     */
+    if (lstat("/tmp", &existing) < 0 || !S_ISDIR(existing.st_mode)) {
+        printf("/tmp is not a directory, refusing to mount over it\n");
         return -1;
     }
     snprintf(options, sizeof(options), "mode=1777,size=%d%%", TMP_SIZE_PERCENT);

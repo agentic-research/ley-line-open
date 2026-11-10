@@ -211,17 +211,14 @@ pub fn read_header(path: &Path) -> Result<Option<ControlHeader>> {
 /// function does not look.
 pub fn reinitialize(path: &Path) -> Result<()> {
     use std::io::Write;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
         .with_context(|| format!("control block path {} has no file name", path.display()))?;
     let mut staged_name = std::ffi::OsString::from(".");
     staged_name.push(name);
     staged_name.push(format!(".reinit.{}", std::process::id()));
-    let staged = parent.join(staged_name);
+    // A sibling, so the rename stays within one directory (and filesystem).
+    let staged = path.with_file_name(staged_name);
 
     let mut block = vec![0u8; CONTROL_SIZE];
     block[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
@@ -247,6 +244,9 @@ pub fn reinitialize(path: &Path) -> Result<()> {
     written?;
     // Make the rename itself durable; a directory that cannot be opened or
     // synced leaves the new block in place, just not yet on disk.
+    // `.` joined with the parent: the parent itself when absolute, `./` for
+    // a bare file name.
+    let parent = Path::new(".").join(path.parent().unwrap_or(Path::new("")));
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
     }
@@ -1566,6 +1566,31 @@ mod tests {
             1,
             "no staging file left behind"
         );
+    }
+
+    /// `read_header`'s edges: a file shorter than a block is fresh (`None`),
+    /// a path that cannot be read is an error rather than "fresh", and an
+    /// arena path that fills all 256 bytes stops at the field's end, not at
+    /// the next field.
+    #[test]
+    fn read_header_reports_short_unreadable_and_full_width_blocks() {
+        let dir = tempdir().unwrap();
+        let short = dir.path().join("short.ctrl");
+        std::fs::write(&short, [1u8; 8]).unwrap();
+        assert_eq!(read_header(&short).unwrap(), None);
+
+        let err = read_header(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("read control block"), "{err:#}");
+
+        let full = dir.path().join("full.ctrl");
+        let mut buf = vec![0u8; CONTROL_SIZE];
+        buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
+        buf[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&2u32.to_ne_bytes());
+        buf[OFF_ARENA_PATH..OFF_ARENA_PATH + ARENA_PATH_LEN].fill(b'a');
+        buf[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].fill(b'z');
+        std::fs::write(&full, &buf).unwrap();
+        let header = read_header(&full).unwrap().unwrap();
+        assert_eq!(header.arena_path, "a".repeat(ARENA_PATH_LEN));
     }
 
     /// Σ axiom (IM), decade F1, ADR-0047 §5 (bead `ley-line-open-10d71a`):

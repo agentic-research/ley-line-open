@@ -178,4 +178,15 @@ exclude_re = [
     # (`O_CLOEXEC`), and the create tests (`O_CREAT`).
     'derived\.rs.*replace \| with \^ in (openat_mode|open_path)',
     'storefs/src/lib\.rs.*replace \| with \^ in StoreFs<S>::(rename_into_scratch|open_scratch)',
+
+    # The control block lease's `try_flock` (bead `ley-line-open-feabf4`),
+    # `how | LOCK_NB` mutated to `^`.
+    #
+    # The `observe_exit` case again. Every caller passes `LOCK_SH` or
+    # `LOCK_EX` as `how`; `flock(2)`'s operation bits are distinct single
+    # bits (1, 2, 4, 8 for SH, EX, NB, UN on Linux and macOS), so `how` and
+    # `LOCK_NB` share no bit and `a | b == a ^ b`: the mutated program passes
+    # the same operation to the same syscall. The sibling `| -> &` mutation
+    # yields 0, an invalid operation, and is killed by every lease test.
+    'control_lease\.rs.*replace \| with \^ in try_flock',
 ]

@@ -685,6 +685,14 @@ pub(crate) mod tests {
             admit(d, &elsewhere.join("a.arena"), &elsewhere.join("a.ctrl")).unwrap();
             // The default arena with its own control block binds elsewhere.
             admit(d, &mache.join("default.arena"), &elsewhere.join("a.ctrl")).unwrap();
+            // The well-known file names in another directory are not the
+            // well-known entries.
+            admit(
+                d,
+                &elsewhere.join("default.arena"),
+                &elsewhere.join("default.ctrl"),
+            )
+            .unwrap();
         }
         // An explicit arena on a well-known control block, and a surface on
         // the other surface's name, are refused.

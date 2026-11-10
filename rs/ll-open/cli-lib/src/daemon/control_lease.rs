@@ -375,4 +375,25 @@ mod tests {
         let _lease = ControlLease::acquire(&ctrl, &dir.path().join("a.arena"), true).unwrap();
         assert_eq!(std::fs::read(&ctrl).unwrap(), bytes);
     }
+
+    /// The lease lives beside the control block, whose directory a fresh
+    /// `--control` may not have created yet.
+    #[test]
+    fn the_lease_creates_the_control_block_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctrl = dir.path().join("not/yet/c.ctrl");
+        let _lease = ControlLease::acquire(&ctrl, &dir.path().join("a.arena"), false).unwrap();
+        assert!(lease_path_for(&ctrl).exists());
+    }
+
+    /// A control path that exists but cannot be opened as a file is an
+    /// error, not "no block yet".
+    #[test]
+    fn a_reset_refuses_a_control_path_it_cannot_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctrl = dir.path().join("c.ctrl");
+        std::fs::create_dir(&ctrl).unwrap();
+        let err = ControlLease::acquire(&ctrl, &dir.path().join("a.arena"), true).unwrap_err();
+        assert!(format!("{err:#}").contains("open control block"), "{err:#}");
+    }
 }

@@ -14,7 +14,7 @@ mache find-smells --db /path/to/your.db --rule '<rule_id>'
 mache serve  # MCP server agents can connect to
 ```
 
-If you're using mache, **you don't run `leyline parse` yourself** — `mache/cmd/serve.go::autoInvokeLeylineParse` shells out to `leyline parse <source> -o <tmp.db>` on-demand, then `DiscoverOrStart` spawns a daemon if one isn't already on `~/.mache/default.ctrl.sock`. The whole leyline lifecycle is mache's responsibility for the mache-consumer path.
+If you're using mache, **you don't run `leyline parse` yourself** — `mache/cmd/serve.go::autoInvokeLeylineParse` shells out to `leyline parse <source> -o <tmp.db>` on-demand, then `DiscoverOrStart` spawns a daemon if one isn't already on `~/.mache/default.sock`. The whole leyline lifecycle is mache's responsibility for the mache-consumer path.
 
 This document covers two paths:
 
@@ -54,7 +54,7 @@ curl -L https://github.com/agentic-research/ley-line-open/releases/latest/downlo
 Ensure `~/.local/bin` is on your `PATH` (or drop the binary anywhere else on `PATH`). That's the whole install — the binary is statically linked, no runtime deps for `leyline parse` / `leyline daemon`.
 
 **Feature set of the released binary**: default features only (`lsp` +
-`validate` + `hdc` + `cdc`). Enough for structural analysis, validation, HDC
+`validate` + `hdc` + `cdc` + `sheaf`). Enough for structural analysis, validation, HDC
 similarity search, and explicit chunk activation. The `vec` (fastembed),
 `mount` (NFS) and `fuse` (FUSE, links libfuse) features are gated OFF in the
 release binary so it doesn't drag libfuse or an ONNX model download onto
@@ -80,7 +80,7 @@ task install:full   # everything portable (--features all, no mount)
 
 Three install shapes to choose from (see [README §Install](README.md#install) for the full matrix):
 
-- **`task install`** — same feature set as the released binary (`lsp` + `validate` + `hdc` + `cdc`). Use the released binary instead unless you need a specific commit.
+- **`task install`** — same feature set as the released binary (`lsp` + `validate` + `hdc` + `cdc` + `sheaf`). Use the released binary instead unless you need a specific commit.
 - **`task install:full`** — everything portable (`--features all`, no mount). Adds `vec` (fastembed model, ~100MB cache at `~/.cache/fastembed/` on first `vec_search`) and `text-search`.
 - **`task install:full+mount`** — everything including both mount backends, NFS (`mount`) and FUSE (`fuse`). Requires `libfuse-t` (macOS) or `libfuse` (Linux) at build time and at runtime.
 
@@ -101,7 +101,7 @@ leyline parse ./path/to/your/code -o /tmp/my-code.db
 # → SQLite db with nodes / _ast / _source (and the interning tables) populated
 ```
 
-`-l <lang>` filters to a single language (`go`, `rust`, `python`, `proto`, `hcl`, ...). The default parses every recognized file extension. Built-in languages: html, markdown, json, yaml, go, python, elixir, hcl/terraform, rust, protobuf, javascript, typescript.
+`-l <lang>` filters to a single language (`go`, `rust`, `python`, `proto`, `hcl`, ...). The default parses every recognized file extension. Built-in languages: html, markdown, json, yaml, go, python, elixir, hcl/terraform, rust, protobuf, javascript, typescript, sql, bash, java, c, cpp, toml, dockerfile, ruby, php, kotlin, swift, scala, csharp, css, groovy, lua.
 
 To enable chunk-backed range reads for an existing projection:
 
@@ -124,7 +124,7 @@ The sweep is transactional and preserves chunks referenced by any manifest.
 ### Run the daemon
 
 ```bash
-# UDS-only (default) — control socket at ~/.mache/default.ctrl.sock,
+# UDS-only (default) — control socket at ~/.mache/default.sock,
 # no HTTP surface. This is what mache's auto-spawn uses.
 leyline daemon --source ./path/to/your/code
 
@@ -145,7 +145,7 @@ MCP serves only the tools `tools/list` advertises; a daemon op that is not an MC
 ### Quick query against a .db
 
 ```bash
-sqlite3 /tmp/my-code.db "SELECT a.kind, COUNT(*) FROM _ast a GROUP BY a.kind ORDER BY 2 DESC LIMIT 10;"
+sqlite3 /tmp/my-code.db "SELECT k.lang, k.raw_kind, COUNT(*) FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id GROUP BY k.kind_id ORDER BY 3 DESC LIMIT 10;"
 sqlite3 /tmp/my-code.db "SELECT language, COUNT(*) FROM _source GROUP BY language;"
 ```
 
@@ -173,7 +173,7 @@ Linux equivalents: `apt-get install capnproto libfuse3-dev` + `cargo install tas
 ```bash
 git clone https://github.com/agentic-research/ley-line-open
 cd ley-line-open
-task ci      # check + clippy + fmt:check + lint:blake3 + smells + build:fs-static + tier:isolation + test + sign:host:{build,test} + compat:check + gen:server-json:check + readme:version-check (~5min cold, much faster with sccache)
+task ci      # the full CI gate (Taskfile.yml `ci:`): fmt, lint and fixture gates, audit, check, clippy, smells, fs:build:static, tier:isolation, test, sign:host:{build,test}, compat:check, gen:server-json:check (~5min cold, much faster with sccache)
 task install # release build + macOS codesign + cp to ~/.local/bin (~50s warm; sccache helps)
 ```
 
@@ -216,10 +216,10 @@ Where to read next:
 
 ## Distribution status (the honest version)
 
-- **GitHub releases** (primary channel, actively used): cut on every `v*` tag via [.github/workflows/release.yml](.github/workflows/release.yml). Each release attaches the assets named in [tools/release-assets.txt](tools/release-assets.txt) plus `SHA256SUMS`: 4 `leyline-{darwin,linux}-{amd64,arm64}` binaries (default features — `lsp` + `validate` + `hdc` + `cdc`; no `vec`, no mount), `leyline-krun-worker-darwin-arm64` (the microVM worker, ad-hoc signed with the hypervisor entitlement; staging checks the entitlement on the staged bytes), 4 `leyline-mcp-descriptor-*`, 16 `capnpc-schema-bridge-{go,jsonschema,tooldefs,zod}-*` generators, 3 `libleyline_fs-*.a` FFI staticlibs + `leyline_fs.h`, 3 wasm modules (`leyline_sign`, `leyline_cas_ffi`, `leyline_envelope`) and `execution.tools.json`. The workflow verifies the published set against that list before it reports success. Latest at [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest). Mache's auto-downloader pulls `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/` — that's the load-bearing consumer path.
+- **GitHub releases** (primary channel, actively used): cut on every `v*` tag via [.github/workflows/release.yml](.github/workflows/release.yml). Each release attaches the assets named in [tools/release-assets.txt](tools/release-assets.txt) plus `SHA256SUMS`: 4 `leyline-{darwin,linux}-{amd64,arm64}` binaries (default features — `lsp` + `validate` + `hdc` + `cdc` + `sheaf`; no `vec`, no mount), `leyline-krun-worker-darwin-arm64` (the microVM worker, ad-hoc signed with the hypervisor entitlement; staging checks the entitlement on the staged bytes), 4 `leyline-mcp-descriptor-*`, 16 `capnpc-schema-bridge-{go,jsonschema,tooldefs,zod}-*` generators, 3 `libleyline_fs-*.a` FFI staticlibs + `leyline_fs.h`, 3 wasm modules (`leyline_sign`, `leyline_cas_ffi`, `leyline_envelope`), and the execution/v1 schema (`execution.capnp`, `traits.capnp`, `execution.tools.json`). The workflow verifies the published set against that list before it reports success. Latest at [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest). Mache's auto-downloader pulls `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/` — that's the load-bearing consumer path.
 - **Distroless OCI image**: `task image` builds `localhost/leyline:v<VERSION>` locally (~20 MB, headless MCP daemon on `:8384`) via `cargo zigbuild` static musl. A `v*` tag also publishes the multi-arch image (linux/amd64 + linux/arm64) to `ghcr.io/agentic-research/ley-line-open:vVERSION` with a build-provenance attestation, which is what `server.json` advertises.
 - **Homebrew**: legacy `homebrew-tap/Formula/leyline.rb` exists but points at the pre-LLO-extraction private repo (v0.2.0, private URLs, `license :cannot_represent`). Not actively maintained; the tap source (`kiln`) has been archived. **Don't `brew install`** today; use the binary-download install above.
-- **crates.io**: [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) runs only when started by hand with a release tag (`workflow_dispatch`); a `v*` tag publishes binaries and the image, never crates. Crates are not published for v0.21.0. Consumers link to the binary or the FFI staticlib, not the source crates.
+- **crates.io**: [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) runs only when started by hand with a release tag (`workflow_dispatch`); a `v*` tag publishes binaries and the image, never crates. No release through v0.26.0 has published crates. Consumers link to the binary or the FFI staticlib, not the source crates.
 
 - **Release gate: the hypervisor suite** (bead `ley-line-open-16a994`). No hosted runner can boot a guest (GitHub's macOS runners lack nested Hypervisor.framework), so CI skips every test that boots one. Before a tag, the real-guest suite (`task runtime:test` with `LEYLINE_REQUIRE_HYPERVISOR=1`, `agent_in_guest` included) is run by hand on an Apple-silicon host against the exact tree being released, and it records a receipt for that tree:
 
@@ -239,7 +239,7 @@ Open distribution work: homebrew formula update, crates.io Trusted Publishing, D
 ## I'm stuck
 
 - **`mache` can't find leyline** — check `which leyline`. mache's `DiscoverOrStart` looks on PATH first, then `~/.mache/bin/leyline`. If `task install` put leyline at `~/.local/bin/leyline`, ensure that's on PATH or symlink to `~/.mache/bin/leyline`.
-- **`leyline parse` says "language X not supported"** — check the feature flags in [`rs/ll-open/ts/Cargo.toml`](rs/ll-open/ts/Cargo.toml). Daemon ships with `html / markdown / json / yaml / go / python / elixir / hcl / rust / proto / javascript / typescript` enabled; other languages need a feature flag at build time.
+- **`leyline parse` says "language X not supported"** — check the feature flags in [`rs/ll-open/ts/Cargo.toml`](rs/ll-open/ts/Cargo.toml). Daemon ships with `html / markdown / json / yaml / go / python / elixir / hcl / rust / proto / javascript / typescript / sql / bash / java / c / cpp / toml / dockerfile / ruby / php / kotlin / swift / scala / csharp / css / groovy / lua` enabled (`rs/ll-open/cli-lib/Cargo.toml`); other languages need a feature flag at build time.
 - **MCP client can't connect** — token gate is on by default (ADR-0022). Either pass `--mcp-no-auth` (localhost only) or fetch `~/.local/share/leyline/daemon.token` and send as `x-leyline-token` header.
 - **Daemon won't warm-start** — `cmd_daemon.rs::try_warm_start_from_arena` logs `warn!` lines for unreadable controller / arena. Check the log; it distinguishes "no arena yet" (silent fall-through to cold start, expected) from "arena exists but unreadable" (visible warn, real failure).
 - **Anything else** — file an issue or a bead (`rsry_bead_create scope:repo:ley-line-open`).

@@ -9,8 +9,8 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 | Field | Value |
 |---|---|
 | LLO version | v0.26.0 |
-| Last verified | 2026-07-27 (status row and roadmap pointer updated 2026-10-23) |
-| Direction | [ROADMAP.md](ROADMAP.md): v1.0 is single host, portable (epic `ley-line-open-b2e687`); integration carries the 0.21.0 cycle |
+| Last verified | 2026-11-09, against integration `22290da9` (docs audit `ley-line-open-a678c2`) |
+| Direction | [ROADMAP.md](ROADMAP.md): v1.0 is single host, portable (epic `ley-line-open-b2e687`); integration carries the v0.27.0 cycle (latest tag v0.26.0) |
 | Authority model | [ADR-0032](adr/0032-declared-decompositions.md) §D4 — see [Authority model](#authority-model) |
 | Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `docs/decades/*.md`, `CHANGELOG.md` |
 
@@ -39,17 +39,21 @@ impossibility results (A)–(D) forbid it.
 
 | Term | What it names | Status |
 |---|---|---|
-| **SQLite arena snapshot root** (`Controller.current_root`) | integrity of one serialized byte image | shipped — `rs/ll-open/cli-lib/src/cmd_daemon.rs:1263-1266` |
+| **SQLite arena snapshot root** (`Controller.current_root`) | integrity of one serialized byte image | shipped — `rs/ll-open/cli-lib/src/cmd_daemon.rs` `image_root` |
 | **Cap'n Proto segment root** (`Head.rootHash`) | which parse run produced these segments (a run receipt: truncated per run, commits to absolute paths and mtimes) | shipped — `rs/ll-open/cli-lib/src/cmd_parse.rs` `hash_segment_files` |
 | **store root** (`Head.storeRoot`) | the store's manifest: every `_tree` file entry as (relative path, mode, blob hash) and every empty directory, with no parser input; the same for a cold, incremental, scoped or relocated parse of the same bytes, for a proposal that produces that store, and across a parser upgrade | shipped — `rs/ll-open/cli-lib/src/store_root.rs`, directory Merkle `leyline/store-tree/v1`, ADR-0047 D-ii (step M1; replaces the retired `treeRoot`, ADR-0040 D1); verified by `leyline verify-head` |
 | **parser identity** (`Head.parserId`) | the derivation the projection was computed under: IR and projection schema versions, extraction/injection/query-set epochs, every compiled grammar's digest | shipped — `rs/ll-open/cli-lib/src/store_root.rs`, ADR-0040 D1; bound beside `storeRoot` by head digest v3, never folded into it |
-| **blob hash** | one CDC/CAS payload | shipped — `rs/ll-core/core/src/substrate.rs:167-179` |
+| **node hash** (`node_content.node_hash`) | one deduplicated syntax subtree (κ kind for a named node, grammar kind for an anonymous token, terminal text, child hashes), location-free | shipped — merkle-ast-v3, `derive_key("leyline/ast-node/v3", …)` in `rs/ll-open/cli-lib/src/cmd_parse.rs` (`hash_leaf`, `hash_internal`), ADR-0047 D-i (step M2) |
+| **blob hash** | one CDC/CAS payload | shipped — `rs/ll-core/core/src/substrate.rs` `impl ContentAddressed for [u8]` |
+| **rootfs digest** | one execution rootfs: BLAKE3 over the exact bytes of its `rootfs.manifest.json` | shipped — `rs/ll-open/runtime/src/backends/libkrun/plan.rs` `verify_manifest`; produced by `leyline rootfs import-oci`; first in `RunReceipt.inputRoots` |
+| **run identity** (`run_id`) | one authorized run (canonical spec digest, grant id, replay key) | shipped as v1, prefix-in-preimage (`rs/ll-open/runtime/src/authorization.rs` `derive_run_id`); the keyed v2 is ADR-0047 M3, proposed (`ley-line-open-ab2093`) |
 | **SQL projection ABI** | the queryable tables, columns, and indexes | shipped — a contract, **not** an identity domain; see §D4 below |
 | `manifestRoot` | which regions changed; transport units | **proposed only.** ADR-0032 §D3; no implementation in `rs/` |
 | `logicalRoot` | derived-view validity | **proposed only.** ADR-0032 §D3; no implementation in `rs/` |
 
-ADR-0032 is Status: Proposed. The first four rows describe shipped code; the last
-two are named here so that nobody invents a competing term for them, and must not
+ADR-0032 is Status: Proposed. Every row above the last two describes shipped code
+(arena-local locators such as `content_id` and `nid` are not identities and have no
+row; ADR-0047 §2.2); the last two are named here so that nobody invents a competing term for them, and must not
 be described anywhere as existing behaviour.
 
 ---
@@ -84,21 +88,26 @@ Content-addressed storage and snapshot primitives used by the other crates.
 | Crate | Purpose | Key types |
 |---|---|---|
 | `leyline-core` | Arena primitives. mmap'd files + control block (v3, published under a seqlock; readers poll `current_root` for hot-reload). `ContentAddressed` trait = the σ substrate entry point (BLAKE3-locked per Σ §3.4) | `ArenaHeader`, `Controller`, `ContentAddressed`, `Hash` |
-| `leyline-schema` | Shared SQLite schema for the `nodes` table + indexes | `create_schema`, `insert_node` |
-| `leyline-public-schema` | Capnp wire schema for the daemon UDS + MCP transport. Source of truth for every base op's request/response shape with `$Json.name` annotations for camel↔snake | `capnp/daemon.capnp` |
-| `leyline-schema-capnp` | Capnp schemas for the Σ event log (`AstNode`, `SourceFile`, `BindingRecord`, `Head`, `AstNodeList`). Decade `ley-line-open-9d30ac` | Generated Rust bindings |
+| `leyline-schema` | Shared SQLite schema for the `nodes` table + indexes and the interning tables; the arena-local locator newtypes, which have no wire encoding | `create_schema`, `insert_node`, `Nid`, `FileId`, `DirId`, `NameId`, `KindId`, `ContentId` |
+| `leyline-public-schema` | Capnp wire schema for the daemon UDS + MCP transport. Source of truth for every native daemon op's request/response shape (execution/v1 payloads are governed by `schema-spec/execution/v1`) with `$Json.name` annotations for camel↔snake | `capnp/daemon.capnp` |
+| `leyline-schema-capnp` | Capnp schemas for the Σ event log (`AstNode`, `SourceFile`, `BindingRecord`, `Head` with `storeRoot`, `parserId` and `parentDigest` (`retiredTreeRoot` is never written), `AstNodeList`). Decade `ley-line-open-9d30ac` | Generated Rust bindings |
 | `leyline-ffi-helpers` | Typed helpers for the C-boundary raw-pointer pattern used by every LLO `extern "C" fn`, so the SAFETY contract lives in one place | `c_input`, `c_output` |
-| `leyline-schema-spec` | Vendor-neutral IDL crate. Ships per-capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`) with canonical test vectors + integrity/identity pins. Verified by `verify_vectors_sha256` (SHA-256 integrity) + `verify_confinement_digest` (BLAKE3-256 identity) + `capability_mapping_coverage` + `version_bump_on_vector_change` cargo tests | Non-code artifact — spec dirs + pin files |
+| `leyline-schema-spec` | Vendor-neutral IDL crate. Ships per-capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`, `execution/v1`, `leyline-net/v1`, and `sigma/v1`, the Σ construction vectors the Go `sigma` package reproduces) with canonical test vectors + integrity/identity pins. Verified by `verify_vectors_sha256` (SHA-256 integrity) + `verify_confinement_digest` (BLAKE3-256 identity) + `capability_mapping_coverage` + `version_bump_on_vector_change` cargo tests | Non-code artifact — spec dirs + pin files |
 | `leyline-mcp-descriptor` | MCP Registry `server.json` emitter — coverage validation + render, shared across ART producers (bead `ley-line-open-4ec276`) | `render`, `ServerMeta`, `ToolRef` |
 | `leyline-mcp-protocol-schema` | MCP JSON-RPC method-name facts generated at build time from a digest-pinned schema; digest mismatch fails compilation, not a test (bead `ley-line-open-60f0d3`) | build-generated constants |
 
 **Contract:** the Σ substrate is **BLAKE3-locked** (ADR-0032 §D5). Every content address is a BLAKE3 digest (`leyline-core::substrate::ContentAddressed for [u8]`, `rs/ll-core/core/src/substrate.rs:129-147`).
 
-SHA-256 is used in three places, none of which is a content address:
+SHA-256 appears only where an external format names it; none is a content address.
+`tools/check_doc_claims.sh` (claim 2) pins the set of crates that depend on `sha2`
+(cli-lib, envelope, runtime, sign) beside the build-time `mcp-protocol-schema` pin:
 
 | Site | Use | Verified at |
 |---|---|---|
-| OCI ecosystem boundary | registry digest format | ecosystem-imposed |
+| OCI ecosystem boundary | registry digest format; `leyline rootfs import-oci` verifies every blob and `diff_id` against it, and the rootfs it publishes is named by BLAKE3 | `rs/ll-open/runtime/src/artifacts/oci.rs` |
+| in-toto / DSSE | in-toto Statement v1 subject digests | `rs/ll-open/envelope/src/lib.rs` |
+| release checksums | `leyline self` verifies release assets against `SHA256SUMS` | `rs/ll-open/cli-lib/src/cmd_self.rs` |
+| MCP protocol schema pin | build-time digest of the vendored schema | `rs/ll-core/mcp-protocol-schema/build.rs` |
 | `VECTORS.sha256` pins under `schema-spec/*/v*/` | test-vector file integrity — a distinct concern from the BLAKE3-256 identity digests pinned in `CONFINEMENT_DIGESTS.blake3` (bead `ley-line-open-193170`) | `rs/ll-core/schema-spec/tests/verify_vectors_sha256.rs:21` |
 | `canonical_kid` | Ed25519 key fingerprint = `lowercasehex(SHA-256(canonical SPKI DER)[:16])` per signet ADR-012 | `rs/ll-open/sign/src/kid.rs:55-58` |
 
@@ -116,17 +125,19 @@ Where source becomes structure. Parses, enriches, signs, presents.
 | `leyline-sheaf` | Čech-cohomology engine; structural cache + δ⁰-driven invalidation (ADR-0020). **2 live sub-components, 2 risk profiles** — see [`sheaf/README.md`](../rs/ll-open/sheaf/README.md) | `CellComplex`, `SheafCache` |
 | `leyline-cache` | Restriction-addressed derived-view cache (ADR-0031). The key is a `PartitionSpec` `RowSet` fold over the review's input-closure rows with `parserId` in params; it changes under any edit inside the closure and holds under edits outside it. No daemon caller yet (`ley-line-open-69305e`) | `restriction_for_call_target`, `ReviewCache`, `KeyStrategy` |
 | `leyline-cdc` | Content-defined chunking (GearHash, xet-compatible params), 8–128 KiB bounds (`cdc/src/lib.rs:29-40`). Produces blob hashes; produces **no** root | `chunk_into`, `read_range` |
-| `leyline-fs` | Filesystem presentation — mounts arena as FUSE or NFS; optional CDC-derived chunk manifests for bounded range reads. **Externally pinned** — cloister depends on this crate directly | `SqliteGraph`, `SqliteGraphAdapter`, `activate_chunked_content` |
+| `leyline-fs` | Arena reader and graph presentation (the FUSE/NFS mount is `leyline-storefs`); optional CDC-derived chunk manifests for bounded range reads. **Externally pinned** — cloister depends on this crate directly | `SqliteGraph`, `SqliteGraphAdapter`, `activate_chunked_content` |
 | `leyline-envelope` | DSSE envelope + in-toto Statement v1 attestation over `leyline-sign`'s root signer; byte-compatible hoist of rosary's `dsse.rs` | `Envelope`, `Statement`, `sign_payload`, `verify_payload` |
 | `leyline-runtime` | Capability-resolved execution lifecycle + isolation backends (`execution/v1`) — authorization, native/libkrun backends, confinement (ADR-0035). **Externally pinned** — cloister's `host-runtime` depends on this crate, gated behind its own `llo-execution` feature | `ExecutionService`, `AuthorizedExecution`, `Backend` |
 | `leyline-schema-bridge` | capnp compiler plugin family — capnp schemas → zod TS / Go / JSON Schema codegen; unmapped constructs are hard errors. Also a rosary build-anchor | `capnpc-schema-bridge-*` binaries |
 | `leyline-vcs` | jj sidecar — automatic versioning of arena snapshots. **External-facing**: no in-workspace consumer; git-rev pinned directly by rosary (see Cross-runtime consumers below) | `VersionedGraph`, `.leyline/` virtual dir |
 | `leyline-sign` | Ed25519 `RootSigner` that signs the at-rest Σ `Head` (S1) + `verify_head` verify-on-load (S2) + the canonical key id `kid = lowercasehex(SHA-256(SPKI)[:16])` (S3, signet ADR-012); plus CMS/gpgsm verify primitives for jj commit signing (interactive host signing stays cloister-side per ADR-0019). **Externally pinned twice** by cloister, at two different revs — see Cross-runtime consumers below | `Ed25519RootSigner`, `verify_head`, `canonical_kid`, Certificate, Signature |
-| `leyline-cas-ffi` | Wasm32-callable FFI for BLAKE3-substrate hash. **External-facing**: no in-workspace consumer; consumed by cloister via workerd's cdylib loader | `leyline_hash_bytes` |
+| `leyline-cas-ffi` | Wasm32-callable FFI for the BLAKE3 substrate hash and `derive_key` (the keyed primitive run-id v2 needs, ADR-0047 M3). **External-facing**: no in-workspace consumer; consumed by cloister via workerd's cdylib loader | `leyline_hash_bytes`, `leyline_derive_key` |
 | `leyline-text-search` | Unstructured-text semantic search backend abstraction. `NullEngine` default; `WitchcraftEngine` (XTR-WARP) behind feature flag | `TextSearchEngine` trait |
 | `leyline-chat-embed` | CLI binary: semantic search over Claude Code chat databases (mache's `claude-chats` ingest) via fastembed/MiniLM | `chat-embed` binary |
 | `leyline-cli-lib` | The daemon. Owns the living db + UDS control socket + MCP HTTP transport; hosts all enrichment passes | `cmd_daemon`, `daemon::ops` |
-| `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib`; injects the storefs host mount into `daemon --mount` | `parse`, `daemon`, `inspect` |
+| `leyline-cli` | The `leyline` binary. Thin wrapper around `leyline-cli-lib`; injects the storefs host mount into `daemon --mount` | `parse`, `daemon`, `execution-daemon`, `inspect`, `verify-head`, `rebuild`, `rootfs import-oci` |
+| `leyline-storefs` | Store-backed filesystem core for the virtio-fs share (ADR-0044) and the host mount (ADR-0045 T8; `mount` feature: NFS, `fuse` feature: FUSE): requests answered from the store, writes landed as proposals | `StoreFs`, `StoreShare` |
+| `leyline-krun-worker` | The microVM worker binary: links the vendored libkrun and its patches (`rs/third_party/`), one guest per process. Not published | `leyline-krun-worker` binary |
 
 **Contract:** The `nodes` + `_ast` + `_source` + `node_content` tables form the
 core **SQL projection ABI**; enrichment passes write derived sidecars (`_lsp*`,
@@ -139,23 +150,24 @@ it has no root, and it must never be given one. `nodes.record` is the
 cross-runtime ABI — mache reads that column directly out of the projection, with
 no cgo (`mache/internal/ingest/ast_walker_nodes.go:23`).
 
-**In-flight (analysis-substrate decade, `docs/decades/analysis-substrate.md`):** The `_cfg` / `_dfg` / `_taint` fact tables — three projections of one differential-dataflow computation over the existing `_ast` / `node_content` / `node_defs` / `node_refs` EDB, driven by `daemon.sheaf.invalidate` as the epoch tracker. v0.7.2 shipped T1's schema + κ CFG-kind vocabulary + reflow-invariant CFG builder + F1_cfg_reflow_stable gate. T1.b3-followup (bead `a0fadd`) wires `_cfg` population into `cmd_parse`; T2 / T3 / T4 still open. `docs/decades/analysis-substrate.md` §4.1 names the sub-file staging layer as a decade-level open question to resolve before T3.b3 (bead `c25128`).
+**In-flight (analysis-substrate decade, `docs/decades/analysis-substrate.md`):** The `_cfg` / `_dfg` / `_taint` fact tables — three projections of one differential-dataflow computation over the existing `_ast` / `node_content` / `node_defs` / `node_refs` EDB, driven by `daemon.sheaf.invalidate` as the epoch tracker. v0.7.2 shipped T1's schema + κ CFG-kind vocabulary + reflow-invariant CFG builder + F1_cfg_reflow_stable gate. `cmd_parse` does not populate `_cfg` yet (T1.b3-followup, bead `a0fadd`); T2 / T3 / T4 still open. `docs/decades/analysis-substrate.md` §4.1 names the sub-file staging layer as a decade-level open question to resolve before T3.b3 (bead `c25128`).
 
 ### Runtime surfaces (served from `leyline-cli-lib`)
 
-Two wire transports, one tool surface. These are **not a third code layer**: both
-listeners are modules of the `leyline-cli-lib` crate, which is itself in Layer 2
-— the UDS listener at `rs/ll-open/cli-lib/src/daemon/socket.rs:38-43` (the only
-`UnixListener` in the workspace) and the MCP HTTP server at
-`rs/ll-open/cli-lib/src/daemon/mcp.rs:688-722`. What follows is the runtime
-topology a consumer sees, not a dependency edge.
+Two wire protocols, one op registry. These are **not a third code layer**: every
+listener is a module of the `leyline-cli-lib` crate, which is itself in Layer 2 —
+the control socket bound by `bind_owner_only` in
+`rs/ll-open/cli-lib/src/daemon/socket.rs`, and MCP over HTTP (`mcp::spawn`) and
+over UDS (`mcp::spawn_uds`) in `rs/ll-open/cli-lib/src/daemon/mcp.rs`. What follows
+is the runtime topology a consumer sees, not a dependency edge.
 
 | Transport | Path | Used by |
 |---|---|---|
-| **UDS** | `~/.mache/<arena>.ctrl.sock` (default) — local-process IPC | mache (Go), other same-machine consumers |
-| **MCP HTTP** | `:8384` default (`--mcp-port`) — JSON-RPC tool surface for agents (token-gated per ADR-0022) | Claude Code (MCP plugin), cloister (proxy via Cloudflare Access) |
+| **UDS** | `<ctrl>.sock`, by default `~/.mache/default.sock` (a daemon whose socket lives elsewhere publishes a `~/.mache/default.sock` discovery link to it) — local-process IPC | mache (Go), other same-machine consumers |
+| **MCP HTTP** | off unless `--mcp-port` is given (the OCI image uses 8384) — JSON-RPC tool surface for agents (token-gated per ADR-0022) | Claude Code (MCP plugin), cloister (proxy via Cloudflare Access) |
+| **MCP UDS** | `--mcp-uds <path>`, mode 0600 | cloister (through its proxy) |
 
-Both transports dispatch to the same op registry — see `rs/ll-open/cli-lib/src/daemon/` for the dispatcher. Adding an op = capnp variant + Rust arm + entry in `is_known_base_op`. The op surface is ~23 base ops grouped by purpose (lifecycle, navigation, graph queries, introspection, LSP, bulk SQL, embedding search).
+The control socket dispatches every op in `BASE_OP_NAMES`. MCP dispatches only the tools `tools/list` advertises, inside the Cloister groups the listener's `--mcp-groups` grant names (raw SQL is its own `sql` group); any other name is refused before dispatch (`-32601` `not_advertised`, `-32001` `not_granted`). Adding an op = a `BaseRequest` variant + a `NATIVE_OP_NAMES` entry (`rs/ll-open/cli-lib/src/daemon/wire.rs`) + a `dispatch_typed` arm (`daemon/ops.rs`). The op surface is the native ops plus the eight execution/v1 ops, grouped by purpose (lifecycle, navigation, graph queries, introspection, LSP, read-only SQL, embedding search, proposals, execution).
 
 ---
 
@@ -165,15 +177,16 @@ This is [ADR-0032](adr/0032-declared-decompositions.md) §D4 applied to the
 shipped code. It is the arbiter when this doc, [README.md](../README.md), and
 [`TABLE_CONTRACT.md`](TABLE_CONTRACT.md) appear to disagree.
 
-Three identity domains are deliberately separate, plus one contract that is not
-an identity domain at all:
+Four identity domains, plus the parser identity bound beside the store root, are
+deliberately separate, and one contract is not an identity domain at all:
 
 | Domain | Authoritative for | May depend on | Must NOT claim | Verification boundary |
 |---|---|---|---|---|
 | **SQLite arena snapshot root** — `Controller.current_root` | the exact byte image of one snapshot | nothing | anything about logical content | BLAKE3 over the whole serialized buffer, checked before deserialization |
 | **Cap'n Proto segment root** — `Head.rootHash` | that a given parse run produced these segments | the segment bytes it folds over | to name the same thing as `current_root` | canonical-encoding fixtures + tagged fold |
 | **store root** — `Head.storeRoot` | the store's manifest — every `_tree` entry as (relative path, git mode, blob hash), directories included — whatever parser projects it | `_tree` entries and `source_blobs`; no parser input | anything about derived rows, bytes on disk, or the run that wrote the segments | `leyline verify-head` recomputes it from the arena and refuses on mismatch |
-| **blob hash** | one CDC/CAS payload | the snapshot that contains it | to be a root for anything | `BlobStore::get` verify-on-read |
+| **parser identity** — `Head.parserId` | the derivation the projection was computed under | schema versions, epochs, grammar digests; no store bytes | anything about the store's contents | `leyline verify-head` recomputes it for the arena (`store_root::verify`); head digest v3 binds it beside `storeRoot` |
+| **blob hash** | one CDC/CAS payload | the snapshot that contains it | to be a root for anything | `BlobStore::get` verify-on-read; every `source_blobs` read goes through `leyline_core::source_blob`, which verifies, and `task lint:source-blob-reads` refuses any other reader |
 | **SQL projection ABI** | queryable tables, columns, and indexes | none of the above | **to be "the substrate"; to have a root** | schema + cross-runtime query fixtures |
 
 This table maps §D4's columns onto the domains that actually exist in code, which
@@ -202,7 +215,7 @@ both before:
   other.
 
 `current_root` is a **flat** BLAKE3 digest of one serialized byte image
-(`rs/ll-open/cli-lib/src/cmd_daemon.rs:1263-1266` → `rs/ll-core/core/src/substrate.rs:147`).
+(`rs/ll-open/cli-lib/src/cmd_daemon.rs` `image_root`, the same value as `ContentAddressed for [u8]` in `rs/ll-core/core/src/substrate.rs`).
 It has no partition structure of its own, and per ADR-0032 impossibility (A) it
 cannot be reconstructed as a fold over CDC chunks — BLAKE3's internal tree is
 over a fixed 1024-byte grid with a position-binding counter, so no
@@ -210,7 +223,7 @@ content-defined chunk hash is ever a node of it.
 
 `Head.rootHash` **is** a tagged fold: `PartitionSpec::address` over per-segment
 addresses under the `leyline/segment-root/v1` scheme
-(`rs/ll-open/cli-lib/src/cmd_parse.rs:1783-1790`, `rs/ll-core/core/src/partition.rs:106-119`),
+(`rs/ll-open/cli-lib/src/cmd_parse.rs` `hash_segment_files`, `rs/ll-core/core/src/partition.rs` `PartitionSpec::address`),
 keyed with `blake3::Hasher::new_derive_key` so the scheme tag is folded into the
 digest rather than riding alongside it (§D2). It is one level over three
 segments, not a recursive Merkle tree.
@@ -222,9 +235,9 @@ either one the Σ substrate.
 
 ### The snapshot loop
 
-LLO's daemon runs a **living SQLite database in memory** with an **arena snapshot loop**:
+LLO's daemon runs a **living SQLite database** (file-backed at `<ctrl>.live.db`, WAL) with an **arena snapshot loop**:
 
-1. **Parse phase**: `leyline-ts` walks tree-sitter ASTs into the in-memory db.
+1. **Parse phase**: `leyline-ts` walks tree-sitter ASTs into the living db.
 2. **Enrichment phase**: each registered pass (LSP → `_lsp*` tables; HDC → `_hdc*` tables; etc.) writes sidecar rows.
 3. **Optional CDC activation**: `daemon --cdc` resumably builds private chunk
    manifests over the whole-file `source_blobs` rows at or above the 8 KiB
@@ -253,7 +266,7 @@ The arena is double-buffered: a writer flip advances the controller; readers see
                   └────┬────┘
                        ▼ writes
         ┌──────────────────────────────┐
-        │ in-memory living db (SQLite) │
+        │ living db (SQLite, .live.db) │
         └──────────────┬───────────────┘
                        ▼ snapshot
         ┌────────────────────────────────┐
@@ -354,21 +367,21 @@ Architectural decisions that shape LLO today:
 | ADR | Subject | Status |
 |---|---|---|
 | [ADR-0014](adr/0014-capnp-as-protocol.md) | Capnp as the wire protocol | Accepted |
-| [ADR-0015](adr/0015-lazy-on-access-ingestion.md) | Lazy-on-access ingestion | Accepted |
-| [ADR-0016](adr/0016-ai-native-query-surface.md) | AI-native query surface | Accepted |
-| [ADR-0020](adr/0020-entity-observation-lattice.md) | Entity-observation lattice (sheaf-driven) | Accepted |
-| [ADR-0021](adr/0021-cache-lockfile-schema.md) | Cache lockfile schema | Accepted |
+| [ADR-0015](adr/0015-lazy-on-access-ingestion.md) | Lazy-on-access ingestion | Proposed |
+| [ADR-0016](adr/0016-ai-native-query-surface.md) | AI-native query surface | Proposed |
+| [ADR-0020](adr/0020-entity-observation-lattice.md) | Entity-observation lattice (sheaf-driven) | Proposed |
+| [ADR-0021](adr/0021-cache-lockfile-schema.md) | Cache lockfile schema | Proposed |
 | [ADR-0022](adr/0022-mcp-wire-auth-shared-secret.md) | MCP wire auth: shared-secret token (local); cloister-proxied (remote) | Accepted |
 | [ADR-0023](adr/0023-agent-first-language-facts.md) | Agent-first language facts (analyzer-as-library, not LSP-wire) | Proposed |
 | [ADR-0024](adr/0024-hdc-substrate-identity-rewrite.md) | HDC substrate-identity rewrite (bundle composition, seeded leaves, fp-quantize) | Accepted (shipped v0.5.0) |
 | [ADR-0025](adr/0025-hdc-compositional-validation.md) | HDC compositional-vs-distance use modes (validate or remove) | Proposed |
 | [ADR-0026](adr/0026-content-addressed-pointer-store.md) | Content-addressed pointer store (`_ast_pointer` + `capnp_blobs`; Phase 1 dual-write) | Superseded by ADR-0040 D5 (Phase 1 retired at `projection-v8`) |
-| [ADR-0027](adr/0027-unified-code-fact-ir-producer.md) | Unified code-fact IR: merkle-AST `node_hash` (κ kind + terminal + child hashes) + `node_content` / `node_child` git-tree object | Accepted (shipped v0.6.0); the hash construction is keyed since merkle-ast-v3 (ADR-0047 D-i) |
-| [ADR-0028](adr/0028-content-addressed-source-blobs.md) | Content-addressed source blobs (`source_blobs`; F-git compat with `git cat-file blob`) | Accepted (Phase 1 shipped) |
+| [ADR-0027](adr/0027-unified-code-fact-ir-producer.md) | Unified code-fact IR: merkle-AST `node_hash` (κ kind of a named node or grammar kind of an anonymous token, + terminal + child hashes) + `node_content` / `node_child` git-tree object | Accepted (shipped v0.6.0); the hash construction is keyed since merkle-ast-v3 (ADR-0047 D-i) |
+| [ADR-0028](adr/0028-content-addressed-source-blobs.md) | Content-addressed source blobs (`source_blobs`; F-git compat with `git cat-file blob`) | Proposed — Phase 1 (`source_blobs`) shipped |
 | [ADR-0029](adr/0029-cas-backed-workspace.md) | CAS-backed workspace (mount driver + manifest; alternative to git-worktree flow) | Proposed (Phase 1 mount driver bead `de3f81`) |
 | [ADR-0030](adr/0030-sheaf-over-embeddings.md) | Sheaf over embeddings — making δ⁰ load-bearing | Rejected — NO-GO, scoped to *approximate* stalk-distance gating |
 | [ADR-0031](adr/0031-restriction-addressed-review-caching.md) | Restriction-addressed derived-view caching over CAS (the *exact* variant ADR-0030's addendum endorses) | Proposed; **amended** by ADR-0032 §D5 to drop SHA-256 |
-| [ADR-0032](adr/0032-declared-decompositions.md) | **Declared decompositions** — three identity structures, one fold operator. §D4 is the authority table this doc's [Authority model](#authority-model) implements | Proposed |
+| [ADR-0032](adr/0032-declared-decompositions.md) | **Declared decompositions** — three identity structures, one fold operator. §D4 is the authority table this doc's [Authority model](#authority-model) implements | Proposed — D2's tagged fold shipped (amended by ADR-0047); `manifestRoot`/`logicalRoot` not implemented |
 | [ADR-0033](adr/0033-cdc-chunk-backed-content.md) | CDC chunk-backed content — a derived chunk index over declared targets | Accepted (retroactive — records what shipped since 0.10.x) |
 | [ADR-0034](adr/0034-construct-identity-content-address-pair.md) | Construct identity is a pair: `node_hash` (content) + qualified token (address) | Accepted |
 | [ADR-0035](adr/0035-confinement-manifest-and-attested-enforcement.md) | Confinement is one manifest; the enforcement mechanism is attested, not assumed | Accepted |
@@ -376,12 +389,13 @@ Architectural decisions that shape LLO today:
 | [ADR-0037](adr/0037-naming-the-proxy-channel.md) | Naming the proxy channel — `confinement/v1` assumes an egress path it cannot express | Accepted (shipped in the release that landed it) |
 | [ADR-0038](adr/0038-host-side-subscription-credential-ingress.md) | Host-side subscription credential ingress: proxy/vault custody without exposing tokens to confined harnesses | Proposed |
 | [ADR-0039](adr/0039-multi-vector-retrieval-over-cas.md) | Multi-vector retrieval over CAS — kernel-delegated caching instead of a bespoke index | Proposed — falsification ladder has not run; no implementation exists |
-| [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` (retired by ADR-0047 M1, now the parser-free `storeRoot`) | Proposed — D1, D3, D4 and D6 shipped (v0.20.2); D5 open; D7 is ADR-0041 |
+| [ADR-0040](adr/0040-the-write-boundary.md) | The write boundary — source and manifest are the data, the arena is a cache; one write API for mount, splice and cloister; `treeRoot` beside `Head.rootHash` (retired by ADR-0047 M1, now the parser-free `storeRoot`) | Proposed — D1, D3, D4 and D6 shipped (v0.20.2), D1 amended by ADR-0047 M1; D5 shipped at `projection-v8` (v0.22.0); D7 is ADR-0041 |
 | [ADR-0041](adr/0041-publication-snapshots.md) | Publication — immutable snapshot files of whole proposals under control block v4 with `(epoch, seq)`; `current_root` retired for `storeRoot` (S6 amended by ADR-0047 M1); one producer; transport carries what proposals carry | Proposed — no implementation exists |
 | [ADR-0042](adr/0042-proposals.md) | Proposals — a write names the bytes its author read and is applied whole or refused whole; file bases, daemon `read_source`/`propose`, mount `ESTALE`; node bases and the closure check open | Proposed — file bases, one-transaction writes, durable acknowledgement, daemon ops and mount bases implemented (#437-#440, `843e03`) |
 | [ADR-0043](adr/0043-one-store-refs-and-checkouts.md) | One store — branches are refs, worktrees are checkouts with an index, git is read and written natively (no subprocess); closes the restart that reverted proposals (`60f39f`) | Accepted — built in phases; phase 0 (single checkout) is #459 |
-| [ADR-0044](adr/0044-userspace-data-plane.md) | Agents see a filesystem served from userspace — the agent runs in a libkrun microVM and its working tree is a virtio-fs share whose backend is LLO (reads from the store, writes as proposals, refusals as errno); host NFS/FUSE mounts are compatibility | Accepted — LLO carries a libkrun patch; phases A–C |
-| [ADR-0045](adr/0045-git-shaped-store-and-merged-proposals.md) | The store is a git-shaped tree — every path holds any bytes with a git mode, directories are entries, the store identity covers both (`treeRoot` then; `storeRoot` since ADR-0047 M1); parsing is a projection and an unparseable file is stored with a diagnostic; a proposal whose base moved merges three ways (`gix-merge`) and overlapping hunks refuse with their ranges; amends ADR-0042 and ADR-0044; T8: the host mount is storefs | Accepted — phases 1–6 (store, proposals, wire, storefs, host mount) |
+| [ADR-0044](adr/0044-userspace-data-plane.md) | Agents see a filesystem served from userspace — the agent runs in a libkrun microVM and its working tree is a virtio-fs share whose backend is LLO (reads from the store, writes as proposals, refusals as errno); host NFS/FUSE mounts are compatibility | Accepted — LLO carries nine libkrun patches (0001–0009); phases A–C |
+| [ADR-0045](adr/0045-git-shaped-store-and-merged-proposals.md) | The store is a git-shaped tree — every path holds any bytes with a git mode, directories are entries, the store identity covers both (`treeRoot` then; `storeRoot` since ADR-0047 M1); parsing is a projection and an unparseable file is stored with a diagnostic; a proposal whose base moved merges three ways (`gix-merge`) and overlapping hunks refuse with their ranges; amends ADR-0042 and ADR-0044; T8: the host mount is storefs | Accepted — phases 1–7 (store, proposals, wire, storefs, host mount, derived-path scratch) |
+| [ADR-0046](adr/0046-connection-broker.md) | Connection broker — the data plane for cloister's declared connections | Proposed (acceptance is the owner's decision); no broker exists, and `credentialBrokerRefs` is refused |
 | [ADR-0047](adr/0047-sigma-amendment-constructions-witnesses-edges.md) | Σ amendment — σ is indexed by construction (one value, one address per construction; three laws), `verify(Ref, Witness)`, four edge kinds (Derives, Contains, Attests, Locates), a conformance table of every shipped identity, and four identity migrations: keyed `node_hash`/`run_id`, a parser-free Merkle `storeRoot` replacing `treeRoot`, `lang`/`raw_kind` per occurrence, blob address stays σ over bytes | Accepted (owner, 2026-11-04) — M0 shipped (`10d71a`); M1 (`storeRoot`, head digest v3, wire `store_root`, projection-v11) implemented by `73c6ee`; M2 (keyed `node_hash` merkle-ast-v3, `lang`/`raw_kind` off `node_content`, projection-v12) implemented by `73add7` and `b5d354`; M3–M4 proposed |
 
 ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`. Mache's ADR-0024 (`incremental-dataflow-taint-as-substrate-queries`) is a separate document in the mache repo whose producer-side lives in LLO's `analysis-substrate` decade — see the decade doc for the mapping.
@@ -392,11 +406,11 @@ ADRs 0017-0019 are cloister-side and live in `~/remotes/art/cloister/docs/adr/`.
 
 | Surface | Built via |
 |---|---|
-| `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` + `cdc` — the structural-analysis core plus explicit CDC activation |
+| `leyline` binary (default features) | `task build` (debug, headless) / `task release` (release, headless) / `task install` (release + codesign + install to `~/.local/bin`). Default features are `lsp` + `validate` + `hdc` + `cdc` + `sheaf` — the structural-analysis core plus explicit CDC activation and the sheaf engine |
 | `leyline` binary (recommended for downstream consumers) | `task install:full` — `--features all` (adds `vec` + `text-search`). Portable — no libfuse-t/libfuse runtime dep |
 | `leyline` binary (NFS mount, no libfuse) | `task build:mount` / `task release:mount` — `--features mount`. Mounts with `--backend nfs`; links no libfuse and needs no `PKG_CONFIG_PATH`; refuses `--backend fuse` naming the `fuse` feature |
 | `leyline` binary (everything including both mount backends) | `task install:full+mount` — `--features full` (`mount` + `fuse`). The FUSE backend requires libfuse-t (macOS `brew install fuse-t`) or libfuse (Linux `apt install libfuse-dev`) at build time and at runtime |
-| Distroless OCI image | `task image` — produces `localhost/leyline:v0.26.0` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.26.0` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
+| Distroless OCI image | `task image` — produces `localhost/leyline:v0.26.0` (~20 MB) via `cargo zigbuild` static musl; image default CMD is `daemon --mcp-port 8384 --mcp-bind 0.0.0.0 --mcp-allow-public`. A `v*` tag publishes the multi-arch image to `ghcr.io/agentic-research/ley-line-open:v0.26.0` with a build-provenance attestation; the tag is `v`-prefixed to match `server.json`'s `packages[0].version`, which is the string cloister derives `<identifier>:<version>` from |
 | FFI staticlibs + header | `task release:fs-static:target` — builds the mache-facing `leyline-fs` staticlib with explicit CDC support and publishes it as a verified GitHub release artifact (linux amd64/arm64 + darwin arm64; macOS amd64 staticlib currently absent) |
 | Go schema client | `clients/go/leyline-schema` — Apache-2.0 nested Go module; `daemon/wire` is the canonical typed JSON consumer API and v0.26.0 is its tested compatibility point |
 

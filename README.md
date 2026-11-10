@@ -53,6 +53,11 @@ development, see [GETTING-STARTED.md](GETTING-STARTED.md).
   serialized byte image (`current_root`). That hash is authoritative for byte
   integrity only — it says nothing about logical content. The generalized
   arena↔consumer Cap'n Proto handoff is tracked by `ley-line-open-50be73`.
+- The head beside each arena names the store with `storeRoot`, a parser-free
+  directory Merkle root over every path, mode and blob hash, and names the
+  parser separately with `parserId`; a signed head commits to both (head
+  digest v3), and `leyline verify-head` recomputes them. `AGENTS.md` lists
+  every identity LLO ships with its construction.
 - CDC is an explicit, derived storage index over whole-file `source_blobs`.
   `source_blobs` remains authoritative; activate and collect CDC manifests with
   `leyline cdc`.
@@ -71,7 +76,7 @@ Those two are the arbiters; this list is a summary of them.
 task install              # released/default feature set
 task install:full         # portable full feature set, no mount backend
 task install:full+mount   # add NFS and FUSE mounts (FUSE links libfuse)
-task ci                   # check, clippy, formatting, tests, FFI gates
+task ci                   # check, clippy, formatting, tests, FFI gates, cargo-deny audit
 task runtime:test        # embedded libkrun runtime contract tests (fake worker)
 ```
 

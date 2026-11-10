@@ -38,15 +38,24 @@ the reviewed implementation.
 
 ## Authority ledger
 
-Keep these claims separate throughout the review:
+Keep these claims separate throughout the review. `AGENTS.md` "Identity and
+Authority Vocabulary" gives each row's exact construction and code location;
+ADR-0047 §3 is the conformance table for the constructions it lists.
 
-| Surface | Authority |
-|---|---|
-| `Controller.current_root` | BLAKE3 of one serialized SQLite arena byte image |
-| `Head.rootHash` | Tagged fold over canonical Cap'n Proto parse segments |
-| blob hash | Identity of one CAS/CDC payload |
-| SQL projection ABI | Queryable shape; a contract, not an identity domain |
-| `manifestRoot`, `logicalRoot` | Proposed only; never describe as shipped |
+| Surface | Authority | Status |
+|---|---|---|
+| `Controller.current_root` | BLAKE3 of one serialized SQLite arena byte image | Shipped |
+| `Head.rootHash` | Keyed fold `leyline/segment-root/v1` over one parse run's canonical Cap'n Proto segments; a run receipt | Shipped |
+| `Head.storeRoot` | Parser-free directory Merkle root `leyline/store-tree/v1` over `_tree` (path, git mode, blob hash) | Shipped (ADR-0047 M1); the retired `treeRoot` refuses a head |
+| `Head.parserId` | Keyed fold `leyline/parser-id/v1` over schema versions, epochs and grammar digests; bound beside `storeRoot`, never inside it | Shipped |
+| head digest | `derive_key("leyline head digest v3", …)` over generation, `rootHash`, `parentHash`, `storeRoot`, `parserId`, parent digest | Shipped (v3); v1 and v2 removed |
+| `node_hash` | `derive_key("leyline/ast-node/v3", …)` over one syntax subtree (κ kind for a named node, grammar kind for an anonymous token; merkle-ast-v3); location-free | Shipped (ADR-0047 M2) |
+| blob hash | Plain BLAKE3 (σ_bytes) of one CAS/CDC payload; σ_bytes is the one unkeyed construction (also `current_root` and the rootfs digest) | Shipped |
+| `run_id` | `run-` ‖ BLAKE3(`cloister/execution/v1/run-id` ‖ 0x00 ‖ length-prefixed spec digest, grant id, replay key) | Shipped (v1); keyed v2 is ADR-0047 M3, proposed |
+| rootfs digest | BLAKE3 of the exact `rootfs.manifest.json` bytes; the CAS directory name and `RunReceipt.inputRoots[0]` | Shipped |
+| locators (`content_id`, `nid`, `file_id`, `dir_id`, `name_id`, `kind_id`) | Arena-local row keys; not an identity, never on the wire, in a signed claim or in a cache key | Shipped (locator) |
+| SQL projection ABI | Queryable shape (`projection-v12`); a contract, not an identity domain | Shipped |
+| blob manifest address, `manifestRoot`, `logicalRoot` | Proposed only (ADR-0047 M4, ADR-0032); never describe as shipped | Proposed |
 
 Never infer one row from another. Require an explicit co-attestation or mapping
 when two authorities must travel together.

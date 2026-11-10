@@ -20,9 +20,13 @@
 //!
 //! - `file_id` is interned in `files` (append-only; rows are never deleted,
 //!   so ids are never reused and a re-created path re-binds to its old id).
-//! - `ordinal` is the node's pre-order rank within its file's parse — the
-//!   same dense `0..n-1` the ADR-0026 pointer store already writes as
-//!   `blob_ord`. Ordinal 0 is the file's own node (the AST root).
+//! - `ordinal` is the node's pre-order rank within its file's parse among
+//!   the file's code occurrences — the same dense `0..n-1` the ADR-0026
+//!   pointer store wrote as `blob_ord`. Ordinal 0 is the file's own node
+//!   (the AST root). Comment occurrences (extraction epoch 7, bead
+//!   `ley-line-open-aa1634`) take the ordinals after every code occurrence,
+//!   in source order, and injected ids the ordinals after those, so `nid`
+//!   order is document order only among code occurrences.
 //! - Directories live in `dirs` as an interned adjacency chain; their nids
 //!   are the negative of their `dir_id`, so the tree stays one namespace.
 //!
@@ -51,8 +55,9 @@ pub use locator::*;
 /// Bits of `nid` reserved for the within-file ordinal.
 pub const NID_ORDINAL_BITS: u32 = 24;
 
-/// Mask over the ordinal bits: `nid & NID_ORDINAL_MASK` is the pre-order
-/// rank; `nid >> NID_ORDINAL_BITS` is the `file_id`. 24 bits = 16,777,215
+/// Mask over the ordinal bits: `nid & NID_ORDINAL_MASK` is the ordinal (the
+/// pre-order rank among code occurrences, comments and injected ids after
+/// them); `nid >> NID_ORDINAL_BITS` is the `file_id`. 24 bits = 16,777,215
 /// nodes per file; the writer must refuse a file that overflows it rather
 /// than let ordinals bleed into the next file's range.
 pub const NID_ORDINAL_MASK: i64 = (1 << NID_ORDINAL_BITS) - 1;

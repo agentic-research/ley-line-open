@@ -95,6 +95,26 @@ struct AstEntry {
     /// hashes; spans/paths/node_ids are OUT). Stamped onto the `_ast`
     /// occurrence row and pointing at the deduped `node_content` row.
     node_hash: [u8; 32],
+    /// The entry's index in the fold's pre-order walk, comments included.
+    /// Sibling order (`nodes.ord`) follows it; the nid ordinal does not,
+    /// because comments take the ordinals after every code entry (bead
+    /// `ley-line-open-aa1634`, [`order_ast_entries`]).
+    pre: usize,
+    /// A comment occurrence ([`emit_comment_occurrence`]).
+    comment: bool,
+}
+
+/// Lay a file's `_ast` entries out in ordinal order: every code entry in
+/// pre-order (root first), then every comment entry in source order (bead
+/// `ley-line-open-aa1634`). Comments come after the code so that adding,
+/// editing or removing a comment moves no code `nid`, the same edit
+/// stability the file-local surrogate was chosen for (review-gate 4,
+/// `stability_matrix_gate.rs`). Injected ids take the ordinals after both.
+fn order_ast_entries(entries: Vec<AstEntry>) -> Vec<AstEntry> {
+    let (mut code, comments): (Vec<AstEntry>, Vec<AstEntry>) =
+        entries.into_iter().partition(|a| !a.comment);
+    code.extend(comments);
+    code
 }
 
 /// A `node_content` row — one per UNIQUE subtree (deduped by `node_hash`).
@@ -975,7 +995,8 @@ pub fn cmd_parse(source: &Path, output: &Path, lang_filter: Option<&str>) -> Res
 ///
 /// projection-v5 lays a file's 24-bit ordinal space out in one order: the AST
 /// entries take `0..ast_entries` in pre-order (index == the pointer store's
-/// blob_ord), and injected-subtree ids — which carry fact rows but no
+/// blob_ord; since extraction epoch 7 the code entries in pre-order, then the
+/// comment entries, [`order_ast_entries`]), and injected-subtree ids — which carry fact rows but no
 /// `_ast`/`nodes` row — take the ordinals immediately after, in fold order.
 /// `j` therefore counts from the AST entry count, not from zero.
 fn injected_ordinal(ast_entries: usize, j: usize) -> usize {
@@ -1859,8 +1880,9 @@ fn parse_into_conn_with(
                     };
                     let base = file_nid(file_id, 0);
 
-                    // Ordinals: `ast_entries` is pre-order (root first), and
-                    // its index IS the pointer store's blob_ord — the nid's
+                    // Ordinals: `ast_entries` is pre-order (root first; code
+                    // entries, then comment entries, `order_ast_entries`),
+                    // and its index IS the pointer store's blob_ord — the nid's
                     // low 24 bits are one and the same number. Injected
                     // nodes (no `_ast`/`nodes` rows, fact rows only) take
                     // the ordinals PAST the `_ast` count, in fold order.
@@ -1887,12 +1909,17 @@ fn parse_into_conn_with(
                     // parent_nid + sibling ord per entry, derived from the
                     // ancestry-prefix id the fold builds (parents precede
                     // children in pre-order, siblings keep source order).
+                    // Walked in the fold's pre-order, comments in place, so
+                    // `ord` is the source order among code and comment
+                    // siblings alike (bead `ley-line-open-aa1634`).
                     // The per-kind display rank derives from `ord` at read
                     // time, reproducing the pre-v5 `{kind}[_{idx}]` names.
                     let mut sib_next: HashMap<Nid, i64> = HashMap::new();
                     let mut placement: HashMap<&str, (Nid, i64)> =
                         HashMap::with_capacity(pf.ast_entries.len());
-                    for a in pf.ast_entries.iter().skip(1) {
+                    let mut in_pre_order: Vec<&AstEntry> = pf.ast_entries.iter().collect();
+                    in_pre_order.sort_unstable_by_key(|a| a.pre);
+                    for a in in_pre_order.into_iter().skip(1) {
                         let parent_str = a
                             .node_id
                             .rsplit_once('/')
@@ -3328,7 +3355,9 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 // in different files share a `node_hash`. Anonymous children (operators
 // like `+`/`-`, keywords, punctuation) ARE folded, which is what
 // distinguishes `a+b` from `a-b`; comments/`extra` nodes are excluded, so a
-// comment-only edit leaves every enclosing hash unchanged.
+// comment-only edit leaves every enclosing hash unchanged. A comment is an
+// `_ast` occurrence with an address of its own (a leaf over its text, bead
+// `ley-line-open-aa1634`), never a child in another node's preimage.
 //
 // merkle-ast-v3 (ADR-0047 D-i, step M2, bead `ley-line-open-73add7`): the
 // encoding is keyed with BLAKE3 `derive_key` under [`NODE_HASH_CONTEXT`].
@@ -3585,6 +3614,8 @@ pub(crate) fn parse_file_pure(
         end_row: root.end_position().row,
         end_col: root.end_position().column,
         node_hash: [0u8; 32],
+        pre: root_idx,
+        comment: false,
     });
 
     // Fold the whole tree bottom-up. Creates the `_ast`/`nodes`/refs rows
@@ -3609,6 +3640,7 @@ pub(crate) fn parse_file_pure(
         &ctx,
     );
     ast_entries[root_idx].node_hash = root_hash;
+    let ast_entries = order_ast_entries(ast_entries);
 
     // Arena query overrides (bead `ley-line-open-e72629`): a pathological
     // override tripped its resource ceiling somewhere in this file. Drop the
@@ -3810,6 +3842,89 @@ pub(crate) fn parse_to_ast_json(
     }))
 }
 
+/// A child [`fold_children`] visits: a non-`extra` child, which it folds
+/// into the parent's `node_hash`, or a comment extra, which it records as an
+/// occurrence only.
+#[derive(Clone, Copy)]
+enum Visit<'t> {
+    Folded(tree_sitter::Node<'t>),
+    Comment(tree_sitter::Node<'t>),
+}
+
+/// Whether `node` is a comment that tree-sitter parsed as an `extra` (bead
+/// `ley-line-open-aa1634`): named, `extra`, and of a grammar kind that names
+/// a comment: `comment`, `line_comment`, `block_comment`, `html_comment`,
+/// `multiline_comment`, `js_comment` across the compiled grammars. Other
+/// named extras, such as Python's `line_continuation`, are not comments and
+/// stay out of the projection. A comment a grammar parses as an ordinary
+/// child (Swift's member-separator `multiline_comment`, bead
+/// `ley-line-open-1b5f3c`) is not an extra and stays in the fold.
+fn is_comment_extra(node: tree_sitter::Node<'_>) -> bool {
+    node.is_extra() && node.is_named() && node.kind().contains("comment")
+}
+
+/// Record one comment extra as a terminal occurrence (bead
+/// `ley-line-open-aa1634`): an `_ast` row with its grammar kind and span, and
+/// a leaf `nodes` row carrying its text, in source order under the node
+/// tree-sitter attached it to. Its nid ordinal comes after every code
+/// entry's ([`order_ast_entries`]), so a comment edit moves no code nid.
+///
+/// OCCURRENCE-ONLY: the comment never enters its parent's `node_hash` fold,
+/// so a comment-only edit leaves every code `node_hash` unchanged. Its own
+/// `content_id` names the leaf `node_content` row `hash_leaf(kind, text)`,
+/// the merkle-ast-v3 address of a terminal with the comment's full text as
+/// its token, so every column of that row is a function of its `node_hash`
+/// and `token` holds the text. The comment is terminal whatever its
+/// grammar's inner structure: Rust's `line_comment` hides a plain comment's
+/// text in anonymous tokens, so folding its children would give every plain
+/// Rust line comment one address. No facts are extracted and no injection is
+/// probed under a comment.
+#[allow(clippy::too_many_arguments)]
+fn emit_comment_occurrence(
+    content: &[u8],
+    comment: tree_sitter::Node<'_>,
+    id: String,
+    source_id: &str,
+    language: TsLanguage,
+    seen: &mut HashSet<[u8; 32]>,
+    nodes: &mut Vec<ParsedNode>,
+    ast_entries: &mut Vec<AstEntry>,
+    node_contents: &mut Vec<ContentRow>,
+) {
+    let text = comment.utf8_text(content).unwrap_or("");
+    let kind = hashed_kind(language, comment);
+    let h = hash_leaf(kind, text);
+    if seen.insert(h) {
+        node_contents.push(ContentRow {
+            node_hash: h,
+            node_tag: NODE_TAG_LEAF,
+            kind: kind.to_string(),
+            token: Some(text.to_string()),
+            arity: 0,
+        });
+    }
+    ast_entries.push(AstEntry {
+        node_id: id.clone(),
+        source_id: source_id.to_string(),
+        node_kind: comment.kind().to_string(),
+        start_byte: comment.start_byte(),
+        end_byte: comment.end_byte(),
+        start_row: comment.start_position().row,
+        start_col: comment.start_position().column,
+        end_row: comment.end_position().row,
+        end_col: comment.end_position().column,
+        node_hash: h,
+        pre: ast_entries.len(),
+        comment: true,
+    });
+    nodes.push(ParsedNode {
+        id,
+        kind: 0,
+        size: text.len() as i64,
+        record: text.to_string(),
+    });
+}
+
 /// Bottom-up (post-order) fold of `node`'s subtree.
 ///
 /// Returns `node`'s merkle-AST `node_hash`. As a side effect it:
@@ -3825,6 +3940,9 @@ pub(crate) fn parse_to_ast_json(
 /// parent's hash in source order. Anonymous children are terminal tokens
 /// (operators/keywords/punctuation) with no children, so they never
 /// produce `_ast`/`nodes` rows — they only contribute their leaf hash.
+/// Comment extras get `_ast`/`nodes` rows in source order among the named
+/// children and are not folded ([`emit_comment_occurrence`]); every other
+/// extra is skipped.
 #[allow(clippy::too_many_arguments)]
 fn fold_children(
     content: &[u8],
@@ -3849,9 +3967,12 @@ fn fold_children(
     injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) -> [u8; 32] {
-    // Gather non-extra children in source order, with tree-sitter field
-    // names, and count named children per kind (for the node_id suffix).
+    // Gather the children in source order: the non-extra ones (folded, with
+    // their tree-sitter field names) and the comment extras (occurrences
+    // only, bead `ley-line-open-aa1634`); any other extra is skipped. Count
+    // named children per kind, comments included, for the node_id suffix.
     let mut children: Vec<tree_sitter::Node> = Vec::new();
+    let mut visits: Vec<Visit> = Vec::new();
     let mut fields: Vec<Option<&'static str>> = Vec::new();
     let mut named_kind_counts = HashMap::<&str, usize>::new();
     {
@@ -3859,12 +3980,20 @@ fn fold_children(
         if cur.goto_first_child() {
             loop {
                 let ch = cur.node();
-                if !ch.is_extra() {
+                let visit = if !ch.is_extra() {
+                    fields.push(cur.field_name());
+                    children.push(ch);
+                    Some(Visit::Folded(ch))
+                } else if is_comment_extra(ch) {
+                    Some(Visit::Comment(ch))
+                } else {
+                    None
+                };
+                if let Some(v) = visit {
                     if ch.is_named() {
                         *named_kind_counts.entry(ch.kind()).or_insert(0) += 1;
                     }
-                    fields.push(cur.field_name());
-                    children.push(ch);
+                    visits.push(v);
                 }
                 if !cur.goto_next_sibling() {
                     break;
@@ -3875,20 +4004,39 @@ fn fold_children(
 
     let mut child_hashes: Vec<[u8; 32]> = Vec::with_capacity(children.len());
     let mut kind_indices = HashMap::<&str, usize>::new();
+    let mut occurrence_name = |kind: &'static str| -> String {
+        if named_kind_counts[kind] > 1 {
+            let idx = kind_indices.entry(kind).or_insert(0);
+            let n = format!("{kind}_{idx}");
+            *idx += 1;
+            n
+        } else {
+            kind.to_string()
+        }
+    };
 
-    for child in &children {
+    for visit in &visits {
+        let child = match visit {
+            Visit::Folded(child) => child,
+            Visit::Comment(comment) => {
+                let id = format!("{node_id}/{}", occurrence_name(comment.kind()));
+                emit_comment_occurrence(
+                    content,
+                    *comment,
+                    id,
+                    source_id,
+                    language,
+                    seen,
+                    nodes,
+                    ast_entries,
+                    node_contents,
+                );
+                continue;
+            }
+        };
         if child.is_named() {
             let kind = child.kind();
-            let needs_suffix = named_kind_counts[kind] > 1;
-            let name = if needs_suffix {
-                let idx = kind_indices.entry(kind).or_insert(0);
-                let n = format!("{kind}_{idx}");
-                *idx += 1;
-                n
-            } else {
-                kind.to_string()
-            };
-            let id = format!("{node_id}/{name}");
+            let id = format!("{node_id}/{}", occurrence_name(kind));
 
             // _ast occurrence row (pre-order; node_hash patched post-fold).
             let entry_idx = ast_entries.len();
@@ -3903,6 +4051,8 @@ fn fold_children(
                 end_row: child.end_position().row,
                 end_col: child.end_position().column,
                 node_hash: [0u8; 32],
+                pre: entry_idx,
+                comment: false,
             });
 
             // Refs via the language-dispatched factory.
@@ -5404,7 +5554,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v12",
+            "projection-v13",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5417,21 +5567,27 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v12"),
+            Some("projection-v13"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
 
-    /// projection-v12 (ADR-0047 M2, beads `ley-line-open-73add7` and
-    /// `ley-line-open-b5d354`): an arena that still carries the v11 label is
-    /// refused at open — its `node_content` holds merkle-ast-v2 addresses and
-    /// the `lang`/`raw_kind` columns this writer no longer inserts. v10 (a
-    /// parser-qualified `treeRoot` in `derived_from`, ADR-0047 M1) and v9 (a
-    /// `node_hash` column where this writer inserts `content_id`) are refused
-    /// the same way.
+    /// projection-v13 (bead `ley-line-open-aa1634`): an arena that still
+    /// carries the v12 label is refused at open — it has no comment
+    /// occurrences, and a reader of it relies on the v12 invariants (every
+    /// `_ast` child has a `node_edge`; `nid` order is document order) that
+    /// v13 breaks. v11 (merkle-ast-v2 addresses and `lang`/`raw_kind` on
+    /// `node_content`, ADR-0047 M2), v10 (a parser-qualified `treeRoot` in
+    /// `derived_from`, ADR-0047 M1) and v9 (a `node_hash` column where this
+    /// writer inserts `content_id`) are refused the same way.
     #[test]
-    fn projection_v9_to_v11_arenas_are_refused_at_open() {
-        for old in ["projection-v9", "projection-v10", "projection-v11"] {
+    fn projection_v9_to_v12_arenas_are_refused_at_open() {
+        for old in [
+            "projection-v9",
+            "projection-v10",
+            "projection-v11",
+            "projection-v12",
+        ] {
             let td = TempDir::new().unwrap();
             std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
             let conn = Connection::open_in_memory().unwrap();
@@ -5441,7 +5597,7 @@ mod tests {
                 .expect_err("an older projection arena must be refused");
             let msg = format!("{err:#}");
             assert!(
-                msg.contains(old) && msg.contains("projection-v12"),
+                msg.contains(old) && msg.contains("projection-v13"),
                 "the refusal must name both versions; got: {msg}",
             );
         }
@@ -5537,7 +5693,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v12"),
+            msg.contains("projection-v4") && msg.contains("projection-v13"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(
@@ -7021,6 +7177,96 @@ mod tests {
         assert_eq!(
             get_meta(&conn, UNBOUND_FACTS_KEY).unwrap().as_deref(),
             Some("999")
+        );
+    }
+
+    /// Every node of `src` under `lang`, with whether [`is_comment_extra`]
+    /// accepts it.
+    fn comment_classification(lang: &str, src: &str) -> Vec<(String, bool, bool)> {
+        let language = TsLanguage::from_name(lang).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language.ts_language()).unwrap();
+        let tree = parser.parse(src.as_bytes(), None).unwrap();
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            out.push((n.kind().to_string(), n.is_extra(), is_comment_extra(n)));
+            let mut c = n.walk();
+            stack.extend(n.children(&mut c));
+        }
+        out
+    }
+
+    /// Bead `ley-line-open-aa1634`: a comment is a node that is `extra`,
+    /// named, and of a comment kind — all three. Python's `line_continuation`
+    /// is a named extra that is not a comment; Rust's `doc_comment` is a
+    /// named comment-kind node that is not an extra (it sits inside the
+    /// `line_comment` extra).
+    #[test]
+    fn a_comment_extra_is_extra_named_and_of_a_comment_kind() {
+        let accepted = |lang: &str, src: &str, kind: &str| -> Vec<bool> {
+            comment_classification(lang, src)
+                .into_iter()
+                .filter(|(k, _, _)| k == kind)
+                .map(|(_, _, yes)| yes)
+                .collect()
+        };
+        let py = "x = 1 + \\\n    2  # c\n";
+        assert_eq!(accepted("python", py, "comment"), vec![true]);
+        assert_eq!(accepted("python", py, "line_continuation"), vec![false]);
+        assert!(
+            comment_classification("python", py)
+                .iter()
+                .any(|(k, extra, _)| k == "line_continuation" && *extra),
+            "the fixture's line_continuation is an extra"
+        );
+        let rs = "/// d\nfn f() {}\n";
+        assert_eq!(accepted("rust", rs, "line_comment"), vec![true]);
+        assert_eq!(accepted("rust", rs, "doc_comment"), vec![false]);
+        assert_eq!(accepted("rust", rs, "function_item"), vec![false]);
+    }
+
+    /// Bead `ley-line-open-aa1634`: the comment occurrences come after every
+    /// code entry ([`order_ast_entries`]), the root first, and a comment's
+    /// fold id takes a per-kind suffix only when its parent has more than one
+    /// named child of that kind, exactly as a code node's does.
+    #[test]
+    fn comment_entries_follow_the_code_and_name_like_code() {
+        let json = parse_to_ast_json(
+            b"// a\npackage p\n\n// b\nfunc F() {\n\t// c\n}\n",
+            TsLanguage::from_name("go").unwrap(),
+            "p.go",
+        )
+        .unwrap();
+        let rows: Vec<(String, String)> = json["ast"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["node_id"].as_str().unwrap().to_string(),
+                    a["node_kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let pair = |id: &str, kind: &str| (id.to_string(), kind.to_string());
+        assert_eq!(
+            rows,
+            vec![
+                pair("p.go", "source_file"),
+                pair("p.go/package_clause", "package_clause"),
+                pair(
+                    "p.go/package_clause/package_identifier",
+                    "package_identifier"
+                ),
+                pair("p.go/function_declaration", "function_declaration"),
+                pair("p.go/function_declaration/identifier", "identifier"),
+                pair("p.go/function_declaration/parameter_list", "parameter_list"),
+                pair("p.go/function_declaration/block", "block"),
+                pair("p.go/comment_0", "comment"),
+                pair("p.go/comment_1", "comment"),
+                pair("p.go/function_declaration/block/comment", "comment"),
+            ]
         );
     }
 }

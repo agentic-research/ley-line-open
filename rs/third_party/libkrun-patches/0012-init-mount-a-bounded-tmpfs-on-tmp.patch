@@ -24,7 +24,7 @@ the workload runs.
 Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
 ---
 diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
-index 28b9e74..3942cf3 100644
+index 1f4b89d..753916a 100644
 --- a/src/init_blob/init/init.c
 +++ b/src/init_blob/init/init.c
 @@ -542,6 +542,58 @@ static int chroot_luks()

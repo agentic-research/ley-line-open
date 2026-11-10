@@ -3614,11 +3614,11 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.11.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea0b22561a9c04a7cb1a302c013e0259cd3b4bb619f145b32f72b8b4bcbed230"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4652,7 +4652,7 @@ dependencies = [
  "env_logger",
  "fastembed",
  "log",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde_json",
 ]
 
@@ -4673,7 +4673,7 @@ dependencies = [
  "leyline-runtime",
  "leyline-storefs",
  "libc",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4721,7 +4721,7 @@ dependencies = [
  "r2d2_sqlite",
  "rand 0.9.4",
  "rayon",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde",
  "serde_json",
  "serial_test",
@@ -4748,7 +4748,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proptest",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -4791,7 +4791,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proptest",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -4813,7 +4813,7 @@ dependencies = [
  "criterion",
  "log",
  "parking_lot",
- "rusqlite",
+ "rusqlite 0.41.1",
  "tempfile",
 ]
 
@@ -4845,7 +4845,7 @@ dependencies = [
  "leyline-schema-capnp",
  "log",
  "lsp-types",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -4917,7 +4917,7 @@ name = "leyline-schema"
 version = "0.26.0"
 dependencies = [
  "anyhow",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde_json",
 ]
 
@@ -5033,7 +5033,7 @@ dependencies = [
  "log",
  "nessie-nfsserve",
  "parking_lot",
- "rusqlite",
+ "rusqlite 0.41.1",
  "tempfile",
  "tokio",
 ]
@@ -5059,7 +5059,7 @@ dependencies = [
  "anyhow",
  "leyline-core",
  "leyline-schema",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde_json",
  "toml",
  "tree-sitter",
@@ -5110,7 +5110,7 @@ dependencies = [
  "log",
  "parking_lot",
  "pollster",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -5190,9 +5190,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -6601,12 +6601,12 @@ dependencies = [
 
 [[package]]
 name = "r2d2_sqlite"
-version = "0.34.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9a289c0a3bf56505c470efa2366e76010f1d892e2492a2f96b223386d63b7e2"
+checksum = "7c9d912daf39c2fffcb3b93409f025f5de84f6bfa1e902c2700dd5eb558026fc"
 dependencies = [
  "r2d2",
- "rusqlite",
+ "rusqlite 0.41.1",
  "uuid",
 ]
 
@@ -7097,9 +7097,16 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.39.0"
+version = "0.39.999"
+dependencies = [
+ "rusqlite 0.41.1",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0d2b0146dd9661bf67bb107c0bb2a55064d556eeb3fc314151b957f313bcd4e"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.11.1",
  "fallible-iterator",
@@ -7978,7 +7985,7 @@ version = "0.26.0"
 dependencies = [
  "anyhow",
  "clap",
- "rusqlite",
+ "rusqlite 0.41.1",
  "serde",
  "serde_json",
  "toml_edit",
@@ -10181,7 +10188,7 @@ dependencies = [
  "once_cell",
  "rand 0.10.1",
  "regex",
- "rusqlite",
+ "rusqlite 0.39.999",
  "safetensors 0.7.0",
  "serde",
  "serde_json",

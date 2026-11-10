@@ -110,7 +110,7 @@ fn projected(s: &Store, path: &str) -> bool {
         .unwrap()
 }
 
-fn image(s: &Store) -> Vec<u8> {
+fn image(s: &mut Store) -> Vec<u8> {
     s.conn.serialize("main").unwrap().to_vec()
 }
 
@@ -196,7 +196,7 @@ fn a_moved_base_with_disjoint_edits_lands_the_merge() {
 /// base lines both sides changed, and nothing lands.
 #[test]
 fn overlapping_edits_refuse_stale_with_conflict_ranges() {
-    let s = store(&[
+    let mut s = store(&[
         ("a.go", Node::File(A, Mode::Regular)),
         ("b.txt", Node::File("b\n", Mode::Regular)),
     ]);
@@ -210,7 +210,7 @@ fn overlapping_edits_refuse_stale_with_conflict_ranges() {
         )],
     )
     .unwrap();
-    let before = image(&s);
+    let before = image(&mut s);
     let ours = A.replace("return 2", "return 200");
     let err = tree_propose(
         &s,
@@ -235,7 +235,7 @@ fn overlapping_edits_refuse_stale_with_conflict_ranges() {
         conflicts,
         BTreeMap::from([("a.go".to_string(), vec![LineRange { start: 4, end: 5 }])])
     );
-    assert_eq!(image(&s), before, "a refused proposal changes nothing");
+    assert_eq!(image(&mut s), before, "a refused proposal changes nothing");
 }
 
 /// T5: bytes that are not UTF-8 never merge; a moved base refuses.
@@ -450,7 +450,7 @@ fn a_path_grant_covers_directories_under_its_paths() {
 /// T4: directories are entries a proposal makes and removes.
 #[test]
 fn mkdir_and_rmdir_are_proposals() {
-    let s = store(&[
+    let mut s = store(&[
         ("a.go", Node::File(A, Mode::Regular)),
         ("sub/b.txt", Node::File("b\n", Mode::Regular)),
     ]);
@@ -473,7 +473,7 @@ fn mkdir_and_rmdir_are_proposals() {
         ])
     );
 
-    let before = image(&s);
+    let before = image(&mut s);
     let refusal = |w: Proposed| refused(tree_propose(&s, vec![w]).unwrap_err());
     assert_eq!(
         refusal(Proposed::mkdir("sub")),
@@ -542,7 +542,7 @@ fn mkdir_and_rmdir_are_proposals() {
             path: "../up".into()
         }
     );
-    assert_eq!(image(&s), before, "every refusal changes nothing");
+    assert_eq!(image(&mut s), before, "every refusal changes nothing");
 
     // The last file leaves; its directory stays, empty, until an rmdir in
     // the same proposal or a later one removes it.
@@ -572,7 +572,7 @@ fn mkdir_and_rmdir_are_proposals() {
 /// left at the old path.
 #[test]
 fn a_directory_rename_is_one_proposal() {
-    let s = store(&[
+    let mut s = store(&[
         ("a.go", Node::File(A, Mode::Regular)),
         ("pkg/b.go", Node::File(A, Mode::Regular)),
         ("pkg/tool", Node::File("#!/bin/sh\n", Mode::Executable)),
@@ -616,12 +616,12 @@ fn a_directory_rename_is_one_proposal() {
         )],
     )
     .unwrap();
-    let before = image(&s);
+    let before = image(&mut s);
     assert!(matches!(
         refused(tree_propose(&s, writes).unwrap_err()),
         Refusal::Stale(_)
     ));
-    assert_eq!(image(&s), before);
+    assert_eq!(image(&mut s), before);
     // Onto an existing directory with entries: refused, nothing moves.
     let err = rename_dir(&s.conn, "lib/deep", "lib").unwrap_err();
     assert!(format!("{err:#}").contains("lib"), "{err:#}");

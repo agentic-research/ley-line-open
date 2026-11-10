@@ -193,7 +193,11 @@ impl SqliteGraph {
     }
 
     /// Serialize the in-memory database to bytes (for flushing back to arena).
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    ///
+    /// `&mut self` because rusqlite 0.41's `Connection::serialize` takes
+    /// `&mut`: a shared (no-copy) image borrows the connection's pages, so
+    /// no statement may run on the connection while the image is alive.
+    pub fn serialize(&mut self) -> Result<Vec<u8>> {
         let data = self.conn.serialize("main")?;
         Ok(data.to_vec())
     }
@@ -501,7 +505,7 @@ mod tests {
     /// then verify SqliteGraph can deserialize and query it.
     #[test]
     fn round_trip_deserialize() -> Result<()> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         source.execute_batch(
             "CREATE TABLE results (id TEXT PRIMARY KEY, name TEXT, value TEXT);
              INSERT INTO results VALUES ('CVE-2024-0001', 'Test Vuln', 'critical');
@@ -532,7 +536,7 @@ mod tests {
     /// Verify get_node_json returns the expected JSON.
     #[test]
     fn get_node_json_round_trip() -> Result<()> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         source.execute_batch(
             "CREATE TABLE results (id TEXT PRIMARY KEY, name TEXT, value TEXT);
              INSERT INTO results VALUES ('node-1', 'Alpha', '42');",
@@ -572,7 +576,7 @@ mod tests {
     /// and verify SqliteGraph can read the active buffer.
     #[test]
     fn arena_buffer_extraction() -> Result<()> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         source.execute_batch(
             "CREATE TABLE results (id TEXT PRIMARY KEY, data TEXT);
              INSERT INTO results VALUES ('node-1', 'hello from buffer 1');",
@@ -623,7 +627,7 @@ mod tests {
 
     /// Helper: create an in-memory DB with the `nodes` table and return a LeylineCtx pointer.
     fn make_test_ctx() -> (*mut LeylineCtx, rusqlite::Connection) {
-        let source = Connection::open_in_memory().unwrap();
+        let mut source = Connection::open_in_memory().unwrap();
         create_schema(&source).unwrap();
         put_dir(&source, "vulns", 1000).unwrap();
         put_file(
@@ -741,7 +745,7 @@ mod tests {
     /// Verify JSON escaping handles \n, \t, \, and " correctly via serde_json.
     #[test]
     fn ffi_json_escaping() -> Result<()> {
-        let source = Connection::open_in_memory().unwrap();
+        let mut source = Connection::open_in_memory().unwrap();
         create_schema(&source).unwrap();
         put_dir(&source, "root", 1000).unwrap();
 

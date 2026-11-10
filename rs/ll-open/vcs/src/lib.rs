@@ -1499,7 +1499,7 @@ mod tests {
     /// Create a writable SqliteGraphAdapter with an empty schema.
     fn writable_graph() -> SqliteGraphAdapter {
         use rusqlite::Connection;
-        let source = Connection::open_in_memory().unwrap();
+        let mut source = Connection::open_in_memory().unwrap();
         // `create_schema`, not a bare table DDL batch: projection-v5 interns
         // names and derives display names through the `v_node_name` view, so
         // the nodes table on its own is no longer a schema the graph adapter

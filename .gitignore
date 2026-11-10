@@ -123,6 +123,10 @@
 # rs/third_party/README.md.
 !rs/third_party/**
 
+# Semver-trick shim crates patched in by rs/Cargo.toml (ley-line-open-6ef210):
+# rusqlite-0.39 serves witchcraft's rusqlite 0.39 requirement from 0.41.
+!rs/shims/**
+
 # Re-deny build artifacts
 **/target/
 # `task release:hypervisor:record` builds here so it can run beside `task ci`

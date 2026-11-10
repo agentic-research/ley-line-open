@@ -49,7 +49,7 @@ use leyline_schema::create_schema;
 /// Build a small SQLite DB and return its serialized bytes.
 /// Used by every test below to keep the input deterministic.
 fn seed_db() -> Vec<u8> {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     create_schema(&conn).unwrap();
     // One directory node. A node's PATH is not stored under projection-v5, so
     // it is interned in `dirs`/`names` and keyed by its negative nid.

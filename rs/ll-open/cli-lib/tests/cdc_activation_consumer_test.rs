@@ -22,16 +22,17 @@ fn the_daemon_entry_point_activates_source_blobs_and_publishes_the_result() {
     .unwrap();
 
     let db_path = temp.path().join("blobs.db");
-    let conn = Connection::open(&db_path).unwrap();
+    let mut conn = Connection::open(&db_path).unwrap();
     leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None).unwrap();
 
     let arena_path = temp.path().join("blobs.arena");
     let ctrl_path = temp.path().join("blobs.ctrl");
     leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
-    let report = leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, true)
-        .unwrap()
-        .expect("CDC was enabled");
+    let report =
+        leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&mut conn, &ctrl_path, true)
+            .unwrap()
+            .expect("CDC was enabled");
     assert!(
         report.populated_blobs > 0,
         "the fixture blob is above the chunking floor, so activation must populate it"
@@ -80,7 +81,7 @@ fn disabled_cdc_activates_nothing_and_still_publishes() {
     std::fs::write(source_dir.join("small.json"), "{\"k\":\"v\"}\n").unwrap();
 
     let db_path = temp.path().join("off.db");
-    let conn = Connection::open(&db_path).unwrap();
+    let mut conn = Connection::open(&db_path).unwrap();
     leyline_cli_lib::cmd_parse::parse_into_conn(&conn, &source_dir, Some("json"), None).unwrap();
 
     let arena_path = temp.path().join("off.arena");
@@ -88,7 +89,8 @@ fn disabled_cdc_activates_nothing_and_still_publishes() {
     leyline_cli_lib::lifecycle::setup_arena(&arena_path, 4 * 1024, Some(&ctrl_path)).unwrap();
 
     let report =
-        leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&conn, &ctrl_path, false).unwrap();
+        leyline_cli_lib::cmd_daemon::activate_cdc_and_snapshot(&mut conn, &ctrl_path, false)
+            .unwrap();
     assert!(report.is_none(), "disabled CDC must activate nothing");
 
     let controller = Controller::open_or_create(&ctrl_path).unwrap();

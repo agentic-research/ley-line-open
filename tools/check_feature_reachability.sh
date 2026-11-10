@@ -150,7 +150,10 @@ done
 # workspace, built only as path dependencies, and their features are upstream's
 # to declare. LLO links them without features of its own: the libkrun crate is
 # a plain dependency of leyline-krun-worker.
-for manifest in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' -not -path './third_party/*' | sort); do
+# shims/ holds semver-trick crates patched in for a dependency's requirement
+# (ley-line-open-6ef210): also excluded from the workspace, and their features
+# mirror the crate they stand in for, enabled by that dependency, not by LLO.
+for manifest in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*worktree*' -not -path './third_party/*' -not -path './shims/*' | sort); do
     dir=$(cd "$(dirname "$manifest")" && pwd -P)
     for feature in $(sed -n '/^\[features\]/,/^\[/p' "$manifest" \
                      | grep -E '^[a-z][a-z0-9_-]* *=' | cut -d= -f1 | tr -d ' '); do

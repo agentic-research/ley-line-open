@@ -152,7 +152,7 @@ impl SqliteGraphAdapter {
         Self::build(graph, Some(pool_size))
     }
 
-    fn build(graph: SqliteGraph, pool_size: Option<usize>) -> Self {
+    fn build(mut graph: SqliteGraph, pool_size: Option<usize>) -> Self {
         let bytes = graph.serialize().unwrap_or_default();
         let pool_size = pool_size
             .unwrap_or_else(|| Self::compute_pool_size(bytes.len()))
@@ -305,7 +305,7 @@ impl SqliteGraphAdapter {
     /// readers see the mutation; stale readers are discarded lazily by
     /// `with_reader`.
     fn refresh_readers(&self) -> Result<()> {
-        let writer = self.writer.lock();
+        let mut writer = self.writer.lock();
         let bytes = writer.serialize()?;
         self.reader_gen.fetch_add(1, Ordering::Release);
         // Drain is best-effort; stale stragglers are caught by generation check
@@ -1329,7 +1329,7 @@ mod tests {
 
     #[test]
     fn sqlite_adapter_round_trip() -> Result<()> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         put_dir(&source, "vulns", 1000)?;
         put_dir(&source, "vulns/CVE-2024-0001", 2000)?;
@@ -1383,7 +1383,7 @@ mod tests {
 
     /// Helper: create a writable adapter with a `nodes` table for write tests.
     fn writable_adapter() -> Result<SqliteGraphAdapter> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         put_dir(&source, "docs", 1000)?;
         put_file(&source, "docs/readme", 2000, Some("hello"))?;
@@ -1442,7 +1442,7 @@ mod tests {
     /// and the rows are unchanged.
     #[test]
     fn a_store_refuses_every_write() -> Result<()> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         put_dir(&source, "docs", 1000)?;
         put_file(&source, "docs/readme", 2000, Some("hello"))?;
@@ -1611,7 +1611,7 @@ mod tests {
         assert!(children.is_empty());
 
         // Now publish real data
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         put_dir(&source, "docs", 1000)?;
         put_file(&source, "docs/readme", 2000, Some("hello"))?;
@@ -1642,7 +1642,7 @@ mod tests {
     fn extra_columns_safe() -> Result<()> {
         // Mache's nodes table has `record_id TEXT` and `source_file TEXT` columns.
         // Verify SqliteGraphAdapter queries work with the full shared schema.
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         put_dir(&source, "funcs", 1000)?;
         let validate = put_dir(&source, "funcs/Validate", 2000)?;
@@ -1691,7 +1691,7 @@ mod tests {
         // Verify large nanosecond values survive the round trip.
         let go_mtime: i64 = 1_700_000_000_000_000_000; // ~2023 in nanos
 
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         put_file(&source, "f", go_mtime, None)?;
 
@@ -1810,7 +1810,7 @@ mod tests {
     /// one file node's content.
     #[cfg(feature = "verify")]
     fn publish_nodes_arena(dir: &Path) -> Result<(PathBuf, String)> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         let content = "verify-on-fault must serve exactly these bytes".to_string();
         put_file(&source, "docs/readme", 1, Some(&content))?;
@@ -2118,7 +2118,7 @@ mod tests {
     /// empty one (`length(record) > 0`).
     #[test]
     fn all_file_contents_returns_every_written_files_real_path_and_bytes() -> Result<()> {
-        let source = Connection::open_in_memory()?;
+        let mut source = Connection::open_in_memory()?;
         create_schema(&source)?;
         put_dir(&source, "pkg", 1000)?;
         put_dir(&source, "pkg/inner", 1000)?;

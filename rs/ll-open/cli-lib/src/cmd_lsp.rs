@@ -138,7 +138,7 @@ pub async fn cmd_lsp(
     // fresh. Both paths converge to a single conn that's then
     // enriched, serialized, and written — factored out below to
     // remove a 6-line duplication.
-    let conn = if let Some(db_path) = merge_db {
+    let mut conn = if let Some(db_path) = merge_db {
         let db_bytes =
             std::fs::read(db_path).with_context(|| format!("read {}", db_path.display()))?;
 

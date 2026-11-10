@@ -291,6 +291,48 @@ pub trait DiskImages: Send + Sync {
             mountpoint.display()
         )))
     }
+    /// Whether the filesystem at `mountpoint` is mounted `nodev` and
+    /// `nosuid`. The default reads it with `statfs(2)`.
+    fn is_restricted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError> {
+        mounted_nodev_nosuid(mountpoint)
+    }
+}
+
+/// Whether `statfs(2)` reports the filesystem holding `path` as `nodev` and
+/// `nosuid`.
+pub fn mounted_nodev_nosuid(path: &Path) -> Result<bool, CasVolumeError> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| CasVolumeError::Config(format!("{} contains a NUL byte", path.display())))?;
+    let failed = || io_error("inspect the mount flags of", path)(io::Error::last_os_error());
+    // macOS reports `nodev` only through statfs(2)'s MNT_ flags; Linux
+    // through statvfs(3)'s ST_ flags.
+    #[cfg(target_os = "macos")]
+    let (flags, wanted) = {
+        // SAFETY: `c_path` is NUL-terminated and `stat` is written by the call.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return Err(failed());
+        }
+        (
+            u64::from(stat.f_flags),
+            (libc::MNT_NODEV | libc::MNT_NOSUID) as u64,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (flags, wanted) = {
+        // SAFETY: `c_path` is NUL-terminated and `stat` is written by the call.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return Err(failed());
+        }
+        #[allow(clippy::unnecessary_cast)]
+        (
+            stat.f_flag as u64,
+            (libc::ST_NODEV | libc::ST_NOSUID) as u64,
+        )
+    };
+    Ok(flags & wanted == wanted)
 }
 
 /// How long one `hdiutil` run may take before it is killed and provisioning
@@ -342,23 +384,40 @@ impl Hdiutil {
             command: rendered(),
             detail,
         };
+        use std::os::unix::process::CommandExt;
+        // In its own process group, so a timeout kills whatever it started
+        // too, not only the tool itself.
         let mut child = Command::new(&self.program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .map_err(|error| tool_error(error.to_string()))?;
+        let group = child.id() as libc::pid_t;
+        let kill_group = || {
+            // SAFETY: signals the process group this call created.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        };
+        let timed_out = || CasVolumeError::Timeout {
+            command: rendered(),
+            after: self.timeout,
+        };
         // Drained on their own threads, so a chatty tool never blocks on a
-        // full pipe while this one waits for it to exit.
+        // full pipe while this one waits for it to exit; collected by the
+        // same deadline, since a descendant can hold a pipe open after the
+        // tool exits.
         let drain = |pipe: Option<Box<dyn io::Read + Send>>| {
+            let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
                 if let Some(mut pipe) = pipe {
                     let _ = pipe.read_to_end(&mut bytes);
                 }
-                bytes
-            })
+                let _ = sender.send(bytes);
+            });
+            receiver
         };
         let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
         let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
@@ -367,19 +426,21 @@ impl Hdiutil {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
+                    kill_group();
                     let _ = child.wait();
-                    return Err(CasVolumeError::Timeout {
-                        command: rendered(),
-                        after: self.timeout,
-                    });
+                    return Err(timed_out());
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                 Err(error) => return Err(tool_error(error.to_string())),
             }
         };
-        let stdout = stdout.join().unwrap_or_default();
-        let stderr = stderr.join().unwrap_or_default();
+        let collect = |receiver: std::sync::mpsc::Receiver<Vec<u8>>| {
+            receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        };
+        let (Ok(stdout), Ok(stderr)) = (collect(stdout), collect(stderr)) else {
+            kill_group();
+            return Err(timed_out());
+        };
         if status.success() {
             return Ok(stdout);
         }
@@ -622,6 +683,12 @@ impl CasVolume {
         match self.host {
             HostOs::MacOs => {
                 let layout = self.layout();
+                if !layout.dir.is_dir() {
+                    return Ok(false);
+                }
+                // Under the provisioning lock, so a detach never lands between
+                // another process's image check and its use of the volume.
+                let _provisioning = provisioning_lock(&layout.dir)?;
                 if !self.images.is_mounted(&layout.mountpoint)? {
                     return Ok(false);
                 }
@@ -635,23 +702,19 @@ impl CasVolume {
 
     fn provision_macos(&self, create: bool) -> Result<Option<ProvisionedCas>, CasVolumeError> {
         let layout = self.layout();
-        let image_exists = fs::symlink_metadata(&layout.image).is_ok();
-        if !image_exists && !create {
+        if fs::symlink_metadata(&layout.image).is_err() && !create {
             return Ok(None);
         }
         private_directory(&layout.dir)?;
         // Across processes too: two providers (or a daemon and the CLI)
-        // provisioning at once take turns. Each holder's tool runs are
-        // bounded, so a wait here is too. Released when `_provisioning`
-        // drops.
-        let lock_path = layout.dir.join("provision.lock");
-        let _provisioning = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(io_error("open", &lock_path))?;
-        _provisioning.lock().map_err(io_error("lock", &lock_path))?;
+        // provisioning or detaching at once take turns. Released when
+        // `_provisioning` drops.
+        let _provisioning = provisioning_lock(&layout.dir)?;
+        // Read under the lock: another process may have created it.
+        let image_exists = fs::symlink_metadata(&layout.image).is_ok();
+        if !image_exists && !create {
+            return Ok(None);
+        }
         if create {
             remove_stale_partials(&layout.dir)?;
         }
@@ -707,10 +770,25 @@ impl CasVolume {
             .map_err(io_error("inspect", &layout.cas_root))?;
         let mount =
             fs::metadata(&layout.mountpoint).map_err(io_error("inspect", &layout.mountpoint))?;
-        if !cas.is_dir() || cas.dev() != mount.dev() {
+        // And the volume is still mounted there after `cas/` was made: a
+        // detach in between would leave a `cas/` on the host's own disk,
+        // whose device then equals its parent's.
+        if !cas.is_dir()
+            || cas.dev() != mount.dev()
+            || !self.images.is_mounted(&layout.mountpoint)?
+        {
             return Err(CasVolumeError::Config(format!(
                 "{} must be a directory on the volume attached at {}, not a link or another mount",
                 layout.cas_root.display(),
+                layout.mountpoint.display()
+            )));
+        }
+        // Nothing in the CAS is a device or gains privilege on the host: an
+        // unprivileged attach mounts nodev and nosuid, and a volume mounted
+        // without them (by root, say) is refused.
+        if !self.images.is_restricted(&layout.mountpoint)? {
+            return Err(CasVolumeError::Config(format!(
+                "the volume at {} is not mounted nodev and nosuid; detach it and provision again as an unprivileged user",
                 layout.mountpoint.display()
             )));
         }
@@ -819,6 +897,21 @@ impl CasStorage {
     }
 }
 
+/// Take the cross-process provisioning lock (`<dir>/provision.lock`): held
+/// while provisioning or detaching, released when the file drops. Each
+/// holder's tool runs are bounded, so a wait for it is too.
+fn provisioning_lock(dir: &Path) -> Result<fs::File, CasVolumeError> {
+    let lock_path = dir.join("provision.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(io_error("open", &lock_path))?;
+    lock.lock().map_err(io_error("lock", &lock_path))?;
+    Ok(lock)
+}
+
 /// Remove each `partial-<pid>.sparsebundle` in `dir` whose process no longer
 /// exists: what a provider that crashed between `hdiutil create` and the
 /// rename left (bead `ley-line-open-167b29`). A live process's is its own
@@ -893,6 +986,11 @@ mod tests {
         /// Report this image (or, with `Some(None)`, none) as mounted at
         /// every mountpoint instead of the one attached.
         reports_image: Option<Option<PathBuf>>,
+        /// Another process detaches the volume right after its image is
+        /// checked.
+        detached_after_check: bool,
+        /// The mount lacks nodev or nosuid.
+        unrestricted: bool,
     }
 
     impl Fake {
@@ -947,8 +1045,72 @@ mod tests {
             if let Some(reported) = &self.reports_image {
                 return Ok(reported.clone());
             }
-            Ok(self.images.lock().get(mountpoint).cloned())
+            let image = self.images.lock().get(mountpoint).cloned();
+            if self.detached_after_check {
+                self.mounted.lock().remove(mountpoint);
+            }
+            Ok(image)
         }
+        fn is_restricted(&self, _: &Path) -> Result<bool, CasVolumeError> {
+            Ok(!self.unrestricted)
+        }
+    }
+
+    /// Review of 167b29 (C1): a detach between the image check and the
+    /// creation of `cas/` would leave `cas/` on the host's own disk; it is
+    /// refused, not reported as the volume.
+    #[test]
+    fn a_volume_detached_mid_provision_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            detached_after_check: true,
+            ..Fake::default()
+        };
+        let error = volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not a link or another mount"),
+            "{error}"
+        );
+    }
+
+    /// Review of 167b29 (N4): a volume mounted without nodev or nosuid is
+    /// refused; the real mount's flags are read with statfs.
+    #[test]
+    fn a_volume_without_nodev_and_nosuid_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            unrestricted: true,
+            ..Fake::default()
+        };
+        let error = volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap_err();
+        assert!(error.to_string().contains("nodev and nosuid"), "{error}");
+        // A temporary directory on the host's root volume is neither.
+        assert!(!mounted_nodev_nosuid(state.path()).unwrap());
+        assert!(mounted_nodev_nosuid(&state.path().join("missing")).is_err());
+    }
+
+    /// Review of 167b29 (C2): a tool that exits while something it started
+    /// still holds its output is bounded by the same timeout, and that
+    /// descendant is killed with it.
+    #[test]
+    fn a_tool_whose_descendant_holds_its_output_is_bounded_too() {
+        let scratch = tempfile::tempdir().unwrap();
+        let tool = Hdiutil {
+            program: script(scratch.path(), "hdiutil-forks", "sleep 30 &\nexit 0"),
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let error = tool.detach(Path::new("/m")).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(error, CasVolumeError::Timeout { .. }), "{error}");
     }
 
     /// A shell script standing in for hdiutil.

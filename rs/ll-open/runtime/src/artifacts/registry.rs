@@ -385,7 +385,16 @@ fn is_public(ip: IpAddr) -> bool {
                 return public_v4(mapped);
             }
             let segments = ip.segments();
-            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+            // NAT64: the well-known prefix (64:ff9b::/96) and the local-use
+            // one (64:ff9b:1::/48, RFC 8215, which may translate to private
+            // space) carry an IPv4 address in their last 32 bits; so does
+            // the deprecated IPv4-compatible form (::a.b.c.d).
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+                || segments[..3] == [0x64, 0xff9b, 1]
+                || (segments[..6] == [0, 0, 0, 0, 0, 0]
+                    && !ip.is_loopback()
+                    && !ip.is_unspecified())
+            {
                 let [.., high, low] = segments;
                 return public_v4(Ipv4Addr::from((u32::from(high) << 16) | u32::from(low)));
             }
@@ -1342,6 +1351,10 @@ mod tests {
             "::ffff:10.1.2.3",
             "64:ff9b::a00:1",
             "64:ff9b::7f00:1",
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1:2::c0a8:101",
+            "::a00:1",
+            "::7f00:1",
         ];
         for address in non_public {
             assert!(!is_public(address.parse().unwrap()), "{address}");
@@ -1369,6 +1382,9 @@ mod tests {
             "::ffff:8.8.8.8",
             "64:ff9b::808:808",
             "64:ff9c::a00:1",
+            "64:ff9b:1::808:808",
+            "64:ff9b:2::a00:1",
+            "::808:808",
         ];
         for address in public {
             assert!(is_public(address.parse().unwrap()), "{address}");

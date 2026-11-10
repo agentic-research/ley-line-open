@@ -395,8 +395,8 @@ fn is_public(ip: IpAddr) -> bool {
                     && !ip.is_loopback()
                     && !ip.is_unspecified())
             {
-                let [.., high, low] = segments;
-                return public_v4(Ipv4Addr::from((u32::from(high) << 16) | u32::from(low)));
+                let [.., a, b, c, d] = ip.octets();
+                return public_v4(Ipv4Addr::new(a, b, c, d));
             }
             !(ip.is_unspecified()
                 || ip.is_loopback()
@@ -517,32 +517,33 @@ fn past_deadline() -> ureq::Error {
 }
 
 impl<T> Deadline<T> {
-    /// `timeout`, shortened to what remains before the deadline (and
-    /// whether it was), or the deadline's error once nothing remains.
-    fn bound(&self, timeout: NextTimeout) -> Result<(NextTimeout, bool), ureq::Error> {
-        let Some(deadline) = guard(&self.guard).deadline else {
-            return Ok((timeout, false));
-        };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(past_deadline());
-        }
-        Ok(if *timeout.after > remaining {
-            let shortened = NextTimeout {
-                after: ureq_time::Duration::Exact(remaining),
+    /// What remains before the deadline, `None` without one.
+    fn remaining(&self) -> Option<Duration> {
+        guard(&self.guard)
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// `timeout`, shortened to what remains before the deadline, or the
+    /// deadline's error once nothing remains.
+    fn bound(&self, timeout: NextTimeout) -> Result<NextTimeout, ureq::Error> {
+        match self.remaining() {
+            None => Ok(timeout),
+            Some(remaining) if remaining.is_zero() => Err(past_deadline()),
+            Some(remaining) => Ok(NextTimeout {
+                after: ureq_time::Duration::Exact(remaining.min(*timeout.after)),
                 reason: timeout.reason,
-            };
-            (shortened, true)
-        } else {
-            (timeout, false)
-        })
+            }),
+        }
     }
 
     /// The inner transport's result, its timeout reported as the deadline's
-    /// when the deadline is what shortened it.
-    fn within<R>(result: Result<R, ureq::Error>, shortened: bool) -> Result<R, ureq::Error> {
+    /// once the deadline has passed.
+    fn within<R>(&self, result: Result<R, ureq::Error>) -> Result<R, ureq::Error> {
         match result {
-            Err(ureq::Error::Timeout(_)) if shortened => Err(past_deadline()),
+            Err(ureq::Error::Timeout(_)) if self.remaining().is_some_and(|left| left.is_zero()) => {
+                Err(past_deadline())
+            }
             other => other,
         }
     }
@@ -554,13 +555,15 @@ impl<T: Transport> Transport for Deadline<T> {
     }
 
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
-        let (timeout, shortened) = self.bound(timeout)?;
-        Self::within(self.inner.transmit_output(amount, timeout), shortened)
+        let timeout = self.bound(timeout)?;
+        let result = self.inner.transmit_output(amount, timeout);
+        self.within(result)
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        let (timeout, shortened) = self.bound(timeout)?;
-        Self::within(self.inner.await_input(timeout), shortened)
+        let timeout = self.bound(timeout)?;
+        let result = self.inner.await_input(timeout);
+        self.within(result)
     }
 
     fn is_open(&mut self) -> bool {
@@ -1472,6 +1475,11 @@ mod tests {
             self.last_timeout = Some(*timeout.after);
             self.waits += 1;
             if self.timeout_after.is_some_and(|after| self.waits > after) {
+                // A real transport times out once its wait has elapsed.
+                let until = Instant::now() + *timeout.after;
+                while Instant::now() < until {
+                    std::thread::yield_now();
+                }
                 return Err(ureq::Error::Timeout(timeout.reason));
             }
             self.buffers.input_append_buf()[0] = b'a';
@@ -1481,7 +1489,11 @@ mod tests {
         }
 
         fn is_open(&mut self) -> bool {
-            true
+            self.waits % 2 == 0
+        }
+
+        fn is_tls(&self) -> bool {
+            self.timeout_after.is_some()
         }
     }
 
@@ -1555,16 +1567,22 @@ mod tests {
         // timeout is the deadline's.
         let mut near = deadline_over(
             Trickle::new(Some(0)),
-            Some(Instant::now() + Duration::from_millis(500)),
+            Some(Instant::now() + Duration::from_millis(100)),
         );
         let error = near.await_input(one_second()).unwrap_err();
         assert!(is_past_deadline(&error), "{error}");
         let waited = near.inner.last_timeout.unwrap();
-        assert!(waited <= Duration::from_millis(500), "{waited:?}");
-        near.transmit_output(0, one_second()).unwrap();
-        assert!(near.inner.last_timeout.unwrap() <= Duration::from_millis(500));
-        assert!(near.is_open());
-        assert!(!near.is_tls());
+        assert!(waited <= Duration::from_millis(100), "{waited:?}");
+        // Past the deadline, a write is refused before the inner transport.
+        let error = near.transmit_output(0, one_second()).unwrap_err();
+        assert!(is_past_deadline(&error), "{error}");
+
+        // The wrapper reports the inner transport's state as it is.
+        let mut wrapped = deadline_over(Trickle::new(None), None);
+        assert!(wrapped.is_open() && !wrapped.is_tls());
+        wrapped.await_input(one_second()).unwrap();
+        assert!(!wrapped.is_open());
+        assert!(near.is_tls());
     }
 
     #[test]

@@ -153,10 +153,13 @@ pub fn execute_with_ready(
         confinement_digest: manifest.confinement_digest()?,
     })?;
 
-    let executable = config
-        .rootfs
-        .canonical_path
-        .join(OsStr::from_bytes(config.executable.as_bytes()));
+    // The plan names the executable as the guest does, anchored at `/`
+    // (`guest_executable`); on the host it lives under the rootfs, and
+    // joining an absolute path would replace the rootfs instead.
+    let guest_path = config.executable.as_bytes();
+    let executable = config.rootfs.canonical_path.join(OsStr::from_bytes(
+        guest_path.strip_prefix(b"/").unwrap_or(guest_path),
+    ));
     let mut command = Command::new(&executable);
     command
         .args(

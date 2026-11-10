@@ -390,6 +390,8 @@ struct Run<'a> {
     manifest: Option<&'a ConfinementManifest>,
     hijack: bool,
     run_id: &'a str,
+    /// Where the guest program sits in the rootfs, guest-relative.
+    executable: &'a str,
 }
 
 impl<'a> Run<'a> {
@@ -403,7 +405,13 @@ impl<'a> Run<'a> {
             manifest: None,
             hijack: false,
             run_id,
+            executable: "bin/guest",
         }
+    }
+
+    fn at(mut self, executable: &'a str) -> Self {
+        self.executable = executable;
+        self
     }
 
     fn env(mut self, key: &str, value: &str) -> Self {
@@ -459,7 +467,7 @@ impl<'a> Run<'a> {
         hypervisor::compile_guest(&source, &binary);
         let bytes = fs::read(&binary).expect("guest bytes");
         let cas = self.root.join("cas");
-        let rootfs = conformance::publish_rootfs(&cas, &[("bin/guest", &bytes, 0o755)]);
+        let rootfs = conformance::publish_rootfs(&cas, &[(self.executable, &bytes, 0o755)]);
         let run_root = self.root.join(format!("{}-runs", self.run_id));
         fs::create_dir_all(&run_root).expect("run root");
 
@@ -483,7 +491,7 @@ impl<'a> Run<'a> {
                 algorithm: "blake3-256".into(),
                 value: rootfs,
             },
-            executable: "bin/guest".into(),
+            executable: self.executable.into(),
             arguments,
             public_environment: self.environment,
             allowed_egress: Vec::new(),
@@ -1403,6 +1411,39 @@ fn the_guest_cannot_open_a_datagram_socket() {
              or a control failed. worker stderr:\n{stderr}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// A top-level executable, no workspace (bead ley-line-open-fe130c).
+
+/// A program that reports and exits 0.
+const HELLO: &str = r#"fn main() {
+    println!("connections-probe: hello");
+}
+"#;
+
+/// A scratch or distroless image's entrypoint sits at the rootfs top level
+/// (`/hello`). Without a workspace the plan used to hand init the bare name,
+/// init's `execvp` searched PATH, and the run exited 127; the same bytes at
+/// `bin/hello` ran. The plan now anchors every executable at `/`.
+#[test]
+fn a_top_level_executable_runs_without_a_workspace() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    let (_fixture, root) = fixture();
+    let mut booted = Run::new(&root, &libkrunfw, HELLO, "top-level")
+        .at("hello")
+        .boot();
+    let status = booted.guest.child.wait().expect("the worker exits");
+    let stderr = booted.guest.end();
+    assert_eq!(booted.report, "hello");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the guest's exit status. worker stderr:\n{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

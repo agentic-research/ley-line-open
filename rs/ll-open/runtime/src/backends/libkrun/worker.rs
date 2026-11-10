@@ -156,9 +156,9 @@ fn workspace_share(
 }
 
 /// Have the guest init mount the workspace share at [`WORKSPACE_DIR`] and
-/// start the workload there. The executable stays the rootfs's: the plan's
-/// guest-relative path is anchored at `/`, since init would otherwise
-/// resolve it against the share.
+/// start the workload there. The executable stays the rootfs's: the plan
+/// already anchors it at `/` (`guest_executable`), so it does not resolve
+/// against the share.
 fn mount_workspace(config: &mut KrunConfig) {
     config.environment.push(
         std::ffi::CString::new(format!(
@@ -167,12 +167,6 @@ fn mount_workspace(config: &mut KrunConfig) {
         .expect("static mount entry has no NUL"),
     );
     config.workdir = std::ffi::CString::new(WORKSPACE_DIR).expect("static workdir has no NUL");
-    if !config.executable.as_bytes().starts_with(b"/") {
-        let mut absolute = b"/".to_vec();
-        absolute.extend_from_slice(config.executable.as_bytes());
-        config.executable =
-            std::ffi::CString::new(absolute).expect("a CString's bytes have no NUL");
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,8 +657,8 @@ mod tests {
                 },
                 canonical_path: PathBuf::from("/rootfs"),
             },
-            // Guest-relative, as `compile_plan` passes the catalog's path.
-            executable: CString::new("bin/agent").unwrap(),
+            // Anchored at `/`, as `compile_plan` passes the catalog's path.
+            executable: CString::new("/bin/agent").unwrap(),
             arguments: Vec::new(),
             environment: vec![CString::new("MODE=audit").unwrap()],
             workdir: CString::new("/").unwrap(),
@@ -684,14 +678,8 @@ mod tests {
             ]
         );
         assert_eq!(config.workdir, CString::new("/work").unwrap());
-        // The executable is the rootfs's, wherever the workload starts: a
-        // relative path would resolve against /work, the share.
+        // The executable is the rootfs's, wherever the workload starts.
         assert_eq!(config.executable, CString::new("/bin/agent").unwrap());
-
-        let mut absolute = config;
-        absolute.executable = CString::new("/usr/bin/agent").unwrap();
-        mount_workspace(&mut absolute);
-        assert_eq!(absolute.executable, CString::new("/usr/bin/agent").unwrap());
     }
 
     // The worker's own checks, asserted in-process. Each runs before libkrun

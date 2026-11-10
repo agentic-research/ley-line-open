@@ -144,7 +144,11 @@ unicode-normalization = "0.1"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
-rusqlite = { workspace = true, features = ["bundled", "serialize"] }
+# `series` (with `vtab`): a test-only eponymous virtual-table module,
+# `generate_series`, that the `query` op's module allow-list must refuse
+# and its classification guard must flag (bead `ley-line-open-a9be1f`).
+# `functions`: a test-only SQL function that denies mid-stream (a9d50a).
+rusqlite = { workspace = true, features = ["bundled", "serialize", "functions", "vtab", "series"] }
 leyline-core = { path = "../../ll-core/core" }
 # S1: reconstruct a Signature from head bytes to verify a written head.
 ed25519-dalek = "3"
@@ -190,6 +194,13 @@ harness = false
 [[bench]]
 name = "read_wall_time"
 path = "benches/read_wall_time.rs"
+harness = false
+
+# What the `query` op's authorizer install/remove costs the reader pool's
+# other ops through statement expiry (bead ley-line-open-a9d50a, N2).
+[[bench]]
+name = "query_authorizer_expiry"
+path = "benches/query_authorizer_expiry.rs"
 harness = false
 
 # ─────────────────────────────────────────────────────────────────────

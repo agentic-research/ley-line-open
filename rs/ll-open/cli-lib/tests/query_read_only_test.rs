@@ -30,6 +30,9 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
+        // As `cmd_daemon` does: sqlite-vec's modules on every connection.
+        #[cfg(feature = "vec")]
+        leyline_cli_lib::daemon::vec_index::register_vec();
         let dir = tempfile::TempDir::new().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
@@ -153,6 +156,16 @@ impl Daemon {
 
     fn host_path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
+    }
+
+    /// Run `setup` on every reader-pool connection, as an extension
+    /// registering a module or a function on each would.
+    fn on_every_reader(&self, setup: impl Fn(&rusqlite::Connection)) {
+        let pool = &self.ctx.live_db.reader_pool;
+        let readers: Vec<_> = (0..pool.max_size()).map(|_| pool.get().unwrap()).collect();
+        for reader in &readers {
+            setup(reader);
+        }
     }
 }
 
@@ -365,6 +378,149 @@ fn the_protocol_fixture_refusal_is_what_the_daemon_sends() {
     let sql = fixture["request"]["sql"].as_str().unwrap();
     assert_eq!(d.over_socket(sql), fixture["response"]);
     assert_eq!(d.over_mcp(sql).0, fixture["response"]);
+}
+
+/// A virtual-table module the build did not have, registered on every
+/// reader as a later `sqlite3_auto_extension` would register one, is refused
+/// when a statement reads it (bead `ley-line-open-a9be1f`). So is a virtual
+/// table in the schema, whose module runs on every read.
+#[test]
+fn an_unlisted_module_is_refused() {
+    let d = Daemon::start();
+    d.on_every_reader(|reader| rusqlite::vtab::series::load_module(reader).unwrap());
+    for sql in [
+        "SELECT value FROM generate_series(1, 3)",
+        "SELECT count(*) FROM generate_series(1, 3)",
+        "SELECT a FROM t WHERE a IN (SELECT value FROM generate_series(1, 3))",
+    ] {
+        assert_refused(&d, sql, "denied_action", "read");
+        assert_eq!(
+            d.over_socket(sql)["refusal"]["subject"],
+            "generate_series",
+            "{sql}"
+        );
+    }
+
+    d.ctx
+        .live_db
+        .writer
+        .lock()
+        .execute_batch(
+            "CREATE VIRTUAL TABLE docs USING fts5(body);
+             INSERT INTO docs VALUES ('alpha');",
+        )
+        .unwrap();
+    assert_refused(&d, "SELECT body FROM docs", "denied_action", "read");
+    assert_eq!(
+        d.over_mcp("SELECT body FROM docs").0["refusal"]["subject"],
+        "docs"
+    );
+    // Only `main`'s tables are read: naming the temp schema opens it.
+    assert_refused(
+        &d,
+        "SELECT name FROM sqlite_temp_master",
+        "denied_action",
+        "read",
+    );
+    // The table's own storage is a plain table and is read as one.
+    assert_eq!(
+        d.over_socket("SELECT count(*) AS n FROM docs_content")["rows"],
+        json!([{"n": "1"}])
+    );
+}
+
+/// The allowed modules still return rows over both transports.
+#[test]
+fn allowed_modules_return_rows() {
+    let d = Daemon::start();
+    let mut cases = vec![
+        (
+            "SELECT value FROM json_each('[1, 2]')",
+            json!([{"value": "1"}, {"value": "2"}]),
+        ),
+        (
+            "SELECT key FROM json_tree('{\"k\": 1}') WHERE key IS NOT NULL",
+            json!([{"key": "k"}]),
+        ),
+        (
+            "SELECT name FROM dbstat WHERE name = 't'",
+            json!([{"name": "t"}]),
+        ),
+    ];
+    if cfg!(feature = "vec") {
+        cases.push((
+            "SELECT count(*) AS n FROM vec_each('[1.0, 2.0, 3.0]')",
+            json!([{"n": "3"}]),
+        ));
+    }
+    for (sql, want) in cases {
+        let socket = d.over_socket(sql);
+        let (mcp, is_error) = d.over_mcp(sql);
+        assert_eq!(socket["rows"], want, "socket: {sql}: {socket}");
+        assert_eq!(mcp, socket, "mcp: {sql}");
+        assert!(!is_error, "{sql}");
+    }
+}
+
+/// How many times the test `abs` below has run.
+static ABS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A denial raised while the statement steps, after a row has been
+/// produced, returns the refusal and no rows over both transports (bead
+/// `ley-line-open-a9d50a`, N3).
+#[test]
+fn a_denial_after_rows_returns_no_rows() {
+    use std::sync::atomic::Ordering;
+    let d = Daemon::start();
+
+    // The review's statement: its second row reads `pragma_database_list`.
+    // That read is now refused when the statement is prepared.
+    assert_refused(
+        &d,
+        "SELECT a, CASE WHEN a = 2 THEN (SELECT name FROM pragma_database_list) END FROM t ORDER BY a",
+        "denied_action",
+        "pragma",
+    );
+
+    // A denial that can only come during a step: `abs`, an allowed name,
+    // overridden on every reader to prepare a denied statement on its own
+    // connection when it is given 2, the second row.
+    d.on_every_reader(|reader| {
+        use rusqlite::functions::FunctionFlags;
+        reader
+            .create_scalar_function("abs", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+                ABS_CALLS.fetch_add(1, Ordering::SeqCst);
+                let n: i64 = ctx.get(0)?;
+                if n == 2 {
+                    // SAFETY: the connection outlives the call it runs.
+                    let inner = unsafe { ctx.get_connection()? };
+                    inner.prepare("SELECT name FROM pragma_database_list")?;
+                }
+                Ok(n)
+            })
+            .unwrap();
+    });
+    let sql = "SELECT a, abs(a) AS b FROM t ORDER BY rowid";
+    ABS_CALLS.store(0, Ordering::SeqCst);
+    let socket = d.over_socket(sql);
+    assert_eq!(
+        ABS_CALLS.swap(0, Ordering::SeqCst),
+        2,
+        "row 1 was produced before row 2 was denied"
+    );
+    let (mcp, is_error) = d.over_mcp(sql);
+    assert_eq!(ABS_CALLS.load(Ordering::SeqCst), 2);
+    for (transport, reply) in [("socket", &socket), ("mcp", &mcp)] {
+        assert_eq!(reply["ok"], false, "{transport}: {reply}");
+        assert!(reply.get("rows").is_none(), "{transport}: {reply}");
+        assert_eq!(
+            reply["refusal"],
+            json!({"reason": "denied_action", "action": "pragma", "subject": "database_list"}),
+            "{transport}: {reply}"
+        );
+    }
+    assert!(is_error);
+    assert_eq!(socket, mcp);
 }
 
 #[test]

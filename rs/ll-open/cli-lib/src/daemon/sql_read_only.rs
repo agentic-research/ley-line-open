@@ -12,9 +12,15 @@
 //!    statement takes, at prepare time and again for statements SQLite
 //!    prepares while stepping (a table-valued pragma's inner `PRAGMA`, the
 //!    internal statements of `VACUUM`). It allows only [`AuthAction::Select`],
-//!    [`AuthAction::Read`], [`AuthAction::Recursive`], the functions in
-//!    [`ALLOWED_FUNCTIONS`] and the pragmas in [`ALLOWED_PRAGMAS`]. Every
-//!    other action is denied, including ones this build does not know: an
+//!    [`AuthAction::Recursive`], the functions in [`ALLOWED_FUNCTIONS`], the
+//!    pragmas in [`ALLOWED_PRAGMAS`], and an [`AuthAction::Read`] of a plain
+//!    table or view of `main`, of a module in [`ALLOWED_MODULES`] or of an
+//!    allowed pragma's `pragma_` table (bead `ley-line-open-a9be1f`). A read
+//!    of any other virtual-table module, a table-valued function a later
+//!    extension adds, or a virtual table in the schema, is refused when the
+//!    statement is prepared; `Catalog` says how a module is told from a
+//!    table. Every other action is denied, including ones this build does
+//!    not know: an
 //!    `ATTACH` whose file name is an expression reaches the authorizer as
 //!    `SQLITE_ATTACH` with no file name, which rusqlite reports as
 //!    [`AuthAction::Unknown`]. A deny list naming `Attach` would let it
@@ -196,6 +202,52 @@ pub const ALLOWED_PRAGMAS: &[&str] = &[
     "table_xinfo",
 ];
 
+/// The virtual-table modules a `query` statement may read as a table-valued
+/// function or an eponymous table (bead `ley-line-open-a9be1f`): read-only
+/// views of their arguments or of the database's own pages.
+///
+/// - `json_each`, `json_tree`: the rows of a JSON value.
+/// - `dbstat`: the database's b-tree pages.
+/// - `vec_each`: the elements of a vector, when sqlite-vec is registered.
+///
+/// The table-valued pragmas in [`ALLOWED_PRAGMAS`] (`pragma_table_info`,
+/// ...) are allowed by that list. Every other module is refused, including
+/// ones a later SQLite, sqlite-vec or another `sqlite3_auto_extension`
+/// adds; `every_module_is_classified` fails until such a module is listed
+/// here or in [`DENIED_MODULES`].
+pub const ALLOWED_MODULES: &[&str] = &["dbstat", "json_each", "json_tree", "vec_each"];
+
+/// The modules of this build left out of [`ALLOWED_MODULES`]. The list
+/// classifies them; the authorizer refuses every module not allowed, listed
+/// here or not.
+///
+/// - The full-text and R-tree modules (`fts3`, `fts4`, `fts5`, `rtree`, ...)
+///   back virtual tables created in the schema, and their auxiliary modules
+///   (`fts3tokenize`, `fts4aux`, `fts5vocab`) read those tables' internals.
+/// - `jsonb_each` and `jsonb_tree`: not needed beside their JSON-text forms.
+/// - `pragma_module_list`: a pragma outside [`ALLOWED_PRAGMAS`].
+/// - sqlite-vec's `vec0`: backs vector tables created in a schema.
+pub const DENIED_MODULES: &[&str] = &[
+    "fts3",
+    "fts3tokenize",
+    "fts4",
+    "fts4aux",
+    "fts5",
+    "fts5vocab",
+    "jsonb_each",
+    "jsonb_tree",
+    "pragma_module_list",
+    "rtree",
+    "rtree_i32",
+    "vec0",
+];
+
+/// The schema table of `main`, which `main`'s schema does not list, under
+/// the name the authorizer reports for it (`sqlite_schema` is reported as
+/// `sqlite_master`). `sqlite_temp_master` is left out: reading it opens the
+/// connection's temp database.
+const SCHEMA_TABLES: &[&str] = &["sqlite_master"];
+
 /// Why a `query` statement was refused. On the wire it is
 /// `QueryRefusal.reason` (`daemon.capnp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,9 +330,10 @@ pub fn query<T>(
     run: impl FnOnce(&mut Statement<'_>) -> Result<T>,
 ) -> Result<T> {
     let seen = Arc::new(Mutex::new(Seen::default()));
+    let catalog = Catalog::read(conn)?;
     // Every statement borrows the connection through the guard, so each one
     // is dropped before the guard removes the authorizer.
-    let authorized = Authorizer::install(conn, Arc::clone(&seen))?;
+    let authorized = Authorizer::install(conn, catalog, Arc::clone(&seen))?;
 
     let mut stmt = match authorized.conn().prepare(sql) {
         Ok(stmt) => stmt,
@@ -346,10 +399,10 @@ fn denial_or(seen: &Mutex<Seen>, err: anyhow::Error) -> anyhow::Error {
 struct Authorizer<'c>(&'c mut Connection);
 
 impl<'c> Authorizer<'c> {
-    fn install(conn: &'c mut Connection, seen: Arc<Mutex<Seen>>) -> Result<Self> {
+    fn install(conn: &'c mut Connection, catalog: Catalog, seen: Arc<Mutex<Seen>>) -> Result<Self> {
         conn.authorizer(Some(move |ctx: AuthContext<'_>| {
             let mut seen = lock(&seen);
-            match judge(&ctx.action) {
+            match judge(&ctx.action, &catalog) {
                 Judgement::Select => {
                     seen.saw_select = true;
                     Authorization::Allow
@@ -386,11 +439,70 @@ enum Judgement {
     Deny(Refusal),
 }
 
+/// What a `Read` may name, read from the connection before the authorizer
+/// is installed: which names are plain schema tables and which are
+/// virtual-table modules.
+///
+/// SQLite reports a read of a table, a view, a virtual table and a
+/// table-valued function alike, as [`AuthAction::Read`] naming the table
+/// (with an empty column when no column is used), so the name is the only
+/// thing the authorizer can judge. SQLite resolves a name to a schema table
+/// first and to an eponymous module only when no schema table has it.
+///
+/// - `tables`: every table and view in the `main` and `temp` schemas
+///   (`sqlite_schema`), less the virtual tables (type `table` with
+///   `rootpage` 0, which runs its module's code on every read).
+/// - `modules`: every module registered on the connection
+///   (`pragma_module_list`). SQLite registers the JSON and pragma modules
+///   only when a statement first names them, so a name missing here can
+///   still be a module.
+///
+/// Neither list is decided by reading the SQL text of the statement.
+#[derive(Debug, Default)]
+struct Catalog {
+    tables: Vec<String>,
+    modules: Vec<String>,
+}
+
+impl Catalog {
+    fn read(conn: &Connection) -> Result<Self> {
+        let names = |sql: &str| -> Result<Vec<String>> {
+            let mut stmt = conn.prepare(sql)?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(names)
+        };
+        // Only `main`: naming `temp` would open the connection's temp
+        // database, and `query` can create nothing there.
+        let mut tables = names(
+            "SELECT name FROM main.sqlite_schema \
+             WHERE type IN ('table', 'view') AND NOT (type = 'table' AND rootpage = 0)",
+        )?;
+        tables.extend(SCHEMA_TABLES.iter().map(|t| t.to_string()));
+        let modules = names("SELECT name FROM pragma_module_list")?;
+        Ok(Self { tables, modules })
+    }
+
+    /// `name` is read as a plain schema table: it is one, and no module has
+    /// its name. A schema table that shares an unlisted module's name is
+    /// refused, because a writer that drops the table between this
+    /// catalog's read and the prepare would turn the name into the module.
+    fn is_plain_table(&self, name: &str) -> bool {
+        listed_owned(&self.tables, name) && !listed_owned(&self.modules, name)
+    }
+}
+
+fn listed_owned(list: &[String], name: &str) -> bool {
+    list.iter().any(|item| item.eq_ignore_ascii_case(name))
+}
+
 /// The authorizer's decision for one action: deny unless allowed.
-fn judge(action: &AuthAction<'_>) -> Judgement {
+fn judge(action: &AuthAction<'_>, catalog: &Catalog) -> Judgement {
     match action {
         AuthAction::Select => Judgement::Select,
-        AuthAction::Read { .. } | AuthAction::Recursive => Judgement::Allow,
+        AuthAction::Recursive => Judgement::Allow,
+        AuthAction::Read { table_name, .. } => judge_read(table_name, catalog),
         AuthAction::Function { function_name } if listed(ALLOWED_FUNCTIONS, function_name) => {
             Judgement::Allow
         }
@@ -399,13 +511,42 @@ fn judge(action: &AuthAction<'_>) -> Judgement {
         }
         denied => {
             let (action, subject) = describe(denied);
-            Judgement::Deny(Refusal {
-                reason: RefusalReason::DeniedAction,
-                action: action.into(),
-                subject,
-            })
+            deny(action, subject)
         }
     }
+}
+
+/// A read of `table`: a plain schema table, an allowed module, or a
+/// `pragma_` table whose pragma is allowed. Anything else is refused when
+/// the statement is prepared: an unlisted `pragma_` table as its pragma,
+/// whatever else as a `read` of that name.
+fn judge_read(table: &str, catalog: &Catalog) -> Judgement {
+    if let Some(pragma) = strip_prefix_ignore_ascii_case(table, "pragma_") {
+        return if listed(ALLOWED_PRAGMAS, pragma) {
+            Judgement::Allow
+        } else {
+            deny("pragma", pragma.to_string())
+        };
+    }
+    if listed(ALLOWED_MODULES, table) || catalog.is_plain_table(table) {
+        Judgement::Allow
+    } else {
+        deny("read", table.to_string())
+    }
+}
+
+fn deny(action: &str, subject: String) -> Judgement {
+    Judgement::Deny(Refusal {
+        reason: RefusalReason::DeniedAction,
+        action: action.into(),
+        subject,
+    })
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = name.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &name[prefix.len()..])
 }
 
 /// SQLite matches function and pragma names without regard to ASCII case.
@@ -472,13 +613,14 @@ fn transaction_name(operation: TransactionOperation) -> &'static str {
     }
 }
 
-/// The first keyword of `sql`, lower case, past white space and comments:
+/// The first keyword of `sql`, lower case, past white space, comments, NUL
+/// and the empty statements of a leading `;`, all of which SQLite skips:
 /// what a [`RefusalReason::NotAQuery`] refusal names. It labels the refusal
 /// and decides nothing.
 fn leading_keyword(sql: &str) -> String {
     let mut rest = sql;
     loop {
-        rest = rest.trim_start();
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';' || c == '\0');
         if let Some(after) = rest.strip_prefix("--") {
             rest = after.split_once('\n').map_or("", |(_, tail)| tail);
         } else if let Some(after) = rest.strip_prefix("/*") {
@@ -639,11 +781,10 @@ mod tests {
     #[test]
     fn a_denial_during_a_step_is_a_refusal_even_if_run_swallows_it() {
         let (_dir, _w, mut r) = reader();
-        let err = query(
-            &mut r,
-            "SELECT a FROM t UNION ALL SELECT name FROM pragma_database_list",
-            |stmt| Ok(stmt.query_map([], |_| Ok(()))?.count()),
-        )
+        deny_on_two(&r);
+        let err = query(&mut r, "SELECT abs(a) FROM t ORDER BY rowid", |stmt| {
+            Ok(stmt.query_map([], |_| Ok(()))?.count())
+        })
         .expect_err("a swallowed denial must still refuse");
         let refusal = err.downcast_ref::<Refusal>().expect("a refusal");
         assert_eq!(
@@ -725,6 +866,48 @@ mod tests {
                 Judgement::Allow,
             ),
             (A::Recursive, Judgement::Allow),
+            (
+                A::Read {
+                    table_name: "JSON_EACH",
+                    column_name: "",
+                },
+                Judgement::Allow,
+            ),
+            (
+                A::Read {
+                    table_name: "Pragma_Table_Info",
+                    column_name: "name",
+                },
+                Judgement::Allow,
+            ),
+            (
+                A::Read {
+                    table_name: "pragma_database_list",
+                    column_name: "file",
+                },
+                deny("pragma", "database_list"),
+            ),
+            (
+                A::Read {
+                    table_name: "generate_series",
+                    column_name: "value",
+                },
+                deny("read", "generate_series"),
+            ),
+            (
+                A::Read {
+                    table_name: "series",
+                    column_name: "",
+                },
+                deny("read", "series"),
+            ),
+            (
+                A::Read {
+                    table_name: "pragma",
+                    column_name: "",
+                },
+                deny("read", "pragma"),
+            ),
             (
                 A::Function {
                     function_name: "abs",
@@ -909,8 +1092,14 @@ mod tests {
                 deny("unknown", "x"),
             ),
         ];
+        // `T` is a plain table; `series` is a table and also a module, so
+        // a read of it is refused.
+        let catalog = Catalog {
+            tables: vec!["T".into(), "series".into()],
+            modules: vec!["series".into(), "generate_series".into()],
+        };
         for (action, want) in table {
-            assert_eq!(judge(&action), want, "{action:?}");
+            assert_eq!(judge(&action, &catalog), want, "{action:?}");
         }
         // Allowed actions still have names, for completeness of `describe`.
         assert_eq!(describe(&A::Select), ("select", String::new()));
@@ -971,5 +1160,347 @@ mod tests {
         assert_eq!(leading_keyword("-- only a comment"), "empty");
         assert_eq!(leading_keyword("/* open"), "empty");
         assert_eq!(leading_keyword(""), "empty");
+    }
+
+    /// SQLite skips empty statements, so `;` and NUL before the keyword do
+    /// not change what runs, and the label names the statement past them
+    /// (bead `ley-line-open-a9d50a`, N1).
+    #[test]
+    fn the_leading_keyword_skips_empty_statements_and_nul() {
+        assert_eq!(leading_keyword("; VACUUM INTO 'x'"), "vacuum");
+        assert_eq!(leading_keyword(";;\n ; -- c\n;Vacuum"), "vacuum");
+        assert_eq!(leading_keyword("\0VACUUM"), "vacuum");
+        assert_eq!(leading_keyword("\0 ;/* c */\0 begin"), "begin");
+        assert_eq!(leading_keyword(";"), "empty");
+        let (_dir, _w, mut r) = reader();
+        let got = refusal(&mut r, "; VACUUM");
+        assert_eq!(
+            (got.reason, got.action.as_str()),
+            (RefusalReason::NotAQuery, "vacuum")
+        );
+    }
+
+    /// A reader as the daemon's reader pool hands it out, with sqlite-vec
+    /// registered first when the build has it, as `cmd_daemon` does.
+    fn pool() -> (tempfile::TempDir, crate::daemon::db_pool::LiveDb) {
+        #[cfg(feature = "vec")]
+        crate::daemon::vec_index::register_vec();
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::daemon::db_pool::LiveDb::open_fresh_for_test(&dir.path().join("live.db"));
+        (dir, db)
+    }
+
+    /// Every virtual-table module registered on `conn`, read on the raw
+    /// connection (no authorizer).
+    fn modules(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT name FROM pragma_module_list").unwrap();
+        let mut names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|n| n.unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The modules SQLite registers only when a statement first names them
+    /// (`sqlite3LocateTable`): the JSON ones, and `carray` when it is
+    /// compiled in. `pragma_` modules register the same way and are judged
+    /// by [`ALLOWED_PRAGMAS`].
+    const LAZY_BUILTIN_MODULES: &[&str] = &[
+        "carray",
+        "json_each",
+        "json_tree",
+        "jsonb_each",
+        "jsonb_tree",
+    ];
+
+    /// The modules of `conn`, the lazily registered built-ins included,
+    /// that are neither allowed nor denied by name. The listing registers
+    /// `pragma_module_list` itself; any other `pragma_` module on a fresh
+    /// connection is an extension's.
+    fn unclassified(conn: &Connection) -> Vec<String> {
+        for name in LAZY_BUILTIN_MODULES {
+            // Naming the module registers it; one this build lacks fails
+            // to prepare.
+            let _ = conn.prepare(&format!("SELECT 1 FROM {name}"));
+        }
+        modules(conn)
+            .into_iter()
+            .filter(|m| !listed(ALLOWED_MODULES, m) && !listed(DENIED_MODULES, m))
+            .collect()
+    }
+
+    /// The modules sqlite-vec registers, present only in a `vec` build.
+    const VEC_MODULES: &[&str] = &["vec0", "vec_each"];
+
+    /// Like `every_builtin_function_is_classified`, for modules: a module a
+    /// later SQLite, sqlite-vec or another auto-extension adds is reachable
+    /// from `query` only once someone lists it (bead
+    /// `ley-line-open-a9be1f`).
+    #[test]
+    fn every_module_is_classified() {
+        let (_dir, db) = pool();
+        let conn = db.reader_pool.get().unwrap();
+        assert_eq!(
+            unclassified(&conn),
+            Vec::<String>::new(),
+            "modules neither allowed nor denied"
+        );
+        let present = modules(&conn);
+        for name in ALLOWED_MODULES.iter().chain(DENIED_MODULES) {
+            assert!(
+                !(listed(ALLOWED_MODULES, name) && listed(DENIED_MODULES, name)),
+                "{name} is both allowed and denied"
+            );
+            if cfg!(feature = "vec") || !listed(VEC_MODULES, name) {
+                assert!(
+                    listed(
+                        &present.iter().map(String::as_str).collect::<Vec<_>>(),
+                        name
+                    ),
+                    "{name} is not a module of this build: {present:?}"
+                );
+            }
+        }
+    }
+
+    /// The guard above bites: a module the build did not have is
+    /// unclassified, and `query` refuses to read it.
+    #[test]
+    fn a_new_module_is_unclassified_and_refused() {
+        let (_dir, db) = pool();
+        let mut conn = db.reader_pool.get().unwrap();
+        rusqlite::vtab::series::load_module(&conn).unwrap();
+        assert_eq!(unclassified(&conn), vec!["generate_series".to_string()]);
+        for sql in [
+            "SELECT value FROM generate_series(1, 3)",
+            "SELECT count(*) FROM generate_series(1, 3)",
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM Generate_Series(1, 3))",
+        ] {
+            let got = refusal(&mut conn, sql);
+            assert_eq!(
+                (got.reason, got.action.as_str()),
+                (RefusalReason::DeniedAction, "read"),
+                "{sql}"
+            );
+            assert!(
+                got.subject.eq_ignore_ascii_case("generate_series"),
+                "{sql}: {got:?}"
+            );
+        }
+    }
+
+    /// The allowed modules and pragmas still return rows; every other
+    /// `pragma_` table is refused as its pragma when the statement is
+    /// prepared.
+    #[test]
+    fn allowed_modules_return_rows() {
+        let (_dir, _w, mut r) = reader();
+        for (sql, n) in [
+            ("SELECT value FROM json_each('[1, 2, 3]')", 3),
+            ("SELECT count(*) FROM Json_Each('[1, 2]')", 1),
+            ("SELECT key FROM json_tree('{\"a\": 1}')", 2),
+            ("SELECT name FROM dbstat", 2),
+            ("SELECT name FROM pragma_table_info('t')", 1),
+            ("SELECT name FROM sqlite_master", 1),
+            ("SELECT name FROM sqlite_schema", 1),
+        ] {
+            assert_eq!(rows(&mut r, sql).unwrap().len(), n, "{sql}");
+        }
+        // Only `main` is read; a temp table cannot be created, and naming
+        // the temp schema would open the temp database.
+        let got = refusal(&mut r, "SELECT name FROM sqlite_temp_master");
+        assert_eq!(
+            (got.action.as_str(), got.subject.as_str()),
+            ("read", "sqlite_temp_master")
+        );
+        for (sql, pragma) in [
+            ("SELECT name FROM pragma_module_list", "module_list"),
+            ("SELECT count(*) FROM pragma_database_list", "database_list"),
+        ] {
+            let got = refusal(&mut r, sql);
+            assert_eq!(
+                (got.reason, got.action.as_str(), got.subject.as_str()),
+                (RefusalReason::DeniedAction, "pragma", pragma),
+                "{sql}"
+            );
+        }
+    }
+
+    #[cfg(feature = "vec")]
+    #[test]
+    fn vec_each_returns_rows() {
+        let (_dir, db) = pool();
+        let mut conn = db.reader_pool.get().unwrap();
+        assert_eq!(
+            rows(&mut conn, "SELECT value FROM vec_each('[1.0, 2.0]')")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// Plain schema objects are read as before: tables, views, `WITHOUT
+    /// ROWID` tables, the shadow tables of a virtual table, and
+    /// `sqlite_sequence`.
+    #[test]
+    fn schema_tables_and_views_are_read() {
+        let (_dir, w, mut r) = reader();
+        w.execute_batch(
+            "CREATE VIEW v AS SELECT a FROM t;
+             CREATE TABLE k (id INTEGER PRIMARY KEY, x) WITHOUT ROWID;
+             CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT);
+             INSERT INTO s DEFAULT VALUES;
+             CREATE VIRTUAL TABLE docs USING fts5(body);",
+        )
+        .unwrap();
+        for (sql, n) in [
+            ("SELECT a FROM v", 2),
+            ("SELECT count(*) FROM k", 1),
+            ("SELECT name FROM sqlite_sequence", 1),
+            ("SELECT id FROM docs_data", 2),
+            ("SELECT 1 FROM t AS json_tree", 2),
+        ] {
+            assert_eq!(rows(&mut r, sql).unwrap().len(), n, "{sql}");
+        }
+    }
+
+    /// A virtual table in the schema runs its module's code on every read,
+    /// so it is refused like an unlisted module, whatever the reader's
+    /// history (bead `ley-line-open-07237c`): the same refusal on a reader
+    /// that never connected the table and on one that did.
+    #[test]
+    fn a_schema_virtual_table_is_refused_on_any_reader() {
+        let (_dir, w, _r) = reader();
+        w.execute_batch(
+            "CREATE VIRTUAL TABLE docs USING fts5(body);
+             INSERT INTO docs VALUES ('alpha');
+             CREATE VIRTUAL TABLE boxes USING rtree(id, x0, x1);
+             INSERT INTO boxes VALUES (1, 0, 1);",
+        )
+        .unwrap();
+        let path = w.path().unwrap().to_string();
+        let mut mismatches = Vec::new();
+        // (statement, table, the refused action and subject on a fresh
+        // reader, the same on a reader that connected the table). The
+        // refusal names the first denied action. On a fresh reader the
+        // R-tree module's constructor prepares its own `INSERT` into the
+        // node table before SQLite reports the read of `boxes`, so that
+        // insert is named; the decision is the same.
+        for (sql, table, fresh_label, connected_label) in [
+            (
+                "SELECT body FROM docs",
+                "docs",
+                ("read", "docs"),
+                ("read", "docs"),
+            ),
+            (
+                "SELECT count(*) FROM docs WHERE docs MATCH 'alpha'",
+                "docs",
+                ("function", "match"),
+                ("function", "match"),
+            ),
+            (
+                "SELECT id FROM boxes",
+                "boxes",
+                ("insert", "boxes_node"),
+                ("read", "boxes"),
+            ),
+            (
+                "SELECT count(*) FROM boxes WHERE x0 >= 0",
+                "boxes",
+                ("insert", "boxes_node"),
+                ("read", "boxes"),
+            ),
+        ] {
+            let mut outcomes = Vec::new();
+            for connected in [false, true] {
+                let mut fresh = Connection::open(&path).unwrap();
+                fresh.pragma_update(None, "query_only", "ON").unwrap();
+                if connected {
+                    // Connect the table without the authorizer, as another
+                    // op on the same pooled reader would.
+                    let n: i64 = fresh
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(n, 1);
+                }
+                let got = refusal(&mut fresh, sql);
+                assert_eq!(got.reason, RefusalReason::DeniedAction, "{sql}");
+                outcomes.push(got);
+            }
+            let label = |r: &Refusal| (r.action.clone(), r.subject.clone());
+            let got = (label(&outcomes[0]), label(&outcomes[1]));
+            let want = (
+                (fresh_label.0.to_string(), fresh_label.1.to_string()),
+                (connected_label.0.to_string(), connected_label.1.to_string()),
+            );
+            if got != want {
+                mismatches.push(format!("{sql}: fresh, connected: {got:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// A schema table whose name is also an unlisted module's is refused:
+    /// which of the two a name resolves to can change between the
+    /// classification and the prepare (a writer drops the table), so the
+    /// collision fails closed.
+    #[test]
+    fn a_table_named_like_an_unlisted_module_is_refused() {
+        let (_dir, w, mut r) = reader();
+        w.execute_batch("CREATE TABLE fts5vocab (x); INSERT INTO fts5vocab VALUES (1);")
+            .unwrap();
+        let got = refusal(&mut r, "SELECT x FROM fts5vocab");
+        assert_eq!(
+            (got.action.as_str(), got.subject.as_str()),
+            ("read", "fts5vocab")
+        );
+    }
+
+    /// A function that prepares a statement on its own connection while
+    /// the outer statement steps: what an action denied during a step looks
+    /// like (a table-valued pragma's inner `PRAGMA` was one before reads of
+    /// unlisted `pragma_` tables were refused at prepare). It overrides
+    /// `abs`, an allowed name, and denies only on its second row.
+    fn deny_on_two(conn: &Connection) {
+        use rusqlite::functions::FunctionFlags;
+        conn.create_scalar_function("abs", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+            let n: i64 = ctx.get(0)?;
+            if n == 2 {
+                // SAFETY: the connection outlives the call it is running.
+                let inner = unsafe { ctx.get_connection()? };
+                inner.prepare("SELECT name FROM pragma_database_list")?;
+            }
+            Ok(n)
+        })
+        .unwrap();
+    }
+
+    /// Row 1 is produced before row 2's step is denied, and the caller
+    /// still gets the refusal and no rows (bead `ley-line-open-a9d50a`,
+    /// N3).
+    #[test]
+    fn a_denial_after_rows_returns_no_rows() {
+        let (_dir, _w, mut r) = reader();
+        deny_on_two(&r);
+        let mut produced = 0;
+        let err = query(&mut r, "SELECT abs(a) FROM t ORDER BY rowid", |stmt| {
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {
+                produced += 1;
+            }
+            Ok(produced)
+        })
+        .expect_err("a denial on row 2 refuses the statement");
+        assert_eq!(produced, 1, "row 1 was stepped before the denial");
+        let got = err.downcast_ref::<Refusal>().expect("a refusal");
+        assert_eq!(
+            (got.action.as_str(), got.subject.as_str()),
+            ("pragma", "database_list")
+        );
     }
 }

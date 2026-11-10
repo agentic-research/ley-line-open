@@ -1549,6 +1549,222 @@ fn a_full_duplex_stream_crosses_the_relay() {
 }
 
 // ---------------------------------------------------------------------------
+// Connect before listen (bead ley-line-open-a915e3).
+//
+// A peer can connect to a serve channel before the workload listens on its
+// port. The relay holds the connection and retries the workload for at most
+// SERVE_HOLD (init.c's SERVE_HOLD_MS), so the peer's first connection works
+// once the workload listens. A workload that never listens gets the held
+// connection closed at the bound. On macOS the host end of a serve channel
+// is a UNIX stream socket, and its peer sees only end-of-file however the
+// other end closes (AF_UNIX carries no reset), so the outcome asserted is
+// end-of-file plus the timing bound. A refusal the peer can tell apart is
+// bead ley-line-open-b00ae3.
+
+/// init.c's SERVE_HOLD_MS.
+const SERVE_HOLD: Duration = Duration::from_secs(10);
+
+/// How far past SERVE_HOLD the end of a held connection may land: the
+/// relay's last backoff step (200 ms) plus the vsock and host hops. Only a
+/// bound on a failure.
+const SERVE_HOLD_SLACK: Duration = Duration::from_secs(5);
+
+/// A server that binds only after a peer has tried to reach it. It reports
+/// `waiting`, then watches the guest's TCP `AttemptFails` counter, which a
+/// connect refused by an unbound port raises: the relay's first try for a
+/// held connection. Only then does it bind `$LISTEN_ADDR` and answer one
+/// line per connection as SERVER does. The watch is the event the test
+/// waits on; the guest yields between reads.
+const LATE_SERVER: &str = r#"use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+
+fn attempt_fails() -> u64 {
+    let snmp = std::fs::read_to_string("/proc/net/snmp").unwrap_or_default();
+    let mut rows = snmp.lines().filter(|line| line.starts_with("Tcp:"));
+    let (Some(names), Some(values)) = (rows.next(), rows.next()) else {
+        return 0;
+    };
+    names
+        .split_whitespace()
+        .zip(values.split_whitespace())
+        .find(|(name, _)| *name == "AttemptFails")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn main() {
+    let before = attempt_fails();
+    println!("connections-probe: waiting");
+    while attempt_fails() == before {
+        std::thread::yield_now();
+    }
+    let listener = TcpListener::bind(std::env::var("LISTEN_ADDR").unwrap()).unwrap();
+    println!("late-server: listening after a refused attempt");
+    let mut served = 0u32;
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        served += 1;
+        let mut line = String::new();
+        let _ = BufReader::new(&stream).read_line(&mut line);
+        let _ = write!(stream, "guest#{served}:{line}");
+    }
+}
+"#;
+
+/// A workload that never listens: it reports and holds the VM.
+const IDLE: &str = r#"fn main() {
+    println!("connections-probe: idle");
+    loop {
+        std::thread::park();
+    }
+}
+"#;
+
+/// Host to VM, late: a host peer that connects and sends its request before
+/// the workload listens gets the workload's answer on that same first
+/// connection. The workload binds only after the relay's first refused
+/// try, so the connection was held, not merely late.
+#[test]
+fn a_serve_connection_made_before_the_workload_listens_is_held_until_it_does() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    if !presentation_is_live_here() {
+        return;
+    }
+    let (_fixture, root) = fixture();
+    let socket = root.join("api.sock");
+    let manifest = with_grants(&libkrunfw, vec![serve_grant(&socket, SERVE_PORT)]);
+    let mut booted = Run::new(&root, &libkrunfw, LATE_SERVER, "late-host")
+        .env("LISTEN_ADDR", &format!("127.0.0.1:{SERVE_PORT}"))
+        .manifest(&manifest)
+        .boot();
+    assert_eq!(booted.report, "waiting");
+    let first = connect_unix(&socket).map(|mut stream| exchange(&mut stream, "early"));
+    let stderr = booted.guest.end();
+    assert_eq!(
+        first.as_deref().ok(),
+        Some("guest#1:early"),
+        "a host peer that connected before the workload listened did not reach it \
+         on its first connection. worker stderr:\n{stderr}"
+    );
+}
+
+/// Host to VM, never: a host peer of a workload that never listens is held
+/// for the bound, then sees the connection end without a byte; never a
+/// hang, and not at once (which would be the accept-then-close a915e3
+/// reported).
+#[test]
+fn a_serve_connection_to_a_workload_that_never_listens_ends_at_the_bound() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    if !presentation_is_live_here() {
+        return;
+    }
+    let (_fixture, root) = fixture();
+    let socket = root.join("api.sock");
+    let manifest = with_grants(&libkrunfw, vec![serve_grant(&socket, SERVE_PORT)]);
+    let mut booted = Run::new(&root, &libkrunfw, IDLE, "never-host")
+        .manifest(&manifest)
+        .boot();
+    assert_eq!(booted.report, "idle");
+    let started = std::time::Instant::now();
+    let outcome = connect_unix(&socket).map(|mut stream| exchange(&mut stream, "nobody"));
+    let held = started.elapsed();
+    let stderr = booted.guest.end();
+    assert_eq!(
+        outcome.as_deref().ok(),
+        Some("<eof>"),
+        "worker stderr:\n{stderr}"
+    );
+    assert!(
+        held >= SERVE_HOLD && held <= SERVE_HOLD + SERVE_HOLD_SLACK,
+        "the held connection ended after {held:?}, outside [{SERVE_HOLD:?}, \
+         {SERVE_HOLD:?} + {SERVE_HOLD_SLACK:?}]. worker stderr:\n{stderr}"
+    );
+}
+
+/// VM to VM: VM A serves its declared port at host path P; VM B dials P
+/// (B's connect path is A's bind path), A started first. B's stock client
+/// connects before A's workload listens, and its first connection gets A's
+/// answer.
+#[test]
+fn vm_to_vm_a_connection_made_before_the_server_listens_is_held_until_it_does() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    if !presentation_is_live_here() {
+        return;
+    }
+    let (_fixture, root) = fixture();
+    let path = root.join("edge.sock");
+    let served = with_grants(&libkrunfw, vec![serve_grant(&path, SERVE_PORT)]);
+    let mut server = Run::new(&root, &libkrunfw, LATE_SERVER, "late-vm-a")
+        .env("LISTEN_ADDR", &format!("127.0.0.1:{SERVE_PORT}"))
+        .manifest(&served)
+        .boot();
+    assert_eq!(server.report, "waiting");
+    let dialed = with_grants(&libkrunfw, vec![dial_grant(&path, DIAL_PORT)]);
+    let mut client = Run::new(&root, &libkrunfw, CLIENT, "late-vm-b")
+        .env("DB_ADDR", &format!("127.0.0.1:{DIAL_PORT}"))
+        .args(&["env:DB_ADDR"])
+        .manifest(&dialed)
+        .boot();
+    let client_stderr = client.guest.end();
+    let server_stderr = server.guest.end();
+    assert_eq!(
+        client.report, "dialed DB_ADDR=guest#1:hello-DB_ADDR",
+        "VM B's first connection did not reach VM A's late workload.\nB \
+         stderr:\n{client_stderr}\nA stderr:\n{server_stderr}"
+    );
+}
+
+/// VM to VM, never: VM B's stock client of a VM A whose workload never
+/// listens is held for the bound and then reads end-of-file.
+#[test]
+fn vm_to_vm_a_connection_to_a_server_that_never_listens_ends_at_the_bound() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    if !presentation_is_live_here() {
+        return;
+    }
+    let (_fixture, root) = fixture();
+    let path = root.join("edge.sock");
+    let served = with_grants(&libkrunfw, vec![serve_grant(&path, SERVE_PORT)]);
+    let mut server = Run::new(&root, &libkrunfw, IDLE, "never-vm-a")
+        .manifest(&served)
+        .boot();
+    assert_eq!(server.report, "idle");
+    let dialed = with_grants(&libkrunfw, vec![dial_grant(&path, DIAL_PORT)]);
+    // B's report comes after its client's connection ends, so B's whole
+    // boot spans the hold: at least the bound, at most the report bound.
+    let started = std::time::Instant::now();
+    let mut client = Run::new(&root, &libkrunfw, CLIENT, "never-vm-b")
+        .env("DB_ADDR", &format!("127.0.0.1:{DIAL_PORT}"))
+        .args(&["env:DB_ADDR"])
+        .manifest(&dialed)
+        .boot();
+    let spanned = started.elapsed();
+    let client_stderr = client.guest.end();
+    let server_stderr = server.guest.end();
+    assert_eq!(
+        client.report, "dialed DB_ADDR=eof",
+        "B stderr:\n{client_stderr}\nA stderr:\n{server_stderr}"
+    );
+    assert!(
+        spanned >= SERVE_HOLD,
+        "VM B's connection ended after {spanned:?}, before the hold bound \
+         {SERVE_HOLD:?}: it was not held"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Acceptance test 9: stability.
 
 /// Dial and serve in one run, `LEYLINE_CONNECTIONS_RUNS` times (default 1)

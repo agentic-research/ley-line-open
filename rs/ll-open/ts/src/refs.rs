@@ -6,7 +6,9 @@
 use tree_sitter::Node;
 
 /// Version of the extraction rules — the `extract_*` emission behavior
-/// that derives `node_defs` / `node_refs` / `_imports` from an AST.
+/// that derives `node_defs` / `node_refs` / `_imports` from an AST — and,
+/// since epoch 7, of which `extra` nodes the parse walk records as `_ast`
+/// occurrences.
 ///
 /// `node_hash` is a fold over source bytes only, so a rules change with
 /// unchanged sources is invisible to the merkle/sheaf invalidation
@@ -17,7 +19,8 @@ use tree_sitter::Node;
 /// re-derivation when the stored value disagrees with the binary's —
 /// see bead `ley-line-open-20988a`.
 ///
-/// Bump whenever ANY `extract_*` emission behavior changes. When
+/// Bump whenever ANY `extract_*` emission behavior changes, or the set of
+/// occurrences the parse walk emits for unchanged source does. When
 /// queries-as-data lands (bead `ley-line-open-206d53`) this constant is
 /// superseded by the query_set_hash computed over the loaded query set.
 ///
@@ -55,7 +58,15 @@ use tree_sitter::Node;
 ///   reference), anchored at the value-position container. Additive:
 ///   every epoch-5 row is still emitted unchanged. Without the bump an
 ///   upgraded arena keeps reporting value-passed handlers as unused.
-pub const EXTRACTION_EPOCH: u64 = 6;
+/// - 7: comment occurrences (bead `ley-line-open-aa1634`). The parse walk
+///   (`fold_children` in `cli-lib/src/cmd_parse.rs`) records every comment
+///   that tree-sitter parsed as an `extra` as a terminal `_ast`/`nodes`
+///   occurrence; every other row, `node_hash` included, is unchanged. Not
+///   an `extract_*` change: the epoch also versions which occurrences the
+///   walk emits, because no other version moves for it (`node_hash` and
+///   the projection's tables and columns stay put). Without the bump an
+///   upgraded arena keeps serving `_ast` with no comments.
+pub const EXTRACTION_EPOCH: u64 = 7;
 
 /// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the
 /// compile-time constant so one test binary can act as two releases
@@ -1447,7 +1458,7 @@ mod epoch_pin {
     /// `(EXTRACTION_EPOCH, fingerprint of COMPILED_TAGS)` — re-pin both
     /// together.
     const PINNED: (u64, &str) = (
-        6,
+        7,
         "7417cb4d11b6f3fa7856aedf19cf6a27597c27ba3a0c230a373f8cebdfe14225",
     );
 

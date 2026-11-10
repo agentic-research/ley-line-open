@@ -3328,7 +3328,9 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 // in different files share a `node_hash`. Anonymous children (operators
 // like `+`/`-`, keywords, punctuation) ARE folded, which is what
 // distinguishes `a+b` from `a-b`; comments/`extra` nodes are excluded, so a
-// comment-only edit leaves every enclosing hash unchanged.
+// comment-only edit leaves every enclosing hash unchanged. A comment is an
+// `_ast` occurrence with an address of its own (a leaf over its text, bead
+// `ley-line-open-aa1634`), never a child in another node's preimage.
 //
 // merkle-ast-v3 (ADR-0047 D-i, step M2, bead `ley-line-open-73add7`): the
 // encoding is keyed with BLAKE3 `derive_key` under [`NODE_HASH_CONTEXT`].
@@ -3810,6 +3812,84 @@ pub(crate) fn parse_to_ast_json(
     }))
 }
 
+/// A child [`fold_children`] visits: a non-`extra` child, which it folds
+/// into the parent's `node_hash`, or a comment extra, which it records as an
+/// occurrence only.
+#[derive(Clone, Copy)]
+enum Visit<'t> {
+    Folded(tree_sitter::Node<'t>),
+    Comment(tree_sitter::Node<'t>),
+}
+
+/// Whether `node` is a comment that tree-sitter parsed as an `extra` (bead
+/// `ley-line-open-aa1634`): named, `extra`, and of a grammar kind that names
+/// a comment. Across the shipped grammars that is `comment` (Go, Python,
+/// JavaScript, TypeScript, C, C++, Bash, HCL, SQL), `line_comment` and
+/// `block_comment` (Rust, Java). Other named extras, such as Python's
+/// `line_continuation`, are not comments and stay out of the projection.
+fn is_comment_extra(node: tree_sitter::Node<'_>) -> bool {
+    node.is_extra() && node.is_named() && node.kind().contains("comment")
+}
+
+/// Record one comment extra as a terminal occurrence (bead
+/// `ley-line-open-aa1634`): an `_ast` row with its grammar kind and span, and
+/// a leaf `nodes` row carrying its text, in source order under the node
+/// tree-sitter attached it to.
+///
+/// OCCURRENCE-ONLY: the comment never enters its parent's `node_hash` fold,
+/// so a comment-only edit leaves every code `node_hash` unchanged. Its own
+/// `content_id` names the leaf `node_content` row `hash_leaf(kind, text)`,
+/// the merkle-ast-v3 address of a terminal with the comment's full text as
+/// its token, so every column of that row is a function of its `node_hash`
+/// and `token` holds the text. The comment is terminal whatever its
+/// grammar's inner structure: Rust's `line_comment` hides a plain comment's
+/// text in anonymous tokens, so folding its children would give every plain
+/// Rust line comment one address. No facts are extracted and no injection is
+/// probed under a comment.
+#[allow(clippy::too_many_arguments)]
+fn emit_comment_occurrence(
+    content: &[u8],
+    comment: tree_sitter::Node<'_>,
+    id: String,
+    source_id: &str,
+    language: TsLanguage,
+    seen: &mut HashSet<[u8; 32]>,
+    nodes: &mut Vec<ParsedNode>,
+    ast_entries: &mut Vec<AstEntry>,
+    node_contents: &mut Vec<ContentRow>,
+) {
+    let text = comment.utf8_text(content).unwrap_or("");
+    let kind = hashed_kind(language, comment);
+    let h = hash_leaf(kind, text);
+    if seen.insert(h) {
+        node_contents.push(ContentRow {
+            node_hash: h,
+            node_tag: NODE_TAG_LEAF,
+            kind: kind.to_string(),
+            token: Some(text.to_string()),
+            arity: 0,
+        });
+    }
+    ast_entries.push(AstEntry {
+        node_id: id.clone(),
+        source_id: source_id.to_string(),
+        node_kind: comment.kind().to_string(),
+        start_byte: comment.start_byte(),
+        end_byte: comment.end_byte(),
+        start_row: comment.start_position().row,
+        start_col: comment.start_position().column,
+        end_row: comment.end_position().row,
+        end_col: comment.end_position().column,
+        node_hash: h,
+    });
+    nodes.push(ParsedNode {
+        id,
+        kind: 0,
+        size: text.len() as i64,
+        record: text.to_string(),
+    });
+}
+
 /// Bottom-up (post-order) fold of `node`'s subtree.
 ///
 /// Returns `node`'s merkle-AST `node_hash`. As a side effect it:
@@ -3825,6 +3905,9 @@ pub(crate) fn parse_to_ast_json(
 /// parent's hash in source order. Anonymous children are terminal tokens
 /// (operators/keywords/punctuation) with no children, so they never
 /// produce `_ast`/`nodes` rows — they only contribute their leaf hash.
+/// Comment extras get `_ast`/`nodes` rows in source order among the named
+/// children and are not folded ([`emit_comment_occurrence`]); every other
+/// extra is skipped.
 #[allow(clippy::too_many_arguments)]
 fn fold_children(
     content: &[u8],
@@ -3849,9 +3932,12 @@ fn fold_children(
     injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) -> [u8; 32] {
-    // Gather non-extra children in source order, with tree-sitter field
-    // names, and count named children per kind (for the node_id suffix).
+    // Gather the children in source order: the non-extra ones (folded, with
+    // their tree-sitter field names) and the comment extras (occurrences
+    // only, bead `ley-line-open-aa1634`); any other extra is skipped. Count
+    // named children per kind, comments included, for the node_id suffix.
     let mut children: Vec<tree_sitter::Node> = Vec::new();
+    let mut visits: Vec<Visit> = Vec::new();
     let mut fields: Vec<Option<&'static str>> = Vec::new();
     let mut named_kind_counts = HashMap::<&str, usize>::new();
     {
@@ -3859,12 +3945,20 @@ fn fold_children(
         if cur.goto_first_child() {
             loop {
                 let ch = cur.node();
-                if !ch.is_extra() {
+                let visit = if !ch.is_extra() {
+                    fields.push(cur.field_name());
+                    children.push(ch);
+                    Some(Visit::Folded(ch))
+                } else if is_comment_extra(ch) {
+                    Some(Visit::Comment(ch))
+                } else {
+                    None
+                };
+                if let Some(v) = visit {
                     if ch.is_named() {
                         *named_kind_counts.entry(ch.kind()).or_insert(0) += 1;
                     }
-                    fields.push(cur.field_name());
-                    children.push(ch);
+                    visits.push(v);
                 }
                 if !cur.goto_next_sibling() {
                     break;
@@ -3875,20 +3969,39 @@ fn fold_children(
 
     let mut child_hashes: Vec<[u8; 32]> = Vec::with_capacity(children.len());
     let mut kind_indices = HashMap::<&str, usize>::new();
+    let mut occurrence_name = |kind: &'static str| -> String {
+        if named_kind_counts[kind] > 1 {
+            let idx = kind_indices.entry(kind).or_insert(0);
+            let n = format!("{kind}_{idx}");
+            *idx += 1;
+            n
+        } else {
+            kind.to_string()
+        }
+    };
 
-    for child in &children {
+    for visit in &visits {
+        let child = match visit {
+            Visit::Folded(child) => child,
+            Visit::Comment(comment) => {
+                let id = format!("{node_id}/{}", occurrence_name(comment.kind()));
+                emit_comment_occurrence(
+                    content,
+                    *comment,
+                    id,
+                    source_id,
+                    language,
+                    seen,
+                    nodes,
+                    ast_entries,
+                    node_contents,
+                );
+                continue;
+            }
+        };
         if child.is_named() {
             let kind = child.kind();
-            let needs_suffix = named_kind_counts[kind] > 1;
-            let name = if needs_suffix {
-                let idx = kind_indices.entry(kind).or_insert(0);
-                let n = format!("{kind}_{idx}");
-                *idx += 1;
-                n
-            } else {
-                kind.to_string()
-            };
-            let id = format!("{node_id}/{name}");
+            let id = format!("{node_id}/{}", occurrence_name(kind));
 
             // _ast occurrence row (pre-order; node_hash patched post-fold).
             let entry_idx = ast_entries.len();

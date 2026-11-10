@@ -47,7 +47,7 @@ tree, the patches or the script, and weekly (bead `ley-line-open-396d77`).
 
 Prepared as an upstream pull request; not yet submitted. Each is one
 `git format-patch` commit. `0001`–`0006` were written on top of `v1.19.4`
-and apply unchanged to `v1.19.6`; `0007` to `0009` were written on top of
+and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
 `v1.19.6`:
 
 1. `0001` — **libkrun/macos: start the mapping worker for virtio-fs DAX
@@ -115,6 +115,27 @@ and apply unchanged to `v1.19.6`; `0007` to `0009` were written on top of
    proxy's `listen` is a no-op). Found by the live-guest datagram test,
    which reached a guest UDP socket from loopback and from the host's LAN
    address under a §4 grant (bead `ley-line-open-0026d2`).
+10. `0010` — **init: present declared connections as guest-loopback TCP,
+    deny UDP.** The embedder lists its declared connections in
+    `KRUN_LOOPBACK_CHANNELS` (`dial:<tcp port>:<vsock port>`,
+    `serve:<tcp port>:<vsock port>`); init binds every listener before the
+    workload starts, and a relay process joins each connection to the
+    host's vsock port (dial) or to the workload's loopback listener
+    (serve), one process per direction, copying bytes only. A malformed list or a listener that cannot
+    be bound stops the guest before the workload runs. Init also installs a
+    seccomp filter every guest process inherits: `AF_INET`/`AF_INET6`
+    sockets may only be TCP streams, `AF_PACKET` and `io_uring_setup` are
+    refused, and another ABI's system call ends the process; a kernel that
+    refuses the filter stops the guest. The worker computes the list from
+    the attested confinement document (§6 `guestPort`; ADR-0046 Q7, bead
+    `ley-line-open-be3711`).
+11. `0011` — **devices/vsock: bind a listening mapping's host socket before
+    the guest starts.** The muxer thread bound it when the device
+    activated, inside a running guest, and only logged a socket it could
+    not bind, so a VM ran without a declared channel (bead
+    `ley-line-open-bb2143`). The sockets are now bound when the device is
+    created, owner-only (a 077 umask around the bind), and a failure
+    returns `-EADDRNOTAVAIL` from `krun_start_enter`.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).
@@ -127,7 +148,8 @@ libkrun embeds `/init.krun`, the first process of every guest, at build time
 at `tools/krun_init_cc.sh`: the host `cc` (static glibc) on a Linux host
 building for its own architecture, otherwise `zig cc` against musl for the
 target's architecture. Nothing is taken from an installed libkrun. With zig
-0.15.2 the aarch64 init is 81,672 bytes and byte-identical across builds.
+0.15.2 the aarch64 init is 88,072 bytes (with patch `0010`) and
+byte-identical across builds.
 
 ### What stays installed
 

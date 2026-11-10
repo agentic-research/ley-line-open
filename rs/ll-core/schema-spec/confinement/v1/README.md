@@ -93,6 +93,11 @@ This v1 **DEFINES** (new content not in either upstream spec):
   rather than in `CONFINEMENT_DIGESTS.blake3`. Verified by
   `verify_confinement_port_lists` (schema-spec crate) and, against an
   implementation, by `confinement_port_list_vectors` (leyline-runtime).
+- `test-vectors/manifest-guest-port.json` — §6 `guestPort` (the guest
+  loopback presentation): canonical forms with their `confinementDigest`,
+  the unchanged digest of a document without it, and the refusals.
+  Verified by `verify_confinement_guest_port` (schema-spec crate) and
+  `confinement_guest_port_vectors` (leyline-runtime).
 - `VECTORS.sha256` — **SHA-256 CONTENT-INTEGRITY pins** for the test
   vectors ("the bytes on disk haven't drifted"). Verified by
   `verify_vectors_sha256` (schema-spec crate). This is a
@@ -408,6 +413,51 @@ mirror image of §4, not a dimension that escapes the platform gap.
 
 A bundle needing no local channel omits the block entirely, which —
 per §1 — denies all of them.
+
+### `guestPort`: presenting a channel to a guest workload
+
+An additive v1 extension (ADR-0046 Q7, bead `ley-line-open-be3711`). On a
+tier whose workload runs in a guest (the microVM tier), a §6 grant may name
+the TCP port on the guest's loopback where the channel is presented to an
+unmodified workload:
+
+```json
+"unixSocket": {
+  "allow": [
+    {"path": "/run/llo/conn/db.sock", "mode": "connect", "guestPort": 13306},
+    {"path": "/run/llo/conn/api.sock", "mode": "bind", "guestPort": 8080}
+  ]
+}
+```
+
+- **`connect` with `guestPort` (dial).** The workload connects to
+  `127.0.0.1:<guestPort>` and reaches whatever is listening at `path`. The
+  runner binds the guest port before the workload starts, so the workload
+  cannot take it first.
+- **`bind` with `guestPort` (serve).** A peer connecting to `path` on the
+  host reaches the workload's listener on `127.0.0.1:<guestPort>`. The
+  serve-without-dial clause of `bind` is unchanged: the workload cannot
+  dial out through this grant.
+- **`connect-bind` with `guestPort` is refused.** A dial presentation
+  listens on the guest port and a served one needs the workload listening
+  there; one port cannot be both. Declare two grants.
+- **`"mode": "connect"` is spelled only beside `guestPort`.** A connect
+  grant without one is still the bare string and only the bare string, so
+  every grant keeps exactly one spelling.
+- **`guestPort` is 1–65535 and names one grant.** Two grants presenting the
+  same guest port are refused. The issuer chooses the port and the digest
+  commits to it; a runner derives no guest address of its own. A workload
+  learns the address from its configuration (for example an environment
+  variable the issuer sets), which is not authority: naming an address no
+  grant presents reaches nothing.
+- **Refusals.** A runner whose workload is not in a guest (the native tiers)
+  MUST refuse a grant carrying `guestPort` (§9 condition 6): the workload
+  there dials the socket itself. A runner that carries the guest's ordinary
+  sockets out of the guest (libkrun's socket impersonation) MUST refuse it
+  too, because the guest loopback is then not the guest's alone.
+
+A document that carries no `guestPort` is unchanged by the extension and
+digests as it did.
 
 ## §7 Canonical serialization
 

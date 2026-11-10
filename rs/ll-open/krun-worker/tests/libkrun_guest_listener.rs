@@ -49,7 +49,10 @@
 //! TSI stream proxy. Its datagram proxy is a separate path that never read the
 //! map, so "only declared listeners are reachable" had to be measured for UDP
 //! as well, under hijacking and a §4 grant together, which is when the VMM's
-//! profile is widest.
+//! profile is widest. Since LLO libkrun patch 0010 the guest init also
+//! refuses every datagram socket (bead `ley-line-open-be3711`), so the guest's
+//! attempts are refused in the guest and the host-side assertions measure the
+//! second line, patch 0009, with nothing reaching it.
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -595,13 +598,22 @@ fn an_undeclared_guest_udp_port_is_not_reachable_from_the_host() {
         "the declared TCP listener did not answer, so the hijacked path was not \
          live in this run and nothing below was measured. worker stderr:\n{worker_stderr}"
     );
+    // Since LLO libkrun patch 0010 the guest cannot open a datagram socket at
+    // all (bead ley-line-open-be3711): its UDP binds and its sendto socket are
+    // refused with EACCES before the VMM sees them. Patch 0009 stays the
+    // second line, measured by the host-side assertions below whatever the
+    // guest managed.
     for port in fixed {
         assert!(
-            report.contains(&format!("udp{port}=bound")),
-            "the guest could not bind UDP {port}, so this run measured nothing about \
-             it. Guest said: {report}\nworker stderr:\n{worker_stderr}"
+            report.contains(&format!("udp{port}=PermissionDenied")),
+            "SECURITY: the guest's UDP bind on {port} was not refused. Guest said: \
+             {report}\nworker stderr:\n{worker_stderr}"
         );
     }
+    assert!(
+        report.contains("sendto-socket=PermissionDenied"),
+        "SECURITY: the guest opened a UDP socket to send from. Guest said: {report}"
+    );
     for (address, port, outcome) in &fixed_outcomes {
         assert_eq!(
             *outcome,
@@ -611,11 +623,6 @@ fn an_undeclared_guest_udp_port_is_not_reachable_from_the_host() {
              stderr:\n{worker_stderr}"
         );
     }
-    assert!(
-        report.contains("sendto="),
-        "the guest never attempted its datagram, so the reply path was not \
-         exercised. Guest said: {report}"
-    );
     // The host refuses to transmit the guest's datagram (the VMM's profile
     // opens outbound TCP to the declared ports only), so no peer was reached
     // and the VMM must hold no UDP port at all. Before LLO libkrun patch 0009

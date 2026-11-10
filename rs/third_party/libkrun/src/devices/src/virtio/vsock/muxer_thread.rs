@@ -1,6 +1,5 @@
-use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -27,7 +26,7 @@ pub struct MuxerThread {
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
-    unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    unix_ipc_listeners: Vec<(u32, OwnedFd)>,
 }
 
 impl MuxerThread {
@@ -41,7 +40,7 @@ impl MuxerThread {
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
-        unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        unix_ipc_listeners: Vec<(u32, OwnedFd)>,
     ) -> Self {
         MuxerThread {
             cid,
@@ -52,7 +51,7 @@ impl MuxerThread {
             queue,
             interrupt,
             reaper_sender,
-            unix_ipc_port_map,
+            unix_ipc_listeners,
         }
     }
 
@@ -149,19 +148,14 @@ impl MuxerThread {
         }
     }
 
-    fn create_lisening_ipc_sockets(&self) {
-        for (port, (path, do_listen)) in &self.unix_ipc_port_map {
-            if !do_listen {
-                continue;
-            }
-            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            let proxy = match UnixAcceptorProxy::new(id, path, *port) {
-                Ok(proxy) => proxy,
-                Err(e) => {
-                    warn!("Failed to create listening proxy at {path:?}: {e:?}");
-                    continue;
-                }
-            };
+    /// Serve the host sockets of the listening port mappings. They were
+    /// bound before the guest started (`VsockMuxer::new`), so a mapping that
+    /// cannot be bound refuses the VM instead of leaving it without the
+    /// channel.
+    fn serve_listening_ipc_sockets(&mut self) {
+        for (port, fd) in std::mem::take(&mut self.unix_ipc_listeners) {
+            let id = ((port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let proxy = UnixAcceptorProxy::from_listener(id, fd, port);
             self.proxy_map
                 .write()
                 .unwrap()
@@ -172,9 +166,9 @@ impl MuxerThread {
         }
     }
 
-    fn work(self) {
+    fn work(mut self) {
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
+        self.serve_listening_ipc_sockets();
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self

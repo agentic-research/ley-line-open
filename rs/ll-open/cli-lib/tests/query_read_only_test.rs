@@ -30,9 +30,6 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
-        // As `cmd_daemon` does: sqlite-vec's modules on every connection.
-        #[cfg(feature = "vec")]
-        leyline_cli_lib::daemon::vec_index::register_vec();
         let dir = tempfile::TempDir::new().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();

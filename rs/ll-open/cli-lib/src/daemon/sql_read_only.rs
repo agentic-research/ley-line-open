@@ -271,6 +271,10 @@ const TEMP_SCHEMA_TABLE: &str = "sqlite_temp_master";
 /// statement first names them (the JSON and `pragma_` ones) are not
 /// removable; the JSON ones are allowed and the `pragma_` ones are judged
 /// by the authorizer.
+///
+/// Call it before any statement reads a virtual table on `conn`. A table a
+/// statement connected before the drop stays connected and readable, and
+/// [`query`]'s check of the registered modules cannot see it.
 pub fn restrict_modules(conn: &Connection) -> rusqlite::Result<()> {
     let keep: Vec<std::ffi::CString> = ALLOWED_MODULES
         .iter()

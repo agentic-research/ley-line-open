@@ -121,6 +121,8 @@ impl LiveDb {
         //   dropped before anything runs, so no reader ever connects a
         //   module outside the allow-list, however a statement names it.
         //   No reader op reads an FTS, R-tree or vec0 table in `live.db`.
+        //   No statement may read a virtual table on the connection before
+        //   it: one connected before the drop would stay readable.
         let manager = SqliteConnectionManager::file(path).with_init(|conn| {
             conn.pragma_update(None, "query_only", "ON")?;
             conn.pragma_update(None, "busy_timeout", 5000i64)?;

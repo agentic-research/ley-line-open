@@ -11,8 +11,11 @@ Section: Breaking
   `docs/TABLE_CONTRACT.md` gives the query for a fielded child's grammar kind
   (an anonymous child's is its `kind`, since the merkle-ast-v3 fold applies
   κ to named nodes only).
-  Injected-language subtrees have no occurrence rows, so their language and
-  grammar kind are no longer in the projection (`ley-line-open-cc5c55`).
+  `node_defs` and `node_refs` gain `kind_id` (→ `kinds`), the occurrence's
+  own `(lang, raw_kind)` as on `_ast`: equal to the `_ast` row's for a host
+  occurrence, and the only carrier for an injected-language occurrence,
+  which has no `_ast` row (a Go file's injected `CREATE TABLE users` def
+  answers `('sql', 'create_table')`; bead `ley-line-open-cc5c55`).
   `leyline rebuild`'s logical-row gate compares every `node_content` column;
   the exclusion it carried for these two is gone. `PROJECTION_SCHEMA_VERSION`
   is `projection-v12`; a v11 arena is refused at parse open.

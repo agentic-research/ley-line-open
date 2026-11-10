@@ -212,6 +212,15 @@ pub fn insert_ast(
 /// backfills NULL on legacy rows, and a second `''` encoding would split
 /// the no-qualifier shape in two. Additive column: legacy DBs migrate
 /// via `create_qualifier_column`'s idempotent ALTER path.
+///
+/// `kind_id` (projection-v12, ADR-0047 D-iii, bead `ley-line-open-cc5c55`)
+/// is the occurrence's interned `(lang, raw_kind)` in `kinds`, as on `_ast`.
+/// For a host occurrence it equals its `_ast` row's `kind_id`; an injected
+/// occurrence (bead `ley-line-open-c822a6`) has no `_ast` row, and this is
+/// where its language and grammar kind live, since `node_content` holds
+/// neither. The parse writes it on every row it emits; NULL only on rows a
+/// caller inserts without one (the `insert_ref`/`insert_def` helpers).
+/// Same for `node_defs`.
 pub const REFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
@@ -238,7 +247,8 @@ CREATE TABLE IF NOT EXISTS node_refs (
     end_row INTEGER,
     end_col INTEGER,
     qualifier TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );";
 
 /// DDL for the `node_refs` indexes — deferred post-COMMIT.
@@ -266,7 +276,8 @@ CREATE TABLE IF NOT EXISTS node_refs (
     end_row INTEGER,
     end_col INTEGER,
     qualifier TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
 CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(nid);
@@ -310,7 +321,8 @@ CREATE TABLE IF NOT EXISTS node_defs (
     end_row INTEGER,
     end_col INTEGER,
     canonical_kind TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );";
 
 /// DDL for the `node_defs` indexes — deferred post-COMMIT.
@@ -338,7 +350,8 @@ CREATE TABLE IF NOT EXISTS node_defs (
     end_row INTEGER,
     end_col INTEGER,
     canonical_kind TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
 CREATE INDEX IF NOT EXISTS idx_defs_node ON node_defs(nid);
@@ -489,24 +502,28 @@ SELECT a.nid, a.kind_id, a.start_byte, a.end_byte,
   LEFT JOIN node_content c ON c.content_id = a.content_id;";
 
 /// `v_node_refs_hash` — the projection-v9 `node_refs` shape, `node_hash`
-/// included, as a read-only view. Same contract as [`AST_HASH_VIEW_DDL`].
+/// included, as a read-only view, plus the occurrence's `kind_id`
+/// (projection-v12). Same contract as [`AST_HASH_VIEW_DDL`].
 pub const REFS_HASH_VIEW_DDL: &str = "\
 CREATE VIEW IF NOT EXISTS v_node_refs_hash AS
 SELECT r.token, r.nid, r.container_nid, r.node_kind,
        r.start_byte, r.end_byte, r.start_row, r.start_col, r.end_row, r.end_col,
        r.qualifier,
-       c.node_hash AS node_hash
+       c.node_hash AS node_hash,
+       r.kind_id
   FROM node_refs r
   LEFT JOIN node_content c ON c.content_id = r.content_id;";
 
 /// `v_node_defs_hash` — the projection-v9 `node_defs` shape, `node_hash`
-/// included, as a read-only view. Same contract as [`AST_HASH_VIEW_DDL`].
+/// included, as a read-only view, plus the occurrence's `kind_id`
+/// (projection-v12). Same contract as [`AST_HASH_VIEW_DDL`].
 pub const DEFS_HASH_VIEW_DDL: &str = "\
 CREATE VIEW IF NOT EXISTS v_node_defs_hash AS
 SELECT d.token, d.nid, d.container_nid, d.node_kind,
        d.start_byte, d.end_byte, d.start_row, d.start_col, d.end_row, d.end_col,
        d.canonical_kind,
-       c.node_hash AS node_hash
+       c.node_hash AS node_hash,
+       d.kind_id
   FROM node_defs d
   LEFT JOIN node_content c ON c.content_id = d.content_id;";
 

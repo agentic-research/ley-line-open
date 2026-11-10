@@ -627,6 +627,35 @@ mod tests {
         );
     }
 
+    /// F3 over injected occurrences (bead `ley-line-open-cc5c55`): a Go file
+    /// with SQL in a string has def and ref rows whose `kind_id` names
+    /// `sql:*` kinds and no `_ast` row; a rebuild after a write reproduces
+    /// them, `kind_id` rendered as what it names.
+    #[test]
+    fn a_rebuild_reproduces_injected_occurrence_kinds() {
+        const Q: &str = "package q\n\nimport \"database/sql\"\n\n\
+            func setup(db *sql.DB) {\n\tdb.Exec(`CREATE TABLE users (id INTEGER)`)\n}\n";
+        const Q2: &str = "package q\n\nimport \"database/sql\"\n\n\
+            func setup(db *sql.DB) {\n\tdb.Exec(`CREATE TABLE teams (id INTEGER)`)\n}\n";
+        let a = arena(&[("q.go", Q), ("sub/deep/r.rs", R)]);
+        write(&a.conn, &Grant::Whole, "q.go", Q2.as_bytes().to_vec()).unwrap();
+        let injected: i64 = a
+            .conn
+            .query_row(
+                "SELECT count(*) FROM node_defs d JOIN kinds k ON k.kind_id = d.kind_id \
+                 WHERE k.lang = 'sql' AND d.token = 'teams'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            injected, 1,
+            "the written file's injected def carries its kind"
+        );
+        let (into, _) = rebuilt(&a.conn, &Grant::Whole);
+        assert_same_rows(&logical(&into), &logical(&a.conn));
+    }
+
     /// F5: a sub-manifest rebuilt on its own produces the same file-local
     /// row images the full arena holds, compared modulo `file_id`.
     #[test]

@@ -218,8 +218,11 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v3";
 ///   kind is its `kind`, because the merkle-ast-v3 fold applies κ to named
 ///   nodes only (an anonymous token hashes its grammar kind). Every
 ///   `node_hash` moves to merkle-ast-v3 (`IR_SCHEMA_VERSION`), and with it
-///   `parserId`; `storeRoot` and `Head.rootHash` do not move. A v11 arena is
-///   refused at parse open.
+///   `parserId`; `storeRoot` and `Head.rootHash` do not move. `node_defs` and
+///   `node_refs` gain `kind_id` (→ `kinds`), the occurrence's own `(lang,
+///   raw_kind)`: an injected-language occurrence has no `_ast` row, and this
+///   is where its language and grammar kind live (bead
+///   `ley-line-open-cc5c55`). A v11 arena is refused at parse open.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same

@@ -108,6 +108,18 @@ struct ContentRow {
     arity: usize,
 }
 
+/// A named node of an injected subtree (bead `ley-line-open-c822a6`): its
+/// fact id, its `node_hash`, and the occurrence facts `node_content` does not
+/// hold (projection-v12, ADR-0047 D-iii): the injected grammar's language and
+/// the node's grammar kind. It has no `_ast` row, so its `node_defs` /
+/// `node_refs` rows carry these as `kind_id` (bead `ley-line-open-cc5c55`).
+struct InjectedNode {
+    id: String,
+    hash: [u8; 32],
+    lang: &'static str,
+    raw_kind: &'static str,
+}
+
 /// A git-tree edge parent→child at `ordinal`, by hash; the insert loop
 /// interns both endpoints into a `node_edge` row.
 struct ChildRow {
@@ -161,7 +173,7 @@ pub(crate) struct ParsedFile {
     /// but their fact rows still need the `node_hash` pointer at their
     /// own content-addressed subtree. Merged into `hash_by_id` in the
     /// insert loop, next to the `_ast`-derived entries.
-    injected_hashes: Vec<(String, [u8; 32])>,
+    injected_hashes: Vec<InjectedNode>,
     /// ADR-0045 T3: the first `ERROR` or `MISSING` node tree-sitter
     /// produced, when the file did not parse cleanly. The file is projected
     /// either way; this becomes its `_parse_diagnostics` row.
@@ -620,11 +632,11 @@ batch_table! {
     // NULL on the qualified-token row and on genuinely bare calls.
     RefBatch, RefRow,
     "",
-    12,
-    push_fn: (token: String, nid: Nid, content_id: Option<ContentId>, container_nid: Option<Nid>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
-    push_body: { RefRow { token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    13,
+    push_fn: (token: String, nid: Nid, content_id: Option<ContentId>, container_nid: Option<Nid>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>, kind_id: Option<KindId>),
+    push_body: { RefRow { token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.nid);
@@ -638,6 +650,7 @@ batch_table! {
             out.push(&r.start_col);
             out.push(&r.end_row);
             out.push(&r.end_col);
+            out.push(&r.kind_id);
         }
         out
     },
@@ -645,8 +658,8 @@ batch_table! {
 
 impl RefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 12, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.nid);
@@ -660,6 +673,7 @@ impl RefBatch {
                 out.push(&r.start_col);
                 out.push(&r.end_row);
                 out.push(&r.end_col);
+                out.push(&r.kind_id);
             }
             out
         })
@@ -675,18 +689,19 @@ batch_table! {
     // container_node_id) shape as refs, plus `canonical_kind`.
     DefBatch, DefRow,
     "",
-    12,
+    13,
     push_fn: (
         token: String,
         nid: Nid,
         content_id: Option<ContentId>,
         container_nid: Option<Nid>,
         canonical_kind: Option<&'static str>,
-        node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>
+        node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>,
+        kind_id: Option<KindId>
     ),
-    push_body: { DefRow { token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    push_body: { DefRow { token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.nid);
@@ -700,6 +715,7 @@ batch_table! {
             out.push(&r.start_col);
             out.push(&r.end_row);
             out.push(&r.end_col);
+            out.push(&r.kind_id);
         }
         out
     },
@@ -707,8 +723,8 @@ batch_table! {
 
 impl DefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 12, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.nid);
@@ -722,6 +738,7 @@ impl DefBatch {
                 out.push(&r.start_col);
                 out.push(&r.end_row);
                 out.push(&r.end_col);
+                out.push(&r.kind_id);
             }
             out
         })
@@ -1861,9 +1878,9 @@ fn parse_into_conn_with(
                     for (i, a) in pf.ast_entries.iter().enumerate() {
                         nid_by_id.insert(a.node_id.as_str(), base + i as i64);
                     }
-                    for (j, (id, _)) in pf.injected_hashes.iter().enumerate() {
+                    for (j, n) in pf.injected_hashes.iter().enumerate() {
                         nid_by_id
-                            .entry(id.as_str())
+                            .entry(n.id.as_str())
                             .or_insert(base + injected_ordinal(pf.ast_entries.len(), j) as i64);
                     }
 
@@ -2009,9 +2026,16 @@ fn parse_into_conn_with(
                     // nodes have no `_ast` rows; their (node_id →
                     // node_hash) pairs ride ParsedFile so injected fact
                     // rows resolve to their own content-addressed subtrees.
-                    for (id, h) in &pf.injected_hashes {
-                        hash_by_id.insert(id.as_str(), *h);
+                    for n in &pf.injected_hashes {
+                        hash_by_id.insert(n.id.as_str(), n.hash);
                     }
+                    // The same nodes' language and grammar kind, for the
+                    // `kind_id` their fact rows carry (projection-v12).
+                    let injected_kind: HashMap<&str, (&str, &str)> = pf
+                        .injected_hashes
+                        .iter()
+                        .map(|n| (n.id.as_str(), (n.lang, n.raw_kind)))
+                        .collect();
 
                     // node_id -> the `_ast` entry, so an occurrence row can
                     // carry its OWN span and grammar kind instead of the
@@ -2030,16 +2054,23 @@ fn parse_into_conn_with(
                     }
                     let span_of = |id: &str| OccurrenceSpan::of(entry_by_id.get(id).copied());
 
-                    // Interning memo for this file's kinds.
+                    // Interning memo for this file's kinds: the host
+                    // language's, and an injected grammar's for injected
+                    // occurrences.
                     let lang = pf.language.clone();
-                    let mut kind_id_of = |conn: &Connection, raw_kind: &str| -> Result<KindId> {
-                        if let Some(k) = kind_cache.get(&(lang.clone(), raw_kind.to_string())) {
+                    let mut kind_in = |conn: &Connection,
+                                       lang: &str,
+                                       raw_kind: &str|
+                     -> Result<KindId> {
+                        if let Some(k) = kind_cache.get(&(lang.to_string(), raw_kind.to_string())) {
                             return Ok(*k);
                         }
-                        let k = leyline_ts::schema::intern_kind(conn, &lang, raw_kind)?;
-                        kind_cache.insert((lang.clone(), raw_kind.to_string()), k);
+                        let k = leyline_ts::schema::intern_kind(conn, lang, raw_kind)?;
+                        kind_cache.insert((lang.to_string(), raw_kind.to_string()), k);
                         Ok(k)
                     };
+                    let mut kind_id_of =
+                        |conn: &Connection, raw_kind: &str| kind_in(conn, &lang, raw_kind);
 
                     // `nodes` rows: the file's own node (ordinal 0, parent =
                     // its directory) and every AST node (parent + sibling
@@ -2125,6 +2156,17 @@ fn parse_into_conn_with(
                             .copied()
                             .with_context(|| format!("{}: fact id {id:?} unmapped", pf.rel))
                     };
+                    // The occurrence's interned (lang, raw_kind): its `_ast`
+                    // row's for a host node, the injected grammar's for an
+                    // injected one (projection-v12, bead `ley-line-open-cc5c55`).
+                    let mut occurrence_kind =
+                        |conn: &Connection, id: &str| -> Result<Option<KindId>> {
+                            let kind = match entry_by_id.get(id) {
+                                Some(e) => Some((lang.as_str(), e.node_kind.as_str())),
+                                None => injected_kind.get(id).copied(),
+                            };
+                            kind.map(|(l, k)| kind_in(conn, l, k)).transpose()
+                        };
                     for r in &pf.refs {
                         match r {
                             ExtractedRef::Ref {
@@ -2151,6 +2193,7 @@ fn parse_into_conn_with(
                                     sp.start_col,
                                     sp.end_row,
                                     sp.end_col,
+                                    occurrence_kind(conn, node_id)?,
                                 );
                             }
                             ExtractedRef::Def {
@@ -2177,6 +2220,7 @@ fn parse_into_conn_with(
                                     sp.start_col,
                                     sp.end_row,
                                     sp.end_col,
+                                    occurrence_kind(conn, node_id)?,
                                 );
                             }
                             ExtractedRef::Import {
@@ -2230,11 +2274,11 @@ fn parse_into_conn_with(
         source_buf.flush_batched(conn)?;
         refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_refs (token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id) VALUES ",
     )?;
         defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_defs (token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id) VALUES ",
     )?;
         imports_buf.flush_batched(conn)?;
 
@@ -3501,7 +3545,7 @@ pub(crate) fn parse_file_pure(
     // for injected-subtree nodes, which have no `_ast` rows. The
     // env-var off-switch is the falsification seam for the host-hash-
     // independence gate, read once per file (rayon workers only read).
-    let mut injected_hashes: Vec<(String, [u8; 32])> = Vec::new();
+    let mut injected_hashes: Vec<InjectedNode> = Vec::new();
     let injections_on = !leyline_ts::injections::injections_disabled();
     // Arena query overrides (bead `ley-line-open-e72629`): per-file bounds flag
     // set when an override engine trips its resource ceiling on any node.
@@ -3802,7 +3846,7 @@ fn fold_children(
     refs: &mut Vec<ExtractedRef>,
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
-    injected_hashes: &mut Vec<(String, [u8; 32])>,
+    injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) -> [u8; 32] {
     // Gather non-extra children in source order, with tree-sitter field
@@ -4080,7 +4124,7 @@ fn fold_injected(
     refs: &mut Vec<ExtractedRef>,
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
-    injected_hashes: &mut Vec<(String, [u8; 32])>,
+    injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) {
     let mut parser = tree_sitter::Parser::new();
@@ -4108,7 +4152,12 @@ fn fold_injected(
         injected_hashes,
         ctx,
     );
-    injected_hashes.push((root_id.to_string(), root_hash));
+    injected_hashes.push(InjectedNode {
+        id: root_id.to_string(),
+        hash: root_hash,
+        lang: site.language.name(),
+        raw_kind: root.kind(),
+    });
 }
 
 /// Bottom-up fold of an INJECTED subtree — [`fold_children`] minus the
@@ -4137,7 +4186,7 @@ fn fold_injected_node(
     refs: &mut Vec<ExtractedRef>,
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
-    injected_hashes: &mut Vec<(String, [u8; 32])>,
+    injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) -> [u8; 32] {
     let mut children: Vec<tree_sitter::Node> = Vec::new();
@@ -4212,7 +4261,12 @@ fn fold_injected_node(
                 injected_hashes,
                 ctx,
             );
-            injected_hashes.push((id, child_hash));
+            injected_hashes.push(InjectedNode {
+                id,
+                hash: child_hash,
+                lang: language.name(),
+                raw_kind: child.kind(),
+            });
             child_hashes.push(child_hash);
         } else {
             let child_hash = fold_injected_node(

@@ -297,9 +297,10 @@ has no `_ast` row, and its raw kind is its `node_content.kind` because the merkl
 applies κ to named nodes only. Before v3 it applied κ to every node, and JavaScript's and
 TypeScript's anonymous `class` keyword was stored as κ `type`, its grammar kind nowhere in
 the projection (`an_anonymous_tokens_kind_is_its_grammar_kind`,
-`rs/ll-open/cli-lib/tests/ir_producer.rs`). Injected
-subtrees have no `_ast` row either; their language and grammar kind are no longer in the
-projection, and no shipped reader needed them (`ley-line-open-cc5c55`).
+`rs/ll-open/cli-lib/tests/ir_producer.rs`). Injected subtrees have no `_ast` row (`_ast` is the
+host's tree, independent of the injection pass); their occurrences are their `node_defs` /
+`node_refs` rows, which projection-v12 gives a `kind_id → kinds` column, as `_ast` has, so an
+injected def still answers its `(lang, raw_kind)` (`ley-line-open-cc5c55`).
 
 **Versioning and migration.** Moves: two `node_content` columns (`schema.rs:404-411`). Does not
 move: any hash or root. Bump: one projection version, shared with D-i's `node_hash` v3 (§4.6).

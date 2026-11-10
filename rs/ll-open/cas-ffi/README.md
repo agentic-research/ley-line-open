@@ -1,6 +1,6 @@
 # leyline-cas-ffi
 
-Wasm32-callable C FFI for ll-core CAS (content-addressed storage) primitives. Single substrate-aligned BLAKE3 hash, exposed to non-Rust consumers (cloister via workerd's cdylib loader; future Swift / TS hosts).
+Wasm32-callable C FFI for ll-core CAS (content-addressed storage) primitives. The substrate's BLAKE3 hash and its keyed `derive_key` primitive, exposed to non-Rust consumers (cloister via workerd's cdylib loader; future Swift / TS hosts).
 
 **License:** AGPL-3.0-or-later. **Bead:** `ley-line-open-0c8c0b`.
 

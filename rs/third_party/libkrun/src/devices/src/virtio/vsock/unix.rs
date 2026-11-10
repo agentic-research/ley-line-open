@@ -659,7 +659,16 @@ pub struct UnixAcceptorProxy {
 }
 
 impl UnixAcceptorProxy {
-    pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
+    /// Bind and listen on the host socket at `path`, the host end of a
+    /// listening port mapping.
+    ///
+    /// The socket is created owner-only (a 077 umask around the bind: no
+    /// group or other access), whatever the process umask: a peer reaches
+    /// the guest through this
+    /// path, so only the embedder's own user may connect to it, and the
+    /// directory the embedder chose decides the rest.
+    pub fn bind_listener(path: &PathBuf) -> Result<OwnedFd, ProxyError> {
+        use nix::sys::stat::{umask, Mode};
         let fd = socket(
             AddressFamily::Unix,
             SockType::Stream,
@@ -667,14 +676,19 @@ impl UnixAcceptorProxy {
             None,
         )
         .map_err(ProxyError::CreatingSocket)?;
-        bind(
-            fd.as_raw_fd(),
-            &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
-        )
-        .map_err(ProxyError::CreatingSocket)?;
+        let address = UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?;
+        let previous = umask(Mode::from_bits_truncate(0o077));
+        let bound = bind(fd.as_raw_fd(), &address);
+        umask(previous);
+        bound.map_err(ProxyError::CreatingSocket)?;
         listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
             .map_err(ProxyError::CreatingSocket)?;
-        Ok(UnixAcceptorProxy { id, fd, peer_port })
+        Ok(fd)
+    }
+
+    /// The acceptor for a host socket [`Self::bind_listener`] already bound.
+    pub fn from_listener(id: u64, fd: OwnedFd, peer_port: u32) -> Self {
+        UnixAcceptorProxy { id, fd, peer_port }
     }
 }
 

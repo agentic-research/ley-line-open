@@ -1,6 +1,6 @@
 # ADR-0045 — The store is a git-shaped tree, parsing is a projection over it, and a moved base merges
 
-**Status:** Accepted (2026-10-15, owner direction); phases 1–6 built (below)
+**Status:** Accepted (2026-10-15, owner direction); phases 1–7 built (below)
 **Bead:** `ley-line-open-bb8aa6`; T8 `ley-line-open-53d701`, `ley-line-open-3e73dc`
 **Amends:** ADR-0042 (P1a "what the store can hold", P2 "there is no merge", P4/P5 syntax
 refusals, the NFS mount bases of `6116c9`), ADR-0044 (V2 refusal errnos, V3 "Read freshness":

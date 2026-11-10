@@ -21,6 +21,9 @@ that any second implementation can conform to.
   (envelope shape, receipt commitment, error responses, injection
   strategies). Ships a Python reference implementation under
   `ref-impl-py/` and 10 conformance vectors under `test-vectors/`.
+- **`confinement/v1/`** — the kernel-confinement manifest
+  (`ConfinementManifest`): its JSON Schema, canonical serialization and
+  BLAKE3 identity pins (ADR-0035).
 - **`build-cache/v1/`** — OCI-shaped remote build cache transport
   (manifest shape, digest encoding, push/pull protocols). Ships a
   5-file vector bundle under `vectors/`.
@@ -46,9 +49,9 @@ These spec dirs pin their vector bundles with a `VECTORS.sha256` file:
 
 - `credential-isolation/v1/VECTORS.sha256` — 10 vectors under `test-vectors/`
 - `build-cache/v1/vectors/VECTORS.sha256` — 5 vectors alongside it
-- `confinement/v1/VECTORS.sha256` — canonical `ConfinementManifest` vector
+- `confinement/v1/VECTORS.sha256` — the canonical `ConfinementManifest` vector and the §3/§4 port-list vector
 - `leyline-net/v1/test-vectors/VECTORS.sha256` — 24 frame vectors + digests.json + fixtures.capnp
-- `execution/v1/VECTORS.sha256` — canonical intent/grant/receipt carrier vector
+- `execution/v1/VECTORS.sha256` — the canonical intent/grant/receipt carrier, the OCI resource-limit case, and the `run_id` derivation vectors
 - `sigma/v1/VECTORS.sha256` — the Σ construction known-answer vectors
 
 The crate's `verify_vectors_sha256` test walks every listed file and re-hashes

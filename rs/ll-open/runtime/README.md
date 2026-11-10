@@ -46,11 +46,11 @@ Deny means never materializing what the rootfs cannot carry faithfully. For the 
 
 The citations are for the libkrun tier, whose guest runs that init. The native tier runs the workload with the rootfs as its working directory and the host's own `/dev`, `/proc` and `/sys`; for it, a dropped device or link is one rootfs manifest v1 could never have carried, and a dropped unreadable file is one its verifier could never have read.
 
-Where each kind of test runs: the importer, the resolver and the conformance rows that need no guest run anywhere, including in a container; a real guest needs a hypervisor, so macOS Hypervisor.framework tests run on a macOS host and Linux KVM tests on a host or runner given `/dev/kvm` (the libkrun column of the conformance matrix, below). Booting an imported rootfs in a guest is not yet part of the suite.
+Where each kind of test runs: the importer, the resolver and the conformance rows that need no guest run anywhere, including in a container; a real guest needs a hypervisor, so macOS Hypervisor.framework tests run on a macOS host and Linux KVM tests on a host or runner given `/dev/kvm` (the libkrun column of the conformance matrix, below). Booting an imported rootfs in a guest is part of the hypervisor suite: `krun-worker/tests/libkrun_oci_rootfs.rs` (below).
 
 ## Features
 
-This crate has no cargo features. The `vmm` feature it had until bead `ley-line-open-395e43` is removed: libkrun and the `leyline-krun-worker` binary are the `leyline-krun-worker` crate's. Building that crate compiles libkrun's Linux guest init with `$CC_LINUX`, which the repository's `.cargo/config.toml` points at `tools/krun_init_cc.sh` (the host `cc` on Linux, `zig cc` elsewhere).
+This crate's only cargo feature is `test-support`, a test-only hook on `KrunWorkerBackend` that no shipping build enables (bead `ley-line-open-831bf1`). The `vmm` feature it had until bead `ley-line-open-395e43` is removed: libkrun and the `leyline-krun-worker` binary are the `leyline-krun-worker` crate's. Building that crate compiles libkrun's Linux guest init with `$CC_LINUX`, which the repository's `.cargo/config.toml` points at `tools/krun_init_cc.sh` (the host `cc` on Linux, `zig cc` elsewhere).
 
 - At run time the worker loads one library, libkrunfw (the guest kernel), at `krun_create_ctx`, after its sandbox is applied: grant it with `--runtime-file` and put its directory on the loader path.
 - **`confinement`** — ADR-0035's single-declaration manifest: one `cloister/confinement/v1` value from which the applied `nono::CapabilitySet`, the `confinementDigest`, and the digest a backend commits to are all projections, so they cannot drift relative to each other. (Before this existed, `build_process_capabilities` compiled a hardcoded policy with no relationship to the grant's named digest — PR #312 finding 2.)
@@ -63,7 +63,7 @@ This crate has no cargo features. The `vmm` feature it had until bead `ley-line-
 
 - **`leyline-cli-lib`** — hosts the `llo_execution_*` daemon ops (`capabilities`, `provision`, `status`, `start`, `inspect`, `cancel`, `collect`, `cleanup`).
 - **`leyline-cli`**.
-- **cloister** (external, `rs/crates/host-runtime`) — depends on this crate directly via git-rev pin, gated behind its own `llo-execution` feature (`dep:leyline-runtime`), because `leyline-runtime` pulls in `nono` unconditionally as its enforcement mechanism. With default features it also compiles the linked VMM; see `vmm` above.
+- **cloister** (external, `rs/crates/host-runtime`) — depends on this crate directly via git-rev pin, gated behind its own `llo-execution` feature (`dep:leyline-runtime`), because `leyline-runtime` pulls in `nono` unconditionally as its enforcement mechanism. This crate does not link libkrun; the VMM is the separate `leyline-krun-worker` binary.
 
 ## Correctness stance
 
@@ -93,6 +93,8 @@ One set of shared rows, run against both backends with a real worker and a real 
 Every guest row also puts `krunvm`, `task` and `go-task` traps first on `PATH` and fails if the execution path ran any of them.
 
 Beside the matrix, `krun-worker/tests/libkrun_oci_rootfs.rs` (bead `ley-line-open-68a55d`) boots a rootfs produced by `import_oci_layout` (`leyline rootfs import-oci`): a static guest packed into a two-layer OCI image is imported, resolved by a `CatalogResolver` from its executable artifact, started through `start_authorized` with the worker under test, and must print its marker on the guest console, exit 0, and get a receipt whose `inputRoots` names the imported digest. One byte changed in a file under that digest in the CAS is refused before the guest boots.
+
+`krun-worker/tests/libkrun_guest_connections.rs` (bead `ley-line-open-be3711`, ADR-0046 Q7) is the declared-connection suite: a §6 grant with `guestPort` reaches a stock `std::net` client and server in the guest as TCP on its loopback, in both directions. It holds the Q7 acceptance tests: dial-out to exactly the declared peer (and nothing once the grant is removed, with a different attested digest); serve reached by the declared peer only; a sweep of every guest loopback port and a set of host vsock ports that finds exactly the declared ones, which match `guest_loopback_channels` computed without a VMM, no route off the guest, and no undeclared VMM socket; a request that cannot widen reach; refusals by name before readiness (unbound peer, over-length socket path, hijacking, off macOS); teardown on cancel; guest datagram sockets refused under both boundaries; and a stability loop (`LEYLINE_CONNECTIONS_RUNS`, default 1) that reports boot stalls separately.
 
 Run it with `task runtime:test`, or one column at a time:
 

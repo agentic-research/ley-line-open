@@ -48,15 +48,28 @@ arena implementation detail is not a portable consumer API.
 
 These identities are intentionally distinct:
 
-- **Cap'n Proto segment/root**: identifies canonical portable records.
-- **SQLite arena root**: identifies one complete published database snapshot.
+- **Cap'n Proto segment root** (`Head.rootHash`): identifies the segments one
+  parse run wrote.
+- **Store root** (`Head.storeRoot`): the parser-free directory Merkle tree over
+  the store's files (path, git mode, blob hash) and directories.
+- **Parser identity** (`Head.parserId`): the derivation the projection was
+  computed under, bound beside the store root, never folded into it.
+- **SQLite arena root** (`current_root`): identifies one complete published
+  database snapshot.
+- **Node hash** (`node_hash`): identifies one deduplicated syntax subtree,
+  independent of where it occurs.
 - **Blob/chunk hash**: identifies an individual payload or CDC chunk.
 - **SQL projection ABI**: identifies the table/column compatibility promise; it
   is not a hash.
 
+Arena-local integers such as `nid` and `content_id` are locators, not
+identities: they name a row only inside one arena. `AGENTS.md` lists every
+identity with its construction.
+
 Content-addressed storage (CAS) uses deterministic bytes and a BLAKE3 digest as
-an identity. A Merkle-linked head can additionally bind a snapshot to its
-predecessor. Integrity answers “did these bytes change?”; signatures and the
+an identity. A signed head (head digest v3) binds the segment root, store root
+and parser identity to the previous head's digest; it does not bind the arena
+snapshot root. Integrity answers “did these bytes change?”; signatures and the
 identity layer answer “who is allowed to publish or consume them?”
 
 CDC is an optimization at the BlobStore boundary for deduplication and partial
@@ -66,8 +79,10 @@ slice.
 
 ## Runtime boundaries
 
-The daemon serves local clients over a Unix-domain socket (UDS) and exposes an
-optional MCP HTTP endpoint. The Go `daemon/wire` package is the typed JSON
+The daemon serves local clients over a Unix-domain socket (UDS) and exposes
+optional MCP endpoints over HTTP and UDS, which serve only the advertised tools
+inside the Cloister groups the listener grants (`--mcp-groups`). Its `query` op
+runs one read-only `SELECT` and refuses anything else with a typed refusal. The Go `daemon/wire` package is the typed JSON
 consumer boundary. Event fields must follow the live wire contract (including
 numeric `seq` values); compatibility handling belongs at that boundary rather
 than in every caller.

@@ -106,8 +106,9 @@ SELECT e.field
 
 Two rules, both measured on a 460-file Rust arena at `projection-v5`:
 
-1. **Never join on ordinal.** `nodes.ord` counts NAMED children only and is
-   dense (0, 1, 2); `node_child.ordinal` counts ALL children including unnamed
+1. **Never join on ordinal.** `nodes.ord` counts NAMED children, and since
+   extraction epoch 7 the comment occurrences among them, and is dense (0, 1,
+   2); `node_child.ordinal` counts ALL non-`extra` children including unnamed
    tokens such as `impl` and `for` (1, 3, 4). They do not correspond.
 2. **`(parent_hash, child_hash)` is not a key.** A parent holding two
    identical-content children in different roles maps to more than one field:
@@ -175,6 +176,108 @@ For a host occurrence `node_defs.kind_id` equals its `_ast` row's `kind_id`
 `rs/ll-open/cli-lib/tests/injection_extraction_test.rs`). An injected node that
 is neither a def nor a ref has no occurrence row; its content row holds its κ
 kind.
+
+### Comments at `projection-v13` (extraction epoch 7)
+
+Since `projection-v13` and extraction epoch 7 (bead `ley-line-open-aa1634`)
+every comment that tree-sitter parsed as an `extra` is an `_ast` occurrence
+and a `nodes` row. Before it the parse walk skipped every `extra` node, so
+`_ast` held no comment. No table or column moved, but two invariants a v12
+reader could rely on no longer hold: an `_ast` child does not always have a
+`node_edge` from its parent (a comment never does), and `nid` order is not
+document order (comments are numbered after the code). That is why the
+projection version moved: a v12 arena is refused at parse open, and a
+consumer written against v12 must refuse v13 rather than read it. A comment is a named `extra` whose grammar kind contains `comment`,
+and the kinds are the grammars' own: `comment` (Go, Python, JavaScript,
+TypeScript, C, C++, Bash, HCL, SQL and others), `line_comment` /
+`block_comment` (Rust, Java, Kotlin, Groovy), `html_comment` (JavaScript,
+TypeScript), `multiline_comment` (Swift), `js_comment` (CSS). Match them with
+`raw_kind LIKE '%comment%'`, never a fixed list. Other named extras, such as
+Python's `line_continuation`, are not comments and still have no row.
+Comments inside an injected subtree have no row either: injected nodes have
+no `_ast` rows at all.
+
+One exception is not an extra: Swift's grammar uses `multiline_comment` as a
+class-member separator (`var a = 1 /* x */ var b = 2`), and Scala aliases a
+shebang to a named `comment`. There the comment is an ordinary child, as it
+was before epoch 7: it is folded into its parent's `node_hash` and takes a
+pre-order ordinal among the code (bead `ley-line-open-1b5f3c`,
+`a_swift_member_separator_comment_is_folded_not_extra`). Every other bullet
+below is about comments parsed as extras.
+
+- **Placement.** A comment sits in source order among the named children of
+  the node tree-sitter attached it to (`nodes.parent_nid`, `nodes.ord`). For a
+  comment between top-level declarations that is the file's root; a comment
+  inside a body is a child of the body (Go's `block` or `statement_list`,
+  Rust's `block`, TypeScript's `statement_block`, Java's `class_body`). Its
+  `nodes` row is a leaf (`kind = 0`) whose `record` is the comment text.
+- **Span.** `start_byte`/`end_byte` and the row/column pairs are tree-sitter's.
+  A Rust `line_comment`'s span includes its trailing newline, so it ends at
+  column 0 of the next row. An inner node whose first or last child is a
+  comment spans that comment too (a file's root starts at a leading comment);
+  that was already so before epoch 7, since the tree is unchanged.
+- **Terminal.** A comment occurrence has no children, whatever its grammar's
+  inner structure (Rust's `doc_comment` and `outer_doc_comment_marker` are not
+  rows). A doc comment is told apart by its opener: `///`, `//!`, `/**`, `/*!`
+  in Rust, `/**` in Java, JavaScript, TypeScript, C and C++. Go has no doc
+  syntax; a doc comment is the comment run directly above a declaration.
+  Python docstrings are string occurrences, as before.
+- **Content.** The occurrence's `content_id` names the leaf `node_content` row
+  whose `node_hash` is the merkle-ast-v3 leaf hash of the comment's grammar
+  kind and full text, so `node_content.token` is the comment text and every
+  column of the row is still a function of `node_hash`. Two identical comments
+  share the row. No `node_edge` reaches it: the row is the comment's own root.
+- **Identity.** Comments are not in any other node's `node_hash` preimage. A
+  comment-only edit changes no code `node_hash`: only the edited comment's own
+  occurrence moves. A comment adds no `node_defs`, `node_refs` or `_imports`
+  row and is never probed for an injection.
+- **Locators.** A file's code occurrences keep their pre-order ordinals
+  (`nid & 0xFFFFFF`), unchanged from epoch 6; its comments take the ordinals
+  after every code occurrence, in source order, and injected ids the ordinals
+  after those. So adding, editing or removing a comment moves no code `nid`,
+  only comment `nid`s and, for injected ids, their ordinal past the `_ast`
+  count. `nodes.ord` is the source order among code and comment siblings, so
+  a code sibling after a comment has a larger `ord` than at epoch 6. Read
+  document order from `nodes.ord` or the span, never from `nid` order.
+  `nid`s are locators; nothing outside the arena may hold one.
+
+A definition's doc comment is the run of comment siblings directly before the
+definition's occurrence, with no blank line inside the run or between it and
+the definition. A consumer attaches it; the projection has no view for it.
+The recipe (`a_defs_doc_comment_is_its_preceding_comment_run`,
+`rs/ll-open/cli-lib/tests/comment_occurrences_test.rs`) walks back from the
+def's `nodes` row one sibling at a time; `end_col = 0` marks a comment whose
+span ends with its newline:
+
+```sql
+WITH RECURSIVE run(nid, parent_nid, ord, start_row, depth) AS (
+    SELECT n.nid, n.parent_nid, n.ord, a.start_row, 0
+      FROM node_defs d
+      JOIN nodes n ON n.nid = d.nid
+      JOIN _ast a ON a.nid = d.nid
+     WHERE d.token = :token
+    UNION ALL
+    SELECT s.nid, s.parent_nid, s.ord, sa.start_row, run.depth + 1
+      FROM run
+      JOIN nodes s ON s.parent_nid = run.parent_nid AND s.ord = run.ord - 1
+      JOIN _ast sa ON sa.nid = s.nid
+      JOIN kinds k ON k.kind_id = sa.kind_id
+     WHERE k.raw_kind LIKE '%comment%'
+       AND sa.end_row - (sa.end_col = 0) >= run.start_row - 1
+)
+SELECT k.raw_kind, c.token
+  FROM run
+  JOIN _ast a ON a.nid = run.nid
+  JOIN kinds k ON k.kind_id = a.kind_id
+  JOIN node_content c ON c.content_id = a.content_id
+ WHERE run.depth > 0
+ ORDER BY run.ord;
+```
+
+A definition wrapped by another node takes its doc comment from the wrapper's
+siblings: a TypeScript `export function` is a `function_declaration` under an
+`export_statement`, and the comment precedes the `export_statement`; Rust
+attributes (`attribute_item`) sit between a doc comment and its item.
 
 ### Reading `node_hash` at `projection-v10`
 
@@ -265,8 +368,11 @@ Produced by `parse_into_conn`. Always present.
 As of `projection-v5` (bead `ley-line-open-17c271`) the node key is a
 file-scoped integer: `nid = (file_id << 24) | ordinal` for files (ordinal 0 =
 the file's own node, the AST root) and their AST nodes; `nid = -dir_id` for
-directories. `ordinal` is the pre-order rank within the file's parse — the
-same dense `0..n-1` the pointer store addresses blobs with, so
+directories. `ordinal` is the pre-order rank within the file's parse among
+its code occurrences; since extraction epoch 7 the file's comment
+occurrences take the ordinals after every code occurrence, in source order
+(bead `ley-line-open-aa1634`), and injected ids the ordinals after those. It
+is the same dense `0..n-1` the pointer store addressed blobs with, so
 `nid & 0xFFFFFF` IS the blob index. Per-file scoping everywhere is
 `nid BETWEEN (file_id<<24) AND (file_id<<24)|0xFFFFFF` — a PK range SEARCH,
 never a prefix-LIKE. Display paths are DERIVED: `v_node_path`/`v_node_name`
@@ -278,18 +384,18 @@ the projection is derived-only, so no in-place migration exists.
 |-------|---------|
 | `names` / `dirs` / `files` / `kinds` | Interning tables (`projection-v5`). Every path component, directory link, file, and tree-sitter kind stored ONCE; all four are append-only — rows are never deleted or renumbered, which is what makes `file_id` reuse impossible and a directory rename a ONE-row `UPDATE dirs SET name_id`. The rule is enforced in the database: `*_append_only_delete` and `*_append_only_update` triggers abort any DELETE and any UPDATE that changes a row's id (`INTERN_GUARDS_DDL`, bead `ley-line-open-80f037`). `dirs.dir_id = 1` is the root ("", parent NULL). |
 | `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record_id, record, source_file; ley-line's own writers leave `record_id` and `source_file` NULL, which remain for mache's lazy-resolution flow). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
-| `_ast` | AST positions (nid → kind_id, byte/row/col ranges, `content_id`). `content_id INTEGER REFERENCES node_content(content_id)` replaced the 32-byte `node_hash` at `projection-v10` (bead `ley-line-open-738dd9`); read the hash through `v_ast_hash` or a join (see "Reading `node_hash` at projection-v10" below), and find every location of a subtree with `idx_ast_content`. No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
+| `_ast` | AST positions (nid → kind_id, byte/row/col ranges, `content_id`). `content_id INTEGER REFERENCES node_content(content_id)` replaced the 32-byte `node_hash` at `projection-v10` (bead `ley-line-open-738dd9`); read the hash through `v_ast_hash` or a join (see "Reading `node_hash` at projection-v10" below), and find every location of a subtree with `idx_ast_content`. No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). One row per named node and, since extraction epoch 7 (bead `ley-line-open-aa1634`), one per comment, a terminal row whose `content_id` names the leaf content row holding the comment's text; comments are in no other row's `node_hash` (see "Comments at `projection-v13`" above). |
 | `_source` | Source file metadata (`id`, `language`, `content` (inline mode) or `path` (reference mode), `content_hash`, and `file_id` — the interned integer that keys every node row's high bits). As of `projection-v7` (ADR-0045 T1) one row per file the parse PROJECTED: a file of no grammar, a binary or an oversized file has a `_tree` entry and no `_source` row. `content_hash` equals the path's `_tree.blob_hash`. List every file from `_tree`, not from here. |
 | `node_refs` | Token references (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. A row is either a CALL ref, anchored at the call node (`call_expression`, Python `call`, Java `method_invocation`/`object_creation_expression`, Rust `macro_invocation`), or, since extraction epoch 6 (bead `ley-line-open-a9ff82`), a VALUE ref: a name in value position (declaration/assignment right-hand side, argument, return, composite or initializer literal element, Python decorator, JSX expression, `export default`, method value, Java method reference), anchored at that value-position CONTAINER (`argument_list`/`arguments`, `var_spec`, `short_var_declaration`, `assignment_statement`/`assignment`/`assignment_expression`, `return_statement`/`return_expression`, `keyed_element`, `literal_value`, `let_declaration`, `variable_declarator`, `init_declarator`, `initializer_pair`, `initializer_list`, `pointer_expression` (`&f` only), `method_reference`, `decorator`, ...). Tell them apart by `node_kind` / `kind_id`, never by token; the span is the container's. A qualified value (`s.M`, `self.m`, `H::f`, `this::m`) dual-emits and carries `qualifier` exactly as a qualified call does. Value refs cover Go, Rust, Python, JavaScript, TypeScript, Java, C and C++; field reads in those positions are syntactically identical to method values and emit too, unbound when no def carries the token. Go's bare argument and keyed-literal identifiers predate epoch 6. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. `kind_id` (`projection-v12`, bead `ley-line-open-cc5c55`) → `kinds(lang, raw_kind)` is the occurrence's own language and grammar kind, written on every row the parse writes: its `_ast` row's `kind_id` for a host occurrence, the injected grammar's for an injected one. |
 | `node_defs` | Token definitions (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). `kind_id` as on `node_refs` (`projection-v12`). No `qualifier` column. |
 | `_imports` | Import statements (alias, path, source_id) |
-| `_meta` | Key-value metadata (source_root, parse_time, version vectors, and `derived_from` = `v2 <storeRoot hex> <parserId hex> <projection_schema_version>`, the derivation the projection reproduces under `leyline rebuild`; ADR-0040 D6, ADR-0047 D-ii. The leading `v2` is the format discriminator: the retired v1 value (three fields, `treeRoot` first, before projection-v11) is refused by version, never read as v2). `unbound_facts` = the count of `node_refs` rows whose token has no `node_defs` row, as the head's `unboundFacts` records it; written with the rows by every parse pass (bead `ley-line-open-8c8ded`). `extraction_epoch` = the `EXTRACTION_EPOCH` (`rs/ll-open/ts/src/refs.rs`, its History lists each epoch's emission change) whose rules produced the `node_defs`/`node_refs`/`_imports` rows, stamped by every full-tree pass; a binary with a different epoch re-derives every file before stamping its own. A consumer reading the arena directly can test it: `extraction_epoch >= 6` means `node_refs` holds value refs in every language listed on the `node_refs` row above |
+| `_meta` | Key-value metadata (source_root, parse_time, version vectors, and `derived_from` = `v2 <storeRoot hex> <parserId hex> <projection_schema_version>`, the derivation the projection reproduces under `leyline rebuild`; ADR-0040 D6, ADR-0047 D-ii. The leading `v2` is the format discriminator: the retired v1 value (three fields, `treeRoot` first, before projection-v11) is refused by version, never read as v2). `unbound_facts` = the count of `node_refs` rows whose token has no `node_defs` row, as the head's `unboundFacts` records it; written with the rows by every parse pass (bead `ley-line-open-8c8ded`). `extraction_epoch` = the `EXTRACTION_EPOCH` (`rs/ll-open/ts/src/refs.rs`, its History lists each epoch's emission change) whose rules produced the `node_defs`/`node_refs`/`_imports` rows and, since epoch 7, chose which `extra` nodes are `_ast` occurrences, stamped by every full-tree pass; a binary with a different epoch re-derives every file before stamping its own. A consumer reading the arena directly can test it: `extraction_epoch >= 6` means `node_refs` holds value refs in every language listed on the `node_refs` row above, and `extraction_epoch >= 7` means `_ast` and `nodes` hold comment occurrences (always so at `projection-v13`, which refuses a v12 arena) |
 
 **Merkle-AST IR** (added v0.6.0 per ADR-0027):
 
 | Table | Purpose |
 |-------|---------|
-| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes, keyed under `derive_key("leyline/ast-node/v3", …)` since merkle-ast-v3 — the identity, stored once per subtree; the FK target of `_cfg`, while `node_edge` (v9) and `_ast`/`node_defs`/`node_refs` (v10) reference `content_id`), `node_tag`, `kind`, `token`, `arity`. Every column is a function of `node_hash`: `raw_kind` and `lang` left at `projection-v12` (ADR-0047 D-iii, bead `ley-line-open-b5d354`) because the hash does not determine them, so the row held whichever file's occurrence landed first. Read them per occurrence through `_ast.kind_id → kinds`; see "A fielded child's grammar kind at `projection-v12`" below. Byte-identical subtrees dedup cross-file to one row. |
+| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes, keyed under `derive_key("leyline/ast-node/v3", …)` since merkle-ast-v3 — the identity, stored once per subtree; the FK target of `_cfg`, while `node_edge` (v9) and `_ast`/`node_defs`/`node_refs` (v10) reference `content_id`), `node_tag`, `kind`, `token`, `arity`. Every column is a function of `node_hash`: `raw_kind` and `lang` left at `projection-v12` (ADR-0047 D-iii, bead `ley-line-open-b5d354`) because the hash does not determine them, so the row held whichever file's occurrence landed first. Read them per occurrence through `_ast.kind_id → kinds`; see "A fielded child's grammar kind at `projection-v12`" below. Byte-identical subtrees dedup cross-file to one row. A comment occurrence's leaf row (extraction epoch 7) is the root of its own one-node tree: `node_edge` never reaches it, and its `token` is the comment text. |
 | `node_edge` | Git-tree object, interned (`projection-v9`, bead `ley-line-open-9b7d28`): `(parent_id, ordinal) PRIMARY KEY → child_id, field`, `WITHOUT ROWID`. Both endpoints REFERENCE `node_content(content_id)` (FK-enforced). One row per child of each unique parent, anonymous tokens included. A node's preimage is recoverable by one join: `ORDER BY ordinal`, map ids to `node_hash`, refold. |
 | `node_child` | **A read-only VIEW** (`projection-v9`) with the v8 table's columns — `parent_hash`, `ordinal`, `child_hash`, `field` — over `node_edge ⋈ node_content ×2`. Every v8 read (`WHERE parent_hash = ?`, `JOIN node_content c ON c.node_hash = nc.child_hash`, `ORDER BY ordinal`) runs unchanged, and an inner join or `IN` filter on `parent_hash` plans as two index probes. **Do not put it on the right of a `LEFT JOIN`:** SQLite cannot flatten a join view there and materializes all of it (kibana slice, one file: 7.7 s through the view, 0.11 s against `node_edge`). Write `LEFT JOIN node_edge e ON e.parent_id = a.content_id LEFT JOIN node_content cc ON cc.content_id = e.child_id` instead (`projection-v10`: `_ast` holds the parent's `content_id` itself; at v9 it took `LEFT JOIN node_content pc ON pc.node_hash = a.node_hash` first). A write to the view fails; the writer is `node_edge`. |
 | `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` | **Read-only VIEWs** (`projection-v10`, bead `ley-line-open-738dd9`) with the column sets of `_ast`, `node_refs` and `node_defs` — `node_hash` in place of `content_id`, rendered by `LEFT JOIN node_content ON content_id` (the v9 sets, plus `kind_id` on the refs and defs views since `projection-v12`). `content_id` is not a column of any of them. Same planning caveat as `node_child`: on the right of a `LEFT JOIN` they materialize; join the base table instead. Not named `v_ast` because mache installs a TEMP `v_ast` with its own vocabulary on every connection, and a TEMP view shadows a main-schema one. |

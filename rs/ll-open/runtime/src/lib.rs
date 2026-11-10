@@ -27,7 +27,7 @@ pub use model::{
     BackendCapabilities, BackendClass, BackendEvidenceDocument, BackendRun, BackendRunStatus,
     CeilingMechanism, CpuLimits, DEFAULT_CPU_PERIOD_US, DigestRef, EnforcedCeilings,
     ExecutionRequest, MemoryLimits, PidsLimits, ReceiptContext, ResourceLimits, RunEventRecord,
-    RunInspection, RunReceiptData, RunRecord, RunState, WorkerChannel, WorkspaceGrant,
+    RunInspection, RunOutput, RunReceiptData, RunRecord, RunState, WorkerChannel, WorkspaceGrant,
     WorkspaceOperation,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

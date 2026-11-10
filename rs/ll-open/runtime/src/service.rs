@@ -54,6 +54,14 @@ pub trait Backend: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// What an active run has printed so far, bounded, for the embedder
+    /// that started it. `None` when the run is not active here, or when the
+    /// backend keeps no output (the default). A run's failure carries its
+    /// final output in [`BackendRunStatus::Failed`] instead.
+    fn output(&self, _run_id: &str) -> Option<crate::RunOutput> {
+        None
+    }
+
     /// Cancel one active execution and release backend-owned resources.
     ///
     /// The boolean is false when the backend has no active run with this ID;

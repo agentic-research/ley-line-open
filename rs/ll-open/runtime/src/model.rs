@@ -585,6 +585,27 @@ pub enum BackendRunStatus {
     Failed(ExecutionError),
 }
 
+/// What an active run has printed, kept bounded by its backend (bead
+/// `ley-line-open-a26ad0`). The bytes are the workload's own and untrusted:
+/// invalid UTF-8 and control characters other than newline and tab are
+/// already replaced with U+FFFD. Only the in-process embedder that started
+/// the run sees them ([`crate::Backend::output`]); nothing writes them to
+/// disk, logs them, or carries them over the daemon's wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOutput {
+    /// The tail of the guest's console: whatever the workload printed.
+    pub guest: String,
+    /// How many earlier console bytes the tail no longer holds.
+    pub guest_dropped_bytes: u64,
+    /// The tail of the worker's own standard error after readiness.
+    pub worker_stderr: String,
+    /// How many earlier worker standard-error bytes the tail no longer holds.
+    pub worker_stderr_dropped_bytes: u64,
+    /// The worker's terminal `failed` event, when it wrote one: the cause it
+    /// names for a failure after readiness.
+    pub worker_failure: Option<ExecutionError>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunState {

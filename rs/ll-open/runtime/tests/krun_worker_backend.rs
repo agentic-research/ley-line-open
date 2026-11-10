@@ -5,10 +5,11 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
+use leyline_runtime::backends::libkrun::output::GUEST_OUTPUT_TAIL_BYTES;
 use leyline_runtime::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
 use leyline_runtime::{
-    Backend, BackendClass, BackendRunStatus, CpuLimits, DigestRef, ExecutionError,
-    ExecutionRequest, MemoryLimits, ResourceLimits, WorkerChannel, WorkspaceGrant,
+    Backend, BackendClass, BackendRunStatus, CpuLimits, DigestRef, ErrorCode, ExecutionError,
+    ExecutionRequest, MemoryLimits, ResourceLimits, RunOutput, WorkerChannel, WorkspaceGrant,
     WorkspaceOperation,
 };
 use tempfile::TempDir;
@@ -198,6 +199,144 @@ fn backend_reports_a_nonzero_worker_exit_as_failed() {
         other => panic!("expected failed worker, got {other:?}"),
     }
     assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// A worker that fails after readiness reports its cause and what the guest
+/// printed in the run's failure (bead ley-line-open-a26ad0): the terminal
+/// `failed` event's code and detail, the guest console's tail, and the
+/// worker's other standard error, with the guest's control bytes replaced.
+#[test]
+fn a_failed_run_reports_its_terminal_event_and_what_the_guest_printed() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, _ephemeral_root) = backend_with_worker(
+        &fixture,
+        concat!(
+            "#!/bin/sh\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n",
+            "printf 'guest says hello\\n\\033[31mred\\n'\n",
+            "printf 'libkrun: something went wrong\\n' >&2\n",
+            "printf '%s\\n' '{\"type\":\"failed\",\"error\":{\"code\":\"resource-exhausted\",\"retryable\":true,\"detail\":\"krun_start_enter failed: -12\"}}' >&2\n",
+            "exit 1\n",
+        ),
+    );
+
+    backend.start(&request()).expect("ready worker");
+    let completion = backend
+        .wait_for_completion("run-backend-01")
+        .expect("worker completion");
+    let BackendRunStatus::Failed(error) = completion else {
+        panic!("expected a failed run, got {completion:?}");
+    };
+    assert_eq!(error.code, ErrorCode::ResourceExhausted, "{error:?}");
+    assert!(error.retryable, "{error:?}");
+    assert!(
+        error
+            .detail
+            .starts_with("krun_start_enter failed: -12 (libkrun worker exited"),
+        "the worker's own cause leads the detail: {}",
+        error.detail
+    );
+    assert!(
+        error.detail.contains("guest says hello\n"),
+        "{}",
+        error.detail
+    );
+    assert!(
+        error.detail.contains("\u{FFFD}[31mred"),
+        "the guest's escape byte is replaced: {}",
+        error.detail
+    );
+    assert!(!error.detail.contains('\u{1b}'), "{}", error.detail);
+    assert!(
+        error.detail.contains("libkrun: something went wrong"),
+        "{}",
+        error.detail
+    );
+}
+
+/// A guest that prints more than the tail holds costs the tail, not what it
+/// printed: the failure keeps the last GUEST_OUTPUT_TAIL_BYTES and says how
+/// many earlier bytes it dropped.
+#[test]
+fn a_failed_run_keeps_only_the_tail_of_a_large_output() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, _ephemeral_root) = backend_with_worker(
+        &fixture,
+        concat!(
+            "#!/bin/sh\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n",
+            "/usr/bin/head -c 100000 /dev/zero | /usr/bin/tr '\\000' 'a'\n",
+            "printf 'THE-END'\n",
+            "exit 3\n",
+        ),
+    );
+
+    backend.start(&request()).expect("ready worker");
+    let BackendRunStatus::Failed(error) = backend
+        .wait_for_completion("run-backend-01")
+        .expect("worker completion")
+    else {
+        panic!("expected a failed run");
+    };
+    let dropped = 100_000 + "THE-END".len() - GUEST_OUTPUT_TAIL_BYTES;
+    assert!(
+        error
+            .detail
+            .contains(&format!("tail; {dropped} earlier bytes dropped")),
+        "{}",
+        &error.detail[..error.detail.len().min(400)]
+    );
+    assert!(
+        error.detail.ends_with("THE-END"),
+        "the tail is the last bytes"
+    );
+    assert!(error.detail.len() < GUEST_OUTPUT_TAIL_BYTES + 1024);
+}
+
+/// While a run is active, what it has printed is readable by its embedder,
+/// event-driven: `wait_for_output` returns once the console holds the
+/// marker, and the trait's `output` returns the same tail. A cancelled run
+/// keeps nothing.
+#[test]
+fn an_active_run_exposes_its_output_to_the_embedder() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, _ephemeral_root) = backend_with_worker(
+        &fixture,
+        concat!(
+            "#!/bin/sh\n",
+            "IFS= read -r _\n",
+            "printf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n",
+            "printf 'server listening on 3306\\n'\n",
+            "exec /usr/bin/tail -f /dev/null\n",
+        ),
+    );
+
+    backend.start(&request()).expect("ready worker");
+    let seen = backend
+        .wait_for_output(
+            "run-backend-01",
+            &|output: &RunOutput| output.guest.contains("listening"),
+            READY_TIMEOUT,
+        )
+        .expect("an active run");
+    assert_eq!(seen.guest, "server listening on 3306\n");
+    assert_eq!(
+        Backend::output(&backend, "run-backend-01").map(|output| output.guest),
+        Some("server listening on 3306\n".to_owned())
+    );
+    assert_eq!(Backend::output(&backend, "no-such-run"), None);
+    assert!(backend.cancel("run-backend-01").expect("cancel"));
+    assert_eq!(Backend::output(&backend, "run-backend-01"), None);
+    assert!(
+        backend
+            .wait_for_output("run-backend-01", &|_| true, READY_TIMEOUT)
+            .is_err()
+    );
 }
 
 /// Once completion is observed the run is no longer active, so a cancel

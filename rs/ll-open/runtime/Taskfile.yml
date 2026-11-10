@@ -28,6 +28,19 @@ tasks:
       # Builds on the worker binary the line above built.
       - cargo test -p leyline-cli --test agent_in_guest
 
+  oci-fixture:
+    desc: >-
+      Regenerate the checked-in OCI image-layout fixture
+      (tests/fixtures/oci-multilayer) from its generator,
+      tests/oci_fixture/mod.rs, after a deliberate change to the generator.
+      `cargo test --test oci_rootfs` fails while the two disagree.
+    dir: '{{.TASKFILE_DIR}}/../..'
+    env:
+      RUSTC_WRAPPER: ''
+      LEYLINE_BLESS_OCI_FIXTURE: '1'
+    cmds:
+      - cargo test -p leyline-runtime --test oci_rootfs checked_in_fixture_matches_its_generator
+
   test:cgroup:
     desc: >-
       Run the native tier's cgroup v2 ceiling tests against a real delegated

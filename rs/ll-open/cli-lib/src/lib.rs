@@ -21,6 +21,7 @@ pub mod cmd_load;
 pub mod cmd_lsp;
 pub mod cmd_parse;
 pub mod cmd_rebuild;
+pub mod cmd_rootfs;
 pub mod cmd_self;
 pub mod cmd_splice;
 pub mod daemon;
@@ -104,6 +105,44 @@ pub enum CdcCommands {
 /// model — the binary owns its own install/update instead of every
 /// consumer's Taskfile reinventing a copy step; see `cmd_self` for the
 /// full contract).
+/// What `rootfs import-oci` does with an image's symbolic links, which
+/// rootfs manifest v1 cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SymlinkMode {
+    /// Refuse the import, naming the first link.
+    Refuse,
+    /// Replace each link with a copy of its in-image target.
+    Resolve,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RootfsCommands {
+    /// Import a digest-pinned image from an OCI image layout as a rootfs
+    /// for this host's platform, and print the published rootfs as JSON.
+    /// Never contacts a registry or a container daemon: produce the layout
+    /// with skopeo, crane, `docker buildx --output type=oci`, buildah or
+    /// podman first.
+    ImportOci {
+        /// The OCI image layout directory (holding `oci-layout`).
+        #[arg(long)]
+        layout: PathBuf,
+
+        /// `sha256:<hex>` (or `name@sha256:<hex>`) of the image index or
+        /// manifest. Tags are refused.
+        #[arg(long)]
+        image: String,
+
+        /// The content-addressed rootfs store: the directory
+        /// `execution-daemon --cas-root` serves.
+        #[arg(long)]
+        cas_root: PathBuf,
+
+        /// Symbolic-link policy.
+        #[arg(long, value_enum, default_value_t = SymlinkMode::Refuse)]
+        symlinks: SymlinkMode,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum SelfCommands {
     /// Copy the running executable into a stable install dir
@@ -217,6 +256,12 @@ pub enum Commands {
         /// sub-manifest. Default: every file.
         #[arg(long = "path")]
         paths: Vec<String>,
+    },
+
+    /// Build execution rootfs trees in a content-addressed rootfs store.
+    Rootfs {
+        #[command(subcommand)]
+        command: RootfsCommands,
     },
 
     /// Edit an AST node's text in a .db file (splice + reproject).
@@ -403,6 +448,7 @@ pub async fn run(cmd: Commands) -> Result<()> {
                 )
             }
         }
+        Commands::Rootfs { command } => cmd_rootfs::run(&command),
         Commands::Splice { db, node, text } => cmd_splice::cmd_splice(&db, &node, &text),
         #[cfg(feature = "lsp")]
         Commands::Lsp {

@@ -160,7 +160,18 @@ leyline rootfs import-oci \
 It selects this host's Linux platform, verifies every blob, applies the layers
 with OCI whiteout semantics, and prints JSON whose `rootfs` is the catalog
 entry's `rootfs`. Tags are refused. The image format is never the isolation
-boundary; the backend is. See
+boundary; the backend is.
+
+The CAS root must be on a case-sensitive filesystem to import an image whose
+paths differ only by case (Debian's perl ships `Pod/` and `pod/`). macOS's
+default APFS is not, and the import refuses such an image by naming both paths
+and saying the CAS root is case-insensitive; images without such a pair import
+anywhere. `leyline rootfs provision-cas` prints a CAS root that is: on macOS a
+grow-on-demand case-sensitive APFS sparsebundle it creates and attaches, with
+no sudo, beneath `~/.local/state/leyline/cas-volume/` (`$LEYLINE_STATE_DIR`
+moves it); on Linux it checks `<state>/cas`. `execution-daemon --cas-volume`
+serves that root instead of `--cas-root` and re-attaches the volume when it
+starts. See
 [`rs/ll-open/runtime/README.md`](rs/ll-open/runtime/README.md) "Container
 images" for the contract.
 

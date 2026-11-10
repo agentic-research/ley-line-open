@@ -30,6 +30,7 @@ use anyhow::{Context, Result};
 use leyline_runtime::artifacts::oci::{
     DEFAULT_MAX_ROOTFS_BYTES, ImportedRootfs, OciImport, Platform, SymlinkPolicy, import_oci_layout,
 };
+use leyline_runtime::cas_volume::{CasVolume, ProvisionedCas, default_state_dir};
 
 use crate::{RootfsCommands, SymlinkMode};
 
@@ -66,7 +67,36 @@ pub fn run(command: &RootfsCommands) -> Result<()> {
             println!("{}", serde_json::to_string(&imported)?);
             Ok(())
         }
+        RootfsCommands::ProvisionCas {
+            state_dir,
+            size_cap_gib,
+        } => {
+            let provisioned = provision_cas(state_dir.as_deref(), *size_cap_gib)?;
+            println!("{}", serde_json::to_string(&provisioned)?);
+            Ok(())
+        }
     }
+}
+
+/// `leyline rootfs provision-cas` (bead `ley-line-open-ba86d3`): a CAS root
+/// on a case-sensitive filesystem beneath `state_dir` (or LLO's default
+/// state directory), per `leyline_runtime::cas_volume`.
+pub fn provision_cas(state_dir: Option<&Path>, size_cap_gib: u64) -> Result<ProvisionedCas> {
+    let state_dir = match state_dir {
+        Some(state_dir) => state_dir.to_path_buf(),
+        None => default_state_dir()?,
+    };
+    let size_cap = size_cap_gib
+        .checked_mul(1 << 30)
+        .context("--size-cap-gib is too large")?;
+    CasVolume::new(&state_dir, size_cap)?
+        .provision()
+        .with_context(|| {
+            format!(
+                "provision a case-sensitive CAS root in {}",
+                state_dir.display()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -176,5 +206,35 @@ mod tests {
             format!("{error:#}").contains("mutable image reference"),
             "{error:#}"
         );
+    }
+
+    /// `provision-cas` validates before it touches the host: a cap too
+    /// large to express, too small for a volume, or a relative state
+    /// directory is refused and nothing is created. (The real provisioning
+    /// is `leyline-runtime`'s `tests/cas_volume.rs`.)
+    #[test]
+    fn provision_cas_refuses_bad_configuration_before_touching_the_host() {
+        let state = tempfile::TempDir::new().unwrap();
+        for (state_dir, gib, needle) in [
+            (state.path(), u64::MAX, "too large"),
+            (state.path(), 0, "at least"),
+            (Path::new("relative"), 64, "absolute path"),
+        ] {
+            let error = provision_cas(Some(state_dir), gib).unwrap_err();
+            assert!(format!("{error:#}").contains(needle), "{error:#}");
+        }
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+    }
+
+    /// On Linux the command makes no volume: it verifies `<state>/cas`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn provision_cas_on_linux_verifies_the_state_directory() {
+        let state = tempfile::TempDir::new().unwrap();
+        let provisioned = provision_cas(Some(state.path()), 64).unwrap();
+        assert_eq!(provisioned.cas_root, state.path().join("cas"));
+        let json = serde_json::to_value(&provisioned).unwrap();
+        assert_eq!(json["casRoot"], provisioned.cas_root.to_str().unwrap());
+        assert_eq!(json["filesystem"]["caseSensitive"], true);
     }
 }

@@ -19,6 +19,7 @@ use leyline_runtime::artifacts::oci::{
 };
 use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver};
 use leyline_runtime::backends::libkrun::volume::materialize_ephemeral_rootfs;
+use leyline_runtime::cas_volume::{FilesystemSensitivity, probe_sensitivity};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -2110,4 +2111,150 @@ fn first_party_images_import_deterministically_under_resolve() {
             "{name}: the known answer"
         );
     }
+}
+
+/// Debian's perl ships `Pod/` and `pod/` side by side (bead
+/// `ley-line-open-ba86d3`): two image paths that differ only by case.
+fn case_colliding_layers() -> Vec<Layer> {
+    vec![Layer::gzip(vec![
+        dir("usr", 0o755),
+        dir("usr/share", 0o755),
+        dir("usr/share/perl", 0o755),
+        dir("usr/share/perl/Pod", 0o755),
+        file(
+            "usr/share/perl/Pod/Usage.pm",
+            0o644,
+            b"package Pod::Usage;\n",
+        ),
+        dir("usr/share/perl/pod", 0o755),
+        file(
+            "usr/share/perl/pod/perlfunc.pod",
+            0o644,
+            b"=head1 perlfunc\n",
+        ),
+    ])]
+}
+
+/// What an import on `cas` must do with an image whose tree holds two
+/// names `cas`'s filesystem compares as one: refuse it by naming both and
+/// the CAS root's insensitivity, before writing anything, or (on a
+/// filesystem that tells them apart) import both. Each host asserts the
+/// branch its filesystem takes.
+fn assert_collision_refused_or_imported(
+    layers: Vec<Layer>,
+    first: &str,
+    second: &str,
+    insensitive: impl Fn(&FilesystemSensitivity) -> bool,
+    reason: &str,
+) {
+    let scratch = TempDir::new().expect("scratch");
+    let layout = scratch.path().join("oci");
+    let digest = single_image(&layout, layers);
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).expect("cas");
+    let filesystem = probe_sensitivity(&cas).expect("probe the CAS root");
+    let result = import(
+        &layout,
+        &digest,
+        Platform::linux("arm64"),
+        SymlinkPolicy::Refuse,
+        &cas,
+    );
+    if insensitive(&filesystem) {
+        let error = result.expect_err("a collision on this CAS root must be refused");
+        let message = error.to_string();
+        assert!(
+            matches!(&error, OciImportError::PathCollision { first: a, second: b, .. }
+                if (a.as_str(), b.as_str()) == (first, second)),
+            "{error:?}"
+        );
+        for needle in [first, second, reason, "the image is not at fault"] {
+            assert!(
+                message.contains(needle),
+                "{needle:?} missing from: {message}"
+            );
+        }
+        assert!(
+            message.contains(&cas.canonicalize().unwrap().display().to_string()),
+            "the refusal names the CAS root: {message}"
+        );
+        assert_eq!(
+            cas_entries(&cas),
+            Vec::<String>::new(),
+            "a refused import leaves nothing in the CAS root"
+        );
+    } else {
+        let imported = result.expect("a filesystem that tells them apart imports both");
+        let files = manifest_files(&cas, &imported.rootfs);
+        let holds = |name: &str| {
+            files
+                .keys()
+                .any(|path| path == name || path.starts_with(&format!("{name}/")))
+        };
+        assert!(holds(first) && holds(second), "{files:?}");
+    }
+}
+
+#[test]
+fn a_case_collision_is_refused_by_name_on_a_case_insensitive_cas_root() {
+    // A TempDir on macOS's default APFS is case-insensitive; on Linux CI it
+    // is case-sensitive, and the image imports.
+    if cfg!(target_os = "macos") {
+        let probe = TempDir::new().unwrap();
+        assert!(
+            !probe_sensitivity(probe.path()).unwrap().case_sensitive,
+            "this test expects macOS's default (case-insensitive) APFS for TMPDIR"
+        );
+    }
+    assert_collision_refused_or_imported(
+        case_colliding_layers(),
+        "usr/share/perl/Pod",
+        "usr/share/perl/pod",
+        |filesystem| !filesystem.case_sensitive,
+        "is case-insensitive",
+    );
+}
+
+#[test]
+fn a_normalization_collision_is_refused_by_name_on_a_normalization_insensitive_cas_root() {
+    // Every APFS volume, case-sensitive ones included, treats the NFC and
+    // NFD spellings of a name as one.
+    assert_collision_refused_or_imported(
+        vec![Layer::gzip(vec![
+            file("caf\u{e9}", 0o644, b"nfc\n"),
+            file("cafe\u{301}", 0o644, b"nfd\n"),
+        ])],
+        // Path (byte) order: `e` sorts before the first byte of U+00E9.
+        "cafe\u{301}",
+        "caf\u{e9}",
+        |filesystem| !filesystem.normalization_sensitive,
+        "is normalization-insensitive",
+    );
+}
+
+#[test]
+fn the_import_reports_the_cas_roots_name_sensitivity_and_static_images_still_import() {
+    let cas = TempDir::new().expect("cas");
+    let expected = probe_sensitivity(cas.path()).expect("probe");
+    if cfg!(target_os = "macos") {
+        assert!(!expected.case_sensitive, "TMPDIR is default APFS");
+    }
+    // The fixture has no two names that fold together, so it imports on a
+    // case-insensitive root as on any other: the preflight refuses nothing
+    // by itself.
+    let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
+    assert_eq!(imported.cas_root_filesystem, expected);
+    let json = serde_json::to_value(&imported).unwrap();
+    assert_eq!(
+        json["casRootFilesystem"],
+        serde_json::json!({
+            "caseSensitive": expected.case_sensitive,
+            "normalizationSensitive": expected.normalization_sensitive,
+        })
+    );
+    assert_eq!(
+        cas_entries(cas.path()),
+        vec![imported.rootfs.value.clone()],
+        "the probe leaves nothing behind"
+    );
 }

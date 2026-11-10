@@ -390,15 +390,21 @@ impl<B: Backend> ExecutionService<B> {
             ));
         }
         // `inputRoots` is "Content roots materialized for the run": the
-        // rootfs the resolver chose, which the backend verifies against this
-        // digest before the workload runs, then each granted workspace. The
-        // rootfs is read here, from the request the backend is handed, so the
-        // receipt names what was materialized rather than what was asked for.
+        // rootfs the resolver chose, then each granted workspace. The rootfs
+        // is read from the request the backend is handed (both first-party
+        // backends verify the materialized tree against this digest before
+        // the workload runs), not from anything the caller asked for.
         let rootfs = format!("{}:{}", request.rootfs.algorithm, request.rootfs.value);
         let record = self.start(request)?;
-        self.state.write().receipts.insert(
-            record.run_id.clone(),
-            ReceiptContext {
+        // A replayed start answers an existing run, possibly under other
+        // authority (another spec, grant or input roots sharing its replay
+        // key). That run's receipt stays the one it was started under: it is
+        // recorded once, never rewritten (bead ley-line-open-799fbc).
+        self.state
+            .write()
+            .receipts
+            .entry(record.run_id.clone())
+            .or_insert(ReceiptContext {
                 run_spec_digest: authorized.spec_digest,
                 run_grant_digest: authorized.grant_digest,
                 confinement_digest: authorized.confinement_digest,
@@ -412,8 +418,7 @@ impl<B: Backend> ExecutionService<B> {
                             .map(|workspace| workspace.graph_root),
                     )
                     .collect(),
-            },
-        );
+            });
         Ok(record)
     }
 

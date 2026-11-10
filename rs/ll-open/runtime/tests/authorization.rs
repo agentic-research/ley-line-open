@@ -1411,6 +1411,69 @@ fn the_receipt_names_the_workspace_share_the_run_held() {
     assert_eq!(receipt.backend_evidence.channels, Vec::new());
 }
 
+/// A start that replays an existing run's replay key under other authority
+/// (another spec, grant and input roots) answers the existing run, and leaves
+/// that run's receipt as it was started: the receipt names the authority and
+/// content the run ran under, never a later caller's (bead
+/// `ley-line-open-799fbc`).
+#[test]
+fn a_replayed_start_never_rewrites_the_existing_runs_receipt() {
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let service = ExecutionService::new(SharingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-replay-receipt")
+        .expect("provision backend");
+    let first_spec = spec_bytes();
+    let first_grant = grant_bytes(&first_spec, true, 2_000, 0);
+    let first = service
+        .start_authorized(&first_spec, &first_grant, &policy, &TestResolver)
+        .expect("the first run");
+    let before = service.collect(&first.run_id).expect("collect");
+    assert_eq!(
+        before.context.input_roots,
+        vec![format!("blake3-256:{}", "a".repeat(64))]
+    );
+
+    // Same replay key (every fixture grant carries one), other spec, other
+    // grant, and a workspace input.
+    let root = "e".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &root)]);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &"b".repeat(64),
+            workspaces: vec![(
+                "repo",
+                &root,
+                vec![execution_capnp::WorkspaceOperation::Read],
+            )],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    let replayed = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect("a replayed start answers the existing run");
+    assert_eq!(replayed.run_id, first.run_id);
+
+    let after = service.collect(&first.run_id).expect("collect again");
+    assert_eq!(after.context, before.context);
+    assert_eq!(
+        after.context.run_spec_digest,
+        canonical_digest(&first_spec).expect("spec digest")
+    );
+}
+
 /// `RunReceipt.inputRoots` is "Content roots materialized for the run"
 /// (execution.capnp): the rootfs the resolver chose, which every backend
 /// verifies against its digest before the workload runs, and then each

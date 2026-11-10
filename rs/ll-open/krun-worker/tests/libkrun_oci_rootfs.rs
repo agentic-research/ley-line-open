@@ -18,7 +18,10 @@
 //!
 //! The negative row tampers with one file under the imported digest (same
 //! size, same mode, one byte different) and requires the run refused before
-//! the guest boots: no run, no run root, nothing on the console.
+//! the guest boots: the worker, spawned, refuses the tampered file by name
+//! while preparing the run and before configuring the VM, leaving no run, no
+//! run root, and an empty console. (The libkrun backend verifies the rootfs
+//! in the worker; nothing on the host checks it before the worker spawns.)
 //!
 //! ## The console
 //!
@@ -456,11 +459,13 @@ fn a_tampered_file_under_the_imported_digest_is_refused_before_the_guest_boots()
         0,
         "a refused run leaves no run root"
     );
-    // The worker refuses while preparing the run, before it builds the VM:
-    // nothing booted, so nothing reached the console.
+    // The worker was spawned (the launcher created the console) and refused
+    // while preparing the run, before it configured the VM: nothing booted,
+    // so nothing reached the console. The libkrun backend verifies the
+    // rootfs in the worker, not in the host before spawning it.
     assert_eq!(
-        guest.console().unwrap_or_default(),
-        "",
-        "the guest never booted"
+        guest.console(),
+        Some(String::new()),
+        "the worker ran and the guest never booted"
     );
 }

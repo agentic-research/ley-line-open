@@ -107,5 +107,8 @@ fn the_schema_refuses_the_guest_port_rejects_it_can_express() {
             None => panic!("reject {name} must say whether the schema refuses it"),
         }
     }
-    assert!(refused >= 6, "expected the schema to refuse six rejects, got {refused}");
+    assert!(
+        refused >= 6,
+        "expected the schema to refuse six rejects, got {refused}"
+    );
 }

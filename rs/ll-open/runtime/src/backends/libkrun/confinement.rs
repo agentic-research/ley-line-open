@@ -1017,11 +1017,7 @@ pub fn vsock_unix_mappings(
 
 /// The longest path a UNIX socket address carries on this host: `sun_path`
 /// less its terminating NUL (104 bytes on macOS and the BSDs, 108 on Linux).
-pub const SUN_PATH_MAX: usize = if cfg!(target_os = "linux") {
-    107
-} else {
-    103
-};
+pub const SUN_PATH_MAX: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
 
 /// Refuse a §6 `guestPort` on a tier whose workload is not in a guest.
 ///
@@ -1664,7 +1660,9 @@ mod tests {
     }
 
     fn dial(path: &str, port: u16) -> UnixSocketGrant {
-        UnixSocketGrant::connect(path).with_guest_port(port).unwrap()
+        UnixSocketGrant::connect(path)
+            .with_guest_port(port)
+            .unwrap()
     }
 
     fn serve(path: &str, port: u16) -> UnixSocketGrant {
@@ -1744,7 +1742,9 @@ mod tests {
     #[test]
     fn a_presentation_is_refused_under_socket_hijacking() {
         let manifest = presented(vec![dial("/run/c/db.sock", 13306)]);
-        let error = guest_loopback_channels(&manifest, super::super::plan::KRUN_TSI_HIJACK_INET, "macos").unwrap_err();
+        let error =
+            guest_loopback_channels(&manifest, super::super::plan::KRUN_TSI_HIJACK_INET, "macos")
+                .unwrap_err();
         assert!(error.detail.contains("hijack"), "{error}");
         assert!(error.detail.contains("13306"), "{error}");
     }
@@ -1838,8 +1838,8 @@ mod tests {
         assert!(!served.exists(), "the trial bind left its socket behind");
 
         // Serve, refused: a missing directory, and an occupied path.
-        let error = check_channel_host_ends(&[mapping(&root.join("missing/s.sock"), 1, true)])
-            .unwrap_err();
+        let error =
+            check_channel_host_ends(&[mapping(&root.join("missing/s.sock"), 1, true)]).unwrap_err();
         assert!(error.detail.contains("directory"), "{error}");
         std::fs::write(&served, b"").unwrap();
         let error = check_channel_host_ends(&[mapping(&served, 1, true)]).unwrap_err();

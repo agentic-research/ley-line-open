@@ -378,7 +378,10 @@ fn parse_unix_socket_object(
             Some(port)
         }
     };
-    let grant = match (map.get("mode").and_then(serde_json::Value::as_str), guest_port) {
+    let grant = match (
+        map.get("mode").and_then(serde_json::Value::as_str),
+        guest_port,
+    ) {
         (Some("connect"), Some(_)) => UnixSocketGrant::connect(path),
         (Some("bind"), _) => UnixSocketGrant::bind(path),
         (Some("connect-bind"), _) => UnixSocketGrant::connect_bind(path),

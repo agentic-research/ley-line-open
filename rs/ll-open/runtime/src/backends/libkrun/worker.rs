@@ -617,11 +617,7 @@ pub fn prepare(
     // (`guest_loopback_channels`), handed to init in a variable the request
     // cannot set (`refuse_reserved_environment`), so the guest-visible set is
     // exactly what the digest below commits to.
-    let channels = guest_loopback_channels(
-        &manifest,
-        config.tsi_features,
-        std::env::consts::OS,
-    )?;
+    let channels = guest_loopback_channels(&manifest, config.tsi_features, std::env::consts::OS)?;
     if let Some(variable) = loopback_channels_env(&channels) {
         config.environment.push(variable);
     }
@@ -813,11 +809,19 @@ mod tests {
         }
 
         // libkrun writes the executable unquoted.
-        for executable in ["bin/x init=/bin/y", "bin/x\tinit=/bin/y", "bin/\"x", "bin/x\n"] {
+        for executable in [
+            "bin/x init=/bin/y",
+            "bin/x\tinit=/bin/y",
+            "bin/\"x",
+            "bin/x\n",
+        ] {
             let mut hostile = request();
             hostile.executable = executable.into();
             let error = refuse_reserved_environment(&hostile).unwrap_err();
-            assert!(error.detail.contains("executable"), "{executable:?}: {error}");
+            assert!(
+                error.detail.contains("executable"),
+                "{executable:?}: {error}"
+            );
         }
 
         // An ordinary address is the workload's own configuration, not

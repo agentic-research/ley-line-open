@@ -533,8 +533,7 @@ impl<'a> Run<'a> {
             let _ = child.wait();
             return Err(BootFailure::Refused(readiness));
         }
-        let ready: serde_json::Value =
-            serde_json::from_str(&readiness).expect("readiness is JSON");
+        let ready: serde_json::Value = serde_json::from_str(&readiness).expect("readiness is JSON");
         let digest = ready["confinement_digest"]
             .as_str()
             .unwrap_or_default()
@@ -557,8 +556,8 @@ impl<'a> Run<'a> {
                     Ok(_) => {
                         let line = String::from_utf8_lossy(&raw).into_owned();
                         if let Some(at) = line.find(REPORT) {
-                            let _ = report_tx
-                                .send(Ok(line[at + REPORT.len()..].trim_end().to_owned()));
+                            let _ =
+                                report_tx.send(Ok(line[at + REPORT.len()..].trim_end().to_owned()));
                             return;
                         }
                         console.push(line.trim_end().to_owned());
@@ -584,12 +583,10 @@ impl<'a> Run<'a> {
             Err(_) => {
                 let stderr = guest.end();
                 return match report_rx.recv() {
-                    Ok(Err(console)) if !console.is_empty() => {
-                        Err(BootFailure::NoReport {
-                            console: console.join("\n"),
-                            stderr,
-                        })
-                    }
+                    Ok(Err(console)) if !console.is_empty() => Err(BootFailure::NoReport {
+                        console: console.join("\n"),
+                        stderr,
+                    }),
                     _ => Err(BootFailure::Stalled { stderr }),
                 };
             }
@@ -841,7 +838,11 @@ fn a_served_port_is_reached_by_its_declared_peer_only() {
     // socket in its profile stands in for one.
     let mode = {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(&socket).expect("the served socket").permissions().mode() & 0o777
+        fs::metadata(&socket)
+            .expect("the served socket")
+            .permissions()
+            .mode()
+            & 0o777
     };
     let second = Command::new("/usr/bin/sandbox-exec")
         .arg("-p")
@@ -960,7 +961,12 @@ fn only_the_declared_ports_exist_and_they_match_the_pure_function() {
         "SECURITY: the host vsock ports that accept differ from the declared set. \
          report: {report}"
     );
-    for remote in ["203.0.113.2:80", "1.1.1.1:443", "10.0.2.2:80", "[2001:db8::1]:80"] {
+    for remote in [
+        "203.0.113.2:80",
+        "1.1.1.1:443",
+        "10.0.2.2:80",
+        "[2001:db8::1]:80",
+    ] {
         let outcome = field(remote);
         assert!(
             outcome == "NetworkUnreachable" || outcome == "HostUnreachable",

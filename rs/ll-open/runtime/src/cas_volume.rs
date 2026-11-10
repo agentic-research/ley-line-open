@@ -523,6 +523,19 @@ impl CasVolume {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(io_error("create", &layout.cas_root)(error)),
         }
+        // The CAS root is a directory on the attached volume itself, never a
+        // link to (or a mount of) somewhere else.
+        let cas = fs::symlink_metadata(&layout.cas_root)
+            .map_err(io_error("inspect", &layout.cas_root))?;
+        let mount =
+            fs::metadata(&layout.mountpoint).map_err(io_error("inspect", &layout.mountpoint))?;
+        if !cas.is_dir() || cas.dev() != mount.dev() {
+            return Err(CasVolumeError::Config(format!(
+                "{} must be a directory on the volume attached at {}, not a link or another mount",
+                layout.cas_root.display(),
+                layout.mountpoint.display()
+            )));
+        }
         let filesystem = self.probe(&layout.cas_root)?;
         if !filesystem.case_sensitive {
             return Err(CasVolumeError::CaseInsensitive {
@@ -813,6 +826,21 @@ mod tests {
             error.to_string().contains("nothing is mounted at"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_cas_root_that_is_a_link_off_the_volume_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let volume = volume(state.path(), HostOs::MacOs, &fake, sensitive);
+        volume.provision().unwrap();
+        let cas_root = volume.cas_root();
+        fs::remove_dir(&cas_root).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &cas_root).unwrap();
+        let error = volume.provision().unwrap_err();
+        assert!(error.to_string().contains("not a link"), "{error}");
+        assert!(volume.attach_existing().is_err());
     }
 
     #[test]

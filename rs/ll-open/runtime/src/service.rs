@@ -143,7 +143,14 @@ impl<B: Backend> ExecutionService<B> {
                 "provision idempotency key must not be empty",
             ));
         }
-        // Storage first, outside the state lock (creating and attaching a
+        // A request refused for its class changes nothing: checked before
+        // storage, which may create and attach a volume.
+        if self.backend.capabilities().backend_class != backend_class {
+            return Err(ExecutionError::unsupported(
+                "requested backend class is unavailable",
+            ));
+        }
+        // Storage next, outside the state lock (creating and attaching a
         // volume takes seconds): a backend checks its CAS root exists.
         let cas_root = match &self.storage {
             Some(storage) => Some(storage.provision().map_err(storage_error)?),

@@ -318,6 +318,47 @@ fn provision_makes_the_cas_root_exist_before_the_backend_checks_it_and_reports_i
     assert_eq!(output["provisioned"], true);
 }
 
+/// A provision refused for its backend class touches no storage: no volume
+/// is created or attached for a request that will fail.
+#[test]
+fn a_provision_for_the_wrong_backend_class_touches_no_storage() {
+    use leyline_runtime::cas_volume::{
+        CasStorage, CasVolume, CasVolumeError, DEFAULT_SIZE_CAP_BYTES, DiskImages, HostOs,
+    };
+    use std::path::Path;
+    struct Untouchable;
+    impl DiskImages for Untouchable {
+        fn create(&self, _: &Path, _: u64) -> Result<(), CasVolumeError> {
+            panic!("a refused provision created a volume")
+        }
+        fn attach(&self, _: &Path, _: &Path) -> Result<(), CasVolumeError> {
+            panic!("a refused provision attached a volume")
+        }
+        fn detach(&self, _: &Path) -> Result<(), CasVolumeError> {
+            panic!("detach")
+        }
+        fn is_mounted(&self, _: &Path) -> Result<bool, CasVolumeError> {
+            panic!("a refused provision inspected the volume")
+        }
+    }
+    let state = tempfile::TempDir::new().unwrap();
+    let volume = CasVolume::with_parts(
+        state.path(),
+        DEFAULT_SIZE_CAP_BYTES,
+        HostOs::MacOs,
+        Box::new(Untouchable),
+        |_| unreachable!("a refused provision probed the volume"),
+    )
+    .unwrap();
+    // CompletingBackend is a microVM backend.
+    let error = ExecutionService::new(CompletingBackend)
+        .with_cas_storage(CasStorage::Volume(volume))
+        .provision(BackendClass::Native, "provision-wrong-class")
+        .expect_err("the wrong class is refused");
+    assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+    assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn provision_refuses_a_missing_operator_cas_root_and_a_refused_host_by_name() {
     use leyline_runtime::cas_volume::{CasStorage, CasVolume, DEFAULT_SIZE_CAP_BYTES};

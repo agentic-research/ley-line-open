@@ -1393,9 +1393,9 @@ fn read_layer(
 }
 
 /// The name a filesystem of `sensitivity` stores `name` under, as far as
-/// comparing two names goes: NFD when it ignores normalization, lowercase
-/// when it ignores case. An approximation of the filesystem's own folding
-/// (APFS folds case by Unicode case folding); a pair it misses still fails
+/// comparing two names goes: NFD when it ignores normalization, Unicode
+/// full case folding when it ignores case. The filesystem's own tables may
+/// differ in a corner (a Unicode version); a pair this misses still fails
 /// when the second is written, inside staging, before anything is published.
 fn folded(name: &str, sensitivity: FilesystemSensitivity) -> String {
     use unicode_normalization::UnicodeNormalization;
@@ -1408,7 +1408,9 @@ fn folded(name: &str, sensitivity: FilesystemSensitivity) -> String {
     };
     let mut key = normalize(name);
     if !sensitivity.case_sensitive {
-        key = normalize(&key.to_lowercase());
+        // Full Unicode case folding (CaseFolding.txt C+F), as APFS folds:
+        // `ß` and `ss`, final `ς` and `σ`, `ſ` and `s` are one name there.
+        key = normalize(&unicase::UniCase::new(key).to_folded_case());
     }
     key
 }
@@ -1735,6 +1737,23 @@ mod tests {
         assert_eq!(collision(&perl, CASE_ONLY), expected);
         assert_eq!(collision(&perl, CASE_SENSITIVE_APFS), None);
         assert_eq!(collision(&perl, FilesystemSensitivity::EXACT), None);
+        // Full case folding, as APFS folds (each pair verified to name one
+        // file on case-insensitive APFS): final sigma, long s, sharp s and
+        // the ff ligature.
+        for (a, b) in [
+            ("a\u{3c3}", "a\u{3c2}"),
+            ("x\u{3a3}", "x\u{3c3}"),
+            ("\u{17f}", "s"),
+            ("\u{df}", "ss"),
+            ("\u{fb00}", "ff"),
+        ] {
+            assert_eq!(
+                collision(&[a, b], DEFAULT_APFS).map(|found| found.2),
+                Some(NameCollision::Case),
+                "{a:?} and {b:?}"
+            );
+            assert_eq!(collision(&[a, b], CASE_SENSITIVE_APFS), None);
+        }
         // A file and a directory collide as two files do.
         assert_eq!(
             collision(&["lib/Sys", "lib/sys/x"], DEFAULT_APFS),

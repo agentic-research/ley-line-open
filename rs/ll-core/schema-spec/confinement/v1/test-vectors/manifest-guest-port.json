@@ -184,6 +184,23 @@
       }
     },
     {
+      "name": "guest-port-float",
+      "description": "JSON Schema's integer type admits 13306.0; the parser reads ports as unsigned integers and refuses it, the stricter side of the pair.",
+      "schemaRefuses": false,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect",
+              "guestPort": 13306.0
+            }
+          ]
+        }
+      }
+    },
+    {
       "name": "one-guest-port-twice",
       "description": "Two grants presenting one guest port. JSON Schema cannot express it; the parser refuses it.",
       "schemaRefuses": false,

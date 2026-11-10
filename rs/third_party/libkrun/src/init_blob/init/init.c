@@ -1450,7 +1450,8 @@ close_socket:
  * IPPROTO_TCP; AF_PACKET is refused outright; io_uring_setup(2) is refused
  * because io_uring creates sockets without calling socket(2); any other
  * architecture's system calls (the i386 ABI on x86_64) end the process,
- * and so do x32 calls. Every other socket family is untouched: AF_UNIX
+ * and x32 calls are refused with EACCES. Every other socket family is
+ * untouched: AF_UNIX
  * and AF_VSOCK stay as the VMM configured them.
  *
  * Installed in init before it starts anything else, so the filter is
@@ -1706,51 +1707,46 @@ static int write_all(int fd, const char *buffer, ssize_t length)
 }
 
 /*
- * Copy bytes both ways between two connected stream sockets until both
- * directions have ended. An end of stream on one side is passed on as a
- * write shutdown of the other; an error on either ends both.
+ * Copy bytes from one connected stream socket to another until the source
+ * ends, then pass the end on as a write shutdown.
+ */
+static void copy_stream(int from, int to)
+{
+    static char buffer[65536];
+    ssize_t length;
+
+    for (;;) {
+        length = read(from, buffer, sizeof(buffer));
+        if (length < 0 && errno == EINTR) {
+            continue;
+        }
+        if (length <= 0 || write_all(to, buffer, length) < 0) {
+            break;
+        }
+    }
+    shutdown(to, SHUT_WR);
+}
+
+/*
+ * Join two connected stream sockets in both directions, each in its own
+ * process, so that a write blocked in one direction never stops the other
+ * from being read: a full-duplex protocol that runs over one TCP stream
+ * runs over the join too. Returns when both directions have ended.
  */
 static void join_streams(int a, int b)
 {
-    static char buffer[65536];
-    struct pollfd fds[2];
-    bool open[2] = {true, true};
-    int ends[2] = {a, b};
-    ssize_t length;
-    int i;
+    pid_t other = fork();
 
-    while (open[0] || open[1]) {
-        for (i = 0; i < 2; i++) {
-            fds[i].fd = open[i] ? ends[i] : -1;
-            fds[i].events = POLLIN;
-            fds[i].revents = 0;
-        }
-        if (poll(fds, 2, -1) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return;
-        }
-        for (i = 0; i < 2; i++) {
-            if (!open[i] || fds[i].revents == 0) {
-                continue;
-            }
-            length = read(ends[i], buffer, sizeof(buffer));
-            if (length < 0 && errno == EINTR) {
-                continue;
-            }
-            if (length < 0) {
-                return;
-            }
-            if (length == 0) {
-                open[i] = false;
-                shutdown(ends[1 - i], SHUT_WR);
-                continue;
-            }
-            if (write_all(ends[1 - i], buffer, length) < 0) {
-                return;
-            }
-        }
+    if (other < 0) {
+        return;
+    }
+    if (other == 0) {
+        copy_stream(a, b);
+        _exit(0);
+    }
+    copy_stream(b, a);
+    /* SIGCHLD is ignored here, so this returns once the copier is gone. */
+    while (waitpid(other, NULL, 0) < 0 && errno == EINTR) {
     }
 }
 

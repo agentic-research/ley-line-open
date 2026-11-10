@@ -21,22 +21,24 @@ listener is bound before the workload starts, so a workload cannot take
 a dial port first and never starts with one missing; a malformed list
 or a listener that cannot be bound stops the guest before the workload
 runs. A relay process forked from init serves the listeners and joins
-each connection in a process of its own, copying bytes with read(2) and
-write(2) only, so no ancillary data crosses it. The variable is removed
+each connection in processes of its own, one per direction so that a
+blocked write in one direction never stops the other being read,
+copying bytes with read(2) and write(2) only, so no ancillary data
+crosses it. The variable is removed
 from the workload's environment.
 
 Init also installs a seccomp filter, before it starts anything, that
 refuses every datagram, raw and packet socket: AF_INET and AF_INET6
 sockets may be SOCK_STREAM with protocol 0 or IPPROTO_TCP and nothing
 else, AF_PACKET is refused, io_uring_setup is refused (io_uring creates
-sockets without socket(2)), and a system call of another ABI ends the
-process. Every process in the guest inherits the filter. A kernel that
+sockets without socket(2)), a system call of another ABI ends the
+process, and an x32 call is refused. Every process in the guest inherits the filter. A kernel that
 refuses the filter stops the guest before the workload runs.
 
 Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
 ---
 diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
-index 471ed65..ce46000 100644
+index 471ed65..ae26602 100644
 --- a/src/init_blob/init/init.c
 +++ b/src/init_blob/init/init.c
 @@ -32,9 +32,18 @@
@@ -58,7 +60,7 @@ index 471ed65..ce46000 100644
  #endif
  
  #include "dhcp.h"
-@@ -1431,6 +1440,407 @@ close_socket:
+@@ -1431,6 +1440,403 @@ close_socket:
      close(sockfd);
      return result;
  }
@@ -72,7 +74,8 @@ index 471ed65..ce46000 100644
 + * IPPROTO_TCP; AF_PACKET is refused outright; io_uring_setup(2) is refused
 + * because io_uring creates sockets without calling socket(2); any other
 + * architecture's system calls (the i386 ABI on x86_64) end the process,
-+ * and so do x32 calls. Every other socket family is untouched: AF_UNIX
++ * and x32 calls are refused with EACCES. Every other socket family is
++ * untouched: AF_UNIX
 + * and AF_VSOCK stay as the VMM configured them.
 + *
 + * Installed in init before it starts anything else, so the filter is
@@ -328,51 +331,46 @@ index 471ed65..ce46000 100644
 +}
 +
 +/*
-+ * Copy bytes both ways between two connected stream sockets until both
-+ * directions have ended. An end of stream on one side is passed on as a
-+ * write shutdown of the other; an error on either ends both.
++ * Copy bytes from one connected stream socket to another until the source
++ * ends, then pass the end on as a write shutdown.
++ */
++static void copy_stream(int from, int to)
++{
++    static char buffer[65536];
++    ssize_t length;
++
++    for (;;) {
++        length = read(from, buffer, sizeof(buffer));
++        if (length < 0 && errno == EINTR) {
++            continue;
++        }
++        if (length <= 0 || write_all(to, buffer, length) < 0) {
++            break;
++        }
++    }
++    shutdown(to, SHUT_WR);
++}
++
++/*
++ * Join two connected stream sockets in both directions, each in its own
++ * process, so that a write blocked in one direction never stops the other
++ * from being read: a full-duplex protocol that runs over one TCP stream
++ * runs over the join too. Returns when both directions have ended.
 + */
 +static void join_streams(int a, int b)
 +{
-+    static char buffer[65536];
-+    struct pollfd fds[2];
-+    bool open[2] = {true, true};
-+    int ends[2] = {a, b};
-+    ssize_t length;
-+    int i;
++    pid_t other = fork();
 +
-+    while (open[0] || open[1]) {
-+        for (i = 0; i < 2; i++) {
-+            fds[i].fd = open[i] ? ends[i] : -1;
-+            fds[i].events = POLLIN;
-+            fds[i].revents = 0;
-+        }
-+        if (poll(fds, 2, -1) < 0) {
-+            if (errno == EINTR) {
-+                continue;
-+            }
-+            return;
-+        }
-+        for (i = 0; i < 2; i++) {
-+            if (!open[i] || fds[i].revents == 0) {
-+                continue;
-+            }
-+            length = read(ends[i], buffer, sizeof(buffer));
-+            if (length < 0 && errno == EINTR) {
-+                continue;
-+            }
-+            if (length < 0) {
-+                return;
-+            }
-+            if (length == 0) {
-+                open[i] = false;
-+                shutdown(ends[1 - i], SHUT_WR);
-+                continue;
-+            }
-+            if (write_all(ends[1 - i], buffer, length) < 0) {
-+                return;
-+            }
-+        }
++    if (other < 0) {
++        return;
++    }
++    if (other == 0) {
++        copy_stream(a, b);
++        _exit(0);
++    }
++    copy_stream(b, a);
++    /* SIGCHLD is ignored here, so this returns once the copier is gone. */
++    while (waitpid(other, NULL, 0) < 0 && errno == EINTR) {
 +    }
 +}
 +
@@ -466,7 +464,7 @@ index 471ed65..ce46000 100644
  #endif
  
  int main(int argc, char **argv)
-@@ -1586,6 +1996,21 @@ int main(int argc, char **argv)
+@@ -1586,6 +1992,21 @@ int main(int argc, char **argv)
              printf("Warning: Couldn't enable dummy interface\n");
          }
      }

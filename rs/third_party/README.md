@@ -121,7 +121,7 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     `serve:<tcp port>:<vsock port>`); init binds every listener before the
     workload starts, and a relay process joins each connection to the
     host's vsock port (dial) or to the workload's loopback listener
-    (serve), copying bytes only. A malformed list or a listener that cannot
+    (serve), one process per direction, copying bytes only. A malformed list or a listener that cannot
     be bound stops the guest before the workload runs. Init also installs a
     seccomp filter every guest process inherits: `AF_INET`/`AF_INET6`
     sockets may only be TCP streams, `AF_PACKET` and `io_uring_setup` are
@@ -134,8 +134,8 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     activated, inside a running guest, and only logged a socket it could
     not bind, so a VM ran without a declared channel (bead
     `ley-line-open-bb2143`). The sockets are now bound when the device is
-    created, and a failure returns `-EADDRNOTAVAIL` from
-    `krun_start_enter`.
+    created, owner-only (a 077 umask around the bind), and a failure
+    returns `-EADDRNOTAVAIL` from `krun_start_enter`.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

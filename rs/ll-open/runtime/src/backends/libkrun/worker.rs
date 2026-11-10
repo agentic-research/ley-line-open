@@ -40,11 +40,23 @@ pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
 /// connections it presents where, are the worker's decision, taken from the
 /// attested document.
 ///
-/// Also refused: a double quote anywhere in a key or value. libkrun hands the
-/// environment to the guest on the kernel command line, each entry quoted, so
-/// a quote in a value ends the entry and whatever follows becomes a separate
-/// kernel parameter or init variable. That would let a request set the very
-/// variables named here (and kernel parameters) without naming them as keys.
+/// libkrun hands the environment and the executable to the guest on the
+/// kernel command line, and the guest kernel parses every `key=value` there
+/// as a boot parameter before init sees what is left. So the request's part
+/// of that line is held to what cannot be read as anything else (bead
+/// `ley-line-open-eb5e4e`):
+///
+/// - a key is `[A-Z_][A-Z0-9_]*`. Kernel boot parameters are lowercase
+///   (`init=`, `rdinit=`, `console=`) or dotted module parameters, so an
+///   uppercase key is never one: `{"init": "/bin/x"}` would otherwise replace
+///   the guest init, and with it the datagram filter and the relay;
+/// - no key starts with `KRUN_`: those are the guest init's own settings
+///   (its mounts, its channels, `KRUN_INIT`, `KRUN_CONFIG`, ...), set by the
+///   worker or by no one;
+/// - no value contains a double quote, which would end the entry and start
+///   another;
+/// - the executable has no whitespace, quote or control character, because
+///   libkrun writes it unquoted (`KRUN_INIT=<executable>`).
 fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), ExecutionError> {
     for reserved in [VIRTIOFS_MOUNTS_ENV, LOOPBACK_CHANNELS_ENV] {
         if request.public_environment.contains_key(reserved) {
@@ -54,15 +66,45 @@ fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), Executi
             )));
         }
     }
-    if let Some((key, _)) = request
-        .public_environment
-        .iter()
-        .find(|(key, value)| key.contains('"') || value.contains('"'))
+    for (key, value) in &request.public_environment {
+        let well_formed = key
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase() || first == b'_')
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+        if !well_formed {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment key {key:?} is not [A-Z_][A-Z0-9_]*: the microVM tier \
+                 passes the environment on the guest kernel command line, where any other \
+                 key could be read as a kernel parameter (init=, console=, a module's)"
+            )));
+        }
+        if key.starts_with("KRUN_") {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment may not set {key}: KRUN_ variables configure the guest \
+                 init, and the worker sets the ones a run has"
+            )));
+        }
+        if value.contains('"') {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment entry {key:?} contains a double quote, which would end its \
+                 entry on the guest kernel command line and start another; the microVM tier \
+                 refuses it"
+            )));
+        }
+    }
+    if request
+        .executable
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '"')
     {
         return Err(ExecutionError::invalid(format!(
-            "publicEnvironment entry {key:?} contains a double quote, which would end its \
-             entry on the guest kernel command line and start another; the microVM tier \
-             refuses it"
+            "executable {:?} contains whitespace, a quote or a control character; libkrun \
+             writes it unquoted on the guest kernel command line, where it would split \
+             into further parameters",
+            request.executable
         )));
     }
     Ok(())
@@ -723,15 +765,56 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidSpec);
         assert!(error.detail.contains(LOOPBACK_CHANNELS_ENV), "{error}");
 
-        for (key, value) in [
-            ("DB_ADDR", "x\" KRUN_LOOPBACK_CHANNELS=\"dial:80:65536"),
-            ("A\" tsi_hijack \"B", "1"),
+        let mut smuggled = request();
+        smuggled.public_environment.insert(
+            "DB_ADDR".into(),
+            "x\" KRUN_LOOPBACK_CHANNELS=\"dial:80:65536".into(),
+        );
+        let error = refuse_reserved_environment(&smuggled).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("double quote"), "{error}");
+
+        // A key the guest kernel would read as its own parameter (bead
+        // ley-line-open-eb5e4e): `init=` replaces the guest init, and with it
+        // the datagram filter and the relay. Any key outside [A-Z_][A-Z0-9_]*
+        // is refused, and so is every KRUN_ variable.
+        for key in [
+            "init",
+            "rdinit",
+            "console",
+            "virtio_vsock.x",
+            "A\" tsi_hijack \"B",
+            "A B",
+            "A=B",
+            "1ADDR",
+            "",
+            "http_proxy",
+            "KRUN_INIT",
+            "KRUN_CONFIG",
+            "KRUN_INIT_PID1",
         ] {
-            let mut smuggled = request();
-            smuggled.public_environment.insert(key.into(), value.into());
-            let error = refuse_reserved_environment(&smuggled).unwrap_err();
-            assert_eq!(error.code, ErrorCode::InvalidSpec);
-            assert!(error.detail.contains("double quote"), "{error}");
+            let mut injected = request();
+            injected.public_environment.insert(key.into(), "1".into());
+            let error = refuse_reserved_environment(&injected).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidSpec, "{key:?}");
+            let named = format!("{key:?}");
+            assert!(
+                error.detail.contains(&named) || error.detail.contains(key),
+                "{key:?}: {error}"
+            );
+        }
+        for key in ["_A", "A1", "DB_ADDR", "Z"] {
+            let mut fine = request();
+            fine.public_environment.insert(key.into(), "1".into());
+            assert!(refuse_reserved_environment(&fine).is_ok(), "{key:?}");
+        }
+
+        // libkrun writes the executable unquoted.
+        for executable in ["bin/x init=/bin/y", "bin/x\tinit=/bin/y", "bin/\"x", "bin/x\n"] {
+            let mut hostile = request();
+            hostile.executable = executable.into();
+            let error = refuse_reserved_environment(&hostile).unwrap_err();
+            assert!(error.detail.contains("executable"), "{executable:?}: {error}");
         }
 
         // An ordinary address is the workload's own configuration, not

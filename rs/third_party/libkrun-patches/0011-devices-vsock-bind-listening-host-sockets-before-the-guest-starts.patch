@@ -13,7 +13,9 @@ declared, and nothing told the embedder.
 The sockets are now bound when the device is created, in
 krun_start_enter before the guest boots, and a socket that cannot be
 bound fails krun_start_enter with -EADDRNOTAVAIL. The muxer thread
-serves the sockets it is handed.
+serves the sockets it is handed. Each socket is created owner-only (a
+077 umask around the bind) whatever the process umask, so only the
+embedder's own user may connect to the path that reaches the guest.
 
 Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
 ---
@@ -201,22 +203,41 @@ index 1a21588..d24d6d9 100644
              let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
              match self
 diff --git a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
-index f88eb70..2ab69f9 100644
+index f88eb70..e947e3c 100644
 --- a/src/devices/src/virtio/vsock/unix.rs
 +++ b/src/devices/src/virtio/vsock/unix.rs
-@@ -659,7 +659,9 @@ pub struct UnixAcceptorProxy {
+@@ -659,7 +659,16 @@ pub struct UnixAcceptorProxy {
  }
  
  impl UnixAcceptorProxy {
 -    pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
 +    /// Bind and listen on the host socket at `path`, the host end of a
 +    /// listening port mapping.
++    ///
++    /// The socket is created owner-only (a 077 umask around the bind: no
++    /// group or other access), whatever the process umask: a peer reaches
++    /// the guest through this
++    /// path, so only the embedder's own user may connect to it, and the
++    /// directory the embedder chose decides the rest.
 +    pub fn bind_listener(path: &PathBuf) -> Result<OwnedFd, ProxyError> {
++        use nix::sys::stat::{umask, Mode};
          let fd = socket(
              AddressFamily::Unix,
              SockType::Stream,
-@@ -674,7 +676,12 @@ impl UnixAcceptorProxy {
+@@ -667,14 +676,19 @@ impl UnixAcceptorProxy {
+             None,
+         )
          .map_err(ProxyError::CreatingSocket)?;
+-        bind(
+-            fd.as_raw_fd(),
+-            &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
+-        )
+-        .map_err(ProxyError::CreatingSocket)?;
++        let address = UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?;
++        let previous = umask(Mode::from_bits_truncate(0o077));
++        let bound = bind(fd.as_raw_fd(), &address);
++        umask(previous);
++        bound.map_err(ProxyError::CreatingSocket)?;
          listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
              .map_err(ProxyError::CreatingSocket)?;
 -        Ok(UnixAcceptorProxy { id, fd, peer_port })

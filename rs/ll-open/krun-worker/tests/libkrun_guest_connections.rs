@@ -831,9 +831,18 @@ fn a_served_port_is_reached_by_its_declared_peer_only() {
     .map(|_| ())
     .map_err(|error| error.kind());
     let sockets = sockets_of(booted.guest.pid());
-    // A second host process whose sandbox does not hold the socket: the
-    // declared peer is whoever the socket's grant reaches, and this process
-    // is not one of them. `sandbox-exec` stands in for any confined process.
+    // Peer identity on the host is the filesystem's (ADR-0046 D5): the VMM
+    // creates the socket owner-only (a 077 umask: no group or other access,
+    // 0700 on macOS), so only the embedder's user may connect, and
+    // the directory the issuer chose narrows that further. A process of
+    // another user is refused by the mode (not run here: the test runs as
+    // one user). A same-user process is refused only by its own confinement,
+    // which LLO applies to every workload it runs: `sandbox-exec` without the
+    // socket in its profile stands in for one.
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(&socket).expect("the served socket").permissions().mode() & 0o777
+    };
     let second = Command::new("/usr/bin/sandbox-exec")
         .arg("-p")
         .arg(format!(
@@ -860,6 +869,12 @@ fn a_served_port_is_reached_by_its_declared_peer_only() {
         first.as_deref().ok(),
         Some("guest#1:first"),
         "the declared peer did not reach the guest's listener. worker stderr:\n{stderr}"
+    );
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "SECURITY: the served socket is mode {mode:o}; a user other than the \
+         embedder's who can reach it reaches the guest's listener"
     );
     assert_eq!(
         host_tcp,
@@ -1024,20 +1039,32 @@ fn the_request_cannot_widen_reach() {
         "worker stderr:\n{stderr}"
     );
 
-    for (run_id, key, value) in [
-        ("widen-named", "KRUN_LOOPBACK_CHANNELS", "dial:13307:65536"),
+    // Each would otherwise reach the guest kernel command line: the channel
+    // list by name, by a quote breaking out of a value, and the guest init
+    // itself replaced through the kernel's own `init=` parameter, which would
+    // take the datagram filter and the relay with it (ley-line-open-eb5e4e).
+    for (run_id, key, value, named) in [
+        (
+            "widen-named",
+            "KRUN_LOOPBACK_CHANNELS",
+            "dial:13307:65536",
+            "KRUN_LOOPBACK_CHANNELS",
+        ),
         (
             "widen-smuggled",
             "DB_ADDR",
             "x\" KRUN_LOOPBACK_CHANNELS=\"dial:13307:65536",
+            "double quote",
         ),
+        ("widen-init", "init", "/bin/guest", "\\\"init\\\""),
+        ("widen-krun-init", "KRUN_INIT", "/bin/guest", "KRUN_INIT"),
     ] {
         let refusal = Run::new(&root, &libkrunfw, CLIENT, run_id)
             .env(key, value)
             .manifest(&manifest)
             .refused();
         assert!(
-            refusal.contains("KRUN_LOOPBACK_CHANNELS") || refusal.contains("double quote"),
+            refusal.contains("\"failed\"") && refusal.contains(named),
             "{run_id}: {refusal}"
         );
     }
@@ -1370,6 +1397,108 @@ fn the_guest_cannot_open_a_datagram_socket() {
              or a control failed. worker stderr:\n{stderr}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Full duplex through the relay.
+
+/// Bytes the full-duplex case sends each way: far beyond every buffer on
+/// the path (socket buffers, the vsock credit window, the relay's 64 KiB), so
+/// a relay that stops reading one direction while a write in the other is
+/// blocked deadlocks here.
+const DUPLEX_BYTES: usize = 16 << 20;
+
+/// The full-duplex guest: dials `$DB_ADDR`, writes DUPLEX_BYTES from one
+/// thread while reading DUPLEX_BYTES on another, and reports both counts.
+const DUPLEX: &str = r#"use std::io::{Read, Write};
+use std::net::TcpStream;
+
+fn main() {
+    let total: usize = std::env::var("DUPLEX_BYTES").unwrap().parse().unwrap();
+    let stream = TcpStream::connect(std::env::var("DB_ADDR").unwrap()).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let sent = std::thread::spawn(move || {
+        let chunk = vec![0x5au8; 65536];
+        let mut sent = 0;
+        while sent < total {
+            let n = (total - sent).min(chunk.len());
+            writer.write_all(&chunk[..n]).unwrap();
+            sent += n;
+        }
+        sent
+    });
+    let mut reader = stream;
+    let mut buffer = vec![0u8; 65536];
+    let mut received = 0usize;
+    while received < total {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => received += n,
+        }
+    }
+    let sent = sent.join().unwrap();
+    println!("connections-probe: duplex sent={sent} received={received}");
+    loop {
+        std::thread::park();
+    }
+}
+"#;
+
+/// A protocol that writes and reads at once (gRPC streams, a MySQL client
+/// pipelining) crosses the relay as it would one TCP stream: both sides
+/// send DUPLEX_BYTES at the same time, and both receive all of it.
+#[test]
+fn a_full_duplex_stream_crosses_the_relay() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    if !presentation_is_live_here() {
+        return;
+    }
+    let (_fixture, root) = fixture();
+    let socket = root.join("db.sock");
+    let listener = UnixListener::bind(&socket).expect("the declared peer");
+    let host = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("the guest dials");
+        let mut writer = stream.try_clone().expect("clone");
+        let sender = std::thread::spawn(move || {
+            let chunk = vec![0xa5u8; 65536];
+            let mut sent = 0;
+            while sent < DUPLEX_BYTES {
+                let n = (DUPLEX_BYTES - sent).min(chunk.len());
+                if writer.write_all(&chunk[..n]).is_err() {
+                    break;
+                }
+                sent += n;
+            }
+            sent
+        });
+        let mut reader = stream;
+        let mut buffer = vec![0u8; 65536];
+        let mut received = 0usize;
+        while received < DUPLEX_BYTES {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => received += n,
+            }
+        }
+        (sender.join().unwrap_or(0), received)
+    });
+    let manifest = with_grants(&libkrunfw, vec![dial_grant(&socket, DIAL_PORT)]);
+    let mut booted = Run::new(&root, &libkrunfw, DUPLEX, "duplex")
+        .env("DB_ADDR", &format!("127.0.0.1:{DIAL_PORT}"))
+        .env("DUPLEX_BYTES", &DUPLEX_BYTES.to_string())
+        .manifest(&manifest)
+        .boot();
+    let host = host.join().expect("host side");
+    let stderr = booted.guest.end();
+    assert_eq!(
+        booted.report,
+        format!("duplex sent={DUPLEX_BYTES} received={DUPLEX_BYTES}"),
+        "worker stderr:\n{stderr}"
+    );
+    assert_eq!(host, (DUPLEX_BYTES, DUPLEX_BYTES));
 }
 
 // ---------------------------------------------------------------------------

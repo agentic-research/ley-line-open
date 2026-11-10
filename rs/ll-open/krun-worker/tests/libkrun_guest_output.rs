@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
 use leyline_runtime::{
-    Backend, BackendRunStatus, DigestRef, ExecutionRequest, ResourceLimits, RunOutput,
+    Backend, BackendRunStatus, DigestRef, ExecutionRequest, GuestOutput, ResourceLimits,
 };
 use tempfile::TempDir;
 
@@ -38,6 +38,13 @@ const FAILING: &str = r#"fn main() {
     println!("output-probe: to stdout");
     eprintln!("output-probe: to stderr");
     std::process::exit(3);
+}
+"#;
+
+/// Writes a line to each stream, then exits 0.
+const SUCCEEDING: &str = r#"fn main() {
+    println!("output-probe: done");
+    eprintln!("output-probe: note");
 }
 "#;
 
@@ -121,17 +128,34 @@ fn a_failed_guest_reports_what_it_printed() {
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, FAILING, "output-failing");
     backend.start(&request).expect("the guest starts");
-    let status = backend
-        .wait_for_completion(&request.run_id)
+    let outcome = backend
+        .wait_for_outcome(&request.run_id)
         .expect("the run completes");
-    let BackendRunStatus::Failed(error) = status else {
-        panic!("a guest exiting 3 must fail the run, got {status:?}");
+    let BackendRunStatus::Failed(error) = &outcome.status else {
+        panic!("a guest exiting 3 must fail the run, got {outcome:?}");
     };
+    assert_eq!(
+        (error.code, error.retryable),
+        (leyline_runtime::ErrorCode::BackendFailed, false)
+    );
     assert!(
         error.detail.contains("exit status: 3"),
         "the exit stays named: {}",
         error.detail
     );
+    // The typed field: the stderr marker in the stderr tail, the stdout
+    // line in the stdout tail, labelled untrusted.
+    let output = outcome.output.expect("the run's guest output");
+    assert!(output.untrusted);
+    assert!(
+        output.stderr_tail.contains("output-probe: to stderr"),
+        "the typed stderr tail lacks the guest's marker: {output:?}"
+    );
+    assert!(
+        output.stdout_tail.contains("output-probe: to stdout"),
+        "the typed stdout tail lacks the guest's line: {output:?}"
+    );
+    // The failure's detail carries them too.
     for line in ["output-probe: to stdout", "output-probe: to stderr"] {
         assert!(
             error.detail.contains(line),
@@ -139,6 +163,32 @@ fn a_failed_guest_reports_what_it_printed() {
             error.detail
         );
     }
+}
+
+/// A guest that succeeds also hands back what it printed, typed.
+#[test]
+fn a_finished_guest_reports_what_it_printed() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    let fixture = TempDir::new().expect("fixture");
+    let root = fixture.path().canonicalize().expect("canonical fixture");
+    let (backend, request) = backend_and_request(&root, &libkrunfw, SUCCEEDING, "output-ok");
+    backend.start(&request).expect("the guest starts");
+    let outcome = backend
+        .wait_for_outcome(&request.run_id)
+        .expect("the run completes");
+    assert_eq!(outcome.status, BackendRunStatus::Succeeded);
+    let output = outcome.output.expect("the run's guest output");
+    assert!(
+        output.stdout_tail.contains("output-probe: done"),
+        "{output:?}"
+    );
+    assert!(
+        output.stderr_tail.contains("output-probe: note"),
+        "{output:?}"
+    );
 }
 
 /// Writes, on its standard error, a line shaped like the worker's terminal
@@ -202,17 +252,17 @@ fn a_serving_guest_announcement_is_readable_while_it_runs() {
     let seen = backend
         .wait_for_output(
             &request.run_id,
-            &|output: &RunOutput| output.guest.contains("listening on 3306"),
+            &|output: &GuestOutput| output.stdout_tail.contains("listening on 3306"),
             BOUND,
         )
         .expect("an active run");
     assert!(
-        seen.guest.contains("output-probe: listening on 3306"),
+        seen.stdout_tail.contains("output-probe: listening on 3306"),
         "the serving guest's announcement never arrived: {seen:?}"
     );
     assert!(
         Backend::output(&backend, &request.run_id)
-            .is_some_and(|output| output.guest.contains("listening on 3306"))
+            .is_some_and(|output| output.stdout_tail.contains("listening on 3306"))
     );
     assert!(backend.cancel(&request.run_id).expect("cancel"));
     assert_eq!(Backend::output(&backend, &request.run_id), None);

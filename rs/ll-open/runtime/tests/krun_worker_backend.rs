@@ -9,7 +9,7 @@ use leyline_runtime::backends::libkrun::output::GUEST_OUTPUT_TAIL_BYTES;
 use leyline_runtime::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
 use leyline_runtime::{
     Backend, BackendClass, BackendRunStatus, CpuLimits, DigestRef, ErrorCode, ExecutionError,
-    ExecutionRequest, MemoryLimits, ResourceLimits, RunOutput, WorkerChannel, WorkspaceGrant,
+    ExecutionRequest, GuestOutput, MemoryLimits, ResourceLimits, WorkerChannel, WorkspaceGrant,
     WorkspaceOperation,
 };
 use tempfile::TempDir;
@@ -224,11 +224,24 @@ fn a_failed_run_reports_its_terminal_event_and_what_the_guest_printed() {
     );
 
     backend.start(&request()).expect("ready worker");
-    let completion = backend
-        .wait_for_completion("run-backend-01")
+    let outcome = backend
+        .wait_for_outcome("run-backend-01")
         .expect("worker completion");
-    let BackendRunStatus::Failed(error) = completion else {
-        panic!("expected a failed run, got {completion:?}");
+    let output = outcome.output.clone().expect("typed guest output");
+    assert!(output.untrusted);
+    assert_eq!(output.stdout_tail, "guest says hello\n\u{FFFD}[31mred\n");
+    assert!(
+        output
+            .stderr_tail
+            .contains("libkrun: something went wrong\n"),
+        "{output:?}"
+    );
+    assert_eq!(
+        output.reported_failure.map(|reported| reported.code),
+        Some(ErrorCode::ResourceExhausted)
+    );
+    let BackendRunStatus::Failed(error) = outcome.status else {
+        panic!("expected a failed run, got {outcome:?}");
     };
     // The guest writes the worker's standard error too, so the reported
     // event is text, and the classification stays the supervisor's.
@@ -297,7 +310,9 @@ fn a_reported_event_cannot_carry_control_bytes() {
     let seen = backend
         .wait_for_output(
             "run-backend-01",
-            &|output: &RunOutput| output.reported_failure.is_some() && !output.guest.is_empty(),
+            &|output: &GuestOutput| {
+                output.reported_failure.is_some() && !output.stdout_tail.is_empty()
+            },
             READY_TIMEOUT,
         )
         .expect("an active run");
@@ -392,18 +407,18 @@ fn an_active_run_exposes_its_output_to_the_embedder() {
     let seen = backend
         .wait_for_output(
             "run-backend-01",
-            &|output: &RunOutput| {
+            &|output: &GuestOutput| {
                 if !opened.replace(true) {
                     fs::write(&gate, b"go\n").expect("open the gate");
                 }
-                output.guest.contains("listening")
+                output.stdout_tail.contains("listening")
             },
             READY_TIMEOUT,
         )
         .expect("an active run");
-    assert_eq!(seen.guest, "server listening on 3306\n");
+    assert_eq!(seen.stdout_tail, "server listening on 3306\n");
     assert_eq!(
-        Backend::output(&backend, "run-backend-01").map(|output| output.guest),
+        Backend::output(&backend, "run-backend-01").map(|output| output.stdout_tail),
         Some("server listening on 3306\n".to_owned())
     );
     assert_eq!(Backend::output(&backend, "no-such-run"), None);

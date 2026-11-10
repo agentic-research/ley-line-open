@@ -54,12 +54,22 @@ pub trait Backend: Send + Sync + 'static {
         Ok(None)
     }
 
-    /// What an active run has printed so far, bounded, for the embedder
-    /// that started it. `None` when the run is not active here, or when the
-    /// backend keeps no output (the default). A run's failure carries its
-    /// final output in [`BackendRunStatus::Failed`] instead.
-    fn output(&self, _run_id: &str) -> Option<crate::RunOutput> {
+    /// What an active run's guest has printed so far, bounded, for the
+    /// embedder that started it. `None` when the run is not active here, or
+    /// when the backend keeps no output (the default). A finished run's
+    /// output comes with its status from [`Backend::poll_outcome`].
+    fn output(&self, _run_id: &str) -> Option<crate::GuestOutput> {
         None
+    }
+
+    /// [`Backend::poll`] with the finished run's guest output alongside its
+    /// status, as one typed [`crate::RunOutcome`]. Like `poll`, it consumes
+    /// the completion. The default carries no output.
+    fn poll_outcome(&self, run_id: &str) -> Result<Option<crate::RunOutcome>, ExecutionError> {
+        Ok(self.poll(run_id)?.map(|status| crate::RunOutcome {
+            status,
+            output: None,
+        }))
     }
 
     /// Cancel one active execution and release backend-owned resources.

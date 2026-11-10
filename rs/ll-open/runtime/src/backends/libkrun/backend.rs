@@ -12,7 +12,7 @@ use tempfile::Builder as TempDirBuilder;
 
 use crate::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
-    ExecutionRequest, RunOutput,
+    ExecutionRequest, GuestOutput,
 };
 
 use super::output::OutputCapture;
@@ -69,7 +69,7 @@ pub struct KrunWorkerBackend {
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
-    completed: Arc<Mutex<HashMap<String, BackendRunStatus>>>,
+    completed: Arc<Mutex<HashMap<String, crate::RunOutcome>>>,
     completion_cv: Arc<Condvar>,
     /// What each active run has printed (bead `ley-line-open-a26ad0`):
     /// published with the run in `children`, retired with it.
@@ -106,9 +106,9 @@ impl KrunWorkerBackend {
     pub fn wait_for_output(
         &self,
         run_id: &str,
-        until: &dyn Fn(&RunOutput) -> bool,
+        until: &dyn Fn(&GuestOutput) -> bool,
         timeout: Duration,
-    ) -> Result<RunOutput, ExecutionError> {
+    ) -> Result<GuestOutput, ExecutionError> {
         let capture =
             self.outputs.lock().get(run_id).cloned().ok_or_else(|| {
                 ExecutionError::invalid(format!("run_id is not active: {run_id}"))
@@ -223,10 +223,17 @@ impl KrunWorkerBackend {
     /// lifecycle synchronization point; callers must not infer completion by
     /// watching the ephemeral filesystem or sleeping for a guessed duration.
     pub fn wait_for_completion(&self, run_id: &str) -> Result<BackendRunStatus, ExecutionError> {
+        Ok(self.wait_for_outcome(run_id)?.status)
+    }
+
+    /// [`Self::wait_for_completion`] with the run's guest output alongside
+    /// its status: the typed [`crate::RunOutcome`], whose `output` holds the
+    /// bounded, sanitized, untrusted tails of a finished or failed run.
+    pub fn wait_for_outcome(&self, run_id: &str) -> Result<crate::RunOutcome, ExecutionError> {
         let mut completed = self.completed.lock();
         loop {
-            if let Some(status) = completed.remove(run_id) {
-                return Ok(status);
+            if let Some(outcome) = completed.remove(run_id) {
+                return Ok(outcome);
             }
             if !self.children.lock().contains_key(run_id) {
                 return Err(ExecutionError::invalid(format!(
@@ -611,12 +618,20 @@ impl Backend for KrunWorkerBackend {
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }
-            // A failure names the worker's own cause, when it reported one,
-            // and carries what the run printed; a success or a cancel
-            // carries nothing, and the capture is released either way.
+            // What the guest printed, once its streams have ended, travels
+            // with the terminal status as a typed `RunOutcome`. A failure
+            // keeps the supervisor's classification and also carries the
+            // tails in its detail. The live capture is released.
+            let output = capture.settle();
             let status = match result.clone() {
                 Ok(()) => BackendRunStatus::Succeeded,
-                Err(error) => BackendRunStatus::Failed(capture.fold_into(error)),
+                Err(error) => {
+                    BackendRunStatus::Failed(super::output::failure_with_output(error, &output))
+                }
+            };
+            let outcome = crate::RunOutcome {
+                status,
+                output: Some(output),
             };
             outputs.lock().remove(&run_id);
             // Retire the run and publish its completion as one step, under
@@ -626,7 +641,7 @@ impl Backend for KrunWorkerBackend {
             {
                 let mut completed = completed.lock();
                 children.lock().remove(&run_id);
-                completed.insert(run_id, status);
+                completed.insert(run_id, outcome);
             }
             completion_cv.notify_all();
             let _ = finished_tx.send(result);
@@ -641,10 +656,14 @@ impl Backend for KrunWorkerBackend {
     }
 
     fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(self.poll_outcome(run_id)?.map(|outcome| outcome.status))
+    }
+
+    fn poll_outcome(&self, run_id: &str) -> Result<Option<crate::RunOutcome>, ExecutionError> {
         Ok(self.completed.lock().remove(run_id))
     }
 
-    fn output(&self, run_id: &str) -> Option<RunOutput> {
+    fn output(&self, run_id: &str) -> Option<GuestOutput> {
         let capture = self.outputs.lock().get(run_id).cloned()?;
         Some(capture.snapshot())
     }
@@ -689,10 +708,13 @@ mod tests {
             ready_timeout: Duration::from_secs(1),
             tsi_hijack_inet: false,
         });
-        backend
-            .completed
-            .lock()
-            .insert("run-1".into(), BackendRunStatus::Succeeded);
+        backend.completed.lock().insert(
+            "run-1".into(),
+            crate::RunOutcome {
+                status: BackendRunStatus::Succeeded,
+                output: None,
+            },
+        );
         assert!(matches!(
             Backend::poll(&backend, "run-1").expect("poll"),
             Some(BackendRunStatus::Succeeded)

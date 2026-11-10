@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::{ExecutionError, RunOutput};
+use crate::{ExecutionError, GuestOutput};
 
 use super::worker::WorkerEvent;
 
@@ -229,7 +229,7 @@ impl OutputCapture {
     }
 
     /// What the run has printed so far.
-    pub fn snapshot(&self) -> RunOutput {
+    pub fn snapshot(&self) -> GuestOutput {
         snapshot(&self.state.lock())
     }
 
@@ -237,7 +237,7 @@ impl OutputCapture {
     /// for both streams to end. Returns the output it saw last. `until` runs
     /// under the capture's lock: it must not read this run's output again
     /// (`Backend::output`), or it deadlocks and stalls the drains.
-    pub fn wait(&self, until: &dyn Fn(&RunOutput) -> bool, deadline: Instant) -> RunOutput {
+    pub fn wait(&self, until: &dyn Fn(&GuestOutput) -> bool, deadline: Instant) -> GuestOutput {
         let mut state = self.state.lock();
         loop {
             let output = snapshot(&state);
@@ -251,14 +251,11 @@ impl OutputCapture {
         }
     }
 
-    /// The failure a finished run reports: the supervisor's `observed`
-    /// failure, whose code and `retryable` it keeps, followed by any
-    /// reported `failed` event (as unverified text) and what the run
-    /// printed.
-    pub fn fold_into(&self, observed: ExecutionError) -> ExecutionError {
+    /// A finished run's final output: what it printed once both streams
+    /// have ended, waiting at most [`DRAIN_BOUND`] for them.
+    pub fn settle(&self) -> GuestOutput {
         let deadline = Instant::now() + DRAIN_BOUND;
-        let output = self.wait(&|_| false, deadline);
-        failure_with_output(observed, &output)
+        self.wait(&|_| false, deadline)
     }
 }
 
@@ -276,12 +273,13 @@ fn read_until_end(mut stream: impl Read, mut sink: impl FnMut(&[u8])) {
     }
 }
 
-fn snapshot(state: &State) -> RunOutput {
-    RunOutput {
-        guest: state.guest.text(),
-        guest_dropped_bytes: state.guest.dropped,
-        worker_stderr: state.worker.text(),
-        worker_stderr_dropped_bytes: state.worker.dropped,
+fn snapshot(state: &State) -> GuestOutput {
+    GuestOutput {
+        stdout_tail: state.guest.text(),
+        stdout_dropped_bytes: state.guest.dropped,
+        stderr_tail: state.worker.text(),
+        stderr_dropped_bytes: state.worker.dropped,
+        untrusted: true,
         reported_failure: state.failure.clone(),
     }
 }
@@ -303,7 +301,7 @@ fn parse_event(line: &[u8], failure: &mut Option<ExecutionError>) {
 /// `failed` event appended as unverified text and then the run's printed
 /// output. The section headings are framing, not authority: a guest's own
 /// bytes keep their newlines and can imitate them.
-pub fn failure_with_output(observed: ExecutionError, output: &RunOutput) -> ExecutionError {
+pub fn failure_with_output(observed: ExecutionError, output: &GuestOutput) -> ExecutionError {
     // The classification is always the supervisor's. A `failed` event read
     // after readiness arrived on a stream the guest also writes, so it is
     // reported as text, never adopted as the code or `retryable`.
@@ -316,11 +314,15 @@ pub fn failure_with_output(observed: ExecutionError, output: &RunOutput) -> Exec
         ));
     }
     for (name, text, dropped) in [
-        ("guest console", &output.guest, output.guest_dropped_bytes),
+        (
+            "guest console",
+            &output.stdout_tail,
+            output.stdout_dropped_bytes,
+        ),
         (
             "guest stderr and worker diagnostics",
-            &output.worker_stderr,
-            output.worker_stderr_dropped_bytes,
+            &output.stderr_tail,
+            output.stderr_dropped_bytes,
         ),
     ] {
         if text.is_empty() {
@@ -388,7 +390,7 @@ mod tests {
             output.reported_failure.map(|error| error.detail),
             Some("cause".into())
         );
-        assert!(output.worker_stderr.starts_with("libkrun noise\n"));
+        assert!(output.stderr_tail.starts_with("libkrun noise\n"));
 
         // An event without its final newline is read at end of stream.
         let capture = OutputCapture::new();
@@ -423,15 +425,13 @@ mod tests {
     #[test]
     fn a_failure_keeps_the_supervisors_classification_and_gains_the_output() {
         let observed = ExecutionError::backend("libkrun worker exited with exit status: 1");
-        let quiet = failure_with_output(observed.clone(), &RunOutput::default());
+        let quiet = failure_with_output(observed.clone(), &GuestOutput::default());
         assert_eq!(quiet, observed);
 
-        let output = RunOutput {
-            guest: "boom\n".into(),
-            guest_dropped_bytes: 7,
-            worker_stderr: String::new(),
-            worker_stderr_dropped_bytes: 0,
-            reported_failure: None,
+        let output = GuestOutput {
+            stdout_tail: "boom\n".into(),
+            stdout_dropped_bytes: 7,
+            ..GuestOutput::default()
         };
         let loud = failure_with_output(observed.clone(), &output);
         assert_eq!(
@@ -446,14 +446,14 @@ mod tests {
 
         // A reported event, which the guest can forge, is text only: the
         // code and `retryable` stay the supervisor's.
-        let reported = RunOutput {
-            worker_stderr: "noise".into(),
+        let reported = GuestOutput {
+            stderr_tail: "noise".into(),
             reported_failure: Some(ExecutionError {
                 code: ErrorCode::Unauthorized,
                 retryable: true,
                 detail: "cause".into(),
             }),
-            ..RunOutput::default()
+            ..GuestOutput::default()
         };
         let named = failure_with_output(observed.clone(), &reported);
         assert_eq!(
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fold_waits_for_output_still_arriving() {
+    fn a_settle_waits_for_output_still_arriving() {
         let capture = Arc::new(OutputCapture::new());
         capture.drain_worker(&b""[..]);
         let (send, receive) = std::sync::mpsc::channel();
@@ -546,20 +546,20 @@ mod tests {
             let capture = Arc::clone(&capture);
             std::thread::spawn(move || capture.drain_guest(Channel(receive)))
         };
-        let folder = {
+        let settler = {
             let capture = Arc::clone(&capture);
-            std::thread::spawn(move || capture.fold_into(ExecutionError::backend("exited")))
+            std::thread::spawn(move || capture.settle())
         };
-        until_parked(&capture, &folder);
+        until_parked(&capture, &settler);
         send.send(b"late".to_vec()).unwrap();
         drop(send);
-        let error = folder.join().unwrap();
+        let output = settler.join().unwrap();
         drainer.join().unwrap();
-        assert!(
-            error.detail.ends_with("---\nlate"),
-            "the fold returned before the console ended: {}",
-            error.detail
+        assert_eq!(
+            output.stdout_tail, "late",
+            "settle returned before the guest's stream ended"
         );
+        assert!(output.untrusted);
     }
 
     #[test]
@@ -570,7 +570,7 @@ mod tests {
             let capture = Arc::clone(&capture);
             std::thread::spawn(move || {
                 capture.wait(
-                    &|output| output.worker_stderr.contains('x'),
+                    &|output| output.stderr_tail.contains('x'),
                     Instant::now() + Duration::from_secs(60),
                 )
             })
@@ -578,7 +578,7 @@ mod tests {
         until_parked(&capture, &waiter);
         capture.drain_worker(&b"x"[..]);
         let seen = waiter.join().unwrap();
-        assert_eq!(seen.worker_stderr, "x", "one ended stream ended the wait");
+        assert_eq!(seen.stderr_tail, "x", "one ended stream ended the wait");
     }
 
     #[test]
@@ -587,18 +587,18 @@ mod tests {
         let writer = Arc::clone(&capture);
         let deadline = Instant::now() + Duration::from_secs(30);
         let thread = std::thread::spawn(move || writer.drain_guest(&b"ready\n"[..]));
-        let seen = capture.wait(&|output| output.guest.contains("ready"), deadline);
-        assert_eq!(seen.guest, "ready\n");
+        let seen = capture.wait(&|output| output.stdout_tail.contains("ready"), deadline);
+        assert_eq!(seen.stdout_tail, "ready\n");
         thread.join().unwrap();
         // Guest ended; the worker stream ending too ends a wait that can
         // never be satisfied, well before its deadline.
         capture.drain_worker(&b""[..]);
         let seen = capture.wait(&|_| false, deadline);
-        assert_eq!(seen.guest, "ready\n");
+        assert_eq!(seen.stdout_tail, "ready\n");
         assert!(Instant::now() < deadline);
         // A wait whose deadline passes returns what it saw.
         let open = OutputCapture::new();
         let seen = open.wait(&|_| false, Instant::now());
-        assert_eq!(seen, RunOutput::default());
+        assert_eq!(seen, GuestOutput::default());
     }
 }

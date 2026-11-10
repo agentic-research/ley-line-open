@@ -201,10 +201,11 @@ fn backend_reports_a_nonzero_worker_exit_as_failed() {
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
 
-/// A worker that fails after readiness reports its cause and what the guest
-/// printed in the run's failure (bead ley-line-open-a26ad0): the terminal
-/// `failed` event's code and detail, the guest console's tail, and the
-/// worker's other standard error, with the guest's control bytes replaced.
+/// A worker that fails after readiness has its reported cause and what the
+/// guest printed in the run's failure (bead ley-line-open-a26ad0): the
+/// terminal `failed` event as unverified text, the guest's standard output
+/// tail, and the rest of the standard error, with the guest's control bytes
+/// replaced. The code and `retryable` stay the supervisor's.
 #[test]
 fn a_failed_run_reports_its_terminal_event_and_what_the_guest_printed() {
     let _serial = common::serial();
@@ -229,13 +230,23 @@ fn a_failed_run_reports_its_terminal_event_and_what_the_guest_printed() {
     let BackendRunStatus::Failed(error) = completion else {
         panic!("expected a failed run, got {completion:?}");
     };
-    assert_eq!(error.code, ErrorCode::ResourceExhausted, "{error:?}");
-    assert!(error.retryable, "{error:?}");
+    // The guest writes the worker's standard error too, so the reported
+    // event is text, and the classification stays the supervisor's.
+    assert_eq!(
+        (error.code, error.retryable),
+        (ErrorCode::BackendFailed, false),
+        "{error:?}"
+    );
     assert!(
-        error
-            .detail
-            .starts_with("krun_start_enter failed: -12 (libkrun worker exited"),
-        "the worker's own cause leads the detail: {}",
+        error.detail.starts_with("libkrun worker exited"),
+        "the supervisor's observation leads the detail: {}",
+        error.detail
+    );
+    assert!(
+        error.detail.contains(
+            "(unverified): ResourceExhausted, retryable true: krun_start_enter failed: -12"
+        ),
+        "the reported event is named: {}",
         error.detail
     );
     assert!(

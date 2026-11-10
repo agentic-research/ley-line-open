@@ -1,18 +1,25 @@
 //! What a libkrun run printed, kept bounded (bead `ley-line-open-a26ad0`).
 //!
-//! A libkrun worker writes two streams. Its standard output is the guest's
-//! console: whatever the workload prints. Its standard error carries the
-//! worker's JSON events: readiness, which the backend reads in `start`, and,
-//! when the worker fails after readiness, one terminal `failed` event that
-//! names the cause. Before this module both were discarded once the run was
-//! ready, so a failed guest left only "libkrun worker exited with exit status:
-//! 1", and a serving guest left nothing at all.
+//! A libkrun worker writes two streams. Its standard output carries the
+//! guest's standard output (libkrun's `krun-stdout` console port). Its
+//! standard error carries the worker's JSON events (readiness, which the
+//! backend reads in `start`, and a terminal `failed` event when the worker
+//! fails), libkrun's diagnostics, and, once the guest runs, the guest's
+//! standard error (the `krun-stderr` port). Before this module both were
+//! discarded once the run was ready, so a failed guest left only "libkrun
+//! worker exited with exit status: 1", and a serving guest left nothing at
+//! all.
 //!
-//! [`OutputCapture`] keeps the last [`GUEST_OUTPUT_TAIL_BYTES`] of the console
-//! and the last [`WORKER_STDERR_TAIL_BYTES`] of the worker's post-readiness
-//! standard error, plus the terminal `failed` event if the worker wrote one.
-//! Older bytes are dropped and counted, so a run that prints without bound
-//! costs a fixed amount of memory.
+//! [`OutputCapture`] keeps the last [`GUEST_OUTPUT_TAIL_BYTES`] of the
+//! standard output and the last [`WORKER_STDERR_TAIL_BYTES`] of the
+//! post-readiness standard error, plus the last line there shaped like a
+//! `failed` event. Older bytes are dropped and counted, so a run that prints
+//! without bound costs a fixed amount of memory.
+//!
+//! Because the guest writes the same standard error, a `failed` line read
+//! after readiness may be the guest's forgery. It is reported as unverified
+//! text and never becomes the failure's code or `retryable`, which stay the
+//! supervisor's.
 //!
 //! Where the bytes go is deny by default. They reach exactly two places, both
 //! the in-process embedder that started the run:
@@ -245,9 +252,9 @@ impl OutputCapture {
         }
     }
 
-    /// The failure a finished run reports: the worker's own terminal
-    /// `failed` event when it wrote one (it names the cause; `observed` is
-    /// only how the supervisor saw the exit), followed by what the run
+    /// The failure a finished run reports: the supervisor's `observed`
+    /// failure, whose code and `retryable` it keeps, followed by any
+    /// reported `failed` event (as unverified text) and what the run
     /// printed.
     pub fn fold_into(&self, observed: ExecutionError) -> ExecutionError {
         let deadline = Instant::now() + DRAIN_BOUND;
@@ -262,7 +269,7 @@ fn snapshot(state: &State) -> RunOutput {
         guest_dropped_bytes: state.guest.dropped,
         worker_stderr: state.worker.text(),
         worker_stderr_dropped_bytes: state.worker.dropped,
-        worker_failure: state.failure.clone(),
+        reported_failure: state.failure.clone(),
     }
 }
 
@@ -279,18 +286,21 @@ fn parse_event(line: &[u8], failure: &mut Option<ExecutionError>) {
 /// `observed`, replaced by the worker's own failure when it reported one,
 /// with the run's printed output appended to the detail.
 pub fn failure_with_output(observed: ExecutionError, output: &RunOutput) -> ExecutionError {
-    let mut error = match &output.worker_failure {
-        Some(reported) => ExecutionError {
-            code: reported.code,
-            retryable: reported.retryable,
-            detail: format!("{} ({})", reported.detail, observed.detail),
-        },
-        None => observed,
-    };
+    // The classification is always the supervisor's. A `failed` event read
+    // after readiness arrived on a stream the guest also writes, so it is
+    // reported as text, never adopted as the code or `retryable`.
+    let mut error = observed;
+    if let Some(reported) = &output.reported_failure {
+        error.detail.push_str(&format!(
+            "\nreported on the worker's standard error, which the guest's standard error \
+             shares (unverified): {:?}, retryable {}: {}",
+            reported.code, reported.retryable, reported.detail
+        ));
+    }
     for (name, text, dropped) in [
-        ("guest output", &output.guest, output.guest_dropped_bytes),
+        ("guest console", &output.guest, output.guest_dropped_bytes),
         (
-            "worker stderr",
+            "guest stderr and worker diagnostics",
             &output.worker_stderr,
             output.worker_stderr_dropped_bytes,
         ),
@@ -357,7 +367,7 @@ mod tests {
         capture.push_worker(b"\n");
         let output = capture.snapshot();
         assert_eq!(
-            output.worker_failure.map(|error| error.detail),
+            output.reported_failure.map(|error| error.detail),
             Some("cause".into())
         );
         assert!(output.worker_stderr.starts_with("libkrun noise\n"));
@@ -365,11 +375,11 @@ mod tests {
         // An event without its final newline is read at end of stream.
         let capture = OutputCapture::new();
         capture.drain_worker(FAILED);
-        assert!(capture.snapshot().worker_failure.is_some());
+        assert!(capture.snapshot().reported_failure.is_some());
         // Only `failed` events count; readiness or junk is ignored.
         let capture = OutputCapture::new();
         capture.drain_worker(&b"{\"type\":\"ready\",\"run_id\":\"r\"}\nnot json\n{broken\n"[..]);
-        assert_eq!(capture.snapshot().worker_failure, None);
+        assert_eq!(capture.snapshot().reported_failure, None);
     }
 
     #[test]
@@ -379,21 +389,21 @@ mod tests {
         long.extend(std::iter::repeat_n(b' ', EVENT_LINE_MAX_BYTES));
         capture.push_worker(&long);
         capture.push_worker(b"\n");
-        assert_eq!(capture.snapshot().worker_failure, None);
+        assert_eq!(capture.snapshot().reported_failure, None);
         capture.push_worker(FAILED);
         capture.push_worker(b"\n");
-        assert!(capture.snapshot().worker_failure.is_some());
+        assert!(capture.snapshot().reported_failure.is_some());
         // A line of exactly the limit is still parsed.
         let capture = OutputCapture::new();
         let mut exact = FAILED.to_vec();
         exact.resize(EVENT_LINE_MAX_BYTES, b' ');
         capture.push_worker(&exact);
         capture.push_worker(b"\n");
-        assert!(capture.snapshot().worker_failure.is_some());
+        assert!(capture.snapshot().reported_failure.is_some());
     }
 
     #[test]
-    fn a_failure_without_an_event_keeps_its_cause_and_gains_the_output() {
+    fn a_failure_keeps_the_supervisors_classification_and_gains_the_output() {
         let observed = ExecutionError::backend("libkrun worker exited with exit status: 1");
         let quiet = failure_with_output(observed.clone(), &RunOutput::default());
         assert_eq!(quiet, observed);
@@ -403,31 +413,40 @@ mod tests {
             guest_dropped_bytes: 7,
             worker_stderr: String::new(),
             worker_stderr_dropped_bytes: 0,
-            worker_failure: None,
+            reported_failure: None,
         };
         let loud = failure_with_output(observed.clone(), &output);
-        assert_eq!(loud.code, observed.code);
+        assert_eq!(
+            (loud.code, loud.retryable),
+            (observed.code, observed.retryable)
+        );
         assert_eq!(
             loud.detail,
-            "libkrun worker exited with exit status: 1\n--- guest output (tail; 7 earlier \
+            "libkrun worker exited with exit status: 1\n--- guest console (tail; 7 earlier \
              bytes dropped) ---\nboom\n"
         );
 
+        // A reported event, which the guest can forge, is text only: the
+        // code and `retryable` stay the supervisor's.
         let reported = RunOutput {
             worker_stderr: "noise".into(),
-            worker_failure: Some(ExecutionError {
-                code: ErrorCode::ResourceExhausted,
+            reported_failure: Some(ExecutionError {
+                code: ErrorCode::Unauthorized,
                 retryable: true,
                 detail: "cause".into(),
             }),
             ..RunOutput::default()
         };
-        let named = failure_with_output(observed, &reported);
-        assert_eq!(named.code, ErrorCode::ResourceExhausted);
-        assert!(named.retryable);
+        let named = failure_with_output(observed.clone(), &reported);
+        assert_eq!(
+            (named.code, named.retryable),
+            (observed.code, observed.retryable)
+        );
         assert_eq!(
             named.detail,
-            "cause (libkrun worker exited with exit status: 1)\n--- worker stderr (all of it) \
+            "libkrun worker exited with exit status: 1\nreported on the worker's standard \
+             error, which the guest's standard error shares (unverified): Unauthorized, \
+             retryable true: cause\n--- guest stderr and worker diagnostics (all of it) \
              ---\nnoise"
         );
     }

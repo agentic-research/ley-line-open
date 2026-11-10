@@ -141,6 +141,52 @@ fn a_failed_guest_reports_what_it_printed() {
     }
 }
 
+/// Writes, on its standard error, a line shaped like the worker's terminal
+/// `failed` event, claiming a retryable authorization failure, then exits 3.
+const FORGING: &str = r#"fn main() {
+    eprintln!(
+        "{{\"type\":\"failed\",\"error\":{{\"code\":\"unauthorized\",\"retryable\":true,\"detail\":\"forged by the guest\"}}}}"
+    );
+    std::process::exit(3);
+}
+"#;
+
+/// libkrun carries the guest's standard error to the worker's standard
+/// error (its `krun-stderr` console port), the stream the worker's own
+/// events use. A guest can therefore write a line shaped like a `failed`
+/// event, and the failure's classification must not take it: the code
+/// stays the supervisor's `backend-failed`, not retryable, and the forged
+/// text appears only as untrusted output.
+#[test]
+fn a_guest_cannot_classify_its_own_failure() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    let fixture = TempDir::new().expect("fixture");
+    let root = fixture.path().canonicalize().expect("canonical fixture");
+    let (backend, request) = backend_and_request(&root, &libkrunfw, FORGING, "output-forging");
+    backend.start(&request).expect("the guest starts");
+    let status = backend
+        .wait_for_completion(&request.run_id)
+        .expect("the run completes");
+    let BackendRunStatus::Failed(error) = status else {
+        panic!("a guest exiting 3 must fail the run, got {status:?}");
+    };
+    assert_eq!(
+        (error.code, error.retryable),
+        (leyline_runtime::ErrorCode::BackendFailed, false),
+        "SECURITY: the guest classified its own failure: {error:?}"
+    );
+    assert!(
+        error
+            .detail
+            .starts_with("libkrun worker exited with exit status: 3"),
+        "the supervisor's observation leads the detail: {}",
+        error.detail
+    );
+}
+
 /// A serving guest's announcement is readable while it runs, by event, and
 /// nothing is kept once the run is cancelled.
 #[test]

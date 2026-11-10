@@ -597,13 +597,19 @@ pub struct RunOutput {
     pub guest: String,
     /// How many earlier console bytes the tail no longer holds.
     pub guest_dropped_bytes: u64,
-    /// The tail of the worker's own standard error after readiness.
+    /// The tail of the worker's standard error after readiness. libkrun
+    /// carries the guest's standard error there too (its `krun-stderr`
+    /// console port), so this holds the workload's standard error and the
+    /// worker's own diagnostics, interleaved.
     pub worker_stderr: String,
     /// How many earlier worker standard-error bytes the tail no longer holds.
     pub worker_stderr_dropped_bytes: u64,
-    /// The worker's terminal `failed` event, when it wrote one: the cause it
-    /// names for a failure after readiness.
-    pub worker_failure: Option<ExecutionError>,
+    /// The last line on the worker's standard error shaped like its terminal
+    /// `failed` event. UNVERIFIED: the guest writes the same stream and can
+    /// print such a line, so this is a report to read, never a
+    /// classification to act on. A run's failure keeps the supervisor's code
+    /// and `retryable` whatever this says.
+    pub reported_failure: Option<ExecutionError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

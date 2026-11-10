@@ -3853,10 +3853,12 @@ enum Visit<'t> {
 
 /// Whether `node` is a comment that tree-sitter parsed as an `extra` (bead
 /// `ley-line-open-aa1634`): named, `extra`, and of a grammar kind that names
-/// a comment. Across the shipped grammars that is `comment` (Go, Python,
-/// JavaScript, TypeScript, C, C++, Bash, HCL, SQL), `line_comment` and
-/// `block_comment` (Rust, Java). Other named extras, such as Python's
-/// `line_continuation`, are not comments and stay out of the projection.
+/// a comment: `comment`, `line_comment`, `block_comment`, `html_comment`,
+/// `multiline_comment`, `js_comment` across the compiled grammars. Other
+/// named extras, such as Python's `line_continuation`, are not comments and
+/// stay out of the projection. A comment a grammar parses as an ordinary
+/// child (Swift's member-separator `multiline_comment`, bead
+/// `ley-line-open-1b5f3c`) is not an extra and stays in the fold.
 fn is_comment_extra(node: tree_sitter::Node<'_>) -> bool {
     node.is_extra() && node.is_named() && node.kind().contains("comment")
 }

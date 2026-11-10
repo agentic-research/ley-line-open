@@ -108,7 +108,7 @@ Two rules, both measured on a 460-file Rust arena at `projection-v5`:
 
 1. **Never join on ordinal.** `nodes.ord` counts NAMED children, and since
    extraction epoch 7 the comment occurrences among them, and is dense (0, 1,
-   2); `node_child.ordinal` counts ALL non-comment children including unnamed
+   2); `node_child.ordinal` counts ALL non-`extra` children including unnamed
    tokens such as `impl` and `for` (1, 3, 4). They do not correspond.
 2. **`(parent_hash, child_hash)` is not a key.** A parent holding two
    identical-content children in different roles maps to more than one field:
@@ -182,11 +182,23 @@ kind.
 Since extraction epoch 7 (bead `ley-line-open-aa1634`) every comment that
 tree-sitter parsed as an `extra` is an `_ast` occurrence and a `nodes` row.
 Before it the parse walk skipped every `extra` node, so `_ast` held no
-comment. The kinds are the grammars' own: `comment` (Go, Python, JavaScript,
-TypeScript, C, C++, Bash, HCL, SQL), and `line_comment` / `block_comment`
-(Rust, Java). Other named extras, such as Python's `line_continuation`, are
-not comments and still have no row. Comments inside an injected subtree have
-no row either: injected nodes have no `_ast` rows at all.
+comment. A comment is a named `extra` whose grammar kind contains `comment`,
+and the kinds are the grammars' own: `comment` (Go, Python, JavaScript,
+TypeScript, C, C++, Bash, HCL, SQL and others), `line_comment` /
+`block_comment` (Rust, Java, Kotlin, Groovy), `html_comment` (JavaScript,
+TypeScript), `multiline_comment` (Swift), `js_comment` (CSS). Match them with
+`raw_kind LIKE '%comment%'`, never a fixed list. Other named extras, such as
+Python's `line_continuation`, are not comments and still have no row.
+Comments inside an injected subtree have no row either: injected nodes have
+no `_ast` rows at all.
+
+One exception is not an extra: Swift's grammar uses `multiline_comment` as a
+class-member separator (`var a = 1 /* x */ var b = 2`), and Scala aliases a
+shebang to a named `comment`. There the comment is an ordinary child, as it
+was before epoch 7: it is folded into its parent's `node_hash` and takes a
+pre-order ordinal among the code (bead `ley-line-open-1b5f3c`,
+`a_swift_member_separator_comment_is_folded_not_extra`). Every other bullet
+below is about comments parsed as extras.
 
 - **Placement.** A comment sits in source order among the named children of
   the node tree-sitter attached it to (`nodes.parent_nid`, `nodes.ord`). For a
@@ -245,7 +257,7 @@ WITH RECURSIVE run(nid, parent_nid, ord, start_row, depth) AS (
       JOIN nodes s ON s.parent_nid = run.parent_nid AND s.ord = run.ord - 1
       JOIN _ast sa ON sa.nid = s.nid
       JOIN kinds k ON k.kind_id = sa.kind_id
-     WHERE k.raw_kind IN ('comment', 'line_comment', 'block_comment')
+     WHERE k.raw_kind LIKE '%comment%'
        AND sa.end_row - (sa.end_col = 0) >= run.start_row - 1
 )
 SELECT k.raw_kind, c.token
@@ -351,8 +363,11 @@ Produced by `parse_into_conn`. Always present.
 As of `projection-v5` (bead `ley-line-open-17c271`) the node key is a
 file-scoped integer: `nid = (file_id << 24) | ordinal` for files (ordinal 0 =
 the file's own node, the AST root) and their AST nodes; `nid = -dir_id` for
-directories. `ordinal` is the pre-order rank within the file's parse — the
-same dense `0..n-1` the pointer store addresses blobs with, so
+directories. `ordinal` is the pre-order rank within the file's parse among
+its code occurrences; since extraction epoch 7 the file's comment
+occurrences take the ordinals after every code occurrence, in source order
+(bead `ley-line-open-aa1634`), and injected ids the ordinals after those. It
+is the same dense `0..n-1` the pointer store addressed blobs with, so
 `nid & 0xFFFFFF` IS the blob index. Per-file scoping everywhere is
 `nid BETWEEN (file_id<<24) AND (file_id<<24)|0xFFFFFF` — a PK range SEARCH,
 never a prefix-LIKE. Display paths are DERIVED: `v_node_path`/`v_node_name`

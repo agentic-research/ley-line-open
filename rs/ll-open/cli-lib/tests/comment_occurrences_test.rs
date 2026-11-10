@@ -404,6 +404,34 @@ fn a_comment_only_edit_changes_no_node_hash() {
     );
 }
 
+/// The one place a comment is NOT an extra (bead `ley-line-open-1b5f3c`):
+/// Swift's grammar uses `multiline_comment` as a class-member separator, so
+/// there it is an ordinary folded child, in pre-order among the code, and a
+/// comment-only edit in that position moves the enclosing hashes. The
+/// occurrence-only rule covers extras; this pins the exception until 1b5f3c
+/// decides it.
+#[test]
+fn a_swift_member_separator_comment_is_folded_not_extra() {
+    let a = parse_one("c.swift", "class C { var a = 1 /* x */ var b = 2 }\n");
+    let b = parse_one("c.swift", "class C { var a = 1 /* y */ var b = 2 }\n");
+    let sep = |conn: &Connection| -> Occ {
+        occurrences(conn, "c.swift")
+            .into_iter()
+            .find(|o| o.raw_kind == "multiline_comment")
+            .expect("the separator comment is an occurrence")
+    };
+    assert_eq!(sep(&a).parent_kind.as_deref(), Some("class_body"));
+    assert_ne!(
+        code_hashes(&a, "c.swift")
+            .into_iter()
+            .find(|(k, _)| k == "class_body"),
+        code_hashes(&b, "c.swift")
+            .into_iter()
+            .find(|(k, _)| k == "class_body"),
+        "a non-extra comment is in its parent's fold"
+    );
+}
+
 /// The `(nid, grammar kind)` of every non-comment occurrence.
 fn code_nids(conn: &Connection, rel: &str) -> Vec<(i64, String)> {
     let (lo, hi) = file_range(conn, rel);
@@ -740,7 +768,7 @@ fn a_defs_doc_comment_is_its_preceding_comment_run() {
               JOIN nodes s ON s.parent_nid = run.parent_nid AND s.ord = run.ord - 1
               JOIN _ast sa ON sa.nid = s.nid
               JOIN kinds k ON k.kind_id = sa.kind_id
-             WHERE k.raw_kind IN ('comment', 'line_comment', 'block_comment')
+             WHERE k.raw_kind LIKE '%comment%'
                AND sa.end_row - (sa.end_col = 0) >= run.start_row - 1
         )
         SELECT k.raw_kind, cc.token

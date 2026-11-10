@@ -224,7 +224,12 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v3";
 ///   is where its language and grammar kind live (bead
 ///   `ley-line-open-cc5c55`). A v11 arena is refused at parse open.
 ///
-/// Bump on ANY table added or removed, or column added or removed. Two
+/// Bump on ANY table added or removed, or column added or removed. A change
+/// to which rows the parse writes into an unchanged table shape — new fact
+/// rows (extraction epoch 6), new occurrence rows and the ordinal layout
+/// they take (epoch 7, comment occurrences, bead `ley-line-open-aa1634`) —
+/// moves `EXTRACTION_EPOCH` instead, and with it `parserId`; a consumer that
+/// depends on the row set reads `_meta.extraction_epoch`. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer

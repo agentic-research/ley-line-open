@@ -9,7 +9,9 @@ Section: Fixed
   names a leaf `node_content` row whose `token` is the comment text.
   Comments stay out of every other node's `node_hash`, so a comment-only edit
   changes no code `node_hash`, and they add no def, ref or import rows. Other
-  extras (Python's `line_continuation`) still have no row. A doc comment is
+  extras (Python's `line_continuation`) still have no row. Swift's
+  member-separator `multiline_comment` and Scala's shebang `comment` are not
+  extras; they stay folded, as before. A doc comment is
   the comment run directly above a definition; `docs/TABLE_CONTRACT.md` gives
   the query. `EXTRACTION_EPOCH` moves 6 → 7, which moves `parserId` and makes
   an existing arena re-derive on the next parse. Code occurrences keep their

@@ -159,16 +159,24 @@ pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
         None => None,
     };
     let mut signals = ShutdownSignals::install()?;
-
     eprintln!("press Ctrl+C to stop");
+    wait_for(&mut signals, timeout_dur).await;
+    Ok(())
+}
 
-    match signals.wait(timeout_dur).await {
+/// Wait on signals installed earlier, or the timeout, and log which ended
+/// the wait. A command that announces readiness installs its signals first
+/// (bead `ley-line-open-e7459a`): a SIGTERM sent on the announcement must
+/// reach the handler, not the default action, which would kill the process
+/// with none of its shutdown done.
+pub async fn wait_for(signals: &mut ShutdownSignals, timeout: Option<Duration>) -> Shutdown {
+    let ended = signals.wait(timeout).await;
+    match ended {
         Shutdown::Interrupt => eprintln!("\nreceived Ctrl+C, shutting down"),
         Shutdown::Terminate => eprintln!("received SIGTERM, shutting down"),
         Shutdown::Timeout => eprintln!("timeout reached, shutting down"),
     }
-
-    Ok(())
+    ended
 }
 
 #[cfg(test)]

@@ -137,14 +137,19 @@ fn lines_of(child: &mut Child) -> Receiver<String> {
 }
 
 /// Start a daemon and wait for its `daemon ready` line.
-fn start(mut command: Command) -> Running {
+fn start(command: Command) -> Running {
+    start_until(command, "daemon ready")
+}
+
+/// Start a daemon and wait for the first stderr line containing `marker`.
+fn start_until(mut command: Command, marker: &str) -> Running {
     let mut child = command.spawn().expect("spawn leyline daemon");
     let log = lines_of(&mut child);
     let mut seen = Vec::new();
     loop {
         match log.recv_timeout(GUARD) {
             Ok(line) => {
-                let ready = line.contains("daemon ready");
+                let ready = line.contains(marker);
                 seen.push(line);
                 if ready {
                     return Running {
@@ -268,7 +273,7 @@ fn an_explicit_arena_daemon_leaves_the_default_socket_untouched() {
     );
 
     let (status, log) = daemon.stop();
-    assert!(status.success(), "{log}");
+    assert!(status.success(), "{status}:\n{log}");
     assert_eq!(
         std::fs::read_link(&default_sock).unwrap(),
         elsewhere,
@@ -320,7 +325,7 @@ fn the_default_instance_removes_its_own_socket_on_exit() {
     UnixStream::connect(&default_sock).expect("and serves on it");
 
     let (status, log) = daemon.stop();
-    assert!(status.success(), "{log}");
+    assert!(status.success(), "{status}:\n{log}");
     assert!(
         std::fs::symlink_metadata(&default_sock).is_err(),
         "a clean exit removes the default instance's own socket"
@@ -342,13 +347,39 @@ fn the_default_instance_exit_keeps_a_socket_another_daemon_took() {
     let newer = UnixListener::bind(&default_sock).unwrap();
 
     let (status, log) = daemon.stop();
-    assert!(status.success(), "{log}");
+    assert!(status.success(), "{status}:\n{log}");
     assert!(
         std::fs::symlink_metadata(&default_sock).is_ok(),
         "the exiting daemon must not remove a socket it no longer owns"
     );
     UnixStream::connect(&default_sock).expect("the newer daemon still answers");
     drop(newer);
+}
+
+/// A SIGTERM sent the moment the daemon announces itself (its socket line,
+/// before `daemon ready`) reaches the handler: the daemon shuts down cleanly
+/// and removes its socket. It used to install the handlers only after
+/// announcing ready, so a supervisor signalling on the announcement hit the
+/// default action and killed it with nothing cleaned up (seen on Linux CI).
+#[test]
+fn a_sigterm_on_the_socket_announcement_shuts_down_cleanly() {
+    let fx = Fixture::new();
+    let daemon = start_until(
+        fx.daemon(&[
+            "--arena".as_ref(),
+            os(&fx.work("s.arena")),
+            "--control".as_ref(),
+            os(&fx.work("s.ctrl")),
+        ]),
+        "daemon socket at",
+    );
+    let (status, log) = daemon.stop();
+    assert!(status.success(), "{status}:\n{log}");
+    assert!(log.contains("received SIGTERM"), "{log}");
+    assert!(
+        std::fs::symlink_metadata(fx.work("s.sock")).is_err(),
+        "a clean shutdown removes the socket"
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -378,7 +409,7 @@ fn reset_arena_reinitialises_an_unheld_older_control_block() {
     assert_eq!(control_version(&ctrl), 3, "the control block is now v3");
     UnixStream::connect(fx.work("a.sock")).expect("the daemon serves");
     let (status, log) = daemon.stop();
-    assert!(status.success(), "{log}");
+    assert!(status.success(), "{status}:\n{log}");
 }
 
 /// (2) A v2 control block another process holds keeps the refusal under
@@ -481,5 +512,5 @@ fn reset_arena_refuses_a_control_block_a_live_daemon_serves() {
     );
     UnixStream::connect(fx.work("c.sock")).expect("the live daemon still serves");
     let (status, log) = live.stop();
-    assert!(status.success(), "{log}");
+    assert!(status.success(), "{status}:\n{log}");
 }

@@ -332,7 +332,16 @@ pub async fn run_daemon_with_options(
     let source = source.as_deref();
     let backend = backend.as_str();
     let language = language.as_deref();
-    let timeout = timeout.as_deref();
+    // A bad timeout refuses the start before any work. The signal handlers
+    // are installed now, before anything announces this daemon (its socket,
+    // `daemon ready`): a supervisor that sends SIGTERM on that announcement
+    // must reach the handler and get the final snapshot and socket cleanup,
+    // not the default action, which kills the process with neither.
+    let timeout = timeout
+        .as_deref()
+        .map(lifecycle::parse_duration)
+        .transpose()?;
+    let mut shutdown_signals = lifecycle::ShutdownSignals::install()?;
     // Bead `ley-line-open-b7dd03`: gate non-loopback `--mcp-bind` behind
     // an explicit `--mcp-allow-public` flag. The MCP wire now has a
     // shared-secret token gate (ADR-0022 / bead `ley-line-open-b885d1`);
@@ -870,7 +879,7 @@ pub async fn run_daemon_with_options(
     eprintln!("daemon ready — press Ctrl+C to stop");
 
     // 11. Wait for shutdown.
-    lifecycle::wait_for_shutdown(timeout).await?;
+    lifecycle::wait_for(&mut shutdown_signals, timeout).await;
 
     // 12. Graceful shutdown: unmount, final snapshot, cleanup.
     drop(mounted);

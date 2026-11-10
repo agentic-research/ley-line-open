@@ -1764,6 +1764,134 @@ fn vm_to_vm_a_connection_to_a_server_that_never_listens_ends_at_the_bound() {
     );
 }
 
+/// The hang-up guest. It counts the relay's processes, the guest processes
+/// besides init that carry init's name (the relay forks without exec), and
+/// talks to the host over its dial channel, `$DB_ADDR`:
+///
+/// - `dialed`, then it waits for `go`, after which the dial connection's own
+///   relay processes all exist, and reports `baseline <n>`;
+/// - `held` once one more relay process exists: the one holding the host's
+///   serve connection while nothing listens on the served port, which no
+///   process ever does here;
+/// - after the host's `closed`, `released <ms>` once that process is gone,
+///   `ms` timed from `closed`.
+const HANGUP: &str = r#"use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::time::Instant;
+
+fn relays() -> usize {
+    let init = std::fs::read_to_string("/proc/1/comm").unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name != "1"
+                && name.bytes().all(|byte| byte.is_ascii_digit())
+                && std::fs::read_to_string(entry.path().join("comm"))
+                    .map(|comm| comm == init)
+                    .unwrap_or(false)
+        })
+        .count()
+}
+
+fn wait_for(count: usize) {
+    while relays() != count {
+        std::thread::yield_now();
+    }
+}
+
+fn main() {
+    println!("connections-probe-start");
+    let mut host = TcpStream::connect(std::env::var("DB_ADDR").unwrap()).unwrap();
+    let mut lines = BufReader::new(host.try_clone().unwrap()).lines();
+    writeln!(host, "dialed").unwrap();
+    let _ = lines.next();
+    let baseline = relays();
+    println!("hangup: baseline {baseline}");
+    writeln!(host, "baseline {baseline}").unwrap();
+    wait_for(baseline + 1);
+    println!("hangup: held");
+    writeln!(host, "held").unwrap();
+    let _ = lines.next();
+    let closed = Instant::now();
+    println!("hangup: closed");
+    wait_for(baseline);
+    writeln!(host, "released {}", closed.elapsed().as_millis()).unwrap();
+    println!("connections-probe: done");
+    loop {
+        std::thread::park();
+    }
+}
+"#;
+
+/// A held serve connection whose peer hangs up is released then, not at the
+/// bound: the relay's wait ends on the hang-up, and the process holding the
+/// connection exits well inside SERVE_HOLD.
+#[test]
+fn a_held_serve_connection_is_released_when_its_peer_hangs_up() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    if !presentation_is_live_here() {
+        return;
+    }
+    let (_fixture, root) = fixture();
+    let dial_socket = root.join("db.sock");
+    let serve_socket = root.join("api.sock");
+    let listener = UnixListener::bind(&dial_socket).expect("the control peer");
+    let manifest = with_grants(
+        &libkrunfw,
+        vec![
+            dial_grant(&dial_socket, DIAL_PORT),
+            serve_grant(&serve_socket, SERVE_PORT),
+        ],
+    );
+    let served = serve_socket.clone();
+    let control = std::thread::spawn(move || -> Result<u64, String> {
+        let (stream, _) = listener.accept().map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(REPORT_BOUND))
+            .map_err(|error| error.to_string())?;
+        let mut writer = stream.try_clone().map_err(|error| error.to_string())?;
+        let mut lines = BufReader::new(stream).lines();
+        let mut next = |expected: &str| -> Result<String, String> {
+            match lines.next() {
+                Some(Ok(line)) if line.starts_with(expected) => Ok(line),
+                other => Err(format!("expected {expected:?}, got {other:?}")),
+            }
+        };
+        next("dialed")?;
+        writeln!(writer, "go").map_err(|error| error.to_string())?;
+        next("baseline")?;
+        let peer = UnixStream::connect(&served).map_err(|error| error.to_string())?;
+        next("held")?;
+        drop(peer);
+        writeln!(writer, "closed").map_err(|error| error.to_string())?;
+        let released = next("released ")?;
+        released["released ".len()..]
+            .parse()
+            .map_err(|error| format!("{released:?}: {error}"))
+    });
+    let mut booted = Run::new(&root, &libkrunfw, HANGUP, "hangup")
+        .env("DB_ADDR", &format!("127.0.0.1:{DIAL_PORT}"))
+        .manifest(&manifest)
+        .boot();
+    let released = control.join().expect("the control peer");
+    let stderr = booted.guest.end();
+    assert_eq!(booted.report, "done", "worker stderr:\n{stderr}");
+    let released = released.unwrap_or_else(|error| panic!("{error}. worker stderr:\n{stderr}"));
+    assert!(
+        Duration::from_millis(released) < SERVE_HOLD / 2,
+        "the held connection was released {released} ms after its peer hung up; \
+         a release at the bound ({SERVE_HOLD:?}) means the hang-up was not seen"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Acceptance test 9: stability.
 

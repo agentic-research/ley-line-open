@@ -1682,9 +1682,11 @@ static int open_loopback_listener(struct loopback_channel *channel)
  * doubling, to SERVE_RETRY_MAX_MS, so the hold makes at most about 60
  * connect attempts, and each wait is a poll(2) on the host side that ends
  * early when the peer hangs up: nothing spins, and a peer that gave up is
- * not held. Only ECONNREFUSED (nothing listening yet) is retried. Each
- * connection is held in its own process, so a held connection never delays
- * another, on this channel or any other.
+ * not held. Only ECONNREFUSED (nothing listening yet) is retried, and the
+ * bound covers only that: once something listens, a handshake its full
+ * accept queue delays is waited for as a blocking connect(2) would wait.
+ * Each connection is held in its own process, so a held connection never
+ * delays another, on this channel or any other.
  *
  * What the peer sees when the hold ends without a workload: the host end of
  * a serve channel is a UNIX stream socket, and on macOS a UNIX stream peer
@@ -1743,7 +1745,8 @@ static int connect_workload(const struct loopback_channel *channel, int host)
     struct sockaddr_in inet;
     struct pollfd fds[2];
     long deadline = monotonic_ms() + SERVE_HOLD_MS, wait;
-    int delay = SERVE_RETRY_FIRST_MS, error, fd, flags;
+    int delay = SERVE_RETRY_FIRST_MS, error, fd, flags, ready;
+    bool last = false;
     socklen_t length;
 
     loopback_address(&inet, channel->tcp_port);
@@ -1757,13 +1760,23 @@ static int connect_workload(const struct loopback_channel *channel, int host)
             error = errno;
         }
         if (error == EINPROGRESS) {
+            /*
+             * Something listens, and its handshake has not completed (a full
+             * accept queue drops the SYN). The hold bounds only the time
+             * nothing listens, so this waits as the blocking connect(2) it
+             * replaces did: until the kernel completes or abandons the
+             * handshake, or the host side hangs up.
+             */
             fds[0].fd = fd;
             fds[0].events = POLLOUT;
             fds[0].revents = 0;
             fds[1].fd = host;
             fds[1].events = POLLRDHUP;
             fds[1].revents = 0;
-            if (poll_until(fds, 2, deadline) <= 0 || fds[1].revents != 0) {
+            do {
+                ready = poll(fds, 2, -1);
+            } while (ready < 0 && errno == EINTR);
+            if (ready <= 0 || fds[1].revents != 0) {
                 close(fd);
                 return -1;
             }
@@ -1781,18 +1794,23 @@ static int connect_workload(const struct loopback_channel *channel, int host)
             return fd;
         }
         close(fd);
-        if (error != ECONNREFUSED) {
+        if (error != ECONNREFUSED || last) {
             return -1;
         }
-        /* Not listening yet: wait, unless the host side hangs up first. */
+        /*
+         * Not listening yet: wait, unless the host side hangs up first. A
+         * wait the bound cuts short is followed by one last attempt, so a
+         * workload that listens just before the bound is still reached.
+         */
         wait = monotonic_ms() + delay;
+        if (wait >= deadline) {
+            wait = deadline;
+            last = true;
+        }
         fds[0].fd = host;
         fds[0].events = POLLRDHUP;
         fds[0].revents = 0;
-        if (wait > deadline) {
-            wait = deadline;
-        }
-        if (poll_until(fds, 1, wait) != 0 || monotonic_ms() >= deadline) {
+        if (poll_until(fds, 1, wait) != 0) {
             return -1;
         }
         delay = delay * 2 > SERVE_RETRY_MAX_MS ? SERVE_RETRY_MAX_MS : delay * 2;

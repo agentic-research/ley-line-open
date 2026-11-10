@@ -381,40 +381,78 @@ fn the_protocol_fixture_refusal_is_what_the_daemon_sends() {
 }
 
 /// A virtual-table module the build did not have, registered on every
-/// reader as a later `sqlite3_auto_extension` would register one, is refused
-/// when a statement reads it (bead `ley-line-open-a9be1f`). So is a virtual
-/// table in the schema, whose module runs on every read.
+/// reader after the pool restricted its modules (as an extension might),
+/// makes `query` refuse every statement on the reader, the join that names
+/// the module without reporting a read included (bead
+/// `ley-line-open-a9be1f`).
 #[test]
-fn an_unlisted_module_is_refused() {
+fn a_reader_holding_an_unlisted_module_refuses_every_statement() {
     let d = Daemon::start();
     d.on_every_reader(|reader| rusqlite::vtab::series::load_module(reader).unwrap());
     for sql in [
         "SELECT value FROM generate_series(1, 3)",
-        "SELECT count(*) FROM generate_series(1, 3)",
-        "SELECT a FROM t WHERE a IN (SELECT value FROM generate_series(1, 3))",
+        "SELECT x.value FROM (SELECT 3 AS value UNION SELECT 99) AS x \
+         JOIN generate_series(1, 5) USING (value)",
+        "SELECT a FROM t",
     ] {
-        assert_refused(&d, sql, "denied_action", "read");
+        assert_refused(&d, sql, "denied_action", "module");
         assert_eq!(
             d.over_socket(sql)["refusal"]["subject"],
             "generate_series",
             "{sql}"
         );
     }
+}
 
+/// The reader pool holds no module outside the allow-list, so a virtual
+/// table in the schema built on one cannot be read on any reader, directly
+/// or through a join that reports no read: the statement fails with `no
+/// such module` and returns no rows, over both transports, whatever the
+/// reader ran before (bead `ley-line-open-07237c`).
+#[test]
+fn a_schema_virtual_table_is_unreadable() {
+    let d = Daemon::start();
     d.ctx
         .live_db
         .writer
         .lock()
         .execute_batch(
             "CREATE VIRTUAL TABLE docs USING fts5(body);
-             INSERT INTO docs VALUES ('alpha');",
+             INSERT INTO docs VALUES ('alpha');
+             CREATE VIRTUAL TABLE boxes USING rtree(id, x0, x1);
+             INSERT INTO boxes VALUES (2, 0, 1);",
         )
         .unwrap();
-    assert_refused(&d, "SELECT body FROM docs", "denied_action", "read");
-    assert_eq!(
-        d.over_mcp("SELECT body FROM docs").0["refusal"]["subject"],
-        "docs"
-    );
+    for (sql, module) in [
+        ("SELECT body FROM docs", "fts5"),
+        ("SELECT a FROM t NATURAL JOIN docs", "fts5"),
+        ("SELECT id FROM boxes", "rtree"),
+        (
+            "WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM n WHERE id < 5) \
+             SELECT n.id FROM n NATURAL JOIN boxes",
+            "rtree",
+        ),
+    ] {
+        // Twice: the first attempt leaves nothing connected for the second.
+        for _ in 0..2 {
+            let before = d.state();
+            let socket = d.over_socket(sql);
+            let (mcp, is_error) = d.over_mcp(sql);
+            for (transport, reply) in [("socket", &socket), ("mcp", &mcp)] {
+                assert_eq!(reply["ok"], false, "{transport}: {sql}: {reply}");
+                assert!(reply.get("rows").is_none(), "{transport}: {sql}: {reply}");
+                assert!(
+                    reply["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(&format!("no such module: {module}")),
+                    "{transport}: {sql}: {reply}"
+                );
+            }
+            assert!(is_error, "{sql}");
+            assert_eq!(d.state(), before, "{sql} changed the daemon");
+        }
+    }
     // Only `main`'s tables are read: naming the temp schema opens it.
     assert_refused(
         &d,
@@ -443,8 +481,18 @@ fn allowed_modules_return_rows() {
             json!([{"key": "k"}]),
         ),
         (
+            "SELECT count(*) AS n FROM jsonb_each(jsonb('[1, 2]'))",
+            json!([{"n": "2"}]),
+        ),
+        (
             "SELECT name FROM dbstat WHERE name = 't'",
             json!([{"name": "t"}]),
+        ),
+        // A full join's merged column is reported as a read of the
+        // subquery's name, which is not a table of the schema.
+        (
+            "SELECT a FROM (SELECT 1 AS a) AS s FULL JOIN t USING (a) ORDER BY a",
+            json!([{"a": "1"}, {"a": "2"}]),
         ),
     ];
     if cfg!(feature = "vec") {

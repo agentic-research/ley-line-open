@@ -141,9 +141,9 @@ fn query_op(conn: &mut Connection, i: u32) {
 /// them.
 fn catalog_reads(conn: &Connection) {
     for sql in [
-        "SELECT name FROM main.sqlite_schema \
-         WHERE type IN ('table', 'view') AND NOT (type = 'table' AND rootpage = 0)",
         "SELECT name FROM pragma_module_list",
+        "SELECT name, type = 'table' AND rootpage = 0 FROM main.sqlite_schema \
+         WHERE type IN ('table', 'view')",
     ] {
         let mut stmt = conn.prepare(sql).expect("prepare");
         let n = stmt

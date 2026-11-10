@@ -83,8 +83,16 @@ pub fn handle_base_op_value(
     let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_value(parsed);
     Some(match typed_result {
         Ok(typed) => ctx.observe_op(&op, || dispatch_typed(ctx, typed)),
-        Err(e) => build_error_response(&format!("{op}: {e}"))
-            .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}"))),
+        // An execution/v1 request the op cannot decode is `invalidSpec`, as
+        // the runtime classifies a malformed request it decodes itself
+        // (bead `ley-line-open-e347ae`); the text is unchanged.
+        Err(e) => {
+            let message = format!("{op}: {e}");
+            let execution = is_execution_op(&op)
+                .then(|| leyline_runtime::ExecutionError::invalid(message.clone()));
+            error_envelope(&message, execution.as_ref())
+                .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}")))
+        }
     })
 }
 
@@ -205,17 +213,85 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
         } => op_execution_cancel(ctx, run_id, idempotency_key),
     };
     result.unwrap_or_else(|e| {
-        build_error_response(&format!("{e:#}"))
+        handler_error_response(&e)
             .unwrap_or_else(|enc| fallback_error_envelope(&format!("handler error: {enc}")))
     })
+}
+
+/// The error envelope for a failed handler: its message, and, when the
+/// failure is execution/v1's typed [`leyline_runtime::ExecutionError`], its
+/// classification as `executionError` (bead `ley-line-open-e347ae`), so UDS
+/// and MCP callers branch on `code` and `retryable` rather than the text.
+fn handler_error_response(e: &anyhow::Error) -> Result<String> {
+    error_envelope(
+        &format!("{e:#}"),
+        e.downcast_ref::<leyline_runtime::ExecutionError>(),
+    )
+}
+
+/// The error envelope: `message` as `error`, and `execution` as
+/// `executionError` when there is one.
+fn error_envelope(
+    message: &str,
+    execution: Option<&leyline_runtime::ExecutionError>,
+) -> Result<String> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::error_response::Builder =
+        builder.init_root();
+    root.set_error(message);
+    if let Some(execution) = execution {
+        let mut wire = root.init_execution_error();
+        wire.set_code(execution_error_code(execution.code));
+        wire.set_retryable(execution.retryable);
+        wire.set_message(&execution.detail);
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::error_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
+}
+
+/// Whether `op` is an execution/v1 op, whose every failure is classified.
+fn is_execution_op(op: &str) -> bool {
+    op.starts_with("llo_execution_")
+}
+
+/// The daemon schema's mirror of execution/v1's `ErrorCode`.
+fn execution_error_code(
+    code: leyline_runtime::ErrorCode,
+) -> leyline_public_schema::daemon_capnp::ExecutionErrorCode {
+    use leyline_public_schema::daemon_capnp::ExecutionErrorCode as W;
+    use leyline_runtime::ErrorCode as C;
+    match code {
+        C::InvalidSpec => W::InvalidSpec,
+        C::InvalidGrant => W::InvalidGrant,
+        C::Unauthenticated => W::Unauthenticated,
+        C::Unauthorized => W::Unauthorized,
+        C::IdentityPolicyMismatch => W::IdentityPolicyMismatch,
+        C::UnsupportedBackend => W::UnsupportedBackend,
+        C::NotProvisioned => W::NotProvisioned,
+        C::ResourceConflict => W::ResourceConflict,
+        C::ResourceExhausted => W::ResourceExhausted,
+        C::BackendFailed => W::BackendFailed,
+        C::Cancelled => W::Cancelled,
+        C::Internal => W::Internal,
+        C::WorkspaceUnserved => W::WorkspaceUnserved,
+    }
 }
 
 fn execution_handler(
     ctx: &DaemonContext,
 ) -> Result<std::sync::Arc<dyn super::execution::ExecutionHandler>> {
-    ctx.ext
-        .execution_handler()
-        .ok_or_else(|| anyhow::anyhow!("execution/v1 service is not configured"))
+    ctx.ext.execution_handler().ok_or_else(|| {
+        // Classified (bead `ley-line-open-e347ae`): this daemon serves no
+        // execution/v1 backend at all, and retrying here cannot change
+        // that.
+        leyline_runtime::ExecutionError {
+            code: leyline_runtime::ErrorCode::UnsupportedBackend,
+            retryable: false,
+            detail: "execution/v1 service is not configured".into(),
+        }
+        .into()
+    })
 }
 
 fn op_execution_capabilities(ctx: &DaemonContext) -> Result<String> {
@@ -1024,19 +1100,18 @@ fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
         // An unresolvable parent lists as empty — the same answer the
         // pre-v5 `WHERE parent_id = ?` gave an unknown id.
         let parent_nid = leyline_schema::resolve_path(conn, id)?;
-        let ids: Vec<(i64, String, i32, i64)> = match parent_nid {
+        let ids: Vec<(String, i32, i64)> = match parent_nid {
             Some(parent_nid) => {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT n.nid, v.name, n.kind, n.size \
+                    "SELECT v.name, n.kind, n.size \
                      FROM nodes n JOIN v_node_name v ON v.nid = n.nid \
                      WHERE n.parent_nid = ?1 ORDER BY v.name",
                 )?;
                 stmt.query_map([parent_nid], |row| {
                     Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i32>(2)?,
-                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i64>(2)?,
                     ))
                 })?
                 .collect::<Result<_, _>>()?
@@ -1046,13 +1121,12 @@ fn op_list_children(ctx: &DaemonContext, id: &str) -> Result<String> {
         let parent_path = id.to_string();
         let raw: Vec<(String, String, String, i32, i64)> = ids
             .into_iter()
-            .map(|(nid, name, kind, size)| {
+            .map(|(name, kind, size)| {
                 let child_path = if parent_path.is_empty() {
                     name.clone()
                 } else {
                     format!("{parent_path}/{name}")
                 };
-                let _ = nid;
                 (child_path, parent_path.clone(), name, kind, size)
             })
             .collect();
@@ -2112,10 +2186,10 @@ fn query_lsp_rows_for_file<F>(
     file: &str,
     table: &str,
     sql: &str,
-    mapper: F,
+    mut mapper: F,
 ) -> Result<Vec<serde_json::Value>>
 where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value>,
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Map<String, serde_json::Value>>,
 {
     if !table_exists(conn, table) {
         return Ok(vec![]);
@@ -2125,28 +2199,37 @@ where
     let Some((lo, hi)) = file_range_params(conn, file)? else {
         return Ok(vec![]);
     };
+    // Every statement selects the row's `nid` first. It is read here as a
+    // `Nid`, a locator with no serde encoding, and stays out of the reply
+    // JSON the mapper builds from the other columns: the row cannot carry a
+    // bare locator, by type (bead `ley-line-open-765bd5`).
     let mut stmt = conn.prepare_cached(sql)?;
-    let mut rows = stmt
-        .query_map(rusqlite::params![lo, hi], mapper)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = stmt
+        .query_map(rusqlite::params![lo, hi], |row| {
+            Ok((row.get::<_, Nid>(0)?, mapper(row)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(Nid, serde_json::Map<String, serde_json::Value>)>>>()?;
     // Wire contract: consumers address nodes by display path, and EVERY row
     // carries `node_id` (seam-audit F2 — v4 always had one; a strict decoder
-    // may reject its absence). The mapper's `nid` is the row's key inside
-    // the arena and is replaced by `node_id`, never emitted (bead
-    // `ley-line-open-80f037` F3). Rendering matches `wire_ref_of`; a render
-    // failure propagates.
-    for v in &mut rows {
-        if let Some(obj) = v.as_object_mut()
-            && let Some(nid) = obj.remove("nid").and_then(|n| n.as_i64())
-        {
-            // The mapper carried the row key as a bare integer only so it
-            // could ride in this `Value`; it re-enters the locator type here
-            // and leaves as a display path.
-            let nid = Nid::from_raw(nid);
-            obj.insert("node_id".to_string(), json!(node_id_of(conn, nid)?));
-        }
-    }
-    Ok(rows)
+    // may reject its absence). The `nid` is the row's key inside the arena
+    // and is rendered as `node_id`, never emitted (bead `ley-line-open-80f037`
+    // F3). Rendering matches `wire_ref_of`; a render failure propagates.
+    rows.into_iter()
+        .map(|(nid, mut fields)| {
+            fields.insert("node_id".to_string(), json!(node_id_of(conn, nid)?));
+            Ok(serde_json::Value::Object(fields))
+        })
+        .collect()
+}
+
+/// A row's reply fields, by name, for a row mapper.
+fn fields<const N: usize>(
+    pairs: [(&str, serde_json::Value); N],
+) -> serde_json::Map<String, serde_json::Value> {
+    pairs
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
 }
 
 /// Document symbols for a file.
@@ -2159,15 +2242,14 @@ fn op_lsp_symbols(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
     );
     ctx.with_read(|conn| {
         let rows = query_lsp_rows_for_file(conn, file, "_lsp", &sql, |row| {
-            Ok(json!({
-                "nid": row.get::<_, i64>(0)?,
-                "kind": row.get::<_, String>(1)?,
-                "detail": row.get::<_, String>(2)?,
-                "start_line": row.get::<_, i32>(3)?,
-                "start_col": row.get::<_, i32>(4)?,
-                "end_line": row.get::<_, i32>(5)?,
-                "end_col": row.get::<_, i32>(6)?,
-            }))
+            Ok(fields([
+                ("kind", json!(row.get::<_, String>(1)?)),
+                ("detail", json!(row.get::<_, String>(2)?)),
+                ("start_line", json!(row.get::<_, i32>(3)?)),
+                ("start_col", json!(row.get::<_, i32>(4)?)),
+                ("end_line", json!(row.get::<_, i32>(5)?)),
+                ("end_col", json!(row.get::<_, i32>(6)?)),
+            ]))
         })?;
         Ok(lsp_rows_response("symbols", rows, false))
     })
@@ -2184,14 +2266,13 @@ fn op_lsp_diagnostics(ctx: &DaemonContext, args: &LspFile) -> Result<String> {
     );
     ctx.with_read(|conn| {
         let rows = query_lsp_rows_for_file(conn, file, "_lsp", &sql, |row| {
-            Ok(json!({
-                "nid": row.get::<_, i64>(0)?,
-                "diagnostics": row.get::<_, String>(1)?,
-                "start_line": row.get::<_, i32>(2)?,
-                "start_col": row.get::<_, i32>(3)?,
-                "end_line": row.get::<_, i32>(4)?,
-                "end_col": row.get::<_, i32>(5)?,
-            }))
+            Ok(fields([
+                ("diagnostics", json!(row.get::<_, String>(1)?)),
+                ("start_line", json!(row.get::<_, i32>(2)?)),
+                ("start_col", json!(row.get::<_, i32>(3)?)),
+                ("end_line", json!(row.get::<_, i32>(4)?)),
+                ("end_col", json!(row.get::<_, i32>(5)?)),
+            ]))
         })?;
         Ok(lsp_rows_response("diagnostics", rows, false))
     })
@@ -5994,10 +6075,9 @@ mod tests {
         // for the asymmetry caught by the iter-35 adversarial review.
         let conn = Connection::open_in_memory().unwrap();
         let sql = format!("SELECT nid FROM _lsp WHERE {NID_FOR_FILE}");
-        let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
-            Ok(json!({"nid": row.get::<_, i64>(0)?}))
-        })
-        .unwrap();
+        let rows =
+            query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |_row| Ok(fields([])))
+                .unwrap();
         assert!(rows.is_empty(), "missing table must yield empty, not error");
     }
 
@@ -6040,7 +6120,7 @@ mod tests {
         .unwrap();
         let sql = format!("SELECT nid, foo FROM _lsp WHERE {NID_FOR_FILE}");
         let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
-            Ok(json!({"nid": row.get::<_, i64>(0)?, "foo": row.get::<_, String>(1)?}))
+            Ok(fields([("foo", json!(row.get::<_, String>(1)?))]))
         })
         .unwrap();
         assert!(rows.is_empty());
@@ -6059,7 +6139,7 @@ mod tests {
         .unwrap();
         let sql = format!("SELECT nid, foo FROM _lsp WHERE {NID_FOR_FILE}");
         let rows = query_lsp_rows_for_file(&conn, "src/lib.rs", "_lsp", &sql, |row| {
-            Ok(json!({"nid": row.get::<_, i64>(0)?, "foo": row.get::<_, String>(1)?}))
+            Ok(fields([("foo", json!(row.get::<_, String>(1)?))]))
         })
         .unwrap();
         assert_eq!(rows.len(), 2, "expected 2 scoped rows, got {rows:?}");
@@ -7987,6 +8067,117 @@ mod tests {
         assert_eq!(real.node_id, "a.go/x");
     }
 
+    /// Bead `ley-line-open-e347ae`: every execution/v1 error code reaches the
+    /// envelope as the schema's camelCase name with its `retryable`, beside
+    /// the unchanged message; the daemon schema's mirror enum is
+    /// execution.capnp's, name for name; a failure that is not an execution
+    /// error carries no classification.
+    #[test]
+    fn an_execution_error_envelope_carries_its_classification() {
+        let names = |schema: capnp::schema::EnumSchema| -> Vec<String> {
+            schema
+                .get_enumerants()
+                .unwrap()
+                .into_iter()
+                .map(|e| {
+                    e.get_proto()
+                        .get_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        };
+        let enum_of = |ty: capnp::introspect::Type| match ty.which() {
+            capnp::introspect::TypeVariant::Enum(raw) => capnp::schema::EnumSchema::new(raw),
+            _ => panic!("not an enum"),
+        };
+        use capnp::introspect::Introspect;
+        assert_eq!(
+            names(enum_of(
+                leyline_public_schema::daemon_capnp::ExecutionErrorCode::introspect()
+            )),
+            names(enum_of(
+                leyline_public_schema::execution_capnp::ErrorCode::introspect()
+            )),
+        );
+
+        for (i, code) in leyline_runtime::ErrorCode::ALL.into_iter().enumerate() {
+            let retryable = i % 2 == 0;
+            let error = leyline_runtime::ExecutionError {
+                code,
+                retryable,
+                detail: "why".into(),
+            };
+            let expected_message = error.to_string();
+            let e = anyhow::Error::new(error);
+            let reply: serde_json::Value =
+                serde_json::from_str(&handler_error_response(&e).unwrap()).unwrap();
+            assert_eq!(
+                reply,
+                json!({
+                    "ok": false,
+                    "error": expected_message,
+                    "executionError": {
+                        "code": code.wire_name(),
+                        "retryable": retryable,
+                        "message": "why",
+                    },
+                }),
+                "{code:?}"
+            );
+        }
+        let plain: serde_json::Value = serde_json::from_str(
+            &handler_error_response(&anyhow::anyhow!("not an execution error")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plain,
+            json!({"ok": false, "error": "not an execution error"})
+        );
+    }
+
+    /// Bead `ley-line-open-e347ae`: every failed execution/v1 op is
+    /// classified, not only the runtime's own errors. A request the op
+    /// cannot decode is `invalidSpec` with its text unchanged; a daemon with
+    /// no execution/v1 service is `unsupportedBackend`; a non-execution op's
+    /// decode failure carries no classification.
+    #[tokio::test]
+    async fn every_failed_execution_op_is_classified() {
+        let (_dir, ctx) = setup();
+        let reply = |line: &str| -> serde_json::Value {
+            serde_json::from_str(&handle_base_op(&ctx, line).expect("a known op")).unwrap()
+        };
+
+        let undecodable = reply(r#"{"op":"llo_execution_collect"}"#);
+        assert_eq!(undecodable["ok"], false, "{undecodable}");
+        let text = undecodable["error"].as_str().unwrap().to_owned();
+        assert!(text.starts_with("llo_execution_collect: "), "{text}");
+        assert_eq!(
+            undecodable["executionError"],
+            json!({"code": "invalidSpec", "retryable": false, "message": text}),
+        );
+
+        let unconfigured = reply(r#"{"op":"llo_execution_status","runId":""}"#);
+        assert_eq!(
+            unconfigured,
+            json!({
+                "ok": false,
+                "error": "UnsupportedBackend: execution/v1 service is not configured",
+                "executionError": {
+                    "code": "unsupportedBackend",
+                    "retryable": false,
+                    "message": "execution/v1 service is not configured",
+                },
+            })
+        );
+
+        let other = reply(r#"{"op":"get_node"}"#);
+        assert_eq!(other["ok"], false, "{other}");
+        assert!(other.get("executionError").is_none(), "{other}");
+    }
+
     /// Bead `ley-line-open-80f037` F3(e): a nid is arena-local
     /// (TABLE_CONTRACT; ADR-0034 D6) and never goes on the wire. A fact row
     /// whose node has neither a tree path nor a `_source` anchor is refused
@@ -8012,7 +8203,7 @@ mod tests {
         .unwrap();
         let sql = format!("SELECT nid, foo FROM _lsp WHERE {NID_FOR_FILE}");
         let rows = query_lsp_rows_for_file(&conn, "a.go", "_lsp", &sql, |row| {
-            Ok(json!({"nid": row.get::<_, i64>(0)?, "foo": row.get::<_, String>(1)?}))
+            Ok(fields([("foo", json!(row.get::<_, String>(1)?))]))
         })
         .unwrap();
         let mut ids: Vec<&str> = rows

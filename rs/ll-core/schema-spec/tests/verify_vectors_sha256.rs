@@ -1,11 +1,9 @@
 //! `verify_vectors_sha256` — walk every `VECTORS.sha256` file in the spec
 //! tree and re-hash the listed vector files, asserting SHA-256 equality.
 //!
-//! The spec dirs ship two `VECTORS.sha256` files, one per capability that
-//! publishes conformance vectors:
-//!
-//! - `credential-isolation/v1/VECTORS.sha256`
-//! - `build-cache/v1/vectors/VECTORS.sha256`
+//! Each capability that publishes conformance vectors ships one
+//! `VECTORS.sha256` file; [`VECTORS_FILES`] lists them, and
+//! `every_vectors_file_on_disk_is_listed` keeps that list complete.
 //!
 //! Each file uses the standard `sha256sum` line shape (`<hex>  <path>`),
 //! where `<path>` is relative to the directory containing the
@@ -86,6 +84,35 @@ fn verify_vectors_sha256() {
     assert!(
         checked > 0,
         "verify_vectors_sha256 found no vectors to check — did the spec tree move?"
+    );
+}
+
+/// Every `VECTORS.sha256` file in the spec tree is in [`VECTORS_FILES`]: a
+/// pin file the list misses would never be checked.
+#[test]
+fn every_vectors_file_on_disk_is_listed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut on_disk = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|n| n == "VECTORS.sha256") {
+                let rel = path.strip_prefix(&root).expect("under the crate root");
+                on_disk.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    on_disk.sort();
+    let mut listed: Vec<String> = VECTORS_FILES.iter().map(|s| s.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        on_disk, listed,
+        "VECTORS_FILES must list exactly the VECTORS.sha256 files in the spec tree"
     );
 }
 

@@ -7,7 +7,7 @@
 //! **Known RED.** `run_id` is `"run-" ‖ σ_bytes(domain ‖ 0x00 ‖ fields)`:
 //! plain σ over an in-band-prefixed preimage, so the bytes of that preimage,
 //! stored as a blob, have the run's address as their `blob_hash`. The strict
-//! test is `#[ignore]`d until ADR-0047 M3 (`ley-line-open-73add7`, run-id v2
+//! test is `#[ignore]`d until ADR-0047 M3 (`ley-line-open-ab2093`, run-id v2
 //! under `derive_key`); the `_measured` test runs in every `task ci` and pins
 //! today's aliasing so M3 cannot land without flipping both.
 
@@ -52,7 +52,7 @@ fn aliases() -> usize {
 /// Law (c) (ADR-0047 §1.2): a blob holding `run_id`'s encoding does not
 /// carry the run's address.
 #[test]
-#[ignore = "RED until ADR-0047 M3 (73add7): run_id is plain σ over a prefixed preimage"]
+#[ignore = "RED until ADR-0047 M3 (ab2093): run_id is plain σ over a prefixed preimage"]
 fn crafted_preimage_does_not_alias_across_constructions() {
     assert_eq!(
         aliases(),
@@ -68,7 +68,7 @@ fn crafted_preimage_does_not_alias_across_constructions() {
 fn crafted_preimage_does_not_alias_across_constructions_measured() {
     let n = aliases();
     eprintln!(
-        "crafted_preimage_does_not_alias_across_constructions (run_id): {n} of {} cases alias: RED until 73add7",
+        "crafted_preimage_does_not_alias_across_constructions (run_id): {n} of {} cases alias: RED until ab2093",
         cases().len()
     );
     assert_eq!(

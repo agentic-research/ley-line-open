@@ -21,9 +21,13 @@ name: leyline-schema-go
 # All `run:` blocks below execute repo-controlled scripts only; no
 # untrusted ${{ github.event.* }} input is interpolated.
 
+# `integration` as well as `main` (bead ley-line-open-a4787a): feature PRs
+# land on integration, so with a main-only filter a clients/go change reached
+# integration untested by GitHub, and the first GitHub Go run was the
+# promotion PR.
 on:
   push:
-    branches: [main]
+    branches: [main, integration]
     paths:
       - "clients/go/leyline-schema/**"
       - "rs/ll-core/schema-capnp/schemas/**"
@@ -32,7 +36,7 @@ on:
       - "rs/ll-core/schema-spec/sigma/**"
       - ".github/workflows/leyline-schema-go.yml"
   pull_request:
-    branches: [main]
+    branches: [main, integration]
     paths:
       - "clients/go/leyline-schema/**"
       - "rs/ll-core/schema-capnp/schemas/**"

@@ -361,6 +361,23 @@
     "go_drift_skip": null
   },
 
+  "llo_execution_status_unconfigured": {
+    "request": {"op": "llo_execution_status", "runId": ""},
+    "response": {
+      "ok": false,
+      "error": "UnsupportedBackend: execution/v1 service is not configured",
+      "executionError": {
+        "code": "unsupportedBackend",
+        "retryable": false,
+        "message": "execution/v1 service is not configured"
+      }
+    },
+    "response_required_keys": ["ok", "error", "executionError"],
+    "response_optional_keys": [],
+    "go_binding": "ExecutionErrorResponse",
+    "go_drift_skip": null
+  },
+
   "sheaf_set_topology": {
     "request": {
       "op": "sheaf_set_topology",

@@ -34,6 +34,34 @@ use anyhow::{Context, Result};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
+/// The reader pool's connection manager: [`SqliteConnectionManager`], except
+/// that a reader whose temp database has been opened is discarded when it
+/// returns to the pool, and the pool opens a fresh one (bead
+/// `ley-line-open-3befbc`). The `query` op refuses a statement that opens
+/// it, but SQLite opens the temp schema while preparing such a statement
+/// (a `NATURAL` join with `temp.sqlite_master`, `pragma_table_info(..,
+/// 'temp')`), before the refusal; no reader op uses it, so a reader that has
+/// it open is one a caller changed, and is not handed out again.
+#[derive(Debug)]
+pub struct ReaderManager(SqliteConnectionManager);
+
+impl r2d2::ManageConnection for ReaderManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> std::result::Result<Connection, rusqlite::Error> {
+        self.0.connect()
+    }
+
+    fn is_valid(&self, conn: &mut Connection) -> std::result::Result<(), rusqlite::Error> {
+        self.0.is_valid(conn)
+    }
+
+    fn has_broken(&self, conn: &mut Connection) -> bool {
+        super::sql_read_only::temp_is_open(conn)
+    }
+}
+
 /// The daemon's living-database container. Replaces the pre-15b
 /// `Mutex<Connection>` field on `DaemonContext`.
 ///
@@ -47,7 +75,7 @@ pub struct LiveDb {
     /// pool on Drop. Each pool connection has `query_only=ON` so a
     /// misclassified write path fails with `SQLITE_READONLY` instead
     /// of silently mutating state.
-    pub reader_pool: r2d2::Pool<SqliteConnectionManager>,
+    pub reader_pool: r2d2::Pool<ReaderManager>,
     /// Single dedicated writer connection. Held exclusively by
     /// `with_write` — SQLite WAL serializes writers at the file
     /// level, and this `Mutex` mirrors that constraint at the Rust
@@ -140,7 +168,7 @@ impl LiveDb {
             // for the p99-read-latency assertion; a cold pool would
             // pay a first-open cost inside the measured window.
             .min_idle(Some(pool_size))
-            .build(manager)
+            .build(ReaderManager(manager))
             .with_context(|| {
                 format!(
                     "build reader connection pool for live_db at {}",
@@ -207,6 +235,42 @@ mod tests {
         assert_eq!(mode.to_lowercase(), "wal");
         conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
         conn
+    }
+
+    /// Bead `ley-line-open-3befbc`: a reader returned with its temp database
+    /// open is discarded and replaced by a fresh one; a reader returned
+    /// without is kept, the same connection, its per-connection settings
+    /// intact.
+    #[test]
+    fn a_reader_with_its_temp_database_open_is_discarded() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pool_test.db");
+        let live = LiveDb::new(wal_writer(&path), &path, 1).unwrap();
+        let cache_size = |conn: &Connection| -> i64 {
+            conn.query_row("PRAGMA cache_size", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let reader = live.reader_pool.get().unwrap();
+        assert!(!crate::daemon::sql_read_only::temp_is_open(&reader));
+        reader.pragma_update(None, "cache_size", -1234).unwrap();
+        drop(reader);
+        let reader = live.reader_pool.get().unwrap();
+        assert_eq!(cache_size(&reader), -1234, "a clean reader is kept");
+
+        reader
+            .query_row("SELECT count(*) FROM temp.sqlite_master", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert!(crate::daemon::sql_read_only::temp_is_open(&reader));
+        drop(reader);
+        let reader = live.reader_pool.get().unwrap();
+        assert!(
+            !crate::daemon::sql_read_only::temp_is_open(&reader),
+            "the dirtied reader was replaced"
+        );
+        assert_ne!(cache_size(&reader), -1234, "by a fresh connection");
     }
 
     #[test]

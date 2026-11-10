@@ -1,6 +1,6 @@
 [package]
 name = "leyline-cache"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Restriction-addressed derived-view cache (ADR-0031): a review result keyed by a tagged fold over its input closure"

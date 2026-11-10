@@ -139,6 +139,26 @@ leyline execution-daemon \
   --trust-key /etc/leyline/trust/issuer.pub
 ```
 
+`--cas-root` holds rootfs trees named by the BLAKE3 of their
+`rootfs.manifest.json`. To make one from a container image, write the image as
+an OCI image layout (skopeo, crane, `docker buildx --output type=oci`, buildah
+or podman; none is needed afterwards) and import it by digest:
+
+```bash
+leyline rootfs import-oci \
+  --layout ./app-oci \
+  --image sha256:<index or manifest digest> \
+  --cas-root /var/lib/leyline/cas \
+  --symlinks resolve
+```
+
+It selects this host's Linux platform, verifies every blob, applies the layers
+with OCI whiteout semantics, and prints JSON whose `rootfs` is the catalog
+entry's `rootfs`. Tags are refused. The image format is never the isolation
+boundary; the backend is. See
+[`rs/ll-open/runtime/README.md`](rs/ll-open/runtime/README.md) "Container
+images" for the contract.
+
 The catalog is local trusted configuration; it is not a substitute for the
 signed `RunSpec`/`RunGrant` wire contract. Signet/NotMe/Interlace trust roots
 remain embedding-owned: production callers must pass an `EvidenceVerifier` to

@@ -1,0 +1,4 @@
+Section: Fixed
+
+- **An execution receipt's `inputRoots` now names the run's rootfs** (bead `ley-line-open-68a55d`).
+  `RunReceipt.inputRoots` is documented as the content roots materialized for the run, and the runtime's own comments said the rootfs reached it, but `start_authorized` recorded only the workspace graph roots: a receipt for a run without a workspace named no content at all, and nothing in it identified the rootfs the workload ran in. The list is now the rootfs digest the resolver chose (which the backend verifies before the workload runs), then each granted workspace's graph root, on both backends. A consumer that read an empty list as "no workspace" should look for workspace roots after the first entry. Found by a new hypervisor-suite test that boots a rootfs produced by `leyline rootfs import-oci` in a libkrun guest through execution/v1 and checks the receipt names it.

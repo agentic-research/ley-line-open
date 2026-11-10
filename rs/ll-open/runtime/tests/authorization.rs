@@ -1411,6 +1411,81 @@ fn the_receipt_names_the_workspace_share_the_run_held() {
     assert_eq!(receipt.backend_evidence.channels, Vec::new());
 }
 
+/// `RunReceipt.inputRoots` is "Content roots materialized for the run"
+/// (execution.capnp): the rootfs the resolver chose, which every backend
+/// verifies against its digest before the workload runs, and then each
+/// granted workspace's graph root. A receipt that left the rootfs out named
+/// nothing about what ran (bead `ley-line-open-68a55d`).
+#[test]
+fn the_receipt_input_roots_name_the_rootfs_then_each_granted_workspace() {
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let confinement = "b".repeat(64);
+    // Distinct from TestResolver's rootfs ("a" x 64), so the order is seen.
+    let root = "e".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &root)]);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![(
+                "repo",
+                &root,
+                vec![execution_capnp::WorkspaceOperation::Read],
+            )],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    let rootfs = format!("blake3-256:{}", "a".repeat(64));
+
+    let service = ExecutionService::new(SharingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-roots")
+        .expect("provision backend");
+    let shared = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect("a run granted a workspace");
+    let receipt = service.collect(&shared.run_id).expect("collect");
+    assert_eq!(
+        receipt.context.input_roots,
+        vec![rootfs.clone(), format!("blake3-256:{root}")]
+    );
+    let wire: serde_json::Value = serde_json::from_str(
+        &collect_json(&service, &json!({"runId": shared.run_id}).to_string())
+            .expect("collect JSON"),
+    )
+    .expect("receipt JSON");
+    assert_eq!(
+        wire["receipt"]["inputRoots"],
+        json!([
+            {"algorithm": "blake3-256", "value": "a".repeat(64)},
+            {"algorithm": "blake3-256", "value": root},
+        ])
+    );
+
+    let plain_spec = spec_bytes();
+    let plain_grant = grant_bytes(&plain_spec, true, 2_000, 0);
+    let plain_service = ExecutionService::new(SharingBackend);
+    plain_service
+        .provision(BackendClass::MicroVm, "provision-plain-roots")
+        .expect("provision backend");
+    let plain = plain_service
+        .start_authorized(&plain_spec, &plain_grant, &policy, &TestResolver)
+        .expect("a run without a workspace");
+    let receipt = plain_service.collect(&plain.run_id).expect("collect");
+    assert_eq!(receipt.context.input_roots, vec![rootfs]);
+}
+
 /// Starts every run and serves none of its workspaces: a tier that accepts a
 /// workspace grant and drops it. Records each run it is told to cancel.
 #[derive(Clone, Default)]

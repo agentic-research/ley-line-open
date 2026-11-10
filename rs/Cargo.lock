@@ -4823,6 +4823,8 @@ version = "0.26.0"
 dependencies = [
  "blake3",
  "capnp",
+ "flate2",
+ "hex",
  "leyline-cli-lib",
  "leyline-public-schema",
  "leyline-runtime",
@@ -4831,6 +4833,8 @@ dependencies = [
  "libkrun",
  "parking_lot",
  "serde_json",
+ "sha2 0.10.9",
+ "tar",
  "tempfile",
  "wait-timeout",
 ]

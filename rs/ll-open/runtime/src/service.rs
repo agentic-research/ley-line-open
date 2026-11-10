@@ -389,6 +389,12 @@ impl<B: Backend> ExecutionService<B> {
                 "resolver changed the grant's workspaces",
             ));
         }
+        // `inputRoots` is "Content roots materialized for the run": the
+        // rootfs the resolver chose, which the backend verifies against this
+        // digest before the workload runs, then each granted workspace. The
+        // rootfs is read here, from the request the backend is handed, so the
+        // receipt names what was materialized rather than what was asked for.
+        let rootfs = format!("{}:{}", request.rootfs.algorithm, request.rootfs.value);
         let record = self.start(request)?;
         self.state.write().receipts.insert(
             record.run_id.clone(),
@@ -397,11 +403,14 @@ impl<B: Backend> ExecutionService<B> {
                 run_grant_digest: authorized.grant_digest,
                 confinement_digest: authorized.confinement_digest,
                 backend_class: authorized.backend,
-                input_roots: authorized
-                    .intent
-                    .workspace_inputs
-                    .into_iter()
-                    .map(|workspace| workspace.graph_root)
+                input_roots: std::iter::once(rootfs)
+                    .chain(
+                        authorized
+                            .intent
+                            .workspace_inputs
+                            .into_iter()
+                            .map(|workspace| workspace.graph_root),
+                    )
                     .collect(),
             },
         );

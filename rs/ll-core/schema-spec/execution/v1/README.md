@@ -63,10 +63,12 @@ cannot serve one refuses the start before it spawns anything, with
 backend class can tell "this tier serves no workspace" from the
 `unsupportedBackend` refusals (egress, an unenforceable ceiling, another
 tier's grant) by code. The Rust `ExecutionError` carries it as `code`; the
-daemon, CLI and MCP replies carry it today only as the error text's prefix
-(`WorkspaceUnserved: …`), without a structured `code` or `retryable` field
-(bead `ley-line-open-e347ae`). Choosing another tier is the caller's policy;
-the runtime does not reroute a run.
+daemon's error envelope, on the control socket and over MCP alike, carries
+it as `executionError: {"code": "workspaceUnserved", "retryable": false}`
+(`daemon.capnp` `ExecutionErrorClass`, bead `ley-line-open-e347ae`), beside
+the unchanged error text, whose `WorkspaceUnserved: …` prefix earlier
+consumers match. Choosing another tier is the caller's policy; the runtime
+does not reroute a run.
 
 The service also checks the backend's answer: the workspace shares the
 backend reports holding (the `workspaceShare` channels of its evidence

@@ -237,6 +237,42 @@ mod tests {
         conn
     }
 
+    /// Bead `ley-line-open-3befbc`: a reader returned with its temp database
+    /// open is discarded and replaced by a fresh one; a reader returned
+    /// without is kept, the same connection, its per-connection settings
+    /// intact.
+    #[test]
+    fn a_reader_with_its_temp_database_open_is_discarded() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pool_test.db");
+        let live = LiveDb::new(wal_writer(&path), &path, 1).unwrap();
+        let cache_size = |conn: &Connection| -> i64 {
+            conn.query_row("PRAGMA cache_size", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let reader = live.reader_pool.get().unwrap();
+        assert!(!crate::daemon::sql_read_only::temp_is_open(&reader));
+        reader.pragma_update(None, "cache_size", -1234).unwrap();
+        drop(reader);
+        let reader = live.reader_pool.get().unwrap();
+        assert_eq!(cache_size(&reader), -1234, "a clean reader is kept");
+
+        reader
+            .query_row("SELECT count(*) FROM temp.sqlite_master", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert!(crate::daemon::sql_read_only::temp_is_open(&reader));
+        drop(reader);
+        let reader = live.reader_pool.get().unwrap();
+        assert!(
+            !crate::daemon::sql_read_only::temp_is_open(&reader),
+            "the dirtied reader was replaced"
+        );
+        assert_ne!(cache_size(&reader), -1234, "by a fresh connection");
+    }
+
     #[test]
     fn default_pool_size_respects_bounds() {
         let size = default_pool_size();

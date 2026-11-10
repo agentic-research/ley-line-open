@@ -630,6 +630,43 @@ struct ErrorResponse {
   # so the wire always reads `"ok": false` for error responses. Added
   # additively per ADR-0014 §2; pre-b0ea2e the field was on every typed
   # envelope via the hand-written wire.rs ErrorResponse struct.
+
+  executionError @2 :ExecutionErrorClass $Json.name("executionError");
+  # Set only when an execution/v1 op (`llo_execution_*`) fails with the
+  # runtime's typed error: its classification, so a caller branches on
+  # `code` and `retryable` instead of reading `error` (bead
+  # `ley-line-open-e347ae`). Absent from every other error envelope.
+  # Additive: `error` keeps its text, whose `<Code>: ` prefix (Rust Debug
+  # spelling, e.g. `WorkspaceUnserved: `) existing consumers match.
+}
+
+# The machine-readable part of execution/v1's `ExecutionError`
+# (`execution.capnp`), carried by the daemon's error envelope on the UDS and
+# MCP transports alike.
+struct ExecutionErrorClass {
+  code      @0 :ExecutionErrorCode;
+  retryable @1 :Bool;
+  # Whether a retry under the same authority may succeed.
+}
+
+# execution/v1's `ErrorCode` (`rs/ll-core/schema-spec/execution/v1/
+# execution.capnp`), enumerant for enumerant and ordinal for ordinal; a test
+# (`daemon::ops`) fails if the two drift. On the JSON wire each is its
+# camelCase name, the spelling of execution-tools.json's `ErrorCode`.
+enum ExecutionErrorCode {
+  invalidSpec            @0;
+  invalidGrant           @1;
+  unauthenticated        @2;
+  unauthorized           @3;
+  identityPolicyMismatch @4;
+  unsupportedBackend     @5;
+  notProvisioned         @6;
+  resourceConflict       @7;
+  resourceExhausted      @8;
+  backendFailed          @9;
+  cancelled              @10;
+  internal               @11;
+  workspaceUnserved      @12;
 }
 
 # ── Sheaf cache UDS operations ─────────────────────────────────────

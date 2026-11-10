@@ -1688,8 +1688,10 @@ fn device_nodes_anywhere_else_are_still_refused_by_name() {
         (char_device("etc/console", 5, 1), "etc/console"),
         (block_device("var/disk", 8, 0), "var/disk"),
         (fifo("run/initctl"), "run/initctl"),
-        // `tmp` is not a kernel mount: init.c mounts nothing there on Linux.
-        (char_device("tmp/null", 1, 3), "tmp/null"),
+        // `var/tmp` is not `/tmp`: only the top-level directory is mounted.
+        (char_device("var/tmp/null", 1, 3), "var/tmp/null"),
+        // The tmpfs mount point itself.
+        (fifo("tmp"), "tmp"),
         // A name that merely begins with `dev` is not under /dev.
         (char_device("devices/null", 1, 3), "devices/null"),
         // The mount point itself: init could not mount over a device.
@@ -1720,6 +1722,42 @@ fn device_nodes_anywhere_else_are_still_refused_by_name() {
         Err(OciImportError::UnsafePath { path, .. }) => assert_eq!(path, "dev/console"),
         other => panic!("expected UnsafePath, got {other:?}"),
     }
+}
+
+/// The guest init mounts a tmpfs over /tmp before the workload runs (LLO
+/// patch 0012, bead ley-line-open-db5899), so `tmp/` follows the
+/// kernel-mounted rules: a device or FIFO beneath it is dropped, and a link
+/// into it (a distro's `var/tmp -> /tmp`) is dropped under resolve, since
+/// the guest's walk ends in the empty tmpfs, not in the image's bytes. A
+/// regular file beneath it is still imported, shadowed in the guest, as
+/// under `dev/`.
+#[test]
+fn tmp_is_kernel_mounted_for_devices_and_links() {
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            file("tmp/seed", 0o644, b"image bytes"),
+            fifo("tmp/pipe"),
+            symlink("var/tmp", "/tmp"),
+            symlink("seed-link", "/tmp/seed"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    let imported = result.expect("an image with tmp/ entries imports under resolve");
+    assert_eq!(
+        dropped_entries(&imported),
+        [(0, "tmp/pipe", SpecialEntryKind::Fifo)]
+    );
+    assert_eq!(
+        dropped_links(&imported.links_dropped_kernel_mount),
+        [("seed-link", "/tmp/seed"), ("var/tmp", "/tmp")]
+    );
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert!(
+        files.contains_key("tmp/seed"),
+        "a regular file under tmp/ is imported: {files:?}"
+    );
+    assert!(!files.contains_key("seed-link") && !files.contains_key("var/tmp"));
 }
 
 #[test]

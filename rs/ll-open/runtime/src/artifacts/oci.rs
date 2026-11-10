@@ -67,7 +67,7 @@
 //!     unprivileged reader, the guest's virtio-fs server included, can read
 //!     it.
 //!   - Under `Resolve`, a link whose resolution goes beneath (or ends at)
-//!     `dev`, `proc` or `sys` ([`ImportedRootfs::links_dropped_kernel_mount`]),
+//!     `dev`, `proc`, `sys` or `tmp` ([`ImportedRootfs::links_dropped_kernel_mount`]),
 //!     and a link whose target the image does not hold
 //!     ([`ImportedRootfs::links_dropped_dangling`]). See below.
 //! - **Symbolic links.** The manifest admits none, so [`SymlinkPolicy`]
@@ -182,7 +182,7 @@ pub enum SymlinkPolicy {
     #[default]
     Refuse,
     /// Replace each link with a copy of its in-image target. A link into
-    /// `dev`, `proc` or `sys`, or one whose target the image does not hold,
+    /// `dev`, `proc`, `sys` or `tmp`, or one whose target the image does not hold,
     /// is dropped and reported instead; one that loops or escapes the image
     /// root is refused.
     Resolve,
@@ -424,7 +424,7 @@ pub struct ImportedRootfs {
     // import that reuses a CAS entry reports its own. None is part of the
     // rootfs identity.
     /// Device nodes and FIFOs strictly beneath a directory the guest init
-    /// mounts a kernel filesystem over (`dev`, `proc`, `sys`), in layer and
+    /// mounts a kernel filesystem over (`dev`, `proc`, `sys`, `tmp`), in layer and
     /// archive order, each as it was dropped: a later entry may still write
     /// a regular file at the same path. None is written.
     pub special_entries_dropped: Vec<DroppedEntry>,
@@ -1366,7 +1366,7 @@ fn read_layer(
                     // anywhere else it would be a hole in the rootfs.
                     if !under_kernel_mount(&path) {
                         return Err(OciImportError::Unsupported(format!(
-                            "layer {layer} entry {raw}: {kind:?} entries are not expressible in rootfs manifest v1, and only those beneath dev/, proc/ or sys/ (which the guest init mounts kernel filesystems over) are dropped"
+                            "layer {layer} entry {raw}: {kind:?} entries are not expressible in rootfs manifest v1, and only those beneath dev/, proc/, sys/ or tmp/ (which the guest init mounts kernel filesystems over) are dropped"
                         )));
                     }
                     changes.dropped.push(DroppedEntry {

@@ -10,16 +10,20 @@
 // against the same known-answer vectors,
 // rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json, so a Go
 // consumer recomputes a storeRoot from a manifest, or a head digest from a
-// Head, and compares bytes rather than trusting a stamp.
+// Head, and compares bytes rather than trusting a stamp. ClaimOf reads a
+// Head's claim and refuses a head digest v2 Head with ErrRetiredDigestV2.
 package sigma
 
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/agentic-research/ley-line-open/clients/go/leyline-schema/common"
+	"github.com/agentic-research/ley-line-open/clients/go/leyline-schema/head"
 	"github.com/zeebo/blake3"
 )
 
@@ -291,6 +295,118 @@ func HeadPreimage(c HeadClaim) []byte {
 		p.Write(c.ParentDigest[:])
 	}
 	return p.Bytes()
+}
+
+// ErrRetiredDigestV2 refuses a Head written under head digest v2: one that
+// carries retiredTreeRoot (@7), whatever else it stamps. LLO's Rust readers
+// refuse it with HeadFormatError::RetiredDigestV2 (ADR-0047 M1). An old
+// version is refused loudly, never read leniently as an unstamped head
+// (bead ley-line-open-a46711). Test with errors.Is.
+var ErrRetiredDigestV2 = errors.New("head is a head digest v2 head (it carries the retired treeRoot); only v3 heads, which stamp storeRoot, are read (ADR-0047 M1)")
+
+// ClaimOf reads the claim a signature over h attests, as LLO's
+// head_claim::claim_of does. A Head carrying retiredTreeRoot returns
+// ErrRetiredDigestV2 before anything else is read. A Head that stamps
+// neither storeRoot nor parserId has no claim: (nil, nil). A hash field
+// present but not 32 bytes, a present all-zero parentDigest, and a head
+// that stamps one of storeRoot and parserId without the other are errors.
+func ClaimOf(h head.Head) (*HeadClaim, error) {
+	if h.HasRetiredTreeRoot() {
+		return nil, ErrRetiredDigestV2
+	}
+	root, err := requiredHash(h.RootHash, "rootHash")
+	if err != nil {
+		return nil, err
+	}
+	parent, err := requiredHash(h.ParentHash, "parentHash")
+	if err != nil {
+		return nil, err
+	}
+	var parentDigest *Hash
+	if h.HasParentDigest() {
+		d, present, err := optionalHash(h.ParentDigest, "parentDigest")
+		if err != nil {
+			return nil, err
+		}
+		if present {
+			if d == (Hash{}) {
+				return nil, fmt.Errorf("head parentDigest is all zero; absence is an unset field, not zero")
+			}
+			parentDigest = &d
+		}
+	}
+	store, hasStore, err := stampHash(h.HasStoreRoot(), h.StoreRoot, "storeRoot")
+	if err != nil {
+		return nil, err
+	}
+	parser, hasParser, err := stampHash(h.HasParserId(), h.ParserId, "parserId")
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case !hasStore && !hasParser:
+		return nil, nil
+	case hasStore && !hasParser:
+		return nil, fmt.Errorf("head is half-stamped: it carries storeRoot but no parserId")
+	case !hasStore && hasParser:
+		return nil, fmt.Errorf("head is half-stamped: it carries parserId but no storeRoot")
+	}
+	return &HeadClaim{
+		Generation:   h.Generation(),
+		RootHash:     root,
+		ParentHash:   parent,
+		ParentDigest: parentDigest,
+		StoreRoot:    store,
+		ParserID:     parser,
+	}, nil
+}
+
+// requiredHash reads a hash field every head carries: present, 32 bytes.
+// parentHash is all zero for a first head, which is a value, not absence.
+func requiredHash(get func() (common.Hash, error), name string) (Hash, error) {
+	h, present, err := optionalHash(get, name)
+	if err != nil {
+		return Hash{}, err
+	}
+	if !present {
+		return Hash{}, fmt.Errorf("head has no %s", name)
+	}
+	return h, nil
+}
+
+// optionalHash reads a hash field: unset or empty is absence; anything else
+// must be 32 bytes.
+func optionalHash(get func() (common.Hash, error), name string) (Hash, bool, error) {
+	field, err := get()
+	if err != nil {
+		return Hash{}, false, fmt.Errorf("read head %s: %w", name, err)
+	}
+	b, err := field.Bytes()
+	if err != nil {
+		return Hash{}, false, fmt.Errorf("read head %s: %w", name, err)
+	}
+	if len(b) == 0 {
+		return Hash{}, false, nil
+	}
+	if len(b) != 32 {
+		return Hash{}, false, fmt.Errorf("head %s is %d bytes, expected 32", name, len(b))
+	}
+	var h Hash
+	copy(h[:], b)
+	return h, true, nil
+}
+
+// stampHash reads storeRoot or parserId: unset, empty or all zero is
+// unstamped, as LLO's store_root::hash_field reads them.
+func stampHash(has bool, get func() (common.Hash, error), name string) (Hash, bool, error) {
+	if !has {
+		return Hash{}, false, nil
+	}
+	h, present, err := optionalHash(get, name)
+	if err != nil || !present || h == (Hash{}) {
+		return Hash{}, false, err
+	}
+	return h, true, nil
 }
 
 // HeadDigest is head digest v3. It refuses a claim with an unstamped (all

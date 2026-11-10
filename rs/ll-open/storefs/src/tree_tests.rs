@@ -251,6 +251,34 @@ fn mkdir_and_rmdir_are_proposals() {
     );
 }
 
+/// Bead `ley-line-open-bbd7c8`: the filesystem reads `_tree` rows through
+/// `tree::decode`, so a directory row carrying a blob and a file row
+/// without one are refused (EIO) by lookup and by a listing of their
+/// directory, never served as a directory or listed as a file.
+#[test]
+fn a_malformed_tree_row_is_refused_not_served() {
+    for insert in [
+        "INSERT INTO _tree (path, mode, blob_hash) VALUES ('bad', 16384, zeroblob(32));",
+        "INSERT INTO _tree (path, mode, blob_hash) VALUES ('bad', 33188, NULL);",
+    ] {
+        let f = fixture_with(whole(), true, A);
+        f.fs.store()
+            .with_write(|conn| Ok(conn.execute_batch(insert)?))
+            .unwrap();
+        let fs = next_session(&f);
+        assert_eq!(
+            lookup_in(&fs, "bad").map(|_| ()),
+            Err(Errno::EIO),
+            "{insert}"
+        );
+        assert_eq!(
+            fs.readdir(ROOT_INODE, 0).map(|_| ()),
+            Err(Errno::EIO),
+            "{insert}"
+        );
+    }
+}
+
 /// T4: a directory RENAME is one proposal over every path under it.
 #[test]
 fn a_directory_rename_is_one_proposal() {

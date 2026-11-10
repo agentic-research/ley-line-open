@@ -1035,6 +1035,43 @@ fn the_fixture_rootfs_identity_is_a_known_answer() {
     assert_eq!(imported.rootfs.value, FIXTURE_ARM64_ROOTFS);
 }
 
+/// The rootfs digest's published known-answer vector (ADR-0047 §3, bead
+/// `ley-line-open-39309e`): its digest is σ_bytes over its manifest bytes,
+/// and the importer writes exactly those bytes for the checked-in fixture,
+/// so a second implementation can check its manifest serialization and its
+/// digest independently.
+#[test]
+fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ll-core/schema-spec/execution/v1/test-vectors/rootfs-manifest.json");
+    let vector: Value = serde_json::from_slice(&fs::read(&path).expect("the vector")).unwrap();
+    let cases = vector["cases"].as_array().expect("cases");
+    assert!(!cases.is_empty(), "the vector holds no case");
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let manifest = case["manifest"].as_str().expect("manifest bytes, as text");
+        let digest = case["digest"].as_str().expect("digest");
+        assert_eq!(
+            blake3::hash(manifest.as_bytes()).to_hex().as_str(),
+            digest,
+            "{name}: the digest is BLAKE3 over the manifest's exact bytes"
+        );
+        assert_eq!(
+            name, "oci-multilayer-linux-arm64",
+            "the one case is the fixture's"
+        );
+        assert_eq!(digest, FIXTURE_ARM64_ROOTFS, "{name}");
+        let cas = TempDir::new().expect("cas");
+        let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
+        let written = manifest_bytes(cas.path(), &imported.rootfs);
+        assert_eq!(
+            String::from_utf8(written).expect("UTF-8 manifest"),
+            manifest,
+            "{name}: the importer's manifest bytes"
+        );
+    }
+}
+
 #[test]
 fn provenance_reports_the_image_config_platform() {
     let scratch = TempDir::new().expect("scratch");

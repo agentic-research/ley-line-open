@@ -385,6 +385,9 @@ fn a_directory_the_owner_cannot_read_is_refused() {
     for (entry, named) in [
         (dir("locked/", 0o000), "locked/"),
         (dir("locked/", 0o311), "locked/"),
+        // Readable but not searchable hides contents as well.
+        (dir("locked/", 0o400), "locked/"),
+        (dir("locked/", 0o644), "locked/"),
         (dir("./", 0o000), "./"),
     ] {
         let (scratch, result) = import_single(
@@ -397,7 +400,7 @@ fn a_directory_the_owner_cannot_read_is_refused() {
         match result {
             Err(OciImportError::UnsafePath { path, reason, .. }) => {
                 assert_eq!(path, named);
-                assert!(reason.contains("owner cannot read"), "{reason}");
+                assert!(reason.contains("owner cannot read and search"), "{reason}");
             }
             other => panic!("expected {named} to be refused, got {other:?}"),
         }
@@ -407,7 +410,7 @@ fn a_directory_the_owner_cannot_read_is_refused() {
     let (_scratch, result) = import_single(
         vec![Layer::plain(vec![
             dir("private/", 0o700),
-            dir("readonly/", 0o400),
+            dir("listable/", 0o500),
             file("private/f", 0o644, b"x"),
         ])],
         SymlinkPolicy::Refuse,
@@ -1846,6 +1849,118 @@ fn a_dangling_link_inside_a_copied_directory_is_reported_at_each_copy() {
         [("lib/gone", "missing.so"), ("usr/lib/gone", "missing.so")]
     );
     assert_eq!(imported.symlinks_resolved, 1);
+}
+
+#[test]
+fn a_dotdot_straight_out_of_a_kernel_mount_point_is_followed_into_the_image() {
+    // In the guest `/dev/..` is `/`: the link reaches the image's etc/f, and
+    // is copied from it, whatever the image holds under dev/.
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("dev/stray", 0o644, b"shadowed"),
+            file("etc/f", 0o644, b"f"),
+            symlink("etc/x", "/dev/../etc/f"),
+            symlink("etc/y", "../sys/./../etc/f"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    let imported = result.expect("import");
+    assert!(imported.links_dropped_kernel_mount.is_empty());
+    assert_eq!(imported.symlinks_resolved, 2);
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert_eq!(files["etc/x"], files["etc/f"]);
+    assert_eq!(files["etc/y"], files["etc/f"]);
+}
+
+#[test]
+fn links_into_the_workspace_mount_point_are_refused() {
+    // The guest init mounts a run's workspace at /work: neither the image's
+    // work/ nor its absence decides what such a link reaches.
+    for (entries, link) in [
+        (
+            vec![symlink("etc/app.toml", "/work/app.toml")],
+            "etc/app.toml",
+        ),
+        (
+            vec![
+                file("work/app.toml", 0o644, b"image"),
+                symlink("cfg", "work/app.toml"),
+            ],
+            "cfg",
+        ),
+        (vec![symlink("w", "/work")], "w"),
+    ] {
+        let (scratch, result) = import_single(vec![Layer::plain(entries)], SymlinkPolicy::Resolve);
+        match result {
+            Err(OciImportError::SymlinkUnresolvable { path, reason }) => {
+                assert_eq!(path, link);
+                assert!(reason.contains("/work"), "{reason}");
+            }
+            other => panic!("expected {link} to be refused, got {other:?}"),
+        }
+        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+    }
+}
+
+#[test]
+fn a_hard_link_to_a_dropped_device_is_refused() {
+    // A runtime would create a second device node at the link's path, which
+    // may lie outside /dev: the import cannot drop it there.
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            char_device("dev/null", 1, 3),
+            hardlink("etc/null", "dev/null"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    match result {
+        Err(OciImportError::UnsafePath { path, reason, .. }) => {
+            assert_eq!(path, "etc/null");
+            assert_eq!(reason, "the hard link's target does not exist");
+        }
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+}
+
+#[test]
+fn dropped_entries_are_reported_by_normalized_path_and_reuse_one_cas_entry() {
+    let scratch = TempDir::new().expect("scratch");
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).unwrap();
+    let with = single_image(
+        &scratch.path().join("with"),
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            char_device("./dev//console", 5, 1),
+            file("etc/shadow", 0o000, b"s"),
+        ])],
+    );
+    let without = single_image(
+        &scratch.path().join("without"),
+        vec![Layer::plain(vec![file("bin/x", 0o755, b"x")])],
+    );
+    let attempt = |layout: &str, digest: &str| {
+        import(
+            &scratch.path().join(layout),
+            digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas,
+        )
+        .expect("import")
+    };
+    let a = attempt("with", &with);
+    assert_eq!(
+        dropped_entries(&a),
+        [(0, "dev/console", SpecialEntryKind::Char)]
+    );
+    // The image without the dropped entries names the same rootfs, reuses
+    // the entry the first import published (its directories verify), and
+    // reports no drops of its own.
+    let b = attempt("without", &without);
+    assert_eq!(a.rootfs, b.rootfs);
+    assert!(b.special_entries_dropped.is_empty() && b.unreadable_files_dropped.is_empty());
+    assert_eq!(cas_entries(&cas), vec![a.rootfs.value.clone()]);
 }
 
 /// One first-party image and what importing it under `--symlinks resolve`

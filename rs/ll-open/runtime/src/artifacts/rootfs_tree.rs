@@ -298,13 +298,14 @@ impl Tree {
     /// difference: a `..` that would climb above the image root is refused
     /// instead of clamped at `/`, including in the part of a target after a
     /// missing component or a kernel mount point. Two kinds of link are
-    /// dropped, never written, and reported: one whose resolution reaches
-    /// [`KERNEL_MOUNTED`] (the guest kernel supplies what is there, not the
-    /// image), and one whose target the image does not hold (the guest's
-    /// `open` through it fails `ENOENT`, as it does on the absent path).
-    /// Loops, a target that continues through a regular file, an empty
-    /// target, and links whose expansion would contain themselves are
-    /// refused. `max_nodes` bounds the copied tree.
+    /// dropped, never written, and reported: one whose resolution goes
+    /// beneath (or ends at) one of [`KERNEL_MOUNTED`] (the guest kernel
+    /// decides what is there, not the image; a `..` straight back out of the
+    /// mount point is followed as the guest follows it), and one whose
+    /// target the image does not hold. A link that reaches `/work`, where a
+    /// run's workspace is mounted, loops, a target that continues through a
+    /// regular file, an empty target, and links whose expansion would
+    /// contain themselves are refused. `max_nodes` bounds the copied tree.
     pub(crate) fn resolve_symlinks(&self, max_nodes: usize) -> Result<Resolved, ResolveError> {
         let mut state = Expansion {
             tree: self,
@@ -347,10 +348,23 @@ impl Tree {
                 }
                 _ => {
                     stack.push(component);
-                    // The guest's kernel, not the image, decides what lies
-                    // at or beneath a kernel mount point. What remains of
-                    // the target must still stay inside the root.
+                    // A run's workspace is mounted here when one is granted:
+                    // neither the image nor its absence decides what a link
+                    // into it reaches.
+                    if stack[0] == workspace_mount_point() {
+                        return Err(INTO_WORKSPACE);
+                    }
                     if KERNEL_MOUNTED.contains(&stack[0].as_str()) {
+                        // The mount point itself is the kernel's directory,
+                        // whatever the image holds there; `..` from it is
+                        // the root again, so keep walking.
+                        if stack.len() == 1 {
+                            continue;
+                        }
+                        // Beneath it, the guest's kernel decides what the
+                        // rest of the walk reaches (its own links included:
+                        // `/proc/self/root`), never the image. What remains
+                        // of the target must still stay inside the root.
                         stay_in_root(stack.len(), &pending)?;
                         return Ok(Resolution::KernelMount);
                     }
@@ -384,11 +398,23 @@ impl Tree {
                 }
             }
         }
+        // The walk ended at a kernel mount point.
+        if stack.len() == 1 && KERNEL_MOUNTED.contains(&stack[0].as_str()) {
+            return Ok(Resolution::KernelMount);
+        }
         Ok(Resolution::Found(stack))
     }
 }
 
 const CLIMBS_ABOVE_ROOT: &str = "the target climbs above the image root";
+const INTO_WORKSPACE: &str = "the target reaches /work, where the guest mounts a run's workspace, which the image cannot supply";
+
+/// `/work` without its slash: the top-level directory the libkrun worker has
+/// the guest init mount a granted workspace over
+/// (`backends::libkrun::worker::WORKSPACE_DIR`; init.c `mount_virtiofs_list`).
+fn workspace_mount_point() -> &'static str {
+    crate::backends::libkrun::worker::WORKSPACE_DIR.trim_start_matches('/')
+}
 
 /// Whether the lexical remainder of a target, read from a directory `depth`
 /// components below the root, never climbs above it.
@@ -682,7 +708,12 @@ mod tests {
             ("", "/dev"),
             ("", "proc/self/mounts"),
             ("etc", "../sys/./x/.."),
+            // Beneath the mount the kernel's own links decide (`self` is
+            // one), so the image never answers, even where the guest's
+            // walk would come back out.
             ("etc", "../proc/self/../.."),
+            ("", "proc/self/root/etc/f"),
+            ("", "/proc/."),
         ] {
             assert_eq!(
                 tree.resolve(&path(parent), target),
@@ -702,6 +733,21 @@ mod tests {
                 "{parent} {target}"
             );
         }
+        // `..` straight out of a mount point is the root again, as in the
+        // guest: the image answers.
+        for (parent, target) in [("etc", "/dev/../etc/f"), ("", "sys/./../etc/f")] {
+            assert_eq!(
+                tree.resolve(&path(parent), target),
+                Ok(Resolution::Found(path("etc/f"))),
+                "{parent} {target}"
+            );
+        }
+        // The workspace mount point is refused, present in the image or not.
+        tree.insert(&path("work/f"), file(2)).unwrap();
+        for target in ["/work", "/work/f", "work/missing", "/work/.."] {
+            assert_eq!(tree.resolve(&[], target), Err(INTO_WORKSPACE), "{target}");
+        }
+        assert_eq!(workspace_mount_point(), "work");
         // A regular file in the way is not "missing": refused as before.
         assert_eq!(
             tree.resolve(&[], "etc/f/x"),

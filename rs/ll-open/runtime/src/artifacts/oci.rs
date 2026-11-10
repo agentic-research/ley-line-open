@@ -47,13 +47,15 @@
 //!   points. Setuid, setgid and sticky bits are cleared (and counted): the
 //!   tree is written by an unprivileged host user, and a host file carrying
 //!   them is a hazard the manifest has no reason to admit. A directory entry
-//!   its owner cannot read (written `0755` it would expose its subtree), a
-//!   device node or FIFO outside the kernel-mounted directories below, a
-//!   sparse file or an aufs `.wh..wh.` entry is refused by name. A hard link
-//!   becomes a second regular file with its target's content and mode.
-//! - **What the guest could never observe is dropped, never written, and
-//!   reported.** Each rule names a reason the workload cannot tell the
-//!   difference through `open`:
+//!   its owner cannot both read and search (written `0755` it would expose
+//!   its subtree), a device node or FIFO outside the kernel-mounted
+//!   directories below, a sparse file or an aufs `.wh..wh.` entry is refused
+//!   by name. A hard link becomes a second regular file with its target's
+//!   content and mode.
+//! - **Entries the rootfs cannot carry faithfully are dropped, never
+//!   written, and reported** instead of refusing the image. The runtime
+//!   README's "Dropped entries" section states, for each rule, what a guest
+//!   can still observe of the difference:
 //!   - A device node or FIFO strictly beneath `dev/`, `proc/` or `sys/`
 //!     ([`ImportedRootfs::special_entries_dropped`]): libkrun's guest init
 //!     mounts devtmpfs, proc and sysfs over those directories before the
@@ -63,23 +65,21 @@
 //!   - A regular file whose owner-read bit is clear (`etc/shadow` at
 //!     `0000`, [`ImportedRootfs::unreadable_files_dropped`]): no
 //!     unprivileged reader, the guest's virtio-fs server included, can read
-//!     it. `stat` reports `ENOENT` where it would have reported the file.
-//!   - Under `Resolve`, a link whose resolution reaches `dev`, `proc` or
-//!     `sys` ([`ImportedRootfs::links_dropped_kernel_mount`]), and a link
-//!     whose target the image does not hold
+//!     it.
+//!   - Under `Resolve`, a link whose resolution goes beneath (or ends at)
+//!     `dev`, `proc` or `sys` ([`ImportedRootfs::links_dropped_kernel_mount`]),
+//!     and a link whose target the image does not hold
 //!     ([`ImportedRootfs::links_dropped_dangling`]). See below.
 //! - **Symbolic links.** The manifest admits none, so [`SymlinkPolicy`]
 //!   decides: `Refuse` (the default) names the first link; `Resolve` replaces
 //!   each link with a copy of the regular file or directory it resolves to
 //!   inside the image, absolute targets meaning the image's root, never the
-//!   host's. A dangling link inside the root is dropped: `open` through it
-//!   fails `ENOENT` in the guest, as on the absent path; only `readlink`,
-//!   `lstat` and a write that would create the target through the link
-//!   differ. A link into a kernel mount is dropped too: the guest kernel,
-//!   not the image, supplies what is there, so no image bytes stand in for
-//!   it (a read through the absent link fails `ENOENT` where the real link
-//!   would reach the kernel's file). A loop, a link whose `..` climbs above
-//!   the image root (also after a missing component), a target that
+//!   host's. A link into a kernel mount is dropped: the guest kernel, not
+//!   the image, decides what is there, so no image bytes stand in for it.
+//!   A dangling link inside the root is dropped: nothing is written in its
+//!   place. A link that reaches `/work` (where a run's workspace is
+//!   mounted), a loop, a link whose `..` climbs above the image root (also
+//!   after a missing component or a kernel mount point), a target that
 //!   continues through a regular file, an empty target, and a directory link
 //!   that contains itself are refused. A layer entry whose path passes
 //!   through a link (`link/passwd` after `link -> /etc`) is refused under
@@ -92,9 +92,9 @@
 //! - **Deterministic identity.** The manifest lists files in path order with
 //!   fixed field order, so the same image content gives the same rootfs
 //!   digest whatever the layers' archive order, the host, or the run. A
-//!   dropped entry is absent from the manifest, so an image that differs
-//!   from another only by dropped entries has the same digest, and an image
-//!   with none has the digest it had before the drop rules existed.
+//!   dropped entry is absent from the manifest: an image's digest is that of
+//!   the same image with its dropped entries, and whatever they replaced in
+//!   lower layers, removed.
 //! - **Atomic, verified publication.** The staged tree is verified against
 //!   its own manifest, then renamed to `<cas-root>/<digest>`. An existing
 //!   entry is reused only if its files verify and its directories are exactly
@@ -351,11 +351,17 @@ pub struct ImportedRootfs {
     pub files: usize,
     /// Files whose setuid, setgid or sticky bit was cleared.
     pub special_mode_bits_cleared: usize,
-    /// Links replaced by copies of their targets (`SymlinkPolicy::Resolve`).
+    /// Links replaced by copies of their targets (`SymlinkPolicy::Resolve`),
+    /// counting a copy later dropped as unreadable.
     pub symlinks_resolved: usize,
-    /// Device nodes and FIFOs under a directory the guest init mounts a
-    /// kernel filesystem over (`dev`, `proc`, `sys`), in layer and archive
-    /// order. None is written; the guest could never observe one.
+    // The four lists below are per-import provenance, like `image`: two
+    // images can give one rootfs digest with different lists, and an
+    // import that reuses a CAS entry reports its own. None is part of the
+    // rootfs identity.
+    /// Device nodes and FIFOs strictly beneath a directory the guest init
+    /// mounts a kernel filesystem over (`dev`, `proc`, `sys`), in layer and
+    /// archive order, each as it was dropped: a later entry may still write
+    /// a regular file at the same path. None is written.
     pub special_entries_dropped: Vec<DroppedEntry>,
     /// Links (`SymlinkPolicy::Resolve`) whose resolution reaches `dev`,
     /// `proc` or `sys`, which the guest's kernel provides at boot. In path
@@ -395,7 +401,8 @@ pub enum SpecialEntryKind {
 pub struct DroppedEntry {
     /// The layer whose archive held it, from 0.
     pub layer: usize,
-    /// Its path in that archive, relative to the image root.
+    /// Its path relative to the image root, normalized as the manifest
+    /// writes paths (`./dev//console` is `dev/console`).
     pub path: String,
     pub kind: SpecialEntryKind,
 }
@@ -1157,17 +1164,18 @@ fn read_layer(
             }
             if kind == tar::EntryType::Directory {
                 // Directory modes are not carried (each is written 0755), so
-                // one the image made unreadable would expose its subtree.
+                // one whose owner cannot both list it and reach into it
+                // would expose what it hides.
                 let mode = entry
                     .header()
                     .mode()
                     .map_err(io_error("read an entry mode"))?;
-                if mode & 0o400 == 0 {
+                if mode & 0o500 != 0o500 {
                     return Err(unsafe_path(
                         layer,
                         &raw,
                         &format!(
-                            "a directory its owner cannot read (mode {:04o}) would be written 0755, exposing what it hides",
+                            "a directory its owner cannot read and search (mode {:04o}) would be written 0755, exposing what it hides",
                             mode & 0o7777
                         ),
                     ));
@@ -1249,7 +1257,7 @@ fn read_layer(
                     }
                     changes.dropped.push(DroppedEntry {
                         layer,
-                        path: raw.clone(),
+                        path: path.join("/"),
                         kind,
                     });
                     Change::Drop(path)
@@ -1335,6 +1343,10 @@ impl Writer<'_> {
         }
         // `Final::without_unreadable_files` removed every file whose owner
         // cannot read it: each file written here can be verified.
+        debug_assert!(
+            mode & 0o400 != 0,
+            "{relative}: unreadable files are dropped before writing"
+        );
         self.written += file.size;
         if self.written > self.limit {
             return Err(OciImportError::TooLarge { limit: self.limit });

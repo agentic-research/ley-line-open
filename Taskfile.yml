@@ -589,6 +589,17 @@ tasks:
     cmds:
       - tools/test_hypervisor_attestation.sh
 
+  guest-tools:fixture-test:
+    desc: Prove a guest-tools pin is fetched from the first source holding its bytes, falls back to the mirror, and fails naming a pin no source has (ae6b99)
+    cmds:
+      - tools/test_fetch_pinned.sh
+
+  # Needs the network, so `task ci` does not run it.
+  guest-tools:mirror:check:
+    desc: Confirm every guest-tools pin is on LLO's content-addressed mirror (the guest-tools-pins release) with the pinned bytes (ae6b99)
+    cmds:
+      - tools/guest_tools_mirror.sh check
+
   release:publish:
     desc: Smoke the CLI, then atomically tag, wait for release CI, and verify public vVERSION
     requires:
@@ -1741,6 +1752,7 @@ tasks:
       - task: release:publish:fixture-test
       - task: release:retry:fixture-test
       - task: release:hypervisor:fixture-test
+      - task: guest-tools:fixture-test
       - task: schema:consumer-fixture-test
       - task: schema:go-sigma-vectors
       - task: schema:execution-asset-consumer-test

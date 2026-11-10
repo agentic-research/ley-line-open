@@ -163,9 +163,20 @@ is the runtime topology a consumer sees, not a dependency edge.
 
 | Transport | Path | Used by |
 |---|---|---|
-| **UDS** | `<ctrl>.sock`, by default `~/.mache/default.sock` (a daemon whose socket lives elsewhere publishes a `~/.mache/default.sock` discovery link to it) — local-process IPC | mache (Go), other same-machine consumers |
+| **UDS** | `<ctrl>.sock`, by default `~/.mache/default.sock`. Only the default instance (`~/.mache/default.arena` with `~/.mache/default.ctrl`) binds that name, and it removes the name on exit only while it still holds its own socket; a daemon on any other `--arena`/`--control` serves at its own `<ctrl>.sock` and never touches `default.sock` (clients reach it through `LEYLINE_SOCKET`) — local-process IPC | mache (Go), other same-machine consumers |
 | **MCP HTTP** | off unless `--mcp-port` is given (the OCI image uses 8384) — JSON-RPC tool surface for agents (token-gated per ADR-0022) | Claude Code (MCP plugin), cloister (proxy via Cloudflare Access) |
 | **MCP UDS** | `--mcp-uds <path>`, mode 0600 | cloister (through its proxy) |
+
+**Well-known names are scoped to `$HOME/.mache`.** The rule above applies only to the entries `$HOME/.mache/default.sock` and `$HOME/.mache/execution.sock` (paths compared as directory entries, so a symlinked `HOME` still matches). A `default.ctrl` or `default.sock` in any other directory is an ordinary explicit instance and is admitted.
+
+**Control block lease (`<ctrl>.lock`).** Beside every control block sits its lease: the full control path with `.lock` appended (`~/.mache/default.ctrl.lock`). It is a cross-repo contract, and it is never removed.
+- Every running daemon holds it `flock` `LOCK_SH` for its lifetime. A long-lived process that maps the control block (mache's `mount --control`) holds it `LOCK_SH` too.
+- `--reset-arena` takes it `LOCK_EX | LOCK_NB` and keeps it exclusive for the daemon's lifetime, so a normal start on that block is refused meanwhile.
+- During the reset it also takes the `.ctrl` itself `LOCK_EX | LOCK_NB`, and probes the lock of the arena the block names (for daemons released before the lease).
+- Only with all of these free does a reset reinitialise a control block of another VERSION. It writes a fresh block and renames it over the old one, so it is a new inode, and logs the old version.
+- The lease lives in a sibling file because the `.ctrl` lock is the seqlock's publish lock: a lifetime shared lock on the `.ctrl` would block the daemon's own publishes.
+
+**Stable refusal text.** A reset refused because another process holds the block (its lease, a lock on the `.ctrl`, or the arena it names) fails with an error beginning `--reset-arena refused: another process holds` (`control_lease::HELD_REFUSAL`). The text is stable, and consumers may key a retry on it: mache's brief publish and probe locks on the `.ctrl` make that refusal transient. Refusals that a retry cannot fix (a symlinked or unopenable control path) do not carry it.
 
 The control socket dispatches every op in `BASE_OP_NAMES`. MCP dispatches only the tools `tools/list` advertises, inside the Cloister groups the listener's `--mcp-groups` grant names (raw SQL is its own `sql` group); any other name is refused before dispatch (`-32601` `not_advertised`, `-32001` `not_granted`). Adding an op = a `BaseRequest` variant + a `NATIVE_OP_NAMES` entry (`rs/ll-open/cli-lib/src/daemon/wire.rs`) + a `dispatch_typed` arm (`daemon/ops.rs`). The op surface is the native ops plus the eight execution/v1 ops, grouped by purpose (lifecycle, navigation, graph queries, introspection, LSP, read-only SQL, embedding search, proposals, execution).
 

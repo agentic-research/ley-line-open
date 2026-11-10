@@ -190,7 +190,7 @@ impl Host {
             .arg(self.changed_ms.to_string())
             .arg("--workspace-change-window-ms")
             .arg("30000")
-            // The daemon publishes a discovery link under $HOME/.mache.
+            // A temp HOME keeps the run off the real ~/.mache.
             .env("HOME", self.path("home"))
             .env("TMPDIR", self.path("tmp"))
             .env(library_var, library_dir)

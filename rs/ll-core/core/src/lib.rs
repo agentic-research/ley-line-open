@@ -14,7 +14,7 @@ pub mod substrate;
 
 pub use blob_store::{FsBlobStore, MemBlobStore};
 pub use construction::{Construction, Ref};
-pub use control::Controller;
+pub use control::{ControlHeader, Controller};
 pub use head_digest::{HeadClaim, head_digest};
 pub use layout::{
     ArenaHeader, GrowRefused, create_arena, max_grown_arena_size, write_grown_arena, write_to_arena,

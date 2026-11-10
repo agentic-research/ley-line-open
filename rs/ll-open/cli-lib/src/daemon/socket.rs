@@ -13,11 +13,10 @@ use crate::daemon::events::ConnectionState;
 use crate::daemon::ops;
 
 /// `rm -f` semantics: remove `path` if present, log a warning when
-/// removal fails for any reason other than "file does not exist". Both
-/// the stale-socket cleanup and the default.sock symlink-replacement
-/// path want exactly this behavior — missing-file is the common case
-/// (fresh start), and other errors (permissions, EBUSY, etc) deserve
-/// to be surfaced without aborting the daemon's bring-up.
+/// removal fails for any reason other than "file does not exist".
+/// Missing-file is the common case (fresh start), and other errors
+/// (permissions, EBUSY, etc) deserve to be surfaced without aborting the
+/// daemon's bring-up.
 fn remove_file_best_effort(path: &std::path::Path, what: &str) {
     if let Err(e) = std::fs::remove_file(path)
         && e.kind() != std::io::ErrorKind::NotFound
@@ -26,13 +25,21 @@ fn remove_file_best_effort(path: &std::path::Path, what: &str) {
     }
 }
 
-/// Which auto-discovery symlink a bound daemon publishes under `~/.mache`.
+/// Which well-known instance under `~/.mache` a daemon may be.
 ///
-/// Two daemons that publish the same name silently steal each other's
-/// clients: the second to start repoints the symlink, and every client that
-/// resolves it then talks to the wrong daemon against the wrong arena. The
-/// execution/v1 surface therefore owns a distinct name rather than sharing
-/// the substrate daemon's `default.sock`.
+/// Clients discover a daemon at a well-known socket: mache dials
+/// `~/.mache/default.sock`, execution clients `~/.mache/execution.sock`.
+/// Each name belongs to one *default instance*: the daemon on
+/// `~/.mache/<name>.arena` with `~/.mache/<name>.ctrl`, whose `<ctrl>.sock`
+/// IS the well-known socket. Any other daemon is an explicit instance and
+/// never creates, replaces or removes a well-known name (bead
+/// `ley-line-open-e7459a`): it serves only at its own `<ctrl>.sock`, and its
+/// clients are handed that path (mache: `LEYLINE_SOCKET`).
+///
+/// Daemons once published a symlink at the well-known name pointing at
+/// whatever socket they bound. Every daemon that started repointed it, so
+/// an explicit instance took the default's clients and left the name
+/// dangling when it exited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SocketDiscovery {
     /// `~/.mache/default.sock` — the substrate daemon mache resolves.
@@ -41,18 +48,133 @@ pub enum SocketDiscovery {
     /// `~/.mache/execution.sock` — the first-party execution/v1 surface.
     /// Consumers may override the path with `LEYLINE_EXECUTION_SOCKET`.
     Execution,
-    /// Publish nothing. For tests, and for embedders that hand the socket
-    /// path to their clients directly instead of relying on discovery.
+    /// No well-known instance. For tests, and for embedders that hand the
+    /// socket path to their clients directly.
     Unpublished,
 }
 
 impl SocketDiscovery {
-    /// Symlink filename this daemon owns, or `None` when it publishes none.
-    pub fn symlink_name(self) -> Option<&'static str> {
+    /// The instance name this surface's default instance uses under
+    /// `~/.mache` (`<name>.arena`, `<name>.ctrl`, `<name>.sock`), or `None`.
+    pub fn instance_name(self) -> Option<&'static str> {
         match self {
-            Self::Substrate => Some("default.sock"),
-            Self::Execution => Some("execution.sock"),
+            Self::Substrate => Some("default"),
+            Self::Execution => Some("execution"),
             Self::Unpublished => None,
+        }
+    }
+}
+
+/// `a` and `b` name the same directory entry: equal file names in
+/// directories that resolve to the same place. The entries themselves need
+/// not exist, and a symlink at either is not followed.
+fn same_entry(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let dir = |p: &std::path::Path| {
+        let parent = p
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+    };
+    a.file_name() == b.file_name() && dir(a) == dir(b)
+}
+
+/// Refuse a daemon whose socket (`<ctrl>.sock`) would land on a well-known
+/// name it is not the default instance for (bead `ley-line-open-e7459a`).
+///
+/// `home` is the directory holding `.mache`; `None` (no home) has no
+/// well-known names to protect. A daemon whose socket lands on
+/// `~/.mache/<name>.sock` must be `discovery`'s own surface and serve
+/// `~/.mache/<name>.arena` through `~/.mache/<name>.ctrl`; anything else,
+/// such as an explicit `--arena` with the default `--control`, would bind
+/// the name and take its clients.
+pub fn admit_well_known(
+    discovery: SocketDiscovery,
+    home: Option<&std::path::Path>,
+    arena: &std::path::Path,
+    ctrl: &std::path::Path,
+) -> anyhow::Result<()> {
+    let Some(home) = home else {
+        return Ok(());
+    };
+    let mache = home.join(".mache");
+    let sock = ctrl.with_extension("sock");
+    for kind in [SocketDiscovery::Substrate, SocketDiscovery::Execution] {
+        let name = kind.instance_name().expect("a well-known surface");
+        let well_known = mache.join(format!("{name}.sock"));
+        if !same_entry(&sock, &well_known) {
+            continue;
+        }
+        let default_arena = mache.join(format!("{name}.arena"));
+        let default_ctrl = mache.join(format!("{name}.ctrl"));
+        // Both paths, not just the socket: `default.foo` also has
+        // `default.sock` as its `.sock`, and would serve that name while
+        // publishing to a control block mache never reads.
+        if kind == discovery && same_entry(arena, &default_arena) && same_entry(ctrl, &default_ctrl)
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "control block {} would put this daemon's socket at {}, the {name} instance's \
+             discovery socket; only the {name} instance (--arena {} --control {}) serves \
+             there. Give this daemon its own --control outside {} and hand its clients \
+             that socket.",
+            ctrl.display(),
+            well_known.display(),
+            default_arena.display(),
+            default_ctrl.display(),
+            mache.display()
+        );
+    }
+    Ok(())
+}
+
+/// A bound control socket, removed on drop only while its path still names
+/// the socket this daemon bound.
+///
+/// Compare-then-remove: by the time a daemon exits, another may have bound
+/// the same path (mache's `DiscoverOrStart` clears a socket it finds dead and
+/// spawns a fresh daemon there). Removing by name would then take the newer
+/// daemon's socket away from its clients. The check compares the entry's
+/// device and inode with the ones bound. It and the unlink are two
+/// syscalls, so a rebind landing between them is still removed; for the
+/// default instance that window is closed in practice by the arena lock,
+/// which this daemon holds until after the socket is dropped, so no second
+/// default instance can be serving yet.
+#[derive(Debug)]
+pub struct BoundSocket {
+    path: PathBuf,
+    id: Option<(u64, u64)>,
+}
+
+impl BoundSocket {
+    /// The socket's path.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Give up removal on drop and return the path.
+    pub fn into_path(mut self) -> PathBuf {
+        self.id = None;
+        std::mem::take(&mut self.path)
+    }
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        let Some(bound) = self.id else { return };
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if (meta.dev(), meta.ino()) == bound => {
+                remove_file_best_effort(&self.path, "daemon socket");
+            }
+            Ok(_) => log::info!(
+                "{} now names another socket; leaving it in place",
+                self.path.display()
+            ),
+            Err(_) => {}
         }
     }
 }
@@ -83,7 +205,10 @@ impl SocketDiscovery {
 /// not fit is an error naming both paths, never a panic. Every failure is
 /// returned so the daemon's caller sees the reason instead of exit 101, and
 /// the staging directory is removed on every path out.
-fn bind_owner_only(sock_path: &std::path::Path) -> anyhow::Result<UnixListener> {
+///
+/// Returns the listener and the socket's `(device, inode)`, read while it is
+/// still in the private directory, so it is certainly the inode bound.
+fn bind_owner_only(sock_path: &std::path::Path) -> anyhow::Result<(UnixListener, (u64, u64))> {
     use anyhow::Context;
     let parent = sock_path
         .parent()
@@ -110,14 +235,16 @@ fn bind_owner_only(sock_path: &std::path::Path) -> anyhow::Result<UnixListener> 
         .create(&staging)
         .with_context(|| format!("create private staging directory {}", staging.display()))?;
 
-    let bound = (|| -> anyhow::Result<UnixListener> {
+    let bound = (|| -> anyhow::Result<(UnixListener, (u64, u64))> {
+        use std::os::unix::fs::MetadataExt;
         let listener = UnixListener::bind(&staged_path)
             .with_context(|| format!("bind UDS socket at {}", staged_path.display()))?;
         std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
             .context("restrict UDS socket to owner-only permissions")?;
+        let meta = std::fs::symlink_metadata(&staged_path).context("stat the bound UDS socket")?;
         std::fs::rename(&staged_path, sock_path)
             .with_context(|| format!("publish UDS socket at {}", sock_path.display()))?;
-        Ok(listener)
+        Ok((listener, (meta.dev(), meta.ino())))
     })();
     let _ = std::fs::remove_dir_all(&staging);
     bound
@@ -142,21 +269,34 @@ const SUN_PATH_MAX: usize = 104;
 )))]
 const SUN_PATH_MAX: usize = 108;
 
-/// Spawn the UDS socket listener as a background tokio task.
+/// Spawn the UDS socket listener as a background tokio task, and return its
+/// path. The socket is left in place when the daemon exits; a daemon that
+/// removes its socket on exit uses [`bind`].
 ///
-/// 1. Removes any stale socket file at `sock_path`.
-/// 2. Binds a `UnixListener` under an owner-only umask.
-/// 3. Publishes the `discovery` symlink under `~/.mache`, if any.
-/// 4. Spawns a tokio task per connection.
-/// 5. Each connection reads line-delimited JSON, dispatches, writes response.
-///
-/// Returns the socket path. The listener runs in the background. Fails, rather
-/// than panicking, when the socket cannot be bound (see [`bind_owner_only`]).
+/// `discovery` names the surface the caller serves. Nothing here publishes
+/// under it: a daemon is reachable at a well-known name only by binding that
+/// name as its default instance, which [`admit_well_known`] decides before
+/// any bind.
 pub fn spawn(
     ctx: Arc<DaemonContext>,
     sock_path: PathBuf,
     discovery: SocketDiscovery,
 ) -> anyhow::Result<PathBuf> {
+    let _ = discovery;
+    bind(ctx, sock_path).map(BoundSocket::into_path)
+}
+
+/// Bind the UDS socket and serve it as a background tokio task.
+///
+/// 1. Removes any stale socket file at `sock_path`.
+/// 2. Binds a `UnixListener` reachable only by its owner.
+/// 3. Spawns a tokio task per connection.
+/// 4. Each connection reads line-delimited JSON, dispatches, writes response.
+///
+/// Returns the bound socket, which removes the path on drop while it still
+/// names this socket (see [`BoundSocket`]). Fails, rather than panicking,
+/// when the socket cannot be bound (see [`bind_owner_only`]).
+pub fn bind(ctx: Arc<DaemonContext>, sock_path: PathBuf) -> anyhow::Result<BoundSocket> {
     // Remove any stale socket left from a previous run.
     remove_file_best_effort(&sock_path, "stale socket");
 
@@ -164,37 +304,12 @@ pub fn spawn(
     // a filesystem capability: the path itself grants access to every daemon
     // operation, so it is never reachable under inherited permissions, even
     // briefly. MCP's UDS transport applies the same owner-only boundary.
-    let listener = bind_owner_only(&sock_path)?;
+    let (listener, id) = bind_owner_only(&sock_path)?;
 
-    // Publish this daemon's own discovery symlink. Skipped when the socket
-    // already IS that path (avoids a self-referencing symlink) and when the
-    // caller publishes nothing.
-    if let Some(symlink_name) = discovery.symlink_name()
-        && let Some(home) = dirs::home_dir()
-    {
-        let mache_dir = home.join(".mache");
-        let symlink_path = mache_dir.join(symlink_name);
-        if sock_path != symlink_path {
-            // Each step is best-effort — a daemon that can't auto-symlink
-            // is still functional, just not discoverable via the default
-            // path. Log so a broken mache discovery is debuggable.
-            if let Err(e) = std::fs::create_dir_all(&mache_dir) {
-                log::warn!(
-                    "could not create {} for socket auto-discovery: {e}",
-                    mache_dir.display(),
-                );
-            }
-            remove_file_best_effort(&symlink_path, "old discovery symlink");
-            if let Err(e) = std::os::unix::fs::symlink(&sock_path, &symlink_path) {
-                log::warn!(
-                    "could not create {symlink_name} symlink at {}: {e}",
-                    symlink_path.display(),
-                );
-            }
-        }
-    }
-
-    let path = sock_path.clone();
+    let bound = BoundSocket {
+        path: sock_path,
+        id: Some(id),
+    };
 
     tokio::spawn(async move {
         loop {
@@ -212,7 +327,7 @@ pub fn spawn(
         }
     });
 
-    Ok(path)
+    Ok(bound)
 }
 
 /// Bound on the writer-task's outbound queue. Op responses and pushed
@@ -527,18 +642,173 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn each_daemon_surface_owns_a_distinct_discovery_name() {
-        // Two daemons publishing one name is the whole defect: the second to
-        // bind repoints the symlink under the first one's clients.
+    fn each_daemon_surface_owns_a_distinct_instance_name() {
+        // Two surfaces sharing one name is the defect: the second to bind
+        // takes the first one's clients.
+        assert_eq!(SocketDiscovery::Substrate.instance_name(), Some("default"));
         assert_eq!(
-            SocketDiscovery::Substrate.symlink_name(),
-            Some("default.sock")
+            SocketDiscovery::Execution.instance_name(),
+            Some("execution")
         );
-        assert_eq!(
-            SocketDiscovery::Execution.symlink_name(),
-            Some("execution.sock")
-        );
-        assert_eq!(SocketDiscovery::Unpublished.symlink_name(), None);
+        assert_eq!(SocketDiscovery::Unpublished.instance_name(), None);
+    }
+
+    /// The refusal is scoped to `$HOME/.mache`, not to a file name: a
+    /// `default.ctrl`/`default.sock` (or `execution.*`) anywhere else is an
+    /// ordinary explicit instance. mache's test spawners run daemons on
+    /// private temp dirs (`d.ctrl`, `a.ctrl`, `test.ctrl`) and rely on this.
+    #[test]
+    fn well_known_names_outside_home_mache_are_admitted() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".mache")).unwrap();
+        let spawn_dir = TempDir::new().unwrap();
+        let tmp = spawn_dir.path();
+        // `HOME` itself, not `HOME/.mache`, is also outside the scope.
+        let dirs = [tmp.to_path_buf(), home.path().to_path_buf()];
+        for d in [
+            SocketDiscovery::Substrate,
+            SocketDiscovery::Execution,
+            SocketDiscovery::Unpublished,
+        ] {
+            for dir in &dirs {
+                for (arena, ctrl) in [
+                    ("x.arena", "default.ctrl"),
+                    ("default.arena", "default.ctrl"),
+                    ("x.arena", "execution.ctrl"),
+                    ("x.arena", "default.sock"),
+                    ("d.arena", "d.ctrl"),
+                    ("a.arena", "a.ctrl"),
+                    ("test.arena", "test.ctrl"),
+                ] {
+                    admit_well_known(d, Some(home.path()), &dir.join(arena), &dir.join(ctrl))
+                        .unwrap_or_else(|e| panic!("{d:?} {arena} {ctrl}: {e:#}"));
+                }
+            }
+        }
+    }
+
+    /// Bead `ley-line-open-e7459a`: only a surface's default instance may
+    /// bind its well-known socket. Paths are compared as directory entries,
+    /// so a HOME reached through a symlink still matches.
+    #[test]
+    fn only_the_default_instance_is_admitted_to_a_well_known_socket() {
+        let base = TempDir::new().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir_all(real.join(".mache")).unwrap();
+        let home = base.path().join("home");
+        std::os::unix::fs::symlink(&real, &home).unwrap();
+        let mache = real.join(".mache");
+        let elsewhere = base.path().join("x");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let admit = |d, arena: &std::path::Path, ctrl: &std::path::Path| {
+            admit_well_known(d, Some(&home), arena, ctrl)
+        };
+        use SocketDiscovery::*;
+
+        // Each default instance, its paths spelled through the real dir.
+        for (d, name) in [(Substrate, "default"), (Execution, "execution")] {
+            admit(
+                d,
+                &mache.join(format!("{name}.arena")),
+                &mache.join(format!("{name}.ctrl")),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        }
+        // An explicit instance off the well-known names.
+        for d in [Substrate, Execution, Unpublished] {
+            admit(d, &elsewhere.join("a.arena"), &elsewhere.join("a.ctrl")).unwrap();
+            // The default arena with its own control block binds elsewhere.
+            admit(d, &mache.join("default.arena"), &elsewhere.join("a.ctrl")).unwrap();
+            // The well-known file names in another directory are not the
+            // well-known entries.
+            admit(
+                d,
+                &elsewhere.join("default.arena"),
+                &elsewhere.join("default.ctrl"),
+            )
+            .unwrap();
+        }
+        // An explicit arena on a well-known control block, and a surface on
+        // the other surface's name, are refused.
+        let refused = [
+            (
+                Substrate,
+                elsewhere.join("a.arena"),
+                mache.join("default.ctrl"),
+            ),
+            (
+                Execution,
+                mache.join("default.arena"),
+                mache.join("default.ctrl"),
+            ),
+            (
+                Unpublished,
+                mache.join("default.arena"),
+                mache.join("default.ctrl"),
+            ),
+            (
+                Substrate,
+                mache.join("execution.arena"),
+                mache.join("execution.ctrl"),
+            ),
+            // A control block whose `.sock` lands on the name all the same.
+            (
+                Substrate,
+                elsewhere.join("a.arena"),
+                mache.join("default.other"),
+            ),
+            // Even with the default arena (bead `ley-line-open-1d58bc`).
+            (
+                Substrate,
+                mache.join("default.arena"),
+                mache.join("default.other"),
+            ),
+        ];
+        for (d, arena, ctrl) in refused {
+            let err = admit(d, &arena, &ctrl).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("discovery socket"),
+                "{d:?} {} {}: {err:#}",
+                arena.display(),
+                ctrl.display()
+            );
+        }
+        // No home: no well-known names to protect.
+        admit_well_known(
+            Substrate,
+            None,
+            &elsewhere.join("a"),
+            &mache.join("default.ctrl"),
+        )
+        .unwrap();
+    }
+
+    /// Compare-then-remove: a bound socket removes its path on drop only
+    /// while the path still names the socket it bound.
+    #[tokio::test]
+    async fn a_bound_socket_removes_only_its_own_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c.sock");
+
+        let bound = bind(test_context(dir.path()), path.clone()).unwrap();
+        assert_eq!(bound.path(), path);
+        drop(bound);
+        assert!(std::fs::symlink_metadata(&path).is_err(), "removed on drop");
+
+        let bound = bind(test_context(dir.path()), path.clone()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let newer = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(bound);
+        std::os::unix::net::UnixStream::connect(&path).expect("the newer socket stays");
+        drop(newer);
+
+        let kept = spawn(
+            test_context(dir.path()),
+            dir.path().join("k.sock"),
+            SocketDiscovery::Unpublished,
+        )
+        .unwrap();
+        assert!(kept.exists(), "spawn leaves its socket in place");
     }
 
     #[tokio::test]

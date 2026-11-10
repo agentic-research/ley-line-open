@@ -157,6 +157,102 @@ impl Drop for PublishLock {
     }
 }
 
+/// The fields of a control block every VERSION so far lays out the same
+/// way, read without the VERSION gate `Controller::open_or_create` applies:
+/// what a reset needs to decide whether, and over what, it may reinitialise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlHeader {
+    pub magic: u32,
+    pub version: u32,
+    /// The arena path at `[16..272]`, up to its NUL. Read without the
+    /// seqlock, so a publish in flight can tear it: use it only as a hint.
+    pub arena_path: String,
+}
+
+/// Read the header of the control block at `path`. `Ok(None)` when there is
+/// no file or it is shorter than one block, which `open_or_create` treats as
+/// a fresh control block.
+pub fn read_header(path: &Path) -> Result<Option<ControlHeader>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("read control block {}", path.display()));
+        }
+    };
+    if bytes.len() < CONTROL_SIZE {
+        return Ok(None);
+    }
+    let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+    let path_bytes = &bytes[OFF_ARENA_PATH..OFF_ARENA_PATH + ARENA_PATH_LEN];
+    let end = path_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(ARENA_PATH_LEN);
+    Ok(Some(ControlHeader {
+        magic: word(OFF_MAGIC),
+        version: word(OFF_VERSION),
+        arena_path: String::from_utf8_lossy(&path_bytes[..end]).into_owned(),
+    }))
+}
+
+/// Replace the control block at `path` with a fresh one at the current
+/// [`VERSION`]: magic and version set, no arena, the zero root.
+///
+/// The fresh block is written to a sibling file and renamed over `path`, so
+/// the replacement is a new inode. A process that still maps the old block
+/// keeps reading the old bytes, at the old version, and never sees this
+/// version's seqlock under its own layout; any process that opens `path`
+/// afterwards gets the new block, and one built for another version refuses
+/// it by its own VERSION check. Writing in place would instead hand a mapped
+/// older reader bytes it misreads.
+///
+/// The caller decides whether anything still uses the old block; this
+/// function does not look.
+pub fn reinitialize(path: &Path) -> Result<()> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .with_context(|| format!("control block path {} has no file name", path.display()))?;
+    let mut staged_name = std::ffi::OsString::from(".");
+    staged_name.push(name);
+    staged_name.push(format!(".reinit.{}", std::process::id()));
+    // A sibling, so the rename stays within one directory (and filesystem).
+    let staged = path.with_file_name(staged_name);
+
+    let mut block = vec![0u8; CONTROL_SIZE];
+    block[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
+    block[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&VERSION.to_ne_bytes());
+
+    let written = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&staged)
+            .with_context(|| format!("create {}", staged.display()))?;
+        file.write_all(&block)
+            .with_context(|| format!("write {}", staged.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", staged.display()))?;
+        std::fs::rename(&staged, path)
+            .with_context(|| format!("rename {} over {}", staged.display(), path.display()))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    written?;
+    // Make the rename itself durable; a directory that cannot be opened or
+    // synced leaves the new block in place, just not yet on disk.
+    // `.` joined with the parent: the parent itself when absolute, `./` for
+    // a bare file name.
+    let parent = Path::new(".").join(path.parent().unwrap_or(Path::new("")));
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 impl Controller {
     /// Open or create a control file at the given path.
     pub fn open_or_create(path: &Path) -> Result<Self> {
@@ -209,8 +305,12 @@ impl Controller {
                      v3 publishes the control block under a seqlock (odd sequence while a \
                      publish is in flight); older readers cannot detect an in-flight publish \
                      and older writers never mark one, so the versions do not interoperate. \
-                     Upgrade every leyline and mache process sharing this control block.",
+                     Upgrade every leyline and mache process sharing this control block, or, \
+                     to discard its contents, stop every process using it and restart the \
+                     daemon with --reset-arena, which reinitialises it at v{} when no other \
+                     process holds it.",
                     existing_version,
+                    VERSION,
                     VERSION
                 );
             }
@@ -1412,7 +1512,85 @@ mod tests {
                     && msg.contains("expects v3"),
                 "error must name the file's v{old} and the binary's v3 (got: {msg})",
             );
+            assert!(
+                msg.contains("--reset-arena"),
+                "the refusal names the recovery (bead ley-line-open-feabf4): {msg}"
+            );
         }
+    }
+
+    /// Bead `ley-line-open-feabf4`: `read_header` reads an older block's
+    /// version and arena without the VERSION gate, and `reinitialize`
+    /// replaces it with a fresh current-VERSION block on a new inode, so a
+    /// process still mapping the old block keeps its old bytes.
+    #[test]
+    fn reinitialize_replaces_an_older_block_on_a_new_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.ctrl");
+        assert_eq!(read_header(&path).unwrap(), None, "no file, no header");
+
+        let mut buf = vec![0u8; CONTROL_SIZE];
+        buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
+        buf[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&2u32.to_ne_bytes());
+        buf[OFF_ARENA_PATH..OFF_ARENA_PATH + 7].copy_from_slice(b"/a.aren");
+        std::fs::write(&path, &buf).unwrap();
+        assert_eq!(
+            read_header(&path).unwrap(),
+            Some(ControlHeader {
+                magic: MAGIC,
+                version: 2,
+                arena_path: "/a.aren".into(),
+            })
+        );
+
+        let old = std::fs::File::open(&path).unwrap();
+        let old_mapping = unsafe { memmap2::Mmap::map(&old).unwrap() };
+        let old_ino = old.metadata().unwrap().ino();
+
+        reinitialize(&path).unwrap();
+
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), old_ino);
+        assert_eq!(
+            &old_mapping[OFF_VERSION..OFF_VERSION + 4],
+            &2u32.to_ne_bytes(),
+            "a mapping of the old block still reads the old version"
+        );
+        let header = read_header(&path).unwrap().unwrap();
+        assert_eq!((header.magic, header.version), (MAGIC, VERSION));
+        assert_eq!(header.arena_path, "");
+        let c = Controller::open_or_create(&path).expect("the new block opens");
+        assert!(c.published_root().is_none(), "with nothing published");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no staging file left behind"
+        );
+    }
+
+    /// `read_header`'s edges: a file shorter than a block is fresh (`None`),
+    /// a path that cannot be read is an error rather than "fresh", and an
+    /// arena path that fills all 256 bytes stops at the field's end, not at
+    /// the next field.
+    #[test]
+    fn read_header_reports_short_unreadable_and_full_width_blocks() {
+        let dir = tempdir().unwrap();
+        let short = dir.path().join("short.ctrl");
+        std::fs::write(&short, [1u8; 8]).unwrap();
+        assert_eq!(read_header(&short).unwrap(), None);
+
+        let err = read_header(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("read control block"), "{err:#}");
+
+        let full = dir.path().join("full.ctrl");
+        let mut buf = vec![0u8; CONTROL_SIZE];
+        buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&MAGIC.to_ne_bytes());
+        buf[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&2u32.to_ne_bytes());
+        buf[OFF_ARENA_PATH..OFF_ARENA_PATH + ARENA_PATH_LEN].fill(b'a');
+        buf[OFF_ARENA_SIZE..OFF_ARENA_SIZE + 8].fill(b'z');
+        std::fs::write(&full, &buf).unwrap();
+        let header = read_header(&full).unwrap().unwrap();
+        assert_eq!(header.arena_path, "a".repeat(ARENA_PATH_LEN));
     }
 
     /// Σ axiom (IM), decade F1, ADR-0047 §5 (bead `ley-line-open-10d71a`):

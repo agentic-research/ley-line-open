@@ -39,6 +39,11 @@ sha2 = { workspace = true }
 rustix = { version = "1.1.4", features = ["fs"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+# OCI registry pulls (artifacts::registry, bead ley-line-open-97b636):
+# synchronous HTTP over rustls, the workspace's pin (cli-lib's self-update
+# uses it), so no crate is added to the lockfile. Redirects, timeouts, the
+# scheme policy and every size bound are applied by the caller, not ureq.
+ureq = { workspace = true }
 
 [features]
 # Test-only hooks on KrunWorkerBackend that bypass or retarget the

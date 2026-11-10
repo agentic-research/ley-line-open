@@ -131,7 +131,7 @@ pub const DEFAULT_MAX_ROOTFS_BYTES: u64 = 16 << 30;
 
 /// Index, manifest and config documents larger than this are refused (the
 /// image spec's own guidance for manifests is 4 MiB).
-const MAX_DOCUMENT_BYTES: u64 = 4 << 20;
+pub(super) const MAX_DOCUMENT_BYTES: u64 = 4 << 20;
 
 /// Bound on the entries a `Resolve` expansion may produce.
 const MAX_RESOLVED_ENTRIES: usize = 1 << 20;
@@ -141,11 +141,11 @@ const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
 /// Linux's `PATH_MAX`: the longest archive path or link target accepted.
 const MAX_PATH_BYTES: usize = 4096;
 
-const INDEX_TYPES: [&str; 2] = [
+pub(super) const INDEX_TYPES: [&str; 2] = [
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 ];
-const MANIFEST_TYPES: [&str; 2] = [
+pub(super) const MANIFEST_TYPES: [&str; 2] = [
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 ];
@@ -282,6 +282,16 @@ pub enum OciImportError {
     TooLarge { limit: u64 },
     #[error("CAS: {0}")]
     Cas(String),
+    #[error("malformed registry reference {0:?}: expected [registry/]repository@sha256:<hex>")]
+    MalformedReference(String),
+    #[error("registry: {0}")]
+    Registry(String),
+    #[error("insecure transport refused: {0}")]
+    InsecureTransport(String),
+    #[error("the registry redirected more than {limit} times")]
+    TooManyRedirects { limit: u32 },
+    #[error("the image exceeds its {limit}-byte download limit")]
+    DownloadTooLarge { limit: u64 },
     #[error("{action}: {source}")]
     Io {
         action: &'static str,
@@ -588,7 +598,7 @@ pub fn import_oci_layout(
 }
 
 /// The `sha256:<hex>` a reference pins, or why it pins nothing.
-fn parse_reference(reference: &str) -> Result<String, OciImportError> {
+pub(super) fn parse_reference(reference: &str) -> Result<String, OciImportError> {
     let pinned = reference
         .rsplit_once('@')
         .map_or(reference, |(_, digest)| digest);
@@ -615,6 +625,17 @@ fn parse_reference(reference: &str) -> Result<String, OciImportError> {
         )));
     }
     Err(OciImportError::MutableReference(reference.to_string()))
+}
+
+/// The hex of a well-formed descriptor digest. A digest is joined to a path
+/// (and, by a registry pull, to a URL), so it is never trusted to be a name.
+pub(super) fn sha256_hex(digest: &str) -> Result<&str, OciImportError> {
+    match digest.strip_prefix("sha256:") {
+        Some(hex) if is_lower_hex(hex, 64) => Ok(hex),
+        _ => Err(OciImportError::Unsupported(format!(
+            "descriptor digest {digest:?}: only sha256 digests are verified"
+        ))),
+    }
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -657,12 +678,7 @@ impl Layout {
     /// The blob file for a descriptor digest, which must be well formed: the
     /// digest is joined to a path, so it is never trusted to be a name.
     fn blob_path(&self, digest: &str) -> Result<PathBuf, OciImportError> {
-        match digest.strip_prefix("sha256:") {
-            Some(hex) if is_lower_hex(hex, 64) => Ok(self.blobs.join(hex)),
-            _ => Err(OciImportError::Unsupported(format!(
-                "descriptor digest {digest:?}: only sha256 digests are verified"
-            ))),
-        }
+        Ok(self.blobs.join(sha256_hex(digest)?))
     }
 
     /// Open the blob for `digest`, which must be a regular file: opening a
@@ -725,7 +741,7 @@ impl Layout {
     }
 }
 
-fn check_blob(
+pub(super) fn check_blob(
     digest: &str,
     size: Option<u64>,
     actual_size: u64,
@@ -753,17 +769,20 @@ fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn parse<'a, T: Deserialize<'a>>(bytes: &'a [u8], what: &str) -> Result<T, OciImportError> {
+pub(super) fn parse<'a, T: Deserialize<'a>>(
+    bytes: &'a [u8],
+    what: &str,
+) -> Result<T, OciImportError> {
     serde_json::from_slice(bytes)
         .map_err(|error| OciImportError::Malformed(format!("invalid {what}: {error}")))
 }
 
 #[derive(Deserialize)]
-struct Descriptor {
+pub(super) struct Descriptor {
     #[serde(rename = "mediaType")]
     media_type: String,
-    digest: String,
-    size: u64,
+    pub(super) digest: String,
+    pub(super) size: u64,
     #[serde(default)]
     platform: Option<DescriptorPlatform>,
 }
@@ -777,16 +796,16 @@ struct DescriptorPlatform {
 }
 
 #[derive(Deserialize)]
-struct Index {
+pub(super) struct Index {
     manifests: Vec<Descriptor>,
 }
 
 #[derive(Deserialize)]
-struct Manifest {
+pub(super) struct Manifest {
     #[serde(rename = "mediaType", default)]
     media_type: Option<String>,
-    config: Descriptor,
-    layers: Vec<Descriptor>,
+    pub(super) config: Descriptor,
+    pub(super) layers: Vec<Descriptor>,
 }
 
 #[derive(Deserialize)]
@@ -833,14 +852,14 @@ struct ConfigProcess {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Document {
+pub(super) enum Document {
     Index,
     Manifest,
 }
 
 /// Whether the pinned document is an index or a manifest: by its declared
 /// `mediaType`, or, when it declares none (the field is optional), by shape.
-fn classify(bytes: &[u8]) -> Result<Document, OciImportError> {
+pub(super) fn classify(bytes: &[u8]) -> Result<Document, OciImportError> {
     #[derive(Deserialize)]
     struct Probe {
         #[serde(rename = "schemaVersion", default)]
@@ -878,7 +897,7 @@ fn classify(bytes: &[u8]) -> Result<Document, OciImportError> {
     Ok(document)
 }
 
-fn select_platform<'a>(
+pub(super) fn select_platform<'a>(
     index: &'a Index,
     platform: &Platform,
 ) -> Result<&'a Descriptor, OciImportError> {

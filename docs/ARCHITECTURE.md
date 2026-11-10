@@ -104,7 +104,7 @@ SHA-256 appears only where an external format names it; none is a content addres
 
 | Site | Use | Verified at |
 |---|---|---|
-| OCI ecosystem boundary | registry digest format; `leyline rootfs import-oci` verifies every blob and `diff_id` against it, and the rootfs it publishes is named by BLAKE3 | `rs/ll-open/runtime/src/artifacts/oci.rs` |
+| OCI ecosystem boundary | registry digest format; `leyline rootfs import-oci` verifies every blob and `diff_id` against it (a `--from-registry` pull checks each fetched blob with the same function before staging it as a layout), and the rootfs it publishes is named by BLAKE3 | `rs/ll-open/runtime/src/artifacts/oci.rs`, `registry.rs` |
 | in-toto / DSSE | in-toto Statement v1 subject digests | `rs/ll-open/envelope/src/lib.rs` |
 | release checksums | `leyline self` verifies release assets against `SHA256SUMS` | `rs/ll-open/cli-lib/src/cmd_self.rs` |
 | MCP protocol schema pin | build-time digest of the vendored schema | `rs/ll-core/mcp-protocol-schema/build.rs` |

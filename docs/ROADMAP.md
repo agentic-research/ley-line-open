@@ -5,7 +5,7 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-11-09, at integration `22290da9` (latest tag v0.26.0; v0.27.0 is being cut from integration).
+Last updated: 2026-11-10, at the v0.27.0 tree `a80868e0` (latest tag v0.27.0).
 
 ## v1.0: single host, portable
 
@@ -34,8 +34,10 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- v0.27.0 — promote integration to main with the changes listed under
-  "Shipped since v0.26.0" below.
+- ADR-0046 Q7 (decided 2026-11-10, default deny): declared connections
+  appear to an unmodified guest workload as TCP on guest loopback, in both
+  directions, and a declared channel that can't be built refuses the start
+  (`ley-line-open-be3711`, `ley-line-open-bb2143`).
 
 **Next**
 - `18bfdd` — group commit: writes that land close together become one proposal,
@@ -143,7 +145,7 @@ an ordinary repository to git, CI, review, editors and build tools.
 - **Upstream libkrun** (`10feaa`): submit LLO's nine patches to
   containers/libkrun, on the owner's go-ahead.
 
-## Shipped since v0.26.0 (the v0.27.0 release)
+## Shipped in v0.27.0 (2026-11-10)
 
 | PR | Change | Bead |
 |---|---|---|

@@ -52,6 +52,10 @@ pub fn daemon_context_with_ext(
 
     // File-backed WAL LiveDb — the pool needs a real file (bead
     // `ley-line-open-f0239d`).
+    // sqlite-vec registers on connections opened after this, so register
+    // it before the reader pool opens its connections.
+    #[cfg(feature = "vec")]
+    leyline_cli_lib::daemon::vec_index::register_vec();
     let live_db_path = ctrl_path.with_extension("live.db");
     let live_db = leyline_cli_lib::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
 

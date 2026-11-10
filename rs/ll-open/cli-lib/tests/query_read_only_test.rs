@@ -154,6 +154,16 @@ impl Daemon {
     fn host_path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
+
+    /// Run `setup` on every reader-pool connection, as an extension
+    /// registering a module or a function on each would.
+    fn on_every_reader(&self, setup: impl Fn(&rusqlite::Connection)) {
+        let pool = &self.ctx.live_db.reader_pool;
+        let readers: Vec<_> = (0..pool.max_size()).map(|_| pool.get().unwrap()).collect();
+        for reader in &readers {
+            setup(reader);
+        }
+    }
 }
 
 /// The refusal `query` must return for `sql`: `ok` false, no rows, and a
@@ -365,6 +375,197 @@ fn the_protocol_fixture_refusal_is_what_the_daemon_sends() {
     let sql = fixture["request"]["sql"].as_str().unwrap();
     assert_eq!(d.over_socket(sql), fixture["response"]);
     assert_eq!(d.over_mcp(sql).0, fixture["response"]);
+}
+
+/// A virtual-table module the build did not have, registered on every
+/// reader after the pool restricted its modules (as an extension might),
+/// makes `query` refuse every statement on the reader, the join that names
+/// the module without reporting a read included (bead
+/// `ley-line-open-a9be1f`).
+#[test]
+fn a_reader_holding_an_unlisted_module_refuses_every_statement() {
+    let d = Daemon::start();
+    d.on_every_reader(|reader| rusqlite::vtab::series::load_module(reader).unwrap());
+    for sql in [
+        "SELECT value FROM generate_series(1, 3)",
+        "SELECT x.value FROM (SELECT 3 AS value UNION SELECT 99) AS x \
+         JOIN generate_series(1, 5) USING (value)",
+        "SELECT a FROM t",
+    ] {
+        assert_refused(&d, sql, "denied_action", "module");
+        assert_eq!(
+            d.over_socket(sql)["refusal"]["subject"],
+            "generate_series",
+            "{sql}"
+        );
+    }
+}
+
+/// The reader pool holds no module outside the allow-list, so a virtual
+/// table in the schema built on one cannot be read on any reader, directly
+/// or through a join that reports no read: the statement fails with `no
+/// such module` and returns no rows, over both transports, whatever the
+/// reader ran before (bead `ley-line-open-07237c`).
+#[test]
+fn a_schema_virtual_table_is_unreadable() {
+    let d = Daemon::start();
+    d.ctx
+        .live_db
+        .writer
+        .lock()
+        .execute_batch(
+            "CREATE VIRTUAL TABLE docs USING fts5(body);
+             INSERT INTO docs VALUES ('alpha');
+             CREATE VIRTUAL TABLE boxes USING rtree(id, x0, x1);
+             INSERT INTO boxes VALUES (2, 0, 1);",
+        )
+        .unwrap();
+    for (sql, module) in [
+        ("SELECT body FROM docs", "fts5"),
+        ("SELECT a FROM t NATURAL JOIN docs", "fts5"),
+        ("SELECT id FROM boxes", "rtree"),
+        (
+            "WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM n WHERE id < 5) \
+             SELECT n.id FROM n NATURAL JOIN boxes",
+            "rtree",
+        ),
+    ] {
+        // Twice: the first attempt leaves nothing connected for the second.
+        for _ in 0..2 {
+            let before = d.state();
+            let socket = d.over_socket(sql);
+            let (mcp, is_error) = d.over_mcp(sql);
+            for (transport, reply) in [("socket", &socket), ("mcp", &mcp)] {
+                assert_eq!(reply["ok"], false, "{transport}: {sql}: {reply}");
+                assert!(reply.get("rows").is_none(), "{transport}: {sql}: {reply}");
+                assert!(
+                    reply["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(&format!("no such module: {module}")),
+                    "{transport}: {sql}: {reply}"
+                );
+            }
+            assert!(is_error, "{sql}");
+            assert_eq!(d.state(), before, "{sql} changed the daemon");
+        }
+    }
+    // Only `main`'s tables are read: naming the temp schema opens it.
+    assert_refused(
+        &d,
+        "SELECT name FROM sqlite_temp_master",
+        "denied_action",
+        "read",
+    );
+    // The table's own storage is a plain table and is read as one.
+    assert_eq!(
+        d.over_socket("SELECT count(*) AS n FROM docs_content")["rows"],
+        json!([{"n": "1"}])
+    );
+}
+
+/// The allowed modules still return rows over both transports.
+#[test]
+fn allowed_modules_return_rows() {
+    let d = Daemon::start();
+    let mut cases = vec![
+        (
+            "SELECT value FROM json_each('[1, 2]')",
+            json!([{"value": "1"}, {"value": "2"}]),
+        ),
+        (
+            "SELECT key FROM json_tree('{\"k\": 1}') WHERE key IS NOT NULL",
+            json!([{"key": "k"}]),
+        ),
+        (
+            "SELECT count(*) AS n FROM jsonb_each(jsonb('[1, 2]'))",
+            json!([{"n": "2"}]),
+        ),
+        (
+            "SELECT name FROM dbstat WHERE name = 't'",
+            json!([{"name": "t"}]),
+        ),
+        // A full join's merged column is reported as a read of the
+        // subquery's name, which is not a table of the schema.
+        (
+            "SELECT a FROM (SELECT 1 AS a) AS s FULL JOIN t USING (a) ORDER BY a",
+            json!([{"a": "1"}, {"a": "2"}]),
+        ),
+    ];
+    if cfg!(feature = "vec") {
+        cases.push((
+            "SELECT count(*) AS n FROM vec_each('[1.0, 2.0, 3.0]')",
+            json!([{"n": "3"}]),
+        ));
+    }
+    for (sql, want) in cases {
+        let socket = d.over_socket(sql);
+        let (mcp, is_error) = d.over_mcp(sql);
+        assert_eq!(socket["rows"], want, "socket: {sql}: {socket}");
+        assert_eq!(mcp, socket, "mcp: {sql}");
+        assert!(!is_error, "{sql}");
+    }
+}
+
+/// How many times the test `abs` below has run.
+static ABS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A denial raised while the statement steps, after a row has been
+/// produced, returns the refusal and no rows over both transports (bead
+/// `ley-line-open-a9d50a`, N3).
+#[test]
+fn a_denial_after_rows_returns_no_rows() {
+    use std::sync::atomic::Ordering;
+    let d = Daemon::start();
+
+    // The review's statement: its second row reads `pragma_database_list`.
+    // That read is now refused when the statement is prepared.
+    assert_refused(
+        &d,
+        "SELECT a, CASE WHEN a = 2 THEN (SELECT name FROM pragma_database_list) END FROM t ORDER BY a",
+        "denied_action",
+        "pragma",
+    );
+
+    // A denial that can only come during a step: `abs`, an allowed name,
+    // overridden on every reader to prepare a denied statement on its own
+    // connection when it is given 2, the second row.
+    d.on_every_reader(|reader| {
+        use rusqlite::functions::FunctionFlags;
+        reader
+            .create_scalar_function("abs", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+                ABS_CALLS.fetch_add(1, Ordering::SeqCst);
+                let n: i64 = ctx.get(0)?;
+                if n == 2 {
+                    // SAFETY: the connection outlives the call it runs.
+                    let inner = unsafe { ctx.get_connection()? };
+                    inner.prepare("SELECT name FROM pragma_database_list")?;
+                }
+                Ok(n)
+            })
+            .unwrap();
+    });
+    let sql = "SELECT a, abs(a) AS b FROM t ORDER BY rowid";
+    ABS_CALLS.store(0, Ordering::SeqCst);
+    let socket = d.over_socket(sql);
+    assert_eq!(
+        ABS_CALLS.swap(0, Ordering::SeqCst),
+        2,
+        "row 1 was produced before row 2 was denied"
+    );
+    let (mcp, is_error) = d.over_mcp(sql);
+    assert_eq!(ABS_CALLS.load(Ordering::SeqCst), 2);
+    for (transport, reply) in [("socket", &socket), ("mcp", &mcp)] {
+        assert_eq!(reply["ok"], false, "{transport}: {reply}");
+        assert!(reply.get("rows").is_none(), "{transport}: {reply}");
+        assert_eq!(
+            reply["refusal"],
+            json!({"reason": "denied_action", "action": "pragma", "subject": "database_list"}),
+            "{transport}: {reply}"
+        );
+    }
+    assert!(is_error);
+    assert_eq!(socket, mcp);
 }
 
 #[test]

@@ -87,14 +87,34 @@ pub fn fifo(path: &str) -> Entry {
     Entry::Fifo { path: path.into() }
 }
 
-fn set_raw(field: &mut [u8], value: &str) {
+/// Write `value` into a ustar name field. A value that does not fit is
+/// first written as a GNU long-name (`L`) or long-link (`K`) entry, which
+/// the next header's truncated field defers to.
+fn set_raw(
+    builder: &mut tar::Builder<Vec<u8>>,
+    kind: tar::EntryType,
+    field: &mut [u8],
+    value: &str,
+) {
     let bytes = value.as_bytes();
-    assert!(
-        bytes.len() < field.len(),
-        "fixture name {value:?} does not fit a ustar header field"
-    );
+    if bytes.len() >= field.len() {
+        let mut long = tar::Header::new_ustar();
+        long.set_entry_type(kind);
+        long.set_mtime(0);
+        long.set_mode(0o644);
+        long.set_size(bytes.len() as u64 + 1);
+        let name = b"././@LongLink";
+        long.as_old_mut().name[..name.len()].copy_from_slice(name);
+        long.set_cksum();
+        let mut data = bytes.to_vec();
+        data.push(0);
+        builder
+            .append(&long, data.as_slice())
+            .expect("append long-name entry");
+    }
+    let kept = bytes.len().min(field.len() - 1);
     field.fill(0);
-    field[..bytes.len()].copy_from_slice(bytes);
+    field[..kept].copy_from_slice(&bytes[..kept]);
 }
 
 /// An uncompressed layer tarball holding `entries` in the order given.
@@ -121,13 +141,23 @@ pub fn tar(entries: &[Entry]) -> Vec<u8> {
             Entry::Symlink { path, target } => {
                 header.set_entry_type(tar::EntryType::Symlink);
                 header.set_mode(0o777);
-                set_raw(&mut header.as_old_mut().linkname, target);
+                set_raw(
+                    &mut builder,
+                    tar::EntryType::GNULongLink,
+                    &mut header.as_old_mut().linkname,
+                    target,
+                );
                 (path, &[])
             }
             Entry::Hardlink { path, target } => {
                 header.set_entry_type(tar::EntryType::Link);
                 header.set_mode(0o644);
-                set_raw(&mut header.as_old_mut().linkname, target);
+                set_raw(
+                    &mut builder,
+                    tar::EntryType::GNULongLink,
+                    &mut header.as_old_mut().linkname,
+                    target,
+                );
                 (path, &[])
             }
             Entry::Fifo { path } => {
@@ -136,7 +166,12 @@ pub fn tar(entries: &[Entry]) -> Vec<u8> {
                 (path, &[])
             }
         };
-        set_raw(&mut header.as_old_mut().name, path);
+        set_raw(
+            &mut builder,
+            tar::EntryType::GNULongName,
+            &mut header.as_old_mut().name,
+            path,
+        );
         header.set_cksum();
         builder.append(&header, data).expect("append tar entry");
     }
@@ -249,7 +284,7 @@ impl Layout {
         layers: &[Layer],
         diff_ids: Option<Vec<String>>,
     ) -> Descriptor {
-        let mut descriptors = Vec::new();
+        let mut blobs = Vec::new();
         let mut computed = Vec::new();
         for layer in layers {
             let uncompressed = tar(&layer.entries);
@@ -259,25 +294,36 @@ impl Layout {
             } else {
                 uncompressed
             };
-            descriptors.push(self.blob(layer.media_type, &stored).json());
+            blobs.push((layer.media_type, stored));
         }
-        let config = self.json_blob(
-            OCI_CONFIG,
-            &json!({
-                "architecture": architecture,
-                "os": os,
-                "config": {
-                    "Entrypoint": ["/bin/tool"],
-                    "Cmd": ["--serve"],
-                    "Env": ["PATH=/usr/bin:/bin"],
-                    "WorkingDir": "/"
-                },
-                "rootfs": {
-                    "type": "layers",
-                    "diff_ids": diff_ids.unwrap_or(computed)
-                }
-            }),
-        );
+        self.image_from_blobs(
+            json!({"architecture": architecture, "os": os}),
+            &blobs,
+            diff_ids.unwrap_or(computed),
+        )
+    }
+
+    /// Write layer blobs exactly as given, a config whose platform fields
+    /// are `platform` and whose diff_ids are `diff_ids`, and the manifest.
+    pub fn image_from_blobs(
+        &self,
+        platform: Value,
+        blobs: &[(&str, Vec<u8>)],
+        diff_ids: Vec<String>,
+    ) -> Descriptor {
+        let descriptors: Vec<Value> = blobs
+            .iter()
+            .map(|(media_type, bytes)| self.blob(media_type, bytes).json())
+            .collect();
+        let mut config = platform;
+        config["config"] = json!({
+            "Entrypoint": ["/bin/tool"],
+            "Cmd": ["--serve"],
+            "Env": ["PATH=/usr/bin:/bin"],
+            "WorkingDir": "/"
+        });
+        config["rootfs"] = json!({"type": "layers", "diff_ids": diff_ids});
+        let config = self.json_blob(OCI_CONFIG, &config);
         self.json_blob(
             OCI_MANIFEST,
             &json!({

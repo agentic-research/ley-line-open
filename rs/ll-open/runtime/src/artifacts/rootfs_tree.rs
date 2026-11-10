@@ -56,6 +56,29 @@ pub(crate) enum Final {
     File(FileNode),
 }
 
+impl Final {
+    /// The tree without any directory that holds no regular file, at any
+    /// depth. The root directory is kept.
+    pub(crate) fn without_empty_directories(self) -> Final {
+        fn prune(entries: BTreeMap<String, Final>) -> BTreeMap<String, Final> {
+            entries
+                .into_iter()
+                .filter_map(|(name, node)| match node {
+                    Final::File(file) => Some((name, Final::File(file))),
+                    Final::Dir(children) => {
+                        let children = prune(children);
+                        (!children.is_empty()).then_some((name, Final::Dir(children)))
+                    }
+                })
+                .collect()
+        }
+        match self {
+            Final::Dir(entries) => Final::Dir(prune(entries)),
+            file => file,
+        }
+    }
+}
+
 /// Why a symbolic link has no in-root regular file or directory to stand for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Unresolvable {

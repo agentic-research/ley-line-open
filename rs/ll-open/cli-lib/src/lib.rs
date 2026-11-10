@@ -101,10 +101,6 @@ pub enum CdcCommands {
     },
 }
 
-/// Self-management subcommands (bead ley-line-open-321ded, rustup/uv
-/// model — the binary owns its own install/update instead of every
-/// consumer's Taskfile reinventing a copy step; see `cmd_self` for the
-/// full contract).
 /// What `rootfs import-oci` does with an image's symbolic links, which
 /// rootfs manifest v1 cannot express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -143,6 +139,10 @@ pub enum RootfsCommands {
     },
 }
 
+/// Self-management subcommands (bead ley-line-open-321ded, rustup/uv
+/// model — the binary owns its own install/update instead of every
+/// consumer's Taskfile reinventing a copy step; see `cmd_self` for the
+/// full contract).
 #[derive(Debug, Subcommand)]
 pub enum SelfCommands {
     /// Copy the running executable into a stable install dir

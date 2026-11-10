@@ -22,10 +22,15 @@
 //! - **Pinned input only.** The reference is `sha256:<hex>` (or
 //!   `name@sha256:<hex>`, where the name is a label). A tag is refused; the
 //!   layout's `index.json`, whose tags are mutable, is never read.
-//! - **Every byte authenticated.** Each blob is read from
-//!   `blobs/sha256/<hex>` into private staging and must hash to its digest
-//!   and match its descriptor's size before it is parsed. Each layer's
-//!   uncompressed stream must hash to the config's `diff_id`.
+//! - **Every byte authenticated.** Each blob must be a regular file at
+//!   `blobs/sha256/<hex>`, is read into owner-only staging, and must hash to
+//!   its digest and match its descriptor's size before it is parsed. Each
+//!   layer's whole uncompressed stream (every gzip member) must hash to the
+//!   config's `diff_id`.
+//! - **Bounded.** `max_rootfs_bytes` bounds the decompressed bytes read from
+//!   all layers together (headers and long-name metadata included) and,
+//!   separately, the bytes written. Paths and link targets longer than
+//!   `PATH_MAX` (4096 bytes) are refused.
 //! - **Platform.** An index selects the one entry for the requested
 //!   platform (`arm64` without a variant is `arm64/v8`); none or several is
 //!   an error. The image config must agree with the requested platform.
@@ -34,10 +39,12 @@
 //!   remove lower-layer entries only, never ones the same layer adds.
 //! - **What rootfs manifest v1 can express.** Regular files with their
 //!   permission bits. Directories are written `0755` and only where a file
-//!   needs them: neither a directory's mode, an empty directory, ownership,
+//!   needs them (a directory that holds no file, at any depth, is not
+//!   written): neither a directory's mode, an empty directory, ownership,
 //!   timestamps nor extended attributes is in the manifest, so none is
 //!   carried, and two imports with the same identity are the same tree on
-//!   disk. Setuid, setgid and sticky bits are cleared (and counted): the tree
+//!   disk. The guest init creates its own `/dev`, `/proc`, `/sys` and `/tmp`
+//!   mount points. Setuid, setgid and sticky bits are cleared (and counted): the tree
 //!   is written by an unprivileged host user, and a host file carrying them
 //!   is a hazard the manifest has no reason to admit. A file its owner cannot
 //!   read, a device node, a FIFO, a sparse file or an aufs `.wh..wh.` entry
@@ -53,14 +60,18 @@
 //!   `link -> /etc`) is refused under either policy.
 //! - **No traversal.** Absolute paths, `..` components, entries under a
 //!   regular file, and `rootfs.manifest.json` at the image root are refused.
-//!   Nothing is written to disk until the finished tree is, beneath private
-//!   staging inside the CAS root, so no hostile entry reaches the host.
+//!   No image path reaches the host filesystem until the finished tree is
+//!   written beneath owner-only staging inside the CAS root; until then,
+//!   extracted file contents are stored only under their BLAKE3 names.
 //! - **Deterministic identity.** The manifest lists files in path order with
 //!   fixed field order, so the same image content gives the same rootfs
 //!   digest whatever the layers' archive order, the host, or the run.
 //! - **Atomic, verified publication.** The staged tree is verified against
 //!   its own manifest, then renamed to `<cas-root>/<digest>`. An existing
-//!   entry is reused only if it verifies, and never overwritten.
+//!   entry is reused only if its files verify and its directories are exactly
+//!   the ones this import wrote, all `0755`; it is never overwritten. Files
+//!   are not fsynced before the rename: after a host crash an entry may fail
+//!   to verify, and an import then refuses it rather than reusing it.
 //!
 //! No Docker, Buildah or Podman daemon, and no krunvm, is involved: those
 //! tools are optional producers of the layout. The isolation boundary is
@@ -68,12 +79,15 @@
 //!
 //! [OCI image layout]: https://github.com/opencontainers/image-spec/blob/v1.1.0/image-layout.md
 
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use leyline_core::ContentAddressed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -92,6 +106,9 @@ const MAX_DOCUMENT_BYTES: u64 = 4 << 20;
 const MAX_RESOLVED_ENTRIES: usize = 1 << 20;
 
 const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
+
+/// Linux's `PATH_MAX`: the longest archive path or link target accepted.
+const MAX_PATH_BYTES: usize = 4096;
 
 const INDEX_TYPES: [&str; 2] = [
     "application/vnd.oci.image.index.v1+json",
@@ -253,8 +270,10 @@ pub struct OciImport<'a> {
     pub reference: &'a str,
     pub platform: Platform,
     pub symlinks: SymlinkPolicy,
-    /// Bound on the bytes extracted from the layers, and separately on the
-    /// bytes of the rootfs written (resolved link copies included).
+    /// Bound on what the layers extract (file bytes plus 512 per archive
+    /// entry, across every layer, whiteouts and overwritten files included),
+    /// and separately on the bytes of the rootfs written (resolved link
+    /// copies included).
     pub max_rootfs_bytes: u64,
 }
 
@@ -346,13 +365,8 @@ pub fn import_oci_layout(
         .platform
         .admits(&config.os, &config.architecture, config.variant.as_deref())
     {
-        let image = Platform {
-            os: config.os,
-            architecture: config.architecture,
-            variant: config.variant,
-        };
         return Err(OciImportError::PlatformMismatch {
-            image: image.to_string(),
+            image: config.platform().to_string(),
             requested: request.platform.to_string(),
         });
     }
@@ -374,7 +388,11 @@ pub fn import_oci_layout(
         .prefix(".oci-import-")
         .tempdir_in(&cas_root)
         .map_err(io_error("create import staging in the CAS root"))?;
-    let mut store = ContentStore::create(staging.path().join("content"), request.max_rootfs_bytes)?;
+    // Owner-only: staged layers hold files a later layer may white out.
+    fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o700))
+        .map_err(io_error("make import staging private"))?;
+    let mut store = ContentStore::create(staging.path().join("content"))?;
+    let budget = Budget::new(request.max_rootfs_bytes);
     let mut tree = Tree::default();
     for (index, (layer, diff_id)) in manifest
         .layers
@@ -385,7 +403,8 @@ pub fn import_oci_layout(
         let compression = Compression::of(&layer.media_type)?;
         let staged = staging.path().join(format!("layer-{index}"));
         layout.stage_layer(layer, &staged)?;
-        let changes = read_layer(index, &staged, compression, diff_id, &mut store)?;
+        let changes = read_layer(index, &staged, compression, diff_id, &mut store, &budget)
+            .map_err(|error| budget.explain(error))?;
         fs::remove_file(&staged).map_err(io_error("remove a staged layer"))?;
         changes.apply(index, &mut tree)?;
     }
@@ -409,6 +428,9 @@ pub fn import_oci_layout(
                 )),
             })?,
     };
+    // Rootfs manifest v1 lists files only, so a directory that holds none is
+    // not part of the identity: write none, and one digest names one tree.
+    let finished = finished.without_empty_directories();
 
     let staged_root = staging.path().join("rootfs");
     let written = write_rootfs(&staged_root, &finished, &store, request.max_rootfs_bytes)?;
@@ -422,8 +444,9 @@ pub fn import_oci_layout(
             error.detail
         ))
     })?;
-    publish(&cas_root, &staged_root, &rootfs)?;
+    publish(&cas_root, &staged_root, &rootfs, &written.directories)?;
 
+    let platform = config.platform();
     let runtime = config.config.unwrap_or_default();
     Ok(ImportedRootfs {
         rootfs,
@@ -431,7 +454,7 @@ pub fn import_oci_layout(
             reference,
             manifest: manifest_digest,
             config: manifest.config.digest,
-            platform: request.platform.clone(),
+            platform,
         },
         files: written.files,
         special_mode_bits_cleared: written.special_mode_bits_cleared,
@@ -524,9 +547,22 @@ impl Layout {
         }
     }
 
+    /// Open the blob for `digest`, which must be a regular file: opening a
+    /// FIFO planted in the layout would block the import forever.
+    fn open_blob(&self, digest: &str) -> Result<File, OciImportError> {
+        let path = self.blob_path(digest)?;
+        let metadata = fs::metadata(&path).map_err(io_error("open an image blob"))?;
+        if !metadata.is_file() {
+            return Err(OciImportError::Malformed(format!(
+                "blob {digest} is not a regular file"
+            )));
+        }
+        File::open(&path).map_err(io_error("open an image blob"))
+    }
+
     /// A JSON document blob, read whole and authenticated.
     fn document(&self, digest: &str, size: Option<u64>) -> Result<Vec<u8>, OciImportError> {
-        let file = File::open(self.blob_path(digest)?).map_err(io_error("open an image blob"))?;
+        let file = self.open_blob(digest)?;
         let mut bytes = Vec::new();
         file.take(MAX_DOCUMENT_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -544,8 +580,7 @@ impl Layout {
     /// what is parsed afterwards is the copy, so the layout cannot change it
     /// between verification and use.
     fn stage_layer(&self, layer: &Descriptor, staged: &Path) -> Result<(), OciImportError> {
-        let source =
-            File::open(self.blob_path(&layer.digest)?).map_err(io_error("open a layer blob"))?;
+        let source = self.open_blob(&layer.digest)?;
         let mut destination = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -645,6 +680,17 @@ struct ImageConfig {
     rootfs: ConfigRootfs,
     #[serde(default)]
     config: Option<ConfigProcess>,
+}
+
+impl ImageConfig {
+    /// The platform the (digest-verified) config says the image is for.
+    fn platform(&self) -> Platform {
+        Platform {
+            os: self.os.clone(),
+            architecture: self.architecture.clone(),
+            variant: self.variant.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -766,19 +812,12 @@ impl Compression {
 struct ContentStore {
     dir: PathBuf,
     next: u64,
-    extracted: u64,
-    limit: u64,
 }
 
 impl ContentStore {
-    fn create(dir: PathBuf, limit: u64) -> Result<Self, OciImportError> {
+    fn create(dir: PathBuf) -> Result<Self, OciImportError> {
         fs::create_dir(&dir).map_err(io_error("create the import content store"))?;
-        Ok(Self {
-            dir,
-            next: 0,
-            extracted: 0,
-            limit,
-        })
+        Ok(Self { dir, next: 0 })
     }
 
     fn path(&self, content: &blake3::Hash) -> PathBuf {
@@ -804,10 +843,6 @@ impl ContentStore {
                 break;
             }
             size += read as u64;
-            self.extracted += read as u64;
-            if self.extracted > self.limit {
-                return Err(OciImportError::TooLarge { limit: self.limit });
-            }
             hasher.update(&buffer[..read]);
             file.write_all(&buffer[..read])
                 .map_err(io_error("extract a layer file"))?;
@@ -818,15 +853,58 @@ impl ContentStore {
     }
 }
 
-/// A `Read` that hashes everything read through it: a layer's diff_id.
-struct DiffIdReader<R> {
-    inner: R,
-    hasher: Sha256,
+/// The import's bound on decompressed layer bytes: every byte of every
+/// layer's tar stream, headers, metadata payloads, whited-out and trailing
+/// bytes included, counted where the stream is read.
+struct Budget {
+    limit: u64,
+    remaining: Cell<u64>,
+    exceeded: Cell<bool>,
 }
 
-impl<R: Read> Read for DiffIdReader<R> {
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            remaining: Cell::new(limit),
+            exceeded: Cell::new(false),
+        }
+    }
+
+    /// Spend `bytes`, or fail the read that would overspend.
+    fn spend(&self, bytes: usize) -> io::Result<()> {
+        let remaining = self.remaining.get();
+        if bytes as u64 > remaining {
+            self.exceeded.set(true);
+            return Err(io::Error::other("the import's decompressed-byte limit"));
+        }
+        self.remaining.set(remaining - bytes as u64);
+        Ok(())
+    }
+
+    /// An error raised while the budget was exhausted is that exhaustion,
+    /// whichever reader (tar's, the content store's) reported it.
+    fn explain(&self, error: OciImportError) -> OciImportError {
+        if self.exceeded.get() {
+            OciImportError::TooLarge { limit: self.limit }
+        } else {
+            error
+        }
+    }
+}
+
+/// A `Read` that hashes everything read through it — a layer's diff_id —
+/// and charges it to the import's budget.
+struct DiffIdReader<'a, R> {
+    inner: R,
+    hasher: Sha256,
+    budget: &'a Budget,
+}
+
+impl<R: Read> Read for DiffIdReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buffer)?;
+        self.budget.spend(read)?;
         self.hasher.update(&buffer[..read]);
         Ok(read)
     }
@@ -878,6 +956,11 @@ fn unsafe_path(layer: usize, raw: &str, reason: &str) -> OciImportError {
 /// empty components (`./a//b/`) are dropped; an absolute path or a `..`
 /// component is refused, never normalized.
 fn guest_path(raw: &str) -> Result<Vec<String>, &'static str> {
+    // PATH_MAX. Also bounds the tree's depth, which every pass over it
+    // recurses through.
+    if raw.len() > MAX_PATH_BYTES {
+        return Err("paths longer than 4096 bytes are refused");
+    }
     if raw.starts_with('/') {
         return Err("absolute paths are refused");
     }
@@ -908,15 +991,20 @@ fn read_layer(
     compression: Compression,
     diff_id: &str,
     store: &mut ContentStore,
+    budget: &Budget,
 ) -> Result<LayerChanges, OciImportError> {
     let file = BufReader::new(File::open(staged).map_err(io_error("open a staged layer"))?);
+    // Every gzip member, as RFC 1952 and other OCI implementations read a
+    // layer: the diff_id covers the whole stream, and trailing bytes that
+    // are not a member are an error, not ignored.
     let decoded: Box<dyn Read> = match compression {
         Compression::None => Box::new(file),
-        Compression::Gzip => Box::new(flate2::read::GzDecoder::new(file)),
+        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(file)),
     };
     let mut reader = DiffIdReader {
         inner: decoded,
         hasher: Sha256::new(),
+        budget,
     };
     let mut changes = LayerChanges::default();
     {
@@ -993,6 +1081,13 @@ fn read_layer(
                         Some(bytes) => utf8(layer, &bytes)?,
                         None => String::new(),
                     };
+                    if target.len() > MAX_PATH_BYTES {
+                        return Err(unsafe_path(
+                            layer,
+                            &raw,
+                            "link targets longer than 4096 bytes are refused",
+                        ));
+                    }
                     Change::Node(path, Node::Symlink(target))
                 }
                 tar::EntryType::Link => {
@@ -1025,6 +1120,8 @@ struct Written {
     digest: String,
     files: usize,
     special_mode_bits_cleared: usize,
+    /// Every directory written, relative, the root as "". All are `0755`.
+    directories: BTreeSet<String>,
 }
 
 #[derive(Serialize)]
@@ -1046,6 +1143,7 @@ struct Writer<'a> {
     written: u64,
     files: Vec<ManifestFile>,
     special_mode_bits_cleared: usize,
+    directories: BTreeSet<String>,
 }
 
 impl Writer<'_> {
@@ -1061,6 +1159,7 @@ impl Writer<'_> {
             match node {
                 Final::Dir(children) => {
                     create_directory(&path)?;
+                    self.directories.insert(relative.clone());
                     self.directory(&path, &relative, children)?;
                 }
                 Final::File(file) => self.file(&path, relative, file)?,
@@ -1136,6 +1235,7 @@ fn write_rootfs(
         written: 0,
         files: Vec::new(),
         special_mode_bits_cleared: 0,
+        directories: BTreeSet::from([String::new()]),
     };
     writer.directory(root, "", entries)?;
     let manifest = serde_json::to_vec(&ManifestDocument {
@@ -1148,28 +1248,79 @@ fn write_rootfs(
     fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644))
         .map_err(io_error("set the rootfs manifest's mode"))?;
     Ok(Written {
-        digest: blake3::hash(&manifest).to_hex().to_string(),
+        // σ_bytes over the manifest: the identity `verify_manifest` checks.
+        digest: manifest.as_slice().hash().to_string(),
         files: writer.files.len(),
         special_mode_bits_cleared: writer.special_mode_bits_cleared,
+        directories: writer.directories,
     })
 }
 
+/// Every directory under `root`, relative, the root as "", with its mode.
+/// Links are not followed (and a verified rootfs holds none).
+fn directories_on_disk(root: &Path) -> Result<BTreeMap<String, u32>, OciImportError> {
+    fn walk(
+        dir: &Path,
+        prefix: &str,
+        out: &mut BTreeMap<String, u32>,
+    ) -> Result<(), OciImportError> {
+        for entry in fs::read_dir(dir).map_err(io_error("enumerate a CAS entry"))? {
+            let entry = entry.map_err(io_error("enumerate a CAS entry"))?;
+            let metadata = entry
+                .path()
+                .symlink_metadata()
+                .map_err(io_error("inspect a CAS entry"))?;
+            if metadata.is_dir() {
+                let relative = join(prefix, &entry.file_name().to_string_lossy());
+                out.insert(relative.clone(), metadata.permissions().mode() & 0o7777);
+                walk(&entry.path(), &relative, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mode = fs::symlink_metadata(root)
+        .map_err(io_error("inspect a CAS entry"))?
+        .permissions()
+        .mode()
+        & 0o7777;
+    let mut out = BTreeMap::from([(String::new(), mode)]);
+    walk(root, "", &mut out)?;
+    Ok(out)
+}
+
 /// Rename the verified staged tree to `<cas-root>/<digest>`. An entry that
-/// is already there is reused only if the CAS resolver verifies it.
-fn publish(cas_root: &Path, staged: &Path, rootfs: &DigestRef) -> Result<(), OciImportError> {
+/// is already there is reused only if the CAS resolver verifies its files
+/// and its directories are exactly the ones this import wrote, all `0755`:
+/// the manifest does not cover directories, and the per-run copy carries
+/// them into the guest.
+fn publish(
+    cas_root: &Path,
+    staged: &Path,
+    rootfs: &DigestRef,
+    directories: &BTreeSet<String>,
+) -> Result<(), OciImportError> {
     let destination = cas_root.join(&rootfs.value);
     if destination.symlink_metadata().is_err() && fs::rename(staged, &destination).is_ok() {
         return Ok(());
     }
-    DirectoryRootfsResolver::new(cas_root)
+    let refuse = |detail: String| {
+        OciImportError::Cas(format!(
+            "{} already exists and does not verify as rootfs {}; refusing to replace it: {detail}",
+            destination.display(),
+            rootfs.value,
+        ))
+    };
+    let resolved = DirectoryRootfsResolver::new(cas_root)
         .resolve(rootfs)
-        .map(|_| ())
-        .map_err(|error| {
-            OciImportError::Cas(format!(
-                "{} already exists and does not verify as rootfs {}; refusing to replace it: {}",
-                destination.display(),
-                rootfs.value,
-                error.detail
-            ))
-        })
+        .map_err(|error| refuse(error.detail))?;
+    let expected: BTreeMap<String, u32> = directories
+        .iter()
+        .map(|directory| (directory.clone(), 0o755))
+        .collect();
+    if directories_on_disk(&resolved.canonical_path)? != expected {
+        return Err(refuse(
+            "its directories or their modes differ from the ones its manifest implies".into(),
+        ));
+    }
+    Ok(())
 }

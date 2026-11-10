@@ -144,4 +144,28 @@ mod tests {
             .collect();
         assert_eq!(published.len(), 1);
     }
+
+    /// The `leyline` dispatcher routes `rootfs` here and returns its error.
+    #[test]
+    fn the_command_dispatcher_runs_rootfs_commands() {
+        let (layout, _) = fixture();
+        let cas = tempfile::TempDir::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(crate::run(crate::Commands::Rootfs {
+                command: RootfsCommands::ImportOci {
+                    layout,
+                    image: "latest".into(),
+                    cas_root: cas.path().to_path_buf(),
+                    symlinks: SymlinkMode::Refuse,
+                },
+            }))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("mutable image reference"),
+            "{error:#}"
+        );
+    }
 }

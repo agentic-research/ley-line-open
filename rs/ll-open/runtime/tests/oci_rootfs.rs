@@ -767,6 +767,69 @@ fn the_rootfs_identity_is_deterministic_across_runs_and_archive_order() {
     );
 }
 
+/// Every directory under `root`, relative, with its mode.
+fn directories(root: &Path) -> Vec<(String, u32)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u32)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = path.symlink_metadata().unwrap();
+            if meta.is_dir() {
+                out.push((
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    meta.permissions().mode() & 0o7777,
+                ));
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = vec![(
+        String::new(),
+        fs::metadata(root).unwrap().permissions().mode() & 0o7777,
+    )];
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn one_rootfs_digest_names_one_tree_on_disk() {
+    // Rootfs manifest v1 lists files only. Directories that hold no file,
+    // and directory modes, are not in it, so the importer must not write
+    // them: otherwise two images with one digest differ on disk, and which
+    // tree a CAS holds depends on which image arrived first.
+    let (with_dirs, a) = import_single(
+        vec![
+            Layer::plain(vec![
+                dir("tmp/", 0o1777),
+                dir("proc/", 0o555),
+                dir("bin/", 0o700),
+                file("bin/x", 0o755, b"x"),
+                file("var/cache/old", 0o644, b"old"),
+            ]),
+            // Emptied by an opaque whiteout: an empty directory again.
+            Layer::plain(vec![file("var/cache/.wh..wh..opq", 0o644, b"")]),
+        ],
+        SymlinkPolicy::Refuse,
+    );
+    let (without, b) = import_single(
+        vec![Layer::plain(vec![file("bin/x", 0o755, b"x")])],
+        SymlinkPolicy::Refuse,
+    );
+    let (a, b) = (a.expect("import with empty dirs"), b.expect("import"));
+    assert_eq!(a.rootfs, b.rootfs);
+    let tree = |scratch: &TempDir, imported: &ImportedRootfs| {
+        directories(&scratch.path().join("cas").join(&imported.rootfs.value))
+    };
+    assert_eq!(tree(&with_dirs, &a), tree(&without, &b));
+    assert_eq!(
+        tree(&with_dirs, &a),
+        vec![(String::new(), 0o755), ("bin".to_string(), 0o755)]
+    );
+}
+
 #[test]
 fn the_imported_rootfs_is_what_the_backends_resolve_and_materialize() {
     let cas = TempDir::new().expect("cas");
@@ -813,6 +876,366 @@ fn a_tampered_cas_entry_is_not_reused() {
 }
 
 #[test]
+fn a_cas_entry_with_tampered_directories_is_not_reused() {
+    // The manifest does not cover directories, and the per-run copy carries
+    // their modes into the guest: a reused entry must have exactly the
+    // directories the import would write, all 0755.
+    type Tamper = (&'static str, fn(&Path));
+    let tamper: [Tamper; 3] = [
+        ("a widened directory", |root| {
+            fs::set_permissions(root.join("etc"), fs::Permissions::from_mode(0o777)).unwrap()
+        }),
+        ("a planted directory", |root| {
+            fs::create_dir(root.join("planted")).unwrap()
+        }),
+        ("a widened root", |root| {
+            fs::set_permissions(root, fs::Permissions::from_mode(0o1777)).unwrap()
+        }),
+    ];
+    for (what, tamper) in tamper {
+        let cas = TempDir::new().expect("cas");
+        let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
+        tamper(&cas.path().join(&imported.rootfs.value));
+        match import(
+            &checked_in_fixture(),
+            &fixture().index.digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Resolve,
+            cas.path(),
+        ) {
+            Err(OciImportError::Cas(detail)) => {
+                assert!(detail.contains("directories"), "{what}: {detail}")
+            }
+            other => panic!("{what}: expected a CAS refusal, got {other:?}"),
+        }
+    }
+}
+
+/// The checked-in fixture's linux/arm64 rootfs identity, as a known answer:
+/// a change to manifest serialization, ordering or the identity
+/// construction changes it, on any host.
+const FIXTURE_ARM64_ROOTFS: &str =
+    "be444e4e419e52df2b05c1bf04c748694afb774383b8138911f6e7d305880e07";
+
+#[test]
+fn the_fixture_rootfs_identity_is_a_known_answer() {
+    let cas = TempDir::new().expect("cas");
+    let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
+    assert_eq!(imported.rootfs.value, FIXTURE_ARM64_ROOTFS);
+}
+
+#[test]
+fn provenance_reports_the_image_config_platform() {
+    let scratch = TempDir::new().expect("scratch");
+    let layout_dir = scratch.path().join("oci");
+    let layout = Layout::create(&layout_dir);
+    let layer = tar(&[file("a", 0o644, b"a")]);
+    let image = layout.image_from_blobs(
+        serde_json::json!({"architecture": "amd64", "os": "linux", "variant": "v3"}),
+        &[(OCI_LAYER_TAR, layer.clone())],
+        vec![sha256(&layer)],
+    );
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).unwrap();
+    let imported = import(
+        &layout_dir,
+        &image.digest,
+        Platform::linux("amd64"),
+        SymlinkPolicy::Refuse,
+        &cas,
+    )
+    .expect("a variant-less request admits any amd64 variant");
+    assert_eq!(
+        imported.image.platform,
+        Platform::linux("amd64").with_variant("v3")
+    );
+}
+
+#[test]
+fn every_gzip_member_of_a_layer_is_read() {
+    let whole = tar(&[file("a", 0o644, b"a"), file("b", 0o644, b"b")]);
+    // Split between the two entries' headers: 512-byte header + 512-byte
+    // padded data for `a`.
+    let (first, rest) = whole.split_at(1024);
+    let mut members = gzip(first);
+    members.extend(gzip(rest));
+    let scratch = TempDir::new().expect("scratch");
+    let layout_dir = scratch.path().join("oci");
+    let layout = Layout::create(&layout_dir);
+    let image = layout.image_from_blobs(
+        serde_json::json!({"architecture": "arm64", "os": "linux"}),
+        &[(OCI_LAYER_GZIP, members.clone())],
+        vec![sha256(&whole)],
+    );
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).unwrap();
+    let imported = import(
+        &layout_dir,
+        &image.digest,
+        Platform::linux("arm64"),
+        SymlinkPolicy::Refuse,
+        &cas,
+    )
+    .expect("a multi-member gzip layer imports whole");
+    assert_eq!(imported.files, 2);
+
+    // Bytes after the last member that are not a gzip member are an error,
+    // not silently ignored.
+    let mut trailing = gzip(&whole);
+    trailing.extend(b"not gzip");
+    let image = layout.image_from_blobs(
+        serde_json::json!({"architecture": "arm64", "os": "linux"}),
+        &[(OCI_LAYER_GZIP, trailing)],
+        vec![sha256(&whole)],
+    );
+    assert!(
+        import(
+            &layout_dir,
+            &image.digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn path_and_link_target_lengths_are_bounded() {
+    // A path deeper than PATH_MAX is refused by name, not by overflowing a
+    // recursion, and leaves nothing in the CAS root.
+    let deep = format!("{}f", "a/".repeat(2048));
+    assert_eq!(deep.len(), 4097);
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![file(&deep, 0o644, b"x")])],
+        SymlinkPolicy::Refuse,
+    );
+    match result {
+        Err(OciImportError::UnsafePath { path, .. }) => assert_eq!(path, deep),
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+    assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+    // Exactly PATH_MAX is accepted: a whiteout of that length is a no-op.
+    let at_limit = format!("{}.wh.zz", "w/".repeat(2045));
+    assert_eq!(at_limit.len(), 4096);
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("kept", 0o644, b"k"),
+            file(&at_limit, 0o644, b""),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    assert_eq!(result.expect("a 4096-byte path").files, 1);
+
+    // Link targets: 4097 bytes is refused as a path; 4096 reaches the
+    // symlink policy.
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![symlink("l", &"t".repeat(4097))])],
+        SymlinkPolicy::Refuse,
+    );
+    assert!(matches!(result, Err(OciImportError::UnsafePath { .. })));
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![symlink("l", &"t".repeat(4096))])],
+        SymlinkPolicy::Refuse,
+    );
+    assert!(matches!(result, Err(OciImportError::SymlinkRefused { .. })));
+}
+
+#[test]
+fn archive_metadata_counts_against_the_limit() {
+    // A long-name entry is buffered by the tar reader before any file data:
+    // its bytes are charged too, so a huge one fails as TooLarge.
+    let scratch = TempDir::new().expect("scratch");
+    let layout = scratch.path().join("oci");
+    let digest = single_image(
+        &layout,
+        vec![Layer::plain(vec![file(&"n".repeat(20_000), 0o644, b"x")])],
+    );
+    let cas = TempDir::new().expect("cas");
+    let mut limited = request(
+        &layout,
+        &digest,
+        Platform::linux("arm64"),
+        SymlinkPolicy::Refuse,
+    );
+    limited.max_rootfs_bytes = 10_000;
+    assert!(matches!(
+        import_oci_layout(&limited, cas.path()),
+        Err(OciImportError::TooLarge { limit: 10_000 })
+    ));
+    assert!(cas_entries(cas.path()).is_empty());
+}
+
+#[test]
+fn a_root_directory_entry_is_accepted() {
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            dir("./", 0o755),
+            file("./a", 0o644, b"a"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    assert_eq!(result.expect("`./` names the image root").files, 1);
+}
+
+#[test]
+fn documents_are_classified_by_media_type_or_shape() {
+    let scratch = TempDir::new().expect("scratch");
+    let layout_dir = scratch.path().join("oci");
+    let layout = Layout::create(&layout_dir);
+    let image = layout.image(
+        "linux",
+        "arm64",
+        &[Layer::plain(vec![file("a", 0o644, b"a")])],
+        None,
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(layout.blob_path(&image.digest)).unwrap()).unwrap();
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).unwrap();
+    let attempt = |digest: &str| {
+        import(
+            &layout_dir,
+            digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas,
+        )
+    };
+
+    // `mediaType` is optional: a manifest and an index are known by shape.
+    let mut bare_manifest = manifest.clone();
+    bare_manifest.as_object_mut().unwrap().remove("mediaType");
+    let bare_manifest = layout.json_blob(OCI_MANIFEST, &bare_manifest);
+    assert_eq!(
+        attempt(&bare_manifest.digest).expect("bare manifest").files,
+        1
+    );
+    let bare_index = layout.json_blob(
+        OCI_INDEX,
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST,
+                "digest": image.digest,
+                "size": image.size,
+                "platform": {"architecture": "arm64", "os": "linux"}
+            }]
+        }),
+    );
+    assert_eq!(attempt(&bare_index.digest).expect("bare index").files, 1);
+
+    // A declared media type that is neither is refused as unsupported.
+    let mut foreign = manifest.clone();
+    foreign["mediaType"] = "application/vnd.example.artifact+json".into();
+    let foreign = layout.json_blob(OCI_MANIFEST, &foreign);
+    assert!(matches!(
+        attempt(&foreign.digest),
+        Err(OciImportError::Unsupported(_))
+    ));
+
+    // A descriptor whose digest is not lowercase sha256 hex is never joined
+    // to a path.
+    let hostile = layout.json_blob(
+        OCI_INDEX,
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST,
+                "digest": format!("sha256:../../{}", &image.hex()[6..]),
+                "size": image.size,
+                "platform": {"architecture": "arm64", "os": "linux"}
+            }]
+        }),
+    );
+    assert!(matches!(
+        attempt(&hostile.digest),
+        Err(OciImportError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn a_blob_that_is_not_a_regular_file_is_refused() {
+    let scratch = TempDir::new().expect("scratch");
+    let layout_dir = scratch.path().join("oci");
+    let layout = Layout::create(&layout_dir);
+    let image = layout.image(
+        "linux",
+        "arm64",
+        &[Layer::plain(vec![file("a", 0o644, b"a")])],
+        None,
+    );
+    let blob = layout.blob_path(&image.digest);
+    fs::remove_file(&blob).unwrap();
+    fs::create_dir(&blob).unwrap();
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).unwrap();
+    assert!(matches!(
+        import(
+            &layout_dir,
+            &image.digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas
+        ),
+        Err(OciImportError::Malformed(_))
+    ));
+}
+
+#[test]
+fn documents_are_bounded_at_four_mebibytes() {
+    // JSON tolerates trailing whitespace: pad an index to exactly the bound
+    // (accepted) and one byte past it (refused).
+    let scratch = TempDir::new().expect("scratch");
+    let layout_dir = scratch.path().join("oci");
+    let layout = Layout::create(&layout_dir);
+    let image = layout.image(
+        "linux",
+        "arm64",
+        &[Layer::plain(vec![file("a", 0o644, b"a")])],
+        None,
+    );
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST,
+            "digest": image.digest,
+            "size": image.size,
+            "platform": {"architecture": "arm64", "os": "linux"}
+        }]
+    }))
+    .unwrap();
+    let padded = |length: usize| {
+        let mut bytes = index.clone();
+        bytes.resize(length, b' ');
+        layout.blob(OCI_INDEX, &bytes)
+    };
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).unwrap();
+    let attempt = |digest: &str| {
+        import(
+            &layout_dir,
+            digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas,
+        )
+    };
+    assert_eq!(
+        attempt(&padded(4 << 20).digest)
+            .expect("at the bound")
+            .files,
+        1
+    );
+    assert!(matches!(
+        attempt(&padded((4 << 20) + 1).digest),
+        Err(OciImportError::Unsupported(_))
+    ));
+}
+
+#[test]
 fn hostile_paths_are_refused_and_nothing_escapes() {
     let cases: Vec<(Vec<Entry>, &str)> = vec![
         (vec![file("../evil", 0o644, b"x")], "../evil"),
@@ -846,9 +1269,16 @@ fn hostile_paths_are_refused_and_nothing_escapes() {
     for (entries, named) in cases {
         let (scratch, result) = import_single(vec![Layer::plain(entries)], SymlinkPolicy::Resolve);
         match result {
-            Err(OciImportError::UnsafePath { layer, path, .. }) => {
+            Err(OciImportError::UnsafePath {
+                layer,
+                path,
+                reason,
+            }) => {
                 assert_eq!(layer, 0);
                 assert_eq!(path, named);
+                if named == "link/passwd" {
+                    assert_eq!(reason, "the path passes through a symbolic link");
+                }
             }
             other => panic!("expected UnsafePath for {named}, got {other:?}"),
         }
@@ -960,19 +1390,16 @@ fn an_import_larger_than_its_limit_is_refused() {
         import_oci_layout(&limited, cas.path()),
         Err(OciImportError::TooLarge { limit: 8 })
     ));
-    // The limit counts what is written, resolved copies included: the exact
-    // total imports, one byte less does not.
-    let full = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
-    let total: u64 = manifest_files(cas.path(), &full.rootfs)
-        .keys()
-        .map(|path| {
-            fs::metadata(cas.path().join(&full.rootfs.value).join(path))
-                .unwrap()
-                .len()
-        })
+    // Extraction is charged every decompressed byte of every layer read:
+    // headers, whited-out and overwritten files, and the archive's trailing
+    // blocks. The exact total imports, one byte less does not.
+    let extracted: u64 = [base_layer(), change_layer(), arch_layer("arm64")]
+        .iter()
+        .map(|entries| tar(entries).len() as u64)
         .sum();
+    let full = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
     let exact = TempDir::new().expect("cas");
-    limited.max_rootfs_bytes = total;
+    limited.max_rootfs_bytes = extracted;
     assert_eq!(
         import_oci_layout(&limited, exact.path())
             .expect("an import exactly at its limit")
@@ -980,9 +1407,39 @@ fn an_import_larger_than_its_limit_is_refused() {
         full.rootfs
     );
     let under = TempDir::new().expect("cas");
-    limited.max_rootfs_bytes = total - 1;
+    limited.max_rootfs_bytes = extracted - 1;
     assert!(matches!(
         import_oci_layout(&limited, under.path()),
         Err(OciImportError::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn the_written_rootfs_is_held_to_the_limit_too() {
+    // Resolving `lib -> usr/lib` writes the 6000-byte file twice: 12000
+    // bytes written from a layer of under 9000 decompressed bytes.
+    let scratch = TempDir::new().expect("scratch");
+    let layout = scratch.path().join("oci");
+    let entries = vec![
+        file("usr/lib/big", 0o644, &[7; 6000]),
+        symlink("lib", "usr/lib"),
+    ];
+    assert!(tar(&entries).len() < 9000);
+    let digest = single_image(&layout, vec![Layer::plain(entries)]);
+    let attempt = |limit: u64| {
+        let cas = TempDir::new().expect("cas");
+        let mut limited = request(
+            &layout,
+            &digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Resolve,
+        );
+        limited.max_rootfs_bytes = limit;
+        import_oci_layout(&limited, cas.path()).map(|imported| imported.files)
+    };
+    assert_eq!(attempt(12000).expect("exactly at the limit"), 2);
+    assert!(matches!(
+        attempt(11999),
+        Err(OciImportError::TooLarge { limit: 11999 })
     ));
 }

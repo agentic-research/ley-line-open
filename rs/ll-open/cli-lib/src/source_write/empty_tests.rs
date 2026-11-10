@@ -1,7 +1,7 @@
 //! Bead `ley-line-open-bc7df6`: an empty file is a real file. A zero-byte
 //! file is created, replaced to and from, deleted and recreated, parsed and
 //! merged like any other: it lands as 0 bytes whose blob hash is BLAKE3 of
-//! no bytes, and every accepted proposal lands the `treeRoot` a cold parse
+//! no bytes, and every accepted proposal lands the `storeRoot` a cold parse
 //! of the resulting tree lands. None of these paths skips it, drops it or
 //! reports success with nothing landed (the bug class of bead `8a26d8`).
 
@@ -102,7 +102,7 @@ fn source_hash(conn: &Connection, path: &str) -> Option<Hash> {
     bytes.map(|b| Hash::from_bytes(b.try_into().expect("a 32-byte content hash")))
 }
 
-fn file_id(conn: &Connection, path: &str) -> i64 {
+fn file_id(conn: &Connection, path: &str) -> leyline_schema::FileId {
     conn.query_row("SELECT file_id FROM _source WHERE id = ?1", [path], |r| {
         r.get(0)
     })
@@ -116,7 +116,7 @@ type AstRow = (i64, String, i64, i64, Option<Vec<u8>>);
 /// every nid (ADR-0040 F5): what a cold parse and a write must agree on.
 fn ast_rows(conn: &Connection, path: &str) -> Vec<AstRow> {
     let (lo, hi) = leyline_schema::file_nid_range(file_id(conn, path));
-    let mask = leyline_schema::file_nid(1, 0) - 1;
+    let mask = leyline_schema::NID_ORDINAL_MASK;
     let mut stmt = conn
         .prepare(
             "SELECT a.nid, k.raw_kind, a.start_byte, a.end_byte, a.node_hash \
@@ -138,14 +138,14 @@ fn ast_rows(conn: &Connection, path: &str) -> Vec<AstRow> {
     .unwrap()
 }
 
-/// The `treeRoot` a cold parse of `files` lands.
+/// The `storeRoot` a cold parse of `files` lands.
 fn cold_root(files: &[(&str, &str)]) -> Hash {
     let src = TempDir::new().unwrap();
     lay_out(src.path(), files);
     let conn = Connection::open_in_memory().unwrap();
     crate::cmd_parse::parse_into_conn(&conn, src.path(), None, None)
         .unwrap()
-        .tree_root
+        .store_root
 }
 
 /// Every claim an empty file at `path` must satisfy in `s`: a regular
@@ -198,7 +198,7 @@ fn an_empty_create_lands_a_zero_byte_file() {
         Vec::<u8>::new()
     );
     let cold = [("a.go", A), ("e.go", ""), ("docs/e.txt", "")];
-    assert_eq!(accepted.tree_root, cold_root(&cold));
+    assert_eq!(accepted.store_root, cold_root(&cold));
     let cold_store = store(&cold);
     assert_eq!(
         ast_rows(&s.conn, "e.go"),
@@ -234,7 +234,7 @@ fn a_replace_to_empty_and_back_lands_each_side() {
         assert_empty_file(&s, "b.txt");
         assert_eq!(source_hash(&s.conn, "a.go"), Some(empty()));
         let cold = [("a.go", ""), ("b.txt", "")];
-        assert_eq!(accepted.tree_root, cold_root(&cold));
+        assert_eq!(accepted.store_root, cold_root(&cold));
         assert_eq!(
             ast_rows(&s.conn, "a.go"),
             ast_rows(&store(&cold).conn, "a.go")
@@ -247,7 +247,7 @@ fn a_replace_to_empty_and_back_lands_each_side() {
         .unwrap();
         assert_eq!(back.blobs["a.go"], h(A));
         assert_eq!(stored(&s, "a.go").as_deref(), Some(A.as_bytes()));
-        assert_eq!(back.tree_root, cold_root(&[("a.go", A), ("b.txt", "")]));
+        assert_eq!(back.store_root, cold_root(&[("a.go", A), ("b.txt", "")]));
     }
 }
 
@@ -262,7 +262,7 @@ fn delete_then_recreate_empty_lands_and_the_empty_file_deletes() {
     assert_empty_file(&s, "a.go");
     assert_eq!(source_hash(&s.conn, "a.go"), Some(empty()));
     assert_eq!(
-        recreated.tree_root,
+        recreated.store_root,
         cold_root(&[("a.go", ""), ("b.go", "package a\n")])
     );
 
@@ -270,7 +270,7 @@ fn delete_then_recreate_empty_lands_and_the_empty_file_deletes() {
     // accepted and changes nothing; a create of bytes over the empty file
     // is stale against the empty blob.
     let same = propose_whole(&s, vec![Proposed::create("a.go", Vec::new())]).unwrap();
-    assert_eq!(same.tree_root, recreated.tree_root);
+    assert_eq!(same.store_root, recreated.store_root);
     let Refusal::Stale(moved) =
         refused(propose_whole(&s, vec![Proposed::create("a.go", A.into())]).unwrap_err())
     else {
@@ -289,7 +289,7 @@ fn delete_then_recreate_empty_lands_and_the_empty_file_deletes() {
     assert_eq!(deleted.removed, BTreeSet::from(["a.go".to_string()]));
     assert_eq!(crate::tree::entry(&s.conn, "a.go").unwrap(), None);
     assert_eq!(source_hash(&s.conn, "a.go"), None);
-    assert_eq!(deleted.tree_root, cold_root(&[("b.go", "package a\n")]));
+    assert_eq!(deleted.store_root, cold_root(&[("b.go", "package a\n")]));
 }
 
 /// An empty file in each projected language parses: its `_source` row
@@ -334,15 +334,18 @@ fn an_empty_file_in_a_projected_language_parses_and_reparses_idempotently() {
         );
         assert!(hash.is_some(), "{path}: the root has a node_hash");
     }
-    let first = crate::tree_root::DerivedFrom::read(&s.conn)
+    let first = crate::store_root::DerivedFrom::read(&s.conn)
         .unwrap()
         .expect("a parse stamps derived_from")
-        .tree_root;
+        .store_root;
     assert_eq!(first, cold_root(&files));
     let images: Vec<_> = files.iter().map(|(p, _)| ast_rows(&s.conn, p)).collect();
 
     let again = crate::cmd_parse::parse_into_conn(&s.conn, s.src.path(), None, None).unwrap();
-    assert_eq!(again.tree_root, first, "a reparse lands the same tree root");
+    assert_eq!(
+        again.store_root, first,
+        "a reparse lands the same tree root"
+    );
     assert_eq!(again.errors, 0);
     let after: Vec<_> = files.iter().map(|(p, _)| ast_rows(&s.conn, p)).collect();
     assert_eq!(after, images, "a reparse keeps every file's rows");
@@ -355,7 +358,7 @@ fn an_empty_file_in_a_projected_language_parses_and_reparses_idempotently() {
     let mut now = files.to_vec();
     now.retain(|(p, _)| *p != "a.rs");
     now.push(("a.rs", ""));
-    assert_eq!(emptied.tree_root, cold_root(&now));
+    assert_eq!(emptied.store_root, cold_root(&now));
 }
 
 /// The three-way merge over an empty side, directly. Every change from an
@@ -519,5 +522,5 @@ fn a_moved_base_with_an_empty_side_merges_or_refuses_typed() {
     assert_eq!(accepted.blobs["f.txt"], empty());
     assert!(accepted.merged.is_empty(), "what landed is what was sent");
     assert_empty_file(&s, "f.txt");
-    assert_eq!(accepted.tree_root, cold_root(&[("f.txt", "")]));
+    assert_eq!(accepted.store_root, cold_root(&[("f.txt", "")]));
 }

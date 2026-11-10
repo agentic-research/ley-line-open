@@ -19,7 +19,7 @@ Treat a bead as a pointer, not as proof. Verify every claim against the current 
 
 Two design rules the roadmap depends on:
 
-- **A write's behavior follows its path's class, not a mode.** Authored paths are proposals (merged, durable, in `treeRoot`). Derived paths, the ones the tree's ignore rules match, are never proposals; they live in per-run scratch at native speed (`39998b`).
+- **A write's behavior follows its path's class, not a mode.** Authored paths are proposals (merged, durable, in `storeRoot`). Derived paths, the ones the tree's ignore rules match, are never proposals; they live in per-run scratch at native speed (`39998b`).
 - **Accepted means durable in `live.db`.** Publication of the arena is a derived, coalesced step (#478); a reply promises only what one durable append guarantees (`98d0c3`).
 
 ## Review Routing
@@ -44,14 +44,14 @@ Do not use “root,” “hash,” or “identity” without naming the domain a
 | --- | --- | --- | --- |
 | `Controller.current_root` | One exact serialized SQLite arena snapshot | BLAKE3 over the complete serialized byte image | Shipped |
 | `Head.rootHash` | The Cap'n Proto segments produced by one parse run (a run receipt: truncated per run, carries absolute paths and mtimes) | Tagged fold over canonical segment addresses | Shipped |
-| `Head.treeRoot` | The store's manifest: every `_tree` file entry as (relative path, git mode, blob hash) and every empty directory, under one `parserId` | Tagged fold `leyline/tree-root/v1` over the committed `_tree` table (mode `0o100644` folds as before; other modes and empty directories are framed by their git mode), `parserId` as params; recomputed by `leyline verify-head` | Shipped (ADR-0040 D1; modes and directories ADR-0045 T2) |
-| `Head.parserId` | The derivation `treeRoot` was computed under | Tagged fold `leyline/parser-id/v1` over IR and projection schema versions, extraction/injection/query-set epochs, and every compiled grammar's digest | Shipped (ADR-0040 D1) |
+| `Head.storeRoot` | The store's manifest: every `_tree` file entry as (relative path, git mode, blob hash) and every empty directory, with no parser input | Directory Merkle tree `leyline/store-tree/v1` over the committed `_tree` table: each directory node is a `RowSet` fold with empty params over its children in name-byte order, child `i` contributing `(BLAKE3(name), 2i, |name|)` and `(blob hash or child node address, 2i+1, git mode)`; recomputed by `leyline verify-head` | Shipped (ADR-0047 D-ii, step M1; replaces the retired `Head.treeRoot`, whose presence refuses a head as head digest v2) |
+| `Head.parserId` | The derivation the projection was computed under | Tagged fold `leyline/parser-id/v1` over IR and projection schema versions, extraction/injection/query-set epochs, and every compiled grammar's digest | Shipped (ADR-0040 D1) |
 | Blob hash | One content-addressed blob or CDC payload | BLAKE3 over that payload | Shipped |
 | SQL projection ABI | Consumer-visible relational shape and behavior | Tables, columns, constraints, semantics, fixtures | Shipped; not an identity domain |
 | `manifestRoot` | CDC transport/dedup structure | Defined by ADR-0032 | Proposed only |
 | `logicalRoot` | Derived-view validity | Defined by ADR-0032 | Proposed only |
 
-`current_root`, `Head.rootHash`, `Head.treeRoot`, and blob hashes do not name the same bytes and are not interchangeable; `treeRoot` is the only one of them that names a source tree. Proposed identities must not appear in shipped APIs, documentation, or tests as though they already govern authority.
+`current_root`, `Head.rootHash`, `Head.storeRoot`, and blob hashes do not name the same bytes and are not interchangeable; `storeRoot` is the only one of them that names a source tree, and it names it independently of the parser (the parser-qualified identity is the pair `(storeRoot, parserId)`, bound by head digest v3 and `_meta.derived_from`). Proposed identities must not appear in shipped APIs, documentation, or tests as though they already govern authority.
 
 ## Change Discipline
 

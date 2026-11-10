@@ -215,6 +215,28 @@ pub fn restriction_key(scheme: &str, parser_id: Hash, rows: &[Row]) -> Hash {
     .address(&entries)
 }
 
+/// The restriction-key construction (ADR-0031 as amended, ADR-0047 §3: the
+/// first shipped lawful `Ref<Restriction>`). Its fold is
+/// [`restriction_key`]; nothing moves.
+pub enum Restriction {}
+
+/// What a restriction key is a function of: the family's scheme, the parser
+/// identity the facts were extracted under, and the closure's rows.
+#[derive(Clone, Copy, Debug)]
+pub struct RestrictionWitness<'w> {
+    pub scheme: &'w str,
+    pub parser_id: Hash,
+    pub rows: &'w [Row],
+}
+
+impl leyline_core::Construction for Restriction {
+    const NAME: &'static str = "restriction";
+    type Witness<'w> = RestrictionWitness<'w>;
+    fn fold(w: RestrictionWitness<'_>) -> Hash {
+        restriction_key(w.scheme, w.parser_id, w.rows)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fact substrate: the node_defs / node_refs / _imports rows the live
 // pipeline emits. Parser-independent — a production consumer fills these
@@ -724,8 +746,9 @@ pub fn review_public_api(
 
 /// Whole-object CAS address of the WHOLE CORPUS (the only per-object address
 /// that is sound for a cross-file review). Parser-free: a `RowSet` fold
-/// under [`WHOLE_OBJECT_SCHEME`] with one row `(path, σ(source))` per file,
-/// so it names the same information as a `treeRoot` over the corpus.
+/// under [`WHOLE_OBJECT_SCHEME`] with one row `(path, σ(source))` per file.
+/// A flat fold with no modes and no empty directories: a different
+/// construction from `storeRoot`, standing in for it as the whole-input key.
 pub fn whole_object_hash(corpus: &[(String, String)]) -> Hash {
     let rows: Vec<Row> = corpus
         .iter()
@@ -745,7 +768,7 @@ pub fn whole_object_hash(corpus: &[(String, String)]) -> Hash {
 /// in params. It is the tightest key a cache can build without knowing the
 /// review's closure: sound, and invalidated by every edit anywhere in the
 /// tree.
-pub fn whole_input_key(tree_root: Hash, parser_id: Hash, target: &str) -> Hash {
+pub fn whole_input_key(store_root: Hash, parser_id: Hash, target: &str) -> Hash {
     let target_row = Row::new(RowKind::Container, Provenance::Query, &[target.as_bytes()]);
     PartitionSpec {
         domain: Domain::RowSet,
@@ -755,7 +778,7 @@ pub fn whole_input_key(tree_root: Hash, parser_id: Hash, target: &str) -> Hash {
     }
     .address(&[
         Entry {
-            addr: tree_root,
+            addr: store_root,
             a: 0,
             b: 0,
         },

@@ -15,8 +15,8 @@
 //! - `_ast` rows pointing at their subtree (`content_id`, projection-v10),
 //!   their `node_content` / `node_edge` rows,
 //!   `node_defs` / `node_refs` (bead `143f17`);
-//! - `treeRoot` recomputed from the committed `_source` set and stamped into
-//!   the sibling head when the arena is file-backed (D1).
+//! - `storeRoot` recomputed from the committed `_tree` and stamped into the
+//!   sibling head when the arena is file-backed (D1; ADR-0047 D-ii).
 //!
 //! Publication stays with the caller: the daemon (its socket's `propose`, a
 //! guest's share and the host mount alike) snapshots to the arena after the
@@ -77,8 +77,8 @@ impl Grant {
 pub struct Written {
     /// The `source_blobs` key of the bytes, now `_source.content_hash`.
     pub source_blob_hash: Hash,
-    /// The arena's `treeRoot` after the write.
-    pub tree_root: Hash,
+    /// The arena's `storeRoot` after the write.
+    pub store_root: Hash,
     /// See [`Accepted::post_commit_error`].
     pub post_commit_error: Option<String>,
 }
@@ -408,8 +408,8 @@ pub struct Accepted {
     /// The directories the proposal made, and removed.
     pub mkdirs: BTreeSet<String>,
     pub rmdirs: BTreeSet<String>,
-    /// The arena's `treeRoot` after the proposal.
-    pub tree_root: Hash,
+    /// The arena's `storeRoot` after the proposal.
+    pub store_root: Hash,
     /// A step after `COMMIT` that failed (moving the sidecars into place,
     /// an index build, the head write). The proposal is applied either
     /// way; the arena's head and sidecars may describe the previous state
@@ -594,8 +594,8 @@ fn decide_one(conn: &Connection, w: Proposed) -> Result<Decided> {
                 return Ok(stale(Some(expected), Some(theirs), &path));
             }
             let (Some(base), Some(current)) = (
-                crate::tree::blob_bytes(conn, expected)?,
-                crate::tree::blob_bytes(conn, theirs)?,
+                crate::tree::blob_bytes_at(conn, &path, expected)?,
+                crate::tree::blob_bytes_at(conn, &path, theirs)?,
             ) else {
                 return Ok(stale(Some(expected), Some(theirs), &path));
             };
@@ -656,7 +656,7 @@ fn propose_checked(conn: &Connection, writes: Vec<Proposed>) -> Result<Accepted>
         merged,
         mkdirs: edits.mkdirs,
         rmdirs: edits.rmdirs,
-        tree_root: committed.result.tree_root,
+        store_root: committed.result.store_root,
         post_commit_error: committed.post_commit.map(|e| format!("{e:#}")),
     })
 }
@@ -834,7 +834,7 @@ pub fn rename_dir(conn: &Connection, from: &str, to: &str) -> Result<Vec<Propose
                 writes.push(Proposed::mkdir(moved_to));
             }
             Entry::File { mode, blob } => {
-                let bytes = crate::tree::blob_bytes(conn, blob)?.with_context(|| {
+                let bytes = crate::tree::blob_bytes_at(conn, &path, blob)?.with_context(|| {
                     format!("rename of '{path}': the store holds no blob {blob}")
                 })?;
                 writes.push(Proposed::delete(path, Base::Blob(blob)));
@@ -864,7 +864,7 @@ pub fn rename(conn: &Connection, from: &str, to: &str) -> Result<Vec<Proposed>> 
                 Some(Entry::File { blob, .. }) => Base::Blob(blob),
                 None => Base::Absent,
             };
-            let bytes = crate::tree::blob_bytes(conn, blob)?
+            let bytes = crate::tree::blob_bytes_at(conn, from, blob)?
                 .with_context(|| format!("rename of '{from}': the store holds no blob {blob}"))?;
             Ok(vec![
                 Proposed::delete(from, Base::Blob(blob)),
@@ -913,7 +913,7 @@ pub fn write(conn: &Connection, grant: &Grant, path: &str, bytes: Vec<u8>) -> Re
     let accepted = propose(conn, grant, vec![Proposed::write(path, Base::Any, bytes)])?;
     Ok(Written {
         source_blob_hash: accepted.blobs[path],
-        tree_root: accepted.tree_root,
+        store_root: accepted.store_root,
         post_commit_error: accepted.post_commit_error,
     })
 }
@@ -982,7 +982,7 @@ mod tests {
         }
     }
 
-    fn file_id(conn: &Connection, rel: &str) -> i64 {
+    fn file_id(conn: &Connection, rel: &str) -> leyline_schema::FileId {
         conn.query_row("SELECT file_id FROM _source WHERE id = ?1", [rel], |r| {
             r.get(0)
         })
@@ -994,13 +994,19 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct FileImage {
         ast: Vec<(i64, String, i64, i64, i64, i64, i64, i64, Option<Vec<u8>>)>,
-        content: Vec<(Vec<u8>, String, String, Option<String>, Option<i64>)>,
+        content: Vec<(Vec<u8>, i64, String, Option<String>, Option<i64>)>,
         children: Vec<(Vec<u8>, i64, Vec<u8>, Option<String>)>,
         defs: Vec<(String, i64, Option<Vec<u8>>)>,
         refs: Vec<(String, i64, Option<Vec<u8>>)>,
     }
 
-    fn rows<T, F>(conn: &Connection, sql: &str, lo: i64, hi: i64, f: F) -> Vec<T>
+    fn rows<T, F>(
+        conn: &Connection,
+        sql: &str,
+        lo: leyline_schema::Nid,
+        hi: leyline_schema::Nid,
+        f: F,
+    ) -> Vec<T>
     where
         F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     {
@@ -1017,7 +1023,7 @@ mod tests {
     fn image(conn: &Connection, rel: &str) -> FileImage {
         let fid = file_id(conn, rel);
         let (lo, hi) = leyline_schema::file_nid_range(fid);
-        let mask = leyline_schema::file_nid(1, 0) - 1;
+        let mask = leyline_schema::NID_ORDINAL_MASK;
         let ast = rows(
             conn,
             "SELECT a.nid, k.raw_kind, a.start_byte, a.end_byte, a.start_row, a.start_col, \
@@ -1042,7 +1048,7 @@ mod tests {
         );
         let content = rows(
             conn,
-            "SELECT node_hash, kind, raw_kind, token, arity FROM node_content \
+            "SELECT node_hash, node_tag, kind, token, arity FROM node_content \
               WHERE node_hash IN (SELECT node_hash FROM v_ast_hash WHERE nid BETWEEN ?1 AND ?2) \
               ORDER BY node_hash",
             lo,
@@ -1105,14 +1111,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, expected.as_bytes().to_vec());
-        let blob: Vec<u8> = a
-            .conn
-            .query_row(
-                "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                [&stored],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let blob = crate::tree::blob_bytes(&a.conn, expected).unwrap().unwrap();
         assert_eq!(blob, A2.as_bytes());
         assert_eq!(
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "a.go")).unwrap(),
@@ -1143,32 +1142,32 @@ mod tests {
         assert_eq!(image(&a.conn, "b.go"), image(&cold.conn, "b.go"));
     }
 
-    /// D1 through D3: the head's `treeRoot` moves with the write and still
+    /// D1 through D3: the head's `storeRoot` moves with the write and still
     /// verifies against the arena; it is the cold parse's root for the same
     /// tree.
     #[test]
-    fn a_write_restamps_the_heads_tree_root() {
+    fn a_write_restamps_the_heads_store_root() {
         let a = arena(&[("a.go", A), ("b.go", B)]);
-        let crate::tree_root::Verification::Valid {
-            tree_root: before, ..
-        } = crate::tree_root::verify(&a.db).unwrap()
+        let crate::store_root::Verification::Valid {
+            store_root: before, ..
+        } = crate::store_root::verify(&a.db).unwrap()
         else {
             panic!("a cold parse stamps a valid head");
         };
         let w = write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
-        let crate::tree_root::Verification::Valid {
-            tree_root: after, ..
-        } = crate::tree_root::verify(&a.db).unwrap()
+        let crate::store_root::Verification::Valid {
+            store_root: after, ..
+        } = crate::store_root::verify(&a.db).unwrap()
         else {
             panic!("the head verifies after a write");
         };
         assert_ne!(before, after);
-        assert_eq!(w.tree_root, after);
+        assert_eq!(w.store_root, after);
         let cold = arena(&[("a.go", A2), ("b.go", B)]);
-        let crate::tree_root::Verification::Valid {
-            tree_root: cold_root,
+        let crate::store_root::Verification::Valid {
+            store_root: cold_root,
             ..
-        } = crate::tree_root::verify(&cold.db).unwrap()
+        } = crate::store_root::verify(&cold.db).unwrap()
         else {
             panic!("a cold parse stamps a valid head");
         };
@@ -1325,13 +1324,8 @@ mod tests {
             .post_commit_error
             .expect("the failed head write is reported");
         assert!(problem.contains("head"), "{problem}");
-        let stored: Vec<u8> = a
-            .conn
-            .query_row(
-                "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                [A2.as_bytes().hash().as_bytes().to_vec()],
-                |r| r.get(0),
-            )
+        let stored = crate::tree::blob_bytes(&a.conn, A2.as_bytes().hash())
+            .unwrap()
             .unwrap();
         assert_eq!(stored, A2.as_bytes());
 
@@ -1380,14 +1374,14 @@ mod tests {
         let cold = arena(&[("a.go", A2), ("b.go", B2)]);
         assert_eq!(image(&a.conn, "a.go"), image(&cold.conn, "a.go"));
         assert_eq!(image(&a.conn, "b.go"), image(&cold.conn, "b.go"));
-        let crate::tree_root::Verification::Valid {
-            tree_root: cold_root,
+        let crate::store_root::Verification::Valid {
+            store_root: cold_root,
             ..
-        } = crate::tree_root::verify(&cold.db).unwrap()
+        } = crate::store_root::verify(&cold.db).unwrap()
         else {
             panic!("a cold parse stamps a valid head");
         };
-        assert_eq!(w.tree_root, cold_root);
+        assert_eq!(w.store_root, cold_root);
     }
 
     /// A proposal is applied whole or not at all: one change the store
@@ -1683,6 +1677,44 @@ mod tests {
         assert!(whole_image(&a.conn) == before, "a check lands nothing");
     }
 
+    /// Bead `ley-line-open-12d305`: a proposal against a moved base reads
+    /// the base's bytes to merge. A base blob whose bytes were changed under
+    /// its key is refused with a typed error naming the path and the blob,
+    /// and nothing lands.
+    #[test]
+    fn a_tampered_merge_base_is_refused_naming_the_path_and_blob() {
+        let a = arena(&[("a.go", A), ("b.go", B)]);
+        write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
+        let base = A.as_bytes().hash();
+        a.conn
+            .execute(
+                "UPDATE source_blobs SET blob_bytes = ?1 WHERE blob_hash = ?2",
+                rusqlite::params![B.as_bytes(), base.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let before = whole_image(&a.conn);
+        let err = propose(
+            &a.conn,
+            &Grant::Whole,
+            vec![proposed("a.go", Base::Blob(base), B2)],
+        )
+        .unwrap_err();
+        let tampered = err
+            .downcast_ref::<leyline_core::source_blob::SourceBlobError>()
+            .expect("a typed source-blob refusal");
+        assert_eq!(tampered.path.as_deref(), Some("a.go"));
+        assert_eq!(tampered.blob, base);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("a.go") && msg.contains(&base.to_string()),
+            "{msg}"
+        );
+        assert!(
+            whole_image(&a.conn) == before,
+            "a refused proposal lands nothing"
+        );
+    }
+
     /// The written bytes, not the disk's, are what the arena holds: the
     /// cold parse is handed the write and never reads the file.
     #[test]
@@ -1703,10 +1735,10 @@ mod tests {
 
     const C: &str = "package a\n\nfunc D() int { return 4 }\n";
 
-    /// The `treeRoot` a verified head names.
+    /// The `storeRoot` a verified head names.
     fn verified_root(db: &Path) -> Hash {
-        match crate::tree_root::verify(db).unwrap() {
-            crate::tree_root::Verification::Valid { tree_root, .. } => tree_root,
+        match crate::store_root::verify(db).unwrap() {
+            crate::store_root::Verification::Valid { store_root, .. } => store_root,
             other => panic!("the head does not verify: {other:?}"),
         }
     }
@@ -1720,7 +1752,7 @@ mod tests {
     }
 
     /// Rows a file's `file_id` still owns anywhere in the projection.
-    fn rows_of_file_id(conn: &Connection, fid: i64) -> i64 {
+    fn rows_of_file_id(conn: &Connection, fid: leyline_schema::FileId) -> i64 {
         let (lo, hi) = leyline_schema::file_nid_range(fid);
         let count = |sql: &str| -> i64 { conn.query_row(sql, [lo, hi], |r| r.get(0)).unwrap() };
         count("SELECT count(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2")
@@ -1751,7 +1783,7 @@ mod tests {
         let cold = arena(&[("a.go", A), ("b.go", B), ("sub/c.go", C)]);
         assert_eq!(image(&a.conn, "sub/c.go"), image(&cold.conn, "sub/c.go"));
         assert_eq!(image(&a.conn, "a.go"), image(&cold.conn, "a.go"));
-        let ids: BTreeSet<i64> = ["a.go", "b.go", "sub/c.go"]
+        let ids: BTreeSet<leyline_schema::FileId> = ["a.go", "b.go", "sub/c.go"]
             .iter()
             .map(|p| file_id(&a.conn, p))
             .collect();
@@ -1760,8 +1792,8 @@ mod tests {
             leyline_ts::splice::source_bytes(&a.conn, file_id(&a.conn, "sub/c.go")).unwrap(),
             C.as_bytes()
         );
-        assert_eq!(accepted.tree_root, verified_root(&a.db));
-        assert_eq!(accepted.tree_root, verified_root(&cold.db));
+        assert_eq!(accepted.store_root, verified_root(&a.db));
+        assert_eq!(accepted.store_root, verified_root(&cold.db));
         assert!(
             !a._src.path().join("sub/c.go").exists(),
             "a proposal writes no file"
@@ -1797,8 +1829,8 @@ mod tests {
         assert_eq!(defs, 0, "b.go's definition left with it");
         let cold = arena(&[("a.go", A)]);
         assert_eq!(image(&a.conn, "a.go"), image(&cold.conn, "a.go"));
-        assert_eq!(accepted.tree_root, verified_root(&a.db));
-        assert_eq!(accepted.tree_root, verified_root(&cold.db));
+        assert_eq!(accepted.store_root, verified_root(&a.db));
+        assert_eq!(accepted.store_root, verified_root(&cold.db));
         assert!(
             a._src.path().join("b.go").exists(),
             "a proposal removes no file from disk"
@@ -1909,7 +1941,7 @@ mod tests {
             image(&a.conn, "moved/a.go"),
             image(&cold.conn, "moved/a.go")
         );
-        assert_eq!(accepted.tree_root, verified_root(&cold.db));
+        assert_eq!(accepted.store_root, verified_root(&cold.db));
     }
 
     /// A rename over an existing file replaces it against the blob the

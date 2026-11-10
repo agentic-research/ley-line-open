@@ -204,12 +204,14 @@ fn identity_snapshot(conn: &Connection) -> Vec<i64> {
     out
 }
 
-/// The nid range a file owns, for scoping a snapshot to one file.
+/// The nid range a file owns, as the raw integers the snapshot holds, for
+/// scoping a snapshot to one file.
 fn file_range(conn: &Connection, rel: &str) -> (i64, i64) {
     let file_id = leyline_ts::schema::lookup_file_id(conn, rel)
         .unwrap()
         .unwrap_or_else(|| panic!("{rel} must be interned"));
-    leyline_ts::schema::file_nid_range(file_id)
+    let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
+    (lo.get(), hi.get())
 }
 
 /// **A scoped reparse of one file must not disturb the identity of any other

@@ -166,7 +166,7 @@ struct GraphStore {
     _dir: TempDir,
     live: Arc<LiveDb>,
     live_db: std::path::PathBuf,
-    tree_root: String,
+    store_root: String,
 }
 
 impl GraphStore {
@@ -182,17 +182,17 @@ impl GraphStore {
             leyline_cli_lib::checkout::ensure_tables(conn)
         })
         .expect("cold-parse the store");
-        let tree_root = live
-            .with_read(|conn| leyline_cli_lib::tree_root::DerivedFrom::read(conn))
+        let store_root = live
+            .with_read(|conn| leyline_cli_lib::store_root::DerivedFrom::read(conn))
             .expect("read the store's tree root")
             .expect("a cold parse stamps the tree root")
-            .tree_root
+            .store_root
             .to_string();
         Self {
             _dir: dir,
             live,
             live_db,
-            tree_root,
+            store_root,
         }
     }
 
@@ -243,7 +243,7 @@ impl WorkspaceShares for StoreShares {
 
 fn graph_io() {
     let store = GraphStore::new();
-    let grant = conformance::workspace_grant(&store.tree_root);
+    let grant = conformance::workspace_grant(&store.store_root);
     let shares = Arc::new(StoreShares {
         live: Arc::clone(&store.live),
         graph_root: grant.graph_root.clone(),

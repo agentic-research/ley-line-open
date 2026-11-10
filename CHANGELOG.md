@@ -14,6 +14,333 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.26.0] — 2026-11-10
+
+**A breaking identity and correctness release. Arenas do not carry over:
+re-parse.** ADR-0047 steps M1 and M2 ship. Every break is versioned, and
+the old version is refused at the boundary, never read leniently:
+- the store root is parser-free (`storeRoot`, `leyline/store-tree/v1`),
+  and the head digest moves to v3 (a head carrying the retired `treeRoot`
+  is refused);
+- `node_hash` is keyed (`merkle-ast-v3`), so no node hash can equal a blob
+  hash;
+- `node_content` drops `lang`/`raw_kind`, which now live per occurrence;
+- the projection is `projection-v12`, and a v10 or v11 arena is refused at
+  open;
+- `wire_format_major` is 2, so a pre-0.26 client fails the handshake
+  instead of reading `store_root` as absent.
+
+`SCHEMA_VERSION` is 0.26.0, and the Go module moves with the binary: pin
+both in one commit.
+
+Correctness and security fixes:
+- `query` is read-only by construction;
+- MCP serves only advertised, granted tools;
+- every write emits exactly one event;
+- source-blob reads verify their bytes;
+- a run never starts without its granted workspace (`workspaceUnserved`);
+- rustls 0.23.46;
+- six dead daemon ops are removed.
+
+Consumers adopt through mache-107423, mache-108e26, cloister-83d669,
+cloister-dc4a53 and cloister-98c26d.
+
+### Security
+
+- **A run never starts without a workspace its grant names, and the refusal
+  has its own execution/v1 code, `workspaceUnserved`** (bead
+  `ley-line-open-204a94`). `ErrorCode` gains `workspaceUnserved` at ordinal 12
+  (append-only). The native tier, the microVM tier without a source tree, and
+  the microVM tier given more than one workspace now refuse with it before
+  spawning anything; these were `unsupportedBackend`, the same code as an
+  egress grant or an unenforceable ceiling, so a caller could not tell a run
+  another tier would serve from one no tier would. `ExecutionService` also
+  checks each backend's answer: a start whose reported workspace shares are
+  not exactly the granted workspaces (one missing, or one the grant never
+  named) is cancelled and refused with `workspaceUnserved`, and the run is
+  never recorded; if the cancel fails, the run is recorded `failed` (no
+  receipt, its run_id refuses another start, `cleanup` retries the cancel). A `Backend` implementation outside this repository that
+  accepts workspace grants must report a `WorkerChannel::WorkspaceShare` for
+  each, or its runs are refused. A client matching `unsupportedBackend` for
+  these refusals must match `workspaceUnserved` instead.
+
+- **rustls 0.23.46** (bead `ley-line-open-642105`). The binary reaches rustls
+  through sigstore verification (`nono` -> `sigstore-rekor` -> `reqwest`).
+  0.23.45 carried four advisories, fixed in 0.23.46:
+  - `Debug` formatting of a session exposed TLS master secrets and resumption
+    PSKs;
+  - Brotli certificate decompression could allocate up to 1 GiB before
+    authentication;
+  - an unauthenticated ServerHello could downgrade later key exchanges to
+    classical X25519 only;
+  - an ECH rejection could expose buffered application data.
+
+- **MCP dispatches only the tools it advertises, inside the Cloister groups
+  the listener grants** (bead `ley-line-open-851a65`). `tools/call` used to
+  dispatch any canonical daemon op, so `load` (which replaces the arena),
+  `sheaf_update_topology` and `sheaf_reap` were callable over MCP although
+  `tools/list` never offered them, and Cloister's group policy, written
+  against the advertised tools, did not limit them. Now a name `tools/list`
+  does not advertise is refused before dispatch with JSON-RPC error `-32601`
+  and `data: {"reason": "not_advertised", "tool"}`. The new
+  `--mcp-groups <a,b>` (`DaemonConfig::mcp_groups`, `mcp::McpGrant`) grants a
+  daemon's MCP listeners exactly those groups of `server.json`'s
+  `_meta.art.cloister/v1.groups[]`: a call outside the grant is refused with
+  `-32001` and `data: {"reason": "not_granted", "tool", "group"}`,
+  `tools/list` lists only the granted tools, and a name no group has refuses
+  startup. Without the flag every group is granted, so advertised tools work
+  as before. The `query` tool, which runs any SQL on the writer (`DROP`,
+  `ATTACH`, `VACUUM INTO` a host path), moves out of the read-side `query`
+  group into its own `sql` group in `server.json`, so a `query` grant is a
+  read grant; Cloister configurations that route raw SQL through the `query`
+  backend must add `sql` (making `query` itself read-only is
+  `ley-line-open-b7e9a3`). Breaking for Rust callers: `mcp::spawn` and `mcp::spawn_uds` take
+  the grant as a new last argument.
+
+- **The daemon's `query` op is read-only** (bead `ley-line-open-b7e9a3`).
+  It ran its SQL on the living db's writer, so any caller of the control
+  socket, or of MCP with the `sql` group, could `DROP` or rewrite tables,
+  `ATTACH` a host file, or `VACUUM INTO` a host path (which writes even on a
+  `query_only` connection). The statement now runs on a reader-pool
+  connection (`query_only=ON`) under a SQLite authorizer that denies by
+  default: it allows `SELECT`, reading a table, recursive CTEs, a listed set
+  of pure functions (`load_extension`, `sqlite_log` and the connection-state
+  functions are not among them) and the table-valued schema-introspection
+  pragmas (`pragma_table_info` and kin). The statement must also be a single
+  one that SQLite reports as a read-only `SELECT`. An `ATTACH` whose file
+  name is an expression, which reaches the authorizer as an action rusqlite
+  does not name and which SQLite reports read-only, is refused by the
+  deny-by-default rule alone. A refused statement returns `ok: false`, an
+  `error` message, and a typed `refusal` (`QueryResponse.refusal` in
+  `daemon.capnp`, additive): `reason` is `denied_action`,
+  `multiple_statements` or `not_a_query`, `action` names the refused action
+  (`insert`, `delete`, `attach`, `pragma`, `function`, ..., or the
+  statement's keyword such as `vacuum`), and `subject` what it names. A DROP
+  or CREATE TABLE is refused as the schema-table write SQLite asks for first
+  (`delete` or `insert` on `sqlite_master`). It is refused before any row is
+  returned and changes nothing. Behavior change: `query` no longer writes;
+  an empty statement and a bare `PRAGMA` are refused. A `SELECT` returns the
+  same rows as before. Go: `wire.QueryResponse` gains `Error` and `Refusal`
+  (`wire.QueryRefusal`, `wire.QueryRefusalReason`). The `query` tool stays
+  in its own Cloister group, `sql`.
+
+### Breaking
+
+- **`node_hash` is keyed: merkle-ast-v3 replaces merkle-ast-v2 (ADR-0047 M2,
+  D-i, bead `ley-line-open-73add7`).** merkle-ast-v2 hashed a node as plain
+  BLAKE3 over `"llo/ast/v1" ‖ 0x00 ‖ tag ‖ …`, so a file whose bytes were that
+  preimage had a `blob_hash` equal to the node's `node_hash` (the 18-byte file
+  `llo/ast/v1\0\0\x02fn\x02fn` named the Rust leaf `fn`). merkle-ast-v3 keys
+  the same fields, without the prefix, under
+  `derive_key("leyline/ast-node/v3", …)`, a different BLAKE3 mode from plain
+  hashing, so no `blob_hash` reaches a `node_hash`. The fold also applies κ
+  to named nodes only: an anonymous token hashes and stores its grammar kind
+  (JavaScript's and TypeScript's `class` keyword had been stored as κ
+  `type`). Every value moves.
+  - **What moves:** `node_content.node_hash`, the `v_ast_hash`,
+    `v_node_defs_hash` and `v_node_refs_hash` views, `parserId` (it folds
+    `IR_SCHEMA_VERSION`, now `merkle-ast-v3`) and the `_meta.derived_from`
+    stamp. `storeRoot` and `Head.rootHash` do not move.
+  - **Version handshake and `compatibility.json`:** `ir_schema_version` is
+    `merkle-ast-v3`. A consumer that memoizes `node_hash` values must treat
+    the bump as a lineage boundary and re-key. `wire_format_major` stays 2: no
+    wire field is renamed, removed or retyped; `validate`'s `emit_ast` rows
+    and sheaf region hashes carry v3 values in the same fields.
+  - **Known-answer vectors:** the `astNode` cases of
+    `schema-spec/sigma/v1/test-vectors/constructions.json` are v3 (each pins
+    its context), and the Go module `clients/go/leyline-schema` package
+    `sigma` adds `AstLeafHash`/`AstInternalHash` and reproduces them
+    (`task schema:go-sigma-vectors`).
+  - **Old arenas:** the bump ships with `projection-v12`, so a v11 arena is
+    refused at parse open; delete the `.db` and reparse. Nothing converts old
+    hashes.
+
+- **The store identity is parser-free: `treeRoot` is removed and `storeRoot`
+  replaces it (ADR-0047 M1, bead `ley-line-open-73c6ee`).** `treeRoot` folded
+  `parserId` into its params, so a grammar, epoch or projection bump renamed
+  an unchanged store. `storeRoot` is a directory Merkle tree
+  (`leyline/store-tree/v1`): one keyed `RowSet` fold per directory, params
+  empty, children in name-byte order as `(σ(name), 2i, |name|)` and
+  `(child, 2i + 1, git mode)`. One edit refolds only the directories on its
+  path (240 entries on a 50,000-file store, where the flat fold refolded
+  100,000). The parser stays bound beside it, never inside it:
+  - **Head digest v3** (`leyline head digest v3`) binds `storeRoot` and
+    `parserId` separately. `Head.storeRoot @10` is new; `Head.treeRoot @7` is
+    renamed `retiredTreeRoot` and never written. A head that carries it is a
+    v2 head and is refused by every reader with the typed
+    `HeadFormatError::RetiredDigestV2`: `leyline verify-head` fails, and a
+    parse does not chain onto it. Delete the `.head.capnp` and reparse to
+    start a v3 chain. A v2 signature does not verify under v3.
+  - **Daemon wire, `wire_format_major` 2:** `read_source` and `propose`
+    answer `store_root` (`ReadSourceResponse.storeRoot @6`,
+    `ProposeResponse.storeRoot @7`); `tree_root` is retired and never sent.
+    The `leyline_version` handshake and `compatibility.json` report wire
+    major 2, so a major-1 client refuses the daemon instead of reading the
+    missing `tree_root` as "no root recorded". The Go `daemon/wire` mirror's
+    `TreeRoot` fields are now `StoreRoot`; a consumer that decodes with
+    `DisallowUnknownFields` refuses a pre-M1 `tree_root` response, and a
+    lenient decoder drops it. The generated Go accessor `head.Head.TreeRoot`
+    is now `RetiredTreeRoot`, and `StoreRoot` is new. The `no_tree_root`
+    refusal reason is unchanged.
+  - **Projection `projection-v11`.** `_meta.derived_from` is the versioned
+    value `v2 <storeRoot> <parserId> <projection>`; `leyline rebuild` refuses
+    the retired three-field v1 value, and a v10 arena is refused at parse
+    open. `leyline verify-head` prints `valid storeRoot=...`, and it and
+    `leyline rebuild` refuse a `_tree` whose directory rows are not closed
+    under parents (bead `ley-line-open-835aad`), which would otherwise fold
+    to the closed manifest's root.
+  - **Rust API:** `leyline_cli_lib::tree_root` is `store_root`
+    (`StoreLeaf`, `StoreTree`, `StoreRoot`, `store_root_of`, `store_root`);
+    `ParseResult`, `Write` and `Accepted` carry `store_root`;
+    `leyline-cache`'s `WholeInput.tree_root` is `store_root`.
+  - **Grants:** a workspace grant's `graphRoot` is `blake3-256:<storeRoot>`,
+    so a parser upgrade no longer invalidates it.
+  - **Cross-runtime vectors:** `sigma/v1` replaces its `treeRoot` cases with
+    `storeRoot` cases that pin every directory node, and its `headDigest`
+    cases move to v3. The Go module gains package `sigma`, which reproduces
+    the `PartitionSpec` fold, `storeRoot` and head digest v3 from those
+    vectors.
+
+- **Six dead daemon ops are removed: `flush`, `list_roots`, `sheaf_stalks`,
+  `get_schema`, `get_refs_map` and `get_defs_map`** (bead
+  `ley-line-open-8523ee`). None has a caller in LLO, mache or ley-line at
+  their `origin/main`. `flush` read `current_root`, which `status` returns,
+  changed nothing, and still emitted a `daemon.flush` event; `list_roots` was
+  `list_children` with `id: ""`; `sheaf_stalks` returned a strict subset of
+  `sheaf_status`; `get_schema` returned a hardcoded crate list; mache builds
+  its refs and defs maps from its own index. The wire refuses each name as an
+  unknown op, the MCP registry and its Cloister groups drop the four that were
+  tools, and `daemon.capnp` drops `FlushRequest`/`FlushResponse`,
+  `TokenMapEntry`, `GetRefsMap*`, `GetDefsMap*`, `SchemaTier`, `GetSchema*`
+  and `SheafStalksResponse`, with the matching Go bindings in
+  `clients/go/leyline-schema` (`wire.FlushResponse`, `wire.TokenMapEntry`,
+  `wire.GetRefsMapResponse`, `wire.GetDefsMapResponse`, `wire.SchemaTier`,
+  `wire.GetSchemaResponse`, `wire.SheafStalksResponse`). Migrate `flush` to
+  `status`, `list_roots` to `list_children`, and `sheaf_stalks` to
+  `sheaf_status`. `get_db_path` stays: open bead `ley-line-open-cc386f` plans
+  mache's `udsGraph` use of it.
+
+- **`node_content` drops `lang` and `raw_kind`: projection-v12 (ADR-0047 M2,
+  D-iii, bead `ley-line-open-b5d354`).** Neither is in `node_hash`'s
+  preimage, so one row served every file and language holding the same
+  subtree, kept whichever occurrence landed first, and kept a replaced file's
+  value after a write (a Go and a Rust file sharing the `"` leaf left
+  `lang = 'go'` after the Go string was deleted). Every `node_content` column
+  is now a function of `node_hash`. Read a node's language and grammar kind
+  per occurrence through `_ast.kind_id → kinds(lang, raw_kind)`;
+  `docs/TABLE_CONTRACT.md` gives the query for a fielded child's grammar kind
+  (an anonymous child's is its `kind`, since the merkle-ast-v3 fold applies
+  κ to named nodes only).
+  `node_defs` and `node_refs` gain `kind_id` (→ `kinds`), the occurrence's
+  own `(lang, raw_kind)` as on `_ast`: equal to the `_ast` row's for a host
+  occurrence, and the only carrier for an injected-language occurrence,
+  which has no `_ast` row (a Go file's injected `CREATE TABLE users` def
+  answers `('sql', 'create_table')`; bead `ley-line-open-cc5c55`).
+  `leyline rebuild`'s logical-row gate compares every `node_content` column;
+  the exclusion it carried for these two is gone. `PROJECTION_SCHEMA_VERSION`
+  is `projection-v12`; a v11 arena is refused at parse open.
+
+### Added
+
+- **The Σ axiom falsification suite and known-answer vectors for every shipped
+  construction** (bead `ley-line-open-10d71a`, ADR-0047 step M0). Each axiom
+  of the Σ decade is a test named as ADR-0047 §5 names it, in the crate that
+  owns the construction: (CA) round trip and tamper refusal over
+  `MemBlobStore`, `FsBlobStore`, the chunk pool, blob-manifest reconstruction
+  and `source_blobs`; (DET) one checked-in vector per construction in
+  `schema-spec/sigma/v1/test-vectors/constructions.json`, with pinned
+  preimages, plus a parse on one and on eight rayon threads that names the same
+  identities; (IM) a write-sequence property over every address-keyed table and
+  a writer SIGKILLed at four deterministic points of a publish; §1.3 Merkle cost
+  for `treeRoot` and `node_hash`; and the construction-separation laws. Two
+  claims fail on shipped code and stay visible: `treeRoot` is one flat fold (an
+  edit refolds 100,000 entries in a 50,000-file store; turned green by M1,
+  `ley-line-open-73c6ee`) and `node_hash`/`run_id` put their tag inside a plain
+  σ preimage (a file of a leaf's preimage has that leaf's address; M2/M3,
+  `ley-line-open-73add7`). Each has an ignored strict test and a measured test
+  that runs in CI.
+- **`Ref<D>`: construction-indexed addresses in `leyline-core`**
+  (`leyline_core::construction`). A `Ref<D>` is `repr(transparent)` over `Hash`,
+  minted only by `D`'s fold (`Ref::derive`) or by re-deriving a claimed address
+  from a witness (`Ref::verified`); there is no `from_bytes`, no `ZERO` and no
+  conversion between constructions, and comparing refs of two constructions
+  does not compile. Constructions: `Blob`, `Chunk`, `ArenaImage`, `HeadDigest`
+  (core), `Parser`, `TreeRoot`, `AstNode` (cli-lib), `Restriction` (cache).
+  `leyline verify-head` and `leyline rebuild` now type the stamps they check.
+  Additive: no identity value, schema, projection or wire type changes, and the
+  vectors were pinned before the types landed.
+
+- **Arena-local locators are their own types** (bead `ley-line-open-12e252`,
+  ADR-0047 step M0). `leyline-schema` defines `Nid`, `FileId`, `DirId`,
+  `NameId`, `KindId` and `ContentId`, each a `repr(transparent)` newtype over
+  `i64` with SQL impls (`ToSql`/`FromSql`) and nothing else: no `serde` or
+  Cap'n Proto impl, and no conversion between locators, from an integer or
+  from a content address except the explicit `from_raw`/`get`. The schema
+  API (`file_nid`, `dir_nid`, `ensure_file_id`, `intern_name`, `intern_kind`,
+  `insert_node`, `node_path`, `resolve_path`, `file_nid_range`, …) and the
+  projection writers in `leyline-ts`, `leyline-lsp`, `leyline-fs` and
+  `leyline-cli-lib` take and return them, so passing a nid where a `file_id`
+  belongs, swapping a `name_id` and a `kind_id`, or serializing a nid onto a
+  wire is a compile error (compile-fail doc tests in
+  `leyline_schema::locator`). Bead `80f037` F3 refuses a bare nid on the wire
+  at runtime; this makes it a type error. Nothing moves: the stored integers,
+  the nid encoding and every column are unchanged.
+- **`leyline_derive_key` in `leyline-cas-ffi`**, BLAKE3
+  `derive_key(context, input)` over the C ABI and in the wasm build, with a C
+  header (`rs/ll-open/cas-ffi/include/leyline_cas_ffi.h`). It is the
+  prerequisite of run-id v2 (ADR-0047 D-i, M3): cloister derives `run_id`
+  through this FFI. It delegates to the new `leyline_core::substrate::derive_key`
+  and is pinned by `deriveKey` cases in
+  `schema-spec/sigma/v1/test-vectors/constructions.json`, taken from BLAKE3's
+  own test vectors and checked from Rust, through the C ABI and against the
+  wasm export surface. Additive: `leyline_hash_bytes` and every Σ address are
+  unchanged.
+
+### Fixed
+
+- **`source_blobs` reads verify their bytes against their address** (bead
+  `ley-line-open-10d71a`). `tree::blob_bytes`, the reader behind `read_source`,
+  the store filesystem and `leyline rebuild`, returned whatever bytes a row
+  held under a blob hash. A row changed in place is now refused (the store
+  filesystem answers `EIO`) instead of being served as the file the hash names:
+  Σ (CA) as verify-on-read, the contract `BlobStore::get` already states.
+
+- **Checkout no longer materialises a tampered `source_blobs` row, and every
+  `source_blobs` read verifies through one accessor** (bead
+  `ley-line-open-12d305`). `checkout`'s materialiser selected `blob_bytes`
+  directly and wrote whatever a row held under a blob hash into the working
+  directory; a row changed under its key is now refused, the file is left as
+  it was, and the reconcile reports the path and the blob hash. The four
+  remaining raw readers (`tree::blob_bytes`, checkout, `splice::source_bytes`
+  and CDC activation) now read through `leyline_core::source_blob` (new
+  `sqlite` feature), which re-derives the key with `Ref<Blob>::verified` and
+  refuses a mismatch with a typed `SourceBlobError` naming the blob and, where
+  the caller knows it, the path. `task lint:source-blob-reads` (in `task ci`)
+  fails on any production `SELECT` of `source_blobs.blob_bytes` outside that
+  module.
+
+- **Every op that changes state emits exactly one `daemon.<op>` event, over
+  the socket and over MCP, and an op that changes nothing emits none** (bead
+  `ley-line-open-851f00`). Only the control socket emitted, and only for a
+  hand-kept list of op names, so a `propose`, `reparse` or `enrich` made over
+  MCP reached no subscriber; `hdc_calibrate`, a writing `query` and the lazy
+  schema installs of `agreement` and the HDC ops wrote without an event; and
+  `snapshot` emitted `daemon.snapshot` whether or not anything changed. The
+  live db's write boundary (`DaemonContext::with_write`) now compares the
+  writer's row-change count and schema version before and after each write,
+  and the publish boundary (`with_publish`, used by `snapshot`, `reparse`,
+  `enrich` and `load`) compares the published `current_root`;
+  `DaemonContext::observe_op`, around the dispatch both transports share,
+  emits once per op that crossed a changing boundary. `STATE_CHANGING_OPS`
+  is gone. Lazy LSP enrichment, which a `lsp_*` read queues onto the blocking
+  pool, stays where it is and runs as its own `enrich` op, so the `_lsp` rows
+  it lands emit `daemon.enrich`: moving it off the read path would make the
+  first `lsp_*` call on an unenriched file answer nothing instead of
+  answering `enriched: true` and filling on the retry. Subscribers see new
+  topics (`daemon.query`, `daemon.hdc_calibrate`, `daemon.agreement`, ...)
+  with the existing `{"op": <op>}` payload, and no longer see an event for
+  a refused proposal or a snapshot of unchanged bytes.
+
 ## [0.25.0] — 2026-11-05
 
 **A correctness release for daemon clients. The projection is unchanged

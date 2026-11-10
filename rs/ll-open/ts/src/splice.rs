@@ -3,12 +3,14 @@
 //!
 //! A write to a node is `source[..start] + new_text + source[end..]`. What
 //! happens to those bytes next — the blob store, the manifest, the
-//! re-projection, `treeRoot` — is ADR-0040 D3's one write path
+//! re-projection, `storeRoot` — is ADR-0040 D3's one write path
 //! (`leyline_cli_lib::source_write::write`), which every writer calls. This
 //! module never writes the arena.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension};
+use leyline_core::Hash;
+use leyline_schema::{FileId, Nid};
+use rusqlite::Connection;
 
 /// Splice new text into a node's byte range, returning the modified source bytes.
 ///
@@ -18,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// projection-v5: keyed on the integer `nid`; the node's file is `nid >> 24`,
 /// joined to `_source.file_id`. Callers holding a display path resolve it
 /// first via [`crate::schema::resolve_path`].
-pub fn splice(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
+pub fn splice(conn: &Connection, nid: Nid, new_text: &str) -> Result<Vec<u8>> {
     // Look up byte range from _ast
     let (start_byte, end_byte): (usize, usize) = conn
         .query_row(
@@ -62,7 +64,7 @@ pub fn splice(conn: &Connection, nid: i64, new_text: &str) -> Result<Vec<u8>> {
 /// working tree, not the arena's record of the file. A chunk-activated blob
 /// (bytes moved into chunks by `leyline-fs`) is reported as such rather than
 /// read wrongly.
-pub fn source_bytes(conn: &Connection, file_id: i64) -> Result<Vec<u8>> {
+pub fn source_bytes(conn: &Connection, file_id: FileId) -> Result<Vec<u8>> {
     /// The `_source` columns a file's bytes can live behind.
     struct SourceRow {
         id: String,
@@ -89,22 +91,17 @@ pub fn source_bytes(conn: &Connection, file_id: i64) -> Result<Vec<u8>> {
     let bytes = match (content, &content_hash) {
         (Some(c), _) => c,
         (None, Some(hash)) => {
-            let blob: Option<Option<Vec<u8>>> =
-                if leyline_schema::table_exists(conn, "source_blobs")? {
-                    conn.query_row(
-                        "SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1",
-                        [hash],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                } else {
-                    None
-                };
+            // The one verifying reader of `source_blobs` (bead
+            // `ley-line-open-12d305`): bytes that do not hash to their key,
+            // and a chunk-activated row, are refused naming the file.
+            let blob = match <[u8; 32]>::try_from(hash.as_slice()) {
+                Ok(key) if leyline_schema::table_exists(conn, "source_blobs")? => {
+                    leyline_core::source_blob::read_at(conn, &id, Hash::from_bytes(key))?
+                }
+                _ => None,
+            };
             match blob {
-                Some(Some(bytes)) => bytes,
-                Some(None) => bail!(
-                    "source '{id}' is chunk-activated in source_blobs; read it through leyline-fs"
-                ),
+                Some(bytes) => bytes,
                 None => bail!(
                     "source '{id}' names content hash {} but source_blobs holds no such blob",
                     hex_of(hash)
@@ -150,7 +147,7 @@ mod tests {
 
     /// Resolve a display path to its nid — the v5 addressing boundary.
     #[cfg(feature = "html")]
-    fn nid_of(conn: &Connection, path: &str) -> i64 {
+    fn nid_of(conn: &Connection, path: &str) -> Nid {
         crate::schema::resolve_path(conn, path)
             .unwrap()
             .unwrap_or_else(|| panic!("path must resolve: {path:?}"))
@@ -216,7 +213,7 @@ mod tests {
     fn splice_nonexistent_node_fails() {
         let conn = setup_html(b"<p>Hello</p>");
         // A nid far outside any interned file's populated range.
-        let result = splice(&conn, 1 << 40, "text");
+        let result = splice(&conn, Nid::from_raw(1 << 40), "text");
         assert!(result.is_err());
     }
 
@@ -251,7 +248,10 @@ mod tests {
     fn source_bytes_reads_the_blob_its_hash_names() {
         let h = hash_of(b"package a\n");
         let conn = blob_arena(&h, Some(b"package a\n"));
-        assert_eq!(source_bytes(&conn, 7).unwrap(), b"package a\n");
+        assert_eq!(
+            source_bytes(&conn, FileId::from_raw(7)).unwrap(),
+            b"package a\n"
+        );
     }
 
     /// Bead `0d3b72`: a hash with no blob row is an error, never a fall
@@ -260,16 +260,42 @@ mod tests {
     fn source_bytes_fails_closed_on_a_hash_with_no_blob() {
         let h = hash_of(b"package a\n");
         let conn = blob_arena(&h, None);
-        let msg = format!("{:#}", source_bytes(&conn, 7).unwrap_err());
+        let msg = format!(
+            "{:#}",
+            source_bytes(&conn, FileId::from_raw(7)).unwrap_err()
+        );
         assert!(msg.contains("holds no such blob"), "{msg}");
         assert!(msg.contains(&hex_of(&h)), "the error names the hash: {msg}");
+    }
+
+    /// An arena with no `source_blobs` table holds no blob for the hash:
+    /// the refusal says so, rather than surfacing a failed read.
+    #[test]
+    fn source_bytes_without_a_source_blobs_table_holds_no_such_blob() {
+        let h = hash_of(b"package a\n");
+        let conn = blob_arena(&h, None);
+        conn.execute_batch("DROP TABLE source_blobs").unwrap();
+        let err = source_bytes(&conn, FileId::from_raw(7)).unwrap_err();
+        assert!(
+            err.downcast_ref::<leyline_core::source_blob::SourceBlobError>()
+                .is_none(),
+            "{err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("holds no such blob"), "{msg}");
     }
 
     #[test]
     fn source_bytes_refuses_a_blob_that_does_not_hash_to_its_key() {
         let key = hash_of(b"package a\n");
         let conn = blob_arena(&key, Some(b"package b\n"));
-        let msg = format!("{:#}", source_bytes(&conn, 7).unwrap_err());
+        let err = source_bytes(&conn, FileId::from_raw(7)).unwrap_err();
+        let typed = err
+            .downcast_ref::<leyline_core::source_blob::SourceBlobError>()
+            .expect("the refusal is the typed source-blob error (bead 12d305)");
+        assert_eq!(typed.path.as_deref(), Some("a.go"));
+        assert_eq!(typed.blob.as_bytes()[..], key[..]);
+        let msg = format!("{err:#}");
         assert!(msg.contains("hash to"), "{msg}");
         assert!(msg.contains(&hex_of(&key)), "names the key: {msg}");
         assert!(
@@ -288,14 +314,17 @@ mod tests {
         let conn = blob_arena(&hash_of(b"package a\n"), None);
         conn.execute("UPDATE _source SET content = X'00' WHERE file_id = 7", [])
             .unwrap();
-        let err = source_bytes(&conn, 7).unwrap_err();
+        let err = source_bytes(&conn, FileId::from_raw(7)).unwrap_err();
         assert!(format!("{err:#}").contains("hash to"), "{err:#}");
         conn.execute(
             "UPDATE _source SET content = ?1 WHERE file_id = 7",
             [b"package a\n".as_slice()],
         )
         .unwrap();
-        assert_eq!(source_bytes(&conn, 7).unwrap(), b"package a\n");
+        assert_eq!(
+            source_bytes(&conn, FileId::from_raw(7)).unwrap(),
+            b"package a\n"
+        );
     }
 
     #[test]
@@ -306,10 +335,10 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(source_bytes(&conn, 7).unwrap(), b"A");
+        assert_eq!(source_bytes(&conn, FileId::from_raw(7)).unwrap(), b"A");
         conn.execute("UPDATE _source SET content = NULL WHERE file_id = 7", [])
             .unwrap();
-        let err = source_bytes(&conn, 7).unwrap_err();
+        let err = source_bytes(&conn, FileId::from_raw(7)).unwrap_err();
         assert!(format!("{err:#}").contains("neither"), "{err:#}");
     }
 }

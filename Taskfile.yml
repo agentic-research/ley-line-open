@@ -472,6 +472,14 @@ tasks:
     cmds:
       - tools/test_go_schema_consumer.sh
 
+  schema:go-sigma-vectors:
+    desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec, node_hash v3) the Rust tests check (73c6ee, 73add7)
+    dir: clients/go/leyline-schema
+    env:
+      GOWORK: "off"
+    cmds:
+      - go test -count=1 ./sigma/
+
   schema:execution-asset-consumer-test:
     desc: Compile the execution/v1 schema release assets standalone to zod RunSpec/RunGrant/RunReceipt (6d811a)
     cmds:
@@ -1053,6 +1061,19 @@ tasks:
       invariants stay load-bearing.
     cmds:
       - tools/lint_blake3.sh
+
+  # Σ axiom CA as verify-on-read (bead ley-line-open-12d305): every
+  # production read of `source_blobs.blob_bytes` goes through the one
+  # verifying accessor, `leyline_core::source_blob`.
+  lint:source-blob-reads:
+    desc: No production SELECT of source_blobs.blob_bytes outside leyline_core::source_blob
+    cmds:
+      - sh tools/lint_source_blob_reads.sh .
+
+  lint:source-blob-reads:fixture-test:
+    desc: Prove the source-blob read gate fails on single-line, multi-line, JOIN, blob_open and cfg(test)-adjacent raw reads
+    cmds:
+      - sh tools/test_lint_source_blob_reads.sh
 
   taskfile:anchors:fixture-test:
     desc: |
@@ -1721,11 +1742,14 @@ tasks:
       - task: release:retry:fixture-test
       - task: release:hypervisor:fixture-test
       - task: schema:consumer-fixture-test
+      - task: schema:go-sigma-vectors
       - task: schema:execution-asset-consumer-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check
       - task: release:crates:fixture-test
       - task: lint:blake3
+      - task: lint:source-blob-reads:fixture-test
+      - task: lint:source-blob-reads
       - task: lint:architecture-vocabulary
       - task: lint:doc-claims
       - task: lint:mutants-cfg-coverage

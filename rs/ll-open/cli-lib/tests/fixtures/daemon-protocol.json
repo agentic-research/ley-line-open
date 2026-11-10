@@ -22,18 +22,6 @@
     "go_drift_skip": null
   },
 
-  "flush": {
-    "request": {"op": "flush"},
-    "response": {
-      "ok": true,
-      "root_published": false
-    },
-    "response_required_keys": ["ok", "root_published"],
-    "response_optional_keys": ["current_root"],
-    "go_binding": "FlushResponse",
-    "go_drift_skip": null
-  },
-
   "snapshot": {
     "request": {"op": "snapshot"},
     "response": {
@@ -45,18 +33,6 @@
     "response_required_keys": ["ok", "generation", "current_root", "root_published"],
     "response_optional_keys": [],
     "go_binding": "SnapshotResponse",
-    "go_drift_skip": null
-  },
-
-  "list_roots": {
-    "request": {"op": "list_roots"},
-    "response": {
-      "ok": true,
-      "children": []
-    },
-    "response_required_keys": ["ok", "children"],
-    "response_optional_keys": [],
-    "go_binding": "ListChildrenResponse",
     "go_drift_skip": null
   },
 
@@ -112,11 +88,11 @@
       "ok": true,
       "content": "fn main() {}\n",
       "blob_hash": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "mode": "100644"
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["content", "blob_hash", "tree_root", "mode", "error"],
+    "response_optional_keys": ["content", "blob_hash", "store_root", "mode", "error"],
     "go_binding": "ReadSourceResponse",
     "go_drift_skip": null
   },
@@ -148,7 +124,7 @@
       }
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -166,7 +142,7 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {
           "path": "src/main.rs",
@@ -176,7 +152,7 @@
       "merged": ["src/main.rs"]
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -193,13 +169,13 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {"path": "README.md", "blob_hash": "5e6f7a8b9c0d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d"}
       ]
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -220,7 +196,7 @@
       }
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -234,14 +210,14 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {"path": "src/main.rs", "blob_hash": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a"}
       ],
       "post_commit_error": "Σ head write after a committed parse failed; the rows are committed but the head was not advanced"
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -256,13 +232,13 @@
     },
     "response": {
       "ok": true,
-      "tree_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "store_root": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
       "blobs": [
         {"path": "src/lib.rs", "blob_hash": "5e6f7a8b9c0d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d"}
       ]
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -289,7 +265,7 @@
       }
     },
     "response_required_keys": ["ok"],
-    "response_optional_keys": ["tree_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
+    "response_optional_keys": ["store_root", "blobs", "merged", "refusal", "error", "post_commit_error"],
     "go_binding": "ProposeResponse",
     "go_drift_skip": null
   },
@@ -336,50 +312,6 @@
     "go_drift_skip": null
   },
 
-  "get_refs_map": {
-    "request": {"op": "get_refs_map"},
-    "response": {
-      "ok": true,
-      "entries": [
-        {"token": "some_fn", "node_ids": ["file1.rs#caller"]},
-        {"token": "another_fn", "node_ids": ["file1.rs#caller2", "file2.rs#caller3"]}
-      ]
-    },
-    "response_required_keys": ["ok", "entries"],
-    "response_optional_keys": [],
-    "go_binding": "GetRefsMapResponse",
-    "go_drift_skip": null
-  },
-
-  "get_defs_map": {
-    "request": {"op": "get_defs_map"},
-    "response": {
-      "ok": true,
-      "entries": [
-        {"token": "some_fn", "node_ids": ["file1.rs#some_fn"]}
-      ]
-    },
-    "response_required_keys": ["ok", "entries"],
-    "response_optional_keys": [],
-    "go_binding": "GetDefsMapResponse",
-    "go_drift_skip": null
-  },
-
-  "get_schema": {
-    "request": {"op": "get_schema"},
-    "response": {
-      "ok": true,
-      "tiers": [
-        {"name": "ll-core", "crates": ["leyline-core", "leyline-schema"]},
-        {"name": "ll-open", "crates": ["leyline-fs", "leyline-cli"]}
-      ]
-    },
-    "response_required_keys": ["ok", "tiers"],
-    "response_optional_keys": [],
-    "go_binding": "GetSchemaResponse",
-    "go_drift_skip": null
-  },
-
   "get_db_path": {
     "request": {"op": "get_db_path"},
     "response": {
@@ -410,6 +342,23 @@
     "response_optional_keys": ["truncated", "limit"],
     "go_binding": "QueryResponse",
     "go_drift_skip": "Structural: schema declares rows:List(QueryRow) with positional values:List(Text); handler emits column-keyed maps. Can't be reconciled additively without changing the wire shape (would break debug consumers of `op_query`). Tracked as follow-up; this is the only op that genuinely needs a design call rather than a schema bump."
+  },
+
+  "query_refused": {
+    "request": {"op": "query", "sql": "INSERT INTO nodes (id) VALUES ('x')"},
+    "response": {
+      "ok": false,
+      "error": "query refused (denied_action): the query op is read-only and does not allow `insert` on `nodes`",
+      "refusal": {
+        "reason": "denied_action",
+        "action": "insert",
+        "subject": "nodes"
+      }
+    },
+    "response_required_keys": ["ok"],
+    "response_optional_keys": ["error", "refusal"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
   },
 
   "sheaf_set_topology": {
@@ -450,15 +399,6 @@
     "response_required_keys": ["defect", "generation", "valid", "total"],
     "response_optional_keys": [],
     "go_binding": "SheafDefectResponse",
-    "go_drift_skip": null
-  },
-
-  "sheaf_stalks": {
-    "request": {"op": "sheaf_stalks"},
-    "response": {"generation": "0", "valid": 0, "total": 0},
-    "response_required_keys": ["generation", "valid", "total"],
-    "response_optional_keys": [],
-    "go_binding": "SheafStalksResponse",
     "go_drift_skip": null
   },
 

@@ -107,7 +107,7 @@ impl KrunWorkerBackend {
             [] => Ok(None),
             [grant] => {
                 let shares = self.shares.as_ref().ok_or_else(|| {
-                    ExecutionError::unsupported(format!(
+                    ExecutionError::workspace_unserved(format!(
                         "the run is granted workspace {:?}, and this libkrun backend \
                          serves no workspace shares (start the daemon with a source \
                          tree)",
@@ -116,7 +116,7 @@ impl KrunWorkerBackend {
                 })?;
                 shares.open(&request.run_id, grant).map(Some)
             }
-            grants => Err(ExecutionError::unsupported(format!(
+            grants => Err(ExecutionError::workspace_unserved(format!(
                 "the microVM tier attaches one workspace as /work; the run is granted {}",
                 grants.len()
             ))),

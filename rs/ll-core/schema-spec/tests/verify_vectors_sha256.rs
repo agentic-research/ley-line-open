@@ -42,6 +42,7 @@ const VECTORS_FILES: &[&str] = &[
     // digests.json, and fixtures.capnp. The BLAKE3 half of the gate
     // lives in leyline-schema-capnp's tests/leyline_net_vectors.rs.
     "leyline-net/v1/test-vectors/VECTORS.sha256",
+    "sigma/v1/VECTORS.sha256",
 ];
 
 #[test]

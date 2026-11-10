@@ -23,8 +23,15 @@
 //! lives in cloister" framing for wire-level auth no longer applies —
 //! the token gate is the local same-machine boundary.
 //!
+//! Call scope (bead `ley-line-open-851a65`): `tools/call` dispatches only a
+//! tool `tools/list` advertises, and only inside the Cloister groups the
+//! listener grants ([`McpGrant`], `--mcp-groups`). A daemon op that is not an
+//! MCP tool is refused, never dispatched. Which caller is granted which group
+//! is Cloister's policy; the grant is LLO's mechanism for enforcing it.
+//!
 //! Out of scope here, by design (lives in cloister / notme-proxy):
-//! - Per-tool authorization (cloister vault slice grants, ADR-0013)
+//! - Deciding which caller holds which group, and per-tool authorization
+//!   finer than a group (cloister vault slice grants, ADR-0013)
 //! - mTLS termination + cross-machine identity scoping
 //! - OIDC / Cloudflare Access (the remote-access path; ADR-0022 Mode B)
 
@@ -161,7 +168,7 @@ pub fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "query",
-            description: "Run an arbitrary SQL query against the living db.",
+            description: "Run one read-only SELECT against the living db and return its rows. Any other statement (a write, DDL, ATTACH, VACUUM, a pragma, a second statement) is refused with a typed `refusal` and changes nothing. Cloister group `sql`.",
             schema: json!({
                 "type": "object",
                 "properties": {"sql": {"type": "string"}},
@@ -192,7 +199,7 @@ pub fn tool_registry() -> Vec<McpTool> {
                           the store holds, parsed or not). Returns its content (a symlink's \
                           target), `blob_hash` (pass it as the `base` of a later `propose`), \
                           its git `mode` (`100644`, `100755` or `120000`) and the arena's \
-                          `tree_root`.",
+                          `store_root`.",
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -282,21 +289,6 @@ pub fn tool_registry() -> Vec<McpTool> {
                 "properties": {"id": {"type": "string"}},
                 "required": ["id"]
             }),
-        },
-        McpTool {
-            name: "get_refs_map",
-            description: "Bulk export the full (token → [node_id]) refs index from node_refs. For graph-wide consumers (community detection, architecture diagrams).",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        },
-        McpTool {
-            name: "get_defs_map",
-            description: "Bulk export the full (token → [node_id]) defs index from node_defs. For graph-wide consumers (impact analysis, find_definition).",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        },
-        McpTool {
-            name: "get_schema",
-            description: "Export LLO's tier topology — the layer ownership map of ll-core/ll-open crates. Used by mache's diagram/architecture handlers.",
-            schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         },
         McpTool {
             name: "get_db_path",
@@ -515,11 +507,6 @@ pub fn tool_registry() -> Vec<McpTool> {
             schema: json!({"type": "object", "properties": {}}),
         },
         McpTool {
-            name: "sheaf_stalks",
-            description: "Cache validity counts (generation + valid + total).",
-            schema: json!({"type": "object", "properties": {}}),
-        },
-        McpTool {
             name: "sheaf_status",
             description: "Combined cache health snapshot: generation, valid, total, defect, tracked_edges (co-change tracker).",
             schema: json!({"type": "object", "properties": {}}),
@@ -650,10 +637,19 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
                 "sheaf_set_topology",
                 "sheaf_invalidate",
                 "sheaf_defect",
-                "sheaf_stalks",
                 "sheaf_status",
                 "sheaf_learned_weights",
             ],
+        },
+        // Raw SQL: `query` runs caller-written SQL. It is read-only (bead
+        // `ley-line-open-b7e9a3`: one SELECT, under a deny-by-default
+        // authorizer, on a `query_only` reader), but it reads any table, so
+        // it stays a grant of its own apart from the read-side `query` group
+        // (bead `ley-line-open-851a65`).
+        CloisterGroupDecl {
+            name: "sql",
+            advertised_prefix: "",
+            upstream_names: vec!["query"],
         },
         // Query / graph navigation — bare-name advertisement; these
         // are the read-side ops over the projected db.
@@ -661,16 +657,12 @@ pub fn cloister_groups() -> Vec<CloisterGroupDecl> {
             name: "query",
             advertised_prefix: "",
             upstream_names: vec![
-                "query",
                 "list_children",
                 "read_content",
                 "read_source",
                 "find_callers",
                 "find_defs",
                 "find_callees",
-                "get_refs_map",
-                "get_defs_map",
-                "get_schema",
                 "get_db_path",
                 "get_node",
                 "inspect_symbol",
@@ -768,7 +760,7 @@ struct JsonRpcRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonRpcResponse {
+pub(crate) struct JsonRpcResponse {
     jsonrpc: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<Value>,
@@ -807,6 +799,130 @@ impl JsonRpcResponse {
             }),
         }
     }
+    fn err_with_data(
+        id: Option<Value>,
+        code: i32,
+        message: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: Some(data),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Call authorization: advertised tools only, inside the listener's grant
+// ---------------------------------------------------------------------------
+
+/// JSON-RPC error code for a `tools/call` that names a tool `tools/list` does
+/// not advertise: an unknown name, or a canonical daemon op that is not an
+/// MCP tool (`load`, `sheaf_update_topology`, `sheaf_reap`, ...). The error's
+/// `data` is `{"reason": "not_advertised", "tool": <name>}`.
+pub const TOOL_NOT_ADVERTISED: i32 = -32601;
+
+/// JSON-RPC error code for a `tools/call` that names an advertised tool whose
+/// Cloister group the listener was not granted. The error's `data` is
+/// `{"reason": "not_granted", "tool": <name>, "group": <group>}`.
+pub const TOOL_NOT_GRANTED: i32 = -32001;
+
+/// The Cloister groups ([`cloister_groups`]) an MCP listener's callers hold
+/// (bead `ley-line-open-851a65`).
+///
+/// Which caller holds which group is Cloister's policy; this type is LLO's
+/// mechanism for it. A listener is started with one grant (`--mcp-groups`),
+/// and every `tools/call` on it must name an advertised tool whose group is
+/// in the grant. A tool outside the grant is refused before dispatch, and
+/// `tools/list` lists only the granted tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpGrant {
+    /// `None` grants every declared group.
+    groups: Option<std::collections::BTreeSet<&'static str>>,
+}
+
+impl McpGrant {
+    /// Every group [`cloister_groups`] declares: the listener serves the
+    /// whole advertised surface.
+    pub fn all() -> Self {
+        Self { groups: None }
+    }
+
+    /// Exactly the named groups. Fails closed: a name [`cloister_groups`]
+    /// does not declare, or no name at all, is an error rather than a grant
+    /// of nothing or of everything.
+    pub fn groups<S: AsRef<str>>(names: &[S]) -> Result<Self> {
+        let declared = cloister_groups();
+        if names.is_empty() {
+            anyhow::bail!("an MCP group grant names no group");
+        }
+        let mut groups = std::collections::BTreeSet::new();
+        for name in names {
+            let name = name.as_ref();
+            let Some(group) = declared.iter().find(|g| g.name == name) else {
+                let known: Vec<&str> = declared.iter().map(|g| g.name).collect();
+                anyhow::bail!("unknown MCP group `{name}`; the groups are {known:?}");
+            };
+            groups.insert(group.name);
+        }
+        Ok(Self {
+            groups: Some(groups),
+        })
+    }
+
+    fn permits(&self, group: &str) -> bool {
+        self.groups.as_ref().is_none_or(|g| g.contains(group))
+    }
+}
+
+/// Router state: the daemon and the grant its listener serves.
+#[derive(Clone)]
+struct McpState {
+    ctx: Arc<DaemonContext>,
+    grant: Arc<McpGrant>,
+}
+
+/// Why a `tools/call` is refused before it reaches the daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum CallRefusal {
+    NotAdvertised,
+    NotGranted { group: &'static str },
+}
+
+/// The Cloister group of each tool `tools/list` advertises. A name absent
+/// here is not advertised. `cloister_groups_cover_every_registered_tool_exactly_once`
+/// pins that the groups claim exactly the registry, so the map is the
+/// advertised surface.
+fn advertised_groups() -> &'static std::collections::HashMap<&'static str, &'static str> {
+    static GROUPS: OnceLock<std::collections::HashMap<&'static str, &'static str>> =
+        OnceLock::new();
+    GROUPS.get_or_init(|| {
+        let registry: std::collections::HashSet<&'static str> =
+            tool_registry().iter().map(|t| t.name).collect();
+        cloister_groups()
+            .into_iter()
+            .flat_map(|g| g.upstream_names.into_iter().map(move |n| (n, g.name)))
+            .filter(|(n, _)| registry.contains(n))
+            .collect()
+    })
+}
+
+/// Whether a caller holding `grant` may call the tool `name`.
+fn authorize_call(grant: &McpGrant, name: &str) -> std::result::Result<(), CallRefusal> {
+    let Some(&group) = advertised_groups().get(name) else {
+        return Err(CallRefusal::NotAdvertised);
+    };
+    if grant.permits(group) {
+        Ok(())
+    } else {
+        Err(CallRefusal::NotGranted { group })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,10 +939,16 @@ impl JsonRpcResponse {
 /// `None` means `--mcp-no-auth` was passed (and logged as a warning), or an
 /// in-process caller opted out. This function wires the router; it does not
 /// make the policy decision.
-fn build_router(ctx: Arc<DaemonContext>, token: Option<Arc<String>>) -> Router {
+///
+/// `grant` is the set of Cloister groups this listener's callers hold; every
+/// `tools/list` and `tools/call` on the router is scoped to it.
+fn build_router(ctx: Arc<DaemonContext>, token: Option<Arc<String>>, grant: McpGrant) -> Router {
     let mcp_routes = Router::new()
         .route("/mcp", post(handle_post).get(handle_get))
-        .with_state(ctx);
+        .with_state(McpState {
+            ctx,
+            grant: Arc::new(grant),
+        });
     match token {
         Some(tok) => mcp_routes.layer(middleware::from_fn_with_state(tok, auth::require_token)),
         None => mcp_routes,
@@ -852,10 +974,11 @@ pub fn spawn_uds(
     ctx: Arc<DaemonContext>,
     sock_path: std::path::PathBuf,
     token: Option<Arc<String>>,
+    grant: McpGrant,
 ) -> Result<tokio::task::JoinHandle<()>> {
     use std::os::unix::fs::PermissionsExt;
 
-    let app = build_router(ctx, token);
+    let app = build_router(ctx, token, grant);
 
     // A stale socket file from a killed daemon makes bind fail with
     // EADDRINUSE even though nothing is listening. Same treatment the control
@@ -910,8 +1033,9 @@ pub fn spawn(
     bind: Option<std::net::IpAddr>,
     port: u16,
     token: Option<Arc<String>>,
+    grant: McpGrant,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let app = build_router(ctx, token);
+    let app = build_router(ctx, token, grant);
 
     let bind = bind.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let addr: SocketAddr = SocketAddr::new(bind, port);
@@ -938,7 +1062,7 @@ pub fn spawn(
 // ---------------------------------------------------------------------------
 
 /// `POST /mcp` — JSON-RPC requests.
-async fn handle_post(State(ctx): State<Arc<DaemonContext>>, body: String) -> Response {
+async fn handle_post(State(state): State<McpState>, body: String) -> Response {
     let request: JsonRpcRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -981,9 +1105,9 @@ async fn handle_post(State(ctx): State<Arc<DaemonContext>>, body: String) -> Res
                 "serverInfo": {"name": "leyline", "version": super::version::BINARY_VERSION}
             }),
         ),
-        leyline_mcp_protocol_schema::METHOD_TOOLS_LIST => handle_tools_list(id),
+        leyline_mcp_protocol_schema::METHOD_TOOLS_LIST => handle_tools_list(&state.grant, id),
         leyline_mcp_protocol_schema::METHOD_TOOLS_CALL => {
-            handle_tools_call(&ctx, id, &request.params)
+            handle_tools_call(&state.ctx, &state.grant, id, &request.params)
         }
         "ping" => JsonRpcResponse::ok(Some(id), json!({})),
         other => JsonRpcResponse::err(Some(id), -32601, format!("method not found: {other}")),
@@ -1003,9 +1127,11 @@ fn json_response(resp: JsonRpcResponse) -> Response {
     (StatusCode::OK, axum::Json(resp)).into_response()
 }
 
-fn handle_tools_list(id: Value) -> JsonRpcResponse {
+/// `tools/list` — the advertised tools inside the listener's grant.
+fn handle_tools_list(grant: &McpGrant, id: Value) -> JsonRpcResponse {
     let tools: Vec<Value> = tool_registry()
         .into_iter()
+        .filter(|t| authorize_call(grant, t.name).is_ok())
         .map(|t| {
             json!({
                 "name": t.name,
@@ -1019,14 +1145,38 @@ fn handle_tools_list(id: Value) -> JsonRpcResponse {
 
 /// `tools/call` — translate `{ name, arguments }` into the daemon's existing
 /// op shape and dispatch through `handle_base_op`.
-fn handle_tools_call(
+///
+/// Only an advertised tool inside `grant` is dispatched (bead
+/// `ley-line-open-851a65`). The check runs before the arguments are read,
+/// so a refused call never reaches the daemon.
+pub(crate) fn handle_tools_call(
     ctx: &std::sync::Arc<DaemonContext>,
+    grant: &McpGrant,
     id: Value,
     params: &Value,
 ) -> JsonRpcResponse {
     let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
         return JsonRpcResponse::err(Some(id), -32602, "missing `name` in params");
     };
+    match authorize_call(grant, name) {
+        Ok(()) => {}
+        Err(CallRefusal::NotAdvertised) => {
+            return JsonRpcResponse::err_with_data(
+                Some(id),
+                TOOL_NOT_ADVERTISED,
+                format!("unknown tool: {name}"),
+                json!({"reason": "not_advertised", "tool": name}),
+            );
+        }
+        Err(CallRefusal::NotGranted { group }) => {
+            return JsonRpcResponse::err_with_data(
+                Some(id),
+                TOOL_NOT_GRANTED,
+                format!("tool `{name}` is in group `{group}`, which this listener does not grant"),
+                json!({"reason": "not_granted", "tool": name, "group": group}),
+            );
+        }
+    }
 
     // Build the op request: clone arguments verbatim, add `op` field.
     let mut req = match params.get("arguments") {
@@ -1095,7 +1245,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let ctx = crate::daemon::socket::tests::test_context(dir.path());
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).to_string();
-        let response = handle_post(State(ctx), body).await;
+        let state = McpState {
+            ctx,
+            grant: Arc::new(McpGrant::all()),
+        };
+        let response = handle_post(State(state), body).await;
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1293,6 +1447,192 @@ mod tests {
                 g.name,
             );
         }
+    }
+
+    /// The canonical ops `tool_registry()` does not advertise. `load`
+    /// (replaces the arena), `sheaf_update_topology` and `sheaf_reap` are
+    /// among them on every build.
+    fn unadvertised_ops() -> Vec<&'static str> {
+        let advertised: std::collections::HashSet<&str> =
+            tool_registry().iter().map(|t| t.name).collect();
+        crate::daemon::ops::base_op_names()
+            .into_iter()
+            .filter(|op| !advertised.contains(op))
+            .collect()
+    }
+
+    /// Bead `ley-line-open-851a65`: `tools/call` dispatches only what
+    /// `tools/list` advertises. Before the fix it dispatched any canonical
+    /// op, `load` (which replaces the arena) included.
+    #[tokio::test]
+    async fn unadvertised_ops_are_refused_over_mcp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        let unadvertised = unadvertised_ops();
+        assert!(unadvertised.contains(&"load"), "{unadvertised:?}");
+        #[cfg(feature = "sheaf")]
+        for op in ["sheaf_update_topology", "sheaf_reap"] {
+            assert!(unadvertised.contains(&op), "{unadvertised:?}");
+        }
+        let root_before = leyline_core::Controller::open_or_create(&ctx.ctrl_path)
+            .unwrap()
+            .published_root();
+        for op in unadvertised.into_iter().chain(["no_such_tool"]) {
+            let reply = call(&ctx, &McpGrant::all(), op, json!({"db": ""}));
+            assert!(reply.get("result").is_none(), "`{op}` dispatched: {reply}");
+            assert_eq!(reply["error"]["code"], TOOL_NOT_ADVERTISED, "{reply}");
+            assert_eq!(
+                reply["error"]["data"]["reason"], "not_advertised",
+                "{reply}"
+            );
+            assert_eq!(reply["error"]["data"]["tool"], op, "{reply}");
+        }
+        let root_after = leyline_core::Controller::open_or_create(&ctx.ctrl_path)
+            .unwrap()
+            .published_root();
+        assert_eq!(root_before, root_after, "a refused call changed the arena");
+    }
+
+    /// One `tools/call` as JSON.
+    fn call(ctx: &Arc<DaemonContext>, grant: &McpGrant, name: &str, args: Value) -> Value {
+        let reply = handle_tools_call(
+            ctx,
+            grant,
+            json!(1),
+            &json!({"name": name, "arguments": args}),
+        );
+        serde_json::to_value(&reply).unwrap()
+    }
+
+    /// Bead `ley-line-open-851a65`: an advertised tool whose Cloister group
+    /// the listener does not grant is refused before dispatch, with the
+    /// group named; a tool inside the grant runs.
+    #[tokio::test]
+    async fn advertised_op_outside_the_granted_group_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        let grant = McpGrant::groups(&["query"]).unwrap();
+
+        for (tool, group) in [
+            ("propose", "write"),
+            ("snapshot", "lifecycle"),
+            ("status", "lifecycle"),
+            // Raw SQL writes, so the read-side grant does not carry it.
+            ("query", "sql"),
+        ] {
+            let reply = call(
+                &ctx,
+                &grant,
+                tool,
+                json!({"writes": [], "sql": "DROP TABLE IF EXISTS nodes"}),
+            );
+            assert!(
+                reply.get("result").is_none(),
+                "`{tool}` dispatched: {reply}"
+            );
+            assert_eq!(reply["error"]["code"], TOOL_NOT_GRANTED, "{reply}");
+            assert_eq!(reply["error"]["data"]["reason"], "not_granted", "{reply}");
+            assert_eq!(reply["error"]["data"]["tool"], tool, "{reply}");
+            assert_eq!(reply["error"]["data"]["group"], group, "{reply}");
+        }
+        // The refused snapshot published nothing.
+        assert!(
+            leyline_core::Controller::open_or_create(&ctx.ctrl_path)
+                .unwrap()
+                .published_root()
+                .is_none(),
+            "a refused snapshot published the arena"
+        );
+
+        // Dispatched (the empty test db has no tree, so the op itself errors).
+        let reply = call(&ctx, &grant, "list_children", json!({"id": ""}));
+        assert!(reply.get("result").is_some(), "{reply}");
+        let sql = McpGrant::groups(&["sql"]).unwrap();
+        let reply = call(&ctx, &sql, "query", json!({"sql": "SELECT 1 AS one"}));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+
+        // Every group is callable under the full grant.
+        let reply = call(&ctx, &McpGrant::all(), "status", json!({}));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+    }
+
+    /// `tools/list` advertises exactly the granted tools: a caller is never
+    /// shown a tool it would be refused.
+    #[test]
+    fn tools_list_is_scoped_to_the_grant() {
+        let listed = |grant: &McpGrant| -> Vec<String> {
+            let reply = serde_json::to_value(handle_tools_list(grant, json!(1))).unwrap();
+            reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let all: Vec<String> = tool_registry().iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(listed(&McpGrant::all()), all);
+
+        let grant = McpGrant::groups(&["lsp", "write"]).unwrap();
+        let mut expected: Vec<&str> = cloister_groups()
+            .into_iter()
+            .filter(|g| g.name == "lsp" || g.name == "write")
+            .flat_map(|g| g.upstream_names)
+            .collect();
+        expected.sort_unstable();
+        let mut got = listed(&grant);
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    /// The refusal codes are wire contract: `-32601` is JSON-RPC's
+    /// method-not-found, `-32001` sits in the server-defined range.
+    #[test]
+    fn refusal_codes_are_pinned() {
+        assert_eq!(TOOL_NOT_ADVERTISED, -32601);
+        assert_eq!(TOOL_NOT_GRANTED, -32001);
+    }
+
+    /// The router a listener serves carries its grant to `tools/call`.
+    #[tokio::test]
+    async fn the_router_enforces_its_grant() {
+        use tower::ServiceExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = crate::daemon::socket::tests::test_context(dir.path());
+        let router = build_router(ctx, None, McpGrant::groups(&["query"]).unwrap());
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "propose", "arguments": {"writes": []}},
+        })
+        .to_string();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply["error"]["code"], TOOL_NOT_GRANTED, "{reply}");
+    }
+
+    /// A grant fails closed: a group nothing declares, or an empty grant,
+    /// is an error, never a silent grant of everything or of nothing.
+    #[test]
+    fn a_grant_names_only_declared_groups() {
+        let err = McpGrant::groups(&["query", "admin"]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown MCP group `admin`"),
+            "{err:#}"
+        );
+        let none: [&str; 0] = [];
+        assert!(McpGrant::groups(&none).is_err());
+        let grant = McpGrant::groups(&["query", "query"]).unwrap();
+        assert!(grant.permits("query"));
+        assert!(!grant.permits("write"));
+        assert!(McpGrant::all().permits("write"));
     }
 
     #[test]

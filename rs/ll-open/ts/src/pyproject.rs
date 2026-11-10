@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use leyline_schema::create_schema;
+use leyline_schema::{DirId, create_schema};
 
 /// Intern one named tree node in directory nid space (projection-v5, bead
 /// `ley-line-open-17c271`): the pyproject projection is a tree of NAMED
@@ -24,19 +24,19 @@ use leyline_schema::create_schema;
 /// returns the node's `dir_id` (its nid is the negation).
 fn named_node(
     conn: &Connection,
-    parent_dir_id: i64,
+    parent_dir_id: DirId,
     name: &str,
     kind: i32,
     size: i64,
     mtime: i64,
     record: &str,
-) -> Result<i64> {
+) -> Result<DirId> {
     let name_id = leyline_schema::intern_name(conn, name)?;
     conn.execute(
         "INSERT OR IGNORE INTO dirs (parent_dir_id, name_id) VALUES (?1, ?2)",
         rusqlite::params![parent_dir_id, name_id],
     )?;
-    let dir_id: i64 = conn.query_row(
+    let dir_id: DirId = conn.query_row(
         "SELECT dir_id FROM dirs WHERE parent_dir_id = ?1 AND name_id = ?2",
         rusqlite::params![parent_dir_id, name_id],
         |r| r.get(0),
@@ -115,7 +115,7 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
 
     // /project metadata
     if let Some(project) = doc.get("project").and_then(|v| v.as_table()) {
-        let project_dir = named_node(conn, 1, "project", 1, 0, mtime, "")?;
+        let project_dir = named_node(conn, DirId::ROOT, "project", 1, 0, mtime, "")?;
 
         for key in ["name", "version", "description", "requires-python"] {
             if let Some(val) = project.get(key).and_then(|v| v.as_str()) {
@@ -125,7 +125,7 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
 
         // /deps — project.dependencies
         if let Some(deps) = project.get("dependencies").and_then(|v| v.as_array()) {
-            let deps_dir = named_node(conn, 1, "deps", 1, 0, mtime, "")?;
+            let deps_dir = named_node(conn, DirId::ROOT, "deps", 1, 0, mtime, "")?;
             for raw in deps {
                 if let Some(s) = raw.as_str() {
                     let dep = parse_dep(s).with_context(|| format!("parsing dep: {s}"))?;
@@ -146,7 +146,7 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
     // /dev — dependency-groups.dev
     if let Some(groups) = doc.get("dependency-groups").and_then(|v| v.as_table()) {
         for (group_name, entries) in groups {
-            let group_dir = named_node(conn, 1, group_name, 1, 0, mtime, "")?;
+            let group_dir = named_node(conn, DirId::ROOT, group_name, 1, 0, mtime, "")?;
             if let Some(arr) = entries.as_array() {
                 for raw in arr {
                     if let Some(s) = raw.as_str() {
@@ -173,7 +173,7 @@ pub fn project_pyproject_into(content: &str, conn: &Connection) -> Result<()> {
             .get("optional-dependencies")
             .and_then(|v| v.as_table())
         {
-            let optional_dir = named_node(conn, 1, "optional", 1, 0, mtime, "")?;
+            let optional_dir = named_node(conn, DirId::ROOT, "optional", 1, 0, mtime, "")?;
             for (extra_name, entries) in opt {
                 let extra_dir = named_node(conn, optional_dir, extra_name, 1, 0, mtime, "")?;
                 if let Some(arr) = entries.as_array() {

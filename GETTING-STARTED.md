@@ -140,6 +140,8 @@ The daemon hosts a living SQLite database with an arena snapshot loop — parses
 
 **MCP HTTP transport is opt-in** — pass `--mcp-port <port>` to enable it. Without that flag the daemon runs UDS-only, which is what mache's auto-spawn expects. When you DO enable it, the token gate is on by default (ADR-0022): the token lives at `~/.local/share/leyline/daemon.token` on Linux (`~/Library/Application Support/leyline/daemon.token` on macOS). Pass `--mcp-no-auth` to disable for localhost-only debugging. Public-bind (`0.0.0.0` etc.) is refused unless you also pass `--mcp-allow-public`.
 
+MCP serves only the tools `tools/list` advertises; a daemon op that is not an MCP tool (`load`, `sheaf_update_topology`, `sheaf_reap`, ...) is refused with JSON-RPC error `-32601`. `--mcp-groups query,lsp` grants the MCP listeners' callers only those Cloister groups (the `groups[].name`s in `server.json`): a call outside the grant is refused with `-32001`, `tools/list` lists only the granted tools, and an unknown group name refuses startup. Without the flag every group is granted. `query` is read-side only; raw SQL (the `query` tool) is its own group, `sql`. The `query` op runs one read-only `SELECT` (on a reader, under a deny-by-default SQLite authorizer): a write, DDL, `ATTACH`, `VACUUM`, a pragma or a second statement is refused with a typed `refusal` (`reason`, `action`, `subject`) and changes nothing.
+
 ### Quick query against a .db
 
 ```bash

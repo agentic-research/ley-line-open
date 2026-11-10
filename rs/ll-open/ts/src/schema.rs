@@ -4,9 +4,10 @@
 //! AST-specific tables (`_source`, `_ast`) that enable bidirectional splicing.
 
 pub use leyline_schema::{
-    NODES_INDEXES_DDL, NODES_TABLE_DDL, create_nodes_indexes, create_nodes_table, create_schema,
-    dir_nid, ensure_dir_nodes, ensure_file_id, file_nid, file_nid_range, insert_node, intern_kind,
-    intern_name, lookup_file_id, nid_file_id, nid_ordinal, node_path, resolve_path,
+    ContentId, DirId, FileId, KindId, NODES_INDEXES_DDL, NODES_TABLE_DDL, NameId, Nid,
+    create_nodes_indexes, create_nodes_table, create_schema, dir_nid, ensure_dir_nodes,
+    ensure_file_id, file_nid, file_nid_range, insert_node, intern_kind, intern_name,
+    lookup_file_id, nid_file_id, nid_ordinal, node_path, resolve_path,
 };
 
 use anyhow::Result;
@@ -123,7 +124,7 @@ pub fn insert_source(
     id: &str,
     language: &str,
     content: &[u8],
-    file_id: i64,
+    file_id: FileId,
 ) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO _source (id, language, content, file_id) VALUES (?1, ?2, ?3, ?4)",
@@ -139,7 +140,7 @@ pub fn insert_source_ref(
     id: &str,
     language: &str,
     path: &str,
-    file_id: i64,
+    file_id: FileId,
 ) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO _source (id, language, path, file_id) VALUES (?1, ?2, ?3, ?4)",
@@ -152,15 +153,15 @@ pub fn insert_source_ref(
 #[allow(clippy::too_many_arguments)]
 pub fn insert_ast(
     conn: &Connection,
-    nid: i64,
-    kind_id: i64,
+    nid: Nid,
+    kind_id: KindId,
     start_byte: usize,
     end_byte: usize,
     start_row: usize,
     start_col: usize,
     end_row: usize,
     end_col: usize,
-    content_id: Option<i64>,
+    content_id: Option<ContentId>,
 ) -> Result<()> {
     // rusqlite 0.39 dropped the blanket `ToSql for usize` — bind through
     // `i64` instead. Tree-sitter byte/row/col indices fit comfortably in
@@ -211,6 +212,15 @@ pub fn insert_ast(
 /// backfills NULL on legacy rows, and a second `''` encoding would split
 /// the no-qualifier shape in two. Additive column: legacy DBs migrate
 /// via `create_qualifier_column`'s idempotent ALTER path.
+///
+/// `kind_id` (projection-v12, ADR-0047 D-iii, bead `ley-line-open-cc5c55`)
+/// is the occurrence's interned `(lang, raw_kind)` in `kinds`, as on `_ast`.
+/// For a host occurrence it equals its `_ast` row's `kind_id`; an injected
+/// occurrence (bead `ley-line-open-c822a6`) has no `_ast` row, and this is
+/// where its language and grammar kind live, since `node_content` holds
+/// neither. The parse writes it on every row it emits; NULL only on rows a
+/// caller inserts without one (the `insert_ref`/`insert_def` helpers).
+/// Same for `node_defs`.
 pub const REFS_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_refs (
     token TEXT NOT NULL,
@@ -237,7 +247,8 @@ CREATE TABLE IF NOT EXISTS node_refs (
     end_row INTEGER,
     end_col INTEGER,
     qualifier TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );";
 
 /// DDL for the `node_refs` indexes — deferred post-COMMIT.
@@ -265,7 +276,8 @@ CREATE TABLE IF NOT EXISTS node_refs (
     end_row INTEGER,
     end_col INTEGER,
     qualifier TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_refs_token ON node_refs(token);
 CREATE INDEX IF NOT EXISTS idx_refs_node ON node_refs(nid);
@@ -309,7 +321,8 @@ CREATE TABLE IF NOT EXISTS node_defs (
     end_row INTEGER,
     end_col INTEGER,
     canonical_kind TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );";
 
 /// DDL for the `node_defs` indexes — deferred post-COMMIT.
@@ -337,7 +350,8 @@ CREATE TABLE IF NOT EXISTS node_defs (
     end_row INTEGER,
     end_col INTEGER,
     canonical_kind TEXT,
-    content_id INTEGER REFERENCES node_content(content_id)
+    content_id INTEGER REFERENCES node_content(content_id),
+    kind_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_defs_token ON node_defs(token);
 CREATE INDEX IF NOT EXISTS idx_defs_node ON node_defs(nid);
@@ -397,17 +411,20 @@ CREATE INDEX IF NOT EXISTS idx_imports_source ON _imports(source_id);";
 /// `node_edge` (v9) and of `_ast`/`node_defs`/`node_refs` (projection-v10,
 /// bead `ley-line-open-738dd9`). It is NOT an identity: two arenas number the
 /// same subtree differently, and nothing outside this database may cite it.
-/// `kind` is the hashed canonical κ kind; `raw_kind` is the grammar kind (a
-/// content column, NOT hashed). `token` is the terminal UTF-8 text for
-/// leaves (NULL for internal nodes); `arity` is the child count.
+/// `kind` is the hashed canonical κ kind; `token` is the terminal UTF-8 text
+/// for leaves (NULL for internal nodes); `arity` is the child count. Every
+/// column is a function of `node_hash` (projection-v12, ADR-0047 D-iii, bead
+/// `ley-line-open-b5d354`): the grammar kind and language, which the hash
+/// does not determine, are occurrence facts read through `_ast.kind_id →
+/// kinds(lang, raw_kind)`. An anonymous token has no `_ast` row; its grammar
+/// kind is its `kind`, because the merkle-ast-v3 fold applies κ to named
+/// nodes only.
 pub const NODE_CONTENT_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS node_content (
     content_id INTEGER PRIMARY KEY,
     node_hash  BLOB    NOT NULL UNIQUE,
     node_tag   INTEGER NOT NULL,
     kind       TEXT    NOT NULL,
-    raw_kind   TEXT    NOT NULL,
-    lang       TEXT    NOT NULL,
     token      TEXT,
     arity      INTEGER NOT NULL
 );";
@@ -485,24 +502,28 @@ SELECT a.nid, a.kind_id, a.start_byte, a.end_byte,
   LEFT JOIN node_content c ON c.content_id = a.content_id;";
 
 /// `v_node_refs_hash` — the projection-v9 `node_refs` shape, `node_hash`
-/// included, as a read-only view. Same contract as [`AST_HASH_VIEW_DDL`].
+/// included, as a read-only view, plus the occurrence's `kind_id`
+/// (projection-v12). Same contract as [`AST_HASH_VIEW_DDL`].
 pub const REFS_HASH_VIEW_DDL: &str = "\
 CREATE VIEW IF NOT EXISTS v_node_refs_hash AS
 SELECT r.token, r.nid, r.container_nid, r.node_kind,
        r.start_byte, r.end_byte, r.start_row, r.start_col, r.end_row, r.end_col,
        r.qualifier,
-       c.node_hash AS node_hash
+       c.node_hash AS node_hash,
+       r.kind_id
   FROM node_refs r
   LEFT JOIN node_content c ON c.content_id = r.content_id;";
 
 /// `v_node_defs_hash` — the projection-v9 `node_defs` shape, `node_hash`
-/// included, as a read-only view. Same contract as [`AST_HASH_VIEW_DDL`].
+/// included, as a read-only view, plus the occurrence's `kind_id`
+/// (projection-v12). Same contract as [`AST_HASH_VIEW_DDL`].
 pub const DEFS_HASH_VIEW_DDL: &str = "\
 CREATE VIEW IF NOT EXISTS v_node_defs_hash AS
 SELECT d.token, d.nid, d.container_nid, d.node_kind,
        d.start_byte, d.end_byte, d.start_row, d.start_col, d.end_row, d.end_col,
        d.canonical_kind,
-       c.node_hash AS node_hash
+       c.node_hash AS node_hash,
+       d.kind_id
   FROM node_defs d
   LEFT JOIN node_content c ON c.content_id = d.content_id;";
 
@@ -585,8 +606,8 @@ pub fn create_refs_indexes(conn: &Connection) -> Result<()> {
 pub fn insert_ref(
     conn: &Connection,
     token: &str,
-    nid: i64,
-    container_nid: Option<i64>,
+    nid: Nid,
+    container_nid: Option<Nid>,
     qualifier: Option<&str>,
 ) -> Result<()> {
     conn.execute(
@@ -611,8 +632,8 @@ pub fn insert_ref(
 pub fn insert_def(
     conn: &Connection,
     token: &str,
-    nid: i64,
-    container_nid: Option<i64>,
+    nid: Nid,
+    container_nid: Option<Nid>,
     canonical_kind: Option<&str>,
 ) -> Result<()> {
     conn.execute(
@@ -1210,7 +1231,7 @@ mod tests {
 
     /// Mint a minimal two-row file (file node + one leaf) plus a ref and a
     /// def, the v5 way. Returns the file's nid range.
-    fn mint_file(conn: &Connection, rel: &str, token: &str) -> (i64, i64) {
+    fn mint_file(conn: &Connection, rel: &str, token: &str) -> (Nid, Nid) {
         let file_id = ensure_file_id(conn, rel).unwrap();
         let dir_id = ensure_dir_nodes(conn, rel, 1).unwrap();
         let base = file_nid(file_id, 0);
@@ -1243,7 +1264,7 @@ mod tests {
         file_nid_range(file_id)
     }
 
-    fn rows_in_range(conn: &Connection, table: &str, key: &str, lo: i64, hi: i64) -> i64 {
+    fn rows_in_range(conn: &Connection, table: &str, key: &str, lo: Nid, hi: Nid) -> i64 {
         conn.query_row(
             &format!("SELECT COUNT(*) FROM {table} WHERE {key} BETWEEN ?1 AND ?2"),
             params![lo, hi],
@@ -1555,8 +1576,8 @@ mod tests {
     /// that the FK resolves.
     fn insert_test_node_content(conn: &Connection, node_hash: &[u8]) {
         conn.execute(
-            "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, raw_kind, lang, token, arity) \
-             VALUES (?1, 1, 'function', 'function_declaration', 'go', NULL, 0)",
+            "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, token, arity) \
+             VALUES (?1, 1, 'function', NULL, 0)",
             rusqlite::params![node_hash],
         )
         .unwrap();
@@ -1898,15 +1919,16 @@ mod tests {
         // Two content rows, so a join on the wrong id renders the wrong hash.
         insert_test_node_content(&conn, &[0x11u8; 32]);
         insert_test_node_content(&conn, &[0x22u8; 32]);
-        let id: i64 = conn
+        let id: ContentId = conn
             .query_row(
                 "SELECT content_id FROM node_content WHERE node_hash = ?1",
                 params![&[0x22u8; 32][..]],
                 |r| r.get(0),
             )
             .unwrap();
-        insert_ast(&conn, 7, 1, 0, 1, 0, 0, 0, 1, Some(id)).unwrap();
-        insert_ast(&conn, 8, 1, 0, 1, 0, 0, 0, 1, None).unwrap();
+        let kind = KindId::from_raw(1);
+        insert_ast(&conn, Nid::from_raw(7), kind, 0, 1, 0, 0, 0, 1, Some(id)).unwrap();
+        insert_ast(&conn, Nid::from_raw(8), kind, 0, 1, 0, 0, 0, 1, None).unwrap();
         conn.execute(
             "INSERT INTO node_refs (token, nid, content_id) VALUES ('r', 7, ?1)",
             params![id],
@@ -2183,7 +2205,8 @@ mod tests {
         // and an `_ast` row through exactly these tables.
         let file_id = ensure_file_id(&conn, "main.go").unwrap();
         insert_source(&conn, "main.go", "go", b"package main\n", file_id).unwrap();
-        insert_ast(&conn, file_nid(file_id, 0), 1, 0, 13, 0, 0, 1, 0, None).unwrap();
+        let kind = intern_kind(&conn, "go", "source_file").unwrap();
+        insert_ast(&conn, file_nid(file_id, 0), kind, 0, 13, 0, 0, 1, 0, None).unwrap();
 
         // Idempotent — `cmd_parse` calls it once per invocation on a
         // possibly-existing arena.
@@ -2195,7 +2218,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_ast_tables(&conn).unwrap();
 
-        insert_source_ref(&conn, "pkg/main.go", "go", "/repo/pkg/main.go", 7).unwrap();
+        let seven = FileId::from_raw(7);
+        insert_source_ref(&conn, "pkg/main.go", "go", "/repo/pkg/main.go", seven).unwrap();
 
         let (id, language, path, content, file_id): (
             String,
@@ -2223,7 +2247,7 @@ mod tests {
         );
 
         // INSERT OR REPLACE: re-registering the same id updates in place.
-        insert_source_ref(&conn, "pkg/main.go", "go", "/elsewhere/main.go", 7).unwrap();
+        insert_source_ref(&conn, "pkg/main.go", "go", "/elsewhere/main.go", seven).unwrap();
         let (n, path): (i64, Option<String>) = conn
             .query_row("SELECT COUNT(*), MAX(path) FROM _source", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))

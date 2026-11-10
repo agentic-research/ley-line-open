@@ -1,6 +1,10 @@
 # ADR-0040 — The write boundary: source and manifest are the data, the arena is a cache
 
 **Status:** Proposed (2026-10-10)
+**Amended by:** ADR-0047 M1 (`ley-line-open-73c6ee`): D1's `treeRoot` is retired and replaced
+by the parser-free directory Merkle `storeRoot` (`leyline/store-tree/v1`, `Head.storeRoot @10`,
+head digest v3); D6's `derived_from` names `storeRoot` (value format `v2`). Text below that
+describes `treeRoot` is the record of D1 as first shipped; each section notes what M1 changed.
 **Bead:** `ley-line-open-e79c0f` (review ledger; the beads under "Next moves" carry the work)
 **Related:**
 
@@ -105,21 +109,40 @@ cloister may run that verifier. `current_root` is unchanged (ADR-0032 D1, integr
 injection and query-set epochs, and the effective query set including arena-resident overrides
 (`_queries`). Two arenas with different overrides must not share a `(sourceHash, parserId)` key.
 
+**Amended by ADR-0047 M1.** Folding `parserId` into the tree identity renamed an unchanged store
+at every grammar, epoch or projection bump (law C7, parameter independence), and one flat fold
+made an edit or a membership proof cost O(n) (Σ §1.3). `treeRoot` is removed: `Head.treeRoot @7`
+is renamed `retiredTreeRoot`, never written, and a head that carries it is refused as a head
+digest v2 head (`HeadFormatError::RetiredDigestV2`). The store identity is `Head.storeRoot @10`:
+
+```
+storeRoot = node(root directory)
+node(dir) = A("leyline/store-tree/v1", params = ∅,
+              children sorted by name bytes, child i:
+                (σ_bytes(name), 2i, |name|), (child, 2i+1, git mode))
+child     = blob hash (file, symlink) | node(subdirectory) (b = 0o040000)
+```
+
+An empty directory is `node` of no entries. `parserId` stays in the head, bound beside
+`storeRoot` by head digest v3, and in `derived_from`; it is never an input of `storeRoot`.
+`leyline verify-head` recomputes `storeRoot` first, then `parserId`.
+
 ### D2 — The manifest is ADR-0029's object, under a new name for its root
 
 ADR-0029 §2.1's `Manifest { entries: [(path, blob_hash, mode)] }` is the structure layer. Three
 other things are called "manifest" in this repository (ADR-0032's CDC `manifestRoot` over image
-chunk regions, `net.capnp`'s signed frame header, ADR-0029's). The root of this one is `treeRoot`
-and nothing else; the word "manifest" is not used for a root. A sub-manifest over a subset of
+chunk regions, `net.capnp`'s signed frame header, ADR-0029's). The root of this one is
+`storeRoot` (`treeRoot` before ADR-0047 M1) and nothing else; a sub-manifest's root is the
+address of its directory node, which is the `storeRoot` of a store holding exactly that subtree; the word "manifest" is not used for a root. A sub-manifest over a subset of
 paths is the same object, smaller: it is the slice grant of ring 2 and the transport unit.
 
 ### D3 — One write API, called by every writer
 
-`write(grant, path, bytes) -> (sourceBlobHash, treeRoot')`:
+`write(grant, path, bytes) -> (sourceBlobHash, storeRoot')` (`treeRoot'` before ADR-0047 M1):
 
 1. refuse if `path` is outside `grant`;
 2. `INSERT OR IGNORE INTO source_blobs` the bytes under their hash;
-3. advance the manifest entry for `path`; recompute `treeRoot`;
+3. advance the manifest entry for `path`; recompute `storeRoot`;
 4. re-project the one file into ring 1 through the same per-file projection the cold parse uses
    (`node_hash`, `node_content`, `node_child` with field names, `_ast_blob` until D5 retires it);
 5. publish.
@@ -192,11 +215,12 @@ hashes (`9b7d28`); the anonymous share on the kibana slice is unmeasured and is 
 
 ### D6 — The arena is declared derived, and says from what
 
-`_meta` records `derived_from = (treeRoot, parserId, projection_schema_version)`. `leyline
-rebuild` reproduces the projection from ring 0. The rebuild gate targets the logical row set with
+`_meta` records `derived_from = (storeRoot, parserId, projection_schema_version)` (amended by
+ADR-0047 M1; the first component was `treeRoot`). `leyline rebuild` reproduces the projection
+from ring 0. The rebuild gate targets the logical row set with
 the known non-functions canonicalised (`nodes.mtime`, `_meta.parse_time`, absolute `_source.path`)
 and excludes `_lsp*` (external toolchain output) and `current_root` (an image hash). A consumer
-that wants to trust a transported arena compares its `derived_from` to the `treeRoot` it holds.
+that wants to trust a transported arena compares its `derived_from` to the `storeRoot` it holds.
 
 `file_id` is arena-local: `ensure_file_id` (`ll-core/schema/src/lib.rs:347`) is an
 `INSERT OR IGNORE` sequence in each database, and `nid = (file_id << 24) | ordinal`. A
@@ -206,18 +230,21 @@ only; `file_id` is applied at projection time; F3 and F5 compare row images modu
 (equivalently, with nids rewritten to `(relative path, ordinal)`). `file_id` is not derived from a
 path hash: with 39 usable bits, birthday collisions are expected around a million files.
 
-As implemented (`f31efd`, `cli-lib/src/cmd_rebuild.rs`): `derived_from` is one `_meta` value,
-`<treeRoot hex> <parserId hex> <projection_schema_version>`, stamped by every parse including a
-scoped pass and a D3 write. `leyline rebuild <from> <into> [--path P]...` refuses an arena with no
-stamp, a `_source` set that no longer folds to the stamped `treeRoot`, and a stamped `parserId`
-other than this binary's: rebuilding under another parser is a re-derivation, not a
+As implemented (`f31efd`, `cli-lib/src/cmd_rebuild.rs`; value format v2 since ADR-0047 M1,
+`73c6ee`): `derived_from` is one `_meta` value,
+`v2 <storeRoot hex> <parserId hex> <projection_schema_version>`, stamped by every parse including
+a scoped pass and a D3 write; the retired v1 value (three fields, `treeRoot` first) is refused by
+version. `leyline rebuild <from> <into> [--path P]...` refuses an arena with no stamp, a v1
+stamp, a `_tree` manifest that no longer folds to the stamped `storeRoot` (checked first), and a
+stamped `parserId` other than this binary's: rebuilding under another parser is a re-derivation, not a
 reproduction, and is left to `leyline parse`. The gate also renders the other interned ids
 (`name_id`, `kind_id`, dir nids) as what they name, and restricts the content-addressed stores
 (`source_blobs`, `capnp_blobs`, `node_content`, `node_child`) to what the projection reaches,
 since a write leaves the replaced bytes and subtrees behind. It found two more non-functions:
 `node_content.lang` and `node_content.raw_kind` are outside the `node_hash` preimage, so
-`INSERT OR IGNORE` keeps the first file's value and a write leaves a stale one. They are excluded by
-name and fixed in projection-v7 (`b5d354`).
+`INSERT OR IGNORE` keeps the first file's value and a write leaves a stale one. They were excluded by
+name until projection-v12 removed them from `node_content` (ADR-0047 D-iii, `b5d354`); the gate now
+compares every `node_content` column.
 
 ### D7 — Publication stays as it is until the write boundary exists
 
@@ -256,9 +283,9 @@ Each is a test that fails on `main` today or would fail if the decision were wro
 
 | # | Claim | Test |
 |---|---|---|
-| F1 | `treeRoot` is a tree identity | four parses of the same bytes — a second directory, touched mtimes, shuffled discovery order (f4c), one no-op scoped reparse — yield one `treeRoot`; `rootHash` differs across them today (`0c80c7`, `143002`) |
+| F1 | `treeRoot` is a tree identity (since ADR-0047 M1: `storeRoot`, closed by `cmd_parse::tests::store_root_names_the_store_and_root_hash_names_the_run`) | four parses of the same bytes — a second directory, touched mtimes, shuffled discovery order (f4c), one no-op scoped reparse — yield one `treeRoot`; `rootHash` differs across them today (`0c80c7`, `143002`) |
 | F2 | a write is durable at the boundary | daemon with mount: write through the mount, fsync, reparse another file, read back through the mount and the socket, restart, read again; all return the written bytes (`192018`) |
-| F3 | the projection is rebuildable after writes | cold parse, N writes through D3, `leyline rebuild` into a fresh arena; the logical row sets agree and so do `treeRoot` and `derived_from` (`143f17`, `0d3b72`). Closed by `cmd_rebuild::tests::a_rebuild_after_writes_reproduces_the_written_arena` (`f31efd`) |
+| F3 | the projection is rebuildable after writes | cold parse, N writes through D3, `leyline rebuild` into a fresh arena; the logical row sets agree and so do `treeRoot` (`storeRoot` since ADR-0047 M1) and `derived_from` (`143f17`, `0d3b72`). Closed by `cmd_rebuild::tests::a_rebuild_after_writes_reproduces_the_written_arena` (`f31efd`) |
 | F4 | content keys are location-free | two arenas containing a byte-identical file share that file's `(sourceHash, parserId)` derivation and its `node_hash` set; today `capnp_blobs` holds two blobs (F4 of the identity review) |
 | F5 | a sub-manifest transports | a sub-manifest of N paths plus their blobs, parsed on a clean machine, produces the same N file-local row images the full arena holds for those files, compared modulo `file_id` (D6). Closed by `cmd_rebuild::tests::a_sub_manifest_rebuild_matches_the_full_arenas_files`, with the source tree deleted in `a_rebuild_needs_no_source_tree` (`f31efd`) |
 | F6 | the grant is enforced | a write to a path outside the grant is refused with no side effect on ring 0 or ring 1 |
@@ -289,13 +316,14 @@ ______________________________________________________________________
   interning and ~35× after.
 - The memory profile: resident images per mounted daemon go from four to one (D4), and whole-
   image copies per save go from six to two now and to zero under D7.
-- execution/v1 receipts gain a root with a defined referent (`treeRoot`, scheme-tagged) to cite;
+- execution/v1 receipts gain a root with a defined referent (`treeRoot`, scheme-tagged; since
+  ADR-0047 M1 the parser-free `storeRoot`) to cite;
   their `DigestRef` must carry a domain tag before `current_root` is ever demoted, which D7 is
   the first to need.
 - ADR-0026 is amended: Phase 1 retired, Phase 2 and 3 withdrawn. ADR-0029 is unblocked: its
   manifest has a shipped root and a write rule with code behind it. ADR-0032 is partially
-  shipped: D2's tagged fold and D3's additive co-attested field, with `treeRoot` where it
-  expected `manifestRoot` and `logicalRoot` to follow.
+  shipped: D2's tagged fold and D3's additive co-attested field, with `treeRoot` (now
+  `storeRoot`) where it expected `manifestRoot` and `logicalRoot` to follow.
 - Documentation drift to fix with D1: `ARCHITECTURE.md` lists ADR-0026 and ADR-0028 as Accepted
   while the files say Proposed.
 

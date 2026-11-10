@@ -138,7 +138,11 @@ pub fn insert_extracted_refs(
     conn: &rusqlite::Connection,
     refs: &[ExtractedRef],
 ) -> anyhow::Result<()> {
-    let mut nid_of = |id: &str| leyline_schema::intern_name(conn, id);
+    // A correlation id, not a real node address (see above): the interned
+    // `names` row stands in for the nid, so the crossing is explicit.
+    let mut nid_of = |id: &str| {
+        leyline_schema::intern_name(conn, id).map(|name| leyline_schema::Nid::from_raw(name.get()))
+    };
     for r in refs {
         match r {
             ExtractedRef::Def {

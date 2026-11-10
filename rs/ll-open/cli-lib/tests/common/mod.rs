@@ -80,6 +80,50 @@ pub fn daemon_context_with_ext(
     })
 }
 
+/// Minimal HTTP/1.1 POST to `/mcp` over a Unix domain socket, returning the
+/// status code and body. Written by hand because the point is to prove a RAW
+/// socket client works — the same thing notme-proxy does — not that a
+/// particular Rust HTTP crate can.
+pub fn post_mcp_over_uds(sock: &Path, body: &str, token: Option<&str>) -> (u16, String) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(sock).expect("connect MCP uds");
+    let auth = token
+        .map(|t| format!("x-leyline-token: {t}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         {auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(req.as_bytes()).expect("write request");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("read status");
+    let code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+
+    // Drain headers, then the rest is the body.
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+    }
+    let mut body_out = String::new();
+    let mut chunk = String::new();
+    while reader.read_line(&mut chunk).unwrap_or(0) > 0 {
+        body_out.push_str(&chunk);
+        chunk.clear();
+    }
+    (code, body_out)
+}
+
 /// Block until `path` accepts a connection, or fail after `attempts`.
 ///
 /// Replaces a fixed `thread::sleep` after spawning a listener. A wall-clock

@@ -60,6 +60,18 @@ P  =  "llo/ast/v1" ‖ 0x00                     # domain + version tag (git-obje
 node_hash = ContentAddressed::hash(P)         # 32-byte BLOB
 ```
 
+> **Amended by ADR-0047 D-i (merkle-ast-v3, bead `ley-line-open-73add7`).** The
+> in-band `"llo/ast/v1" ‖ 0x00` prefix did not separate `node_hash` from plain
+> BLAKE3: a file whose bytes were `P` had a `blob_hash` equal to the node's
+> `node_hash`. The shipped construction keys the rest of `P` instead:
+> `node_hash = derive_key("leyline/ast-node/v3", node_tag ‖ uvarint(len(kind)) ‖ kind ‖ …)`
+> (`leyline_core::substrate::derive_key`), with the same fields, framing and
+> fold, except that κ applies to named nodes only: an anonymous token folds
+> its grammar kind (JavaScript's `class` keyword had folded κ `type`). Known-answer vectors: `rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json`
+> (`astNode`). ADR-0047 D-iii also removed `raw_kind` and `lang` from
+> `node_content` (projection-v12): neither is in the preimage, so neither is a
+> property of the row's key.
+
 Decisive choices:
 
 - **Fold ALL non-`extra` children — named AND anonymous — in source order.**

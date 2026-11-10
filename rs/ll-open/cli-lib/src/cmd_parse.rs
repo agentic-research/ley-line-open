@@ -47,6 +47,12 @@ pub const MAX_PARSE_FILE_SIZE: i64 = 8 * 1024 * 1024;
 ///   the κ `function` it lacked, so every Rust trait signature's `node_hash`
 ///   moved. Nothing else changed: the fold, the `llo/ast/v1` domain tag, and
 ///   every other kind are untouched.
+/// - `merkle-ast-v3` — ADR-0047 D-i (bead `ley-line-open-73add7`): the same
+///   fields, keyed with `derive_key("leyline/ast-node/v3", …)` instead of
+///   plain σ behind the in-band `llo/ast/v1 ‖ 0x00` prefix, and κ applied
+///   to named nodes only (an anonymous token folds its grammar kind; before
+///   v3, JavaScript's `class` keyword folded κ `type`). Every `node_hash`
+///   moved.
 pub use crate::daemon::version::IR_SCHEMA_VERSION;
 use leyline_ts::query_engine::QuerySet;
 use leyline_ts::refs::{ExtractedRef, current_extraction_epoch, extract_refs_resolved};
@@ -92,14 +98,26 @@ struct AstEntry {
 }
 
 /// A `node_content` row — one per UNIQUE subtree (deduped by `node_hash`).
+/// Every column is a function of `node_hash` (projection-v12, ADR-0047
+/// D-iii): the grammar kind and language are occurrence facts, on `_ast`.
 struct ContentRow {
     node_hash: [u8; 32],
     node_tag: u8,
     kind: String,
-    raw_kind: String,
-    lang: String,
     token: Option<String>,
     arity: usize,
+}
+
+/// A named node of an injected subtree (bead `ley-line-open-c822a6`): its
+/// fact id, its `node_hash`, and the occurrence facts `node_content` does not
+/// hold (projection-v12, ADR-0047 D-iii): the injected grammar's language and
+/// the node's grammar kind. It has no `_ast` row, so its `node_defs` /
+/// `node_refs` rows carry these as `kind_id` (bead `ley-line-open-cc5c55`).
+struct InjectedNode {
+    id: String,
+    hash: [u8; 32],
+    lang: &'static str,
+    raw_kind: &'static str,
 }
 
 /// A git-tree edge parent→child at `ordinal`, by hash; the insert loop
@@ -155,7 +173,7 @@ pub(crate) struct ParsedFile {
     /// but their fact rows still need the `node_hash` pointer at their
     /// own content-addressed subtree. Merged into `hash_by_id` in the
     /// insert loop, next to the `_ast`-derived entries.
-    injected_hashes: Vec<(String, [u8; 32])>,
+    injected_hashes: Vec<InjectedNode>,
     /// ADR-0045 T3: the first `ERROR` or `MISSING` node tree-sitter
     /// produced, when the file did not parse cleanly. The file is projected
     /// either way; this becomes its `_parse_diagnostics` row.
@@ -250,7 +268,7 @@ const BULK_BATCH_ROWS: usize = 3000;
 /// The ceiling lives in `leyline_schema` so there is one value for every
 /// crate that sizes an `IN (...)` list or a multi-row INSERT (bead
 /// `ley-line-open-35fc5e`).
-use leyline_schema::SQLITE_MAX_BOUND_PARAMS;
+use leyline_schema::{ContentId, DirId, FileId, KindId, NameId, Nid, SQLITE_MAX_BOUND_PARAMS};
 
 /// Rows per multi-row INSERT for a table of `cols` columns.
 ///
@@ -463,7 +481,7 @@ batch_table! {
     NodeBatch, NodeRow,
     "INSERT OR IGNORE INTO nodes (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record) VALUES ",
     9,
-    push_fn: (nid: i64, parent_nid: Option<i64>, name_id: Option<i64>, kind_id: Option<i64>, kind: i32, ord: i64, size: i64, mtime: i64, record: String),
+    push_fn: (nid: Nid, parent_nid: Option<Nid>, name_id: Option<NameId>, kind_id: Option<KindId>, kind: i32, ord: i64, size: i64, mtime: i64, record: String),
     push_body: { NodeRow { nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
@@ -500,7 +518,7 @@ batch_table! {
     AstBatch, AstRow,
     "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) VALUES ",
     9,
-    push_fn: (nid: i64, kind_id: i64, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, content_id: i64),
+    push_fn: (nid: Nid, kind_id: KindId, start_byte: i64, end_byte: i64, start_row: i64, start_col: i64, end_row: i64, end_col: i64, content_id: ContentId),
     push_body: { AstRow { nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 9);
@@ -525,7 +543,7 @@ batch_table! {
     SourceBatch, SourceRow,
     "INSERT INTO _source (id, language, path, content_hash, file_id) VALUES ",
     5,
-    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>, file_id: i64),
+    push_fn: (id: String, language: String, path: String, content_hash: Vec<u8>, file_id: FileId),
     push_body: { SourceRow { id, language, path, content_hash, file_id } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 5);
@@ -548,22 +566,20 @@ batch_table! {
     // emits a hash it has checked is new to the arena, so a conflict on
     // either key is a writer bug and must fail the pass, not be ignored.
     NodeContentBatch, NodeContentRow,
-    "INSERT INTO node_content (content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity) VALUES ",
-    8,
+    "INSERT INTO node_content (content_id, node_hash, node_tag, kind, token, arity) VALUES ",
+    6,
     push_fn: (
-        content_id: i64, node_hash: Vec<u8>, node_tag: i64, kind: String, raw_kind: String,
-        lang: String, token: Option<String>, arity: i64
+        content_id: ContentId, node_hash: Vec<u8>, node_tag: i64, kind: String,
+        token: Option<String>, arity: i64
     ),
-    push_body: { NodeContentRow { content_id, node_hash, node_tag, kind, raw_kind, lang, token, arity } },
+    push_body: { NodeContentRow { content_id, node_hash, node_tag, kind, token, arity } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 8);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
         for r in chunk {
             out.push(&r.content_id);
             out.push(&r.node_hash);
             out.push(&r.node_tag);
             out.push(&r.kind);
-            out.push(&r.raw_kind);
-            out.push(&r.lang);
             out.push(&r.token);
             out.push(&r.arity);
         }
@@ -581,7 +597,7 @@ batch_table! {
     NodeEdgeBatch, NodeEdgeRow,
     "INSERT OR IGNORE INTO node_edge (parent_id, ordinal, child_id, field) VALUES ",
     4,
-    push_fn: (parent_id: i64, ordinal: i64, child_id: i64, field: Option<String>),
+    push_fn: (parent_id: ContentId, ordinal: i64, child_id: ContentId, field: Option<String>),
     push_body: { NodeEdgeRow { parent_id, ordinal, child_id, field } },
     flatten: |chunk| {
         let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
@@ -616,11 +632,11 @@ batch_table! {
     // NULL on the qualified-token row and on genuinely bare calls.
     RefBatch, RefRow,
     "",
-    12,
-    push_fn: (token: String, nid: i64, content_id: Option<i64>, container_nid: Option<i64>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>),
-    push_body: { RefRow { token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    13,
+    push_fn: (token: String, nid: Nid, content_id: Option<ContentId>, container_nid: Option<Nid>, qualifier: Option<String>, node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>, kind_id: Option<KindId>),
+    push_body: { RefRow { token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.nid);
@@ -634,6 +650,7 @@ batch_table! {
             out.push(&r.start_col);
             out.push(&r.end_row);
             out.push(&r.end_col);
+            out.push(&r.kind_id);
         }
         out
     },
@@ -641,8 +658,8 @@ batch_table! {
 
 impl RefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 12, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.nid);
@@ -656,6 +673,7 @@ impl RefBatch {
                 out.push(&r.start_col);
                 out.push(&r.end_row);
                 out.push(&r.end_col);
+                out.push(&r.kind_id);
             }
             out
         })
@@ -671,18 +689,19 @@ batch_table! {
     // container_node_id) shape as refs, plus `canonical_kind`.
     DefBatch, DefRow,
     "",
-    12,
+    13,
     push_fn: (
         token: String,
-        nid: i64,
-        content_id: Option<i64>,
-        container_nid: Option<i64>,
+        nid: Nid,
+        content_id: Option<ContentId>,
+        container_nid: Option<Nid>,
         canonical_kind: Option<&'static str>,
-        node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>
+        node_kind: Option<String>, start_byte: Option<i64>, end_byte: Option<i64>, start_row: Option<i64>, start_col: Option<i64>, end_row: Option<i64>, end_col: Option<i64>,
+        kind_id: Option<KindId>
     ),
-    push_body: { DefRow { token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col } },
+    push_body: { DefRow { token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id } },
     flatten: |chunk| {
-        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
         for r in chunk {
             out.push(&r.token);
             out.push(&r.nid);
@@ -696,6 +715,7 @@ batch_table! {
             out.push(&r.start_col);
             out.push(&r.end_row);
             out.push(&r.end_col);
+            out.push(&r.kind_id);
         }
         out
     },
@@ -703,8 +723,8 @@ batch_table! {
 
 impl DefBatch {
     fn flush_batched_for(&mut self, conn: &Connection, prefix: &str) -> Result<()> {
-        flush_in_batches(conn, &mut self.rows, prefix, 12, |chunk| {
-            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 12);
+        flush_in_batches(conn, &mut self.rows, prefix, 13, |chunk| {
+            let mut out: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 13);
             for r in chunk {
                 out.push(&r.token);
                 out.push(&r.nid);
@@ -718,6 +738,7 @@ impl DefBatch {
                 out.push(&r.start_col);
                 out.push(&r.end_row);
                 out.push(&r.end_col);
+                out.push(&r.kind_id);
             }
             out
         })
@@ -781,9 +802,9 @@ pub struct ParseResult {
     pub errors: u64,
     /// Relative paths of files that were actually parsed (not skipped).
     pub changed_files: Vec<String>,
-    /// ADR-0040 D1: the arena's `treeRoot` after this pass, folded from the
-    /// committed `_source` set.
-    pub tree_root: leyline_core::Hash,
+    /// ADR-0047 D-ii: the arena's `storeRoot` after this pass, the directory
+    /// Merkle root of the committed `_tree`.
+    pub store_root: leyline_core::Hash,
 }
 
 /// A pass whose transaction committed. The steps after `COMMIT` (moving
@@ -1767,7 +1788,7 @@ fn parse_into_conn_with(
     // are 2.7x faster than it (bead comment, 771k edges). A hash an earlier
     // pass stored is looked up once by its `node_hash` index — never on a
     // cold parse, whose arena starts empty.
-    let mut content_ids: HashMap<[u8; 32], i64> = HashMap::with_capacity(200_000);
+    let mut content_ids: HashMap<[u8; 32], ContentId> = HashMap::with_capacity(200_000);
     let mut next_content_id: i64 = conn.query_row(
         "SELECT COALESCE(MAX(content_id), 0) + 1 FROM node_content",
         [],
@@ -1782,12 +1803,12 @@ fn parse_into_conn_with(
     // Parents whose edges this pass has already buffered. A parent's edge
     // set is a function of its hash, emitted whole by the first file that
     // folds it; `INSERT OR IGNORE` covers a parent an earlier pass wrote.
-    let mut edges_written: HashSet<i64> = HashSet::with_capacity(200_000);
+    let mut edges_written: HashSet<ContentId> = HashSet::with_capacity(200_000);
 
     // rel-path → leaf dir_id memo, so each file's dir chain hits SQL once.
-    let mut dir_cache: HashMap<String, i64> = HashMap::new();
+    let mut dir_cache: HashMap<String, DirId> = HashMap::new();
     // (lang, raw_kind) → kind_id memo for the interning below.
-    let mut kind_cache: HashMap<(String, String), i64> = HashMap::new();
+    let mut kind_cache: HashMap<(String, String), KindId> = HashMap::new();
     let mut changed_files: Vec<String> = Vec::new();
 
     // Buffer-fill and flush time, accumulated per chunk for the
@@ -1852,14 +1873,15 @@ fn parse_into_conn_with(
                         pf.rel,
                         total_ordinals,
                     );
-                    let mut nid_by_id: HashMap<&str, i64> = HashMap::with_capacity(total_ordinals);
+                    // `base` is ordinal 0, so `base + k` is `file_nid(file_id, k)`.
+                    let mut nid_by_id: HashMap<&str, Nid> = HashMap::with_capacity(total_ordinals);
                     for (i, a) in pf.ast_entries.iter().enumerate() {
-                        nid_by_id.insert(a.node_id.as_str(), base | i as i64);
+                        nid_by_id.insert(a.node_id.as_str(), base + i as i64);
                     }
-                    for (j, (id, _)) in pf.injected_hashes.iter().enumerate() {
+                    for (j, n) in pf.injected_hashes.iter().enumerate() {
                         nid_by_id
-                            .entry(id.as_str())
-                            .or_insert(base | injected_ordinal(pf.ast_entries.len(), j) as i64);
+                            .entry(n.id.as_str())
+                            .or_insert(base + injected_ordinal(pf.ast_entries.len(), j) as i64);
                     }
 
                     // parent_nid + sibling ord per entry, derived from the
@@ -1867,8 +1889,8 @@ fn parse_into_conn_with(
                     // children in pre-order, siblings keep source order).
                     // The per-kind display rank derives from `ord` at read
                     // time, reproducing the pre-v5 `{kind}[_{idx}]` names.
-                    let mut sib_next: HashMap<i64, i64> = HashMap::new();
-                    let mut placement: HashMap<&str, (i64, i64)> =
+                    let mut sib_next: HashMap<Nid, i64> = HashMap::new();
+                    let mut placement: HashMap<&str, (Nid, i64)> =
                         HashMap::with_capacity(pf.ast_entries.len());
                     for a in pf.ast_entries.iter().skip(1) {
                         let parent_str = a
@@ -1942,7 +1964,7 @@ fn parse_into_conn_with(
                             conn.prepare_cached(
                                 "SELECT content_id FROM node_content WHERE node_hash = ?1",
                             )?
-                            .query_row([&c.node_hash[..]], |r| r.get::<_, i64>(0))
+                            .query_row([&c.node_hash[..]], |r| r.get::<_, ContentId>(0))
                             .optional()?
                         } else {
                             None
@@ -1950,15 +1972,13 @@ fn parse_into_conn_with(
                         let id = match stored {
                             Some(id) => id,
                             None => {
-                                let id = next_content_id;
+                                let id = ContentId::from_raw(next_content_id);
                                 next_content_id += 1;
                                 content_buf.push(
                                     id,
                                     c.node_hash.to_vec(),
                                     c.node_tag as i64,
                                     c.kind,
-                                    c.raw_kind,
-                                    c.lang,
                                     c.token,
                                     c.arity as i64,
                                 );
@@ -1971,7 +1991,7 @@ fn parse_into_conn_with(
                     // (v9), `_ast`/`node_defs`/`node_refs` occurrences (v10,
                     // bead `ley-line-open-738dd9`) — resolves here. A miss is
                     // a fold that named a subtree it did not emit: loud.
-                    let id_of = |h: &[u8; 32]| -> Result<i64> {
+                    let id_of = |h: &[u8; 32]| -> Result<ContentId> {
                         content_ids.get(h).copied().with_context(|| {
                             format!(
                                 "node_hash {} has no node_content row in {}",
@@ -1980,7 +2000,7 @@ fn parse_into_conn_with(
                             )
                         })
                     };
-                    let mut parents_here: Vec<i64> = Vec::new();
+                    let mut parents_here: Vec<ContentId> = Vec::new();
                     for c in pf.node_children {
                         let parent_id = id_of(&c.parent_hash)?;
                         if edges_written.contains(&parent_id) {
@@ -2006,9 +2026,16 @@ fn parse_into_conn_with(
                     // nodes have no `_ast` rows; their (node_id →
                     // node_hash) pairs ride ParsedFile so injected fact
                     // rows resolve to their own content-addressed subtrees.
-                    for (id, h) in &pf.injected_hashes {
-                        hash_by_id.insert(id.as_str(), *h);
+                    for n in &pf.injected_hashes {
+                        hash_by_id.insert(n.id.as_str(), n.hash);
                     }
+                    // The same nodes' language and grammar kind, for the
+                    // `kind_id` their fact rows carry (projection-v12).
+                    let injected_kind: HashMap<&str, (&str, &str)> = pf
+                        .injected_hashes
+                        .iter()
+                        .map(|n| (n.id.as_str(), (n.lang, n.raw_kind)))
+                        .collect();
 
                     // node_id -> the `_ast` entry, so an occurrence row can
                     // carry its OWN span and grammar kind instead of the
@@ -2027,16 +2054,23 @@ fn parse_into_conn_with(
                     }
                     let span_of = |id: &str| OccurrenceSpan::of(entry_by_id.get(id).copied());
 
-                    // Interning memo for this file's kinds.
+                    // Interning memo for this file's kinds: the host
+                    // language's, and an injected grammar's for injected
+                    // occurrences.
                     let lang = pf.language.clone();
-                    let mut kind_id_of = |conn: &Connection, raw_kind: &str| -> Result<i64> {
-                        if let Some(k) = kind_cache.get(&(lang.clone(), raw_kind.to_string())) {
+                    let mut kind_in = |conn: &Connection,
+                                       lang: &str,
+                                       raw_kind: &str|
+                     -> Result<KindId> {
+                        if let Some(k) = kind_cache.get(&(lang.to_string(), raw_kind.to_string())) {
                             return Ok(*k);
                         }
-                        let k = leyline_ts::schema::intern_kind(conn, &lang, raw_kind)?;
-                        kind_cache.insert((lang.clone(), raw_kind.to_string()), k);
+                        let k = leyline_ts::schema::intern_kind(conn, lang, raw_kind)?;
+                        kind_cache.insert((lang.to_string(), raw_kind.to_string()), k);
                         Ok(k)
                     };
+                    let mut kind_id_of =
+                        |conn: &Connection, raw_kind: &str| kind_in(conn, &lang, raw_kind);
 
                     // `nodes` rows: the file's own node (ordinal 0, parent =
                     // its directory) and every AST node (parent + sibling
@@ -2100,7 +2134,7 @@ fn parse_into_conn_with(
                     for (ordinal, a) in pf.ast_entries.iter().enumerate() {
                         let kind_id = kind_id_of(conn, &a.node_kind)?;
                         ast_buf.push(
-                            base | ordinal as i64,
+                            base + ordinal as i64,
                             kind_id,
                             a.start_byte as i64,
                             a.end_byte as i64,
@@ -2116,12 +2150,23 @@ fn parse_into_conn_with(
                     // correlation ids to nids here, where the file's ordinal
                     // assignment is in hand. Injected ids resolve through
                     // the same map (they own the post-`_ast` ordinals).
-                    let nid_of = |id: &str| -> Result<i64> {
+                    let nid_of = |id: &str| -> Result<Nid> {
                         nid_by_id
                             .get(id)
                             .copied()
                             .with_context(|| format!("{}: fact id {id:?} unmapped", pf.rel))
                     };
+                    // The occurrence's interned (lang, raw_kind): its `_ast`
+                    // row's for a host node, the injected grammar's for an
+                    // injected one (projection-v12, bead `ley-line-open-cc5c55`).
+                    let mut occurrence_kind =
+                        |conn: &Connection, id: &str| -> Result<Option<KindId>> {
+                            let kind = match entry_by_id.get(id) {
+                                Some(e) => Some((lang.as_str(), e.node_kind.as_str())),
+                                None => injected_kind.get(id).copied(),
+                            };
+                            kind.map(|(l, k)| kind_in(conn, l, k)).transpose()
+                        };
                     for r in &pf.refs {
                         match r {
                             ExtractedRef::Ref {
@@ -2148,6 +2193,7 @@ fn parse_into_conn_with(
                                     sp.start_col,
                                     sp.end_row,
                                     sp.end_col,
+                                    occurrence_kind(conn, node_id)?,
                                 );
                             }
                             ExtractedRef::Def {
@@ -2174,6 +2220,7 @@ fn parse_into_conn_with(
                                     sp.start_col,
                                     sp.end_row,
                                     sp.end_col,
+                                    occurrence_kind(conn, node_id)?,
                                 );
                             }
                             ExtractedRef::Import {
@@ -2227,11 +2274,11 @@ fn parse_into_conn_with(
         source_buf.flush_batched(conn)?;
         refs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_refs (token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_refs (token, nid, content_id, container_nid, qualifier, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id) VALUES ",
     )?;
         defs_buf.flush_batched_for(
         conn,
-        "INSERT INTO node_defs (token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col) VALUES ",
+        "INSERT INTO node_defs (token, nid, content_id, container_nid, canonical_kind, node_kind, start_byte, end_byte, start_row, start_col, end_row, end_col, kind_id) VALUES ",
     )?;
         imports_buf.flush_batched(conn)?;
 
@@ -2331,8 +2378,8 @@ fn parse_into_conn_with(
             _ => None,
         }
     };
-    // ADR-0040 D1: the tree identity and the derivation identity, folded from
-    // `_source` inside the transaction — the whole corpus, not this run's
+    // ADR-0047 D-ii: the store identity and the derivation identity, folded
+    // from `_tree` inside the transaction — the whole store, not this run's
     // delta — on the main thread where the connection is. The head writer
     // stays pure filesystem work and just stamps them, after COMMIT.
     // ADR-0045 T1, T3: the manifest follows what this pass saw — every file
@@ -2353,8 +2400,12 @@ fn parse_into_conn_with(
             unprojected: &unprojected,
         },
     )?;
-    let parser_id = crate::tree_root::ParserInputs::current(&query_set).parser_id();
-    let tree_root = crate::tree_root::tree_root(conn, parser_id)?;
+    let parser = crate::store_root::ParserInputs::current(&query_set).parser_ref();
+    // Parser-free (ADR-0047 law C7): the store's name does not depend on the
+    // derivation, which the head and `derived_from` bind beside it.
+    let store = crate::store_root::store_root_ref(conn)?;
+    // The stamps are wire and `_meta` fields: they carry the bare address.
+    let (parser_id, store_root) = (*parser.as_hash(), *store.as_hash());
 
     // ---- Post-sweep ----
     //
@@ -2417,13 +2468,13 @@ fn parse_into_conn_with(
         "projection_schema_version",
         crate::daemon::version::PROJECTION_SCHEMA_VERSION,
     )?;
-    // ADR-0040 D6: what this projection was derived from — the whole tree,
-    // so a scoped pass stamps it too.
+    // ADR-0040 D6 / ADR-0047 D-ii: what this projection was derived from —
+    // the whole store, so a scoped pass stamps it too.
     set_meta(
         conn,
-        crate::tree_root::DERIVED_FROM_KEY,
-        &crate::tree_root::DerivedFrom {
-            tree_root,
+        crate::store_root::DERIVED_FROM_KEY,
+        &crate::store_root::DerivedFrom {
+            store_root,
             parser_id,
             projection_schema_version: crate::daemon::version::PROJECTION_SCHEMA_VERSION
                 .to_string(),
@@ -2481,7 +2532,7 @@ fn parse_into_conn_with(
     };
     let head_handle = db_path_for_head.filter(|_| sidecars_in_place).map(|p| {
         std::thread::spawn(move || -> Result<()> {
-            write_head_for_path(&p, unbound_facts, tree_root, parser_id)
+            write_head_for_path(&p, unbound_facts, store_root, parser_id)
         })
     });
 
@@ -2548,7 +2599,7 @@ fn parse_into_conn_with(
     // A head-write failure is reported (bead `ley-line-open-0c8ee7`). It
     // used to log and return Ok: the rows are committed, so the parse
     // "worked". But the head is what names what was committed — the run
-    // receipt, and since ADR-0040 D1 the tree identity — and a parse whose
+    // receipt, and since ADR-0047 D-ii the store identity — and a parse whose
     // head could not be advanced (a corrupt existing head the chain refuses
     // to re-root over, an unwritable sidecar, a signing-key error) must say
     // so, not advertise a head that still describes the previous tree. The
@@ -2609,7 +2660,7 @@ fn parse_into_conn_with(
             deleted,
             errors: errors + oversized,
             changed_files,
-            tree_root,
+            store_root,
         },
         post_commit: combine_post_commit(post_commit),
     })
@@ -2839,8 +2890,11 @@ pub fn parse_trusted_query_hashes(raw: Option<&str>) -> std::collections::HashSe
 /// state. Returns `(parentHash, generation, parentDigest)` where
 /// parentHash is the previous root (zero if no Head exists yet),
 /// generation is the next monotonic counter value (1 if no Head exists
-/// yet), and parentDigest is the v2 digest of the previous head's claim
+/// yet), and parentDigest is the v3 digest of the previous head's claim
 /// (`None` if there is no previous head or it had no claim; bead b68fa6).
+/// A head digest v2 head is refused, typed
+/// ([`crate::head_claim::HeadFormatError::RetiredDigestV2`]): a v3 chain
+/// never extends a v2 one.
 ///
 /// Fails closed (bead `ley-line-open-0c8ee7`): only a head that does not
 /// exist starts a chain. A head that exists but cannot be read, framed or
@@ -2893,7 +2947,7 @@ fn read_head_for_chain(
     let prev_gen = h.get_generation();
 
     // S2: verify before adopting this head as chain state; the signature
-    // covers the whole v2 claim (bead b68fa6). See `head_claim`.
+    // covers the whole v3 claim (bead b68fa6). See `head_claim`.
     crate::head_claim::enforce_signature(h, head_path, crate::head_claim::Reader::Chain, policy)
         .context("refusing to chain onto the head")?;
     let prev_digest = crate::head_claim::digest_of(h)
@@ -2964,14 +3018,14 @@ fn head_signer_from_env() -> Result<Option<leyline_sign::root_signer::Ed25519Roo
 fn write_head_for_path(
     db_path: &Path,
     unbound_facts: u64,
-    tree_root: leyline_core::Hash,
+    store_root: leyline_core::Hash,
     parser_id: leyline_core::Hash,
 ) -> Result<()> {
     // Readers refuse a half-stamped head (bead `ley-line-open-80f037` F3), so
     // the writer never produces one: the next parse could not chain onto it.
-    if (tree_root == leyline_core::Hash::ZERO) != (parser_id == leyline_core::Hash::ZERO) {
+    if (store_root == leyline_core::Hash::ZERO) != (parser_id == leyline_core::Hash::ZERO) {
         bail!(
-            "refusing to write a half-stamped head: treeRoot and parserId are stamped together or not at all"
+            "refusing to write a half-stamped head: storeRoot and parserId are stamped together or not at all"
         );
     }
     let (root, segment_bytes) = hash_segment_files(db_path)?;
@@ -2990,11 +3044,13 @@ fn write_head_for_path(
         h.set_unbound_facts(unbound_facts);
         h.reborrow().init_root_hash().set_bytes(&root);
         h.reborrow().init_parent_hash().set_bytes(&parent);
-        // ADR-0040 D1: the tree identity and its derivation identity, computed
-        // by the caller from the committed `_source` table (see `tree_root`).
+        // ADR-0047 D-ii: the store identity and the derivation identity,
+        // computed by the caller from the committed `_tree` (see
+        // `store_root`). `retiredTreeRoot` is never set: its presence is
+        // what marks a head as v2.
         h.reborrow()
-            .init_tree_root()
-            .set_bytes(tree_root.as_bytes());
+            .init_store_root()
+            .set_bytes(store_root.as_bytes());
         h.reborrow()
             .init_parser_id()
             .set_bytes(parser_id.as_bytes());
@@ -3005,12 +3061,13 @@ fn write_head_for_path(
         }
 
         // S1: sign the head when a signing key is configured. The signature
-        // covers the v2 head digest over the whole claim — generation,
-        // rootHash, parentHash, parentDigest, treeRoot, parserId (bead
-        // b68fa6) — so it cannot be replayed at another generation, grafted
-        // onto another chain, or cited for another tree. A head without a
-        // stamped tree identity has no claim and is refused rather than
-        // signed. No key ⇒ the head is written unsigned.
+        // covers the v3 head digest over the whole claim — generation,
+        // rootHash, parentHash, parentDigest, storeRoot, parserId (bead
+        // b68fa6, ADR-0047 M1) — so it cannot be replayed at another
+        // generation, grafted onto another chain, or cited for another store
+        // or derivation. A head without a stamped store identity has no
+        // claim and is refused rather than signed. No key ⇒ the head is
+        // written unsigned.
         if let Some(signer) = head_signer_from_env()? {
             use leyline_core::RootSigner;
             let claim = leyline_core::HeadClaim::new(
@@ -3018,10 +3075,10 @@ fn write_head_for_path(
                 leyline_core::Hash::from_bytes(root),
                 leyline_core::Hash::from_bytes(parent),
                 parent_digest,
-                tree_root,
+                store_root,
                 parser_id,
             )
-            .context("refusing to sign a head without a stamped treeRoot and parserId")?;
+            .context("refusing to sign a head without a stamped storeRoot and parserId")?;
             let digest = leyline_core::head_digest(&claim);
             let sig = signer.sign(digest).context("sign head digest")?;
             let pk = signer.verifying_key();
@@ -3272,9 +3329,19 @@ fn serialize_ast_node_record(buf: &mut Vec<u8>, a: &AstEntry) -> Result<()> {
 // like `+`/`-`, keywords, punctuation) ARE folded, which is what
 // distinguishes `a+b` from `a-b`; comments/`extra` nodes are excluded, so a
 // comment-only edit leaves every enclosing hash unchanged.
+//
+// merkle-ast-v3 (ADR-0047 D-i, step M2, bead `ley-line-open-73add7`): the
+// encoding is keyed with BLAKE3 `derive_key` under [`NODE_HASH_CONTEXT`].
+// merkle-ast-v2 hashed the same fields as plain σ behind an in-band
+// `llo/ast/v1 ‖ 0x00` prefix, so a file whose bytes were that preimage had a
+// `blob_hash` equal to the node's `node_hash` (law (c)). Derive-key mode
+// hashes under different domain flags from plain mode, so no `blob_hash`
+// reaches a `node_hash`.
 
-/// Domain/version tag for the merkle-AST preimage (git-object style).
-const NODE_HASH_DOMAIN: &[u8] = b"llo/ast/v1";
+/// The derive-key context of `node_hash` (merkle-ast-v3), owned by this
+/// construction alone. Pinned by the `astNode` cases of
+/// `schema-spec/sigma/v1/test-vectors/constructions.json`.
+const NODE_HASH_CONTEXT: &str = "leyline/ast-node/v3";
 /// Node-tag byte: leaf (terminal) node.
 const NODE_TAG_LEAF: u8 = 0x00;
 /// Node-tag byte: internal (n-ary) node.
@@ -3297,30 +3364,26 @@ fn write_uvarint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// Merkle-AST hash of a terminal node: `domain ‖ 0x00 ‖ leaf_tag ‖
-/// uvarint(len(kind)) ‖ kind ‖ uvarint(len(token)) ‖ token`. Hashed via the
-/// locked σ surface (`ContentAddressed::hash`), never `blake3::hash`
+/// Merkle-AST hash of a terminal node: `derive_key(NODE_HASH_CONTEXT,
+/// leaf_tag ‖ uvarint(len(kind)) ‖ kind ‖ uvarint(len(token)) ‖ token)`.
+/// Keyed through `leyline_core::substrate::derive_key`, never `blake3`
 /// directly (the `lint:blake3` gate).
 fn hash_leaf(kind: &str, token: &str) -> [u8; 32] {
-    let mut p = Vec::with_capacity(NODE_HASH_DOMAIN.len() + 6 + kind.len() + token.len());
-    p.extend_from_slice(NODE_HASH_DOMAIN);
-    p.push(0x00);
+    let mut p = Vec::with_capacity(5 + kind.len() + token.len());
     p.push(NODE_TAG_LEAF);
     write_uvarint(&mut p, kind.len() as u64);
     p.extend_from_slice(kind.as_bytes());
     write_uvarint(&mut p, token.len() as u64);
     p.extend_from_slice(token.as_bytes());
-    *p.hash().as_bytes()
+    *leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &p).as_bytes()
 }
 
-/// Merkle-AST hash of an internal node: `domain ‖ 0x00 ‖ internal_tag ‖
-/// uvarint(len(kind)) ‖ kind ‖ uvarint(child_count) ‖ child_hash[0..n]`
-/// (32 bytes each, SOURCE ORDER). Same σ surface as [`hash_leaf`].
+/// Merkle-AST hash of an internal node: `derive_key(NODE_HASH_CONTEXT,
+/// internal_tag ‖ uvarint(len(kind)) ‖ kind ‖ uvarint(child_count) ‖
+/// child_hash[0..n])` (32 bytes each, SOURCE ORDER). Same keyed primitive as
+/// [`hash_leaf`].
 fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
-    let mut p =
-        Vec::with_capacity(NODE_HASH_DOMAIN.len() + 6 + kind.len() + child_hashes.len() * 32);
-    p.extend_from_slice(NODE_HASH_DOMAIN);
-    p.push(0x00);
+    let mut p = Vec::with_capacity(5 + kind.len() + child_hashes.len() * 32);
     p.push(NODE_TAG_INTERNAL);
     write_uvarint(&mut p, kind.len() as u64);
     p.extend_from_slice(kind.as_bytes());
@@ -3328,7 +3391,62 @@ fn hash_internal(kind: &str, child_hashes: &[[u8; 32]]) -> [u8; 32] {
     for h in child_hashes {
         p.extend_from_slice(h);
     }
-    *p.hash().as_bytes()
+    *leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &p).as_bytes()
+}
+
+/// The kind a node's `node_hash` folds and its `node_content.kind` stores:
+/// the canonical κ kind of a NAMED node, and the grammar kind of an
+/// anonymous token, verbatim (merkle-ast-v3). κ is a vocabulary for
+/// constructs; an anonymous token is a keyword, operator or punctuation
+/// whose spelling can collide with a construct's name (JavaScript's `class`
+/// keyword against the `class` expression, which κ maps to `type`). An
+/// anonymous token has no `_ast` occurrence row, so its content row is the
+/// only place its grammar kind is kept (ADR-0047 D-iii).
+fn hashed_kind(language: TsLanguage, node: tree_sitter::Node<'_>) -> &'static str {
+    let raw = node.kind();
+    if node.is_named() {
+        language.canonical_kind(raw).unwrap_or(raw)
+    } else {
+        raw
+    }
+}
+
+/// The `node_hash` construction (`merkle-ast-v3`, ADR-0027 as keyed by
+/// ADR-0047 D-i), typed (ADR-0047 §2.3). Its fold is [`hash_leaf`] /
+/// [`hash_internal`] under `derive_key("leyline/ast-node/v3", …)`, so a
+/// `Ref<AstNode>` neither compares with a `Ref<Blob>` (law (b)) nor shares
+/// its bytes with one (law (c)).
+pub enum AstNode {}
+
+/// What a `node_hash` is a function of: a leaf's canonical kind and token,
+/// or an internal node's canonical kind and its non-`extra` children in
+/// source order.
+#[derive(Clone, Copy, Debug)]
+pub enum AstNodeWitness<'w> {
+    Leaf {
+        kind: &'w str,
+        token: &'w str,
+    },
+    Internal {
+        kind: &'w str,
+        children: &'w [leyline_core::Ref<AstNode>],
+    },
+}
+
+impl leyline_core::Construction for AstNode {
+    const NAME: &'static str = "ast-node";
+    type Witness<'w> = AstNodeWitness<'w>;
+    fn fold(w: AstNodeWitness<'_>) -> leyline_core::Hash {
+        let addr = match w {
+            AstNodeWitness::Leaf { kind, token } => hash_leaf(kind, token),
+            AstNodeWitness::Internal { kind, children } => {
+                let children: Vec<[u8; 32]> =
+                    children.iter().map(|c| *c.as_hash().as_bytes()).collect();
+                hash_internal(kind, &children)
+            }
+        };
+        leyline_core::Hash::from_bytes(addr)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3414,7 +3532,6 @@ pub(crate) fn parse_file_pure(
 
     let root = tree.root_node();
     let syntax_error = first_syntax_error(root);
-    let lang_name = language.name();
 
     let mut nodes = Vec::new();
     let mut ast_entries = Vec::new();
@@ -3428,7 +3545,7 @@ pub(crate) fn parse_file_pure(
     // for injected-subtree nodes, which have no `_ast` rows. The
     // env-var off-switch is the falsification seam for the host-hash-
     // independence gate, read once per file (rayon workers only read).
-    let mut injected_hashes: Vec<(String, [u8; 32])> = Vec::new();
+    let mut injected_hashes: Vec<InjectedNode> = Vec::new();
     let injections_on = !leyline_ts::injections::injections_disabled();
     // Arena query overrides (bead `ley-line-open-e72629`): per-file bounds flag
     // set when an override engine trips its resource ceiling on any node.
@@ -3479,7 +3596,6 @@ pub(crate) fn parse_file_pure(
         source_id,
         source_id,
         language,
-        lang_name,
         // Bead ley-line-open-6e798d: root has no enclosing function/method.
         None,
         injections_on,
@@ -3716,7 +3832,6 @@ fn fold_children(
     node_id: &str,
     source_id: &str,
     language: TsLanguage,
-    lang_name: &str,
     // Bead `ley-line-open-6e798d`: node_id of the nearest enclosing κ
     // `function`/`method` ancestor. `None` at top level. When we descend
     // into a child whose κ canonical kind is `function`/`method`, we
@@ -3731,7 +3846,7 @@ fn fold_children(
     refs: &mut Vec<ExtractedRef>,
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
-    injected_hashes: &mut Vec<(String, [u8; 32])>,
+    injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) -> [u8; 32] {
     // Gather non-extra children in source order, with tree-sitter field
@@ -3892,7 +4007,6 @@ fn fold_children(
                 &id,
                 source_id,
                 language,
-                lang_name,
                 child_container,
                 injections_on,
                 seen,
@@ -3918,7 +4032,6 @@ fn fold_children(
                 "",
                 source_id,
                 language,
-                lang_name,
                 container_node_id,
                 injections_on,
                 seen,
@@ -3935,8 +4048,7 @@ fn fold_children(
     }
 
     // Compute this node's content address and emit its deduped content rows.
-    let raw_kind = node.kind();
-    let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
+    let canonical = hashed_kind(language, node);
     if children.is_empty() {
         // Leaf: hash the terminal token verbatim (length-prefixed, NUL-safe).
         let token = node.utf8_text(content).unwrap_or("");
@@ -3946,8 +4058,6 @@ fn fold_children(
                 node_hash: h,
                 node_tag: NODE_TAG_LEAF,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: Some(token.to_string()),
                 arity: 0,
             });
@@ -3960,8 +4070,6 @@ fn fold_children(
                 node_hash: h,
                 node_tag: NODE_TAG_INTERNAL,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: None,
                 arity: child_hashes.len(),
             });
@@ -3988,8 +4096,7 @@ fn fold_children(
 /// The injected subtree gets its OWN content-addressed root: its
 /// hashes are computed by the same [`hash_leaf`]/[`hash_internal`]
 /// fold — over the INJECTED grammar's kinds — and land as
-/// `node_content`/`node_child` rows (`lang` = the injected language),
-/// so a standalone file with the same statement bytes dedups to the
+/// `node_content`/`node_child` rows, so a standalone file with the same statement bytes dedups to the
 /// same rows. Nothing here touches the HOST fold's preimages,
 /// `_ast`/`nodes` occurrence rows, or the pointer/capnp stores — host
 /// structural identity is independent of the injected grammar's
@@ -4017,7 +4124,7 @@ fn fold_injected(
     refs: &mut Vec<ExtractedRef>,
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
-    injected_hashes: &mut Vec<(String, [u8; 32])>,
+    injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) {
     let mut parser = tree_sitter::Parser::new();
@@ -4045,7 +4152,12 @@ fn fold_injected(
         injected_hashes,
         ctx,
     );
-    injected_hashes.push((root_id.to_string(), root_hash));
+    injected_hashes.push(InjectedNode {
+        id: root_id.to_string(),
+        hash: root_hash,
+        lang: site.language.name(),
+        raw_kind: root.kind(),
+    });
 }
 
 /// Bottom-up fold of an INJECTED subtree — [`fold_children`] minus the
@@ -4074,7 +4186,7 @@ fn fold_injected_node(
     refs: &mut Vec<ExtractedRef>,
     node_contents: &mut Vec<ContentRow>,
     node_children: &mut Vec<ChildRow>,
-    injected_hashes: &mut Vec<(String, [u8; 32])>,
+    injected_hashes: &mut Vec<InjectedNode>,
     ctx: &ExtractCtx,
 ) -> [u8; 32] {
     let mut children: Vec<tree_sitter::Node> = Vec::new();
@@ -4149,7 +4261,12 @@ fn fold_injected_node(
                 injected_hashes,
                 ctx,
             );
-            injected_hashes.push((id, child_hash));
+            injected_hashes.push(InjectedNode {
+                id,
+                hash: child_hash,
+                lang: language.name(),
+                raw_kind: child.kind(),
+            });
             child_hashes.push(child_hash);
         } else {
             let child_hash = fold_injected_node(
@@ -4170,9 +4287,7 @@ fn fold_injected_node(
         }
     }
 
-    let raw_kind = node.kind();
-    let canonical = language.canonical_kind(raw_kind).unwrap_or(raw_kind);
-    let lang_name = language.name();
+    let canonical = hashed_kind(language, node);
     if children.is_empty() {
         let token = node.utf8_text(content).unwrap_or("");
         let h = hash_leaf(canonical, token);
@@ -4181,8 +4296,6 @@ fn fold_injected_node(
                 node_hash: h,
                 node_tag: NODE_TAG_LEAF,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: Some(token.to_string()),
                 arity: 0,
             });
@@ -4195,8 +4308,6 @@ fn fold_injected_node(
                 node_hash: h,
                 node_tag: NODE_TAG_INTERNAL,
                 kind: canonical.to_string(),
-                raw_kind: raw_kind.to_string(),
-                lang: lang_name.to_string(),
                 token: None,
                 arity: child_hashes.len(),
             });
@@ -4269,6 +4380,95 @@ mod tree_tests;
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Σ (DET), ADR-0047 §5 `det_known_answer_vectors`, the `node_hash` slice
+    /// (bead `ley-line-open-10d71a`): the private leaf and internal folds
+    /// reproduce the `astNode` cases of
+    /// `schema-spec/sigma/v1/test-vectors/constructions.json`, and each
+    /// pinned address is `derive_key("leyline/ast-node/v3", preimage)` and
+    /// not σ of any byte string a file could hold (merkle-ast-v3, ADR-0047
+    /// M2, bead `ley-line-open-73add7`). The Go module checks the same cases
+    /// (`task schema:go-sigma-vectors`).
+    #[test]
+    fn det_known_answer_vectors() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ll-core/schema-spec/sigma/v1/test-vectors/constructions.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let cases = v["astNode"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        let unhex = |s: &serde_json::Value| hex::decode(s.as_str().unwrap()).unwrap();
+        // The typed leaves, each derived from its own witness: the children
+        // an internal case's typed witness is built from.
+        let leaf_refs: Vec<leyline_core::Ref<AstNode>> = cases
+            .iter()
+            .filter(|c| c["tag"] == "leaf")
+            .map(|c| {
+                leyline_core::Ref::derive(AstNodeWitness::Leaf {
+                    kind: c["kind"].as_str().unwrap(),
+                    token: c["token"].as_str().unwrap(),
+                })
+            })
+            .collect();
+        for case in cases {
+            let kind = case["kind"].as_str().unwrap();
+            let (address, typed) = match case["tag"].as_str().unwrap() {
+                "leaf" => {
+                    let token = case["token"].as_str().unwrap();
+                    (
+                        hash_leaf(kind, token),
+                        leyline_core::Ref::<AstNode>::derive(AstNodeWitness::Leaf { kind, token }),
+                    )
+                }
+                "internal" => {
+                    let children: Vec<[u8; 32]> = case["children"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| unhex(c).try_into().unwrap())
+                        .collect();
+                    let typed_children: Vec<leyline_core::Ref<AstNode>> = children
+                        .iter()
+                        .map(|c| {
+                            *leaf_refs
+                                .iter()
+                                .find(|r| r.as_hash().as_bytes() == c)
+                                .expect("internal cases fold pinned leaves")
+                        })
+                        .collect();
+                    (
+                        hash_internal(kind, &children),
+                        leyline_core::Ref::derive(AstNodeWitness::Internal {
+                            kind,
+                            children: &typed_children,
+                        }),
+                    )
+                }
+                other => panic!("unknown tag {other}"),
+            };
+            assert_eq!(
+                address.to_vec(),
+                unhex(&case["address"]),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(typed.as_hash().as_bytes(), &address, "{}", case["name"]);
+            // The address is the keyed digest of the pinned encoding, under
+            // the pinned context (merkle-ast-v3, ADR-0047 D-i) ...
+            let preimage = unhex(&case["preimageHex"]);
+            assert_eq!(case["context"].as_str(), Some(NODE_HASH_CONTEXT));
+            assert_eq!(
+                leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &preimage).as_bytes(),
+                &address,
+                "{}",
+                case["name"]
+            );
+            // ... and no plain σ reaches it, with or without merkle-ast-v2's
+            // in-band prefix: law (c), the `73add7` collision.
+            let legacy = [b"llo/ast/v1\0".as_slice(), &preimage].concat();
+            assert_ne!(preimage.as_slice().hash().as_bytes(), &address);
+            assert_ne!(legacy.as_slice().hash().as_bytes(), &address);
+        }
+    }
 
     #[test]
     fn collect_files_skips_known_bloat_dirs() {
@@ -4455,7 +4655,7 @@ mod tests {
         conn.execute(
             "INSERT INTO _ast (nid, kind_id, start_byte, end_byte, start_row, start_col, end_row, end_col, content_id) \
              VALUES (?1, 1, 0, 0, 0, 0, 0, 0, NULL)",
-            [leyline_schema::file_nid(2, 0)],
+            [leyline_schema::file_nid(FileId::from_raw(2), 0)],
         )
         .unwrap();
         std::fs::write(root.join("b.go"), b"package m\nfunc B() {}\n").unwrap();
@@ -4553,7 +4753,10 @@ mod tests {
         let doomed_nid = leyline_ts::schema::resolve_path(&conn, "doomed")
             .unwrap()
             .expect("doomed/ dir row must exist after cold parse");
-        assert!(doomed_nid < 0, "a directory resolves to a negative nid");
+        assert!(
+            leyline_schema::nid_dir_id(doomed_nid).is_some(),
+            "a directory resolves to a negative nid"
+        );
 
         // Remove the file AND its parent dir from disk, then reparse.
         std::fs::remove_file(root.join("doomed/a.go")).unwrap();
@@ -5201,7 +5404,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v10",
+            "projection-v12",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5214,30 +5417,34 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v10"),
+            Some("projection-v12"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
 
-    /// projection-v10 (bead `ley-line-open-738dd9`): an arena that still
-    /// carries the v9 label is refused at open — its `_ast`/`node_refs`/
-    /// `node_defs` hold a `node_hash` column where this writer inserts
-    /// `content_id`, and `CREATE TABLE IF NOT EXISTS` would keep the old
-    /// shape.
+    /// projection-v12 (ADR-0047 M2, beads `ley-line-open-73add7` and
+    /// `ley-line-open-b5d354`): an arena that still carries the v11 label is
+    /// refused at open — its `node_content` holds merkle-ast-v2 addresses and
+    /// the `lang`/`raw_kind` columns this writer no longer inserts. v10 (a
+    /// parser-qualified `treeRoot` in `derived_from`, ADR-0047 M1) and v9 (a
+    /// `node_hash` column where this writer inserts `content_id`) are refused
+    /// the same way.
     #[test]
-    fn a_projection_v9_arena_is_refused_at_open() {
-        let td = TempDir::new().unwrap();
-        std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
-        set_meta(&conn, "projection_schema_version", "projection-v9").unwrap();
-        let err = parse_into_conn(&conn, td.path(), Some("go"), None)
-            .expect_err("a projection-v9 arena must be refused");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("projection-v9") && msg.contains("projection-v10"),
-            "the refusal must name both versions; got: {msg}",
-        );
+    fn projection_v9_to_v11_arenas_are_refused_at_open() {
+        for old in ["projection-v9", "projection-v10", "projection-v11"] {
+            let td = TempDir::new().unwrap();
+            std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            parse_into_conn(&conn, td.path(), Some("go"), None).unwrap();
+            set_meta(&conn, "projection_schema_version", old).unwrap();
+            let err = parse_into_conn(&conn, td.path(), Some("go"), None)
+                .expect_err("an older projection arena must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(old) && msg.contains("projection-v12"),
+                "the refusal must name both versions; got: {msg}",
+            );
+        }
     }
 
     /// The `node_child` edge set of each subtree, rendered by hash.
@@ -5330,7 +5537,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v10"),
+            msg.contains("projection-v4") && msg.contains("projection-v12"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(
@@ -5639,7 +5846,7 @@ mod tests {
         // SAFETY: edition-2024 env mutation, serialized against every other
         // test that touches the head signing/trust vars by the `serial` label.
         unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &hex) };
-        let wrote = write_head_for_path(&db, 0, TEST_TREE_ROOT, TEST_PARSER_ID);
+        let wrote = write_head_for_path(&db, 0, TEST_STORE_ROOT, TEST_PARSER_ID);
         unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
         wrote.expect("write signed head");
 
@@ -5667,7 +5874,7 @@ mod tests {
         );
 
         // Re-derive the digest the way a verifier would, from the head itself:
-        // the whole v2 claim, treeRoot and parserId included.
+        // the whole v3 claim, storeRoot and parserId included.
         let claim = crate::head_claim::claim_of(h)
             .unwrap()
             .expect("a signed head carries a claim");
@@ -5682,11 +5889,11 @@ mod tests {
                 ),
                 leyline_core::Hash::ZERO,
                 None,
-                TEST_TREE_ROOT,
+                TEST_STORE_ROOT,
                 TEST_PARSER_ID,
             )
             .unwrap(),
-            "the signed claim carries the stamped treeRoot and parserId"
+            "the signed claim carries the stamped storeRoot and parserId"
         );
         let digest = leyline_core::head_digest(&claim);
 
@@ -5729,8 +5936,8 @@ mod tests {
                 .init_parent_hash()
                 .set_bytes(old.get_parent_hash().unwrap().get_bytes().unwrap());
             h.reborrow()
-                .init_tree_root()
-                .set_bytes(old.get_tree_root().unwrap().get_bytes().unwrap());
+                .init_store_root()
+                .set_bytes(old.get_store_root().unwrap().get_bytes().unwrap());
             h.reborrow()
                 .init_parser_id()
                 .set_bytes(old.get_parser_id().unwrap().get_bytes().unwrap());
@@ -5755,9 +5962,9 @@ mod tests {
         });
     }
 
-    /// Stamped identities for heads the signing tests write: a v2 claim needs
+    /// Stamped identities for heads the signing tests write: a v3 claim needs
     /// both, and neither may be the unstamped ZERO.
-    const TEST_TREE_ROOT: leyline_core::Hash = leyline_core::Hash::from_bytes([0x11; 32]);
+    const TEST_STORE_ROOT: leyline_core::Hash = leyline_core::Hash::from_bytes([0x11; 32]);
     const TEST_PARSER_ID: leyline_core::Hash = leyline_core::Hash::from_bytes([0x22; 32]);
 
     /// Write a head signed by `seed` and return `(head path, trusted pk hex)`.
@@ -5772,7 +5979,7 @@ mod tests {
             .collect();
         // SAFETY: callers hold the `env_leyline_head_keys` serial label.
         unsafe { std::env::set_var("LEYLINE_HEAD_SIGNING_KEY", &sk_hex) };
-        let wrote = write_head_for_path(db, 0, TEST_TREE_ROOT, TEST_PARSER_ID);
+        let wrote = write_head_for_path(db, 0, TEST_STORE_ROOT, TEST_PARSER_ID);
         unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
         wrote.expect("write signed head");
         (with_extension(db, "head.capnp"), pk_hex)
@@ -5795,21 +6002,21 @@ mod tests {
         read_head_for_chain(head_path, &trusting(pk_hex))
     }
 
-    /// Bead b68fa6 (ADR-0040 D1: treeRoot is the root signatures cite): a
-    /// signed head whose treeRoot was rewritten after signing is refused.
+    /// Bead b68fa6 (ADR-0047 D-ii: storeRoot is the root signatures cite): a
+    /// signed head whose storeRoot was rewritten after signing is refused.
     #[test]
     #[serial_test::serial(env_leyline_head_keys)]
-    fn read_head_rejects_a_rewritten_tree_root_when_trust_set_configured() {
+    fn read_head_rejects_a_rewritten_store_root_when_trust_set_configured() {
         let dir = tempfile::tempdir().unwrap();
         let (head_path, pk_hex) = write_signed_test_head(&dir.path().join("t.db"), [5u8; 32]);
         assert!(read_head_trusting(&head_path, &pk_hex).is_ok());
         rewrite_head(&head_path, |h| {
-            h.reborrow().init_tree_root().set_bytes(&[0x33; 32]);
+            h.reborrow().init_store_root().set_bytes(&[0x33; 32]);
         });
         let got = read_head_trusting(&head_path, &pk_hex);
         assert!(
             got.is_err(),
-            "a rewritten treeRoot must be refused, got {got:?}"
+            "a rewritten storeRoot must be refused, got {got:?}"
         );
     }
 
@@ -5876,7 +6083,7 @@ mod tests {
     }
 
     /// Bead b68fa6, the unstamped case: with a signing key configured, a head
-    /// without a stamped treeRoot or parserId is refused, never signed over a
+    /// without a stamped storeRoot or parserId is refused, never signed over a
     /// ZERO stand-in.
     #[test]
     #[serial_test::serial(env_leyline_head_keys)]
@@ -5885,7 +6092,7 @@ mod tests {
         let sk_hex: String = [5u8; 32].iter().map(|b| format!("{b:02x}")).collect();
         for (name, tree, parser) in [
             ("no_tree.db", leyline_core::Hash::ZERO, TEST_PARSER_ID),
-            ("no_parser.db", TEST_TREE_ROOT, leyline_core::Hash::ZERO),
+            ("no_parser.db", TEST_STORE_ROOT, leyline_core::Hash::ZERO),
         ] {
             let db = dir.path().join(name);
             std::fs::write(&db, b"").unwrap();
@@ -5895,7 +6102,7 @@ mod tests {
             unsafe { std::env::remove_var("LEYLINE_HEAD_SIGNING_KEY") };
             let err = wrote.expect_err("an unstamped head must not be signed");
             assert!(
-                format!("{err:#}").contains("treeRoot and parserId"),
+                format!("{err:#}").contains("storeRoot and parserId"),
                 "{err:#}"
             );
             assert!(
@@ -5914,7 +6121,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (head_path, pk_hex) = write_signed_test_head(&dir.path().join("c.db"), [5u8; 32]);
         rewrite_head(&head_path, |h| {
-            h.reborrow().init_tree_root().set_bytes(&[]);
+            h.reborrow().init_store_root().set_bytes(&[]);
             h.reborrow().init_parser_id().set_bytes(&[]);
         });
         let got = read_head_trusting(&head_path, &pk_hex);
@@ -5961,7 +6168,7 @@ mod tests {
         assert!(got.is_ok(), "unsigned head must still read: {got:?}");
     }
 
-    /// Reads `(rootHash, treeRoot, parserId)` from the head beside `db`.
+    /// Reads `(rootHash, storeRoot, parserId)` from the head beside `db`.
     fn read_head_roots(db: &Path) -> ([u8; 32], [u8; 32], [u8; 32]) {
         use leyline_schema_capnp::head_capnp::head;
         let bytes = std::fs::read(head_path_for(db)).unwrap();
@@ -5976,7 +6183,7 @@ mod tests {
         };
         (
             get(h.get_root_hash().and_then(|x| x.get_bytes())),
-            get(h.get_tree_root().and_then(|x| x.get_bytes())),
+            get(h.get_store_root().and_then(|x| x.get_bytes())),
             get(h.get_parser_id().and_then(|x| x.get_bytes())),
         )
     }
@@ -5986,15 +6193,16 @@ mod tests {
         parse_into_conn(&conn, src, None, scope).unwrap();
     }
 
-    /// ADR-0040 D1, falsifier F1 (bead `ley-line-open-f2df7f`): `treeRoot`
-    /// names the tree and `rootHash` names the run. Four parses of the same
+    /// ADR-0040 D1, falsifier F1 (bead `ley-line-open-f2df7f`), carried to
+    /// ADR-0047 D-ii: `storeRoot` names the store and `rootHash` names the
+    /// run. Four parses of the same
     /// bytes — a second directory, a touched mtime, a no-op rerun, a scoped
-    /// reparse — yield one `treeRoot`; one changed byte changes it. The same
+    /// reparse — yield one `storeRoot`; one changed byte changes it. The same
     /// test records the two shipped `rootHash` facts it replaces: the run
     /// receipt moves with the directory (bead `143002`) and with the set of
     /// files a run re-parsed (bead `0c80c7`).
     #[test]
-    fn tree_root_names_the_tree_and_root_hash_names_the_run() {
+    fn store_root_names_the_store_and_root_hash_names_the_run() {
         let td = TempDir::new().unwrap();
         let write_tree = |dir: &Path| {
             std::fs::create_dir_all(dir.join("pkg")).unwrap();
@@ -6008,11 +6216,11 @@ mod tests {
         let db_a = td.path().join("a.db");
         parse_dir(&db_a, &src_a, None);
         let (root_1, tree_1, parser_1) = read_head_roots(&db_a);
-        assert_ne!(tree_1, [0u8; 32], "treeRoot must be stamped");
+        assert_ne!(tree_1, [0u8; 32], "storeRoot must be stamped");
         assert_ne!(parser_1, [0u8; 32], "parserId must be stamped");
         assert_ne!(
             tree_1, root_1,
-            "treeRoot and rootHash are different domains"
+            "storeRoot and rootHash are different domains"
         );
 
         // The same bytes in a second directory.
@@ -6023,7 +6231,7 @@ mod tests {
         let (root_2, tree_2, parser_2) = read_head_roots(&db_b);
         assert_eq!(
             tree_2, tree_1,
-            "treeRoot is the same for the same bytes elsewhere"
+            "storeRoot is the same for the same bytes elsewhere"
         );
         assert_eq!(parser_2, parser_1, "parserId is a function of the binary");
         assert_ne!(
@@ -6041,12 +6249,12 @@ mod tests {
             .unwrap();
         parse_dir(&db_a, &src_a, None);
         let (_, tree_3, _) = read_head_roots(&db_a);
-        assert_eq!(tree_3, tree_1, "a touched mtime does not move treeRoot");
+        assert_eq!(tree_3, tree_1, "a touched mtime does not move storeRoot");
 
         // A no-op rerun.
         parse_dir(&db_a, &src_a, None);
         let (root_4, tree_4, _) = read_head_roots(&db_a);
-        assert_eq!(tree_4, tree_1, "a no-op rerun does not move treeRoot");
+        assert_eq!(tree_4, tree_1, "a no-op rerun does not move storeRoot");
         assert_ne!(
             root_4, root_1,
             "rootHash of a no-op rerun covers no files (bead 0c80c7); recorded, not endorsed"
@@ -6073,15 +6281,15 @@ mod tests {
         std::fs::write(src_a.join("pkg/b.go"), b"package pkg\n\nfunc Baz() {}\n").unwrap();
         parse_dir(&db_a, &src_a, None);
         let (_, tree_7, parser_7) = read_head_roots(&db_a);
-        assert_ne!(tree_7, tree_1, "one changed byte moves treeRoot");
+        assert_ne!(tree_7, tree_1, "one changed byte moves storeRoot");
         assert_eq!(parser_7, parser_1, "the derivation did not change");
 
         // The verifier agrees with the head it just wrote, and disagrees once
-        // the manifest changes under it (ADR-0045 T2: `treeRoot` names
+        // the manifest changes under it (ADR-0045 T2: `storeRoot` names
         // `_tree`), whether a blob or only a mode moves.
         assert!(matches!(
-            crate::tree_root::verify(&db_a).unwrap(),
-            crate::tree_root::Verification::Valid { .. }
+            crate::store_root::verify(&db_a).unwrap(),
+            crate::store_root::Verification::Valid { .. }
         ));
         {
             let conn = Connection::open(&db_a).unwrap();
@@ -6089,8 +6297,8 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            crate::tree_root::verify(&db_a).unwrap(),
-            crate::tree_root::Verification::TreeRootMismatch { .. }
+            crate::store_root::verify(&db_a).unwrap(),
+            crate::store_root::Verification::StoreRootMismatch { .. }
         ));
         {
             let conn = Connection::open(&db_a).unwrap();
@@ -6101,39 +6309,42 @@ mod tests {
             .unwrap();
         }
         assert!(matches!(
-            crate::tree_root::verify(&db_a).unwrap(),
-            crate::tree_root::Verification::TreeRootMismatch { .. }
+            crate::store_root::verify(&db_a).unwrap(),
+            crate::store_root::Verification::StoreRootMismatch { .. }
         ));
     }
 
     /// Bead b68fa6: `leyline verify-head` checks the signature over the
-    /// stamped treeRoot when a trust set is configured, so a head whose
-    /// treeRoot was rewritten is refused on the signature, before (and
+    /// stamped storeRoot when a trust set is configured, so a head whose
+    /// storeRoot was rewritten is refused on the signature, before (and
     /// independently of) the comparison with the arena.
     #[test]
     #[serial_test::serial(env_leyline_head_keys)]
-    fn verify_head_checks_the_signature_over_tree_root() {
+    fn verify_head_checks_the_signature_over_store_root() {
         let td = TempDir::new().unwrap();
         let (db, pk_hex) = signed_parse(&td);
 
         let policy = trusting(&pk_hex);
-        let clean = crate::tree_root::verify_with(&db, &policy);
+        let clean = crate::store_root::verify_with(&db, &policy);
         rewrite_head(&head_path_for(&db), |h| {
-            h.reborrow().init_tree_root().set_bytes(&[0x33; 32]);
+            h.reborrow().init_store_root().set_bytes(&[0x33; 32]);
         });
-        let forged = crate::tree_root::verify_with(&db, &policy);
+        let forged = crate::store_root::verify_with(&db, &policy);
 
         assert!(
             matches!(
                 clean,
-                Ok(crate::tree_root::Verification::Valid {
+                Ok(crate::store_root::Verification::Valid {
                     signature: crate::head_claim::SignatureCheck::Verified,
                     ..
                 })
             ),
             "{clean:?}"
         );
-        let err = format!("{:#}", forged.expect_err("a rewritten treeRoot is refused"));
+        let err = format!(
+            "{:#}",
+            forged.expect_err("a rewritten storeRoot is refused")
+        );
         assert!(err.contains("failed signature verification"), "{err}");
     }
 
@@ -6161,7 +6372,7 @@ mod tests {
 
     /// Bead b68fa6 (identity review C1): a signed → unsigned downgrade. The
     /// attacker strips the signature and kid, edits the arena, and restamps
-    /// treeRoot to match. With a trust set configured, `verify-head` must not
+    /// storeRoot to match. With a trust set configured, `verify-head` must not
     /// report that head as valid, with or without
     /// `LEYLINE_HEAD_REQUIRE_SIGNATURE`.
     #[test]
@@ -6173,29 +6384,28 @@ mod tests {
             let conn = Connection::open(&db).unwrap();
             conn.execute("UPDATE _tree SET mode = 33261 WHERE path = 'a.go'", [])
                 .unwrap();
-            let (_, _, parser_id) = read_head_roots(&db);
-            crate::tree_root::tree_root(&conn, leyline_core::Hash::from_bytes(parser_id)).unwrap()
+            crate::store_root::store_root(&conn).unwrap()
         };
         rewrite_head(&head_path_for(&db), |h| {
             h.set_signature(&[]);
             h.set_signer_kid(&[]);
             h.reborrow()
-                .init_tree_root()
+                .init_store_root()
                 .set_bytes(forged_tree.as_bytes());
         });
 
-        let got = crate::tree_root::verify_with(&db, &trusting(&pk_hex));
+        let got = crate::store_root::verify_with(&db, &trusting(&pk_hex));
         let err = format!("{:#}", got.expect_err("a stripped signature is refused"));
         assert!(err.contains("unsigned"), "{err}");
 
         // With no trust set the stamp is consistent with the arena, and the
         // verdict says the signature was not checked rather than a bare valid.
         let unchecked =
-            crate::tree_root::verify_with(&db, &crate::head_claim::HeadPolicy::default());
+            crate::store_root::verify_with(&db, &crate::head_claim::HeadPolicy::default());
         assert!(
             matches!(
                 unchecked,
-                Ok(crate::tree_root::Verification::Valid {
+                Ok(crate::store_root::Verification::Valid {
                     signature: crate::head_claim::SignatureCheck::NotChecked,
                     ..
                 })
@@ -6204,18 +6414,18 @@ mod tests {
         );
     }
 
-    /// A head written before ADR-0040 carries neither field; the verifier
-    /// says so instead of calling it valid.
+    /// A head that stamps neither field; the verifier says so instead of
+    /// calling it valid.
     #[test]
-    fn verify_reports_a_head_without_tree_root_as_not_stamped() {
+    fn verify_reports_a_head_without_store_root_as_not_stamped() {
         let td = TempDir::new().unwrap();
         let src = td.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("a.go"), b"package m\n").unwrap();
         let db = td.path().join("out.db");
         parse_dir(&db, &src, None);
-        crate::tree_root::cmd_verify_head(&db).expect("a freshly parsed arena verifies");
-        // Rewrite the head with the pre-ADR-0040 field set only.
+        crate::store_root::cmd_verify_head(&db).expect("a freshly parsed arena verifies");
+        // Rewrite the head with the run-receipt fields only.
         use leyline_schema_capnp::head_capnp::head;
         let mut src_msg = capnp::message::Builder::new_default();
         {
@@ -6230,13 +6440,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            crate::tree_root::verify(&db).unwrap(),
-            crate::tree_root::Verification::NotStamped
+            crate::store_root::verify(&db).unwrap(),
+            crate::store_root::Verification::NotStamped
         );
-        let err = crate::tree_root::cmd_verify_head(&db)
+        let err = crate::store_root::cmd_verify_head(&db)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no treeRoot"), "{err}");
+        assert!(err.contains("no storeRoot"), "{err}");
     }
 
     /// Bead `ley-line-open-80f037` F3(d): the writer never produces the
@@ -6247,7 +6457,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (name, tree, parser) in [
             ("no_tree.db", leyline_core::Hash::ZERO, TEST_PARSER_ID),
-            ("no_parser.db", TEST_TREE_ROOT, leyline_core::Hash::ZERO),
+            ("no_parser.db", TEST_STORE_ROOT, leyline_core::Hash::ZERO),
         ] {
             let db = dir.path().join(name);
             std::fs::write(&db, b"").unwrap();
@@ -6257,9 +6467,9 @@ mod tests {
         }
     }
 
-    /// Bead `ley-line-open-80f037` F3(d): a head carrying `treeRoot` without
+    /// Bead `ley-line-open-80f037` F3(d): a head carrying `storeRoot` without
     /// `parserId` is malformed. `verify-head` refuses it instead of calling
-    /// it a pre-ADR-0040 head.
+    /// it unstamped.
     #[test]
     fn verify_refuses_a_half_stamped_head() {
         let td = TempDir::new().unwrap();
@@ -6275,17 +6485,66 @@ mod tests {
             h.set_generation(1);
             h.reborrow().init_root_hash().set_bytes(&[7u8; 32]);
             h.reborrow().init_parent_hash().set_bytes(&[0u8; 32]);
-            h.reborrow().init_tree_root().set_bytes(&[9u8; 32]);
+            h.reborrow().init_store_root().set_bytes(&[9u8; 32]);
         }
         let mut f = std::fs::File::create(head_path_for(&db)).unwrap();
         leyline_schema_capnp::canonical::write_canonical_message::<head::Owned, _>(
             &src_msg, &mut f,
         )
         .unwrap();
-        let err = crate::tree_root::verify_with(&db, &crate::head_claim::HeadPolicy::default())
+        let err = crate::store_root::verify_with(&db, &crate::head_claim::HeadPolicy::default())
             .expect_err("a half-stamped head is malformed");
         let err = format!("{err:#}");
         assert!(err.contains("half-stamped"), "{err}");
+    }
+
+    /// ADR-0047 M1: a head digest v2 head beside an arena — `treeRoot` at
+    /// ordinal 7, as v0.25 wrote it, signed or not — is refused with the
+    /// typed error by both readers: `verify-head` does not call it
+    /// unstamped, and the next parse does not chain onto it.
+    #[test]
+    fn a_v2_head_is_refused_by_verify_head_and_by_the_chain() {
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.go"), b"package m\n").unwrap();
+        let db = td.path().join("out.db");
+        parse_dir(&db, &src, None);
+        let (_, store, parser) = read_head_roots(&db);
+        rewrite_head(&head_path_for(&db), |h| {
+            h.reborrow().init_store_root().set_bytes(&[]);
+            h.reborrow().init_retired_tree_root().set_bytes(&store);
+            h.reborrow().init_parser_id().set_bytes(&parser);
+        });
+        let typed = |err: &anyhow::Error| {
+            err.chain()
+                .find_map(|e| e.downcast_ref::<crate::head_claim::HeadFormatError>())
+                .copied()
+        };
+        let err = crate::store_root::verify_with(&db, &crate::head_claim::HeadPolicy::default())
+            .expect_err("a v2 head is refused");
+        assert_eq!(
+            typed(&err),
+            Some(crate::head_claim::HeadFormatError::RetiredDigestV2),
+            "{err:#}"
+        );
+        let err = read_head_for_chain(
+            &head_path_for(&db),
+            &crate::head_claim::HeadPolicy::default(),
+        )
+        .expect_err("a v3 chain does not extend a v2 head");
+        assert_eq!(
+            typed(&err),
+            Some(crate::head_claim::HeadFormatError::RetiredDigestV2),
+            "{err:#}"
+        );
+        let err = write_head_for_path(&db, 0, TEST_STORE_ROOT, TEST_PARSER_ID)
+            .expect_err("the writer refuses to chain onto a v2 head");
+        assert_eq!(
+            typed(&err),
+            Some(crate::head_claim::HeadFormatError::RetiredDigestV2),
+            "{err:#}"
+        );
     }
 
     /// The env wrapper reads `LLO_TRUSTED_QUERY_HASHES` and nothing else.

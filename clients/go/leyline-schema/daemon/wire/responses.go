@@ -73,14 +73,6 @@ type StatusResponse struct {
 	RootPublished *bool `json:"root_published"`
 }
 
-// FlushResponse is the wire shape of the `flush` op response. CurrentRoot
-// follows the root absence rule on [StatusResponse.RootPublished].
-type FlushResponse struct {
-	OK            *bool   `json:"ok"`
-	CurrentRoot   *string `json:"current_root,omitempty"`
-	RootPublished *bool   `json:"root_published"`
-}
-
 // SnapshotResponse is the wire shape of the `snapshot` op response.
 // CurrentRoot follows the root absence rule on
 // [StatusResponse.RootPublished].
@@ -134,12 +126,14 @@ type ReadSourceResponse struct {
 	Content *string `json:"content,omitempty"`
 	// BlobHash is the file's `_tree.blob_hash`, 64 hex chars.
 	BlobHash *string `json:"blob_hash,omitempty"`
-	// TreeRoot is the arena's treeRoot the file was read under, 64 hex chars.
-	TreeRoot *string `json:"tree_root,omitempty"`
 	Error    *string `json:"error,omitempty"`
 	// Mode is the file's git mode, six octal digits: [ModeRegular],
 	// [ModeExecutable] or [ModeSymlink].
 	Mode *string `json:"mode,omitempty"`
+	// StoreRoot is the arena's storeRoot the file was read under, 64 hex
+	// chars: the parser-free directory Merkle root `leyline/store-tree/v1`
+	// (LLO ADR-0047 D-ii). It replaced `tree_root`, which is never sent.
+	StoreRoot *string `json:"store_root,omitempty"`
 }
 
 // Git modes a [ReadSourceResponse.Mode] reports and a [ProposedWrite.Mode]
@@ -266,8 +260,9 @@ type ProposalRefusal struct {
 // beside Refusal: decide on OK and Refusal, never on whether Error is set.
 type ProposeResponse struct {
 	OK *bool `json:"ok"`
-	// TreeRoot is the arena's treeRoot after the proposal (OK only).
-	TreeRoot *string `json:"tree_root,omitempty"`
+	// StoreRoot is the arena's storeRoot after the proposal (OK only; LLO
+	// ADR-0047 D-ii). A grammar or epoch upgrade does not move it.
+	StoreRoot *string `json:"store_root,omitempty"`
 	// Blobs is each written path's new blob hash (OK only).
 	Blobs   []PathHash       `json:"blobs,omitempty"`
 	Refusal *ProposalRefusal `json:"refusal,omitempty"`
@@ -311,36 +306,6 @@ type FindCalleesResponse struct {
 	Callees []Ref `json:"callees"`
 }
 
-// TokenMapEntry is one (token, node_ids) pair in a refs-map / defs-map response.
-type TokenMapEntry struct {
-	Token   *string  `json:"token"`
-	NodeIDs []string `json:"node_ids"`
-}
-
-// GetRefsMapResponse is the wire shape of the `get_refs_map` op response.
-type GetRefsMapResponse struct {
-	OK      *bool           `json:"ok"`
-	Entries []TokenMapEntry `json:"entries"`
-}
-
-// GetDefsMapResponse is the wire shape of the `get_defs_map` op response.
-type GetDefsMapResponse struct {
-	OK      *bool           `json:"ok"`
-	Entries []TokenMapEntry `json:"entries"`
-}
-
-// SchemaTier is one entry in the `get_schema` op response.
-type SchemaTier struct {
-	Name   *string  `json:"name"`
-	Crates []string `json:"crates"`
-}
-
-// GetSchemaResponse is the wire shape of the `get_schema` op response.
-type GetSchemaResponse struct {
-	OK    *bool        `json:"ok"`
-	Tiers []SchemaTier `json:"tiers"`
-}
-
 // GetDbPathResponse is the wire shape of the `get_db_path` op response.
 type GetDbPathResponse struct {
 	OK           *bool   `json:"ok"`
@@ -352,11 +317,48 @@ type GetDbPathResponse struct {
 	HeadPath     *string `json:"head_path"`
 }
 
-// QueryResponse is the wire shape of the `query` op response.
+// QueryRefusalReason is why a `query` statement was refused, in its wire
+// spelling (the capnp `QueryRefusalReason` enumerant's `$Json.name`). A
+// reason this package does not name still decodes; a client must treat it
+// as a refusal.
+type QueryRefusalReason string
+
+// The QueryRefusalReason enumerants, in capnp ordinal order.
+const (
+	// QueryRefusalDeniedAction: the SQLite authorizer denied an action the
+	// statement takes; [QueryRefusal.Action] names it.
+	QueryRefusalDeniedAction QueryRefusalReason = "denied_action"
+	// QueryRefusalMultipleStatements: the SQL holds more than one
+	// statement. None of them ran.
+	QueryRefusalMultipleStatements QueryRefusalReason = "multiple_statements"
+	// QueryRefusalNotAQuery: the statement is not a read-only SELECT;
+	// [QueryRefusal.Action] is its leading keyword.
+	QueryRefusalNotAQuery QueryRefusalReason = "not_a_query"
+)
+
+// QueryRefusal is why a `query` statement was refused (LLO bead
+// ley-line-open-b7e9a3). Nothing ran and nothing changed.
+type QueryRefusal struct {
+	Reason *QueryRefusalReason `json:"reason"`
+	// Action is the refused action: an authorizer action in snake case
+	// (`insert`, `delete`, `attach`, `pragma`, `function`, ...) for
+	// denied_action, the leading keyword for not_a_query, `statement` for
+	// multiple_statements.
+	Action *string `json:"action"`
+	// Subject is what Action names (a table, pragma, function or attached
+	// file), when it names something.
+	Subject *string `json:"subject,omitempty"`
+}
+
+// QueryResponse is the wire shape of the `query` op response. `query` runs
+// one read-only SELECT: OK false with Refusal means the statement was
+// refused, OK false without it is an error running an allowed statement.
 type QueryResponse struct {
-	OK      *bool      `json:"ok"`
-	Columns []string   `json:"columns"`
-	Rows    []QueryRow `json:"rows"`
+	OK      *bool         `json:"ok"`
+	Columns []string      `json:"columns"`
+	Rows    []QueryRow    `json:"rows"`
+	Error   *string       `json:"error,omitempty"`
+	Refusal *QueryRefusal `json:"refusal,omitempty"`
 }
 
 // ── Sheaf op responses ─────────────────────────────────────────────
@@ -391,13 +393,6 @@ type SheafDefectResponse struct {
 	Generation *uint64  `json:"generation,string"`
 	Valid      *uint32  `json:"valid"`
 	Total      *uint32  `json:"total"`
-}
-
-// SheafStalksResponse is the wire shape of the `sheaf_stalks` op response.
-type SheafStalksResponse struct {
-	Generation *uint64 `json:"generation,string"`
-	Valid      *uint32 `json:"valid"`
-	Total      *uint32 `json:"total"`
 }
 
 // SheafStatusResponse is the wire shape of the `sheaf_status` op response.

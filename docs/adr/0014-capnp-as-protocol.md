@@ -47,7 +47,12 @@ Workerd (Cloudflare's open-source Workers runtime) and Sandstorm (capnp's birthp
 
 **Rule.** ADR-0014 schemas follow the same discipline:
 - Fields appended at next free `@N` with default values
-- Never rename; deprecated fields use `# DEPRECATED:` docstrings and stay in place
+- Never rename; deprecated fields use `# DEPRECATED:` docstrings and stay in place. One exception,
+  in use since ADR-0045: a field or enumerant a versioned break *retires* keeps its ordinal and is
+  renamed `retired<Name>` (JSON `retired_<name>`), never written, so the binary wire keeps reading
+  it and a reader can refuse its presence by name (`RefusalReason.retiredSyntax`;
+  `Head.retiredTreeRoot @7` and the daemon responses' `retiredTreeRoot`, ADR-0047 M1). The rename
+  is the break, and it is versioned where it lands (head digest v3, `wire_format_major` 2).
 - Never reuse an ordinal; never repurpose a field's meaning even if the type happens to match
 - File IDs (`@0xb0c0debaadc0deb0` etc.) are stable; CI gate on the `(filename, fileId)` allowlist
 - **No `schemaVersion :UInt64` field** in any T8 schema. The schema files themselves, addressed by the canonical hash of their source bytes (and locked to the toolchain triplet — see §3), are the version manifest.

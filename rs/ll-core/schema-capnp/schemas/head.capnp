@@ -53,15 +53,17 @@ struct Head {
   unboundFacts @4 :UInt64;
 
   # Signature over the canonical head digest — NOT over rootHash alone.
-  # The digest (v2) is BLAKE3_derive_key("leyline head digest v2",
-  # generation LE-8 ‖ rootHash ‖ parentHash ‖ treeRoot ‖ parserId ‖ P),
+  # The digest (v3) is BLAKE3_derive_key("leyline head digest v3",
+  # generation LE-8 ‖ rootHash ‖ parentHash ‖ storeRoot ‖ parserId ‖ P),
   # P = 0x00 without a parentDigest, 0x01 ‖ parentDigest with one; see
   # `leyline_core::head_digest`. Binding all six stops a signature being
   # replayed at another generation, grafted onto a forked chain, or cited for
-  # a tree or derivation it did not attest. A head that does not stamp
-  # treeRoot and parserId has no claim and is never signed; a signature on
-  # one does not verify. v1 (the first three fields only) is removed: a v1
-  # signature does not verify under v2. Ed25519
+  # a store or derivation it did not attest. A head that does not stamp
+  # storeRoot and parserId has no claim and is never signed; a signature on
+  # one does not verify. v1 (the first three fields only) and v2 (treeRoot
+  # in storeRoot's position) are removed: a v1 or v2 signature does not
+  # verify under v3, and a head carrying `retiredTreeRoot` is refused as a
+  # v2 head before any signature is checked (ADR-0047 M1). Ed25519
   # (64 bytes), matching the frozen leyline-net/v1 manifest so the in-flight
   # manifest and the at-rest head share one scheme and one trust root.
   #
@@ -81,60 +83,79 @@ struct Head {
   # canonical bytes.
   signerKid @6 :Data;
 
-  # ADR-0040 D1 — the tree identity, beside the run receipt above.
-  #
-  # `rootHash` names the segments ONE RUN wrote (truncated per run, so an
-  # incremental parse's root covers only the files it re-parsed, and the
-  # source record carries absolute paths and mtimes). `treeRoot` names the
-  # TREE: a tagged fold (scheme `leyline/tree-root/v1`, `PartitionSpec`
-  # RowSet domain, `canonVersion` 1) with `parserId`'s 32 bytes as the
-  # spec's params, over the store's manifest `_tree` (ADR-0045 T1/T2).
-  # The leaves are every file entry (regular, executable or symlink; a
-  # symlink's blob is its target) and every EMPTY directory; a non-empty
-  # directory is implied by its children and is not a leaf. Leaves are
-  # sorted by the relative path's bytes; leaf `i` contributes two entries:
-  #   (BLAKE3(relative path bytes), 2i,   byte length of the path)
-  #   (content,                     2i+1, modeTag)
-  # where `content` is the file's blob hash (`source_blobs` key) or, for an
-  # empty directory, BLAKE3 of no bytes; and `modeTag` is 0 for `0o100644`
-  # (so a tree of regular files folds as before ADR-0045) and the git mode
-  # itself otherwise (`0o100755`, `0o120000`, `0o040000`). Reference:
-  # `rs/ll-open/cli-lib/src/tree_root.rs` `tree_root_of`. Computed after
-  # COMMIT from the whole `_tree`, so it is the same for a cold parse, an
-  # incremental parse, a scoped reparse, a second directory, and a touched
-  # mtime, and differs when one byte, one path or one mode differs. Anyone
-  # holding the arena recomputes it (`leyline verify-head`); a mismatch is
-  # refused.
-  #
-  # SIGNED: the head signature's digest (`head_digest`, context
-  # "leyline head digest v2") binds `treeRoot` and `parserId` with
-  # `generation`, `rootHash`, `parentHash` and `parentDigest` (bead
-  # `ley-line-open-b68fa6`). A head that does not stamp both has no claim and
-  # is never signed.
-  #
-  # Additive per ADR-0014 §1: a head that does not set these fields has the
-  # same canonical bytes as before they existed. Empty = not stamped
-  # (written by a pre-ADR-0040 producer).
-  treeRoot @7 :Common.Hash;
+  # RETIRED by ADR-0047 M1 (bead `ley-line-open-73c6ee`): was `treeRoot`,
+  # the flat `leyline/tree-root/v1` fold with `parserId` as its params, so a
+  # grammar or epoch bump renamed an unchanged store. No producer writes it.
+  # A head that carries it is a head digest v2 head: every reader refuses it
+  # with a typed error (`HeadFormatError::RetiredDigestV2`) and never reads
+  # it as a claim, a parent digest or a store identity. The ordinal is kept
+  # (ADR-0014: never reused) so the refusal can see it.
+  retiredTreeRoot @7 :Common.Hash;
 
-  # ADR-0040 D1 — the identity of the derivation `treeRoot` was computed
-  # under: a tagged fold (scheme `leyline/parser-id/v1`) over the IR schema
-  # version, the projection schema version, the extraction, injection and
-  # query-set epochs (the last covers arena-resident query overrides by
-  # content hash), and every compiled grammar's node-kind and field tables.
-  # Two arenas with the same source under different `parserId`s are
-  # different derivations and must not share derived caches.
+  # ADR-0040 D1 — the identity of the derivation the projection was
+  # computed under: a tagged fold (scheme `leyline/parser-id/v1`) over the
+  # IR schema version, the projection schema version, the extraction,
+  # injection and query-set epochs (the last covers arena-resident query
+  # overrides by content hash), and every compiled grammar's node-kind and
+  # field tables. Two arenas with the same store under different
+  # `parserId`s are different derivations and must not share derived
+  # caches. It is NOT folded into `storeRoot` (ADR-0047 law C7): the
+  # parser-qualified identity is the pair, bound by the head digest and by
+  # `_meta.derived_from`.
   parserId @8 :Common.Hash;
 
-  # Bead ley-line-open-b68fa6 — the v2 head digest of the previous head's
+  # Bead ley-line-open-b68fa6 — the v3 head digest of the previous head's
   # claim (`leyline_core::head_digest`), bound into this head's signature.
   # `parentHash` names only the previous run's segments, and a no-op rerun
   # writes the same segments in every arena, so it does not identify which
-  # chain this head extends; this field names the previous claim, tree
+  # chain this head extends; this field names the previous claim, store
   # included. Empty when there is no previous head or the previous head had
-  # no claim (it stamped no treeRoot/parserId); the digest encodes that
-  # absence with a presence byte, never as zero.
+  # no claim (it stamped no storeRoot/parserId); the digest encodes that
+  # absence with a presence byte, never as zero. A v3 head never chains onto
+  # a v2 head: the v2 head is refused, so its digest is never computed.
   #
   # Additive per ADR-0014 §1: unset does not change canonical bytes.
   parentDigest @9 :Common.Hash;
+
+  # ADR-0047 D-ii / M1 — the store identity, beside the run receipt above.
+  #
+  # `rootHash` names the segments ONE RUN wrote (truncated per run, so an
+  # incremental parse's root covers only the files it re-parsed, and the
+  # source record carries absolute paths and mtimes). `storeRoot` names the
+  # STORE: a directory Merkle tree over the store's manifest `_tree`
+  # (ADR-0045 T1/T2), with no parser input (ADR-0047 law C7: a grammar,
+  # epoch or projection bump does not rename an unchanged store).
+  #
+  # Each directory node is a `PartitionSpec` fold (domain RowSet, scheme
+  # `leyline/store-tree/v1`, params EMPTY, `canonVersion` 1; ADR-0032 D2)
+  # over its direct children, sorted by the child name's bytes (a name is
+  # one path component: no `/`, not empty, not `.` or `..`). Child `i`
+  # contributes two entries:
+  #   (BLAKE3(name bytes), 2i,   byte length of the name)
+  #   (child,              2i+1, git mode of the child)
+  # where `child` is the file's blob hash (`source_blobs` key; a symlink's
+  # blob is its target) for a file (`0o100644`, `0o100755`, `0o120000`), and
+  # the child directory's node address for a directory (`0o040000`). An
+  # empty directory is the fold of no entries. `storeRoot` is the root
+  # directory's node address; a subtree's node address is the `storeRoot`
+  # of a store holding exactly that subtree. The manifest's directory
+  # entries are implied by their children, so a store is a function of its
+  # files and its empty directories. Reference:
+  # `rs/ll-open/cli-lib/src/store_root.rs` `StoreTree::root`; known-answer
+  # vectors: `rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json`
+  # `storeRoot`. Computed after COMMIT from the whole `_tree`, so it is the
+  # same for a cold parse, an incremental parse, a scoped reparse, a second
+  # directory, a touched mtime and a parser upgrade, and differs when one
+  # byte, one path or one mode differs. One edit refolds only the directory
+  # nodes on its path. Anyone holding the arena recomputes it (`leyline
+  # verify-head`); a mismatch is refused.
+  #
+  # SIGNED: the head signature's digest (`head_digest`, context
+  # "leyline head digest v3") binds `storeRoot` and `parserId` separately,
+  # with `generation`, `rootHash`, `parentHash` and `parentDigest`. A head
+  # that does not stamp both has no claim and is never signed.
+  #
+  # Additive per ADR-0014 §1: a head that does not set it has the same
+  # canonical bytes as before it existed. Empty = not stamped.
+  storeRoot @10 :Common.Hash;
 }

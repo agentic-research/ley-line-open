@@ -198,7 +198,6 @@ pub fn emit_cfg_for_source(
         .parse(source, None)
         .context("tree-sitter parse returned None during CFG emission")?;
     let root = tree.root_node();
-    let lang_name = language.name();
 
     let mut total_blocks = 0usize;
     for function_body_node in find_function_bodies(root, language) {
@@ -208,7 +207,7 @@ pub fn emit_cfg_for_source(
         // ADR-0027 fold; this stub is enough for T1.b3's F1 falsifiability
         // check because the CFG builder never joins against node_content
         // itself — only the FK gate cares.
-        insert_stub_node_content(conn, &body_hash, function_body_node, lang_name)?;
+        insert_stub_node_content(conn, &body_hash, function_body_node)?;
 
         let out = build_cfg(function_body_node, body_hash, language);
         insert_cfg_rows(conn, &out, source_id)?;
@@ -277,11 +276,13 @@ fn function_body_of<'t>(func_node: tree_sitter::Node<'t>) -> Option<tree_sitter:
 
 /// Content-addressed hash of a function-body subtree.
 ///
-/// This is a T1.b3-scope simplification: uses BLAKE3 of a canonical
-/// linearization of the subtree (κ kind + terminal token + child
-/// hashes, matching the shape `cmd_parse::fold_children` uses).
-/// Byte-identical to what the full merkle-AST fold produces for the
-/// same subtree — the F1 gate pins that identity.
+/// This is a T1.b3-scope simplification: plain BLAKE3 of a linearization
+/// of the subtree (κ kind + terminal token + child hashes, the fields
+/// `cmd_parse::fold_children` folds). It is NOT `node_hash`: the encoding
+/// differs (NUL-delimited, no node tag or lengths) and `node_hash` is keyed
+/// (merkle-ast-v3, `derive_key("leyline/ast-node/v3", …)`). The F1 gate
+/// pins only that this hash is reflow-invariant; the parse writes no
+/// `_cfg` rows, so only that gate's arenas hold it.
 fn compute_body_hash(source: &[u8], node: tree_sitter::Node<'_>, language: TsLanguage) -> [u8; 32] {
     // Post-order fold matching cmd_parse's shape: κ kind (or raw when
     // no κ mapping) + terminal token bytes (only for leaves) +
@@ -338,17 +339,11 @@ fn insert_stub_node_content(
     conn: &Connection,
     node_hash: &[u8; 32],
     node: tree_sitter::Node<'_>,
-    lang_name: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, raw_kind, lang, token, arity) \
-         VALUES (?1, 1, ?2, ?2, ?3, NULL, ?4)",
-        rusqlite::params![
-            &node_hash[..],
-            node.kind(),
-            lang_name,
-            node.named_child_count() as i64,
-        ],
+        "INSERT OR IGNORE INTO node_content (node_hash, node_tag, kind, token, arity) \
+         VALUES (?1, 1, ?2, NULL, ?3)",
+        rusqlite::params![&node_hash[..], node.kind(), node.named_child_count() as i64,],
     )
     .context("stub node_content insert")?;
     Ok(())

@@ -34,7 +34,12 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- Nothing in flight: `39998b` and `98d0c3` shipped (below); the next items follow.
+- `204a94` (in review) — a workspace grant no backend serves is refused
+  before spawn with its own execution/v1 code, `workspaceUnserved`, so
+  Cloister can route the run to a tier that serves workspaces; the service
+  cancels and refuses a run whose backend reports a start without serving
+  every granted workspace. The native pre-spawn refusal itself shipped in
+  #502 (`f8ebcf`).
 
 **Next**
 - `0fadab` — cut v0.21.0 from integration and hand mache the upgrade note
@@ -46,8 +51,6 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   own base, merge and `ESTALE`.
 - `483134` — `WorkspaceGrant` gains a write scope (exact paths and directory
   prefixes); storefs refuses writes outside it.
-- `204a94` — the native backend refuses a workspace-bearing run instead of
-  starting without the workspace.
 - `5c2040` — VM tests on Linux/KVM. Apple silicon is a manual release gate
   instead of CI (hosted macOS runners lack nested Hypervisor.framework):
   `task release:hypervisor:record` writes the receipt `tools/tag_release.sh`
@@ -71,8 +74,10 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 **Then**
 - `619a99` — ADR-0047's identity migrations, before the contract freeze because
   each moves a wire or projection identity: M1 parser-free Merkle `storeRoot`
-  (head digest v3, projection-v11), M2 keyed `node_hash` with `lang`/`raw_kind`
-  per occurrence (merkle-ast-v3, projection-v12), M3 run-id v2, M4 rooted blob
+  (head digest v3, projection-v11; implemented by `73c6ee`, mache adopts it in
+  `mache-107423`), M2 keyed `node_hash` with `lang`/`raw_kind`
+  per occurrence (merkle-ast-v3, projection-v12; implemented by `73add7` and
+  `b5d354`, mache adopts it in `mache-108e26`), M3 run-id v2, M4 rooted blob
   manifests. Each is one versioned bump; its mache or cloister issue is filed
   before its PR merges.
 - `b70e44`, `10075e` — the contract freeze, after the ADR status decisions.
@@ -116,7 +121,7 @@ Native filesystems are among the most optimized code there is, and every cost
 LLO has paid sits where it deviates from them: no page cache, one flush per
 write instead of a group-committed journal, semantic work on the write path,
 O(volume) work on a write, build output through the store. The direction
-(`d4f424`) is a control plane (the store of record: `treeRoot`, proposals,
+(`d4f424`) is a control plane (the store of record: `storeRoot`, proposals,
 merge, grants, projection) over several data planes that hold or serve the same
 bytes, each with its own identity domain and an adapter that turns its writes
 into proposals:

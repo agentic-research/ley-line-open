@@ -202,9 +202,12 @@ type DaemonReparseCompletePayload struct {
 }
 
 // DaemonOpPayload is the `data` payload for the generic `daemon.<op>`
-// topic — emitted by the UDS dispatcher after every state-changing op
-// (see `is_state_changing` in `daemon/ops.rs`). Carries just the op
-// name; the actual mutation has its own per-op response.
+// topic — emitted once by any op, over the UDS socket or MCP, that
+// changed the live db or the published arena; an op that changed
+// nothing emits nothing (`DaemonContext::observe_op` in
+// `daemon/mod.rs`). A read that queues lazy enrichment is followed by
+// `daemon.enrich` when that enrichment lands. Carries just the op name;
+// the actual mutation has its own per-op response.
 type DaemonOpPayload struct {
 	Op *string `json:"op"`
 }
@@ -281,8 +284,8 @@ func decodePayload(topic string, data json.RawMessage) (any, error) {
 		}
 		return p, nil
 	default:
-		// Generic daemon.<op> topics (load, reparse, flush, snapshot,
-		// enrich — see ops.rs::STATE_CHANGING_OPS): they all carry
+		// Generic daemon.<op> topics (load, reparse, enrich, propose,
+		// query, hdc_calibrate, ... — any op that changed state): they all carry
 		// {op: NAME}. Treat any `daemon.*` not matched above as that
 		// shape; truly unknown topics fall through to the raw message.
 		if len(topic) > len("daemon.") && topic[:len("daemon.")] == "daemon." {

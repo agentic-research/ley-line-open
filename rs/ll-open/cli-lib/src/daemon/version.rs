@@ -53,16 +53,23 @@ pub const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v0.11.0 release advances both. Binary-only releases leave this literal
 /// unchanged; a public consumer-contract release requires a matching nested
 /// Go-module tag.
-pub const SCHEMA_VERSION: &str = "0.25.0";
+pub const SCHEMA_VERSION: &str = "0.26.0";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions
 /// are non-breaking inside the same major.
 ///
 /// **History:**
-/// - 1: current. Includes the v0.4.3 wire shape — `data: {...}`
-///   nested under `Event`, `generation`/`prior_generation` as quoted
-///   strings per capnp_json u64 convention.
+/// - 1: the v0.4.3 wire shape — `data: {...}` nested under `Event`,
+///   `generation`/`prior_generation` as quoted strings per capnp_json u64
+///   convention.
+/// - 2: current (ADR-0047 M1, bead `ley-line-open-73c6ee`). `read_source`
+///   and `propose` answer `store_root` (the parser-free `storeRoot`) and
+///   never send `tree_root`. A major-1 client that decodes leniently would
+///   read the missing `tree_root` as "no root recorded", so the major moves
+///   and the handshake refuses it instead. ADR-0047 M2 (merkle-ast-v3) does
+///   not move it: no field is renamed, removed or retyped; `node_hash` values
+///   change lineage, which `ir_schema_version` on the same handshake names.
 ///
 /// A v0.4.2 daemon at wire-format major 0 would not satisfy a v0.4.3+
 /// client's expectations, even though both predate this constant — the
@@ -82,8 +89,17 @@ pub const SCHEMA_VERSION: &str = "0.25.0";
 /// compares this against the lineage it cached under; a mismatch means its
 /// cached addresses are not comparable and must be discarded.
 ///
+/// `merkle-ast-v3` (ADR-0047 D-i, step M2, bead `ley-line-open-73add7`) keys
+/// the fold with `derive_key("leyline/ast-node/v3", …)`; every `node_hash`
+/// moved from its v2 value. The wire carries `node_hash` with the same type
+/// and framing (hex in `validate`'s `emit_ast` rows, member hashes behind a
+/// sheaf region hash), so [`WIRE_FORMAT_MAJOR`] stays 2: this field, on the
+/// version handshake, is the lineage signal for a client that reads it (the
+/// daemon does not require the handshake first), and a v2 value compared
+/// with a v3 one is unequal, never a false match.
+///
 /// Bump lives in `cmd_parse::IR_SCHEMA_VERSION`, which re-exports this.
-pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
+pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v3";
 
 /// Shape of the SQLite projection: which tables exist and which columns they
 /// carry.
@@ -180,15 +196,56 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v2";
 ///   column sets, `node_hash` included. No identity moves: `node_hash`,
 ///   `Head.rootHash` and `treeRoot` are byte-identical. A v9 arena is
 ///   refused at parse open.
+/// - `projection-v11` — the store identity is parser-free (ADR-0047 D-ii /
+///   M1, bead `ley-line-open-73c6ee`). No table or column moves; the
+///   meaning of a stamped value does: `_meta.derived_from` becomes the v2
+///   value `v2 <storeRoot> <parserId> <projection_schema_version>`, whose
+///   first component is the directory Merkle `storeRoot`
+///   (`leyline/store-tree/v1`) where v1 carried the flat, parser-qualified
+///   `treeRoot`. The head beside the arena moves to head digest v3
+///   (`Head.storeRoot @10`; `treeRoot @7` is retired and refused), and the
+///   daemon wire's `tree_root` becomes `store_root`. `node_hash` and
+///   `Head.rootHash` are byte-identical; `parserId` changes, as at every
+///   bump, because it folds this label. A v10 arena is refused at parse
+///   open, and `leyline rebuild` refuses a v1 `derived_from`.
+/// - `projection-v12` — `node_hash` is keyed and `node_content` is a function
+///   of it (ADR-0047 M2: D-i and D-iii, beads `ley-line-open-73add7` and
+///   `ley-line-open-b5d354`). `node_content` loses `raw_kind` and `lang`: they
+///   are not in `node_hash`'s preimage, so the row kept whichever file's
+///   occurrence landed first and a write left the replaced file's value
+///   behind. Each occurrence keeps its own through `_ast.kind_id → kinds(lang,
+///   raw_kind)`; an anonymous token has no occurrence row, and its grammar
+///   kind is its `kind`, because the merkle-ast-v3 fold applies κ to named
+///   nodes only (an anonymous token hashes its grammar kind). Every
+///   `node_hash` moves to merkle-ast-v3 (`IR_SCHEMA_VERSION`), and with it
+///   `parserId`; `storeRoot` and `Head.rootHash` do not move. `node_defs` and
+///   `node_refs` gain `kind_id` (→ `kinds`), the occurrence's own `(lang,
+///   raw_kind)`: an injected-language occurrence has no `_ast` row, and this
+///   is where its language and grammar kind live (bead
+///   `ley-line-open-cc5c55`). A v11 arena is refused at parse open.
 ///
 /// Bump on ANY table added or removed, or column added or removed. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v10";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v12";
 
-pub const WIRE_FORMAT_MAJOR: u32 = 1;
+/// Current major of the JSON wire shape; its history is documented above,
+/// beside the module's version facts. Pinned by
+/// `wire_format_major_is_pinned`.
+pub const WIRE_FORMAT_MAJOR: u32 = 2;
+
+#[cfg(test)]
+mod pin_tests {
+    /// ADR-0047 M1 retired `tree_root` from two responses: a rename on the
+    /// wire, so the major moved. Bumping or reverting it is a deliberate
+    /// edit of this literal and of the history above.
+    #[test]
+    fn wire_format_major_is_pinned() {
+        assert_eq!(super::WIRE_FORMAT_MAJOR, 2);
+    }
+}
 
 /// Earliest schema-client version compatible with this daemon binary.
 /// Consumers compare their embedded schema-client version against this

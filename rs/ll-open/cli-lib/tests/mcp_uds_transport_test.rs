@@ -22,51 +22,8 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-/// Minimal HTTP/1.1 POST over an already-connected UDS. Written by hand
-/// because the point is to prove a RAW socket client works — the same thing
-/// notme-proxy does — not that a particular Rust HTTP crate can.
-fn post_over_uds(sock: &PathBuf, body: &str, token: Option<&str>) -> (u16, String) {
-    let mut stream = UnixStream::connect(sock).expect("connect MCP uds");
-    let auth = token
-        .map(|t| format!("x-leyline-token: {t}\r\n"))
-        .unwrap_or_default();
-    let req = format!(
-        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
-         {auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    stream.write_all(req.as_bytes()).expect("write request");
-    stream.flush().expect("flush");
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line).expect("read status");
-    let code: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0);
-
-    // Drain headers, then the rest is the body.
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-            break;
-        }
-    }
-    let mut body_out = String::new();
-    let mut chunk = String::new();
-    while reader.read_line(&mut chunk).unwrap_or(0) > 0 {
-        body_out.push_str(&chunk);
-        chunk.clear();
-    }
-    (code, body_out)
-}
 
 #[test]
 fn mcp_tools_list_completes_over_uds_with_the_token_gate_enabled() {
@@ -77,8 +34,13 @@ fn mcp_tools_list_completes_over_uds_with_the_token_gate_enabled() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     let ctx = common::daemon_context(tmp.path());
-    leyline_cli_lib::daemon::mcp::spawn_uds(ctx, sock.clone(), Some(Arc::new(token.clone())))
-        .expect("spawn MCP over uds");
+    leyline_cli_lib::daemon::mcp::spawn_uds(
+        ctx,
+        sock.clone(),
+        Some(Arc::new(token.clone())),
+        leyline_cli_lib::daemon::mcp::McpGrant::all(),
+    )
+    .expect("spawn MCP over uds");
 
     // Poll the real condition rather than sleeping a fixed interval — a
     // wall-clock sleep as a stop condition races the scheduler and flakes under
@@ -100,13 +62,84 @@ fn mcp_tools_list_completes_over_uds_with_the_token_gate_enabled() {
 
     // Without the token the gate must refuse — otherwise the new transport
     // would be an open surface that a happy-path test would never notice.
-    let (code, _) = post_over_uds(&sock, req, None);
+    let (code, _) = common::post_mcp_over_uds(&sock, req, None);
     assert_eq!(code, 401, "unauthenticated tools/list must be rejected");
 
-    let (code, body) = post_over_uds(&sock, req, Some(&token));
+    let (code, body) = common::post_mcp_over_uds(&sock, req, Some(&token));
     assert_eq!(code, 200, "authenticated tools/list must succeed: {body}");
     assert!(
         body.contains("\"tools\""),
         "tools/list must return a tools array over UDS; got {body}",
     );
+}
+
+/// Bead `ley-line-open-851a65`, end to end through the router a listener
+/// actually serves: a listener granted only `query` refuses `load` (a daemon
+/// op MCP does not advertise), `propose` (group `write`) and raw SQL (group
+/// `sql`), lists only the `query` group's tools, and answers them.
+#[test]
+fn a_listener_serves_only_its_granted_groups() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock: PathBuf = tmp.path().join("llo-mcp.sock");
+    let token = "b".repeat(64);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let ctx = common::daemon_context(tmp.path());
+    leyline_cli_lib::daemon::mcp::spawn_uds(
+        ctx,
+        sock.clone(),
+        Some(Arc::new(token.clone())),
+        leyline_cli_lib::daemon::mcp::McpGrant::groups(&["query"]).unwrap(),
+    )
+    .expect("spawn MCP over uds");
+    drop(common::wait_for_uds(&sock, 10_000));
+
+    let call = |name: &str, args: &str| -> serde_json::Value {
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+        );
+        let (code, body) = common::post_mcp_over_uds(&sock, &req, Some(&token));
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    };
+
+    let load = call("load", r#"{"db":""}"#);
+    assert_eq!(
+        load["error"]["code"],
+        leyline_cli_lib::daemon::mcp::TOOL_NOT_ADVERTISED,
+        "{load}"
+    );
+    let propose = call("propose", r#"{"writes":[]}"#);
+    assert_eq!(
+        propose["error"]["code"],
+        leyline_cli_lib::daemon::mcp::TOOL_NOT_GRANTED,
+        "{propose}"
+    );
+    assert_eq!(propose["error"]["data"]["group"], "write", "{propose}");
+    // Raw SQL is group `sql`, not `query`: a read-side grant does not run
+    // caller-written SQL at all.
+    let drop = call("query", r#"{"sql":"DROP TABLE IF EXISTS nodes"}"#);
+    assert_eq!(drop["error"]["data"]["group"], "sql", "{drop}");
+    // Dispatched: the empty test db has no tree, so the op itself errors.
+    let listed = call("list_children", r#"{"id":""}"#);
+    assert!(listed.get("result").is_some(), "{listed}");
+
+    let (_, body) = common::post_mcp_over_uds(
+        &sock,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        Some(&token),
+    );
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    let query_group = leyline_cli_lib::daemon::mcp::cloister_groups()
+        .into_iter()
+        .find(|g| g.name == "query")
+        .unwrap();
+    assert_eq!(names, query_group.upstream_names, "{body}");
 }

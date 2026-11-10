@@ -1,7 +1,11 @@
 # ADR-0047 — Σ amendment: σ is indexed by construction; witnesses, four edge kinds, and the identity migrations
 
 **Status:** Accepted (owner, 2026-11-04). Decisions D-i to D-iv below take the recommended
-option; the alternatives and their costs are kept as the record.
+option; the alternatives and their costs are kept as the record. Implementation: M0 shipped
+(`ley-line-open-10d71a`); M1 (D-ii) is implemented by `ley-line-open-73c6ee`; M2 (D-i for
+`node_hash`, and D-iii) is implemented by `ley-line-open-73add7` and `ley-line-open-b5d354`;
+M3–M4 are proposed. Sections that describe shipped code before M1 say so; §3 records the
+conformance after M2.
 **Bead:** `ley-line-open-619a99`
 **Amends:** the Σ decade (`docs/decades/2026-merkle-cas-substrate.md` §1.1–§1.3, typed in
 `rs/ll-core/core/src/substrate.rs`); ADR-0032 D2 (generalised from "every address is a tagged
@@ -76,9 +80,9 @@ probability. Enforced by keying every construction except `σ_bytes`.
 
 | Law | Test (to add) | Fails today? |
 |---|---|---|
-| (a) | `construction_equality_is_value_equality`: for every registered construction, a proptest that distinct values under `≡_D` give distinct addresses and that every presentation of one value (enumeration order for sets; location, run and arena for content) gives one address; plus a known-answer vector per construction (§5, (DET)). The restriction key's `key_tests::injectivity` (`rs/ll-open/cache/src/restriction.rs`) is the model. | `node_content` rows fail (a): `lang` and `raw_kind` are not functions of `node_hash` (D-iii). The hashes themselves pass. |
+| (a) | `construction_equality_is_value_equality`: for every registered construction, a proptest that distinct values under `≡_D` give distinct addresses and that every presentation of one value (enumeration order for sets; location, run and arena for content) gives one address; plus a known-answer vector per construction (§5, (DET)). The restriction key's `key_tests::injectivity` (`rs/ll-open/cache/src/restriction.rs`) is the model. | `node_content` rows failed (a) until M2: `lang` and `raw_kind` were not functions of `node_hash` (D-iii). Projection-v12 drops them; `a_write_leaves_no_stale_language_on_a_shared_node` and the rebuild gate (`cmd_rebuild.rs`, no exclusion) pass. |
 | (b) | `ref_of_one_construction_does_not_compare_with_another`: a `trybuild` compile-fail test that `Ref<Blob> == Ref<AstNode>`, `Ref<Tree> → Ref<ArenaImage>` and any `From<Ref<A>> for Ref<B>` do not compile; plus a test that a `Loc` does not serialize without its version. | Not representable yet: one `Hash` carries every construction (`substrate.rs:58`). |
-| (c) | `crafted_preimage_does_not_alias_across_constructions`: for every keyed construction D, `σ_bytes(enc_D(x)) ≠ σ_D(x)` on sampled x; includes the `ley-line-open-73add7` reproduction (an 18-byte file whose `blob_hash` equals the `node_hash` of the Rust leaf `fn`) as a fixed case. | Yes, for `node_hash` and `run_id` (D-i). |
+| (c) | `crafted_preimage_does_not_alias_across_constructions`: for every keyed construction D, `σ_bytes(enc_D(x)) ≠ σ_D(x)` on sampled x; includes the `ley-line-open-73add7` reproduction (an 18-byte file whose `blob_hash` equals the `node_hash` of the Rust leaf `fn`) as a fixed case. | Yes, for `run_id` (D-i, M3). `node_hash` passes since M2 (merkle-ast-v3): `crafted_preimage_does_not_alias_across_constructions` (`rs/ll-open/cli-lib/tests/sigma_axioms.rs`) runs in every `task ci`. |
 
 ## 2. Witnesses, `verify`, and the four edge kinds
 
@@ -107,9 +111,9 @@ has no witness of its own; it resolves inside a version (§2.2, Locates).
 
 | Edge | Form | Evidence | Shipped instances |
 |---|---|---|---|
-| **Derives** | `A → B` | B recomputed from A's witness plus public inputs | bytes → `blob_hash`, chunk hashes; `(manifest, parserId)` → `treeRoot`; `(bytes, parserId)` → `node_hash`; spec → `run_id` |
-| **Contains** | `A ∋ B` | a path of witnesses from A down to an entry naming B (Σ §1.3) | `treeRoot ∋ (path, mode, blob)`; `node_hash ∋` child `node_hash`; blob manifest ∋ chunk |
-| **Attests** | `A ⟷ B` | S over a keyed digest naming both (ADR-0032 D3) | `RunReceipt`/`EvidenceBinding` over `run_id` and spec digest; head digest v2 over `rootHash`, `treeRoot`, `parserId` (#517) |
+| **Derives** | `A → B` | B recomputed from A's witness plus public inputs | bytes → `blob_hash`, chunk hashes; manifest → `storeRoot` (no parser input, M1); `(bytes, parserId)` → `node_hash`; spec → `run_id` |
+| **Contains** | `A ∋ B` | a path of witnesses from A down to an entry naming B (Σ §1.3) | `storeRoot ∋` directory node `∋ (name, mode, child)`, one node per path component; `node_hash ∋` child `node_hash`; blob manifest ∋ chunk |
+| **Attests** | `A ⟷ B` | S over a keyed digest naming both (ADR-0032 D3) | `RunReceipt`/`EvidenceBinding` over `run_id` and spec digest; head digest v3 over `rootHash`, `storeRoot`, `parserId` (M1; v2 bound `treeRoot`, #517) |
 | **Locates** | `(Ref<V>, k) → B` | resolution of local key k inside version V; the result is checked by B's own witness | `nid`, `content_id`, `file_id`, `name_id`, `kind_id` |
 
 **Locators are valid only as `(version Ref, local key)`.** A bare locator replayed against
@@ -122,14 +126,20 @@ emits a raw `nid` as `node_id`, 80f037 F3).
 `Ref<D: Construction>` is a `repr(transparent)` newtype over the 32-byte address with D as a
 phantom; it is minted only beside its fold (no public `from_bytes`, no `ZERO`; absence is
 `Option`), and no `From` exists between constructions. Arena-local ids are newtypes (`Nid`,
-`FileId`, `NameId`, `KindId`, `ContentId`) with SQL impls and no serde or Cap'n Proto impls; a
-`Loc<V, K>` pairs one with a `Ref<V>`. `kid` stays outside Σ (SHA-256 of canonical SPKI, a
+`FileId`, `DirId`, `NameId`, `KindId`, `ContentId`) with SQL impls and no serde or Cap'n Proto
+impls. They live in `leyline-schema` (`rs/ll-core/schema/src/locator.rs`), which owns the nid
+encoding and is Apache-2.0 and so cannot depend on AGPL `leyline-core`. A `Loc<V, K>` will pair
+one with a `Ref<V>`; it is not built yet. `kid` stays outside Σ (SHA-256 of canonical SPKI, a
 key's name). Cap'n Proto does not gain a construction-tag field beside a digest (a label
 adjacent to a digest is the unbound label ADR-0032 D2 forbids); new identity fields get
 distinct struct types, existing `Common.Hash` ordinals stay put (ADR-0014) behind typed
 accessors.
 
 ## 3. Conformance: every shipped identity against the laws
+
+Line citations are at `e4690505` (before M1). The `parserId`, head digest and store-identity rows
+are updated for M1 (`73c6ee`); `tree_root.rs` became `store_root.rs`. The `node_hash` row is
+updated for M2 (`73add7`, `b5d354`).
 
 | Identity | Construction (code) | (a) | (c) | Other | Verdict |
 |---|---|---|---|---|---|
@@ -138,22 +148,23 @@ accessors.
 | `Controller.current_root` | σ_bytes over the arena image (`rs/ll-core/core/src/control.rs:68`) | yes | base case | — | **Complies** |
 | spec digest (`blake3-256:`) | σ_bytes ∘ Cap'n Proto canonical form (`rs/ll-open/runtime/src/authorization.rs:343`) | yes | base case | typed by `DigestRef` | **Complies** |
 | `confinementDigest` | σ_bytes ∘ canonical JSON (`rs/ll-core/schema-spec/confinement/v1/README.md:80`) | yes | base case | — | **Complies** |
-| `parserId` | keyed `RowSet` fold `leyline/parser-id/v1` (`rs/ll-open/cli-lib/src/tree_root.rs:89-121`) | yes | yes | — | **Complies** |
+| `parserId` | keyed `RowSet` fold `leyline/parser-id/v1` (`rs/ll-open/cli-lib/src/store_root.rs`, `ParserInputs::parser_id`) | yes | yes | — | **Complies** |
 | grammar digest | keyed fold `leyline/grammar-digest/v1` (`rs/ll-open/ts/src/languages.rs:166,288`) | yes | yes | — | **Complies** |
 | `Head.rootHash` | keyed fold `leyline/segment-root/v1` (`rs/ll-open/cli-lib/src/cmd_parse.rs:2644,2725`) | yes, over segments | yes | a run receipt, not a store identity (carries absolute paths and mtimes) | **Complies** |
-| head digest v2 | own context `leyline head digest v2` (`head_digest.rs:61`) | yes | yes | binds `treeRoot`, `parserId`, `parentDigest` (#517) | **Complies**; moves to v3 under D-ii |
+| head digest v3 | own context `leyline head digest v3` (`head_digest.rs`, `HEAD_DIGEST_CONTEXT`) | yes | yes | binds `storeRoot` and `parserId` separately, and `parentDigest`; a head carrying `retiredTreeRoot` is refused as v2 (`HeadFormatError::RetiredDigestV2`) | **Complies** (v2, which bound `treeRoot`, removed by M1) |
 | restriction key | keyed `RowSet` fold, rows under `derive_key("leyline/restriction/v1")`, `parserId` in params (`rs/ll-open/cache/src/restriction.rs:87-103,200-214`) | yes (proptest) | yes | whole-object arm passes `Hash::ZERO` as params (`restriction.rs:740`): lawful (a distinct construction), but a sentinel where `Option` belongs | **Complies**: first shipped lawful `Ref<Restriction>` |
-| `node_hash` | plain σ over `"llo/ast/v1" ‖ 0x00 ‖ tag ‖ …` (`cmd_parse.rs:3270,3297-3325`) | hash yes; `node_content` row no (`lang`, `raw_kind`, `rs/ll-open/cli-lib/src/cmd_rebuild.rs:368`) | **no**: prefix-in-preimage, reproduced collision (`73add7`) | — | **Violates (c)** → D-i; row violates (a) → D-iii |
+| `node_hash` | merkle-ast-v3: `derive_key("leyline/ast-node/v3", tag ‖ …)` (`cmd_parse.rs`, `hash_leaf`/`hash_internal`, `NODE_HASH_CONTEXT`); merkle-ast-v2 was plain σ over `"llo/ast/v1" ‖ 0x00 ‖ tag ‖ …` | yes; the `node_content` row too since projection-v12 dropped `lang` and `raw_kind` (D-iii) | yes (M2; the `73add7` collision is a fixed case of the law (c) test) | known-answer vectors `astNode` checked in Rust and Go | **Complies** (M2). Was: violates (c) and the row violates (a) |
 | `run_id` | plain σ over `"cloister/execution/v1/run-id" ‖ 0x00 ‖ …` (`authorization.rs:864,912-925`) | yes | **no**: prefix-in-preimage | pinned cross-repo by `execution/v1/test-vectors/run-id.json` | **Violates (c)** → D-i |
-| `Head.treeRoot` | keyed `RowSet` fold `leyline/tree-root/v1`, **`params = parserId`**, flat over 2n entries (`tree_root.rs:157-182`) | yes, for the (store, parser) pair | yes | **violates parameter independence** (a grammar, epoch or projection bump renames an unchanged store, `73c6ee`) and **Σ §1.3** (one flat fold: an edit or a membership proof costs O(n), not O(log n)) | **Non-conforming** → D-ii |
+| `Head.storeRoot` | directory Merkle tree, one keyed `RowSet` fold `leyline/store-tree/v1` per directory, params empty (`store_root.rs`, `StoreTree::root`) | yes (proptests in `store_root.rs`; known-answer vectors per node) | yes | parameter independent (no parser input); one edit refolds the nodes on its path (240 entries for the 50,000-file fixture, bound 300) | **Complies** (M1). It replaced `Head.treeRoot` (`leyline/tree-root/v1`, `params = parserId`, flat over 2n entries), which violated parameter independence and Σ §1.3 and is removed |
 | blob manifest | rootless rows keyed by `blob_hash` (`rs/ll-open/fs/src/blob_chunked.rs:53-64`) | — | — | no address; sub-floor blobs never enter the pool (619a99 F3: 572 of 954 blobs on `rs/`) | **Not an identity yet** → D-iv |
 | locators (`nid`, `content_id`, interned ids) | arena-local integers (`rs/ll-core/schema/src/lib.rs:86-98,138-143`) | n/a | n/a | one bare-`nid` wire leak (`daemon/ops.rs:1480`) | **Complies except the leak** (80f037) |
 
-**Headline.** Of 15 shipped identities, 10 comply; `node_hash` and `run_id` violate
-construction separation (both prefix-in-preimage); `treeRoot` violates parameter independence
-and §1.3 (parser in params, flat fold); `node_content`'s `lang`/`raw_kind` violate (a); the
-blob manifest has no address; one locator leaks bare onto the wire. Plain `blob_hash` is the
-single unkeyed base case and stays so.
+**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after M1, 12 after M2;
+`run_id` violates construction separation (prefix-in-preimage) until M3, as `node_hash` did until
+M2; `treeRoot` violated parameter independence and §1.3 (parser in params, flat fold) until M1
+replaced it with `storeRoot`; `node_content`'s `lang`/`raw_kind` violated (a) until M2 removed
+them; the blob manifest has no address; one locator leaks bare onto the wire. Plain `blob_hash`
+is the single unkeyed base case and stays so.
 
 ## 4. Decisions
 
@@ -183,11 +194,18 @@ bound to an old `run_id` stops verifying (fail closed, since verifiers recompute
   `derived_from` stamp. Does not move: `Head.rootHash` (no AST segment field carries a node
   hash, `rs/ll-core/schema-capnp/schemas/ast.capnp:29-43`), and after D-ii lands, `storeRoot`.
   Construction: `derive_key("leyline/ast-node/v3", tag ‖ uvarint|kind| ‖ kind ‖ …)`, the
-  current preimage without the in-band prefix. Bump: `IR_SCHEMA_VERSION`
+  current preimage without the in-band prefix. As shipped (M2) the fold also applies κ to named
+  nodes only, so an anonymous token's `kind` is its grammar kind (D-iii needs it: such a token has
+  no occurrence row). Bump: `IR_SCHEMA_VERSION`
   `merkle-ast-v2 → merkle-ast-v3` (`rs/ll-open/cli-lib/src/daemon/version.rs:72`), which mache
   already records (`mache/cmd/build_meta.go:60-75`). Old artifact: an arena whose
   `_meta.ir_schema_version` is `merkle-ast-v2` fails `leyline rebuild`'s `parserId` check and
-  the incremental guard, and is re-parsed cold; nothing converts old hashes.
+  the incremental guard, and is re-parsed cold; nothing converts old hashes. As shipped (M2),
+  the shared `projection-v12` bump refuses a v11 arena at parse open before either check runs.
+  On the wire `node_hash` appears as hex in `validate`'s `emit_ast` rows and behind sheaf region
+  hashes (whose fold binds `parserId`); its type and framing do not change, so the wire format
+  major stays 2. The version handshake's `ir_schema_version` (`merkle-ast-v3`) names the lineage,
+  and a v2 value compared with a v3 value is unequal, never a false match.
 - `run_id` — moves: every derived run identity and the pinned vector. Construction:
   `derive_key("cloister/execution/v1/run-id/v2", u64le|spec| ‖ spec ‖ u64le|grant| ‖ grant ‖
   u64le|replay| ‖ replay)`, rendered `run-v2-<64 hex>`. Bump: the vector file gains the v2
@@ -211,34 +229,46 @@ parameters enter the identity (prolly), which reintroduces a tunable into a cont
 
 **Decision: (A).** Each directory node is a keyed `RowSet` fold under
 `leyline/store-tree/v1`, params empty, over its entries sorted by name bytes: per entry
-`(σ_bytes(name), a = 2i, b = |name|)` and `(child, a = 2i + 1, b = mode_tag(mode))`, where
+`(σ_bytes(name), a = 2i, b = |name|)` and `(child, a = 2i + 1, b = git mode)`, where
 `child` is the `blob_hash` for a file or symlink and the child directory's node address for a
-directory; an empty directory is the fold of no entries. `storeRoot` is the root directory's
+directory, and `b` is the child's full git mode (`0o100644`, `0o100755`, `0o120000`, or
+`0o040000` for a directory; the `tree-root/v1` convention of `0` for a regular file is not
+carried over, since no pre-M1 root has to be preserved); an empty directory is the fold of no
+entries. `storeRoot` is the root directory's
 address. A subtree's address is the `storeRoot` of a store holding exactly that subtree, so a
 sub-manifest (ADR-0040 D2) is named by its own root. Contains proofs are the directory nodes on
 one path: O(depth × fanout). That meets Σ §1.3 for bounded fanout; a single directory with
 very wide fanout costs O(fanout), which the §1.3 falsifier (§5) measures; a fanout split for
 wide directories would be `store-tree/v2`.
 
-**Consequences.** A grammar, epoch or projection bump no longer renames the store, so open
-proposals stay valid across a parser upgrade (they carry `storeRoot` bases). `treeRoot` is
+**Consequences.** A grammar, epoch or projection bump no longer renames the store, so a grant
+whose `graphRoot` is `blake3-256:<storeRoot>` stays valid across a parser upgrade (proposals
+carry per-path blob-hash bases, which never depended on the parser). `treeRoot` is
 removed; `derived_from = (storeRoot, parserId, projection_schema_version)` carries the
 derivation. ADR-0041 S6 simplifies: the transport unit is named by `storeRoot` alone, and
 blobs verify against it without the sender's parser.
 
 **Versioning and migration.**
-- Moves: `Head.treeRoot @7` is no longer written; `Head.storeRoot @10` is added
-  (`rs/ll-core/schema-capnp/schemas/head.capnp:118,127,139`; ordinals are never reused, ADR-0014).
-  Head digest `v2 → v3` (`leyline head digest v3`, binding `storeRoot` in `treeRoot`'s
-  position); a v2 signature does not verify under v3 because the context differs. Daemon wire:
-  `tree_root` (`rs/ll-core/public-schema/capnp/daemon.capnp:299,451`) is replaced by
-  `store_root` under new ordinals; `compatibility.json`, the generated Go bindings and
-  `server.json` are regenerated. `_meta.derived_from`'s first component becomes `storeRoot`.
-  Bump: `PROJECTION_SCHEMA_VERSION` `projection-v10 → projection-v11` (`version.rs:175`), and the
-  release `SCHEMA_VERSION` (`version.rs:42`).
-- Old artifact: `leyline verify-head` on a head with no `storeRoot` reports it unstamped and
-  refuses; `leyline rebuild` refuses a v10 stamp; the daemon re-parses a v10 arena cold.
-  Proposals naming a `tree_root` base are refused as malformed at the wire.
+- Moves: `Head.treeRoot @7` is renamed `retiredTreeRoot` and no longer written;
+  `Head.storeRoot @10` is added (ordinals are never reused, ADR-0014). Head digest `v2 → v3`
+  (`leyline head digest v3`, binding `storeRoot` in `treeRoot`'s position); a v2 signature does
+  not verify under v3 because the context differs. Daemon wire: `ReadSourceResponse.treeRoot @3`
+  and `ProposeResponse.treeRoot @1` are renamed `retiredTreeRoot` (JSON `retired_tree_root`,
+  never sent) and `store_root` is added as `ReadSourceResponse.storeRoot @6` and
+  `ProposeResponse.storeRoot @7`; the `no_tree_root` refusal reason is unchanged (it names the
+  filesystem source directory, not this identity). The generated Go bindings and `server.json`
+  are regenerated; `compatibility.json` carries no field that moves. `_meta.derived_from`
+  becomes the value `v2 <storeRoot> <parserId> <projection_schema_version>`. Bump:
+  `PROJECTION_SCHEMA_VERSION` `projection-v10 → projection-v11`. The public schema-client
+  `SCHEMA_VERSION` is not edited by the M1 PR: `tools/bump_release_version.sh` bumps it at the
+  release because `clients/go/leyline-schema` changed.
+- Old artifact: a head carrying `retiredTreeRoot` is refused with the typed error
+  `HeadFormatError::RetiredDigestV2` by `leyline verify-head`, by the signature policy, and by
+  the next parse's chain (delete the head and reparse to start a v3 chain); a head that stamps
+  neither `storeRoot` nor `parserId` is reported unstamped and refused. `leyline rebuild` refuses
+  a v1 `derived_from` by version. A projection-v10 arena is refused at parse open and at daemon
+  warm start, and is rebuilt by a cold reparse. Proposal requests never carried a `tree_root`
+  (a base is a blob hash, `any` or `absent`); responses no longer carry it.
 - Order: mache issue filed → LLO M1 PR (scheme, head digest v3, wire, projection-v11, ADR-0040
   D1/D6 and ADR-0041 S6 text) → mache pins.
 
@@ -256,11 +286,21 @@ they cannot be columns of its content row. (A) changes what the address means to
 storage defect; (C) keeps a row that is not a function of its key.
 
 **Consequences.** `node_content` becomes a function of `node_hash`; `cmd_rebuild.rs:368`'s
-exclusion is deleted and the gate compares every column (`b5d354`'s acceptance). The `R3`
-storage cut of `ley-line-open-9c1af2` comes with it. Precondition the implementation proves: a
+exclusion is deleted and the gate compares every column (`b5d354`'s acceptance). The
+`lang`/`raw_kind` half of `ley-line-open-9c1af2`'s `R3` storage cut comes with it; `kind` stays
+TEXT, and 9c1af2 keeps its measurement. Precondition the implementation proves: a
 consumer reading a child's raw kind reads it from the child occurrence, and for content rows
 no occurrence reaches, the raw kind is recoverable or not needed (test: a re-parse reproduces
-every per-occurrence `(lang, raw_kind)`).
+every per-occurrence `(lang, raw_kind)`). As shipped (M2): named nodes keep both through
+`_ast.kind_id → kinds`, and the rebuild gate compares those per occurrence; an anonymous token
+has no `_ast` row, and its raw kind is its `node_content.kind` because the merkle-ast-v3 fold
+applies κ to named nodes only. Before v3 it applied κ to every node, and JavaScript's and
+TypeScript's anonymous `class` keyword was stored as κ `type`, its grammar kind nowhere in
+the projection (`an_anonymous_tokens_kind_is_its_grammar_kind`,
+`rs/ll-open/cli-lib/tests/ir_producer.rs`). Injected subtrees have no `_ast` row (`_ast` is the
+host's tree, independent of the injection pass); their occurrences are their `node_defs` /
+`node_refs` rows, which projection-v12 gives a `kind_id → kinds` column, as `_ast` has, so an
+injected def still answers its `(lang, raw_kind)` (`ley-line-open-cc5c55`).
 
 **Versioning and migration.** Moves: two `node_content` columns (`schema.rs:404-411`). Does not
 move: any hash or root. Bump: one projection version, shared with D-i's `node_hash` v3 (§4.6).
@@ -319,15 +359,17 @@ merges.
 
 | Step | Contents | Bump | Identities moved |
 |---|---|---|---|
-| M0 | `Ref<D>`, `Witness<D>`, `verify`, locator newtypes in `leyline-core`; the law tests that hold today (§1.3) and the axiom suite (§5); cas-ffi derive-key export | none (additive) | none |
-| M1 | D-ii: `storeRoot` (`store-tree/v1`), head digest v3, wire `store_root`, `derived_from` v2 | `projection-v11`, head digest v3, release | `treeRoot` removed, `storeRoot` added |
-| M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin; `9c1af2`'s R3 rides along | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
+| M0 | `Ref<D>`, `Witness<D>`, `verify`, locator newtypes in `leyline-schema`; the law tests that hold today (§1.3) and the axiom suite (§5); cas-ffi derive-key export | none (additive) | none |
+| M1 | D-ii: `storeRoot` (`store-tree/v1`), head digest v3, wire `store_root`, `derived_from` v2 — **implemented** (`73c6ee`) | `projection-v11`, head digest v3, release | `treeRoot` removed, `storeRoot` added |
+| M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin — **implemented** (`73add7`, `b5d354`); wire format major unchanged (2). Of `9c1af2`'s R3, the `lang`/`raw_kind` half lands here (its option (b)); `node_content.kind` stays TEXT and the dbstat measurement is still open on `9c1af2` | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
 | M3 | D-i `run_id` v2 | run-id vector v2, release | `run_id` |
 | M4 | D-iv: rooted blob manifests, one-chunk sub-floor manifests | `projection-v13` | none moved; manifest address added |
 
 M1 precedes M2 so that the `IR_SCHEMA_VERSION` bump in M2 does not rename the store. M3 is
 independent of M1/M2 and may run in parallel with them. Law (c)'s test lands green at the end
-of M3; until then it carries the two known failures as named cases that M2 and M3 close.
+of M3; until then it carries the two known failures as named cases that M2 and M3 close. M2
+closed the `node_hash` case (`leyline-cli-lib`'s test runs green); `run_id`'s, in
+`leyline-runtime`, waits for M3.
 
 ## 5. The axiom-falsification suite
 
@@ -339,7 +381,7 @@ never filed. These are its tests; each runs in `task ci`.
 | (CA) ρ(σ(v)) = v | `ca_round_trip_every_store`: proptest over arbitrary bytes (empty, sub-floor, ≥ `MAX_CHUNK`) through every ρ: `source_blobs` via storefs read, the chunk pool (`SqliteBlobStore`), blob-manifest reconstruction. `ca_tampered_payload_is_refused`: flip one stored byte; every ρ fails closed (decade F3). | `rs/ll-open/fs`, `rs/ll-open/storefs`, `rs/ll-open/cdc` |
 | (DET) | `det_known_answer_vectors`: one checked-in vector per construction (σ_bytes, each `PartitionSpec` construction, `parserId` on fixed inputs, `storeRoot`, `node_hash`, segment root, head digest, restriction key, `run_id`), consumed by Rust tests and published under `schema-spec` for Go and TypeScript consumers; run on Linux and macOS CI. `det_parse_is_thread_count_invariant`: parse a fixture tree with one and with N rayon threads; equal `node_hash` sets, `storeRoot`, `rootHash` modulo absolute paths. | `rs/ll-core/core`, `rs/ll-core/schema-spec`, `rs/ll-open/cli-lib` |
 | (IM) | `im_address_is_never_rebound`: a proptest over write sequences; for every address-keyed table (`source_blobs`, `node_content`, `content_chunks`, `capnp_blobs`) the bytes first stored under an address never change and still satisfy σ = address. `im_sigkill_mid_publish_never_exposes_torn_root` (decade F1): kill a writer at random points during publish; every observed root resolves to a complete image that hashes to it. | `rs/ll-open/cli-lib`, `rs/ll-open/fs` |
-| §1.3 Merkle | `merkle_one_leaf_edit_rehashes_one_path` (decade F4): a 50,000-file store, edit one file, count fold invocations; bound c · depth · fanout. Fails on today's flat `treeRoot` (rehashes 2n entries); its passing is M1's closing test. `node_hash_edit_touches_depth_plus_one_rows`: one leaf edit adds at most depth + 1 `node_content` rows (passes today). | `rs/ll-open/cli-lib` |
+| §1.3 Merkle | `merkle_one_leaf_edit_rehashes_one_path` (decade F4): a 50,000-file store, edit one file, count fold invocations; bound c · depth · fanout. Failed on the flat `treeRoot` (100,000 entries refolded); passes since M1 (`73c6ee`): the directory Merkle `storeRoot` refolds the three nodes on the edited path, 240 entries against the bound 300. M1's closing test. `node_hash_edit_touches_depth_plus_one_rows`: one leaf edit adds at most depth + 1 `node_content` rows (passes today). | `rs/ll-open/cli-lib` |
 
 ## 6. Verb mapping (`ae82a7`)
 

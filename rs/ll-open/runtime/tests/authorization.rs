@@ -1070,7 +1070,10 @@ fn the_service_refuses_a_resolver_that_changes_the_granted_workspaces() {
         required_backend: BackendClass::MicroVm,
         required_confinement_digest: None,
     };
-    let service = ExecutionService::new(RecordingBackend);
+    // A backend that serves the shares it is granted: one that served none
+    // would be refused by the service in its own right (bead
+    // `ley-line-open-204a94`), and the positive start below would fail.
+    let service = ExecutionService::new(SharingBackend);
     service
         .provision(BackendClass::MicroVm, "provision-workspaces")
         .expect("provision backend");
@@ -1406,6 +1409,310 @@ fn the_receipt_names_the_workspace_share_the_run_held() {
     assert_ne!(plain.run_id, shared.run_id);
     let receipt = plain_service.collect(&plain.run_id).expect("collect");
     assert_eq!(receipt.backend_evidence.channels, Vec::new());
+}
+
+/// Starts every run and serves none of its workspaces: a tier that accepts a
+/// workspace grant and drops it. Records each run it is told to cancel.
+#[derive(Clone, Default)]
+struct DroppingBackend {
+    cancelled: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Backend for DroppingBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        CompletingBackend.capabilities()
+    }
+
+    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "dropping/1".into(),
+            channels: Vec::new(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(Some(BackendRunStatus::Succeeded))
+    }
+
+    fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+        self.cancelled.lock().unwrap().push(run_id.to_owned());
+        Ok(true)
+    }
+}
+
+/// A spec and grant that grant the `repo` workspace at `root` (64 hex).
+fn workspace_spec_and_grant(root: &str) -> (Vec<u8>, Vec<u8>) {
+    let confinement = "b".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", root)]);
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![(
+                "repo",
+                root,
+                vec![execution_capnp::WorkspaceOperation::Read],
+            )],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    (spec, grant)
+}
+
+/// Bead `ley-line-open-204a94`: no backend can run a granted workspace
+/// workspace-less. Each tier refuses a grant it cannot serve before it
+/// spawns anything, but `Backend` is a public trait; the service holds the
+/// line at the seam. A backend that reports `Ok` without a `WorkspaceShare`
+/// channel for every granted workspace has started the workload without
+/// it: the service cancels that run, forgets it, and refuses the start with
+/// the typed `workspaceUnserved` code on the same path as every other
+/// execution/v1 refusal, including the JSON surface the daemon, CLI and MCP
+/// adapters project.
+#[test]
+fn a_backend_that_drops_a_granted_workspace_is_cancelled_and_refused() {
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let root = "a".repeat(64);
+    let (spec, grant) = workspace_spec_and_grant(&root);
+
+    let backend = DroppingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-dropping")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect_err("a backend that served no share for the granted workspace");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(!error.retryable, "{error:?}");
+    assert!(error.detail.contains("\"repo\""), "{error:?}");
+    let run_id = derive_run_id(
+        &canonical_digest(&spec).expect("spec digest"),
+        "grant-01",
+        "replay-01",
+    );
+    assert_eq!(
+        *backend.cancelled.lock().unwrap(),
+        vec![run_id.clone()],
+        "the workspace-less run is cancelled, once"
+    );
+    assert_eq!(
+        service.status(&run_id).expect("status"),
+        None,
+        "the refused run never became a run"
+    );
+
+    // The JSON surface the daemon, CLI and MCP adapters call carries the
+    // same typed code.
+    let input = json!({
+        "spec": serde_json::from_str::<serde_json::Value>(&spec_json(&spec)).unwrap(),
+        "grant": serde_json::from_str::<serde_json::Value>(&grant_json(&grant)).unwrap(),
+    })
+    .to_string();
+    let error = start_json_with_verifier(
+        &service,
+        &input,
+        &policy,
+        &TestResolver,
+        &MetadataOnlyEvidenceVerifier,
+    )
+    .expect_err("the JSON surface refuses the same start");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+
+    // A run with no workspaces on the same backend is unaffected.
+    let plain_spec = spec_bytes();
+    let plain_grant = grant_bytes(&plain_spec, true, 2_000, 0);
+    let plain = service
+        .start_authorized(&plain_spec, &plain_grant, &policy, &TestResolver)
+        .expect("a run without a workspace starts");
+    assert_eq!(plain.state, leyline_runtime::RunState::Running);
+    assert_eq!(backend.cancelled.lock().unwrap().len(), 2);
+}
+
+/// A cancel that also fails does not turn the refusal into something else:
+/// the start is still `workspaceUnserved`, and the cancel's failure is named
+/// in it rather than lost. The workload may still be live, so the run is not
+/// forgotten: it is recorded `Failed` (never receipted), its run_id refuses
+/// a second start, and `cleanup` retries the cancel.
+#[test]
+fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
+    /// Its first cancel fails; later ones succeed.
+    #[derive(Clone, Default)]
+    struct Unstoppable {
+        cancels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Backend for Unstoppable {
+        fn capabilities(&self) -> BackendCapabilities {
+            CompletingBackend.capabilities()
+        }
+        fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(BackendRun {
+                backend_id: "unstoppable/1".into(),
+                channels: Vec::new(),
+            })
+        }
+        fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+            if self
+                .cancels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                Err(ExecutionError::backend("the worker would not stop"))
+            } else {
+                Ok(true)
+            }
+        }
+    }
+
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    let backend = Unstoppable::default();
+    let service = ExecutionService::new(backend.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-unstoppable")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect_err("a backend that served no share and would not stop");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("\"repo\""), "{error:?}");
+    assert!(
+        error.detail.contains("the worker would not stop"),
+        "{error:?}"
+    );
+
+    let run_id = derive_run_id(
+        &canonical_digest(&spec).expect("spec digest"),
+        "grant-01",
+        "replay-01",
+    );
+    let record = service
+        .status(&run_id)
+        .expect("status")
+        .expect("a run that may still be live stays addressable");
+    assert_eq!(record.state, leyline_runtime::RunState::Failed);
+    let states: Vec<_> = service
+        .inspect(&run_id, 0)
+        .expect("inspect")
+        .events
+        .into_iter()
+        .map(|event| event.state)
+        .collect();
+    assert_eq!(
+        states.last(),
+        Some(&leyline_runtime::RunState::Failed),
+        "{states:?}"
+    );
+    assert!(
+        service.collect(&run_id).is_err(),
+        "a refused start is never receipted"
+    );
+
+    // The same authority cannot start a second workload beside it.
+    let again = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect_err("its run_id is still held");
+    assert_eq!(
+        again.code,
+        leyline_runtime::ErrorCode::ResourceConflict,
+        "{again:?}"
+    );
+    assert_eq!(
+        backend.starts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second start never reached the backend"
+    );
+
+    // `cleanup` retries the cancel, which now succeeds.
+    let cleaned = service
+        .cleanup(&run_id)
+        .expect("cleanup retries the cancel");
+    assert_eq!(cleaned.state, leyline_runtime::RunState::Cleaned);
+    assert_eq!(backend.cancels.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// The other direction of the same comparison: a share for a workspace the
+/// grant never named is authority the run was not given.
+#[test]
+fn a_backend_that_serves_an_ungranted_workspace_is_cancelled_and_refused() {
+    struct OverSharing(DroppingBackend);
+    impl Backend for OverSharing {
+        fn capabilities(&self) -> BackendCapabilities {
+            self.0.capabilities()
+        }
+        fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+            let mut channels: Vec<WorkerChannel> = request
+                .workspaces
+                .iter()
+                .map(|grant| WorkerChannel::WorkspaceShare {
+                    workspace: grant.name.clone(),
+                    graph_root: grant.graph_root.clone(),
+                })
+                .collect();
+            channels.push(WorkerChannel::WorkspaceShare {
+                workspace: "docs".into(),
+                graph_root: format!("blake3-256:{}", "c".repeat(64)),
+            });
+            Ok(BackendRun {
+                backend_id: "oversharing/1".into(),
+                channels,
+            })
+        }
+        fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+            self.0.cancel(run_id)
+        }
+    }
+
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    let dropping = DroppingBackend::default();
+    let service = ExecutionService::new(OverSharing(dropping.clone()));
+    service
+        .provision(BackendClass::MicroVm, "provision-oversharing")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect_err("a share the grant never named");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("\"docs\""), "{error:?}");
+    assert_eq!(dropping.cancelled.lock().unwrap().len(), 1);
 }
 
 fn spec_json(bytes: &[u8]) -> String {

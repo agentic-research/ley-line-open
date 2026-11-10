@@ -29,6 +29,7 @@ on:
       - "rs/ll-core/schema-capnp/schemas/**"
       - "rs/ll-core/public-schema/capnp/**"
       - "rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json"
+      - "rs/ll-core/schema-spec/sigma/**"
       - ".github/workflows/leyline-schema-go.yml"
   pull_request:
     branches: [main]
@@ -37,6 +38,7 @@ on:
       - "rs/ll-core/schema-capnp/schemas/**"
       - "rs/ll-core/public-schema/capnp/**"
       - "rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json"
+      - "rs/ll-core/schema-spec/sigma/**"
       - ".github/workflows/leyline-schema-go.yml"
 
 jobs:

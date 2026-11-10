@@ -1,4 +1,5 @@
 pub mod blob_store;
+pub mod construction;
 pub mod control;
 pub mod head_digest;
 #[cfg(feature = "interrupt")]
@@ -7,9 +8,12 @@ pub mod layout;
 pub mod mmap;
 pub mod outboard;
 pub mod partition;
+#[cfg(feature = "sqlite")]
+pub mod source_blob;
 pub mod substrate;
 
 pub use blob_store::{FsBlobStore, MemBlobStore};
+pub use construction::{Construction, Ref};
 pub use control::Controller;
 pub use head_digest::{HeadClaim, head_digest};
 pub use layout::{

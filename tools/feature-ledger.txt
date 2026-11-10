@@ -59,6 +59,13 @@
 # control to another enable row.
 ll-core/core          interrupt          not-shipping    enable  -
 
+# ley-line-open-12d305 — the one verify-on-read reader of `source_blobs`
+# (`source_blob`), behind `sqlite` so core's SQLite-free consumers do not
+# link rusqlite. Shipping: leyline-ts, leyline-fs and leyline-cli-lib enable
+# it. mutants=enable so the gated reader compiles under mutation and its
+# unit tests run against the mutants.
+ll-core/core          sqlite             ships-optin     enable  ley-line-open-12d305
+
 # Dev tooling — regenerates test fixtures; nothing user-facing gates on it.
 # mutants=skip: the gated paths run only during fixture regeneration.
 ll-core/schema-capnp  regen-fixtures     not-shipping    skip    -
@@ -117,6 +124,13 @@ ll-open/text-search   engine-witchcraft  not-shipping    exclude-file:ll-open/te
 # Grammar for HCL, reachable via the opt-in shipping configs, not default.
 # mutants=enable so its gated parser code compiles under mutation.
 ll-open/ts            hcl                ships-optin     enable  -
+
+# Grammar for Go: leyline-cli-lib enables it, the ts default set does not.
+# mutants=enable: cfg.rs's emitter recognises a function body only through a
+# grammar κ maps (`go`, `rust`, `python`), and its tests are `go`-gated, so
+# without this row ADR-0047 M2's cfg.rs diff (ley-line-open-b5d354) reported
+# three MISSED that no compiled test could reach.
+ll-open/ts            go                 ships-optin     enable  -
 
 # ley-line-open-988b93 — NOT a grammar: a 349-line dependency-graph
 # projection (pyproject.toml -> mountable /deps tree). Unwired too — nothing

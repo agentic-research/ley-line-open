@@ -1,13 +1,13 @@
 //! Reading a `Head`'s signed claim and enforcing its signature (bead
 //! `ley-line-open-b68fa6`).
 //!
-//! The signature on `${db}.head.capnp` covers the v2 head digest over
+//! The signature on `${db}.head.capnp` covers the v3 head digest over
 //! [`HeadClaim`]: `generation`, `rootHash`, `parentHash`, `parentDigest`,
-//! `treeRoot` and `parserId`. Both readers of a head — the parse that chains
+//! `storeRoot` and `parserId`. Both readers of a head — the parse that chains
 //! onto it ([`crate::cmd_parse`]) and `leyline verify-head`
-//! ([`crate::tree_root`]) — read the claim and apply the signature policy
+//! ([`crate::store_root`]) — read the claim and apply the signature policy
 //! through this module, so the two cannot disagree about which fields a valid
-//! signature attests.
+//! signature attests, or about which head versions they refuse.
 
 use std::path::Path;
 
@@ -16,34 +16,72 @@ use leyline_core::{Hash, HeadClaim};
 use leyline_schema_capnp::head_capnp::head;
 use leyline_sign::root_signer::{HeadVerdict, VerifyingKey, verify_head};
 
-/// The head's ADR-0040 stamp: `(treeRoot, parserId)`.
-///
-/// `Ok(None)` when the head stamps neither (a head written before ADR-0040,
-/// or one whose fields were cleared). A head stamps both or neither, so one
-/// without the other is malformed and an error (bead `ley-line-open-80f037`
-/// F3), as is a hash field that is present but not 32 bytes.
-pub fn stamp_of(h: head::Reader<'_>) -> Result<Option<(Hash, Hash)>> {
-    let tree = crate::tree_root::hash_field(h.get_tree_root().ok().map(|x| x.get_bytes()))?;
-    let parser = crate::tree_root::hash_field(h.get_parser_id().ok().map(|x| x.get_bytes()))?;
-    match (tree, parser) {
-        (Some(tree), Some(parser)) => Ok(Some((tree, parser))),
-        (None, None) => Ok(None),
-        (Some(_), None) => bail!("head is half-stamped: it carries treeRoot but no parserId"),
-        (None, Some(_)) => bail!("head is half-stamped: it carries parserId but no treeRoot"),
+/// A head this binary refuses to read, by version (ADR-0047 M1). Returned
+/// inside the [`anyhow::Error`] of every head read, so a caller tells it
+/// apart with `downcast_ref` rather than by matching message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadFormatError {
+    /// The head carries `retiredTreeRoot` (ordinal 7): it was written under
+    /// head digest v2, whose store identity `treeRoot` folded `parserId`.
+    /// It is never read as a claim, a parent digest or a store identity.
+    RetiredDigestV2,
+}
+
+impl std::fmt::Display for HeadFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeadFormatError::RetiredDigestV2 => f.write_str(
+                "head is a head digest v2 head (it carries the retired treeRoot); this binary \
+                 reads only v3 heads, which stamp storeRoot (ADR-0047 M1). Delete the head and \
+                 reparse to start a v3 chain",
+            ),
+        }
     }
+}
+
+impl std::error::Error for HeadFormatError {}
+
+/// The head's stamp: `(storeRoot, parserId)`.
+///
+/// `Ok(None)` when the head stamps neither (or its fields were cleared). A
+/// head stamps both or neither, so one without the other is malformed and an
+/// error (bead `ley-line-open-80f037` F3), as is a hash field that is present
+/// but not 32 bytes. A head that carries `retiredTreeRoot` is refused with
+/// [`HeadFormatError::RetiredDigestV2`] whatever else it stamps.
+pub fn stamp_of(h: head::Reader<'_>) -> Result<Option<(Hash, Hash)>> {
+    refuse_retired_versions(h)?;
+    let store = crate::store_root::hash_field(h.get_store_root().ok().map(|x| x.get_bytes()))?;
+    let parser = crate::store_root::hash_field(h.get_parser_id().ok().map(|x| x.get_bytes()))?;
+    match (store, parser) {
+        (Some(store), Some(parser)) => Ok(Some((store, parser))),
+        (None, None) => Ok(None),
+        (Some(_), None) => bail!("head is half-stamped: it carries storeRoot but no parserId"),
+        (None, Some(_)) => bail!("head is half-stamped: it carries parserId but no storeRoot"),
+    }
+}
+
+/// Refuse a head written under a removed digest version. A `retiredTreeRoot`
+/// field that is present at all, even empty or all-zero, marks the head as
+/// v2: no v3 producer sets it, so its presence is never ambiguous.
+fn refuse_retired_versions(h: head::Reader<'_>) -> Result<()> {
+    if h.has_retired_tree_root() {
+        return Err(HeadFormatError::RetiredDigestV2.into());
+    }
+    Ok(())
 }
 
 /// Read the claim a signature over `h` would attest.
 ///
-/// `Ok(None)` when the head does not stamp `treeRoot` and `parserId` (see
-/// [`stamp_of`]): such a head has no v2 claim. A malformed hash field —
-/// present but not 32 bytes, or a present all-zero `parentDigest` — and a
-/// half-stamped head are errors, never a default.
+/// `Ok(None)` when the head does not stamp `storeRoot` and `parserId` (see
+/// [`stamp_of`]): such a head has no v3 claim. A v2 head, a malformed hash
+/// field — present but not 32 bytes, or a present all-zero `parentDigest` —
+/// and a half-stamped head are errors, never a default.
 pub fn claim_of(h: head::Reader<'_>) -> Result<Option<HeadClaim>> {
+    refuse_retired_versions(h)?;
     let root = required_hash(h.get_root_hash().map(|x| x.get_bytes()), "rootHash")?;
     let parent = required_hash(h.get_parent_hash().map(|x| x.get_bytes()), "parentHash")?;
     let parent_digest = optional_digest(h.get_parent_digest().ok().map(|x| x.get_bytes()))?;
-    let Some((tree, parser)) = stamp_of(h)? else {
+    let Some((store, parser)) = stamp_of(h)? else {
         return Ok(None);
     };
     Ok(HeadClaim::new(
@@ -51,12 +89,12 @@ pub fn claim_of(h: head::Reader<'_>) -> Result<Option<HeadClaim>> {
         root,
         parent,
         parent_digest,
-        tree,
+        store,
         parser,
     ))
 }
 
-/// The v2 digest of `h`'s claim, for the next head's `parentDigest`; `None`
+/// The v3 digest of `h`'s claim, for the next head's `parentDigest`; `None`
 /// when `h` has no claim.
 pub fn digest_of(h: head::Reader<'_>) -> Result<Option<Hash>> {
     Ok(claim_of(h)?.as_ref().map(leyline_core::head_digest))
@@ -110,7 +148,7 @@ pub enum Reader {
     /// unless `LEYLINE_HEAD_REQUIRE_SIGNATURE` is set, so configuring a trust
     /// set does not break an existing unsigned arena's next parse.
     Chain,
-    /// `leyline verify-head`, whose output is a claim about the tree. With a
+    /// `leyline verify-head`, whose output is a claim about the store. With a
     /// trust set configured an unsigned head is refused: a stripped signature
     /// must not read as valid. With no trust set,
     /// `LEYLINE_HEAD_REQUIRE_SIGNATURE` refuses, because nothing can be
@@ -162,15 +200,17 @@ impl HeadPolicy {
 
 /// Apply the head signature policy (S2) to `h`, read from `head_path`.
 ///
-/// An invalid signature is always refused. With no trusted keys there is
-/// nothing to verify against; see [`Reader`] for how each reader treats an
-/// unsigned head.
+/// A head of a removed digest version is refused first, under every policy
+/// ([`HeadFormatError`]). An invalid signature is always refused. With no
+/// trusted keys there is nothing to verify against; see [`Reader`] for how
+/// each reader treats an unsigned head.
 pub fn enforce_signature(
     h: head::Reader<'_>,
     head_path: &Path,
     reader: Reader,
     policy: &HeadPolicy,
 ) -> Result<SignatureCheck> {
+    refuse_retired_versions(h).with_context(|| format!("head at {}", head_path.display()))?;
     let trusted = &policy.trusted;
     if trusted.is_empty() {
         if reader == Reader::VerifyHead && policy.require_signature {
@@ -185,10 +225,10 @@ pub fn enforce_signature(
         HeadVerdict::Valid => Ok(SignatureCheck::Verified),
         // Never acceptable: the head was edited after signing, corrupted,
         // signed by a key this reader does not trust, signed without the
-        // treeRoot/parserId the signature must cover, or signed under the
-        // removed v1 digest.
+        // storeRoot/parserId the signature must cover, or signed under a
+        // removed digest version.
         HeadVerdict::Invalid => bail!(
-            "head at {} failed signature verification (the signature must cover the whole claim under head digest v2; a head signed before v2 must be re-signed by deleting it and reparsing)",
+            "head at {} failed signature verification (the signature must cover the whole claim under head digest v3; a head signed before v3 must be re-signed by deleting it and reparsing)",
             head_path.display()
         ),
         HeadVerdict::Unsigned => {
@@ -220,7 +260,7 @@ mod tests {
             h.set_generation(3);
             h.reborrow().init_root_hash().set_bytes(&[1u8; 32]);
             h.reborrow().init_parent_hash().set_bytes(&[0u8; 32]);
-            h.reborrow().init_tree_root().set_bytes(&[4u8; 32]);
+            h.reborrow().init_store_root().set_bytes(&[4u8; 32]);
             h.reborrow().init_parser_id().set_bytes(&[6u8; 32]);
             f(&mut h);
         }
@@ -269,36 +309,36 @@ mod tests {
             Some(leyline_core::head_digest(&want(None).unwrap()))
         );
         let bytes = build(|h| {
-            h.reborrow().init_tree_root().set_bytes(&[]);
+            h.reborrow().init_store_root().set_bytes(&[]);
             h.reborrow().init_parser_id().set_bytes(&[]);
         });
         let msg = capnp::serialize::read_message(&mut &bytes[..], Default::default()).unwrap();
         assert_eq!(digest_of(msg.get_root().unwrap()).unwrap(), None);
     }
 
-    /// Unstamped (pre-ADR-0040) heads have no claim; the signature verifier
+    /// Unstamped heads have no claim; the signature verifier
     /// then refuses any signature on them.
     #[test]
     fn an_unstamped_head_has_no_claim() {
         let unset = build(|h| {
-            h.reborrow().init_tree_root().set_bytes(&[]);
+            h.reborrow().init_store_root().set_bytes(&[]);
             h.reborrow().init_parser_id().set_bytes(&[]);
         });
         assert_eq!(claim_from(&unset).unwrap(), None);
         let zero = build(|h| {
-            h.reborrow().init_tree_root().set_bytes(&[0u8; 32]);
+            h.reborrow().init_store_root().set_bytes(&[0u8; 32]);
             h.reborrow().init_parser_id().set_bytes(&[0u8; 32]);
         });
         assert_eq!(claim_from(&zero).unwrap(), None);
     }
 
-    /// Bead `ley-line-open-80f037` F3(d): a head stamps both `treeRoot` and
+    /// Bead `ley-line-open-80f037` F3(d): a head stamps both `storeRoot` and
     /// `parserId` or neither. One without the other is a malformed head, not
-    /// one written before ADR-0040.
+    /// an unstamped one.
     #[test]
     fn a_half_stamped_head_is_malformed() {
         for half in [
-            build(|h| h.reborrow().init_tree_root().set_bytes(&[])),
+            build(|h| h.reborrow().init_store_root().set_bytes(&[])),
             build(|h| h.reborrow().init_parser_id().set_bytes(&[0u8; 32])),
         ] {
             let err = claim_from(&half)
@@ -315,13 +355,76 @@ mod tests {
         assert!(claim_from(&short_parent).is_err());
         let short_root = build(|h| h.reborrow().init_root_hash().set_bytes(&[1u8; 31]));
         assert!(claim_from(&short_root).is_err());
-        let short_tree = build(|h| h.reborrow().init_tree_root().set_bytes(&[4u8; 3]));
-        assert!(claim_from(&short_tree).is_err());
+        let short_store = build(|h| h.reborrow().init_store_root().set_bytes(&[4u8; 3]));
+        assert!(claim_from(&short_store).is_err());
         let short_digest = build(|h| h.reborrow().init_parent_digest().set_bytes(&[8u8; 9]));
         assert!(claim_from(&short_digest).is_err());
         let zero_digest = build(|h| h.reborrow().init_parent_digest().set_bytes(&[0u8; 32]));
         let err = claim_from(&zero_digest).unwrap_err().to_string();
         assert!(err.contains("all zero"), "{err}");
+    }
+
+    /// A head digest v2 head, as a v0.25 producer wrote it: `treeRoot` at
+    /// ordinal 7, no `storeRoot`.
+    fn v2_head(f: impl FnOnce(&mut head::Builder)) -> Vec<u8> {
+        build(|h| {
+            h.reborrow().init_store_root().set_bytes(&[]);
+            h.reborrow().init_retired_tree_root().set_bytes(&[4u8; 32]);
+            f(h);
+        })
+    }
+
+    fn retired(err: &anyhow::Error) -> Option<HeadFormatError> {
+        err.chain()
+            .find_map(|e| e.downcast_ref::<HeadFormatError>())
+            .copied()
+    }
+
+    /// ADR-0047 M1: a head digest v2 head is refused with a typed error by
+    /// every reader — the claim, the stamp, the parent digest and the
+    /// signature policy under every configuration — never read as a v3
+    /// claim and never silently treated as unstamped. Presence of the
+    /// retired field is enough, even beside a storeRoot or with empty bytes.
+    #[test]
+    fn a_v2_head_is_refused_with_a_typed_error() {
+        let read = |bytes: &[u8], f: &dyn Fn(head::Reader<'_>) -> Result<()>| {
+            let msg = capnp::serialize::read_message(&mut &bytes[..], Default::default()).unwrap();
+            f(msg.get_root().unwrap())
+        };
+        for bytes in [
+            v2_head(|_| {}),
+            v2_head(|h| h.reborrow().init_retired_tree_root().set_bytes(&[])),
+            v2_head(|h| h.reborrow().init_store_root().set_bytes(&[4u8; 32])),
+            v2_head(|h| {
+                h.reborrow().init_retired_tree_root().set_bytes(&[0u8; 32]);
+                h.reborrow().init_parser_id().set_bytes(&[]);
+            }),
+        ] {
+            let err = claim_from(&bytes).expect_err("a v2 head is refused");
+            assert_eq!(retired(&err), Some(HeadFormatError::RetiredDigestV2));
+            let err = read(&bytes, &|h| stamp_of(h).map(|_| ())).unwrap_err();
+            assert_eq!(retired(&err), Some(HeadFormatError::RetiredDigestV2));
+            let err = read(&bytes, &|h| digest_of(h).map(|_| ())).unwrap_err();
+            assert_eq!(retired(&err), Some(HeadFormatError::RetiredDigestV2));
+            for reader in [Reader::Chain, Reader::VerifyHead] {
+                for policy in [HeadPolicy::default(), trusting(false), trusting(true)] {
+                    let err = enforce(&bytes, reader, &policy).unwrap_err();
+                    assert_eq!(retired(&err), Some(HeadFormatError::RetiredDigestV2));
+                    let msg = format!("{err:#}");
+                    assert!(
+                        msg.contains("t.head.capnp") && msg.contains("head digest v2"),
+                        "{msg}"
+                    );
+                }
+            }
+        }
+        // A v3 head is not refused by the version gate.
+        assert!(claim_from(&build(|_| {})).unwrap().is_some());
+        let msg = HeadFormatError::RetiredDigestV2.to_string();
+        assert!(
+            msg.contains("storeRoot") && msg.contains("reparse"),
+            "{msg}"
+        );
     }
 
     /// A head with no rootHash at all is an error.
@@ -430,7 +533,7 @@ mod tests {
         tampered.clear();
         tampered.extend(build(|h| {
             h.set_signature(&sig);
-            h.reborrow().init_tree_root().set_bytes(&[0x33; 32]);
+            h.reborrow().init_store_root().set_bytes(&[0x33; 32]);
         }));
         for reader in [Reader::Chain, Reader::VerifyHead] {
             let err = enforce(&tampered, reader, &trusting(false))
@@ -452,7 +555,7 @@ mod tests {
     }
 
     /// Every `Head` field takes a declared position on the signature: bound
-    /// into the v2 digest, or deliberately outside it. A field added to
+    /// into the v3 digest, or deliberately outside it. A field added to
     /// `head.capnp` fails this test until it is classified here (and, when
     /// bound, until `HeadClaim` and `head_digest` carry it).
     #[test]
@@ -463,7 +566,7 @@ mod tests {
             "parentHash",
             "parentDigest",
             "generation",
-            "treeRoot",
+            "storeRoot",
             "parserId",
         ];
         // Outside the signature, with the reason:
@@ -472,7 +575,15 @@ mod tests {
         // - segmentBytes: a torn-write sanity count over the segments
         //   rootHash already commits to.
         // - unboundFacts: a producer-side ratchet metric, not an identity.
-        const UNSIGNED: &[&str] = &["signature", "signerKid", "segmentBytes", "unboundFacts"];
+        // - retiredTreeRoot: never written; its presence refuses the head
+        //   as v2 (`HeadFormatError::RetiredDigestV2`) before any digest.
+        const UNSIGNED: &[&str] = &[
+            "signature",
+            "signerKid",
+            "segmentBytes",
+            "unboundFacts",
+            "retiredTreeRoot",
+        ];
 
         let mut msg = capnp::message::Builder::new_default();
         let h: head::Builder = msg.init_root();

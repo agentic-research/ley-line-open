@@ -27,7 +27,7 @@ fn seed(conn: &Connection) {
     leyline_schema::insert_node(
         conn,
         leyline_schema::dir_nid(dir_id),
-        Some(leyline_schema::dir_nid(1)),
+        Some(leyline_schema::dir_nid(leyline_schema::DirId::ROOT)),
         Some(dir_name),
         None,
         1,

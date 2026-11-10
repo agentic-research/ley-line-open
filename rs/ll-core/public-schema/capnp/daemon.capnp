@@ -148,7 +148,7 @@ struct StatusResponse {
   #
   # THE ROOT ABSENCE RULE (bead `ley-line-open-80f037`), one rule for every
   # message on the daemon wire that carries `current_root`: the `status`,
-  # `reparse`, `snapshot`, `flush`, `enrich` and `load` responses, and the
+  # `reparse`, `snapshot`, `enrich` and `load` responses, and the
   # `daemon.sheaf.invalidate` event.
   #   * `root_published` is always present.
   #   * `current_root` is present exactly when `root_published` is `true`,
@@ -197,15 +197,9 @@ struct SnapshotResponse {
   rootPublished @3 :Bool  $Json.name("root_published");
 }
 
-struct FlushRequest {}
-
-struct FlushResponse {
-  ok          @0 :Bool;
-  currentRoot @1 :Text  $Json.name("current_root");
-  # The root absence rule on `StatusResponse.rootPublished` governs
-  # `currentRoot`. Additive (bead `ley-line-open-80f037`).
-  rootPublished @2 :Bool  $Json.name("root_published");
-}
+# `FlushRequest` / `FlushResponse` were removed with the `flush` op: it
+# read `current_root`, which `status` already returns, and changed
+# nothing (bead `ley-line-open-8523ee`).
 
 # `leyline_version` op response (bead ley-line-open-cb8960).
 #
@@ -254,9 +248,10 @@ struct LeylineVersionResponse {
   buildDate        @5 :Text   $Json.name("build_date");
 
   # The node_hash ADDRESS LINEAGE this daemon's parse produces, e.g.
-  # "merkle-ast-v2". node_hash's preimage carries the canonical kappa kind, so
+  # "merkle-ast-v3". node_hash's preimage carries the canonical kappa kind, so
   # a kappa-map or grammar change rewrites addresses for byte-identical
-  # sources. Consumers that MEMOIZE on node_hash compare this against the
+  # sources, as does a change of construction (merkle-ast-v3 keyed the fold,
+  # ADR-0047 D-i). Consumers that MEMOIZE on node_hash compare this against the
   # lineage they cached under; a mismatch means those addresses are not
   # comparable. Additive field — per the wireFormatMajor note above, additions
   # inside the same major are non-breaking.
@@ -295,10 +290,49 @@ struct QueryRequest {
   sql @0 :Text;
 }
 
+# `query` runs one read-only SELECT (bead `ley-line-open-b7e9a3`). `ok` true
+# carries the rows. `ok` false with `refusal` means the statement was refused
+# before it returned anything and nothing changed; `ok` false without
+# `refusal` is an error running an allowed statement (a syntax error, a
+# missing table).
 struct QueryResponse {
   ok      @0 :Bool;
   columns @1 :List(Text);
   rows    @2 :List(QueryRow);
+  error   @3 :Text;
+  refusal @4 :QueryRefusal;
+}
+
+# Why a `query` statement was refused.
+enum QueryRefusalReason {
+  # The SQLite authorizer denied an action the statement takes; `action`
+  # names it. Allowed are SELECT, reading a table, a recursive CTE, a listed
+  # pure function, and a listed schema-introspection pragma in its
+  # table-valued form; everything else is denied.
+  deniedAction       @0 $Json.name("denied_action");
+  # The SQL holds more than one statement. None of them ran.
+  multipleStatements @1 $Json.name("multiple_statements");
+  # The statement is not a read-only SELECT (`VACUUM`, a bare `PRAGMA`, an
+  # empty statement); `action` is its leading keyword.
+  notAQuery          @2 $Json.name("not_a_query");
+}
+
+struct QueryRefusal {
+  reason  @0 :QueryRefusalReason;
+  # The refused action. For `denied_action`, the SQLite authorizer action in
+  # snake case: `insert`, `update`, `delete`, `drop_table`, `create_table`,
+  # `attach`, `detach`, `pragma`, `function`, `transaction`, ... It is the
+  # first action SQLite asked for and was denied: a DROP, or a CREATE of a
+  # table, asks first to write the schema table, so it is refused as
+  # `delete` or `insert` with `subject` `sqlite_master` (`sqlite_temp_master`
+  # for a temporary object). For
+  # `not_a_query`, the statement's leading keyword, lower case (`vacuum`), or
+  # `empty`. For `multiple_statements`, `statement`.
+  action  @1 :Text;
+  # What the action names, when it names something: the table, index,
+  # trigger, view, pragma or function, or the file an ATTACH names as a
+  # literal. Unset otherwise.
+  subject @2 :Text;
 }
 
 struct ListChildrenRequest {
@@ -335,12 +369,17 @@ struct ReadSourceResponse {
   # The file's `_tree.blob_hash`, 64 hex chars: the `source_blobs` key of
   # `content` and the hash `propose` compares a base against.
   blobHash @2 :Text  $Json.name("blob_hash");
-  # The arena's treeRoot (ADR-0040 D1) the file was read under, 64 hex chars.
-  treeRoot @3 :Text  $Json.name("tree_root");
+  # Retired by ADR-0047 M1 and never sent: was `tree_root`, the arena's
+  # parser-qualified treeRoot. Its ordinal is kept; read `store_root`.
+  retiredTreeRoot @3 :Text  $Json.name("retired_tree_root");
   error    @4 :Text;
   # The file's git mode, six octal digits: `100644` (regular), `100755`
   # (executable) or `120000` (symlink; `content` is its target). ADR-0045.
   mode     @5 :Text;
+  # The arena's storeRoot (ADR-0047 D-ii: the parser-free directory Merkle
+  # root `leyline/store-tree/v1` of `_tree`) the file was read under, 64 hex
+  # chars. Unset when the arena records no `derived_from`.
+  storeRoot @6 :Text  $Json.name("store_root");
 }
 
 # What one write of a proposal does at its path (ADR-0042 P1, ADR-0045 T4).
@@ -487,8 +526,9 @@ struct ProposalRefusal {
 # so nothing changed either).
 struct ProposeResponse {
   ok              @0 :Bool;
-  # The arena's treeRoot after the proposal (ok only).
-  treeRoot        @1 :Text  $Json.name("tree_root");
+  # Retired by ADR-0047 M1 and never sent: was `tree_root`, the arena's
+  # parser-qualified treeRoot. Its ordinal is kept; read `store_root`.
+  retiredTreeRoot @1 :Text  $Json.name("retired_tree_root");
   # Each written path's new blob hash (ok only).
   blobs           @2 :List(PathHash);
   # Set when the proposal was refused.
@@ -503,6 +543,9 @@ struct ProposeResponse {
   # the three-way merge with what the path held (ADR-0045 T5); what landed
   # is not the `content` sent. Unset when nothing merged.
   merged          @6 :List(Text);
+  # The arena's storeRoot after the proposal (ok only; ADR-0047 D-ii), 64
+  # hex chars. A grammar or epoch upgrade does not move it.
+  storeRoot       @7 :Text  $Json.name("store_root");
 }
 
 struct FindCallersRequest {
@@ -536,41 +579,10 @@ struct FindCalleesResponse {
   callees @1 :List(Ref);
 }
 
-struct TokenMapEntry {
-  # One token → many node_ids. Used by both refs map and defs map bulk
-  # responses. source_id is intentionally omitted — bulk consumers want
-  # graph topology; per-token find_callers/find_defs still expose it.
-  token   @0 :Text;
-  nodeIds @1 :List(Text)  $Json.name("node_ids");
-}
-
-struct GetRefsMapRequest {}
-
-struct GetRefsMapResponse {
-  ok      @0 :Bool;
-  entries @1 :List(TokenMapEntry);
-}
-
-struct GetDefsMapRequest {}
-
-struct GetDefsMapResponse {
-  ok      @0 :Bool;
-  entries @1 :List(TokenMapEntry);
-}
-
-struct SchemaTier {
-  # One tier in LLO's layer-ownership topology (ll-core / ll-open / future
-  # extension-defined names). See docs/TABLE_CONTRACT.md "Layer Ownership".
-  name   @0 :Text;
-  crates @1 :List(Text);
-}
-
-struct GetSchemaRequest {}
-
-struct GetSchemaResponse {
-  ok    @0 :Bool;
-  tiers @1 :List(SchemaTier);
-}
+# The `get_refs_map`, `get_defs_map` and `get_schema` ops and their
+# structs (`TokenMapEntry`, `GetRefsMap*`, `GetDefsMap*`, `SchemaTier`,
+# `GetSchema*`) were removed with no caller in LLO, mache or
+# ley-line (bead `ley-line-open-8523ee`).
 
 struct GetDbPathRequest {}
 
@@ -754,11 +766,9 @@ struct SheafDefectResponse {
   total      @3 :UInt32;
 }
 
-struct SheafStalksResponse {
-  generation @0 :UInt64;
-  valid      @1 :UInt32;
-  total      @2 :UInt32;
-}
+# `SheafStalksResponse` was removed with the `sheaf_stalks` op: its
+# fields are a strict subset of `SheafStatusResponse` (bead
+# `ley-line-open-8523ee`).
 
 struct SheafStatusResponse {
   generation   @0 :UInt64;

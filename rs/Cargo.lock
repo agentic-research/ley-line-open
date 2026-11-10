@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "compat-gen"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "leyline-cli-lib",
@@ -4610,30 +4610,33 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "leyline-cache"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "blake3",
  "leyline-core",
  "leyline-perf-sample",
  "leyline-ts",
  "proptest",
+ "serde_json",
  "sha2 0.11.0",
  "tree-sitter",
 ]
 
 [[package]]
 name = "leyline-cas-ffi"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "blake3",
  "leyline-core",
  "leyline-ffi-helpers",
+ "serde_json",
+ "tempfile",
  "wasmparser 0.254.0",
 ]
 
 [[package]]
 name = "leyline-cdc"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "gearhash",
@@ -4642,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-chat-embed"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4655,7 +4658,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-cli"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4678,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-cli-lib"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -4736,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-core"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4745,13 +4748,15 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proptest",
+ "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "leyline-envelope"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -4767,11 +4772,11 @@ dependencies = [
 
 [[package]]
 name = "leyline-ffi-helpers"
-version = "0.25.0"
+version = "0.26.0"
 
 [[package]]
 name = "leyline-fs"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4785,6 +4790,7 @@ dependencies = [
  "log",
  "memmap2",
  "parking_lot",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4800,7 +4806,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-hdc"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4813,7 +4819,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-krun-worker"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "blake3",
  "capnp",
@@ -4831,7 +4837,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-lsp"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "capnp",
@@ -4848,7 +4854,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-mcp-descriptor"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "jsonschema",
@@ -4858,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-mcp-protocol-schema"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "jsonschema",
  "serde_json",
@@ -4867,11 +4873,11 @@ dependencies = [
 
 [[package]]
 name = "leyline-perf-sample"
-version = "0.25.0"
+version = "0.26.0"
 
 [[package]]
 name = "leyline-public-schema"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "capnp",
  "capnp-json",
@@ -4881,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-runtime"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4908,15 +4914,16 @@ dependencies = [
 
 [[package]]
 name = "leyline-schema"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]
 name = "leyline-schema-bridge"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "capnp",
  "indoc",
@@ -4927,7 +4934,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-schema-capnp"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "blake3",
  "capnp",
@@ -4939,7 +4946,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-schema-spec"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "blake3",
  "jsonschema",
@@ -4949,7 +4956,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-sheaf"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4972,7 +4979,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-sign"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -5013,7 +5020,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-storefs"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5033,7 +5040,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-text-search"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -5047,7 +5054,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-ts"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "leyline-core",
@@ -5091,7 +5098,7 @@ dependencies = [
 
 [[package]]
 name = "leyline-vcs"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -7133,9 +7140,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -7559,7 +7566,7 @@ dependencies = [
 
 [[package]]
 name = "server-json-gen"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "leyline-cli-lib",
@@ -7967,7 +7974,7 @@ checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
 
 [[package]]
 name = "smell-projector"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "clap",

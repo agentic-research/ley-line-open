@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use leyline_cli_lib::daemon::{ContextSlot, DaemonContext};
 use leyline_cli_lib::source_write::Grant;
-use leyline_cli_lib::tree_root::DerivedFrom;
+use leyline_cli_lib::store_root::DerivedFrom;
 use leyline_runtime::backends::libkrun::share::{FsService, WorkspaceShares};
 use leyline_runtime::{ErrorCode, ExecutionError, WorkspaceGrant, WorkspaceOperation};
 
@@ -94,9 +94,10 @@ fn refused(code: ErrorCode, retryable: bool, detail: String) -> ExecutionError {
 
 impl WorkspaceShares for DaemonShares {
     /// A share of the store, scoped by the grant's operations, when the
-    /// store's `treeRoot` (ADR-0040 D1: the tagged fold over every
-    /// `_source` row) is the grant's `graphRoot`: the run starts from the
-    /// tree it was authorized against. Once open, the share serves the live
+    /// store's `storeRoot` (ADR-0047 D-ii: the parser-free directory Merkle
+    /// root of `_tree`) is the grant's `graphRoot`: the run starts from the
+    /// store it was authorized against, and a parser upgrade does not
+    /// invalidate the grant. Once open, the share serves the live
     /// store: another writer's proposals are visible at the next open, and
     /// an edit against bytes another writer moved is refused (ADR-0044 V3).
     ///
@@ -129,8 +130,8 @@ impl WorkspaceShares for DaemonShares {
                 "the daemon serving workspace shares has not started".into(),
             )
         })?;
-        let tree_root = Store::with_read(ctx.as_ref(), |conn| {
-            Ok(DerivedFrom::read(conn)?.map(|derived| derived.tree_root))
+        let store_root = Store::with_read(ctx.as_ref(), |conn| {
+            Ok(DerivedFrom::read(conn)?.map(|derived| derived.store_root))
         })
         .map_err(|error| {
             refused(
@@ -139,7 +140,7 @@ impl WorkspaceShares for DaemonShares {
                 format!("read the store's tree root: {error:#}"),
             )
         })?;
-        let held = tree_root.map(|root| format!("blake3-256:{root}"));
+        let held = store_root.map(|root| format!("blake3-256:{root}"));
         if held.as_deref() != Some(grant.graph_root.as_str()) {
             return Err(refused(
                 ErrorCode::IdentityPolicyMismatch,

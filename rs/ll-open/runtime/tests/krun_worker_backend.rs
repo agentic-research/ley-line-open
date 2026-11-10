@@ -982,7 +982,7 @@ fn a_granted_workspace_is_refused_before_spawn_where_no_share_can_serve_it() {
     let error = backend
         .start(&request_with(vec![workspace("repo")]))
         .expect_err("a workspace grant with nothing to serve it");
-    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert_eq!(error.code, leyline_runtime::ErrorCode::WorkspaceUnserved);
     assert!(error.detail.contains("repo"), "{error}");
 
     // Two workspaces: the tier attaches one.
@@ -991,7 +991,7 @@ fn a_granted_workspace_is_refused_before_spawn_where_no_share_can_serve_it() {
     let error = backend
         .start(&request_with(vec![workspace("repo"), workspace("docs")]))
         .expect_err("two workspaces");
-    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert_eq!(error.code, leyline_runtime::ErrorCode::WorkspaceUnserved);
     assert!(shares.opened.lock().unwrap().is_empty());
 
     // The provider refuses: its error is the run's.

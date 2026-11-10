@@ -30,7 +30,10 @@
 //! 4. **Own-CA-root dedup.** The injected `create_table` subtree's
 //!    `node_hash` equals the hash the SAME statement bytes produce in
 //!    a standalone `.sql` file (the merkle fold is span-free), and the
-//!    hash resolves in `node_content` with `lang = 'sql'`.
+//!    hash resolves in `node_content` (κ kind `type`; projection-v12 keeps
+//!    no language on the content row; the injected def occurrence carries
+//!    `('sql', 'create_table')` through `node_defs.kind_id → kinds`,
+//!    `ley-line-open-cc5c55`).
 
 use leyline_cli_lib::cmd_parse;
 use rusqlite::Connection;
@@ -115,7 +118,7 @@ struct DefRow {
     token: String,
     /// The def site's nid. Injected rows have no `_ast`/`nodes` row, so
     /// this is the only handle on them.
-    nid: i64,
+    nid: leyline_schema::Nid,
     /// Rel path of the host file (`_source.id` via `nid >> 24`).
     file: String,
     /// Container rendered as its display path, `None` for a NULL container.
@@ -190,7 +193,7 @@ const LITERAL_NODE_PATH: &str = "app.go/function_declaration_0/block/statement_l
 
 /// The count of `_ast` rows in `file_id`'s range — the first ordinal an
 /// injected node can occupy.
-fn ast_count(conn: &Connection, file_id: i64) -> i64 {
+fn ast_count(conn: &Connection, file_id: leyline_schema::FileId) -> i64 {
     let (lo, hi) = leyline_ts::schema::file_nid_range(file_id);
     conn.query_row(
         "SELECT COUNT(*) FROM _ast WHERE nid BETWEEN ?1 AND ?2",
@@ -254,8 +257,8 @@ fn inj_sql_create_table_def_lands_on_host_file() {
         .unwrap()
         .expect("app.go must be interned");
     assert_eq!(
-        users.nid >> 24,
-        file_id,
+        leyline_ts::schema::nid_file_id(users.nid),
+        Some(file_id),
         "injected def's nid must be in app.go's range"
     );
     assert!(
@@ -407,8 +410,8 @@ fn inj_own_ca_root_dedups_with_standalone_sql() {
     // equals the node_hash the SAME statement bytes produce in a
     // standalone .sql file — the merkle fold is span-free and
     // grammar-scoped, so content addressing crosses the host boundary.
-    // The hash also resolves in node_content with lang='sql' (the
-    // node_defs.node_hash → node_content FK made loud).
+    // The hash also resolves in node_content (the node_defs.content_id →
+    // node_content FK made loud).
     let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let go_repo = go_fixture();
     let db_dir = TempDir::new().unwrap();
@@ -437,15 +440,99 @@ fn inj_own_ca_root_dedups_with_standalone_sql() {
         "identical SQL bytes must content-address identically whether injected or standalone"
     );
 
+    // The row is the κ tree's: `create_table` is κ `type` (projection-v12
+    // keeps only what `node_hash` determines; the SQL grammar kind is an
+    // occurrence fact, pinned by
+    // `inj_injected_occurrence_carries_its_language_and_grammar_kind`).
     let conn = Connection::open(&host_db).unwrap();
-    let (lang, raw_kind): (String, String) = conn
+    let kind: String = conn
         .query_row(
-            "SELECT lang, raw_kind FROM node_content WHERE lower(hex(node_hash)) = ?1",
+            "SELECT kind FROM node_content WHERE lower(hex(node_hash)) = ?1",
             [&host_hash],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .expect("injected def's node_hash must resolve in node_content (own CA root)");
-    assert_eq!((lang.as_str(), raw_kind.as_str()), ("sql", "create_table"));
+    assert_eq!(kind, "type");
+}
+
+/// An injected occurrence carries its own language and grammar kind (ADR-0047
+/// D-iii, bead `ley-line-open-cc5c55`). projection-v12 took `lang` and
+/// `raw_kind` off `node_content`; a host occurrence keeps them through
+/// `_ast.kind_id → kinds`, and an injected node has no `_ast` row, so the
+/// occurrence rows that DO exist for it, `node_defs`/`node_refs`, carry
+/// `kind_id → kinds` themselves. The Go host's injected `CREATE TABLE users`
+/// def answers ('sql', 'create_table'); the host's own Go defs answer 'go'.
+#[test]
+fn inj_injected_occurrence_carries_its_language_and_grammar_kind() {
+    let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let go_repo = go_fixture();
+    let db_dir = TempDir::new().unwrap();
+    let db = db_dir.path().join("host.db");
+    parse_pass(&db, go_repo.path(), "go");
+    let conn = Connection::open(&db).unwrap();
+    let kind_of = |token: &str| -> Vec<(String, String)> {
+        conn.prepare(
+            "SELECT k.lang, k.raw_kind FROM node_defs d JOIN kinds k ON k.kind_id = d.kind_id \
+             WHERE d.token = ?1 ORDER BY d.nid",
+        )
+        .unwrap()
+        .query_map([token], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    assert_eq!(
+        kind_of("users"),
+        vec![("sql".to_string(), "create_table".to_string())]
+    );
+    // Every def and ref occurrence carries a kind_id, host and injected alike.
+    let unkinded: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM node_defs WHERE kind_id IS NULL) \
+                  + (SELECT count(*) FROM node_refs WHERE kind_id IS NULL)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unkinded, 0);
+    // A host occurrence's kind_id is its `_ast` row's, defs and refs alike.
+    let disagree: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM node_defs d JOIN _ast a ON a.nid = d.nid \
+                      WHERE a.kind_id IS NOT d.kind_id) \
+                  + (SELECT count(*) FROM node_refs r JOIN _ast a ON a.nid = r.nid \
+                      WHERE a.kind_id IS NOT r.kind_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(disagree, 0);
+    // An injected ref occurrence answers its injected language too.
+    let injected_ref_langs: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT k.lang FROM node_refs r JOIN kinds k ON k.kind_id = r.kind_id \
+              WHERE NOT EXISTS (SELECT 1 FROM _ast a WHERE a.nid = r.nid)",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        injected_ref_langs.iter().all(|l| l == "sql"),
+        "{injected_ref_langs:?}"
+    );
+    let host_langs: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT k.lang FROM node_defs d JOIN _ast a ON a.nid = d.nid \
+             JOIN kinds k ON k.kind_id = d.kind_id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(host_langs, vec!["go".to_string()]);
 }
 
 #[test]

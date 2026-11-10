@@ -58,7 +58,7 @@ fn seed_db() -> Vec<u8> {
     leyline_schema::insert_node(
         &conn,
         leyline_schema::dir_nid(dir_id),
-        Some(leyline_schema::dir_nid(1)),
+        Some(leyline_schema::dir_nid(leyline_schema::DirId::ROOT)),
         Some(name_id),
         None,
         1,

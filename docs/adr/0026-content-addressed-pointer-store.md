@@ -403,7 +403,7 @@ not location-free, because `AstNode.sourceId` placed the relative path inside it
 | Domain | Authoritative bytes before | After |
 |---|---|---|
 | `Head.rootHash` | The `.source.capnp`, `.ast.capnp`, `.bindings.capnp` segment files one run wrote, folded under `leyline/segment-root/v1` | Unchanged. The segment records are built by `serialize_ast_node_record`, independently of the blob; the kibana parse writes a byte-identical `.ast.capnp` and `.source.capnp` before and after |
-| `Head.treeRoot` | `_tree` (path, mode, blob hash) under `parserId` | Unchanged definition. Its value moves once because `parserId` folds `projection_schema_version`, as at every projection bump |
+| `Head.treeRoot` (retired by ADR-0047 M1, now the parser-free `Head.storeRoot`) | `_tree` (path, mode, blob hash) under `parserId` | Unchanged definition. Its value moved once because `parserId` folded `projection_schema_version`, as at every projection bump; `storeRoot` does not move at a projection bump |
 | `Head.parserId` | The derivation inputs, including `projection_schema_version` | Moves to the `projection-v8` input; definition unchanged |
 | Blob hash (`capnp_blobs.blob_hash`) | BLAKE3 of one canonical `AstNodeList` | Retired. It was folded into no root and named by no head |
 | `current_root` | The serialized arena image | Unchanged definition; the image is smaller |

@@ -103,7 +103,7 @@ pub fn read_source(sock: &Path, path: &str) -> Option<(String, String)> {
     (reply["ok"] == true).then(|| {
         (
             reply["content"].as_str().unwrap_or_default().to_owned(),
-            reply["tree_root"].as_str().unwrap_or_default().to_owned(),
+            reply["store_root"].as_str().unwrap_or_default().to_owned(),
         )
     })
 }
@@ -250,8 +250,8 @@ impl Host {
     pub fn graph_root(&self, probe: &str) -> String {
         fs::write(self.path("catalog.json"), r#"{"entries":[]}"#).expect("catalog");
         let daemon = self.daemon("seed");
-        let (_, tree_root) = read_source(&daemon.sock, probe).expect("the probe file is stored");
-        format!("blake3-256:{tree_root}")
+        let (_, store_root) = read_source(&daemon.sock, probe).expect("the probe file is stored");
+        format!("blake3-256:{store_root}")
     }
 
     /// Write the catalog entry naming the agent binary inside `rootfs`, as

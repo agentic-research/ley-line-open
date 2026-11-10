@@ -224,6 +224,60 @@ impl<B: Backend> ExecutionService<B> {
                 return Err(error);
             }
         };
+        // A backend reports each workspace share its worker holds. Every
+        // tier refuses a grant it cannot serve before it spawns anything,
+        // but `Backend` is a public trait, and a tier that answered `Ok`
+        // without a share for a granted workspace has started the workload
+        // without it (bead ley-line-open-204a94). The service holds that
+        // line at the seam: the run is cancelled and never recorded, so it
+        // cannot complete, be collected, or claim the workspace's graph
+        // root as an input.
+        if let Err(error) = served_exactly(&request.workspaces, &started.channels) {
+            // The refusal is the answer either way; a cancel that also fails
+            // is named in it rather than masking it.
+            let cancel = self.backend.cancel(&request.run_id);
+            let mut state = self.state.write();
+            state.starting.remove(&request.run_id);
+            let Err(cancel) = cancel else {
+                return Err(error);
+            };
+            // The workload may still be running. Forgetting it would leave a
+            // live run nothing can address and free its run_id for a second
+            // start. It is recorded `Failed` instead: terminal, so it is never
+            // polled or receipted (it has no receipt context), its run_id
+            // refuses another start, and `cleanup` retries the cancel.
+            let error = ExecutionError {
+                detail: format!(
+                    "{}; cancelling the run also failed, so it is recorded failed \
+                     and `cleanup` retries the cancel: {cancel}",
+                    error.detail
+                ),
+                ..error
+            };
+            let detail_digest = serde_json::to_vec(&error)
+                .ok()
+                .map(|bytes| format!("blake3-256:{}", bytes.hash()));
+            state.runs.insert(
+                request.run_id.clone(),
+                RunRecord {
+                    run_id: request.run_id.clone(),
+                    replay_key: request.replay_key.clone(),
+                    state: RunState::Failed,
+                    backend_id: started.backend_id,
+                },
+            );
+            state.events.insert(
+                request.run_id,
+                vec![
+                    event(1, RunState::Accepted),
+                    event(2, RunState::Provisioning),
+                    event(3, RunState::Ready),
+                    event(4, RunState::Running),
+                    event_with_detail(5, RunState::Failed, detail_digest),
+                ],
+            );
+            return Err(error);
+        }
         let record = RunRecord {
             run_id: request.run_id.clone(),
             replay_key: request.replay_key.clone(),
@@ -542,6 +596,50 @@ impl<B: Backend> ExecutionService<B> {
             .push(event_with_detail(sequence, terminal, detail_digest));
         Ok(())
     }
+}
+
+/// The workspace shares a backend reports must be exactly the run's granted
+/// workspaces, by name and graph root, each once: a granted workspace with
+/// no share ran the workload without it, and a share the grant never named
+/// is authority the run was not given. Either is `workspaceUnserved`.
+fn served_exactly(
+    granted: &[crate::WorkspaceGrant],
+    channels: &[crate::WorkerChannel],
+) -> Result<(), ExecutionError> {
+    let mut granted: Vec<(&str, &str)> = granted
+        .iter()
+        .map(|grant| (grant.name.as_str(), grant.graph_root.as_str()))
+        .collect();
+    let mut served: Vec<(&str, &str)> = channels
+        .iter()
+        .map(|channel| match channel {
+            crate::WorkerChannel::WorkspaceShare {
+                workspace,
+                graph_root,
+            } => (workspace.as_str(), graph_root.as_str()),
+        })
+        .collect();
+    granted.sort_unstable();
+    served.sort_unstable();
+    if granted == served {
+        return Ok(());
+    }
+    let detail = if let Some((name, root)) = granted.iter().find(|grant| !served.contains(grant)) {
+        format!(
+            "the backend started the run without serving its granted workspace {name:?} \
+             at {root}; the start is refused"
+        )
+    } else if let Some((name, root)) = served.iter().find(|share| !granted.contains(share)) {
+        format!(
+            "the backend served workspace {name:?} at {root}, which the run is not \
+             granted; the start is refused"
+        )
+    } else {
+        "the backend's workspace shares do not match the run's granted workspaces one \
+         for one; the start is refused"
+            .to_owned()
+    };
+    Err(ExecutionError::workspace_unserved(detail))
 }
 
 fn event(sequence: u64, state: RunState) -> RunEventRecord {

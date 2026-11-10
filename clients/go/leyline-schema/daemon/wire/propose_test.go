@@ -130,8 +130,8 @@ func TestProposeResponseRoundTripsAppliedWithMerged(t *testing.T) {
 	if got.OK == nil || !*got.OK || got.Refusal != nil {
 		t.Fatalf("an applied proposal is ok:true with no refusal; got ok=%v refusal=%+v", got.OK, got.Refusal)
 	}
-	if got.TreeRoot == nil || len(*got.TreeRoot) != 64 {
-		t.Fatalf("tree_root is 64 hex chars; got %v", got.TreeRoot)
+	if got.StoreRoot == nil || len(*got.StoreRoot) != 64 {
+		t.Fatalf("store_root is 64 hex chars; got %v", got.StoreRoot)
 	}
 	if len(got.Blobs) != 1 || got.Blobs[0].Path == nil || *got.Blobs[0].Path != "src/main.rs" ||
 		got.Blobs[0].BlobHash == nil || len(*got.Blobs[0].BlobHash) != 64 {
@@ -234,7 +234,7 @@ func TestReadSourceResponseRoundTrips(t *testing.T) {
 	roundTrip(t, loadFixture(t, "read_source").Response, &got)
 	if got.OK == nil || !*got.OK || got.Content == nil || *got.Content != "fn main() {}\n" ||
 		got.BlobHash == nil || len(*got.BlobHash) != 64 ||
-		got.TreeRoot == nil || len(*got.TreeRoot) != 64 ||
+		got.StoreRoot == nil || len(*got.StoreRoot) != 64 ||
 		got.Mode == nil || *got.Mode != ModeRegular {
 		t.Fatalf("read_source: %+v", got)
 	}
@@ -246,11 +246,30 @@ func TestReadSourceResponseRoundTrips(t *testing.T) {
 func TestReadSourceResponseKeepsAnEmptyFile(t *testing.T) {
 	const emptyBlob = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 	data := []byte(`{"ok":true,"content":"","blob_hash":"` + emptyBlob +
-		`","tree_root":"` + emptyBlob + `","mode":"100644"}`)
+		`","store_root":"` + emptyBlob + `","mode":"100644"}`)
 	var got ReadSourceResponse
 	roundTrip(t, data, &got)
 	if got.Content == nil || *got.Content != "" || got.BlobHash == nil || *got.BlobHash != emptyBlob {
 		t.Fatalf("an empty file: %+v", got)
+	}
+}
+
+// LLO ADR-0047 M1: `tree_root` is retired. A response that carries it — a
+// pre-M1 daemon's — is refused by the strict decode, never read as if it
+// named the parser-free store.
+func TestATreeRootResponseIsRefused(t *testing.T) {
+	const root = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"
+	for _, tc := range []struct {
+		name string
+		data string
+		v    any
+	}{
+		{"read_source", `{"ok":true,"content":"x","tree_root":"` + root + `"}`, &ReadSourceResponse{}},
+		{"propose", `{"ok":true,"tree_root":"` + root + `","blobs":[]}`, &ProposeResponse{}},
+	} {
+		if err := strictDecode([]byte(tc.data), tc.v); err == nil {
+			t.Fatalf("%s: a tree_root response decoded: %+v", tc.name, tc.v)
+		}
 	}
 }
 

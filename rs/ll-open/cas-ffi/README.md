@@ -12,7 +12,11 @@ Mirrors `leyline-sign` (ADR-0019) as the precedent pattern: "Rust substrate prim
 
 ## What's here
 
-- **`ffi`** — C-ABI functions. v0.1 exposes one entry point: `leyline_hash_bytes(input_ptr, input_len, output_ptr, output_len) -> i32`. Returns BLAKE3-of-input into the caller's output buffer; status codes documented per function.
+- **`ffi`** — C-ABI functions, declared in [`include/leyline_cas_ffi.h`](include/leyline_cas_ffi.h) (cbindgen output; `tests/c_header.rs` compiles a probe against it):
+  - `leyline_hash_bytes(in_ptr, in_len, out_buf, out_len) -> i32` — σ_bytes, BLAKE3 of the input.
+  - `leyline_derive_key(ctx_ptr, ctx_len, in_ptr, in_len, out_buf, out_len) -> i32` — BLAKE3 `derive_key(context, input)`, the keyed primitive every keyed Σ construction is built on. The context is UTF-8, not NUL-terminated, and must be non-empty. The prerequisite of run-id v2 (ADR-0047 D-i): cloister derives `run_id` through it. Pinned by the `deriveKey` cases of `ll-core/schema-spec/sigma/v1/test-vectors/constructions.json` (BLAKE3's own test vectors). Bead `ley-line-open-12e252`.
+
+  Both write 32 bytes and return `32`, or return `-1` (writing nothing) on a null pointer, a refused argument, or `out_len < 32`.
 - **Crate-type triple** — `cdylib` (wasm32 + dlopen from TS), `staticlib` (Swift/C consumers), `rlib` (in-workspace Rust composition). Matches `leyline-sign/Cargo.toml`.
 
 ## Out of scope

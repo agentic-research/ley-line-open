@@ -122,6 +122,12 @@ pub struct DaemonConfig {
     /// protocol, not MCP, so this is the only MCP surface an attested
     /// caller can dial.
     pub mcp_uds: Option<std::path::PathBuf>,
+    /// The Cloister groups (`daemon::mcp::cloister_groups`) the MCP
+    /// listeners grant their callers (bead `ley-line-open-851a65`). `None`
+    /// grants every group; `Some` grants exactly those named, and a name no
+    /// group has refuses startup. A `tools/call` outside the grant is
+    /// refused, and `tools/list` lists only the granted tools.
+    pub mcp_groups: Option<Vec<String>>,
     /// Bead `ley-line-open-c7d00f`: when `true`, drop any existing
     /// live-db + zero the controller before starting so a cold parse
     /// runs against `--source` regardless of prior arena state.
@@ -309,8 +315,16 @@ pub async fn run_daemon_with_options(
         mcp_allow_public,
         mcp_no_auth,
         mcp_uds,
+        mcp_groups,
         reset_arena,
     } = config;
+    // Resolved before any arena or db work: a grant naming an undeclared
+    // group refuses startup rather than serving a wider or narrower surface
+    // than the operator asked for (bead `ley-line-open-851a65`).
+    let mcp_grant = match mcp_groups.as_deref() {
+        None => crate::daemon::mcp::McpGrant::all(),
+        Some(groups) => crate::daemon::mcp::McpGrant::groups(groups).context("--mcp-groups")?,
+    };
     let arena = arena.as_path();
     let control = control.as_deref();
     let mount = mount.as_deref();
@@ -683,6 +697,7 @@ pub async fn run_daemon_with_options(
                         ctx.clone(),
                         uds_path.clone(),
                         token.clone(),
+                        mcp_grant.clone(),
                     ) {
                         Ok(_h) => {}
                         Err(e) => log::error!(
@@ -693,7 +708,13 @@ pub async fn run_daemon_with_options(
                 }
                 match mcp_port {
                     Some(port) => {
-                        match crate::daemon::mcp::spawn(ctx.clone(), mcp_bind, port, token) {
+                        match crate::daemon::mcp::spawn(
+                            ctx.clone(),
+                            mcp_bind,
+                            port,
+                            token,
+                            mcp_grant,
+                        ) {
                             Ok(h) => Some(h),
                             Err(e) => {
                                 log::error!(
@@ -3827,6 +3848,7 @@ mod tests {
             mcp_allow_public: false,
             mcp_no_auth: false,
             mcp_uds: None,
+            mcp_groups: None,
             reset_arena: false,
         }
     }
@@ -3849,6 +3871,26 @@ mod tests {
             msg.contains("0.0.0.0"),
             "error message must echo the offending address; got: {msg}"
         );
+    }
+
+    /// Bead `ley-line-open-851a65`: a grant naming a group nothing declares
+    /// refuses startup before the arena is touched or a listener binds.
+    #[tokio::test]
+    async fn an_unknown_mcp_group_refuses_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let arena = tmp.path().join("arena");
+        let sock = tmp.path().join("mcp.sock");
+        let mut config = test_mcp_gate_config(&arena, 12346);
+        config.mcp_uds = Some(sock.clone());
+        config.mcp_no_auth = true;
+        config.mcp_groups = Some(vec!["query".into(), "admin".into()]);
+        let err = run_daemon(config, std::sync::Arc::new(NoExt))
+            .await
+            .expect_err("an unknown group must refuse startup");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown MCP group `admin`"), "{msg}");
+        assert!(!sock.exists(), "no MCP listener was bound");
+        assert!(!arena.exists(), "the arena was not touched");
     }
 
     #[derive(Default)]

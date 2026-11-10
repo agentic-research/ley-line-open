@@ -4,7 +4,7 @@
 //! mode (regular, executable, symlink whose blob is its target), or a
 //! directory. The directory set is closed under parents. `_source` is the
 //! projection's registry of the files the parse projects; `_tree` is what
-//! the store holds, and `treeRoot` folds it ([`crate::tree_root`]).
+//! the store holds, and `storeRoot` folds it ([`crate::store_root`]).
 //!
 //! `mtime` and `size` are the walk's stat cache, as `nodes.mtime`/`size`
 //! are for projected files: a file whose stat matches is not read again.
@@ -322,12 +322,21 @@ pub fn stats(conn: &Connection) -> Result<std::collections::HashMap<String, (i64
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The bytes the store holds for `blob`.
+/// The bytes the store holds for `blob`, verified: `None` when the store
+/// holds no such blob, and an error when the bytes stored under `blob` do
+/// not hash to it. Σ (CA) as verify-on-read (`BlobStore::get`'s contract,
+/// decade F3): `read_source`, `storefs` and `rebuild` read source blobs
+/// here, so a row whose bytes were changed under its key fails closed
+/// instead of being served as the file the key names (bead
+/// `ley-line-open-10d71a`). The read is [`leyline_core::source_blob::read`],
+/// the one reader of `source_blobs` bytes (bead `ley-line-open-12d305`).
 pub fn blob_bytes(conn: &Connection, blob: Hash) -> Result<Option<Vec<u8>>> {
-    Ok(conn
-        .prepare_cached("SELECT blob_bytes FROM source_blobs WHERE blob_hash = ?1")?
-        .query_row([blob.as_bytes().as_slice()], |r| r.get(0))
-        .optional()?)
+    Ok(leyline_core::source_blob::read(conn, blob)?)
+}
+
+/// [`blob_bytes`] for the file at `path`: a refusal names the path.
+pub fn blob_bytes_at(conn: &Connection, path: &str, blob: Hash) -> Result<Option<Vec<u8>>> {
+    Ok(leyline_core::source_blob::read_at(conn, path, blob)?)
 }
 
 /// A file's diagnostic (ADR-0045 T3): the first error tree-sitter found,

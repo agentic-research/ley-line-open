@@ -251,7 +251,7 @@ func TestDecodeEvent_HeadAndFilesChanged(t *testing.T) {
 }
 
 // TestDecodeEvent_GenericDaemonOp: a daemon.<op> topic not enumerated
-// explicitly (e.g., daemon.load, daemon.flush, daemon.reparse) is
+// explicitly (e.g., daemon.load, daemon.propose, daemon.reparse) is
 // routed to the generic DaemonOpPayload shape.
 func TestDecodeEvent_GenericDaemonOp(t *testing.T) {
 	line := []byte(`{"event":true,"seq":"3","topic":"daemon.load","source":"leyline","data":{"op":"load"}}`)

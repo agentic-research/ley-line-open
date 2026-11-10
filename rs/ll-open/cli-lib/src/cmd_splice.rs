@@ -54,7 +54,7 @@ mod tests {
     /// COMMITTED to disk rather than what some still-open handle believes.
     fn read_source(db: &Path) -> Result<Vec<u8>> {
         let conn = Connection::open(db)?;
-        let file_id: i64 = conn.query_row(
+        let file_id: leyline_schema::FileId = conn.query_row(
             "SELECT file_id FROM _source WHERE id = 'test.html'",
             [],
             |r| r.get(0),

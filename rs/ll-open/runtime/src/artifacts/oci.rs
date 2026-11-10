@@ -43,21 +43,47 @@
 //!   written): neither a directory's mode, an empty directory, ownership,
 //!   timestamps nor extended attributes is in the manifest, so none is
 //!   carried, and two imports with the same identity are the same tree on
-//!   disk. The guest init creates its own `/dev`, `/proc`, `/sys` and `/tmp`
-//!   mount points. Setuid, setgid and sticky bits are cleared (and counted): the tree
-//!   is written by an unprivileged host user, and a host file carrying them
-//!   is a hazard the manifest has no reason to admit. A file its owner cannot
-//!   read, a device node, a FIFO, a sparse file or an aufs `.wh..wh.` entry
-//!   is refused by name. A hard link becomes a second regular file with its
-//!   target's content and mode.
+//!   disk. The guest init creates its own `/dev`, `/proc` and `/sys` mount
+//!   points. Setuid, setgid and sticky bits are cleared (and counted): the
+//!   tree is written by an unprivileged host user, and a host file carrying
+//!   them is a hazard the manifest has no reason to admit. A directory entry
+//!   its owner cannot read (written `0755` it would expose its subtree), a
+//!   device node or FIFO outside the kernel-mounted directories below, a
+//!   sparse file or an aufs `.wh..wh.` entry is refused by name. A hard link
+//!   becomes a second regular file with its target's content and mode.
+//! - **What the guest could never observe is dropped, never written, and
+//!   reported.** Each rule names a reason the workload cannot tell the
+//!   difference through `open`:
+//!   - A device node or FIFO strictly beneath `dev/`, `proc/` or `sys/`
+//!     ([`ImportedRootfs::special_entries_dropped`]): libkrun's guest init
+//!     mounts devtmpfs, proc and sysfs over those directories before the
+//!     workload runs (`init.c` `mount_filesystems`; see
+//!     `rootfs_tree::KERNEL_MOUNTED` for the line citations). It replaces
+//!     whatever a lower layer had at its path.
+//!   - A regular file whose owner-read bit is clear (`etc/shadow` at
+//!     `0000`, [`ImportedRootfs::unreadable_files_dropped`]): no
+//!     unprivileged reader, the guest's virtio-fs server included, can read
+//!     it. `stat` reports `ENOENT` where it would have reported the file.
+//!   - Under `Resolve`, a link whose resolution reaches `dev`, `proc` or
+//!     `sys` ([`ImportedRootfs::links_dropped_kernel_mount`]), and a link
+//!     whose target the image does not hold
+//!     ([`ImportedRootfs::links_dropped_dangling`]). See below.
 //! - **Symbolic links.** The manifest admits none, so [`SymlinkPolicy`]
 //!   decides: `Refuse` (the default) names the first link; `Resolve` replaces
 //!   each link with a copy of the regular file or directory it resolves to
 //!   inside the image, absolute targets meaning the image's root, never the
-//!   host's. A dangling link, a loop, a link whose `..` climbs above the
-//!   image root, and a directory link that contains itself are refused. A
-//!   layer entry whose path passes through a link (`link/passwd` after
-//!   `link -> /etc`) is refused under either policy.
+//!   host's. A dangling link inside the root is dropped: `open` through it
+//!   fails `ENOENT` in the guest, as on the absent path; only `readlink`,
+//!   `lstat` and a write that would create the target through the link
+//!   differ. A link into a kernel mount is dropped too: the guest kernel,
+//!   not the image, supplies what is there, so no image bytes stand in for
+//!   it (a read through the absent link fails `ENOENT` where the real link
+//!   would reach the kernel's file). A loop, a link whose `..` climbs above
+//!   the image root (also after a missing component), a target that
+//!   continues through a regular file, an empty target, and a directory link
+//!   that contains itself are refused. A layer entry whose path passes
+//!   through a link (`link/passwd` after `link -> /etc`) is refused under
+//!   either policy.
 //! - **No traversal.** Absolute paths, `..` components, entries under a
 //!   regular file, and `rootfs.manifest.json` at the image root are refused.
 //!   No image path reaches the host filesystem until the finished tree is
@@ -65,7 +91,10 @@
 //!   extracted file contents are stored only under their BLAKE3 names.
 //! - **Deterministic identity.** The manifest lists files in path order with
 //!   fixed field order, so the same image content gives the same rootfs
-//!   digest whatever the layers' archive order, the host, or the run.
+//!   digest whatever the layers' archive order, the host, or the run. A
+//!   dropped entry is absent from the manifest, so an image that differs
+//!   from another only by dropped entries has the same digest, and an image
+//!   with none has the digest it had before the drop rules existed.
 //! - **Atomic, verified publication.** The staged tree is verified against
 //!   its own manifest, then renamed to `<cas-root>/<digest>`. An existing
 //!   entry is reused only if its files verify and its directories are exactly
@@ -91,7 +120,9 @@ use leyline_core::ContentAddressed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::rootfs_tree::{FileNode, Final, Node, PathError, ResolveError, Tree, join};
+use super::rootfs_tree::{
+    FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join, under_kernel_mount,
+};
 use crate::DigestRef;
 use crate::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver, verify_manifest};
 
@@ -141,7 +172,10 @@ pub enum SymlinkPolicy {
     /// Refuse the import, naming the first link in path order.
     #[default]
     Refuse,
-    /// Replace each link with a copy of its in-image target.
+    /// Replace each link with a copy of its in-image target. A link into
+    /// `dev`, `proc` or `sys`, or one whose target the image does not hold,
+    /// is dropped and reported instead; one that loops or escapes the image
+    /// root is refused.
     Resolve,
 }
 
@@ -319,7 +353,60 @@ pub struct ImportedRootfs {
     pub special_mode_bits_cleared: usize,
     /// Links replaced by copies of their targets (`SymlinkPolicy::Resolve`).
     pub symlinks_resolved: usize,
+    /// Device nodes and FIFOs under a directory the guest init mounts a
+    /// kernel filesystem over (`dev`, `proc`, `sys`), in layer and archive
+    /// order. None is written; the guest could never observe one.
+    pub special_entries_dropped: Vec<DroppedEntry>,
+    /// Links (`SymlinkPolicy::Resolve`) whose resolution reaches `dev`,
+    /// `proc` or `sys`, which the guest's kernel provides at boot. In path
+    /// order; one per path written, so a link inside a copied directory is
+    /// listed at each copy.
+    pub links_dropped_kernel_mount: Vec<DroppedLink>,
+    /// Links (`SymlinkPolicy::Resolve`) whose target is absent from the
+    /// image and never leaves its root. In path order, as above.
+    pub links_dropped_dangling: Vec<DroppedLink>,
+    /// Regular files without their owner-read bit (`etc/shadow` at `0000`),
+    /// in path order, one per path that would have been written (a hard
+    /// link or a resolved link to one is another). None is written.
+    pub unreadable_files_dropped: Vec<DroppedFile>,
     pub image_config: ImageRuntimeConfig,
+}
+
+/// A regular file an import dropped because its owner cannot read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedFile {
+    /// Where it would have been written, relative to the image root.
+    pub path: String,
+    /// Its permission bits as the layer gave them, special bits included.
+    pub mode: u32,
+}
+
+/// What kind of entry a dropped special entry was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpecialEntryKind {
+    Char,
+    Block,
+    Fifo,
+}
+
+/// A device node or FIFO an import dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedEntry {
+    /// The layer whose archive held it, from 0.
+    pub layer: usize,
+    /// Its path in that archive, relative to the image root.
+    pub path: String,
+    pub kind: SpecialEntryKind,
+}
+
+/// A symbolic link an import dropped instead of copying its target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedLink {
+    /// Where the link would have been written, relative to the image root.
+    pub path: String,
+    /// The link's target, verbatim.
+    pub target: String,
 }
 
 /// Import the image `request` pins from its OCI layout into `cas_root`, an
@@ -394,6 +481,7 @@ pub fn import_oci_layout(
     let mut store = ContentStore::create(staging.path().join("content"))?;
     let budget = Budget::new(request.max_rootfs_bytes);
     let mut tree = Tree::default();
+    let mut special_entries_dropped = Vec::new();
     for (index, (layer, diff_id)) in manifest
         .layers
         .iter()
@@ -406,15 +494,20 @@ pub fn import_oci_layout(
         let changes = read_layer(index, &staged, compression, diff_id, &mut store, &budget)
             .map_err(|error| budget.explain(error))?;
         fs::remove_file(&staged).map_err(io_error("remove a staged layer"))?;
-        changes.apply(index, &mut tree)?;
+        special_entries_dropped.extend(changes.apply(index, &mut tree)?);
     }
 
-    let (finished, symlinks_resolved) = match request.symlinks {
+    let resolved = match request.symlinks {
         SymlinkPolicy::Refuse => {
             if let Some((path, target)) = tree.first_symlink() {
                 return Err(OciImportError::SymlinkRefused { path, target });
             }
-            (tree.into_final(), 0)
+            Resolved {
+                tree: tree.into_final(),
+                copied: 0,
+                kernel_mount: Vec::new(),
+                dangling: Vec::new(),
+            }
         }
         SymlinkPolicy::Resolve => tree
             .resolve_symlinks(MAX_RESOLVED_ENTRIES)
@@ -428,6 +521,20 @@ pub fn import_oci_layout(
                 )),
             })?,
     };
+    let dropped_links = |links: Vec<(String, String)>| {
+        links
+            .into_iter()
+            .map(|(path, target)| DroppedLink { path, target })
+            .collect()
+    };
+    let links_dropped_kernel_mount = dropped_links(resolved.kernel_mount);
+    let links_dropped_dangling = dropped_links(resolved.dangling);
+    let symlinks_resolved = resolved.copied;
+    let (finished, unreadable) = resolved.tree.without_unreadable_files();
+    let unreadable_files_dropped = unreadable
+        .into_iter()
+        .map(|(path, mode)| DroppedFile { path, mode })
+        .collect();
     // Rootfs manifest v1 lists files only, so a directory that holds none is
     // not part of the identity: write none, and one digest names one tree.
     let finished = finished.without_empty_directories();
@@ -459,6 +566,10 @@ pub fn import_oci_layout(
         files: written.files,
         special_mode_bits_cleared: written.special_mode_bits_cleared,
         symlinks_resolved,
+        special_entries_dropped,
+        links_dropped_kernel_mount,
+        links_dropped_dangling,
+        unreadable_files_dropped,
         image_config: ImageRuntimeConfig {
             entrypoint: runtime.entrypoint.unwrap_or_default(),
             cmd: runtime.cmd.unwrap_or_default(),
@@ -914,6 +1025,9 @@ impl<R: Read> Read for DiffIdReader<'_, R> {
 enum Change {
     Node(Vec<String>, Node),
     Hardlink(Vec<String>, Vec<String>),
+    /// An entry that is not written: it replaces whatever a lower layer (or
+    /// an earlier entry of this one) had at its path, and leaves nothing.
+    Drop(Vec<String>),
 }
 
 /// One layer, read whole before any of it is applied: its whiteouts must
@@ -923,10 +1037,12 @@ struct LayerChanges {
     whiteouts: Vec<(String, Vec<String>, String)>,
     opaques: Vec<(String, Vec<String>)>,
     entries: Vec<(String, Change)>,
+    dropped: Vec<DroppedEntry>,
 }
 
 impl LayerChanges {
-    fn apply(self, layer: usize, tree: &mut Tree) -> Result<(), OciImportError> {
+    /// Apply the layer to `tree`, returning the entries it dropped.
+    fn apply(self, layer: usize, tree: &mut Tree) -> Result<Vec<DroppedEntry>, OciImportError> {
         let refuse = |raw: String| move |error: PathError| unsafe_path(layer, &raw, error.reason());
         for (raw, parent, name) in self.whiteouts {
             tree.whiteout(&parent, &name).map_err(refuse(raw))?;
@@ -938,10 +1054,11 @@ impl LayerChanges {
             match change {
                 Change::Node(path, node) => tree.insert(&path, node),
                 Change::Hardlink(path, target) => tree.hardlink(&path, &target),
+                Change::Drop(path) => tree.remove(&path),
             }
             .map_err(refuse(raw))?;
         }
-        Ok(())
+        Ok(self.dropped)
     }
 }
 
@@ -1039,6 +1156,22 @@ fn read_layer(
                 continue;
             }
             if kind == tar::EntryType::Directory {
+                // Directory modes are not carried (each is written 0755), so
+                // one the image made unreadable would expose its subtree.
+                let mode = entry
+                    .header()
+                    .mode()
+                    .map_err(io_error("read an entry mode"))?;
+                if mode & 0o400 == 0 {
+                    return Err(unsafe_path(
+                        layer,
+                        &raw,
+                        &format!(
+                            "a directory its owner cannot read (mode {:04o}) would be written 0755, exposing what it hides",
+                            mode & 0o7777
+                        ),
+                    ));
+                }
                 if !path.is_empty() {
                     changes
                         .entries
@@ -1100,6 +1233,26 @@ fn read_layer(
                         unsafe_path(layer, &raw, &format!("hard link target: {reason}"))
                     })?;
                     Change::Hardlink(path, target)
+                }
+                tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo => {
+                    let kind = match kind {
+                        tar::EntryType::Char => SpecialEntryKind::Char,
+                        tar::EntryType::Block => SpecialEntryKind::Block,
+                        _ => SpecialEntryKind::Fifo,
+                    };
+                    // Beneath a kernel mount the guest could never see it;
+                    // anywhere else it would be a hole in the rootfs.
+                    if !under_kernel_mount(&path) {
+                        return Err(OciImportError::Unsupported(format!(
+                            "layer {layer} entry {raw}: {kind:?} entries are not expressible in rootfs manifest v1, and only those beneath dev/, proc/ or sys/ (which the guest init mounts kernel filesystems over) are dropped"
+                        )));
+                    }
+                    changes.dropped.push(DroppedEntry {
+                        layer,
+                        path: raw.clone(),
+                        kind,
+                    });
+                    Change::Drop(path)
                 }
                 other => {
                     return Err(OciImportError::Unsupported(format!(
@@ -1180,11 +1333,8 @@ impl Writer<'_> {
             mode &= 0o777;
             self.special_mode_bits_cleared += 1;
         }
-        if mode & 0o400 == 0 {
-            return Err(OciImportError::Unsupported(format!(
-                "{relative} has mode {mode:04o}: a file its owner cannot read cannot be verified against the rootfs manifest"
-            )));
-        }
+        // `Final::without_unreadable_files` removed every file whose owner
+        // cannot read it: each file written here can be verified.
         self.written += file.size;
         if self.written > self.limit {
             return Err(OciImportError::TooLarge { limit: self.limit });

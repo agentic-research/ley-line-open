@@ -11,6 +11,25 @@ use std::collections::{BTreeMap, VecDeque};
 /// Linux's `MAXSYMLINKS`: how many links one resolution may traverse.
 const MAX_SYMLINK_HOPS: usize = 40;
 
+/// The top-level directories libkrun's guest init mounts a kernel
+/// filesystem over before the workload runs (`mount_filesystems` in
+/// `rs/third_party/libkrun/src/init_blob/init/init.c`): devtmpfs on `/dev`
+/// (init.c:550, then devpts on `/dev/pts` at :594 and tmpfs on `/dev/shm` at
+/// :601), proc on `/proc` (:566), sysfs on `/sys` (:573, then cgroup2 on
+/// `/sys/fs/cgroup` at :580). Each mount either succeeds, is already there
+/// (`EBUSY`), or makes init exit before anything runs (:1495-1498). Nothing
+/// an image holds beneath these is visible to the workload, and nothing a
+/// link names beneath them is the image's to supply. `/tmp` is not one:
+/// init mounts there only in TDX builds (:1467-1487), and then an ext4
+/// volume, not a kernel filesystem.
+pub(crate) const KERNEL_MOUNTED: [&str; 3] = ["dev", "proc", "sys"];
+
+/// Whether `path`, from the image root, lies strictly beneath one of
+/// [`KERNEL_MOUNTED`] (the mount point itself is not beneath it).
+pub(crate) fn under_kernel_mount(path: &[String]) -> bool {
+    path.len() >= 2 && KERNEL_MOUNTED.contains(&path[0].as_str())
+}
+
 /// A regular file's content (by BLAKE3, held in the import's content store)
 /// and permission bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +76,39 @@ pub(crate) enum Final {
 }
 
 impl Final {
+    /// The tree without any regular file whose owner-read bit is clear, and
+    /// those files as `(path, mode)` in path order. Nothing unprivileged can
+    /// read one: not the import's verifier, not the CAS resolver, not the
+    /// guest's virtio-fs server, which runs as the same unprivileged user.
+    pub(crate) fn without_unreadable_files(self) -> (Final, Vec<(String, u32)>) {
+        fn filter(
+            entries: BTreeMap<String, Final>,
+            prefix: &str,
+            dropped: &mut Vec<(String, u32)>,
+        ) -> BTreeMap<String, Final> {
+            entries
+                .into_iter()
+                .filter_map(|(name, node)| match node {
+                    Final::File(file) if file.mode & 0o400 == 0 => {
+                        dropped.push((join(prefix, &name), file.mode));
+                        None
+                    }
+                    Final::File(file) => Some((name, Final::File(file))),
+                    Final::Dir(children) => {
+                        let children = filter(children, &join(prefix, &name), dropped);
+                        Some((name, Final::Dir(children)))
+                    }
+                })
+                .collect()
+        }
+        let mut dropped = Vec::new();
+        let tree = match self {
+            Final::Dir(entries) => Final::Dir(filter(entries, "", &mut dropped)),
+            file => file,
+        };
+        (tree, dropped)
+    }
+
     /// The tree without any directory that holds no regular file, at any
     /// depth. The root directory is kept.
     pub(crate) fn without_empty_directories(self) -> Final {
@@ -153,6 +205,15 @@ impl Tree {
         Ok(())
     }
 
+    /// Remove whatever is at `path` (non-empty), as an entry that cannot be
+    /// written replaces it: the parent must be reachable exactly as
+    /// [`Tree::insert`] requires.
+    pub(crate) fn remove(&mut self, path: &[String]) -> Result<(), PathError> {
+        let (name, parent) = path.split_last().expect("remove names a non-root path");
+        self.ensure_dir(parent)?.remove(name);
+        Ok(())
+    }
+
     /// A hard link at `path` to the regular file at `target`: a second file
     /// with the target's content and mode (they share one inode's mode).
     pub(crate) fn hardlink(&mut self, path: &[String], target: &[String]) -> Result<(), PathError> {
@@ -235,26 +296,37 @@ impl Tree {
     ///
     /// Resolution follows the guest's path semantics with one deliberate
     /// difference: a `..` that would climb above the image root is refused
-    /// instead of clamped at `/`. Dangling links, loops, and links whose
-    /// expansion would contain themselves are refused. `max_nodes` bounds the
-    /// copied tree. Returns the tree and how many links were replaced.
-    pub(crate) fn resolve_symlinks(
-        &self,
-        max_nodes: usize,
-    ) -> Result<(Final, usize), ResolveError> {
+    /// instead of clamped at `/`, including in the part of a target after a
+    /// missing component or a kernel mount point. Two kinds of link are
+    /// dropped, never written, and reported: one whose resolution reaches
+    /// [`KERNEL_MOUNTED`] (the guest kernel supplies what is there, not the
+    /// image), and one whose target the image does not hold (the guest's
+    /// `open` through it fails `ENOENT`, as it does on the absent path).
+    /// Loops, a target that continues through a regular file, an empty
+    /// target, and links whose expansion would contain themselves are
+    /// refused. `max_nodes` bounds the copied tree.
+    pub(crate) fn resolve_symlinks(&self, max_nodes: usize) -> Result<Resolved, ResolveError> {
         let mut state = Expansion {
             tree: self,
             active: vec![Vec::new()],
             nodes: 0,
             max_nodes,
-            resolved: 0,
+            copied: 0,
+            kernel_mount: Vec::new(),
+            dangling: Vec::new(),
         };
         let root = state.expand(&[])?;
-        Ok((Final::Dir(root), state.resolved))
+        Ok(Resolved {
+            tree: Final::Dir(root),
+            copied: state.copied,
+            kernel_mount: state.kernel_mount,
+            dangling: state.dangling,
+        })
     }
 
-    /// The real path `target` names, read from the directory `parent`.
-    fn resolve(&self, parent: &[String], target: &str) -> Result<Vec<String>, &'static str> {
+    /// What `target` names, read from the directory `parent`: the real path
+    /// of a node in the image, or why it names none the image supplies.
+    fn resolve(&self, parent: &[String], target: &str) -> Result<Resolution, &'static str> {
         if target.is_empty() {
             return Err("the link's target is empty");
         }
@@ -270,13 +342,25 @@ impl Tree {
                 "." => {}
                 ".." => {
                     if stack.pop().is_none() {
-                        return Err("the target climbs above the image root");
+                        return Err(CLIMBS_ABOVE_ROOT);
                     }
                 }
                 _ => {
                     stack.push(component);
+                    // The guest's kernel, not the image, decides what lies
+                    // at or beneath a kernel mount point. What remains of
+                    // the target must still stay inside the root.
+                    if KERNEL_MOUNTED.contains(&stack[0].as_str()) {
+                        stay_in_root(stack.len(), &pending)?;
+                        return Ok(Resolution::KernelMount);
+                    }
                     match self.lookup(&stack) {
-                        None => return Err("the target does not exist in the image"),
+                        // The guest's walk stops here with ENOENT, whatever
+                        // follows; what follows must still stay in the root.
+                        None => {
+                            stay_in_root(stack.len(), &pending)?;
+                            return Ok(Resolution::Dangling);
+                        }
                         Some(Node::Dir(_)) => {}
                         Some(Node::File(_)) => {
                             if !pending.is_empty() {
@@ -300,8 +384,48 @@ impl Tree {
                 }
             }
         }
-        Ok(stack)
+        Ok(Resolution::Found(stack))
     }
+}
+
+const CLIMBS_ABOVE_ROOT: &str = "the target climbs above the image root";
+
+/// Whether the lexical remainder of a target, read from a directory `depth`
+/// components below the root, never climbs above it.
+fn stay_in_root(mut depth: usize, pending: &VecDeque<String>) -> Result<(), &'static str> {
+    for component in pending {
+        match component.as_str() {
+            "." => {}
+            ".." => depth = depth.checked_sub(1).ok_or(CLIMBS_ABOVE_ROOT)?,
+            _ => depth += 1,
+        }
+    }
+    Ok(())
+}
+
+/// What a link's target names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resolution {
+    /// The real path of a node in the image (the root if empty).
+    Found(Vec<String>),
+    /// A path at or beneath `dev`, `proc` or `sys`: the guest kernel's.
+    KernelMount,
+    /// A path the image does not hold, inside its root.
+    Dangling,
+}
+
+/// A link the expansion dropped instead of copying, as
+/// `(path written, target)`.
+pub(crate) type Dropped = (String, String);
+
+/// What [`Tree::resolve_symlinks`] produced.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Resolved {
+    pub tree: Final,
+    /// Links replaced by copies of their targets.
+    pub copied: usize,
+    pub kernel_mount: Vec<Dropped>,
+    pub dangling: Vec<Dropped>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,11 +440,25 @@ struct Expansion<'a> {
     active: Vec<Vec<String>>,
     nodes: usize,
     max_nodes: usize,
-    resolved: usize,
+    copied: usize,
+    kernel_mount: Vec<Dropped>,
+    dangling: Vec<Dropped>,
 }
 
 impl Expansion<'_> {
     fn expand(&mut self, real: &[String]) -> Result<BTreeMap<String, Final>, ResolveError> {
+        self.expand_at(real, "")
+    }
+
+    /// The finished entries of the directory whose real path is `real`,
+    /// written at `written` (which differs from `real` inside a copied
+    /// directory). A refusal names the link's real path; a drop names where
+    /// it would have been written.
+    fn expand_at(
+        &mut self,
+        real: &[String],
+        written: &str,
+    ) -> Result<BTreeMap<String, Final>, ResolveError> {
         let dir = self
             .tree
             .dir_at(real)
@@ -333,9 +471,10 @@ impl Expansion<'_> {
             }
             let mut child = real.to_vec();
             child.push(name.clone());
+            let path = join(written, name);
             let node = match node {
                 Node::File(file) => Final::File(*file),
-                Node::Dir(_) => Final::Dir(self.enter(child)?),
+                Node::Dir(_) => Final::Dir(self.enter(child, &path)?),
                 Node::Symlink(target) => {
                     let unresolvable = |reason| {
                         ResolveError::Unresolvable(Unresolvable {
@@ -343,8 +482,18 @@ impl Expansion<'_> {
                             reason,
                         })
                     };
-                    let resolved = self.tree.resolve(real, target).map_err(unresolvable)?;
-                    self.resolved += 1;
+                    let resolved = match self.tree.resolve(real, target).map_err(unresolvable)? {
+                        Resolution::Found(resolved) => resolved,
+                        Resolution::KernelMount => {
+                            self.kernel_mount.push((path, target.clone()));
+                            continue;
+                        }
+                        Resolution::Dangling => {
+                            self.dangling.push((path, target.clone()));
+                            continue;
+                        }
+                    };
+                    self.copied += 1;
                     match self.tree.lookup(&resolved) {
                         Some(Node::File(file)) => Final::File(*file),
                         // An empty path is the image root, a directory.
@@ -357,7 +506,7 @@ impl Expansion<'_> {
                                 "the link names a directory that contains it",
                             ));
                         }
-                        _ => Final::Dir(self.enter(resolved)?),
+                        _ => Final::Dir(self.enter(resolved, &path)?),
                     }
                 }
             };
@@ -366,9 +515,13 @@ impl Expansion<'_> {
         Ok(out)
     }
 
-    fn enter(&mut self, real: Vec<String>) -> Result<BTreeMap<String, Final>, ResolveError> {
+    fn enter(
+        &mut self,
+        real: Vec<String>,
+        written: &str,
+    ) -> Result<BTreeMap<String, Final>, ResolveError> {
         self.active.push(real.clone());
-        let expanded = self.expand(&real);
+        let expanded = self.expand_at(&real, written);
         self.active.pop();
         expanded
     }
@@ -463,8 +616,9 @@ mod tests {
         tree.insert(&path("x"), Node::Symlink("a".into())).unwrap();
         tree.insert(&path("y"), Node::Symlink("/x/b".into()))
             .unwrap();
-        assert_eq!(tree.resolve(&[], "y/f"), Ok(path("a/b/f")));
-        assert_eq!(tree.resolve(&path("a/b"), "../../y/./f"), Ok(path("a/b/f")));
+        let found = |value| Ok(Resolution::Found(path(value)));
+        assert_eq!(tree.resolve(&[], "y/f"), found("a/b/f"));
+        assert_eq!(tree.resolve(&path("a/b"), "../../y/./f"), found("a/b/f"));
         // Exactly MAX_SYMLINK_HOPS links resolve; one more does not.
         let mut chain = Tree::default();
         chain.insert(&path("end"), file(1)).unwrap();
@@ -479,7 +633,7 @@ mod tests {
                 .unwrap();
         }
         let last = format!("l{}", MAX_SYMLINK_HOPS - 1);
-        assert_eq!(chain.resolve(&[], &last), Ok(path("end")));
+        assert_eq!(chain.resolve(&[], &last), found("end"));
         chain
             .insert(&path("over"), Node::Symlink(last.clone()))
             .unwrap();
@@ -496,5 +650,80 @@ mod tests {
         tree.insert(&path("b"), file(2)).unwrap();
         assert!(tree.resolve_symlinks(2).is_ok());
         assert_eq!(tree.resolve_symlinks(1), Err(ResolveError::TooManyNodes));
+    }
+
+    #[test]
+    fn only_paths_strictly_beneath_dev_proc_and_sys_are_kernel_mounted() {
+        for beneath in ["dev/console", "proc/1/mounts", "sys/fs/cgroup"] {
+            assert!(under_kernel_mount(&path(beneath)), "{beneath}");
+        }
+        for not in ["dev", "proc", "sys", "devices/x", "tmp/x", "etc/dev", ""] {
+            assert!(!under_kernel_mount(&path(not)), "{not}");
+        }
+    }
+
+    #[test]
+    fn a_missing_or_kernel_target_is_named_unless_its_remainder_escapes() {
+        let mut tree = Tree::default();
+        tree.insert(&path("etc/f"), file(1)).unwrap();
+        for (parent, target) in [
+            ("", "missing"),
+            ("", "/missing/./.."),
+            ("etc", "missing/../../etc/f"),
+            ("etc", "f-missing/x/../.."),
+        ] {
+            assert_eq!(
+                tree.resolve(&path(parent), target),
+                Ok(Resolution::Dangling),
+                "{parent} {target}"
+            );
+        }
+        for (parent, target) in [
+            ("", "/dev"),
+            ("", "proc/self/mounts"),
+            ("etc", "../sys/./x/.."),
+            ("etc", "../proc/self/../.."),
+        ] {
+            assert_eq!(
+                tree.resolve(&path(parent), target),
+                Ok(Resolution::KernelMount),
+                "{parent} {target}"
+            );
+        }
+        for (parent, target) in [
+            ("", "missing/../.."),
+            ("etc", "missing/../../.."),
+            ("", "/proc/../.."),
+            ("", "dev/./../.."),
+        ] {
+            assert_eq!(
+                tree.resolve(&path(parent), target),
+                Err(CLIMBS_ABOVE_ROOT),
+                "{parent} {target}"
+            );
+        }
+        // A regular file in the way is not "missing": refused as before.
+        assert_eq!(
+            tree.resolve(&[], "etc/f/x"),
+            Err("the target continues through a regular file")
+        );
+    }
+
+    #[test]
+    fn remove_takes_out_what_is_there_and_never_follows_a_link() {
+        let mut tree = Tree::default();
+        tree.insert(&path("d/x"), file(1)).unwrap();
+        tree.remove(&path("d/x")).unwrap();
+        assert_eq!(tree.lookup(&path("d/x")), None);
+        // Absent is not an error; the parents are created as insert would.
+        tree.remove(&path("e/y")).unwrap();
+        assert_eq!(tree.lookup(&path("e")), Some(&Node::Dir(Dir::new())));
+        tree.insert(&path("l"), Node::Symlink("d".into())).unwrap();
+        assert_eq!(tree.remove(&path("l/x")), Err(PathError::TraversesSymlink));
+        tree.insert(&path("f"), file(2)).unwrap();
+        assert_eq!(
+            tree.remove(&path("f/x")),
+            Err(PathError::ParentNotDirectory)
+        );
     }
 }

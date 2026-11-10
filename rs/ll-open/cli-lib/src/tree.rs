@@ -207,7 +207,11 @@ impl std::fmt::Display for MalformedRow {
 
 impl std::error::Error for MalformedRow {}
 
-fn decode(path: &str, mode: u32, blob: Option<Vec<u8>>) -> Result<Entry> {
+/// One `_tree` row as an [`Entry`], refusing a mode git does not store, a
+/// blob that does not fit the mode ([`MalformedRow`]) and a blob that is
+/// not 32 bytes. Every reader of `_tree` rows goes through it, here and in
+/// `leyline-storefs`.
+pub fn decode(path: &str, mode: u32, blob: Option<Vec<u8>>) -> Result<Entry> {
     let Some(git) = GitMode::from_git(mode) else {
         bail!("_tree entry {path:?} has mode {mode:o}, which git does not store");
     };

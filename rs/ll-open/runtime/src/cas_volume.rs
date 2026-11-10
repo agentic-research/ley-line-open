@@ -291,48 +291,42 @@ pub trait DiskImages: Send + Sync {
             mountpoint.display()
         )))
     }
-    /// Whether the filesystem at `mountpoint` is mounted `nodev` and
-    /// `nosuid`. The default reads it with `statfs(2)`.
-    fn is_restricted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError> {
-        mounted_nodev_nosuid(mountpoint)
+    /// `statfs(2)`'s mount flags for the filesystem at `mountpoint`.
+    fn mount_flags(&self, mountpoint: &Path) -> Result<u64, CasVolumeError> {
+        mount_flags(mountpoint)
     }
 }
 
-/// Whether `statfs(2)` reports the filesystem holding `path` as `nodev` and
-/// `nosuid`.
-pub fn mounted_nodev_nosuid(path: &Path) -> Result<bool, CasVolumeError> {
+/// `statfs(2)`'s `f_flags` for the filesystem holding `path`: `MNT_*` bits
+/// on macOS, `ST_*` bits on Linux.
+pub fn mount_flags(path: &Path) -> Result<u64, CasVolumeError> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| CasVolumeError::Config(format!("{} contains a NUL byte", path.display())))?;
-    let failed = || io_error("inspect the mount flags of", path)(io::Error::last_os_error());
-    // macOS reports `nodev` only through statfs(2)'s MNT_ flags; Linux
-    // through statvfs(3)'s ST_ flags.
-    #[cfg(target_os = "macos")]
-    let (flags, wanted) = {
-        // SAFETY: `c_path` is NUL-terminated and `stat` is written by the call.
-        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
-            return Err(failed());
-        }
-        (
-            u64::from(stat.f_flags),
-            (libc::MNT_NODEV | libc::MNT_NOSUID) as u64,
-        )
-    };
-    #[cfg(not(target_os = "macos"))]
-    let (flags, wanted) = {
-        // SAFETY: `c_path` is NUL-terminated and `stat` is written by the call.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
-            return Err(failed());
-        }
-        #[allow(clippy::unnecessary_cast)]
-        (
-            stat.f_flag as u64,
-            (libc::ST_NODEV | libc::ST_NOSUID) as u64,
-        )
-    };
-    Ok(flags & wanted == wanted)
+    // SAFETY: `c_path` is NUL-terminated and `stat` is written by the call.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(io_error("inspect the mount flags of", path)(
+            io::Error::last_os_error(),
+        ));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Ok(stat.f_flags as u64)
+}
+
+/// The `nodev` and `nosuid` bits of [`mount_flags`].
+#[cfg(target_os = "macos")]
+const MOUNT_NODEV: u64 = libc::MNT_NODEV as u64;
+#[cfg(target_os = "macos")]
+const MOUNT_NOSUID: u64 = libc::MNT_NOSUID as u64;
+#[cfg(not(target_os = "macos"))]
+const MOUNT_NODEV: u64 = libc::ST_NODEV as u64;
+#[cfg(not(target_os = "macos"))]
+const MOUNT_NOSUID: u64 = libc::ST_NOSUID as u64;
+
+/// Whether mount flags include both `nodev` and `nosuid`.
+fn nodev_and_nosuid(flags: u64) -> bool {
+    flags & MOUNT_NODEV != 0 && flags & MOUNT_NOSUID != 0
 }
 
 /// How long one `hdiutil` run may take before it is killed and provisioning
@@ -786,7 +780,7 @@ impl CasVolume {
         // Nothing in the CAS is a device or gains privilege on the host: an
         // unprivileged attach mounts nodev and nosuid, and a volume mounted
         // without them (by root, say) is refused.
-        if !self.images.is_restricted(&layout.mountpoint)? {
+        if !nodev_and_nosuid(self.images.mount_flags(&layout.mountpoint)?) {
             return Err(CasVolumeError::Config(format!(
                 "the volume at {} is not mounted nodev and nosuid; detach it and provision again as an unprivileged user",
                 layout.mountpoint.display()
@@ -924,8 +918,8 @@ fn remove_stale_partials(dir: &Path) -> Result<(), CasVolumeError> {
             .to_str()
             .and_then(|name| name.strip_prefix("partial-"))
             .and_then(|rest| rest.strip_suffix(".sparsebundle"))
-            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-            .filter(|pid| *pid > 0)
+            .and_then(|pid| pid.parse::<std::num::NonZeroU32>().ok())
+            .and_then(|pid| libc::pid_t::try_from(pid.get()).ok())
         else {
             continue;
         };
@@ -1051,8 +1045,12 @@ mod tests {
             }
             Ok(image)
         }
-        fn is_restricted(&self, _: &Path) -> Result<bool, CasVolumeError> {
-            Ok(!self.unrestricted)
+        fn mount_flags(&self, _: &Path) -> Result<u64, CasVolumeError> {
+            Ok(if self.unrestricted {
+                0
+            } else {
+                MOUNT_NODEV | MOUNT_NOSUID
+            })
         }
     }
 
@@ -1088,9 +1086,46 @@ mod tests {
             .provision()
             .unwrap_err();
         assert!(error.to_string().contains("nodev and nosuid"), "{error}");
-        // A temporary directory on the host's root volume is neither.
-        assert!(!mounted_nodev_nosuid(state.path()).unwrap());
-        assert!(mounted_nodev_nosuid(&state.path().join("missing")).is_err());
+        // Both bits, not either.
+        assert!(nodev_and_nosuid(MOUNT_NODEV | MOUNT_NOSUID | 1));
+        assert!(!nodev_and_nosuid(MOUNT_NODEV));
+        assert!(!nodev_and_nosuid(MOUNT_NOSUID));
+        assert!(!nodev_and_nosuid(0));
+        // The real flags: the root filesystem is the root (macOS
+        // MNT_ROOTFS), a temporary directory is neither nodev nor nosuid,
+        // and a missing path is an error, for the tool's default too.
+        #[cfg(target_os = "macos")]
+        assert_ne!(
+            Hdiutil::default().mount_flags(Path::new("/")).unwrap() & libc::MNT_ROOTFS as u64,
+            0
+        );
+        assert!(!nodev_and_nosuid(mount_flags(state.path()).unwrap()));
+        assert!(mount_flags(&state.path().join("missing")).is_err());
+        assert!(mount_flags(Path::new("a\0b")).is_err());
+    }
+
+    /// The real tool's `attached_image` reads `hdiutil info`.
+    #[test]
+    fn the_real_tools_attached_image_comes_from_hdiutil_info() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mnt = scratch.path().join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        let tool = Hdiutil {
+            program: script(
+                scratch.path(),
+                "hdiutil-info",
+                &format!(
+                    "[ \"$1\" = info ] || exit 9\nprintf 'image-path      : /a/cas.sparsebundle\\n/dev/disk7s1\\tx\\t{}\\n'",
+                    mnt.display()
+                ),
+            ),
+            timeout: Duration::from_secs(20),
+        };
+        assert_eq!(
+            tool.attached_image(&mnt).unwrap(),
+            Some(PathBuf::from("/a/cas.sparsebundle"))
+        );
+        assert_eq!(tool.attached_image(scratch.path()).unwrap(), None);
     }
 
     /// Review of 167b29 (C2): a tool that exits while something it started
@@ -1099,8 +1134,13 @@ mod tests {
     #[test]
     fn a_tool_whose_descendant_holds_its_output_is_bounded_too() {
         let scratch = tempfile::tempdir().unwrap();
+        let pidfile = scratch.path().join("descendant");
         let tool = Hdiutil {
-            program: script(scratch.path(), "hdiutil-forks", "sleep 30 &\nexit 0"),
+            program: script(
+                scratch.path(),
+                "hdiutil-forks",
+                &format!("sleep 30 &\necho $! > '{}'\nexit 0", pidfile.display()),
+            ),
             timeout: Duration::from_millis(300),
         };
         let started = Instant::now();
@@ -1111,6 +1151,21 @@ mod tests {
             started.elapsed()
         );
         assert!(matches!(error, CasVolumeError::Timeout { .. }), "{error}");
+        // The whole process group was killed: the descendant is gone (once
+        // its new parent reaps it).
+        let descendant: libc::pid_t = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_exists(descendant) {
+            assert!(
+                Instant::now() < deadline,
+                "descendant {descendant} survived"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// A shell script standing in for hdiutil.

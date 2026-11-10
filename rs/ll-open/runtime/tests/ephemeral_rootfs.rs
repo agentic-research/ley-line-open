@@ -100,9 +100,9 @@ fn guest_writes_are_isolated_from_the_immutable_cas_root() {
 }
 
 /// Every directory of a tree with its mode, rootfs-relative (`""` is the
-/// root), and every non-directory's path.
-fn tree_shape(root: &Path) -> (Vec<(String, u32)>, Vec<String>) {
-    fn walk(root: &Path, dir: &Path, dirs: &mut Vec<(String, u32)>, rest: &mut Vec<String>) {
+/// root), and every non-directory's path with its mode.
+fn tree_shape(root: &Path) -> (Vec<(String, u32)>, Vec<(String, u32)>) {
+    fn walk(root: &Path, dir: &Path, dirs: &mut Vec<(String, u32)>, rest: &mut Vec<(String, u32)>) {
         let relative = dir
             .strip_prefix(root)
             .unwrap()
@@ -116,15 +116,17 @@ fn tree_shape(root: &Path) -> (Vec<(String, u32)>, Vec<String>) {
             .collect();
         entries.sort();
         for path in entries {
-            if fs::symlink_metadata(&path).unwrap().is_dir() {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
                 walk(root, &path, dirs, rest);
             } else {
-                rest.push(
+                rest.push((
                     path.strip_prefix(root)
                         .unwrap()
                         .to_string_lossy()
                         .into_owned(),
-                );
+                    metadata.permissions().mode() & 0o7777,
+                ));
             }
         }
     }
@@ -166,8 +168,44 @@ fn a_widened_or_planted_directory_never_reaches_the_guest() {
             ("usr/bin".to_string(), 0o755),
         ]
     );
-    assert_eq!(files, ["rootfs.manifest.json", "usr/bin/probe"]);
+    assert_eq!(
+        files,
+        [
+            ("rootfs.manifest.json".to_string(), 0o644),
+            ("usr/bin/probe".to_string(), 0o755)
+        ]
+    );
     verify_ephemeral_rootfs(&materialized).expect("the normalized copy verifies");
+}
+
+/// The manifest file's bytes are the digest; its mode in the CAS entry is
+/// not, so the copy's is fixed at 0644 and any other is refused before VM
+/// entry (execution-boundary review of 38ff59).
+#[test]
+fn the_manifest_files_mode_is_normalized_and_verified() {
+    let _serial = common::serial();
+    for cas_mode in [0o4777, 0o600, 0o1644] {
+        let fixture = TempDir::new().expect("fixture");
+        let source = rootfs_fixture(fixture.path());
+        let manifest = source.canonical_path.join("rootfs.manifest.json");
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(cas_mode)).unwrap();
+        let destination = fixture.path().join("run-root");
+        fs::create_dir(&destination).expect("run root");
+        let materialized =
+            materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+        let copied = materialized.canonical_path.join("rootfs.manifest.json");
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o7777,
+            0o644,
+            "{cas_mode:o}"
+        );
+        fs::set_permissions(&copied, fs::Permissions::from_mode(cas_mode)).unwrap();
+        let error = verify_ephemeral_rootfs(&materialized).expect_err("a re-moded manifest");
+        assert!(
+            error.detail.contains("manifest file mode"),
+            "{cas_mode:o}: {error:?}"
+        );
+    }
 }
 
 /// One digest names one guest tree: two CAS entries with the same manifest

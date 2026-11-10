@@ -87,6 +87,10 @@ pub fn materialize_ephemeral_rootfs(
     Ok(materialized)
 }
 
+/// The mode of `rootfs.manifest.json` in a per-run view. Its bytes are the
+/// digest; its inode mode in the CAS entry is not, so it is not carried.
+pub const MANIFEST_FILE_MODE: u32 = 0o644;
+
 /// What a per-run copy holds: the manifest's files and the directories they
 /// imply, rootfs-relative.
 struct CopyPlan {
@@ -201,7 +205,14 @@ fn copy_directory_fd(
                 )));
             };
             let destination_path = destination.join(name);
-            let permissions = fs::Permissions::from_mode((before.st_mode as u32) & 0o7777);
+            // The manifest's own mode is not in any digest: the copy gets a
+            // fixed one, as its directories do.
+            let mode = if entry_relative.as_os_str() == ROOTFS_MANIFEST {
+                MANIFEST_FILE_MODE
+            } else {
+                (before.st_mode as u32) & 0o7777
+            };
+            let permissions = fs::Permissions::from_mode(mode);
             let mut source_file = File::from(opened);
             let mut destination_file = OpenOptions::new()
                 .write(true)
@@ -238,6 +249,16 @@ fn ensure_same_entry(before: &rustix::fs::Stat, opened: &OwnedFd) -> Result<(), 
 /// refused by name.
 pub fn verify_ephemeral_rootfs(rootfs: &ResolvedRootfs) -> Result<(), ExecutionError> {
     let tree = verify_manifest(&rootfs.canonical_path, &rootfs.digest)?;
+    let manifest_mode = fs::symlink_metadata(rootfs.canonical_path.join(ROOTFS_MANIFEST))
+        .map_err(|error| invalid_io("inspect ephemeral rootfs manifest", error))?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if manifest_mode != MANIFEST_FILE_MODE {
+        return Err(ExecutionError::invalid(format!(
+            "rootfs manifest file mode {manifest_mode:o} is not the normalized {MANIFEST_FILE_MODE:o}"
+        )));
+    }
     let implied = implied_directories(&tree.files);
     for (directory, mode) in &tree.directories {
         if !implied.contains(directory) {

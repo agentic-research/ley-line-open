@@ -15,8 +15,9 @@
 //! game-over).
 //!
 //! The UDS dispatch path is NOT gated by this token. The daemon's UDS
-//! socket lives next to the arena's controller file (default
-//! `~/.mache/default.ctrl.sock`); a process that can `connect(2)` to
+//! socket lives next to the arena's controller file, as
+//! `ctrl_path.with_extension("sock")` (default `~/.mache/default.sock`
+//! beside `~/.mache/default.ctrl`); a process that can `connect(2)` to
 //! the socket is one that can already reach the daemon directly. UDS
 //! peer-credential checks (SO_PEERCRED / getpeereid) are a follow-up
 //! beyond this ADR.

@@ -31,12 +31,12 @@ set -eu
 # if a binary-only release actually touched clients/go/leyline-schema without
 # bumping SCHEMA_VERSION to match) — what was missing was a bump step that
 # didn't defeat it by force-bumping SCHEMA_VERSION on every release
-# regardless. This script checks the same thing tag_release.sh checks at tag
-# time — whether clients/go/leyline-schema drifted since the schema's own
-# last tag — and only bumps SCHEMA_VERSION when it did. Getting this
-# heuristic imperfectly right is safe: tag_release.sh is the real gate and
-# will refuse to tag if this script's guess disagrees with what actually
-# changed.
+# regardless. This script checks the same thing verify_release_version.sh and
+# tag_release.sh check — whether the public schema surface (the Go client and
+# the schema-spec IDL and vectors, release_schema_surface_unchanged in
+# release_common.sh) drifted since the schema's own last tag — and only bumps
+# SCHEMA_VERSION when it did. All three read that one definition, so the bump
+# cannot produce a release the verifier refuses (bead ley-line-open-a4946a).
 if [ "$#" -ne 1 ]; then
     echo "usage: $0 <new-version-without-v>" >&2
     exit 2
@@ -107,7 +107,7 @@ if ! "$git_bin" rev-parse -q --verify "refs/tags/$old_schema_tag" >/dev/null 2>&
     "$git_bin" fetch -q origin "refs/tags/$old_schema_tag:refs/tags/$old_schema_tag" 2>/dev/null || true
 fi
 if "$git_bin" rev-parse -q --verify "refs/tags/$old_schema_tag" >/dev/null 2>&1; then
-    if ! "$git_bin" diff --quiet "$old_schema_tag" -- clients/go/leyline-schema; then
+    if ! release_schema_surface_unchanged "$git_bin" "$old_schema_tag"; then
         schema_changed=1
     fi
 else
@@ -118,9 +118,9 @@ fi
 if [ "$schema_changed" -eq 1 ]; then
     sed -i.bak "s/pub const SCHEMA_VERSION: \&str = \"$old_schema_version\";/pub const SCHEMA_VERSION: \&str = \"$new_version\";/" "$version_rs"
     rm -f "$version_rs.bak"
-    echo "bumped SCHEMA_VERSION $old_schema_version -> $new_version (clients/go/leyline-schema changed since $old_schema_tag)" >&2
+    echo "bumped SCHEMA_VERSION $old_schema_version -> $new_version (the public schema surface changed since $old_schema_tag)" >&2
 else
-    echo "SCHEMA_VERSION left at $old_schema_version — clients/go/leyline-schema unchanged since $old_schema_tag" >&2
+    echo "SCHEMA_VERSION left at $old_schema_version — the public schema surface is unchanged since $old_schema_tag" >&2
 fi
 
 # compatibility.json's two fields track BINARY_VERSION and SCHEMA_VERSION

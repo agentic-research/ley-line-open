@@ -218,7 +218,7 @@ struct RunReceipt $Traits.doc("Terminal substrate evidence; may be embedded by a
   workloadIdentityEvidence  @7  :EvidenceRef           $Traits.doc("Workload identity evidence used for authorization.");
   actorProvenanceEvidence   @8  :EvidenceRef           $Traits.doc("Delegated actor/provenance evidence used for authorization.");
   backend                    @9  :BackendEvidence       $Traits.doc("Backend identity and enforcement evidence.");
-  inputRoots                 @10 :List(DigestRef)       $Traits.doc("Content roots materialized for the run.");
+  inputRoots                 @10 :List(DigestRef)       $Traits.doc("Content roots materialized for the run: the rootfs first, then each granted workspace's graph root in grant order.");
   outputs                    @11 :List(ArtifactResult)  $Traits.doc("Declared collected outputs only.");
   usage                      @12 :ResourceUsage         $Traits.doc("Terminal resource accounting.");
   startedAtUnixMs           @13 :UInt64                $Traits.doc("Substrate-observed start time.");

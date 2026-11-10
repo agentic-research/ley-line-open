@@ -34,6 +34,12 @@ leyline-public-schema = { path = "../../ll-core/public-schema" }
 # cli-lib, answered by storefs's adapter, exactly as the daemon serves one.
 leyline-cli-lib = { path = "../cli-lib", default-features = false }
 leyline-storefs = { path = "../storefs" }
+# The OCI-imported rootfs guest test (bead ley-line-open-68a55d) builds its
+# image layout with runtime/tests/oci_fixture, the import suite's generator.
+flate2 = "1.1.9"
+hex = { workspace = true }
+sha2 = { workspace = true }
+tar = { version = "0.4.45", default-features = false }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 wait-timeout = "0.2"

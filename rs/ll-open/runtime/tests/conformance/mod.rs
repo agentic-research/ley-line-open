@@ -735,6 +735,13 @@ pub struct GrantSpec<'a> {
     /// Each one both requested by the spec (`workspaceInputs`) and resolved
     /// by the grant (`workspaces`).
     pub workspaces: Vec<WorkspaceGrant>,
+    /// The spec's `executable` artifact: media type and BLAKE3 hex. What a
+    /// `CatalogResolver` keys its entries on.
+    pub executable: (String, String),
+    /// Both the spec's `requestedLimits` and the grant's `limits`; left out
+    /// of both messages when all zero. A run resolved from the grant (as
+    /// `CatalogResolver` resolves it) is held to these.
+    pub limits: ResourceLimits,
 }
 
 impl<'a> GrantSpec<'a> {
@@ -754,8 +761,27 @@ impl<'a> GrantSpec<'a> {
             expires_at_unix_ms: now_unix_ms() + 3_600_000,
             allowed_egress: Vec::new(),
             workspaces: Vec::new(),
+            executable: (
+                "application/vnd.leyline.executable".to_owned(),
+                "c".repeat(64),
+            ),
+            limits: ResourceLimits::default(),
         }
     }
+}
+
+/// Write `limits` into an execution/v1 `ResourceLimits`.
+fn set_limits(mut target: execution_capnp::resource_limits::Builder<'_>, limits: &ResourceLimits) {
+    target.set_wall_time_ms(limits.wall_time_ms);
+    target.set_output_bytes(limits.output_bytes);
+    target
+        .reborrow()
+        .init_memory()
+        .set_limit(limits.memory.limit);
+    let mut cpu = target.reborrow().init_cpu();
+    cpu.set_quota(limits.cpu.quota);
+    cpu.set_period(limits.cpu.period);
+    target.init_pids().set_limit(limits.pids.limit);
 }
 
 pub fn now_unix_ms() -> u64 {
@@ -771,9 +797,12 @@ pub fn spec_and_grant(authority: &GrantSpec<'_>) -> (Vec<u8>, Vec<u8>) {
     let mut message = Builder::new_default();
     let mut spec = message.init_root::<execution_capnp::run_spec::Builder<'_>>();
     spec.set_schema_version(EXECUTION_SCHEMA_VERSION);
+    if authority.limits != ResourceLimits::default() {
+        set_limits(spec.reborrow().init_requested_limits(), &authority.limits);
+    }
     let mut executable = spec.init_executable();
-    executable.set_media_type("application/vnd.leyline.executable");
-    set_digest(executable.init_digest(), &"c".repeat(64));
+    executable.set_media_type(&authority.executable.0);
+    set_digest(executable.init_digest(), &authority.executable.1);
     if !authority.workspaces.is_empty() {
         let mut inputs = message
             .get_root::<execution_capnp::run_spec::Builder<'_>>()
@@ -817,6 +846,9 @@ pub fn spec_and_grant(authority: &GrantSpec<'_>) -> (Vec<u8>, Vec<u8>) {
             .expect("digest prefix"),
     );
     grant.set_confinement_manifest(authority.confinement_document);
+    if authority.limits != ResourceLimits::default() {
+        set_limits(grant.reborrow().init_limits(), &authority.limits);
+    }
     grant.set_backend_class(match authority.class {
         BackendClass::Native => execution_capnp::BackendClass::Native,
         BackendClass::MicroVm => execution_capnp::BackendClass::MicroVm,
@@ -1009,7 +1041,13 @@ pub fn assert_receipt(
         receipt.context.confinement_digest, started.digest,
         "{name}: the receipt names the policy the worker attested"
     );
-    assert!(receipt.context.input_roots.is_empty(), "{name}");
+    // The content roots materialized for the run: its rootfs, and no
+    // workspace (no shared row grants one).
+    assert_eq!(
+        receipt.context.input_roots,
+        vec![format!("blake3-256:{}", column.spec.rootfs)],
+        "{name}: the receipt names the rootfs the run materialized"
+    );
     assert_eq!(receipt.backend_evidence.backend_id, column.spec.backend_id);
     assert!(
         receipt.backend_evidence.channels.is_empty(),

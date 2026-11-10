@@ -28,6 +28,59 @@
     object: (_) @qualifier
     attribute: (identifier) @name)) @ref
 
+; ── Identifier-as-VALUE references (bead ley-line-open-a9ff82) ──────
+;
+; A function named as a value — `h = helper`, `register(helper)`,
+; `Thread(target=worker)`, `{"k": f}`, `[f]`, `return f`, a bare
+; `@decorator`, or a bound method `self.meth` — is a use mache's
+; dead_code needs. Each pattern anchors at the value-position CONTAINER
+; (queries match downward only); the container's grammar kind tells a
+; value ref from a call ref in `node_refs.node_kind` / `kind_id`. An
+; attribute dual-emits `obj.attr` + `attr` with qualifier `obj`, like
+; an attribute call; attribute READS in these positions emit too
+; (syntactically identical to a bound method), and stay unbound when
+; no def carries the token. Assignment targets do not emit.
+
+(argument_list [
+  (identifier) @name
+  (attribute object: (_) @qualifier attribute: (identifier) @name)
+]) @ref
+
+(keyword_argument
+  value: [
+    (identifier) @name
+    (attribute object: (_) @qualifier attribute: (identifier) @name)
+  ]) @ref
+
+(assignment
+  right: [
+    (identifier) @name
+    (attribute object: (_) @qualifier attribute: (identifier) @name)
+  ]) @ref
+
+(return_statement [
+  (identifier) @name
+  (attribute object: (_) @qualifier attribute: (identifier) @name)
+]) @ref
+
+(pair
+  value: [
+    (identifier) @name
+    (attribute object: (_) @qualifier attribute: (identifier) @name)
+  ]) @ref
+
+(list [
+  (identifier) @name
+  (attribute object: (_) @qualifier attribute: (identifier) @name)
+]) @ref
+
+; `@decorator` / `@pkg.decorator` without a call. `@decorator(...)` is
+; a call and emits through the call patterns above.
+(decorator [
+  (identifier) @name
+  (attribute object: (_) @qualifier attribute: (identifier) @name)
+]) @ref
+
 ; ── Imports ─────────────────────────────────────────────────────────
 
 ; `import a.b.c` — the alias is the LAST dotted segment. The engine's

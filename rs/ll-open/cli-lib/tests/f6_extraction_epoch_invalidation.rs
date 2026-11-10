@@ -297,7 +297,59 @@ fn f6_epoch_5_rederives_hcl_typed_refs_from_epoch_4_arena() {
         ],
         "epoch migration must materialize the new HCL typed refs"
     );
-    assert_eq!(stored_epoch(&db_path).as_deref(), Some("5"));
+    assert_eq!(
+        stored_epoch(&db_path).as_deref(),
+        Some(current_epoch.as_str())
+    );
+}
+
+/// Extraction epoch 6 (bead `ley-line-open-a9ff82`) adds identifier-as-VALUE
+/// refs. An arena derived at epoch 5 holds the call ref only; with its
+/// source bytes unchanged, the epoch-6 binary must re-derive and
+/// materialize the value ref — the same silent-staleness shape as epochs
+/// 2, 3 and 5.
+#[test]
+fn f6_epoch_6_rederives_value_refs_from_epoch_5_arena() {
+    let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = TempDir::new().unwrap();
+    fs::write(
+        repo.path().join("probe.go"),
+        "package m\nfunc helper(){}; func Add(){ return helper(x) }; var h = helper\n",
+    )
+    .unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("live.db");
+
+    // Model epoch 5's real output: the current extractor builds a valid
+    // arena, then the one row epoch 5 never emitted (the `var_spec` value
+    // ref; the `x` argument ref predates epoch 6) is removed.
+    {
+        let _g = EpochOverride::set("5");
+        parse_pass(&db_path, repo.path());
+    }
+    execute(&db_path, "DELETE FROM node_refs WHERE node_kind = 'var_spec'");
+    assert_eq!(
+        refs_snapshot(&db_path),
+        vec![("helper".to_string(), 1), ("x".to_string(), 1)]
+    );
+
+    let current_epoch = leyline_ts::refs::EXTRACTION_EPOCH.to_string();
+    let result = {
+        let _g = EpochOverride::set(&current_epoch);
+        parse_pass(&db_path, repo.path())
+    };
+
+    assert_eq!(
+        (result.parsed, result.unchanged),
+        (1, 0),
+        "the current extraction identity must invalidate an epoch-5 arena"
+    );
+    assert_eq!(
+        refs_snapshot(&db_path),
+        vec![("helper".to_string(), 2), ("x".to_string(), 1)],
+        "epoch migration must materialize the value-position helper ref"
+    );
+    assert_eq!(stored_epoch(&db_path).as_deref(), Some("6"));
 }
 
 #[test]

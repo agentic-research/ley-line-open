@@ -57,6 +57,69 @@
     object: (_) @qualifier
     property: (_) @name)) @ref
 
+; ── Identifier-as-VALUE references (bead ley-line-open-a9ff82) ──────
+;
+; A function named as a value — `const h = helper`, `x = helper`,
+; `register(helper)`, `{k: helper}`, `{helper}`, `[helper]`,
+; `return helper`, `onClick={helper}`, `export default helper`, or a
+; method value `this.handle` — is a use mache's dead_code needs. Each
+; pattern anchors at the value-position CONTAINER (queries match
+; downward only); the container's grammar kind tells a value ref from
+; a call ref in `node_refs.node_kind` / `kind_id`. A member expression
+; dual-emits `obj.prop` + `prop` with qualifier `obj`, like a member
+; call; property READS in these positions emit too (syntactically
+; identical to a method value) and stay unbound when no def carries the
+; token. Binding positions (declarator names, assignment LHS) do not
+; emit.
+
+(arguments [
+  (identifier) @name
+  (member_expression object: (_) @qualifier property: (_) @name)
+]) @ref
+
+(variable_declarator
+  value: [
+    (identifier) @name
+    (member_expression object: (_) @qualifier property: (_) @name)
+  ]) @ref
+
+(assignment_expression
+  right: [
+    (identifier) @name
+    (member_expression object: (_) @qualifier property: (_) @name)
+  ]) @ref
+
+(return_statement [
+  (identifier) @name
+  (member_expression object: (_) @qualifier property: (_) @name)
+]) @ref
+
+(pair
+  value: [
+    (identifier) @name
+    (member_expression object: (_) @qualifier property: (_) @name)
+  ]) @ref
+
+; Shorthand property `{helper}` names the binding `helper` as a value.
+(object
+  (shorthand_property_identifier) @name) @ref
+
+(array [
+  (identifier) @name
+  (member_expression object: (_) @qualifier property: (_) @name)
+]) @ref
+
+(jsx_expression [
+  (identifier) @name
+  (member_expression object: (_) @qualifier property: (_) @name)
+]) @ref
+
+(export_statement
+  value: [
+    (identifier) @name
+    (member_expression object: (_) @qualifier property: (_) @name)
+  ]) @ref
+
 ; ── Imports ─────────────────────────────────────────────────────────
 ; @path captures the string_fragment INSIDE the source string, so no
 ; quote stripping is needed regardless of quote style; an empty source

@@ -50,6 +50,20 @@
 (object_creation_expression
   type: (type_identifier) @name) @ref
 
+; Method reference — Java's only form of a method used as a VALUE
+; (bead ley-line-open-a9ff82): `this::handle`, `Type::method`,
+; `obj::method`. Dual-emits `recv.method` + `method` with qualifier
+; `recv` on the `.` separator, so the qualified row resolves against
+; the `Type.method` def form. The trailing `.` anchors require exactly
+; two named children; `Type::new` (constructor reference, `new` is
+; anonymous) has one and does not match.
+(method_reference
+  .
+  (_) @qualifier
+  .
+  (identifier) @name
+  .) @ref
+
 ; ── Imports ─────────────────────────────────────────────────────────
 
 ; `import java.util.List;` (and `import static java.lang.Math.max;` —

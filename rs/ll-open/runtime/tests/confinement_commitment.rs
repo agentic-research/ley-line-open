@@ -612,14 +612,13 @@ fn a_unix_socket_grant_reaches_the_native_tier_and_moves_its_digest() {
 /// mapping existed.
 #[test]
 fn a_socket_grant_becomes_exactly_the_vsock_mappings_its_modes_permit() {
-    // A bound endpoint for the connect grant's ordering contract — the test
-    // binary itself, same stand-in `unix_socket_mode`'s tests use: the check
-    // reads `Path::exists`, not "is a socket", and the binary cannot race or
-    // leak.
-    let bound = std::env::current_exe()
-        .expect("test binary has a path")
-        .display()
-        .to_string();
+    // A bound endpoint for the connect grant's ordering contract: the check
+    // reads `Path::exists`, not "is a socket", so any short path that exists
+    // stands in, and `/dev/null` cannot race or leak. Short because the
+    // mapping refuses a path no UNIX socket address can carry (`SUN_PATH_MAX`,
+    // bead ley-line-open-bb2143), which a build directory's test binary can
+    // exceed.
+    let bound = "/dev/null".to_owned();
 
     let manifest = ConfinementManifest::new()
         .with_unix_socket(leyline_runtime::confinement::UnixSocketGrant::connect(

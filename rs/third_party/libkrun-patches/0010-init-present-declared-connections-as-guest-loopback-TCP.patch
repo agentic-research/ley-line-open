@@ -1,0 +1,495 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Tue, 10 Nov 2026 00:30:00 -0600
+Subject: [PATCH] init: present declared connections as guest-loopback TCP, deny UDP
+
+An embedder that gives the guest vsock port mappings for its declared
+connections leaves an unmodified workload unable to use them: the
+workload speaks TCP to an address it reads from its environment, and
+knows nothing of AF_VSOCK. The embedder now lists the connections in
+KRUN_LOOPBACK_CHANNELS, comma-separated:
+
+- dial:<tcp port>:<vsock port>: init listens on 127.0.0.1:<tcp port>,
+  and joins each connection the workload makes there to a new
+  connection to the host's <vsock port>;
+- serve:<tcp port>:<vsock port>: init listens on <vsock port>, and
+  joins each connection the host makes there to a new connection to
+  127.0.0.1:<tcp port>, where the workload listens.
+
+The embedder computes the list and init derives nothing from it. Every
+listener is bound before the workload starts, so a workload cannot take
+a dial port first and never starts with one missing; a malformed list
+or a listener that cannot be bound stops the guest before the workload
+runs. A relay process forked from init serves the listeners and joins
+each connection in processes of its own, one per direction so that a
+blocked write in one direction never stops the other being read,
+copying bytes with read(2) and write(2) only, so no ancillary data
+crosses it. The variable is removed
+from the workload's environment.
+
+Init also installs a seccomp filter, before it starts anything, that
+refuses every datagram, raw and packet socket: AF_INET and AF_INET6
+sockets may be SOCK_STREAM with protocol 0 or IPPROTO_TCP and nothing
+else, AF_PACKET is refused, io_uring_setup is refused (io_uring creates
+sockets without socket(2)), a system call of another ABI ends the
+process, and an x32 call is refused. Every process in the guest inherits the filter. A kernel that
+refuses the filter stops the guest before the workload runs.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+---
+diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
+index 471ed65..28b9e74 100644
+--- a/src/init_blob/init/init.c
++++ b/src/init_blob/init/init.c
+@@ -32,9 +32,18 @@
+ #include <grp.h>
+ 
+ #if __linux__
++#include <linux/audit.h>
++#include <linux/filter.h>
+ #include <linux/reboot.h>
++#include <linux/seccomp.h>
+ #include <linux/vm_sockets.h>
++#include <netinet/in.h>
++#include <poll.h>
++#include <signal.h>
++#include <stddef.h>
++#include <sys/prctl.h>
+ #include <sys/reboot.h>
++#include <sys/syscall.h>
+ #endif
+ 
+ #include "dhcp.h"
+@@ -1431,6 +1440,407 @@ close_socket:
+     close(sockfd);
+     return result;
+ }
++
++/*
++ * Refuse every datagram, raw and packet socket the guest could open, so no
++ * process in the guest sends or receives UDP. An embedder that declares
++ * stream connections only has no use for them, and a socket that cannot be
++ * created cannot be carried out by the VMM either. For AF_INET and
++ * AF_INET6, socket(2) succeeds only for SOCK_STREAM with protocol 0 or
++ * IPPROTO_TCP; AF_PACKET is refused outright; io_uring_setup(2) is refused
++ * because io_uring creates sockets without calling socket(2); any other
++ * architecture's system calls (the i386 ABI on x86_64) end the process,
++ * and x32 calls are refused with EACCES. Every other socket family is
++ * untouched: AF_UNIX
++ * and AF_VSOCK stay as the VMM configured them.
++ *
++ * Installed in init before it starts anything else, so the filter is
++ * inherited by every process the guest runs and cannot be removed. Returns
++ * -1, and the guest must not start its workload, when the kernel refuses
++ * the filter.
++ */
++#if defined(__aarch64__)
++#define GUEST_AUDIT_ARCH AUDIT_ARCH_AARCH64
++#elif defined(__x86_64__)
++#define GUEST_AUDIT_ARCH AUDIT_ARCH_X86_64
++#endif
++#ifndef __NR_io_uring_setup
++#define __NR_io_uring_setup 425
++#endif
++#ifndef SECCOMP_RET_KILL_PROCESS
++#define SECCOMP_RET_KILL_PROCESS SECCOMP_RET_KILL
++#endif
++
++static int deny_datagram_sockets(void)
++{
++#ifdef GUEST_AUDIT_ARCH
++    /* Jump offsets count from the next instruction: ALLOW is 17, DENY 18. */
++    struct sock_filter filter[] = {
++        /* 0 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++                         offsetof(struct seccomp_data, arch)),
++        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, GUEST_AUDIT_ARCH, 1, 0),
++        /* 2 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
++        /* 3 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++                         offsetof(struct seccomp_data, nr)),
++        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 13, 0),
++        /* 5 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 12, 0),
++        /* 6 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 10),
++        /* 7 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++                         offsetof(struct seccomp_data, args[0])),
++        /* 8 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_PACKET, 9, 0),
++        /* 9 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0),
++        /* 10 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, 6),
++        /* 11 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++                          offsetof(struct seccomp_data, args[1])),
++        /* 12 */ BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xf),
++        /* 13 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 0, 4),
++        /* 14 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++                          offsetof(struct seccomp_data, args[2])),
++        /* 15 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0),
++        /* 16 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_TCP, 0, 1),
++        /* 17 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
++        /* 18 */ BPF_STMT(BPF_RET | BPF_K,
++                          SECCOMP_RET_ERRNO | (EACCES & SECCOMP_RET_DATA)),
++    };
++    struct sock_fprog program = {
++        .len = sizeof(filter) / sizeof(filter[0]),
++        .filter = filter,
++    };
++
++    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) < 0) {
++        perror("prctl(PR_SET_SECCOMP)");
++        return -1;
++    }
++    return 0;
++#else
++    printf("no datagram socket filter for this architecture\n");
++    return -1;
++#endif
++}
++
++/*
++ * The connections the VMM's embedder declared for this guest, presented to
++ * an unmodified workload as TCP on the guest's loopback interface.
++ * KRUN_LOOPBACK_CHANNELS lists them, comma-separated:
++ *
++ *   dial:<tcp port>:<vsock port>   init listens on 127.0.0.1:<tcp port>;
++ *                                  each connection the workload makes there
++ *                                  is joined to a new connection to the
++ *                                  host's <vsock port>.
++ *   serve:<tcp port>:<vsock port>  init listens on <vsock port>; each
++ *                                  connection the host makes there is joined
++ *                                  to a new connection to 127.0.0.1:<tcp
++ *                                  port>, where the workload listens.
++ *
++ * The embedder computes the list; init derives nothing. Every listener is
++ * bound before the workload starts, so the workload can neither take a dial
++ * port first nor find one missing, and a vsock port is reachable only if
++ * the VMM was given a mapping for it. A malformed list, or any listener
++ * that cannot be set up, stops the guest before the workload runs: a
++ * workload must not start with fewer connections than its embedder
++ * declared. The relay copies bytes only. It reads with read(2), so no
++ * ancillary data (no SCM_RIGHTS) crosses it, and it holds nothing the
++ * declaration did not name. The variable is removed from the environment
++ * the workload inherits.
++ */
++#define LOOPBACK_CHANNELS_MAX 64
++
++struct loopback_channel {
++    bool serve;
++    unsigned int tcp_port;
++    unsigned int vsock_port;
++    int listener;
++};
++
++static int parse_port(const char *text, unsigned long max, unsigned int *port)
++{
++    char *end;
++    unsigned long value;
++
++    if (*text < '0' || *text > '9') {
++        return -1;
++    }
++    errno = 0;
++    value = strtoul(text, &end, 10);
++    if (errno != 0 || *end != '\0' || value == 0 || value > max) {
++        return -1;
++    }
++    *port = (unsigned int)value;
++    return 0;
++}
++
++static int parse_loopback_channels(char *list, struct loopback_channel *channels,
++                                   int *count)
++{
++    char *entry, *save = NULL, *tcp, *vsock;
++    int i;
++
++    *count = 0;
++    for (entry = strtok_r(list, ",", &save); entry != NULL;
++         entry = strtok_r(NULL, ",", &save)) {
++        if (*count == LOOPBACK_CHANNELS_MAX) {
++            printf("KRUN_LOOPBACK_CHANNELS: more than %d channels\n",
++                   LOOPBACK_CHANNELS_MAX);
++            return -1;
++        }
++        tcp = strchr(entry, ':');
++        vsock = tcp ? strchr(tcp + 1, ':') : NULL;
++        if (tcp == NULL || vsock == NULL) {
++            printf("KRUN_LOOPBACK_CHANNELS: malformed entry '%s'\n", entry);
++            return -1;
++        }
++        *tcp++ = '\0';
++        *vsock++ = '\0';
++        if (strcmp(entry, "dial") == 0) {
++            channels[*count].serve = false;
++        } else if (strcmp(entry, "serve") == 0) {
++            channels[*count].serve = true;
++        } else {
++            printf("KRUN_LOOPBACK_CHANNELS: unknown direction '%s'\n", entry);
++            return -1;
++        }
++        if (parse_port(tcp, 65535, &channels[*count].tcp_port) < 0 ||
++            parse_port(vsock, 0xffffffffUL, &channels[*count].vsock_port) < 0) {
++            printf("KRUN_LOOPBACK_CHANNELS: malformed port in '%s'\n", entry);
++            return -1;
++        }
++        for (i = 0; i < *count; i++) {
++            if (channels[i].tcp_port == channels[*count].tcp_port ||
++                channels[i].vsock_port == channels[*count].vsock_port) {
++                printf("KRUN_LOOPBACK_CHANNELS: port %u or %u listed twice\n",
++                       channels[*count].tcp_port, channels[*count].vsock_port);
++                return -1;
++            }
++        }
++        channels[*count].listener = -1;
++        (*count)++;
++    }
++    return 0;
++}
++
++static void loopback_address(struct sockaddr_in *address, unsigned int port)
++{
++    memset(address, 0, sizeof(*address));
++    address->sin_family = AF_INET;
++    address->sin_port = htons((uint16_t)port);
++    address->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++}
++
++static void vsock_address(struct sockaddr_vm *address, unsigned int cid,
++                          unsigned int port)
++{
++    memset(address, 0, sizeof(*address));
++    address->svm_family = AF_VSOCK;
++    address->svm_cid = cid;
++    address->svm_port = port;
++}
++
++static int open_loopback_listener(struct loopback_channel *channel)
++{
++    struct sockaddr_in inet;
++    struct sockaddr_vm vm;
++    int fd;
++
++    if (channel->serve) {
++        fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
++        vsock_address(&vm, VMADDR_CID_ANY, channel->vsock_port);
++        if (fd < 0 || bind(fd, (struct sockaddr *)&vm, sizeof(vm)) < 0 ||
++            listen(fd, 128) < 0) {
++            perror("KRUN_LOOPBACK_CHANNELS: serve listener");
++            return -1;
++        }
++    } else {
++        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
++        loopback_address(&inet, channel->tcp_port);
++        if (fd < 0 || bind(fd, (struct sockaddr *)&inet, sizeof(inet)) < 0 ||
++            listen(fd, 128) < 0) {
++            perror("KRUN_LOOPBACK_CHANNELS: dial listener");
++            return -1;
++        }
++    }
++    channel->listener = fd;
++    return 0;
++}
++
++/* Open this channel's far side: the host's vsock port, or the workload. */
++static int dial_far_side(const struct loopback_channel *channel)
++{
++    struct sockaddr_in inet;
++    struct sockaddr_vm vm;
++    int fd;
++
++    if (channel->serve) {
++        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
++        loopback_address(&inet, channel->tcp_port);
++        if (fd >= 0 && connect(fd, (struct sockaddr *)&inet, sizeof(inet)) == 0) {
++            return fd;
++        }
++    } else {
++        fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
++        vsock_address(&vm, VMADDR_CID_HOST, channel->vsock_port);
++        if (fd >= 0 && connect(fd, (struct sockaddr *)&vm, sizeof(vm)) == 0) {
++            return fd;
++        }
++    }
++    if (fd >= 0) {
++        close(fd);
++    }
++    return -1;
++}
++
++static int write_all(int fd, const char *buffer, ssize_t length)
++{
++    ssize_t written;
++
++    while (length > 0) {
++        written = write(fd, buffer, length);
++        if (written < 0 && errno == EINTR) {
++            continue;
++        }
++        if (written <= 0) {
++            return -1;
++        }
++        buffer += written;
++        length -= written;
++    }
++    return 0;
++}
++
++/*
++ * Copy bytes from one connected stream socket to another until the source
++ * ends, then pass the end on as a write shutdown.
++ */
++static void copy_stream(int from, int to)
++{
++    static char buffer[65536];
++    ssize_t length;
++
++    for (;;) {
++        length = read(from, buffer, sizeof(buffer));
++        if (length < 0 && errno == EINTR) {
++            continue;
++        }
++        if (length <= 0 || write_all(to, buffer, length) < 0) {
++            break;
++        }
++    }
++    shutdown(to, SHUT_WR);
++}
++
++/*
++ * Join two connected stream sockets in both directions, each in its own
++ * process, so that a write blocked in one direction never stops the other
++ * from being read: a full-duplex protocol that runs over one TCP stream
++ * runs over the join too. Returns when both directions have ended.
++ */
++static void join_streams(int a, int b)
++{
++    pid_t other = fork();
++
++    if (other < 0) {
++        return;
++    }
++    if (other == 0) {
++        copy_stream(a, b);
++        _exit(0);
++    }
++    copy_stream(b, a);
++    /* SIGCHLD is ignored here, so this returns once the copier is gone. */
++    while (waitpid(other, NULL, 0) < 0 && errno == EINTR) {
++    }
++}
++
++static void run_loopback_relay(struct loopback_channel *channels, int count)
++{
++    struct pollfd fds[LOOPBACK_CHANNELS_MAX];
++    int i, accepted, far, j;
++
++    /* Every connection is joined in its own process; none is waited for. */
++    signal(SIGCHLD, SIG_IGN);
++    for (;;) {
++        for (i = 0; i < count; i++) {
++            fds[i].fd = channels[i].listener;
++            fds[i].events = POLLIN;
++            fds[i].revents = 0;
++        }
++        if (poll(fds, count, -1) < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            perror("KRUN_LOOPBACK_CHANNELS: poll");
++            _exit(1);
++        }
++        for (i = 0; i < count; i++) {
++            if (fds[i].revents == 0) {
++                continue;
++            }
++            /* accept(2) plus FD_CLOEXEC: accept4 is a GNU extension that
++             * glibc declares only under _GNU_SOURCE, which init.c does not
++             * define. Single-threaded, so nothing can exec in between. */
++            accepted = accept(channels[i].listener, NULL, NULL);
++            if (accepted < 0) {
++                continue;
++            }
++            fcntl(accepted, F_SETFD, FD_CLOEXEC);
++            if (fork() == 0) {
++                for (j = 0; j < count; j++) {
++                    close(channels[j].listener);
++                }
++                far = dial_far_side(&channels[i]);
++                if (far >= 0) {
++                    join_streams(accepted, far);
++                }
++                _exit(0);
++            }
++            close(accepted);
++        }
++    }
++}
++
++/*
++ * Bind every channel KRUN_LOOPBACK_CHANNELS lists and start the relay that
++ * serves them. Returns 0 with nothing to do, 0 once the relay runs, and -1
++ * when the guest must not start its workload.
++ */
++static int start_loopback_channels(void)
++{
++    struct loopback_channel channels[LOOPBACK_CHANNELS_MAX];
++    char *list;
++    int count, i;
++    pid_t relay;
++
++    list = clone_str(getenv("KRUN_LOOPBACK_CHANNELS"));
++    unsetenv("KRUN_LOOPBACK_CHANNELS");
++    if (list == NULL) {
++        return 0;
++    }
++    if (parse_loopback_channels(list, channels, &count) < 0) {
++        free(list);
++        return -1;
++    }
++    free(list);
++    for (i = 0; i < count; i++) {
++        if (open_loopback_listener(&channels[i]) < 0) {
++            return -1;
++        }
++    }
++    if (count == 0) {
++        return 0;
++    }
++    relay = fork();
++    if (relay < 0) {
++        perror("KRUN_LOOPBACK_CHANNELS: fork");
++        return -1;
++    }
++    if (relay == 0) {
++        run_loopback_relay(channels, count);
++        _exit(1);
++    }
++    for (i = 0; i < count; i++) {
++        close(channels[i].listener);
++    }
++    return 0;
++}
+ #endif
+ 
+ int main(int argc, char **argv)
+@@ -1586,6 +1996,21 @@ int main(int argc, char **argv)
+             printf("Warning: Couldn't enable dummy interface\n");
+         }
+     }
++
++    /*
++     * After the interfaces are configured, which needs a datagram socket,
++     * and before anything else runs: every process from here on inherits
++     * the filter.
++     */
++    if (deny_datagram_sockets() < 0) {
++        printf("Couldn't deny datagram sockets, bailing out\n");
++        exit(-1);
++    }
++
++    if (start_loopback_channels() < 0) {
++        printf("Couldn't set up KRUN_LOOPBACK_CHANNELS, bailing out\n");
++        exit(-1);
++    }
+ #endif
+ 
+     config_argv = NULL;
+-- 
+2.50.1 (Apple Git-155)
+

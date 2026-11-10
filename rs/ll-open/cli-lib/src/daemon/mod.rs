@@ -6,6 +6,7 @@ pub mod auth;
 pub mod client;
 #[cfg(feature = "sheaf")]
 pub mod complex_build_pass;
+pub mod control_lease;
 pub mod db_pool;
 #[cfg(feature = "vec")]
 pub mod embed;

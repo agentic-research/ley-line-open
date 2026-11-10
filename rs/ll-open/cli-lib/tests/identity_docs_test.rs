@@ -256,3 +256,112 @@ fn source_file_schema_does_not_describe_a_bytes_field() {
         "source.capnp must say the record carries the hash and not the bytes"
     );
 }
+
+/// AGENTS.md's identity vocabulary and the review kit's authority ledger
+/// name each construction's context or scheme; every one must be the string
+/// the code keys with (bead `ley-line-open-a678c2`). `run_id` is still the
+/// v1 prefix-in-preimage construction, so both must say v2 is proposed.
+#[test]
+fn identity_vocabulary_names_the_contexts_the_code_keys_with() {
+    let agents = normalized(include_str!("../../../../AGENTS.md"));
+    let kit = normalized(include_str!(
+        "../../../../.claude/skills/leyline-review-kit/SKILL.md"
+    ));
+    let parse = include_str!("../src/cmd_parse.rs");
+    let store = include_str!("../src/store_root.rs");
+    let digest = include_str!("../../../ll-core/core/src/head_digest.rs");
+    let auth = include_str!("../../runtime/src/authorization.rs");
+    let version = include_str!("../src/daemon/version.rs");
+
+    // (code that declares it, the string the docs must carry)
+    let constructions = [
+        (
+            parse,
+            "const SEGMENT_ROOT_SCHEME: &str = \"leyline/segment-root/v1\";",
+            "leyline/segment-root/v1",
+        ),
+        (
+            store,
+            "pub const STORE_TREE_SCHEME: &str = \"leyline/store-tree/v1\";",
+            "leyline/store-tree/v1",
+        ),
+        (
+            store,
+            "pub const PARSER_ID_SCHEME: &str = \"leyline/parser-id/v1\";",
+            "leyline/parser-id/v1",
+        ),
+        (
+            digest,
+            "pub const HEAD_DIGEST_CONTEXT: &str = \"leyline head digest v3\";",
+            "leyline head digest v3",
+        ),
+        (
+            parse,
+            "const NODE_HASH_CONTEXT: &str = \"leyline/ast-node/v3\";",
+            "leyline/ast-node/v3",
+        ),
+        (
+            auth,
+            "const RUN_ID_DOMAIN: &[u8] = b\"cloister/execution/v1/run-id\";",
+            "cloister/execution/v1/run-id",
+        ),
+        (
+            version,
+            "pub const PROJECTION_SCHEMA_VERSION: &str = \"projection-v12\";",
+            "projection-v12",
+        ),
+    ];
+    for (code, declaration, name) in constructions {
+        assert!(
+            code.contains(declaration),
+            "the code no longer declares `{declaration}`; update AGENTS.md, the review kit and this test"
+        );
+        assert!(
+            agents.contains(name),
+            "AGENTS.md's identity vocabulary does not name `{name}`"
+        );
+        assert!(
+            kit.contains(name),
+            "leyline-review-kit's authority ledger does not name `{name}`"
+        );
+    }
+
+    // AGENTS.md names the partition fold every keyed scheme above folds under.
+    let partition = include_str!("../../../ll-core/core/src/partition.rs");
+    assert!(
+        partition.contains("pub const PARTITION_CONTEXT: &str = \"leyline partition fold v1\";"),
+        "partition.rs changed PARTITION_CONTEXT; update AGENTS.md and this test"
+    );
+    assert!(
+        agents.contains("`BLAKE3_derive_key(\"leyline partition fold v1\", …)`"),
+        "AGENTS.md must name the partition fold's context"
+    );
+
+    // run_id v1 is what ships: its row says so, apart from the v2 row.
+    assert!(
+        agents.contains("| Shipped (v1, prefix-in-preimage"),
+        "AGENTS.md must list run_id v1 as the shipped construction"
+    );
+
+    // run_id v2 is ADR-0047 M3: not in the code, so proposed in both docs.
+    assert!(
+        !auth.contains("run-id/v2"),
+        "authorization.rs derives run-id v2; mark it shipped in AGENTS.md and the review kit"
+    );
+    assert!(
+        agents.contains(
+            "| `run_id` v2 | The same run | `derive_key(\"cloister/execution/v1/run-id/v2\", …)`, rendered `run-v2-<hex>` | Proposed only"
+        ),
+        "AGENTS.md must list run_id v2 as proposed"
+    );
+    assert!(
+        kit.contains("keyed v2 is ADR-0047 M3, proposed"),
+        "the review kit must list run_id v2 as proposed"
+    );
+
+    // A locator is not an identity, and the docs say so.
+    assert!(
+        agents.contains("a locator, not an identity"),
+        "AGENTS.md must say content_id and the other locators are not identities"
+    );
+}

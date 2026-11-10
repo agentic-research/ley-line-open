@@ -83,9 +83,11 @@ fn compiles_only_a_manifest_verified_content_addressed_rootfs() {
             .canonicalize()
             .expect("canonical fixture root")
     );
+    // Anchored at the guest's `/`: init execvp's it, and a path without a
+    // slash would be searched on PATH (bead ley-line-open-fe130c).
     assert_eq!(
         plan.executable.to_str().expect("exec text"),
-        "usr/bin/probe"
+        "/usr/bin/probe"
     );
     assert_eq!(plan.vcpus, 2);
     assert_eq!(plan.ram_mib, 2048);

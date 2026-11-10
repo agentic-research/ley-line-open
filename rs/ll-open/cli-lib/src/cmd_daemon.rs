@@ -147,9 +147,10 @@ pub struct DaemonOptions {
     /// Activate/resume the private CDC index over `source_blobs` before the
     /// first arena snapshot.
     pub cdc: bool,
-    /// Auto-discovery symlink this daemon publishes. The execution entry
-    /// points force their own name so an execution daemon cannot silently
-    /// take over `~/.mache/default.sock` from a running substrate daemon.
+    /// The surface whose well-known socket this daemon may bind as its
+    /// default instance (see `SocketDiscovery`). The execution entry points
+    /// force their own, so an execution daemon can never be admitted to
+    /// `~/.mache/default.sock`.
     pub discovery: crate::daemon::socket::SocketDiscovery,
     /// What serves `--mount` (bead `ley-line-open-3e73dc`): the store's
     /// filesystem behind the host's FUSE or NFS client. `leyline-storefs`
@@ -261,11 +262,10 @@ pub async fn run_execution_daemon_with_context(
     .await
 }
 
-/// The execution surface always publishes under its own discovery name,
-/// whatever the caller passed. Sharing `default.sock` with the substrate
-/// daemon means whichever starts second silently steals the other's clients:
-/// every mache client that resolves the symlink then talks to the wrong
-/// daemon against the wrong arena.
+/// The execution surface is always its own discovery surface, whatever the
+/// caller passed. Admitted to `default.sock`, an execution daemon would take
+/// the substrate daemon's clients: every mache client dialing that name would
+/// talk to the wrong daemon against the wrong arena.
 fn execution_daemon_options(options: DaemonOptions) -> DaemonOptions {
     DaemonOptions {
         discovery: crate::daemon::socket::SocketDiscovery::Execution,
@@ -332,7 +332,16 @@ pub async fn run_daemon_with_options(
     let source = source.as_deref();
     let backend = backend.as_str();
     let language = language.as_deref();
-    let timeout = timeout.as_deref();
+    // A bad timeout refuses the start before any work. The signal handlers
+    // are installed now, before anything announces this daemon (its socket,
+    // `daemon ready`): a supervisor that sends SIGTERM on that announcement
+    // must reach the handler and get the final snapshot and socket cleanup,
+    // not the default action, which kills the process with neither.
+    let timeout = timeout
+        .as_deref()
+        .map(lifecycle::parse_duration)
+        .transpose()?;
+    let mut shutdown_signals = lifecycle::ShutdownSignals::install()?;
     // Bead `ley-line-open-b7dd03`: gate non-loopback `--mcp-bind` behind
     // an explicit `--mcp-allow-public` flag. The MCP wire now has a
     // shared-secret token gate (ADR-0022 / bead `ley-line-open-b885d1`);
@@ -365,6 +374,17 @@ pub async fn run_daemon_with_options(
         );
     }
 
+    // Bead `ley-line-open-e7459a`: only a surface's default instance binds
+    // its well-known socket. Decided before any lock or file is touched, so
+    // a refused daemon leaves the well-known name exactly as it found it.
+    let ctrl_path = lifecycle::control_path_for(arena, control);
+    crate::daemon::socket::admit_well_known(
+        options.discovery,
+        dirs::home_dir().as_deref(),
+        arena,
+        &ctrl_path,
+    )?;
+
     // 0. Admission control — two gates run in sequence, belt+suspenders.
     //
     // (a) `flock(2)`-backed advisory lockfile at `<arena>.lock` (bead
@@ -389,6 +409,23 @@ pub async fn run_daemon_with_options(
         .unwrap_or_default();
     let _arena_owner = crate::daemon::arena_owner::try_acquire(arena, &source_root_str)
         .context("arena admission control (owner sentinel)")?;
+
+    // (c) The control block's lease (bead `ley-line-open-feabf4`): held
+    //     shared for the daemon's lifetime, or exclusively by a daemon that
+    //     resets. With `--reset-arena`, and nothing else holding the block,
+    //     a block of another VERSION is reinitialised here, before
+    //     `setup_arena` opens it and would refuse it.
+    let _control_lease =
+        crate::daemon::control_lease::ControlLease::acquire(&ctrl_path, arena, reset_arena)
+            .context("control block admission control")?;
+
+    // sqlite-vec is a process-wide `sqlite3_auto_extension`: it reaches only
+    // connections opened after it is registered. Registered here, before the
+    // writer and every pooled reader open, so `query` on a reader can name
+    // its modules (`vec_each`, ...) (bead `ley-line-open-3bf5dc`). It used to
+    // run while building the vector index, after the pool was full.
+    #[cfg(feature = "vec")]
+    crate::daemon::vec_index::register_vec();
 
     // 1. Arena setup.
     let ctrl_path = lifecycle::setup_arena(arena, arena_bytes(arena_size_mib), control)?;
@@ -524,7 +561,8 @@ pub async fn run_daemon_with_options(
     });
     #[cfg(feature = "vec")]
     let vec_index = {
-        crate::daemon::vec_index::register_vec();
+        // sqlite-vec was registered before the living db opened; see
+        // `register_vec` above `init_living_db`.
         Arc::new(
             crate::daemon::vec_index::VectorIndex::new(embedder.dimensions(), None)
                 .context("create sidecar VectorIndex")?,
@@ -628,9 +666,11 @@ pub async fn run_daemon_with_options(
     // Initial parse (during init_living_db) is done — daemon is ready to serve.
     state.write().phase = DaemonPhase::Ready;
 
-    let sock_path = ctrl_path.with_extension("sock");
-    crate::daemon::socket::spawn(ctx.clone(), sock_path.clone(), options.discovery)?;
-    eprintln!("daemon socket at {}", sock_path.display());
+    // Dropped on every way out of this function, before the arena lock
+    // (declared earlier): it removes the socket only while the path still
+    // names the socket bound here (bead `ley-line-open-e7459a`).
+    let sock = crate::daemon::socket::bind(ctx.clone(), ctrl_path.with_extension("sock"))?;
+    eprintln!("daemon socket at {}", sock.path().display());
 
     // Optional MCP HTTP transport — feeds cloister gateway / any MCP client.
     // Same dispatch table as the UDS socket; just an MCP-shaped wrapper.
@@ -839,7 +879,7 @@ pub async fn run_daemon_with_options(
     eprintln!("daemon ready — press Ctrl+C to stop");
 
     // 11. Wait for shutdown.
-    lifecycle::wait_for_shutdown(timeout).await?;
+    lifecycle::wait_for(&mut shutdown_signals, timeout).await;
 
     // 12. Graceful shutdown: unmount, final snapshot, cleanup.
     drop(mounted);
@@ -851,7 +891,7 @@ pub async fn run_daemon_with_options(
     if let Some(handle) = mcp_handle {
         handle.abort();
     }
-    let _ = std::fs::remove_file(&sock_path);
+    drop(sock);
 
     Ok(())
 }

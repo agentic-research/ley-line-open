@@ -51,6 +51,15 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs(secs))
 }
 
+/// The control block path for `arena`: `control` when given, else the arena
+/// path with a `.ctrl` extension.
+pub fn control_path_for(arena: &Path, control: Option<&Path>) -> PathBuf {
+    match control {
+        Some(p) => p.to_path_buf(),
+        None => arena.with_extension("ctrl"),
+    }
+}
+
 /// Set up the arena and controller without mounting.
 ///
 /// Returns the controller path (resolved) so callers can build a graph.
@@ -59,11 +68,7 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     // Create the arena file.
     let _mmap = create_arena(arena, arena_size).context("create arena")?;
 
-    // Derive control path: explicit or arena path with .ctrl extension.
-    let ctrl_path = match control {
-        Some(p) => p.to_path_buf(),
-        None => arena.with_extension("ctrl"),
-    };
+    let ctrl_path = control_path_for(arena, control);
 
     // Open/create the controller.
     let mut ctrl = Controller::open_or_create(&ctrl_path).context("open controller")?;
@@ -154,16 +159,24 @@ pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
         None => None,
     };
     let mut signals = ShutdownSignals::install()?;
-
     eprintln!("press Ctrl+C to stop");
+    wait_for(&mut signals, timeout_dur).await;
+    Ok(())
+}
 
-    match signals.wait(timeout_dur).await {
+/// Wait on signals installed earlier, or the timeout, and log which ended
+/// the wait. A command that announces readiness installs its signals first
+/// (bead `ley-line-open-e7459a`): a SIGTERM sent on the announcement must
+/// reach the handler, not the default action, which would kill the process
+/// with none of its shutdown done.
+pub async fn wait_for(signals: &mut ShutdownSignals, timeout: Option<Duration>) -> Shutdown {
+    let ended = signals.wait(timeout).await;
+    match ended {
         Shutdown::Interrupt => eprintln!("\nreceived Ctrl+C, shutting down"),
         Shutdown::Terminate => eprintln!("received SIGTERM, shutting down"),
         Shutdown::Timeout => eprintln!("timeout reached, shutting down"),
     }
-
-    Ok(())
+    ended
 }
 
 #[cfg(test)]

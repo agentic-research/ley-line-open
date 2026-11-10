@@ -14,8 +14,8 @@ use std::path::Path;
 
 use leyline_runtime::DigestRef;
 use leyline_runtime::artifacts::oci::{
-    DEFAULT_MAX_ROOTFS_BYTES, ImportedRootfs, OciImport, OciImportError, Platform, SymlinkPolicy,
-    import_oci_layout,
+    DEFAULT_MAX_ROOTFS_BYTES, DroppedLink, ImportedRootfs, OciImport, OciImportError, Platform,
+    SpecialEntryKind, SymlinkPolicy, import_oci_layout,
 };
 use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver};
 use leyline_runtime::backends::libkrun::volume::materialize_ephemeral_rootfs;
@@ -299,17 +299,123 @@ fn permissions_are_preserved_and_special_bits_are_cleared() {
 }
 
 #[test]
-fn a_file_the_owner_cannot_read_is_refused() {
-    let (_scratch, result) = import_single(
-        vec![Layer::plain(vec![file("etc/shadow", 0o000, b"x")])],
+fn a_file_the_owner_cannot_read_is_dropped_and_reported() {
+    // LLO's v0.27.0 image (chainguard/static) ships etc/shadow at 0000.
+    // Nothing unprivileged can read it: not the importer's verifier, not the
+    // resolver, not the guest's virtio-fs server. It is never written.
+    let (scratch, result) = import_single(
+        vec![
+            Layer::plain(vec![
+                file("bin/x", 0o755, b"x"),
+                file("etc/shadow", 0o000, b"root:*:"),
+                file("etc/gshadow", 0o4200, b"w"),
+                file("etc/passwd", 0o644, b"root"),
+            ]),
+            // A hard link and a resolved link to it are the same unreadable
+            // file at another path, and are dropped there too.
+            Layer::plain(vec![
+                hardlink("etc/shadow-hard", "etc/shadow"),
+                symlink("shadow-link", "etc/shadow"),
+            ]),
+        ],
+        SymlinkPolicy::Resolve,
+    );
+    let imported = result.expect("an image with an unreadable file imports");
+    let dropped: Vec<(&str, u32)> = imported
+        .unreadable_files_dropped
+        .iter()
+        .map(|file| (file.path.as_str(), file.mode))
+        .collect();
+    assert_eq!(
+        dropped,
+        [
+            ("etc/gshadow", 0o4200),
+            ("etc/shadow", 0o000),
+            ("etc/shadow-hard", 0o000),
+            ("shadow-link", 0o000),
+        ]
+    );
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["bin/x", "etc/passwd"]
+    );
+    // A dropped file clears no special bit: it is never written.
+    assert_eq!(imported.special_mode_bits_cleared, 0);
+    // As if the image never had them.
+    let (_scratch, without) = import_single(
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            file("etc/passwd", 0o644, b"root"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    let without = without.expect("import");
+    assert_eq!(imported.rootfs, without.rootfs);
+    assert!(without.unreadable_files_dropped.is_empty());
+    let json = serde_json::to_value(&imported).unwrap();
+    assert_eq!(json["unreadableFilesDropped"][1]["path"], "etc/shadow");
+    assert_eq!(json["unreadableFilesDropped"][1]["mode"], 0);
+
+    // A directory left holding only dropped files is not written either:
+    // one digest still names one tree on disk.
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            file("secret/only", 0o000, b"s"),
+        ])],
         SymlinkPolicy::Refuse,
     );
-    match result {
-        Err(OciImportError::Unsupported(detail)) => {
-            assert!(detail.contains("etc/shadow"), "{detail}")
+    let imported = result.expect("import");
+    assert_eq!(imported.rootfs, {
+        let (_s, r) = import_single(
+            vec![Layer::plain(vec![file("bin/x", 0o755, b"x")])],
+            SymlinkPolicy::Refuse,
+        );
+        r.expect("import").rootfs
+    });
+    let root = scratch.path().join("cas").join(&imported.rootfs.value);
+    assert!(root.join("secret").symlink_metadata().is_err());
+}
+
+#[test]
+fn a_directory_the_owner_cannot_read_is_refused() {
+    // Directory modes are not carried (all are written 0755), so writing
+    // one the image made unreadable would expose the subtree it hides.
+    for (entry, named) in [
+        (dir("locked/", 0o000), "locked/"),
+        (dir("locked/", 0o311), "locked/"),
+        // Readable but not searchable hides contents as well.
+        (dir("locked/", 0o400), "locked/"),
+        (dir("locked/", 0o644), "locked/"),
+        (dir("./", 0o000), "./"),
+    ] {
+        let (scratch, result) = import_single(
+            vec![Layer::plain(vec![
+                entry,
+                file("locked/inside", 0o644, b"x"),
+            ])],
+            SymlinkPolicy::Refuse,
+        );
+        match result {
+            Err(OciImportError::UnsafePath { path, reason, .. }) => {
+                assert_eq!(path, named);
+                assert!(reason.contains("owner cannot read and search"), "{reason}");
+            }
+            other => panic!("expected {named} to be refused, got {other:?}"),
         }
-        other => panic!("expected Unsupported, got {other:?}"),
+        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
     }
+    // Owner-readable directories of any other mode import as before.
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            dir("private/", 0o700),
+            dir("listable/", 0o500),
+            file("private/f", 0o644, b"x"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    assert_eq!(result.expect("import").files, 1);
 }
 
 #[test]
@@ -389,7 +495,6 @@ fn a_resolved_directory_link_copies_the_directory() {
 #[test]
 fn unresolvable_symbolic_links_are_refused_by_name() {
     for (entries, link) in [
-        (vec![symlink("dangling", "missing")], "dangling"),
         (vec![dir("a/", 0o755), symlink("a/self", ".")], "a/self"),
         (vec![dir("a/", 0o755), symlink("a/up", "..")], "a/up"),
         (vec![symlink("x", "y"), symlink("y", "x")], "x"),
@@ -398,6 +503,11 @@ fn unresolvable_symbolic_links_are_refused_by_name() {
             "through",
         ),
         (vec![symlink("empty", "")], "empty"),
+        // A missing component does not license an escape: the rest of the
+        // target is still read, and a `..` above the root is refused.
+        (vec![symlink("esc", "missing/../../etc")], "esc"),
+        (vec![symlink("esc", "/nonexistent/../../etc")], "esc"),
+        (vec![symlink("esc", "/proc/self/../../../etc")], "esc"),
     ] {
         let (_scratch, result) = import_single(vec![Layer::plain(entries)], SymlinkPolicy::Resolve);
         match result {
@@ -1456,4 +1566,548 @@ fn the_written_rootfs_is_held_to_the_limit_too() {
         attempt(11999),
         Err(OciImportError::TooLarge { limit: 11999 })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Entries the guest could never observe (beads ley-line-open-fe3d26, -391965).
+// ---------------------------------------------------------------------------
+
+fn dropped_entries(imported: &ImportedRootfs) -> Vec<(usize, &str, SpecialEntryKind)> {
+    imported
+        .special_entries_dropped
+        .iter()
+        .map(|entry| (entry.layer, entry.path.as_str(), entry.kind))
+        .collect()
+}
+
+fn dropped_links(links: &[DroppedLink]) -> Vec<(&str, &str)> {
+    links
+        .iter()
+        .map(|link| (link.path.as_str(), link.target.as_str()))
+        .collect()
+}
+
+#[test]
+fn device_nodes_under_kernel_mounted_directories_are_dropped_and_reported() {
+    // LLO's own v0.27.0 image ships dev/console, dev/null, dev/random,
+    // dev/urandom and dev/zero as character devices in layer 0. The guest
+    // init mounts devtmpfs over /dev, proc over /proc and sysfs over /sys
+    // before the workload runs, so none of them is observable.
+    let devices = vec![
+        dir("dev/", 0o755),
+        char_device("dev/console", 5, 1),
+        char_device("dev/null", 1, 3),
+        block_device("dev/vda", 254, 0),
+        fifo("dev/initctl"),
+        char_device("proc/kmsg", 1, 11),
+        char_device("sys/fs/fuse", 10, 229),
+    ];
+    let mut with = vec![file("bin/x", 0o755, b"x")];
+    with.extend(devices);
+    let (scratch, result) = import_single(vec![Layer::gzip(with)], SymlinkPolicy::Refuse);
+    let imported = result.expect("an image whose devices live under /dev imports");
+    assert_eq!(
+        dropped_entries(&imported),
+        [
+            (0, "dev/console", SpecialEntryKind::Char),
+            (0, "dev/null", SpecialEntryKind::Char),
+            (0, "dev/vda", SpecialEntryKind::Block),
+            (0, "dev/initctl", SpecialEntryKind::Fifo),
+            (0, "proc/kmsg", SpecialEntryKind::Char),
+            (0, "sys/fs/fuse", SpecialEntryKind::Char),
+        ]
+    );
+    let root = scratch.path().join("cas").join(&imported.rootfs.value);
+    for absent in ["dev", "proc", "sys"] {
+        assert!(
+            root.join(absent).symlink_metadata().is_err(),
+            "{absent} must not be written"
+        );
+    }
+    // A dropped entry is as if the image never had it: the rootfs identity
+    // equals that of the same image without the devices.
+    let (_scratch, without) = import_single(
+        vec![Layer::gzip(vec![file("bin/x", 0o755, b"x")])],
+        SymlinkPolicy::Refuse,
+    );
+    let without = without.expect("import");
+    assert_eq!(imported.rootfs, without.rootfs);
+    assert!(without.special_entries_dropped.is_empty());
+    // And it is reported in the CLI's JSON.
+    let json = serde_json::to_value(&imported).unwrap();
+    assert_eq!(json["specialEntriesDropped"][0]["path"], "dev/console");
+    assert_eq!(json["specialEntriesDropped"][0]["kind"], "char");
+    assert_eq!(json["specialEntriesDropped"][0]["layer"], 0);
+    assert_eq!(json["specialEntriesDropped"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn a_dropped_device_removes_what_a_lower_layer_had_at_its_path() {
+    // A device over a lower layer's regular file replaces it, as in any
+    // layered filesystem: dropping the device must not resurrect the file.
+    let (scratch, result) = import_single(
+        vec![
+            Layer::plain(vec![
+                file("dev/console", 0o644, b"lower"),
+                file("bin/x", 0o755, b"x"),
+            ]),
+            Layer::plain(vec![char_device("dev/console", 5, 1)]),
+        ],
+        SymlinkPolicy::Refuse,
+    );
+    let imported = result.expect("import");
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["bin/x"]
+    );
+    assert_eq!(
+        dropped_entries(&imported),
+        [(1, "dev/console", SpecialEntryKind::Char)]
+    );
+    // Within one layer, archive order decides: a later regular file wins.
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            char_device("dev/console", 5, 1),
+            file("dev/console", 0o644, b"later"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    let imported = result.expect("import");
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["dev/console"]
+    );
+}
+
+#[test]
+fn device_nodes_anywhere_else_are_still_refused_by_name() {
+    for (entry, named) in [
+        (char_device("etc/console", 5, 1), "etc/console"),
+        (block_device("var/disk", 8, 0), "var/disk"),
+        (fifo("run/initctl"), "run/initctl"),
+        // `tmp` is not a kernel mount: init.c mounts nothing there on Linux.
+        (char_device("tmp/null", 1, 3), "tmp/null"),
+        // A name that merely begins with `dev` is not under /dev.
+        (char_device("devices/null", 1, 3), "devices/null"),
+        // The mount point itself: init could not mount over a device.
+        (char_device("dev", 1, 3), "dev"),
+        (fifo("proc"), "proc"),
+    ] {
+        let (scratch, result) = import_single(
+            vec![Layer::plain(vec![file("bin/x", 0o755, b"x"), entry])],
+            SymlinkPolicy::Refuse,
+        );
+        match result {
+            Err(OciImportError::Unsupported(detail)) => {
+                assert!(detail.contains(named), "{named}: {detail}")
+            }
+            other => panic!("expected {named} to be refused, got {other:?}"),
+        }
+        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+    }
+    // Under a link, the device's real location is unknown: refused.
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            symlink("dev", "/etc"),
+            char_device("dev/console", 5, 1),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    match result {
+        Err(OciImportError::UnsafePath { path, .. }) => assert_eq!(path, "dev/console"),
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+}
+
+#[test]
+fn links_into_kernel_mounted_paths_are_dropped_and_reported() {
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            symlink("etc/mtab", "../proc/self/mounts"),
+            symlink("etc/mtab-abs", "/proc/mounts"),
+            symlink("dev-fd", "/dev/fd"),
+            symlink("sys-root", "/sys"),
+            // Even when the image holds bytes there, the guest sees the
+            // kernel's file, not these: they are never copied to the link.
+            file("proc/cpuinfo", 0o644, b"image bytes"),
+            symlink("cpuinfo", "/proc/cpuinfo"),
+            // A link that reaches /proc through another link.
+            symlink("p", "/proc"),
+            symlink("via", "p/self/mounts"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    let imported = result.expect("an image with /proc links imports under resolve");
+    assert_eq!(
+        dropped_links(&imported.links_dropped_kernel_mount),
+        [
+            ("cpuinfo", "/proc/cpuinfo"),
+            ("dev-fd", "/dev/fd"),
+            ("etc/mtab", "../proc/self/mounts"),
+            ("etc/mtab-abs", "/proc/mounts"),
+            ("p", "/proc"),
+            ("sys-root", "/sys"),
+            ("via", "p/self/mounts"),
+        ]
+    );
+    assert!(imported.links_dropped_dangling.is_empty());
+    assert_eq!(imported.symlinks_resolved, 0);
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    // proc/cpuinfo itself is an ordinary image file (shadowed in the guest,
+    // and unchanged from before this rule); no link became a copy of it.
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["bin/x", "proc/cpuinfo"]
+    );
+    let json = serde_json::to_value(&imported).unwrap();
+    assert_eq!(json["linksDroppedKernelMount"][2]["path"], "etc/mtab");
+    assert_eq!(
+        json["linksDroppedKernelMount"][2]["target"],
+        "../proc/self/mounts"
+    );
+}
+
+#[test]
+fn dangling_links_are_dropped_and_reported_under_resolve() {
+    let entries = vec![
+        file("bin/x", 0o755, b"x"),
+        file("usr/share/doc/libapt/NEWS.Debian.gz", 0o644, b"news"),
+        // rosary's image: the link's target is not in the image.
+        symlink("usr/share/zoneinfo/localtime", "/etc/localtime"),
+        // mache's image: a doc link left behind by a dpkg path-exclude.
+        symlink(
+            "usr/share/doc/apt/NEWS.Debian.gz",
+            "../libapt-pkg6.0t64/NEWS.Debian.gz",
+        ),
+        symlink("nowhere", "/nonexistent"),
+        // A link to a dangling link dangles too.
+        symlink("chain", "nowhere"),
+        // A missing directory component, then a `..` that stays in the root.
+        symlink("detour", "missing/../bin/x"),
+    ];
+    let (scratch, result) = import_single(vec![Layer::plain(entries)], SymlinkPolicy::Resolve);
+    let imported = result.expect("an image with dangling links imports under resolve");
+    assert_eq!(
+        dropped_links(&imported.links_dropped_dangling),
+        [
+            ("chain", "nowhere"),
+            ("detour", "missing/../bin/x"),
+            ("nowhere", "/nonexistent"),
+            (
+                "usr/share/doc/apt/NEWS.Debian.gz",
+                "../libapt-pkg6.0t64/NEWS.Debian.gz"
+            ),
+            ("usr/share/zoneinfo/localtime", "/etc/localtime"),
+        ]
+    );
+    assert!(imported.links_dropped_kernel_mount.is_empty());
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["bin/x", "usr/share/doc/libapt/NEWS.Debian.gz"]
+    );
+    // As if the image never had the links.
+    let (_scratch, without) = import_single(
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            file("usr/share/doc/libapt/NEWS.Debian.gz", 0o644, b"news"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    assert_eq!(imported.rootfs, without.expect("import").rootfs);
+    let json = serde_json::to_value(&imported).unwrap();
+    assert_eq!(json["linksDroppedDangling"][2]["path"], "nowhere");
+    assert_eq!(json["linksDroppedDangling"][2]["target"], "/nonexistent");
+
+    // The default policy is unchanged: the first link is refused by name.
+    let (_scratch, refused) = import_single(
+        vec![Layer::plain(vec![symlink("nowhere", "/nonexistent")])],
+        SymlinkPolicy::Refuse,
+    );
+    assert!(matches!(
+        refused,
+        Err(OciImportError::SymlinkRefused { path, .. }) if path == "nowhere"
+    ));
+}
+
+#[test]
+fn a_dangling_link_inside_a_copied_directory_is_reported_at_each_copy() {
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("usr/lib/libc.so", 0o755, b"libc"),
+            symlink("usr/lib/gone", "missing.so"),
+            symlink("lib", "usr/lib"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    let imported = result.expect("import");
+    assert_eq!(
+        dropped_links(&imported.links_dropped_dangling),
+        [("lib/gone", "missing.so"), ("usr/lib/gone", "missing.so")]
+    );
+    assert_eq!(imported.symlinks_resolved, 1);
+}
+
+#[test]
+fn a_dotdot_straight_out_of_a_kernel_mount_point_is_followed_into_the_image() {
+    // In the guest `/dev/..` is `/`: the link reaches the image's etc/f, and
+    // is copied from it, whatever the image holds under dev/.
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("dev/stray", 0o644, b"shadowed"),
+            file("etc/f", 0o644, b"f"),
+            symlink("etc/x", "/dev/../etc/f"),
+            symlink("etc/y", "../sys/./../etc/f"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    let imported = result.expect("import");
+    assert!(imported.links_dropped_kernel_mount.is_empty());
+    assert_eq!(imported.symlinks_resolved, 2);
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert_eq!(files["etc/x"], files["etc/f"]);
+    assert_eq!(files["etc/y"], files["etc/f"]);
+}
+
+#[test]
+fn links_into_the_workspace_mount_point_are_refused() {
+    // The guest init mounts a run's workspace at /work: neither the image's
+    // work/ nor its absence decides what such a link reaches.
+    for (entries, link) in [
+        (
+            vec![symlink("etc/app.toml", "/work/app.toml")],
+            "etc/app.toml",
+        ),
+        (
+            vec![
+                file("work/app.toml", 0o644, b"image"),
+                symlink("cfg", "work/app.toml"),
+            ],
+            "cfg",
+        ),
+        (vec![symlink("w", "/work")], "w"),
+    ] {
+        let (scratch, result) = import_single(vec![Layer::plain(entries)], SymlinkPolicy::Resolve);
+        match result {
+            Err(OciImportError::SymlinkUnresolvable { path, reason }) => {
+                assert_eq!(path, link);
+                assert!(reason.contains("/work"), "{reason}");
+            }
+            other => panic!("expected {link} to be refused, got {other:?}"),
+        }
+        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+    }
+}
+
+#[test]
+fn a_hard_link_to_a_dropped_device_is_refused() {
+    // A runtime would create a second device node at the link's path, which
+    // may lie outside /dev: the import cannot drop it there.
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            char_device("dev/null", 1, 3),
+            hardlink("etc/null", "dev/null"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    match result {
+        Err(OciImportError::UnsafePath { path, reason, .. }) => {
+            assert_eq!(path, "etc/null");
+            assert_eq!(reason, "the hard link's target does not exist");
+        }
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+}
+
+#[test]
+fn dropped_entries_are_reported_by_normalized_path_and_reuse_one_cas_entry() {
+    let scratch = TempDir::new().expect("scratch");
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).unwrap();
+    let with = single_image(
+        &scratch.path().join("with"),
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            char_device("./dev//console", 5, 1),
+            file("etc/shadow", 0o000, b"s"),
+        ])],
+    );
+    let without = single_image(
+        &scratch.path().join("without"),
+        vec![Layer::plain(vec![file("bin/x", 0o755, b"x")])],
+    );
+    let attempt = |layout: &str, digest: &str| {
+        import(
+            &scratch.path().join(layout),
+            digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas,
+        )
+        .expect("import")
+    };
+    let a = attempt("with", &with);
+    assert_eq!(
+        dropped_entries(&a),
+        [(0, "dev/console", SpecialEntryKind::Char)]
+    );
+    // The image without the dropped entries names the same rootfs, reuses
+    // the entry the first import published (its directories verify), and
+    // reports no drops of its own.
+    let b = attempt("without", &without);
+    assert_eq!(a.rootfs, b.rootfs);
+    assert!(b.special_entries_dropped.is_empty() && b.unreadable_files_dropped.is_empty());
+    assert_eq!(cas_entries(&cas), vec![a.rootfs.value.clone()]);
+}
+
+/// One first-party image and what importing it under `--symlinks resolve`
+/// gives, as a known answer.
+struct Acceptance {
+    name: &'static str,
+    image: &'static str,
+    expected: Outcome,
+}
+
+/// An import's rootfs digest and counts: files, links copied, then the
+/// special entries, kernel-mount links, dangling links and unreadable files
+/// dropped.
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    rootfs: &'static str,
+    counts: [usize; 6],
+}
+
+impl Outcome {
+    fn of(imported: &ImportedRootfs) -> (String, [usize; 6]) {
+        (
+            imported.rootfs.value.clone(),
+            [
+                imported.files,
+                imported.symlinks_resolved,
+                imported.special_entries_dropped.len(),
+                imported.links_dropped_kernel_mount.len(),
+                imported.links_dropped_dangling.len(),
+                imported.unreadable_files_dropped.len(),
+            ],
+        )
+    }
+}
+
+/// The first-party images Cloister reported refused (beads fe3d26 and
+/// 391965), plus hello-world as a control. Opt-in: the OCI layouts are not
+/// in the repository. Set `LEYLINE_OCI_ACCEPTANCE_DIR` to a directory holding
+/// `mache/`, `rosary/`, `llo/` and `hello/` layouts, each with the image's
+/// index and its linux/arm64 manifest, config and layers.
+const ACCEPTANCE_IMAGES: [Acceptance; 4] = [
+    Acceptance {
+        // LLO v0.27.0. Its dev/ devices, its etc/mtab -> /proc/mounts and
+        // its chainguard base's etc/shadow (mode 0000) are dropped.
+        name: "llo",
+        image: "sha256:6eca7788899f5bd96cd2fca373ef44fa9247542810f1fc91092650ee599153c5",
+        expected: Outcome {
+            rootfs: "c5017ae629d0e499662c2b07a34cf366e1ea216f8e6699cdbd0898d564494b37",
+            counts: [1248, 14, 5, 1, 0, 1],
+        },
+    },
+    Acceptance {
+        name: "mache",
+        image: "sha256:8620a0dc2d4c2ae7f6cc1f0ee68d6823a8bc9af6a8cf01d332c08738d9203ac7",
+        expected: Outcome {
+            rootfs: "dd52c667ff1c44e151bd8f05392607b0760b204dfe5d8e66d92fd76857ea4810",
+            counts: [5169, 982, 0, 0, 51, 0],
+        },
+    },
+    Acceptance {
+        name: "rosary",
+        image: "sha256:38aadea5d94b5f96ea43d9decd3c6f46f97c71a765fc73afd5f44387c21800ad",
+        expected: Outcome {
+            rootfs: "2982e7d59b5d33d5f1ef26af332e2963f6bbb7596017bc0be0ff0b57b25b6a23",
+            counts: [1869, 487, 0, 0, 1, 0],
+        },
+    },
+    Acceptance {
+        name: "hello",
+        // The control: imported before these rules at the same digest
+        // (Cloister's measurement on v0.27.0).
+        image: "sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef",
+        expected: Outcome {
+            rootfs: "8597bea8e4baf11379489ff6eb118e21af4127718e465920d328326be727e4ec",
+            counts: [1, 0, 0, 0, 0, 0],
+        },
+    },
+];
+
+#[test]
+fn first_party_images_import_deterministically_under_resolve() {
+    let Some(dir) = std::env::var_os("LEYLINE_OCI_ACCEPTANCE_DIR") else {
+        eprintln!(
+            "SKIPPED (NOT a pass): LEYLINE_OCI_ACCEPTANCE_DIR is unset; the first-party \
+             OCI layouts are not in the repository"
+        );
+        return;
+    };
+    let dir = Path::new(&dir);
+    let mut outcomes = Vec::new();
+    for Acceptance {
+        name,
+        image: digest,
+        expected,
+    } in ACCEPTANCE_IMAGES
+    {
+        let layout = dir.join(name);
+        let once = |cas: &Path| {
+            import(
+                &layout,
+                digest,
+                Platform::linux("arm64"),
+                SymlinkPolicy::Resolve,
+                cas,
+            )
+            .unwrap_or_else(|error| panic!("{name} ({digest}) must import: {error}"))
+        };
+        let (first, second) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let a = once(first.path());
+        let b = once(second.path());
+        assert_eq!(a.rootfs, b.rootfs, "{name}: two imports, one digest");
+        assert_eq!(
+            manifest_bytes(first.path(), &a.rootfs),
+            manifest_bytes(second.path(), &b.rootfs)
+        );
+        assert_eq!(a, b, "{name}: two imports, one report");
+        let (rootfs, counts) = Outcome::of(&a);
+        eprintln!(
+            "{name} {digest}: rootfs blake3-256:{rootfs} [files, symlinksResolved, \
+             specialEntriesDropped, linksDroppedKernelMount, linksDroppedDangling, \
+             unreadableFilesDropped] = {counts:?}"
+        );
+        for file in &a.unreadable_files_dropped {
+            eprintln!("  dropped unreadable {} mode {:04o}", file.path, file.mode);
+        }
+        for entry in &a.special_entries_dropped {
+            eprintln!(
+                "  dropped {:?} layer {} {}",
+                entry.kind, entry.layer, entry.path
+            );
+        }
+        for link in &a.links_dropped_kernel_mount {
+            eprintln!(
+                "  dropped kernel-mount link {} -> {}",
+                link.path, link.target
+            );
+        }
+        for link in &a.links_dropped_dangling {
+            eprintln!("  dropped dangling link {} -> {}", link.path, link.target);
+        }
+        outcomes.push((name, (rootfs, counts), expected));
+    }
+    for (name, (rootfs, counts), expected) in outcomes {
+        assert_eq!(
+            (rootfs.as_str(), counts),
+            (expected.rootfs, expected.counts),
+            "{name}: the known answer"
+        );
+    }
 }

@@ -6,11 +6,11 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 
 | Crate | Purpose |
 |---|---|
-| [`leyline-core`](ll-core/core/) | Arena header + Controller (mmap'd control block, `current_root: [u8; 32]`); `ContentAddressed` trait (σ substrate entry point, BLAKE3-locked) |
-| [`leyline-schema`](ll-core/schema/) | Shared SQLite `nodes` table DDL — local SQL projection contract |
+| [`leyline-core`](ll-core/core/) | Arena header + Controller (mmap'd control block, `current_root: [u8; 32]`); `ContentAddressed` trait (σ substrate entry point, BLAKE3-locked); `derive_key`; `Ref<D>` construction-indexed addresses; the ADR-0032 partition fold; head digest v3; the verifying `source_blob` accessor |
+| [`leyline-schema`](ll-core/schema/) | Shared SQLite `nodes` and interning-table DDL (append-only guards, path views) — local SQL projection contract; the arena-local locator newtypes `Nid`, `FileId`, `DirId`, `NameId`, `KindId`, `ContentId` (no wire encoding) |
 | [`leyline-public-schema`](ll-core/public-schema/) | Cap'n Proto schema for the daemon UDS + MCP wire (`daemon.capnp`) |
 | [`leyline-schema-capnp`](ll-core/schema-capnp/) | Cap'n Proto schemas for the Σ event log (AstNode, SourceFile, BindingRecord, Head, AstNodeList) |
-| [`leyline-schema-spec`](ll-core/schema-spec/) | Vendor-neutral capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`); ships canonical test vectors + SHA-256 integrity pins + BLAKE3-256 identity pins verified by cargo tests |
+| [`leyline-schema-spec`](ll-core/schema-spec/) | Vendor-neutral capability specs (`credential-isolation/v1`, `confinement/v1`, `build-cache/v1`, `mcp-tool/v1`, `execution/v1`, `leyline-net/v1`, `sigma/v1`); ships canonical test vectors + SHA-256 integrity pins + BLAKE3-256 identity pins verified by cargo tests |
 | [`leyline-ffi-helpers`](ll-core/ffi-helpers/) | Typed helpers (`c_input`, `c_output`, `c_cstr`, `c_ref`) for the C-boundary raw-pointer pattern every LLO `extern "C" fn` uses |
 | [`leyline-mcp-descriptor`](ll-core/mcp-descriptor/) | MCP Registry `server.json` emitter — shared coverage-validation + render, used by `server-json-gen` |
 | [`leyline-mcp-protocol-schema`](ll-core/mcp-protocol-schema/) | MCP JSON-RPC method-name facts generated at build time from a digest-pinned schema; a digest mismatch fails compilation |
@@ -19,7 +19,7 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 
 | Crate | Purpose |
 |---|---|
-| [`leyline-fs`](ll-open/fs/) | SqliteGraph (zero-copy `sqlite3_deserialize`), Graph trait, reader pool, NFS/FUSE mount |
+| [`leyline-fs`](ll-open/fs/) | SqliteGraph (zero-copy `sqlite3_deserialize`), Graph trait, reader pool, CDC chunk pool, FFI staticlib (the NFS/FUSE mount is `leyline-storefs`) |
 | [`leyline-ts`](ll-open/ts/) | Tree-sitter AST projection + bidirectional splice; κ CFG-kind vocabulary + CFG builder (T1.b3, [`analysis-substrate`](../docs/decades/analysis-substrate.md) decade) |
 | [`leyline-lsp`](ll-open/lsp/) | LSP client — spawns language servers, projects symbols + diagnostics; emits `BindingRecord` capnp event log |
 | [`leyline-hdc`](ll-open/hdc/) | Hyperdimensional computing — per-scope hypervectors for structural code search |
@@ -30,17 +30,28 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | [`leyline-runtime`](ll-open/runtime/) | Capability-resolved execution lifecycle + isolation backends (`execution/v1`) — authorization, backends (native/libkrun), confinement (ADR-0035) |
 | [`leyline-vcs`](ll-open/vcs/) | jj sidecar — automatic versioning of arena snapshots. **External-facing**: no in-workspace consumer, git-rev pinned directly by rosary |
 | [`leyline-sign`](ll-open/sign/) | Σ `Head` root signer/verifier (`Ed25519RootSigner`, `verify_head`, canonical `kid`; S1/S2/S3) + CMS signing primitives + gpgsm-compatible binary for jj commit signing (host feature ships `leyline-sign-helper` daemon per ADR-0019) |
-| [`leyline-cas-ffi`](ll-open/cas-ffi/) | Wasm32-callable FFI for BLAKE3-substrate hash. **External-facing**: no in-workspace consumer, consumed by cloister via workerd's cdylib loader |
+| [`leyline-cas-ffi`](ll-open/cas-ffi/) | Wasm32-callable FFI for the BLAKE3 substrate hash (`leyline_hash_bytes`) and `derive_key` (`leyline_derive_key`). **External-facing**: no in-workspace consumer, consumed by cloister via workerd's cdylib loader |
 | [`leyline-schema-bridge`](ll-open/schema-bridge/) | capnp compiler plugin family — capnp schemas → zod TS / Go / JSON Schema codegen; unmapped constructs are hard errors. Build-time tool, also a rosary build-anchor |
 | [`leyline-text-search`](ll-open/text-search/) | Unstructured-text semantic search backend abstraction. `NullEngine` default; `WitchcraftEngine` (XTR-WARP) behind feature flag |
 | [`leyline-chat-embed`](ll-open/chat-embed/) | CLI binary: semantic search over Claude Code chat databases via fastembed/MiniLM |
 | [`leyline-cli-lib`](ll-open/cli-lib/) | Daemon: living SQLite db + arena flip + Σ root advance + MCP/UDS surfaces; hosts every enrichment pass |
 | [`leyline-storefs`](ll-open/storefs/) | Store-backed filesystem core for the virtio-fs device (ADR-0044 V2) and the host mount (ADR-0045 T8, `mount` feature: FUSE and loopback NFSv3 adapters): FUSE-shaped requests answered from the store, writes landed as ADR-0042 proposals at FLUSH/FSYNC, refusals as Linux errno values |
-| [`leyline-cli`](ll-open/cli/) | `leyline` binary — `parse`, `lsp`, `daemon`, `inspect` subcommands |
+| [`leyline-cli`](ll-open/cli/) | `leyline` binary — `parse`, `daemon`, `execution-daemon`, `execution`, `lsp`, `inspect`, `load`, `cdc`, `verify-head`, `rebuild`, `rootfs` (`import-oci`), `splice`, `doctor`, `self` subcommands |
+| [`leyline-krun-worker`](ll-open/krun-worker/) | The microVM worker binary: links the vendored libkrun (`../third_party/`) and runs one guest per process for `leyline-runtime`'s libkrun backend. Not published |
+| [`leyline-perf-sample`](ll-open/perf-sample/) | Wall-clock sampling for perf gates (minimum of N, interleaved arms). Test support only, not published |
+
+## Tools (`tools/`) and shims (`shims/`)
+
+| Crate | Purpose |
+|---|---|
+| [`compat-gen`](tools/compat-gen/) | Generates `compatibility.json` from `leyline-cli-lib::daemon::version` |
+| [`server-json-gen`](tools/server-json-gen/) | Generates `server.json` (MCP Registry, with the Cloister groups block) from the daemon's tool registry |
+| [`smell-projector`](tools/smell-projector/) | Projects `rs/` into SQLite and runs the smell rules behind `task smells` |
+| [`rusqlite` 0.39 shim](shims/rusqlite-0.39/) | Excluded from the workspace and applied by `[patch.crates-io]`: serves witchcraft's rusqlite 0.39 requirement from rusqlite 0.41, so the workspace links one SQLite (3.54.1) |
 
 ## Crate dependency graph
 
-Logical units, not a literal per-crate graph (24 crates is too dense to read at that resolution) — grouped by shared release/test stance, per the `[[repo]]` external-consumer audit below. Crates outlined in orange are **git-rev/tag pinned directly by another repo's `Cargo.toml`** — bumping them isn't free for LLO's internal cadence alone, regardless of how rarely they change internally.
+Logical units, not a literal per-crate graph (31 crates is too dense to read at that resolution) — grouped by shared release/test stance, per the `[[repo]]` external-consumer audit below. Crates outlined in orange are **git-rev/tag pinned directly by another repo's `Cargo.toml`** — bumping them isn't free for LLO's internal cadence alone, regardless of how rarely they change internally.
 
 ```mermaid
 graph TD
@@ -104,7 +115,7 @@ graph TD
 
 ## Tier-isolation gate
 
-`ll-core/*` crates MUST compile without `ll-open/*`. CI gate: `task tier:isolation` builds `leyline-core`, `leyline-schema`, `leyline-public-schema`, `leyline-schema-capnp` in isolation. If a `ll-core/*` Cargo.toml gains a `ll-open/*` path dep, the gate fails.
+`ll-core/*` crates MUST compile without `ll-open/*`. CI gate: `task tier:isolation` builds `leyline-core`, `leyline-schema` and `leyline-public-schema` in isolation. If a `ll-core/*` Cargo.toml gains a `ll-open/*` path dep, the gate fails.
 
 ## Build
 
@@ -114,7 +125,7 @@ cargo build --workspace
 cargo test --workspace
 
 # Or via the Taskfile from the repo root (preferred — wires pkg-config for macFUSE-T on macOS):
-cd .. && task ci             # check + clippy + fmt + FFI staticlib + tier isolation + test
+cd .. && task ci             # the full CI gate (Taskfile.yml `ci:`), including audit, FFI staticlib, tier isolation and test
 cd .. && task install:full   # release + codesign + install to ~/.local/bin — recommended for consumers
 # See ../README.md#install for the full three-path matrix (install / install:full / install:full+mount).
 ```

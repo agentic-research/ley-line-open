@@ -12,8 +12,17 @@
 //!  "image":{"reference":"sha256:…","manifest":"sha256:…","config":"sha256:…",
 //!           "platform":{"os":"linux","architecture":"arm64"}},
 //!  "files":10,"specialModeBitsCleared":1,"symlinksResolved":2,
+//!  "specialEntriesDropped":[{"layer":0,"path":"dev/console","kind":"char"}],
+//!  "linksDroppedKernelMount":[{"path":"etc/mtab","target":"/proc/mounts"}],
+//!  "linksDroppedDangling":[{"path":"usr/share/zoneinfo/localtime","target":"/etc/localtime"}],
+//!  "unreadableFilesDropped":[{"path":"etc/shadow","mode":0}],
 //!  "imageConfig":{"entrypoint":["/bin/tool"],"cmd":[],"env":[],"workingDir":"/","user":""}}
 //! ```
+//!
+//! The four `…Dropped` lists name what the import did not write; the runtime
+//! README's "Container images" section states each rule and what, if
+//! anything, a guest can observe of the difference. Each list is empty when
+//! nothing was dropped.
 
 use std::path::Path;
 

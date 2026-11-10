@@ -1,6 +1,7 @@
 # ADR-0044 — Agents see a filesystem served from userspace: an LLO virtio-fs device in a microVM
 
-**Status:** Accepted (2026-10-15); LLO carries the libkrun patch until upstream takes it
+**Status:** Accepted (2026-10-15); LLO carries nine libkrun patches
+(`rs/third_party/libkrun-patches/0001`–`0009`) until upstream takes them
 **Bead:** see "Beads" below
 **Related:**
 
@@ -283,7 +284,9 @@ daemon, so the share crosses a process boundary on one connected UNIX socket pai
 libkrun backend (`KrunWorkerBackend::with_workspace_shares`) opens the run's share before it
 spawns the worker and passes one end as an inherited descriptor (`--workspace-share-fd`); the
 worker's virtio-fs device (`ShareFs`, libkrun's `DynFileSystem`) forwards each FUSE request down
-it (`backends::libkrun::share`: JSON header, READ and WRITE bytes as raw payload), and the daemon
+it (`backends::libkrun::share`: a JSON header at Phase C, a Cap'n Proto header,
+`public-schema/capnp/share.capnp`, since `ley-line-open-39d3a4`; READ and WRITE bytes as raw
+payload), and the daemon
 answers from `StoreShare` (the storefs README "Adapter" mapping) over a `StoreFs` on its own
 `DaemonContext`: the share and the socket propose on one writer, and a landed share proposal is
 written into the checkout and published to the arena as a socket proposal is. The grant scopes

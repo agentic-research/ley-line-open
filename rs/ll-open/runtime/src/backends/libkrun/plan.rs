@@ -127,7 +127,7 @@ pub fn compile_plan(
     Ok(KrunConfig {
         run_id: request.run_id.clone(),
         rootfs,
-        executable: c_string(&request.executable, "executable")?,
+        executable: guest_executable(&request.executable)?,
         arguments: request
             .arguments
             .iter()
@@ -333,6 +333,21 @@ fn validate_relative_path(value: &str) -> Result<(), ExecutionError> {
     Ok(())
 }
 
+/// The executable as the guest names it: the rootfs-relative path the request
+/// carries, anchored at the guest's `/` (bead `ley-line-open-fe130c`).
+///
+/// Absolute in every plan, not only when a workspace moves the working
+/// directory: libkrun's init `execvp`s what it is given, and a bare name
+/// (`hello`, as a scratch or distroless image's entrypoint is) has no slash,
+/// so `execvp` searched `PATH` and the run exited 127 while the same bytes at
+/// `bin/hello` ran. A run never depends on `PATH` to find its own executable.
+/// Consumers on the host (the native tier) join it to the rootfs without the
+/// leading slash.
+pub fn guest_executable(relative: &str) -> Result<CString, ExecutionError> {
+    let relative = relative.trim_start_matches('/');
+    c_string(&format!("/{relative}"), "executable")
+}
+
 fn c_string(value: &str, field: &str) -> Result<CString, ExecutionError> {
     CString::new(value)
         .map_err(|_| ExecutionError::invalid(format!("{field} contains an interior NUL byte")))
@@ -340,4 +355,25 @@ fn c_string(value: &str, field: &str) -> Result<CString, ExecutionError> {
 
 fn invalid_io(action: &str, error: std::io::Error) -> ExecutionError {
     ExecutionError::invalid(format!("{action}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guest_executable;
+
+    /// Bead ley-line-open-fe130c: the exec path is absolute whatever the
+    /// catalog's guest-relative path looks like, a top-level name included.
+    #[test]
+    fn the_guest_executable_is_always_absolute() {
+        for (relative, guest) in [
+            ("hello", "/hello"),
+            ("bin/hello", "/bin/hello"),
+            ("usr/local/bin/x", "/usr/local/bin/x"),
+            ("/already", "/already"),
+        ] {
+            let path = guest_executable(relative).unwrap();
+            assert_eq!(path.to_str().unwrap(), guest, "{relative}");
+        }
+        assert!(guest_executable("a\0b").is_err());
+    }
 }

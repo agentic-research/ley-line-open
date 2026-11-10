@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Tue, 10 Nov 2026 01:00:00 -0600
+Subject: [PATCH] devices/vsock: bind a listening mapping's host socket before the guest starts
+
+The muxer thread bound the host socket of each listening port mapping
+when the vsock device activated, inside a guest that was already
+running, and a socket it could not bind (a path longer than sun_path, a
+missing directory, a path that already exists) was logged as a warning
+and skipped. The VM then ran without a channel its embedder had
+declared, and nothing told the embedder.
+
+The sockets are now bound when the device is created, in
+krun_start_enter before the guest boots, and a socket that cannot be
+bound fails krun_start_enter with -EADDRNOTAVAIL. The muxer thread
+serves the sockets it is handed. Each socket is created owner-only (a
+077 umask around the bind) whatever the process umask, so only the
+embedder's own user may connect to the path that reaches the guest.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+---
+diff --git a/src/devices/src/virtio/vsock/device.rs b/src/devices/src/virtio/vsock/device.rs
+index a61043b..ef49aa9 100644
+--- a/src/devices/src/virtio/vsock/device.rs
++++ b/src/devices/src/virtio/vsock/device.rs
+@@ -58,7 +58,7 @@ impl Vsock {
+     ) -> super::Result<Vsock> {
+         Ok(Vsock {
+             cid,
+-            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags),
++            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags)?,
+             queue_rx: None,
+             queue_tx: None,
+             queue_events: Vec::new(),
+diff --git a/src/devices/src/virtio/vsock/mod.rs b/src/devices/src/virtio/vsock/mod.rs
+index c307c54..4f0e90e 100644
+--- a/src/devices/src/virtio/vsock/mod.rs
++++ b/src/devices/src/virtio/vsock/mod.rs
+@@ -174,6 +174,8 @@ pub enum VsockError {
+     UnwritableDescriptor,
+     /// EventFd error
+     EventFd(std::io::Error),
++    /// The host socket of a listening port mapping could not be bound.
++    ListeningSocket(std::path::PathBuf, String),
+ }
+ 
+ type Result<T> = std::result::Result<T, VsockError>;
+diff --git a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+index 31822dc..d91f7f5 100644
+--- a/src/devices/src/virtio/vsock/muxer.rs
++++ b/src/devices/src/virtio/vsock/muxer.rs
+@@ -1,4 +1,5 @@
+ use std::collections::HashMap;
++use std::os::fd::OwnedFd;
+ use std::os::unix::io::RawFd;
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex, RwLock};
+@@ -15,7 +16,7 @@ use super::reaper::ReaperThread;
+ use super::timesync::TimesyncThread;
+ use super::tsi_dgram::TsiDgramProxy;
+ use super::tsi_stream::TsiStreamProxy;
+-use super::unix::UnixProxy;
++use super::unix::{UnixAcceptorProxy, UnixProxy};
+ use super::TsiFlags;
+ use super::VsockError;
+ use crossbeam_channel::{unbounded, Sender};
+@@ -107,17 +108,36 @@ pub struct VsockMuxer {
+     proxy_map: ProxyMap,
+     reaper_sender: Option<Sender<u64>>,
+     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
++    /// The host sockets of the listening mappings, bound in `new` and served
++    /// once the device activates.
++    unix_ipc_listeners: Vec<(u32, OwnedFd)>,
+     tsi_flags: TsiFlags,
+ }
+ 
+ impl VsockMuxer {
++    /// Bind every listening mapping's host socket now, before the guest
++    /// starts. The muxer thread used to bind them when the device activated,
++    /// inside a running guest, and only logged a socket it could not bind,
++    /// so a VM could run without a channel its embedder declared. A socket
++    /// that cannot be bound now fails the device, and with it the VM.
+     pub(crate) fn new(
+         cid: u64,
+         host_port_map: Option<HashMap<u16, u16>>,
+         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+         tsi_flags: TsiFlags,
+-    ) -> Self {
+-        VsockMuxer {
++    ) -> Result<Self, VsockError> {
++        let mut unix_ipc_listeners = Vec::new();
++        for (port, (path, listen)) in unix_ipc_port_map.iter().flatten() {
++            if !listen {
++                continue;
++            }
++            let fd = UnixAcceptorProxy::bind_listener(path).map_err(|error| {
++                error!("Failed to create listening proxy at {path:?}: {error:?}");
++                VsockError::ListeningSocket(path.clone(), format!("{error:?}"))
++            })?;
++            unix_ipc_listeners.push((*port, fd));
++        }
++        Ok(VsockMuxer {
+             cid,
+             host_port_map,
+             queue: None,
+@@ -128,8 +148,9 @@ impl VsockMuxer {
+             proxy_map: Arc::new(RwLock::new(HashMap::new())),
+             reaper_sender: None,
+             unix_ipc_port_map,
++            unix_ipc_listeners,
+             tsi_flags,
+-        }
++        })
+     }
+ 
+     pub(crate) fn activate(
+@@ -160,7 +181,7 @@ impl VsockMuxer {
+             queue,
+             interrupt.clone(),
+             sender.clone(),
+-            self.unix_ipc_port_map.clone().unwrap_or_default(),
++            std::mem::take(&mut self.unix_ipc_listeners),
+         );
+         thread.run();
+ 
+diff --git a/src/devices/src/virtio/vsock/muxer_thread.rs b/src/devices/src/virtio/vsock/muxer_thread.rs
+index 1a21588..d24d6d9 100644
+--- a/src/devices/src/virtio/vsock/muxer_thread.rs
++++ b/src/devices/src/virtio/vsock/muxer_thread.rs
+@@ -1,6 +1,5 @@
+-use std::collections::HashMap;
++use std::os::fd::OwnedFd;
+ use std::os::unix::io::RawFd;
+-use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+ use std::thread;
+ 
+@@ -27,7 +26,7 @@ pub struct MuxerThread {
+     queue: Arc<Mutex<VirtQueue>>,
+     interrupt: InterruptTransport,
+     reaper_sender: Sender<u64>,
+-    unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
++    unix_ipc_listeners: Vec<(u32, OwnedFd)>,
+ }
+ 
+ impl MuxerThread {
+@@ -41,7 +40,7 @@ impl MuxerThread {
+         queue: Arc<Mutex<VirtQueue>>,
+         interrupt: InterruptTransport,
+         reaper_sender: Sender<u64>,
+-        unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
++        unix_ipc_listeners: Vec<(u32, OwnedFd)>,
+     ) -> Self {
+         MuxerThread {
+             cid,
+@@ -52,7 +51,7 @@ impl MuxerThread {
+             queue,
+             interrupt,
+             reaper_sender,
+-            unix_ipc_port_map,
++            unix_ipc_listeners,
+         }
+     }
+ 
+@@ -149,19 +148,14 @@ impl MuxerThread {
+         }
+     }
+ 
+-    fn create_lisening_ipc_sockets(&self) {
+-        for (port, (path, do_listen)) in &self.unix_ipc_port_map {
+-            if !do_listen {
+-                continue;
+-            }
+-            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+-            let proxy = match UnixAcceptorProxy::new(id, path, *port) {
+-                Ok(proxy) => proxy,
+-                Err(e) => {
+-                    warn!("Failed to create listening proxy at {path:?}: {e:?}");
+-                    continue;
+-                }
+-            };
++    /// Serve the host sockets of the listening port mappings. They were
++    /// bound before the guest started (`VsockMuxer::new`), so a mapping that
++    /// cannot be bound refuses the VM instead of leaving it without the
++    /// channel.
++    fn serve_listening_ipc_sockets(&mut self) {
++        for (port, fd) in std::mem::take(&mut self.unix_ipc_listeners) {
++            let id = ((port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
++            let proxy = UnixAcceptorProxy::from_listener(id, fd, port);
+             self.proxy_map
+                 .write()
+                 .unwrap()
+@@ -172,9 +166,9 @@ impl MuxerThread {
+         }
+     }
+ 
+-    fn work(self) {
++    fn work(mut self) {
+         let mut thread_rng = rng();
+-        self.create_lisening_ipc_sockets();
++        self.serve_listening_ipc_sockets();
+         loop {
+             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+             match self
+diff --git a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
+index f88eb70..e947e3c 100644
+--- a/src/devices/src/virtio/vsock/unix.rs
++++ b/src/devices/src/virtio/vsock/unix.rs
+@@ -659,7 +659,16 @@ pub struct UnixAcceptorProxy {
+ }
+ 
+ impl UnixAcceptorProxy {
+-    pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
++    /// Bind and listen on the host socket at `path`, the host end of a
++    /// listening port mapping.
++    ///
++    /// The socket is created owner-only (a 077 umask around the bind: no
++    /// group or other access), whatever the process umask: a peer reaches
++    /// the guest through this
++    /// path, so only the embedder's own user may connect to it, and the
++    /// directory the embedder chose decides the rest.
++    pub fn bind_listener(path: &PathBuf) -> Result<OwnedFd, ProxyError> {
++        use nix::sys::stat::{umask, Mode};
+         let fd = socket(
+             AddressFamily::Unix,
+             SockType::Stream,
+@@ -667,14 +676,19 @@ impl UnixAcceptorProxy {
+             None,
+         )
+         .map_err(ProxyError::CreatingSocket)?;
+-        bind(
+-            fd.as_raw_fd(),
+-            &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
+-        )
+-        .map_err(ProxyError::CreatingSocket)?;
++        let address = UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?;
++        let previous = umask(Mode::from_bits_truncate(0o077));
++        let bound = bind(fd.as_raw_fd(), &address);
++        umask(previous);
++        bound.map_err(ProxyError::CreatingSocket)?;
+         listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
+             .map_err(ProxyError::CreatingSocket)?;
+-        Ok(UnixAcceptorProxy { id, fd, peer_port })
++        Ok(fd)
++    }
++
++    /// The acceptor for a host socket [`Self::bind_listener`] already bound.
++    pub fn from_listener(id: u64, fd: OwnedFd, peer_port: u32) -> Self {
++        UnixAcceptorProxy { id, fd, peer_port }
+     }
+ }
+ 
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index f2ff270..7bea3b0 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -3026,7 +3026,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+                 unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                 tsi_flags: *tsi_flags,
+             };
+-            ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
++            // Creating the device binds the host sockets of its listening
++            // mappings; one that cannot be bound refuses the VM here.
++            if let Err(e) = ctx_cfg.vmr.set_vsock_device(vsock_device_config) {
++                error!("Error configuring vsock: {e:?}");
++                return -libc::EADDRNOTAVAIL;
++            }
+         }
+         VsockConfig::Implicit => {
+             // Implicit vsock configuration - use heuristics
+@@ -3052,7 +3057,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+                     unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                     tsi_flags,
+                 };
+-                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
++                if let Err(e) = ctx_cfg.vmr.set_vsock_device(vsock_device_config) {
++                    error!("Error configuring vsock: {e:?}");
++                    return -libc::EADDRNOTAVAIL;
++                }
+             }
+         }
+     }
+-- 
+2.50.1 (Apple Git-155)
+

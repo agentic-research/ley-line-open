@@ -13,7 +13,9 @@ use crate::{ExecutionError, ExecutionRequest, WorkerChannel};
 use serde::{Deserialize, Serialize};
 
 use super::confinement::{
-    VmmHostResources, apply_manifest, confinement_manifest, guest_port_map, vsock_unix_mappings,
+    LOOPBACK_CHANNELS_ENV, VmmHostResources, apply_manifest, check_channel_host_ends,
+    confinement_manifest, guest_loopback_channels, guest_port_map, loopback_channels_env,
+    vsock_unix_mappings,
 };
 use super::plan::{DirectoryRootfsResolver, KRUN_TSI_HIJACK_INET, KrunConfig, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
@@ -33,13 +35,79 @@ pub const WORKSPACE_DIR: &str = "/work";
 /// `tag:directory` pairs init mounts as virtio-fs before the workload runs.
 pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
 
-/// Refuse a workload environment that names the guest init's mount list:
-/// which shares the guest mounts, and where, is the worker's decision.
+/// Refuse a workload environment that names the guest init's mount list or
+/// its loopback channels: which shares the guest mounts, and which declared
+/// connections it presents where, are the worker's decision, taken from the
+/// attested document.
+///
+/// libkrun hands the environment and the executable to the guest on the
+/// kernel command line, and the guest kernel parses every `key=value` there
+/// as a boot parameter before init sees what is left. So the request's part
+/// of that line is held to what the kernel's quote-aware parser cannot read
+/// as anything else (bead `ley-line-open-eb5e4e`). Readers that split the
+/// line on whitespace and ignore quotes (init's `tsi_enabled`, arm64's
+/// id-register overrides) can still see a word inside a quoted value; none
+/// of them widens reach, and the gap is bead `ley-line-open-f7f862`:
+///
+/// - a key is `[A-Z_][A-Z0-9_]*`. Kernel boot parameters are lowercase
+///   (`init=`, `rdinit=`, `console=`) or dotted module parameters, so an
+///   uppercase key is never one: `{"init": "/bin/x"}` would otherwise replace
+///   the guest init, and with it the datagram filter and the relay;
+/// - no key starts with `KRUN_`: those are the guest init's own settings
+///   (its mounts, its channels, `KRUN_INIT`, `KRUN_CONFIG`, ...), set by the
+///   worker or by no one;
+/// - no value contains a double quote, which would end the entry and start
+///   another;
+/// - the executable has no whitespace, quote or control character, because
+///   libkrun writes it unquoted (`KRUN_INIT=<executable>`).
 fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), ExecutionError> {
-    if request.public_environment.contains_key(VIRTIOFS_MOUNTS_ENV) {
+    for reserved in [VIRTIOFS_MOUNTS_ENV, LOOPBACK_CHANNELS_ENV] {
+        if request.public_environment.contains_key(reserved) {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment may not set {reserved}: the worker sets it from the \
+                 attested confinement document"
+            )));
+        }
+    }
+    for (key, value) in &request.public_environment {
+        let well_formed = key
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase() || first == b'_')
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+        if !well_formed {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment key {key:?} is not [A-Z_][A-Z0-9_]*: the microVM tier \
+                 passes the environment on the guest kernel command line, where any other \
+                 key could be read as a kernel parameter (init=, console=, a module's)"
+            )));
+        }
+        if key.starts_with("KRUN_") {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment may not set {key}: KRUN_ variables configure the guest \
+                 init, and the worker sets the ones a run has"
+            )));
+        }
+        if value.contains('"') {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment entry {key:?} contains a double quote, which would end its \
+                 entry on the guest kernel command line and start another; the microVM tier \
+                 refuses it"
+            )));
+        }
+    }
+    if request
+        .executable
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '"')
+    {
         return Err(ExecutionError::invalid(format!(
-            "publicEnvironment may not set {VIRTIOFS_MOUNTS_ENV}: the worker sets the \
-             guest's virtio-fs mounts"
+            "executable {:?} contains whitespace, a quote or a control character; libkrun \
+             writes it unquoted on the guest kernel command line, where it would split \
+             into further parameters",
+            request.executable
         )));
     }
     Ok(())
@@ -88,9 +156,9 @@ fn workspace_share(
 }
 
 /// Have the guest init mount the workspace share at [`WORKSPACE_DIR`] and
-/// start the workload there. The executable stays the rootfs's: the plan's
-/// guest-relative path is anchored at `/`, since init would otherwise
-/// resolve it against the share.
+/// start the workload there. The executable stays the rootfs's: the plan
+/// already anchors it at `/` (`guest_executable`), so it does not resolve
+/// against the share.
 fn mount_workspace(config: &mut KrunConfig) {
     config.environment.push(
         std::ffi::CString::new(format!(
@@ -99,12 +167,6 @@ fn mount_workspace(config: &mut KrunConfig) {
         .expect("static mount entry has no NUL"),
     );
     config.workdir = std::ffi::CString::new(WORKSPACE_DIR).expect("static workdir has no NUL");
-    if !config.executable.as_bytes().starts_with(b"/") {
-        let mut absolute = b"/".to_vec();
-        absolute.extend_from_slice(config.executable.as_bytes());
-        config.executable =
-            std::ffi::CString::new(absolute).expect("a CString's bytes have no NUL");
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,6 +605,22 @@ pub fn prepare(
     // the issuer can compute every port from the document they signed.
     config.vsock_unix_map = vsock_unix_mappings(&manifest)?;
 
+    // ADR-0046 Q7: the grants carrying a `guestPort` are presented to the
+    // workload as TCP on the guest's loopback, by the guest init (LLO libkrun
+    // patch 0010). The list is a pure function of the same attested document
+    // (`guest_loopback_channels`), handed to init in a variable the request
+    // cannot set (`refuse_reserved_environment`), so the guest-visible set is
+    // exactly what the digest below commits to.
+    let channels = guest_loopback_channels(&manifest, config.tsi_features, std::env::consts::OS)?;
+    if let Some(variable) = loopback_channels_env(&channels) {
+        config.environment.push(variable);
+    }
+
+    // Every declared channel's host end can exist, or the run is refused
+    // naming it, before the process confines itself and long before the VMM
+    // (invariant I4; bead ley-line-open-bb2143).
+    check_channel_host_ends(&config.vsock_unix_map)?;
+
     apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
     Ok(PreparedRun {
@@ -579,8 +657,8 @@ mod tests {
                 },
                 canonical_path: PathBuf::from("/rootfs"),
             },
-            // Guest-relative, as `compile_plan` passes the catalog's path.
-            executable: CString::new("bin/agent").unwrap(),
+            // Anchored at `/`, as `compile_plan` passes the catalog's path.
+            executable: CString::new("/bin/agent").unwrap(),
             arguments: Vec::new(),
             environment: vec![CString::new("MODE=audit").unwrap()],
             workdir: CString::new("/").unwrap(),
@@ -600,14 +678,8 @@ mod tests {
             ]
         );
         assert_eq!(config.workdir, CString::new("/work").unwrap());
-        // The executable is the rootfs's, wherever the workload starts: a
-        // relative path would resolve against /work, the share.
+        // The executable is the rootfs's, wherever the workload starts.
         assert_eq!(config.executable, CString::new("/bin/agent").unwrap());
-
-        let mut absolute = config;
-        absolute.executable = CString::new("/usr/bin/agent").unwrap();
-        mount_workspace(&mut absolute);
-        assert_eq!(absolute.executable, CString::new("/usr/bin/agent").unwrap());
     }
 
     // The worker's own checks, asserted in-process. Each runs before libkrun
@@ -665,6 +737,88 @@ mod tests {
         let error = refuse_reserved_environment(&request).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidSpec);
         assert!(error.detail.contains(VIRTIOFS_MOUNTS_ENV), "{error}");
+    }
+
+    /// Invariant I3 (bead ley-line-open-be3711): the request cannot name a
+    /// loopback channel, directly or by smuggling one onto the guest kernel
+    /// command line through a quote.
+    #[test]
+    fn a_workload_cannot_set_the_guest_inits_loopback_channels() {
+        let mut named = request();
+        named
+            .public_environment
+            .insert(LOOPBACK_CHANNELS_ENV.into(), "dial:80:65536".into());
+        let error = refuse_reserved_environment(&named).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains(LOOPBACK_CHANNELS_ENV), "{error}");
+
+        let mut smuggled = request();
+        smuggled.public_environment.insert(
+            "DB_ADDR".into(),
+            "x\" KRUN_LOOPBACK_CHANNELS=\"dial:80:65536".into(),
+        );
+        let error = refuse_reserved_environment(&smuggled).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("double quote"), "{error}");
+
+        // A key the guest kernel would read as its own parameter (bead
+        // ley-line-open-eb5e4e): `init=` replaces the guest init, and with it
+        // the datagram filter and the relay. Any key outside [A-Z_][A-Z0-9_]*
+        // is refused, and so is every KRUN_ variable.
+        for key in [
+            "init",
+            "rdinit",
+            "console",
+            "virtio_vsock.x",
+            "A\" tsi_hijack \"B",
+            "A B",
+            "A=B",
+            "1ADDR",
+            "",
+            "http_proxy",
+            "KRUN_INIT",
+            "KRUN_CONFIG",
+            "KRUN_INIT_PID1",
+        ] {
+            let mut injected = request();
+            injected.public_environment.insert(key.into(), "1".into());
+            let error = refuse_reserved_environment(&injected).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidSpec, "{key:?}");
+            let named = format!("{key:?}");
+            assert!(
+                error.detail.contains(&named) || error.detail.contains(key),
+                "{key:?}: {error}"
+            );
+        }
+        for key in ["_A", "A1", "DB_ADDR", "Z"] {
+            let mut fine = request();
+            fine.public_environment.insert(key.into(), "1".into());
+            assert!(refuse_reserved_environment(&fine).is_ok(), "{key:?}");
+        }
+
+        // libkrun writes the executable unquoted.
+        for executable in [
+            "bin/x init=/bin/y",
+            "bin/x\tinit=/bin/y",
+            "bin/\"x",
+            "bin/x\n",
+        ] {
+            let mut hostile = request();
+            hostile.executable = executable.into();
+            let error = refuse_reserved_environment(&hostile).unwrap_err();
+            assert!(
+                error.detail.contains("executable"),
+                "{executable:?}: {error}"
+            );
+        }
+
+        // An ordinary address is the workload's own configuration, not
+        // authority: it passes, and reaches only what a grant presents.
+        let mut address = request();
+        address
+            .public_environment
+            .insert("DB_ADDR".into(), "127.0.0.1:13306".into());
+        assert!(refuse_reserved_environment(&address).is_ok());
     }
 
     #[test]

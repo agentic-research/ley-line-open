@@ -1,6 +1,7 @@
 # ADR-0040 — The write boundary: source and manifest are the data, the arena is a cache
 
-**Status:** Proposed (2026-10-10)
+**Status:** Proposed (2026-10-10); D1 (as amended by ADR-0047 M1), D3, D4, D5 and D6 are
+implemented (D5 and D6 carry "As implemented" notes); D7 is ADR-0041
 **Amended by:** ADR-0047 M1 (`ley-line-open-73c6ee`): D1's `treeRoot` is retired and replaced
 by the parser-free directory Merkle `storeRoot` (`leyline/store-tree/v1`, `Head.storeRoot @10`,
 head digest v3); D6's `derived_from` names `storeRoot` (value format `v2`). Text below that

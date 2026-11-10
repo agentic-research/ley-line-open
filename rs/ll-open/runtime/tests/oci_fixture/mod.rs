@@ -52,6 +52,17 @@ pub enum Entry {
     Fifo {
         path: String,
     },
+    /// A character device node, as a distro base layer ships `dev/console`.
+    CharDevice {
+        path: String,
+        major: u32,
+        minor: u32,
+    },
+    BlockDevice {
+        path: String,
+        major: u32,
+        minor: u32,
+    },
 }
 
 pub fn dir(path: &str, mode: u32) -> Entry {
@@ -85,6 +96,22 @@ pub fn hardlink(path: &str, target: &str) -> Entry {
 
 pub fn fifo(path: &str) -> Entry {
     Entry::Fifo { path: path.into() }
+}
+
+pub fn char_device(path: &str, major: u32, minor: u32) -> Entry {
+    Entry::CharDevice {
+        path: path.into(),
+        major,
+        minor,
+    }
+}
+
+pub fn block_device(path: &str, major: u32, minor: u32) -> Entry {
+    Entry::BlockDevice {
+        path: path.into(),
+        major,
+        minor,
+    }
 }
 
 /// Write `value` into a ustar name field. A value that does not fit is
@@ -163,6 +190,20 @@ pub fn tar(entries: &[Entry]) -> Vec<u8> {
             Entry::Fifo { path } => {
                 header.set_entry_type(tar::EntryType::Fifo);
                 header.set_mode(0o644);
+                (path, &[])
+            }
+            Entry::CharDevice { path, major, minor } => {
+                header.set_entry_type(tar::EntryType::Char);
+                header.set_mode(0o600);
+                header.set_device_major(*major).expect("device major");
+                header.set_device_minor(*minor).expect("device minor");
+                (path, &[])
+            }
+            Entry::BlockDevice { path, major, minor } => {
+                header.set_entry_type(tar::EntryType::Block);
+                header.set_mode(0o660);
+                header.set_device_major(*major).expect("device major");
+                header.set_device_minor(*minor).expect("device minor");
                 (path, &[])
             }
         };

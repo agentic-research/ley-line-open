@@ -14,6 +14,171 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.28.0] — 2026-11-10
+
+**The declared-connections release (ADR-0046 Q7). Arenas from 0.27.0 carry
+over (projection unchanged, `projection-v12`); `SCHEMA_VERSION` is 0.28.0
+because confinement/v1 §6 gained `guestPort` (additive; existing digests
+unchanged).**
+- **Guest connections:** a microVM workload reaches its declared connections
+  as plain TCP on guest loopback, in both directions, with no AF_VSOCK
+  awareness needed. TSI hijack stays off, and guest UDP, raw sockets and
+  io_uring are refused.
+- **Fail closed:** a declared channel that can't be built refuses the start
+  by name.
+- **Breaking for microVM requests:** `publicEnvironment` keys must match
+  `[A-Z_][A-Z0-9_]*` and must not start with `KRUN_`.
+- **Image import:** `leyline rootfs import-oci` imports LLO's, mache's and
+  rosary's published images. Unrepresentable entries are dropped and
+  reported, never materialized.
+- **Read-only `query`:** it now reaches only listed virtual-table modules.
+- **Daemon startup:**
+  - only the default instance touches `~/.mache/default.sock`;
+  - `--reset-arena` recovers an older control block when no other process
+    holds `<ctrl>.lock`;
+  - shutdown signals are honoured from the moment the daemon reports ready.
+
+### Security
+
+- **The read-only `query` op reaches only listed virtual-table modules** (bead `ley-line-open-a9be1f`).
+  The authorizer allowed a read of any table name, so whichever table-valued functions and eponymous virtual tables the build and every `sqlite3_auto_extension` registered were reachable, and a module added later with host reach (`fsdir`, `zipfile`, `csv`) would have been allowed with no failing test. The reader pool now drops every module but `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`, `dbstat` and sqlite-vec's `vec_each` from each connection it opens (`sqlite3_drop_modules`), because a `USING` or `NATURAL` join reaches a table-valued function without SQLite ever reporting a read of it to the authorizer. A `query` on a connection that still holds another module is refused as `denied_action` with action `module`. The authorizer also refuses a read of a virtual table in the schema, of `sqlite_temp_master`, of a `pragma_` table whose pragma is not allowed, and an allowed pragma on a schema other than `main`. A virtual table built on a dropped module (FTS, R-tree) fails with `no such module` on every reader, whatever the reader ran before (bead `ley-line-open-07237c`). A test fails when the build gains a module that is neither allowed nor denied by name. A refusal after a leading `;` or NUL names the statement's keyword (`vacuum`), and a denial after rows were produced is pinned to return the refusal and no rows over both transports (bead `ley-line-open-a9d50a`).
+
+### Added
+
+- **Declared connections reach an unmodified microVM workload as TCP on the
+  guest's loopback, in both directions, and nothing undeclared exists**
+  (bead `ley-line-open-be3711`, ADR-0046 Q7, LLO libkrun patches `0010` and
+  `0011`). confinement/v1 §6 grants gain an optional `guestPort`, additive
+  within v1: `{"path": …, "mode": "connect", "guestPort": N}` lets the
+  workload dial `127.0.0.1:N` and reach the peer at the socket, and
+  `{"path": …, "mode": "bind", "guestPort": N}` lets the peer at the socket
+  reach the workload's listener on `127.0.0.1:N`. The issuer chooses the
+  port and `confinementDigest` commits to it; a document without
+  `guestPort` digests as before (`test-vectors/manifest-guest-port.json`).
+  The `cloister/confinement/v1` string is unchanged, so an issuer must emit
+  `guestPort` only to this release or later: an earlier LLO refuses a
+  `connect` grant carrying it as a malformed mode, and a `bind` grant
+  carrying it as a digest mismatch.
+  The worker projects the attested document into the guest init's channel
+  list, and the init binds every dial port before the workload starts and
+  joins each connection to the grant's vsock port, copying bytes only.
+  Refused by name: `guestPort` on the native tiers, on `connect-bind`,
+  twice in one document, under `--tsi-hijack-inet`, and off macOS until the
+  presentation runs live there. The guest init now also refuses every
+  datagram, raw and packet socket in the guest (a seccomp filter every guest
+  process inherits), under either boundary. A run
+  whose declared socket cannot exist (a path longer than `sun_path`, a
+  missing directory, an unbound peer) is refused before readiness, naming
+  the grant; libkrun used to start the VM and log the failure (bead
+  `ley-line-open-bb2143`). The VMM creates a served socket owner-only (no group or other access).
+  On the microVM tier, where libkrun passes the environment and the
+  executable on the guest kernel command line, a `publicEnvironment` key
+  must be `[A-Z_][A-Z0-9_]*` and not start with `KRUN_`, a value may not
+  contain a double quote, and the executable may not contain whitespace or
+  a quote: before this, `{"init": "/bin/x"}` replaced the guest init (bead
+  `ley-line-open-eb5e4e`). Rust consumers of
+  `leyline-runtime`: `UnixSocketGrant::Connect` is now a struct variant
+  carrying `guest_port`; the constructors are unchanged.
+
+### Changed
+
+- **The documentation matches the v0.26.0 code** (bead `ley-line-open-a678c2`).
+  `GETTING-STARTED.md` names the control socket the daemon binds,
+  `~/.mache/default.sock` (it said `default.ctrl.sock`), its `_ast` example
+  query joins `kinds` (it read an `_ast.kind` column that does not exist), and
+  it lists the default `sheaf` feature and all 28 built-in languages.
+  `AGENTS.md` lists every identity LLO ships with its construction: the head
+  digest v3, the keyed `node_hash`, `run_id` (v1; v2 is proposed), the rootfs
+  digest, and the arena-local locators, which are not identities.
+  `docs/TABLE_CONTRACT.md` gives the actual columns of `nodes`, `_source`,
+  `_cfg` and the `_lsp*` tables and lists `query_blobs`/`_queries`;
+  `docs/ARCHITECTURE.md`'s ADR table gives each ADR's own status; and
+  `docs/ROADMAP.md` records what shipped through v0.26.0 and in v0.27.0.
+
+### Fixed
+
+- **The daemon's reader pool has sqlite-vec's modules** (bead
+  `ley-line-open-3bf5dc`). With the `vec` feature the daemon registered
+  sqlite-vec (a process-wide `sqlite3_auto_extension`, which reaches only
+  connections opened afterwards) while building its vector index, after the
+  reader pool had opened every connection. A `query` naming `vec_each` or
+  another sqlite-vec module failed with "no such table". The daemon now
+  registers it before the living database and its readers open.
+
+- **A daemon on an explicit `--arena` no longer takes over
+  `~/.mache/default.sock`** (bead `ley-line-open-e7459a`). Every daemon used
+  to repoint `default.sock` at its own socket and leave it dangling when it
+  exited, so mache's `DiscoverOrStart` reached the wrong daemon or a dead
+  path. Only the default instance (`~/.mache/default.arena` with
+  `~/.mache/default.ctrl`, which is what mache passes) binds that name, and
+  on exit it removes the name only while it still holds the socket it bound.
+  Any other daemon serves at its own `<ctrl>.sock` and never creates,
+  replaces or removes `default.sock`; reach it with `LEYLINE_SOCKET`. An
+  explicit `--arena` with the default `--control` is refused. The execution
+  daemon follows the same rule for `~/.mache/execution.sock`. The daemon no
+  longer publishes discovery symlinks, and `SocketDiscovery::symlink_name` is
+  replaced by `instance_name`. A daemon's exit now removes its own socket only
+  while the path still names it, so a newer daemon's socket survives an older
+  one's exit. The rule is scoped to `$HOME/.mache`: a `default.ctrl` or
+  `default.sock` in any other directory is an ordinary daemon. The daemon now
+  installs its SIGINT/SIGTERM handlers before it announces itself; a
+  supervisor that sent SIGTERM on `daemon ready` used to kill it with no final
+  snapshot and its socket left behind.
+
+- **A microVM run whose executable sits at the rootfs top level runs**
+  (bead `ley-line-open-fe130c`). The plan anchored a guest-relative
+  executable at `/` only when a workspace was mounted. Without one, libkrun's
+  init was handed a bare name such as `hello`, `execvp` searched `PATH`, and
+  the run exited 127, which broke most scratch and distroless images
+  imported with `leyline rootfs import-oci`. `compile_plan` now anchors every
+  executable at `/`, so no run depends on `PATH` to find its own program.
+
+- **`leyline rootfs import-oci` imports LLO's, mache's and rosary's published images** (beads `ley-line-open-fe3d26`, `ley-line-open-391965`).
+  Each was refused whole over an entry the rootfs cannot carry faithfully:
+  - LLO v0.27.0 over the `dev/console` character device and the mode-`0000` `etc/shadow` in its chainguard base;
+  - mache and rosary, under `--symlinks resolve`, over dangling links (`usr/share/doc/apt/NEWS.Debian.gz`, `usr/share/zoneinfo/localtime`).
+
+  The import now drops these entries, writes nothing in their place, and lists each in one of four new JSON fields:
+  - `specialEntriesDropped`: device nodes and FIFOs strictly beneath `dev/`, `proc/` or `sys/`. libkrun's guest init mounts kernel filesystems over those directories before the workload runs.
+  - `unreadableFilesDropped`: regular files without their owner-read bit. No unprivileged reader can read one, the guest's virtio-fs server included.
+  - `linksDroppedKernelMount` (under `--symlinks resolve`): links whose resolution goes beneath, or ends at, `dev`, `proc` or `sys`.
+  - `linksDroppedDangling` (under `--symlinks resolve`): links whose target the image does not hold.
+
+  The runtime README's "Dropped entries" section cites the `init.c` lines behind each rule and states what a guest can still observe of each drop.
+
+  Still refused by name:
+  - devices elsewhere;
+  - link loops;
+  - a `..` above the image root, including after a missing component;
+  - a directory link that contains itself.
+
+  `--symlinks refuse` stays the default and is unchanged.
+
+  Behavior changes for images that imported before:
+  - Under `resolve`, a link into `dev`, `proc` or `sys` whose target the image held (`cpuinfo -> /proc/cpuinfo` beside an image file `proc/cpuinfo`) was a copy of the image's bytes. It is now dropped, which changes that image's rootfs digest.
+  - A link that reaches `/work`, where a run's workspace is mounted, is now refused.
+  - A directory entry whose owner cannot both read and search it is now refused: directories are written `0755`, so it would expose what it hides.
+
+  The rootfs digest is still BLAKE3 over `rootfs.manifest.json`, and a dropped entry is not in it. An image with nothing to drop or newly refuse keeps its digest: hello-world's is unchanged, as is the test fixture's known answer.
+
+- **`--reset-arena` recovers a control block written by another VERSION**
+  (bead `ley-line-open-feabf4`). After the VERSION 2 → 3 change, a daemon on
+  a v2 `.ctrl` was refused even with `--reset-arena`, so mache's auto-start
+  failed until `~/.mache/default.ctrl` was moved aside by hand. A normal
+  start still refuses the mismatch, and the message now names the recovery.
+  With `--reset-arena`, the daemon reinitialises the block at the current
+  VERSION and logs the old one, but only when no other process holds it:
+  every running daemon now holds `<ctrl>.lock` shared for its lifetime, the
+  reset needs it exclusively (and keeps it), the `.ctrl` itself must be
+  unlocked, and no daemon may still hold the lock of the arena the block
+  names. Any holder refuses the reset, by name. The new block replaces the
+  old one by rename, so a process still mapping the old block keeps its old
+  bytes rather than misreading the new seqlock. The same lease refuses a
+  `--reset-arena` against a control block a live daemon serves. The lease
+  name (`<ctrl>.lock`, shared by daemons and long-lived readers, exclusive
+  for a reset) and the refusal prefix `--reset-arena refused: another
+  process holds` are stable contracts (`docs/ARCHITECTURE.md`).
+
 ## [0.27.0] — 2026-11-10
 
 **A security and microVM release. Arenas from 0.26.0 carry over (projection

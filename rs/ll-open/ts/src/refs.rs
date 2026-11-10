@@ -48,7 +48,14 @@ use tree_sitter::Node;
 ///   `ley-line-open-55c1cc`). HCL previously emitted `_ast` but no
 ///   `node_refs`; the bump forces existing arenas to re-derive
 ///   `env:<variable>` and `mod:<module-source>` rows.
-pub const EXTRACTION_EPOCH: u64 = 5;
+/// - 6: identifier-as-VALUE refs (bead `ley-line-open-a9ff82`). Go,
+///   Rust, Python, JavaScript, TypeScript, Java, C and C++ now emit a
+///   `node_refs` row for a name in value position (assignment,
+///   argument, return, composite literal, method value / method
+///   reference), anchored at the value-position container. Additive:
+///   every epoch-5 row is still emitted unchanged. Without the bump an
+///   upgraded arena keeps reporting value-passed handlers as unused.
+pub const EXTRACTION_EPOCH: u64 = 6;
 
 /// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the
 /// compile-time constant so one test binary can act as two releases
@@ -1408,6 +1415,62 @@ fn refs_with_qualifier(conn: &rusqlite::Connection) -> Vec<(String, Option<Strin
         .expect("query node_refs (token, qualifier)")
         .map(|r| r.expect("row decode"))
         .collect()
+}
+
+/// The epoch gate is a MANUAL bump: `node_hash` and `query_set_epoch`
+/// (compiled defaults contribute a constant) both stay put when a
+/// compiled-in `tags.scm` changes, so an unbumped query edit leaves
+/// upgraded arenas serving the old facts under an unchanged `parserId`.
+/// This pins the epoch to a fingerprint of every compiled-in
+/// `tags.scm`: editing a query without bumping [`EXTRACTION_EPOCH`]
+/// (and re-pinning here, with a History line) fails. Imperative
+/// extractor arms are not covered — their edits still need the bump by
+/// review.
+#[cfg(test)]
+mod epoch_pin {
+    use leyline_core::ContentAddressed;
+
+    const COMPILED_TAGS: &[(&str, &str)] = &[
+        ("bash", include_str!("../queries/bash/tags.scm")),
+        ("c", include_str!("../queries/c/tags.scm")),
+        ("cpp", include_str!("../queries/cpp/tags.scm")),
+        ("go", include_str!("../queries/go/tags.scm")),
+        ("hcl", include_str!("../queries/hcl/tags.scm")),
+        ("java", include_str!("../queries/java/tags.scm")),
+        ("javascript", include_str!("../queries/javascript/tags.scm")),
+        ("python", include_str!("../queries/python/tags.scm")),
+        ("rust", include_str!("../queries/rust/tags.scm")),
+        ("sql", include_str!("../queries/sql/tags.scm")),
+        ("typescript", include_str!("../queries/typescript/tags.scm")),
+    ];
+
+    /// `(EXTRACTION_EPOCH, fingerprint of COMPILED_TAGS)` — re-pin both
+    /// together.
+    const PINNED: (u64, &str) = (
+        6,
+        "7417cb4d11b6f3fa7856aedf19cf6a27597c27ba3a0c230a373f8cebdfe14225",
+    );
+
+    fn tags_fingerprint() -> String {
+        let mut p = Vec::new();
+        for (lang, scm) in COMPILED_TAGS {
+            for part in [lang.as_bytes(), scm.as_bytes()] {
+                p.extend_from_slice(&(part.len() as u64).to_le_bytes());
+                p.extend_from_slice(part);
+            }
+        }
+        p.hash().to_string()
+    }
+
+    #[test]
+    fn compiled_queries_are_pinned_to_the_extraction_epoch() {
+        assert_eq!(
+            (super::EXTRACTION_EPOCH, tags_fingerprint().as_str()),
+            PINNED,
+            "a compiled-in tags.scm changed: bump EXTRACTION_EPOCH (with a History \
+             line) and re-pin PINNED to the new (epoch, fingerprint)"
+        );
+    }
 }
 
 #[cfg(test)]

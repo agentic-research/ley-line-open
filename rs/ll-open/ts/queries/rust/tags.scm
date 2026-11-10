@@ -49,6 +49,67 @@
     name: (_) @name)) @ref
  (#set! qualifier-separator "::"))
 
+; ── Identifier-as-VALUE references (bead ley-line-open-a9ff82) ──────
+;
+; A function named as a value — `let h = helper`, `v.map(helper)`,
+; `reg(Self::f)`, `S { f: helper }`, `[helper]`, `return helper`, or a
+; block's tail expression — is a use mache's dead_code needs. Each
+; pattern anchors at the value-position CONTAINER (queries match
+; downward only); the container's grammar kind tells a value ref from
+; a call ref in `node_refs.node_kind` / `kind_id`. A path dual-emits
+; `a::f` + `f` with qualifier `a`, exactly like a qualified call.
+; `obj.field` without a call is a field read, never a method value in
+; Rust, and does not emit. Binding patterns (`let x`, assignment LHS)
+; do not emit.
+
+((arguments [
+   (identifier) @name
+   (scoped_identifier path: (_)? @qualifier name: (_) @name)
+ ]) @ref
+ (#set! qualifier-separator "::"))
+
+((let_declaration
+   value: [
+     (identifier) @name
+     (scoped_identifier path: (_)? @qualifier name: (_) @name)
+   ]) @ref
+ (#set! qualifier-separator "::"))
+
+((assignment_expression
+   right: [
+     (identifier) @name
+     (scoped_identifier path: (_)? @qualifier name: (_) @name)
+   ]) @ref
+ (#set! qualifier-separator "::"))
+
+((return_expression [
+   (identifier) @name
+   (scoped_identifier path: (_)? @qualifier name: (_) @name)
+ ]) @ref
+ (#set! qualifier-separator "::"))
+
+((field_initializer
+   value: [
+     (identifier) @name
+     (scoped_identifier path: (_)? @qualifier name: (_) @name)
+   ]) @ref
+ (#set! qualifier-separator "::"))
+
+((array_expression [
+   (identifier) @name
+   (scoped_identifier path: (_)? @qualifier name: (_) @name)
+ ]) @ref
+ (#set! qualifier-separator "::"))
+
+; Tail expression: the block's LAST named child (`.` anchor). A
+; statement ends in `;` and is an expression_statement, so a bare
+; identifier here is the block's value.
+((block [
+   (identifier) @name
+   (scoped_identifier path: (_)? @qualifier name: (_) @name)
+ ] .) @ref
+ (#set! qualifier-separator "::"))
+
 ; ── Macro invocations ───────────────────────────────────────────────
 
 ; `println!(..)`, `vec![..]`. Scoped macros (`std::format!`) emit the

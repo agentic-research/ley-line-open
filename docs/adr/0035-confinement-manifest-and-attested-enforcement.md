@@ -612,7 +612,10 @@ backend`. The check runs in `ExecutionService::start` and again in each backend'
 
 Why each refused cell is refused:
 
-- **`outputBytes`, every tier.** No backend collects output into a bounded buffer yet.
+- **`outputBytes`, every tier.** No backend collects a run's output as a result bounded by
+  the grant. The microVM tier keeps a fixed-size tail of the guest console for diagnostics
+  (bead `ley-line-open-a26ad0`, runtime README `backends::libkrun::output`). That tail is
+  not this ceiling: it never fails a run and is not counted in `ResourceUsage.outputBytes`.
 - **`pids.limit` on the microVM.** The guest is Linux, so a guest-side `pids.max` is
   possible in principle, but nothing in LLO writes the guest's cgroups: that is layer 3,
   which is not built.

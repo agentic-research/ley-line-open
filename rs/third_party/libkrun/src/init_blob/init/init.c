@@ -542,6 +542,45 @@ static int chroot_luks()
 }
 #endif
 
+#if __linux__ && !defined(TDX)
+/*
+ * A writable /tmp for the workload, which POSIX programs assume and which a
+ * rootfs need not carry (an image's empty tmp/ holds no file, so a rootfs
+ * built from it has none): a tmpfs, mode 1777 like any /tmp, nosuid and
+ * nodev, mounted before the workload starts. It is memory-backed and
+ * per-boot, so nothing written there outlives the guest or reaches the
+ * host, and it adds no reach. Whatever the rootfs holds under tmp/ is
+ * hidden beneath it.
+ *
+ * Its size is bounded at TMP_SIZE_PERCENT of the guest's RAM. tmpfs pages
+ * count against the guest's memory, which the hypervisor bounds; the
+ * kernel's default of half of RAM would let /tmp alone take half of what
+ * the workload was granted. A quarter leaves the workload three quarters
+ * for itself and gives a database or a build room for its scratch files. A
+ * write past the bound fails with ENOSPC.
+ *
+ * TDX builds use /tmp for their root volume and keep upstream's handling.
+ */
+#define TMP_SIZE_PERCENT 25
+
+static int mount_tmp(void)
+{
+    char options[32];
+
+    if (mkdir("/tmp", 01777) < 0 && errno != EEXIST) {
+        perror("mkdir(/tmp)");
+        return -1;
+    }
+    snprintf(options, sizeof(options), "mode=1777,size=%d%%", TMP_SIZE_PERCENT);
+    if (mount("tmpfs", "/tmp", "tmpfs", MS_NODEV | MS_NOSUID | MS_RELATIME,
+              options) < 0) {
+        perror("mount(/tmp)");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static int mount_filesystems()
 {
 #if __linux__
@@ -613,6 +652,12 @@ static int mount_filesystems()
         perror("mount(/dev/shm)");
         return -1;
     }
+
+#ifndef TDX
+    if (mount_tmp() < 0) {
+        return -1;
+    }
+#endif
 
     /* May fail if already exists and that's fine. */
     symlink("/proc/self/fd", "/dev/fd");

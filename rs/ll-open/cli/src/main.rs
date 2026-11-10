@@ -78,9 +78,33 @@ enum Cmd {
         #[arg(long)]
         control: Option<PathBuf>,
 
-        /// Existing immutable content-addressed rootfs directory.
+        /// Existing immutable content-addressed rootfs directory. Exactly
+        /// one of this and `--cas-volume` is required.
+        #[arg(
+            long,
+            required_unless_present = "cas_volume",
+            conflicts_with = "cas_volume"
+        )]
+        cas_root: Option<PathBuf>,
+
+        /// Serve the CAS root of a case-sensitive volume LLO provisions
+        /// beneath this state directory (default: `$LEYLINE_STATE_DIR`,
+        /// else `$XDG_STATE_HOME/leyline`, else `~/.local/state/leyline`).
+        /// On macOS a sparsebundle at `<state>/cas-volume/cas.sparsebundle`
+        /// attached at `<state>/cas-volume/mnt`, CAS root
+        /// `<state>/cas-volume/mnt/cas`; on Linux `<state>/cas` on a
+        /// case-sensitive filesystem; refused elsewhere. Start re-attaches a
+        /// volume an earlier provision created and never creates one: the
+        /// `llo_execution_provision` operation does, and reports the CAS
+        /// root as `casRoot`.
+        #[arg(long, num_args = 0..=1, value_name = "STATE_DIR")]
+        cas_volume: Option<Option<PathBuf>>,
+
+        /// The logical maximum of a volume `--cas-volume` creates, in GiB
+        /// (default 64). The image grows on demand up to it; an existing
+        /// image keeps the cap it was created with.
         #[arg(long)]
-        cas_root: PathBuf,
+        cas_volume_size_cap_gib: Option<u64>,
 
         /// Parent directory for ephemeral per-run rootfs volumes.
         #[arg(long)]
@@ -327,6 +351,65 @@ struct Cli {
     command: Cmd,
 }
 
+/// The execution daemon's CAS root: an operator directory that must exist,
+/// or a case-sensitive volume (bead `ley-line-open-ba86d3`) re-attached
+/// here if an earlier provision created it. Start never creates a volume;
+/// `llo_execution_provision` does.
+fn execution_cas_storage(
+    cas_root: Option<PathBuf>,
+    cas_volume: Option<Option<PathBuf>>,
+    size_cap_gib: Option<u64>,
+) -> Result<leyline_runtime::cas_volume::CasStorage> {
+    use leyline_runtime::cas_volume::{CasStorage, CasVolume, default_state_dir};
+    match (cas_root, cas_volume) {
+        (Some(_), None) if size_cap_gib.is_some() => {
+            bail!("--cas-volume-size-cap-gib applies to --cas-volume, not --cas-root")
+        }
+        (Some(cas_root), None) => {
+            if !cas_root.is_dir() {
+                bail!(
+                    "CAS root is not an existing directory: {}",
+                    cas_root.display()
+                );
+            }
+            Ok(CasStorage::Directory(cas_root))
+        }
+        (None, Some(state_dir)) => {
+            let state_dir = match state_dir {
+                Some(state_dir) => state_dir,
+                None => default_state_dir()?,
+            };
+            let size_cap = match size_cap_gib {
+                Some(gib) => gib
+                    .checked_mul(1 << 30)
+                    .context("--cas-volume-size-cap-gib is too large")?,
+                None => leyline_runtime::cas_volume::DEFAULT_SIZE_CAP_BYTES,
+            };
+            let volume = CasVolume::new(state_dir, size_cap)?;
+            match volume
+                .attach_existing()
+                .context("re-attach the CAS volume")?
+            {
+                Some(attached) => eprintln!(
+                    "execution-daemon: CAS root {} ({})",
+                    attached.cas_root.display(),
+                    if attached.attached {
+                        "volume re-attached"
+                    } else {
+                        "volume already attached"
+                    }
+                ),
+                None => eprintln!(
+                    "execution-daemon: no CAS volume yet; llo_execution_provision creates {}",
+                    volume.cas_root().display()
+                ),
+            }
+            Ok(CasStorage::Volume(volume))
+        }
+        _ => bail!("pass exactly one of --cas-root and --cas-volume"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -378,6 +461,8 @@ async fn main() -> Result<()> {
             arena,
             control,
             cas_root,
+            cas_volume,
+            cas_volume_size_cap_gib,
             run_root,
             worker,
             catalog,
@@ -410,12 +495,8 @@ async fn main() -> Result<()> {
                     worker.display()
                 );
             }
-            if !cas_root.is_dir() {
-                bail!(
-                    "CAS root is not an existing directory: {}",
-                    cas_root.display()
-                );
-            }
+            let storage = execution_cas_storage(cas_root, cas_volume, cas_volume_size_cap_gib)?;
+            let cas_root = storage.cas_root();
             std::fs::create_dir_all(&run_root)
                 .with_context(|| format!("create execution run root {}", run_root.display()))?;
             let catalog_bytes = std::fs::read(&catalog)
@@ -472,7 +553,9 @@ async fn main() -> Result<()> {
                         ),
                         None => backend,
                     };
-                    let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
+                    let service = Arc::new(
+                        leyline_runtime::ExecutionService::new(backend).with_cas_storage(storage),
+                    );
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::Native,
                         ..Default::default()
@@ -526,7 +609,9 @@ async fn main() -> Result<()> {
                     } else {
                         backend
                     };
-                    let service = Arc::new(leyline_runtime::ExecutionService::new(backend));
+                    let service = Arc::new(
+                        leyline_runtime::ExecutionService::new(backend).with_cas_storage(storage),
+                    );
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::MicroVm,
                         ..Default::default()
@@ -724,7 +809,7 @@ mod tests {
                 catalog,
                 ..
             } => {
-                assert_eq!(cas_root, PathBuf::from("/var/lib/leyline/cas"));
+                assert_eq!(cas_root, Some(PathBuf::from("/var/lib/leyline/cas")));
                 assert_eq!(run_root, PathBuf::from("/var/lib/leyline/runs"));
                 assert_eq!(worker, PathBuf::from("/usr/libexec/leyline-native-worker"));
                 assert_eq!(
@@ -733,6 +818,69 @@ mod tests {
                 );
             }
             _ => panic!("expected execution-daemon command"),
+        }
+    }
+
+    /// `--cas-volume` replaces `--cas-root` (bead ley-line-open-ba86d3):
+    /// exactly one is required, the state directory is optional, and the
+    /// size cap belongs to the volume.
+    #[test]
+    fn execution_daemon_takes_exactly_one_of_cas_root_and_cas_volume() {
+        let rest = [
+            "--run-root",
+            "/runs",
+            "--worker",
+            "/worker",
+            "--catalog",
+            "/catalog.json",
+        ];
+        let parse = |head: &[&str]| {
+            Cli::try_parse_from(
+                ["leyline", "execution-daemon"]
+                    .iter()
+                    .chain(head)
+                    .chain(&rest)
+                    .copied(),
+            )
+        };
+        let volume = |head: &[&str]| match parse(head).expect("parses").command {
+            Cmd::ExecutionDaemon {
+                cas_root,
+                cas_volume,
+                cas_volume_size_cap_gib,
+                ..
+            } => (cas_root, cas_volume, cas_volume_size_cap_gib),
+            _ => panic!("expected execution-daemon command"),
+        };
+        assert_eq!(volume(&["--cas-volume"]), (None, Some(None), None));
+        assert_eq!(
+            volume(&["--cas-volume", "/state", "--cas-volume-size-cap-gib", "8"]),
+            (None, Some(Some(PathBuf::from("/state"))), Some(8))
+        );
+        assert!(parse(&[]).is_err(), "one of the two is required");
+        assert!(
+            parse(&["--cas-root", "/cas", "--cas-volume", "/state"]).is_err(),
+            "not both"
+        );
+        let cas = tempfile::TempDir::new().unwrap();
+        let error = execution_cas_storage(Some(cas.path().to_path_buf()), None, Some(8))
+            .expect_err("the size cap needs a volume");
+        assert!(
+            error.to_string().contains("applies to --cas-volume"),
+            "{error}"
+        );
+        assert!(execution_cas_storage(Some(cas.path().to_path_buf()), None, None).is_ok());
+        assert!(
+            execution_cas_storage(Some(cas.path().join("missing")), None, None).is_err(),
+            "an operator CAS root must exist"
+        );
+        // A volume never provisioned: start creates nothing.
+        let state = tempfile::TempDir::new().unwrap();
+        let storage =
+            execution_cas_storage(None, Some(Some(state.path().to_path_buf())), Some(1)).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(storage.cas_root(), state.path().join("cas-volume/mnt/cas"));
+            assert!(!state.path().join("cas-volume").exists());
         }
     }
 

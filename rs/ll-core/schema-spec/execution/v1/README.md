@@ -185,6 +185,14 @@ verifier recomputes the document and compares digests.
 must not create a volume or initialize a backend. `provision`, `start`,
 `cancel`, and `cleanup` are explicit idempotent mutations.
 
+`ProvisionOutput.casRoot` (appended 2026-11-10, bead `ley-line-open-ba86d3`)
+is the absolute host path of the content-addressed rootfs store the provider
+serves, made to exist by that provision: with `execution-daemon --cas-volume`,
+the CAS root of the case-sensitive volume it provisioned (on macOS, a
+sparsebundle it attached); with `--cas-root`, that directory. It is the
+directory `leyline rootfs import-oci --cas-root` writes to. Empty from a
+provider that reports none.
+
 Schema evolution is append-only within v1: add fields at new ordinals and add
 enum variants at the end. Removing or reinterpreting a field requires v2.
 

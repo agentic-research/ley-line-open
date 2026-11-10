@@ -38,6 +38,7 @@ The import's contract, each clause tested in [`tests/oci_rootfs.rs`](tests/oci_r
 | Links | Rootfs manifest v1 has no link entries. `--symlinks refuse` (the default) names the first link; `resolve` replaces each with a copy of the file or directory it resolves to inside the image (absolute targets mean the image root). Under `resolve`, a link into a kernel mount and a dangling link are dropped (see "Dropped entries"); a link that reaches `/work`, a loop, a `..` above the image root (also in the part of a target after a missing component), a target that continues through a regular file, an empty target and a directory link containing itself are refused. Hard links become a second regular file. |
 | Paths | Absolute paths, `..`, entries under a regular file or through a link, device nodes and FIFOs outside the kernel mounts, and an image-root `rootfs.manifest.json` are refused. No image path reaches the host filesystem until the finished tree is written beneath staging inside the CAS root; extracted contents wait there under their BLAKE3 names. |
 | Identity | Files are listed in path order with fixed field order, so the same image content has the same rootfs digest whatever its archive order, host or run. A dropped entry is not in the manifest: an image's digest is that of the same image with its dropped entries, and whatever they replaced in lower layers, removed. The drop lists in the JSON are per-import provenance like `image`, not part of the identity: two images with one digest can report different drops. These rules changed what some images import as (`changes/ley-line-open-fe3d26.md` lists the cases); an image with nothing to drop or newly refuse keeps its digest. |
+| Name collisions | Before any layer is read, the import probes once how the CAS root's filesystem compares names (two empty files in a private directory it removes) and reports it as `casRootFilesystem` (`{caseSensitive, normalizationSensitive}`). Before any image path is written, two paths of the finished tree that the filesystem would store as one name (`usr/share/perl/Pod` and `usr/share/perl/pod` on a case-insensitive root; the NFC and NFD spellings of a name on any APFS volume, case-sensitive ones included) refuse the import with `PathCollision`, naming both paths and the CAS root's case or normalization insensitivity; the CAS root is left as it was. They are never merged, renamed or dropped: a merged tree is a different filesystem from the image. An image with no such pair imports on any root to the same digest. See "Case-sensitive CAS volume" below. |
 | Publication | The staged tree is verified against its own manifest and renamed into place. An existing entry is reused only if its files verify and its directories are exactly the ones the import wrote, all `0755`; it is never replaced. Files are not fsynced before the rename. The resolver itself still checks files only (bead `ley-line-open-38ff59`). |
 
 ### Registry pulls
@@ -71,6 +72,37 @@ Deny means never materializing what the rootfs cannot carry faithfully. For the 
 The citations are for the libkrun tier, whose guest runs that init. The native tier runs the workload with the rootfs as its working directory and the host's own `/dev`, `/proc` and `/sys`; for it, a dropped device or link is one rootfs manifest v1 could never have carried, and a dropped unreadable file is one its verifier could never have read.
 
 Where each kind of test runs: the importer, the resolver and the conformance rows that need no guest run anywhere, including in a container; a real guest needs a hypervisor, so macOS Hypervisor.framework tests run on a macOS host and Linux KVM tests on a host or runner given `/dev/kvm` (the libkrun column of the conformance matrix, below). Booting an imported rootfs in a guest is part of the hypervisor suite: `krun-worker/tests/libkrun_oci_rootfs.rs` (below).
+
+### Case-sensitive CAS volume
+
+`cas_volume` (bead `ley-line-open-ba86d3`) supplies a CAS root on a case-sensitive filesystem, for images that need one. Design is host-agnostic; macOS ships first, and every other host refuses by name.
+
+| Host | `CasVolume::provision` |
+| --- | --- |
+| macOS | Creates (once) a grow-on-demand, case-sensitive APFS sparsebundle with `/usr/bin/hdiutil create -type SPARSEBUNDLE -fs "Case-sensitive APFS"`, under a private name renamed into place, and attaches it with `hdiutil attach -nobrowse -noautoopen -owners on -mountpoint`. Runs as the calling user: `hdiutil` creates and attaches a user-owned image without privilege, and the mount is `nodev,nosuid`. No network, no secret. |
+| Linux | Makes no volume: creates `<state>/cas` if missing, probes it, and succeeds on a case-sensitive filesystem; otherwise refuses by name (`CaseInsensitive`, e.g. a casefolded directory or vfat). |
+| Other | Refused by name (`UnsupportedHost`). |
+
+Paths are fixed beneath the state directory `<state>`: `$LEYLINE_STATE_DIR`, else `$XDG_STATE_HOME/leyline`, else `$HOME/.local/state/leyline` (`default_state_dir`).
+
+```text
+<state>/cas-volume/                  owner-only (0700)
+<state>/cas-volume/cas.sparsebundle  the image
+<state>/cas-volume/mnt/              its mountpoint
+<state>/cas-volume/mnt/cas/          the CAS root (macOS)
+<state>/cas/                         the CAS root (Linux)
+```
+
+- **Returned path.** `ProvisionedCas.cas_root` is the CAS root: the `--cas-root` of `leyline rootfs import-oci`, and what Cloister sets `CLOISTER_CAS_ROOT` to. The result also names the image, the mountpoint, whether this call created or attached it, the size cap and the probed `filesystem`.
+- **Idempotent.** An existing image is attached, an attached one is reused, and neither is recreated or reformatted. A volume that is mounted but probes case-insensitive is refused, as is a `cas/` that is a link or not on the attached volume. The volume is not otherwise matched to its image: `<state>/cas-volume` is owner-only, and every rootfs is digest-verified on resolve.
+- **Size cap.** `DEFAULT_SIZE_CAP_BYTES` (64 GiB) is the image's logical maximum, set when it is created (at least 1 GiB); the image file holds only what is written. A cap passed for an existing image is not applied: resize it with `hdiutil resize -size <new> <state>/cas-volume/cas.sparsebundle` while detached. The image does not shrink by itself (`hdiutil compact`, while detached, reclaims freed space).
+- **Start.** `CasVolume::attach_existing` re-attaches a volume an earlier provision created and never creates one; a provider or daemon calls it when it starts. `leyline execution-daemon --cas-volume [STATE_DIR] [--cas-volume-size-cap-gib N]` does, instead of `--cas-root`; its `llo_execution_provision` provisions the volume before the backend's readiness check and reports the CAS root as `ProvisionOutput.casRoot` (with `--cas-root` it reports that directory).
+- **Detach and cleanup.** Nothing detaches the volume implicitly, daemon exit included: it stays attached until `CasVolume::detach`, `hdiutil detach <state>/cas-volume/mnt`, logout or reboot. A detach fails, and leaves it attached, while a file in it is open (a running VM's rootfs copy, an import). Removing it is the operator's: detach, then delete `cas.sparsebundle`. Every rootfs in it can be re-imported.
+- **CLI.** `leyline rootfs provision-cas [--state-dir DIR] [--size-cap-gib N]` provisions and prints `ProvisionedCas` as JSON (`casRoot`, `mountpoint`, `image`, `created`, `attached`, `sizeCapBytes`, `filesystem`).
+
+`hdiutil` on macOS 26 and later prints a deprecation warning pointing at `diskutil image`; it still performs these operations.
+
+Tests: the logic of every host is unit-tested with a fake disk-image tool (`src/cas_volume.rs`); `tests/cas_volume.rs` and `rs/ll-open/cli/tests/execution_cas_volume.rs` run the real tool on macOS with `LEYLINE_CAS_VOLUME_TESTS=1` (each detaches and deletes what it created) and always run on Linux; with `LEYLINE_OCI_ACCEPTANCE_DIR` also set, the mache and rosary images import into a provisioned volume with their recorded digests.
 
 ## Features
 

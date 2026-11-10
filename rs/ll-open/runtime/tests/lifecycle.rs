@@ -236,6 +236,182 @@ fn a_backend_without_output_reports_none() {
     assert_eq!(Backend::output(&CompletingBackend, "any-run"), None);
 }
 
+/// A backend that is available only once its CAS root exists, as the
+/// native and libkrun backends are.
+struct NeedsCasRoot(std::path::PathBuf);
+
+impl Backend for NeedsCasRoot {
+    fn capabilities(&self) -> BackendCapabilities {
+        let available = self.0.is_dir();
+        BackendCapabilities {
+            backend_id: "needs-cas/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available,
+            unavailable_reason: (!available).then(|| "no CAS root".into()),
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
+        }
+    }
+
+    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        unreachable!("provision tests start nothing")
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        Ok(false)
+    }
+}
+
+#[test]
+fn provision_makes_the_cas_root_exist_before_the_backend_checks_it_and_reports_it() {
+    use leyline_runtime::cas_volume::{CasStorage, CasVolume, DiskImages, FilesystemSensitivity};
+    // Linux semantics on any host: the CAS root is `<state>/cas`, made to
+    // exist and probed (here, by a probe that reports case-sensitive).
+    struct NoImages;
+    impl DiskImages for NoImages {
+        fn create(
+            &self,
+            _: &std::path::Path,
+            _: u64,
+        ) -> Result<(), leyline_runtime::cas_volume::CasVolumeError> {
+            unreachable!()
+        }
+        fn attach(
+            &self,
+            _: &std::path::Path,
+            _: &std::path::Path,
+        ) -> Result<(), leyline_runtime::cas_volume::CasVolumeError> {
+            unreachable!()
+        }
+        fn detach(
+            &self,
+            _: &std::path::Path,
+        ) -> Result<(), leyline_runtime::cas_volume::CasVolumeError> {
+            unreachable!()
+        }
+        fn is_mounted(
+            &self,
+            _: &std::path::Path,
+        ) -> Result<bool, leyline_runtime::cas_volume::CasVolumeError> {
+            unreachable!()
+        }
+    }
+    let state = tempfile::TempDir::new().unwrap();
+    let volume = CasVolume::with_parts(
+        state.path(),
+        leyline_runtime::cas_volume::DEFAULT_SIZE_CAP_BYTES,
+        leyline_runtime::cas_volume::HostOs::Linux,
+        Box::new(NoImages),
+        |_| Ok(FilesystemSensitivity::EXACT),
+    )
+    .unwrap();
+    let cas_root = volume.cas_root();
+    let service = ExecutionService::new(NeedsCasRoot(cas_root.clone()))
+        .with_cas_storage(CasStorage::Volume(volume));
+    assert_eq!(service.provisioned_cas_root(), None);
+    service
+        .provision(BackendClass::MicroVm, "provision-storage")
+        .expect("storage first, then the backend finds its CAS root");
+    assert!(cas_root.is_dir());
+    assert_eq!(service.provisioned_cas_root(), Some(cas_root.clone()));
+
+    let output: serde_json::Value = serde_json::from_str(
+        &leyline_runtime::transport::provision_json(
+            &service,
+            r#"{"backendClass":"microVm","idempotencyKey":"provision-storage"}"#,
+        )
+        .expect("provision JSON"),
+    )
+    .unwrap();
+    assert_eq!(output["casRoot"], cas_root.to_str().unwrap());
+    assert_eq!(output["provisioned"], true);
+}
+
+/// A provision refused for its backend class touches no storage: no volume
+/// is created or attached for a request that will fail.
+#[test]
+fn a_provision_for_the_wrong_backend_class_touches_no_storage() {
+    use leyline_runtime::cas_volume::{
+        CasStorage, CasVolume, CasVolumeError, DEFAULT_SIZE_CAP_BYTES, DiskImages, HostOs,
+    };
+    use std::path::Path;
+    struct Untouchable;
+    impl DiskImages for Untouchable {
+        fn create(&self, _: &Path, _: u64) -> Result<(), CasVolumeError> {
+            panic!("a refused provision created a volume")
+        }
+        fn attach(&self, _: &Path, _: &Path) -> Result<(), CasVolumeError> {
+            panic!("a refused provision attached a volume")
+        }
+        fn detach(&self, _: &Path) -> Result<(), CasVolumeError> {
+            panic!("detach")
+        }
+        fn is_mounted(&self, _: &Path) -> Result<bool, CasVolumeError> {
+            panic!("a refused provision inspected the volume")
+        }
+    }
+    let state = tempfile::TempDir::new().unwrap();
+    let volume = CasVolume::with_parts(
+        state.path(),
+        DEFAULT_SIZE_CAP_BYTES,
+        HostOs::MacOs,
+        Box::new(Untouchable),
+        |_| unreachable!("a refused provision probed the volume"),
+    )
+    .unwrap();
+    // CompletingBackend is a microVM backend.
+    let error = ExecutionService::new(CompletingBackend)
+        .with_cas_storage(CasStorage::Volume(volume))
+        .provision(BackendClass::Native, "provision-wrong-class")
+        .expect_err("the wrong class is refused");
+    assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+    assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn provision_refuses_a_missing_operator_cas_root_and_a_refused_host_by_name() {
+    use leyline_runtime::cas_volume::{CasStorage, CasVolume, DEFAULT_SIZE_CAP_BYTES};
+    let missing = std::env::temp_dir().join("leyline-no-such-cas-root-ba86d3");
+    let service = ExecutionService::new(CompletingBackend)
+        .with_cas_storage(CasStorage::Directory(missing.clone()));
+    let error = service
+        .provision(BackendClass::MicroVm, "provision-missing")
+        .expect_err("a missing --cas-root is not provisioned");
+    assert_eq!(error.code, ErrorCode::BackendFailed);
+    assert!(
+        error.detail.contains("is not an existing directory"),
+        "{error:?}"
+    );
+    assert!(!service.is_provisioned());
+
+    let state = tempfile::TempDir::new().unwrap();
+    let volume = CasVolume::with_parts(
+        state.path(),
+        DEFAULT_SIZE_CAP_BYTES,
+        leyline_runtime::cas_volume::HostOs::Other("plan9"),
+        Box::new(leyline_runtime::cas_volume::Hdiutil::default()),
+        leyline_runtime::cas_volume::probe_sensitivity,
+    )
+    .unwrap();
+    let error = ExecutionService::new(CompletingBackend)
+        .with_cas_storage(CasStorage::Volume(volume))
+        .provision(BackendClass::MicroVm, "provision-plan9")
+        .expect_err("refused by name");
+    assert_eq!(error.code, ErrorCode::UnsupportedBackend);
+    assert!(error.detail.contains("not supported on plan9"), "{error:?}");
+
+    // Without storage the output still carries the field, empty.
+    let service = ExecutionService::new(CompletingBackend);
+    let output: serde_json::Value = serde_json::from_str(
+        &leyline_runtime::transport::provision_json(
+            &service,
+            r#"{"backendClass":"microVm","idempotencyKey":"provision-plain"}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(output["casRoot"], "");
+}
+
 #[test]
 fn status_projects_backend_completion_without_sleeping() {
     let service = ExecutionService::new(CompletingBackend);

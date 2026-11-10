@@ -218,6 +218,11 @@ pub fn provision_json<B: crate::Backend>(
     let mut output = output_message.init_root::<execution_capnp::provision_output::Builder<'_>>();
     output.set_provisioned(true);
     output.set_backend_id(&capabilities.backend_id);
+    // Always set, empty without storage: the generated schema requires it.
+    let cas_root = service.provisioned_cas_root().unwrap_or_default();
+    output.set_cas_root(cas_root.to_str().ok_or_else(|| {
+        ExecutionError::backend(format!("the CAS root {} is not UTF-8", cas_root.display()))
+    })?);
     encode_provision(output_message)
 }
 

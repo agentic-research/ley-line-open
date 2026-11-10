@@ -8,6 +8,7 @@ pub mod artifacts;
 pub mod authorization;
 pub mod backends;
 pub mod cas_evidence;
+pub mod cas_volume;
 mod catalog;
 pub mod confinement;
 mod error;

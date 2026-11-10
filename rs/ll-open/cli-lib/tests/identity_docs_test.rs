@@ -307,8 +307,8 @@ fn identity_vocabulary_names_the_contexts_the_code_keys_with() {
         ),
         (
             version,
-            "pub const PROJECTION_SCHEMA_VERSION: &str = \"projection-v12\";",
-            "projection-v12",
+            "pub const PROJECTION_SCHEMA_VERSION: &str = \"projection-v13\";",
+            "projection-v13",
         ),
     ];
     for (code, declaration, name) in constructions {

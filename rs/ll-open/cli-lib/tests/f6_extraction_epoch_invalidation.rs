@@ -352,7 +352,83 @@ fn f6_epoch_6_rederives_value_refs_from_epoch_5_arena() {
         vec![("helper".to_string(), 2), ("x".to_string(), 1)],
         "epoch migration must materialize the value-position helper ref"
     );
-    assert_eq!(stored_epoch(&db_path).as_deref(), Some("6"));
+    assert_eq!(
+        stored_epoch(&db_path).as_deref(),
+        Some(current_epoch.as_str())
+    );
+}
+
+/// The comment occurrences of `db_path`'s arena: `(grammar kind, text)` in
+/// nid order.
+fn comment_occurrences(db_path: &Path) -> Vec<(String, String)> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT k.raw_kind, c.token FROM _ast a
+               JOIN kinds k ON k.kind_id = a.kind_id
+               JOIN node_content c ON c.content_id = a.content_id
+              WHERE k.raw_kind = 'comment' ORDER BY a.nid",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// Extraction epoch 7 (bead `ley-line-open-aa1634`) adds comment
+/// occurrences to `_ast`. An arena derived at epoch 6 holds none; with its
+/// source bytes unchanged, the epoch-7 binary must re-derive the file and
+/// materialize them.
+#[test]
+fn f6_epoch_7_rederives_comment_occurrences_from_epoch_6_arena() {
+    let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = TempDir::new().unwrap();
+    fs::write(
+        repo.path().join("doc.go"),
+        "package m\n\n// Helper is documented.\nfunc Helper() {}\n",
+    )
+    .unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("live.db");
+
+    // Model epoch 6's real output: the current parse builds a valid arena,
+    // then the rows epoch 6 never emitted (the comment's `_ast` and `nodes`
+    // rows) are removed.
+    {
+        let _g = EpochOverride::set("6");
+        parse_pass(&db_path, repo.path());
+    }
+    execute(
+        &db_path,
+        "DELETE FROM nodes WHERE nid IN (SELECT a.nid FROM _ast a \
+         JOIN kinds k ON k.kind_id = a.kind_id WHERE k.raw_kind = 'comment')",
+    );
+    execute(
+        &db_path,
+        "DELETE FROM _ast WHERE kind_id IN (SELECT kind_id FROM kinds WHERE raw_kind = 'comment')",
+    );
+    assert_eq!(comment_occurrences(&db_path), vec![]);
+
+    let current_epoch = leyline_ts::refs::EXTRACTION_EPOCH.to_string();
+    let result = {
+        let _g = EpochOverride::set(&current_epoch);
+        parse_pass(&db_path, repo.path())
+    };
+    assert_eq!(
+        (result.parsed, result.unchanged),
+        (1, 0),
+        "the current extraction identity must invalidate an epoch-6 arena"
+    );
+    assert_eq!(
+        comment_occurrences(&db_path),
+        vec![(
+            "comment".to_string(),
+            "// Helper is documented.".to_string()
+        )],
+        "epoch migration must materialize the comment occurrence"
+    );
+    assert_eq!(stored_epoch(&db_path).as_deref(), Some("7"));
 }
 
 #[test]

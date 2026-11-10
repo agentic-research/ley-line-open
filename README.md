@@ -159,7 +159,16 @@ leyline rootfs import-oci \
 
 It selects this host's Linux platform, verifies every blob, applies the layers
 with OCI whiteout semantics, and prints JSON whose `rootfs` is the catalog
-entry's `rootfs`. Tags are refused. The image format is never the isolation
+entry's `rootfs`. Tags are refused. A Zarf package's `images/` directory is
+such a layout. Or pull the image by digest over HTTPS, anonymously, with the
+same verification, rootfs digest and JSON:
+
+```bash
+leyline rootfs import-oci \
+  --from-registry ghcr.io/owner/app@sha256:<index or manifest digest> \
+  --cas-root /var/lib/leyline/cas \
+  --symlinks resolve
+``` The image format is never the isolation
 boundary; the backend is. See
 [`rs/ll-open/runtime/README.md`](rs/ll-open/runtime/README.md) "Container
 images" for the contract.

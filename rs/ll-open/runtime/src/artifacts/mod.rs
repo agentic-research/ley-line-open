@@ -11,4 +11,5 @@
 //! tools may produce the OCI image layout an import reads, and nothing else.
 
 pub mod oci;
+pub mod registry;
 mod rootfs_tree;

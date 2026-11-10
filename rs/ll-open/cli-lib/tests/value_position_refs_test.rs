@@ -79,10 +79,15 @@ fn receiver_row(token: &str, kind: &str) -> Row {
 const RECEIVER: &str = "receiver:";
 
 /// Each expected value-position row is present AND resolves to a def,
-/// except `receiver_row`s, which are present and do not resolve.
-fn assert_value_refs_resolve(lang: &str, rel: &str, src: &str, expected: &[Row]) {
+/// except `receiver_row`s, which are present and do not resolve. Then
+/// the file's WHOLE ref multiset must equal `expected` plus `others`
+/// (call refs and value refs to locals): a value site emitting twice,
+/// or a binding position (`x :=`, `let x`, an assignment LHS) emitting
+/// at all, fails here.
+fn assert_value_refs_resolve(lang: &str, rel: &str, src: &str, expected: &[Row], others: &[Row]) {
     let conn = parse_one(lang, rel, src);
     let rows = ref_rows(&conn, rel);
+    let mut want_all: Vec<Row> = others.to_vec();
     for want in expected {
         let (want, must_resolve) = match want.2.strip_prefix(RECEIVER) {
             Some(kind) => ((want.0.clone(), want.1.clone(), kind.to_string()), false),
@@ -96,7 +101,14 @@ fn assert_value_refs_resolve(lang: &str, rel: &str, src: &str, expected: &[Row])
                 "{lang}: value-position ref {want:?} resolution to a node_defs row"
             ),
         }
+        want_all.push(want);
     }
+    want_all.sort();
+    let got: Vec<Row> = rows.into_iter().map(|(r, _)| r).collect();
+    assert_eq!(
+        got, want_all,
+        "{lang}: the file's ref multiset is not exact"
+    );
 }
 
 /// The exact ref multiset of a CALL-ONLY fixture. Pinned against the
@@ -188,6 +200,14 @@ func wire(s S) func() {
             row("byElem", None, "literal_value"),
             row("byReturn", None, "return_statement"),
         ],
+        // `x := ..`, `var y` and the `y =` target are bindings and emit
+        // nothing; `_, _ = x, y` reads them.
+        &[
+            row("register", None, "call_expression"),
+            row("register", None, "call_expression"),
+            row("x", None, "assignment_statement"),
+            row("y", None, "assignment_statement"),
+        ],
     );
 }
 
@@ -230,6 +250,12 @@ fn wire(c: bool) -> fn() {
             row("by_array", None, "array_expression"),
             row("by_return", None, "return_expression"),
             row("by_tail", None, "block"),
+        ],
+        // `let mut b: fn() = a` reads `a`; the `b =` target emits nothing.
+        &[
+            row("a", None, "let_declaration"),
+            row("reg", None, "call_expression"),
+            row("reg", None, "call_expression"),
         ],
     );
 }
@@ -276,6 +302,13 @@ def factory():
             row("by_deco", None, "decorator"),
             row("by_return", None, "return_statement"),
         ],
+        // `return f` in `by_deco` reads its parameter.
+        &[
+            row("Thread", None, "call"),
+            row("f", None, "return_statement"),
+            row("register", None, "call"),
+            row("register", None, "call"),
+        ],
     );
 }
 
@@ -315,14 +348,33 @@ fn js_value_rows() -> Vec<Row> {
     ]
 }
 
+fn js_register_calls() -> Vec<Row> {
+    vec![
+        row("register", None, "call_expression"),
+        row("register", None, "call_expression"),
+    ]
+}
+
 #[test]
 fn javascript_function_used_only_as_value_resolves() {
-    assert_value_refs_resolve("javascript", "value.js", JS_VALUE_SRC, &js_value_rows());
+    assert_value_refs_resolve(
+        "javascript",
+        "value.js",
+        JS_VALUE_SRC,
+        &js_value_rows(),
+        &js_register_calls(),
+    );
 }
 
 #[test]
 fn typescript_function_used_only_as_value_resolves() {
-    assert_value_refs_resolve("typescript", "value.tsx", JS_VALUE_SRC, &js_value_rows());
+    assert_value_refs_resolve(
+        "typescript",
+        "value.tsx",
+        JS_VALUE_SRC,
+        &js_value_rows(),
+        &js_register_calls(),
+    );
 }
 
 #[test]
@@ -350,6 +402,7 @@ fn java_method_used_only_as_value_resolves() {
             row("A.staticTarget", None, "method_reference"),
             row("staticTarget", Some("A"), "method_reference"),
         ],
+        &[row("run", None, "method_invocation")],
     );
 }
 
@@ -388,7 +441,17 @@ fn c_value_rows() -> Vec<Row> {
 
 #[test]
 fn c_function_used_only_as_value_resolves() {
-    assert_value_refs_resolve("c", "value.c", C_VALUE_SRC, &c_value_rows());
+    // `fn x;` and the `x =` target are bindings and emit nothing.
+    assert_value_refs_resolve(
+        "c",
+        "value.c",
+        C_VALUE_SRC,
+        &c_value_rows(),
+        &[
+            row("reg", None, "call_expression"),
+            row("reg", None, "call_expression"),
+        ],
+    );
 }
 
 #[test]
@@ -404,7 +467,17 @@ fn cpp_function_used_only_as_value_resolves() {
         row("ns::g", None, "assignment_expression"),
         row("g", Some("ns"), "assignment_expression"),
     ]);
-    assert_value_refs_resolve("cpp", "value.cpp", &src, &rows);
+    assert_value_refs_resolve(
+        "cpp",
+        "value.cpp",
+        &src,
+        &rows,
+        &[
+            row("reg", None, "call_expression"),
+            row("reg", None, "call_expression"),
+            row("reg", None, "call_expression"),
+        ],
+    );
 }
 
 // ── call-only fixtures: rows unchanged ─────────────────────────────────

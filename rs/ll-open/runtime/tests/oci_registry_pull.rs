@@ -813,6 +813,53 @@ fn what_the_import_would_refuse_is_refused_before_any_blob_is_requested() {
         );
         assert!(cas_entries(cas.path()).is_empty());
     }
+
+    // A config descriptor of exactly 4 MiB is admitted, and its blob is
+    // requested (here it is not that size, so it is then refused for that).
+    let mut largest_config = manifest.clone();
+    largest_config["config"]["size"] = (4u64 << 20).into();
+    let (registry, digests) = serving(
+        &[serde_json::to_vec(&largest_config).unwrap()],
+        Behavior::default(),
+    );
+    let reference = registry.reference(&digests[0]);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    assert!(
+        matches!(&result, Err(OciImportError::DigestMismatch { reason, .. }) if reason.contains("size")),
+        "{result:?}"
+    );
+    assert!(
+        !blob_requests(&registry).is_empty(),
+        "{:?}",
+        registry.paths()
+    );
+}
+
+#[test]
+fn a_token_that_is_not_a_header_value_is_refused() {
+    let fixture = fixture();
+    for token in ["", "two words", "line\nbreak"] {
+        let reply = serde_json::to_vec(&serde_json::json!({ "token": token })).unwrap();
+        let registry = registry(Behavior {
+            token_reply: Some(("200 OK".into(), reply)),
+            ..Behavior::default()
+        });
+        let reference = registry.reference(&fixture.index.digest);
+        let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+        assert!(
+            matches!(&result, Err(OciImportError::Registry(detail)) if detail.contains("no usable token")),
+            "{token:?}: {result:?}"
+        );
+    }
+    // `access_token` is read when `token` is absent.
+    let reply = serde_json::to_vec(&serde_json::json!({ "access_token": TOKEN })).unwrap();
+    let registry = registry(Behavior {
+        token_reply: Some(("200 OK".into(), reply)),
+        ..Behavior::default()
+    });
+    let reference = registry.reference(&fixture.index.digest);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    result.expect("a token under access_token");
 }
 
 #[test]

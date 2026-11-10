@@ -649,7 +649,8 @@ struct Deadlined {
 impl Read for Deadlined {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.body.read(buffer)?;
-        if Instant::now() > self.deadline {
+        // How far past the deadline: zero until it passes.
+        if Instant::now().saturating_duration_since(self.deadline) > Duration::ZERO {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "the response did not arrive within its deadline",

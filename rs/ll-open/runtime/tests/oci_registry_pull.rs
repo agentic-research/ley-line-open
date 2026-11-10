@@ -23,8 +23,8 @@ use tempfile::TempDir;
 
 mod oci_fixture;
 mod oci_registry;
-use oci_fixture::{Fixture, build_fixture, checked_in_fixture};
-use oci_registry::{Behavior, TOKEN, TestRegistry};
+use oci_fixture::{Fixture, build_fixture, checked_in_fixture, sha256};
+use oci_registry::{Behavior, Slow, TOKEN, TestRegistry};
 
 const REPOSITORY: &str = "fixture/multilayer";
 
@@ -576,14 +576,53 @@ fn the_total_download_is_bounded_before_any_layer_is_fetched() {
 #[test]
 fn a_stalled_body_times_out() {
     let fixture = fixture();
+    for slow in [Slow::Headers, Slow::Body] {
+        let registry = registry(Behavior {
+            slow_blobs: slow,
+            ..Behavior::default()
+        });
+        let reference = registry.reference(&fixture.index.digest);
+        let request = RegistryPull {
+            limits: RegistryLimits {
+                response_timeout: Duration::from_millis(300),
+                min_bytes_per_second: u64::MAX,
+                ..RegistryLimits::default()
+            },
+            ..pull(&reference, Some(&registry.authority))
+        };
+        let started = std::time::Instant::now();
+        let (cas, result) = pull_into(&request);
+        let error = result.expect_err("a stalled blob");
+        assert!(
+            matches!(error, OciImportError::Registry(_)),
+            "{slow:?}: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{slow:?}: {:?}",
+            started.elapsed()
+        );
+        assert!(cas_entries(cas.path()).is_empty());
+    }
+}
+
+/// A body that keeps arriving, never idle for `response_timeout`, still has
+/// a deadline: `response_timeout` plus its size at the minimum rate.
+#[test]
+fn a_slow_drip_body_meets_its_deadline() {
+    let fixture = fixture();
+    let config = arm64_blobs(&fixture)[0].clone();
     let registry = registry(Behavior {
-        stall_blobs: true,
+        // Never idle for the response timeout, so only the deadline stops it
+        // (ureq alone would wait a second per byte once a deadline passed).
+        slow_blobs: Slow::Drip(Duration::from_millis(900)),
+        slow_only: Some(config.clone()),
         ..Behavior::default()
     });
     let reference = registry.reference(&fixture.index.digest);
     let request = RegistryPull {
         limits: RegistryLimits {
-            response_timeout: Duration::from_millis(300),
+            response_timeout: Duration::from_secs(2),
             min_bytes_per_second: u64::MAX,
             ..RegistryLimits::default()
         },
@@ -591,14 +630,47 @@ fn a_stalled_body_times_out() {
     };
     let started = std::time::Instant::now();
     let (cas, result) = pull_into(&request);
-    let error = result.expect_err("a stalled blob");
-    assert!(matches!(error, OciImportError::Registry(_)), "{error}");
+    let error = result.expect_err("a body slower than its deadline");
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        started.elapsed()
+        matches!(&error, OciImportError::Registry(detail) if detail.contains("deadline")),
+        "{error}"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(6),
+        "{elapsed:?}"
     );
     assert!(cas_entries(cas.path()).is_empty());
+}
+
+/// A body may take longer than `response_timeout` to arrive, as a large
+/// layer does, when it arrives within its size's deadline.
+#[test]
+fn a_body_slower_than_the_response_timeout_but_within_its_rate_arrives() {
+    let fixture = fixture();
+    let config = arm64_blobs(&fixture)[0].clone();
+    let registry = registry(Behavior {
+        slow_blobs: Slow::Drip(Duration::from_millis(2)),
+        slow_only: Some(config.clone()),
+        ..Behavior::default()
+    });
+    let reference = registry.reference(&fixture.index.digest);
+    let request = RegistryPull {
+        limits: RegistryLimits {
+            response_timeout: Duration::from_millis(300),
+            min_bytes_per_second: 100,
+            ..RegistryLimits::default()
+        },
+        ..pull(&reference, Some(&registry.authority))
+    };
+    let started = std::time::Instant::now();
+    let (_cas, result) = pull_into(&request);
+    result.expect("a slow body within its deadline");
+    assert!(
+        started.elapsed() > Duration::from_millis(300),
+        "the drip must outlast the response timeout: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -650,14 +722,325 @@ fn a_registry_error_status_is_reported() {
     let _ = fixture;
 }
 
+fn fixture_json(digest: &str) -> Value {
+    serde_json::from_slice(
+        &fs::read(
+            checked_in_fixture()
+                .join("blobs/sha256")
+                .join(digest.strip_prefix("sha256:").unwrap()),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Serve `documents` (beside the fixture) at their own digests; returns them.
+fn serving(documents: &[Vec<u8>], behavior: Behavior) -> (TestRegistry, Vec<String>) {
+    let mut behavior = behavior;
+    let digests: Vec<String> = documents.iter().map(|bytes| sha256(bytes)).collect();
+    for (digest, bytes) in digests.iter().zip(documents) {
+        behavior.tamper.insert(digest.clone(), bytes.clone());
+    }
+    (registry(behavior), digests)
+}
+
+fn blob_requests(registry: &TestRegistry) -> Vec<String> {
+    registry
+        .paths()
+        .into_iter()
+        .filter(|path| path.contains("/blobs/"))
+        .collect()
+}
+
+#[test]
+fn an_index_entry_digest_is_well_formed_before_it_is_requested() {
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:../../other/manifests/x?q",
+            "size": 10,
+            "platform": {"os": "linux", "architecture": "arm64"}
+        }]
+    }))
+    .unwrap();
+    let (registry, digests) = serving(&[index], Behavior::default());
+    let reference = registry.reference(&digests[0]);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    assert!(
+        matches!(&result, Err(OciImportError::Unsupported(detail)) if detail.contains("only sha256")),
+        "{result:?}"
+    );
+    let manifests: Vec<_> = registry
+        .paths()
+        .into_iter()
+        .filter(|path| path.contains("/manifests/"))
+        .collect();
+    assert!(
+        manifests.iter().all(|path| path.ends_with(&digests[0])),
+        "{manifests:?}"
+    );
+}
+
+#[test]
+fn what_the_import_would_refuse_is_refused_before_any_blob_is_requested() {
+    let fixture = fixture();
+    let manifest = fixture_json(&fixture.arm64.digest);
+    let mut not_an_image = manifest.clone();
+    not_an_image["config"]["mediaType"] = "application/vnd.cncf.helm.config.v1+json".into();
+    let mut zstd = manifest.clone();
+    zstd["layers"][1]["mediaType"] = "application/vnd.oci.image.layer.v1.tar+zstd".into();
+    let mut huge_config = manifest.clone();
+    huge_config["config"]["size"] = ((4u64 << 20) + 1).into();
+    for (lie, refusal) in [
+        (not_an_image, "not a container image"),
+        (zstd, "layer media type"),
+        (huge_config, "larger than"),
+    ] {
+        let (registry, digests) =
+            serving(&[serde_json::to_vec(&lie).unwrap()], Behavior::default());
+        let reference = registry.reference(&digests[0]);
+        let (cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+        assert!(
+            matches!(&result, Err(OciImportError::Unsupported(detail)) if detail.contains(refusal)),
+            "{refusal}: {result:?}"
+        );
+        assert!(
+            blob_requests(&registry).is_empty(),
+            "{refusal}: {:?}",
+            registry.paths()
+        );
+        assert!(cas_entries(cas.path()).is_empty());
+    }
+}
+
+#[test]
+fn a_layer_listed_twice_is_fetched_once() {
+    let fixture = fixture();
+    let mut manifest = fixture_json(&fixture.arm64.digest);
+    let mut config = fixture_json(manifest["config"]["digest"].as_str().unwrap());
+    let layer = manifest["layers"][0].clone();
+    let diff_id = config["rootfs"]["diff_ids"][0].clone();
+    manifest["layers"] = serde_json::json!([layer.clone(), layer.clone()]);
+    config["rootfs"]["diff_ids"] = serde_json::json!([diff_id.clone(), diff_id]);
+    let config = serde_json::to_vec(&config).unwrap();
+    manifest["config"]["digest"] = sha256(&config).into();
+    manifest["config"]["size"] = config.len().into();
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    let (registry, digests) = serving(&[manifest, config], Behavior::default());
+    let reference = registry.reference(&digests[0]);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    result.expect("an image that lists one layer twice");
+    let layer = layer["digest"].as_str().unwrap();
+    let fetched: Vec<_> = blob_requests(&registry)
+        .into_iter()
+        .filter(|path| path.starts_with("/v2/") && path.ends_with(layer))
+        .collect();
+    assert_eq!(fetched.len(), 1, "{:?}", registry.paths());
+}
+
+#[test]
+fn a_registry_that_refuses_the_anonymous_token_is_refused() {
+    let fixture = fixture();
+    let registry = registry(Behavior {
+        refuse_token: true,
+        ..Behavior::default()
+    });
+    let reference = registry.reference(&fixture.index.digest);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    let error = result.expect_err("a refused token");
+    assert!(
+        matches!(&error, OciImportError::Registry(detail) if detail.contains("credentials are not supported")),
+        "{error}"
+    );
+    assert_no_token(&error);
+    let tokens = registry
+        .paths()
+        .iter()
+        .filter(|path| path.starts_with("/token"))
+        .count();
+    assert_eq!(tokens, 1, "{:?}", registry.paths());
+}
+
+#[test]
+fn a_token_endpoint_that_challenges_is_not_answered() {
+    let fixture = fixture();
+    let registry = registry(Behavior {
+        token_reply: Some(("401 Unauthorized".into(), Vec::new())),
+        ..Behavior::default()
+    });
+    let reference = registry.reference(&fixture.index.digest);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    assert!(
+        matches!(&result, Err(OciImportError::Registry(detail)) if detail.contains("401")),
+        "{result:?}"
+    );
+    let tokens = registry
+        .paths()
+        .iter()
+        .filter(|path| path.starts_with("/token"))
+        .count();
+    assert_eq!(tokens, 1, "{:?}", registry.paths());
+}
+
+#[test]
+fn a_token_reply_is_bounded_at_sixty_four_kibibytes() {
+    let fixture = fixture();
+    let padded = |length: usize| {
+        let head = format!("{{\"token\":\"{TOKEN}\"");
+        let mut reply = head.into_bytes();
+        reply.resize(length - 1, b' ');
+        reply.push(b'}');
+        reply
+    };
+    let registry = registry(Behavior {
+        token_reply: Some(("200 OK".into(), padded(64 << 10))),
+        ..Behavior::default()
+    });
+    let reference = registry.reference(&fixture.index.digest);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    result.expect("a token reply of exactly 64 KiB");
+
+    let registry = self::registry(Behavior {
+        token_reply: Some(("200 OK".into(), padded((64 << 10) + 1))),
+        ..Behavior::default()
+    });
+    let reference = registry.reference(&fixture.index.digest);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    assert!(
+        matches!(&result, Err(OciImportError::Registry(detail)) if detail.contains("larger than")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_document_may_use_the_whole_remaining_budget() {
+    let fixture = fixture();
+    let registry = registry(Behavior::default());
+    let reference = registry.reference(&fixture.index.digest);
+    let request = RegistryPull {
+        limits: RegistryLimits {
+            max_download_bytes: blob_size(&fixture.index.digest),
+            ..RegistryLimits::default()
+        },
+        ..pull(&reference, Some(&registry.authority))
+    };
+    let (_cas, result) = pull_into(&request);
+    assert!(
+        matches!(result, Err(OciImportError::DownloadTooLarge { .. })),
+        "{result:?}"
+    );
+    // The index fit exactly; the manifest after it did not.
+    assert!(
+        registry
+            .paths()
+            .iter()
+            .any(|path| path.contains(fixture.arm64.hex())),
+        "{:?}",
+        registry.paths()
+    );
+}
+
+#[test]
+fn documents_are_bounded_at_four_mebibytes() {
+    let fixture = fixture();
+    let padded = |length: usize| {
+        let mut index = fs::read(
+            checked_in_fixture()
+                .join("blobs/sha256")
+                .join(fixture.index.hex()),
+        )
+        .unwrap();
+        index.resize(length, b' ');
+        index
+    };
+    let (registry, digests) = serving(&[padded(4 << 20)], Behavior::default());
+    let reference = registry.reference(&digests[0]);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    result.expect("an index of exactly 4 MiB");
+
+    let (registry, digests) = serving(&[padded((4 << 20) + 1)], Behavior::default());
+    let reference = registry.reference(&digests[0]);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    assert!(
+        matches!(&result, Err(OciImportError::Unsupported(detail)) if detail.contains("larger than")),
+        "{result:?}"
+    );
+}
+
+fn network_tests_enabled(what: &str) -> bool {
+    let enabled =
+        std::env::var_os("LEYLINE_REGISTRY_NETWORK_TESTS").is_some_and(|value| value == "1");
+    if !enabled {
+        eprintln!(
+            "SKIPPED (NOT a pass): pulling {what} from Docker Hub needs the network; \
+             set LEYLINE_REGISTRY_NETWORK_TESTS=1 to run it"
+        );
+    }
+    enabled
+}
+
+/// A Debian-based image (Cloister's request): dolthub/dolt-sql-server's
+/// index, pinned by the digest Docker Hub served for `latest` on
+/// 2026-11-10, imported twice under `--symlinks resolve`. Exercises the
+/// dangling-link drop rule; the identity and the drop counts are known
+/// answers. Opt-in: it needs the network and about 3 GB of temporary space.
+///
+/// The image holds paths that differ only in case
+/// (`usr/share/perl/5.36.0/Pod` and `…/pod`, `…/perl/5.36.0/Sys` and
+/// `…/sys`), so on a case-insensitive host filesystem (macOS's default
+/// APFS) the import refuses to write it, as it refuses any such image. On
+/// macOS run it with `TMPDIR` on a case-sensitive volume.
+#[test]
+fn dolt_sql_server_from_docker_hub_is_a_known_answer() {
+    if !network_tests_enabled("dolthub/dolt-sql-server") {
+        return;
+    }
+    let reference = "dolthub/dolt-sql-server@sha256:4208ed89253c9d6a36af78f0129a293dc892681b5aca50ae66b943704b8fe052";
+    let request = RegistryPull {
+        platform: Platform::linux("arm64"),
+        symlinks: SymlinkPolicy::Resolve,
+        ..pull(reference, None)
+    };
+    let (_first_cas, first) = pull_into(&request);
+    let first = first.expect("pull dolt-sql-server from Docker Hub");
+    let (_second_cas, second) = pull_into(&request);
+    let second = second.expect("pull dolt-sql-server again");
+    assert_eq!(first, second, "two pulls of one digest");
+    let counts = (
+        first.files,
+        first.special_mode_bits_cleared,
+        first.symlinks_resolved,
+        first.special_entries_dropped.len(),
+        first.links_dropped_kernel_mount.len(),
+        first.links_dropped_dangling.len(),
+        first.unreadable_files_dropped.len(),
+    );
+    eprintln!(
+        "dolt-sql-server arm64: rootfs blake3-256:{} manifest {} [files, specialModeBitsCleared, \
+         symlinksResolved, specialEntriesDropped, linksDroppedKernelMount, linksDroppedDangling, \
+         unreadableFilesDropped] = {counts:?}",
+        first.rootfs.value, first.image.manifest
+    );
+    assert_eq!(
+        first.image.manifest,
+        "sha256:6571792965684c0adae45d9062cf4c91d4d81e248cc4b02a4bfeb94d75561280"
+    );
+    assert_eq!(first.rootfs.value, DOLT_ARM64_ROOTFS);
+    assert_eq!(counts, DOLT_ARM64_COUNTS);
+}
+
+const DOLT_ARM64_ROOTFS: &str = "bfe91967c44c9ca5ea71fbf6136d29f093e6791b18e5c8669047817298653b39";
+/// files, specialModeBitsCleared, symlinksResolved, specialEntriesDropped,
+/// linksDroppedKernelMount, linksDroppedDangling, unreadableFilesDropped.
+const DOLT_ARM64_COUNTS: (usize, usize, usize, usize, usize, usize, usize) =
+    (11697, 24, 2002, 0, 0, 14, 0);
+
 /// The bead's known answer, against Docker Hub. Opt-in: it needs the network.
 #[test]
 fn hello_world_from_docker_hub_is_a_known_answer() {
-    if std::env::var_os("LEYLINE_REGISTRY_NETWORK_TESTS").is_none_or(|value| value != "1") {
-        eprintln!(
-            "SKIPPED (NOT a pass): pulling hello-world from Docker Hub needs the network; \
-             set LEYLINE_REGISTRY_NETWORK_TESTS=1 to run it"
-        );
+    if !network_tests_enabled("hello-world") {
         return;
     }
     let reference =

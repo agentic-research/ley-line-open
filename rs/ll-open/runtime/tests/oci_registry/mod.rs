@@ -48,8 +48,28 @@ pub struct Behavior {
     /// The `WWW-Authenticate` challenge a token-less `/v2/` request gets.
     /// `None` serves without any token.
     pub challenge: Option<String>,
-    /// Send a blob's headers, then stall instead of sending its body.
-    pub stall_blobs: bool,
+    /// How a blob's bytes are sent.
+    pub slow_blobs: Slow,
+    /// Serve only this digest slowly (every blob when `None`).
+    pub slow_only: Option<String>,
+    /// `/token` answers with this status line and body instead of the
+    /// token (a `401` carries a challenge naming `/token` again).
+    pub token_reply: Option<(String, Vec<u8>)>,
+    /// Challenge every `/v2/` request, the token's included.
+    pub refuse_token: bool,
+}
+
+/// How slowly a blob is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slow {
+    /// At once.
+    No,
+    /// Never send the response headers.
+    Headers,
+    /// Send the headers, then never the body.
+    Body,
+    /// Send the body one byte at a time, this far apart.
+    Drip(Duration),
 }
 
 impl Default for Behavior {
@@ -59,7 +79,10 @@ impl Default for Behavior {
             blob_redirects: 1,
             redirect_blobs_to: None,
             challenge: Some(String::new()),
-            stall_blobs: false,
+            slow_blobs: Slow::No,
+            slow_only: None,
+            token_reply: None,
+            refuse_token: false,
         }
     }
 }
@@ -178,6 +201,17 @@ fn handle(stream: TcpStream, state: &Mutex<State>, origin: &str) {
             let _ = stream.flush();
             thread::sleep(Duration::from_secs(20));
         }
+        Response::Drip(headers, bytes, gap) => {
+            let _ = stream.write_all(headers.as_bytes());
+            for byte in bytes {
+                let _ = stream.flush();
+                thread::sleep(gap);
+                if stream.write_all(&[byte]).is_err() {
+                    return;
+                }
+            }
+            let _ = stream.flush();
+        }
         Response::Full(bytes) => {
             let _ = stream.write_all(&bytes);
             let _ = stream.flush();
@@ -190,6 +224,7 @@ fn handle(stream: TcpStream, state: &Mutex<State>, origin: &str) {
 enum Response {
     Full(Vec<u8>),
     Stall(String),
+    Drip(String, Vec<u8>, Duration),
 }
 
 fn reply(status: &str, headers: &[(&str, String)], body: &[u8]) -> Response {
@@ -219,11 +254,23 @@ fn blob_bytes(layout: &Path, behavior: &Behavior, digest: &str) -> Option<Vec<u8
 
 fn serve_blob(layout: &Path, behavior: &Behavior, digest: &str, content_type: &str) -> Response {
     match blob_bytes(layout, behavior, digest) {
-        Some(bytes) if behavior.stall_blobs && content_type == "application/octet-stream" => {
-            Response::Stall(format!(
+        Some(bytes)
+            if behavior.slow_blobs != Slow::No
+                && content_type == "application/octet-stream"
+                && behavior
+                    .slow_only
+                    .as_deref()
+                    .is_none_or(|only| only == digest) =>
+        {
+            let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 bytes.len()
-            ))
+            );
+            match behavior.slow_blobs {
+                Slow::Headers => Response::Stall(String::new()),
+                Slow::Drip(gap) => Response::Drip(headers, bytes, gap),
+                _ => Response::Stall(headers),
+            }
         }
         Some(bytes) => reply("200 OK", &[("Content-Type", content_type.into())], &bytes),
         None => reply(
@@ -242,8 +289,11 @@ fn route(
     origin: &str,
 ) -> Response {
     let path = seen.path.as_str();
-    if let Some(query) = path.strip_prefix("/token?") {
-        let _ = query;
+    if path.starts_with("/token?") {
+        if let Some((status, body)) = &behavior.token_reply {
+            let challenge = format!("Bearer realm=\"http://{origin}/token\",service=\"again\"");
+            return reply(status, &[("WWW-Authenticate", challenge)], body);
+        }
         return reply(
             "200 OK",
             &[("Content-Type", "application/json".into())],
@@ -273,7 +323,8 @@ fn route(
         return reply("404 Not Found", &[], b"");
     };
     if let Some(challenge) = &behavior.challenge
-        && seen.authorization.as_deref() != Some(&format!("Bearer {TOKEN}"))
+        && (behavior.refuse_token
+            || seen.authorization.as_deref() != Some(&format!("Bearer {TOKEN}")))
     {
         let challenge = if challenge.is_empty() {
             format!(

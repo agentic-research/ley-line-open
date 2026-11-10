@@ -38,8 +38,9 @@
 //! - **Bounded.** [`RegistryLimits`]: the bytes downloaded in total (the
 //!   documents as they arrive, then the descriptors' sizes before any blob is
 //!   requested), the redirects one request may follow, the connect
-//!   timeout, the time to a response's headers, and a body deadline of that
-//!   time plus the descriptor's size at a minimum transfer rate.
+//!   timeout, the time to a response's headers and the longest a body may
+//!   go without a byte, and each request's deadline: that time plus the
+//!   descriptor's size at a minimum transfer rate.
 //!
 //! [OCI distribution API]: https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md
 
@@ -48,7 +49,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -56,8 +57,9 @@ use ureq::http::Uri;
 
 use super::oci::{
     DEFAULT_MAX_ROOTFS_BYTES, Document, INDEX_TYPES, ImportedRootfs, Index, MANIFEST_TYPES,
-    MAX_DOCUMENT_BYTES, Manifest, OciImport, OciImportError, Platform, SymlinkPolicy, check_blob,
-    classify, import_oci_layout, parse, parse_reference, select_platform, sha256_hex,
+    MAX_DOCUMENT_BYTES, Manifest, OciImport, OciImportError, Platform, SymlinkPolicy,
+    admit_manifest, check_blob, classify, import_oci_layout, parse, parse_reference,
+    select_platform, sha256_hex,
 };
 
 /// Docker Hub's registry endpoint, for names without a registry.
@@ -75,11 +77,13 @@ pub struct RegistryLimits {
     pub max_redirects: u32,
     /// Bound on resolving and connecting (TLS handshake included).
     pub connect_timeout: Duration,
-    /// Bound on sending a request and receiving its response headers, and
-    /// the fixed part of every body's deadline.
+    /// Bound on sending a request and receiving its response headers, on
+    /// any wait for the next byte of a body, and the fixed part of every
+    /// request's deadline.
     pub response_timeout: Duration,
-    /// The slowest transfer accepted: a body of `n` bytes must arrive within
-    /// `response_timeout + n / min_bytes_per_second`.
+    /// The slowest transfer accepted: a request for a body of `n` bytes
+    /// (connecting included) must finish within
+    /// `response_timeout + n / min_bytes_per_second` (whole seconds).
     pub min_bytes_per_second: u64,
 }
 
@@ -138,24 +142,22 @@ pub fn pull_oci_image(
         .copied()
         .collect::<Vec<_>>()
         .join(", ");
-    let top = client.document("manifests", &target.digest, None, &manifest_accept)?;
+    let top = client.document(&target.digest, None, &manifest_accept)?;
     layout.write(&target.digest, &top)?;
     let manifest_bytes = match classify(&top)? {
         Document::Index => {
             let index: Index = parse(&top, "image index")?;
             let selected = select_platform(&index, &request.platform)?;
-            let bytes = client.document(
-                "manifests",
-                &selected.digest,
-                Some(selected.size),
-                &manifest_accept,
-            )?;
+            let bytes = client.document(&selected.digest, Some(selected.size), &manifest_accept)?;
             layout.write(&selected.digest, &bytes)?;
             bytes
         }
         Document::Manifest => top,
     };
     let manifest: Manifest = parse(&manifest_bytes, "image manifest")?;
+    // What the import would refuse before reading a layer, refused before
+    // requesting one.
+    admit_manifest(&manifest)?;
     let blobs: Vec<_> = std::iter::once(&manifest.config)
         .chain(&manifest.layers)
         .collect();
@@ -366,10 +368,18 @@ impl<'a> Client<'a> {
             .proxy(None)
             .accept_encoding(ureq::config::AutoHeaderValue::None)
             .user_agent(concat!("leyline-runtime/", env!("CARGO_PKG_VERSION")))
+            // ureq bounds each phase by its own timeout and by the one
+            // before it, measured from that phase's end. So `send_request`
+            // also bounds the wait for the response headers, while
+            // `recv_response` is left unset: set, it would also end every
+            // body that takes longer than it, a large layer's included.
+            // `recv_body` is measured from each read (an idle bound). The
+            // body's deadline is `Deadlined`'s: once a ureq deadline has
+            // passed, ureq waits up to a second per read instead of failing.
             .timeout_resolve(Some(limits.connect_timeout))
             .timeout_connect(Some(limits.connect_timeout))
             .timeout_send_request(Some(limits.response_timeout))
-            .timeout_recv_response(Some(limits.response_timeout))
+            .timeout_recv_body(Some(limits.response_timeout))
             .build()
             .new_agent();
         Self {
@@ -422,14 +432,16 @@ impl<'a> Client<'a> {
     }
 
     /// GET `url`, following redirects within the limit, answering one
-    /// bearer challenge from the registry, and returning the `200` response.
+    /// bearer challenge from the registry, and returning the `200` response's
+    /// body, held to the deadline for `body_size` bytes from the moment its
+    /// request was sent.
     fn get(
         &mut self,
         url: String,
         accept: Option<&str>,
         body_size: u64,
         registry: bool,
-    ) -> Result<ureq::http::Response<ureq::Body>, OciImportError> {
+    ) -> Result<Deadlined, OciImportError> {
         let mut url = url;
         let mut redirects = 0;
         // The token goes to the registry's own URL and nowhere else: never to
@@ -438,6 +450,7 @@ impl<'a> Client<'a> {
         let mut challenged = false;
         loop {
             let uri = self.admit(&url)?;
+            let deadline = Instant::now() + self.body_timeout(body_size);
             let mut builder = self.agent.get(&url);
             if let Some(accept) = accept {
                 builder = builder.header("Accept", accept);
@@ -445,17 +458,17 @@ impl<'a> Client<'a> {
             if to_registry && let Some(token) = &self.token {
                 builder = builder.header("Authorization", format!("Bearer {token}"));
             }
-            let response = builder
-                .config()
-                .timeout_recv_body(Some(self.body_timeout(body_size)))
-                .build()
-                .call()
-                .map_err(|error| {
-                    OciImportError::Registry(format!("GET {}: {error}", redact(&url)))
-                })?;
+            let response = builder.call().map_err(|error| {
+                OciImportError::Registry(format!("GET {}: {error}", redact(&url)))
+            })?;
             let status = response.status().as_u16();
             match status {
-                200 => return Ok(response),
+                200 => {
+                    return Ok(Deadlined {
+                        body: response.into_body().into_reader(),
+                        deadline,
+                    });
+                }
                 401 if to_registry && !challenged => {
                     challenged = true;
                     let challenge = response
@@ -528,12 +541,9 @@ impl<'a> Client<'a> {
         if let Some((_, service)) = parameters.iter().find(|(name, _)| name == "service") {
             url.push_str(&format!("&service={}", percent_encode(service)));
         }
-        let response = self.get(url, Some("application/json"), MAX_TOKEN_BYTES, false)?;
+        let body = self.get(url, Some("application/json"), MAX_TOKEN_BYTES, false)?;
         let mut bytes = Vec::new();
-        response
-            .into_body()
-            .into_reader()
-            .take(MAX_TOKEN_BYTES + 1)
+        body.take(MAX_TOKEN_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| OciImportError::Registry(format!("read a token reply: {error}")))?;
         if bytes.len() as u64 > MAX_TOKEN_BYTES {
@@ -550,27 +560,26 @@ impl<'a> Client<'a> {
             .ok_or_else(|| OciImportError::Registry("the token reply holds no usable token".into()))
     }
 
-    /// A document (`manifests`) or config-sized blob, read whole, counted,
-    /// and verified by the layout import's own check before it is returned.
+    /// An index or manifest, read whole, counted, and verified by the
+    /// layout import's own check before it is returned.
     fn document(
         &mut self,
-        kind: &str,
         digest: &str,
         size: Option<u64>,
         accept: &str,
     ) -> Result<Vec<u8>, OciImportError> {
-        let url = format!("{}/v2/{}/{kind}/{digest}", self.origin, self.repository);
-        let response = self.get(url, Some(accept), MAX_DOCUMENT_BYTES, true)?;
+        // An index entry's digest is the registry's to choose: well formed
+        // before it is part of a URL.
+        sha256_hex(digest)?;
+        let url = format!("{}/v2/{}/manifests/{digest}", self.origin, self.repository);
+        let body = self.get(url, Some(accept), MAX_DOCUMENT_BYTES, true)?;
         let budget = self
             .limits
             .max_download_bytes
             .saturating_sub(self.downloaded);
         let bound = budget.min(MAX_DOCUMENT_BYTES);
         let mut bytes = Vec::new();
-        response
-            .into_body()
-            .into_reader()
-            .take(bound + 1)
+        body.take(bound + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| OciImportError::Registry(format!("read {digest}: {error}")))?;
         let read = bytes.len() as u64;
@@ -600,10 +609,8 @@ impl<'a> Client<'a> {
         let destination = layout.path(digest)?;
         let partial = destination.with_extension("partial");
         let url = format!("{}/v2/{}/blobs/{digest}", self.origin, self.repository);
-        let response = self.get(url, None, size, true)?;
-        let mut reader = response
-            .into_body()
-            .into_reader()
+        let mut reader = self
+            .get(url, None, size, true)?
             .take(size.saturating_add(1));
         let mut file = OpenOptions::new()
             .write(true)
@@ -625,9 +632,30 @@ impl<'a> Client<'a> {
                 .map_err(io_error("stage an image blob"))?;
             read_total += read as u64;
         }
+        // Counted when its size was reserved, before any blob was requested.
         check_blob(digest, Some(size), read_total, &hasher.finalize())?;
-        self.downloaded += read_total;
         fs::rename(&partial, &destination).map_err(io_error("stage an image blob"))
+    }
+}
+
+/// A response body that fails once its deadline passes. ureq's own timeouts
+/// cannot be that deadline: its body timeout restarts at every read, and a
+/// phase deadline that has passed becomes a one-second wait per read.
+struct Deadlined {
+    body: ureq::BodyReader<'static>,
+    deadline: Instant,
+}
+
+impl Read for Deadlined {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.body.read(buffer)?;
+        if Instant::now() > self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the response did not arrive within its deadline",
+            ));
+        }
+        Ok(read)
     }
 }
 
@@ -888,6 +916,19 @@ mod tests {
             strict.admit("not a url"),
             Err(OciImportError::Registry(_))
         ));
+        // The refusal names what was refused.
+        let plain = strict
+            .admit("http://127.0.0.1:5000/v2/?q=secret")
+            .unwrap_err();
+        assert!(
+            plain
+                .to_string()
+                .contains("plain HTTP to http://127.0.0.1:5000/v2/ "),
+            "{plain}"
+        );
+        assert!(!plain.to_string().contains("secret"), "{plain}");
+        let other = strict.admit("ftp://ghcr.io/x").unwrap_err();
+        assert!(other.to_string().contains("only HTTPS URLs"), "{other}");
         let local = client(Some("127.0.0.1:5000"), &limits);
         assert!(local.admit("http://127.0.0.1:5000/v2/").is_ok());
         assert!(local.admit("https://cdn.example/x").is_ok());

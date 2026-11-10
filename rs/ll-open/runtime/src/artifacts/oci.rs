@@ -449,18 +449,7 @@ pub fn import_oci_layout(
         Document::Manifest => (reference.clone(), top),
     };
     let manifest: Manifest = parse(&manifest_bytes, "image manifest")?;
-    if !MANIFEST_TYPES.contains(&manifest.media_type.as_deref().unwrap_or(MANIFEST_TYPES[0])) {
-        return Err(OciImportError::Unsupported(format!(
-            "manifest media type {:?}",
-            manifest.media_type
-        )));
-    }
-    if !CONFIG_TYPES.contains(&manifest.config.media_type.as_str()) {
-        return Err(OciImportError::Unsupported(format!(
-            "config media type {:?}: not a container image",
-            manifest.config.media_type
-        )));
-    }
+    admit_manifest(&manifest)?;
     let config: ImageConfig = parse(
         &layout.document(&manifest.config.digest, Some(manifest.config.size))?,
         "image config",
@@ -595,6 +584,35 @@ pub fn import_oci_layout(
             user: runtime.user.unwrap_or_default(),
         },
     })
+}
+
+/// What a manifest must be before its config is read or its layers are
+/// fetched: an image manifest whose config is a container image config no
+/// larger than a document, and whose layers are all of a readable type.
+/// A registry pull applies it before requesting any blob.
+pub(super) fn admit_manifest(manifest: &Manifest) -> Result<(), OciImportError> {
+    if !MANIFEST_TYPES.contains(&manifest.media_type.as_deref().unwrap_or(MANIFEST_TYPES[0])) {
+        return Err(OciImportError::Unsupported(format!(
+            "manifest media type {:?}",
+            manifest.media_type
+        )));
+    }
+    if !CONFIG_TYPES.contains(&manifest.config.media_type.as_str()) {
+        return Err(OciImportError::Unsupported(format!(
+            "config media type {:?}: not a container image",
+            manifest.config.media_type
+        )));
+    }
+    if manifest.config.size > MAX_DOCUMENT_BYTES {
+        return Err(OciImportError::Unsupported(format!(
+            "document {} is larger than {MAX_DOCUMENT_BYTES} bytes",
+            manifest.config.digest
+        )));
+    }
+    for layer in &manifest.layers {
+        Compression::of(&layer.media_type)?;
+    }
+    Ok(())
 }
 
 /// The `sha256:<hex>` a reference pins, or why it pins nothing.

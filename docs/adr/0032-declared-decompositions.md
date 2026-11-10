@@ -1,6 +1,8 @@
 # ADR-0032 — Declared decompositions: three identity structures, one fold operator
 
-**Status:** Proposed (2026-07-27)
+**Status:** Proposed (2026-07-27); D2's tagged fold is implemented (`leyline-core`
+`partition.rs`) and amended by ADR-0047 (every construction is keyed); `manifestRoot` and
+`logicalRoot` are not implemented
 **Bead:** `ley-line-open-ef5c1d` (P0)
 **Related:**
 

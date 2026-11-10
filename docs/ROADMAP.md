@@ -5,7 +5,7 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-10-26, at integration `c9577606` (latest tag v0.20.5; v0.21.0 is the release candidate).
+Last updated: 2026-11-10, at the v0.27.0 tree `a80868e0` (latest tag v0.27.0).
 
 ## v1.0: single host, portable
 
@@ -20,10 +20,10 @@ v1.0.0 tag is published with its crates on crates.io, and
 
 | v1 criterion | What it means | Beads |
 |---|---|---|
-| Portable, proven | The in-guest end-to-end test gates every release on Apple silicon (a manual run recorded as a per-tree receipt that tagging requires, `16a994`) and runs on Linux/KVM; the released macOS worker carries the hypervisor entitlement (`984acf`) | `16a994`, `5c2040`, `984acf` |
+| Portable, proven | The in-guest end-to-end test gates every release on Apple silicon (a manual run recorded as a per-tree receipt that tagging requires, `16a994`) and runs on Linux/KVM; the released macOS worker carries the hypervisor entitlement (`984acf`) | `5c2040` (`16a994`, `984acf` done in v0.21.0) |
 | Stable contracts | The `propose` wire, the projection ABI (`_tree`, `_source`, `_parse_diagnostics`), execution/v1 and the share header are frozen under semver, with fixtures that fail on a breaking change; the governing ADRs have a decided status | `b70e44`, `10075e` |
 | Write path for real workloads | Build output stays out of the store; bursts of authored writes commit as one batch; a write is acknowledged after one durable append; a guest write stays under 50 ms | `39998b`, `18bfdd`, `98d0c3` |
-| Fail-closed authority | A run writes only inside its grant's write scope; a backend refuses a workspace it cannot serve | `483134`, `204a94` |
+| Fail-closed authority | A run writes only inside its grant's write scope; a backend refuses a workspace it cannot serve | `483134` (`204a94` done in v0.26.0) |
 | Installable | The crates publish to crates.io; a release is a tag, not a git revision | `c3e8c6`, `395e43` |
 | Git compatible at the boundary | Real `git` (status, diff, commit, log, blame, push, fetch) behaves in an agent's working tree as in a plain clone; git object ids are an export-only identity domain | `cf8fdb` |
 | Limits fixed or documented | Two writers on one NFS mount; `.git` in the mount | `5ec040`, `5ee38a` |
@@ -34,18 +34,12 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- `204a94` (in review) — a workspace grant no backend serves is refused
-  before spawn with its own execution/v1 code, `workspaceUnserved`, so
-  Cloister can route the run to a tier that serves workspaces; the service
-  cancels and refuses a run whose backend reports a start without serving
-  every granted workspace. The native pre-spawn refusal itself shipped in
-  #502 (`f8ebcf`).
+- ADR-0046 Q7 (decided 2026-11-10, default deny): declared connections
+  appear to an unmodified guest workload as TCP on guest loopback, in both
+  directions, and a declared channel that can't be built refuses the start
+  (`ley-line-open-be3711`, `ley-line-open-bb2143`).
 
 **Next**
-- `0fadab` — cut v0.21.0 from integration and hand mache the upgrade note
-  (release train `5de852`). The fix for silent loss with two writers on one
-  host NFS mount it waited for landed in #485 (`3889ec`); crates are not
-  published for v0.21.0 (publish-crates runs only by hand).
 - `18bfdd` — group commit: writes that land close together become one proposal,
   one parse pass, one durable flush and one publish, with each file keeping its
   own base, merge and `ESTALE`.
@@ -72,14 +66,13 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 - `bf80bd` — collapse the worker-to-daemon hop on the share's hot path.
 
 **Then**
-- `619a99` — ADR-0047's identity migrations, before the contract freeze because
-  each moves a wire or projection identity: M1 parser-free Merkle `storeRoot`
-  (head digest v3, projection-v11; implemented by `73c6ee`, mache adopts it in
-  `mache-107423`), M2 keyed `node_hash` with `lang`/`raw_kind`
-  per occurrence (merkle-ast-v3, projection-v12; implemented by `73add7` and
-  `b5d354`, mache adopts it in `mache-108e26`), M3 run-id v2, M4 rooted blob
-  manifests. Each is one versioned bump; its mache or cloister issue is filed
-  before its PR merges.
+- ADR-0047's remaining identity migrations, before the contract freeze because
+  each moves a wire or projection identity: M3 run-id v2 (`ab2093`; `derive_key`
+  context `cloister/execution/v1/run-id/v2`, rendered `run-v2-…`; cloister
+  derives it through the cas-ffi `leyline_derive_key` export that shipped in
+  v0.26.0) and M4 rooted blob manifests (`58cf9a`). Each is one versioned
+  bump; its mache or cloister issue is filed before its PR merges. M0, M1 and
+  M2 shipped in v0.26.0 (see below).
 - `b70e44`, `10075e` — the contract freeze, after the ADR status decisions.
 - `cf8fdb` — the git conformance suite.
 - `c3e8c6` — publish the crates in dependency order (unblocks `395e43`).
@@ -149,10 +142,31 @@ an ordinary repository to git, CI, review, editors and build tools.
   shared memory on unified-memory hosts; revalidate by root or generation at open.
 - **Merge gate for the shared tree** (`39c0fc`, `6bbeea`): a clean line merge can
   still break the build; the gate is the owner's design decision.
-- **Upstream libkrun** (`10feaa`): submit LLO's seven patches to
+- **Upstream libkrun** (`10feaa`): submit LLO's nine patches to
   containers/libkrun, on the owner's go-ahead.
 
-## Shipped in the 0.21.0 cycle (release candidate; crates not published)
+## Shipped in v0.27.0 (2026-11-10)
+
+| PR | Change | Bead |
+|---|---|---|
+| #540 | rusqlite 0.41, bundled SQLite 3.54.1 (RUSTSEC-2026-0459); a shim serves witchcraft's rusqlite 0.39 requirement from 0.41 | `6ef210` |
+| #541 | `leyline rootfs import-oci`: a digest-pinned OCI image layout becomes a content-addressed execution rootfs | `7736ab` |
+| #542 | libkrun patch 0009: with a port map, a TSI datagram socket carries replies only; guest-tools pins are fetched by digest | `0026d2`, `ae6b99` |
+| #543 | No RustSec vulnerability in `rs/Cargo.lock`; `task audit` (`cargo deny`, `deny.toml`) runs in `task ci` | `3adcf7`, `643a35` |
+| #544 | An OCI-imported rootfs boots in a libkrun guest; a receipt's `inputRoots` names the rootfs first; a replayed start never rewrites a receipt | `68a55d`, `799fbc` |
+
+## Shipped in v0.21.1 to v0.26.0
+
+| Release | Change | Bead |
+|---|---|---|
+| v0.21.1 | The native tier refuses a run whose grant names a Graph workspace; execution/v1 conformance matrix across native nono and libkrun | `204a94` (part), `f8ebcf` |
+| v0.22.0 | `projection-v8` retires `capnp_blobs`/`_ast_blob`; `projection-v9` interns `node_child` into `node_edge` | `f30fdf`, `9b7d28` |
+| v0.23.0 | `status` reports `source_root`; Go types for `read_source` and `propose`; `mount` builds NFS without FUSE | `246526`, `247489`, `9d4712` |
+| v0.24.0 | `projection-v10` (occurrence tables point at `node_content` by `content_id`); head digest v2 | `738dd9`, `b68fa6` |
+| v0.25.0 | Root absence is stated, never zero; arena-local nids leave the wire; `leyline-cache`; ADR-0047 accepted | `80f037`, `754aa1`, `619a99` |
+| v0.26.0 | ADR-0047 M0 (axiom suite, `Ref<D>`, locator newtypes, cas-ffi `leyline_derive_key`), M1 (parser-free `storeRoot`, head digest v3, `projection-v11`, wire format major 2) and M2 (keyed `node_hash` merkle-ast-v3, `lang`/`raw_kind` per occurrence, `projection-v12`); verify-on-read for `source_blobs`; MCP serves only advertised, granted tools; read-only `query`; `workspaceUnserved` | `10d71a`, `12e252`, `73c6ee`, `73add7`, `b5d354`, `12d305`, `851a65`, `b7e9a3`, `204a94` |
+
+## Shipped in v0.21.0 (crates not published)
 
 | PR | Change | Bead |
 |---|---|---|

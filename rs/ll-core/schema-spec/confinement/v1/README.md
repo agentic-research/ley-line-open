@@ -142,8 +142,8 @@ which mediates `connect(2)` and `sendmsg(2)`-with-explicit-recipient on pathname
 UNIX sockets, at exactly the per-path granularity §6 declares. So the dimension
 is expressible on Linux upstream. What blocks it is this stack: the `landlock`
 crate stops at ABI 7 and has no `RESOLVE_UNIX` constant to emit, and the sandbox
-layer targets ABI 5 and consults its UNIX-socket capabilities only in the macOS
-backend. When those advance, §6 becomes enforceable on Linux without a spec
+layer (nono 0.71) probes Landlock up to ABI 6 and consults its UNIX-socket
+capabilities only in the macOS backend. When those advance, §6 becomes enforceable on Linux without a spec
 change, and the refusal in condition 6 stops firing on its own.
 
 Note also that `RESOLVE_UNIX` is scoped by domain: it governs connections to

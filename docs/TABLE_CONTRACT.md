@@ -38,7 +38,7 @@ that asymmetry has cost real design time: the node-key work (bead
 consumer repo, and the consumer had to answer four questions LLO could not
 answer about its own ABI. A producer contract is only half a contract.
 
-Counts are non-test, non-writer `FROM`/`JOIN` references at the stated commit.
+Counts are non-test, non-writer `FROM`/`JOIN` references as of 2026-08-19 (the `node_content` and `node_child` rows re-checked at integration `22290da9`).
 They are a floor, not an audit: dynamic SQL and consumers outside this
 workspace are invisible to them. Re-derive rather than trust when it matters.
 
@@ -277,9 +277,9 @@ the projection is derived-only, so no in-place migration exists.
 | Table | Purpose |
 |-------|---------|
 | `names` / `dirs` / `files` / `kinds` | Interning tables (`projection-v5`). Every path component, directory link, file, and tree-sitter kind stored ONCE; all four are append-only — rows are never deleted or renumbered, which is what makes `file_id` reuse impossible and a directory rename a ONE-row `UPDATE dirs SET name_id`. The rule is enforced in the database: `*_append_only_delete` and `*_append_only_update` triggers abort any DELETE and any UPDATE that changes a row's id (`INTERN_GUARDS_DDL`, bead `ley-line-open-80f037`). `dirs.dir_id = 1` is the root ("", parent NULL). |
-| `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
+| `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record_id, record, source_file; ley-line's own writers leave `record_id` and `source_file` NULL, which remain for mache's lazy-resolution flow). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
 | `_ast` | AST positions (nid → kind_id, byte/row/col ranges, `content_id`). `content_id INTEGER REFERENCES node_content(content_id)` replaced the 32-byte `node_hash` at `projection-v10` (bead `ley-line-open-738dd9`); read the hash through `v_ast_hash` or a join (see "Reading `node_hash` at projection-v10" below), and find every location of a subtree with `idx_ast_content`. No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
-| `_source` | Source file metadata (id → language, abs path, `file_id` — the interned integer that keys every node row's high bits). As of `projection-v7` (ADR-0045 T1) one row per file the parse PROJECTED: a file of no grammar, a binary or an oversized file has a `_tree` entry and no `_source` row. `content_hash` equals the path's `_tree.blob_hash`. List every file from `_tree`, not from here. |
+| `_source` | Source file metadata (`id`, `language`, `content` (inline mode) or `path` (reference mode), `content_hash`, and `file_id` — the interned integer that keys every node row's high bits). As of `projection-v7` (ADR-0045 T1) one row per file the parse PROJECTED: a file of no grammar, a binary or an oversized file has a `_tree` entry and no `_source` row. `content_hash` equals the path's `_tree.blob_hash`. List every file from `_tree`, not from here. |
 | `node_refs` | Token references (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. `kind_id` (`projection-v12`, bead `ley-line-open-cc5c55`) → `kinds(lang, raw_kind)` is the occurrence's own language and grammar kind, written on every row the parse writes: its `_ast` row's `kind_id` for a host occurrence, the injected grammar's for an injected one. |
 | `node_defs` | Token definitions (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). `kind_id` as on `node_refs` (`projection-v12`). No `qualifier` column. |
 | `_imports` | Import statements (alias, path, source_id) |
@@ -350,7 +350,7 @@ directory, not assumed from the platform.
 
 | Table | Purpose |
 |-------|---------|
-| `_cfg` | Intra-procedural CFG basic blocks — `(node_hash, block_id) PRIMARY KEY`, `block_kind TEXT` (one of `CFG_CANONICAL_KINDS`), `complexity INTEGER` nullable. Node_hash FK to `node_content`. The key is reflow-invariant, but it is not a `node_hash`: `emit_cfg_for_source` keys a body by a plain-BLAKE3 stub fold and inserts a `node_content` row for it, which does not re-derive under merkle-ast-v3 (`ley-line-open-cc7855`). The parse writes no `_cfg` rows. |
+| `_cfg` | Intra-procedural CFG basic blocks — `(node_hash, block_id) PRIMARY KEY`, `source_id TEXT` (indexed by `idx_cfg_source`), `block_kind TEXT` (one of `CFG_CANONICAL_KINDS`), `entry_offset`/`exit_offset` byte offsets, `complexity INTEGER` nullable. Node_hash FK to `node_content`. The key is reflow-invariant, but it is not a `node_hash`: `emit_cfg_for_source` keys a body by a plain-BLAKE3 stub fold and inserts a `node_content` row for it, which does not re-derive under merkle-ast-v3 (`ley-line-open-cc7855`). The parse writes no `_cfg` rows. |
 | `_cfg_edge` | Directed edges between CFG blocks. Composite FK on both endpoints referencing `_cfg(node_hash, block_id)`. `edge_kind TEXT` (free-form in v0.7.2; T3 taint will canonicalize). |
 
 Population TODO (bead `ley-line-open-a0fadd`): T1.b3-followup wires `cfg::emit_cfg_for_source` into `cmd_parse`'s rayon-worker + batched-insert plumbing so `_cfg` populates on parse. Until then, schema is present but empty on parse output; `_cfg` is only populated by consumers calling `leyline_ts::cfg::emit_cfg_for_source` directly.
@@ -362,11 +362,11 @@ Depends on tree-sitter. Tables are optional — queries degrade gracefully.
 
 | Table | Purpose |
 |-------|---------|
-| `_lsp` | Core symbol metadata (node_id, symbol_kind, detail, line ranges, diagnostics) |
-| `_lsp_defs` | Go-to-definition results (node_id → def_uri, line/col) |
-| `_lsp_refs` | **Legacy / read-only.** Find-references results (node_id → ref_uri, line/col). New writes retired at T8.9 (`9d3a3b4`); contract migrated to `BindingRecord` capnp event log at `${db}.bindings.capnp`. DDL retained for legacy `.db` read compatibility. |
-| `_lsp_hover` | Hover documentation (node_id → hover_text) |
-| `_lsp_completions` | Completion items (node_id → label, kind, detail) |
+| `_lsp` | Core symbol metadata (nid, symbol_kind, detail, start/end line and column, diagnostics) |
+| `_lsp_defs` | Go-to-definition results (nid, def_token → def_uri, line/col) |
+| `_lsp_refs` | **Legacy / read-only.** Find-references results (nid, referrer_nid, ref_token → ref_uri, line/col). New writes retired at T8.9 (`9d3a3b4`); contract migrated to `BindingRecord` capnp event log at `${db}.bindings.capnp`. DDL retained for legacy `.db` read compatibility. |
+| `_lsp_hover` | Hover documentation (nid → hover_text) |
+| `_lsp_completions` | Completion items (nid → label, kind, detail, documentation, sort_text) |
 
 ### Embeddings (extension layer)
 
@@ -393,6 +393,7 @@ database** (not the living db) because `vec0` virtual tables cannot survive
 | `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` (views) | `projection-v10` `node_hash`-rendering compatibility views (base) |
 | `names` / `dirs` / `files` / `kinds` | projection-v5 interning tables (base; no prefix) |
 | `source_blobs` | ADR-0028 content-addressed source (base; no prefix) |
+| `query_blobs` / `_queries` | arena-resident override tree-sitter queries: `blob_hash` (BLAKE3) → `blob_bytes`, and `(lang, kind)` → `blob_hash` (base; leyline-ts) |
 | `content_chunks` / `blob_manifest` | CDC derived chunk cache — private, not part of the SQL projection ABI |
 | `_checkout*` | daemon checkout of its `--source` directory — private, not part of the SQL projection ABI |
 
@@ -471,18 +472,19 @@ Composing the two yields **handler ↔ schema** transitively. Either half
 failing means the chain broke. The fixture file is the deliberate
 intermediate artifact, not an artifact of the implementation.
 
-Ops with known schema↔reality drift (`get_node` snake_case, `status` missing
-fields, etc.) are SKIPPED in the Go half with the drift reason as the skip
-message; the Rust half still runs for them. Bead A-2 (`b631c8`) reconciles
-the schema additively; each `go_drift_skip` flipping to null converts a
-skip to a pass.
+One op, `query`, is SKIPPED in the Go half, with the drift reason as the
+skip message: the schema declares positional `rows: List(QueryRow)` and the
+handler emits column-keyed maps, which no additive schema change reconciles.
+The Rust half still runs it. Every other fixture's `go_drift_skip` is null;
+bead A-2 (`b631c8`) reconciled the others additively.
 
 ## Rules
 
 1. **Disjoint writes**: `A.writes() ∩ B.writes() = ∅` for any two passes A, B.
 2. **Atomic layer writes**: All writes from a single pass run in one SQLite transaction.
-3. **Causal basis**: Each layer records `{name}_parse_basis` in `_meta` — the
-   `parse_version` it was computed against. Staleness = basis < current parse_version.
+3. **Causal basis** (not implemented): no layer records a parse basis in
+   `_meta` today. A projection's derivation is `_meta.derived_from`; an
+   enrichment layer's staleness is not tracked.
 4. **Optional tables**: Consumers (mache, FUSE) must handle missing enrichment
    tables gracefully. Check `SELECT 1 FROM sqlite_master WHERE name = ?`.
 5. **SQL projection ABI**: LL and LLO may add/query documented tables in the

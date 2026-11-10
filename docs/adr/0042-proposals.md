@@ -2,7 +2,7 @@
 
 **Status:** Proposed (2026-10-12); P1, P2 (file bases), the daemon ops and the mount's file bases
 are implemented on the PRs listed under "Shipped so far"; amended 2026-10-14 with P1a (create,
-delete, rename)
+delete, rename); amended by ADR-0045 (a moved base merges three ways; the host mount is storefs)
 **Bead:** `ley-line-open-d70f99` (design); implementation beads below
 **Related:**
 

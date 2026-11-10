@@ -2772,15 +2772,14 @@ async fn test_op_reparse_nonexistent_source_sets_error_phase_and_recovers() {
     );
 }
 
-/// `op_query` is a SQL injection foot-gun (cf. ley-line-open-6213d4 — MCP
-/// trust boundary doc). This test pins the *current* behavior so a future
-/// fix (gate destructive verbs, restrict to SELECT-only, require auth) is
-/// caught as an intentional change rather than a silent one.
-///
-/// Specifically: today, sending arbitrary DDL via `op_query` succeeds and
-/// runs against the living db. That's the foot-gun; this test documents it.
+/// `op_query` was a SQL foot-gun (cf. ley-line-open-6213d4 — MCP trust
+/// boundary doc): DDL sent through it ran against the living db. It is
+/// read-only now (bead `ley-line-open-b7e9a3`); this pin, which used to
+/// assert the DROP succeeded, asserts it is refused and the table survives.
+/// `tests/query_read_only_test.rs` covers every refused shape over both
+/// transports.
 #[tokio::test]
-async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
+async fn test_op_query_refuses_destructive_sql_pin_for_6213d4() {
     use leyline_cli_lib::daemon::DaemonContext;
     use std::sync::Arc;
 
@@ -2808,25 +2807,20 @@ async fn test_op_query_destructive_runs_today_pin_for_6213d4() {
 
     let parsed = uds_round_trip(&sock_path, r#"{"op":"query","sql":"DROP TABLE doomed"}"#).await;
 
-    // Today: the DROP succeeds. This pins that fact so 6213d4 can land an
-    // intentional behavior change (gate / SELECT-only / require auth) and
-    // this test will fail loudly, prompting an update.
-    assert_eq!(
-        parsed["ok"], true,
-        "today op_query runs raw DDL — see 6213d4 for the lockdown plan; got: {parsed}",
-    );
+    assert_eq!(parsed["ok"], false, "{parsed}");
+    assert_eq!(parsed["refusal"]["reason"], "denied_action", "{parsed}");
 
-    let table_gone: bool = ctx
+    let table_kept: bool = ctx
         .live_db
         .writer
         .lock()
         .query_row(
-            "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type='table' AND name='doomed'",
+            "SELECT COUNT(*) = 1 FROM sqlite_master WHERE type='table' AND name='doomed'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert!(table_gone, "DROP TABLE actually executed");
+    assert!(table_kept, "DROP TABLE must not execute");
 }
 
 /// `vec_search` with a dim-mismatched embedder must surface a clean error,

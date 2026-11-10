@@ -263,10 +263,18 @@ type getDbPathResponse struct {
 	HeadPath     *string `json:"head_path"`
 }
 
+type queryRefusal struct {
+	Reason  *string `json:"reason"`
+	Action  *string `json:"action"`
+	Subject *string `json:"subject,omitempty"`
+}
+
 type queryResponse struct {
-	OK      *bool      `json:"ok"`
-	Columns []string   `json:"columns"`
-	Rows    []queryRow `json:"rows"`
+	OK      *bool         `json:"ok"`
+	Columns []string      `json:"columns"`
+	Rows    []queryRow    `json:"rows"`
+	Error   *string       `json:"error,omitempty"`
+	Refusal *queryRefusal `json:"refusal,omitempty"`
 }
 
 // ── Sheaf ops (ae7a35) ─────────────────────────────────────────────
@@ -364,7 +372,14 @@ func decoderFor(name string) func([]byte) error {
 	case "GetDbPathResponse":
 		return func(b []byte) error { var v getDbPathResponse; return strictUnmarshal(b, &v) }
 	case "QueryResponse":
-		return func(b []byte) error { var v queryResponse; return strictUnmarshal(b, &v) }
+		return func(b []byte) error {
+			var v queryResponse
+			if err := strictUnmarshal(b, &v); err != nil {
+				return err
+			}
+			var w wire.QueryResponse
+			return strictUnmarshal(b, &w)
+		}
 	case "SheafSetTopologyResponse":
 		return func(b []byte) error { var v sheafSetTopologyResponse; return strictUnmarshal(b, &v) }
 	case "SheafInvalidateResponse":

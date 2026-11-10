@@ -922,52 +922,81 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
     // rows iter + JSON serialize.
     let _prof = ReadProfileTimer::new("query");
 
-    // Bead `ley-line-open-f0239d`: `op_query` accepts arbitrary SQL and
-    // can't statically distinguish reads from writes (`DROP TABLE` looks
-    // like a query to the wire). Use the writer connection so every
-    // shape of SQL still works — the pre-15b `with_read` classification
-    // was a misclass hidden by the shared `Mutex<Connection>`. The
-    // destructive-SQL foot-gun documented at
-    // `test_op_query_destructive_runs_today_pin_for_6213d4` continues
-    // to work. Over MCP the tool is therefore its own Cloister group,
-    // `sql`, not part of the read-side `query` group (bead
-    // `ley-line-open-851a65`); a read-only `query` is
-    // `ley-line-open-b7e9a3`.
-    ctx.with_write(|conn| {
-        let mut stmt = conn.prepare(sql).context("prepare SQL")?;
-        let col_count = stmt.column_count();
-        let headers: Vec<String> = (0..col_count)
-            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
-            .collect();
+    // Bead `ley-line-open-b7e9a3`: the statement runs on a reader-pool
+    // connection (`query_only=ON`) under the deny-by-default authorizer of
+    // `sql_read_only`, and only a single read-only SELECT runs. A refused
+    // statement returns a typed `QueryRefusal` and no rows.
+    let outcome = ctx
+        .with_read(|conn| super::sql_read_only::query(conn, sql, |stmt| query_rows(stmt, limit)));
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(err) => match err.downcast_ref::<super::sql_read_only::Refusal>() {
+            Some(refusal) => query_refusal_response(refusal),
+            None => Err(err),
+        },
+    }
+}
 
-        let mut rows_out: Vec<serde_json::Value> = Vec::new();
-        let mut rows = stmt.query([]).context("execute SQL")?;
-        let mut truncated = false;
-        while let Some(row) = rows.next()? {
-            if rows_out.len() >= limit {
-                // Stop iterating: SQLite has more rows but the caller
-                // capped the response. Mark as truncated so clients can
-                // paginate with an explicit LIMIT/OFFSET in their SQL.
-                truncated = true;
-                break;
-            }
-            let mut obj = serde_json::Map::new();
-            for (i, col) in headers.iter().enumerate() {
-                obj.insert(col.clone(), sql_value_to_json(row.get_ref(i)?));
-            }
-            rows_out.push(serde_json::Value::Object(obj));
-        }
+/// The `query` op's success response: up to `limit` rows of `stmt`, each an
+/// object keyed by column name.
+fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String> {
+    let col_count = stmt.column_count();
+    let headers: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+        .collect();
 
-        let mut response = serde_json::Map::new();
-        response.insert("ok".into(), json!(true));
-        response.insert("columns".into(), json!(headers));
-        response.insert("rows".into(), json!(rows_out));
-        if truncated {
-            response.insert("truncated".into(), json!(true));
-            response.insert("limit".into(), json!(limit));
+    let mut rows_out: Vec<serde_json::Value> = Vec::new();
+    let mut rows = stmt.query([]).context("execute SQL")?;
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if rows_out.len() >= limit {
+            // Stop iterating: SQLite has more rows but the caller
+            // capped the response. Mark as truncated so clients can
+            // paginate with an explicit LIMIT/OFFSET in their SQL.
+            truncated = true;
+            break;
         }
-        Ok(serde_json::Value::Object(response).to_string())
-    })
+        let mut obj = serde_json::Map::new();
+        for (i, col) in headers.iter().enumerate() {
+            obj.insert(col.clone(), sql_value_to_json(row.get_ref(i)?));
+        }
+        rows_out.push(serde_json::Value::Object(obj));
+    }
+
+    let mut response = serde_json::Map::new();
+    response.insert("ok".into(), json!(true));
+    response.insert("columns".into(), json!(headers));
+    response.insert("rows".into(), json!(rows_out));
+    if truncated {
+        response.insert("truncated".into(), json!(true));
+        response.insert("limit".into(), json!(limit));
+    }
+    Ok(serde_json::Value::Object(response).to_string())
+}
+
+/// The `query` op's refusal: `ok` false, the refusal's message as `error`,
+/// and the typed `refusal`. No rows.
+fn query_refusal_response(refusal: &super::sql_read_only::Refusal) -> Result<String> {
+    use super::sql_read_only::RefusalReason as Ours;
+    use leyline_public_schema::daemon_capnp::QueryRefusalReason as Wire;
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::query_response::Builder =
+        builder.init_root();
+    root.set_ok(false);
+    root.set_error(refusal.to_string());
+    let mut out = root.init_refusal();
+    out.set_reason(match refusal.reason {
+        Ours::DeniedAction => Wire::DeniedAction,
+        Ours::MultipleStatements => Wire::MultipleStatements,
+        Ours::NotAQuery => Wire::NotAQuery,
+    });
+    out.set_action(&refusal.action);
+    if !refusal.subject.is_empty() {
+        out.set_subject(&refusal.subject);
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::query_response::Reader>()?;
+    Ok(capnp_json::to_json(reader)?)
 }
 
 /// List children of a node (or roots if id="").
@@ -5338,6 +5367,30 @@ mod tests {
         assert_eq!(parsed["limit"], 10);
     }
 
+    /// Bead `ley-line-open-b7e9a3`: a refused statement's wire shape. The
+    /// refusal carries a `subject` only when the action names something.
+    #[tokio::test]
+    async fn op_query_refusal_carries_a_subject_only_when_one_is_named() {
+        let (_dir, ctx) = setup();
+        let refused = |sql: &str| -> serde_json::Value {
+            let out = handle_base_op_legacy(&ctx, "query", &json!({ "sql": sql }))
+                .expect("op_query must dispatch");
+            serde_json::from_str(&out).unwrap()
+        };
+        assert_eq!(
+            refused("VACUUM"),
+            json!({
+                "ok": false,
+                "error": "query refused (not_a_query): the query op runs only a read-only SELECT, not `vacuum`",
+                "refusal": {"reason": "not_a_query", "action": "vacuum"},
+            })
+        );
+        assert_eq!(
+            refused("PRAGMA writable_schema = ON")["refusal"],
+            json!({"reason": "denied_action", "action": "pragma", "subject": "writable_schema"})
+        );
+    }
+
     #[tokio::test]
     async fn op_query_omits_truncated_when_under_limit() {
         // A query that returns fewer rows than the cap MUST NOT carry
@@ -8688,19 +8741,16 @@ mod tests {
             (json!({"op": "list_children", "id": ""}), vec![]),
             // Nothing changed since the reparse published.
             (json!({"op": "snapshot"}), vec![]),
+            // `query` is read-only (bead `ley-line-open-b7e9a3`): a write
+            // is refused and changes nothing.
             (
                 json!({"op": "query", "sql": "CREATE TABLE scratch_q (x)"}),
-                vec!["daemon.query"],
-            ),
-            (
-                json!({"op": "query", "sql": "INSERT INTO scratch_q VALUES (1)"}),
-                vec!["daemon.query"],
-            ),
-            (
-                json!({"op": "query", "sql": "SELECT x FROM scratch_q"}),
                 vec![],
             ),
-            (json!({"op": "snapshot"}), vec!["daemon.snapshot"]),
+            (
+                json!({"op": "query", "sql": "SELECT count(*) AS n FROM _source"}),
+                vec![],
+            ),
             (json!({"op": "snapshot"}), vec![]),
             (
                 json!({"op": "enrich", "pass": "lsp"}),
@@ -8752,6 +8802,10 @@ mod tests {
                 json!({"op": "agreement", "token": "A", "payload_kind": "k"}),
                 vec![],
             ),
+            // The schema it installed is unpublished: a snapshot publishes
+            // it, once.
+            (json!({"op": "snapshot"}), vec!["daemon.snapshot"]),
+            (json!({"op": "snapshot"}), vec![]),
         ]);
         // `load` replaces the arena. It is a socket op; MCP refuses it
         // unadvertised (bead `ley-line-open-851a65`), so it changes nothing.

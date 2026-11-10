@@ -289,10 +289,49 @@ struct QueryRequest {
   sql @0 :Text;
 }
 
+# `query` runs one read-only SELECT (bead `ley-line-open-b7e9a3`). `ok` true
+# carries the rows. `ok` false with `refusal` means the statement was refused
+# before it returned anything and nothing changed; `ok` false without
+# `refusal` is an error running an allowed statement (a syntax error, a
+# missing table).
 struct QueryResponse {
   ok      @0 :Bool;
   columns @1 :List(Text);
   rows    @2 :List(QueryRow);
+  error   @3 :Text;
+  refusal @4 :QueryRefusal;
+}
+
+# Why a `query` statement was refused.
+enum QueryRefusalReason {
+  # The SQLite authorizer denied an action the statement takes; `action`
+  # names it. Allowed are SELECT, reading a table, a recursive CTE, a listed
+  # pure function, and a listed schema-introspection pragma in its
+  # table-valued form; everything else is denied.
+  deniedAction       @0 $Json.name("denied_action");
+  # The SQL holds more than one statement. None of them ran.
+  multipleStatements @1 $Json.name("multiple_statements");
+  # The statement is not a read-only SELECT (`VACUUM`, a bare `PRAGMA`, an
+  # empty statement); `action` is its leading keyword.
+  notAQuery          @2 $Json.name("not_a_query");
+}
+
+struct QueryRefusal {
+  reason  @0 :QueryRefusalReason;
+  # The refused action. For `denied_action`, the SQLite authorizer action in
+  # snake case: `insert`, `update`, `delete`, `drop_table`, `create_table`,
+  # `attach`, `detach`, `pragma`, `function`, `transaction`, ... It is the
+  # first action SQLite asked for and was denied: a DROP, or a CREATE of a
+  # table, asks first to write the schema table, so it is refused as
+  # `delete` or `insert` with `subject` `sqlite_master` (`sqlite_temp_master`
+  # for a temporary object). For
+  # `not_a_query`, the statement's leading keyword, lower case (`vacuum`), or
+  # `empty`. For `multiple_statements`, `statement`.
+  action  @1 :Text;
+  # What the action names, when it names something: the table, index,
+  # trigger, view, pragma or function, or the file an ATTACH names as a
+  # literal. Unset otherwise.
+  subject @2 :Text;
 }
 
 struct ListChildrenRequest {

@@ -241,10 +241,13 @@ impl Surfaces {
                 format!("{error:#}"),
                 error
                     .downcast_ref::<leyline_runtime::ExecutionError>()
-                    .map_or(
-                        Value::Null,
-                        |e| json!({"code": e.code.wire_name(), "retryable": e.retryable}),
-                    ),
+                    .map_or(Value::Null, |e| {
+                        json!({
+                            "code": e.code.wire_name(),
+                            "retryable": e.retryable,
+                            "message": e.detail,
+                        })
+                    }),
             ),
         }
     }
@@ -579,12 +582,10 @@ async fn one_run_reads_identically_through_every_surface() {
         let Outcome::Err(error, classification) = outcome else {
             panic!("expected a refusal, got {outcome:?}");
         };
-        assert_eq!(
-            classification,
-            &json!({"code": "unsupportedBackend", "retryable": false}),
-            "{outcome:?}"
-        );
-        assert!(error.starts_with("UnsupportedBackend: "), "{error}");
+        assert_eq!(classification["code"], "unsupportedBackend", "{outcome:?}");
+        assert_eq!(classification["retryable"], false, "{outcome:?}");
+        let message = classification["message"].as_str().expect("a message");
+        assert_eq!(error, &format!("UnsupportedBackend: {message}"));
     })
     .await;
 

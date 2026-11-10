@@ -3409,12 +3409,17 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
         // (like list_children requiring "children"), an unexpected ok=false
         // is a real failure: the handler should have returned the success
         // shape and didn't. Don't paper over it.
-        let opt_in_error_branch = required_keys.len() == 1
+        // A fixture whose own `response` is an error envelope also opts in,
+        // and its richer required keys are then checked on the error
+        // branch (the execution/v1 `executionError`, bead
+        // `ley-line-open-e347ae`).
+        let opt_in_error_branch = (required_keys.len() == 1
             && required_keys
                 .first()
                 .and_then(|k| k.as_str())
                 .map(|s| s == "ok")
-                .unwrap_or(false);
+                .unwrap_or(false))
+            || fixture["response"]["ok"] == serde_json::json!(false);
         let is_error = obj.get("ok").and_then(|v| v.as_bool()) == Some(false);
 
         if is_error && !opt_in_error_branch {
@@ -3433,6 +3438,13 @@ async fn daemon_protocol_gate_handlers_emit_required_keys() {
             if !obj.contains_key(key_str) {
                 failures.push(format!(
                     "op={op_name}: required key `{key_str}` missing from response: {response}"
+                ));
+            } else if key_str == "executionError" && obj[key_str] != fixture["response"][key_str] {
+                // The classification is the contract: its value, not only
+                // its presence, must match the fixture the Go gate decodes.
+                failures.push(format!(
+                    "op={op_name}: executionError {} differs from the fixture's {}",
+                    obj[key_str], fixture["response"][key_str]
                 ));
             }
         }

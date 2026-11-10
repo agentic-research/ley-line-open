@@ -83,8 +83,16 @@ pub fn handle_base_op_value(
     let typed_result: std::result::Result<BaseRequest, _> = serde_json::from_value(parsed);
     Some(match typed_result {
         Ok(typed) => ctx.observe_op(&op, || dispatch_typed(ctx, typed)),
-        Err(e) => build_error_response(&format!("{op}: {e}"))
-            .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}"))),
+        // An execution/v1 request the op cannot decode is `invalidSpec`, as
+        // the runtime classifies a malformed request it decodes itself
+        // (bead `ley-line-open-e347ae`); the text is unchanged.
+        Err(e) => {
+            let message = format!("{op}: {e}");
+            let execution = is_execution_op(&op)
+                .then(|| leyline_runtime::ExecutionError::invalid(message.clone()));
+            error_envelope(&message, execution.as_ref())
+                .unwrap_or_else(|enc| fallback_error_envelope(&format!("dispatch error: {enc}")))
+        }
     })
 }
 
@@ -215,18 +223,36 @@ fn dispatch_typed(ctx: &std::sync::Arc<DaemonContext>, req: BaseRequest) -> Stri
 /// classification as `executionError` (bead `ley-line-open-e347ae`), so UDS
 /// and MCP callers branch on `code` and `retryable` rather than the text.
 fn handler_error_response(e: &anyhow::Error) -> Result<String> {
+    error_envelope(
+        &format!("{e:#}"),
+        e.downcast_ref::<leyline_runtime::ExecutionError>(),
+    )
+}
+
+/// The error envelope: `message` as `error`, and `execution` as
+/// `executionError` when there is one.
+fn error_envelope(
+    message: &str,
+    execution: Option<&leyline_runtime::ExecutionError>,
+) -> Result<String> {
     let mut builder = capnp::message::Builder::new_default();
     let mut root: leyline_public_schema::daemon_capnp::error_response::Builder =
         builder.init_root();
-    root.set_error(format!("{e:#}"));
-    if let Some(execution) = e.downcast_ref::<leyline_runtime::ExecutionError>() {
-        let mut class = root.init_execution_error();
-        class.set_code(execution_error_code(execution.code));
-        class.set_retryable(execution.retryable);
+    root.set_error(message);
+    if let Some(execution) = execution {
+        let mut wire = root.init_execution_error();
+        wire.set_code(execution_error_code(execution.code));
+        wire.set_retryable(execution.retryable);
+        wire.set_message(&execution.detail);
     }
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::error_response::Reader>()?;
     Ok(capnp_json::to_json(reader)?)
+}
+
+/// Whether `op` is an execution/v1 op, whose every failure is classified.
+fn is_execution_op(op: &str) -> bool {
+    op.starts_with("llo_execution_")
 }
 
 /// The daemon schema's mirror of execution/v1's `ErrorCode`.
@@ -255,9 +281,17 @@ fn execution_error_code(
 fn execution_handler(
     ctx: &DaemonContext,
 ) -> Result<std::sync::Arc<dyn super::execution::ExecutionHandler>> {
-    ctx.ext
-        .execution_handler()
-        .ok_or_else(|| anyhow::anyhow!("execution/v1 service is not configured"))
+    ctx.ext.execution_handler().ok_or_else(|| {
+        // Classified (bead `ley-line-open-e347ae`): this daemon serves no
+        // execution/v1 backend at all, and retrying here cannot change
+        // that.
+        leyline_runtime::ExecutionError {
+            code: leyline_runtime::ErrorCode::UnsupportedBackend,
+            retryable: false,
+            detail: "execution/v1 service is not configured".into(),
+        }
+        .into()
+    })
 }
 
 fn op_execution_capabilities(ctx: &DaemonContext) -> Result<String> {
@@ -8085,7 +8119,11 @@ mod tests {
                 json!({
                     "ok": false,
                     "error": expected_message,
-                    "executionError": {"code": code.wire_name(), "retryable": retryable},
+                    "executionError": {
+                        "code": code.wire_name(),
+                        "retryable": retryable,
+                        "message": "why",
+                    },
                 }),
                 "{code:?}"
             );
@@ -8098,6 +8136,46 @@ mod tests {
             plain,
             json!({"ok": false, "error": "not an execution error"})
         );
+    }
+
+    /// Bead `ley-line-open-e347ae`: every failed execution/v1 op is
+    /// classified, not only the runtime's own errors. A request the op
+    /// cannot decode is `invalidSpec` with its text unchanged; a daemon with
+    /// no execution/v1 service is `unsupportedBackend`; a non-execution op's
+    /// decode failure carries no classification.
+    #[tokio::test]
+    async fn every_failed_execution_op_is_classified() {
+        let (_dir, ctx) = setup();
+        let reply = |line: &str| -> serde_json::Value {
+            serde_json::from_str(&handle_base_op(&ctx, line).expect("a known op")).unwrap()
+        };
+
+        let undecodable = reply(r#"{"op":"llo_execution_collect"}"#);
+        assert_eq!(undecodable["ok"], false, "{undecodable}");
+        let text = undecodable["error"].as_str().unwrap().to_owned();
+        assert!(text.starts_with("llo_execution_collect: "), "{text}");
+        assert_eq!(
+            undecodable["executionError"],
+            json!({"code": "invalidSpec", "retryable": false, "message": text}),
+        );
+
+        let unconfigured = reply(r#"{"op":"llo_execution_status","runId":""}"#);
+        assert_eq!(
+            unconfigured,
+            json!({
+                "ok": false,
+                "error": "UnsupportedBackend: execution/v1 service is not configured",
+                "executionError": {
+                    "code": "unsupportedBackend",
+                    "retryable": false,
+                    "message": "execution/v1 service is not configured",
+                },
+            })
+        );
+
+        let other = reply(r#"{"op":"get_node"}"#);
+        assert_eq!(other["ok"], false, "{other}");
+        assert!(other.get("executionError").is_none(), "{other}");
     }
 
     /// Bead `ley-line-open-80f037` F3(e): a nid is arena-local

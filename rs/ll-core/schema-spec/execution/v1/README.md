@@ -64,8 +64,9 @@ backend class can tell "this tier serves no workspace" from the
 `unsupportedBackend` refusals (egress, an unenforceable ceiling, another
 tier's grant) by code. The Rust `ExecutionError` carries it as `code`; the
 daemon's error envelope, on the control socket and over MCP alike, carries
-it as `executionError: {"code": "workspaceUnserved", "retryable": false}`
-(`daemon.capnp` `ExecutionErrorClass`, bead `ley-line-open-e347ae`), beside
+it as `executionError: {"code": "workspaceUnserved", "retryable": false,
+"message": "…"}` (`daemon.capnp` `ExecutionError`, bead
+`ley-line-open-e347ae`), beside
 the unchanged error text, whose `WorkspaceUnserved: …` prefix earlier
 consumers match. Choosing another tier is the caller's policy; the runtime
 does not reroute a run.

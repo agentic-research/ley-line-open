@@ -38,7 +38,7 @@ refuses the filter stops the guest before the workload runs.
 Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
 ---
 diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
-index 471ed65..ae26602 100644
+index 471ed65..28b9e74 100644
 --- a/src/init_blob/init/init.c
 +++ b/src/init_blob/init/init.c
 @@ -32,9 +32,18 @@
@@ -60,7 +60,7 @@ index 471ed65..ae26602 100644
  #endif
  
  #include "dhcp.h"
-@@ -1431,6 +1440,403 @@ close_socket:
+@@ -1431,6 +1440,407 @@ close_socket:
      close(sockfd);
      return result;
  }
@@ -398,10 +398,14 @@ index 471ed65..ae26602 100644
 +            if (fds[i].revents == 0) {
 +                continue;
 +            }
-+            accepted = accept4(channels[i].listener, NULL, NULL, SOCK_CLOEXEC);
++            /* accept(2) plus FD_CLOEXEC: accept4 is a GNU extension that
++             * glibc declares only under _GNU_SOURCE, which init.c does not
++             * define. Single-threaded, so nothing can exec in between. */
++            accepted = accept(channels[i].listener, NULL, NULL);
 +            if (accepted < 0) {
 +                continue;
 +            }
++            fcntl(accepted, F_SETFD, FD_CLOEXEC);
 +            if (fork() == 0) {
 +                for (j = 0; j < count; j++) {
 +                    close(channels[j].listener);
@@ -464,7 +468,7 @@ index 471ed65..ae26602 100644
  #endif
  
  int main(int argc, char **argv)
-@@ -1586,6 +1992,21 @@ int main(int argc, char **argv)
+@@ -1586,6 +1996,21 @@ int main(int argc, char **argv)
              printf("Warning: Couldn't enable dummy interface\n");
          }
      }

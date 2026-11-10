@@ -1774,10 +1774,14 @@ static void run_loopback_relay(struct loopback_channel *channels, int count)
             if (fds[i].revents == 0) {
                 continue;
             }
-            accepted = accept4(channels[i].listener, NULL, NULL, SOCK_CLOEXEC);
+            /* accept(2) plus FD_CLOEXEC: accept4 is a GNU extension that
+             * glibc declares only under _GNU_SOURCE, which init.c does not
+             * define. Single-threaded, so nothing can exec in between. */
+            accepted = accept(channels[i].listener, NULL, NULL);
             if (accepted < 0) {
                 continue;
             }
+            fcntl(accepted, F_SETFD, FD_CLOEXEC);
             if (fork() == 0) {
                 for (j = 0; j < count; j++) {
                     close(channels[j].listener);

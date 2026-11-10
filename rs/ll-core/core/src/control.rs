@@ -291,12 +291,11 @@ pub fn remove_stale_reinit_staging(path: &Path) -> Result<Vec<std::path::PathBuf
         if pid.is_empty() || !pid.iter().all(u8::is_ascii_digit) {
             continue;
         }
+        // No other reset runs (the caller's exclusive lease), so nothing
+        // removes the file between the listing and here.
         let stale = path.with_file_name(&name);
-        match std::fs::remove_file(&stale) {
-            Ok(()) => removed.push(stale),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("remove {}", stale.display())),
-        }
+        std::fs::remove_file(&stale).with_context(|| format!("remove {}", stale.display()))?;
+        removed.push(stale);
     }
     Ok(removed)
 }
@@ -1657,6 +1656,14 @@ mod tests {
             Vec::<std::path::PathBuf>::new(),
             "a directory that does not exist holds nothing to remove"
         );
+        // A parent that is not a directory, and a staging name that is not
+        // a removable file, are errors, never "nothing to remove".
+        let not_a_dir = dir.path().join("plain");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert!(remove_stale_reinit_staging(&not_a_dir.join("c.ctrl")).is_err());
+        std::fs::create_dir(dir.path().join(".c.ctrl.reinit.9")).unwrap();
+        let err = remove_stale_reinit_staging(&path).unwrap_err();
+        assert!(format!("{err:#}").contains(".c.ctrl.reinit.9"), "{err:#}");
     }
 
     /// `read_header`'s edges: a file shorter than a block is fresh (`None`),

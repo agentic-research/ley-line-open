@@ -1610,6 +1610,25 @@ mod tests {
         }
     }
 
+    /// A statement that opens a pool reader's temp database is refused as a
+    /// read of the temp schema (bead `ley-line-open-3befbc`): SQLite asks
+    /// the authorizer nothing about a `NATURAL` join's table.
+    #[test]
+    fn a_statement_that_opens_the_temp_database_is_refused() {
+        let (_dir, db) = pool();
+        let mut reader = db.reader_pool.get().unwrap();
+        assert!(!temp_is_open(&reader));
+        let got = refusal(
+            &mut reader,
+            "SELECT q.name FROM (SELECT 'x' AS name) q NATURAL JOIN temp.sqlite_master",
+        );
+        assert_eq!(
+            (got.reason, got.action.as_str(), got.subject.as_str()),
+            (RefusalReason::DeniedAction, "read", TEMP_SCHEMA_TABLE)
+        );
+        assert!(temp_is_open(&reader), "SQLite opened it while preparing");
+    }
+
     /// On a connection the pool did not restrict, which still holds modules
     /// outside the allow-list, every statement is refused, before the
     /// authorizer is installed, naming one such module.

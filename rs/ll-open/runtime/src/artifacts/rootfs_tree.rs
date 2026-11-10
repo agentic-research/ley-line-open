@@ -697,6 +697,8 @@ mod tests {
             ("", "/missing/./.."),
             ("etc", "missing/../../etc/f"),
             ("etc", "f-missing/x/../.."),
+            // Each named component after the missing one goes one deeper.
+            ("", "missing/a/../.."),
         ] {
             assert_eq!(
                 tree.resolve(&path(parent), target),
@@ -723,6 +725,8 @@ mod tests {
         }
         for (parent, target) in [
             ("", "missing/../.."),
+            // `.` after the missing component goes nowhere.
+            ("", "missing/./../.."),
             ("etc", "missing/../../.."),
             ("", "/proc/../.."),
             ("", "dev/./../.."),

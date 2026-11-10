@@ -71,9 +71,11 @@ fn storage_error(error: crate::cas_volume::CasVolumeError) -> ExecutionError {
         CasVolumeError::UnsupportedHost { .. } | CasVolumeError::CaseInsensitive { .. } => {
             ExecutionError::unsupported(detail)
         }
-        CasVolumeError::Config(_) | CasVolumeError::Tool { .. } | CasVolumeError::Io { .. } => {
-            ExecutionError::backend(detail)
-        }
+        CasVolumeError::Config(_)
+        | CasVolumeError::Tool { .. }
+        | CasVolumeError::Timeout { .. }
+        | CasVolumeError::ForeignVolume { .. }
+        | CasVolumeError::Io { .. } => ExecutionError::backend(detail),
     }
 }
 

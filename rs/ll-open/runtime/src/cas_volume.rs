@@ -36,6 +36,23 @@
 //!   creates one) re-attaches it when a provider or daemon starts.
 //!   Removing it is the operator's: detach, then delete the
 //!   `cas.sparsebundle` directory; every rootfs in it is re-importable.
+//!
+//!   Each `hdiutil` run is killed after [`DEFAULT_TOOL_TIMEOUT`] and fails
+//!   by name ([`CasVolumeError::Timeout`]). Provisioning takes a file lock
+//!   (`<state>/cas-volume/provision.lock`) across processes, removes the
+//!   `partial-<pid>.sparsebundle` a crashed provider left (only when that
+//!   process is gone), and uses a volume at `mnt/` only when `hdiutil info`
+//!   names `cas.sparsebundle` as its image ([`CasVolumeError::ForeignVolume`]
+//!   otherwise) (bead `ley-line-open-167b29`).
+//!
+//!   macOS 27 marks `hdiutil create/attach/detach` deprecated in favour of
+//!   `diskutil image` (bead `ley-line-open-168a65`). LLO stays on `hdiutil`:
+//!   `diskutil image create blank` offers no case-sensitive APFS, and
+//!   reaching one through `diskutil` takes four tool runs and a device node
+//!   parsed from output. `tests/cas_volume.rs` pins the exact warnings and
+//!   fails when they change or `diskutil image` gains a case-sensitive
+//!   filesystem; `task runtime:test:cas-volume` runs it, and the recorded
+//!   release suite (`task release:hypervisor:record`) includes it.
 //! - **Linux.** No volume is made. The CAS root is `<state>/cas`; the call
 //!   probes it and succeeds when its filesystem is case-sensitive (ext4,
 //!   xfs, btrfs) and refuses by name otherwise (a casefolded directory,
@@ -50,6 +67,7 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -165,6 +183,21 @@ pub enum CasVolumeError {
     Config(String),
     #[error("{command} failed: {detail}")]
     Tool { command: String, detail: String },
+    /// A disk-image tool run outlived its bound and was killed.
+    #[error("{command} did not finish within {after:?} and was killed")]
+    Timeout { command: String, after: Duration },
+    /// What is mounted at the volume's mountpoint is not its image.
+    #[error(
+        "{} is not the CAS volume: it is mounted from {}, not {}; detach it and provision again",
+        .mountpoint.display(),
+        .found.as_deref().map_or_else(|| "no attached disk image".to_string(), |path| path.display().to_string()),
+        .expected.display()
+    )]
+    ForeignVolume {
+        mountpoint: PathBuf,
+        expected: PathBuf,
+        found: Option<PathBuf>,
+    },
     #[error("{action} {path}: {source}")]
     Io {
         action: &'static str,
@@ -248,51 +281,140 @@ pub trait DiskImages: Send + Sync {
     fn detach(&self, mountpoint: &Path) -> Result<(), CasVolumeError>;
     /// Whether a filesystem is mounted at `mountpoint`.
     fn is_mounted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError>;
+    /// The disk image whose volume is mounted at `mountpoint`, `None` when
+    /// what is mounted there is no attached image (bead
+    /// `ley-line-open-167b29`). A tool that cannot say refuses, so a
+    /// volume is never trusted on the strength of a mount alone.
+    fn attached_image(&self, mountpoint: &Path) -> Result<Option<PathBuf>, CasVolumeError> {
+        Err(CasVolumeError::Config(format!(
+            "this disk-image tool cannot say which image is attached at {}",
+            mountpoint.display()
+        )))
+    }
 }
 
+/// How long one `hdiutil` run may take before it is killed and provisioning
+/// fails by name: creating a 64 GiB sparsebundle takes seconds, and an
+/// attach or detach less.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// `/usr/bin/hdiutil`, by absolute path (never from `PATH`), as the calling
-/// user, with stdin closed.
+/// user, with stdin closed, each run bounded by a timeout.
 #[derive(Debug, Clone)]
 pub struct Hdiutil {
     program: PathBuf,
+    timeout: Duration,
 }
 
 impl Default for Hdiutil {
     fn default() -> Self {
         Self {
             program: PathBuf::from(HDIUTIL),
+            timeout: DEFAULT_TOOL_TIMEOUT,
         }
     }
 }
 
 impl Hdiutil {
+    /// The real tool with another bound on each run.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..Self::default()
+        }
+    }
+
     fn run(&self, args: &[&std::ffi::OsStr]) -> Result<(), CasVolumeError> {
+        self.output(args).map(drop)
+    }
+
+    /// Run the tool and return its standard output. A run that outlives
+    /// [`Hdiutil::timeout`] is killed (provisioning holds the volume's lock
+    /// while it waits) and fails as [`CasVolumeError::Timeout`].
+    fn output(&self, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, CasVolumeError> {
         let rendered = || {
             std::iter::once(self.program.display().to_string())
                 .chain(args.iter().map(|arg| arg.to_string_lossy().into_owned()))
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let output = Command::new(&self.program)
+        let tool_error = |detail: String| CasVolumeError::Tool {
+            command: rendered(),
+            detail,
+        };
+        let mut child = Command::new(&self.program)
             .args(args)
             .stdin(Stdio::null())
-            .output()
-            .map_err(|error| CasVolumeError::Tool {
-                command: rendered(),
-                detail: error.to_string(),
-            })?;
-        if output.status.success() {
-            return Ok(());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| tool_error(error.to_string()))?;
+        // Drained on their own threads, so a chatty tool never blocks on a
+        // full pipe while this one waits for it to exit.
+        let drain = |pipe: Option<Box<dyn io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        };
+        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CasVolumeError::Timeout {
+                        command: rendered(),
+                        after: self.timeout,
+                    });
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => return Err(tool_error(error.to_string())),
+            }
+        };
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
+        if status.success() {
+            return Ok(stdout);
         }
-        Err(CasVolumeError::Tool {
-            command: rendered(),
-            detail: format!(
-                "{}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        })
+        Err(tool_error(format!(
+            "{status}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )))
     }
+}
+
+/// The image `hdiutil info` lists as mounted at `mountpoint`, from its text
+/// output: one block per image, separated by `=` rules, each naming its
+/// `image-path` and then its devices as tab-separated lines whose third
+/// field is a mount point. Paths are compared canonicalized.
+fn attached_image_in_info(info: &str, mountpoint: &Path) -> Option<PathBuf> {
+    let wanted = mountpoint.canonicalize().ok()?;
+    info.split("\n=")
+        .filter_map(|block| {
+            let image = block.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == "image-path").then(|| PathBuf::from(value.trim()))
+            })?;
+            let mounted_here = block.lines().any(|line| {
+                line.starts_with("/dev/")
+                    && line.split('\t').nth(2).is_some_and(|mount| {
+                        let mount = mount.trim();
+                        !mount.is_empty()
+                            && Path::new(mount)
+                                .canonicalize()
+                                .is_ok_and(|mount| mount == wanted)
+                    })
+            });
+            mounted_here.then_some(image)
+        })
+        .next()
 }
 
 /// `hdiutil -size` in mebibytes, rounding up.
@@ -337,6 +459,14 @@ impl DiskImages for Hdiutil {
 
     fn is_mounted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError> {
         is_mount_point(mountpoint)
+    }
+
+    fn attached_image(&self, mountpoint: &Path) -> Result<Option<PathBuf>, CasVolumeError> {
+        let info = self.output(&["info".as_ref()])?;
+        Ok(attached_image_in_info(
+            &String::from_utf8_lossy(&info),
+            mountpoint,
+        ))
     }
 }
 
@@ -510,6 +640,21 @@ impl CasVolume {
             return Ok(None);
         }
         private_directory(&layout.dir)?;
+        // Across processes too: two providers (or a daemon and the CLI)
+        // provisioning at once take turns. Each holder's tool runs are
+        // bounded, so a wait here is too. Released when `_provisioning`
+        // drops.
+        let lock_path = layout.dir.join("provision.lock");
+        let _provisioning = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(io_error("open", &lock_path))?;
+        _provisioning.lock().map_err(io_error("lock", &lock_path))?;
+        if create {
+            remove_stale_partials(&layout.dir)?;
+        }
         let mut created = false;
         if !image_exists {
             created = self.create_image(&layout)?;
@@ -531,6 +676,25 @@ impl CasVolume {
                 });
             }
             attached = true;
+        }
+        // A mount at `mnt` is the volume only if it comes from
+        // `cas.sparsebundle`: someone else's image (or any other filesystem)
+        // mounted there first is refused, not written to.
+        let expected = layout
+            .image
+            .canonicalize()
+            .map_err(io_error("resolve", &layout.image))?;
+        let found = self.images.attached_image(&layout.mountpoint)?;
+        if found
+            .as_deref()
+            .and_then(|path| path.canonicalize().ok())
+            .is_none_or(|found| found != expected)
+        {
+            return Err(CasVolumeError::ForeignVolume {
+                mountpoint: layout.mountpoint,
+                expected: layout.image,
+                found,
+            });
         }
         if fs::symlink_metadata(&layout.cas_root).is_err() {
             fs::create_dir(&layout.cas_root).map_err(io_error("create", &layout.cas_root))?;
@@ -655,6 +819,40 @@ impl CasStorage {
     }
 }
 
+/// Remove each `partial-<pid>.sparsebundle` in `dir` whose process no longer
+/// exists: what a provider that crashed between `hdiutil create` and the
+/// rename left (bead `ley-line-open-167b29`). A live process's is its own
+/// to finish or remove; a name that is not of that form is left alone.
+fn remove_stale_partials(dir: &Path) -> Result<(), CasVolumeError> {
+    for entry in fs::read_dir(dir).map_err(io_error("list", dir))? {
+        let entry = entry.map_err(io_error("list", dir))?;
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("partial-"))
+            .and_then(|rest| rest.strip_suffix(".sparsebundle"))
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        if process_exists(pid) {
+            continue;
+        }
+        let path = entry.path();
+        fs::remove_dir_all(&path).map_err(io_error("remove", &path))?;
+    }
+    Ok(())
+}
+
+/// Whether process `pid` exists: `kill(pid, 0)` succeeds, or fails only
+/// because it belongs to another user.
+fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Create `dir` (and its parents) and make it owner-only. An existing path
 /// must be a directory this user owns.
 fn private_directory(dir: &Path) -> Result<(), CasVolumeError> {
@@ -690,6 +888,11 @@ mod tests {
         create_races: bool,
         /// The tool reports success and writes nothing.
         create_writes_nothing: bool,
+        /// The image each mountpoint was attached from.
+        images: Arc<Mutex<std::collections::BTreeMap<PathBuf, PathBuf>>>,
+        /// Report this image (or, with `Some(None)`, none) as mounted at
+        /// every mountpoint instead of the one attached.
+        reports_image: Option<Option<PathBuf>>,
     }
 
     impl Fake {
@@ -725,17 +928,231 @@ mod tests {
             ));
             if !self.attach_mounts_nothing {
                 self.mounted.lock().insert(mountpoint.to_path_buf());
+                self.images
+                    .lock()
+                    .insert(mountpoint.to_path_buf(), bundle.to_path_buf());
             }
             Ok(())
         }
         fn detach(&self, mountpoint: &Path) -> Result<(), CasVolumeError> {
             self.calls.lock().push("detach".into());
             self.mounted.lock().remove(mountpoint);
+            self.images.lock().remove(mountpoint);
             Ok(())
         }
         fn is_mounted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError> {
             Ok(self.mounted.lock().contains(mountpoint))
         }
+        fn attached_image(&self, mountpoint: &Path) -> Result<Option<PathBuf>, CasVolumeError> {
+            if let Some(reported) = &self.reports_image {
+                return Ok(reported.clone());
+            }
+            Ok(self.images.lock().get(mountpoint).cloned())
+        }
+    }
+
+    /// A shell script standing in for hdiutil.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let program = dir.join(name);
+        fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    /// Bead ley-line-open-167b29 (1): a hung hdiutil fails provisioning by
+    /// name within its timeout instead of holding the volume's lock forever.
+    #[test]
+    fn a_tool_run_that_outlives_its_timeout_is_killed_and_named() {
+        let scratch = tempfile::tempdir().unwrap();
+        let hung = Hdiutil {
+            program: script(scratch.path(), "hdiutil-hangs", "exec sleep 30"),
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let error = hung.create(Path::new("/b"), 1 << 30).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&error, CasVolumeError::Timeout { command, after }
+                if command.contains("create") && *after == Duration::from_millis(300)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("did not finish within"),
+            "{error}"
+        );
+
+        let state = tempfile::tempdir().unwrap();
+        let volume = CasVolume::with_parts(
+            state.path(),
+            4 << 30,
+            HostOs::MacOs,
+            Box::new(hung),
+            sensitive,
+        )
+        .unwrap();
+        for attempt in 0..2 {
+            let error = volume.provision().unwrap_err();
+            assert!(
+                matches!(error, CasVolumeError::Timeout { .. }),
+                "attempt {attempt}: {error}"
+            );
+        }
+        assert_eq!(Hdiutil::default().timeout, DEFAULT_TOOL_TIMEOUT);
+        assert_eq!(
+            Hdiutil::with_timeout(Duration::from_secs(7)).timeout,
+            Duration::from_secs(7)
+        );
+    }
+
+    /// A tool that writes more than a pipe holds before exiting is not
+    /// deadlocked by its own output, and its output is returned.
+    #[test]
+    fn a_chatty_tool_is_drained_while_it_runs() {
+        let scratch = tempfile::tempdir().unwrap();
+        let chatty = Hdiutil {
+            program: script(
+                scratch.path(),
+                "hdiutil-chatty",
+                "head -c 200000 /dev/zero | tr '\\0' a; head -c 200000 /dev/zero | tr '\\0' b >&2",
+            ),
+            timeout: Duration::from_secs(20),
+        };
+        let out = chatty.output(&["info".as_ref()]).unwrap();
+        assert_eq!(out.len(), 200_000);
+    }
+
+    /// Bead ley-line-open-167b29 (2): a crash between `hdiutil create` and
+    /// the rename leaves `partial-<pid>.sparsebundle`. Provisioning removes
+    /// every one whose process is gone, and leaves a live provider's alone.
+    #[test]
+    fn stale_partial_bundles_are_removed_and_live_ones_kept() {
+        let state = tempfile::tempdir().unwrap();
+        let base = state.path().join("cas-volume");
+        fs::create_dir_all(&base).unwrap();
+        let mut exited = Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        let live = std::os::unix::process::parent_id();
+        for pid in [dead, live] {
+            let partial = base.join(format!("partial-{pid}.sparsebundle"));
+            fs::create_dir(&partial).unwrap();
+            fs::write(partial.join("Info.plist"), b"half made").unwrap();
+        }
+        fs::create_dir(base.join("partial-notapid.sparsebundle")).unwrap();
+        volume(state.path(), HostOs::MacOs, &Fake::default(), sensitive)
+            .provision()
+            .unwrap();
+        assert!(
+            !base.join(format!("partial-{dead}.sparsebundle")).exists(),
+            "a dead process's partial bundle is removed"
+        );
+        assert!(
+            base.join(format!("partial-{live}.sparsebundle")).exists(),
+            "a live process's partial bundle is left to it"
+        );
+        assert!(base.join("partial-notapid.sparsebundle").exists());
+    }
+
+    /// Bead ley-line-open-167b29 (3): a filesystem mounted at `mnt` that is
+    /// not `cas.sparsebundle` (another image, or no image at all) is refused,
+    /// whether it was already there or the attach produced it.
+    #[test]
+    fn a_mount_not_backed_by_the_cas_image_is_refused() {
+        for reported in [Some(PathBuf::from("/elsewhere/other.sparsebundle")), None] {
+            let state = tempfile::tempdir().unwrap();
+            let fake = Fake {
+                reports_image: Some(reported.clone()),
+                ..Fake::default()
+            };
+            let volume = volume(state.path(), HostOs::MacOs, &fake, sensitive);
+            let error = volume.provision().unwrap_err();
+            assert!(
+                matches!(&error, CasVolumeError::ForeignVolume { found, expected, .. }
+                    if *found == reported && expected.ends_with("cas-volume/cas.sparsebundle")),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("is not the CAS volume"),
+                "{error}"
+            );
+            // Already mounted (by someone else): refused before use.
+            fake.mounted.lock().insert(volume.layout().mountpoint);
+            assert!(matches!(
+                volume.attach_existing(),
+                Err(CasVolumeError::ForeignVolume { .. })
+            ));
+        }
+        // The image at the stable path is accepted, through a symlinked
+        // spelling of the state directory too.
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap();
+    }
+
+    #[test]
+    fn hdiutil_info_names_the_image_mounted_at_a_mountpoint() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mnt = scratch.path().join("mnt");
+        let other = scratch.path().join("other");
+        fs::create_dir(&mnt).unwrap();
+        fs::create_dir(&other).unwrap();
+        let info = format!(
+            "framework       : 710\n\
+             ================================================\n\
+             image-path      : /a/other.dmg\n\
+             /dev/disk4\tGUID_partition_scheme\t\n\
+             /dev/disk5s1\t41504653\t{}\n\
+             ================================================\n\
+             image-path      : /a/cas.sparsebundle\n\
+             image-alias     : /a/cas.sparsebundle\n\
+             /dev/disk6\tGUID_partition_scheme\t\n\
+             /dev/disk7s1\t41504653\t{}\n",
+            other.display(),
+            mnt.display()
+        );
+        assert_eq!(
+            attached_image_in_info(&info, &mnt),
+            Some(PathBuf::from("/a/cas.sparsebundle"))
+        );
+        assert_eq!(
+            attached_image_in_info(&info, &other),
+            Some(PathBuf::from("/a/other.dmg"))
+        );
+        assert_eq!(attached_image_in_info(&info, scratch.path()), None);
+        assert_eq!(
+            attached_image_in_info(&info, &scratch.path().join("gone")),
+            None
+        );
+        assert_eq!(attached_image_in_info("", &mnt), None);
+    }
+
+    #[test]
+    fn a_tool_that_cannot_name_its_image_refuses() {
+        struct Mute;
+        impl DiskImages for Mute {
+            fn create(&self, _: &Path, _: u64) -> Result<(), CasVolumeError> {
+                Ok(())
+            }
+            fn attach(&self, _: &Path, _: &Path) -> Result<(), CasVolumeError> {
+                Ok(())
+            }
+            fn detach(&self, _: &Path) -> Result<(), CasVolumeError> {
+                Ok(())
+            }
+            fn is_mounted(&self, _: &Path) -> Result<bool, CasVolumeError> {
+                Ok(true)
+            }
+        }
+        assert!(matches!(
+            Mute.attached_image(Path::new("/m")),
+            Err(CasVolumeError::Config(detail)) if detail.contains("cannot say")
+        ));
     }
 
     fn sensitive(_: &Path) -> io::Result<FilesystemSensitivity> {
@@ -938,7 +1355,10 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-            Hdiutil { program }
+            Hdiutil {
+                program,
+                timeout: DEFAULT_TOOL_TIMEOUT,
+            }
         };
         let ok = tool(0);
         ok.create(Path::new("/b.sparsebundle"), 2 << 30).unwrap();
@@ -966,6 +1386,7 @@ mod tests {
         }
         let missing = Hdiutil {
             program: scratch.path().join("absent"),
+            timeout: DEFAULT_TOOL_TIMEOUT,
         };
         assert!(matches!(
             missing.detach(Path::new("/m")),

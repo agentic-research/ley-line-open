@@ -1,0 +1,209 @@
+{
+  "version": "cloister/confinement/v1",
+  "description": "confinement/v1 README §6 `guestPort`: a §6 grant presented to a guest workload as TCP on the guest's loopback (ADR-0046 Q7, ley-line-open-be3711). `cases` pin canonicalization and confinementDigest; every `rejects` input is refused by the parser, and by the schema where `schemaRefuses` is true.",
+  "cases": [
+    {
+      "name": "connect-guest-port",
+      "description": "Dial: the workload connects to 127.0.0.1:13306 and reaches the peer listening at the path. `mode: connect` is spelled as an object only beside a guestPort.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect",
+              "guestPort": 13306
+            }
+          ]
+        }
+      },
+      "canonical": "{\n  \"unixSocket\": {\n    \"allow\": [\n      {\n        \"guestPort\": 13306,\n        \"mode\": \"connect\",\n        \"path\": \"/run/llo/conn/db.sock\"\n      }\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:cd59b7fccedae8f290e8ac92f8781e784a2731f9cefe8c866230ae3dada8bdd1"
+    },
+    {
+      "name": "bind-guest-port",
+      "description": "Serve: a host peer connecting to the path reaches the workload's listener on 127.0.0.1:8080.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "guestPort": 8080,
+              "path": "/run/llo/conn/api.sock",
+              "mode": "bind"
+            }
+          ]
+        }
+      },
+      "canonical": "{\n  \"unixSocket\": {\n    \"allow\": [\n      {\n        \"guestPort\": 8080,\n        \"mode\": \"bind\",\n        \"path\": \"/run/llo/conn/api.sock\"\n      }\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:079b4220a275e25bc0ab69eedda8ce82f7e744b8a02f4f286e6e2d689552759c"
+    },
+    {
+      "name": "dial-and-serve-keep-document-order",
+      "description": "Both directions. §6 grants are not sorted: their order is part of the document, as the microVM tier's vsock ports derive from it.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect",
+              "guestPort": 13306
+            },
+            {
+              "path": "/run/llo/conn/api.sock",
+              "mode": "bind",
+              "guestPort": 8080
+            }
+          ]
+        }
+      },
+      "canonical": "{\n  \"unixSocket\": {\n    \"allow\": [\n      {\n        \"guestPort\": 13306,\n        \"mode\": \"connect\",\n        \"path\": \"/run/llo/conn/db.sock\"\n      },\n      {\n        \"guestPort\": 8080,\n        \"mode\": \"bind\",\n        \"path\": \"/run/llo/conn/api.sock\"\n      }\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:21b4ba470a6804949d80ac42e448a12bfa7bef289706e101a64546a848f0bf8c"
+    },
+    {
+      "name": "no-guest-port-is-unchanged",
+      "description": "The same two grants without guestPort: the bare string and the bind object, exactly as before the extension.",
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            "/run/llo/conn/db.sock",
+            {
+              "path": "/run/llo/conn/api.sock",
+              "mode": "bind"
+            }
+          ]
+        }
+      },
+      "canonical": "{\n  \"unixSocket\": {\n    \"allow\": [\n      \"/run/llo/conn/db.sock\",\n      {\n        \"mode\": \"bind\",\n        \"path\": \"/run/llo/conn/api.sock\"\n      }\n    ]\n  },\n  \"version\": \"cloister/confinement/v1\"\n}",
+      "confinementDigest": "blake3-256:993bedb680ea912c51f8b29c4269f482af465e3341f9b7b028c6e54eba3a309f"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "connect-bind-with-guest-port",
+      "description": "One guest port cannot be both the presentation's listener and the workload's.",
+      "schemaRefuses": true,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect-bind",
+              "guestPort": 13306
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "connect-object-without-guest-port",
+      "description": "A connect grant without a guestPort is the bare string, and only the bare string.",
+      "schemaRefuses": true,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "guest-port-zero",
+      "description": "0 is not an address a workload can dial or serve on.",
+      "schemaRefuses": true,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect",
+              "guestPort": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "guest-port-out-of-range",
+      "description": "A TCP port is 16 bits.",
+      "schemaRefuses": true,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/api.sock",
+              "mode": "bind",
+              "guestPort": 65536
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "guest-port-not-an-integer",
+      "description": "An address string is not a port.",
+      "schemaRefuses": true,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect",
+              "guestPort": "127.0.0.1:13306"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown-key",
+      "description": "A key the reader does not know is refused rather than dropped.",
+      "schemaRefuses": true,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect",
+              "guestPort": 13306,
+              "guestAddress": "127.0.0.2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "one-guest-port-twice",
+      "description": "Two grants presenting one guest port. JSON Schema cannot express it; the parser refuses it.",
+      "schemaRefuses": false,
+      "input": {
+        "version": "cloister/confinement/v1",
+        "unixSocket": {
+          "allow": [
+            {
+              "path": "/run/llo/conn/db.sock",
+              "mode": "connect",
+              "guestPort": 13306
+            },
+            {
+              "path": "/run/llo/conn/api.sock",
+              "mode": "bind",
+              "guestPort": 13306
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

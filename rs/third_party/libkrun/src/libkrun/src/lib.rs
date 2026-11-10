@@ -3026,7 +3026,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                 tsi_flags: *tsi_flags,
             };
-            ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
+            // Creating the device binds the host sockets of its listening
+            // mappings; one that cannot be bound refuses the VM here.
+            if let Err(e) = ctx_cfg.vmr.set_vsock_device(vsock_device_config) {
+                error!("Error configuring vsock: {e:?}");
+                return -libc::EADDRNOTAVAIL;
+            }
         }
         VsockConfig::Implicit => {
             // Implicit vsock configuration - use heuristics
@@ -3052,7 +3057,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                     unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                     tsi_flags,
                 };
-                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
+                if let Err(e) = ctx_cfg.vmr.set_vsock_device(vsock_device_config) {
+                    error!("Error configuring vsock: {e:?}");
+                    return -libc::EADDRNOTAVAIL;
+                }
             }
         }
     }

@@ -385,6 +385,7 @@ pub fn capabilities_from_manifest(
 
     for grant in unix_sockets {
         let path = grant.path();
+        refuse_guest_port_off_the_guest_tier(tier, grant)?;
         let mode = match tier {
             Tier::Native => unix_socket_mode(grant)?,
             Tier::MicroVm => vmm_unix_socket_mode(grant),
@@ -981,6 +982,18 @@ pub fn vsock_unix_mappings(
                  is up."
             )));
         }
+        // A path the host cannot bind or dial is a channel that cannot exist.
+        // libkrun used to find that out inside a running guest and log it
+        // (bead ley-line-open-bb2143); refused here, by name, it never
+        // reaches a VMM.
+        if path.len() > SUN_PATH_MAX {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 unixSocket.allow {path:?} (grant {index}) is {} bytes, \
+                 and a UNIX socket address holds at most {SUN_PATH_MAX} on this host, so \
+                 the channel could never be bound or dialed. Declare a shorter path.",
+                path.len()
+            )));
+        }
         let host_path = std::ffi::CString::new(path)
             .map_err(|_| ExecutionError::invalid("§6 socket path contains a NUL byte"))?;
         let base = VSOCK_UNIX_BASE_PORT + 2 * index as u32;
@@ -1000,6 +1013,221 @@ pub fn vsock_unix_mappings(
         }
     }
     Ok(mappings)
+}
+
+/// The longest path a UNIX socket address carries on this host: `sun_path`
+/// less its terminating NUL (104 bytes on macOS and the BSDs, 108 on Linux).
+pub const SUN_PATH_MAX: usize = if cfg!(target_os = "linux") {
+    107
+} else {
+    103
+};
+
+/// Refuse a §6 `guestPort` on a tier whose workload is not in a guest.
+///
+/// On the native tier the workload is the confined process and dials the
+/// socket itself; there is no guest loopback to present the channel on, so
+/// the clause would compile to nothing while the digest committed to it
+/// (§9 condition 6).
+fn refuse_guest_port_off_the_guest_tier(
+    tier: Tier,
+    grant: &UnixSocketGrant,
+) -> Result<(), ExecutionError> {
+    match (tier, grant.guest_port()) {
+        (Tier::Native, Some(port)) => Err(ExecutionError::invalid(format!(
+            "confinement/v1 §6 guestPort {port} on {:?} is a guest-loopback \
+             presentation, and the native tier's workload is not in a guest: it \
+             dials the socket itself. Drop guestPort, or run on the microVM tier.",
+            grant.path()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Which way a guest-loopback channel carries the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopbackDirection {
+    /// The workload connects to `127.0.0.1:<guest port>`; the guest init
+    /// joins the connection to the grant's dial vsock port.
+    Dial,
+    /// The host peer connects to the grant's socket; the guest init joins the
+    /// connection, arriving on the grant's serve vsock port, to the
+    /// workload's listener on `127.0.0.1:<guest port>`.
+    Serve,
+}
+
+/// One §6 grant presented to the guest workload as TCP on its loopback
+/// (ADR-0046 Q7, bead `ley-line-open-be3711`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackChannel {
+    pub direction: LoopbackDirection,
+    pub guest_port: u16,
+    pub vsock_port: u32,
+}
+
+/// The most channels the guest init presents (`LOOPBACK_CHANNELS_MAX` in
+/// LLO libkrun patch 0010).
+pub const LOOPBACK_CHANNELS_MAX: usize = 64;
+
+/// The guest init's channel list (LLO libkrun patch 0010). The worker sets it
+/// from [`guest_loopback_channels`], and a workload may not.
+pub const LOOPBACK_CHANNELS_ENV: &str = "KRUN_LOOPBACK_CHANNELS";
+
+/// Every channel the guest sees on its loopback, as a pure function of the
+/// attested document: grant `i` with a `guestPort` is presented on that port,
+/// joined to the vsock port [`vsock_unix_mappings`] gives the same grant
+/// (`BASE + 2i` to dial, `BASE + 2i + 1` to serve). Nothing here is chosen:
+/// the guest port is the issuer's and the vsock port is the document's order,
+/// so the issuer computes the whole guest-visible set from what it signed.
+///
+/// Refused when it cannot be delivered as declared:
+///
+/// - with socket hijacking on (`tsi_features != 0`), the guest's `AF_INET`
+///   sockets are carried to the host, so the guest loopback is no longer the
+///   guest's alone and the init's listener would be published or refused by
+///   the port map instead of serving the workload;
+/// - on a platform where the presentation has not been run live (`os` is
+///   `std::env::consts::OS`; macOS only, bead `ley-line-open-be3711`);
+/// - beyond [`LOOPBACK_CHANNELS_MAX`] channels, which the init refuses.
+pub fn guest_loopback_channels(
+    manifest: &ConfinementManifest,
+    tsi_features: u32,
+    os: &str,
+) -> Result<Vec<LoopbackChannel>, ExecutionError> {
+    let mut channels = Vec::new();
+    for (index, grant) in manifest.dimensions().unix_sockets.iter().enumerate() {
+        let Some(guest_port) = grant.guest_port() else {
+            continue;
+        };
+        let base = VSOCK_UNIX_BASE_PORT + 2 * index as u32;
+        let (direction, vsock_port) = match grant {
+            UnixSocketGrant::Connect { .. } => (LoopbackDirection::Dial, base),
+            UnixSocketGrant::Bind { .. } => (LoopbackDirection::Serve, base + 1),
+            UnixSocketGrant::ConnectBind { path } => {
+                return Err(ExecutionError::invalid(format!(
+                    "confinement/v1 §6 connect-bind grant {path:?} carries a guestPort, \
+                     which the manifest builder refuses"
+                )));
+            }
+        };
+        channels.push(LoopbackChannel {
+            direction,
+            guest_port,
+            vsock_port,
+        });
+    }
+    if channels.is_empty() {
+        return Ok(channels);
+    }
+    let ports: Vec<u16> = channels.iter().map(|channel| channel.guest_port).collect();
+    if tsi_features != 0 {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1 §6 guestPort {ports:?} is not deliverable with socket \
+             hijacking (--tsi-hijack-inet): hijacking carries the guest's AF_INET \
+             sockets to the host, so the guest loopback is not the guest's alone and \
+             the presentation would be published or refused by the port map. Run \
+             without hijacking, which is the capability-shaped default."
+        )));
+    }
+    if os != "macos" {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1 §6 guestPort {ports:?} is not deliverable on {os}: the \
+             guest-loopback presentation has run live on macOS/HVF only, and this \
+             tier refuses it elsewhere rather than attest a channel no run has \
+             shown (bead ley-line-open-be3711)."
+        )));
+    }
+    if channels.len() > LOOPBACK_CHANNELS_MAX {
+        return Err(ExecutionError::invalid(format!(
+            "confinement/v1 §6 declares {} guest-loopback channels; the guest init \
+             presents at most {LOOPBACK_CHANNELS_MAX}",
+            channels.len()
+        )));
+    }
+    Ok(channels)
+}
+
+/// The guest init's `KRUN_LOOPBACK_CHANNELS` entry for `channels`, or `None`
+/// when there are none: `dial:<guest port>:<vsock port>` and
+/// `serve:<guest port>:<vsock port>`, comma-separated, in document order.
+pub fn loopback_channels_env(channels: &[LoopbackChannel]) -> Option<std::ffi::CString> {
+    if channels.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = channels
+        .iter()
+        .map(|channel| {
+            let direction = match channel.direction {
+                LoopbackDirection::Dial => "dial",
+                LoopbackDirection::Serve => "serve",
+            };
+            format!("{direction}:{}:{}", channel.guest_port, channel.vsock_port)
+        })
+        .collect();
+    Some(
+        std::ffi::CString::new(format!("{LOOPBACK_CHANNELS_ENV}={}", list.join(",")))
+            .expect("ports and fixed words have no NUL"),
+    )
+}
+
+/// Check that every channel's host end can exist before the VMM is asked to
+/// build it, and refuse the run naming the grant otherwise (invariant I4,
+/// bead `ley-line-open-bb2143`).
+///
+/// A serve mapping's socket is created by the VMM: its directory must exist,
+/// nothing may already be at the path, and a trial bind there must succeed
+/// (it is removed at once). A dial mapping's socket must be one a peer has
+/// bound. Run before the worker confines itself, so the trial bind is not
+/// itself filtered; LLO libkrun patch 0011 refuses the VM if the VMM's own
+/// bind then fails.
+pub fn check_channel_host_ends(mappings: &[VsockUnixMapping]) -> Result<(), ExecutionError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+    for mapping in mappings {
+        let path = Path::new(std::ffi::OsStr::from_bytes(mapping.host_path.as_bytes()));
+        let refuse = |why: String| {
+            Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 unixSocket.allow {} (vsock port {}) cannot be \
+                 delivered: {why}. The run is refused rather than started without \
+                 a declared channel.",
+                path.display(),
+                mapping.port
+            )))
+        };
+        if mapping.listen {
+            match path.parent().map(Path::is_dir) {
+                Some(true) => {}
+                _ => return refuse("its directory does not exist".into()),
+            }
+            if path.symlink_metadata().is_ok() {
+                return refuse("something already exists at the path".into());
+            }
+            match std::os::unix::net::UnixListener::bind(path) {
+                Ok(listener) => {
+                    drop(listener);
+                    std::fs::remove_file(path).map_err(|error| {
+                        ExecutionError::backend(format!(
+                            "remove the trial socket at {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                }
+                Err(error) => return refuse(format!("a trial bind failed: {error}")),
+            }
+        } else if !mappings
+            .iter()
+            .any(|other| other.listen && other.host_path == mapping.host_path)
+        {
+            // A connect-bind grant dials the socket its own serve mapping
+            // creates, so only a dial with no serve half needs a peer.
+            match path.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_socket() => {}
+                Ok(_) => return refuse("the path is not a socket".into()),
+                Err(error) => return refuse(format!("nothing is bound there: {error}")),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn nono_error(error: nono::NonoError) -> ExecutionError {
@@ -1421,5 +1649,213 @@ mod tests {
         // On the native tier the confined process is the workload, whose
         // profile is not this projection.
         assert!(creates(UnixSocketGrant::connect_bind(&socket), Tier::Native).is_empty());
+    }
+
+    // ADR-0046 Q7 (bead ley-line-open-be3711): the guest-loopback
+    // presentation, as pure functions of the attested document.
+
+    fn presented(grants: Vec<UnixSocketGrant>) -> ConfinementManifest {
+        grants
+            .into_iter()
+            .try_fold(ConfinementManifest::new(), |manifest, grant| {
+                manifest.with_unix_socket(grant)
+            })
+            .expect("a well-formed document")
+    }
+
+    fn dial(path: &str, port: u16) -> UnixSocketGrant {
+        UnixSocketGrant::connect(path).with_guest_port(port).unwrap()
+    }
+
+    fn serve(path: &str, port: u16) -> UnixSocketGrant {
+        UnixSocketGrant::bind(path).with_guest_port(port).unwrap()
+    }
+
+    /// Acceptance test 6: the guest-visible set is computed without a VMM,
+    /// from the document alone. Grant `i` keeps the vsock pair `BASE + 2i`
+    /// whether or not it is presented, so a grant without a guest port still
+    /// occupies its index, and the presented ones keep document order.
+    #[test]
+    fn the_guest_visible_set_is_a_pure_function_of_the_document() {
+        let manifest = presented(vec![
+            dial("/run/c/db.sock", 13306),
+            UnixSocketGrant::connect("/run/c/raw.sock"),
+            serve("/run/c/api.sock", 8080),
+        ]);
+        let channels = guest_loopback_channels(&manifest, 0, "macos").unwrap();
+        assert_eq!(
+            channels,
+            vec![
+                LoopbackChannel {
+                    direction: LoopbackDirection::Dial,
+                    guest_port: 13306,
+                    vsock_port: VSOCK_UNIX_BASE_PORT,
+                },
+                LoopbackChannel {
+                    direction: LoopbackDirection::Serve,
+                    guest_port: 8080,
+                    vsock_port: VSOCK_UNIX_BASE_PORT + 2 * 2 + 1,
+                },
+            ]
+        );
+        assert_eq!(
+            loopback_channels_env(&channels).unwrap().to_str().unwrap(),
+            "KRUN_LOOPBACK_CHANNELS=dial:13306:65536,serve:8080:65541"
+        );
+        // Each channel names a vsock port the same document maps, in the
+        // direction it is presented.
+        // (The dial grants name a short path that exists, which the mapping's
+        // own ordering check requires; the indices are what is compared.)
+        let mappings = vsock_unix_mappings(&presented(vec![
+            dial("/dev/null", 13306),
+            UnixSocketGrant::connect("/dev/null"),
+            serve("/run/c/api.sock", 8080),
+        ]))
+        .unwrap();
+        for channel in &channels {
+            let mapping = mappings
+                .iter()
+                .find(|mapping| mapping.port == channel.vsock_port)
+                .expect("every channel rides a mapped vsock port");
+            assert_eq!(
+                mapping.listen,
+                channel.direction == LoopbackDirection::Serve
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_presented_is_nothing_in_the_guest() {
+        let manifest = presented(vec![UnixSocketGrant::connect("/run/c/raw.sock")]);
+        // Not even refused under hijacking or off macOS: there is nothing to
+        // present, so nothing to refuse.
+        for (tsi, os) in [(0, "macos"), (1, "macos"), (0, "linux")] {
+            let channels = guest_loopback_channels(&manifest, tsi, os).unwrap();
+            assert!(channels.is_empty());
+            assert!(loopback_channels_env(&channels).is_none());
+        }
+        assert!(
+            guest_loopback_channels(&ConfinementManifest::new(), 0, "macos")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_presentation_is_refused_under_socket_hijacking() {
+        let manifest = presented(vec![dial("/run/c/db.sock", 13306)]);
+        let error = guest_loopback_channels(&manifest, super::super::plan::KRUN_TSI_HIJACK_INET, "macos").unwrap_err();
+        assert!(error.detail.contains("hijack"), "{error}");
+        assert!(error.detail.contains("13306"), "{error}");
+    }
+
+    /// Acceptance test 8: off macOS the presentation is refused by name.
+    #[test]
+    fn a_presentation_is_refused_by_name_off_macos() {
+        let manifest = presented(vec![serve("/run/c/api.sock", 8080)]);
+        for os in ["linux", "freebsd"] {
+            let error = guest_loopback_channels(&manifest, 0, os).unwrap_err();
+            assert!(error.detail.contains(os), "{error}");
+            assert!(error.detail.contains("8080"), "{error}");
+        }
+        assert!(guest_loopback_channels(&manifest, 0, "macos").is_ok());
+    }
+
+    #[test]
+    fn more_channels_than_the_init_presents_are_refused() {
+        let grants = |count: usize| {
+            (0..count)
+                .map(|index| dial(&format!("/run/c/{index}.sock"), 10_000 + index as u16))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            guest_loopback_channels(&presented(grants(LOOPBACK_CHANNELS_MAX)), 0, "macos")
+                .unwrap()
+                .len(),
+            LOOPBACK_CHANNELS_MAX
+        );
+        let error =
+            guest_loopback_channels(&presented(grants(LOOPBACK_CHANNELS_MAX + 1)), 0, "macos")
+                .unwrap_err();
+        assert!(error.detail.contains("at most"), "{error}");
+    }
+
+    #[test]
+    fn the_native_tier_refuses_a_guest_port_by_name() {
+        let error =
+            refuse_guest_port_off_the_guest_tier(Tier::Native, &dial("/run/c/db.sock", 13306))
+                .unwrap_err();
+        assert!(error.detail.contains("13306") && error.detail.contains("native"));
+        assert!(
+            refuse_guest_port_off_the_guest_tier(Tier::MicroVm, &dial("/run/c/db.sock", 13306))
+                .is_ok()
+        );
+        assert!(
+            refuse_guest_port_off_the_guest_tier(
+                Tier::Native,
+                &UnixSocketGrant::connect("/run/c/db.sock")
+            )
+            .is_ok()
+        );
+    }
+
+    /// Bead ley-line-open-bb2143: a path no UNIX socket address can carry is
+    /// refused before any VMM, naming it.
+    #[test]
+    fn a_socket_path_longer_than_sun_path_is_refused_by_name() {
+        let fits = format!("/{}", "s".repeat(SUN_PATH_MAX - 1));
+        assert_eq!(fits.len(), SUN_PATH_MAX);
+        assert!(vsock_unix_mappings(&presented(vec![UnixSocketGrant::bind(&fits)])).is_ok());
+        let long = format!("/{}", "s".repeat(SUN_PATH_MAX));
+        for grant in [
+            UnixSocketGrant::bind(&long),
+            UnixSocketGrant::connect_bind(&long),
+        ] {
+            let error = vsock_unix_mappings(&presented(vec![grant])).unwrap_err();
+            assert!(error.detail.contains(&long), "{error}");
+            assert!(error.detail.contains("grant 0"), "{error}");
+        }
+    }
+
+    fn mapping(path: &std::path::Path, port: u32, listen: bool) -> VsockUnixMapping {
+        VsockUnixMapping {
+            port,
+            host_path: std::ffi::CString::new(path.display().to_string()).unwrap(),
+            listen,
+        }
+    }
+
+    #[test]
+    fn a_channel_host_end_that_cannot_exist_refuses_the_run() {
+        let directory = tempfile::tempdir().unwrap();
+        // macOS temp paths are long; keep the sockets inside sun_path.
+        let root = directory.path().canonicalize().unwrap();
+
+        // Serve: the VMM will bind, so the trial bind must succeed and leave
+        // nothing behind.
+        let served = root.join("s.sock");
+        check_channel_host_ends(&[mapping(&served, 1, true)]).unwrap();
+        assert!(!served.exists(), "the trial bind left its socket behind");
+
+        // Serve, refused: a missing directory, and an occupied path.
+        let error = check_channel_host_ends(&[mapping(&root.join("missing/s.sock"), 1, true)])
+            .unwrap_err();
+        assert!(error.detail.contains("directory"), "{error}");
+        std::fs::write(&served, b"").unwrap();
+        let error = check_channel_host_ends(&[mapping(&served, 1, true)]).unwrap_err();
+        assert!(error.detail.contains("already exists"), "{error}");
+
+        // Dial: a peer's socket is required, and a plain file is not one.
+        let error = check_channel_host_ends(&[mapping(&served, 2, false)]).unwrap_err();
+        assert!(error.detail.contains("not a socket"), "{error}");
+        let peer_path = root.join("p.sock");
+        let error = check_channel_host_ends(&[mapping(&peer_path, 2, false)]).unwrap_err();
+        assert!(error.detail.contains("nothing is bound"), "{error}");
+        let _peer = std::os::unix::net::UnixListener::bind(&peer_path).unwrap();
+        check_channel_host_ends(&[mapping(&peer_path, 2, false)]).unwrap();
+
+        // connect-bind dials the socket its own serve half creates.
+        let both = root.join("b.sock");
+        check_channel_host_ends(&[mapping(&both, 2, false), mapping(&both, 3, true)]).unwrap();
     }
 }

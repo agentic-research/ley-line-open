@@ -659,7 +659,9 @@ pub struct UnixAcceptorProxy {
 }
 
 impl UnixAcceptorProxy {
-    pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
+    /// Bind and listen on the host socket at `path`, the host end of a
+    /// listening port mapping.
+    pub fn bind_listener(path: &PathBuf) -> Result<OwnedFd, ProxyError> {
         let fd = socket(
             AddressFamily::Unix,
             SockType::Stream,
@@ -674,7 +676,12 @@ impl UnixAcceptorProxy {
         .map_err(ProxyError::CreatingSocket)?;
         listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
             .map_err(ProxyError::CreatingSocket)?;
-        Ok(UnixAcceptorProxy { id, fd, peer_port })
+        Ok(fd)
+    }
+
+    /// The acceptor for a host socket [`Self::bind_listener`] already bound.
+    pub fn from_listener(id: u64, fd: OwnedFd, peer_port: u32) -> Self {
+        UnixAcceptorProxy { id, fd, peer_port }
     }
 }
 

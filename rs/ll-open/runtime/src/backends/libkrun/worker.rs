@@ -13,7 +13,9 @@ use crate::{ExecutionError, ExecutionRequest, WorkerChannel};
 use serde::{Deserialize, Serialize};
 
 use super::confinement::{
-    VmmHostResources, apply_manifest, confinement_manifest, guest_port_map, vsock_unix_mappings,
+    LOOPBACK_CHANNELS_ENV, VmmHostResources, apply_manifest, check_channel_host_ends,
+    confinement_manifest, guest_loopback_channels, guest_port_map, loopback_channels_env,
+    vsock_unix_mappings,
 };
 use super::plan::{DirectoryRootfsResolver, KRUN_TSI_HIJACK_INET, KrunConfig, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
@@ -33,13 +35,34 @@ pub const WORKSPACE_DIR: &str = "/work";
 /// `tag:directory` pairs init mounts as virtio-fs before the workload runs.
 pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
 
-/// Refuse a workload environment that names the guest init's mount list:
-/// which shares the guest mounts, and where, is the worker's decision.
+/// Refuse a workload environment that names the guest init's mount list or
+/// its loopback channels: which shares the guest mounts, and which declared
+/// connections it presents where, are the worker's decision, taken from the
+/// attested document.
+///
+/// Also refused: a double quote anywhere in a key or value. libkrun hands the
+/// environment to the guest on the kernel command line, each entry quoted, so
+/// a quote in a value ends the entry and whatever follows becomes a separate
+/// kernel parameter or init variable. That would let a request set the very
+/// variables named here (and kernel parameters) without naming them as keys.
 fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), ExecutionError> {
-    if request.public_environment.contains_key(VIRTIOFS_MOUNTS_ENV) {
+    for reserved in [VIRTIOFS_MOUNTS_ENV, LOOPBACK_CHANNELS_ENV] {
+        if request.public_environment.contains_key(reserved) {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment may not set {reserved}: the worker sets it from the \
+                 attested confinement document"
+            )));
+        }
+    }
+    if let Some((key, _)) = request
+        .public_environment
+        .iter()
+        .find(|(key, value)| key.contains('"') || value.contains('"'))
+    {
         return Err(ExecutionError::invalid(format!(
-            "publicEnvironment may not set {VIRTIOFS_MOUNTS_ENV}: the worker sets the \
-             guest's virtio-fs mounts"
+            "publicEnvironment entry {key:?} contains a double quote, which would end its \
+             entry on the guest kernel command line and start another; the microVM tier \
+             refuses it"
         )));
     }
     Ok(())
@@ -543,6 +566,26 @@ pub fn prepare(
     // the issuer can compute every port from the document they signed.
     config.vsock_unix_map = vsock_unix_mappings(&manifest)?;
 
+    // ADR-0046 Q7: the grants carrying a `guestPort` are presented to the
+    // workload as TCP on the guest's loopback, by the guest init (LLO libkrun
+    // patch 0010). The list is a pure function of the same attested document
+    // (`guest_loopback_channels`), handed to init in a variable the request
+    // cannot set (`refuse_reserved_environment`), so the guest-visible set is
+    // exactly what the digest below commits to.
+    let channels = guest_loopback_channels(
+        &manifest,
+        config.tsi_features,
+        std::env::consts::OS,
+    )?;
+    if let Some(variable) = loopback_channels_env(&channels) {
+        config.environment.push(variable);
+    }
+
+    // Every declared channel's host end can exist, or the run is refused
+    // naming it, before the process confines itself and long before the VMM
+    // (invariant I4; bead ley-line-open-bb2143).
+    check_channel_host_ends(&config.vsock_unix_map)?;
+
     apply_manifest(&manifest, &config.rootfs.canonical_path)?;
 
     Ok(PreparedRun {
@@ -665,6 +708,39 @@ mod tests {
         let error = refuse_reserved_environment(&request).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidSpec);
         assert!(error.detail.contains(VIRTIOFS_MOUNTS_ENV), "{error}");
+    }
+
+    /// Invariant I3 (bead ley-line-open-be3711): the request cannot name a
+    /// loopback channel, directly or by smuggling one onto the guest kernel
+    /// command line through a quote.
+    #[test]
+    fn a_workload_cannot_set_the_guest_inits_loopback_channels() {
+        let mut named = request();
+        named
+            .public_environment
+            .insert(LOOPBACK_CHANNELS_ENV.into(), "dial:80:65536".into());
+        let error = refuse_reserved_environment(&named).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains(LOOPBACK_CHANNELS_ENV), "{error}");
+
+        for (key, value) in [
+            ("DB_ADDR", "x\" KRUN_LOOPBACK_CHANNELS=\"dial:80:65536"),
+            ("A\" tsi_hijack \"B", "1"),
+        ] {
+            let mut smuggled = request();
+            smuggled.public_environment.insert(key.into(), value.into());
+            let error = refuse_reserved_environment(&smuggled).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidSpec);
+            assert!(error.detail.contains("double quote"), "{error}");
+        }
+
+        // An ordinary address is the workload's own configuration, not
+        // authority: it passes, and reaches only what a grant presents.
+        let mut address = request();
+        address
+            .public_environment
+            .insert("DB_ADDR".into(), "127.0.0.1:13306".into());
+        assert!(refuse_reserved_environment(&address).is_ok());
     }
 
     #[test]

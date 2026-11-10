@@ -393,8 +393,27 @@ Fail-closed rules, in one place:
   (one path; plaintext at the broker for HTTP too). Needs a vault operation cloister would
   define.
 - **Q6. Pingora or hyper.** D6 recommends hyper, with the spike as the closing test.
-- **Q7. The microVM guest relay.** Accept that LLO's guest init grows a loopback→vsock relay
-  so unmodified TCP clients work on the microVM tier, or require workloads to dial sockets.
+- **Q7. The microVM guest relay. DECIDED (owner, 2026-11-10; record and invariants I1–I9
+  on `ley-line-open-e2c5ce`; implemented by `ley-line-open-be3711`).** The rule is default
+  deny wherever it is safe: an undeclared path must not exist, rather than be filtered.
+  - LLO's guest init (libkrun patch 0010) presents each declared connection to an
+    unmodified workload as TCP on the guest's loopback, in both directions. Dial: the
+    workload connects to `127.0.0.1:N` and reaches exactly its declared peer. Serve: the
+    workload listens on its declared port, and only the declared peer, through the §6
+    socket, reaches it. Init binds every dial port before the workload starts, so loopback
+    first-binder semantics confer nothing.
+  - The connection-to-guest-address mapping is computed by the emitter and committed in
+    the attested digest: confinement/v1 §6 `guestPort` (additive within v1). The worker and
+    the guest derive nothing; the worker projects the document into the init's channel list,
+    which a request cannot set.
+  - VM-to-VM is two host-side channels (VM A's serve, VM B's dial) joined on the host. No
+    guest-to-guest path exists.
+  - UDP is denied in the guest: init refuses every datagram, raw and packet socket with a
+    seccomp filter every guest process inherits.
+  - TSI hijack stays off. It is an operator-only downgrade, and a `guestPort` under it is
+    refused by name. Off macOS the presentation is refused by name until it runs live there.
+  - The relay copies bytes only (no `SCM_RIGHTS`, no protocol awareness, no credential);
+    D3 and D4 are out of its scope.
 - **Q8. Endpoint allocation.** Cloister allocates socket paths (ADR-0069 §2), but the issuer
   must predict them for the digest (ADR-0036 equality contract), so a path cannot contain
   the run id. Either a deployment-configured broker root plus bundle and connection name
@@ -424,6 +443,8 @@ Fail-closed rules, in one place:
   schema-spec crate tests. Filed as `ley-line-open-e9d940`, blocked on this ADR (Q2–Q5, Q8).
 - Broker spike (D6 exit criteria).
 - LLO-internal broker confinement profile (D1).
-- Guest-side loopback→vsock relay (Q7).
+- Guest-side loopback relay (Q7): done in `ley-line-open-be3711` (libkrun patches 0010 and
+  0011, confinement/v1 §6 `guestPort`). Cloister's emitter allocates and emits `guestPort`
+  (cloister bead filed with that change). The host-side join for VM-to-VM edges is not built.
 - Runtime wiring: spawn before confinement, failed-start coverage, teardown.
 - Cross-document check (D2) and the `connectionsDigest` field (Q3).

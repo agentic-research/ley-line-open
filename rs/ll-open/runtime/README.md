@@ -80,6 +80,8 @@ Every guest row also puts `krunvm`, `task` and `go-task` traps first on `PATH` a
 
 Beside the matrix, `krun-worker/tests/libkrun_oci_rootfs.rs` (bead `ley-line-open-68a55d`) boots a rootfs produced by `import_oci_layout` (`leyline rootfs import-oci`): a static guest packed into a two-layer OCI image is imported, resolved by a `CatalogResolver` from its executable artifact, started through `start_authorized` with the worker under test, and must print its marker on the guest console, exit 0, and get a receipt whose `inputRoots` names the imported digest. One byte changed in a file under that digest in the CAS is refused before the guest boots.
 
+`krun-worker/tests/libkrun_guest_connections.rs` (bead `ley-line-open-be3711`, ADR-0046 Q7) is the declared-connection suite: a §6 grant with `guestPort` reaches a stock `std::net` client and server in the guest as TCP on its loopback, in both directions. It holds the Q7 acceptance tests: dial-out to exactly the declared peer (and nothing once the grant is removed, with a different attested digest); serve reached by the declared peer only; a sweep of every guest loopback port and a set of host vsock ports that finds exactly the declared ones, which match `guest_loopback_channels` computed without a VMM, no route off the guest, and no undeclared VMM socket; a request that cannot widen reach; refusals by name before readiness (unbound peer, over-length socket path, hijacking, off macOS); teardown on cancel; guest datagram sockets refused under both boundaries; and a stability loop (`LEYLINE_CONNECTIONS_RUNS`, default 1) that reports boot stalls separately.
+
 Run it with `task runtime:test`, or one column at a time:
 
 ```sh

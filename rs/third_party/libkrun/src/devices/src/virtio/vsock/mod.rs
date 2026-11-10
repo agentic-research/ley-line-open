@@ -174,6 +174,8 @@ pub enum VsockError {
     UnwritableDescriptor,
     /// EventFd error
     EventFd(std::io::Error),
+    /// The host socket of a listening port mapping could not be bound.
+    ListeningSocket(std::path::PathBuf, String),
 }
 
 type Result<T> = std::result::Result<T, VsockError>;

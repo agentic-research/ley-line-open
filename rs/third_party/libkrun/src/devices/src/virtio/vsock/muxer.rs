@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -15,7 +16,7 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
-use super::unix::UnixProxy;
+use super::unix::{UnixAcceptorProxy, UnixProxy};
 use super::TsiFlags;
 use super::VsockError;
 use crossbeam_channel::{unbounded, Sender};
@@ -107,17 +108,36 @@ pub struct VsockMuxer {
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    /// The host sockets of the listening mappings, bound in `new` and served
+    /// once the device activates.
+    unix_ipc_listeners: Vec<(u32, OwnedFd)>,
     tsi_flags: TsiFlags,
 }
 
 impl VsockMuxer {
+    /// Bind every listening mapping's host socket now, before the guest
+    /// starts. The muxer thread used to bind them when the device activated,
+    /// inside a running guest, and only logged a socket it could not bind,
+    /// so a VM could run without a channel its embedder declared. A socket
+    /// that cannot be bound now fails the device, and with it the VM.
     pub(crate) fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
-    ) -> Self {
-        VsockMuxer {
+    ) -> Result<Self, VsockError> {
+        let mut unix_ipc_listeners = Vec::new();
+        for (port, (path, listen)) in unix_ipc_port_map.iter().flatten() {
+            if !listen {
+                continue;
+            }
+            let fd = UnixAcceptorProxy::bind_listener(path).map_err(|error| {
+                error!("Failed to create listening proxy at {path:?}: {error:?}");
+                VsockError::ListeningSocket(path.clone(), format!("{error:?}"))
+            })?;
+            unix_ipc_listeners.push((*port, fd));
+        }
+        Ok(VsockMuxer {
             cid,
             host_port_map,
             queue: None,
@@ -128,8 +148,9 @@ impl VsockMuxer {
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             reaper_sender: None,
             unix_ipc_port_map,
+            unix_ipc_listeners,
             tsi_flags,
-        }
+        })
     }
 
     pub(crate) fn activate(
@@ -160,7 +181,7 @@ impl VsockMuxer {
             queue,
             interrupt.clone(),
             sender.clone(),
-            self.unix_ipc_port_map.clone().unwrap_or_default(),
+            std::mem::take(&mut self.unix_ipc_listeners),
         );
         thread.run();
 

@@ -104,29 +104,94 @@ impl FsGrant {
 /// purely positive grants, but `Bind` carries a negative clause — MUST NOT dial
 /// — and a tier that cannot enforce that clause has to refuse the mode rather
 /// than widen it to `ConnectBind`. That is the §3/§5 rule, not a special case.
+///
+/// `guest_port` is README §6's `guestPort` (ADR-0046 Q7, bead
+/// `ley-line-open-be3711`): the TCP port on the guest's loopback where the
+/// microVM tier presents this channel to an unmodified workload. On a
+/// `Connect` grant the workload dials `127.0.0.1:<guestPort>` and reaches the
+/// socket's peer; on a `Bind` grant the socket's peer reaches the workload's
+/// listener on `127.0.0.1:<guestPort>`. The issuer chooses it and the digest
+/// commits to it; nothing downstream derives one. `ConnectBind` carries none:
+/// one guest port cannot be both the presentation's listener and the
+/// workload's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnixSocketGrant {
-    Connect(String),
-    Bind { path: String },
-    ConnectBind { path: String },
+    Connect {
+        path: String,
+        guest_port: Option<u16>,
+    },
+    Bind {
+        path: String,
+        guest_port: Option<u16>,
+    },
+    ConnectBind {
+        path: String,
+    },
 }
 
 impl UnixSocketGrant {
     pub fn connect(path: impl Into<String>) -> Self {
-        Self::Connect(path.into())
+        Self::Connect {
+            path: path.into(),
+            guest_port: None,
+        }
     }
 
     pub fn bind(path: impl Into<String>) -> Self {
-        Self::Bind { path: path.into() }
+        Self::Bind {
+            path: path.into(),
+            guest_port: None,
+        }
     }
 
     pub fn connect_bind(path: impl Into<String>) -> Self {
         Self::ConnectBind { path: path.into() }
     }
 
+    /// Present this channel to a guest workload on `127.0.0.1:port`
+    /// (README §6 `guestPort`).
+    ///
+    /// Refused for port 0, which no workload can dial or bind as a fixed
+    /// address, and for `connect-bind`: the presentation listens on the guest
+    /// port for a dial and the workload listens on it to serve, and one port
+    /// cannot be both.
+    pub fn with_guest_port(self, port: u16) -> Result<Self, ExecutionError> {
+        if port == 0 {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 guestPort for {:?} must be 1-65535; 0 is not \
+                 an address a workload can dial or serve on",
+                self.path()
+            )));
+        }
+        match self {
+            Self::Connect { path, .. } => Ok(Self::Connect {
+                path,
+                guest_port: Some(port),
+            }),
+            Self::Bind { path, .. } => Ok(Self::Bind {
+                path,
+                guest_port: Some(port),
+            }),
+            Self::ConnectBind { path } => Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 guestPort {port} on the connect-bind grant {path:?} \
+                 is refused: a dial presentation listens on the guest port and a \
+                 served one needs the workload listening there, and one port \
+                 cannot be both. Declare the dial and the serve as two grants."
+            ))),
+        }
+    }
+
+    /// The guest loopback port this channel is presented on, if any.
+    pub fn guest_port(&self) -> Option<u16> {
+        match self {
+            Self::Connect { guest_port, .. } | Self::Bind { guest_port, .. } => *guest_port,
+            Self::ConnectBind { .. } => None,
+        }
+    }
+
     pub fn path(&self) -> &str {
         match self {
-            Self::Connect(path) => path,
+            Self::Connect { path, .. } => path,
             Self::Bind { path, .. } => path,
             Self::ConnectBind { path, .. } => path,
         }
@@ -137,7 +202,7 @@ impl UnixSocketGrant {
     /// here so a mode cannot be spelled two ways in one build.
     pub fn mode(&self) -> &'static str {
         match self {
-            Self::Connect(_) => "connect",
+            Self::Connect { .. } => "connect",
             Self::Bind { .. } => "bind",
             Self::ConnectBind { .. } => "connect-bind",
         }
@@ -153,7 +218,34 @@ impl UnixSocketGrant {
     /// [`Self::permits_bind`] because `Bind` withholds exactly this, and a tier
     /// that cannot withhold it must refuse the grant.
     pub fn permits_connect(&self) -> bool {
-        matches!(self, Self::Connect(_) | Self::ConnectBind { .. })
+        matches!(self, Self::Connect { .. } | Self::ConnectBind { .. })
+    }
+
+    /// The §7 canonical form of this grant. A connect grant with no guest
+    /// port is the bare string, as it always was; every other grant is an
+    /// object carrying its mode, and its `guestPort` when it has one. So a
+    /// document written before `guestPort` existed digests as it did.
+    fn canonical_value(&self) -> serde_json::Value {
+        if let Self::Connect {
+            path,
+            guest_port: None,
+        } = self
+        {
+            return serde_json::Value::String(path.clone());
+        }
+        let mut entry: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        if let Some(port) = self.guest_port() {
+            entry.insert("guestPort".into(), serde_json::Value::from(port));
+        }
+        entry.insert(
+            "mode".into(),
+            serde_json::Value::String(self.mode().to_owned()),
+        );
+        entry.insert(
+            "path".into(),
+            serde_json::Value::String(self.path().to_owned()),
+        );
+        json_object(entry)
     }
 }
 
@@ -244,6 +336,63 @@ fn one_or_many<'v>(
         }
         serde_json::Value::Array(items) => Ok(items.iter().collect()),
         single => Ok(vec![single]),
+    }
+}
+
+/// Read one §6 object entry: `path`, `mode`, and optionally `guestPort`.
+///
+/// `"mode": "connect"` is accepted only beside a `guestPort`. Without one, a
+/// connect grant is the bare string, and accepting the object too would give
+/// one grant two spellings that digest differently. With one, the object is
+/// the only spelling the grant has. Keys other than these three are refused:
+/// a reader that dropped one would digest a document whose clause had no
+/// effect.
+fn parse_unix_socket_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<UnixSocketGrant, ExecutionError> {
+    if let Some(key) = map
+        .keys()
+        .find(|key| !matches!(key.as_str(), "path" | "mode" | "guestPort"))
+    {
+        return Err(ExecutionError::invalid(format!(
+            "unknown confinement/v1 §6 unixSocket.allow key {key:?}; refusing rather \
+             than digesting a clause nothing reads"
+        )));
+    }
+    let path = map
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ExecutionError::invalid("a unixSocket.allow object needs a `path`"))?;
+    let guest_port = match map.get("guestPort") {
+        None => None,
+        Some(value) => {
+            let port = value
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .ok_or_else(|| {
+                    ExecutionError::invalid(format!(
+                        "confinement/v1 §6 guestPort for {path:?} must be an integer \
+                         port, got {value}"
+                    ))
+                })?;
+            Some(port)
+        }
+    };
+    let grant = match (map.get("mode").and_then(serde_json::Value::as_str), guest_port) {
+        (Some("connect"), Some(_)) => UnixSocketGrant::connect(path),
+        (Some("bind"), _) => UnixSocketGrant::bind(path),
+        (Some("connect-bind"), _) => UnixSocketGrant::connect_bind(path),
+        (other, _) => {
+            return Err(ExecutionError::invalid(format!(
+                "unixSocket.allow mode must be \"bind\" or \"connect-bind\", or \
+                 \"connect\" beside a guestPort (connect-only is otherwise the \
+                 bare-string form), got {other:?}"
+            )));
+        }
+    };
+    match guest_port {
+        Some(port) => grant.with_guest_port(port),
+        None => Ok(grant),
     }
 }
 
@@ -504,6 +653,20 @@ impl ConfinementManifest {
                 "confinement/v1 §6 unixSocket.allow path {path:?} must not traverse with `..`"
             )));
         }
+        // One guest port, one channel: two presentations on one port would
+        // leave the guest with an address that names neither of them.
+        if let Some(port) = grant.guest_port()
+            && let Some(held) = self
+                .unix_sockets
+                .iter()
+                .find(|held| held.guest_port() == Some(port))
+        {
+            return Err(ExecutionError::invalid(format!(
+                "confinement/v1 §6 guestPort {port} is declared for both {:?} and \
+                 {path:?}; a document presents each guest port once",
+                held.path()
+            )));
+        }
         self.unix_sockets.push(grant);
         Ok(self)
     }
@@ -733,28 +896,17 @@ impl ConfinementManifest {
             root.insert("network".into(), json_object(network));
         }
         if !self.unix_sockets.is_empty() {
+            // Bare string for connect-only, object for every bind-capable mode
+            // and for any grant presented on a guest port — the same asymmetry
+            // §2 uses, so the cheaper spelling stays the safer one on the wire
+            // as well as in the builder. The mode string comes from
+            // `grant.mode()` rather than a literal, so adding a mode cannot
+            // leave the canonical bytes spelling it differently from the
+            // schema and the parser.
             let allow: Vec<serde_json::Value> = self
                 .unix_sockets
                 .iter()
-                .map(|grant| match grant {
-                    // Bare string for connect-only, object for every
-                    // bind-capable mode — the same asymmetry §2 uses, so the
-                    // cheaper spelling stays the safer one on the wire as well
-                    // as in the builder. The mode string comes from
-                    // `grant.mode()` rather than a literal here, so adding a
-                    // mode cannot leave the canonical bytes spelling it
-                    // differently from the schema and the parser.
-                    UnixSocketGrant::Connect(path) => serde_json::Value::String(path.clone()),
-                    UnixSocketGrant::Bind { path } | UnixSocketGrant::ConnectBind { path } => {
-                        let mut entry: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-                        entry.insert(
-                            "mode".into(),
-                            serde_json::Value::String(grant.mode().to_owned()),
-                        );
-                        entry.insert("path".into(), serde_json::Value::String(path.clone()));
-                        json_object(entry)
-                    }
-                })
+                .map(UnixSocketGrant::canonical_value)
                 .collect();
             let mut block: BTreeMap<String, serde_json::Value> = BTreeMap::new();
             block.insert("allow".into(), serde_json::Value::Array(allow));
@@ -881,29 +1033,7 @@ impl ConfinementManifest {
             for entry in allow {
                 let grant = match entry {
                     serde_json::Value::String(path) => UnixSocketGrant::connect(path.clone()),
-                    serde_json::Value::Object(map) => {
-                        let path = map
-                            .get("path")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| {
-                                ExecutionError::invalid("a unixSocket.allow object needs a `path`")
-                            })?;
-                        match map.get("mode").and_then(serde_json::Value::as_str) {
-                            Some("bind") => UnixSocketGrant::bind(path),
-                            Some("connect-bind") => UnixSocketGrant::connect_bind(path),
-                            // "connect" is deliberately NOT accepted here: it is
-                            // the bare-string form. One grant, one spelling —
-                            // otherwise two documents differing only in how they
-                            // spell the same grant would digest differently.
-                            other => {
-                                return Err(ExecutionError::invalid(format!(
-                                    "unixSocket.allow mode must be \"bind\" or \"connect-bind\" \
-                                     when present (connect-only is the bare-string form), \
-                                     got {other:?}"
-                                )));
-                            }
-                        }
-                    }
+                    serde_json::Value::Object(map) => parse_unix_socket_object(map)?,
                     other => {
                         return Err(ExecutionError::invalid(format!(
                             "a unixSocket.allow entry must be a string or an object, got {other}"

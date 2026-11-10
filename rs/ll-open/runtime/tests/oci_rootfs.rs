@@ -1682,6 +1682,77 @@ fn a_dropped_device_removes_what_a_lower_layer_had_at_its_path() {
     );
 }
 
+/// Bead `ley-line-open-2aa5d3`: the guest init mounts a kernel filesystem
+/// over each kernel mount point and cannot mount over a regular file, so an
+/// image with a regular file there (or, under `Resolve`, a link that becomes
+/// a copy of one) would import and then never boot. Refused by name.
+#[test]
+fn a_regular_file_at_a_kernel_mount_point_is_refused_by_name() {
+    let mut cases = vec![
+        (
+            vec![file("bin/x", 0o755, b"x"), file("dev", 0o644, b"not a dir")],
+            SymlinkPolicy::Refuse,
+            "dev",
+        ),
+        (
+            vec![file("bin/x", 0o755, b"x"), file("proc", 0o644, b"")],
+            SymlinkPolicy::Refuse,
+            "proc",
+        ),
+        (
+            vec![file("bin/x", 0o755, b"x"), file("sys", 0o755, b"#!/bin/sh")],
+            SymlinkPolicy::Resolve,
+            "sys",
+        ),
+    ];
+    // `tmp` joins them once init mounts a tmpfs there (patch 0012,
+    // ley-line-open-db5899).
+    if leyline_runtime_kernel_mounts_tmp() {
+        cases.push((
+            vec![file("bin/x", 0o755, b"x"), file("tmp", 0o644, b"")],
+            SymlinkPolicy::Refuse,
+            "tmp",
+        ));
+        cases.push((
+            vec![
+                file("etc/hostname", 0o644, b"host\n"),
+                symlink("tmp", "/etc/hostname"),
+            ],
+            SymlinkPolicy::Resolve,
+            "tmp",
+        ));
+    }
+    for (entries, policy, named) in cases {
+        let (scratch, result) = import_single(vec![Layer::plain(entries)], policy);
+        match &result {
+            Err(error @ OciImportError::KernelMountPointNotDirectory { path }) => {
+                assert_eq!(path, named);
+                assert!(error.to_string().contains("never boot"), "{error}");
+            }
+            other => panic!("expected {named} to be refused by name, got {other:?}"),
+        }
+        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+    }
+    // A directory there, and a regular file elsewhere with the same name,
+    // are fine.
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("dev/.keep", 0o644, b""),
+            file("etc/sys", 0o644, b""),
+            file("bin/x", 0o755, b"x"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    result.expect("a directory at a kernel mount point imports");
+}
+
+/// Whether this tree's guest init mounts a tmpfs on `/tmp` (LLO patch 0012).
+fn leyline_runtime_kernel_mounts_tmp() -> bool {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/libkrun-patches/0012-init-mount-a-bounded-tmpfs-on-tmp.patch")
+        .exists()
+}
+
 #[test]
 fn device_nodes_anywhere_else_are_still_refused_by_name() {
     for (entry, named) in [

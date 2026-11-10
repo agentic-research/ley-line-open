@@ -1,0 +1,3 @@
+Section: Fixed
+
+- **`leyline rootfs import-oci` refuses an image with a regular file where the guest init mounts a kernel filesystem** (bead `ley-line-open-2aa5d3`). A regular file at `dev`, `proc` or `sys` (and at `tmp`, once init mounts a tmpfs there), or under `--symlinks resolve` a link there that resolves to a regular file, imported cleanly before this change. The guest then stopped at boot, because `mount(2)` cannot mount over a file. The import now refuses it by name as the new `OciImportError::KernelMountPointNotDirectory { path }`; an exhaustive `match` on `OciImportError` must add it. A device or FIFO at a mount point was already refused.

@@ -129,7 +129,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::rootfs_tree::{
-    FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join, under_kernel_mount,
+    FileNode, Final, KERNEL_MOUNTED, Node, PathError, ResolveError, Resolved, Tree, join,
+    under_kernel_mount,
 };
 use crate::DigestRef;
 use crate::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver, verify_manifest};
@@ -281,6 +282,12 @@ pub enum OciImportError {
         "symbolic link {path} -> {target:?} refused: rootfs manifest v1 cannot express links (import with symlink resolution to copy link targets)"
     )]
     SymlinkRefused { path: String, target: String },
+    /// A regular file (or, under `Resolve`, a link to one) where the guest
+    /// init mounts a kernel filesystem (bead `ley-line-open-2aa5d3`).
+    #[error(
+        "{path} is a regular file, but the guest init mounts a filesystem over /{path} and can mount only over a directory: the image would import and never boot"
+    )]
+    KernelMountPointNotDirectory { path: String },
     #[error("symbolic link {path} cannot be resolved inside the image: {reason}")]
     SymlinkUnresolvable { path: String, reason: String },
     /// Two paths of the finished rootfs that the CAS root's filesystem
@@ -613,6 +620,20 @@ pub fn import_oci_layout(
         .into_iter()
         .map(|(path, mode)| DroppedFile { path, mode })
         .collect();
+    // The guest init mounts a kernel filesystem over each of these and
+    // cannot mount over a regular file (mount(2) fails ENOTDIR), so an image
+    // with one there would import and then never boot: refused by name now
+    // (bead `ley-line-open-2aa5d3`). A device or FIFO there is refused
+    // earlier, a link into a kernel mount dropped under `Resolve`.
+    if let Final::Dir(top) = &finished
+        && let Some(name) = KERNEL_MOUNTED
+            .iter()
+            .find(|name| matches!(top.get(**name), Some(Final::File(_))))
+    {
+        return Err(OciImportError::KernelMountPointNotDirectory {
+            path: (*name).to_string(),
+        });
+    }
     // Rootfs manifest v1 lists files only, so a directory that holds none is
     // not part of the identity: write none, and one digest names one tree.
     let finished = finished.without_empty_directories();

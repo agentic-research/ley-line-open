@@ -1126,13 +1126,27 @@ fn documents_are_classified_by_media_type_or_shape() {
     assert_eq!(attempt(&bare_index.digest).expect("bare index").files, 1);
 
     // A declared media type that is neither is refused as unsupported.
-    let mut foreign = manifest.clone();
-    foreign["mediaType"] = "application/vnd.example.artifact+json".into();
-    let foreign = layout.json_blob(OCI_MANIFEST, &foreign);
-    assert!(matches!(
-        attempt(&foreign.digest),
-        Err(OciImportError::Unsupported(_))
-    ));
+    // A declared media type that is neither is refused by that type, before
+    // any attempt to read it as one or the other.
+    for foreign in [
+        {
+            let mut shaped = manifest.clone();
+            shaped["mediaType"] = "application/vnd.example.artifact+json".into();
+            shaped
+        },
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.example.artifact+json"
+        }),
+    ] {
+        let foreign = layout.json_blob(OCI_MANIFEST, &foreign);
+        match attempt(&foreign.digest) {
+            Err(OciImportError::Unsupported(detail)) => {
+                assert!(detail.contains("application/vnd.example"), "{detail}")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
 
     // A descriptor whose digest is not lowercase sha256 hex is never joined
     // to a path.

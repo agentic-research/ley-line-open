@@ -811,22 +811,23 @@ impl Compression {
 /// Regular-file contents extracted from the layers, keyed by BLAKE3.
 struct ContentStore {
     dir: PathBuf,
-    next: u64,
 }
 
 impl ContentStore {
     fn create(dir: PathBuf) -> Result<Self, OciImportError> {
         fs::create_dir(&dir).map_err(io_error("create the import content store"))?;
-        Ok(Self { dir, next: 0 })
+        Ok(Self { dir })
     }
 
     fn path(&self, content: &blake3::Hash) -> PathBuf {
         self.dir.join(content.to_hex().as_str())
     }
 
+    /// Store one file's content. Files are extracted one at a time and each
+    /// partial file is renamed to its BLAKE3 name (or the import fails), so
+    /// one partial name suffices.
     fn put(&mut self, reader: &mut impl Read) -> Result<(blake3::Hash, u64), OciImportError> {
-        let temporary = self.dir.join(format!("partial-{}", self.next));
-        self.next += 1;
+        let temporary = self.dir.join("partial");
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

@@ -87,7 +87,7 @@ fn build_source_tree(root: &Path, n_files: usize, bytes_per_file: usize) {
 /// lock MUST be held while `db_bytes` is in scope.
 fn snapshot_baseline(live_db: &Mutex<Connection>, ctrl_path: &Path) -> (Duration, Duration, usize) {
     let lock_acquired = Instant::now();
-    let guard = live_db.lock();
+    let mut guard = live_db.lock();
 
     let serialize_start = Instant::now();
     let db_bytes = guard.serialize("main").expect("serialize");
@@ -136,7 +136,7 @@ fn snapshot_shortened(
     ctrl_path: &Path,
 ) -> (Duration, Duration, usize) {
     let lock_acquired = Instant::now();
-    let guard = live_db.lock();
+    let mut guard = live_db.lock();
 
     let serialize_start = Instant::now();
     let db_bytes_owned: Vec<u8> = {

@@ -482,7 +482,7 @@ fn test_inspect_node_lookup() {
     // the root directory's presentation row (negative nid), and the file
     // takes ordinal 0 of its `file_id` range — the nid `resolve_path`
     // hands back for the display path "main.go".
-    let source_conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+    let mut source_conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
     create_schema(&source_conn).expect("create schema");
     leyline_schema::ensure_dir_nodes(&source_conn, "main.go", 1000).expect("mint root dir node");
     let file_id = leyline_schema::ensure_file_id(&source_conn, "main.go").expect("intern main.go");
@@ -957,7 +957,7 @@ fn test_warm_start_crash_recovery() {
 
     // --- Phase 1: Cold start — parse into :memory:, snapshot to arena ---
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     let result = parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
     assert!(
         result.parsed >= 2,
@@ -984,7 +984,7 @@ fn test_warm_start_crash_recovery() {
         .unwrap();
 
     // Snapshot living db to arena.
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
     // T2.4: snapshot advances current_root from sentinel to BLAKE3.
     let root_after_snapshot = Controller::open_or_create(&ctrl_path)
@@ -1089,7 +1089,7 @@ fn test_warm_start_crash_recovery() {
 
     // --- Phase 5: T2.4 — Snapshot again, verify root advanced ---
 
-    snapshot_to_arena(&recovered, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut recovered, &ctrl_path).unwrap();
 
     let root_after_reparse = Controller::open_or_create(&ctrl_path)
         .unwrap()
@@ -1166,7 +1166,7 @@ fn test_multiple_snapshot_cycles() {
     ctrl.set_arena(&arena_path.to_string_lossy(), arena_size)
         .unwrap();
 
-    let conn = cold_parse_go(src.path());
+    let mut conn = cold_parse_go(src.path());
 
     // T2.4: track root advancement across cycles. Each modified-and-snapshot
     // round must yield a strictly different root from the previous one.
@@ -1183,7 +1183,7 @@ fn test_multiple_snapshot_cycles() {
         let result = parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
         assert_eq!(result.parsed, 1, "cycle {i}: only main.go should reparse");
 
-        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+        snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
         let cur_root = Controller::open_or_create(&ctrl_path)
             .unwrap()
@@ -1252,7 +1252,7 @@ fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
         .unwrap();
     drop(ctrl);
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
     // Independently compute the expected root: BLAKE3 of the bytes
@@ -1261,7 +1261,7 @@ fn snapshot_populates_current_root_with_blake3_of_db_bytes() {
     let expected_root: [u8; 32] = blake3::hash(&expected_db_bytes).into();
 
     // Snapshot.
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
     // Re-open Controller and read current_root. T2.4: generation removed
     // from public API; current_root is the sole identity.
@@ -1298,17 +1298,17 @@ fn snapshot_idempotent_root_for_same_db_state() {
         .unwrap();
     drop(ctrl);
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
     let root_after_first = Controller::open_or_create(&ctrl_path)
         .unwrap()
         .current_root();
 
     // Snapshot again with no db changes. T2.4: root stays — purely
     // a function of bytes; no generation surface to observe.
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
     let r = Controller::open_or_create(&ctrl_path).unwrap();
     let root_after_second = r.current_root();
 
@@ -1340,10 +1340,10 @@ fn snapshot_root_advances_when_db_changes() {
         .unwrap();
     drop(ctrl);
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
 
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
     let root_v1 = Controller::open_or_create(&ctrl_path)
         .unwrap()
         .current_root();
@@ -1355,7 +1355,7 @@ fn snapshot_root_advances_when_db_changes() {
     )
     .unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
     let root_v2 = Controller::open_or_create(&ctrl_path)
         .unwrap()
@@ -1399,9 +1399,9 @@ fn t23_reader_accepts_arena_when_root_matches() {
         .unwrap();
     drop(ctrl);
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
     // Reader path — should succeed because the writer published the
     // matching root via set_arena_with_root.
@@ -1433,9 +1433,9 @@ fn t23_reader_refuses_arena_when_buffer_corrupted() {
         .unwrap();
     drop(ctrl);
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     parse_into_conn(&conn, src.path(), Some("go"), None).unwrap();
-    snapshot_to_arena(&conn, &ctrl_path).unwrap();
+    snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
     // Corrupt one byte in the active buffer. Choose an offset deep
     // inside the SQLite payload (past the file header, so the reader
@@ -1490,7 +1490,7 @@ fn t24_reader_rejects_zero_root_with_data() {
     let mut mmap = create_arena(&arena_path, arena_size).unwrap();
 
     // Real SQLite db in the buffer (data_size > 0 after write_to_arena).
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
     let db_bytes = conn.serialize("main").unwrap();
@@ -1594,7 +1594,7 @@ fn t23_reader_errors_clearly_on_non_sqlite_buffer() {
     let arena_size = 4 * 1024 * 1024;
     let mut mmap = create_arena(&arena_path, arena_size).unwrap();
     // Write some valid SQLite bytes via write_to_arena so data_size > 0.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
     let db_bytes = conn.serialize("main").unwrap();

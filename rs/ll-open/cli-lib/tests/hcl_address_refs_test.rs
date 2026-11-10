@@ -54,7 +54,7 @@ terraform {
     )
     .unwrap();
 
-    let producer = Connection::open_in_memory().unwrap();
+    let mut producer = Connection::open_in_memory().unwrap();
     leyline_cli_lib::cmd_parse::parse_into_conn(&producer, source_dir.path(), Some("hcl"), None)
         .unwrap();
     let bytes = producer.serialize("main").unwrap().to_vec();

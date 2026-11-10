@@ -59,7 +59,7 @@ fn seed(conn: &Connection) {
 
 /// Create a writable adapter seeded with test data.
 fn test_adapter() -> SqliteGraphAdapter {
-    let source = Connection::open_in_memory().unwrap();
+    let mut source = Connection::open_in_memory().unwrap();
     create_schema(&source).unwrap();
     seed(&source);
     let data = source.serialize("main").unwrap();
@@ -68,7 +68,7 @@ fn test_adapter() -> SqliteGraphAdapter {
 
 /// Create a read-only adapter with a specific pool size for exhaustion tests.
 fn test_adapter_with_pool(pool_size: usize) -> SqliteGraphAdapter {
-    let source = Connection::open_in_memory().unwrap();
+    let mut source = Connection::open_in_memory().unwrap();
     create_schema(&source).unwrap();
     seed(&source);
     let data = source.serialize("main").unwrap();

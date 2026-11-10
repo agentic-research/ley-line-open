@@ -244,17 +244,28 @@ impl DaemonContext {
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T>,
     {
+        self.with_read_mut(|conn| f(conn))
+    }
+
+    /// [`with_read`](Self::with_read), handing the closure the checked-out
+    /// reader as `&mut`. The checkout is exclusive to the closure; `&mut`
+    /// is what rusqlite (0.41+) asks of connection-wide hooks such as the
+    /// authorizer `sql_read_only::query` installs.
+    pub fn with_read_mut<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<T>,
+    {
         // Pool checkout blocks up to r2d2's default `connection_timeout`
         // (30s) if all readers are in-flight. That's structurally
         // impossible in practice (pool size ≥ 2, connections return on
         // Drop at closure exit), but `?` surfaces the timeout cleanly
         // if it ever hits — better than a silent hang.
-        let conn = self
+        let mut conn = self
             .live_db
             .reader_pool
             .get()
             .map_err(|e| anyhow::anyhow!("reader pool checkout failed: {e}"))?;
-        f(&conn)
+        f(&mut conn)
     }
 
     /// Acquire the exclusive writer connection.

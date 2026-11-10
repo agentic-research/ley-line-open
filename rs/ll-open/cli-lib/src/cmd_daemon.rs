@@ -418,17 +418,18 @@ pub async fn run_daemon_with_options(
     // the underlying live storage swaps from a single mutex-wrapped
     // connection to pool+writer.
     let live_db_path = live_db_path_for(&ctrl_path);
-    let live_conn = match init_living_db(&ctrl_path, &live_db_path, source, language, reset_arena) {
-        Ok(conn) => conn,
-        Err(e) => {
-            state.write().phase = DaemonPhase::Error(format!("init failed: {e:#}"));
-            return Err(e);
-        }
-    };
+    let mut live_conn =
+        match init_living_db(&ctrl_path, &live_db_path, source, language, reset_arena) {
+            Ok(conn) => conn,
+            Err(e) => {
+                state.write().phase = DaemonPhase::Error(format!("init failed: {e:#}"));
+                return Err(e);
+            }
+        };
 
     #[cfg(feature = "cdc")]
     {
-        let report = match activate_cdc_and_snapshot(&live_conn, &ctrl_path, options.cdc) {
+        let report = match activate_cdc_and_snapshot(&mut live_conn, &ctrl_path, options.cdc) {
             Ok(report) => report,
             Err(error) => {
                 state.write().phase =
@@ -458,7 +459,7 @@ pub async fn run_daemon_with_options(
                 DaemonPhase::Error("CDC activation unavailable in this build".into());
             anyhow::bail!("daemon --cdc requires the 'cdc' feature (compile with --features cdc)");
         }
-        snapshot_to_arena(&live_conn, &ctrl_path)?;
+        snapshot_to_arena(&mut live_conn, &ctrl_path)?;
     }
 
     // Build the LiveDb container (writer + reader pool). The writer
@@ -1318,11 +1319,11 @@ fn try_warm_start_from_arena(
 /// free. A proposal that commits during the publish is in the next one.
 pub fn publish_living_db(live_db: &crate::daemon::db_pool::LiveDb, ctrl_path: &Path) -> Result<()> {
     let _publisher = live_db.publish_lock.lock();
-    let conn = live_db
+    let mut conn = live_db
         .reader_pool
         .get()
         .map_err(|e| anyhow::anyhow!("reader pool checkout for a publish failed: {e}"))?;
-    snapshot_to_arena(&conn, ctrl_path)
+    snapshot_to_arena(&mut conn, ctrl_path)
 }
 
 /// Publish when anything committed since the last publish this caller made
@@ -1441,7 +1442,11 @@ pub(crate) fn rollback_image(mut image: Vec<u8>) -> Vec<u8> {
 /// In the daemon every call goes through [`publish_living_db`], which
 /// holds the single-publisher lock: two concurrent calls would write the
 /// same inactive buffer.
-pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
+///
+/// `conn` is `&mut` because rusqlite (0.41+) serializes only through an
+/// exclusive borrow: no statement can change the pages while the image is
+/// read.
+pub fn snapshot_to_arena(conn: &mut rusqlite::Connection, ctrl_path: &Path) -> Result<()> {
     let db_bytes = rollback_image(
         conn.serialize("main")
             .context("serialize living db")?
@@ -1516,7 +1521,7 @@ pub fn snapshot_to_arena(conn: &rusqlite::Connection, ctrl_path: &Path) -> Resul
 /// Successful activation and the disabled path both publish exactly once.
 #[cfg(feature = "cdc")]
 pub fn activate_cdc_and_snapshot(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     ctrl_path: &Path,
     cdc: bool,
 ) -> Result<Option<leyline_fs::activation::BlobActivationReport>> {
@@ -2856,14 +2861,14 @@ mod tests {
             .unwrap()
             .set_arena(&arena_path.to_string_lossy(), 2 * 1024 * 1024)
             .unwrap();
-        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        let mut conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
         conn.execute_batch(
             "CREATE TABLE img_rows (id INTEGER PRIMARY KEY, payload TEXT);
              INSERT INTO img_rows (payload) VALUES ('one'), ('two');",
         )
         .unwrap();
 
-        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+        snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
         let graph = leyline_fs::SqliteGraph::from_arena(&ctrl_path).unwrap();
         let rows: i64 = graph
@@ -2903,7 +2908,7 @@ mod tests {
         }
 
         // File-backed WAL live db + rows to make the snapshot non-trivial.
-        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        let mut conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
         conn.execute_batch(
             "CREATE TABLE snap_rows (id INTEGER PRIMARY KEY, payload TEXT);
              INSERT INTO snap_rows (payload) VALUES ('one'), ('two'), ('three');",
@@ -2919,7 +2924,7 @@ mod tests {
 
         // The load-bearing call — this is what would blow up if
         // serialize() + WAL didn't compose.
-        snapshot_to_arena(&conn, &ctrl_path).expect("snapshot_to_arena on WAL'd db");
+        snapshot_to_arena(&mut conn, &ctrl_path).expect("snapshot_to_arena on WAL'd db");
 
         // Post: current_root must have advanced off zero.
         let root_after = {
@@ -2960,13 +2965,13 @@ mod tests {
             .set_arena(&arena_path.to_string_lossy(), small)
             .unwrap();
 
-        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
+        let mut conn = init_living_db(&ctrl_path, &live_db_path, None, None, false).unwrap();
         conn.execute_batch(
             "CREATE TABLE grow_rows (id INTEGER PRIMARY KEY, payload BLOB);
              INSERT INTO grow_rows (payload) VALUES (x'01');",
         )
         .unwrap();
-        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+        snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
 
         // The first snapshot lands in buffer B: the case that moves.
         let published_root = leyline_core::Controller::open_or_create(&ctrl_path)
@@ -2990,7 +2995,7 @@ mod tests {
             [],
         )
         .unwrap();
-        snapshot_to_arena(&conn, &ctrl_path).unwrap();
+        snapshot_to_arena(&mut conn, &ctrl_path).unwrap();
         let grown = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
         assert!(
             grown.arena_size() > small,
@@ -3053,7 +3058,7 @@ mod tests {
                 .expect("setup_arena on a completely fresh arena");
         assert_eq!(ctrl_path_returned, ctrl_path);
 
-        let conn = init_living_db(&ctrl_path, &live_db_path, None, None, true)
+        let mut conn = init_living_db(&ctrl_path, &live_db_path, None, None, true)
             .expect("--reset-arena must succeed on a fresh arena — this is the reported failure");
         conn.execute_batch(
             "CREATE TABLE reset_rows (id INTEGER PRIMARY KEY, payload TEXT);
@@ -3063,7 +3068,7 @@ mod tests {
 
         // The exact failure site: `snapshot_to_arena` reading back
         // whatever path the reset left behind.
-        snapshot_to_arena(&conn, &ctrl_path)
+        snapshot_to_arena(&mut conn, &ctrl_path)
             .expect("snapshot_to_arena after --reset-arena on a fresh arena");
 
         let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
@@ -3105,7 +3110,7 @@ mod tests {
         // carries into the next run.
         lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, Some(&ctrl_path))
             .expect("setup_arena for repo A");
-        let conn_a = init_living_db(
+        let mut conn_a = init_living_db(
             &ctrl_path,
             &live_db_path,
             Some(&repo_a),
@@ -3113,7 +3118,7 @@ mod tests {
             false,
         )
         .expect("cold start against repo A");
-        snapshot_to_arena(&conn_a, &ctrl_path).expect("snapshot repo A's parse");
+        snapshot_to_arena(&mut conn_a, &ctrl_path).expect("snapshot repo A's parse");
         drop(conn_a);
 
         // Confirm the refusal this bead's remedy exists for actually
@@ -3133,9 +3138,11 @@ mod tests {
         );
 
         // The prescribed remedy: --reset-arena, now against repo B.
-        let conn_b = init_living_db(&ctrl_path, &live_db_path, Some(&repo_b), Some("json"), true)
-            .expect("--reset-arena is the documented remedy for a source switch — it must work");
-        snapshot_to_arena(&conn_b, &ctrl_path)
+        let mut conn_b =
+            init_living_db(&ctrl_path, &live_db_path, Some(&repo_b), Some("json"), true).expect(
+                "--reset-arena is the documented remedy for a source switch — it must work",
+            );
+        snapshot_to_arena(&mut conn_b, &ctrl_path)
             .expect("snapshot_to_arena after reset across a source switch");
 
         let row_count: i64 = conn_b
@@ -3346,8 +3353,8 @@ mod tests {
         )
         .unwrap();
         let live = live_db_path_for(&ctrl);
-        let conn = init_living_db(&ctrl, &live, Some(src), Some("go"), false).unwrap();
-        snapshot_to_arena(&conn, &ctrl).unwrap();
+        let mut conn = init_living_db(&ctrl, &live, Some(src), Some("go"), false).unwrap();
+        snapshot_to_arena(&mut conn, &ctrl).unwrap();
         context_over(&ctrl, Arc::new(NoExt), src, conn)
     }
 

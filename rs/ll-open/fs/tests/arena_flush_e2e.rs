@@ -16,7 +16,7 @@ use leyline_schema::create_schema;
 /// interning the components that render it: the directory chain in `dirs`,
 /// the file in `files`, and each name in `names`.
 fn seed_db() -> Vec<u8> {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     create_schema(&conn).unwrap();
 
     let docs_dir = leyline_schema::intern_dir_chain(&conn, "docs").unwrap();

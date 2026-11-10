@@ -7,7 +7,7 @@ members = [
 # Vendored upstream source LLO builds but does not own (third_party/README.md):
 # path dependencies, never members, so workspace lints, fmt, tests and
 # mutation testing do not reach it.
-exclude = ["third_party"]
+exclude = ["third_party", "shims"]
 resolver = "2"
 
 # ADR-0026 / bead 3b2f55 — canonical dep versions for the workspace.
@@ -26,7 +26,10 @@ resolver = "2"
 anyhow = "1.0.86"
 serde = "1.0.219"
 serde_json = "1.0.140"
-rusqlite = "0.39.0"
+# 0.41 bundles SQLite 3.54.x (libsqlite3-sys 0.39), the fix for
+# RUSTSEC-2026-0459 / CVE-2026-119375. leyline-cli-lib's
+# `bundled_sqlite_is_at_least_cve_fixed_version` test pins the floor.
+rusqlite = "0.41.1"
 
 # Substrate / substrate-adjacent (ADR-0014 §3 exact-pins)
 blake3 = "1.8.5"
@@ -82,6 +85,15 @@ wasmparser = "0.254.0"
 # downloaded byte before it may replace an installed binary.
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
+
+# witchcraft (leyline-text-search `engine-witchcraft`) requires rusqlite
+# 0.39, whose libsqlite3-sys bundles a SQLite with RUSTSEC-2026-0459 and
+# collides with 0.41's on `links = "sqlite3"`. This shim serves every
+# `rusqlite ^0.39` requirement from the workspace's rusqlite 0.41, so the
+# build links one SQLite. Remove it when witchcraft requires >= 0.41
+# (rs/shims/rusqlite-0.39/Cargo.toml).
+[patch.crates-io]
+rusqlite = { path = "shims/rusqlite-0.39" }
 
 # Cross-crate inlining + single codegen unit so the sheaf hot paths
 # (per-edge δ⁰, sparse matvec, restriction-map composition) vectorize

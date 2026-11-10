@@ -90,7 +90,7 @@ fn parse_dep(raw: &str) -> Result<Dep> {
 ///
 /// Returns serialized SQLite bytes ready for arena load.
 pub fn project_pyproject(content: &str) -> Result<Vec<u8>> {
-    let conn = Connection::open_in_memory()?;
+    let mut conn = Connection::open_in_memory()?;
     project_pyproject_into(content, &conn)?;
     let data = conn.serialize("main")?;
     Ok(data.to_vec())

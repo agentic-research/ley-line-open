@@ -14,7 +14,7 @@ use tempfile::TempDir;
 /// Build a minimal arena file: [Header][Buf0][Buf1] with a nodes-table DB
 /// in the active buffer, plus a control file pointing at it.
 fn create_test_arena(dir: &std::path::Path) -> Result<std::path::PathBuf> {
-    let source = Connection::open_in_memory()?;
+    let mut source = Connection::open_in_memory()?;
     create_schema(&source)?;
     // A node's PATH is not stored under projection-v5, so seeding means
     // interning the components that render it rather than writing an id.

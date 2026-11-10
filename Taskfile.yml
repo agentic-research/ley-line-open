@@ -338,6 +338,16 @@ tasks:
     cmds:
       - cargo install cargo-mutants --locked
 
+  deps:cargo-deny:
+    desc: |
+      cargo-deny for `task audit`, from source with --locked at an exact
+      version (same rule as deps:cargo-mutants). Skipped when that version
+      is already on PATH.
+    status:
+      - cargo deny --version 2>/dev/null | grep -qx 'cargo-deny 0.19.6'
+    cmds:
+      - cargo install cargo-deny --locked --version 0.19.6
+
   deps:wasm32:
     desc: |
       The wasm32-unknown-unknown rustup target the wasm publish artifacts
@@ -1149,6 +1159,42 @@ tasks:
     cmds:
       - sh tools/test_license_direction.sh
 
+  # RustSec advisory gate (bead ley-line-open-3adcf7). deny.toml holds the
+  # policy and the dated, bead-linked ignores; tools/lint_deny_ignores.sh
+  # rejects an ignore without a bead or expiry, past its expiry, or on a crate
+  # the release binaries ship.
+  #
+  # The advisory database is fetched from github.com/rustsec/advisory-db into
+  # $CARGO_HOME/advisory-dbs on every run. When the fetch fails, CI fails
+  # (CI is set on GitHub runners): an audit against a stale database is not
+  # evidence. Locally, a failed fetch falls back to the cached database with
+  # a warning, so `task ci` still runs offline; without a cache it fails.
+  audit:
+    desc: Fail on any RustSec advisory in rs/Cargo.lock that deny.toml does not ignore, after linting every ignore (3adcf7)
+    deps: [deps:cargo-deny]
+    cmds:
+      - |
+        set -eu
+        db_root="${CARGO_HOME:-$HOME/.cargo}/advisory-dbs"
+        if cargo deny --manifest-path rs/Cargo.toml fetch --config deny.toml db; then
+          :
+        elif [ -n "${CI:-}" ]; then
+          echo "audit: advisory database fetch failed; CI does not audit against a stale database" >&2
+          exit 1
+        elif find "$db_root" -path '*/crates/*' -name 'RUSTSEC-*.md' 2>/dev/null | grep -q .; then
+          echo "audit: WARNING: advisory database fetch failed; auditing against the cached copy in $db_root" >&2
+        else
+          echo "audit: advisory database fetch failed and there is no cached copy in $db_root" >&2
+          exit 1
+        fi
+        sh tools/lint_deny_ignores.sh deny.toml rs
+        cargo deny --manifest-path rs/Cargo.toml check --config deny.toml --disable-fetch advisories
+
+  audit:fixture-test:
+    desc: Prove the deny.toml ignore lint fails on a missing bead, missing or past expiry, malformed entry, unknown advisory, and a shipped crate (3adcf7)
+    cmds:
+      - sh tools/test_lint_deny_ignores.sh
+
   # CHANGELOG entries are fragments under changes/, one file per change, so
   # two PRs never conflict on CHANGELOG.md (ley-line-open-465ce2).
   lint:changelog-fragments:
@@ -1779,6 +1825,10 @@ tasks:
       # the registry sources `check` has already fetched.
       - task: lint:license-direction:fixture-test
       - task: lint:license-direction
+      # After `check` for the same reason: the ignore lint's cargo tree
+      # resolves against the fetched registry sources.
+      - task: audit:fixture-test
+      - task: audit
       - task: clippy
       - task: smells
       - task: fs:build:static

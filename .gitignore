@@ -21,6 +21,8 @@
 # header for why this is tracked rather than left to each contributor.
 !rust-toolchain.toml
 !.cargo/config.toml
+# RustSec advisory policy for `task audit` (ley-line-open-3adcf7).
+!deny.toml
 
 # GitHub Actions
 !.github/**

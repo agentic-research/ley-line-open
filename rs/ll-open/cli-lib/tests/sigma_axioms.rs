@@ -196,7 +196,9 @@ fn fixture_files() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         (
             "go/a.go",
-            b"package a\n\nfunc Answer(x int) int {\n\tif x > 0 {\n\t\treturn x + 41\n\t}\n\treturn 0\n}\n"
+            // The comments make every axiom cover comment leaves too (bead
+            // `ley-line-open-aa1634`).
+            b"package a\n\n// Answer is documented.\nfunc Answer(x int) int {\n\tif x > 0 { /* positive */\n\t\treturn x + 41\n\t}\n\treturn 0\n}\n"
                 .to_vec(),
         ),
         (
@@ -205,7 +207,7 @@ fn fixture_files() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "rs/lib.rs",
-            b"pub fn add(a: u32, b: u32) -> u32 {\n    if a > b { a - b } else { a + b }\n}\n"
+            b"/// Adds or subtracts.\npub fn add(a: u32, b: u32) -> u32 {\n    // order\n    if a > b { a - b } else { a + b }\n}\n"
                 .to_vec(),
         ),
         ("docs/readme.md", b"# Title\n\nSome *text*.\n".to_vec()),
@@ -662,7 +664,8 @@ fn sources(variant: u8) -> Vec<(&'static str, Vec<u8>)> {
         (
             "b.go",
             format!(
-                "package a\n\nfunc B() string {{\n\treturn \"{}\"\n}}\n",
+                "package a\n\n// B variant {}.\nfunc B() string {{\n\treturn \"{}\"\n}}\n",
+                n % 5,
                 n % 2
             )
             .into_bytes(),

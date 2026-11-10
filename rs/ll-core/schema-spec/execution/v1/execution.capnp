@@ -263,6 +263,7 @@ struct ProvisionInput
 struct ProvisionOutput $Traits.doc("Provisioning result.") {
   provisioned @0 :Bool $Traits.doc("True when the backend is ready.");
   backendId   @1 :Text $Traits.doc("Selected backend implementation identifier.");
+  casRoot     @2 :Text $Traits.doc("Absolute host path of the content-addressed rootfs store the provider serves, after provisioning made it exist (on macOS, on a case-sensitive volume it attached); empty when the provider does not report one.");
 }
 
 struct StartInput

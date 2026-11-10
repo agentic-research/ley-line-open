@@ -128,7 +128,12 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     refused, and another ABI's system call ends the process; a kernel that
     refuses the filter stops the guest. The worker computes the list from
     the attested confinement document (§6 `guestPort`; ADR-0046 Q7, bead
-    `ley-line-open-be3711`).
+    `ley-line-open-be3711`). A host peer that connects to a serve channel
+    before the workload listens is held, and the workload's port retried
+    (backoff 5 ms to 200 ms, `SERVE_HOLD_MS` = 10 s in all, ending early
+    if the peer hangs up), so its first connection works once the workload
+    listens; at the bound the connection is closed, which a macOS UNIX
+    socket peer sees as end-of-file (bead `ley-line-open-a915e3`).
 11. `0011` — **devices/vsock: bind a listening mapping's host socket before
     the guest starts.** The muxer thread bound it when the device
     activated, inside a running guest, and only logged a socket it could

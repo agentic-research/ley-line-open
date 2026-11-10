@@ -1,6 +1,6 @@
 [package]
 name = "leyline-runtime"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2024"
 description = "Capability-resolved execution lifecycle and isolation backends for Leyline"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -18,17 +18,24 @@ base64 = "0.22"
 blake3 = { workspace = true }
 capnp = { workspace = true }
 capnp-json = { workspace = true }
-leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.26.0" }
+# OCI image import (artifacts::oci, bead ley-line-open-7736ab): gzip layer
+# decompression (pure-Rust miniz_oxide backend) and the tar reader. Neither
+# writes to disk; the importer applies every entry to an in-memory tree.
+flate2 = "1.1.9"
+tar = { version = "0.4.45", default-features = false }
+leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.27.0" }
 libc = { workspace = true }
-leyline-core = { path = "../../ll-core/core", version = "0.26.0" }
-leyline-envelope = { path = "../envelope", version = "0.26.0" }
+leyline-core = { path = "../../ll-core/core", version = "0.27.0" }
+leyline-envelope = { path = "../envelope", version = "0.27.0" }
 # The ADR-012 canonical kid of each operator trust key. Features match
 # leyline-envelope's pin: `ffi` off, `root-signer` on.
-leyline-sign = { path = "../sign", version = "0.26.0", default-features = false, features = ["root-signer"] }
+leyline-sign = { path = "../sign", version = "0.27.0", default-features = false, features = ["root-signer"] }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+# OCI descriptor digests are SHA-256; this is their only use here.
+sha2 = { workspace = true }
 rustix = { version = "1.1.4", features = ["fs"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -49,8 +56,6 @@ test-support = []
 # dev-dependency is dropped from the published manifest.
 leyline-runtime = { path = ".", features = ["test-support"] }
 hex = { workspace = true }
-# tests/cas_evidence.rs: recomputes the ADR-012 kid independently.
-sha2 = { workspace = true }
 wait-timeout = "0.2"
 # `kill(pid, 0)` liveness probes for the grandchild-reaping regression test
 # (bead rs-a1e8d0).

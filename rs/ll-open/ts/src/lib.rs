@@ -28,7 +28,7 @@ use crate::project::{project_ast, project_ast_with_source};
 /// Stores the original source in `_source`, byte ranges in `_ast`, and
 /// plain-text records in `nodes` — ready for bidirectional splicing.
 pub fn parse_with_source(content: &[u8], language: TsLanguage, source_id: &str) -> Result<Vec<u8>> {
-    let conn = Connection::open_in_memory()?;
+    let mut conn = Connection::open_in_memory()?;
     let language_name = language.name();
     project_ast_with_source(
         content,
@@ -46,7 +46,7 @@ pub fn parse_with_source(content: &[u8], language: TsLanguage, source_id: &str) 
 /// Backward-compatible: uses a default source ID. Prefer `parse_with_source`
 /// for new code that needs splice support.
 pub fn parse(content: &[u8], language: TsLanguage) -> Result<Vec<u8>> {
-    let conn = Connection::open_in_memory()?;
+    let mut conn = Connection::open_in_memory()?;
     project_ast(content, language.ts_language(), &conn)?;
     let data = conn.serialize("main")?;
     Ok(data.to_vec())

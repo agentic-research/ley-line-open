@@ -926,8 +926,9 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
     // connection (`query_only=ON`) under the deny-by-default authorizer of
     // `sql_read_only`, and only a single read-only SELECT runs. A refused
     // statement returns a typed `QueryRefusal` and no rows.
-    let outcome = ctx
-        .with_read(|conn| super::sql_read_only::query(conn, sql, |stmt| query_rows(stmt, limit)));
+    let outcome = ctx.with_read_mut(|conn| {
+        super::sql_read_only::query(conn, sql, |stmt| query_rows(stmt, limit))
+    });
     match outcome {
         Ok(response) => Ok(response),
         Err(err) => match err.downcast_ref::<super::sql_read_only::Refusal>() {

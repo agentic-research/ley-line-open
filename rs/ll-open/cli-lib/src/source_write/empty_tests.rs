@@ -399,7 +399,7 @@ fn merges_over_an_empty_side() {
 #[test]
 fn a_moved_base_with_an_empty_side_merges_or_refuses_typed() {
     // Base empty, theirs and ours both non-empty and different.
-    let s = store(&[("e.txt", ""), ("a.go", A)]);
+    let mut s = store(&[("e.txt", ""), ("a.go", A)]);
     propose_whole(
         &s,
         vec![Proposed::write(

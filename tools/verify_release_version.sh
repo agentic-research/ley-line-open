@@ -24,7 +24,9 @@ then
 fi
 
 find rs -maxdepth 4 -name Cargo.toml -type f > "$tmp_dir/all-manifests"
-awk '$0 != "rs/Cargo.toml" { print }' \
+# rs/shims/ holds semver-trick stand-ins for other crates' versions
+# (ley-line-open-6ef210): not LLO releases, so they carry no LLO version.
+awk '$0 != "rs/Cargo.toml" && $0 !~ /^rs\/shims\// { print }' \
     "$tmp_dir/all-manifests" > "$tmp_dir/release-manifests-raw"
 LC_ALL=C sort "$tmp_dir/release-manifests-raw" \
     > "$tmp_dir/release-manifests"

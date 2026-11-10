@@ -21,6 +21,8 @@
 # header for why this is tracked rather than left to each contributor.
 !rust-toolchain.toml
 !.cargo/config.toml
+# RustSec advisory policy for `task audit` (ley-line-open-3adcf7).
+!deny.toml
 
 # GitHub Actions
 !.github/**
@@ -122,6 +124,10 @@
 # without the network. `tools/vendor_libkrun.sh check` proves the tree; see
 # rs/third_party/README.md.
 !rs/third_party/**
+
+# Semver-trick shim crates patched in by rs/Cargo.toml (ley-line-open-6ef210):
+# rusqlite-0.39 serves witchcraft's rusqlite 0.39 requirement from 0.41.
+!rs/shims/**
 
 # Re-deny build artifacts
 **/target/

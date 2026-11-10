@@ -1,0 +1,41 @@
+# Semver-trick shim: a `rusqlite` 0.39 that is the workspace's rusqlite 0.41
+# (bead ley-line-open-6ef210).
+#
+# Why it exists: witchcraft (git dep of leyline-text-search, feature
+# `engine-witchcraft`) requires `rusqlite = "0.39"`. Two semver-incompatible
+# rusqlite versions pull two `libsqlite3-sys` crates, and both declare
+# `links = "sqlite3"`, so cargo refuses to resolve the workspace. rusqlite
+# 0.39 bundles SQLite 3.53.x, which carries RUSTSEC-2026-0459
+# (CVE-2026-119375); the fix is SQLite 3.54.0 in rusqlite 0.41.
+#
+# `[patch.crates-io]` in rs/Cargo.toml substitutes this crate for every
+# `rusqlite ^0.39` requirement. It has no `links` key and no C code: it
+# re-exports rusqlite 0.41, so the whole workspace links one SQLite, the
+# patched one. Witchcraft uses only the rusqlite surface that is unchanged
+# between 0.39 and 0.41 (Connection, params!, prepare/query/execute,
+# transactions). `task ci` type-checks it, tests included, through
+# tools/check_feature_reachability.sh (claim 3: not-shipping features still
+# compile); `cargo test -p leyline-text-search --features engine-witchcraft`
+# runs witchcraft's DB against it.
+#
+# Delete this directory and the patch entry once witchcraft upstream
+# requires rusqlite >= 0.41 (bead ley-line-open-204f4e).
+#
+# Not a workspace member (rs/Cargo.toml `exclude`), like third_party/.
+[package]
+name = "rusqlite"
+version = "0.39.999"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "LLO-local semver-trick shim: rusqlite 0.39 API backed by rusqlite 0.41."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite_041 = { package = "rusqlite", version = "0.41.1" }
+
+[features]
+default = []
+bundled = ["rusqlite_041/bundled"]

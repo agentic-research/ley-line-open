@@ -82,6 +82,9 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "instr",
     "json",
     "json_array",
+    // SQLite 3.54 (rusqlite 0.41, bead `ley-line-open-6ef210`): inserts into
+    // a JSON array value and returns the result, like `json_insert`.
+    "json_array_insert",
     "json_array_length",
     "json_error_position",
     "json_extract",
@@ -99,6 +102,7 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "json_valid",
     "jsonb",
     "jsonb_array",
+    "jsonb_array_insert",
     "jsonb_extract",
     "jsonb_group_array",
     "jsonb_group_object",
@@ -269,14 +273,16 @@ impl std::error::Error for Refusal {}
 /// way. Other errors (a syntax error, a missing table) pass through as
 /// before.
 pub fn query<T>(
-    conn: &Connection,
+    conn: &mut Connection,
     sql: &str,
     run: impl FnOnce(&mut Statement<'_>) -> Result<T>,
 ) -> Result<T> {
     let seen = Arc::new(Mutex::new(Seen::default()));
-    let _authorizer = Authorizer::install(conn, Arc::clone(&seen))?;
+    // Every statement borrows the connection through the guard, so each one
+    // is dropped before the guard removes the authorizer.
+    let authorized = Authorizer::install(conn, Arc::clone(&seen))?;
 
-    let mut stmt = match conn.prepare(sql) {
+    let mut stmt = match authorized.conn().prepare(sql) {
         Ok(stmt) => stmt,
         Err(rusqlite::Error::MultipleStatement) => {
             return Err(Refusal {
@@ -333,11 +339,14 @@ fn denial_or(seen: &Mutex<Seen>, err: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// The authorizer, installed on a connection until dropped.
-struct Authorizer<'c>(&'c Connection);
+/// The authorizer, installed on a connection until dropped. It holds the
+/// connection exclusively: rusqlite (0.41+) installs and removes hooks
+/// through `&mut Connection`, and statements reach the connection only
+/// through [`Authorizer::conn`], so none outlives the hook.
+struct Authorizer<'c>(&'c mut Connection);
 
 impl<'c> Authorizer<'c> {
-    fn install(conn: &'c Connection, seen: Arc<Mutex<Seen>>) -> Result<Self> {
+    fn install(conn: &'c mut Connection, seen: Arc<Mutex<Seen>>) -> Result<Self> {
         conn.authorizer(Some(move |ctx: AuthContext<'_>| {
             let mut seen = lock(&seen);
             match judge(&ctx.action) {
@@ -353,6 +362,11 @@ impl<'c> Authorizer<'c> {
             }
         }))?;
         Ok(Self(conn))
+    }
+
+    /// The connection, with the authorizer installed.
+    fn conn(&self) -> &Connection {
+        self.0
     }
 }
 
@@ -503,7 +517,7 @@ mod tests {
         (dir, writer, reader)
     }
 
-    fn rows(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    fn rows(conn: &mut Connection, sql: &str) -> Result<Vec<String>> {
         query(conn, sql, |stmt| {
             let mut out = Vec::new();
             let mut rows = stmt.query([])?;
@@ -514,7 +528,7 @@ mod tests {
         })
     }
 
-    fn refusal(conn: &Connection, sql: &str) -> Refusal {
+    fn refusal(conn: &mut Connection, sql: &str) -> Refusal {
         let err = rows(conn, sql).expect_err(sql);
         err.downcast_ref::<Refusal>()
             .unwrap_or_else(|| panic!("{sql}: not a refusal: {err:#}"))
@@ -523,16 +537,16 @@ mod tests {
 
     #[test]
     fn a_select_returns_its_rows() {
-        let (_dir, _w, r) = reader();
-        assert_eq!(rows(&r, "SELECT a FROM t ORDER BY a").unwrap().len(), 2);
+        let (_dir, _w, mut r) = reader();
+        assert_eq!(rows(&mut r, "SELECT a FROM t ORDER BY a").unwrap().len(), 2);
         assert_eq!(
-            rows(&r, "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 3) SELECT upper('a') || x FROM n")
+            rows(&mut r,"WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 3) SELECT upper('a') || x FROM n")
                 .unwrap()
                 .len(),
             3,
         );
         assert_eq!(
-            rows(&r, "SELECT name FROM pragma_table_info('t')")
+            rows(&mut r, "SELECT name FROM pragma_table_info('t')")
                 .unwrap()
                 .len(),
             1,
@@ -542,19 +556,19 @@ mod tests {
 
     #[test]
     fn a_non_refusal_error_passes_through() {
-        let (_dir, _w, r) = reader();
-        let err = rows(&r, "SELECT nope FROM missing").unwrap_err();
+        let (_dir, _w, mut r) = reader();
+        let err = rows(&mut r, "SELECT nope FROM missing").unwrap_err();
         assert!(err.downcast_ref::<Refusal>().is_none(), "{err:#}");
         assert!(format!("{err:#}").contains("no such table"), "{err:#}");
     }
 
     #[test]
     fn statements_that_write_or_reach_the_host_are_refused() {
-        let (dir, _w, r) = reader();
+        let (dir, _w, mut r) = reader();
         let host = dir.path().join("exfil.db");
         let host = host.to_str().unwrap();
-        let denied = |sql: &str, action: &str, subject: &str| {
-            let got = refusal(&r, sql);
+        let mut denied = |sql: &str, action: &str, subject: &str| {
+            let got = refusal(&mut r, sql);
             assert_eq!(
                 (got.reason, got.action.as_str(), got.subject.as_str()),
                 (RefusalReason::DeniedAction, action, subject),
@@ -593,19 +607,19 @@ mod tests {
         );
         denied("SELECT 1; DROP TABLE t", "delete", "sqlite_master");
 
-        let vacuum = refusal(&r, &format!("VACUUM INTO '{host}'"));
+        let vacuum = refusal(&mut r, &format!("VACUUM INTO '{host}'"));
         assert_eq!(
             (vacuum.reason, vacuum.action.as_str()),
             (RefusalReason::NotAQuery, "vacuum"),
         );
-        let stacked = refusal(&r, "SELECT 1; SELECT 2");
+        let stacked = refusal(&mut r, "SELECT 1; SELECT 2");
         assert_eq!(
             (stacked.reason, stacked.action.as_str()),
             (RefusalReason::MultipleStatements, "statement"),
         );
-        assert_eq!(refusal(&r, "").reason, RefusalReason::NotAQuery);
+        assert_eq!(refusal(&mut r, "").reason, RefusalReason::NotAQuery);
         assert_eq!(
-            refusal(&r, "PRAGMA table_info(t)").reason,
+            refusal(&mut r, "PRAGMA table_info(t)").reason,
             RefusalReason::NotAQuery
         );
 
@@ -613,16 +627,20 @@ mod tests {
             !std::path::Path::new(host).exists(),
             "nothing reached the host path"
         );
-        assert_eq!(rows(&r, "SELECT a FROM t").unwrap().len(), 2, "t is whole");
+        assert_eq!(
+            rows(&mut r, "SELECT a FROM t").unwrap().len(),
+            2,
+            "t is whole"
+        );
     }
 
     /// A step the authorizer denied is a refusal even when `run` swallows
     /// the step's error: the caller never gets a truncated result as success.
     #[test]
     fn a_denial_during_a_step_is_a_refusal_even_if_run_swallows_it() {
-        let (_dir, _w, r) = reader();
+        let (_dir, _w, mut r) = reader();
         let err = query(
-            &r,
+            &mut r,
             "SELECT a FROM t UNION ALL SELECT name FROM pragma_database_list",
             |stmt| Ok(stmt.query_map([], |_| Ok(()))?.count()),
         )
@@ -638,8 +656,8 @@ mod tests {
     /// serves the daemon's other read ops as before.
     #[test]
     fn the_authorizer_is_removed_after_the_statement() {
-        let (_dir, _w, r) = reader();
-        refusal(&r, "DROP TABLE t");
+        let (_dir, _w, mut r) = reader();
+        refusal(&mut r, "DROP TABLE t");
         let n: i64 = r
             .query_row("SELECT changes()", [], |row| row.get(0))
             .unwrap();

@@ -202,7 +202,7 @@ pub fn project_lsp(
     diagnostics: &[Diagnostic],
     source_uri: &str,
 ) -> Result<Vec<u8>> {
-    let conn = Connection::open_in_memory()?;
+    let mut conn = Connection::open_in_memory()?;
     project_lsp_into(symbols, diagnostics, source_uri, &conn)?;
     let data = conn.serialize("main")?;
     Ok(data.to_vec())

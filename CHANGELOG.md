@@ -14,6 +14,129 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.27.0] — 2026-11-10
+
+**A security and microVM release. Arenas from 0.26.0 carry over (projection
+unchanged, `projection-v12`). `SCHEMA_VERSION` is 0.27.0: the execution/v1
+schema's documented `inputRoots` order and its vectors changed, though the Go
+module's code did not.**
+- The bundled SQLite is 3.54.1 (CVE-2026-119375).
+- `cargo audit` reports no vulnerability, and `task audit` in `task ci` now
+  refuses any advisory on a shipped crate.
+- Under `--tsi-hijack-inet` a guest's UDP socket no longer gets a host port
+  (libkrun patch 0009). Declared TCP listeners are proven reachable, and
+  undeclared ones unreachable, on macOS.
+- `leyline rootfs import-oci` turns a digest-pinned OCI image into an
+  execution rootfs, proven to boot in a libkrun guest.
+- One behaviour change for execution/v1 consumers: a receipt's `inputRoots`
+  now lists the rootfs first, so a run with no workspace is no longer `[]`.
+
+The SQLite bump changes the header bytes of a serialized arena, so the same
+rows give a different `current_root` than under 0.26.0. Linux guests should
+keep TSI hijack off until `ley-line-open-381b1d` (UDP egress) closes.
+
+### Security
+
+- **Under `--tsi-hijack-inet`, a guest UDP socket no longer gets a host
+  port that anyone can send to** (bead `ley-line-open-0026d2`, LLO libkrun
+  patch `0009`). libkrun's TSI datagram proxy never read the port map. A
+  guest `sendto` made the VMM bind a host UDP socket at `0.0.0.0` and an
+  ephemeral port before sending anything, and it forwarded every datagram
+  that arrived there to the guest, from any source on any host interface.
+  That held even though the VMM's sandbox refused to transmit the guest's
+  own datagram, which on macOS it always does (a §4 grant opens outbound
+  TCP to the declared ports only). Measured on a live guest under a §4
+  grant: datagrams from loopback and from the host's LAN address reached
+  the guest. With a port map configured (the worker always configures
+  one), the proxy binds nothing for the guest, admits a peer only once the
+  host has actually sent to it or connected to it, and forwards only
+  datagrams from admitted peers; a destination the guest merely names
+  admits nothing. Under the worker's profile the VMM now holds no UDP port
+  at all. A guest UDP bind to a fixed port was already unpublished, on
+  loopback and on the LAN address. `libkrun_guest_listener`'s
+  `an_undeclared_guest_udp_port_is_not_reachable_from_the_host` proves both
+  in one run, beside a declared TCP listener that answers. The guarantee
+  belongs to the `leyline-krun-worker` LLO builds; a stock libkrun does not
+  carry the patch.
+
+- **`rs/Cargo.lock` carries no RustSec vulnerability, and `task ci` now
+  fails on one** (bead `ley-line-open-3adcf7`). Semver-compatible lockfile
+  updates clear the 23 vulnerabilities `cargo audit` reported: in the shipped
+  binaries, rustls-webpki 0.103.16 and webpki-roots 1.0.11 stop trusting the
+  distrusted emSign intermediates (RUSTSEC-2026-0382, -0381) and
+  crossbeam-epoch moves to 0.9.21 (RUSTSEC-2026-0204); outside them, h2,
+  pulldown-cmark, quinn-proto, rkyv, webpki-root-certs and zstd/zstd-safe/
+  zstd-sys move to their fixed releases, and zip moves to 9.4 (bead
+  `ley-line-open-643a35`). The unsound anyhow, faster-hex, lru, memmap2, tokio
+  and zstd-safe releases and the yanked chacha20, der and async-executor
+  releases are replaced too, and imago 0.2.6 drops the unmaintained bincode
+  from `leyline-krun-worker`. A new `task audit` runs
+  `cargo deny check advisories` over every feature of the workspace with the
+  committed `deny.toml`, and `task ci` runs it. Four unmaintained-crate
+  notices in not-shipping features remain ignored (paste, bead
+  `ley-line-open-531fc5`; the zbus 4 stack, bead `ley-line-open-275db8`).
+  `tools/lint_deny_ignores.sh` fails the audit when an ignore lacks a bead or
+  an expiry date, is past its expiry, or names a crate that `leyline-cli` or
+  `leyline-krun-worker` ships.
+
+- **The `engine-witchcraft` feature builds candle 0.11.1 and zip 9.4,
+  past zip's extraction advisories** (bead `ley-line-open-643a35`).
+  witchcraft pins candle at a git revision (0.10.2) that requires zip 7.2,
+  which has RUSTSEC-2026-0367, -0368, -0369 and -0429 (SUID bits kept on
+  extraction, symlinks written outside the destination, permissions applied
+  through symlinks, and a process abort on a symlink entry). A
+  `[patch."https://github.com/huggingface/candle"]` in `rs/Cargo.toml`
+  serves witchcraft's candle crates from the crates.io release 0.11.1, which
+  requires zip ^9.1.3. No release binary enables the feature. Remove the
+  patch when witchcraft pins a candle whose zip is 9.0.5 or later.
+
+- **The bundled SQLite is 3.54.1, past CVE-2026-119375
+  (RUSTSEC-2026-0459)** (bead `ley-line-open-6ef210`). rusqlite moves from
+  0.39 to 0.41 and `libsqlite3-sys` from 0.37 (SQLite 3.51.3) to 0.39.1, and
+  r2d2_sqlite from 0.34 to 0.36 with it. SQLite before 3.54.0 can return
+  uninitialized page-cache memory when it opens a database whose `-wal` file
+  has a different page size. witchcraft (the `engine-witchcraft` feature of
+  `leyline-text-search`) still requires rusqlite 0.39; a semver-trick crate,
+  `rs/shims/rusqlite-0.39`, serves that requirement from rusqlite 0.41 through
+  `[patch.crates-io]`, so the workspace links one SQLite.
+  `sqlite_version_floor_test` fails if a later dependency change brings back
+  a SQLite older than 3.54.0. The daemon's read-only `query` op allows the two
+  JSON functions SQLite 3.54 adds, `json_array_insert` and
+  `jsonb_array_insert`, which compute a value from their arguments as
+  `json_insert` does; every other action is still denied by default. In the
+  Rust API, `snapshot_to_arena`, `activate_cdc_and_snapshot` and
+  `SqliteGraph::serialize` take `&mut` because rusqlite 0.41 serializes a
+  connection only through an exclusive borrow.
+
+### Added
+
+- **`leyline rootfs import-oci` turns a digest-pinned OCI image into an execution rootfs** (bead `ley-line-open-7736ab`).
+  It reads an OCI image layout (written by skopeo, crane, `docker buildx --output type=oci`, buildah or podman, none of which execution needs), selects this host's Linux platform from an index, verifies every blob digest and size and each layer's `diff_id`, applies the layers in order with OCI whiteout and opaque-whiteout semantics, and publishes `<cas-root>/<blake3 hex>/` with its `rootfs.manifest.json`: the rootfs `execution-daemon --cas-root` serves and a catalog entry's `rootfs` names. The digest is deterministic across hosts, runs and archive order. Mutable tags, hostile paths (`..`, absolute, through a link), device nodes and FIFOs are refused; setuid, setgid and sticky bits are cleared; symbolic links, which rootfs manifest v1 cannot express, are refused unless `--symlinks resolve` copies their in-image targets. The library entry point is `leyline_runtime::artifacts::oci::import_oci_layout`.
+
+### Changed
+
+- **An execution receipt's `inputRoots` now names the run's rootfs first, and a replayed start no longer rewrites an existing receipt** (beads `ley-line-open-68a55d`, `ley-line-open-799fbc`).
+  `RunReceipt.inputRoots` is documented as the content roots materialized for the run, and the runtime's own comments said the rootfs reached it. In fact `start_authorized` recorded only the workspace graph roots, so a receipt for a run without a workspace named no content at all, and nothing in any receipt identified the rootfs the workload ran in. The list is now the rootfs digest the resolver chose, which both backends verify before the workload runs, followed by each granted workspace's graph root in grant order. The order is stated in `execution.capnp` and the generated tool definitions, and the canonical vector `test-vectors/canonical-run.json` shows it. A consumer that read an empty list as "no workspace" must now skip the first entry. Separately, a start that reused an existing run's replay key under a different spec or grant was answered with the existing run, but it overwrote that run's receipt context with the new caller's spec, grant, confinement and input roots. The receipt context is now recorded once, when the run first starts. Both defects were found by a new hypervisor-suite test that boots a rootfs produced by `leyline rootfs import-oci` in a libkrun guest through execution/v1.
+
+### Fixed
+
+- **`tools/guest_tools.sh` builds again, and a rotted pin fails naming
+  itself** (bead `ley-line-open-ae6b99`). Alpine deleted
+  `libexpat-2.8.5-r0`; the pin moves to `libexpat-2.10.0-r0` (sha256
+  `99144fe0…`). Every pin is now fetched by `tools/fetch_pinned.sh`, which
+  tries, in order, this machine's content-addressed store
+  (`~/.cache/leyline/pins/<sha256>`, filled with each pin the script has
+  verified, so a machine that fetched a pin once no longer depends on
+  Alpine keeping it), Alpine, and LLO's content-addressed mirror (the
+  `guest-tools-pins` release, assets named by SHA-256, which
+  `tools/guest_tools_mirror.sh upload` creates and fills). Every source is
+  checked against the same pin. When none has the bytes, the script exits
+  naming the pin and what each source answered, instead of curl's bare
+  `404`. The pins live in `tools/guest_tools_pins.sh`;
+  `task guest-tools:mirror:check` reports which pins the mirror holds.
+  `task guest-tools:fixture-test`, run by `task ci`, proves the fallback and
+  the failure message without the network.
+
 ## [0.26.0] — 2026-11-10
 
 **A breaking identity and correctness release. Arenas do not carry over:

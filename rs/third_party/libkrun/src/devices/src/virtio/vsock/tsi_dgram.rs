@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -9,7 +9,7 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::UnixAddr;
 use nix::sys::socket::{
-    bind, connect, getpeername, recv, send, sendto, socket, AddressFamily, MsgFlags, SockFlag,
+    bind, connect, getpeername, recvfrom, send, sendto, socket, AddressFamily, MsgFlags, SockFlag,
     SockType, SockaddrIn, SockaddrLike, SockaddrStorage,
 };
 
@@ -28,6 +28,24 @@ use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
 
+/// How many peers a datagram proxy remembers when it admits only replies.
+/// The oldest is forgotten first.
+const MAX_PEERS: usize = 64;
+
+/// How many datagrams from non-peers one wakeup reads and drops.
+const MAX_DROPS: usize = 64;
+
+/// An INET or INET6 address as the peer filter compares it: the IP and the
+/// port, without IPv6 flow information or scope.
+fn peer_key(addr: &SockaddrStorage) -> Option<(IpAddr, u16)> {
+    if let Some(sin) = addr.as_sockaddr_in() {
+        Some((IpAddr::V4(sin.ip()), sin.port()))
+    } else {
+        addr.as_sockaddr_in6()
+            .map(|sin6| (IpAddr::V6(sin6.ip()), sin6.port()))
+    }
+}
+
 pub struct TsiDgramProxy {
     pub id: u64,
     cid: u64,
@@ -45,9 +63,17 @@ pub struct TsiDgramProxy {
     tx_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: Wrapping<u32>,
+    /// With a configured port map, the peers the host actually reached for
+    /// the guest: each destination a `sendto` delivered to, and a peer
+    /// `connect` succeeded to. Only a datagram from one of them reaches the
+    /// guest: the host socket is a reply path, not a listener, and a peer the
+    /// guest merely named (a send the host's sandbox refused) admits nothing.
+    /// `None` without a map, where every datagram is forwarded, as before.
+    peers: Option<VecDeque<(IpAddr, u16)>>,
 }
 
 impl TsiDgramProxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
         cid: u64,
@@ -56,6 +82,7 @@ impl TsiDgramProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
+        replies_only: bool,
     ) -> Result<Self, ProxyError> {
         let family = match family {
             defs::LINUX_AF_INET => AddressFamily::Inet,
@@ -113,7 +140,32 @@ impl TsiDgramProxy {
             tx_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
+            peers: (replies_only && matches!(family, AddressFamily::Inet | AddressFamily::Inet6))
+                .then(VecDeque::new),
         })
+    }
+
+    /// Remember `addr` as a peer the host reached, when replies are filtered.
+    fn admit_peer(&mut self, addr: &SockaddrStorage) {
+        let (Some(peers), Some(key)) = (self.peers.as_mut(), peer_key(addr)) else {
+            return;
+        };
+        if !peers.contains(&key) {
+            if peers.len() == MAX_PEERS {
+                peers.pop_front();
+            }
+            peers.push_back(key);
+        }
+    }
+
+    /// Whether a datagram from `source` may reach the guest.
+    fn admits(&self, source: Option<&SockaddrStorage>) -> bool {
+        match &self.peers {
+            None => true,
+            Some(peers) => source
+                .and_then(peer_key)
+                .is_some_and(|key| peers.contains(&key)),
+        }
     }
 
     fn init_pkt(&self, pkt: &mut VsockPacket) {
@@ -167,18 +219,34 @@ impl TsiDgramProxy {
             }
             */
 
-            match recv(self.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
-                Ok(cnt) => {
-                    debug!("recv cnt={cnt}");
-                    if cnt > 0 {
-                        RecvPkt::Read(cnt)
-                    } else {
-                        RecvPkt::Close
+            let mut dropped = 0;
+            loop {
+                match recvfrom::<SockaddrStorage>(self.fd.as_raw_fd(), &mut buf[..max_len]) {
+                    Ok((cnt, source)) => {
+                        // A datagram from an address the host never sent to
+                        // for the guest is dropped here, and the next one is
+                        // read. At most MAX_DROPS per wakeup, so a flood
+                        // cannot hold the RX queue: the socket is polled
+                        // level-triggered, so what remains wakes it again.
+                        if !self.admits(source.as_ref()) {
+                            debug!("recv: dropping a datagram from {source:?}, not a peer");
+                            dropped += 1;
+                            if dropped == MAX_DROPS {
+                                break RecvPkt::Error;
+                            }
+                            continue;
+                        }
+                        debug!("recv cnt={cnt}");
+                        break if cnt > 0 {
+                            RecvPkt::Read(cnt)
+                        } else {
+                            RecvPkt::Close
+                        };
                     }
-                }
-                Err(e) => {
-                    debug!("recv_pkt: recv error: {e:?}");
-                    RecvPkt::Error
+                    Err(e) => {
+                        debug!("recv_pkt: recv error: {e:?}");
+                        break RecvPkt::Error;
+                    }
                 }
             }
         } else {
@@ -248,6 +316,7 @@ impl Proxy for TsiDgramProxy {
         let res = match connect(self.fd.as_raw_fd(), &req.addr) {
             Ok(()) => {
                 debug!("connect: Connected");
+                self.admit_peer(&req.addr);
                 self.status = ProxyStatus::Connected;
                 0
             }
@@ -342,6 +411,17 @@ impl Proxy for TsiDgramProxy {
         let mut update = ProxyUpdate::default();
 
         self.sendto_addr = Some(req.addr);
+        // Replies only: nothing is bound here. The host's own sendto binds
+        // the socket when, and only when, a datagram actually leaves, and
+        // only then is its destination admitted (sendto_data). A guest whose
+        // datagrams the host refuses to send never holds a host port.
+        if self.peers.is_some() {
+            if !self.listening {
+                self.listening = true;
+                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+            }
+            return update;
+        }
         if !self.listening {
             let bind_result = match self.family {
                 AddressFamily::Inet => bind(self.fd.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, 0)),
@@ -389,6 +469,7 @@ impl Proxy for TsiDgramProxy {
                 match sendto(self.fd.as_raw_fd(), buf, &addr, flags) {
                     Ok(sent) => {
                         self.tx_cnt += Wrapping(sent as u32);
+                        self.admit_peer(&addr);
                     }
                     Err(err) => debug!("error in sendto: {err}"),
                 }

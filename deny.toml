@@ -1,0 +1,42 @@
+# cargo-deny configuration for the rs/ workspace (bead ley-line-open-3adcf7).
+#
+# Only the advisories check is gated: `task audit` runs
+# `cargo deny check advisories` against rs/Cargo.lock and `task ci` runs
+# `task audit`. Licenses and bans are not configured here; the license
+# direction gate is tools/check_license_direction.sh.
+#
+# IGNORE POLICY, enforced by tools/lint_deny_ignores.sh (part of `task audit`):
+#   * Every ignore is a table `{ id = "RUSTSEC-YYYY-NNNN", reason = "..." }`.
+#   * Its reason names a bead (`bead ley-line-open-xxxxxx`) and an expiry
+#     (`expires YYYY-MM-DD`). An ignore past its expiry fails `task audit`:
+#     fix the advisory, or re-date the ignore with a new reason.
+#   * No ignore may cover a crate in the shipped closure: leyline-cli on
+#     every release target and leyline-krun-worker on aarch64-apple-darwin,
+#     normal edges, release features. Shipped advisories get fixed (bump,
+#     `cargo update -p`, [patch], or removal), never ignored.
+
+[graph]
+# Every feature of every workspace member, so advisories in not-shipping
+# features (tools/feature-ledger.txt) are reported too and must be fixed or
+# carry a dated, bead-linked ignore below.
+all-features = true
+
+[advisories]
+# The default database (github.com/rustsec/advisory-db), cached under
+# $CARGO_HOME/advisory-dbs. `task audit` fetches it first; see the task for
+# the offline behavior.
+unmaintained = "all"
+unsound = "all"
+yanked = "warn"
+ignore = [
+    # paste 1.0.15, unmaintained. Proc-macro reached only through
+    # gemm 0.19 -> candle-core 0.11.1 -> witchcraft ->
+    # leyline-text-search[engine-witchcraft], a not-shipping feature.
+    { id = "RUSTSEC-2024-0436", reason = "paste (unmaintained) via candle's gemm in the not-shipping engine-witchcraft feature; bead ley-line-open-531fc5; expires 2027-02-09" },
+    # zbus 4 stack, unmaintained. Reached only through leyline-sign's
+    # keyring 3 Linux secret-service backend under the not-shipping `host`
+    # and `host-extras` features; nono 0.71 pins the same backend.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 4 (unmaintained) via keyring 3 secret-service in not-shipping leyline-sign host features; bead ley-line-open-275db8; expires 2027-02-09" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 3 (unmaintained) via keyring 3 secret-service in not-shipping leyline-sign host features; bead ley-line-open-275db8; expires 2027-02-09" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 4 (unmaintained) via keyring 3 secret-service in not-shipping leyline-sign host features; bead ley-line-open-275db8; expires 2027-02-09" },
+]

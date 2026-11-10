@@ -15,7 +15,7 @@ use rusqlite::Connection;
 /// content via the optimized single-query path in SqliteGraphAdapter.
 #[test]
 fn all_file_contents_bulk_query() -> Result<()> {
-    let source = Connection::open_in_memory()?;
+    let mut source = Connection::open_in_memory()?;
     create_schema(&source)?;
     // A node's PATH is not stored under projection-v5; `all_file_contents`
     // renders each one through `v_node_path`, so the fixture has to intern

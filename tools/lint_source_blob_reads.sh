@@ -39,7 +39,11 @@ test -f "$root/$accessor" || {
     exit 2
 }
 
+# Build output is not source: `rs/target*` covers rs/target and the
+# separate target directories builds use beside it (rs/target-hypervisor,
+# bead ley-line-open-465ce2), whose generated bindings name sqlite's blob API.
 files=$(cd "$root" && find rs -name '*.rs' \
+    -not -path 'rs/target*/*' \
     -not -path '*/target/*' -not -path '*/tests/*' -not -path '*/benches/*' \
     -not -name '*tests.rs' | LC_ALL=C sort)
 

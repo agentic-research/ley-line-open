@@ -1089,7 +1089,7 @@ mod tests {
         }
     }
 
-    fn whole_image(conn: &Connection) -> Vec<u8> {
+    fn whole_image(conn: &mut Connection) -> Vec<u8> {
         conn.serialize("main").unwrap().to_vec()
     }
 
@@ -1178,16 +1178,16 @@ mod tests {
     /// of the arena.
     #[test]
     fn a_write_outside_the_grant_is_refused_with_no_side_effect() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = whole_image(&a.conn);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&mut a.conn);
         let grant = Grant::Paths(BTreeSet::from(["b.go".to_string()]));
         let err = write(&a.conn, &grant, "a.go", A2.as_bytes().to_vec()).unwrap_err();
         assert!(format!("{err:#}").contains("outside the grant"), "{err:#}");
-        assert_eq!(whole_image(&a.conn), before);
+        assert_eq!(whole_image(&mut a.conn), before);
 
         write(&a.conn, &grant, "b.go", A2.as_bytes().to_vec()).unwrap();
         assert_ne!(
-            whole_image(&a.conn),
+            whole_image(&mut a.conn),
             before,
             "a path inside the grant is written"
         );
@@ -1229,7 +1229,7 @@ mod tests {
     /// with a trigger on the `derived_from` stamp, the last step.
     #[test]
     fn a_write_that_fails_after_its_rows_leaves_the_arena_unchanged() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
         a.conn
             .execute_batch(
                 "CREATE TRIGGER refuse_derived_from BEFORE INSERT ON _meta
@@ -1237,7 +1237,7 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'injected stamp failure'); END;",
             )
             .unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
 
         let err = write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap_err();
         assert!(
@@ -1245,7 +1245,7 @@ mod tests {
             "{err:#}"
         );
         assert!(
-            whole_image(&a.conn) == before,
+            whole_image(&mut a.conn) == before,
             "nothing of a failed write is committed"
         );
         assert_eq!(
@@ -1388,8 +1388,8 @@ mod tests {
     /// refuses refuses the others.
     #[test]
     fn a_proposal_with_one_invalid_file_changes_nothing() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = whole_image(&a.conn);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&mut a.conn);
         let err = propose(
             &a.conn,
             &Grant::Whole,
@@ -1398,7 +1398,7 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:#}").contains("b.go"), "{err:#}");
         assert!(
-            whole_image(&a.conn) == before,
+            whole_image(&mut a.conn) == before,
             "nothing of the proposal lands"
         );
     }
@@ -1409,9 +1409,9 @@ mod tests {
     /// overwrite never wins (ADR-0045 T5).
     #[test]
     fn a_stale_base_is_refused_and_names_what_moved() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
         write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
 
         let err = propose(
             &a.conn,
@@ -1438,7 +1438,7 @@ mod tests {
             "a typed stale refusal: {err:#}"
         );
         assert!(
-            whole_image(&a.conn) == before,
+            whole_image(&mut a.conn) == before,
             "nothing of the proposal lands"
         );
         let message = err.to_string();
@@ -1498,31 +1498,38 @@ mod tests {
     /// nothing.
     #[test]
     fn every_refusal_is_typed_and_changes_nothing() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = whole_image(&a.conn);
-        let refusal = |grant: &Grant, writes: Vec<Proposed>| -> Refusal {
-            let err = propose(&a.conn, grant, writes).unwrap_err();
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&mut a.conn);
+        // Takes the connection rather than capturing it, so `whole_image`
+        // can borrow it mutably between refusals.
+        let refusal = |conn: &Connection, grant: &Grant, writes: Vec<Proposed>| -> Refusal {
+            let err = propose(conn, grant, writes).unwrap_err();
             err.downcast_ref::<Refusal>()
                 .unwrap_or_else(|| panic!("an untyped refusal: {err:#}"))
                 .clone()
         };
         let only_b = Grant::Paths(BTreeSet::from(["b.go".to_string()]));
 
-        assert_eq!(refusal(&Grant::Whole, vec![]), Refusal::Empty);
+        assert_eq!(refusal(&a.conn, &Grant::Whole, vec![]), Refusal::Empty);
         assert_eq!(
-            refusal(&only_b, vec![proposed("a.go", Base::Any, A2)]),
+            refusal(&a.conn, &only_b, vec![proposed("a.go", Base::Any, A2)]),
             Refusal::OutsideGrant {
                 path: "a.go".to_string()
             }
         );
         assert_eq!(
-            refusal(&Grant::Whole, vec![proposed("z.go", Base::Any, A2)]),
+            refusal(
+                &a.conn,
+                &Grant::Whole,
+                vec![proposed("z.go", Base::Any, A2)]
+            ),
             Refusal::NoSuchFile {
                 path: "z.go".to_string()
             }
         );
         assert_eq!(
             refusal(
+                &a.conn,
                 &Grant::Whole,
                 vec![
                     proposed("a.go", Base::Any, A2),
@@ -1534,12 +1541,12 @@ mod tests {
             }
         );
         assert_eq!(
-            refusal(&Grant::Whole, vec![Proposed::rmdir("a.go")]),
+            refusal(&a.conn, &Grant::Whole, vec![Proposed::rmdir("a.go")]),
             Refusal::NotADirectory {
                 path: "a.go".to_string()
             }
         );
-        assert_eq!(whole_image(&a.conn), before);
+        assert_eq!(whole_image(&mut a.conn), before);
 
         a.conn
             .execute(
@@ -1549,6 +1556,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             refusal(
+                &a.conn,
                 &Grant::Whole,
                 vec![proposed("a.go", Base::Any, A2), proposed("b.go", Base::Any, B2)]
             ),
@@ -1558,7 +1566,11 @@ mod tests {
             .execute("UPDATE _source SET path = NULL WHERE id = 'b.go'", [])
             .unwrap();
         assert_eq!(
-            refusal(&Grant::Whole, vec![proposed("b.go", Base::Any, B2)]),
+            refusal(
+                &a.conn,
+                &Grant::Whole,
+                vec![proposed("b.go", Base::Any, B2)]
+            ),
             Refusal::NoTreeRoot {
                 path: "b.go".to_string()
             }
@@ -1571,32 +1583,32 @@ mod tests {
     /// proposal naming it fails closed and nothing lands.
     #[test]
     fn a_manifest_entry_without_a_blob_fails_closed() {
-        let a = arena(&[("a.go", A)]);
+        let mut a = arena(&[("a.go", A)]);
         a.conn
             .execute("UPDATE _tree SET blob_hash = NULL WHERE path = 'a.go'", [])
             .unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
         for base in [Base::Blob(Hash::ZERO), Base::Any] {
             let err =
                 propose(&a.conn, &Grant::Whole, vec![proposed("a.go", base, A2)]).unwrap_err();
             assert!(err.downcast_ref::<Refusal>().is_none(), "{err:#}");
             assert!(format!("{err:#}").contains("no blob_hash"), "{err:#}");
         }
-        assert!(whole_image(&a.conn) == before, "nothing lands");
+        assert!(whole_image(&mut a.conn) == before, "nothing lands");
     }
 
     /// One proposal is one tree: files recorded under different roots are
     /// refused together, since one pass projects one tree.
     #[test]
     fn a_proposal_spanning_two_trees_is_refused() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
         a.conn
             .execute(
                 "UPDATE _source SET path = '/elsewhere/b.go' WHERE id = 'b.go'",
                 [],
             )
             .unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
         let err = propose(
             &a.conn,
             &Grant::Whole,
@@ -1608,7 +1620,7 @@ mod tests {
             "{err:#}"
         );
         assert!(
-            whole_image(&a.conn) == before,
+            whole_image(&mut a.conn) == before,
             "nothing of the proposal lands"
         );
     }
@@ -1616,8 +1628,8 @@ mod tests {
     /// Every path of a proposal must be inside the grant, or none lands.
     #[test]
     fn a_proposal_reaching_outside_its_grant_changes_nothing() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = whole_image(&a.conn);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&mut a.conn);
         let grant = Grant::Paths(BTreeSet::from(["a.go".to_string()]));
         let err = propose(
             &a.conn,
@@ -1627,18 +1639,18 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:#}").contains("outside the grant"), "{err:#}");
         assert!(
-            whole_image(&a.conn) == before,
+            whole_image(&mut a.conn) == before,
             "nothing of the proposal lands"
         );
     }
 
     #[test]
     fn a_write_to_a_file_the_arena_does_not_hold_is_refused() {
-        let a = arena(&[("a.go", A)]);
-        let before = whole_image(&a.conn);
+        let mut a = arena(&[("a.go", A)]);
+        let before = whole_image(&mut a.conn);
         let err = write(&a.conn, &Grant::Whole, "z.go", A2.as_bytes().to_vec()).unwrap_err();
         assert!(format!("{err:#}").contains("no such file"), "{err:#}");
-        assert_eq!(whole_image(&a.conn), before);
+        assert_eq!(whole_image(&mut a.conn), before);
     }
 
     /// `check` decides as `propose` would, landing nothing: an overlapping
@@ -1646,9 +1658,9 @@ mod tests {
     /// outside the grant is refused, and an edit that merges is accepted.
     #[test]
     fn check_decides_as_propose_and_lands_nothing() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
         write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
 
         let overlapping = vec![proposed(
             "a.go",
@@ -1674,7 +1686,7 @@ mod tests {
         ));
 
         check(&a.conn, &Grant::Whole, vec![proposed("b.go", blob(B), B2)]).unwrap();
-        assert!(whole_image(&a.conn) == before, "a check lands nothing");
+        assert!(whole_image(&mut a.conn) == before, "a check lands nothing");
     }
 
     /// Bead `ley-line-open-12d305`: a proposal against a moved base reads
@@ -1683,7 +1695,7 @@ mod tests {
     /// and nothing lands.
     #[test]
     fn a_tampered_merge_base_is_refused_naming_the_path_and_blob() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
         write(&a.conn, &Grant::Whole, "a.go", A2.as_bytes().to_vec()).unwrap();
         let base = A.as_bytes().hash();
         a.conn
@@ -1692,7 +1704,7 @@ mod tests {
                 rusqlite::params![B.as_bytes(), base.as_bytes().as_slice()],
             )
             .unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
         let err = propose(
             &a.conn,
             &Grant::Whole,
@@ -1710,7 +1722,7 @@ mod tests {
             "{msg}"
         );
         assert!(
-            whole_image(&a.conn) == before,
+            whole_image(&mut a.conn) == before,
             "a refused proposal lands nothing"
         );
     }
@@ -1842,8 +1854,8 @@ mod tests {
     /// was deleted since is stale with no current blob.
     #[test]
     fn a_create_over_a_file_and_a_change_to_a_deleted_file_are_stale() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = whole_image(&a.conn);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&mut a.conn);
         let err = propose(
             &a.conn,
             &Grant::Whole,
@@ -1859,7 +1871,7 @@ mod tests {
             }])
         );
         assert!(err.to_string().contains("read no file"), "{err}");
-        assert!(whole_image(&a.conn) == before);
+        assert!(whole_image(&mut a.conn) == before);
 
         propose(
             &a.conn,
@@ -1867,7 +1879,7 @@ mod tests {
             vec![Proposed::delete("b.go", Base::Any)],
         )
         .unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
         for change in [
             Proposed::delete("b.go", blob(B)),
             proposed("b.go", blob(B), B2),
@@ -1894,15 +1906,15 @@ mod tests {
                 path: "b.go".into()
             }
         );
-        assert!(whole_image(&a.conn) == before);
+        assert!(whole_image(&mut a.conn) == before);
     }
 
     /// A delete against a file that moved since it was read is stale.
     #[test]
     fn a_delete_against_a_moved_file_is_stale_and_changes_nothing() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
         write(&a.conn, &Grant::Whole, "b.go", B2.as_bytes().to_vec()).unwrap();
-        let before = whole_image(&a.conn);
+        let before = whole_image(&mut a.conn);
         let err = propose(
             &a.conn,
             &Grant::Whole,
@@ -1917,7 +1929,7 @@ mod tests {
                 current: Some(B2.as_bytes().hash()),
             }])
         );
-        assert!(whole_image(&a.conn) == before);
+        assert!(whole_image(&mut a.conn) == before);
     }
 
     /// A rename is one proposal: the source deleted against the blob it
@@ -1969,8 +1981,8 @@ mod tests {
     /// delete is not applied alone.
     #[test]
     fn a_rename_whose_create_is_refused_leaves_the_source_in_place() {
-        let a = arena(&[("a.go", A), ("b.go", B)]);
-        let before = whole_image(&a.conn);
+        let mut a = arena(&[("a.go", A), ("b.go", B)]);
+        let before = whole_image(&mut a.conn);
         for target in [
             Proposed::create("b.go", A.as_bytes().to_vec()),
             Proposed::create("b.go/c.go", A.as_bytes().to_vec()),
@@ -1987,7 +1999,7 @@ mod tests {
                 "{target:?}: {err:#}"
             );
             assert!(
-                whole_image(&a.conn) == before,
+                whole_image(&mut a.conn) == before,
                 "{target:?} changed the arena"
             );
         }
@@ -1999,8 +2011,8 @@ mod tests {
     /// that is a directory.
     #[test]
     fn a_create_the_store_cannot_hold_is_refused() {
-        let a = arena(&[("a.go", A), ("lib.go/b.go", B)]);
-        let before = whole_image(&a.conn);
+        let mut a = arena(&[("a.go", A), ("lib.go/b.go", B)]);
+        let before = whole_image(&mut a.conn);
         let refused = |writes: Vec<Proposed>| {
             refusal_of(&propose(&a.conn, &Grant::Whole, writes).unwrap_err())
         };
@@ -2057,7 +2069,7 @@ mod tests {
                 path: "c.go".into()
             }
         );
-        assert!(whole_image(&a.conn) == before);
+        assert!(whole_image(&mut a.conn) == before);
 
         // The proposal's own delete frees the path: a file becomes a
         // directory in one change.

@@ -1923,6 +1923,126 @@ fn a_hard_link_to_a_dropped_device_is_refused() {
     }
 }
 
+/// A Zarf package's `images/` directory as oras-go writes it (bead
+/// `ley-line-open-97b636`): an OCI image layout holding several images
+/// whose blobs are shared, and an `index.json` naming each image manifest
+/// by its full reference (`org.opencontainers.image.ref.name`, plus Zarf's
+/// `org.opencontainers.image.base.name`). Returns the package root and
+/// each image's (reference, manifest digest).
+fn zarf_package(root: &Path) -> Vec<(String, String)> {
+    fs::create_dir_all(root).expect("package root");
+    fs::write(
+        root.join("zarf.yaml"),
+        "kind: ZarfPackageConfig\nmetadata:\n  name: fixture\ncomponents:\n  - name: app\n    images:\n      - ghcr.io/example/app:1.0\n      - ghcr.io/example/tool:2.0\n",
+    )
+    .expect("zarf.yaml");
+    let layout = Layout::create(&root.join("images"));
+    let shared = Layer::gzip(vec![
+        dir("etc/", 0o755),
+        file("etc/os-release", 0o644, b"ID=fixture\n"),
+    ]);
+    let app = layout.image(
+        "linux",
+        "arm64",
+        &[
+            Layer::gzip(shared.entries.clone()),
+            Layer::plain(vec![dir("bin/", 0o755), file("bin/app", 0o755, b"app\n")]),
+        ],
+        None,
+    );
+    let tool = layout.image(
+        "linux",
+        "arm64",
+        &[
+            Layer::gzip(shared.entries.clone()),
+            Layer::plain(vec![dir("bin/", 0o755), file("bin/tool", 0o755, b"tool\n")]),
+        ],
+        None,
+    );
+    let images = [
+        ("ghcr.io/example/app:1.0", app),
+        ("ghcr.io/example/tool:2.0", tool),
+    ];
+    let listed: Vec<Value> = images
+        .iter()
+        .map(|(reference, descriptor)| {
+            let mut value = descriptor.json();
+            value["annotations"] = serde_json::json!({
+                "org.opencontainers.image.base.name": reference,
+                "org.opencontainers.image.ref.name": reference,
+            });
+            value
+        })
+        .collect();
+    fs::write(
+        root.join("images/index.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX,
+            "manifests": listed,
+        }))
+        .unwrap(),
+    )
+    .expect("index.json");
+    images
+        .into_iter()
+        .map(|(reference, descriptor)| (reference.to_string(), descriptor.digest))
+        .collect()
+}
+
+#[test]
+fn a_zarf_package_images_directory_imports_as_a_layout() {
+    let scratch = TempDir::new().expect("scratch");
+    let package = scratch.path().join("package");
+    let images = zarf_package(&package);
+    // Both layers of each image are in one blobs/sha256, the first shared.
+    let blobs = fs::read_dir(package.join("images/blobs/sha256"))
+        .unwrap()
+        .count();
+    assert_eq!(blobs, 7, "two configs, two manifests, three layers");
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).expect("cas");
+    let mut rootfs = Vec::new();
+    for (reference, digest) in &images {
+        // The reference Zarf records, re-pinned by its digest: the name is a
+        // label, the digest selects.
+        let name = reference.rsplit_once(':').unwrap().0;
+        let pinned = format!("{name}@{digest}");
+        let imported = import(
+            &package.join("images"),
+            &pinned,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas,
+        )
+        .unwrap_or_else(|error| panic!("{pinned}: {error}"));
+        assert_eq!(&imported.image.reference, digest);
+        assert_eq!(&imported.image.manifest, digest);
+        let files = manifest_files(&cas, &imported.rootfs);
+        assert!(files.contains_key("etc/os-release"), "{files:?}");
+        rootfs.push((
+            files.keys().cloned().collect::<Vec<_>>(),
+            imported.rootfs.value,
+        ));
+    }
+    assert_eq!(rootfs[0].0, vec!["bin/app", "etc/os-release"]);
+    assert_eq!(rootfs[1].0, vec!["bin/tool", "etc/os-release"]);
+    assert_ne!(rootfs[0].1, rootfs[1].1);
+    // The tags in index.json are never read: one is still refused.
+    let error = import(
+        &package.join("images"),
+        "ghcr.io/example/app:1.0",
+        Platform::linux("arm64"),
+        SymlinkPolicy::Refuse,
+        &cas,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, OciImportError::MutableReference(_)),
+        "{error}"
+    );
+}
+
 #[test]
 fn dropped_entries_are_reported_by_normalized_path_and_reuse_one_cas_entry() {
     let scratch = TempDir::new().expect("scratch");

@@ -4793,6 +4793,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "unicode-normalization",
+ "ureq",
  "wait-timeout",
 ]
 

@@ -113,20 +113,46 @@ pub enum SymlinkMode {
 
 #[derive(Debug, Subcommand)]
 pub enum RootfsCommands {
-    /// Import a digest-pinned image from an OCI image layout as a rootfs
-    /// for this host's platform, and print the published rootfs as JSON.
-    /// Never contacts a registry or a container daemon: produce the layout
-    /// with skopeo, crane, `docker buildx --output type=oci`, buildah or
-    /// podman first.
+    /// Import a digest-pinned image as a rootfs for this host's platform,
+    /// and print the published rootfs as JSON. The image comes from an OCI
+    /// image layout (`--layout`, offline: produce it with skopeo, crane,
+    /// `docker buildx --output type=oci`, buildah or podman, or use a Zarf
+    /// package's `images/`) or is pulled by digest from a registry
+    /// (`--from-registry`, HTTPS, anonymous). Both give the same rootfs and
+    /// report for the same digest. Never contacts a container daemon.
     ImportOci {
         /// The OCI image layout directory (holding `oci-layout`).
-        #[arg(long)]
-        layout: PathBuf,
+        #[arg(
+            long,
+            requires = "image",
+            conflicts_with = "from_registry",
+            required_unless_present = "from_registry"
+        )]
+        layout: Option<PathBuf>,
 
-        /// `sha256:<hex>` (or `name@sha256:<hex>`) of the image index or
-        /// manifest. Tags are refused.
-        #[arg(long)]
-        image: String,
+        /// With `--layout`: `sha256:<hex>` (or `name@sha256:<hex>`) of the
+        /// image index or manifest. Tags are refused.
+        #[arg(long, requires = "layout", conflicts_with = "from_registry")]
+        image: Option<String>,
+
+        /// Pull `[registry/]repository@sha256:<hex>` (an index or manifest)
+        /// from its registry instead: only this host's manifest, its config
+        /// and its layers are fetched, each verified before use. Tags are
+        /// refused; a name without a registry is Docker Hub's.
+        #[arg(long, value_name = "REFERENCE")]
+        from_registry: Option<String>,
+
+        /// With `--from-registry`: the one registry, a loopback
+        /// `127.0.0.1:<port>` or `[::1]:<port>`, that may be reached over
+        /// plain HTTP. For a local test registry; refused for any other
+        /// address. Without it, plain HTTP is refused.
+        #[arg(
+            long,
+            value_name = "HOST:PORT",
+            requires = "from_registry",
+            conflicts_with = "layout"
+        )]
+        insecure_plain_http_registry: Option<String>,
 
         /// The content-addressed rootfs store: the directory
         /// `execution-daemon --cas-root` serves.

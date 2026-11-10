@@ -93,6 +93,79 @@
     name: (identifier) @name)) @ref
  (#set! qualifier-separator "::"))
 
+; ── Identifier-as-VALUE references (bead ley-line-open-a9ff82) ──────
+;
+; Same algebra as C (see queries/c/tags.scm): a function initialised,
+; assigned, passed, address-taken, returned, or placed in an
+; initializer list is a use. Each pattern anchors at the value-position
+; CONTAINER; its grammar kind tells a value ref from a call ref in
+; `node_refs.node_kind` / `kind_id`. C++ adds single-level qualified
+; names (`&ns::f`, `y = ns::g`), dual-emitting `ns::f` + `f` with
+; qualifier `ns` like a qualified call. Plain variables in these
+; positions emit too and stay unbound when no def carries the token.
+
+((argument_list [
+   (identifier) @name
+   (qualified_identifier
+     scope: (namespace_identifier) @qualifier
+     name: (identifier) @name)
+ ]) @ref
+ (#set! qualifier-separator "::"))
+
+((init_declarator
+   value: [
+     (identifier) @name
+     (qualified_identifier
+       scope: (namespace_identifier) @qualifier
+       name: (identifier) @name)
+   ]) @ref
+ (#set! qualifier-separator "::"))
+
+((assignment_expression
+   right: [
+     (identifier) @name
+     (qualified_identifier
+       scope: (namespace_identifier) @qualifier
+       name: (identifier) @name)
+   ]) @ref
+ (#set! qualifier-separator "::"))
+
+((return_statement [
+   (identifier) @name
+   (qualified_identifier
+     scope: (namespace_identifier) @qualifier
+     name: (identifier) @name)
+ ]) @ref
+ (#set! qualifier-separator "::"))
+
+; `&helper` / `&ns::f` — address-of only; `*p` is a dereference.
+((pointer_expression
+   operator: "&"
+   argument: [
+     (identifier) @name
+     (qualified_identifier
+       scope: (namespace_identifier) @qualifier
+       name: (identifier) @name)
+   ]) @ref
+ (#set! qualifier-separator "::"))
+
+((initializer_pair
+   value: [
+     (identifier) @name
+     (qualified_identifier
+       scope: (namespace_identifier) @qualifier
+       name: (identifier) @name)
+   ]) @ref
+ (#set! qualifier-separator "::"))
+
+((initializer_list [
+   (identifier) @name
+   (qualified_identifier
+     scope: (namespace_identifier) @qualifier
+     name: (identifier) @name)
+ ]) @ref
+ (#set! qualifier-separator "::"))
+
 ; ── Imports ─────────────────────────────────────────────────────────
 
 ; Same include algebra as C: `<vector>` / `"widget.hpp"` delimiters

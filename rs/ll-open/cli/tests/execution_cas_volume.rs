@@ -137,11 +137,12 @@ impl Drop for Host {
     fn drop(&mut self) {
         if cfg!(target_os = "macos") {
             let volume = self.volume();
-            for _ in 0..10 {
+            // Each attempt is an hdiutil run; retry them until a deadline.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
                 if volume.detach().is_ok() {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(500));
             }
             eprintln!(
                 "the test volume beneath {} is still attached: detach it with hdiutil",

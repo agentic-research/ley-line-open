@@ -50,14 +50,13 @@ impl Provisioned {
 impl Drop for Provisioned {
     fn drop(&mut self) {
         // A detach right after a write can find the volume busy for a
-        // moment (Spotlight is off for it, but fseventsd is not).
-        for _ in 0..10 {
+        // moment (Spotlight is off for it, but fseventsd is not). Each
+        // attempt is an hdiutil run; retry them until a deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
             match self.volume.detach() {
                 Ok(_) => return,
-                Err(error) => {
-                    eprintln!("detach {}: {error}", self.state.path().display());
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
+                Err(error) => eprintln!("detach {}: {error}", self.state.path().display()),
             }
         }
         panic!(

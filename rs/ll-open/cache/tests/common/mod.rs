@@ -154,12 +154,21 @@ fn walk_extract(
                     kind: canonical_kind.unwrap_or("?").to_string(),
                 });
             }
+            // The review family here is CALL-TARGET review, so only
+            // call-anchored refs enter the substrate. Since extraction
+            // epoch 6 (bead `ley-line-open-a9ff82`) `node_refs` also holds
+            // VALUE refs anchored at their value-position container
+            // (`let_declaration`, `arguments`, ...); a consumer that means
+            // "call sites" filters on the occurrence kind, exactly as
+            // TABLE_CONTRACT's `node_refs` row prescribes. Without the
+            // filter a local's rename (`compute_penalty(adjusted)`)
+            // reads as a call-target change.
             ExtractedRef::Ref {
                 token,
                 qualifier,
                 container_node_id,
                 ..
-            } => {
+            } if matches!(node.kind(), "call_expression" | "macro_invocation") => {
                 refs.insert(RefRow {
                     token,
                     qualifier,
@@ -174,6 +183,7 @@ fn walk_extract(
                     source_id: source_id.to_string(),
                 });
             }
+            ExtractedRef::Ref { .. } => {}
         }
     }
 

@@ -38,22 +38,84 @@
     operand: (_) @qualifier
     field: (field_identifier) @name)) @ref
 
-; ── Identifier-as-VALUE references (mache dead_code fix, bead
-; ley-line-open-77c13f follow-up) ────────────────────────────────────
+; ── Identifier-as-VALUE references (mache dead_code fix, beads
+; ley-line-open-77c13f follow-up and ley-line-open-a9ff82) ───────────
+;
+; A function named as a value — assigned, passed, returned, placed in
+; a composite literal, or taken as a method value (`s.M`) — is a use.
+; Each pattern anchors at the value-position CONTAINER (queries match
+; downward only, so no pattern can anchor at the identifier and test
+; its parent); the container's grammar kind is what tells a value ref
+; from a call ref in `node_refs.node_kind` / `kind_id`. A bare
+; identifier emits its token; a selector dual-emits `x.M` + `M` with
+; qualifier `x`, exactly like a qualified call. The selector form is
+; syntactically identical to a field read (`s.Name`), so field reads
+; in these positions emit too — tokens with no def stay unbound.
+; Left-hand sides of assignments and `:=` are bindings, not uses, and
+; do not emit.
 
-; Composite-literal field value: `{RunE: runServe}`. tree-sitter-go
-; wraps both sides in `literal_element`; only a BARE identifier in the
-; second (value) position emits — selector expressions and typed
-; literals emit through their own subtree patterns.
+; Composite-literal field value: `{RunE: runServe}`.
 (keyed_element
-  (literal_element)
-  (literal_element (identifier) @name)) @ref
+  value: (literal_element [
+    (identifier) @name
+    (selector_expression
+      operand: (_) @qualifier
+      field: (field_identifier) @name)
+  ])) @ref
 
-; Function-call arguments: each direct-child bare identifier is a
-; value-position ref. The enclosing call_expression's own pattern
+; Unkeyed composite-literal element: `[]func(){a, s.M}`.
+(literal_value
+  (literal_element [
+    (identifier) @name
+    (selector_expression
+      operand: (_) @qualifier
+      field: (field_identifier) @name)
+  ])) @ref
+
+; Function-call arguments. The enclosing call_expression's own pattern
 ; handles the call target.
-(argument_list
-  (identifier) @name) @ref
+(argument_list [
+  (identifier) @name
+  (selector_expression
+    operand: (_) @qualifier
+    field: (field_identifier) @name)
+]) @ref
+
+; `var h = helper`
+(var_spec
+  value: (expression_list [
+    (identifier) @name
+    (selector_expression
+      operand: (_) @qualifier
+      field: (field_identifier) @name)
+  ])) @ref
+
+; `h := helper`
+(short_var_declaration
+  right: (expression_list [
+    (identifier) @name
+    (selector_expression
+      operand: (_) @qualifier
+      field: (field_identifier) @name)
+  ])) @ref
+
+; `h = helper`
+(assignment_statement
+  right: (expression_list [
+    (identifier) @name
+    (selector_expression
+      operand: (_) @qualifier
+      field: (field_identifier) @name)
+  ])) @ref
+
+; `return helper`
+(return_statement
+  (expression_list [
+    (identifier) @name
+    (selector_expression
+      operand: (_) @qualifier
+      field: (field_identifier) @name)
+  ])) @ref
 
 ; ── Imports ─────────────────────────────────────────────────────────
 

@@ -52,6 +52,43 @@
   function: (field_expression
     field: (field_identifier) @name)) @ref
 
+; ── Identifier-as-VALUE references (bead ley-line-open-a9ff82) ──────
+;
+; A function named as a value — a function pointer initialised,
+; assigned, passed, address-taken, returned, or placed in an
+; initializer list — is a use mache's dead_code needs. Each pattern
+; anchors at the value-position CONTAINER (queries match downward
+; only); the container's grammar kind tells a value ref from a call
+; ref in `node_refs.node_kind` / `kind_id`. Plain variables in these
+; positions emit too and stay unbound when no def carries the token.
+; Declarators and assignment LHS are bindings and do not emit.
+
+(argument_list
+  (identifier) @name) @ref
+
+(init_declarator
+  value: (identifier) @name) @ref
+
+(assignment_expression
+  right: (identifier) @name) @ref
+
+(return_statement
+  (identifier) @name) @ref
+
+; `&helper` — address-of only; `*p` is a dereference, not a use of `p`
+; as a function value.
+(pointer_expression
+  operator: "&"
+  argument: (identifier) @name) @ref
+
+; `{ .fn = helper }`
+(initializer_pair
+  value: (identifier) @name) @ref
+
+; `{ helper, other }`
+(initializer_list
+  (identifier) @name) @ref
+
 ; ── Imports ─────────────────────────────────────────────────────────
 
 ; `#include <stdio.h>` (system_lib_string, angle brackets in the node

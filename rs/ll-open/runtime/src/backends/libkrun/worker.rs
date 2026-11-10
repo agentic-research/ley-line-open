@@ -43,8 +43,11 @@ pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
 /// libkrun hands the environment and the executable to the guest on the
 /// kernel command line, and the guest kernel parses every `key=value` there
 /// as a boot parameter before init sees what is left. So the request's part
-/// of that line is held to what cannot be read as anything else (bead
-/// `ley-line-open-eb5e4e`):
+/// of that line is held to what the kernel's quote-aware parser cannot read
+/// as anything else (bead `ley-line-open-eb5e4e`). Readers that split the
+/// line on whitespace and ignore quotes (init's `tsi_enabled`, arm64's
+/// id-register overrides) can still see a word inside a quoted value; none
+/// of them widens reach, and the gap is bead `ley-line-open-f7f862`:
 ///
 /// - a key is `[A-Z_][A-Z0-9_]*`. Kernel boot parameters are lowercase
 ///   (`init=`, `rdinit=`, `console=`) or dotted module parameters, so an

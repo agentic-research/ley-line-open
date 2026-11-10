@@ -7173,4 +7173,94 @@ mod tests {
             Some("999")
         );
     }
+
+    /// Every node of `src` under `lang`, with whether [`is_comment_extra`]
+    /// accepts it.
+    fn comment_classification(lang: &str, src: &str) -> Vec<(String, bool, bool)> {
+        let language = TsLanguage::from_name(lang).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language.ts_language()).unwrap();
+        let tree = parser.parse(src.as_bytes(), None).unwrap();
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            out.push((n.kind().to_string(), n.is_extra(), is_comment_extra(n)));
+            let mut c = n.walk();
+            stack.extend(n.children(&mut c));
+        }
+        out
+    }
+
+    /// Bead `ley-line-open-aa1634`: a comment is a node that is `extra`,
+    /// named, and of a comment kind — all three. Python's `line_continuation`
+    /// is a named extra that is not a comment; Rust's `doc_comment` is a
+    /// named comment-kind node that is not an extra (it sits inside the
+    /// `line_comment` extra).
+    #[test]
+    fn a_comment_extra_is_extra_named_and_of_a_comment_kind() {
+        let accepted = |lang: &str, src: &str, kind: &str| -> Vec<bool> {
+            comment_classification(lang, src)
+                .into_iter()
+                .filter(|(k, _, _)| k == kind)
+                .map(|(_, _, yes)| yes)
+                .collect()
+        };
+        let py = "x = 1 + \\\n    2  # c\n";
+        assert_eq!(accepted("python", py, "comment"), vec![true]);
+        assert_eq!(accepted("python", py, "line_continuation"), vec![false]);
+        assert!(
+            comment_classification("python", py)
+                .iter()
+                .any(|(k, extra, _)| k == "line_continuation" && *extra),
+            "the fixture's line_continuation is an extra"
+        );
+        let rs = "/// d\nfn f() {}\n";
+        assert_eq!(accepted("rust", rs, "line_comment"), vec![true]);
+        assert_eq!(accepted("rust", rs, "doc_comment"), vec![false]);
+        assert_eq!(accepted("rust", rs, "function_item"), vec![false]);
+    }
+
+    /// Bead `ley-line-open-aa1634`: the comment occurrences come after every
+    /// code entry ([`order_ast_entries`]), the root first, and a comment's
+    /// fold id takes a per-kind suffix only when its parent has more than one
+    /// named child of that kind, exactly as a code node's does.
+    #[test]
+    fn comment_entries_follow_the_code_and_name_like_code() {
+        let json = parse_to_ast_json(
+            b"// a\npackage p\n\n// b\nfunc F() {\n\t// c\n}\n",
+            TsLanguage::from_name("go").unwrap(),
+            "p.go",
+        )
+        .unwrap();
+        let rows: Vec<(String, String)> = json["ast"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["node_id"].as_str().unwrap().to_string(),
+                    a["node_kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let pair = |id: &str, kind: &str| (id.to_string(), kind.to_string());
+        assert_eq!(
+            rows,
+            vec![
+                pair("p.go", "source_file"),
+                pair("p.go/package_clause", "package_clause"),
+                pair(
+                    "p.go/package_clause/package_identifier",
+                    "package_identifier"
+                ),
+                pair("p.go/function_declaration", "function_declaration"),
+                pair("p.go/function_declaration/identifier", "identifier"),
+                pair("p.go/function_declaration/parameter_list", "parameter_list"),
+                pair("p.go/function_declaration/block", "block"),
+                pair("p.go/comment_0", "comment"),
+                pair("p.go/comment_1", "comment"),
+                pair("p.go/function_declaration/block/comment", "comment"),
+            ]
+        );
+    }
 }

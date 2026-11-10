@@ -51,6 +51,15 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs(secs))
 }
 
+/// The control block path for `arena`: `control` when given, else the arena
+/// path with a `.ctrl` extension.
+pub fn control_path_for(arena: &Path, control: Option<&Path>) -> PathBuf {
+    match control {
+        Some(p) => p.to_path_buf(),
+        None => arena.with_extension("ctrl"),
+    }
+}
+
 /// Set up the arena and controller without mounting.
 ///
 /// Returns the controller path (resolved) so callers can build a graph.
@@ -59,11 +68,7 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     // Create the arena file.
     let _mmap = create_arena(arena, arena_size).context("create arena")?;
 
-    // Derive control path: explicit or arena path with .ctrl extension.
-    let ctrl_path = match control {
-        Some(p) => p.to_path_buf(),
-        None => arena.with_extension("ctrl"),
-    };
+    let ctrl_path = control_path_for(arena, control);
 
     // Open/create the controller.
     let mut ctrl = Controller::open_or_create(&ctrl_path).context("open controller")?;

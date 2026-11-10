@@ -163,7 +163,7 @@ is the runtime topology a consumer sees, not a dependency edge.
 
 | Transport | Path | Used by |
 |---|---|---|
-| **UDS** | `<ctrl>.sock`, by default `~/.mache/default.sock` (a daemon whose socket lives elsewhere publishes a `~/.mache/default.sock` discovery link to it) — local-process IPC | mache (Go), other same-machine consumers |
+| **UDS** | `<ctrl>.sock`, by default `~/.mache/default.sock`. Only the default instance (`~/.mache/default.arena` with `~/.mache/default.ctrl`) binds that name, and it removes the name on exit only while it still holds its own socket; a daemon on any other `--arena`/`--control` serves at its own `<ctrl>.sock` and never touches `default.sock` (clients reach it through `LEYLINE_SOCKET`) — local-process IPC | mache (Go), other same-machine consumers |
 | **MCP HTTP** | off unless `--mcp-port` is given (the OCI image uses 8384) — JSON-RPC tool surface for agents (token-gated per ADR-0022) | Claude Code (MCP plugin), cloister (proxy via Cloudflare Access) |
 | **MCP UDS** | `--mcp-uds <path>`, mode 0600 | cloister (through its proxy) |
 

@@ -86,12 +86,10 @@ impl Tail {
     }
 
     fn push(&mut self, data: &[u8]) {
-        let data = if data.len() > self.cap {
-            self.dropped += (data.len() - self.cap) as u64;
-            &data[data.len() - self.cap..]
-        } else {
-            data
-        };
+        // Of a write longer than the tail, only its last `cap` bytes count.
+        let skipped = data.len().saturating_sub(self.cap);
+        self.dropped += skipped as u64;
+        let data = &data[skipped..];
         let overflow = (self.bytes.len() + data.len()).saturating_sub(self.cap);
         self.bytes.drain(..overflow);
         self.dropped += overflow as u64;
@@ -135,7 +133,19 @@ struct State {
     line_overflow: bool,
     guest_open: bool,
     worker_open: bool,
+    /// How many times a wait has parked on `changed`: what a test
+    /// synchronizes on to act only once a wait is really waiting.
+    #[cfg(test)]
+    parks: usize,
 }
+
+#[cfg(test)]
+fn note_parked(state: &mut State) {
+    state.parks += 1;
+}
+
+#[cfg(not(test))]
+fn note_parked(_state: &mut State) {}
 
 /// One run's bounded output, filled by two drain threads and read by the
 /// backend and its embedder.
@@ -162,44 +172,30 @@ impl OutputCapture {
                 line_overflow: false,
                 guest_open: true,
                 worker_open: true,
+                #[cfg(test)]
+                parks: 0,
             }),
             changed: Condvar::new(),
         }
     }
 
     /// Read the guest's console until it ends.
-    pub fn drain_guest(&self, mut stream: impl Read) {
-        let mut buffer = [0u8; 8192];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    self.state.lock().guest.push(&buffer[..read]);
-                    self.changed.notify_all();
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
+    pub fn drain_guest(&self, stream: impl Read) {
+        read_until_end(stream, |data| {
+            self.state.lock().guest.push(data);
+            self.changed.notify_all();
+        });
         self.state.lock().guest_open = false;
         self.changed.notify_all();
     }
 
     /// Read the worker's standard error after readiness until it ends,
     /// keeping its tail and its terminal `failed` event.
-    pub fn drain_worker(&self, mut stream: impl Read) {
-        let mut buffer = [0u8; 8192];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    self.push_worker(&buffer[..read]);
-                    self.changed.notify_all();
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
+    pub fn drain_worker(&self, stream: impl Read) {
+        read_until_end(stream, |data| {
+            self.push_worker(data);
+            self.changed.notify_all();
+        });
         let mut state = self.state.lock();
         // A last event without its newline.
         let line = std::mem::take(&mut state.line);
@@ -248,6 +244,7 @@ impl OutputCapture {
             if until(&output) || (!state.guest_open && !state.worker_open) {
                 return output;
             }
+            note_parked(&mut state);
             if self.changed.wait_until(&mut state, deadline).timed_out() {
                 return snapshot(&state);
             }
@@ -262,6 +259,20 @@ impl OutputCapture {
         let deadline = Instant::now() + DRAIN_BOUND;
         let output = self.wait(&|_| false, deadline);
         failure_with_output(observed, &output)
+    }
+}
+
+/// Hand every chunk `stream` yields to `sink` until it ends: end-of-file, or
+/// any read error but an interrupted read, which is retried.
+fn read_until_end(mut stream: impl Read, mut sink: impl FnMut(&[u8])) {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => sink(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
     }
 }
 
@@ -456,6 +467,118 @@ mod tests {
              retryable true: cause\n--- guest stderr and worker diagnostics (all of it) \
              ---\nnoise"
         );
+    }
+
+    #[test]
+    fn the_bounds_are_the_documented_sizes() {
+        assert_eq!(GUEST_OUTPUT_TAIL_BYTES, 16_384);
+        assert_eq!(WORKER_STDERR_TAIL_BYTES, 8_192);
+        assert_eq!(EVENT_LINE_MAX_BYTES, 65_536);
+    }
+
+    /// A reader that yields a scripted sequence of results, then end of file.
+    struct Script(std::collections::VecDeque<std::io::Result<&'static [u8]>>);
+
+    impl Read for Script {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Ok(bytes)) => {
+                    buffer[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_is_retried_only_when_interrupted() {
+        use std::io::{Error, ErrorKind};
+        let mut seen = Vec::new();
+        read_until_end(
+            Script(
+                [
+                    Err(Error::from(ErrorKind::Interrupted)),
+                    Ok(&b"a"[..]),
+                    Err(Error::from(ErrorKind::Other)),
+                    Ok(&b"b"[..]),
+                ]
+                .into(),
+            ),
+            |data| seen.extend_from_slice(data),
+        );
+        assert_eq!(
+            seen, b"a",
+            "an interrupted read retries; any other error ends"
+        );
+    }
+
+    /// A reader fed from a channel: each message is one read, and the
+    /// sender's drop is end of file.
+    struct Channel(std::sync::mpsc::Receiver<Vec<u8>>);
+
+    impl Read for Channel {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.recv() {
+                Ok(bytes) => {
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    /// Spin until a wait has parked or `waiter` has finished without one.
+    fn until_parked<T>(capture: &OutputCapture, waiter: &std::thread::JoinHandle<T>) {
+        while capture.state.lock().parks == 0 && !waiter.is_finished() {
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_fold_waits_for_output_still_arriving() {
+        let capture = Arc::new(OutputCapture::new());
+        capture.drain_worker(&b""[..]);
+        let (send, receive) = std::sync::mpsc::channel();
+        let drainer = {
+            let capture = Arc::clone(&capture);
+            std::thread::spawn(move || capture.drain_guest(Channel(receive)))
+        };
+        let folder = {
+            let capture = Arc::clone(&capture);
+            std::thread::spawn(move || capture.fold_into(ExecutionError::backend("exited")))
+        };
+        until_parked(&capture, &folder);
+        send.send(b"late".to_vec()).unwrap();
+        drop(send);
+        let error = folder.join().unwrap();
+        drainer.join().unwrap();
+        assert!(
+            error.detail.ends_with("---\nlate"),
+            "the fold returned before the console ended: {}",
+            error.detail
+        );
+    }
+
+    #[test]
+    fn a_wait_lasts_until_both_streams_end() {
+        let capture = Arc::new(OutputCapture::new());
+        capture.drain_guest(&b""[..]);
+        let waiter = {
+            let capture = Arc::clone(&capture);
+            std::thread::spawn(move || {
+                capture.wait(
+                    &|output| output.worker_stderr.contains('x'),
+                    Instant::now() + Duration::from_secs(60),
+                )
+            })
+        };
+        until_parked(&capture, &waiter);
+        capture.drain_worker(&b"x"[..]);
+        let seen = waiter.join().unwrap();
+        assert_eq!(seen.worker_stderr, "x", "one ended stream ended the wait");
     }
 
     #[test]

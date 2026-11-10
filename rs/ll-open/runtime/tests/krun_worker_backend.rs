@@ -363,22 +363,41 @@ fn a_failed_run_keeps_only_the_tail_of_a_large_output() {
 fn an_active_run_exposes_its_output_to_the_embedder() {
     let _serial = common::serial();
     let fixture = TempDir::new().expect("fixture");
+    // The worker announces only after the wait has begun: the condition's
+    // first evaluation opens the gate, so the announcement must be waited
+    // for, not found already there.
+    let gate = fixture.path().join("gate");
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&gate)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
     let (backend, _ephemeral_root) = backend_with_worker(
         &fixture,
-        concat!(
-            "#!/bin/sh\n",
-            "IFS= read -r _\n",
-            "printf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\n",
-            "printf 'server listening on 3306\\n'\n",
-            "exec /usr/bin/tail -f /dev/null\n",
+        &format!(
+            concat!(
+                "#!/bin/sh\n",
+                "IFS= read -r _\n",
+                "printf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\n",
+                "IFS= read -r _ < '{gate}'\n",
+                "printf 'server listening on 3306\\n'\n",
+                "exec /usr/bin/tail -f /dev/null\n",
+            ),
+            gate = gate.display()
         ),
     );
 
     backend.start(&request()).expect("ready worker");
+    let opened = std::cell::Cell::new(false);
     let seen = backend
         .wait_for_output(
             "run-backend-01",
-            &|output: &RunOutput| output.guest.contains("listening"),
+            &|output: &RunOutput| {
+                if !opened.replace(true) {
+                    fs::write(&gate, b"go\n").expect("open the gate");
+                }
+                output.guest.contains("listening")
+            },
             READY_TIMEOUT,
         )
         .expect("an active run");

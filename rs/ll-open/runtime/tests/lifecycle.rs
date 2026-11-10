@@ -228,6 +228,14 @@ fn status_before_start_is_read_only() {
     assert!(backend.calls().is_empty());
 }
 
+/// A backend that keeps no output reports none for any run: the trait's
+/// default is absence, never an empty capture that would read as "the run
+/// printed nothing" (bead ley-line-open-a26ad0).
+#[test]
+fn a_backend_without_output_reports_none() {
+    assert_eq!(Backend::output(&CompletingBackend, "any-run"), None);
+}
+
 #[test]
 fn status_projects_backend_completion_without_sleeping() {
     let service = ExecutionService::new(CompletingBackend);

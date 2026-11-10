@@ -16,7 +16,8 @@
 //!   holding the `.ctrl` shared for its lifetime would block its own
 //!   publishes, and make every reader probing for a dead publisher see a
 //!   live one.
-//! - **`<ctrl>.daemon.lock`, the daemon lock.** Every daemon holds it
+//! - **`<stem>.daemon-lock`, the daemon lock** (beside `<stem>.sock` and
+//!   `<stem>.live.db`, [`daemon_lock_path_for`]). Every daemon holds it
 //!   EXCLUSIVE, non-blocking, for its lifetime, so a control block has one
 //!   daemon whatever `--arena` each names (bead `ley-line-open-1d4003`).
 //!   The lease alone admitted two: both took it shared, the second
@@ -136,16 +137,24 @@ impl ControlLease {
     }
 }
 
-/// The daemon lock for the control block at `ctrl`: `<ctrl>.daemon.lock`.
+/// The daemon lock for the control block at `ctrl`: the control path with
+/// its extension replaced by `daemon-lock` (`c.ctrl` -> `c.daemon-lock`).
 /// Every daemon on the block holds it exclusively for its lifetime, so the
 /// block has one daemon (bead `ley-line-open-1d4003`). It is a file of its
 /// own because the lease is shared by readers (mache's mapper holds
 /// `<ctrl>.lock` shared), which a daemon taking the lease exclusively would
 /// shut out.
+///
+/// Keyed like the resources a daemon derives from its control path, the
+/// socket (`with_extension("sock")`) and the living db
+/// (`with_extension("live.db")`): two control paths that differ only in
+/// extension (`c.ctrl`, `c.other`) share `c.sock` and `c.live.db`, so they
+/// share this lock and the second daemon is refused before it unlinks the
+/// first's live db or replaces its socket (bead `ley-line-open-b0800d`). No
+/// lease (`<path>.lock`) or arena lock (`<arena>.lock`) ends in
+/// `.daemon-lock`, so it names no other lock file.
 pub fn daemon_lock_path_for(ctrl: &Path) -> PathBuf {
-    let mut s = ctrl.as_os_str().to_owned();
-    s.push(".daemon.lock");
-    PathBuf::from(s)
+    ctrl.with_extension("daemon-lock")
 }
 
 /// Take the block's daemon lock exclusively, non-blocking. A second daemon

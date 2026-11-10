@@ -615,3 +615,38 @@ fn a_second_daemon_on_one_control_block_is_refused() {
     let (status, log) = first.stop();
     assert!(status.success(), "{status}:\n{log}");
 }
+
+/// Two control paths that differ only in extension derive one socket and
+/// one living db (`with_extension`), so the second daemon is refused too
+/// (bead `ley-line-open-b0800d`): it would otherwise unlink the first's
+/// `c.live.db` on its cold start and replace its `c.sock`.
+#[test]
+fn a_daemon_on_a_sibling_control_path_is_refused() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fx = Fixture::new();
+    let first = start(fx.daemon(&[
+        "--arena".as_ref(),
+        os(&fx.work("a.arena")),
+        "--control".as_ref(),
+        os(&fx.work("c.ctrl")),
+    ]));
+    let ino = |name: &str| std::fs::metadata(fx.work(name)).expect(name).ino();
+    let (sock, live) = (ino("c.sock"), ino("c.live.db"));
+
+    let stderr = refused(fx.daemon(&[
+        "--arena".as_ref(),
+        os(&fx.work("b.arena")),
+        "--control".as_ref(),
+        os(&fx.work("c.other")),
+    ]));
+    assert!(
+        stderr.contains("another daemon serves the control block"),
+        "{stderr}"
+    );
+    assert_eq!(ino("c.sock"), sock, "the first daemon's socket stays");
+    assert_eq!(ino("c.live.db"), live, "the first daemon's live db stays");
+    UnixStream::connect(fx.work("c.sock")).expect("the first daemon still serves");
+    let (status, log) = first.stop();
+    assert!(status.success(), "{status}:\n{log}");
+}

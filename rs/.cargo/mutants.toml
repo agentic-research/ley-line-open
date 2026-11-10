@@ -200,5 +200,5 @@ exclude_re = [
     # input. The method exists only because `r2d2::ManageConnection` has no
     # default for it; the manager's behaviour is `has_broken`, whose mutants
     # are killed by `db_pool`'s tests.
-    'db_pool\.rs.*replace <impl ManageConnection for ReaderManager>::is_valid -> Result<\(\), rusqlite::Error> with Ok\(\(\)\)',
+    'db_pool\.rs.*replace <impl r2d2::ManageConnection for ReaderManager>::is_valid -> .* with Ok\(\(\)\)',
 ]

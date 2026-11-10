@@ -168,8 +168,20 @@ leyline rootfs import-oci \
   --from-registry ghcr.io/owner/app@sha256:<index or manifest digest> \
   --cas-root /var/lib/leyline/cas \
   --symlinks resolve
-``` The image format is never the isolation
-boundary; the backend is. See
+```
+
+The image format is never the isolation boundary; the backend is.
+
+The CAS root must be on a case-sensitive filesystem to import an image whose
+paths differ only by case (Debian's perl ships `Pod/` and `pod/`). macOS's
+default APFS is not, and the import refuses such an image by naming both paths
+and saying the CAS root is case-insensitive; images without such a pair import
+anywhere. `leyline rootfs provision-cas` prints a CAS root that is: on macOS a
+grow-on-demand case-sensitive APFS sparsebundle it creates and attaches, with
+no sudo, beneath `~/.local/state/leyline/cas-volume/` (`$LEYLINE_STATE_DIR`
+moves it); on Linux it checks `<state>/cas`. `execution-daemon --cas-volume`
+serves that root instead of `--cas-root` and re-attaches the volume when it
+starts. See
 [`rs/ll-open/runtime/README.md`](rs/ll-open/runtime/README.md) "Container
 images" for the contract.
 

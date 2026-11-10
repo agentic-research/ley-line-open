@@ -63,9 +63,9 @@ use tree_sitter::Node;
 ///   that tree-sitter parsed as an `extra` as a terminal `_ast`/`nodes`
 ///   occurrence; every other row, `node_hash` included, is unchanged. Not
 ///   an `extract_*` change: the epoch also versions which occurrences the
-///   walk emits, because no other version moves for it (`node_hash` and
-///   the projection's tables and columns stay put). Without the bump an
-///   upgraded arena keeps serving `_ast` with no comments.
+///   walk emits. Because comments break two consumer invariants (a
+///   comment has no `node_edge`; `nid` order stops being document order),
+///   `projection-v13` moves with this epoch and refuses a v12 arena.
 pub const EXTRACTION_EPOCH: u64 = 7;
 
 /// Effective extraction epoch: `LLO_EXTRACTION_EPOCH` overrides the

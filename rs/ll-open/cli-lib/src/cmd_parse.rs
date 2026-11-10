@@ -5554,7 +5554,7 @@ mod tests {
     fn projection_schema_version_is_stamped_and_pinned() {
         assert_eq!(
             crate::daemon::version::PROJECTION_SCHEMA_VERSION,
-            "projection-v12",
+            "projection-v13",
             "the projection version literal is pinned — see version.rs docs \
              before changing it",
         );
@@ -5567,21 +5567,27 @@ mod tests {
             get_meta(&conn, "projection_schema_version")
                 .unwrap()
                 .as_deref(),
-            Some("projection-v12"),
+            Some("projection-v13"),
             "every parse must stamp _meta.projection_schema_version",
         );
     }
 
-    /// projection-v12 (ADR-0047 M2, beads `ley-line-open-73add7` and
-    /// `ley-line-open-b5d354`): an arena that still carries the v11 label is
-    /// refused at open — its `node_content` holds merkle-ast-v2 addresses and
-    /// the `lang`/`raw_kind` columns this writer no longer inserts. v10 (a
-    /// parser-qualified `treeRoot` in `derived_from`, ADR-0047 M1) and v9 (a
-    /// `node_hash` column where this writer inserts `content_id`) are refused
-    /// the same way.
+    /// projection-v13 (bead `ley-line-open-aa1634`): an arena that still
+    /// carries the v12 label is refused at open — it has no comment
+    /// occurrences, and a reader of it relies on the v12 invariants (every
+    /// `_ast` child has a `node_edge`; `nid` order is document order) that
+    /// v13 breaks. v11 (merkle-ast-v2 addresses and `lang`/`raw_kind` on
+    /// `node_content`, ADR-0047 M2), v10 (a parser-qualified `treeRoot` in
+    /// `derived_from`, ADR-0047 M1) and v9 (a `node_hash` column where this
+    /// writer inserts `content_id`) are refused the same way.
     #[test]
-    fn projection_v9_to_v11_arenas_are_refused_at_open() {
-        for old in ["projection-v9", "projection-v10", "projection-v11"] {
+    fn projection_v9_to_v12_arenas_are_refused_at_open() {
+        for old in [
+            "projection-v9",
+            "projection-v10",
+            "projection-v11",
+            "projection-v12",
+        ] {
             let td = TempDir::new().unwrap();
             std::fs::write(td.path().join("v.go"), b"package v\n").unwrap();
             let conn = Connection::open_in_memory().unwrap();
@@ -5591,7 +5597,7 @@ mod tests {
                 .expect_err("an older projection arena must be refused");
             let msg = format!("{err:#}");
             assert!(
-                msg.contains(old) && msg.contains("projection-v12"),
+                msg.contains(old) && msg.contains("projection-v13"),
                 "the refusal must name both versions; got: {msg}",
             );
         }
@@ -5687,7 +5693,7 @@ mod tests {
             .expect_err("a projection-v4 arena must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("projection-v4") && msg.contains("projection-v12"),
+            msg.contains("projection-v4") && msg.contains("projection-v13"),
             "the refusal must name both versions; got: {msg}",
         );
         assert!(

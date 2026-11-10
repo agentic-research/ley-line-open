@@ -76,7 +76,8 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   each moves a wire or projection identity: M1 parser-free Merkle `storeRoot`
   (head digest v3, projection-v11; implemented by `73c6ee`, mache adopts it in
   `mache-107423`), M2 keyed `node_hash` with `lang`/`raw_kind`
-  per occurrence (merkle-ast-v3, projection-v12), M3 run-id v2, M4 rooted blob
+  per occurrence (merkle-ast-v3, projection-v12; implemented by `73add7` and
+  `b5d354`, mache adopts it in `mache-108e26`), M3 run-id v2, M4 rooted blob
   manifests. Each is one versioned bump; its mache or cloister issue is filed
   before its PR merges.
 - `b70e44`, `10075e` — the contract freeze, after the ADR status decisions.

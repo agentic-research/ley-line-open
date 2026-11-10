@@ -994,7 +994,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct FileImage {
         ast: Vec<(i64, String, i64, i64, i64, i64, i64, i64, Option<Vec<u8>>)>,
-        content: Vec<(Vec<u8>, String, String, Option<String>, Option<i64>)>,
+        content: Vec<(Vec<u8>, i64, String, Option<String>, Option<i64>)>,
         children: Vec<(Vec<u8>, i64, Vec<u8>, Option<String>)>,
         defs: Vec<(String, i64, Option<Vec<u8>>)>,
         refs: Vec<(String, i64, Option<Vec<u8>>)>,
@@ -1048,7 +1048,7 @@ mod tests {
         );
         let content = rows(
             conn,
-            "SELECT node_hash, kind, raw_kind, token, arity FROM node_content \
+            "SELECT node_hash, node_tag, kind, token, arity FROM node_content \
               WHERE node_hash IN (SELECT node_hash FROM v_ast_hash WHERE nid BETWEEN ?1 AND ?2) \
               ORDER BY node_hash",
             lo,

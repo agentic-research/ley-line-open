@@ -362,11 +362,6 @@ mod tests {
                             | ("_source", "path")
                             | ("_tree", "mtime")
                             | ("_tree", "size") => continue,
-                            // Not functions of `node_hash`: neither is in its
-                            // preimage, so `INSERT OR IGNORE` keeps whichever
-                            // file's node landed first, and a write leaves the
-                            // replaced file's value behind (bead `b5d354`).
-                            ("node_content", "lang" | "raw_kind") => continue,
                             ("_meta", "key") if matches!(&v, V::Text(k) if k == "parse_time" || k == "source_root") =>
                             {
                                 continue 'row;
@@ -561,6 +556,104 @@ mod tests {
             DerivedFrom::read(&into).unwrap(),
             DerivedFrom::read(&a.conn).unwrap()
         );
+    }
+
+    /// `node_content` is a function of `node_hash` (ADR-0047 D-iii, bead
+    /// `ley-line-open-b5d354`). The Go and Rust files share the anonymous
+    /// `"` leaf, so one `node_content` row serves both languages, and the Go
+    /// file is parsed first. A write removes the Go file's only string; the
+    /// row the written arena holds for the leaf must equal the row a cold
+    /// parse of the written tree holds, every column but the arena-local
+    /// `content_id`, and the Rust occurrence still reads its own language and
+    /// grammar kind through `_ast.kind_id → kinds`. Before projection-v12 the
+    /// row kept `lang = 'go'` and the cold parse said `rust`.
+    #[test]
+    fn a_write_leaves_no_stale_language_on_a_shared_node() {
+        let a = arena(FILES);
+        let quote: Vec<u8> = a
+            .conn
+            .query_row(
+                "SELECT node_hash FROM node_content WHERE node_tag = 0 AND token = '\"'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("both files hold the `\"` leaf");
+        write(
+            &a.conn,
+            &Grant::Whole,
+            "sub/b.go",
+            b"package b\n\nfunc C() int { return 3 }\n".to_vec(),
+        )
+        .unwrap();
+        let cold = arena(&[
+            ("a.go", A),
+            ("sub/b.go", "package b\n\nfunc C() int { return 3 }\n"),
+            ("sub/deep/r.rs", R),
+        ]);
+        let row = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT * FROM node_content WHERE node_hash = ?1")
+                .unwrap();
+            let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            stmt.query_row([&quote], |r| {
+                Ok(cols
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.as_str() != "content_id")
+                    .map(|(i, c)| {
+                        format!("{c}={:?}", r.get::<_, rusqlite::types::Value>(i).unwrap())
+                    })
+                    .collect())
+            })
+            .unwrap()
+        };
+        assert_eq!(row(&a.conn), row(&cold.conn));
+        // The language and grammar kind are occurrence facts: the one
+        // remaining occurrence of a string in the written arena is Rust's.
+        let langs: Vec<(String, String)> = a
+            .conn
+            .prepare(
+                "SELECT DISTINCT k.lang, k.raw_kind FROM _ast a JOIN kinds k ON k.kind_id = a.kind_id \
+                 WHERE k.raw_kind IN ('interpreted_string_literal', 'string_literal')",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            langs,
+            vec![("rust".to_string(), "string_literal".to_string())]
+        );
+    }
+
+    /// F3 over injected occurrences (bead `ley-line-open-cc5c55`): a Go file
+    /// with SQL in a string has def and ref rows whose `kind_id` names
+    /// `sql:*` kinds and no `_ast` row; a rebuild after a write reproduces
+    /// them, `kind_id` rendered as what it names.
+    #[test]
+    fn a_rebuild_reproduces_injected_occurrence_kinds() {
+        const Q: &str = "package q\n\nimport \"database/sql\"\n\n\
+            func setup(db *sql.DB) {\n\tdb.Exec(`CREATE TABLE users (id INTEGER)`)\n}\n";
+        const Q2: &str = "package q\n\nimport \"database/sql\"\n\n\
+            func setup(db *sql.DB) {\n\tdb.Exec(`CREATE TABLE teams (id INTEGER)`)\n}\n";
+        let a = arena(&[("q.go", Q), ("sub/deep/r.rs", R)]);
+        write(&a.conn, &Grant::Whole, "q.go", Q2.as_bytes().to_vec()).unwrap();
+        let injected: i64 = a
+            .conn
+            .query_row(
+                "SELECT count(*) FROM node_defs d JOIN kinds k ON k.kind_id = d.kind_id \
+                 WHERE k.lang = 'sql' AND d.token = 'teams'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            injected, 1,
+            "the written file's injected def carries its kind"
+        );
+        let (into, _) = rebuilt(&a.conn, &Grant::Whole);
+        assert_same_rows(&logical(&into), &logical(&a.conn));
     }
 
     /// F5: a sub-manifest rebuilt on its own produces the same file-local

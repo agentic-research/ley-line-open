@@ -317,8 +317,8 @@ assert_call "mutants .* -C --lib .*--file ll-core/core/\*\* --features interrupt
     'leyline-core is mutated alone, with both of its features'
 assert_call "mutants .* -C --lib .*--file ll-open/sign/\*\* --features root-signer( |\$)" \
     'leyline-sign is mutated alone, with its own feature'
-assert_call "mutants .* -C --lib .*--file ll-open/ts/\*\* --features hcl,pyproject( |\$)" \
-    'leyline-ts is mutated alone, with both of its features'
+assert_call "mutants .* -C --lib .*--file ll-open/ts/\*\* --features hcl,go,pyproject( |\$)" \
+    'leyline-ts is mutated alone, with its three features'
 # Every feature-carrying generic invocation is confined to one package, and
 # carries only that package's ledger features.
 ledger_rows=$(awk '!/^[[:space:]]*(#|$)/ && $4 == "enable" { print $1, $2 }' \

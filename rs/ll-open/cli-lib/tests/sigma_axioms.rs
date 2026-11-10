@@ -7,19 +7,16 @@
 //! appears in `leyline-core` or `leyline-fs` is the same test over the
 //! stores those crates own.
 //!
-//! **Known RED.** One claim fails on shipped code. It has a strict test,
-//! `#[ignore]`d with the bead whose PR turns it green, and a `*_measured`
-//! test that runs in every `task ci`, prints the measurement, and pins
-//! today's failing value, so the red is visible and the fix cannot land
-//! without flipping both:
+//! No claim here is known RED. The two that were run in every `task ci`
+//! since the steps that turned them green:
 //!
-//! - `crafted_preimage_does_not_alias_across_constructions` — `node_hash`
-//!   is plain σ over a prefixed preimage, so a file whose bytes are a leaf's
-//!   preimage has `blob_hash == node_hash` (ADR-0047 M2, `ley-line-open-73add7`).
-//!
-//! `merkle_one_leaf_edit_rehashes_one_path` was the other until ADR-0047 M1
-//! (`ley-line-open-73c6ee`) replaced the flat `treeRoot` with the directory
-//! Merkle `storeRoot`; it now runs in every `task ci`.
+//! - `merkle_one_leaf_edit_rehashes_one_path`, since ADR-0047 M1
+//!   (`ley-line-open-73c6ee`) replaced the flat `treeRoot` with the
+//!   directory Merkle `storeRoot`;
+//! - `crafted_preimage_does_not_alias_across_constructions`, since ADR-0047
+//!   M2 (`ley-line-open-73add7`) keyed `node_hash` under
+//!   `leyline/ast-node/v3` (merkle-ast-v3): before it, a file whose bytes
+//!   were a leaf's prefixed preimage had `blob_hash == node_hash`.
 //!
 //! `run_id`'s half of law (c) is in `leyline-runtime`.
 
@@ -129,14 +126,21 @@ fn uvarint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// `enc(x)` of a `node_hash` leaf, as the `astNode` vectors pin it.
+/// `enc(x)` of a `node_hash` leaf, as the `astNode` vectors pin it: the
+/// bytes merkle-ast-v3 keys under `leyline/ast-node/v3`.
 fn leaf_preimage(kind: &str, token: &str) -> Vec<u8> {
-    let mut p = b"llo/ast/v1\0\0".to_vec();
+    let mut p = vec![0u8];
     uvarint(&mut p, kind.len() as u64);
     p.extend_from_slice(kind.as_bytes());
     uvarint(&mut p, token.len() as u64);
     p.extend_from_slice(token.as_bytes());
     p
+}
+
+/// The same leaf behind merkle-ast-v2's in-band prefix: the plain-σ
+/// preimage `73add7` reproduced as a file.
+fn legacy_leaf_preimage(kind: &str, token: &str) -> Vec<u8> {
+    [b"llo/ast/v1\0".as_slice(), &leaf_preimage(kind, token)].concat()
 }
 
 /// The stored `node_hash` as a `Ref<AstNode>`, when the row re-derives it
@@ -152,11 +156,19 @@ fn verify_node(
     if let Some(done) = memo.get(hash) {
         return *done;
     }
-    let (tag, kind, _, _, token, arity) = rows.get(hash)?;
+    let (tag, kind, token, arity) = rows.get(hash)?;
     let claimed = Hash::from_bytes(hash.try_into().ok()?);
+    // Every column is part of the witness: a leaf has a token and no
+    // children, an internal node no token and `arity` children.
     let verified = if *tag == 0 {
-        let token = token.as_deref().unwrap_or("");
-        Ref::verified(claimed, AstNodeWitness::Leaf { kind, token })
+        match token.as_deref() {
+            Some(token) if *arity == 0 => {
+                Ref::verified(claimed, AstNodeWitness::Leaf { kind, token })
+            }
+            _ => None,
+        }
+    } else if *tag != 1 || token.is_some() {
+        None
     } else {
         let edges = kids.get(hash).cloned().unwrap_or_default();
         let children: Option<Vec<Ref<AstNode>>> = edges
@@ -592,24 +604,16 @@ fn det_parse_is_thread_count_invariant() {
 // (IM)
 // ---------------------------------------------------------------------------
 
-type NodeRow = (i64, String, String, String, Option<String>, i64);
+/// `(node_tag, kind, token, arity)`: every `node_content` column but the
+/// arena-local `content_id` (projection-v12).
+type NodeRow = (i64, String, Option<String>, i64);
 
 fn node_rows(conn: &Connection) -> BTreeMap<Vec<u8>, NodeRow> {
     let mut stmt = conn
-        .prepare("SELECT node_hash, node_tag, kind, raw_kind, lang, token, arity FROM node_content")
+        .prepare("SELECT node_hash, node_tag, kind, token, arity FROM node_content")
         .unwrap();
     stmt.query_map([], |r| {
-        Ok((
-            r.get(0)?,
-            (
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ),
-        ))
+        Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
     })
     .unwrap()
     .map(|r| r.unwrap())
@@ -711,6 +715,42 @@ proptest! {
                 prop_assert_eq!(&*seen, row, "a node_content row was rebound");
             }
         }
+    }
+}
+
+/// `verify_node` checks every `node_content` column, not just the hashed
+/// ones (projection-v12: every column is a function of `node_hash`). A row
+/// whose `arity` or `token` disagrees with its tag is refused, so the
+/// (IM) test above cannot pass a row that is not its key's function.
+#[test]
+fn verify_node_refuses_a_row_whose_columns_disagree_with_its_key() {
+    let src = TempDir::new().unwrap();
+    write_tree(src.path(), &fixture_files());
+    let conn = Connection::open_in_memory().unwrap();
+    cmd_parse::parse_into_conn(&conn, src.path(), None, None).unwrap();
+    let all_verify = |conn: &Connection| {
+        let (rows, kids) = (node_rows(conn), children(conn));
+        let mut memo = HashMap::new();
+        rows.keys()
+            .all(|h| verify_node(h, &rows, &kids, &mut memo).is_some())
+    };
+    assert!(all_verify(&conn), "a fresh parse verifies");
+    for (mutate, undo) in [
+        (
+            "UPDATE node_content SET arity = 7 WHERE content_id = \
+             (SELECT min(content_id) FROM node_content WHERE node_tag = 0)",
+            "UPDATE node_content SET arity = 0 WHERE node_tag = 0",
+        ),
+        (
+            "UPDATE node_content SET token = 'x' WHERE content_id = \
+             (SELECT min(content_id) FROM node_content WHERE node_tag = 1)",
+            "UPDATE node_content SET token = NULL WHERE node_tag = 1",
+        ),
+    ] {
+        conn.execute(mutate, []).unwrap();
+        assert!(!all_verify(&conn), "`{mutate}` still verifies");
+        conn.execute(undo, []).unwrap();
+        assert!(all_verify(&conn));
     }
 }
 
@@ -891,9 +931,12 @@ fn leaves(conn: &Connection) -> Vec<(String, String)> {
 }
 
 /// The `ley-line-open-73add7` reproduction, generalised: parse a tree, then
-/// add a file whose bytes are the preimage of one of its leaves, and parse
-/// again. Returns the addresses that name both a blob and an AST node.
-fn crafted_aliases() -> BTreeSet<Vec<u8>> {
+/// add files whose bytes are the encoding of one of its leaves, both as
+/// merkle-ast-v3 keys it and behind merkle-ast-v2's in-band prefix, and
+/// parse again. Returns the addresses that name both a blob and an AST
+/// node, and the arena's blob hashes so a caller can check the crafted
+/// files were stored.
+fn crafted_aliases() -> (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>) {
     let src = TempDir::new().unwrap();
     write_tree(src.path(), &fixture_files());
     let out = TempDir::new().unwrap();
@@ -902,70 +945,60 @@ fn crafted_aliases() -> BTreeSet<Vec<u8>> {
     let crafted: Vec<(&str, Vec<u8>)> = leaves(&conn)
         .into_iter()
         .take(4)
+        .chain(std::iter::once(("fn".to_string(), "fn".to_string())))
         .enumerate()
-        .map(|(i, (kind, token))| {
-            (
-                Box::leak(format!("crafted/{i}.bin").into_boxed_str()) as &str,
-                leaf_preimage(&kind, &token),
-            )
+        .flat_map(|(i, (kind, token))| {
+            [
+                (
+                    Box::leak(format!("crafted/{i}.v3.bin").into_boxed_str()) as &str,
+                    leaf_preimage(&kind, &token),
+                ),
+                (
+                    Box::leak(format!("crafted/{i}.v2.bin").into_boxed_str()) as &str,
+                    legacy_leaf_preimage(&kind, &token),
+                ),
+            ]
         })
-        .chain(std::iter::once((
-            "crafted/fn.bin",
-            leaf_preimage("fn", "fn"),
-        )))
         .collect();
     write_tree(src.path(), &crafted);
     cmd_parse::parse_into_conn(&conn, src.path(), None, None).unwrap();
-    node_hashes(&conn)
-        .intersection(&blob_hashes(&conn))
-        .cloned()
-        .collect()
+    let blobs = blob_hashes(&conn);
+    (
+        node_hashes(&conn).intersection(&blobs).cloned().collect(),
+        blobs,
+    )
 }
 
 /// Law (c) for `node_hash` (ADR-0047 §1.2): no file's `blob_hash` is the
 /// `node_hash` of an AST node, so writing a construction's encoding as a
 /// file does not mint its address. The fixed case is `73add7`'s 18-byte
-/// file `llo/ast/v1\0\0\x02fn\x02fn`, the preimage of the Rust leaf `fn`.
-///
-/// RED today: `node_hash` is plain σ over an in-band-prefixed preimage, so
-/// σ_bytes reaches it. ADR-0047 M2 (`ley-line-open-73add7`, `merkle-ast-v3`
-/// under `derive_key`) turns it green and removes this `ignore`. The keyed
-/// constructions (`PartitionSpec`, head digest) pass law (c) in
-/// `leyline-core`'s test of this name.
+/// file `llo/ast/v1\0\0\x02fn\x02fn`, the merkle-ast-v2 preimage of the
+/// Rust leaf `fn`, whose `blob_hash` equalled that leaf's `node_hash` until
+/// merkle-ast-v3 keyed the construction under `leyline/ast-node/v3`
+/// (ADR-0047 M2). The keyed constructions (`PartitionSpec`, head digest)
+/// pass law (c) in `leyline-core`'s test of this name.
 #[test]
-#[ignore = "RED until ADR-0047 M2 (73add7): node_hash is plain σ over a prefixed preimage"]
 fn crafted_preimage_does_not_alias_across_constructions() {
-    let aliases = crafted_aliases();
+    let (aliases, blobs) = crafted_aliases();
     assert!(
         aliases.is_empty(),
         "{} addresses name both a blob and an AST node",
         aliases.len()
     );
-}
-
-/// The measured form, run in every `task ci`: every crafted file aliases a
-/// node today. M2 (`ley-line-open-73add7`) fails this pin and must delete it
-/// along with the strict test's `ignore`.
-#[test]
-fn crafted_preimage_does_not_alias_across_constructions_measured() {
-    let aliases = crafted_aliases();
-    let fixed = leaf_preimage("fn", "fn");
+    let fixed = legacy_leaf_preimage("fn", "fn");
     assert_eq!(fixed.len(), 18, "the 73add7 file is 18 bytes");
-    // The types already refuse to compare a `Ref<AstNode>` with a
-    // `Ref<Blob>` (law (b)); the bytes do not separate them (law (c)).
+    assert!(
+        blobs.contains(fixed.as_slice().hash().as_bytes().as_slice()),
+        "the 73add7 file was stored, so its blob_hash was compared"
+    );
+    // The typed refs agree with the bytes: the leaf and the file that spells
+    // either encoding of it have different addresses.
     let node = Ref::<AstNode>::derive(AstNodeWitness::Leaf {
         kind: "fn",
         token: "fn",
     });
-    let blob = Ref::<leyline_core::construction::Blob>::derive(&fixed);
-    assert_eq!(node.as_hash(), blob.as_hash());
-    eprintln!(
-        "crafted_preimage_does_not_alias_across_constructions: {} blob/node aliases: RED until 73add7",
-        aliases.len()
-    );
-    assert!(
-        aliases.contains(fixed.as_slice().hash().as_bytes().as_slice()),
-        "the 73add7 file's blob_hash is the Rust `fn` leaf's node_hash today"
-    );
-    assert_eq!(aliases.len(), 5, "every crafted preimage aliases its leaf");
+    for file in [fixed, leaf_preimage("fn", "fn")] {
+        let blob = Ref::<leyline_core::construction::Blob>::derive(&file);
+        assert_ne!(node.as_hash(), blob.as_hash());
+    }
 }

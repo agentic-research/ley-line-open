@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/zeebo/blake3"
 )
 
 // The canonical vectors; the Rust tests read the same file.
@@ -55,6 +57,16 @@ type vectors struct {
 		PreimageHex  string  `json:"preimageHex"`
 		Digest       string  `json:"digest"`
 	} `json:"headDigest"`
+	AstNode []struct {
+		Name        string   `json:"name"`
+		Context     string   `json:"context"`
+		Tag         string   `json:"tag"`
+		Kind        string   `json:"kind"`
+		Token       string   `json:"token"`
+		Children    []string `json:"children"`
+		PreimageHex string   `json:"preimageHex"`
+		Address     string   `json:"address"`
+	} `json:"astNode"`
 }
 
 func load(t *testing.T) vectors {
@@ -207,6 +219,47 @@ func TestHeadDigestV3Vectors(t *testing.T) {
 		unstamped.StoreRoot = Hash{}
 		if _, err := HeadDigest(unstamped); err == nil {
 			t.Fatalf("%s: an unstamped storeRoot made a claim", c.Name)
+		}
+	}
+}
+
+// LLO ADR-0047 M2: Go reproduces every node_hash v3 vector, preimage first,
+// and no plain BLAKE3 digest of the encoding (with or without merkle-ast-v2's
+// in-band prefix) is the node_hash: law (c), construction separation.
+func TestAstNodeV3Vectors(t *testing.T) {
+	v := load(t)
+	if len(v.AstNode) == 0 {
+		t.Fatal("no astNode cases")
+	}
+	for _, c := range v.AstNode {
+		if c.Context != AstNodeContext {
+			t.Fatalf("%s: the case pins %q, this package computes %q", c.Name, c.Context, AstNodeContext)
+		}
+		var pre []byte
+		var got Hash
+		switch c.Tag {
+		case "leaf":
+			pre = AstLeafPreimage(c.Kind, c.Token)
+			got = AstLeafHash(c.Kind, c.Token)
+		case "internal":
+			children := make([]Hash, len(c.Children))
+			for i, h := range c.Children {
+				children[i] = hashOf(t, h)
+			}
+			pre = AstInternalPreimage(c.Kind, children)
+			got = AstInternalHash(c.Kind, children)
+		default:
+			t.Fatalf("%s: unknown tag %q", c.Name, c.Tag)
+		}
+		if hex.EncodeToString(pre) != c.PreimageHex {
+			t.Fatalf("%s: preimage\n want %s\n  got %x", c.Name, c.PreimageHex, pre)
+		}
+		if got != hashOf(t, c.Address) {
+			t.Fatalf("%s: node_hash %x, want %s", c.Name, got, c.Address)
+		}
+		legacy := append([]byte("llo/ast/v1\x00"), pre...)
+		if blake3.Sum256(pre) == got || blake3.Sum256(legacy) == got {
+			t.Fatalf("%s: a plain BLAKE3 digest names the node", c.Name)
 		}
 	}
 }

@@ -242,8 +242,9 @@ reproduction, and is left to `leyline parse`. The gate also renders the other in
 (`source_blobs`, `capnp_blobs`, `node_content`, `node_child`) to what the projection reaches,
 since a write leaves the replaced bytes and subtrees behind. It found two more non-functions:
 `node_content.lang` and `node_content.raw_kind` are outside the `node_hash` preimage, so
-`INSERT OR IGNORE` keeps the first file's value and a write leaves a stale one. They are excluded by
-name and fixed in projection-v7 (`b5d354`).
+`INSERT OR IGNORE` keeps the first file's value and a write leaves a stale one. They were excluded by
+name until projection-v12 removed them from `node_content` (ADR-0047 D-iii, `b5d354`); the gate now
+compares every `node_content` column.
 
 ### D7 — Publication stays as it is until the write boundary exists
 

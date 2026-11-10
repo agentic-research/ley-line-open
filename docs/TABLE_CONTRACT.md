@@ -117,6 +117,65 @@ Two rules, both measured on a 460-file Rust arena at `projection-v5`:
    different fields would have a higher rate. Measure before relying on it as a
    general per-node lookup.
 
+### A fielded child's grammar kind at `projection-v12`
+
+`node_content` holds the κ `kind`, not the grammar kind or the language
+(ADR-0047 D-iii): the same subtree appears in several files and languages, and
+a content row cannot say which. Read a child's grammar kind from its
+occurrence. A named child of the parent occurrence `:nid` is the `nodes` row
+under it whose `_ast.content_id` is the edge's `child_id`; an anonymous child
+(an operator, keyword or punctuation token) has no occurrence row, and its
+grammar kind is its content row's `kind`, because the merkle-ast-v3 fold
+applies κ to named nodes only (`an_anonymous_tokens_kind_is_its_grammar_kind`,
+`rs/ll-open/cli-lib/tests/ir_producer.rs`; JavaScript's `class` keyword was
+stored as κ `type` before v3):
+
+```sql
+SELECT e.field,
+       COALESCE((SELECT k.raw_kind
+                   FROM nodes n
+                   JOIN _ast ca ON ca.nid = n.nid
+                   JOIN kinds k ON k.kind_id = ca.kind_id
+                  WHERE n.parent_nid = :nid AND ca.content_id = e.child_id
+                  ORDER BY n.ord
+                  LIMIT 1),
+                c.kind) AS child_raw_kind
+  FROM node_edge e
+  JOIN node_content c ON c.content_id = e.child_id
+ WHERE e.parent_id = :parent_content_id AND e.field IS NOT NULL AND e.field != ''
+ ORDER BY e.ordinal;
+```
+
+`:parent_content_id` is the parent's `_ast.content_id`. Two named siblings with
+the same `content_id` are the same κ tree, not necessarily the same grammar
+kind: κ maps several grammar kinds to one. The query then returns the first
+sibling's grammar kind for both. No case is known: every κ collapse class
+checked differs in an anonymous keyword child (`struct` against `union`,
+`const` against `static`), so its members never share a `content_id`; no test
+pins that. `a_fielded_childs_grammar_kind_is_read_from_its_occurrence`
+(`rs/ll-open/cli-lib/tests/ir_producer.rs`) checks this query against
+tree-sitter on every fielded edge of a Rust, Go and Python tree, including
+children whose κ kind differs (`parameters` → `parameter`).
+
+An injected-language occurrence (bead `ley-line-open-c822a6`, e.g. SQL in a Go
+string) has no `_ast` row: `_ast` is the host file's tree, and the host's
+occurrence layer is independent of the injection pass. Its occurrence rows are
+its `node_defs`/`node_refs` rows, and since `projection-v12` they carry
+`kind_id` like `_ast` does (bead `ley-line-open-cc5c55`). So a def or ref's
+language and grammar kind, host or injected, is one join:
+
+```sql
+SELECT k.lang, k.raw_kind
+  FROM node_defs d JOIN kinds k ON k.kind_id = d.kind_id
+ WHERE d.token = :token;   -- a Go file's injected `CREATE TABLE users` → ('sql', 'create_table')
+```
+
+For a host occurrence `node_defs.kind_id` equals its `_ast` row's `kind_id`
+(`inj_injected_occurrence_carries_its_language_and_grammar_kind`,
+`rs/ll-open/cli-lib/tests/injection_extraction_test.rs`). An injected node that
+is neither a def nor a ref has no occurrence row; its content row holds its κ
+kind.
+
 ### Reading `node_hash` at `projection-v10`
 
 As of `projection-v10` (bead `ley-line-open-738dd9`) `_ast`, `node_refs` and
@@ -221,8 +280,8 @@ the projection is derived-only, so no in-place migration exists.
 | `nodes` | Hierarchical node tree (nid, parent_nid, name_id, kind_id, kind, ord, size, mtime, record). `name_id` interned for filesystem rows, NULL for AST rows — an AST node's display name derives from its kind + per-kind rank among siblings by `ord` (`{raw_kind}[_{k}]`, the pre-v5 `needs_suffix` scheme, now computed at read time). `ord` is the sibling index in SOURCE order — `ORDER BY ord` is the correct sibling ordering (`ORDER BY name` put `_10` before `_2`). |
 | `_ast` | AST positions (nid → kind_id, byte/row/col ranges, `content_id`). `content_id INTEGER REFERENCES node_content(content_id)` replaced the 32-byte `node_hash` at `projection-v10` (bead `ley-line-open-738dd9`); read the hash through `v_ast_hash` or a join (see "Reading `node_hash` at projection-v10" below), and find every location of a subtree with `idx_ast_content`. No `source_id` (the file is `nid >> 24`), no `blob_ord` (the ordinal is `nid & 0xFFFFFF`). |
 | `_source` | Source file metadata (id → language, abs path, `file_id` — the interned integer that keys every node row's high bits). As of `projection-v7` (ADR-0045 T1) one row per file the parse PROJECTED: a file of no grammar, a binary or an oversized file has a `_tree` entry and no `_source` row. `content_hash` equals the path's `_tree.blob_hash`. List every file from `_tree`, not from here. |
-| `node_refs` | Token references (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. |
-| `node_defs` | Token definitions (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). No `qualifier` column. |
+| `node_refs` | Token references (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, qualifier, and since `projection-v3` the occurrence's own `node_kind` + `start_byte`/`end_byte`/`start_row`/`start_col`/`end_row`/`end_col`). `qualifier` (v0.7.9, bead `ley-line-open-4dde42`) = receiver/selector text on the BARE-token row of a qualified call's dual-emit pair (`fmt.Println(..)` → the `Println` row carries `'fmt'`); NULL on the qualified-token row and on bare calls. Injected-subtree occurrences carry real nids past their host file's `_ast` count — fact-row keys with no `nodes`/`_ast` row, exactly as their path-shaped ids had no rows before. `kind_id` (`projection-v12`, bead `ley-line-open-cc5c55`) → `kinds(lang, raw_kind)` is the occurrence's own language and grammar kind, written on every row the parse writes: its `_ast` row's `kind_id` for a host occurrence, the injected grammar's for an injected one. |
+| `node_defs` | Token definitions (token → nid, `content_id` (`node_hash` before `projection-v10`), container_nid, canonical_kind, and since `projection-v3` the occurrence's own `node_kind` + span columns as on `node_refs`). The span is carried here rather than JOINed from `_ast` — SCIP's `Occurrence` shape (bead `ley-line-open-b4509b`). NULL span means the locator has no `_ast` row (injected nodes). `kind_id` as on `node_refs` (`projection-v12`). No `qualifier` column. |
 | `_imports` | Import statements (alias, path, source_id) |
 | `_meta` | Key-value metadata (source_root, parse_time, version vectors, and `derived_from` = `v2 <storeRoot hex> <parserId hex> <projection_schema_version>`, the derivation the projection reproduces under `leyline rebuild`; ADR-0040 D6, ADR-0047 D-ii. The leading `v2` is the format discriminator: the retired v1 value (three fields, `treeRoot` first, before projection-v11) is refused by version, never read as v2). `unbound_facts` = the count of `node_refs` rows whose token has no `node_defs` row, as the head's `unboundFacts` records it; written with the rows by every parse pass (bead `ley-line-open-8c8ded`) |
 
@@ -230,10 +289,10 @@ the projection is derived-only, so no in-place migration exists.
 
 | Table | Purpose |
 |-------|---------|
-| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes — the identity, stored once per subtree; the FK target of `_cfg`, while `node_edge` (v9) and `_ast`/`node_defs`/`node_refs` (v10) reference `content_id`), `node_tag`, `kind`, `raw_kind`, `lang`, `token`, `arity`. Byte-identical subtrees dedup cross-file to one row. |
+| `node_content` | One row per UNIQUE subtree — `content_id INTEGER PRIMARY KEY` (as of `projection-v9`; arena-local, assigned by the writer, NOT an identity: two arenas number one subtree differently, and nothing outside the database may cite it), `node_hash BLOB NOT NULL UNIQUE` (κ kind + terminal + child hashes, keyed under `derive_key("leyline/ast-node/v3", …)` since merkle-ast-v3 — the identity, stored once per subtree; the FK target of `_cfg`, while `node_edge` (v9) and `_ast`/`node_defs`/`node_refs` (v10) reference `content_id`), `node_tag`, `kind`, `token`, `arity`. Every column is a function of `node_hash`: `raw_kind` and `lang` left at `projection-v12` (ADR-0047 D-iii, bead `ley-line-open-b5d354`) because the hash does not determine them, so the row held whichever file's occurrence landed first. Read them per occurrence through `_ast.kind_id → kinds`; see "A fielded child's grammar kind at `projection-v12`" below. Byte-identical subtrees dedup cross-file to one row. |
 | `node_edge` | Git-tree object, interned (`projection-v9`, bead `ley-line-open-9b7d28`): `(parent_id, ordinal) PRIMARY KEY → child_id, field`, `WITHOUT ROWID`. Both endpoints REFERENCE `node_content(content_id)` (FK-enforced). One row per child of each unique parent, anonymous tokens included. A node's preimage is recoverable by one join: `ORDER BY ordinal`, map ids to `node_hash`, refold. |
 | `node_child` | **A read-only VIEW** (`projection-v9`) with the v8 table's columns — `parent_hash`, `ordinal`, `child_hash`, `field` — over `node_edge ⋈ node_content ×2`. Every v8 read (`WHERE parent_hash = ?`, `JOIN node_content c ON c.node_hash = nc.child_hash`, `ORDER BY ordinal`) runs unchanged, and an inner join or `IN` filter on `parent_hash` plans as two index probes. **Do not put it on the right of a `LEFT JOIN`:** SQLite cannot flatten a join view there and materializes all of it (kibana slice, one file: 7.7 s through the view, 0.11 s against `node_edge`). Write `LEFT JOIN node_edge e ON e.parent_id = a.content_id LEFT JOIN node_content cc ON cc.content_id = e.child_id` instead (`projection-v10`: `_ast` holds the parent's `content_id` itself; at v9 it took `LEFT JOIN node_content pc ON pc.node_hash = a.node_hash` first). A write to the view fails; the writer is `node_edge`. |
-| `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` | **Read-only VIEWs** (`projection-v10`, bead `ley-line-open-738dd9`) with the v9 column sets of `_ast`, `node_refs` and `node_defs` — `node_hash` in place of `content_id`, rendered by `LEFT JOIN node_content ON content_id`. `content_id` is not a column of any of them. Same planning caveat as `node_child`: on the right of a `LEFT JOIN` they materialize; join the base table instead. Not named `v_ast` because mache installs a TEMP `v_ast` with its own vocabulary on every connection, and a TEMP view shadows a main-schema one. |
+| `v_ast_hash` / `v_node_refs_hash` / `v_node_defs_hash` | **Read-only VIEWs** (`projection-v10`, bead `ley-line-open-738dd9`) with the column sets of `_ast`, `node_refs` and `node_defs` — `node_hash` in place of `content_id`, rendered by `LEFT JOIN node_content ON content_id` (the v9 sets, plus `kind_id` on the refs and defs views since `projection-v12`). `content_id` is not a column of any of them. Same planning caveat as `node_child`: on the right of a `LEFT JOIN` they materialize; join the base table instead. Not named `v_ast` because mache installs a TEMP `v_ast` with its own vocabulary on every connection, and a TEMP view shadows a main-schema one. |
 
 **Pointer store — retired at `projection-v8`** (ADR-0040 D5, bead `ley-line-open-f30fdf`; ADR-0026 Phase 1 reversed). `capnp_blobs` (one canonical `AstNodeList` blob per file) and `_ast_blob` (`file_id → blob_hash`) are no longer created or written. They were the second stored copy of the syntax tree — 812.8 MB, 35.6% of the 2,284.6 MB kibana arena (bead `ley-line-open-17c271`'s pinned slice) — with no reader. The tree is stored once in the SQL rows above and `node_content`/`node_child`, keyed by the location-free `node_hash`. No identity moved: `Head.rootHash` folds the `.source.capnp`/`.ast.capnp`/`.bindings.capnp` segment files, whose bytes never depended on the blob, and `treeRoot` (retired by ADR-0047 M1, now `storeRoot`) folds `_tree`. A `projection-v7` arena is refused at parse open and rebuilt cold.
 
@@ -291,7 +350,7 @@ directory, not assumed from the platform.
 
 | Table | Purpose |
 |-------|---------|
-| `_cfg` | Intra-procedural CFG basic blocks — `(node_hash, block_id) PRIMARY KEY`, `block_kind TEXT` (one of `CFG_CANONICAL_KINDS`), `complexity INTEGER` nullable. Node_hash FK to `node_content`. Reflow-invariant identity via merkle-AST. |
+| `_cfg` | Intra-procedural CFG basic blocks — `(node_hash, block_id) PRIMARY KEY`, `block_kind TEXT` (one of `CFG_CANONICAL_KINDS`), `complexity INTEGER` nullable. Node_hash FK to `node_content`. The key is reflow-invariant, but it is not a `node_hash`: `emit_cfg_for_source` keys a body by a plain-BLAKE3 stub fold and inserts a `node_content` row for it, which does not re-derive under merkle-ast-v3 (`ley-line-open-cc7855`). The parse writes no `_cfg` rows. |
 | `_cfg_edge` | Directed edges between CFG blocks. Composite FK on both endpoints referencing `_cfg(node_hash, block_id)`. `edge_kind TEXT` (free-form in v0.7.2; T3 taint will canonicalize). |
 
 Population TODO (bead `ley-line-open-a0fadd`): T1.b3-followup wires `cfg::emit_cfg_for_source` into `cmd_parse`'s rayon-worker + batched-insert plumbing so `_cfg` populates on parse. Until then, schema is present but empty on parse output; `_cfg` is only populated by consumers calling `leyline_ts::cfg::emit_cfg_for_source` directly.

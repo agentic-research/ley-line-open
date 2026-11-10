@@ -5,5 +5,5 @@
   "wire_format_major": 2,
   "compat_min_schema_version": "0.6.0",
   "build_date": "unspecified",
-  "ir_schema_version": "merkle-ast-v2"
+  "ir_schema_version": "merkle-ast-v3"
 }

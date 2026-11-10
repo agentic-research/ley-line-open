@@ -71,6 +71,75 @@ fn store_root_docs_name_the_table_the_fold_reads() {
     );
 }
 
+/// `node_hash` is merkle-ast-v3, keyed under `leyline/ast-node/v3` (ADR-0047
+/// D-i, bead `ley-line-open-73add7`), and `node_content` holds only what it
+/// determines (D-iii, `ley-line-open-b5d354`). The docs a second
+/// implementation or a SQL consumer reads say so, checked against the code.
+#[test]
+fn node_hash_docs_name_the_keyed_construction() {
+    let src = include_str!("../src/cmd_parse.rs");
+    let ddl = include_str!("../../ts/src/schema.rs");
+    let sigma = normalized(include_str!(
+        "../../../ll-core/schema-spec/sigma/v1/README.md"
+    ));
+    let adr = normalized(include_str!(
+        "../../../../docs/adr/0047-sigma-amendment-constructions-witnesses-edges.md"
+    ));
+    let contract = normalized(include_str!("../../../../docs/TABLE_CONTRACT.md"));
+
+    // The code: one keyed context, both folds keyed, no in-band prefix.
+    for code in [
+        "const NODE_HASH_CONTEXT: &str = \"leyline/ast-node/v3\";",
+        "*leyline_core::substrate::derive_key(NODE_HASH_CONTEXT, &p).as_bytes()",
+    ] {
+        assert!(
+            src.contains(code),
+            "cmd_parse.rs changed `{code}`; update the node_hash docs with it"
+        );
+    }
+    assert!(
+        !src.contains("NODE_HASH_DOMAIN"),
+        "cmd_parse.rs still carries the merkle-ast-v2 in-band prefix"
+    );
+    assert!(
+        src.matches("substrate::derive_key(NODE_HASH_CONTEXT, &p)")
+            .count()
+            == 2,
+        "both the leaf and the internal fold must be keyed"
+    );
+
+    assert!(
+        sigma
+            .contains("`node_hash` v3 (`merkle-ast-v3`), `derive_key(\"leyline/ast-node/v3\", …)`"),
+        "sigma/v1/README.md's astNode row must name the keyed construction"
+    );
+    assert!(
+        adr.contains(
+            "| `node_hash` | merkle-ast-v3: `derive_key(\"leyline/ast-node/v3\", tag ‖ …)`"
+        ) && adr.contains("**Complies** (M2)"),
+        "ADR-0047 §3's node_hash row must record the keyed construction as shipped"
+    );
+
+    // node_content's columns, in the DDL and in the contract.
+    let table = ddl
+        .split("CREATE TABLE IF NOT EXISTS node_content (")
+        .nth(1)
+        .and_then(|rest| rest.split(");").next())
+        .expect("schema.rs declares node_content");
+    for gone in ["raw_kind", "lang"] {
+        assert!(
+            !table.contains(gone),
+            "node_content's DDL has `{gone}` again; it is not a function of node_hash"
+        );
+    }
+    assert!(
+        contract.contains(
+            "`node_tag`, `kind`, `token`, `arity`. Every column is a function of `node_hash`"
+        ),
+        "TABLE_CONTRACT.md's node_content row must list the v12 columns"
+    );
+}
+
 /// head.capnp is the cross-runtime description of `storeRoot`: another
 /// runtime implements the fold from it. It must describe the directory
 /// nodes, the git mode in `b`, empty params and empty directories as the code

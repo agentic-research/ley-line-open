@@ -49,9 +49,9 @@ use std::path::Path;
 use tempfile::TempDir;
 
 /// A prior lineage. Any value that is not the binary's current
-/// `IR_SCHEMA_VERSION` exercises the mismatch path; `merkle-ast-v1` is the
-/// real one this release supersedes.
-const SUPERSEDED_LINEAGE: &str = "merkle-ast-v1";
+/// `IR_SCHEMA_VERSION` exercises the mismatch path; `merkle-ast-v2` is the
+/// real one merkle-ast-v3 (ADR-0047 M2) supersedes.
+const SUPERSEDED_LINEAGE: &str = "merkle-ast-v2";
 
 fn fixture_repo() -> TempDir {
     let td = TempDir::new().unwrap();

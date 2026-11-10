@@ -95,11 +95,7 @@ pub fn probe_sensitivity(dir: &Path) -> io::Result<FilesystemSensitivity> {
         .tempdir_in(dir)?;
     let differs = |written: &str, looked_up: &str| -> io::Result<bool> {
         fs::File::create(probe.path().join(written))?;
-        match fs::symlink_metadata(probe.path().join(looked_up)) {
-            Ok(_) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(error),
-        }
+        absent(fs::symlink_metadata(probe.path().join(looked_up)))
     };
     let sensitivity = FilesystemSensitivity {
         case_sensitive: differs("case-probe", "CASE-PROBE")?,
@@ -107,6 +103,16 @@ pub fn probe_sensitivity(dir: &Path) -> io::Result<FilesystemSensitivity> {
     };
     probe.close()?;
     Ok(sensitivity)
+}
+
+/// Whether a lookup found nothing: `NotFound` is absence, any other error is
+/// the probe's failure.
+fn absent(lookup: io::Result<fs::Metadata>) -> io::Result<bool> {
+    match lookup {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// LLO's state directory: `$LEYLINE_STATE_DIR`, else
@@ -246,18 +252,28 @@ pub trait DiskImages: Send + Sync {
 
 /// `/usr/bin/hdiutil`, by absolute path (never from `PATH`), as the calling
 /// user, with stdin closed.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Hdiutil;
+#[derive(Debug, Clone)]
+pub struct Hdiutil {
+    program: PathBuf,
+}
+
+impl Default for Hdiutil {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from(HDIUTIL),
+        }
+    }
+}
 
 impl Hdiutil {
     fn run(&self, args: &[&std::ffi::OsStr]) -> Result<(), CasVolumeError> {
         let rendered = || {
-            std::iter::once(HDIUTIL.to_string())
+            std::iter::once(self.program.display().to_string())
                 .chain(args.iter().map(|arg| arg.to_string_lossy().into_owned()))
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let output = Command::new(HDIUTIL)
+        let output = Command::new(&self.program)
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -383,7 +399,7 @@ impl CasVolume {
             state_dir,
             size_cap_bytes,
             HostOs::current(),
-            Box::new(Hdiutil),
+            Box::new(Hdiutil::default()),
             probe_sensitivity,
         )
     }
@@ -500,10 +516,9 @@ impl CasVolume {
         }
         let mut attached = false;
         if !self.images.is_mounted(&layout.mountpoint)? {
-            match fs::create_dir(&layout.mountpoint) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(io_error("create", &layout.mountpoint)(error)),
+            if fs::symlink_metadata(&layout.mountpoint).is_err() {
+                fs::create_dir(&layout.mountpoint)
+                    .map_err(io_error("create", &layout.mountpoint))?;
             }
             self.images.attach(&layout.image, &layout.mountpoint)?;
             if !self.images.is_mounted(&layout.mountpoint)? {
@@ -517,11 +532,10 @@ impl CasVolume {
             }
             attached = true;
         }
-        match fs::create_dir(&layout.cas_root) {
-            Ok(()) => fs::set_permissions(&layout.cas_root, fs::Permissions::from_mode(0o755))
-                .map_err(io_error("set the mode of", &layout.cas_root))?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(io_error("create", &layout.cas_root)(error)),
+        if fs::symlink_metadata(&layout.cas_root).is_err() {
+            fs::create_dir(&layout.cas_root).map_err(io_error("create", &layout.cas_root))?;
+            fs::set_permissions(&layout.cas_root, fs::Permissions::from_mode(0o755))
+                .map_err(io_error("set the mode of", &layout.cas_root))?;
         }
         // The CAS root is a directory on the attached volume itself, never a
         // link to (or a mount of) somewhere else.
@@ -672,6 +686,10 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         mounted: Arc<Mutex<BTreeSet<PathBuf>>>,
         attach_mounts_nothing: bool,
+        /// Another provider places the final image while this one creates.
+        create_races: bool,
+        /// The tool reports success and writes nothing.
+        create_writes_nothing: bool,
     }
 
     impl Fake {
@@ -682,7 +700,15 @@ mod tests {
 
     impl DiskImages for Fake {
         fn create(&self, bundle: &Path, size_cap_bytes: u64) -> Result<(), CasVolumeError> {
-            fs::create_dir(bundle).unwrap();
+            if self.create_races {
+                let theirs = bundle.with_file_name("cas.sparsebundle");
+                fs::create_dir(&theirs).unwrap();
+                fs::write(theirs.join("Info.plist"), b"theirs").unwrap();
+            }
+            if !self.create_writes_nothing {
+                fs::create_dir(bundle).map_err(io_error("create", bundle))?;
+                fs::write(bundle.join("Info.plist"), b"ours").unwrap();
+            }
             self.calls.lock().push(format!(
                 "create {} {}",
                 bundle.file_name().unwrap().to_string_lossy(),
@@ -826,6 +852,172 @@ mod tests {
             error.to_string().contains("nothing is mounted at"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_concurrent_provider_s_image_is_used_and_ours_removed() {
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            create_races: true,
+            ..Fake::default()
+        };
+        let provisioned = volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap();
+        assert!(!provisioned.created, "theirs is in place");
+        let base = state.path().join("cas-volume");
+        assert_eq!(
+            fs::read(base.join("cas.sparsebundle/Info.plist")).unwrap(),
+            b"theirs"
+        );
+        let names: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.to_string_lossy().starts_with("partial-")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_renamed_into_place_is_an_error() {
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            create_writes_nothing: true,
+            ..Fake::default()
+        };
+        let error = volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("rename into place"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_state_path_that_is_not_a_directory_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        fs::write(state.path().join("cas-volume"), b"").unwrap();
+        let error = volume(state.path(), HostOs::MacOs, &Fake::default(), sensitive)
+            .provision()
+            .unwrap_err();
+        assert!(error.to_string().contains("create"), "{error}");
+        let dir = state.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        let file = state.path().join("file");
+        fs::write(&file, b"").unwrap();
+        assert!(private_directory(&dir).is_ok());
+        assert!(matches!(
+            private_directory(&file),
+            Err(CasVolumeError::Io { .. } | CasVolumeError::Config(_))
+        ));
+        let link = state.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(
+            matches!(private_directory(&link), Err(CasVolumeError::Config(_))),
+            "a link to a directory is not the directory"
+        );
+    }
+
+    #[test]
+    fn the_real_tool_runs_by_its_path_with_these_arguments() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log = scratch.path().join("args");
+        let tool = |exit: u8| {
+            let program = scratch.path().join(format!("hdiutil-{exit}"));
+            fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\necho refused >&2\nexit {exit}\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            Hdiutil { program }
+        };
+        let ok = tool(0);
+        ok.create(Path::new("/b.sparsebundle"), 2 << 30).unwrap();
+        ok.attach(Path::new("/b.sparsebundle"), Path::new("/m"))
+            .unwrap();
+        ok.detach(Path::new("/m")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "create|-size|2048m|-type|SPARSEBUNDLE|-fs|Case-sensitive APFS|-volname|LeylineCAS|-nospotlight|/b.sparsebundle|\
+             attach|-nobrowse|-noautoopen|-owners|on|-mountpoint|/m|/b.sparsebundle|\
+             detach|/m|"
+        );
+        let failing = tool(1);
+        for error in [
+            failing.create(Path::new("/b"), 1 << 30).unwrap_err(),
+            failing
+                .attach(Path::new("/b"), Path::new("/m"))
+                .unwrap_err(),
+            failing.detach(Path::new("/m")).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, CasVolumeError::Tool { detail, .. } if detail.contains("refused")),
+                "{error}"
+            );
+        }
+        let missing = Hdiutil {
+            program: scratch.path().join("absent"),
+        };
+        assert!(matches!(
+            missing.detach(Path::new("/m")),
+            Err(CasVolumeError::Tool { .. })
+        ));
+        assert_eq!(
+            Hdiutil::default().program,
+            PathBuf::from("/usr/bin/hdiutil")
+        );
+        assert!(Hdiutil::default().is_mounted(Path::new("/dev")).unwrap());
+        assert!(!Hdiutil::default().is_mounted(scratch.path()).unwrap());
+    }
+
+    #[test]
+    fn absence_is_only_not_found() {
+        assert!(!absent(fs::symlink_metadata("/")).unwrap());
+        assert!(absent(Err(io::Error::from(io::ErrorKind::NotFound))).unwrap());
+        assert!(absent(Err(io::Error::from(io::ErrorKind::PermissionDenied))).is_err());
+    }
+
+    #[test]
+    fn storage_reports_and_provisions_its_cas_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = CasStorage::Directory(dir.path().to_path_buf());
+        assert_eq!(storage.cas_root(), dir.path());
+        assert_eq!(storage.provision().unwrap(), dir.path());
+        let state = tempfile::tempdir().unwrap();
+        let storage = CasStorage::Volume(volume(
+            state.path(),
+            HostOs::Linux,
+            &Fake::default(),
+            sensitive,
+        ));
+        assert_eq!(storage.cas_root(), state.path().join("cas"));
+        assert_eq!(storage.provision().unwrap(), state.path().join("cas"));
+    }
+
+    #[test]
+    fn hosts_and_volumes_render_by_name() {
+        assert_eq!(HostOs::MacOs.to_string(), "macos");
+        assert_eq!(HostOs::Linux.to_string(), "linux");
+        assert_eq!(HostOs::Other("plan9").to_string(), "plan9");
+        let state = tempfile::tempdir().unwrap();
+        let rendered = format!(
+            "{:?}",
+            volume(state.path(), HostOs::MacOs, &Fake::default(), sensitive)
+        );
+        assert!(
+            rendered.starts_with("CasVolume") && rendered.contains("MacOs"),
+            "{rendered}"
+        );
+        assert!(default_state_dir().unwrap().is_absolute());
     }
 
     #[test]
@@ -989,6 +1181,11 @@ mod tests {
         let file = dir.path().join("file");
         fs::write(&file, b"").unwrap();
         assert!(!is_mount_point(&file).unwrap(), "a file is never one");
+        assert!(
+            is_mount_point(&file.join("below")).is_err(),
+            "a lookup that fails other than NotFound is an error, not absence"
+        );
+        assert!(is_mount_point(Path::new("/dev")).unwrap(), "devfs/devtmpfs");
     }
 
     #[test]

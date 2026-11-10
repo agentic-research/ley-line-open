@@ -380,7 +380,7 @@ fn provision_refuses_a_missing_operator_cas_root_and_a_refused_host_by_name() {
         state.path(),
         DEFAULT_SIZE_CAP_BYTES,
         leyline_runtime::cas_volume::HostOs::Other("plan9"),
-        Box::new(leyline_runtime::cas_volume::Hdiutil),
+        Box::new(leyline_runtime::cas_volume::Hdiutil::default()),
         leyline_runtime::cas_volume::probe_sensitivity,
     )
     .unwrap();

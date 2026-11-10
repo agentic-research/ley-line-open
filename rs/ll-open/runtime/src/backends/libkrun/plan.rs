@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::{DigestRef, ExecutionError, ExecutionRequest};
 
-const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
+pub(crate) const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
 
 pub trait RootfsResolver: Send + Sync {
     fn resolve(&self, digest: &DigestRef) -> Result<ResolvedRootfs, ExecutionError>;
@@ -188,7 +188,52 @@ struct ManifestFile {
     blake3: String,
 }
 
-pub(crate) fn verify_manifest(rootfs: &Path, digest: &DigestRef) -> Result<(), ExecutionError> {
+/// What a verified rootfs directory holds beyond its manifest's files: its
+/// directories, rootfs-relative (the root is the empty path), each with its
+/// permission bits.
+#[derive(Debug)]
+pub(crate) struct VerifiedTree {
+    /// The manifest's file paths, which the tree's regular files equal.
+    pub files: BTreeSet<PathBuf>,
+    pub directories: BTreeMap<PathBuf, u32>,
+}
+
+/// The directories manifest v1 implies: the root and every ancestor of a
+/// listed file. v1 names no directory and no directory mode, so these are
+/// all a rootfs digest determines (bead `ley-line-open-38ff59`).
+pub(crate) fn implied_directories<'a>(
+    files: impl IntoIterator<Item = &'a PathBuf>,
+) -> BTreeSet<PathBuf> {
+    let mut directories = BTreeSet::from([PathBuf::new()]);
+    for file in files {
+        directories.extend(
+            file.ancestors()
+                .skip(1)
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                .map(Path::to_path_buf),
+        );
+    }
+    directories
+}
+
+/// The mode every directory of a per-run rootfs view has under manifest v1.
+pub(crate) const NORMALIZED_DIRECTORY_MODE: u32 = 0o755;
+
+/// The manifest's file paths, read from `rootfs` and checked against
+/// `digest`, without reading the files themselves.
+pub(crate) fn manifest_file_paths(
+    rootfs: &Path,
+    digest: &DigestRef,
+) -> Result<BTreeSet<PathBuf>, ExecutionError> {
+    Ok(read_manifest(rootfs, digest)?
+        .into_iter()
+        .map(|entry| PathBuf::from(entry.path))
+        .collect())
+}
+
+/// The manifest's entries, after its bytes are checked against `digest`,
+/// its version, and its paths (guest-relative, no duplicates).
+fn read_manifest(rootfs: &Path, digest: &DigestRef) -> Result<Vec<ManifestFile>, ExecutionError> {
     let manifest_path = rootfs.join(ROOTFS_MANIFEST);
     let metadata = manifest_path
         .symlink_metadata()
@@ -215,7 +260,7 @@ pub(crate) fn verify_manifest(rootfs: &Path, digest: &DigestRef) -> Result<(), E
     }
 
     let mut declared = BTreeSet::new();
-    for entry in manifest.files {
+    for entry in &manifest.files {
         validate_relative_path(&entry.path)?;
         if !declared.insert(PathBuf::from(&entry.path)) {
             return Err(ExecutionError::invalid(format!(
@@ -223,15 +268,35 @@ pub(crate) fn verify_manifest(rootfs: &Path, digest: &DigestRef) -> Result<(), E
                 entry.path
             )));
         }
-        verify_manifest_file(rootfs, &entry)?;
     }
-    if collect_rootfs_files(rootfs)? != declared {
+    Ok(manifest.files)
+}
+
+/// Verify `rootfs` against the manifest `digest` names: every listed file's
+/// content and mode, and no regular file the manifest does not list. Its
+/// directories are returned, not judged: manifest v1 does not name them, so
+/// the CAS resolver accepts any, and a per-run view is held to the implied
+/// set by [`verify_ephemeral_rootfs`](super::volume::verify_ephemeral_rootfs).
+pub(crate) fn verify_manifest(
+    rootfs: &Path,
+    digest: &DigestRef,
+) -> Result<VerifiedTree, ExecutionError> {
+    let entries = read_manifest(rootfs, digest)?;
+    for entry in &entries {
+        verify_manifest_file(rootfs, entry)?;
+    }
+    let declared: BTreeSet<PathBuf> = entries
+        .into_iter()
+        .map(|entry| PathBuf::from(entry.path))
+        .collect();
+    let (files, directories) = collect_rootfs_tree(rootfs)?;
+    if files != declared {
         return Err(ExecutionError::invalid(
             "rootfs files differ from the content-addressed manifest",
         ));
     }
 
-    Ok(())
+    Ok(VerifiedTree { files, directories })
 }
 
 fn verify_manifest_file(rootfs: &Path, entry: &ManifestFile) -> Result<(), ExecutionError> {
@@ -276,12 +341,25 @@ fn verify_manifest_file(rootfs: &Path, entry: &ManifestFile) -> Result<(), Execu
     Ok(())
 }
 
-fn collect_rootfs_files(rootfs: &Path) -> Result<BTreeSet<PathBuf>, ExecutionError> {
+type RootfsTree = (BTreeSet<PathBuf>, BTreeMap<PathBuf, u32>);
+
+fn collect_rootfs_tree(rootfs: &Path) -> Result<RootfsTree, ExecutionError> {
     fn walk(
         rootfs: &Path,
         directory: &Path,
         files: &mut BTreeSet<PathBuf>,
+        directories: &mut BTreeMap<PathBuf, u32>,
     ) -> Result<(), ExecutionError> {
+        let metadata = directory
+            .symlink_metadata()
+            .map_err(|error| invalid_io("read rootfs directory metadata", error))?;
+        let relative = directory
+            .strip_prefix(rootfs)
+            .map_err(|_| ExecutionError::invalid("rootfs entry escapes root"))?;
+        directories.insert(
+            relative.to_path_buf(),
+            metadata.permissions().mode() & 0o7777,
+        );
         for entry in
             fs::read_dir(directory).map_err(|error| invalid_io("enumerate rootfs", error))?
         {
@@ -296,7 +374,7 @@ fn collect_rootfs_files(rootfs: &Path) -> Result<BTreeSet<PathBuf>, ExecutionErr
                 ));
             }
             if metadata.is_dir() {
-                walk(rootfs, &path, files)?;
+                walk(rootfs, &path, files, directories)?;
             } else if metadata.is_file() {
                 let relative = path
                     .strip_prefix(rootfs)
@@ -314,8 +392,9 @@ fn collect_rootfs_files(rootfs: &Path) -> Result<BTreeSet<PathBuf>, ExecutionErr
     }
 
     let mut files = BTreeSet::new();
-    walk(rootfs, rootfs, &mut files)?;
-    Ok(files)
+    let mut directories = BTreeMap::new();
+    walk(rootfs, rootfs, &mut files, &mut directories)?;
+    Ok((files, directories))
 }
 
 fn validate_relative_path(value: &str) -> Result<(), ExecutionError> {
@@ -359,7 +438,29 @@ fn invalid_io(action: &str, error: std::io::Error) -> ExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use super::guest_executable;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    use super::{guest_executable, implied_directories};
+
+    /// Bead ley-line-open-38ff59: the directories manifest v1 implies are
+    /// the root and every ancestor of a listed file, nothing else.
+    #[test]
+    fn implied_directories_are_the_root_and_every_file_ancestor() {
+        let files: Vec<PathBuf> = ["usr/bin/probe", "usr/lib/x/y.so", "top"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let expected: BTreeSet<PathBuf> = ["", "usr", "usr/bin", "usr/lib", "usr/lib/x"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(implied_directories(&files), expected);
+        assert_eq!(
+            implied_directories(&Vec::<PathBuf>::new()),
+            BTreeSet::from([PathBuf::new()])
+        );
+    }
 
     /// Bead ley-line-open-fe130c: the exec path is absolute whatever the
     /// catalog's guest-relative path looks like, a top-level name included.

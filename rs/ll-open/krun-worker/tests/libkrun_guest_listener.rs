@@ -193,6 +193,13 @@ fn main() {{
     for thread in serving {{
         let _ = thread.join();
     }}
+    // Hold the VM until the host ends it, also when every listen was
+    // refused and nothing above is serving: a guest that returned here
+    // would end the VM while the host was still probing, and its report
+    // could be lost with it (bead ley-line-open-c4480a).
+    loop {{
+        std::thread::park();
+    }}
 }}"#
     )
 }
@@ -423,32 +430,13 @@ fn udp_sockets_of(pid: u32) -> Vec<String> {
 }
 
 /// The guest of the datagram case: a TCP listener on `tcp_port` (the declared
-/// control, and the channel the guest reports on), UDP sockets bound on each
-/// of `udp_ports`, and one more that sends a datagram to the host's
-/// `127.0.0.1:host_peer`. Every UDP socket records what it receives. A TCP
-/// line `await <marker>` is answered once some UDP socket has received
-/// `<marker>`, with everything received so far as `<socket>=<payload>`
-/// entries; any other line is echoed as `<port>:<line>`.
+/// control), UDP sockets bound on each of `udp_ports`, and one more that sends
+/// a datagram to the host's `127.0.0.1:host_peer`. It holds every socket and
+/// echoes each TCP line as `<port>:<line>` until the host ends the VM.
 fn udp_guest(tcp_port: u16, udp_ports: &[u16], host_peer: u16) -> String {
     format!(
         r#"use std::io::{{BufRead, BufReader, Write}};
 use std::net::{{TcpListener, UdpSocket}};
-use std::sync::{{Arc, Condvar, Mutex}};
-
-type Received = Arc<(Mutex<Vec<String>>, Condvar)>;
-
-fn record(received: &Received, label: String, socket: UdpSocket) {{
-    let received = received.clone();
-    std::thread::spawn(move || {{
-        let mut buffer = [0u8; 512];
-        while let Ok(length) = socket.recv(&mut buffer) {{
-            let payload = String::from_utf8_lossy(&buffer[..length]).into_owned();
-            let (list, changed) = &*received;
-            list.lock().unwrap().push(format!("{{label}}={{payload}}"));
-            changed.notify_all();
-        }}
-    }});
-}}
 
 fn main() {{
     println!("listener-probe-start");
@@ -460,13 +448,13 @@ fn main() {{
             return;
         }}
     }};
-    let received: Received = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let mut held = Vec::new();
     let mut outcomes = String::new();
     for port in {udp_ports:?} {{
         match UdpSocket::bind(("0.0.0.0", port)) {{
             Ok(socket) => {{
                 outcomes.push_str(&format!(" udp{{port}}=bound"));
-                record(&received, format!("udp{{port}}"), socket);
+                held.push(socket);
             }}
             Err(error) => outcomes.push_str(&format!(" udp{{port}}={{:?}}", error.kind())),
         }}
@@ -477,7 +465,7 @@ fn main() {{
                 Ok(_) => outcomes.push_str(" sendto=sent"),
                 Err(error) => outcomes.push_str(&format!(" sendto={{:?}}", error.kind())),
             }}
-            record(&received, "sendto".to_owned(), client);
+            held.push(client);
         }}
         Err(error) => outcomes.push_str(&format!(" sendto-socket={{:?}}", error.kind())),
     }}
@@ -487,19 +475,9 @@ fn main() {{
         let Ok(mut stream) = stream else {{ continue }};
         let mut line = String::new();
         let _ = BufReader::new(&stream).read_line(&mut line);
-        let reply = match line.trim_end().strip_prefix("await ") {{
-            Some(marker) => {{
-                let (list, changed) = &*received;
-                let mut list = list.lock().unwrap();
-                while !list.iter().any(|entry| entry.ends_with(&format!("={{marker}}"))) {{
-                    list = changed.wait(list).unwrap();
-                }}
-                format!("{{}}\n", list.join(" "))
-            }}
-            None => format!("{tcp_port}:{{line}}"),
-        }};
-        let _ = stream.write_all(reply.as_bytes());
+        let _ = write!(stream, "{tcp_port}:{{line}}");
     }}
+    drop(held);
 }}"#
     )
 }
@@ -522,11 +500,13 @@ fn main() {{
 /// - the host's datagrams to both fixed ports, on loopback and on the host's
 ///   outbound address, must be refused by the host kernel: no host socket
 ///   holds them;
-/// - for every UDP socket the worker process holds, a datagram from a host
-///   address the guest never sent to must not reach the guest. The guest
-///   reports what each of its sockets received once a marker datagram from
-///   the peer it did send to has arrived through the same host socket, and
-///   the host sent its probe first, so the report is the event that decides.
+/// - the worker process must hold no UDP socket bound to a port. The guest's
+///   datagram never leaves the host (the VMM's profile opens outbound TCP to
+///   the declared ports only), so there is no peer whose reply could be due,
+///   and a bound port would be an inbound path no grant declares. Measured
+///   before LLO libkrun patch 0009: the VMM held `*:<ephemeral>`, and
+///   datagrams sent there from loopback and from the host's LAN address
+///   reached the guest.
 #[test]
 fn an_undeclared_guest_udp_port_is_not_reachable_from_the_host() {
     let _serial = common::serial();
@@ -598,52 +578,16 @@ fn an_undeclared_guest_udp_port_is_not_reachable_from_the_host() {
         }
     }
 
-    // Every UDP socket the VMM holds for the guest gets a datagram from a
-    // loopback address the guest never sent to and one from the host's
-    // outbound address, then a marker from the peer it did send to. The
-    // probes go first, into the same host socket, so had either been
-    // forwarded the guest would hold it before the marker; nothing here waits
-    // for a probe's fate, the guest's report after the marker decides it.
+    // Which host UDP sockets the VMM holds, and on which ports. A socket the
+    // VMM created for a guest socket but never bound (`*:*`) has no address
+    // anything can send to; one bound to a port is an inbound path.
     let held = udp_sockets_of(guest.child.id());
-    let mut unsolicited = Vec::new();
-    for socket in &held {
-        let port: u16 = socket
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse().ok())
-            .unwrap_or_else(|| panic!("lsof named a socket without a port: {socket}"));
-        let mut sources = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
-        sources.extend(lan.map(IpAddr::V4));
-        for source in sources {
-            let probe = UdpSocket::bind((source, 0)).expect("probe socket");
-            let target = SocketAddr::from((source, port));
-            probe
-                .send_to(format!("probe-from-{source}").as_bytes(), target)
-                .expect("send the probe");
-            unsolicited.push(format!("{source} -> {target}"));
-        }
-        peer.send_to(b"marker", (Ipv4Addr::LOCALHOST, port))
-            .expect("send the marker from the guest's peer");
-    }
-    if lan.is_none() {
-        eprintln!(
-            "NOTE: this host has no non-loopback IPv4 address, so the datagram \
-             probes came from loopback only"
-        );
-    }
-    let received = (!held.is_empty())
-        .then(|| connect(UDP_CASE_TCP_PORT))
-        .flatten()
-        .map(|mut stream| {
-            stream
-                .set_read_timeout(Some(REPLY_BOUND))
-                .expect("bound the reply");
-            exchange_line(&mut stream, "await marker")
-        });
+    let bound: Vec<&String> = held
+        .iter()
+        .filter(|socket| !socket.ends_with(":*"))
+        .collect();
     let worker_stderr = guest.end_still_running();
-    eprintln!(
-        "guest: {report}\nworker UDP sockets: {held:?}\nfixed ports: {fixed_outcomes:?}\n\
-         unsolicited: {unsolicited:?}\nguest received: {received:?}"
-    );
+    eprintln!("guest: {report}\nworker UDP sockets: {held:?}\nfixed ports: {fixed_outcomes:?}");
 
     assert_eq!(
         control.as_deref(),
@@ -668,28 +612,24 @@ fn an_undeclared_guest_udp_port_is_not_reachable_from_the_host() {
         );
     }
     assert!(
-        !held.is_empty(),
-        "the guest sent a datagram and the VMM holds no host UDP socket for it. \
-         That is closed, but it is not the mechanism this test was written against \
-         (TsiDgramProxy::sendto_addr binds one), so the reply-path half measured \
-         nothing; re-derive this test. Guest said: {report}"
+        report.contains("sendto="),
+        "the guest never attempted its datagram, so the reply path was not \
+         exercised. Guest said: {report}"
     );
-    let received = received.unwrap_or_else(|| {
-        panic!(
-            "the declared TCP listener refused the report request. worker stderr:\n{worker_stderr}"
-        )
-    });
-    let forwarded: Vec<&str> = received
-        .split_whitespace()
-        .filter(|entry| !entry.ends_with("=marker"))
-        .collect();
+    // The host refuses to transmit the guest's datagram (the VMM's profile
+    // opens outbound TCP to the declared ports only), so no peer was reached
+    // and the VMM must hold no UDP port at all. Before LLO libkrun patch 0009
+    // the guest's sendto bound one at 0.0.0.0 regardless, and every datagram
+    // arriving there, from loopback or the LAN, reached the guest. Admitting
+    // the guest's chosen destination without a send would not do either: a
+    // hostile guest would pick who may reach it.
     assert!(
-        received.contains("sendto=marker") && forwarded.is_empty(),
-        "SECURITY: the guest received datagrams {forwarded:?} from host addresses it \
-         never sent to, through the host UDP socket(s) {held:?} the VMM bound for its \
-         sendto. With a port map configured that socket carries replies from the \
-         guest's peers only (LLO libkrun patch 0009). Guest received: {received}\n\
-         worker stderr:\n{worker_stderr}"
+        bound.is_empty(),
+        "SECURITY: the VMM holds host UDP socket(s) {bound:?} for a guest whose \
+         datagrams the host never sent. Anyone who finds the port can reach the \
+         guest through it, and no grant declares it. With a port map configured, a \
+         TSI datagram socket is bound only by a send that leaves (LLO libkrun patch \
+         0009). worker stderr:\n{worker_stderr}"
     );
 }
 

@@ -13,7 +13,9 @@
 #
 # Downloads are untrusted data. Each package is pinned by SHA-256 (the
 # values the V-F3 benchmark recorded, docs/benchmarks/2026-10-15-vf3-
-# virtiofs.md) and checked before it is unpacked; tar only extracts it; the
+# virtiofs.md, except libexpat-2.10.0-r0, pinned on first fetch from Alpine's
+# CDN when 2.9.0-r0 was deleted; apk signatures are not verified) and
+# checked before it is unpacked; tar only extracts it; the
 # binaries run only inside the guest. Nothing here builds or executes a
 # downloaded file on the host.
 #
@@ -24,7 +26,8 @@
 # machine's content-addressed store (~/.cache/leyline/pins/<sha256>, filled
 # with every pin this script has verified), Alpine, and LLO's
 # content-addressed mirror (the `guest-tools-pins` GitHub release, whose
-# assets are named by their SHA-256 alone). Every source is checked against
+# assets are named by their SHA-256 alone; it exists once a maintainer has
+# run `tools/guest_tools_mirror.sh upload`). Every source is checked against
 # the same pin, so the store and the mirror add availability and no trust. A
 # pin missing from all three fails with a message naming it.
 #

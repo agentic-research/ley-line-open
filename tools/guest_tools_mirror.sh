@@ -9,10 +9,12 @@
 #                                              tools/guest_tools.sh <dir> run
 #                                              fetched and the mirror lacks
 #
-# `upload` needs `gh` with write access. It never replaces an asset: a name
-# is a digest, so an asset that exists already holds those bytes, and old
-# pins stay fetchable after a re-pin. The release is a prerelease that is
-# never marked latest, so nothing that resolves /releases/latest sees it.
+# `upload` needs `gh` with write access. The first upload creates the
+# release, as a prerelease that is never marked latest, so nothing that
+# resolves /releases/latest sees it. It never replaces an asset: a name is a
+# digest, so an asset that exists already holds those bytes, and old pins
+# stay fetchable after a re-pin. Until someone runs `upload`, the mirror
+# does not exist and `check` fails for every pin.
 set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd -P)
@@ -37,6 +39,12 @@ case "${1:-}" in
         dir=${2:?usage: $0 upload <dir>}
         work=$(mktemp -d "${TMPDIR:-/tmp}/leyline-guest-tools-mirror.XXXXXX")
         trap 'rm -rf "$work"' 0 1 2 15
+        # The first upload creates the release: a prerelease, never latest.
+        if ! gh release view "$RELEASE" > /dev/null 2>&1; then
+            gh release create "$RELEASE" --prerelease --latest=false \
+                --title "guest-tools pins (content-addressed mirror)" \
+                --notes "Content-addressed mirror of the tools/guest_tools.sh pins (bead ley-line-open-ae6b99). Each asset is named by its SHA-256; tools/fetch_pinned.sh checks it against the pin. Not a ley-line-open release."
+        fi
         present=$(gh release view "$RELEASE" --json assets --jq '.assets[].name')
         echo "$PINS" | while read -r path sum; do
             if echo "$present" | grep -qx "$sum"; then

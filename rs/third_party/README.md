@@ -104,13 +104,17 @@ and apply unchanged to `v1.19.6`; `0007` to `0009` were written on top of
    port, and every datagram that arrived there was forwarded to the guest,
    from any source on any interface, even when the VMM's sandbox had refused
    to transmit the guest's own datagram. With a map configured, an INET
-   datagram proxy now forwards only datagrams whose source is a peer the
-   guest named (a `sendto` destination or its `connect` peer, the 64 most
-   recent), the rule the kernel already applies to a connected UDP socket.
-   A guest UDP bind to a fixed port was already unpublished (the proxy's
-   `listen` is a no-op). Found by the live-guest datagram test, which
-   reached a guest UDP socket from loopback and from the host's LAN address
-   under a §4 grant (bead `ley-line-open-0026d2`).
+   datagram proxy binds nothing for the guest (the host's own `sendto`
+   binds when a datagram leaves), admits a peer only once the host has
+   reached it (a delivered `sendto`, a successful `connect`; the 64 most
+   recent), forwards only datagrams from admitted peers, and drops at most
+   64 others per wakeup. A destination the guest merely named admits
+   nothing, so a hostile guest cannot choose who reaches it. Under LLO's
+   VMM profile no guest datagram leaves, so the VMM holds no UDP port at
+   all. A guest UDP bind to a fixed port was already unpublished (the
+   proxy's `listen` is a no-op). Found by the live-guest datagram test,
+   which reached a guest UDP socket from loopback and from the host's LAN
+   address under a §4 grant (bead `ley-line-open-0026d2`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

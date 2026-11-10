@@ -410,6 +410,14 @@ pub async fn run_daemon_with_options(
         crate::daemon::control_lease::ControlLease::acquire(&ctrl_path, arena, reset_arena)
             .context("control block admission control")?;
 
+    // sqlite-vec is a process-wide `sqlite3_auto_extension`: it reaches only
+    // connections opened after it is registered. Registered here, before the
+    // writer and every pooled reader open, so `query` on a reader can name
+    // its modules (`vec_each`, ...) (bead `ley-line-open-3bf5dc`). It used to
+    // run while building the vector index, after the pool was full.
+    #[cfg(feature = "vec")]
+    crate::daemon::vec_index::register_vec();
+
     // 1. Arena setup.
     let ctrl_path = lifecycle::setup_arena(arena, arena_bytes(arena_size_mib), control)?;
 
@@ -544,7 +552,8 @@ pub async fn run_daemon_with_options(
     });
     #[cfg(feature = "vec")]
     let vec_index = {
-        crate::daemon::vec_index::register_vec();
+        // sqlite-vec was registered before the living db opened; see
+        // `register_vec` above `init_living_db`.
         Arc::new(
             crate::daemon::vec_index::VectorIndex::new(embedder.dimensions(), None)
                 .context("create sidecar VectorIndex")?,

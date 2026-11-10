@@ -656,6 +656,41 @@ mod tests {
         assert_same_rows(&logical(&into), &logical(&a.conn));
     }
 
+    /// F3 over comment occurrences (bead `ley-line-open-aa1634`): files with
+    /// line, block and doc comments rebuild to the same rows, the comment
+    /// `_ast`/`nodes` rows and their leaf `node_content` rows included, after
+    /// a write that changes only a comment.
+    #[test]
+    fn a_rebuild_reproduces_comment_occurrences() {
+        const G: &str = "// Package c.\npackage c\n\n/* block */\n\n// F is documented.\n\
+            func F() int {\n\t// inside\n\treturn 1 /* trailing */\n}\n";
+        const RS: &str = "//! Crate doc.\n\n/// Outer doc.\nfn f() {\n    // line\n}\n\n/** Block. */\nstruct S;\n";
+        let a = arena(&[("c.go", G), ("sub/deep/r.rs", RS)]);
+        write(
+            &a.conn,
+            &Grant::Whole,
+            "c.go",
+            G.replace("// F is documented.", "// F, reworded.")
+                .into_bytes(),
+        )
+        .unwrap();
+        let rows = logical(&a.conn);
+        for text in [
+            "// F, reworded.",
+            "/// Outer doc.\n",
+            "/** Block. */",
+            "// inside",
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|(t, _, s)| t == "node_content" && s.contains(&format!("{text:?}"))),
+                "the arena holds the comment leaf {text:?}"
+            );
+        }
+        let (into, _) = rebuilt(&a.conn, &Grant::Whole);
+        assert_same_rows(&logical(&into), &rows);
+    }
+
     /// F5: a sub-manifest rebuilt on its own produces the same file-local
     /// row images the full arena holds, compared modulo `file_id`.
     #[test]

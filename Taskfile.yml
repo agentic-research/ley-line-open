@@ -483,7 +483,7 @@ tasks:
       - tools/test_go_schema_consumer.sh
 
   schema:go-sigma-vectors:
-    desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec, node_hash v3) the Rust tests check (73c6ee, 73add7)
+    desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec, node_hash v3) and refuses the v2 Head message by version, as the Rust tests do (73c6ee, 73add7, a46711)
     dir: clients/go/leyline-schema
     env:
       GOWORK: "off"

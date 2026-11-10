@@ -30,6 +30,10 @@ use std::time::Duration;
 const GUARD: Duration = Duration::from_secs(120);
 
 const MAGIC: u32 = 0x4C45_5943;
+
+/// The stable prefix of a `--reset-arena` refusal caused by another holder,
+/// spelled out rather than imported: consumers (mache) match this text.
+const HELD_REFUSAL: &str = "--reset-arena refused: another process holds";
 const CONTROL_SIZE: usize = 4096;
 
 /// A temporary HOME and a separate temporary working directory.
@@ -356,6 +360,29 @@ fn the_default_instance_exit_keeps_a_socket_another_daemon_took() {
     drop(newer);
 }
 
+/// The well-known-name rule is scoped to `HOME/.mache`: a daemon whose
+/// control block is `default.ctrl` in some other directory is an ordinary
+/// explicit instance. It starts, serves at its own `default.sock`, and leaves
+/// `HOME/.mache/default.sock` alone.
+#[test]
+fn a_default_named_control_block_outside_home_mache_is_admitted() {
+    let fx = Fixture::new();
+    let default_sock = fx.mache("default.sock");
+    let elsewhere = PathBuf::from("/nonexistent/another-daemon.sock");
+    std::os::unix::fs::symlink(&elsewhere, &default_sock).unwrap();
+
+    let daemon = start(fx.daemon(&[
+        "--arena".as_ref(),
+        os(&fx.work("default.arena")),
+        "--control".as_ref(),
+        os(&fx.work("default.ctrl")),
+    ]));
+    UnixStream::connect(fx.work("default.sock")).expect("it serves at its own socket");
+    let (status, log) = daemon.stop();
+    assert!(status.success(), "{status}:\n{log}");
+    assert_eq!(std::fs::read_link(&default_sock).unwrap(), elsewhere);
+}
+
 /// A SIGTERM sent the moment the daemon announces itself (its socket line,
 /// before `daemon ready`) reaches the handler: the daemon shuts down cleanly
 /// and removes its socket. It used to install the handlers only after
@@ -430,7 +457,7 @@ fn reset_arena_refuses_an_older_control_block_another_process_locks() {
         "--reset-arena".as_ref(),
     ]));
     assert!(
-        stderr.contains("another process holds"),
+        stderr.contains(HELD_REFUSAL),
         "the refusal names the holder condition:\n{stderr}"
     );
     assert_eq!(
@@ -457,7 +484,7 @@ fn reset_arena_refuses_an_older_control_block_a_live_holder_leases() {
         os(&ctrl),
         "--reset-arena".as_ref(),
     ]));
-    assert!(stderr.contains("another process holds"), "{stderr}");
+    assert!(stderr.contains(HELD_REFUSAL), "{stderr}");
     assert_eq!(control_version(&ctrl), 2);
 }
 
@@ -496,6 +523,16 @@ fn reset_arena_refuses_a_control_block_a_live_daemon_serves() {
         os(&ctrl),
     ]));
     let before = std::fs::read(&ctrl).unwrap();
+    // The live daemon holds its lease, exactly `<ctrl>.lock`, shared: a
+    // reader (mache's `mount --control`) can hold it too, and no one can take
+    // it exclusively.
+    let lease = fx.work("c.ctrl.lock");
+    let reader = hold_flock(&lease, libc::LOCK_SH);
+    let probe = std::fs::File::open(&lease).unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    let rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_ne!(rc, 0, "a running daemon holds {}", lease.display());
+    drop(reader);
 
     let stderr = refused(fx.daemon(&[
         "--arena".as_ref(),
@@ -504,7 +541,7 @@ fn reset_arena_refuses_a_control_block_a_live_daemon_serves() {
         os(&ctrl),
         "--reset-arena".as_ref(),
     ]));
-    assert!(stderr.contains("another process holds"), "{stderr}");
+    assert!(stderr.contains(HELD_REFUSAL), "{stderr}");
     assert_eq!(
         std::fs::read(&ctrl).unwrap(),
         before,

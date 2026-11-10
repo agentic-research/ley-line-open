@@ -653,6 +653,40 @@ pub(crate) mod tests {
         assert_eq!(SocketDiscovery::Unpublished.instance_name(), None);
     }
 
+    /// The refusal is scoped to `$HOME/.mache`, not to a file name: a
+    /// `default.ctrl`/`default.sock` (or `execution.*`) anywhere else is an
+    /// ordinary explicit instance. mache's test spawners run daemons on
+    /// private temp dirs (`d.ctrl`, `a.ctrl`, `test.ctrl`) and rely on this.
+    #[test]
+    fn well_known_names_outside_home_mache_are_admitted() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".mache")).unwrap();
+        let spawn_dir = TempDir::new().unwrap();
+        let tmp = spawn_dir.path();
+        // `HOME` itself, not `HOME/.mache`, is also outside the scope.
+        let dirs = [tmp.to_path_buf(), home.path().to_path_buf()];
+        for d in [
+            SocketDiscovery::Substrate,
+            SocketDiscovery::Execution,
+            SocketDiscovery::Unpublished,
+        ] {
+            for dir in &dirs {
+                for (arena, ctrl) in [
+                    ("x.arena", "default.ctrl"),
+                    ("default.arena", "default.ctrl"),
+                    ("x.arena", "execution.ctrl"),
+                    ("x.arena", "default.sock"),
+                    ("d.arena", "d.ctrl"),
+                    ("a.arena", "a.ctrl"),
+                    ("test.arena", "test.ctrl"),
+                ] {
+                    admit_well_known(d, Some(home.path()), &dir.join(arena), &dir.join(ctrl))
+                        .unwrap_or_else(|e| panic!("{d:?} {arena} {ctrl}: {e:#}"));
+                }
+            }
+        }
+    }
+
     /// Bead `ley-line-open-e7459a`: only a surface's default instance may
     /// bind its well-known socket. Paths are compared as directory entries,
     /// so a HOME reached through a symlink still matches.

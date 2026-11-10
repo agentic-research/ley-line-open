@@ -13,4 +13,7 @@ Section: Fixed
   names. Any holder refuses the reset, by name. The new block replaces the
   old one by rename, so a process still mapping the old block keeps its old
   bytes rather than misreading the new seqlock. The same lease refuses a
-  `--reset-arena` against a control block a live daemon serves.
+  `--reset-arena` against a control block a live daemon serves. The lease
+  name (`<ctrl>.lock`, shared by daemons and long-lived readers, exclusive
+  for a reset) and the refusal prefix `--reset-arena refused: another
+  process holds` are stable contracts (`docs/ARCHITECTURE.md`).

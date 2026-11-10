@@ -14,4 +14,8 @@ Section: Fixed
   longer publishes discovery symlinks, and `SocketDiscovery::symlink_name` is
   replaced by `instance_name`. A daemon's exit now removes its own socket only
   while the path still names it, so a newer daemon's socket survives an older
-  one's exit.
+  one's exit. The rule is scoped to `$HOME/.mache`: a `default.ctrl` or
+  `default.sock` in any other directory is an ordinary daemon. The daemon now
+  installs its SIGINT/SIGTERM handlers before it announces itself; a
+  supervisor that sent SIGTERM on `daemon ready` used to kill it with no final
+  snapshot and its socket left behind.

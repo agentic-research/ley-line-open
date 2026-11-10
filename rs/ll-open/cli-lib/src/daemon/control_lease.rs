@@ -39,6 +39,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+/// The prefix of every `--reset-arena` refusal caused by another holder of
+/// the control block: its lease, a lock on the `.ctrl` itself, or the arena it
+/// names. Stable: consumers key a retry on it (mache treats it as transient,
+/// since its own brief publish and probe locks on the `.ctrl` can refuse a
+/// concurrent reset). A refusal that retrying cannot fix (a symlinked control
+/// path, an unopenable one) does not carry it.
+pub const HELD_REFUSAL: &str = "--reset-arena refused: another process holds";
+
 /// The lock a daemon holds on its control block's lease for its lifetime.
 /// Dropping it releases the lock; the lease file stays, since unlinking a
 /// file another process may be locking would split the lock in two.
@@ -94,7 +102,7 @@ impl ControlLease {
 
         if !try_flock(&file, libc::LOCK_EX)? {
             bail!(
-                "--reset-arena refused: another process holds the control block {} \
+                "{HELD_REFUSAL} the control block {} \
                  (a running daemon or reader holds its lease {}). Stop every process \
                  using it, then retry.",
                 ctrl.display(),
@@ -109,7 +117,11 @@ impl ControlLease {
     }
 }
 
-/// The lease file for the control block at `ctrl`: `<ctrl>.lock`.
+/// The lease file for the control block at `ctrl`: `<ctrl>.lock`, the full
+/// control path with `.lock` appended (`default.ctrl` -> `default.ctrl.lock`).
+/// A cross-repo contract: a long-lived reader that maps the control block
+/// (mache's `mount --control`) holds it `LOCK_SH` for its lifetime, so a
+/// `--reset-arena` cannot replace the block under it.
 pub fn lease_path_for(ctrl: &Path) -> PathBuf {
     let mut s = ctrl.as_os_str().to_owned();
     s.push(".lock");
@@ -132,7 +144,7 @@ fn reset_if_unheld(ctrl: &Path, arena: &Path) -> Result<()> {
     // whose publish lock would otherwise conflict with it.
     if !try_flock(&block, libc::LOCK_EX)? {
         bail!(
-            "--reset-arena refused: another process holds a lock on the control block {} \
+            "{HELD_REFUSAL} a lock on the control block {} \
              (a publish in progress, or a reader that locks it). Stop every process using \
              it, then retry.",
             ctrl.display()
@@ -202,7 +214,7 @@ fn refuse_if_named_arena_is_served(ctrl: &Path, named: &str, ours: &Path) -> Res
     };
     if !try_flock(&file, libc::LOCK_EX)? {
         bail!(
-            "--reset-arena refused: another process holds the control block {}: the daemon \
+            "{HELD_REFUSAL} the control block {}: the daemon \
              serving its arena {} is still running (it holds {}). Stop it, then retry.",
             ctrl.display(),
             named.display(),
@@ -374,6 +386,60 @@ mod tests {
         std::fs::write(&ctrl, &bytes).unwrap();
         let _lease = ControlLease::acquire(&ctrl, &dir.path().join("a.arena"), true).unwrap();
         assert_eq!(std::fs::read(&ctrl).unwrap(), bytes);
+    }
+
+    /// The lease's name is a cross-repo contract (mache's long-lived control
+    /// block mapper holds it shared): the full control path plus `.lock`.
+    #[test]
+    fn the_lease_is_the_control_path_with_lock_appended() {
+        assert_eq!(
+            lease_path_for(Path::new("/home/u/.mache/default.ctrl")),
+            PathBuf::from("/home/u/.mache/default.ctrl.lock")
+        );
+        assert_eq!(
+            lease_path_for(Path::new("rel/d.ctrl")),
+            PathBuf::from("rel/d.ctrl.lock")
+        );
+        // A reader holding it shared co-exists with a running daemon, and
+        // refuses a reset.
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctrl = dir.path().join("c.ctrl");
+        let arena = dir.path().join("a.arena");
+        let reader = hold(&dir.path().join("c.ctrl.lock"), libc::LOCK_SH);
+        let _daemon = ControlLease::acquire(&ctrl, &arena, false).unwrap();
+        assert!(ControlLease::acquire(&ctrl, &arena, true).is_err());
+        drop(reader);
+    }
+
+    /// Every refusal caused by another holder starts with [`HELD_REFUSAL`],
+    /// whose text is stable: mache keys a retry on it.
+    #[test]
+    fn every_held_refusal_starts_with_the_stable_prefix() {
+        assert_eq!(HELD_REFUSAL, "--reset-arena refused: another process holds");
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctrl = dir.path().join("c.ctrl");
+        let ours = dir.path().join("ours.arena");
+        let theirs = dir.path().join("theirs.arena");
+        write_block(&ctrl, 2, theirs.to_str().unwrap());
+        let mut refusals = Vec::new();
+
+        // The lease, held by a running daemon.
+        let daemon = ControlLease::acquire(&ctrl, &ours, false).unwrap();
+        refusals.push(ControlLease::acquire(&ctrl, &ours, true).unwrap_err());
+        drop(daemon);
+        // A lock on the `.ctrl` itself.
+        let publisher = hold(&ctrl, libc::LOCK_EX);
+        refusals.push(ControlLease::acquire(&ctrl, &ours, true).unwrap_err());
+        drop(publisher);
+        // A pre-lease daemon serving the arena the block names.
+        let served = crate::daemon::arena_lock::ArenaLock::try_acquire(&theirs).unwrap();
+        refusals.push(ControlLease::acquire(&ctrl, &ours, true).unwrap_err());
+        drop(served);
+
+        for err in refusals {
+            assert!(err.to_string().starts_with(HELD_REFUSAL), "{err:#}");
+        }
+        assert_eq!(version(&ctrl), 2, "every refusal left the block alone");
     }
 
     /// The lease lives beside the control block, whose directory a fresh

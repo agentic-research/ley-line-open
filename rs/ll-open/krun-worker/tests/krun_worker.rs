@@ -129,6 +129,50 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     );
 }
 
+/// The worker binary refuses a drifting commitment as its first and only
+/// event, before any readiness and before the rootfs is materialized (bead
+/// ley-line-open-7a3109). Runs on any host: the refusal precedes libkrun.
+#[test]
+fn the_worker_refuses_a_drifting_commitment_before_readiness() {
+    let _serial = common::serial();
+    let cas = TempDir::new().expect("CAS");
+    let mut request = request_fixture(&cas);
+    request.confinement_digest = format!("blake3-256:{}", "f".repeat(64));
+    let run_root = TempDir::new().expect("run root");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
+    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let mut child = command
+        .args([
+            "--cas-root",
+            cas.path().to_str().expect("CAS UTF-8"),
+            "--run-root",
+            run_root.path().to_str().expect("run root UTF-8"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first-party worker");
+    serde_json::to_writer(child.stdin.as_mut().expect("worker stdin"), &request)
+        .expect("write worker request");
+    child.stdin.take().expect("close worker stdin").flush().ok();
+    let output = child.wait_with_output().expect("worker output");
+
+    assert!(!output.status.success());
+    let event: WorkerEvent = serde_json::from_slice(&output.stderr)
+        .expect("exactly one structured event, and it is not readiness");
+    let WorkerEvent::Failed { error } = event else {
+        panic!("expected a failed worker event, got {event:?}");
+    };
+    assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch, "{error:?}");
+    assert!(error.detail.contains("confinement drift"), "{error:?}");
+    assert!(
+        !run_root.path().join("rootfs").exists(),
+        "the worker materialized a rootfs for a run whose confinement it refused"
+    );
+}
+
 fn base_options() -> Vec<OsString> {
     ["--cas-root", "/cas", "--run-root", "/run-root"]
         .map(OsString::from)

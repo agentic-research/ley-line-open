@@ -135,11 +135,8 @@ pub fn execute_with_ready(
     // the digest attested below. Both come from `committed`, whose policy is
     // parsed from the bytes its digest covers, so the attestation is true by
     // construction rather than by discipline.
-    let capabilities = capabilities_from_manifest(
-        committed.manifest(),
-        &config.rootfs.canonical_path,
-        Tier::Native,
-    )?;
+    let capabilities =
+        capabilities_from_manifest(&committed, &config.rootfs.canonical_path, Tier::Native)?;
     nono::Sandbox::apply_auto(&capabilities).map_err(|error| {
         ExecutionError::backend(format!("apply native nono confinement: {error}"))
     })?;

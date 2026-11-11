@@ -422,7 +422,10 @@ two digests:
 2. **What the digest covers.** All of it: the digest is BLAKE3 over the
    canonical bytes of exactly that document. There is one digest, and
    `RunReceipt.confinementDigest` names the policy the workload was confined
-   by, mechanism included.
+   by, mechanism included. One operator setting stays outside it: the
+   microVM tier's `tsi_hijack_inet` changes how guest sockets reach the host
+   (the port map and loopback channels) but grants the VMM process nothing,
+   since the VMM is still bound by the committed nono profile.
 3. **Why an issuer can still predict it.** Every input is deployment
    configuration (`KrunWorkerConfig`, `NativeWorkerConfig`) or symbolic,
    never per run, so an issuer configured for the deployment computes the
@@ -432,9 +435,12 @@ two digests:
 4. **Applied bytes, not a value beside them.** `ConfinementManifest::commit`
    takes the canonical bytes, digests them, and parses the policy to apply
    back from those same bytes. Both tiers compile their `CapabilitySet`, port
-   map, vsock mappings and loopback channels from that `CommittedConfinement`,
-   and `apply_manifest` accepts nothing else, so applying a policy requires
-   holding the value that compared its bytes with the grant.
+   map, vsock mappings and loopback channels from that `CommittedConfinement`;
+   `capabilities_from_manifest` and `apply_manifest` accept nothing else, so
+   compiling a policy requires holding the value `commit` produced, which
+   compared its bytes with the grant whenever the run carries a commitment.
+   A worker request must state `confinementDigest`; "no commitment" is the
+   explicit empty string, never an omitted key.
 5. **Compared before the workload starts.** `committed_confinement` refuses a
    digest that differs from the request's `confinement_digest` as
    `identity-policy-mismatch` "confinement drift", naming both digests, in the

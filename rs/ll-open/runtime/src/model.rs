@@ -392,7 +392,10 @@ pub struct ExecutionRequest {
     /// with nothing to compare. The service never produces this state (it
     /// refuses a resolver that changes the digest), and a request carrying a
     /// `confinement_manifest` with an empty digest is refused by the worker.
-    #[serde(default)]
+    ///
+    /// Required on the wire, empty or not: a request that omits the key is
+    /// refused rather than read as "no commitment", so that mode is always an
+    /// explicit empty string and never a forgotten field.
     pub confinement_digest: String,
     /// The `confinement/v1` document `confinement_digest` was taken over, when
     /// the grant carried one.

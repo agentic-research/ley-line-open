@@ -881,6 +881,28 @@ fn a_request_binds_the_policy_its_grant_committed_to() {
     .expect("the carried document binds");
     assert_eq!(carried.digest(), digest);
 
+    // A grant-originated dimension is folded from the carried document, and
+    // the digest covers it: the same commitment without the document drifts.
+    let with_listener = compiled.clone().with_port_bind(8443, None).expect("port");
+    let listener_digest = with_listener.confinement_digest().expect("digest");
+    let folded = committed_confinement(
+        &request_carrying(
+            &listener_digest,
+            Some(with_listener.to_canonical_json().expect("json")),
+        ),
+        &runtime_files,
+        &devices,
+    )
+    .expect("the carried listener folds");
+    assert_eq!(folded.manifest().port_binds().len(), 1);
+    assert_eq!(folded.digest(), listener_digest);
+    committed_confinement(
+        &request_carrying(&listener_digest, None),
+        &runtime_files,
+        &devices,
+    )
+    .expect_err("without the carried document the listener is not folded");
+
     // A deployment that differs from the one the issuer committed to.
     let error = committed_confinement(&request_carrying(&digest, None), &runtime_files, &[])
         .expect_err("a different deployment policy must not satisfy the commitment");

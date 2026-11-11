@@ -962,6 +962,25 @@ mod tests {
         );
     }
 
+    /// "No commitment" is stated, never defaulted: a worker request that
+    /// omits `confinementDigest` is refused, so a producer that forgot the
+    /// field cannot reach the attest-with-nothing-to-compare mode by accident.
+    /// An empty string is the explicit spelling of that mode.
+    #[test]
+    fn a_worker_request_without_a_confinement_digest_key_is_refused() {
+        let mut value = serde_json::to_value(request()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("confinementDigest")
+            .expect("the request serializes the key");
+        let error = read_request(value.to_string().as_bytes()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("confinementDigest"), "{error}");
+        // Present and empty: accepted.
+        read_request(serde_json::to_string(&request()).unwrap().as_bytes()).unwrap();
+    }
+
     #[test]
     fn worker_options_refuse_duplicates_and_malformed_values() {
         let base = ["--cas-root", "/cas", "--run-root", "/runs"];

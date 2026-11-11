@@ -270,13 +270,19 @@ pub fn build_process_capabilities(
     devices: &[PathBuf],
 ) -> Result<CapabilitySet, ExecutionError> {
     capabilities_from_manifest(
-        &confinement_manifest(runtime_files, devices, None)?,
+        &confinement_manifest(runtime_files, devices, None)?.commit(None)?,
         rootfs,
         Tier::MicroVm,
     )
 }
 
-/// Compile a manifest into the `CapabilitySet` nono applies.
+/// Compile a committed policy into the `CapabilitySet` nono applies.
+///
+/// Takes a [`CommittedConfinement`], not a manifest (bead
+/// `ley-line-open-7a3109`): the set is compiled from the policy parsed back
+/// from the digested bytes, and holding one means the policy went through
+/// [`ConfinementManifest::commit`], which compared it with the run's
+/// commitment when the run carries one.
 ///
 /// A trailing slash selects `allow_path` (directory subtree); anything else
 /// is `allow_file`. nono rejects a directory passed to `allow_file` and a
@@ -293,10 +299,11 @@ pub fn build_process_capabilities(
 /// field-by-field mapping and the rationale are ADR-0035's second open question
 /// (bead `ley-line-open-c17486`).
 pub fn capabilities_from_manifest(
-    manifest: &ConfinementManifest,
+    committed: &CommittedConfinement,
     run_rootfs: &Path,
     tier: Tier,
 ) -> Result<CapabilitySet, ExecutionError> {
+    let manifest = committed.manifest();
     // Exhaustive by construction: no `..`, so a fifth dimension is a compile
     // error here rather than a clause this function silently ignores. §5 is in
     // this list because it was NOT before — `credential_source` had no accessor
@@ -809,7 +816,6 @@ pub fn apply_manifest(
     committed: &CommittedConfinement,
     run_rootfs: &Path,
 ) -> Result<(), ExecutionError> {
-    let manifest = committed.manifest();
     let support = Sandbox::support_info();
     if !support.is_supported {
         return Err(ExecutionError::backend(format!(
@@ -817,7 +823,7 @@ pub fn apply_manifest(
             support.platform, support.details
         )));
     }
-    let capabilities = capabilities_from_manifest(manifest, run_rootfs, Tier::MicroVm)?;
+    let capabilities = capabilities_from_manifest(committed, run_rootfs, Tier::MicroVm)?;
     Sandbox::apply_auto(&capabilities)
         .map(|_| ())
         .map_err(nono_error)
@@ -1648,13 +1654,17 @@ mod tests {
                 .with_fs_grant(FsGrant::read_write(ATTESTED_RUN_ROOTFS))
                 .and_then(|manifest| manifest.with_unix_socket(grant))
                 .expect("a legal §6 document");
-            capabilities_from_manifest(&manifest, run_rootfs.path(), tier)
-                .expect("compiles on this tier")
-                .platform_rules()
-                .iter()
-                .filter(|rule| rule.contains("file-write-create"))
-                .cloned()
-                .collect()
+            capabilities_from_manifest(
+                &manifest.commit(None).expect("bind"),
+                run_rootfs.path(),
+                tier,
+            )
+            .expect("compiles on this tier")
+            .platform_rules()
+            .iter()
+            .filter(|rule| rule.contains("file-write-create"))
+            .cloned()
+            .collect()
         };
         let socket = directory.path().join("s.sock").display().to_string();
         let expected = vec![format!(

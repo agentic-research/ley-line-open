@@ -51,7 +51,7 @@ fn compile(
     // means for the process that holds it. The microVM projection has its own
     // pair below, because the two must be allowed to disagree (that is what
     // `Tier` exists to express).
-    capabilities_from_manifest(manifest, run_rootfs(), Tier::Native)
+    capabilities_from_manifest(&manifest.commit(None)?, run_rootfs(), Tier::Native)
 }
 
 /// §2 alone compiles everywhere — the baseline the other cases vary from.
@@ -531,7 +531,11 @@ fn the_microvm_projection_accepts_the_socket_grant_the_native_tier_refuses() {
         .with_unix_socket(UnixSocketGrant::bind(served.display().to_string()))
         .expect("a legal §6 grant");
 
-    let microvm = capabilities_from_manifest(&manifest, run_rootfs(), Tier::MicroVm);
+    let microvm = capabilities_from_manifest(
+        &manifest.commit(None).expect("bind"),
+        run_rootfs(),
+        Tier::MicroVm,
+    );
     assert!(
         microvm.is_ok(),
         "the VMM projection must accept §6 on every platform — the workload's \
@@ -606,8 +610,12 @@ fn a_local_connect_grant_is_refused_on_the_microvm_tier_by_name() {
         .with_connect_local(8443)
         .expect("valid connectLocal");
 
-    let error = capabilities_from_manifest(&manifest, run_rootfs(), Tier::MicroVm)
-        .expect_err("the guest's egress does not cross this profile");
+    let error = capabilities_from_manifest(
+        &manifest.commit(None).expect("bind"),
+        run_rootfs(),
+        Tier::MicroVm,
+    )
+    .expect_err("the guest's egress does not cross this profile");
     let message = error.to_string();
     assert!(
         message.contains("connectLocal") && message.contains("§6"),

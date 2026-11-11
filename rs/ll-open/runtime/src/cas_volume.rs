@@ -298,19 +298,13 @@ pub trait DiskImages: Send + Sync {
 }
 
 /// `statfs(2)`'s `f_flags` for the filesystem holding `path`: `MNT_*` bits
-/// on macOS, `ST_*` bits on Linux.
+/// on macOS, `ST_*` bits on Linux. Read through rustix, whose `StatFs`
+/// carries `f_flags` on both, so one code path serves every host.
 pub fn mount_flags(path: &Path) -> Result<u64, CasVolumeError> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| CasVolumeError::Config(format!("{} contains a NUL byte", path.display())))?;
-    // SAFETY: `c_path` is NUL-terminated and `stat` is written by the call.
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
-        return Err(io_error("inspect the mount flags of", path)(
-            io::Error::last_os_error(),
-        ));
-    }
-    #[allow(clippy::unnecessary_cast)]
+    let stat = rustix::fs::statfs(path).map_err(|errno| {
+        io_error("inspect the mount flags of", path)(io::Error::from_raw_os_error(errno.raw_os_error()))
+    })?;
+    #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
     Ok(stat.f_flags as u64)
 }
 

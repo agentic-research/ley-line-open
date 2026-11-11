@@ -84,7 +84,9 @@
 //!   that contains itself are refused. A layer entry whose path passes
 //!   through a link (`link/passwd` after `link -> /etc`) is refused under
 //!   either policy.
-//! - **No traversal.** Absolute paths, `..` components, entries under a
+//! - **No traversal.** An absolute entry name or hard-link target is read
+//!   from the image root (`/nix/store/x` is `nix/store/x`, as containerd
+//!   reads it). `..` components, in an absolute name too, entries under a
 //!   regular file, and `rootfs.manifest.json` at the image root are refused.
 //!   No image path reaches the host filesystem until the finished tree is
 //!   written beneath owner-only staging inside the CAS root; until then,
@@ -1219,17 +1221,18 @@ fn unsafe_path(layer: usize, raw: &str, reason: &str) -> OciImportError {
     }
 }
 
-/// The components of an archive path, relative to the image root. `.` and
-/// empty components (`./a//b/`) are dropped; an absolute path or a `..`
-/// component is refused, never normalized.
+/// The components of an archive path (an entry's name or a hard link's
+/// target), relative to the image root. `.` and empty components
+/// (`./a//b/`) are dropped, so a leading `/` is the image root, as
+/// containerd and Docker read an absolute name (Nix `dockerTools` writes
+/// `/nix/store/...`; bead `ley-line-open-cffbb5`): that changes how a name
+/// is read, never where an entry may land. A `..` component is refused,
+/// never normalized, in an absolute name as in a relative one.
 fn guest_path(raw: &str) -> Result<Vec<String>, &'static str> {
     // PATH_MAX. Also bounds the tree's depth, which every pass over it
     // recurses through.
     if raw.len() > MAX_PATH_BYTES {
         return Err("paths longer than 4096 bytes are refused");
-    }
-    if raw.starts_with('/') {
-        return Err("absolute paths are refused");
     }
     let mut components = Vec::new();
     for component in raw.split('/') {

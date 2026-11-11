@@ -527,8 +527,9 @@ fn xml_tokens(xml: &str) -> Option<Vec<XmlToken<'_>>> {
     let mut tokens = Vec::new();
     let mut rest = xml;
     while let Some(open) = rest.find('<') {
-        if open > 0 {
-            tokens.push(XmlToken::Text(xml_unescape(&rest[..open])?));
+        let (before, _) = rest.split_at(open);
+        if !before.is_empty() {
+            tokens.push(XmlToken::Text(xml_unescape(before)?));
         }
         let close = rest[open..].find('>')? + open;
         let tag = &rest[open + 1..close];
@@ -1652,6 +1653,15 @@ mod tests {
             "<plist><dict><string>v</string></dict></plist>",
             "<plist><dict><key>k</key><string>v</dict></plist>",
             "<plist><dict><key>k<string>v</string></key></dict></plist>",
+            // A value closed by another tag's name, with text and without.
+            "<plist><dict><key>k</key><string>v</key></dict></plist>",
+            "<plist><dict><key>k</key><string></key></dict></plist>",
+            "<plist><dict><key>k</string><string>v</string></dict></plist>",
+            // Text that is not whitespace, where only structure belongs: in
+            // a dictionary, in an array, and between a key and its value.
+            "<plist><dict>junk<key>k</key><string>v</string></dict></plist>",
+            "<plist><array>junk<string>x</string></array></plist>",
+            "<plist><dict><key>k</key>junk<string>v</string></dict></plist>",
             "<plist><string>a &bogus; b</string></plist>",
             "<plist><string>a &#xD800; b</string></plist>",
             "<plist><string>a & b</string></plist>",
@@ -1673,6 +1683,34 @@ mod tests {
         };
         assert!(parse_plist(&nested(MAX_PLIST_DEPTH + 1)).is_some());
         assert_eq!(parse_plist(&nested(MAX_PLIST_DEPTH + 2)), None);
+        // Through dictionaries too.
+        let nested_dicts = |depth: usize| {
+            format!(
+                "<plist>{}<string>x</string>{}</plist>",
+                "<dict><key>k</key>".repeat(depth),
+                "</dict>".repeat(depth)
+            )
+        };
+        assert!(parse_plist(&nested_dicts(MAX_PLIST_DEPTH)).is_some());
+        assert_eq!(parse_plist(&nested_dicts(MAX_PLIST_DEPTH + 1)), None);
+        // Text before the first tag is kept as text, not dropped.
+        assert_eq!(
+            xml_tokens("a<b>c</b>"),
+            Some(vec![
+                XmlToken::Text("a".into()),
+                XmlToken::Open("b"),
+                XmlToken::Text("c".into()),
+                XmlToken::Close("b"),
+            ])
+        );
+        assert_eq!(
+            xml_tokens("<a x=\"1\"><b/></a>"),
+            Some(vec![
+                XmlToken::Open("a"),
+                XmlToken::Empty("b"),
+                XmlToken::Close("a")
+            ])
+        );
     }
 
     #[test]

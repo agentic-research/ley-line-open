@@ -65,10 +65,17 @@ fn pins() -> Vec<(String, String)> {
 #[test]
 fn pinned_documents_reach_their_digest_and_are_canonical() {
     let pins = pins();
-    assert!(pins.len() >= 2, "expected the single and multi documents to be pinned");
+    assert!(
+        pins.len() >= 2,
+        "expected the single and multi documents to be pinned"
+    );
     for (hex, rel) in pins {
         let bytes = fs::read(spec_dir().join(&rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
-        assert_eq!(blake3_hex(&bytes), hex, "connectionsDigest of {rel} drifted from its pin");
+        assert_eq!(
+            blake3_hex(&bytes),
+            hex,
+            "connectionsDigest of {rel} drifted from its pin"
+        );
         let doc = connections::parse(&bytes).unwrap_or_else(|e| panic!("{rel}: {e}"));
         assert_eq!(
             String::from_utf8(doc.canonical_bytes()).unwrap(),
@@ -82,8 +89,14 @@ fn pinned_documents_reach_their_digest_and_are_canonical() {
 fn readme_block(readme: &str, marker: &str) -> String {
     let begin = format!("<!-- {marker}:begin -->");
     let end = format!("<!-- {marker}:end -->");
-    let start = readme.find(&begin).unwrap_or_else(|| panic!("README lacks {begin}")) + begin.len();
-    let stop = readme[start..].find(&end).unwrap_or_else(|| panic!("README lacks {end}")) + start;
+    let start = readme
+        .find(&begin)
+        .unwrap_or_else(|| panic!("README lacks {begin}"))
+        + begin.len();
+    let stop = readme[start..]
+        .find(&end)
+        .unwrap_or_else(|| panic!("README lacks {end}"))
+        + start;
     let block = readme[start..stop].trim();
     let block = block
         .strip_prefix("```text\n")
@@ -126,7 +139,10 @@ fn the_readme_template_is_the_canonical_form() {
             })
             .collect();
         let expected = document.replace("<connections>", &filled.join(",\n"));
-        assert_eq!(expected, text, "the README template disagrees with a pinned canonical document");
+        assert_eq!(
+            expected, text,
+            "the README template disagrees with a pinned canonical document"
+        );
     }
 }
 
@@ -141,19 +157,32 @@ fn accepted_cases_reach_their_canonical_bytes_and_digest() {
         let name = case["name"].as_str().expect("name");
         let input = case["input"].as_str().expect("input is the document text");
         let canonical = case["canonical"].as_str().expect("canonical");
-        let digest = case["connectionsDigest"].as_str().expect("connectionsDigest");
+        let digest = case["connectionsDigest"]
+            .as_str()
+            .expect("connectionsDigest");
         let doc = connections::parse(input.as_bytes())
             .unwrap_or_else(|e| panic!("case {name} was refused: {e}"));
         let bytes = doc.canonical_bytes();
-        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), canonical, "case {name}");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            canonical,
+            "case {name}"
+        );
         assert_eq!(
             format!("blake3-256:{}", blake3_hex(&bytes)),
             digest,
             "case {name}: connectionsDigest"
         );
         let again = connections::parse(&bytes).expect("canonical bytes parse");
-        assert_eq!(again.canonical_bytes(), bytes, "case {name}: not a fixpoint");
-        assert_eq!(again, doc, "case {name}: canonical bytes parse to another document");
+        assert_eq!(
+            again.canonical_bytes(),
+            bytes,
+            "case {name}: not a fixpoint"
+        );
+        assert_eq!(
+            again, doc,
+            "case {name}: canonical bytes parse to another document"
+        );
     }
 }
 
@@ -168,7 +197,12 @@ fn spelling_variants_reach_the_pinned_files() {
             continue;
         };
         let pinned = fs::read_to_string(spec_dir().join(file)).unwrap();
-        assert_eq!(case["canonical"].as_str().unwrap(), pinned, "{}", case["name"]);
+        assert_eq!(
+            case["canonical"].as_str().unwrap(),
+            pinned,
+            "{}",
+            case["name"]
+        );
         checked += 1;
     }
     assert!(checked >= 2, "expected variants of both pinned documents");
@@ -187,8 +221,16 @@ fn rejected_inputs_are_refused_by_name() {
             Ok(_) => panic!("reject {name} was accepted"),
             Err(e) => e,
         };
-        assert_eq!(err.reason.code(), expect["reason"].as_str().unwrap(), "reject {name}: {err}");
-        assert_eq!(err.field, expect["field"].as_str().unwrap(), "reject {name}: {err}");
+        assert_eq!(
+            err.reason.code(),
+            expect["reason"].as_str().unwrap(),
+            "reject {name}: {err}"
+        );
+        assert_eq!(
+            err.field,
+            expect["field"].as_str().unwrap(),
+            "reject {name}: {err}"
+        );
         assert_eq!(
             err.connection.as_deref(),
             expect["connection"].as_str(),
@@ -259,10 +301,17 @@ fn the_python_reference_agrees() {
             "ok reject {} {}|{}|{}",
             case["name"].as_str().unwrap(),
             err.connection.as_deref().unwrap_or("-"),
-            if err.field.is_empty() { "-" } else { &err.field },
+            if err.field.is_empty() {
+                "-"
+            } else {
+                &err.field
+            },
             err.reason.code()
         ));
     }
     let actual: Vec<&str> = stdout.lines().collect();
-    assert_eq!(actual, expected, "the Python reference disagrees with the Rust parser");
+    assert_eq!(
+        actual, expected,
+        "the Python reference disagrees with the Rust parser"
+    );
 }

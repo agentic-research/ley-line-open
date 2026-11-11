@@ -6,9 +6,11 @@ Section: Added
   `connectionsDigest` (BLAKE3-256 over the canonical bytes) pinned for a one- and a
   three-connection document, 12 accepted cases and 87 refusals, each refusal pinned by
   connection, field and reason code. `leyline_schema_spec::connections` is the
-  parser and canonicalizer the runtime will share. It is the crate's first Rust module
-  and has no dependencies. An independent Python reference (standard library only,
-  with its own reader and BLAKE3) must reach every pinned digest and refusal under
+  normative implementation that issuers and runners share instead of reimplementing it:
+  `ConnectionsDocument::new` builds a document, `canonical_bytes` and `digest_hex`
+  write and digest it, and `parse` reads it. `leyline-schema-spec` now depends on
+  `blake3`. An independent Python reference (standard library only, with its own reader
+  and BLAKE3) must reach every pinned digest and refusal under
   `cargo test -p leyline-schema-spec`. Slice 1 accepts only `art.tcp` from a UNIX
   endpoint to a loopback IP literal. Credentials, TLS, names and every other D2 member
   are refused by name. Nothing reads the document yet: authorization and the broker

@@ -1,12 +1,13 @@
-//! `cloister/connections/v1`: parser and canonicalizer (ADR-0046 Slice 1, S2).
+//! `cloister/connections/v1`: builder, parser, canonicalizer and digest
+//! (ADR-0046 Slice 1, S2).
 //!
 //! The connections document is the broker's input contract: one entry per
 //! declared connection, each joining a host UNIX endpoint to one loopback
 //! TCP target. `connectionsDigest` is BLAKE3-256 over the bytes
-//! [`ConnectionsDocument::canonical_bytes`] returns. It names those bytes and
-//! nothing else: it is not `confinementDigest`, a blob hash, or any arena or
-//! store root. This module computes no digest; callers hash the canonical
-//! bytes, so the crate keeps no runtime dependency.
+//! [`ConnectionsDocument::canonical_bytes`] returns
+//! ([`ConnectionsDocument::digest_hex`]). It names those bytes and nothing
+//! else: it is not `confinementDigest`, a blob hash, or any arena or store
+//! root.
 //!
 //! The reader is strict on purpose and hand-rolled for that reason: a general
 //! JSON library decodes escapes, merges duplicate keys and reads `30080.0` as
@@ -22,6 +23,44 @@
 //! but `art.tcp`) are refused by name rather than ignored. The type
 //! represents every loopback literal (`127.0.0.0/8`, `::1`); which of them a
 //! runtime delivers is a runtime check, not a parse rule.
+//!
+//! # Public API
+//!
+//! This module is the normative implementation, and the one the conformance
+//! vectors test. An issuer builds and digests a document with it rather than
+//! reimplementing the canonical form; a runner parses and verifies with it.
+//! Depend on the `leyline-schema-spec` crate (published with every LLO
+//! release, at the release's version).
+//!
+//! - [`ConnectionsDocument::new`]: build from [`Connection`]s, applying every
+//!   field rule; refuses with a [`ConnectionsError`] naming the connection, the
+//!   field and a stable [`Refusal`] code.
+//! - [`ConnectionsDocument::canonical_bytes`]: the bytes `connectionsDigest`
+//!   is taken over, and the bytes `RunGrant.connectionsDocument` carries.
+//! - [`ConnectionsDocument::digest_hex`]: `connectionsDigest`, with
+//!   [`DIGEST_ALGORITHM`] as its `DigestRef.algorithm`.
+//! - [`parse`]: read and validate a document's text; a runner then requires the
+//!   text to equal `canonical_bytes()` (never normalizing).
+//!
+//! ```
+//! use leyline_schema_spec::connections::{Connection, ConnectionsDocument, DIGEST_ALGORITHM};
+//!
+//! let doc = ConnectionsDocument::new(vec![Connection {
+//!     name: "orders-api".into(),
+//!     endpoint_unix: "/private/tmp/cloister-ch-7Qm2/orders.api.sock".into(),
+//!     host: "127.0.0.1".parse().unwrap(),
+//!     port: 30080,
+//! }])?;
+//! // The ADR-0046 S2 example: test-vectors/connections-canonical.json.
+//! assert_eq!(DIGEST_ALGORITHM, "blake3-256");
+//! assert_eq!(
+//!     doc.digest_hex(),
+//!     "9653bdf60e626486d61f63249853462e77dc74a7600d54848c6053bcd0470996"
+//! );
+//! let parsed = leyline_schema_spec::connections::parse(&doc.canonical_bytes())?;
+//! assert_eq!(parsed, doc);
+//! # Ok::<(), leyline_schema_spec::connections::ConnectionsError>(())
+//! ```
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -84,7 +123,77 @@ impl Connection {
     }
 }
 
+/// The `DigestRef.algorithm` a `connectionsDigest` carries.
+pub const DIGEST_ALGORITHM: &str = "blake3-256";
+
 impl ConnectionsDocument {
+    /// Build a document from its connections, as an issuer does, applying the
+    /// same rules [`parse`] applies to each field: a DNS-label `name`, a
+    /// printable-ASCII absolute `endpoint_unix` within the path rules, a
+    /// loopback `host` (any of `127.0.0.0/8`, or `::1`; an `IpAddr` has one
+    /// spelling, so no spelling rule applies), a nonzero `port`, at least one
+    /// connection, and no name or endpoint twice. The order given does not
+    /// matter: the document holds the connections sorted by name.
+    ///
+    /// `ConnectionsDocument::new(doc.connections().to_vec())` is `Ok(doc)` for
+    /// every parsed `doc`, and the canonical bytes of a built document parse
+    /// back to it.
+    pub fn new(mut connections: Vec<Connection>) -> Result<Self, ConnectionsError> {
+        if connections.is_empty() {
+            return Err(ConnectionsError {
+                connection: None,
+                field: "connections".into(),
+                reason: Refusal::EmptyConnections,
+                offset: None,
+            });
+        }
+        for (index, c) in connections.iter().enumerate() {
+            let label = if is_dns_label(&c.name) {
+                c.name.clone()
+            } else {
+                format!("#{index}")
+            };
+            let refuse = |field: &str, reason| ConnectionsError {
+                connection: Some(label.clone()),
+                field: field.into(),
+                reason,
+                offset: None,
+            };
+            if !is_printable_ascii(&c.endpoint_unix) {
+                return Err(refuse("endpoint.unix", Refusal::StringNotPrintableAscii));
+            }
+            if let Some(reason) = endpoint_path_refusal(&c.endpoint_unix) {
+                return Err(refuse("endpoint.unix", reason));
+            }
+            if !is_dns_label(&c.name) {
+                return Err(refuse("name", Refusal::BadName));
+            }
+            if let Some(reason) = host_refusal(c.host) {
+                return Err(refuse("target.tcp.host", reason));
+            }
+            if c.port == 0 {
+                return Err(refuse("target.tcp.port", Refusal::PortOutOfRange));
+            }
+            let earlier = &connections[..index];
+            if earlier.iter().any(|e| e.name == c.name) {
+                return Err(refuse("name", Refusal::DuplicateName));
+            }
+            if earlier.iter().any(|e| e.endpoint_unix == c.endpoint_unix) {
+                return Err(refuse("endpoint.unix", Refusal::DuplicateEndpoint));
+            }
+        }
+        connections.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+        Ok(ConnectionsDocument { connections })
+    }
+
+    /// `connectionsDigest`'s value: BLAKE3-256 over [`Self::canonical_bytes`],
+    /// 64 lowercase hex characters. Carried as a `DigestRef` with
+    /// `algorithm` = [`DIGEST_ALGORITHM`]. It names this document's canonical
+    /// bytes only: not `confinementDigest`, a blob hash, or any store root.
+    pub fn digest_hex(&self) -> String {
+        blake3::hash(&self.canonical_bytes()).to_hex().to_string()
+    }
+
     /// The connections, in canonical (name byte) order.
     pub fn connections(&self) -> &[Connection] {
         &self.connections
@@ -781,7 +890,11 @@ fn validate_connection(index: usize, item: &Json) -> Result<Connection, Connecti
     )?;
 
     // Values in key order: appProtocol, endpoint, name, target.
-    let protocol = as_str(&ctx, "appProtocol", get(&m, "appProtocol").expect("required"))?;
+    let protocol = as_str(
+        &ctx,
+        "appProtocol",
+        get(&m, "appProtocol").expect("required"),
+    )?;
     if protocol != APP_PROTOCOL_TCP {
         let reason = if APP_PROTOCOLS_NOT_DELIVERED.contains(&protocol) {
             Refusal::AppProtocolNotDelivered
@@ -844,6 +957,23 @@ fn validate_connection(index: usize, item: &Json) -> Result<Connection, Connecti
     })
 }
 
+fn is_printable_ascii(s: &str) -> bool {
+    s.bytes()
+        .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+}
+
+/// Why a host a builder supplies is not a loopback target, if it is not one.
+fn host_refusal(host: IpAddr) -> Option<Refusal> {
+    match host {
+        IpAddr::V4(v4) if v4.octets()[0] == 127 => None,
+        IpAddr::V6(v6) if v6 == Ipv6Addr::LOCALHOST => None,
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|m| m.octets()[0] == 127) => {
+            Some(Refusal::NonCanonicalLoopback)
+        }
+        _ => Some(Refusal::NonLoopbackTarget),
+    }
+}
+
 /// `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`
 pub fn is_dns_label(s: &str) -> bool {
     let b = s.as_bytes();
@@ -898,13 +1028,13 @@ fn loopback_host(text: &str) -> Result<IpAddr, Refusal> {
             Refusal::NonLoopbackTarget
         });
     }
-    if text.bytes().all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+    if text
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
         && let Ok(v6) = text.parse::<Ipv6Addr>()
     {
-        let loopback = v6.is_loopback()
-            || v6
-                .to_ipv4_mapped()
-                .is_some_and(|v4| v4.octets()[0] == 127);
+        let loopback =
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.octets()[0] == 127);
         return Err(if loopback {
             Refusal::NonCanonicalLoopback
         } else {
@@ -976,13 +1106,160 @@ mod tests {
         }
         for case in cases["rejects"].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
-            let err = parse(case["input"].as_str().unwrap().as_bytes())
-                .expect_err(name);
+            let err = parse(case["input"].as_str().unwrap().as_bytes()).expect_err(name);
             let want = &case["refusal"];
-            assert_eq!(err.reason.code(), want["reason"].as_str().unwrap(), "{name}: {err}");
+            assert_eq!(
+                err.reason.code(),
+                want["reason"].as_str().unwrap(),
+                "{name}: {err}"
+            );
             assert_eq!(err.field, want["field"].as_str().unwrap(), "{name}: {err}");
-            assert_eq!(err.connection.as_deref(), want["connection"].as_str(), "{name}");
+            assert_eq!(
+                err.connection.as_deref(),
+                want["connection"].as_str(),
+                "{name}"
+            );
         }
+    }
+
+    fn conn(name: &str, unix: &str, host: &str, port: u16) -> Connection {
+        Connection {
+            name: name.into(),
+            endpoint_unix: unix.into(),
+            host: host.parse().unwrap(),
+            port,
+        }
+    }
+
+    /// Building from a parsed document's connections, in any order, gives the
+    /// same document and digest, for every accepted vector.
+    #[test]
+    fn new_round_trips_every_accepted_case() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../connections/v1/test-vectors/connections-cases.json"
+        ))
+        .unwrap();
+        for case in cases["cases"].as_array().unwrap() {
+            let parsed = parse(case["input"].as_str().unwrap().as_bytes()).unwrap();
+            let mut reversed = parsed.connections().to_vec();
+            reversed.reverse();
+            let built = ConnectionsDocument::new(reversed).unwrap();
+            assert_eq!(built, parsed, "{}", case["name"]);
+            assert_eq!(
+                format!("{DIGEST_ALGORITHM}:{}", built.digest_hex()),
+                case["connectionsDigest"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn new_refuses_by_name() {
+        let ok = || conn("a", "/run/a.sock", "127.0.0.1", 1);
+        let refusal = |cs: Vec<Connection>| {
+            let e = ConnectionsDocument::new(cs).unwrap_err();
+            (e.connection, e.field, e.reason)
+        };
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            refusal(vec![]),
+            (None, "connections".into(), Refusal::EmptyConnections)
+        );
+        let cases: Vec<(Connection, Option<String>, &str, Refusal)> = vec![
+            (
+                conn("a", "/run/a\".sock", "127.0.0.1", 1),
+                some("a"),
+                "endpoint.unix",
+                Refusal::StringNotPrintableAscii,
+            ),
+            (
+                conn("a", "/run/\u{e9}.sock", "127.0.0.1", 1),
+                some("a"),
+                "endpoint.unix",
+                Refusal::StringNotPrintableAscii,
+            ),
+            (
+                conn("a", "/run/a\\.sock", "127.0.0.1", 1),
+                some("a"),
+                "endpoint.unix",
+                Refusal::StringNotPrintableAscii,
+            ),
+            (
+                conn("a", "/run/\u{1f}.sock", "127.0.0.1", 1),
+                some("a"),
+                "endpoint.unix",
+                Refusal::StringNotPrintableAscii,
+            ),
+            (
+                conn("a", "/run/\u{7f}.sock", "127.0.0.1", 1),
+                some("a"),
+                "endpoint.unix",
+                Refusal::StringNotPrintableAscii,
+            ),
+            (
+                conn("a", "run/a.sock", "127.0.0.1", 1),
+                some("a"),
+                "endpoint.unix",
+                Refusal::EndpointNotAbsolute,
+            ),
+            (
+                conn("A", "/run/a.sock", "127.0.0.1", 1),
+                some("#0"),
+                "name",
+                Refusal::BadName,
+            ),
+            (
+                conn("a", "/run/a.sock", "10.0.0.1", 1),
+                some("a"),
+                "target.tcp.host",
+                Refusal::NonLoopbackTarget,
+            ),
+            (
+                conn("a", "/run/a.sock", "::2", 1),
+                some("a"),
+                "target.tcp.host",
+                Refusal::NonLoopbackTarget,
+            ),
+            (
+                conn("a", "/run/a.sock", "::ffff:127.0.0.1", 1),
+                some("a"),
+                "target.tcp.host",
+                Refusal::NonCanonicalLoopback,
+            ),
+            (
+                conn("a", "/run/a.sock", "::ffff:10.0.0.1", 1),
+                some("a"),
+                "target.tcp.host",
+                Refusal::NonLoopbackTarget,
+            ),
+            (
+                conn("a", "/run/a.sock", "127.0.0.1", 0),
+                some("a"),
+                "target.tcp.port",
+                Refusal::PortOutOfRange,
+            ),
+        ];
+        for (c, connection, field, reason) in cases {
+            assert_eq!(refusal(vec![c]), (connection, field.into(), reason));
+        }
+        assert_eq!(
+            refusal(vec![ok(), conn("a", "/run/b.sock", "127.0.0.1", 1)]),
+            (some("a"), "name".into(), Refusal::DuplicateName)
+        );
+        assert_eq!(
+            refusal(vec![ok(), conn("b", "/run/a.sock", "127.0.0.1", 1)]),
+            (
+                some("b"),
+                "endpoint.unix".into(),
+                Refusal::DuplicateEndpoint
+            )
+        );
+        // The checks see the earlier connections only, not the whole list.
+        assert!(
+            ConnectionsDocument::new(vec![ok(), conn("b", "/run/b.sock", "::1", 65535)]).is_ok()
+        );
+        assert!(
+            ConnectionsDocument::new(vec![conn("a", "/run/a.sock", "127.255.255.254", 1)]).is_ok()
+        );
     }
 
     #[test]
@@ -1021,13 +1298,36 @@ mod tests {
         // Every JSON whitespace byte, `false`, and nested empty containers,
         // reach the shape check (so the reader accepted them) rather than a
         // syntax refusal.
-        let text = b" \t\r\n{\"version\" :\t\"cloister/connections/v1\" ,\r\n \"connections\": false } \n";
+        let text =
+            b" \t\r\n{\"version\" :\t\"cloister/connections/v1\" ,\r\n \"connections\": false } \n";
         assert_eq!(parse(text).unwrap_err().reason, Refusal::WrongType);
         let text = br#"{"version":"cloister/connections/v1","connections":[{"name":"a","appProtocol":"art.tcp","endpoint":{"unix":"/a"},"target":{"tcp":{"host":"127.0.0.1","port":1,"x":[[],{},null,true,-0.5e+2,1E-1]}}}]}"#;
         let err = parse(text).unwrap_err();
-        assert_eq!((err.reason, err.field.as_str()), (Refusal::UnknownKey, "target.tcp.x"));
-        for bad in [&b"tru"[..], b"[1,]", b"{\"a\" 1}", b"{\"a\":1,}", b"[1 2]", b"\"\\x\"", b"\"\\u12g4\"", b"01", b"-", b"1.", b"1e", b"[", b"{\"a\":1"] {
-            assert_eq!(parse(bad).unwrap_err().reason, Refusal::MalformedJson, "{:?}", std::str::from_utf8(bad));
+        assert_eq!(
+            (err.reason, err.field.as_str()),
+            (Refusal::UnknownKey, "target.tcp.x")
+        );
+        for bad in [
+            &b"tru"[..],
+            b"[1,]",
+            b"{\"a\" 1}",
+            b"{\"a\":1,}",
+            b"[1 2]",
+            b"\"\\x\"",
+            b"\"\\u12g4\"",
+            b"01",
+            b"-",
+            b"1.",
+            b"1e",
+            b"[",
+            b"{\"a\":1",
+        ] {
+            assert_eq!(
+                parse(bad).unwrap_err().reason,
+                Refusal::MalformedJson,
+                "{:?}",
+                std::str::from_utf8(bad)
+            );
         }
     }
 
@@ -1066,12 +1366,21 @@ mod tests {
         assert_eq!(loopback_host("128.0.0.1"), Err(Refusal::NonLoopbackTarget));
         assert_eq!(loopback_host("126.0.0.1"), Err(Refusal::NonLoopbackTarget));
         assert_eq!(loopback_host("010.0.0.1"), Err(Refusal::NonLoopbackTarget));
-        assert_eq!(loopback_host("127.0.0.01"), Err(Refusal::NonCanonicalLoopback));
+        assert_eq!(
+            loopback_host("127.0.0.01"),
+            Err(Refusal::NonCanonicalLoopback)
+        );
         assert_eq!(loopback_host("127.0.0.256"), Err(Refusal::HostIsName));
         assert_eq!(loopback_host("127.0.0"), Err(Refusal::HostIsName));
         assert_eq!(loopback_host("::2"), Err(Refusal::NonLoopbackTarget));
-        assert_eq!(loopback_host("::ffff:10.0.0.1"), Err(Refusal::NonLoopbackTarget));
-        assert_eq!(loopback_host("::ffff:127.0.0.1"), Err(Refusal::NonCanonicalLoopback));
+        assert_eq!(
+            loopback_host("::ffff:10.0.0.1"),
+            Err(Refusal::NonLoopbackTarget)
+        );
+        assert_eq!(
+            loopback_host("::ffff:127.0.0.1"),
+            Err(Refusal::NonCanonicalLoopback)
+        );
         assert_eq!(loopback_host("::"), Err(Refusal::NonLoopbackTarget));
         assert_eq!(loopback_host("[::1]"), Err(Refusal::HostIsName));
         assert_eq!(loopback_host("fe80::1%en0"), Err(Refusal::HostIsName));
@@ -1082,9 +1391,18 @@ mod tests {
         assert_eq!(endpoint_path_refusal("/a/b.sock"), None);
         assert_eq!(endpoint_path_refusal("/a/.b.sock"), None);
         assert_eq!(endpoint_path_refusal("/a/..b"), None);
-        assert_eq!(endpoint_path_refusal("/"), Some(Refusal::EndpointTrailingSlash));
-        assert_eq!(endpoint_path_refusal("/."), Some(Refusal::EndpointDotComponent));
-        assert_eq!(endpoint_path_refusal("/a/./b"), Some(Refusal::EndpointDotComponent));
+        assert_eq!(
+            endpoint_path_refusal("/"),
+            Some(Refusal::EndpointTrailingSlash)
+        );
+        assert_eq!(
+            endpoint_path_refusal("/."),
+            Some(Refusal::EndpointDotComponent)
+        );
+        assert_eq!(
+            endpoint_path_refusal("/a/./b"),
+            Some(Refusal::EndpointDotComponent)
+        );
         let max = format!("/{}", "a".repeat(MAX_ENDPOINT_PATH_BYTES - 1));
         assert_eq!(endpoint_path_refusal(&max), None);
         let over = format!("/{}", "a".repeat(MAX_ENDPOINT_PATH_BYTES));
@@ -1103,7 +1421,10 @@ mod tests {
     #[test]
     fn nesting_limit_is_exact() {
         let arrays = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
-        assert_eq!(parse(arrays(MAX_DEPTH).as_bytes()).unwrap_err().reason, Refusal::WrongType);
+        assert_eq!(
+            parse(arrays(MAX_DEPTH).as_bytes()).unwrap_err().reason,
+            Refusal::WrongType
+        );
         assert_eq!(
             parse(arrays(MAX_DEPTH + 1).as_bytes()).unwrap_err().reason,
             Refusal::MalformedJson

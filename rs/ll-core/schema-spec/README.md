@@ -27,8 +27,12 @@ that any second implementation can conform to.
 - **`connections/v1/`** — the connection broker's input document
   (ADR-0046 Slice 1): JSON Schema, canonical form, `connectionsDigest`
   pins, one vector per parse refusal, and an independent Python
-  reference under `ref-impl-py/`. Parsed by the crate's one Rust module,
-  `leyline_schema_spec::connections`.
+  reference under `ref-impl-py/`. Its normative implementation is the
+  crate's one Rust module, `leyline_schema_spec::connections`: an issuer
+  builds with `ConnectionsDocument::new`, writes `canonical_bytes()` and
+  digests with `digest_hex()` (`DIGEST_ALGORITHM` = `blake3-256`); a runner
+  reads with `parse`. Depend on `leyline-schema-spec` at the LLO release's
+  version rather than reimplementing the canonical form.
 - **`build-cache/v1/`** — OCI-shaped remote build cache transport
   (manifest shape, digest encoding, push/pull protocols). Ships a
   5-file vector bundle under `vectors/`.

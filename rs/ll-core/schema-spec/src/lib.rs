@@ -32,10 +32,11 @@
 //!
 //! # Rust API
 //!
-//! One module: [`connections`], the parser and canonicalizer for
-//! `cloister/connections/v1` (ADR-0046 Slice 1). It lives beside its spec so
-//! the runtime and the vectors share one reading of the document, and it has
-//! no dependency (the digest is the caller's BLAKE3 over the canonical bytes).
+//! One module: [`connections`], the normative builder, parser, canonicalizer
+//! and digest for `cloister/connections/v1` (ADR-0046 Slice 1). It lives
+//! beside its spec so the issuer (cloister), the runner (LLO) and the
+//! conformance vectors share one implementation. Its only dependency is
+//! `blake3`, for `connectionsDigest`.
 
 /// Root of the schema-spec directory tree, evaluated at compile time.
 ///

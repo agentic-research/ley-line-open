@@ -40,7 +40,10 @@ fn every_canonical_document_satisfies_the_schema() {
             let text = case[key].as_str().unwrap();
             let doc: Value = serde_json::from_str(text).unwrap();
             if let Err(e) = validator.validate(&doc) {
-                panic!("case {} ({key}) does not satisfy the schema: {e}", case["name"]);
+                panic!(
+                    "case {} ({key}) does not satisfy the schema: {e}",
+                    case["name"]
+                );
             }
         }
     }
@@ -59,7 +62,10 @@ fn the_schema_refuses_what_it_can_state() {
         let Ok(doc) = serde_json::from_str::<Value>(text) else {
             // Not JSON that serde_json reads, so there is nothing to validate;
             // only a refusal the parser owns can be marked this way.
-            assert!(!refuses, "reject {name} is not JSON but claims the schema refuses it");
+            assert!(
+                !refuses,
+                "reject {name} is not JSON but claims the schema refuses it"
+            );
             continue;
         };
         let valid = validator.validate(&doc).is_ok();

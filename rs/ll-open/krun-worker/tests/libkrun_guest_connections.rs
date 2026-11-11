@@ -1021,10 +1021,10 @@ fn only_the_declared_ports_exist_and_they_match_the_pure_function() {
 // Acceptance test 4: the request cannot widen reach (I3).
 
 /// Addresses in the environment and in argv are the workload's
-/// configuration, not authority: only the declared guest port answers, and
-/// a request that names the init's channel list, directly or by smuggling a
-/// quote onto the kernel command line, is refused before the worker is
-/// ready.
+/// configuration, not authority: only the declared guest port answers. A
+/// request that names the init's channel list is refused before the worker
+/// is ready; a value carrying a quote, or a key `init`, is data and widens
+/// nothing.
 #[test]
 fn the_request_cannot_widen_reach() {
     let _serial = common::serial();
@@ -1053,10 +1053,33 @@ fn the_request_cannot_widen_reach() {
         "worker stderr:\n{stderr}"
     );
 
-    // Each would otherwise reach the guest kernel command line: the channel
-    // list by name, by a quote breaking out of a value, and the guest init
-    // itself replaced through the kernel's own `init=` parameter, which would
+    // The environment no longer rides the kernel command line (LLO libkrun
+    // patch 0013, ley-line-open-7410ec), so a quote cannot break out of a
+    // value to add the channel list, and a key `init` cannot replace the
+    // guest init through the kernel's own `init=` parameter, which would
     // take the datagram filter and the relay with it (ley-line-open-eb5e4e).
+    // Both are now the workload's data: the run boots, the declared dial
+    // still crosses the relay (so init is LLO's), and 13307 stays closed.
+    let mut booted = Run::new(&root, &libkrunfw, CLIENT, "widen-smuggled")
+        .env("DB_ADDR", &format!("127.0.0.1:{DIAL_PORT}"))
+        .env(
+            "SMUGGLED",
+            "x\" KRUN_LOOPBACK_CHANNELS=\"dial:13307:65536",
+        )
+        .env("init", "/bin/guest")
+        .env("OTHER_ADDR", "127.0.0.1:13307")
+        .args(&["env:DB_ADDR", "env:OTHER_ADDR"])
+        .manifest(&manifest)
+        .boot();
+    let stderr = booted.guest.end();
+    assert_eq!(
+        booted.report,
+        "dialed DB_ADDR=host:hello-DB_ADDR OTHER_ADDR=ConnectionRefused",
+        "worker stderr:\n{stderr}"
+    );
+
+    // Init's own settings, named directly, are still refused before the
+    // worker is ready.
     for (run_id, key, value, named) in [
         (
             "widen-named",
@@ -1064,13 +1087,6 @@ fn the_request_cannot_widen_reach() {
             "dial:13307:65536",
             "KRUN_LOOPBACK_CHANNELS",
         ),
-        (
-            "widen-smuggled",
-            "DB_ADDR",
-            "x\" KRUN_LOOPBACK_CHANNELS=\"dial:13307:65536",
-            "double quote",
-        ),
-        ("widen-init", "init", "/bin/guest", "\\\"init\\\""),
         ("widen-krun-init", "KRUN_INIT", "/bin/guest", "KRUN_INIT"),
     ] {
         let refusal = Run::new(&root, &libkrunfw, CLIENT, run_id)

@@ -554,9 +554,11 @@ pub fn spec_and_grant(
     let mut workspace = grant.init_workspaces(1).get(0);
     workspace.set_name("repo");
     set_digest(workspace.reborrow().init_graph_root(), graph_root);
-    let mut operations = workspace.init_operations(2);
+    let mut operations = workspace.reborrow().init_operations(2);
     operations.set(0, execution_capnp::WorkspaceOperation::Read);
     operations.set(1, execution_capnp::WorkspaceOperation::Mutate);
+    // The agent may change anything in the tree it is handed.
+    workspace.init_write_scope(1).set(0, "/");
     let mut grant_bytes = Vec::new();
     capnp::serialize::write_message(&mut grant_bytes, &message).unwrap();
     (spec_json(&spec_bytes), grant_json(&grant_bytes))

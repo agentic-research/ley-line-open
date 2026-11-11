@@ -1442,6 +1442,177 @@ fn mkdir_outside_the_proposal_scope_is_eacces() {
     );
 }
 
+/// A write scope lets a run create the directories on the way to what it
+/// names, and never remove or move one of them: a directory above the scope
+/// is the store's, and taking it away changes `storeRoot` outside the grant.
+/// Only a granted tree, or a directory beneath one, may be removed or moved.
+#[test]
+fn a_write_scope_does_not_reach_the_directories_above_it() {
+    for (scope, ancestor, parent, name) in
+        [("x/y/z/", "x/y", "x", "y"), ("x/y/a.rs", "x/y", "x", "y")]
+    {
+        let f = fixture(Scope {
+            see: Grant::Whole,
+            propose: Grant::from_write_scope(&[scope.to_string()]),
+        });
+        // Another writer holds an empty directory above the scope.
+        f.fs.store()
+            .with_write(|conn| {
+                source_write::propose(
+                    conn,
+                    &Grant::Whole,
+                    vec![Proposed::mkdir("x"), Proposed::mkdir("x/y")],
+                )
+            })
+            .unwrap();
+        let (parent, x) = (ino(&f, parent), ino(&f, "x"));
+        assert_eq!(
+            f.fs.rmdir(parent, name.as_bytes()),
+            Err(Errno::EACCES),
+            "{scope}"
+        );
+        assert_eq!(
+            f.fs.rename(parent, name.as_bytes(), x, b"moved", 0),
+            Err(Errno::EACCES),
+            "{scope}"
+        );
+        assert_eq!(
+            f.fs.rmdir(ROOT_INODE, b"x"),
+            Err(Errno::ENOTEMPTY),
+            "{scope}"
+        );
+        assert!(
+            f.fs.lookup(x, b"y").is_ok(),
+            "{scope}: {ancestor} is still there"
+        );
+        assert!(f.fs.lookup(x, b"moved").is_err(), "{scope}");
+    }
+
+    // The granted tree itself, and a directory beneath it, are the run's.
+    let f = fixture(Scope {
+        see: Grant::Whole,
+        propose: Grant::from_write_scope(&["x/y/z/".to_string()]),
+    });
+    let x = f.fs.mkdir(ROOT_INODE, b"x").unwrap().attr.inode;
+    let y = f.fs.mkdir(x, b"y").unwrap().attr.inode;
+    let z = f.fs.mkdir(y, b"z").unwrap().attr.inode;
+    f.fs.mkdir(z, b"deep").unwrap();
+    assert_eq!(f.fs.rename(z, b"deep", z, b"deeper", 0), Ok(()));
+    assert_eq!(f.fs.rmdir(z, b"deeper"), Ok(()));
+    assert_eq!(f.fs.rmdir(y, b"z"), Ok(()));
+    // Having made them does not make the ancestors its own.
+    assert_eq!(f.fs.rmdir(x, b"y"), Err(Errno::EACCES));
+}
+
+/// The workspace root is writable, as a directory, exactly when the scope
+/// names something: a file alone, a tree alone, or both. A scope naming
+/// nothing leaves the root, like everything else, read-only.
+#[test]
+fn the_root_is_writable_when_the_write_scope_names_anything() {
+    let root_mode = |scope: &[&str]| {
+        let f = fixture(Scope {
+            see: Grant::Whole,
+            propose: Grant::from_write_scope(
+                &scope
+                    .iter()
+                    .map(|entry| entry.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        });
+        f.fs.getattr(ROOT_INODE, None).unwrap().0.mode()
+    };
+    assert_eq!(root_mode(&["a.go"]), 0o040755, "a file alone");
+    assert_eq!(root_mode(&["pkg/sub/"]), 0o040755, "a tree alone");
+    assert_eq!(root_mode(&["a.go", "pkg/sub/"]), 0o040755, "both");
+    assert_eq!(root_mode(&[]), 0o040555, "nothing");
+}
+
+/// An execution/v1 write scope (bead `ley-line-open-483134`): one exact file
+/// and one directory tree. The guest sees the whole tree and may change only
+/// what the scope names; every write, create, rename and delete outside it
+/// is `EACCES` and lands nothing.
+#[test]
+fn a_write_scope_of_a_file_and_a_tree_bounds_every_change() {
+    let f = fixture_with(
+        Scope {
+            see: Grant::Whole,
+            propose: Grant::from_write_scope(&["a.go".to_string(), "pkg/sub/".to_string()]),
+        },
+        true,
+        A,
+    );
+    let (pkg, sub) = (ino(&f, "pkg"), ino(&f, "pkg/sub"));
+
+    // Inside: edit the named file; create, mkdir, rename and delete anywhere
+    // under the tree.
+    assert_eq!(f.fs.flush(edit(&f, "a.go", A_EDIT)), Ok(()));
+    assert_eq!(read_source(&f, "a.go").0, A_EDIT.as_bytes());
+    assert_eq!(create_file(&f, sub, "new.go", C).1, Ok(()));
+    assert!(stored(&f, "pkg/sub/new.go"));
+    let deep = f.fs.mkdir(sub, b"deep").unwrap().attr.inode;
+    assert_eq!(create_file(&f, deep, "d.go", C).1, Ok(()));
+    assert_eq!(f.fs.rename(sub, b"new.go", deep, b"moved.go", 0), Ok(()));
+    assert!(stored(&f, "pkg/sub/deep/moved.go"));
+    assert_eq!(f.fs.unlink(deep, b"moved.go"), Ok(()));
+
+    // The modes say so: writable where the scope reaches, read-only elsewhere.
+    assert_eq!(
+        f.fs.getattr(ino(&f, "a.go"), None).unwrap().0.mode(),
+        0o100644
+    );
+    assert_eq!(
+        f.fs.getattr(ino(&f, "pkg/sub/c.go"), None)
+            .unwrap()
+            .0
+            .mode(),
+        0o100644
+    );
+    assert_eq!(
+        f.fs.getattr(ino(&f, "pkg/b.go"), None).unwrap().0.mode(),
+        0o100444
+    );
+    assert_eq!(f.fs.getattr(sub, None).unwrap().0.mode(), 0o040755);
+    assert_eq!(
+        f.fs.getattr(ino(&f, "secret"), None).unwrap().0.mode(),
+        0o040555
+    );
+
+    // Outside: an edit to a sibling file, a create at the root and beside
+    // the tree, a rename out of the tree and into it from outside, a delete,
+    // and a directory.
+    let b = ino(&f, "pkg/b.go");
+    assert_eq!(f.fs.open(b, O_RDWR).map(|_| ()), Err(Errno::EACCES));
+    assert_eq!(
+        f.fs.create(ROOT_INODE, b"new.go", O_RDWR).map(|_| ()),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        f.fs.create(pkg, b"new.go", O_RDWR).map(|_| ()),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        f.fs.rename(sub, b"c.go", pkg, b"c.go", 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        f.fs.rename(pkg, b"b.go", sub, b"b.go", 0),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(f.fs.unlink(ino(&f, "secret"), b"d.go"), Err(Errno::EACCES));
+    assert_eq!(
+        f.fs.mkdir(ROOT_INODE, b"other").map(|_| ()),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(f.fs.mkdir(pkg, b"sub2").map(|_| ()), Err(Errno::EACCES));
+    // Nothing refused landed, in the store or the checkout.
+    assert_eq!(read_source(&f, "pkg/b.go").0, B.as_bytes());
+    assert_eq!(read_source(&f, "pkg/sub/c.go").0, C.as_bytes());
+    assert!(stored(&f, "secret/d.go"));
+    assert!(!stored(&f, "new.go") && !stored(&f, "pkg/new.go"));
+    assert_eq!(on_disk(&f, "new.go"), None);
+    assert_eq!(on_disk(&f, "pkg/c.go"), None);
+}
+
 #[test]
 fn structural_requests_naming_what_the_guest_cannot_see_are_enoent() {
     let f = fixture(Scope {

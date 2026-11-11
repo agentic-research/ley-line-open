@@ -15,6 +15,7 @@ mod error;
 mod model;
 mod service;
 pub mod transport;
+mod workspaces;
 
 pub use authorization::{
     ArtifactIdentity, AuthorizedExecution, CasDsseEvidenceVerifier, EvidenceBinding, EvidenceField,
@@ -32,3 +33,4 @@ pub use model::{
     WorkspaceGrant, WorkspaceOperation,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};
+pub use workspaces::{AttachedWorkspace, ServedWorkspace, ServedWorkspaces};

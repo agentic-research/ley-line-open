@@ -680,7 +680,7 @@ fn the_lifecycle_backend_runs_the_guest_under_the_same_confinement() {
         ready_timeout: Duration::from_secs(60),
     });
     let request = fixture.request(&[(ENV_STRICT, "1")]);
-    match backend.start(&request) {
+    match backend.start(&request, leyline_runtime::ServedWorkspaces::none()) {
         Ok(_) => {}
         Err(error) if is_apply_failure(&error) => {
             sandbox_unavailable(&error);

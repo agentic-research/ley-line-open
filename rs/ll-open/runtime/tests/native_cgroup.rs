@@ -152,7 +152,12 @@ fn a_delegated_root_places_the_worker_in_a_run_cgroup_carrying_each_ceiling() {
         pids: PidsLimits { limit: 32 },
         ..ResourceLimits::default()
     };
-    backend.start(&request(run_id, limits)).expect("start");
+    backend
+        .start(
+            &request(run_id, limits),
+            leyline_runtime::ServedWorkspaces::none(),
+        )
+        .expect("start");
     assert!(matches!(
         backend.wait_for_completion(run_id).expect("complete"),
         BackendRunStatus::Succeeded
@@ -205,7 +210,12 @@ fn a_delegated_root_enforces_pids_and_its_teardown_kills_what_left_the_group() {
         pids: PidsLimits { limit: 8 },
         ..ResourceLimits::default()
     };
-    backend.start(&request(run_id, limits)).expect("start");
+    backend
+        .start(
+            &request(run_id, limits),
+            leyline_runtime::ServedWorkspaces::none(),
+        )
+        .expect("start");
     let _ = backend.wait_for_completion(run_id).expect("complete");
 
     let events = fs::read_to_string(&out).expect("pids.events");

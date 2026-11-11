@@ -1152,6 +1152,23 @@ mod tests {
         let error = exec_config(&total, "/bin/agent").unwrap_err();
         assert!(error.detail.contains("bytes"), "{error}");
 
+        // NUL cannot exist in an exec argv or environment: refused by name,
+        // in an argument and in a value.
+        let mut nul_argument = request();
+        nul_argument.arguments = vec!["a\0b".into()];
+        let error = exec_config(&nul_argument, "/bin/agent").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("NUL"), "{error}");
+        let mut nul_value = request();
+        nul_value
+            .public_environment
+            .insert("A".into(), "a\0b".into());
+        let error = refuse_reserved_environment(&nul_value).unwrap_err();
+        assert!(
+            error.detail.contains("NUL") && error.detail.contains("\"A\""),
+            "{error}"
+        );
+
         // The bounds themselves are admitted.
         let mut edge = request();
         edge.arguments = vec!["a".repeat(MAX_EXEC_STRING_BYTES - 1)];

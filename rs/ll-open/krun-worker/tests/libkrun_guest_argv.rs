@@ -84,10 +84,9 @@ fn hostile_arguments() -> Vec<String> {
 }
 
 fn hostile_environment() -> BTreeMap<String, String> {
-    let every_ascii: String = (1u8..=0x7f)
-        .filter(|b| *b != b'=')
-        .map(char::from)
-        .collect();
+    // Every byte, `=` included: a value may hold it; only the key may not.
+    let mut every_ascii: String = (1u8..=0x7f).map(char::from).collect();
+    every_ascii.push_str(" caf\u{e9} \u{1F600} \u{4e2d}");
     BTreeMap::from([
         ("A".to_owned(), "x tsi_hijack y".to_owned()),
         ("QUOTED".to_owned(), "v\"q\" -- \\n".to_owned()),

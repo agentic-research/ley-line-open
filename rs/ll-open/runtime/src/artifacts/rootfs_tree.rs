@@ -339,6 +339,7 @@ impl Tree {
             copied: 0,
             kernel_mount: Vec::new(),
             dangling: Vec::new(),
+            directory_modes: BTreeMap::new(),
         };
         let root = state.expand(&[])?;
         Ok(Resolved {
@@ -346,6 +347,7 @@ impl Tree {
             copied: state.copied,
             kernel_mount: state.kernel_mount,
             dangling: state.dangling,
+            directory_modes: state.directory_modes,
         })
     }
 
@@ -476,6 +478,10 @@ pub(crate) struct Resolved {
     pub copied: usize,
     pub kernel_mount: Vec<Dropped>,
     pub dangling: Vec<Dropped>,
+    /// Each written directory's mode, by written path: a copied directory
+    /// takes its real directory's. A directory that is not listed had no
+    /// entry of its own.
+    pub directory_modes: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,6 +499,7 @@ struct Expansion<'a> {
     copied: usize,
     kernel_mount: Vec<Dropped>,
     dangling: Vec<Dropped>,
+    directory_modes: BTreeMap<String, u32>,
 }
 
 impl Expansion<'_> {
@@ -570,6 +577,9 @@ impl Expansion<'_> {
         real: Vec<String>,
         written: &str,
     ) -> Result<BTreeMap<String, Final>, ResolveError> {
+        if let Some(mode) = self.tree.modes.get(&real) {
+            self.directory_modes.insert(written.to_string(), *mode);
+        }
         self.active.push(real.clone());
         let expanded = self.expand_at(&real, written);
         self.active.pop();

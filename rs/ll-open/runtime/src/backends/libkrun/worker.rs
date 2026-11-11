@@ -218,11 +218,14 @@ pub fn write_exec_config(
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
     let path = rootfs.join(EXEC_CONFIG_PATH.trim_start_matches('/'));
+    // `create_new` is O_CREAT|O_EXCL, which fails on any existing entry and
+    // does not follow a symbolic link at the final component (POSIX), so a
+    // link the rootfs placed there is refused rather than written through.
+    // std opens close-on-exec.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o400)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)
         .map_err(|error| {
             ExecutionError::invalid(format!(
@@ -1153,6 +1156,45 @@ mod tests {
         let mut edge = request();
         edge.arguments = vec!["a".repeat(MAX_EXEC_STRING_BYTES - 1)];
         exec_config(&edge, "/bin/agent").unwrap();
+    }
+
+    /// Each bound at its exact edge: one under it is admitted, the edge is
+    /// refused. The per-string bound is the kernel's `MAX_ARG_STRLEN`
+    /// (32 pages, the NUL included).
+    #[test]
+    fn the_exec_bounds_hold_at_their_exact_edges() {
+        assert_eq!(MAX_EXEC_STRING_BYTES, 131_072);
+
+        // Strings: argv[0] plus arguments plus environment entries.
+        let mut at = request();
+        at.arguments = vec!["a".into(); MAX_EXEC_STRINGS - 2];
+        at.public_environment.insert("A".into(), "1".into());
+        exec_config(&at, "/bin/agent").expect("exactly the most strings");
+        at.arguments.push("a".into());
+        let error = exec_config(&at, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("strings"), "{error}");
+
+        // One environment entry, `KEY=VALUE` with its NUL under the bound.
+        let mut entry = request();
+        entry
+            .public_environment
+            .insert("AB".into(), "v".repeat(MAX_EXEC_STRING_BYTES - 4));
+        exec_config(&entry, "/bin/agent").expect("an entry one byte under the bound");
+        entry
+            .public_environment
+            .insert("AB".into(), "v".repeat(MAX_EXEC_STRING_BYTES - 3));
+        let error = exec_config(&entry, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("\"AB\""), "{error}");
+
+        // In all, NULs included: "/bin/agent" (11) + 8 x 131,070 + 5 is
+        // exactly 1 MiB.
+        let mut total = request();
+        total.arguments = vec!["a".repeat(131_069); 8];
+        total.arguments.push("abcd".into());
+        exec_config(&total, "/bin/agent").expect("exactly the most bytes");
+        total.arguments.last_mut().unwrap().push('e');
+        let error = exec_config(&total, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("bytes"), "{error}");
     }
 
     #[test]

@@ -1,29 +1,33 @@
 //! Per-run writable rootfs views for the embedded libkrun backend.
 //!
 //! The authenticated CAS tree remains immutable. A worker receives an empty,
-//! parent-owned directory, copies the manifest's tree into it (the listed
-//! files and the directories they imply, every directory at 0755: manifest
-//! v1 names no directory, so the CAS entry's own directories are not
-//! copied), then verifies the copy, its directories included, against the
-//! same manifest before giving libkrun access to it.
+//! parent-owned directory, copies the manifest's tree into it, then verifies
+//! the copy, its directories and links included, against the same manifest
+//! before giving libkrun access to it. The copy is the manifest's tree, not
+//! the CAS entry's:
+//!
+//! - **Manifest v2** names every directory with its mode, every file and
+//!   every symbolic link: the copy holds exactly those, each directory at
+//!   its declared mode, each link recreated from the manifest's target bytes
+//!   (bead `ley-line-open-4f08ea`). A link is never followed on the host.
+//! - **Manifest v1** names files only: the copy holds the listed files and
+//!   the directories they imply, every directory at 0755, nothing else
+//!   (bead `ley-line-open-38ff59`).
 
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, openat, statat};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, openat, readlinkat, statat};
 
 use crate::ExecutionError;
+use crate::artifacts::rootfs_manifest::{MANIFEST_FILE_MODE as MANIFEST_MODE, RootfsSpec};
 
-use super::plan::{
-    NORMALIZED_DIRECTORY_MODE, ROOTFS_MANIFEST, ResolvedRootfs, implied_directories,
-    manifest_file_paths, verify_manifest,
-};
+use super::plan::{ROOTFS_MANIFEST, ResolvedRootfs, read_manifest, verify_manifest};
 
 /// Materialize a private writable view of an authenticated rootfs.
 ///
@@ -68,16 +72,9 @@ pub fn materialize_ephemeral_rootfs(
         .map_err(|error| invalid_io("create ephemeral guest rootfs", error))?;
     fs::set_permissions(&guest_root, fs::Permissions::from_mode(0o700))
         .map_err(|error| invalid_io("make rootfs private during materialization", error))?;
-    // Manifest v1 names files, not directories, so the copy is the
-    // manifest's tree, not the CAS entry's: the listed files, the
-    // directories they imply, each at 0755, and nothing else (bead
-    // `ley-line-open-38ff59`). The CAS entry's own directory set and modes
-    // are not part of the digest, so they never reach the guest.
-    let files = manifest_file_paths(&source_path, &source.digest)?;
-    let plan = CopyPlan {
-        directories: implied_directories(&files),
-        files,
-    };
+    // The copy is the manifest's tree, not the CAS entry's: what the digest
+    // names reaches the guest, and nothing else does.
+    let plan = read_manifest(&source_path, &source.digest)?;
     copy_directory_contents(&source_path, &guest_root, &plan)?;
     let materialized = ResolvedRootfs {
         digest: source.digest.clone(),
@@ -89,19 +86,18 @@ pub fn materialize_ephemeral_rootfs(
 
 /// The mode of `rootfs.manifest.json` in a per-run view. Its bytes are the
 /// digest; its inode mode in the CAS entry is not, so it is not carried.
-pub const MANIFEST_FILE_MODE: u32 = 0o644;
+pub const MANIFEST_FILE_MODE: u32 = MANIFEST_MODE;
 
-/// What a per-run copy holds: the manifest's files and the directories they
-/// imply, rootfs-relative.
-struct CopyPlan {
-    files: BTreeSet<PathBuf>,
-    directories: BTreeSet<PathBuf>,
+/// The mode the manifest gives the directory at `relative` (the root is
+/// `""`), or `None` when it names none there.
+fn directory_mode(plan: &RootfsSpec, relative: &str) -> Option<u32> {
+    plan.directories.get(relative).copied()
 }
 
 fn copy_directory_contents(
     source: &Path,
     destination: &Path,
-    plan: &CopyPlan,
+    plan: &RootfsSpec,
 ) -> Result<(), ExecutionError> {
     let source = open(
         source,
@@ -109,23 +105,31 @@ fn copy_directory_contents(
         Mode::empty(),
     )
     .map_err(|error| invalid_rustix("open immutable rootfs directory", error))?;
-    copy_directory_fd(&source, Path::new(""), Some(destination), plan)?;
-    fs::set_permissions(
-        destination,
-        fs::Permissions::from_mode(NORMALIZED_DIRECTORY_MODE),
-    )
-    .map_err(|error| invalid_io("set ephemeral guest rootfs permissions", error))
+    copy_directory_fd(&source, "", Some(destination), plan)?;
+    let mode = directory_mode(plan, "")
+        .ok_or_else(|| ExecutionError::invalid("the rootfs manifest names no root directory"))?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode))
+        .map_err(|error| invalid_io("set ephemeral guest rootfs permissions", error))
+}
+
+/// `name` beneath the rootfs-relative directory `relative`.
+fn child_path(relative: &str, name: &str) -> String {
+    if relative.is_empty() {
+        name.to_string()
+    } else {
+        format!("{relative}/{name}")
+    }
 }
 
 /// Copy the entries of `source` (at `relative` in the rootfs) that `plan`
-/// lists into `destination`, which is `None` for a directory the manifest
-/// does not imply: one is walked, so any file in it is refused as
+/// names into `destination`, which is `None` for a directory the manifest
+/// does not name: one is walked, so any file or link in it is refused as
 /// undeclared, but never created.
 fn copy_directory_fd(
     source: &impl AsFd,
-    relative: &Path,
+    relative: &str,
     destination: Option<&Path>,
-    plan: &CopyPlan,
+    plan: &RootfsSpec,
 ) -> Result<(), ExecutionError> {
     let mut entries = Dir::read_from(source)
         .map_err(|error| invalid_rustix("enumerate immutable rootfs", error))?
@@ -145,10 +149,31 @@ fn copy_directory_fd(
         let before = statat(source, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| invalid_rustix("inspect immutable rootfs entry", error))?;
         let expected_type = FileType::from_raw_mode(before.st_mode);
+        let entry_relative = child_path(relative, &String::from_utf8_lossy(name.to_bytes()));
         if expected_type.is_symlink() {
-            return Err(ExecutionError::invalid(
-                "rootfs symbolic links are not supported",
-            ));
+            // A link is recreated from the manifest's bytes, never followed,
+            // and only where the manifest names one with this target.
+            let Some(target) = plan.symlinks.get(&entry_relative) else {
+                return Err(ExecutionError::invalid(if plan.version == 1 {
+                    "rootfs symbolic links are not supported by rootfs manifest v1".to_string()
+                } else {
+                    format!("rootfs symbolic link is not in the content-addressed manifest: {entry_relative}")
+                }));
+            };
+            let on_disk = readlinkat(source, name, Vec::new())
+                .map_err(|error| invalid_rustix("read immutable rootfs link", error))?;
+            let (true, Some(destination)) = (on_disk.as_bytes() == target.as_bytes(), destination)
+            else {
+                return Err(ExecutionError::invalid(format!(
+                    "rootfs symbolic link differs from the content-addressed manifest: {entry_relative}"
+                )));
+            };
+            std::os::unix::fs::symlink(
+                target,
+                destination.join(OsStr::from_bytes(name.to_bytes())),
+            )
+            .map_err(|error| invalid_io("create ephemeral rootfs link", error))?;
+            continue;
         }
         if !expected_type.is_dir() && !expected_type.is_file() {
             return Err(ExecutionError::invalid(
@@ -171,43 +196,37 @@ fn copy_directory_fd(
         ensure_same_entry(&before, &opened)?;
 
         let name = OsStr::from_bytes(entry.file_name().to_bytes());
-        let entry_relative = relative.join(name);
         if expected_type.is_dir() {
-            if !plan.directories.contains(&entry_relative) {
-                // Not implied by the manifest: never created in the copy.
+            let Some(mode) = directory_mode(plan, &entry_relative) else {
+                // Not in the manifest: never created in the copy.
                 copy_directory_fd(&opened, &entry_relative, None, plan)?;
                 continue;
-            }
-            // Every ancestor of an implied directory is implied, so its
+            };
+            // Every directory the manifest names has a named parent, so its
             // parent was created.
             let Some(destination) = destination else {
                 return Err(ExecutionError::invalid(format!(
-                    "rootfs directory {} is implied but its parent is not",
-                    entry_relative.display()
+                    "rootfs directory {entry_relative} is in the manifest but its parent is not"
                 )));
             };
             let destination_path = destination.join(name);
             fs::create_dir(&destination_path)
                 .map_err(|error| invalid_io("create ephemeral rootfs directory", error))?;
             copy_directory_fd(&opened, &entry_relative, Some(&destination_path), plan)?;
-            fs::set_permissions(
-                &destination_path,
-                fs::Permissions::from_mode(NORMALIZED_DIRECTORY_MODE),
-            )
-            .map_err(|error| invalid_io("set ephemeral rootfs directory permissions", error))?;
+            fs::set_permissions(&destination_path, fs::Permissions::from_mode(mode))
+                .map_err(|error| invalid_io("set ephemeral rootfs directory permissions", error))?;
         } else {
-            let listed = plan.files.contains(&entry_relative)
-                || entry_relative.as_os_str() == ROOTFS_MANIFEST;
+            let listed =
+                plan.files.contains_key(&entry_relative) || entry_relative == ROOTFS_MANIFEST;
             let (true, Some(destination)) = (listed, destination) else {
                 return Err(ExecutionError::invalid(format!(
-                    "rootfs file is not in the content-addressed manifest: {}",
-                    entry_relative.display()
+                    "rootfs file is not in the content-addressed manifest: {entry_relative}"
                 )));
             };
             let destination_path = destination.join(name);
             // The manifest's own mode is not in any digest: the copy gets a
-            // fixed one, as its directories do.
-            let mode = if entry_relative.as_os_str() == ROOTFS_MANIFEST {
+            // fixed one.
+            let mode = if entry_relative == ROOTFS_MANIFEST {
                 MANIFEST_FILE_MODE
             } else {
                 (before.st_mode as u32) & 0o7777
@@ -243,9 +262,9 @@ fn ensure_same_entry(before: &rustix::fs::Stat, opened: &OwnedFd) -> Result<(), 
 }
 
 /// Recheck a completed per-run view immediately before VM configuration:
-/// its files against the manifest, and its directories against the
-/// manifest's implied set, each at [`NORMALIZED_DIRECTORY_MODE`], the root
-/// included. A directory planted or re-moded after materialization is
+/// its files and links against the manifest, and its directories, the root
+/// included, exactly the manifest's (v2), or exactly the set v1 implies,
+/// each at 0755. A directory planted or re-moded after materialization is
 /// refused by name.
 pub fn verify_ephemeral_rootfs(rootfs: &ResolvedRootfs) -> Result<(), ExecutionError> {
     let tree = verify_manifest(&rootfs.canonical_path, &rootfs.digest)?;
@@ -259,18 +278,15 @@ pub fn verify_ephemeral_rootfs(rootfs: &ResolvedRootfs) -> Result<(), ExecutionE
             "rootfs manifest file mode {manifest_mode:o} is not the normalized {MANIFEST_FILE_MODE:o}"
         )));
     }
-    let implied = implied_directories(&tree.files);
     for (directory, mode) in &tree.directories {
-        if !implied.contains(directory) {
+        let Some(expected) = tree.spec.directories.get(directory) else {
             return Err(ExecutionError::invalid(format!(
-                "rootfs directory is not implied by the manifest: {}",
-                directory.display()
+                "rootfs directory is not in the content-addressed manifest: {directory}"
             )));
-        }
-        if *mode != NORMALIZED_DIRECTORY_MODE {
+        };
+        if mode != expected {
             return Err(ExecutionError::invalid(format!(
-                "rootfs directory mode {mode:o} is not the normalized {NORMALIZED_DIRECTORY_MODE:o}: /{}",
-                directory.display()
+                "rootfs directory mode {mode:o} is not the manifest's {expected:o}: /{directory}"
             )));
         }
     }

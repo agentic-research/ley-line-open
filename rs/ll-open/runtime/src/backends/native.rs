@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ExecutionError, ExecutionRequest};
 
 use super::libkrun::confinement::{Tier, capabilities_from_manifest, committed_confinement};
-use super::libkrun::plan::{DirectoryRootfsResolver, compile_plan};
+use super::libkrun::plan::{DirectoryRootfsResolver, compile_plan, executable_in_manifest};
 use super::libkrun::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +128,15 @@ pub fn execute_with_ready(
     let mut config = compile_plan(&resolver, request)?;
     config.rootfs = materialize_ephemeral_rootfs(&config.rootfs, &options.run_root)?;
     verify_ephemeral_rootfs(&config.rootfs)?;
+    // The plan names the executable as the guest does; on the host it is the
+    // regular file the manifest reaches through its own links (a rootfs
+    // manifest v2 may route `bin/sh` through `bin -> usr/bin`), resolved
+    // before the sandbox applies and never through a link on the host, where
+    // an absolute target would name the host's own file.
+    let executable = config
+        .rootfs
+        .canonical_path
+        .join(executable_in_manifest(&config.rootfs, &request.executable)?);
 
     // Resolve every host path before nono becomes irreversible. The child
     // process receives no ambient path authority after this call.
@@ -149,13 +158,6 @@ pub fn execute_with_ready(
         confinement_digest: committed.digest().to_owned(),
     })?;
 
-    // The plan names the executable as the guest does, anchored at `/`
-    // (`guest_executable`); on the host it lives under the rootfs, and
-    // joining an absolute path would replace the rootfs instead.
-    let guest_path = config.executable.as_bytes();
-    let executable = config.rootfs.canonical_path.join(OsStr::from_bytes(
-        guest_path.strip_prefix(b"/").unwrap_or(guest_path),
-    ));
     let mut command = Command::new(&executable);
     command
         .args(

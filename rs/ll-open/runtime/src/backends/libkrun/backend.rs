@@ -132,14 +132,14 @@ impl KrunWorkerBackend {
     ) -> Result<Option<ServedWorkspace>, ExecutionError> {
         if !workspaces.serve_exactly(request) {
             return Err(ExecutionError::workspace_unserved(format!(
-                "the request names {} workspace(s) and was handed shares opened for {} \
-                 other than exactly those; a workspace is served only from a share the \
-                 execution service opened for this run under a verified grant",
+                "the request names {} workspace(s) and was handed {}; a workspace is \
+                 served only from a share the execution service opened for this run \
+                 under its verified grant",
                 request.workspaces.len(),
                 if workspaces.grants().next().is_some() {
-                    "workspaces"
+                    "shares that are not exactly this run's"
                 } else {
-                    "no workspace"
+                    "no workspace share"
                 }
             )));
         }
@@ -772,14 +772,19 @@ mod tests {
         assert_eq!(Backend::workspace_capacity(&backend), 1);
     }
 
-    /// A worker that reports ready and exits at once (a guest that fails to
-    /// enter, say) is a run that failed, not a share nobody served. The
-    /// share's serving thread ends with the worker, so the backend itself
-    /// holds the share until the run's outcome is collected: the service's
-    /// start assertion passes, and the run is recorded and ends `Failed`
-    /// with what it printed.
-    #[test]
-    fn a_worker_that_exits_right_after_ready_still_holds_its_share() {
+    /// A backend whose fake worker declares the share it was handed, reports
+    /// ready for run `run-1`, and then runs `after_ready` (shell). Returns the
+    /// backend, the fixture that holds it, and the `run-1` request granted one
+    /// read-only workspace with the shares the service would hand over.
+    fn share_backend(
+        after_ready: &str,
+    ) -> (
+        KrunWorkerBackend,
+        tempfile::TempDir,
+        crate::ExecutionRequest,
+        crate::ServedWorkspaces,
+        crate::workspaces::Opened,
+    ) {
         use crate::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
         use std::os::unix::fs::PermissionsExt;
 
@@ -802,10 +807,10 @@ mod tests {
 
         let fixture = tempfile::tempdir().expect("fixture");
         let worker = fixture.path().join("worker");
-        // Declares the share it was handed, prints, reports ready, exits 1.
         std::fs::write(
             &worker,
-            r#"#!/bin/sh
+            format!(
+                r#"#!/bin/sh
 fd=
 prev=
 for arg in "$@"; do
@@ -813,10 +818,10 @@ for arg in "$@"; do
   prev="$arg"
 done
 IFS= read -r _
-printf '%s\n' "{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{\"descriptor\":$fd,\"channel\":{\"role\":\"workspaceShare\",\"workspace\":\"repo\",\"graphRoot\":\"blake3-256:root\"}}]}" >&2
-printf 'entering the guest failed\n' >&2
-exit 1
-"#,
+printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"descriptor\":$fd,\"channel\":{{\"role\":\"workspaceShare\",\"workspace\":\"repo\",\"graphRoot\":\"blake3-256:root\"}}}}]}}" >&2
+{after_ready}
+"#
+            ),
         )
         .expect("worker script");
         std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).expect("mode");
@@ -871,6 +876,19 @@ exit 1
             &request.workspaces,
         )
         .expect("open the share");
+        (backend, fixture, request, shares, opened)
+    }
+
+    /// A worker that reports ready and exits at once (a guest that fails to
+    /// enter, say) is a run that failed, not a share nobody served. The
+    /// share's serving thread ends with the worker, so the backend itself
+    /// holds the share until the run's outcome is collected: the service's
+    /// start assertion passes, and the run is recorded and ends `Failed`
+    /// with what it printed.
+    #[test]
+    fn a_worker_that_exits_right_after_ready_still_holds_its_share() {
+        let (backend, _fixture, request, shares, opened) =
+            share_backend("printf 'entering the guest failed\\n' >&2\nexit 1");
         let started = backend
             .start(&request, shares)
             .expect("the worker was ready");
@@ -903,5 +921,46 @@ exit 1
         );
         // Collected: the backend lets the share go.
         assert!(!backend.shares.lock().contains_key("run-1"));
+    }
+
+    /// The share is retained for exactly the run's life: kept across a poll
+    /// that finds the run still active, let go when the run is cancelled.
+    #[test]
+    fn a_live_runs_share_is_kept_across_polls_and_released_by_cancel() {
+        let (backend, _fixture, request, shares, _opened) =
+            share_backend("exec /usr/bin/tail -f /dev/null");
+        backend
+            .start(&request, shares)
+            .expect("the worker was ready");
+        assert!(
+            backend.poll_outcome("run-1").expect("poll").is_none(),
+            "the run is active"
+        );
+        assert!(
+            backend.shares.lock().contains_key("run-1"),
+            "a poll that collects nothing keeps the share"
+        );
+        assert!(backend.cancel("run-1").expect("cancel"));
+        assert!(
+            !backend.shares.lock().contains_key("run-1"),
+            "a cancelled run's share is let go"
+        );
+    }
+
+    /// Waiting for a run's outcome collects it, and lets its share go.
+    #[test]
+    fn waiting_for_a_runs_outcome_releases_its_share() {
+        let (backend, _fixture, request, shares, _opened) = share_backend("exit 0");
+        backend
+            .start(&request, shares)
+            .expect("the worker was ready");
+        let outcome = backend
+            .wait_for_outcome("run-1")
+            .expect("the run completes");
+        assert!(matches!(outcome.status, BackendRunStatus::Succeeded));
+        assert!(
+            !backend.shares.lock().contains_key("run-1"),
+            "a collected run's share is let go"
+        );
     }
 }

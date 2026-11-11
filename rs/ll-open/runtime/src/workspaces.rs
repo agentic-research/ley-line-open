@@ -14,14 +14,19 @@
 //! - every proof names this run and one of its grants, whole (name, graph
 //!   root, operations, write scope), each grant once. A share opened for
 //!   another run, or for the same workspace under a wider grant, is refused;
-//! - the share each proof stands for is still held by something the backend
-//!   gave it to. A backend that took a share and let it go has no share
-//!   serving its worker.
+//! - the share each proof stands for is still retained by the backend (or by
+//!   something it handed the share to). A backend that took a share and let
+//!   it go cannot answer its worker's requests.
 //!
-//! What this does not prove: that the worker's own descriptor is wired to
-//! the share. That is the backend's contract with its worker (the libkrun
-//! tier holds its worker's readiness declaration to the descriptor it
-//! handed over).
+//! What this does not prove: that a worker is being served through the
+//! share. The libkrun backend itself retains every run's share until the
+//! run is retired, so for that tier the check passes once `start` returns.
+//! Wiring is each backend's contract with its worker: the libkrun tier holds
+//! its worker's readiness declaration to the descriptor it handed over, and
+//! `a_granted_workspace_is_served_to_the_worker_over_an_inherited_socket`
+//! (runtime/tests/krun_worker_backend.rs) proves a request reaches the share.
+//! A share whose serving end fails answers the guest `EIO`: less access,
+//! never more.
 //!
 //! [`ExecutionService`]: crate::ExecutionService
 //! [`Backend::start`]: crate::Backend::start

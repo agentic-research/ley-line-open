@@ -1071,6 +1071,46 @@ fn a_cas_entry_with_tampered_directories_is_not_reused() {
     }
 }
 
+/// A v2 CAS entry's links are part of what it must be to be reused: one
+/// retargeted, planted, or swapped for a file is refused, and the import
+/// never overwrites it.
+#[test]
+fn a_cas_entry_with_tampered_links_is_not_reused() {
+    type Tamper = (&'static str, fn(&Path));
+    let tamper: [Tamper; 3] = [
+        ("a retargeted link", |root| {
+            fs::remove_file(root.join("usr/bin/alias")).unwrap();
+            std::os::unix::fs::symlink("/bin/sh", root.join("usr/bin/alias")).unwrap();
+        }),
+        ("a planted link", |root| {
+            std::os::unix::fs::symlink("/", root.join("etc/root")).unwrap()
+        }),
+        ("a link swapped for a file", |root| {
+            fs::remove_file(root.join("bin/abs-alias")).unwrap();
+            fs::write(root.join("bin/abs-alias"), b"#!/bin/sh\n").unwrap();
+        }),
+    ];
+    for (what, tamper) in tamper {
+        let cas = TempDir::new().expect("cas");
+        let imported =
+            import_fixture(Platform::linux("arm64"), SymlinkPolicy::Preserve, cas.path());
+        tamper(&cas.path().join(&imported.rootfs.value));
+        match import(
+            &checked_in_fixture(),
+            &fixture().index.digest,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Preserve,
+            cas.path(),
+        ) {
+            Err(OciImportError::Cas(detail)) => {
+                assert!(detail.contains(&imported.rootfs.value), "{what}: {detail}")
+            }
+            other => panic!("{what}: expected a CAS refusal, got {other:?}"),
+        }
+        assert_eq!(cas_entries(cas.path()), vec![imported.rootfs.value.clone()]);
+    }
+}
+
 /// The checked-in fixture's linux/arm64 rootfs identity, as a known answer:
 /// a change to manifest serialization, ordering or the identity
 /// construction changes it, on any host.

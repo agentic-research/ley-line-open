@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use leyline_runtime::DigestRef;
+use leyline_runtime::artifacts::rootfs_manifest::{FileSpec, RootfsSpec, cas_directory_mode};
 use leyline_runtime::backends::libkrun::plan::ResolvedRootfs;
 use leyline_runtime::backends::libkrun::volume::{
     materialize_ephemeral_rootfs, verify_ephemeral_rootfs,
@@ -399,4 +400,198 @@ fn materializer_rejects_special_files_without_blocking() {
         error.detail.contains("non-regular filesystem entry"),
         "unexpected error: {error:?}"
     );
+}
+
+/// The links of the v2 fixture: an absolute one naming a host file, one
+/// climbing far above the root, and a directory link the executable is
+/// reached through.
+const V2_LINKS: [(&str, &str); 3] = [
+    ("bin", "usr/bin"),
+    ("etc/passwd", "/etc/passwd"),
+    ("etc/up", "../../../../../../.."),
+];
+
+/// A rootfs manifest v2 CAS entry (bead `ley-line-open-4f08ea`): `etc`,
+/// `usr`, `usr/bin` (sticky, world-writable, as declared), the file
+/// `usr/bin/probe`, and [`V2_LINKS`].
+fn rootfs_fixture_v2(parent: &Path) -> ResolvedRootfs {
+    let content = b"probe-v2";
+    let mut spec = RootfsSpec::empty_v2();
+    for (path, mode) in [("etc", 0o755), ("usr", 0o755), ("usr/bin", 0o1777)] {
+        spec.directories.insert(path.into(), mode);
+    }
+    spec.files.insert(
+        "usr/bin/probe".into(),
+        FileSpec {
+            mode: 0o755,
+            blake3: blake3::hash(content).to_hex().to_string(),
+        },
+    );
+    for (path, target) in V2_LINKS {
+        spec.symlinks.insert(path.into(), target.into());
+    }
+    let manifest = spec.to_canonical_v2();
+    let rootfs = parent.join("immutable-rootfs-v2");
+    fs::create_dir_all(rootfs.join("usr/bin")).expect("rootfs directories");
+    fs::create_dir(rootfs.join("etc")).expect("etc");
+    fs::write(rootfs.join("usr/bin/probe"), content).expect("rootfs executable");
+    fs::set_permissions(rootfs.join("usr/bin/probe"), fs::Permissions::from_mode(0o755))
+        .expect("executable mode");
+    for (path, target) in V2_LINKS {
+        symlink(target, rootfs.join(path)).expect("rootfs link");
+    }
+    for (path, mode) in spec.directories.iter().rev() {
+        fs::set_permissions(
+            rootfs.join(path),
+            fs::Permissions::from_mode(cas_directory_mode(*mode)),
+        )
+        .expect("directory mode");
+    }
+    fs::write(rootfs.join("rootfs.manifest.json"), &manifest).expect("rootfs manifest");
+    ResolvedRootfs {
+        digest: DigestRef {
+            algorithm: "blake3-256".into(),
+            value: blake3::hash(&manifest).to_hex().to_string(),
+        },
+        canonical_path: rootfs.canonicalize().expect("canonical rootfs"),
+    }
+}
+
+/// Each run's copy recreates every link from the manifest's bytes and
+/// follows none on the host: `etc/passwd` stays a link to `/etc/passwd`
+/// (the host's file is never read into the copy), `etc/up` climbs nowhere,
+/// and the declared directory modes, sticky included, are the copy's.
+#[test]
+fn links_are_recreated_verbatim_and_never_followed_on_the_host() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let source = rootfs_fixture_v2(fixture.path());
+    let destination = fixture.path().join("run-root");
+    fs::create_dir(&destination).expect("run root");
+    let materialized =
+        materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+    let root = &materialized.canonical_path;
+    for (path, target) in V2_LINKS {
+        let metadata = fs::symlink_metadata(root.join(path)).expect(path);
+        assert!(metadata.file_type().is_symlink(), "{path} is a link");
+        assert_eq!(fs::read_link(root.join(path)).unwrap(), Path::new(target), "{path}");
+    }
+    let (directories, files) = tree_shape(root);
+    assert!(
+        directories.contains(&("usr/bin".to_string(), 0o1777)),
+        "{directories:?}"
+    );
+    let names: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+    assert_eq!(
+        names,
+        ["bin", "etc/passwd", "etc/up", "rootfs.manifest.json", "usr/bin/probe"],
+        "the links, the manifest and the one file; nothing reached through a link"
+    );
+    verify_ephemeral_rootfs(&materialized).expect("the copy verifies");
+}
+
+/// A link changed in a run's copy after materialization is refused before
+/// VM entry: retargeted, planted, turned into a file, or a file turned into
+/// a link.
+#[test]
+fn a_link_changed_in_the_copy_is_refused_before_vm_entry() {
+    let _serial = common::serial();
+    for change in ["retarget", "plant", "link-to-file", "file-to-link"] {
+        let fixture = TempDir::new().expect("fixture");
+        let source = rootfs_fixture_v2(fixture.path());
+        let destination = fixture.path().join("run-root");
+        fs::create_dir(&destination).expect("run root");
+        let materialized =
+            materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+        let root = &materialized.canonical_path;
+        match change {
+            "retarget" => {
+                fs::remove_file(root.join("bin")).unwrap();
+                symlink("/usr/bin", root.join("bin")).unwrap();
+            }
+            "plant" => symlink("/", root.join("etc/root")).unwrap(),
+            "link-to-file" => {
+                fs::remove_file(root.join("etc/passwd")).unwrap();
+                fs::write(root.join("etc/passwd"), b"root::0:0::/:/bin/sh\n").unwrap();
+            }
+            _ => {
+                fs::remove_file(root.join("usr/bin/probe")).unwrap();
+                symlink("/bin/sh", root.join("usr/bin/probe")).unwrap();
+            }
+        }
+        verify_ephemeral_rootfs(&materialized).expect_err(change);
+    }
+}
+
+/// libkrun's macOS virtiofs (`LinuxComplete`) lets a host file's
+/// `user.containers.override_stat` xattr decide the owner, mode and type
+/// the guest sees, and no rootfs digest covers xattrs. The copy is made
+/// with fresh files, directories and links, so an override planted on a
+/// CAS entry never reaches a run (identity review of `ley-line-open-4f08ea`,
+/// F7): this pins it against a change to a copy that carries xattrs
+/// (`fs::copy`, `clonefile`).
+#[test]
+fn a_cas_entrys_extended_attributes_never_reach_the_copy() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let source = rootfs_fixture_v2(fixture.path());
+    const OVERRIDE: &str = "user.containers.override_stat";
+    let planted = [
+        source.canonical_path.join("usr/bin/probe"),
+        source.canonical_path.join("usr/bin"),
+    ];
+    for path in &planted {
+        match rustix::fs::setxattr(path, OVERRIDE, b"0:0:04755", rustix::fs::XattrFlags::empty())
+        {
+            Ok(()) => {}
+            Err(rustix::io::Errno::NOTSUP) => {
+                eprintln!(
+                    "SKIPPED (NOT a pass): {} holds no user extended attributes",
+                    fixture.path().display()
+                );
+                return;
+            }
+            Err(error) => panic!("set {OVERRIDE} on {}: {error}", path.display()),
+        }
+        let mut names = [0_u8; 4096];
+        let length = rustix::fs::listxattr(path, &mut names[..]).expect("list xattrs");
+        assert!(String::from_utf8_lossy(&names[..length]).contains(OVERRIDE));
+    }
+    let destination = fixture.path().join("run-root");
+    fs::create_dir(&destination).expect("run root");
+    let materialized =
+        materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+    for relative in ["usr/bin/probe", "usr/bin", "usr", ""] {
+        let path = materialized.canonical_path.join(relative);
+        let mut names = [0_u8; 4096];
+        let length = rustix::fs::listxattr(&path, &mut names[..]).expect("list xattrs");
+        let names = String::from_utf8_lossy(&names[..length]);
+        assert!(
+            !names.contains(OVERRIDE),
+            "/{relative} carries {OVERRIDE}: {names:?}"
+        );
+    }
+}
+
+/// A CAS entry whose link was retargeted, or that holds a link the manifest
+/// does not, never verifies, so it is never copied for a run.
+#[test]
+fn a_cas_entry_with_a_changed_link_is_never_materialized() {
+    let _serial = common::serial();
+    for change in ["retarget", "plant"] {
+        let fixture = TempDir::new().expect("fixture");
+        let source = rootfs_fixture_v2(fixture.path());
+        let etc = source.canonical_path.join("etc");
+        match change {
+            "retarget" => {
+                fs::remove_file(etc.join("passwd")).unwrap();
+                symlink("/etc/master.passwd", etc.join("passwd")).unwrap();
+            }
+            _ => symlink("/", etc.join("root")).unwrap(),
+        }
+        let destination = fixture.path().join("run-root");
+        fs::create_dir(&destination).expect("run root");
+        let error = materialize_ephemeral_rootfs(&source, &destination).expect_err(change);
+        assert!(error.detail.contains("link"), "{change}: {error:?}");
+    }
 }

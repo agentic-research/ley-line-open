@@ -151,6 +151,23 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     mode 1777, `nosuid` and `nodev`, and is sized at 25 % of the guest's
     RAM (`TMP_SIZE_PERCENT`), so a write past that fails `ENOSPC`. A mount
     that fails stops the guest.
+13. `0013` — **init: exec the workload's argv and environment from the
+    config file, decoded exactly.** libkrun hands a workload's arguments
+    (after ` -- `) and environment (`KEY="value"`) to the guest on the
+    kernel command line, which the kernel and init re-parse. An argument
+    `--` cut the argv there, so `tini -- docker-entrypoint.sh` ran with no
+    program; a double quote was consumed or ended its value; a word inside
+    a value could be read as an init token (beads `ley-line-open-7410ec`,
+    `d4b07f`, `f7f862`). With `KRUN_CONFIG_ARGV=1`, init now execs the
+    config file's `Cmd` with its `Env`, and stops the guest if the file or
+    its `Cmd` is missing. It removes the file once read. The worker writes
+    that file (`/.leyline-exec.json`) into the run's own root and keeps the
+    workload's argv and environment off the command line. The patch also
+    fixes upstream's `\uXXXX` decoder, which read the hex from the `u`,
+    never advanced its output and copied the last hex digit through, so
+    every control character other than `\b \t \n \f \r` was mangled. And
+    it reads the file until all of it is in, since one `read(2)` on a
+    virtio-fs root may return less.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

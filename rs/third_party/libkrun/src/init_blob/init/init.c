@@ -780,37 +780,40 @@ static void unescape_string(char *string, int len)
             val++;
             break;
         case 'u': {
-            const char *unescaped = "?";
+            /*
+             * `val` is at the 'u'; jsmn has checked the four hex digits
+             * after it. The upstream decoder read the hex from the 'u'
+             * itself, wrote the decoded bytes without advancing `i`, and
+             * left the last hex digit to be copied as a literal, so a
+             * control character or any \u escape did not reach the
+             * workload intact.
+             */
             char utf8Buf[5];
             unsigned int codepoint = 0;
-            hexToDigit(&codepoint, val++);
-            val += 3;
-            /* check if this is a surrogate */
-            if ((codepoint & 0xFC00) == 0xD800) {
-                val++;
-                if (val[0] == '\\' && val[1] == 'u') {
-                    unsigned int surrogate = 0;
-                    hexToDigit(&surrogate, val + 2);
-                    codepoint = (((codepoint & 0x3F) << 10) |
-                                 ((((codepoint >> 6) & 0xF) + 1) << 16) |
-                                 (surrogate & 0x3FF));
-                    val += 5;
-                } else {
-                    unescaped = "?";
-                    break;
+            size_t n;
+            hexToDigit(&codepoint, val + 1);
+            val += 5;
+            /* A high surrogate followed by a low one is one code point. */
+            if ((codepoint & 0xFC00) == 0xD800 && end - val >= 6 &&
+                val[0] == '\\' && val[1] == 'u') {
+                unsigned int low = 0;
+                hexToDigit(&low, val + 2);
+                if ((low & 0xFC00) == 0xDC00) {
+                    codepoint =
+                        0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                    val += 6;
                 }
             }
-
             Utf32toUtf8(codepoint, utf8Buf);
-            unescaped = utf8Buf;
-
-            if (codepoint == 0) {
-                memcpy(&string[i++], unescaped, 1);
-                continue;
-            }
-            memcpy(&string[i], unescaped, (unsigned int)strlen(unescaped));
+            n = codepoint == 0 ? 1 : strlen(utf8Buf);
+            memcpy(&string[i], utf8Buf, n);
+            i += n;
             break;
         }
+        default:
+            /* jsmn admits no other escape; copy it rather than loop. */
+            string[i++] = '\\';
+            break;
         }
     }
     string[i] = '\0';
@@ -993,9 +996,23 @@ static int config_parse_file(char ***argv, char **workdir, char **uid,
         goto cleanup_fd;
     }
 
-    if (read(fd, data, data_len) < 0) {
-        perror("Error reading config file");
-        goto cleanup_data;
+    /*
+     * Until the whole file is in: one read(2) on a virtio-fs root may return
+     * fewer bytes than asked, and a truncated config is not the config.
+     */
+    {
+        off_t got = 0;
+        while (got < data_len) {
+            ssize_t n = read(fd, data + got, data_len - got);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                perror("Error reading config file");
+                goto cleanup_data;
+            }
+            got += n;
+        }
     }
 
     tokens = malloc(MAX_TOKENS * sizeof(jsmntok_t));
@@ -2078,6 +2095,9 @@ int main(int argc, char **argv)
     char *config_uid, *config_gid;
     char **config_argv, **exec_argv;
     const char *config_file;
+    char *env_config_argv;
+    bool exec_from_config;
+    int config_parsed;
 #if __FreeBSD__
     bool config_file_mounted = false;
 
@@ -2240,14 +2260,35 @@ int main(int argc, char **argv)
         config_file = CONFIG_FILE_PATH;
     }
 
-    config_parse_file(&config_argv, &config_workdir, &config_uid, &config_gid,
-                      config_file);
+    config_parsed = config_parse_file(&config_argv, &config_workdir,
+                                      &config_uid, &config_gid, config_file);
 
 #if __FreeBSD__
     if (config_file_mounted) {
         unmount_config_iso();
     }
 #endif
+
+    /*
+     * KRUN_CONFIG_ARGV=1: the workload's argv and environment come from the
+     * config file alone, never from the kernel command line. The command
+     * line is parsed (quotes are consumed, the first "--" ends the
+     * parameters, whitespace splits), so an argument or value carried there
+     * does not reach the workload byte for byte; the file is JSON and is
+     * not. Without the file, or without an argv in it, the guest stops
+     * rather than run something else. The file is removed once read, so
+     * the workload's root holds only its image.
+     */
+    env_config_argv = getenv("KRUN_CONFIG_ARGV");
+    exec_from_config = env_config_argv && strcmp(env_config_argv, "1") == 0;
+    if (exec_from_config) {
+        if (config_parsed < 0 || !config_argv) {
+            printf("KRUN_CONFIG_ARGV is set and %s gives no argv\n",
+                   config_file);
+            exit(-1);
+        }
+        unlink(config_file);
+    }
 
     krun_home = getenv("KRUN_HOME");
     if (krun_home) {
@@ -2280,7 +2321,9 @@ int main(int argc, char **argv)
 
     exec_argv = argv;
     krun_init = getenv("KRUN_INIT");
-    if (krun_init) {
+    if (exec_from_config) {
+        exec_argv = config_argv;
+    } else if (krun_init) {
         exec_argv[0] = clone_str(krun_init);
     } else if (config_argv) {
         exec_argv = config_argv;

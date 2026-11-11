@@ -630,6 +630,49 @@ struct ErrorResponse {
   # so the wire always reads `"ok": false` for error responses. Added
   # additively per ADR-0014 §2; pre-b0ea2e the field was on every typed
   # envelope via the hand-written wire.rs ErrorResponse struct.
+
+  executionError @2 :ExecutionError $Json.name("executionError");
+  # Set on every failed execution/v1 op (`llo_execution_*`): the runtime's
+  # typed error, a request the op could not decode (`invalidSpec`), or a
+  # daemon serving no execution/v1 service (`unsupportedBackend`), so a
+  # caller branches on `code` and `retryable` instead of reading `error`
+  # (bead `ley-line-open-e347ae`). Absent from every other error envelope;
+  # in the binary encoding check `hasExecutionError` before reading it, since
+  # an unset pointer reads as the default `invalidSpec`. Additive: `error`
+  # keeps its text, whose `<Code>: ` prefix (Rust Debug spelling, e.g.
+  # `WorkspaceUnserved: `) existing consumers match.
+}
+
+# execution/v1's `ExecutionError` (`execution.capnp`) as the daemon's error
+# envelope carries it on the UDS and MCP transports alike, without the
+# optional `detailRef`, which the runtime does not produce.
+struct ExecutionError {
+  code      @0 :ExecutionErrorCode;
+  retryable @1 :Bool;
+  # Whether a retry under the same authority may succeed.
+  message   @2 :Text;
+  # Safe operator-facing message with no secrets: the error's detail, the
+  # part of `error` after its `<Code>: ` prefix.
+}
+
+# execution/v1's `ErrorCode` (`rs/ll-core/schema-spec/execution/v1/
+# execution.capnp`), enumerant for enumerant and ordinal for ordinal; a test
+# (`daemon::ops`) fails if the two drift. On the JSON wire each is its
+# camelCase name, the spelling of execution-tools.json's `ErrorCode`.
+enum ExecutionErrorCode {
+  invalidSpec            @0;
+  invalidGrant           @1;
+  unauthenticated        @2;
+  unauthorized           @3;
+  identityPolicyMismatch @4;
+  unsupportedBackend     @5;
+  notProvisioned         @6;
+  resourceConflict       @7;
+  resourceExhausted      @8;
+  backendFailed          @9;
+  cancelled              @10;
+  internal               @11;
+  workspaceUnserved      @12;
 }
 
 # ── Sheaf cache UDS operations ─────────────────────────────────────

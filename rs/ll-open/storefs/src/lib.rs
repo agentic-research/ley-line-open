@@ -2064,14 +2064,21 @@ impl<S: Store> StoreFs<S> {
             )?
             .query_row([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
+        // The row as `tree::decode` reads it: a malformed row (a directory
+        // with a blob, a file without one, a mode git does not store) is an
+        // error here too, never served (bead `ley-line-open-bbd7c8`).
+        let row = row
+            .map(|(git_mode, hash, size)| {
+                store_tree::decode(path, git_mode, hash).map(|entry| (entry, size))
+            })
+            .transpose()?;
         match row {
-            Some((store_tree::DIRECTORY_MODE, _, _)) => {
+            Some((StoreEntry::Dir, _)) => {
                 if self.scope.see == Grant::Whole || !self.children(conn, path)?.is_empty() {
                     return Ok(dir);
                 }
             }
-            Some((git_mode, Some(hash), Some(size))) if self.scope.see.covers(path) => {
-                let mode = Mode::from_git(git_mode).unwrap_or(Mode::Regular);
+            Some((StoreEntry::File { mode, blob }, Some(size))) if self.scope.see.covers(path) => {
                 return Ok(Some(Stat {
                     kind: if mode == Mode::Symlink {
                         Kind::Symlink
@@ -2079,7 +2086,7 @@ impl<S: Store> StoreFs<S> {
                         Kind::File
                     },
                     size: size as u64,
-                    blob: Some(blob_hash(path, hash)?),
+                    blob: Some(blob),
                     mode: Some(mode),
                 }));
             }
@@ -2105,15 +2112,22 @@ impl<S: Store> StoreFs<S> {
     fn children(&self, conn: &Connection, dir: &str) -> anyhow::Result<BTreeMap<String, Kind>> {
         let prefix = join(dir, "");
         let mut stmt = conn.prepare_cached(
-            "SELECT path, mode FROM _tree WHERE substr(path, 1, length(?1)) = ?1",
+            "SELECT path, mode, blob_hash FROM _tree WHERE substr(path, 1, length(?1)) = ?1",
         )?;
         let whole = self.scope.see == Grant::Whole;
         let mut out = BTreeMap::new();
         for row in stmt.query_map([&prefix], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, Option<Vec<u8>>>(2)?,
+            ))
         })? {
-            let (path, git_mode) = row?;
-            let is_dir = git_mode == store_tree::DIRECTORY_MODE;
+            let (path, git_mode, blob) = row?;
+            // Refuse a malformed row as `tree::decode` does (bead
+            // `ley-line-open-bbd7c8`), rather than list it.
+            let entry = store_tree::decode(&path, git_mode, blob)?;
+            let is_dir = entry == StoreEntry::Dir;
             let rest = &path[prefix.len()..];
             match rest.split_once('/') {
                 // A directory is listed with the whole tree in sight, or
@@ -2495,12 +2509,6 @@ fn blob_of(conn: &Connection, path: &str) -> anyhow::Result<Option<(Hash, Vec<u8
         return Ok(None);
     };
     Ok(store_tree::blob_bytes(conn, blob)?.map(|bytes| (blob, bytes)))
-}
-
-fn blob_hash(path: &str, hash: Vec<u8>) -> anyhow::Result<Hash> {
-    let hash = <[u8; 32]>::try_from(hash)
-        .map_err(|h| anyhow::anyhow!("'{path}': a {}-byte blob hash", h.len()))?;
-    Ok(Hash::from_bytes(hash))
 }
 
 /// The base a later write to `path` is checked against: the blob an

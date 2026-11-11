@@ -585,6 +585,63 @@ pub enum BackendRunStatus {
     Failed(ExecutionError),
 }
 
+/// What a run's guest printed, kept bounded by its backend (bead
+/// `ley-line-open-a26ad0`). This is the one execution/v1 shape for guest
+/// output: the in-process accessors return it, and a later daemon exposure
+/// carries it unchanged (serialized camelCase).
+///
+/// The bytes are the workload's own and UNTRUSTED (`untrusted` is always
+/// true, so every projection carries the label): invalid UTF-8 and control
+/// characters other than newline and tab are already replaced with U+FFFD.
+/// Only the in-process embedder that started the run receives it; nothing
+/// writes it to disk, logs it, or carries it over the daemon's wire yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestOutput {
+    /// The tail of the guest's standard output (libkrun's `krun-stdout`
+    /// port), at most 16 KiB.
+    pub stdout_tail: String,
+    /// How many earlier standard-output bytes the tail no longer holds.
+    pub stdout_dropped_bytes: u64,
+    /// The tail of the worker's standard error after readiness, at most
+    /// 8 KiB. libkrun carries the guest's standard error there (its
+    /// `krun-stderr` port), so this is the workload's standard error
+    /// interleaved with the worker's own diagnostics.
+    pub stderr_tail: String,
+    /// How many earlier standard-error bytes the tail no longer holds.
+    pub stderr_dropped_bytes: u64,
+    /// Always true: these are guest-written bytes.
+    pub untrusted: bool,
+    /// The last line on that standard error shaped like the worker's
+    /// terminal `failed` event. UNVERIFIED: the guest writes the same stream
+    /// and can print such a line, so this is a report to read, never a
+    /// classification to act on. A run's failure keeps the supervisor's code
+    /// and `retryable` whatever this says.
+    pub reported_failure: Option<ExecutionError>,
+}
+
+impl Default for GuestOutput {
+    fn default() -> Self {
+        Self {
+            stdout_tail: String::new(),
+            stdout_dropped_bytes: 0,
+            stderr_tail: String::new(),
+            stderr_dropped_bytes: 0,
+            untrusted: true,
+            reported_failure: None,
+        }
+    }
+}
+
+/// A finished run's terminal status together with what its guest printed:
+/// the typed result of [`crate::Backend::poll_outcome`]. `output` is `None`
+/// for a backend that keeps no guest output (and for a cancelled run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub status: BackendRunStatus,
+    pub output: Option<GuestOutput>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunState {

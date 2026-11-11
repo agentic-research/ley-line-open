@@ -3,10 +3,13 @@ package sigma
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"capnproto.org/go/capnp/v3"
+	"github.com/agentic-research/ley-line-open/clients/go/leyline-schema/head"
 	"github.com/zeebo/blake3"
 )
 
@@ -57,6 +60,12 @@ type vectors struct {
 		PreimageHex  string  `json:"preimageHex"`
 		Digest       string  `json:"digest"`
 	} `json:"headDigest"`
+	HeadMessage []struct {
+		Name       string  `json:"name"`
+		MessageHex string  `json:"messageHex"`
+		Digest     *string `json:"digest"`
+		Refusal    *string `json:"refusal"`
+	} `json:"headMessage"`
 	AstNode []struct {
 		Name        string   `json:"name"`
 		Context     string   `json:"context"`
@@ -220,6 +229,53 @@ func TestHeadDigestV3Vectors(t *testing.T) {
 		if _, err := HeadDigest(unstamped); err == nil {
 			t.Fatalf("%s: an unstamped storeRoot made a claim", c.Name)
 		}
+	}
+}
+
+// LLO bead ley-line-open-a46711: a v3 Head's claim reproduces its pinned
+// digest, and a Head carrying retiredTreeRoot (@7) is refused as head digest
+// v2 with ErrRetiredDigestV2, never read as an unstamped head. Rust checks
+// the same messages (leyline-cli-lib tests/sigma_axioms.rs).
+func TestHeadMessageVectors(t *testing.T) {
+	v := load(t)
+	if len(v.HeadMessage) == 0 {
+		t.Fatal("no headMessage cases")
+	}
+	refused := 0
+	for _, c := range v.HeadMessage {
+		raw, err := hex.DecodeString(c.MessageHex)
+		if err != nil {
+			t.Fatalf("%s: messageHex: %v", c.Name, err)
+		}
+		msg, err := capnp.Unmarshal(raw)
+		if err != nil {
+			t.Fatalf("%s: unmarshal: %v", c.Name, err)
+		}
+		h, err := head.ReadRootHead(msg)
+		if err != nil {
+			t.Fatalf("%s: read Head: %v", c.Name, err)
+		}
+		claim, err := ClaimOf(h)
+		if c.Refusal != nil {
+			if *c.Refusal != "retiredDigestV2" {
+				t.Fatalf("%s: unknown refusal %q", c.Name, *c.Refusal)
+			}
+			if !errors.Is(err, ErrRetiredDigestV2) {
+				t.Fatalf("%s: want ErrRetiredDigestV2, got claim %+v, err %v", c.Name, claim, err)
+			}
+			refused++
+			continue
+		}
+		if err != nil || claim == nil {
+			t.Fatalf("%s: claim %+v, err %v", c.Name, claim, err)
+		}
+		got, err := HeadDigest(*claim)
+		if err != nil || c.Digest == nil || got != hashOf(t, *c.Digest) {
+			t.Fatalf("%s: digest %x (%v), want %v", c.Name, got, err, c.Digest)
+		}
+	}
+	if refused == 0 {
+		t.Fatal("no refused headMessage case: the v2 refusal gates nothing")
 	}
 }
 

@@ -17,12 +17,14 @@ const MAX_SYMLINK_HOPS: usize = 40;
 /// (init.c:559, then devpts on `/dev/pts` at :603 and tmpfs on `/dev/shm` at
 /// :610), proc on `/proc` (:575), sysfs on `/sys` (:582, then cgroup2 on
 /// `/sys/fs/cgroup` at :589). Each mount either succeeds, is already there
-/// (`EBUSY`), or makes init exit before anything runs (:1905-1908). Nothing
-/// an image holds beneath these is visible to the workload, and nothing a
-/// link names beneath them is the image's to supply. `/tmp` is not one:
-/// init mounts there only in TDX builds (:1877-1897), and then an ext4
-/// volume, not a kernel filesystem.
-pub(crate) const KERNEL_MOUNTED: [&str; 3] = ["dev", "proc", "sys"];
+/// (`EBUSY`), or makes init exit before anything runs (:1905-1908). Since
+/// LLO patch `0012` (bead `ley-line-open-db5899`), `mount_tmp`, called from
+/// the same function on every non-TDX boot, also mounts a tmpfs on `/tmp`
+/// or stops the guest. Nothing an image holds beneath these is visible to
+/// the workload, and nothing a link names beneath them is the image's to
+/// supply: an image's `tmp/` content is shadowed by the empty tmpfs just as
+/// its `dev/` nodes are by devtmpfs.
+pub(crate) const KERNEL_MOUNTED: [&str; 4] = ["dev", "proc", "sys", "tmp"];
 
 /// Whether `path`, from the image root, lies strictly beneath one of
 /// [`KERNEL_MOUNTED`] (the mount point itself is not beneath it).
@@ -434,7 +436,7 @@ fn stay_in_root(mut depth: usize, pending: &VecDeque<String>) -> Result<(), &'st
 enum Resolution {
     /// The real path of a node in the image (the root if empty).
     Found(Vec<String>),
-    /// A path at or beneath `dev`, `proc` or `sys`: the guest kernel's.
+    /// A path at or beneath `dev`, `proc`, `sys` or `tmp`: the guest kernel's.
     KernelMount,
     /// A path the image does not hold, inside its root.
     Dangling,
@@ -679,11 +681,20 @@ mod tests {
     }
 
     #[test]
-    fn only_paths_strictly_beneath_dev_proc_and_sys_are_kernel_mounted() {
-        for beneath in ["dev/console", "proc/1/mounts", "sys/fs/cgroup"] {
+    fn only_paths_strictly_beneath_dev_proc_sys_and_tmp_are_kernel_mounted() {
+        for beneath in ["dev/console", "proc/1/mounts", "sys/fs/cgroup", "tmp/x"] {
             assert!(under_kernel_mount(&path(beneath)), "{beneath}");
         }
-        for not in ["dev", "proc", "sys", "devices/x", "tmp/x", "etc/dev", ""] {
+        for not in [
+            "dev",
+            "proc",
+            "sys",
+            "tmp",
+            "devices/x",
+            "var/tmp/x",
+            "etc/dev",
+            "",
+        ] {
             assert!(!under_kernel_mount(&path(not)), "{not}");
         }
     }

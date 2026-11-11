@@ -525,7 +525,7 @@ fn head_records_unbound_facts_parity() {
         "exactly one unbound reference (println, a builtin with no def)"
     );
 
-    // The Head must record the same count so the W5 ratchet reads it without
+    // The Head must record the same count, so a consumer reads it without
     // re-querying the db.
     let head_path = db_path.with_extension("head.capnp");
     let bytes = fs::read(&head_path).expect("head.capnp must be written for a file-backed db");

@@ -10,6 +10,26 @@ release_validate_version() {
     fi
 }
 
+# The public schema surface: everything a SCHEMA_VERSION names, so a change
+# to any of it since the schema's tag must move SCHEMA_VERSION. It is the Go
+# schema client plus the rs/ll-core/schema-spec IDL (Cap'n Proto and JSON
+# Schema) and conformance vectors, which ship as release assets and carry no
+# Go type (bead ley-line-open-da36d2). The bump script, the verifier and the
+# tag script all decide through this one function (bead ley-line-open-a4946a:
+# the bump script once read only the Go half, and produced v0.27.0 and
+# v0.28.0 releases the verifier refused).
+#
+# release_schema_surface_unchanged <git> <tag>: succeeds when the working
+# tree's surface equals <tag>'s.
+release_schema_surface_unchanged() {
+    "$1" diff --quiet "$2" -- \
+        clients/go/leyline-schema \
+        ':(glob)rs/ll-core/schema-spec/*.capnp' \
+        ':(glob)rs/ll-core/schema-spec/**/*.capnp' \
+        ':(glob)rs/ll-core/schema-spec/**/*.schema.json' \
+        ':(glob)rs/ll-core/schema-spec/**/test-vectors/**'
+}
+
 release_remote_tag_commit() {
     git_command=$1
     remote=$2

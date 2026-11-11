@@ -16,6 +16,15 @@
 //!   holding the `.ctrl` shared for its lifetime would block its own
 //!   publishes, and make every reader probing for a dead publisher see a
 //!   live one.
+//! - **`<stem>.daemon-lock`, the daemon lock** (beside `<stem>.sock` and
+//!   `<stem>.live.db`, [`daemon_lock_path_for`]). Every daemon holds it
+//!   EXCLUSIVE, non-blocking, for its lifetime, so a control block has one
+//!   daemon whatever `--arena` each names (bead `ley-line-open-1d4003`).
+//!   The lease alone admitted two: both took it shared, the second
+//!   published into the arena the block names while holding only its own
+//!   arena's lock, and its socket bind replaced the first's `<ctrl>.sock`.
+//!   It is a file of its own so readers, which share the lease, never
+//!   conflict with it.
 //! - **The `.ctrl` itself.** A reset also takes the `.ctrl` exclusive,
 //!   non-blocking, for the length of the reset. That refuses while a
 //!   publisher is mid-publish, and while any process that locks the block
@@ -47,12 +56,14 @@ use anyhow::{Context, Result, bail};
 /// path, an unopenable one) does not carry it.
 pub const HELD_REFUSAL: &str = "--reset-arena refused: another process holds";
 
-/// The lock a daemon holds on its control block's lease for its lifetime.
-/// Dropping it releases the lock; the lease file stays, since unlinking a
-/// file another process may be locking would split the lock in two.
+/// The locks a daemon holds on its control block for its lifetime: the
+/// lease, and the block's daemon lock. Dropping it releases both; the files
+/// stay, since unlinking a file another process may be locking would split
+/// the lock in two.
 #[derive(Debug)]
 pub struct ControlLease {
     _file: File,
+    _daemon: File,
     exclusive: bool,
 }
 
@@ -94,8 +105,10 @@ impl ControlLease {
                     lease_path.display()
                 );
             }
+            let daemon = take_daemon_lock(ctrl, false)?;
             return Ok(Self {
                 _file: file,
+                _daemon: daemon,
                 exclusive: false,
             });
         }
@@ -109,12 +122,74 @@ impl ControlLease {
                 lease_path.display()
             );
         }
+        let daemon = take_daemon_lock(ctrl, true)?;
+        // With the lease exclusive no other reset runs: a staging file left
+        // beside the block is a crashed reset's.
+        leyline_core::control::remove_stale_reinit_staging(ctrl).with_context(|| {
+            format!("--reset-arena: remove stale staging of {}", ctrl.display())
+        })?;
         reset_if_unheld(ctrl, arena)?;
         Ok(Self {
             _file: file,
+            _daemon: daemon,
             exclusive: true,
         })
     }
+}
+
+/// The daemon lock for the control block at `ctrl`: the control path with
+/// its extension replaced by `daemon-lock` (`c.ctrl` -> `c.daemon-lock`).
+/// Every daemon on the block holds it exclusively for its lifetime, so the
+/// block has one daemon (bead `ley-line-open-1d4003`). It is a file of its
+/// own because the lease is shared by readers (mache's mapper holds
+/// `<ctrl>.lock` shared), which a daemon taking the lease exclusively would
+/// shut out.
+///
+/// Keyed like the resources a daemon derives from its control path, the
+/// socket (`with_extension("sock")`) and the living db
+/// (`with_extension("live.db")`): two control paths that differ only in
+/// extension (`c.ctrl`, `c.other`) share `c.sock` and `c.live.db`, so they
+/// share this lock and the second daemon is refused before it unlinks the
+/// first's live db or replaces its socket (bead `ley-line-open-b0800d`). No
+/// lease (`<path>.lock`) or arena lock (`<arena>.lock`) ends in
+/// `.daemon-lock`, so it names no other lock file.
+pub fn daemon_lock_path_for(ctrl: &Path) -> PathBuf {
+    ctrl.with_extension("daemon-lock")
+}
+
+/// Take the block's daemon lock exclusively, non-blocking. A second daemon
+/// on the block, whatever arena it names, is refused: it would publish into
+/// the arena the block names while holding only its own arena's lock, and
+/// its socket bind would replace the first daemon's `<ctrl>.sock`.
+fn take_daemon_lock(ctrl: &Path, reset: bool) -> Result<File> {
+    let path = daemon_lock_path_for(ctrl);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open control block daemon lock {}", path.display()))?;
+    if !try_flock(&file, libc::LOCK_EX)? {
+        // Under a reset the lease is already exclusive, so a holder here
+        // took this lock without the lease: still another holder, refused
+        // with the stable prefix a retry keys on.
+        if reset {
+            bail!(
+                "{HELD_REFUSAL} the control block {}'s daemon lock {}. Stop every process \
+                 using it, then retry.",
+                ctrl.display(),
+                path.display()
+            );
+        }
+        bail!(
+            "another daemon serves the control block {} (it holds {}). A control block has \
+             one daemon: stop that one, or give this daemon its own --control.",
+            ctrl.display(),
+            path.display()
+        );
+    }
+    Ok(file)
 }
 
 /// The lease file for the control block at `ctrl`: `<ctrl>.lock`, the full
@@ -271,28 +346,94 @@ mod tests {
             .version
     }
 
-    /// Normal starts share the lease; a reset needs it alone, and holds it
-    /// alone, refusing normal starts meanwhile.
+    /// A running daemon shares the lease with readers; a reset needs it
+    /// alone, and holds it alone, refusing normal starts meanwhile.
     #[test]
     fn a_reset_excludes_running_daemons_and_is_excluded_by_them() {
         let dir = tempfile::TempDir::new().unwrap();
         let ctrl = dir.path().join("c.ctrl");
         let arena = dir.path().join("a.arena");
 
-        let a = ControlLease::acquire(&ctrl, &arena, false).unwrap();
-        let b = ControlLease::acquire(&ctrl, &arena, false).unwrap();
-        assert!(!a.is_exclusive() && !b.is_exclusive());
+        let reader = hold(&lease_path_for(&ctrl), libc::LOCK_SH);
+        let daemon = ControlLease::acquire(&ctrl, &arena, false).unwrap();
+        assert!(!daemon.is_exclusive());
         let err = ControlLease::acquire(&ctrl, &arena, true).unwrap_err();
         assert!(
             format!("{err:#}").contains("another process holds"),
             "{err:#}"
         );
 
-        drop((a, b));
+        drop((reader, daemon));
         let reset = ControlLease::acquire(&ctrl, &arena, true).unwrap();
         assert!(reset.is_exclusive());
         let err = ControlLease::acquire(&ctrl, &arena, false).unwrap_err();
         assert!(format!("{err:#}").contains("is being reset"), "{err:#}");
+    }
+
+    /// One daemon per control block (bead `ley-line-open-1d4003`): a second
+    /// normal start on the same block is refused whatever arena it names,
+    /// while a reader holding the lease shared is not, and the block's
+    /// daemon lock frees when the first daemon exits.
+    #[test]
+    fn a_second_daemon_on_one_block_is_refused_and_readers_still_share() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctrl = dir.path().join("c.ctrl");
+
+        let first = ControlLease::acquire(&ctrl, &dir.path().join("a.arena"), false).unwrap();
+        let reader = hold(&lease_path_for(&ctrl), libc::LOCK_SH);
+        for arena in ["a.arena", "b.arena"] {
+            let err = ControlLease::acquire(&ctrl, &dir.path().join(arena), false).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("another daemon serves the control block"),
+                "{arena}: {err:#}"
+            );
+        }
+        drop(first);
+        let _second = ControlLease::acquire(&ctrl, &dir.path().join("b.arena"), false).unwrap();
+        drop(reader);
+    }
+
+    /// A reset that crashed between staging its fresh block and renaming it
+    /// leaves `.<name>.reinit.<pid>`; the next reset removes it (bead
+    /// `ley-line-open-40594e`), whatever the block's version, and leaves
+    /// other siblings alone.
+    #[test]
+    fn a_reset_removes_a_crashed_resets_staging_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctrl = dir.path().join("c.ctrl");
+        let stale = dir.path().join(".c.ctrl.reinit.4242");
+        let other = dir.path().join(".d.ctrl.reinit.4242");
+        let lookalike = dir.path().join(".c.ctrl.reinit.x");
+        for version in [2, leyline_core::control::VERSION] {
+            write_block(&ctrl, version, "");
+            for path in [&stale, &other, &lookalike] {
+                std::fs::write(path, b"staged").unwrap();
+            }
+            let lease = ControlLease::acquire(&ctrl, &dir.path().join("a.arena"), true).unwrap();
+            assert!(
+                !stale.exists(),
+                "v{version}: the stale staging file is gone"
+            );
+            assert!(other.exists(), "another block's staging file is not ours");
+            assert!(lookalike.exists(), "not a pid suffix");
+            drop(lease);
+        }
+    }
+
+    /// The probe of the arena a block names is not held past the reset's
+    /// check (bead `ley-line-open-40594e`): a daemon starting on that arena
+    /// afterwards takes its admission lock.
+    #[test]
+    fn the_named_arena_probe_is_released_after_the_reset_checks_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctrl = dir.path().join("c.ctrl");
+        let theirs = dir.path().join("theirs.arena");
+        write_block(&ctrl, 2, theirs.to_str().unwrap());
+        // A lock file left by a daemon that has exited.
+        std::fs::write(dir.path().join("theirs.arena.lock"), b"").unwrap();
+        let _reset = ControlLease::acquire(&ctrl, &dir.path().join("ours.arena"), true).unwrap();
+        crate::daemon::arena_lock::ArenaLock::try_acquire(&theirs)
+            .expect("the probe does not hold the named arena's lock");
     }
 
     /// An older block with no holder is reinitialised; one whose `.ctrl` is

@@ -3381,3 +3381,297 @@ fn a_grant_may_commit_by_digest_alone() {
         "no document was carried, so none may be reported"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0046 Slice 1 S3: RunGrant connectionsDigest @16, connectionsDocument @17
+// and the credentialBrokerRefs marker (bead ley-line-open-521deb).
+
+const CONNECTIONS_DOCUMENT: &str = include_str!(
+    "../../../ll-core/schema-spec/connections/v1/test-vectors/connections-canonical.json"
+);
+const CONNECTIONS_GRANT_VECTOR: &str =
+    include_str!("../../../ll-core/schema-spec/execution/v1/test-vectors/connections-grant.json");
+const MARKER: &str = leyline_runtime::authorization::CONNECTIONS_BROKER_REF;
+
+fn connections_digest_hex() -> String {
+    leyline_schema_spec::connections::parse(CONNECTIONS_DOCUMENT.as_bytes())
+        .expect("pinned document parses")
+        .digest_hex()
+}
+
+/// What to set on a grant: `None` leaves the field null.
+struct Connections<'a> {
+    digest: Option<(&'a str, &'a str)>,
+    document: Option<&'a str>,
+    brokers: &'a [&'a str],
+}
+
+fn with_connections(grant: &[u8], c: &Connections<'_>) -> Vec<u8> {
+    let mut input = grant;
+    let reader = capnp::serialize::read_message(&mut input, ReaderOptions::new()).expect("grant");
+    let mut message = Builder::new_default();
+    message
+        .set_root(
+            reader
+                .get_root::<execution_capnp::run_grant::Reader<'_>>()
+                .expect("grant root"),
+        )
+        .expect("copy grant");
+    let mut root = message
+        .get_root::<execution_capnp::run_grant::Builder<'_>>()
+        .expect("grant root");
+    if let Some((algorithm, value)) = c.digest {
+        let mut digest = root.reborrow().init_connections_digest();
+        digest.set_algorithm(algorithm);
+        digest.set_value(value);
+    }
+    if let Some(document) = c.document {
+        root.reborrow().set_connections_document(document);
+    }
+    let mut brokers = root
+        .reborrow()
+        .init_credential_broker_refs(c.brokers.len() as u32);
+    for (index, broker) in c.brokers.iter().enumerate() {
+        brokers.set(index as u32, *broker);
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &message).expect("serialize");
+    bytes
+}
+
+fn connections_policy() -> AuthorizationPolicy {
+    AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    }
+}
+
+fn authorize_connections(
+    c: &Connections<'_>,
+) -> Result<leyline_runtime::authorization::AuthorizedExecution, ExecutionError> {
+    let spec = spec_bytes();
+    let grant = with_connections(&grant_bytes(&spec, true, 2_000, 0), c);
+    authorize(&spec, &grant, &connections_policy())
+}
+
+#[test]
+fn connections_are_authorized_only_all_or_nothing() {
+    let hex = connections_digest_hex();
+    for mask in 0u8..8 {
+        let digest = (mask & 1 != 0).then_some(("blake3-256", hex.as_str()));
+        let document = (mask & 2 != 0).then_some(CONNECTIONS_DOCUMENT);
+        let brokers: &[&str] = if mask & 4 != 0 { &[MARKER] } else { &[] };
+        let result = authorize_connections(&Connections {
+            digest,
+            document,
+            brokers,
+        });
+        match mask {
+            0 => assert!(result.expect("none of the three").connections.is_none()),
+            7 => {
+                let connections = result
+                    .expect("all three")
+                    .connections
+                    .expect("connections");
+                assert_eq!(connections.digest, format!("blake3-256:{hex}"));
+                assert_eq!(
+                    connections.document.canonical_bytes(),
+                    CONNECTIONS_DOCUMENT.as_bytes()
+                );
+            }
+            _ => {
+                let error = result.expect_err("a partial combination is refused");
+                assert_eq!(
+                    error.code,
+                    leyline_runtime::ErrorCode::InvalidGrant,
+                    "mask {mask}: {}",
+                    error.detail
+                );
+                assert!(error.detail.contains("all-or-nothing"), "{}", error.detail);
+                for (bit, name) in [
+                    (1, "connectionsDigest"),
+                    (2, "connectionsDocument"),
+                    (4, MARKER),
+                ] {
+                    assert_eq!(
+                        error.detail.contains(name),
+                        mask & bit == 0,
+                        "mask {mask} must name exactly the missing parts: {}",
+                        error.detail
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_present_but_empty_connections_field_is_malformed_not_absent() {
+    let hex = connections_digest_hex();
+    for (digest, document, why) in [
+        (("", ""), CONNECTIONS_DOCUMENT, "empty digest"),
+        (("", hex.as_str()), CONNECTIONS_DOCUMENT, "empty algorithm"),
+        (("blake3-256", ""), CONNECTIONS_DOCUMENT, "empty value"),
+        (("blake3-256", hex.as_str()), "", "empty document"),
+    ] {
+        let error = authorize_connections(&Connections {
+            digest: Some(digest),
+            document: Some(document),
+            brokers: &[MARKER],
+        })
+        .expect_err(why);
+        assert_eq!(
+            error.code,
+            leyline_runtime::ErrorCode::InvalidGrant,
+            "{why}: {}",
+            error.detail
+        );
+    }
+}
+
+#[test]
+fn the_carried_document_must_match_its_digest_and_be_canonical() {
+    let other = "c".repeat(64);
+    let error = authorize_connections(&Connections {
+        digest: Some(("blake3-256", &other)),
+        document: Some(CONNECTIONS_DOCUMENT),
+        brokers: &[MARKER],
+    })
+    .expect_err("digest mismatch");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::IdentityPolicyMismatch);
+
+    // The same document with one more space: valid, and refused because a
+    // runner never normalizes, even when the digest names these bytes.
+    let respaced = CONNECTIONS_DOCUMENT.replacen("{\n", "{ \n", 1);
+    assert!(leyline_schema_spec::connections::parse(respaced.as_bytes()).is_ok());
+    let digest = blake3::hash(respaced.as_bytes()).to_hex().to_string();
+    let error = authorize_connections(&Connections {
+        digest: Some(("blake3-256", &digest)),
+        document: Some(&respaced),
+        brokers: &[MARKER],
+    })
+    .expect_err("non-canonical");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::InvalidGrant);
+    assert!(error.detail.contains("canonical form"), "{}", error.detail);
+
+    let named = CONNECTIONS_DOCUMENT.replace("127.0.0.1", "localhost");
+    let digest = blake3::hash(named.as_bytes()).to_hex().to_string();
+    let error = authorize_connections(&Connections {
+        digest: Some(("blake3-256", &digest)),
+        document: Some(&named),
+        brokers: &[MARKER],
+    })
+    .expect_err("invalid document");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::InvalidGrant);
+    assert!(error.detail.contains("host-is-name"), "{}", error.detail);
+}
+
+#[test]
+fn any_broker_entry_but_exactly_the_marker_keeps_the_shipped_refusal() {
+    let hex = connections_digest_hex();
+    for brokers in [
+        &["broker://claude/paid"][..],
+        &[MARKER, "broker://claude/paid"],
+        &["broker://claude/paid", MARKER],
+        &[MARKER, MARKER],
+    ] {
+        let error = authorize_connections(&Connections {
+            digest: Some(("blake3-256", &hex)),
+            document: Some(CONNECTIONS_DOCUMENT),
+            brokers,
+        })
+        .expect_err("not exactly the marker");
+        assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+        assert_eq!(
+            error.detail,
+            "credential broker authority requires a broker integration"
+        );
+    }
+}
+
+/// Until the broker ships (52b5b3), a daemon refuses a run with connections
+/// before the resolver or the backend runs, and advertises no capability.
+#[test]
+fn the_service_refuses_connections_before_resolving_until_a_broker_exists() {
+    struct NeverResolve;
+    impl ExecutionResolver for NeverResolve {
+        fn resolve(
+            &self,
+            _: &leyline_runtime::authorization::AuthorizedExecution,
+        ) -> Result<ExecutionRequest, ExecutionError> {
+            panic!("a grant with connections must be refused before the resolver runs");
+        }
+    }
+    let hex = connections_digest_hex();
+    let spec = spec_bytes();
+    let grant = with_connections(
+        &grant_bytes(&spec, true, 2_000, 0),
+        &Connections {
+            digest: Some(("blake3-256", &hex)),
+            document: Some(CONNECTIONS_DOCUMENT),
+            brokers: &[MARKER],
+        },
+    );
+    let service = ExecutionService::new(RecordingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-01")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &connections_policy(), &NeverResolve)
+        .expect_err("no broker");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert!(
+        error.detail.contains("no connection broker"),
+        "{}",
+        error.detail
+    );
+
+    let capabilities = capabilities_json(&service).expect("capabilities");
+    assert!(
+        !capabilities.contains("cloister/execution/v1/connections"),
+        "a daemon must not advertise what it cannot serve: {capabilities}"
+    );
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// The pinned connections grant vector was produced by the capnp CLI; this
+/// implementation must reach the same canonical and signing bytes, with and
+/// without the fields.
+#[test]
+fn the_connections_grant_vector_matches_this_implementation() {
+    let vector: serde_json::Value =
+        serde_json::from_str(CONNECTIONS_GRANT_VECTOR).expect("vector");
+    for key in ["connections", "withoutConnections"] {
+        let entry = &vector[key];
+        let mut message = Builder::new_default();
+        capnp_json::from_json(
+            &entry["grant"].to_string(),
+            message.init_root::<execution_capnp::run_grant::Builder<'_>>(),
+        )
+        .expect("grant JSON decodes");
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message).expect("serialize");
+        let mut input = bytes.as_slice();
+        let canonical = capnp::serialize::read_message(&mut input, ReaderOptions::new())
+            .expect("read back")
+            .canonicalize()
+            .expect("canonicalize");
+        assert_eq!(
+            capnp::Word::words_to_bytes(&canonical),
+            unhex(entry["canonicalHex"].as_str().unwrap()).as_slice(),
+            "{key}: canonical bytes"
+        );
+        assert_eq!(
+            grant_signing_bytes(&bytes).expect("signing bytes"),
+            unhex(entry["signingBytesHex"].as_str().unwrap()),
+            "{key}: signing bytes"
+        );
+    }
+}

@@ -68,7 +68,7 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     //
     // The worker must fail before it reaches the VMM, on any host: a relative
     // `--runtime-file` is refused when the confinement manifest is built,
-    // after the rootfs is materialized and before `krun_create_ctx`.
+    // before the rootfs is materialized and before `krun_create_ctx`.
     let cas = TempDir::new().expect("CAS");
     let request = request_fixture(&cas);
     let run_root = TempDir::new().expect("run root");
@@ -116,14 +116,60 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
         "the refusal must name the path: {error:?}"
     );
     assert!(!marker.exists(), "worker invoked the krunvm PATH trap");
-    assert_eq!(
-        fs::read(run_root.path().join("rootfs/usr/bin/probe")).expect("ephemeral executable"),
-        b"probe-v1"
+    // The confinement is compiled and bound before the rootfs is read (bead
+    // ley-line-open-7a3109), so a refused policy materializes nothing.
+    assert!(
+        !run_root.path().join("rootfs").exists(),
+        "the worker materialized a rootfs for a run whose confinement it refused"
     );
     assert_eq!(
         fs::read(cas.path().join(&request.rootfs.value).join("usr/bin/probe"))
             .expect("immutable executable"),
         b"probe-v1"
+    );
+}
+
+/// The worker binary refuses a drifting commitment as its first and only
+/// event, before any readiness and before the rootfs is materialized (bead
+/// ley-line-open-7a3109). Runs on any host: the refusal precedes libkrun.
+#[test]
+fn the_worker_refuses_a_drifting_commitment_before_readiness() {
+    let _serial = common::serial();
+    let cas = TempDir::new().expect("CAS");
+    let mut request = request_fixture(&cas);
+    request.confinement_digest = format!("blake3-256:{}", "f".repeat(64));
+    let run_root = TempDir::new().expect("run root");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
+    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let mut child = command
+        .args([
+            "--cas-root",
+            cas.path().to_str().expect("CAS UTF-8"),
+            "--run-root",
+            run_root.path().to_str().expect("run root UTF-8"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first-party worker");
+    serde_json::to_writer(child.stdin.as_mut().expect("worker stdin"), &request)
+        .expect("write worker request");
+    child.stdin.take().expect("close worker stdin").flush().ok();
+    let output = child.wait_with_output().expect("worker output");
+
+    assert!(!output.status.success());
+    let event: WorkerEvent = serde_json::from_slice(&output.stderr)
+        .expect("exactly one structured event, and it is not readiness");
+    let WorkerEvent::Failed { error } = event else {
+        panic!("expected a failed worker event, got {event:?}");
+    };
+    assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch, "{error:?}");
+    assert!(error.detail.contains("confinement drift"), "{error:?}");
+    assert!(
+        !run_root.path().join("rootfs").exists(),
+        "the worker materialized a rootfs for a run whose confinement it refused"
     );
 }
 

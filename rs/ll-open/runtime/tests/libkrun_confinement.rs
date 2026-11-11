@@ -5,7 +5,8 @@ use std::process::Command;
 
 use leyline_runtime::DigestRef;
 use leyline_runtime::backends::libkrun::confinement::{
-    VmmHostResources, apply, build_capabilities, build_process_capabilities,
+    VmmHostResources, apply_manifest, build_capabilities, build_process_capabilities,
+    confinement_manifest,
 };
 use leyline_runtime::backends::libkrun::plan::{KrunConfig, ResolvedRootfs};
 use nono::AccessMode;
@@ -53,7 +54,14 @@ fn nono_enforcement_denies_ambient_host_reads() {
             devices: Vec::new(),
         };
 
-        apply(&config_for_path(Path::new(&rootfs)), &resources).expect("apply nono");
+        let committed = confinement_manifest(&resources.runtime_files, &resources.devices, None)
+            .and_then(|manifest| manifest.commit(None))
+            .expect("bind the policy");
+        apply_manifest(
+            &committed,
+            &config_for_path(Path::new(&rootfs)).rootfs.canonical_path,
+        )
+        .expect("apply nono");
         fs::read(Path::new(&rootfs).join("allowed")).expect("read granted rootfs");
         fs::write(Path::new(&rootfs).join("guest-write"), b"ephemeral")
             .expect("write granted ephemeral rootfs");

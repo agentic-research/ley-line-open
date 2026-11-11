@@ -383,13 +383,19 @@ pub struct ExecutionRequest {
     pub allowed_egress: Vec<String>,
     pub limits: ResourceLimits,
     /// The `confinementDigest` the grant authorized, carried through so the
-    /// supervisor can check the worker's attestation against it.
+    /// worker can compare the policy it is about to apply with it before the
+    /// workload starts, and the supervisor can check the worker's attestation
+    /// against it (bead `ley-line-open-7a3109`).
     ///
-    /// Empty means the resolver declared none, and the worker's attestation
-    /// is then not checked — a state the shipped resolver never produces, and
-    /// which exists only so an embedder-supplied resolver fails loudly at its
-    /// own boundary rather than silently here.
-    #[serde(default)]
+    /// Empty means no commitment: a direct `Backend::start` embedder with no
+    /// grant. The worker then applies the deployment policy and attests it
+    /// with nothing to compare. The service never produces this state (it
+    /// refuses a resolver that changes the digest), and a request carrying a
+    /// `confinement_manifest` with an empty digest is refused by the worker.
+    ///
+    /// Required on the wire, empty or not: a request that omits the key is
+    /// refused rather than read as "no commitment", so that mode is always an
+    /// explicit empty string and never a forgotten field.
     pub confinement_digest: String,
     /// The `confinement/v1` document `confinement_digest` was taken over, when
     /// the grant carried one.

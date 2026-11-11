@@ -8,14 +8,12 @@ use std::process::Command;
 
 use rustix::fs::FileType;
 
-use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest, WorkerChannel};
 use serde::{Deserialize, Serialize};
 
 use super::confinement::{
-    LOOPBACK_CHANNELS_ENV, VmmHostResources, apply_manifest, check_channel_host_ends,
-    confinement_manifest, guest_loopback_channels, guest_port_map, loopback_channels_env,
-    vsock_unix_mappings,
+    LOOPBACK_CHANNELS_ENV, apply_manifest, check_channel_host_ends, committed_confinement,
+    guest_loopback_channels, guest_port_map, loopback_channels_env, vsock_unix_mappings,
 };
 use super::plan::{DirectoryRootfsResolver, KRUN_TSI_HIJACK_INET, KrunConfig, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
@@ -487,6 +485,13 @@ pub fn prepare(
     // run's granted workspace or nothing, and the guest init's mount list
     // is the worker's alone.
     refuse_reserved_environment(request)?;
+    // ONE manifest, applied and attested, and compared with the grant's
+    // commitment here: before the rootfs is read, before the sandbox, and
+    // long before the VM. Every projection below (the port map, the vsock
+    // mappings, the loopback channels, the VMM's own nono profile) is taken
+    // from `committed`, whose policy is parsed from the bytes its digest is
+    // computed over (bead ley-line-open-7a3109).
+    let committed = committed_confinement(request, &options.runtime_files, &options.devices)?;
     let share = workspace_share(request, options.workspace_share_fd)?;
     // Before the rootfs is read or anything else is opened: what this
     // process holds is its standard streams and the declared share.
@@ -510,39 +515,7 @@ pub fn prepare(
     // applied — so libkrunfw must be among the `--runtime-file` grants. All VM
     // configuration and execution happen after ambient authority is dropped.
     verify_ephemeral_rootfs(&config.rootfs)?;
-    let resources = VmmHostResources {
-        runtime_files: options.runtime_files,
-        devices: options.devices,
-    };
-    // ONE manifest, applied and attested. The previous version built a manifest
-    // here and then called `apply(&config, &resources)`, which built a SECOND
-    // one from the same inputs — and its comment claimed the digest described
-    // "the policy this process is actually confined by", which held only because
-    // the arguments happened to match. Change which path `apply` derives from
-    // and the worker would attest a digest for a policy it did not apply, with
-    // nothing to catch it: the digest's only consumer is a comparison against
-    // the grant, not against the applied set.
-    //
-    // `native.rs` already did it this way, and its comment — "Deriving both from
-    // `manifest` is what makes the attestation true by construction rather than
-    // by discipline" — was accurate there and inaccurate one directory over.
-    // Re-parsed rather than carried as a value: the worker is a separate
-    // process, so the document crosses as JSON either way, and parsing it here
-    // means the worker applies the same builder invariants `authorization.rs`
-    // did instead of trusting a shape someone else validated.
-    let authorized = match &request.confinement_manifest {
-        Some(document) => Some(ConfinementManifest::parse(document).map_err(|error| {
-            ExecutionError::invalid(format!(
-                "RunGrant.confinementManifest did not survive the worker boundary: {error}"
-            ))
-        })?),
-        None => None,
-    };
-    let manifest = confinement_manifest(
-        &resources.runtime_files,
-        &resources.devices,
-        authorized.as_ref(),
-    )?;
+    let manifest = committed.manifest();
 
     // §4 on the microVM tier. `apply_manifest` below confines the VMM HOST
     // process; the guest's own listener is governed by the port map, which is a
@@ -596,14 +569,14 @@ pub fn prepare(
     // Since ley-line-open-e2c33f, §4 is a list: every declared listener maps
     // `N:N`, through the pure `guest_port_map` so the refusal and the mapping
     // are testable without a VMM.
-    config.port_map = guest_port_map(&manifest, config.tsi_features)?;
+    config.port_map = guest_port_map(manifest, config.tsi_features)?;
 
     // §6 on this tier: the folded socket grants compile to vsock↔socket
     // mappings, consumed by `prepare_vm`. Derived from the same manifest the
     // digest below attests, through the pure function documented at
     // `vsock_unix_mappings` — so the receipt already covers every mapping and
     // the issuer can compute every port from the document they signed.
-    config.vsock_unix_map = vsock_unix_mappings(&manifest)?;
+    config.vsock_unix_map = vsock_unix_mappings(manifest)?;
 
     // ADR-0046 Q7: the grants carrying a `guestPort` are presented to the
     // workload as TCP on the guest's loopback, by the guest init (LLO libkrun
@@ -611,7 +584,7 @@ pub fn prepare(
     // (`guest_loopback_channels`), handed to init in a variable the request
     // cannot set (`refuse_reserved_environment`), so the guest-visible set is
     // exactly what the digest below commits to.
-    let channels = guest_loopback_channels(&manifest, config.tsi_features, std::env::consts::OS)?;
+    let channels = guest_loopback_channels(manifest, config.tsi_features, std::env::consts::OS)?;
     if let Some(variable) = loopback_channels_env(&channels) {
         config.environment.push(variable);
     }
@@ -621,10 +594,10 @@ pub fn prepare(
     // (invariant I4; bead ley-line-open-bb2143).
     check_channel_host_ends(&config.vsock_unix_map)?;
 
-    apply_manifest(&manifest, &config.rootfs.canonical_path)?;
+    apply_manifest(&committed, &config.rootfs.canonical_path)?;
 
     Ok(PreparedRun {
-        confinement_digest: manifest.confinement_digest()?,
+        confinement_digest: committed.digest().to_owned(),
         config,
         share,
         inherited,
@@ -956,6 +929,56 @@ mod tests {
         .unwrap();
         assert_eq!(options.workspace_share_fd, Some(0));
         assert!(!options.tsi_hijack_inet);
+    }
+
+    /// The worker compares the confinement it will apply with the grant's
+    /// commitment BEFORE the VM exists (bead `ley-line-open-7a3109`).
+    ///
+    /// The supervisor's comparison reads the readiness event, which the worker
+    /// writes immediately before `krun_start_enter`, so on its own it refused
+    /// a drifting run only after the guest was already running. Here the
+    /// refusal comes first: the CAS root does not exist, so a worker that
+    /// reached the rootfs, the VMM or the sandbox would fail on that instead,
+    /// and the drift error proves none of them was reached.
+    #[test]
+    fn a_worker_refuses_a_drifting_commitment_before_it_reads_the_rootfs() {
+        let options = WorkerOptions {
+            cas_root: PathBuf::from("/nonexistent/leyline-cas"),
+            run_root: PathBuf::from("/nonexistent/leyline-runs"),
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            tsi_hijack_inet: false,
+            workspace_share_fd: None,
+        };
+        let mut drifting = request();
+        drifting.limits.wall_time_ms = 1_000;
+        drifting.confinement_digest = format!("blake3-256:{}", "f".repeat(64));
+        let error = prepare(options, &drifting).unwrap_err();
+        assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch, "{error}");
+        assert!(error.detail.contains("confinement drift"), "{error}");
+        assert!(
+            error.detail.contains(&drifting.confinement_digest),
+            "{error}"
+        );
+    }
+
+    /// "No commitment" is stated, never defaulted: a worker request that
+    /// omits `confinementDigest` is refused, so a producer that forgot the
+    /// field cannot reach the attest-with-nothing-to-compare mode by accident.
+    /// An empty string is the explicit spelling of that mode.
+    #[test]
+    fn a_worker_request_without_a_confinement_digest_key_is_refused() {
+        let mut value = serde_json::to_value(request()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("confinementDigest")
+            .expect("the request serializes the key");
+        let error = read_request(value.to_string().as_bytes()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("confinementDigest"), "{error}");
+        // Present and empty: accepted.
+        read_request(serde_json::to_string(&request()).unwrap().as_bytes()).unwrap();
     }
 
     #[test]

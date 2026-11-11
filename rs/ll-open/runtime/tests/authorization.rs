@@ -2556,6 +2556,77 @@ fn a_carried_confinement_manifest_is_verified_against_its_digest() {
     );
 }
 
+/// A resolver that resolves as [`TestResolver`] and then drops the grant's
+/// carried confinement document.
+struct ManifestDroppingResolver;
+
+impl ExecutionResolver for ManifestDroppingResolver {
+    fn resolve(
+        &self,
+        authorized: &leyline_runtime::authorization::AuthorizedExecution,
+    ) -> Result<ExecutionRequest, ExecutionError> {
+        let mut request = TestResolver.resolve(authorized)?;
+        request.confinement_manifest = None;
+        Ok(request)
+    }
+}
+
+/// The carried document is held to the same rule as the digest: carried, never
+/// chosen (bead `ley-line-open-7a3109`). A resolver that dropped it would have
+/// the worker compile LLO's own policy in place of the one the issuer signed;
+/// the drift comparison would refuse it only when the two digests differ, and
+/// only after the backend had started a worker for it.
+#[test]
+fn the_service_refuses_a_resolver_that_changes_the_carried_confinement_document() {
+    use leyline_runtime::confinement::{ConfinementManifest, FsGrant};
+
+    let policy_document = ConfinementManifest::new()
+        .with_fs_grant(FsGrant::read_write("/run/rootfs/"))
+        .expect("valid grant");
+    let document = policy_document.to_canonical_json().expect("canonical");
+    let digest = policy_document.confinement_digest().expect("digest");
+    let value = digest
+        .strip_prefix("blake3-256:")
+        .expect("algorithm-prefixed digest")
+        .to_owned();
+    let spec = spec_bytes();
+    let grant = grant_bytes_with_fixture(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: &document,
+            confinement_value: &value,
+            workspaces: Vec::new(),
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+    );
+    let policy = AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    };
+    let service = ExecutionService::new(RecordingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-manifest")
+        .expect("provision backend");
+    let error = service
+        .start_authorized(&spec, &grant, &policy, &ManifestDroppingResolver)
+        .expect_err("a resolver must carry the grant's confinement document");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
+    assert!(error.detail.contains("confinement document"), "{error}");
+    service
+        .start_authorized(&spec, &grant, &policy, &TestResolver)
+        .expect("a resolver that carries it starts the run");
+}
+
 /// Absence is a distinct, legitimate state: the issuer committed by digest
 /// alone. It must authorize, and must not invent a document.
 #[test]

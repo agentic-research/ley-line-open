@@ -324,8 +324,12 @@ impl Backend for NativeWorkerBackend {
             }) if run_id == request.run_id => {
                 // ADR-0035: the worker attests the policy it compiled, and a
                 // run whose attestation disagrees with the grant never
-                // reaches Running. Checked here, before the worker is
-                // allowed to proceed, because after this point it executes.
+                // reaches Running. The worker writes readiness immediately
+                // before it spawns the workload, so this second check cannot
+                // stop a drifting run from starting: the worker's own
+                // comparison (`committed_confinement`, before the rootfs is
+                // read) is the one that does (bead ley-line-open-7a3109).
+                // This one refuses a worker that attests something else.
                 if !request.confinement_digest.is_empty()
                     && confinement_digest != request.confinement_digest
                 {

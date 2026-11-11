@@ -447,6 +447,15 @@ impl<B: Backend> ExecutionService<B> {
                 "resolver changed the grant's confinement digest",
             ));
         }
+        // The document the digest was taken over is held to the same rule
+        // (bead ley-line-open-7a3109): a resolver that dropped or swapped it
+        // would have the worker fold a policy the issuer never signed, and
+        // only a digest difference would catch that, after a worker started.
+        if request.confinement_manifest != authorized.confinement_manifest {
+            return Err(ExecutionError::identity_mismatch(
+                "resolver changed the grant's carried confinement document",
+            ));
+        }
         // The fifth: a resolver that dropped a workspace grant would run the
         // workload without the share it was granted, and one that widened
         // its operations would let it propose where it may only read.

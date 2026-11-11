@@ -75,7 +75,8 @@ fn connect_probe_child() {
     for port in granted {
         manifest = manifest.with_connect_local(*port).expect("connectLocal");
     }
-    let capabilities = capabilities_from_manifest(&manifest, Path::new("/"), Tier::Native)
+    let committed = manifest.commit(None).expect("bind the policy");
+    let capabilities = capabilities_from_manifest(&committed, Path::new("/"), Tier::Native)
         .expect("connectLocal compiles on the native tier");
     if let Err(error) = nono::Sandbox::apply_auto(&capabilities) {
         println!("PROBE:apply-refused {error}");

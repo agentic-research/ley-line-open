@@ -13,8 +13,8 @@ use leyline_runtime::transport::{
 };
 use leyline_runtime::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
-    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits, WorkerChannel,
-    WorkspaceGrant, WorkspaceOperation,
+    ExecutionRequest, ExecutionResolver, ExecutionService, ResourceLimits, ServedWorkspaces,
+    WorkerChannel, WorkspaceGrant, WorkspaceOperation,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -205,6 +205,27 @@ fn grant_bytes(spec_bytes: &[u8], capability: bool, expires_at: u64, wall_time_m
 }
 
 fn grant_bytes_with_fixture(spec_bytes: &[u8], fixture: GrantFixture<'_>) -> Vec<u8> {
+    grant_bytes_with_write_scope(spec_bytes, fixture, WriteScope::Default)
+}
+
+/// How a fixture grant states each workspace's `writeScope`.
+#[derive(Clone, Copy)]
+enum WriteScope<'a> {
+    /// `["/"]` for a grant that permits a write, unset otherwise.
+    Default,
+    /// The field left unset.
+    Omitted,
+    /// The field set to exactly this list, empty included.
+    Listed(&'a [&'a str]),
+}
+
+/// As [`grant_bytes_with_fixture`], with every workspace's `writeScope`
+/// stated as `write_scope` says.
+fn grant_bytes_with_write_scope(
+    spec_bytes: &[u8],
+    fixture: GrantFixture<'_>,
+    write_scope: WriteScope<'_>,
+) -> Vec<u8> {
     let spec_digest = canonical_digest(spec_bytes)
         .expect("canonical spec digest")
         .strip_prefix("blake3-256:")
@@ -255,9 +276,33 @@ fn grant_bytes_with_fixture(spec_bytes: &[u8], fixture: GrantFixture<'_>) -> Vec
         let mut workspace = workspaces.reborrow().get(index as u32);
         workspace.set_name(name);
         set_digest(workspace.reborrow().init_graph_root(), graph_root);
-        let mut granted_operations = workspace.init_operations(operations.len() as u32);
+        let mut granted_operations = workspace
+            .reborrow()
+            .init_operations(operations.len() as u32);
         for (operation_index, operation) in operations.iter().enumerate() {
             granted_operations.set(operation_index as u32, *operation);
+        }
+        // A grant that permits writes names where (bead
+        // `ley-line-open-483134`). Unless a test states a scope, a writing
+        // fixture is granted the whole workspace.
+        let writes = operations.iter().any(|operation| {
+            matches!(
+                operation,
+                execution_capnp::WorkspaceOperation::Mutate
+                    | execution_capnp::WorkspaceOperation::Commit
+            )
+        });
+        // `None` leaves the field unset, the one encoding of "no scope".
+        let scope: Option<Vec<&str>> = match write_scope {
+            WriteScope::Default if writes => Some(vec!["/"]),
+            WriteScope::Default | WriteScope::Omitted => None,
+            WriteScope::Listed(scope) => Some(scope.to_vec()),
+        };
+        if let Some(scope) = scope {
+            let mut granted_scope = workspace.init_write_scope(scope.len() as u32);
+            for (scope_index, entry) in scope.iter().enumerate() {
+                granted_scope.set(scope_index as u32, entry);
+            }
         }
     }
     let mut bytes = Vec::new();
@@ -1030,6 +1075,7 @@ fn an_authorized_run_carries_each_workspace_grant_in_grant_order() {
                 graph_root: format!("blake3-256:{}", "b".repeat(64)),
                 expected_generation: 7,
                 operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Query],
+                write_scope: Vec::new(),
             },
             WorkspaceGrant {
                 name: "repo".into(),
@@ -1041,6 +1087,7 @@ fn an_authorized_run_carries_each_workspace_grant_in_grant_order() {
                     WorkspaceOperation::Mutate,
                     WorkspaceOperation::Commit,
                 ],
+                write_scope: vec!["/".into()],
             },
         ]
     );
@@ -1073,7 +1120,7 @@ fn the_service_refuses_a_resolver_that_changes_the_granted_workspaces() {
     // A backend that serves the shares it is granted: one that served none
     // would be refused by the service in its own right (bead
     // `ley-line-open-204a94`), and the positive start below would fail.
-    let service = ExecutionService::new(SharingBackend);
+    let (service, _shares) = sharing_service(SharingBackend);
     service
         .provision(BackendClass::MicroVm, "provision-workspaces")
         .expect("provision backend");
@@ -1123,10 +1170,14 @@ impl Backend for RecordingBackend {
         }
     }
 
-    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        request: &ExecutionRequest,
+        _workspaces: ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: format!("test/{}", request.run_id),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -1150,10 +1201,14 @@ impl Backend for CompletingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -1286,8 +1341,60 @@ fn natural_backend_completion_can_collect_a_schema_receipt() {
     assert!(receipt.event_log_root.starts_with("blake3-256:"));
 }
 
-/// Completes at once, holding the workspace share of each granted
-/// workspace, as the libkrun backend reports it.
+/// A share provider that opens every workspace it is asked for and records
+/// each grant, in order. Its shares answer every request `ENOSYS`: these
+/// tests are about who holds a share, not what it serves.
+#[derive(Default)]
+struct OpenShares {
+    opened: std::sync::Mutex<Vec<(String, WorkspaceGrant)>>,
+}
+
+struct UnansweringShare;
+
+impl leyline_runtime::backends::libkrun::share::FsService for UnansweringShare {
+    fn call(
+        &self,
+        _request: leyline_runtime::backends::libkrun::share::Request,
+    ) -> leyline_runtime::backends::libkrun::share::Reply {
+        leyline_runtime::backends::libkrun::share::Reply::Error { errno: 38 }
+    }
+}
+
+impl leyline_runtime::backends::libkrun::share::WorkspaceShares for OpenShares {
+    fn open(
+        &self,
+        run_id: &str,
+        grant: &WorkspaceGrant,
+    ) -> Result<
+        std::sync::Arc<dyn leyline_runtime::backends::libkrun::share::FsService>,
+        ExecutionError,
+    > {
+        self.opened
+            .lock()
+            .unwrap()
+            .push((run_id.to_owned(), grant.clone()));
+        Ok(std::sync::Arc::new(UnansweringShare))
+    }
+}
+
+/// A service over `backend` that serves workspaces from a fresh
+/// [`OpenShares`], returned beside it.
+fn sharing_service<B: Backend>(backend: B) -> (ExecutionService<B>, std::sync::Arc<OpenShares>) {
+    let shares = std::sync::Arc::new(OpenShares::default());
+    (
+        ExecutionService::new(backend).with_workspace_shares(shares.clone()),
+        shares,
+    )
+}
+
+/// The shares [`SharingBackend`]'s runs hold, for the life of the test
+/// binary.
+static HELD_SHARES: std::sync::Mutex<
+    Vec<std::sync::Arc<dyn leyline_runtime::backends::libkrun::share::FsService>>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Completes at once, attaching every workspace share the service hands it,
+/// as the libkrun backend does for the one it mounts.
 struct SharingBackend;
 
 impl Backend for SharingBackend {
@@ -1295,18 +1402,29 @@ impl Backend for SharingBackend {
         CompletingBackend.capabilities()
     }
 
-    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        workspaces: ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "sharing/1".into(),
-            channels: request
-                .workspaces
-                .iter()
-                .map(|grant| WorkerChannel::WorkspaceShare {
-                    workspace: grant.name.clone(),
-                    graph_root: grant.graph_root.clone(),
+            attached: workspaces
+                .into_shares()
+                .into_iter()
+                .map(|share| {
+                    let (service, attached) = share.attach();
+                    // Held as a worker's serving thread holds it: the
+                    // service refuses a start whose share nothing holds.
+                    HELD_SHARES.lock().unwrap().push(service);
+                    attached
                 })
                 .collect(),
         })
+    }
+
+    fn workspace_capacity(&self) -> usize {
+        usize::MAX
     }
 
     fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
@@ -1354,7 +1472,7 @@ fn the_receipt_names_the_workspace_share_the_run_held() {
     let plain_spec = spec_bytes();
     let plain_grant = grant_bytes(&plain_spec, true, 2_000, 0);
 
-    let service = ExecutionService::new(SharingBackend);
+    let (service, _shares) = sharing_service(SharingBackend);
     service
         .provision(BackendClass::MicroVm, "provision-sharing")
         .expect("provision backend");
@@ -1363,7 +1481,7 @@ fn the_receipt_names_the_workspace_share_the_run_held() {
         .expect("a run granted a workspace");
     // Its own service: both grants carry one replay key, and a replayed
     // start answers the first run.
-    let plain_service = ExecutionService::new(SharingBackend);
+    let (plain_service, _plain_shares) = sharing_service(SharingBackend);
     plain_service
         .provision(BackendClass::MicroVm, "provision-plain")
         .expect("provision backend");
@@ -1423,7 +1541,7 @@ fn a_replayed_start_never_rewrites_the_existing_runs_receipt() {
         required_backend: BackendClass::MicroVm,
         required_confinement_digest: None,
     };
-    let service = ExecutionService::new(SharingBackend);
+    let (service, _shares) = sharing_service(SharingBackend);
     service
         .provision(BackendClass::MicroVm, "provision-replay-receipt")
         .expect("provision backend");
@@ -1511,7 +1629,7 @@ fn the_receipt_input_roots_name_the_rootfs_then_each_granted_workspace() {
     );
     let rootfs = format!("blake3-256:{}", "a".repeat(64));
 
-    let service = ExecutionService::new(SharingBackend);
+    let (service, _shares) = sharing_service(SharingBackend);
     service
         .provision(BackendClass::MicroVm, "provision-roots")
         .expect("provision backend");
@@ -1538,7 +1656,7 @@ fn the_receipt_input_roots_name_the_rootfs_then_each_granted_workspace() {
 
     let plain_spec = spec_bytes();
     let plain_grant = grant_bytes(&plain_spec, true, 2_000, 0);
-    let plain_service = ExecutionService::new(SharingBackend);
+    let (plain_service, _plain_shares) = sharing_service(SharingBackend);
     plain_service
         .provision(BackendClass::MicroVm, "provision-plain-roots")
         .expect("provision backend");
@@ -1554,6 +1672,7 @@ fn the_receipt_input_roots_name_the_rootfs_then_each_granted_workspace() {
 #[derive(Clone, Default)]
 struct DroppingBackend {
     cancelled: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Backend for DroppingBackend {
@@ -1561,11 +1680,21 @@ impl Backend for DroppingBackend {
         CompletingBackend.capabilities()
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(BackendRun {
             backend_id: "dropping/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
+    }
+
+    fn workspace_capacity(&self) -> usize {
+        usize::MAX
     }
 
     fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
@@ -1624,7 +1753,8 @@ fn a_backend_that_drops_a_granted_workspace_is_cancelled_and_refused() {
     let (spec, grant) = workspace_spec_and_grant(&root);
 
     let backend = DroppingBackend::default();
-    let service = ExecutionService::new(backend.clone());
+    // The service opens the share; the backend is handed it and drops it.
+    let (service, _shares) = sharing_service(backend.clone());
     service
         .provision(BackendClass::MicroVm, "provision-dropping")
         .expect("provision backend");
@@ -1702,13 +1832,20 @@ fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
         fn capabilities(&self) -> BackendCapabilities {
             CompletingBackend.capabilities()
         }
-        fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        fn start(
+            &self,
+            _request: &ExecutionRequest,
+            _workspaces: ServedWorkspaces,
+        ) -> Result<BackendRun, ExecutionError> {
             self.starts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(BackendRun {
                 backend_id: "unstoppable/1".into(),
-                channels: Vec::new(),
+                attached: Vec::new(),
             })
+        }
+        fn workspace_capacity(&self) -> usize {
+            usize::MAX
         }
         fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
             if self
@@ -1730,7 +1867,7 @@ fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
     };
     let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
     let backend = Unstoppable::default();
-    let service = ExecutionService::new(backend.clone());
+    let (service, _shares) = sharing_service(backend.clone());
     service
         .provision(BackendClass::MicroVm, "provision-unstoppable")
         .expect("provision backend");
@@ -1798,59 +1935,542 @@ fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
     assert_eq!(backend.cancels.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
-/// The other direction of the same comparison: a share for a workspace the
-/// grant never named is authority the run was not given.
-#[test]
-fn a_backend_that_serves_an_ungranted_workspace_is_cancelled_and_refused() {
-    struct OverSharing(DroppingBackend);
-    impl Backend for OverSharing {
-        fn capabilities(&self) -> BackendCapabilities {
-            self.0.capabilities()
-        }
-        fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
-            let mut channels: Vec<WorkerChannel> = request
-                .workspaces
-                .iter()
-                .map(|grant| WorkerChannel::WorkspaceShare {
-                    workspace: grant.name.clone(),
-                    graph_root: grant.graph_root.clone(),
-                })
-                .collect();
-            channels.push(WorkerChannel::WorkspaceShare {
-                workspace: "docs".into(),
-                graph_root: format!("blake3-256:{}", "c".repeat(64)),
-            });
-            Ok(BackendRun {
-                backend_id: "oversharing/1".into(),
-                channels,
-            })
-        }
-        fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
-            self.0.cancel(run_id)
-        }
-    }
+/// A `repo` workspace grant with `operations` and `write_scope`, and its spec.
+fn scoped_workspace_grant(
+    operations: Vec<execution_capnp::WorkspaceOperation>,
+    write_scope: &[&str],
+) -> (Vec<u8>, Vec<u8>) {
+    let root = "a".repeat(64);
+    let confinement = "b".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &root)]);
+    let grant = grant_bytes_with_write_scope(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![("repo", &root, operations)],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+        // An empty slice leaves the field unset; the explicit empty list is
+        // `explicit_empty_scope_grant`'s.
+        if write_scope.is_empty() {
+            WriteScope::Omitted
+        } else {
+            WriteScope::Listed(write_scope)
+        },
+    );
+    (spec, grant)
+}
 
+/// A `repo` grant with `operations` whose `writeScope` is set to an empty
+/// list, as a JSON client that writes `"writeScope": []` produces.
+fn explicit_empty_scope_grant(
+    operations: Vec<execution_capnp::WorkspaceOperation>,
+) -> (Vec<u8>, Vec<u8>) {
+    let root = "a".repeat(64);
+    let confinement = "b".repeat(64);
+    let spec = spec_bytes_with_details(None, 0, &[("repo", &root)]);
+    let grant = grant_bytes_with_write_scope(
+        &spec,
+        GrantFixture {
+            capability: Some((EXECUTION_CAPABILITY, EXECUTION_SCHEMA_VERSION)),
+            expires_at: 2_000,
+            wall_time_ms: 0,
+            confinement_algorithm: "blake3-256",
+            confinement_manifest: "",
+            confinement_value: &confinement,
+            workspaces: vec![("repo", &root, operations)],
+            evidence: EvidenceFixture::Placeholder,
+            signer: None,
+            backend_class: execution_capnp::BackendClass::MicroVm,
+        },
+        WriteScope::Listed(&[]),
+    );
+    (spec, grant)
+}
+
+/// "No scope" has one encoding: the field left unset. An explicit empty list
+/// canonicalizes to different bytes than an unset field (Cap'n Proto keeps a
+/// zero-length list as a non-null pointer), so accepting both would give one
+/// grant two digests and two signatures. The empty list is refused, on a
+/// read-only grant and a writing one alike, naming the workspace and field.
+#[test]
+fn an_explicit_empty_write_scope_is_refused() {
+    use execution_capnp::WorkspaceOperation as Op;
+    for operations in [vec![Op::Read], vec![Op::Read, Op::Mutate]] {
+        let (spec, grant) = explicit_empty_scope_grant(operations);
+        let error =
+            authorize(&spec, &grant, &microvm_policy()).expect_err("an explicit empty writeScope");
+        assert_eq!(error.code, leyline_runtime::ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("writeScope"), "{error}");
+        assert!(error.detail.contains("repo"), "{error}");
+        assert!(error.detail.contains("empty list"), "{error}");
+    }
+    // The same read-only grant with the field unset authorizes, and the two
+    // are different signed bytes.
+    let (spec, unset) = scoped_workspace_grant(vec![Op::Read], &[]);
+    authorize(&spec, &unset, &microvm_policy()).expect("an unset writeScope");
+    let (_, empty) = explicit_empty_scope_grant(vec![Op::Read]);
+    assert_ne!(
+        grant_signing_bytes(&unset).expect("signing bytes"),
+        grant_signing_bytes(&empty).expect("signing bytes"),
+        "an empty list and an unset field canonicalize differently"
+    );
+}
+
+fn microvm_policy() -> AuthorizationPolicy {
+    AuthorizationPolicy {
+        now_unix_ms: Some(1_000),
+        required_backend: BackendClass::MicroVm,
+        required_confinement_digest: None,
+    }
+}
+
+/// Bead `ley-line-open-483134`: a workspace grant names where the run may
+/// write, as exact paths and `/`-terminated directory prefixes, and the
+/// authorized run carries that scope as granted.
+#[test]
+fn an_authorized_workspace_grant_carries_its_write_scope() {
+    use execution_capnp::WorkspaceOperation as Op;
+    let (spec, grant) = scoped_workspace_grant(vec![Op::Read, Op::Mutate], &["src/a.rs", "docs/"]);
+    let authorized = authorize(&spec, &grant, &microvm_policy()).expect("a scoped grant");
+    assert_eq!(
+        authorized.workspaces[0].write_scope,
+        vec!["src/a.rs".to_owned(), "docs/".to_owned()]
+    );
+
+    // The whole workspace is one explicit entry.
+    let (spec, grant) = scoped_workspace_grant(vec![Op::Read, Op::Commit], &["/"]);
+    let authorized = authorize(&spec, &grant, &microvm_policy()).expect("a whole-tree grant");
+    assert_eq!(authorized.workspaces[0].write_scope, vec!["/".to_owned()]);
+
+    // A read-only grant has no write scope.
+    let (spec, grant) = scoped_workspace_grant(vec![Op::Read, Op::List], &[]);
+    let authorized = authorize(&spec, &grant, &microvm_policy()).expect("a read-only grant");
+    assert!(authorized.workspaces[0].write_scope.is_empty());
+}
+
+/// Write authority is never implied in either direction: a grant that
+/// permits `mutate` or `commit` without naming a scope is refused (it would
+/// otherwise mean "anywhere"), and so is a scope on a grant that permits no
+/// write (a scope that grants nothing).
+#[test]
+fn a_write_scope_is_required_exactly_when_the_grant_permits_writes() {
+    use execution_capnp::WorkspaceOperation as Op;
+    for operations in [vec![Op::Read, Op::Mutate], vec![Op::Commit]] {
+        let (spec, grant) = scoped_workspace_grant(operations, &[]);
+        let error = authorize(&spec, &grant, &microvm_policy())
+            .expect_err("a writing grant with no write scope");
+        assert_eq!(error.code, leyline_runtime::ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("writeScope"), "{error}");
+        assert!(error.detail.contains("repo"), "{error}");
+    }
+    let (spec, grant) = scoped_workspace_grant(vec![Op::Read, Op::Query], &["docs/"]);
+    let error = authorize(&spec, &grant, &microvm_policy())
+        .expect_err("a write scope on a grant that permits no write");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::InvalidSpec);
+    assert!(error.detail.contains("writeScope"), "{error}");
+}
+
+/// A scope entry is a workspace-relative path with nothing to interpret: no
+/// absolute path, empty component, `.` or `..`, and no entry twice. `/` is
+/// the whole workspace and stands alone.
+#[test]
+fn a_malformed_write_scope_is_refused_by_entry() {
+    use execution_capnp::WorkspaceOperation as Op;
+    for scope in [
+        &[""][..],
+        &["/etc/passwd"],
+        &["src/../secrets/"],
+        &["./src/"],
+        &["src//a.rs"],
+        &[".."],
+        &["src/a.rs", "src/a.rs"],
+        &["/", "docs/"],
+        &["docs/", "/"],
+        &["src/\0a.rs"],
+    ] {
+        let (spec, grant) = scoped_workspace_grant(vec![Op::Mutate], scope);
+        let error =
+            authorize(&spec, &grant, &microvm_policy()).expect_err("a malformed write scope");
+        assert_eq!(
+            error.code,
+            leyline_runtime::ErrorCode::InvalidSpec,
+            "{scope:?}: {error}"
+        );
+        assert!(error.detail.contains("writeScope"), "{scope:?}: {error}");
+    }
+    for scope in [&["a"][..], &["a/"], &["a/b/c.rs", "a/b/"], &[".hidden/x"]] {
+        let (spec, grant) = scoped_workspace_grant(vec![Op::Mutate], scope);
+        authorize(&spec, &grant, &microvm_policy())
+            .unwrap_or_else(|error| panic!("{scope:?} is a legal scope: {error}"));
+    }
+}
+
+/// Bead `ley-line-open-1022a8`: the service materializes a run's workspace
+/// shares itself, before it calls the backend. A service with nothing to
+/// serve a granted workspace from refuses the start without the backend ever
+/// being asked to start anything: no worker exists to cancel.
+#[test]
+fn a_service_with_no_share_provider_refuses_a_granted_workspace_before_the_backend_is_called() {
     let policy = AuthorizationPolicy {
         now_unix_ms: Some(1_000),
         required_backend: BackendClass::MicroVm,
         required_confinement_digest: None,
     };
     let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
-    let dropping = DroppingBackend::default();
-    let service = ExecutionService::new(OverSharing(dropping.clone()));
+    let backend = DroppingBackend::default();
+    let service = ExecutionService::new(backend.clone());
     service
-        .provision(BackendClass::MicroVm, "provision-oversharing")
+        .provision(BackendClass::MicroVm, "provision-no-provider")
         .expect("provision backend");
     let error = service
         .start_authorized(&spec, &grant, &policy, &TestResolver)
-        .expect_err("a share the grant never named");
+        .expect_err("nothing can serve the granted workspace");
     assert_eq!(
         error.code,
         leyline_runtime::ErrorCode::WorkspaceUnserved,
         "{error:?}"
     );
-    assert!(error.detail.contains("\"docs\""), "{error:?}");
+    assert!(error.detail.contains("\"repo\""), "{error:?}");
+    assert_eq!(
+        backend.starts.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the backend was asked to start a run whose workspace nothing serves"
+    );
+    assert!(
+        backend.cancelled.lock().unwrap().is_empty(),
+        "nothing was started, so nothing is cancelled"
+    );
+}
+
+/// The backend receives its shares as input: by the time `Backend::start` is
+/// called the service has opened the granted workspace, and what the backend
+/// is handed is exactly the grant, write scope included.
+///
+/// The other direction 204a94 tested at run time, a backend claiming a share
+/// the grant never named, no longer has a test because it no longer has a
+/// spelling: a backend cannot construct an `AttachedWorkspace` (the
+/// `compile_fail` examples on `ServedWorkspaces` and `AttachedWorkspace`).
+#[test]
+fn the_service_opens_each_granted_workspace_and_hands_it_to_the_backend() {
+    /// Records the grants it is handed and how many shares the provider had
+    /// opened when it was called, then attaches them.
+    #[derive(Clone)]
+    struct Receiving {
+        shares: std::sync::Arc<OpenShares>,
+        handed: std::sync::Arc<std::sync::Mutex<Vec<(usize, Vec<WorkspaceGrant>)>>>,
+    }
+    impl Backend for Receiving {
+        fn capabilities(&self) -> BackendCapabilities {
+            CompletingBackend.capabilities()
+        }
+        fn start(
+            &self,
+            request: &ExecutionRequest,
+            workspaces: ServedWorkspaces,
+        ) -> Result<BackendRun, ExecutionError> {
+            assert!(workspaces.serve_exactly(request));
+            self.handed.lock().unwrap().push((
+                self.shares.opened.lock().unwrap().len(),
+                workspaces.grants().cloned().collect(),
+            ));
+            SharingBackend.start(request, workspaces)
+        }
+        fn workspace_capacity(&self) -> usize {
+            1
+        }
+        fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+            Ok(true)
+        }
+    }
+
+    use execution_capnp::WorkspaceOperation as Op;
+    let (spec, grant) = scoped_workspace_grant(vec![Op::Read, Op::Mutate], &["src/a.rs", "docs/"]);
+    let shares = std::sync::Arc::new(OpenShares::default());
+    let backend = Receiving {
+        shares: shares.clone(),
+        handed: Default::default(),
+    };
+    let service = ExecutionService::new(backend.clone()).with_workspace_shares(shares.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-receiving")
+        .expect("provision backend");
+    let record = service
+        .start_authorized(&spec, &grant, &microvm_policy(), &TestResolver)
+        .expect("a served workspace starts");
+
+    let granted = WorkspaceGrant {
+        name: "repo".into(),
+        graph_root: format!("blake3-256:{}", "a".repeat(64)),
+        expected_generation: 0,
+        operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+        write_scope: vec!["src/a.rs".into(), "docs/".into()],
+    };
+    assert_eq!(
+        *shares.opened.lock().unwrap(),
+        vec![(record.run_id.clone(), granted.clone())],
+        "the service opens the run's one granted workspace, once, with its scope"
+    );
+    assert_eq!(
+        *backend.handed.lock().unwrap(),
+        vec![(1, vec![granted])],
+        "the share was open before the backend was called, and is the grant"
+    );
+}
+
+/// A proof names the run it was opened for and the whole grant, so a share a
+/// backend kept from one start cannot stand in for another's. Run A is
+/// granted `repo` with `mutate` over the whole workspace; the backend keeps
+/// A's share and refuses A. Run B is granted the same workspace read-only.
+/// Presenting A's share for B is refused: B's worker would hold a share that
+/// lets it write.
+#[test]
+fn a_share_kept_from_another_grant_cannot_stand_in_for_this_runs() {
+    #[derive(Clone, Default)]
+    struct Stashing {
+        stash: std::sync::Arc<std::sync::Mutex<Vec<leyline_runtime::ServedWorkspace>>>,
+        cancelled: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Backend for Stashing {
+        fn capabilities(&self) -> BackendCapabilities {
+            CompletingBackend.capabilities()
+        }
+        fn start(
+            &self,
+            _request: &ExecutionRequest,
+            workspaces: ServedWorkspaces,
+        ) -> Result<BackendRun, ExecutionError> {
+            let mut stash = self.stash.lock().unwrap();
+            if stash.is_empty() {
+                stash.extend(workspaces.into_shares());
+                return Err(ExecutionError::backend("the first start is refused"));
+            }
+            // This run's own shares are dropped; the kept ones are attached.
+            Ok(BackendRun {
+                backend_id: "stashing/1".into(),
+                attached: stash
+                    .drain(..)
+                    .map(|share| {
+                        let (service, attached) = share.attach();
+                        HELD_SHARES.lock().unwrap().push(service);
+                        attached
+                    })
+                    .collect(),
+            })
+        }
+        fn workspace_capacity(&self) -> usize {
+            1
+        }
+        fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+            self.cancelled.lock().unwrap().push(run_id.to_owned());
+            Ok(true)
+        }
+    }
+
+    use execution_capnp::WorkspaceOperation as Op;
+    let backend = Stashing::default();
+    let (service, shares) = sharing_service(backend.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-stashing")
+        .expect("provision backend");
+    let (spec, wide) = scoped_workspace_grant(vec![Op::Read, Op::Mutate], &["/"]);
+    service
+        .start_authorized(&spec, &wide, &microvm_policy(), &TestResolver)
+        .expect_err("the backend refuses run A and keeps its share");
+    let (spec, narrow) = scoped_workspace_grant(vec![Op::Read], &[]);
+    let error = service
+        .start_authorized(&spec, &narrow, &microvm_policy(), &TestResolver)
+        .expect_err("run A's share must not serve run B");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("another grant"), "{error:?}");
+    assert_eq!(shares.opened.lock().unwrap().len(), 2);
+    assert_eq!(
+        backend.cancelled.lock().unwrap().len(),
+        1,
+        "the run started on a kept share is cancelled"
+    );
+}
+
+/// One proof per share. A backend that kept the share of an earlier, refused
+/// start of the same run (same run id, same grant) holds a second valid proof
+/// for the same workspace; presenting both is refused, so the receipt cannot
+/// name the workspace twice.
+#[test]
+fn two_proofs_for_one_granted_workspace_are_refused() {
+    #[derive(Clone, Default)]
+    struct Doubling {
+        kept: std::sync::Arc<std::sync::Mutex<Vec<leyline_runtime::ServedWorkspace>>>,
+        cancelled: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Backend for Doubling {
+        fn capabilities(&self) -> BackendCapabilities {
+            CompletingBackend.capabilities()
+        }
+        fn start(
+            &self,
+            _request: &ExecutionRequest,
+            workspaces: ServedWorkspaces,
+        ) -> Result<BackendRun, ExecutionError> {
+            let mut kept = self.kept.lock().unwrap();
+            if kept.is_empty() {
+                kept.extend(workspaces.into_shares());
+                return Err(ExecutionError::backend("the first start is refused"));
+            }
+            let attached = kept
+                .drain(..)
+                .chain(workspaces.into_shares())
+                .map(|share| {
+                    let (service, attached) = share.attach();
+                    HELD_SHARES.lock().unwrap().push(service);
+                    attached
+                })
+                .collect();
+            Ok(BackendRun {
+                backend_id: "doubling/1".into(),
+                attached,
+            })
+        }
+        fn workspace_capacity(&self) -> usize {
+            1
+        }
+        fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+            self.cancelled.lock().unwrap().push(run_id.to_owned());
+            Ok(true)
+        }
+    }
+
+    let backend = Doubling::default();
+    let (service, _shares) = sharing_service(backend.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-doubling")
+        .expect("provision backend");
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    service
+        .start_authorized(&spec, &grant, &microvm_policy(), &TestResolver)
+        .expect_err("the backend refuses the first start and keeps its share");
+    let error = service
+        .start_authorized(&spec, &grant, &microvm_policy(), &TestResolver)
+        .expect_err("two proofs for one workspace");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("attached 2"), "{error:?}");
+    assert_eq!(backend.cancelled.lock().unwrap().len(), 1);
+}
+
+/// The proof stands for a share that is being served. A backend that takes
+/// the share and lets its service go has nothing answering its worker, so
+/// the start is refused even though it holds a proof for the right grant.
+#[test]
+fn a_share_the_backend_took_and_let_go_is_not_served() {
+    struct LettingGo(DroppingBackend);
+    impl Backend for LettingGo {
+        fn capabilities(&self) -> BackendCapabilities {
+            self.0.capabilities()
+        }
+        fn start(
+            &self,
+            _request: &ExecutionRequest,
+            workspaces: ServedWorkspaces,
+        ) -> Result<BackendRun, ExecutionError> {
+            Ok(BackendRun {
+                backend_id: "letting-go/1".into(),
+                attached: workspaces
+                    .into_shares()
+                    .into_iter()
+                    .map(|share| share.attach().1)
+                    .collect(),
+            })
+        }
+        fn workspace_capacity(&self) -> usize {
+            1
+        }
+        fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+            self.0.cancel(run_id)
+        }
+    }
+
+    let dropping = DroppingBackend::default();
+    let (service, _shares) = sharing_service(LettingGo(dropping.clone()));
+    service
+        .provision(BackendClass::MicroVm, "provision-letting-go")
+        .expect("provision backend");
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    let error = service
+        .start_authorized(&spec, &grant, &microvm_policy(), &TestResolver)
+        .expect_err("a share nothing holds");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("nothing holds it"), "{error:?}");
     assert_eq!(dropping.cancelled.lock().unwrap().len(), 1);
+}
+
+/// The backend is asked whether it serves workspaces before any share is
+/// opened: a tier that serves none (the default) is refused with the
+/// provider never asked and the backend never started.
+#[test]
+fn a_backend_that_serves_no_workspace_is_refused_before_a_share_is_opened() {
+    let (service, shares) = sharing_service(RecordingBackend);
+    service
+        .provision(BackendClass::MicroVm, "provision-no-capacity")
+        .expect("provision backend");
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    let error = service
+        .start_authorized(&spec, &grant, &microvm_policy(), &TestResolver)
+        .expect_err("the backend serves no workspace");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("\"repo\""), "{error:?}");
+    assert!(
+        shares.opened.lock().unwrap().is_empty(),
+        "a share was opened for a run the backend cannot serve"
+    );
+}
+
+/// A request no grant was verified for holds no workspace: the direct
+/// `ExecutionService::start` refuses one that names a workspace, before the
+/// provider or the backend is asked anything.
+#[test]
+fn a_request_without_a_verified_grant_is_never_served_a_workspace() {
+    let backend = DroppingBackend::default();
+    let (service, shares) = sharing_service(backend.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-unverified")
+        .expect("provision backend");
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    let authorized = authorize(&spec, &grant, &microvm_policy()).expect("authorize");
+    let request = TestResolver.resolve(&authorized).expect("resolve");
+    assert_eq!(request.workspaces.len(), 1);
+    let error = service
+        .start(request)
+        .expect_err("a workspace with no verified grant behind it");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("verified grant"), "{error:?}");
+    assert!(shares.opened.lock().unwrap().is_empty());
+    assert_eq!(backend.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 fn spec_json(bytes: &[u8]) -> String {
@@ -1972,6 +2592,7 @@ fn capabilities_projection_uses_declared_backend_class() {
         fn start(
             &self,
             _request: &ExecutionRequest,
+            _workspaces: ServedWorkspaces,
         ) -> Result<leyline_runtime::BackendRun, ExecutionError> {
             unreachable!("unavailable backend must not start")
         }
@@ -2290,6 +2911,114 @@ fn grant_signing_bytes_name_content_not_capnp_framing() {
     );
 }
 
+/// `execution/v1/test-vectors/run-grant-signing.json` pins the bytes an
+/// issuer signs and the signature over them, so a second implementation
+/// checks its canonicalization and its DSSE framing without an LLO checkout.
+/// Its cases differ only in `writeScope`, pinning that an unset field and an
+/// explicit empty list sign different bytes.
+#[test]
+fn run_grant_signing_vector_pins_the_signed_bytes() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ll-core/schema-spec/execution/v1/test-vectors/run-grant-signing.json");
+    let vector: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the signing vector ships"))
+            .expect("the signing vector is JSON");
+    assert_eq!(
+        vector["payloadType"].as_str(),
+        Some(GRANT_SIGNATURE_PAYLOAD_TYPE)
+    );
+    let seed: [u8; 32] = hex::decode(vector["signerSeedHex"].as_str().expect("seed"))
+        .expect("seed hex")
+        .try_into()
+        .expect("a 32-byte seed");
+    let signer = leyline_envelope::Ed25519RootSigner::from_seed(&seed);
+    let cases = vector["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 3, "a vector with no cases gates nothing");
+
+    let mut signed = std::collections::BTreeMap::new();
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        // The grant a case signs: the vector's `grant` with `workspaces`
+        // set to the case's one workspace.
+        let mut grant = vector["grant"].clone();
+        grant["workspaces"] = json!([case["workspace"]]);
+        let mut message = Builder::new_default();
+        capnp_json::from_json(
+            &grant.to_string(),
+            message.init_root::<execution_capnp::run_grant::Builder<'_>>(),
+        )
+        .unwrap_or_else(|error| panic!("{name}: the grant decodes: {error}"));
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message).expect("serialize");
+
+        let signing = grant_signing_bytes(&bytes).expect("signing bytes");
+        let signature =
+            leyline_envelope::sign_payload(GRANT_SIGNATURE_PAYLOAD_TYPE, &signing, &signer);
+        // The covered bytes are the canonical grant with `signature` set to
+        // an EMPTY struct, not omitted. For these grants, which set nothing
+        // after `signature`, that is 24 bytes longer than the canonical form
+        // of the grant as built above, which has no signature at all.
+        let canonical = |empty_signature: bool| {
+            let mut copy = Builder::new_default();
+            copy.set_root(
+                message
+                    .get_root_as_reader::<execution_capnp::run_grant::Reader<'_>>()
+                    .expect("grant root"),
+            )
+            .expect("copy");
+            if empty_signature {
+                copy.get_root::<execution_capnp::run_grant::Builder<'_>>()
+                    .expect("grant root")
+                    .init_signature();
+            }
+            capnp::Word::words_to_bytes(&copy.into_reader().canonicalize().expect("canonicalize"))
+                .to_vec()
+        };
+        let (omitted, empty_struct) = (canonical(false), canonical(true));
+        assert_eq!(signing, empty_struct, "{name}: the empty-struct form");
+        assert_ne!(signing, omitted, "{name}: not the omitted form");
+        assert_eq!(signing.len(), omitted.len() + 24, "{name}");
+
+        assert_eq!(
+            hex::encode(&signing),
+            case["signingBytesHex"].as_str().unwrap_or_default(),
+            "{name}: signing bytes drifted"
+        );
+        assert_eq!(
+            signing.len() as u64,
+            case["signingBytesLength"].as_u64().expect("length"),
+            "{name}: signing bytes changed length"
+        );
+        assert_eq!(
+            blake3::hash(&signing).to_hex().as_str(),
+            case["signingBytesBlake3"]
+                .as_str()
+                .expect("signingBytesBlake3"),
+            "{name}: signing bytes drifted"
+        );
+        assert_eq!(
+            hex::encode(&signature),
+            case["signatureHex"].as_str().expect("signatureHex"),
+            "{name}: signature drifted"
+        );
+
+        // What an authorizer makes of it.
+        let spec = spec_bytes_with_details(None, 0, &[("repo", &"a".repeat(64))]);
+        let authorized = authorize(&spec, &bytes, &microvm_policy());
+        assert_eq!(
+            authorized.is_ok(),
+            case["authorizes"].as_bool().expect("authorizes"),
+            "{name}: {:?}",
+            authorized.err()
+        );
+        signed.insert(name.to_owned(), signing);
+    }
+    assert_ne!(
+        signed["read-only-write-scope-unset"], signed["read-only-write-scope-explicit-empty"],
+        "list presence is signed"
+    );
+}
+
 /// `execution/v1/test-vectors/run-id.json` is the cross-implementation gate
 /// for run-identity derivation: a second implementation reproduces a run's
 /// name from `(canonical spec digest, grantId, replayKey)` without an LLO
@@ -2374,7 +3103,11 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
                 enforced: leyline_runtime::EnforcedCeilings::wall_clock_only(),
             }
         }
-        fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+        fn start(
+            &self,
+            _request: &ExecutionRequest,
+            _workspaces: ServedWorkspaces,
+        ) -> Result<BackendRun, ExecutionError> {
             panic!("start must not be reached: the ceiling is unenforceable here");
         }
         fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {

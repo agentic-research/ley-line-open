@@ -35,6 +35,10 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
+- ADR-0046 Slice 1 (accepted 2026-11-11, for v0.30.0): a per-run host broker
+  joins a declared guest connection to one loopback `127.0.0.1:port`, bytes
+  only, no credential; the parent-death fix ships with it (`e9d940`, `521deb`,
+  `52b5b3`, `5308b7`, `528525`, `52deb4`, `f963e6`; epic `e2c5ce`).
 - The follow-up gap queue (epic `ley-line-open-1262af`): every open design or
   correctness follow-up from the v0.26 to v0.29 releases is worked to zero, in
   groups whose files do not overlap. A pull request files a follow-up only for

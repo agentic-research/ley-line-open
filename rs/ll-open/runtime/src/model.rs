@@ -440,6 +440,14 @@ pub struct WorkspaceGrant {
     pub expected_generation: u64,
     /// Exactly the operations permitted.
     pub operations: Vec<WorkspaceOperation>,
+    /// Where the run may write, create, rename or delete (`execution/v1`
+    /// `WorkspaceGrant.writeScope`, bead `ley-line-open-483134`): exact file
+    /// paths and `/`-terminated directory prefixes, relative to the workspace
+    /// root; the single entry `/` is the whole workspace. Authorization
+    /// refuses a grant unless this is non-empty exactly when `operations`
+    /// permit `mutate` or `commit`. The share the service opens for the
+    /// grant enforces it; reads stay governed by `graph_root`.
+    pub write_scope: Vec<String>,
 }
 
 /// An operation a [`WorkspaceGrant`] permits (`execution/v1`
@@ -496,13 +504,17 @@ fn validate_guest_path(value: &str) -> Result<(), ExecutionError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BackendRun {
     pub backend_id: String,
-    /// Every channel the run's worker holds beyond its standard streams,
-    /// verified against what the worker declared at readiness. The receipt's
-    /// backend evidence names them ([`BackendEvidenceDocument`]).
-    pub channels: Vec<WorkerChannel>,
+    /// The workspace shares the backend took from the
+    /// [`crate::ServedWorkspaces`] it was handed and attached to its worker,
+    /// verified against what the worker declared at readiness. A backend
+    /// cannot write one of these itself, so it cannot claim a share it did
+    /// not take. The service asserts they are the run's granted workspaces
+    /// exactly, and the receipt's backend evidence names them
+    /// ([`BackendEvidenceDocument`]).
+    pub attached: Vec<crate::AttachedWorkspace>,
 }
 
 /// A channel a backend's worker holds outside its confinement manifest.

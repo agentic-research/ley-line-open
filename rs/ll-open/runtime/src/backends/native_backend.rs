@@ -147,7 +147,11 @@ impl Backend for NativeWorkerBackend {
         }
     }
 
-    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        request: &ExecutionRequest,
+        workspaces: crate::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
         // ADR-0035 §4 again, at the backend: `ExecutionService::start` checks
         // too, but this is a public type an embedder can call directly, and a
@@ -165,7 +169,11 @@ impl Backend for NativeWorkerBackend {
         // (bead ley-line-open-f8ebcf). The code is `workspaceUnserved`, not
         // the generic `unsupportedBackend`, so a caller can route the run to
         // a tier that serves workspaces (bead ley-line-open-204a94).
-        if let Some(grant) = request.workspaces.first() {
+        //
+        // Refused whether the workspace is named by the request or handed
+        // over as an open share (bead ley-line-open-1022a8): the tier
+        // attaches none, so it takes none.
+        if let Some(grant) = request.workspaces.first().or(workspaces.grants().next()) {
             return Err(ExecutionError::workspace_unserved(format!(
                 "the run is granted workspace {:?}, and the native tier serves no \
                  workspace shares; run it on the microVM tier",
@@ -444,7 +452,7 @@ impl Backend for NativeWorkerBackend {
             backend_id: "native-nono/1".into(),
             // The native worker inherits its standard streams and nothing
             // else.
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 

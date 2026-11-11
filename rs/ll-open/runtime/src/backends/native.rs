@@ -8,6 +8,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -16,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use crate::{ExecutionError, ExecutionRequest};
 
 use super::libkrun::confinement::{Tier, capabilities_from_manifest, committed_confinement};
-use super::libkrun::plan::{DirectoryRootfsResolver, compile_plan, executable_in_manifest};
+use super::libkrun::plan::{
+    DirectoryRootfsResolver, compile_plan, executable_in_manifest, guest_executable,
+};
 use super::libkrun::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +140,11 @@ pub fn execute_with_ready(
         .rootfs
         .canonical_path
         .join(executable_in_manifest(&config.rootfs, &request.executable)?);
+    // The workload's argv[0] is the guest's path of what the request named,
+    // as the microVM tier's kernel gives it (`/bin/sh`, not the host path of
+    // the `busybox` a link reaches), so a multi-call binary picks the same
+    // applet on both tiers (bead `ley-line-open-10c9d0`).
+    let argv0 = guest_executable(&request.executable)?;
 
     // Resolve every host path before nono becomes irreversible. The child
     // process receives no ambient path authority after this call.
@@ -160,6 +168,7 @@ pub fn execute_with_ready(
 
     let mut command = Command::new(&executable);
     command
+        .arg0(OsStr::from_bytes(argv0.as_bytes()))
         .args(
             config
                 .arguments

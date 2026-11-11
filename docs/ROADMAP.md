@@ -5,8 +5,8 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-11-11, at the `integration` tree `8318d9d2` (latest tag
-v0.29.0, plus #566 and #562).
+Last updated: 2026-11-11, at the `integration` tree `9d41b225` (latest tag
+v0.29.0, plus #566, #562 and #568).
 
 ## v1.0: single host, portable
 
@@ -48,18 +48,16 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
     `workspaceInputs`), `e592ef` (cancel of a finished run), `f7bcb3` (a
     worker-event channel the guest cannot write), `eea8e1` (a run's
     `GuestOutput` on the execution-daemon socket).
-  - **D (image import and storage).** `38ff59` is merged (#562): the per-run
-    rootfs holds only the directories the manifest implies, at `0755`. Open:
-    `4f08ea` (rootfs manifest v2: directories with modes, and
-    symbolic links), `faba8f` (canonical manifest bytes are checked),
-    `18a7a2`, `b1c18d` (registry pull refuses before it downloads),
-    `cffbb5` (absolute tar entry names, as Nix images write them), and the
-    CAS volume's `1665c9`, `167b29`, `168a65`.
+  - **D (image import and storage).** Merged: `38ff59` (#562: the per-run
+    rootfs holds only the directories the manifest implies, at `0755`) and
+    D1 (#568: `b1c18d`, `167b29`, `1665c9`, `168a65`, `2aa5d3`, `cffbb5`).
+    Open: `4f08ea` (rootfs manifest v2: directories with modes, and symbolic
+    links), `faba8f` (canonical manifest bytes are checked) and `18a7a2`.
   - **B (guest and libkrun).** `d4b07f` with `f7f862` first: argv and the
     environment reach the guest init through a channel nothing parses, so the
     kernel command line carries fixed tokens only. Then the loopback relay
     (`ebc78e`, `bb3395`, `156d83`, `b00ae3`), the evidence gaps (`eba800`,
-    `3839c9`, `eb8d81`), `eb3411` and `2aa5d3`.
+    `3839c9`, `eb8d81`) and `eb3411`.
   - **E (parse and identity).** `cc56e6`, `0ed720`, `1e64c4`, `1e76ba`,
     `1b5f3c`, `fa9ec8`, `ff385b`, and ADR-0047 M3 (`ab2093`, breaking: the
     cloister issue is filed first).
@@ -190,6 +188,7 @@ an ordinary repository to git, CI, review, editors and build tools.
 | PR | Change | Bead |
 |---|---|---|
 | #566 | A worker compares the confinement it will apply with the grant before the workload starts, on both tiers (`committed_confinement`); the applied policy is parsed from the digested bytes | `7a3109` |
+| #568 | Gap queue D1: a registry pull refuses a token realm or redirect to a non-public address and bounds every request's headers; CAS volume `hdiutil` runs are bounded, a crashed provider's partial image is cleaned and only its own image is used, and the real-`hdiutil` tests run in a recorded gate; an image with a regular file at a kernel mount point is refused at import; absolute tar entry names (Nix `dockerTools`) import from the image root; rustix 1.1.6 for RUSTSEC-2026-0486 | `b1c18d`, `167b29`, `1665c9`, `168a65`, `2aa5d3`, `cffbb5`, `d68536` |
 | #562 | Gap queue D2: the per-run rootfs copy is built from the manifest, holding exactly the directories the files imply, each at `0755`, so a rootfs digest names one guest tree | `38ff59` |
 
 ## Shipped in v0.29.0 (2026-11-11)

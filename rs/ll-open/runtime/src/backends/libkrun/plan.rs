@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -261,7 +261,7 @@ pub(crate) fn verify_manifest(
             "rootfs symbolic links differ from the content-addressed manifest",
         ));
     }
-    if !on_disk.files.keys().eq(spec.files.keys()) {
+    if !on_disk.files.iter().eq(spec.files.keys()) {
         return Err(ExecutionError::invalid(
             "rootfs files differ from the content-addressed manifest",
         ));
@@ -338,8 +338,9 @@ fn verify_manifest_file(
 /// paths, the root manifest left out.
 #[derive(Debug, Default)]
 struct OnDisk {
-    /// Regular files, each with its permission bits.
-    files: BTreeMap<String, u32>,
+    /// Regular files; each one's mode and content are checked against the
+    /// manifest by `verify_manifest_file`.
+    files: BTreeSet<String>,
     /// Directories, the root as `""`, each with its permission bits.
     directories: BTreeMap<String, u32>,
     /// Symbolic links, each with its target, never followed.
@@ -385,8 +386,7 @@ fn collect_rootfs_tree(rootfs: &Path) -> Result<OnDisk, ExecutionError> {
                 walk(&path, &child, tree)?;
             } else if metadata.is_file() {
                 if child != ROOTFS_MANIFEST {
-                    tree.files
-                        .insert(child, metadata.permissions().mode() & 0o7777);
+                    tree.files.insert(child);
                 }
             } else {
                 return Err(ExecutionError::invalid(

@@ -382,6 +382,45 @@ fn a_file_the_owner_cannot_read_is_dropped_and_reported() {
     assert_eq!(fs::read_dir(root.join("secret")).unwrap().count(), 0);
 }
 
+/// A directory's mode comes from its own archive entry in the layer that
+/// last wrote it. Removed by a whiteout, or beneath an opaque whiteout, its
+/// entry's mode is gone with it: a later layer that recreates it only by
+/// writing beneath it gets an implied `0755`. An opaque whiteout clears
+/// what is beneath its directory, never the directory's own mode.
+#[test]
+fn a_removed_directorys_mode_does_not_outlive_it() {
+    let (scratch, result) = import_single(
+        vec![
+            Layer::plain(vec![
+                dir("gone/", 0o700),
+                dir("kept/", 0o750),
+                dir("kept/inner/", 0o711),
+                file("kept/inner/x", 0o644, b"x"),
+            ]),
+            Layer::plain(vec![
+                file(".wh.gone", 0o644, b""),
+                file("kept/.wh..wh..opq", 0o644, b""),
+            ]),
+            Layer::plain(vec![
+                file("gone/again", 0o644, b"a"),
+                file("kept/inner/y", 0o644, b"y"),
+            ]),
+        ],
+        SymlinkPolicy::Refuse,
+    );
+    let imported = result.expect("import");
+    let spec = manifest_spec(&scratch.path().join("cas"), &imported.rootfs);
+    assert_eq!(
+        spec.directories.into_iter().collect::<Vec<_>>(),
+        [
+            (String::new(), 0o755),
+            ("gone".to_string(), 0o755),
+            ("kept".to_string(), 0o750),
+            ("kept/inner".to_string(), 0o755),
+        ]
+    );
+}
+
 /// v2 carries directory modes, so a directory the image made unreadable is
 /// kept with its mode, owner `rwx` forced (the importer, and each run's
 /// copy, must be able to fill it), never refused and never widened for
@@ -935,6 +974,9 @@ fn one_rootfs_digest_names_one_tree_on_disk() {
     );
     let (a, b) = (a.expect("layered import"), b.expect("flat import"));
     assert_eq!(a.rootfs, b.rootfs);
+    // The JSON's `directories` counts the tree's directories, the root not
+    // among them.
+    assert_eq!((a.directories, b.directories), (5, 5));
     let tree = |scratch: &TempDir, imported: &ImportedRootfs| {
         directories(&scratch.path().join("cas").join(&imported.rootfs.value))
     };

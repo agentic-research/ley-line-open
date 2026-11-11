@@ -2885,6 +2885,35 @@ fn run_grant_signing_vector_pins_the_signed_bytes() {
         let signing = grant_signing_bytes(&bytes).expect("signing bytes");
         let signature =
             leyline_envelope::sign_payload(GRANT_SIGNATURE_PAYLOAD_TYPE, &signing, &signer);
+        // The covered bytes are the canonical grant with `signature` set to
+        // an EMPTY struct, not omitted: 24 bytes longer than the canonical
+        // form of the grant as built above, which has no signature at all.
+        let canonical = |empty_signature: bool| {
+            let mut copy = Builder::new_default();
+            copy.set_root(
+                message
+                    .get_root_as_reader::<execution_capnp::run_grant::Reader<'_>>()
+                    .expect("grant root"),
+            )
+            .expect("copy");
+            if empty_signature {
+                copy.get_root::<execution_capnp::run_grant::Builder<'_>>()
+                    .expect("grant root")
+                    .init_signature();
+            }
+            capnp::Word::words_to_bytes(&copy.into_reader().canonicalize().expect("canonicalize"))
+                .to_vec()
+        };
+        let (omitted, empty_struct) = (canonical(false), canonical(true));
+        assert_eq!(signing, empty_struct, "{name}: the empty-struct form");
+        assert_ne!(signing, omitted, "{name}: not the omitted form");
+        assert_eq!(signing.len(), omitted.len() + 24, "{name}");
+
+        assert_eq!(
+            hex::encode(&signing),
+            case["signingBytesHex"].as_str().unwrap_or_default(),
+            "{name}: signing bytes drifted"
+        );
         assert_eq!(
             signing.len() as u64,
             case["signingBytesLength"].as_u64().expect("length"),

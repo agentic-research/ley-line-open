@@ -43,11 +43,16 @@ Two properties make this the signable form:
   sign; a verifier recomputes them from the grant it received, signature
   and all, and gets the same answer.
 
-A cleared `signature` canonicalizes to a null pointer in the trailing pointer
-slot, which canonicalization truncates. So `signing_bytes` for a signed grant
-are byte-identical to the canonical form of the same grant before the
-signature was attached — and identical to what a producer that predates the
-field would have emitted.
+"Cleared" means **set to an empty `GrantSignature` struct**, not omitted: the
+`signature` pointer is non-null and points at a zero-size struct, whether or
+not the grant as received carried a signature. Canonicalization keeps that
+pointer, so `signing_bytes` are 24 bytes longer than the canonical form of
+the same grant with `signature` left unset (for the vector's first case, 1056
+bytes against 1032), and a signer that omits the field instead produces a
+signature every verifier refuses. An earlier revision of this document said
+the cleared field canonicalizes to a truncated null pointer; that was wrong,
+and the bytes the implementation signs have not changed. In JSON-carrier
+terms the grant an issuer canonicalizes carries `"signature": {}`.
 
 List presence is signed. An unset list field canonicalizes to a null pointer;
 an explicit zero-length list canonicalizes to a non-null pointer, so the two

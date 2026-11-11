@@ -71,6 +71,13 @@ pub struct KrunWorkerBackend {
     /// What each active run has printed (bead `ley-line-open-a26ad0`):
     /// published with the run in `children`, retired with it.
     outputs: Arc<Mutex<HashMap<String, Arc<OutputCapture>>>>,
+    /// The workspace share each run attached, held from `start` until the
+    /// run's outcome is collected or it is cancelled. The share's serving
+    /// thread ends with the worker, so without this a worker that exits
+    /// right after readiness would leave nothing holding the share, and the
+    /// service would refuse a run that in fact started and failed (bead
+    /// `ley-line-open-1022a8`).
+    shares: Mutex<HashMap<String, Arc<dyn FsService>>>,
 }
 
 struct WorkerControl {
@@ -89,6 +96,7 @@ impl KrunWorkerBackend {
             completed: Arc::new(Mutex::new(HashMap::new())),
             completion_cv: Arc::new(Condvar::new()),
             outputs: Arc::new(Mutex::new(HashMap::new())),
+            shares: Mutex::new(HashMap::new()),
         }
     }
 
@@ -192,6 +200,9 @@ impl KrunWorkerBackend {
 
     /// Stop one backend run and release its parent-owned ephemeral rootfs.
     pub fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+        // A cancelled run is retired whatever state it was in: its share is
+        // let go.
+        self.shares.lock().remove(run_id);
         let Some(control) = self.children.lock().remove(run_id) else {
             return Ok(false);
         };
@@ -225,6 +236,7 @@ impl KrunWorkerBackend {
         let mut completed = self.completed.lock();
         loop {
             if let Some(outcome) = completed.remove(run_id) {
+                self.shares.lock().remove(run_id);
                 return Ok(outcome);
             }
             if !self.children.lock().contains_key(run_id) {
@@ -299,6 +311,8 @@ impl Backend for KrunWorkerBackend {
             Self::workspace_share(request, workspaces)?
                 .map(ServedWorkspace::attach)
                 .unzip();
+        // Held by the backend for the run's life, beside the serving thread.
+        let held_share = share.clone();
 
         let rootfs = TempDirBuilder::new()
             .prefix("leyline-run-")
@@ -598,6 +612,9 @@ impl Backend for KrunWorkerBackend {
         self.outputs
             .lock()
             .insert(run_id.clone(), Arc::clone(&capture));
+        if let Some(share) = held_share {
+            self.shares.lock().insert(run_id.clone(), share);
+        }
         self.children.lock().insert(
             run_id.clone(),
             WorkerControl {
@@ -667,7 +684,12 @@ impl Backend for KrunWorkerBackend {
     }
 
     fn poll_outcome(&self, run_id: &str) -> Result<Option<crate::RunOutcome>, ExecutionError> {
-        Ok(self.completed.lock().remove(run_id))
+        let outcome = self.completed.lock().remove(run_id);
+        if outcome.is_some() {
+            // Collected: the run is retired, and its share with it.
+            self.shares.lock().remove(run_id);
+        }
+        Ok(outcome)
     }
 
     fn output(&self, run_id: &str) -> Option<GuestOutput> {
@@ -726,5 +748,138 @@ mod tests {
             Backend::poll(&backend, "run-1").expect("poll"),
             Some(BackendRunStatus::Succeeded)
         ));
+    }
+
+    /// A worker that reports ready and exits at once (a guest that fails to
+    /// enter, say) is a run that failed, not a share nobody served. The
+    /// share's serving thread ends with the worker, so the backend itself
+    /// holds the share until the run's outcome is collected: the service's
+    /// start assertion passes, and the run is recorded and ends `Failed`
+    /// with what it printed.
+    #[test]
+    fn a_worker_that_exits_right_after_ready_still_holds_its_share() {
+        use crate::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Share;
+        impl FsService for Share {
+            fn call(&self, _request: Request) -> Reply {
+                Reply::Done
+            }
+        }
+        struct Provider;
+        impl WorkspaceShares for Provider {
+            fn open(
+                &self,
+                _run_id: &str,
+                _grant: &crate::WorkspaceGrant,
+            ) -> Result<std::sync::Arc<dyn FsService>, crate::ExecutionError> {
+                Ok(std::sync::Arc::new(Share))
+            }
+        }
+
+        let fixture = tempfile::tempdir().expect("fixture");
+        let worker = fixture.path().join("worker");
+        // Declares the share it was handed, prints, reports ready, exits 1.
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+fd=
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--workspace-share-fd" ]; then fd="$arg"; fi
+  prev="$arg"
+done
+IFS= read -r _
+printf '%s\n' "{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{\"descriptor\":$fd,\"channel\":{\"role\":\"workspaceShare\",\"workspace\":\"repo\",\"graphRoot\":\"blake3-256:root\"}}]}" >&2
+printf 'entering the guest failed\n' >&2
+exit 1
+"#,
+        )
+        .expect("worker script");
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let (cas_root, ephemeral_root) = (fixture.path().join("cas"), fixture.path().join("runs"));
+        std::fs::create_dir(&cas_root).expect("cas");
+        std::fs::create_dir(&ephemeral_root).expect("runs");
+        let mut backend = KrunWorkerBackend::new(KrunWorkerConfig {
+            worker,
+            cas_root,
+            ephemeral_root,
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            ready_timeout: Duration::from_secs(30),
+            tsi_hijack_inet: false,
+        });
+        // A shell script stands in for the VMM.
+        backend.entitlement_platform = None;
+
+        let request = crate::ExecutionRequest {
+            run_id: "run-1".into(),
+            replay_key: "replay-1".into(),
+            rootfs: crate::DigestRef {
+                algorithm: "blake3-256".into(),
+                value: "a".repeat(64),
+            },
+            executable: "bin/guest".into(),
+            arguments: Vec::new(),
+            public_environment: Default::default(),
+            allowed_egress: Vec::new(),
+            confinement_digest: String::new(),
+            confinement_manifest: None,
+            workspaces: vec![crate::WorkspaceGrant {
+                name: "repo".into(),
+                graph_root: "blake3-256:root".into(),
+                expected_generation: 0,
+                operations: vec![crate::WorkspaceOperation::Read],
+                write_scope: Vec::new(),
+            }],
+            limits: crate::ResourceLimits {
+                wall_time_ms: 30_000,
+                memory: crate::MemoryLimits { limit: 256 << 20 },
+                cpu: crate::CpuLimits {
+                    quota: 100_000,
+                    period: 100_000,
+                },
+                ..Default::default()
+            },
+        };
+        let (shares, opened) = crate::ServedWorkspaces::materialize(
+            Some(&Provider),
+            &request.run_id,
+            &request.workspaces,
+        )
+        .expect("open the share");
+        let started = backend
+            .start(&request, shares)
+            .expect("the worker was ready");
+
+        // The worker has exited and its completion is published: the
+        // serving thread's end of the share is closed.
+        {
+            let mut completed = backend.completed.lock();
+            while !completed.contains_key("run-1") {
+                backend.completion_cv.wait(&mut completed);
+            }
+        }
+        opened
+            .held(&started.attached)
+            .expect("the backend holds the share of a run whose outcome is uncollected");
+
+        let outcome = backend
+            .poll_outcome("run-1")
+            .expect("poll")
+            .expect("the run completed");
+        let BackendRunStatus::Failed(error) = outcome.status else {
+            panic!(
+                "a worker that exits 1 is a failed run: {:?}",
+                outcome.status
+            );
+        };
+        assert!(
+            error.detail.contains("entering the guest failed"),
+            "the failed run keeps what it printed: {error}"
+        );
+        // Collected: the backend lets the share go.
+        assert!(!backend.shares.lock().contains_key("run-1"));
     }
 }

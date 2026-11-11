@@ -64,6 +64,16 @@ pub const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
 /// would write it. The worker's exclusive create is the backstop.
 pub const RUN_EXEC_SPEC: &str = ".leyline-exec.json";
 
+/// The mode a directory the manifest declares at `declared` has in the
+/// shared CAS entry: group and other write and the sticky bit cleared, so
+/// no other local user can plant an entry in a CAS directory (and make it
+/// fail verification forever) whatever the image declared (bead
+/// `ley-line-open-10efee`). Each run's copy, which only its run reaches,
+/// has the declared mode.
+pub fn cas_directory_mode(declared: u32) -> u32 {
+    declared & 0o755
+}
+
 /// The mode of a rootfs's root directory: it has no manifest entry.
 pub const ROOT_DIRECTORY_MODE: u32 = 0o755;
 

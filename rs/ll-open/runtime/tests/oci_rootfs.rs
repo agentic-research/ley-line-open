@@ -946,13 +946,28 @@ fn one_rootfs_digest_names_one_tree_on_disk() {
         ("var".to_string(), 0o755),
         ("var/cache".to_string(), 0o755),
     ];
-    assert_eq!(tree(&layered, &a), expected);
-    assert_eq!(tree(&flat, &b), expected);
     let declared: Vec<(String, u32)> = manifest_spec(&layered.path().join("cas"), &a.rootfs)
         .directories
         .into_iter()
         .collect();
-    assert_eq!(declared, expected, "the manifest names the tree on disk");
+    assert_eq!(declared, expected, "the manifest names the tree");
+    // The shared CAS entry holds each directory at its declared mode with
+    // group and other write and the sticky bit cleared, so no other local
+    // user can plant an entry in it (review of 4f08ea, bead
+    // ley-line-open-10efee); each run's copy has the declared modes.
+    let in_cas: Vec<(String, u32)> = expected
+        .iter()
+        .map(|(path, mode)| (path.clone(), mode & 0o755))
+        .collect();
+    assert_eq!(tree(&layered, &a), in_cas);
+    assert_eq!(tree(&flat, &b), in_cas);
+    let cas = layered.path().join("cas");
+    let resolved = DirectoryRootfsResolver::new(&cas)
+        .resolve(&a.rootfs)
+        .expect("the CAS entry verifies");
+    let run = TempDir::new().expect("run root");
+    let copy = materialize_ephemeral_rootfs(&resolved, run.path()).expect("the run's copy");
+    assert_eq!(directories(&copy.canonical_path), expected, "the copy");
 
     for (what, layer) in [
         (

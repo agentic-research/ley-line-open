@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use leyline_core::ContentAddressed;
 
 pub(crate) use crate::artifacts::rootfs_manifest::ROOTFS_MANIFEST;
-use crate::artifacts::rootfs_manifest::{FileSpec, RootfsSpec};
+use crate::artifacts::rootfs_manifest::{FileSpec, RootfsSpec, cas_directory_mode};
 use crate::{DigestRef, ExecutionError, ExecutionRequest};
 
 pub trait RootfsResolver: Send + Sync {
@@ -50,7 +50,7 @@ impl RootfsResolver for DirectoryRootfsResolver {
             ));
         }
 
-        verify_manifest(&rootfs, digest)?;
+        verify_manifest(&rootfs, digest, Placement::Cas)?;
         Ok(ResolvedRootfs {
             digest: digest.clone(),
             canonical_path: rootfs,
@@ -224,17 +224,30 @@ pub(crate) fn read_manifest(
     RootfsSpec::parse(&bytes).map_err(ExecutionError::invalid)
 }
 
+/// Where a verified tree sits, which decides the directory modes a v2
+/// manifest requires of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A shared CAS entry (or the importer's staging of one): each
+    /// directory at [`cas_directory_mode`] of its declared mode.
+    Cas,
+    /// One run's copy: each directory at its declared mode.
+    RunCopy,
+}
+
 /// Verify `rootfs` against the manifest `digest` names: its regular files,
 /// each with its content and mode, exactly the manifest's; its symbolic
 /// links, each with its target bytes, exactly the manifest's (none, for
-/// v1); and for v2 its directories, each with its mode, exactly the
-/// manifest's. v1 names no directory, so its directories are returned, not
-/// judged: the CAS resolver accepts any, and a per-run view is held to the
-/// implied set by [`verify_ephemeral_rootfs`](super::volume::verify_ephemeral_rootfs).
+/// v1); and for v2 its directories exactly the manifest's, each at the mode
+/// `placement` requires. v1 names no directory, so its directories are
+/// returned, not judged: the CAS resolver accepts any, and a per-run view
+/// is held to the implied set by
+/// [`verify_ephemeral_rootfs`](super::volume::verify_ephemeral_rootfs).
 /// The tree is walked without following a link before any file is read.
 pub(crate) fn verify_manifest(
     rootfs: &Path,
     digest: &DigestRef,
+    placement: Placement,
 ) -> Result<VerifiedTree, ExecutionError> {
     let spec = read_manifest(rootfs, digest)?;
     let on_disk = collect_rootfs_tree(rootfs)?;
@@ -253,7 +266,20 @@ pub(crate) fn verify_manifest(
             "rootfs files differ from the content-addressed manifest",
         ));
     }
-    if spec.version >= 2 && on_disk.directories != spec.directories {
+    let required = |declared: u32| match placement {
+        Placement::Cas => cas_directory_mode(declared),
+        Placement::RunCopy => declared,
+    };
+    if spec.version >= 2
+        && !on_disk
+            .directories
+            .iter()
+            .map(|(path, mode)| (path, *mode))
+            .eq(spec
+                .directories
+                .iter()
+                .map(|(path, mode)| (path, required(*mode))))
+    {
         return Err(ExecutionError::invalid(
             "rootfs directories or their modes differ from the content-addressed manifest",
         ));

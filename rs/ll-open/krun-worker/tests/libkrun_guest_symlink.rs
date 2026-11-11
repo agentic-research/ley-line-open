@@ -19,7 +19,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use leyline_runtime::artifacts::rootfs_manifest::{FileSpec, RootfsSpec};
+use leyline_runtime::artifacts::rootfs_manifest::{FileSpec, RootfsSpec, cas_directory_mode};
 use leyline_runtime::backends::libkrun::worker::inherit_only;
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
@@ -70,10 +70,15 @@ fn publish_v2(cas: &Path, spec: &RootfsSpec, files: &BTreeMap<&str, Vec<u8>>) ->
     for (path, target) in &spec.symlinks {
         std::os::unix::fs::symlink(target, root.join(path)).expect("rootfs link");
     }
-    // Deepest first, so a directory without owner write is set last.
+    // Deepest first. A CAS entry holds each directory at
+    // `cas_directory_mode` of its declared mode; the run's copy gets the
+    // declared one (`var/spool` 1777 is asserted in the guest).
     for (path, mode) in spec.directories.iter().rev() {
-        fs::set_permissions(root.join(path), fs::Permissions::from_mode(*mode))
-            .expect("directory mode");
+        fs::set_permissions(
+            root.join(path),
+            fs::Permissions::from_mode(cas_directory_mode(*mode)),
+        )
+        .expect("directory mode");
     }
     fs::write(root.join("rootfs.manifest.json"), &manifest).expect("rootfs manifest");
     digest

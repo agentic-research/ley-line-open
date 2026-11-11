@@ -27,7 +27,7 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, openat, read
 use crate::ExecutionError;
 use crate::artifacts::rootfs_manifest::{MANIFEST_FILE_MODE as MANIFEST_MODE, RootfsSpec};
 
-use super::plan::{ROOTFS_MANIFEST, ResolvedRootfs, read_manifest, verify_manifest};
+use super::plan::{Placement, ROOTFS_MANIFEST, ResolvedRootfs, read_manifest, verify_manifest};
 
 /// Materialize a private writable view of an authenticated rootfs.
 ///
@@ -267,7 +267,7 @@ fn ensure_same_entry(before: &rustix::fs::Stat, opened: &OwnedFd) -> Result<(), 
 /// each at 0755. A directory planted or re-moded after materialization is
 /// refused by name.
 pub fn verify_ephemeral_rootfs(rootfs: &ResolvedRootfs) -> Result<(), ExecutionError> {
-    let tree = verify_manifest(&rootfs.canonical_path, &rootfs.digest)?;
+    let tree = verify_manifest(&rootfs.canonical_path, &rootfs.digest, Placement::RunCopy)?;
     let manifest_mode = fs::symlink_metadata(rootfs.canonical_path.join(ROOTFS_MANIFEST))
         .map_err(|error| invalid_io("inspect ephemeral rootfs manifest", error))?
         .permissions()

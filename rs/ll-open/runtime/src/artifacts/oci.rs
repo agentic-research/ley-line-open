@@ -132,14 +132,16 @@ use sha2::{Digest, Sha256};
 
 use super::rootfs_manifest::{
     FileSpec, MANIFEST_FILE_MODE, ROOT_DIRECTORY_MODE, ROOTFS_MANIFEST, RUN_EXEC_SPEC, RootfsSpec,
-    guest_mount_point,
+    cas_directory_mode, guest_mount_point,
 };
 use super::rootfs_tree::{
     FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join,
     under_kernel_mount,
 };
 use crate::DigestRef;
-use crate::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver, verify_manifest};
+use crate::backends::libkrun::plan::{
+    DirectoryRootfsResolver, Placement, RootfsResolver, verify_manifest,
+};
 use crate::cas_volume::{FilesystemSensitivity, probe_sensitivity};
 
 /// The default bound on what one import extracts and writes: 16 GiB.
@@ -699,7 +701,7 @@ pub fn import_oci_layout(
         algorithm: "blake3-256".into(),
         value: written.digest.clone(),
     };
-    verify_manifest(&staged_root, &rootfs).map_err(|error| {
+    verify_manifest(&staged_root, &rootfs, Placement::Cas).map_err(|error| {
         OciImportError::Cas(format!(
             "the staged rootfs does not verify against its own manifest: {}",
             error.detail
@@ -1574,10 +1576,14 @@ impl Writer<'_> {
                     let (mode, cleared) =
                         manifest_directory_mode(self.entry_modes.get(&relative).copied());
                     self.special_mode_bits_cleared += usize::from(cleared);
-                    // Set after its children are written: a mode without
-                    // owner write would have refused them.
-                    fs::set_permissions(&path, fs::Permissions::from_mode(mode))
-                        .map_err(io_error("set a rootfs directory's mode"))?;
+                    // Set after its children are written. The manifest
+                    // keeps the declared mode; the shared CAS entry never
+                    // lets group or other write (see `cas_directory_mode`).
+                    fs::set_permissions(
+                        &path,
+                        fs::Permissions::from_mode(cas_directory_mode(mode)),
+                    )
+                    .map_err(io_error("set a rootfs directory's mode"))?;
                     self.spec.directories.insert(relative, mode);
                 }
                 Final::File(file) => self.file(&path, relative, file)?,

@@ -1081,7 +1081,13 @@ fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
                 );
             }
             1 => {
-                assert_eq!(name, "oci-multilayer-linux-arm64-v1");
+                // The shipped v1 case keeps the name it shipped under.
+                assert_eq!(name, "oci-multilayer-linux-arm64");
+                assert_eq!(
+                    digest,
+                    "be444e4e419e52df2b05c1bf04c748694afb774383b8138911f6e7d305880e07",
+                    "{name}: frozen"
+                );
                 let cas = TempDir::new().expect("cas");
                 let imported =
                     import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());

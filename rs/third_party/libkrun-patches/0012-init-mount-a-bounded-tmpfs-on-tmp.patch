@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 -0600
+Subject: [PATCH] init: mount a bounded tmpfs on /tmp
+
+Init mounted /dev, /proc and /sys, and touched /tmp only in TDX builds,
+so a guest whose rootfs carries no tmp/ entry had no /tmp at all. A
+rootfs imported from an OCI image never does: its manifest lists files,
+so an image's empty tmp/ does not survive. Programs that assume /tmp,
+such as Dolt's sql-server, then fail with "open /tmp: no such file or
+directory".
+
+On every non-TDX boot, init now mounts a tmpfs on /tmp before the
+workload starts. It is mode 1777, nosuid and nodev, and is sized at 25%
+of the guest's RAM, so a write past that bound fails with ENOSPC and
+/tmp cannot take most of the memory the workload was granted. Init
+creates the mount point if the rootfs lacks it, and mounts only over a
+real directory: mount(2) follows a symbolic link, so a /tmp that is a
+link or a file stops the guest instead. The tmpfs is
+memory-backed and lasts one boot, so nothing written there reaches the
+host or outlives the guest. A mount that fails stops the guest before
+the workload runs.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+---
+diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
+index 1f4b89d..753916a 100644
+--- a/src/init_blob/init/init.c
++++ b/src/init_blob/init/init.c
+@@ -542,6 +542,58 @@ static int chroot_luks()
+ }
+ #endif
+ 
++#if __linux__ && !defined(TDX)
++/*
++ * A writable /tmp for the workload, which POSIX programs assume and which a
++ * rootfs need not carry (an image's empty tmp/ holds no file, so a rootfs
++ * built from it has none): a tmpfs, mode 1777 like any /tmp, nosuid and
++ * nodev, mounted before the workload starts. It is memory-backed and
++ * per-boot, so nothing written there outlives the guest or reaches the
++ * host, and it adds no reach. Whatever the rootfs holds under tmp/ is
++ * hidden beneath it.
++ *
++ * Its size is bounded at TMP_SIZE_PERCENT of the guest's RAM. tmpfs pages
++ * count against the guest's memory, which the hypervisor bounds; the
++ * kernel's default of half of RAM would let /tmp alone take half of what
++ * the workload was granted. A quarter gives a database or a build room for
++ * its scratch files. A write past the bound fails with ENOSPC. /dev/shm
++ * keeps the kernel default, so the two together can pin three quarters of
++ * the guest's RAM; either way the guest cannot exceed what its grant sized
++ * the VM at, and the bound is a usability limit inside the guest, which
++ * the workload can remount, not a security boundary.
++ *
++ * TDX builds use /tmp for their root volume and keep upstream's handling.
++ */
++#define TMP_SIZE_PERCENT 25
++
++static int mount_tmp(void)
++{
++    char options[32];
++    struct stat existing;
++
++    if (mkdir("/tmp", 01777) < 0 && errno != EEXIST) {
++        perror("mkdir(/tmp)");
++        return -1;
++    }
++    /*
++     * mount(2) follows a symbolic link in its target, so a rootfs whose
++     * tmp is a link would get the tmpfs wherever the link points. Only a
++     * real directory is mounted over; anything else stops the guest.
++     */
++    if (lstat("/tmp", &existing) < 0 || !S_ISDIR(existing.st_mode)) {
++        printf("/tmp is not a directory, refusing to mount over it\n");
++        return -1;
++    }
++    snprintf(options, sizeof(options), "mode=1777,size=%d%%", TMP_SIZE_PERCENT);
++    if (mount("tmpfs", "/tmp", "tmpfs", MS_NODEV | MS_NOSUID | MS_RELATIME,
++              options) < 0) {
++        perror("mount(/tmp)");
++        return -1;
++    }
++    return 0;
++}
++#endif
++
+ static int mount_filesystems()
+ {
+ #if __linux__
+@@ -614,6 +666,12 @@ static int mount_filesystems()
+         return -1;
+     }
+ 
++#ifndef TDX
++    if (mount_tmp() < 0) {
++        return -1;
++    }
++#endif
++
+     /* May fail if already exists and that's fine. */
+     symlink("/proc/self/fd", "/dev/fd");
+ #endif
+--
+2.50.1 (Apple Git-155)
+

@@ -211,12 +211,8 @@ pub fn read_header(path: &Path) -> Result<Option<ControlHeader>> {
 /// function does not look.
 pub fn reinitialize(path: &Path) -> Result<()> {
     use std::io::Write;
-    let name = path
-        .file_name()
-        .with_context(|| format!("control block path {} has no file name", path.display()))?;
-    let mut staged_name = std::ffi::OsString::from(".");
-    staged_name.push(name);
-    staged_name.push(format!(".reinit.{}", std::process::id()));
+    let mut staged_name = staging_prefix(path)?;
+    staged_name.push(std::process::id().to_string());
     // A sibling, so the rename stays within one directory (and filesystem).
     let staged = path.with_file_name(staged_name);
 
@@ -251,6 +247,57 @@ pub fn reinitialize(path: &Path) -> Result<()> {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// `.<name>.reinit.`: the name [`reinitialize`] stages a fresh block under,
+/// before the pid that staged it.
+fn staging_prefix(path: &Path) -> Result<std::ffi::OsString> {
+    let name = path
+        .file_name()
+        .with_context(|| format!("control block path {} has no file name", path.display()))?;
+    let mut prefix = std::ffi::OsString::from(".");
+    prefix.push(name);
+    prefix.push(".reinit.");
+    Ok(prefix)
+}
+
+/// Remove the staging files [`reinitialize`] left beside the control block
+/// at `path` when it stopped between writing one and renaming it over the
+/// block (a crash), and return their paths. Each is `.<name>.reinit.<pid>`;
+/// a later reset stages under its own pid, so nothing else ever reaps them
+/// (bead `ley-line-open-40594e`).
+///
+/// The caller must exclude every other reinitialise of this block for the
+/// call (the daemon holds the block's lease exclusively): a staging file
+/// another live reset is writing would otherwise be removed under it.
+pub fn remove_stale_reinit_staging(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let prefix = staging_prefix(path)?;
+    let dir = Path::new(".").join(path.parent().unwrap_or(Path::new("")));
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("list {}", dir.display())),
+    };
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("list {}", dir.display()))?;
+        let name = entry.file_name();
+        let Some(pid) = name
+            .as_encoded_bytes()
+            .strip_prefix(prefix.as_encoded_bytes())
+        else {
+            continue;
+        };
+        if pid.is_empty() || !pid.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        // No other reset runs (the caller's exclusive lease), so nothing
+        // removes the file between the listing and here.
+        let stale = path.with_file_name(&name);
+        std::fs::remove_file(&stale).with_context(|| format!("remove {}", stale.display()))?;
+        removed.push(stale);
+    }
+    Ok(removed)
 }
 
 impl Controller {
@@ -1566,6 +1613,57 @@ mod tests {
             1,
             "no staging file left behind"
         );
+    }
+
+    /// Bead `ley-line-open-40594e`: a crashed reset's `.<name>.reinit.<pid>`
+    /// is removed, and only that shape of name for this block.
+    #[test]
+    fn remove_stale_reinit_staging_removes_only_this_blocks_staging_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c.ctrl");
+        let keep = [
+            "c.ctrl",
+            ".c.ctrl.reinit.",
+            ".c.ctrl.reinit.12a",
+            ".d.ctrl.reinit.7",
+            "c.ctrl.reinit.7",
+        ];
+        for name in keep
+            .iter()
+            .chain(&[".c.ctrl.reinit.7", ".c.ctrl.reinit.4242"])
+        {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let mut removed = remove_stale_reinit_staging(&path).unwrap();
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![
+                dir.path().join(".c.ctrl.reinit.4242"),
+                dir.path().join(".c.ctrl.reinit.7")
+            ]
+        );
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut want: Vec<String> = keep.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(left, want);
+        assert_eq!(
+            remove_stale_reinit_staging(&dir.path().join("missing/c.ctrl")).unwrap(),
+            Vec::<std::path::PathBuf>::new(),
+            "a directory that does not exist holds nothing to remove"
+        );
+        // A parent that is not a directory, and a staging name that is not
+        // a removable file, are errors, never "nothing to remove".
+        let not_a_dir = dir.path().join("plain");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert!(remove_stale_reinit_staging(&not_a_dir.join("c.ctrl")).is_err());
+        std::fs::create_dir(dir.path().join(".c.ctrl.reinit.9")).unwrap();
+        let err = remove_stale_reinit_staging(&path).unwrap_err();
+        assert!(format!("{err:#}").contains(".c.ctrl.reinit.9"), "{err:#}");
     }
 
     /// `read_header`'s edges: a file shorter than a block is fresh (`None`),

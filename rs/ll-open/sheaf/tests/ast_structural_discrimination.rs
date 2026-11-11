@@ -75,8 +75,11 @@ fn accumulate(items: &[i64]) -> i64 {
 }
 ";
 
-/// Cosmetic RENAME (`total` → `running_sum`) — derived facts unchanged.
-/// This is the case that inverted the byte stalk in Rung 1.
+/// Cosmetic RENAME (`total` → `running_sum`) — call-target facts unchanged.
+/// This is the case that inverted the byte stalk in Rung 1. Since
+/// extraction epoch 6 (bead `ley-line-open-a9ff82`) the block's tail
+/// expression `total` is a VALUE ref, so the rename moves exactly that
+/// one `node_refs` token; `oracle_confirms_fixture_labels` pins the delta.
 const AFTER_RENAME: &str = "\
 fn accumulate(items: &[i64]) -> i64 {
     let mut running_sum = 0;
@@ -202,10 +205,10 @@ fn structural_stalk_separates_cosmetic_from_meaningful() {
     eprintln!("--- Rung-2 Milestone A: AST-structural stalk discrimination ---");
     eprintln!("small region:");
     eprintln!("  cosmetic whitespace  d/D = {d_ws:.4}   (facts unchanged)");
-    eprintln!("  cosmetic rename      d/D = {d_rename:.4}   (facts unchanged)");
+    eprintln!("  cosmetic rename      d/D = {d_rename:.4}   (call-target facts unchanged)");
     eprintln!("  meaningful (+branch) d/D = {d_meaningful:.4}   (facts changed)");
     eprintln!("big region:");
-    eprintln!("  cosmetic rename      d/D = {big_rename:.4}   (facts unchanged)");
+    eprintln!("  cosmetic rename      d/D = {big_rename:.4}   (call-target facts unchanged)");
     eprintln!("  meaningful (±branch) d/D = {big_meaningful:.4}   (facts changed)");
     eprintln!("EPS_FRAC = {EPS_FRAC} (cosine ≈ 0.95)");
 
@@ -271,10 +274,22 @@ fn oracle_confirms_fixture_labels() {
         derive_facts(AFTER_COSMETIC_WS.as_bytes()),
         "whitespace reflow must not change derived facts",
     );
+    // A local rename leaves every def and call-target fact alone. Since
+    // extraction epoch 6 (bead `ley-line-open-a9ff82`) a local read in
+    // value position is a `node_refs` token too, so the rename moves
+    // exactly the tail expression's value ref and nothing else.
+    let before = derive_facts(BEFORE.as_bytes());
+    let renamed = derive_facts(AFTER_RENAME.as_bytes());
     assert_eq!(
-        derive_facts(BEFORE.as_bytes()),
-        derive_facts(AFTER_RENAME.as_bytes()),
-        "a local rename must not change derived facts (defs/refs are token sets)",
+        (
+            before.difference(&renamed).cloned().collect::<Vec<_>>(),
+            renamed.difference(&before).cloned().collect::<Vec<_>>(),
+        ),
+        (
+            vec!["ref\u{1f}total\u{1f}".to_string()],
+            vec!["ref\u{1f}running_sum\u{1f}".to_string()],
+        ),
+        "a local rename must change only the renamed local's value ref",
     );
     assert_ne!(
         derive_facts(BEFORE.as_bytes()),

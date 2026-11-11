@@ -42,14 +42,14 @@ struct Head {
   # re-hashing.
   segmentBytes @3 :UInt64;
 
-  # Unified code-fact IR (ADR-0027 / mache ADR-0023): count of
-  # `fact_edges` rows whose `dst` is NULL because a reference/call token
-  # did not resolve to a definition symbol in this db. A binding-fidelity
-  # ratchet: the W5 gate asserts this stays <= baseline, so a producer
-  # change that silently drops resolution shows up as a rising count
-  # rather than a silently-zeroed downstream JOIN (the be6136 lesson).
-  # Zero for a db with no IR tables. Counted over the whole db post-
-  # COMMIT, so it reflects the full graph, not just this run's delta.
+  # The count of `node_refs` rows whose `token` has no `node_defs` row in
+  # this db: references that resolve to no definition. Recounted over the
+  # whole db by every parse pass that changes `node_refs` or `node_defs`
+  # (a pass that changes neither carries the count recorded with them), and
+  # stored with the rows as `_meta.unbound_facts` (docs/TABLE_CONTRACT.md).
+  # It depends on the extraction epoch: an epoch that emits more refs (epoch
+  # 6, value refs) raises it with no change in resolution. Zero for a db
+  # with no refs tables. A diagnostic; no gate in LLO ratchets it.
   unboundFacts @4 :UInt64;
 
   # Signature over the canonical head digest — NOT over rootHash alone.

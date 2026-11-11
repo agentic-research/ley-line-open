@@ -3,7 +3,8 @@
 //! Follows the `leyline-sign` (rs/ll-open/sign/src/ffi.rs) pattern:
 //! buffer-based API, return conventions:
 //! - `>= 0`: bytes written to output buffer (always 32 for hash fns)
-//! - `-1`:  error (null pointer, output buffer too small)
+//! - `-1`:  error (null pointer, output buffer too small; for
+//!   `leyline_derive_key` also an empty or non-UTF-8 context)
 
 use leyline_core::substrate::{ContentAddressed, derive_key};
 use leyline_ffi_helpers::{c_input, c_output};

@@ -53,7 +53,7 @@ pub const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v0.11.0 release advances both. Binary-only releases leave this literal
 /// unchanged; a public consumer-contract release requires a matching nested
 /// Go-module tag.
-pub const SCHEMA_VERSION: &str = "0.28.0";
+pub const SCHEMA_VERSION: &str = "0.29.0";
 
 /// Current major version of the JSON wire envelope shape. Bumps on
 /// incompatible changes (renames, removals, type changes); additions
@@ -223,13 +223,30 @@ pub const IR_SCHEMA_VERSION: &str = "merkle-ast-v3";
 ///   raw_kind)`: an injected-language occurrence has no `_ast` row, and this
 ///   is where its language and grammar kind live (bead
 ///   `ley-line-open-cc5c55`). A v11 arena is refused at parse open.
+/// - `projection-v13` — comments are `_ast` occurrences (extraction epoch 7,
+///   bead `ley-line-open-aa1634`). No table or column moves, but two
+///   documented consumer invariants break: an `_ast` child no longer always
+///   has a `node_edge` from its parent (a comment's leaf `node_content` row
+///   is its own root), and `nid` order is no longer document order (a file's
+///   comments take the ordinals after its code, which keeps code nids
+///   stable under comment edits). A v12 reader would silently mis-index
+///   every file with a comment, so a v12 arena is refused at parse open and
+///   a v12 consumer must refuse v13. `node_hash` (merkle-ast-v3) and
+///   `storeRoot` do not move; `parserId` does; `Head.rootHash` moves for a
+///   file with a comment, whose `AstNode` records join `.ast.capnp`.
 ///
-/// Bump on ANY table added or removed, or column added or removed. Two
+/// Bump on ANY table added or removed, or column added or removed, and on
+/// any row-set change that breaks a documented consumer invariant, such as
+/// "every `_ast` child has a `node_edge`" or "`nid` order is document order"
+/// (v13). A purely additive row-set change that breaks no such invariant —
+/// new fact rows, as at extraction epoch 6 — moves only `EXTRACTION_EPOCH`,
+/// and with it `parserId`; a consumer that depends on the row set reads
+/// `_meta.extraction_epoch`. Two
 /// changes in flight at once need two numbers: v3 and v4 landed in the same
 /// window, and both first claimed v3 — a clean textual merge, because both
 /// wrote the same string, describing two different table shapes. A consumer
 /// reading that would have had no way to tell which one it held.
-pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v12";
+pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v13";
 
 /// Current major of the JSON wire shape; its history is documented above,
 /// beside the module's version facts. Pinned by

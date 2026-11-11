@@ -189,4 +189,16 @@ exclude_re = [
     # the same operation to the same syscall. The sibling `| -> &` mutation
     # yields 0, an invalid operation, and is killed by every lease test.
     'control_lease\.rs.*replace \| with \^ in try_flock',
+
+    # The reader pool's `ReaderManager::is_valid` (bead
+    # `ley-line-open-3befbc`) mutated to `Ok(())`.
+    #
+    # It delegates to `r2d2_sqlite::SqliteConnectionManager::is_valid`, which
+    # without r2d2_sqlite's `is-valid` feature (cli-lib does not enable it)
+    # runs `execute_batch("")`: no statement, always `Ok(())` on an open
+    # connection. The mutated program returns the same value from the same
+    # input. The method exists only because `r2d2::ManageConnection` has no
+    # default for it; the manager's behaviour is `has_broken`, whose mutants
+    # are killed by `db_pool`'s tests.
+    'db_pool\.rs.*replace <impl r2d2::ManageConnection for ReaderManager>::is_valid -> .* with Ok\(\(\)\)',
 ]

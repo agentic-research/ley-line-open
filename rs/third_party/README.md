@@ -128,7 +128,12 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     refused, and another ABI's system call ends the process; a kernel that
     refuses the filter stops the guest. The worker computes the list from
     the attested confinement document (§6 `guestPort`; ADR-0046 Q7, bead
-    `ley-line-open-be3711`).
+    `ley-line-open-be3711`). A host peer that connects to a serve channel
+    before the workload listens is held, and the workload's port retried
+    (backoff 5 ms to 200 ms, `SERVE_HOLD_MS` = 10 s in all, ending early
+    if the peer hangs up), so its first connection works once the workload
+    listens; at the bound the connection is closed, which a macOS UNIX
+    socket peer sees as end-of-file (bead `ley-line-open-a915e3`).
 11. `0011` — **devices/vsock: bind a listening mapping's host socket before
     the guest starts.** The muxer thread bound it when the device
     activated, inside a running guest, and only logged a socket it could
@@ -136,6 +141,16 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     `ley-line-open-bb2143`). The sockets are now bound when the device is
     created, owner-only (a 077 umask around the bind), and a failure
     returns `-EADDRNOTAVAIL` from `krun_start_enter`.
+12. `0012` — **init: mount a bounded tmpfs on /tmp.** Upstream's init
+    touched `/tmp` only in TDX builds, so a guest whose rootfs carries no
+    `tmp/` had none. A rootfs imported from an OCI image never carries
+    one, because its manifest lists files and an empty `tmp/` does not
+    survive. Dolt's `sql-server` then failed with "open /tmp: no such file
+    or directory" (bead `ley-line-open-db5899`). On every non-TDX boot,
+    init now mounts a tmpfs on `/tmp` before the workload starts. It has
+    mode 1777, `nosuid` and `nodev`, and is sized at 25 % of the guest's
+    RAM (`TMP_SIZE_PERCENT`), so a write past that fails `ENOSPC`. A mount
+    that fails stops the guest.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

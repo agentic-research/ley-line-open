@@ -8,6 +8,7 @@ pub mod artifacts;
 pub mod authorization;
 pub mod backends;
 pub mod cas_evidence;
+pub mod cas_volume;
 mod catalog;
 pub mod confinement;
 mod error;
@@ -26,8 +27,8 @@ pub use error::{ErrorCode, ExecutionError};
 pub use model::{
     BackendCapabilities, BackendClass, BackendEvidenceDocument, BackendRun, BackendRunStatus,
     CeilingMechanism, CpuLimits, DEFAULT_CPU_PERIOD_US, DigestRef, EnforcedCeilings,
-    ExecutionRequest, MemoryLimits, PidsLimits, ReceiptContext, ResourceLimits, RunEventRecord,
-    RunInspection, RunReceiptData, RunRecord, RunState, WorkerChannel, WorkspaceGrant,
-    WorkspaceOperation,
+    ExecutionRequest, GuestOutput, MemoryLimits, PidsLimits, ReceiptContext, ResourceLimits,
+    RunEventRecord, RunInspection, RunOutcome, RunReceiptData, RunRecord, RunState, WorkerChannel,
+    WorkspaceGrant, WorkspaceOperation,
 };
 pub use service::{Backend, ExecutionResolver, ExecutionService};

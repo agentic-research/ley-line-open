@@ -103,7 +103,10 @@ else
         echo "unchanged schema tag $schema_tag is not published" >&2
         exit 1
     fi
-    "$git_bin" diff --quiet "$schema_tag" -- clients/go/leyline-schema
+    if ! release_schema_surface_unchanged "$git_bin" "$schema_tag"; then
+        echo "the public schema surface differs from $schema_tag" >&2
+        exit 1
+    fi
 fi
 
 if [ -z "$root_remote_commit" ]; then

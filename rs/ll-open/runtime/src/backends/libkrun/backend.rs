@@ -12,8 +12,10 @@ use tempfile::Builder as TempDirBuilder;
 
 use crate::{
     Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
-    ExecutionRequest,
+    ExecutionRequest, GuestOutput,
 };
+
+use super::output::OutputCapture;
 
 use super::super::process::{
     SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
@@ -67,8 +69,11 @@ pub struct KrunWorkerBackend {
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
-    completed: Arc<Mutex<HashMap<String, BackendRunStatus>>>,
+    completed: Arc<Mutex<HashMap<String, crate::RunOutcome>>>,
     completion_cv: Arc<Condvar>,
+    /// What each active run has printed (bead `ley-line-open-a26ad0`):
+    /// published with the run in `children`, retired with it.
+    outputs: Arc<Mutex<HashMap<String, Arc<OutputCapture>>>>,
 }
 
 struct WorkerControl {
@@ -87,7 +92,28 @@ impl KrunWorkerBackend {
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             completion_cv: Arc::new(Condvar::new()),
+            outputs: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Wait, at most `timeout`, until what the active run `run_id` has
+    /// printed satisfies `until`, and return it: an event-driven way for an
+    /// embedder to wait for a served guest to announce itself. Returns the
+    /// output seen last when the run's streams end or the timeout passes
+    /// first, and an error when `run_id` is not active. `until` runs under
+    /// the run's capture lock, so it must not call [`Backend::output`] for
+    /// the same run.
+    pub fn wait_for_output(
+        &self,
+        run_id: &str,
+        until: &dyn Fn(&GuestOutput) -> bool,
+        timeout: Duration,
+    ) -> Result<GuestOutput, ExecutionError> {
+        let capture =
+            self.outputs.lock().get(run_id).cloned().ok_or_else(|| {
+                ExecutionError::invalid(format!("run_id is not active: {run_id}"))
+            })?;
+        Ok(capture.wait(until, Instant::now() + timeout))
     }
 
     /// Serve each run's granted workspace from `shares` (ADR-0044 V5).
@@ -197,10 +223,17 @@ impl KrunWorkerBackend {
     /// lifecycle synchronization point; callers must not infer completion by
     /// watching the ephemeral filesystem or sleeping for a guessed duration.
     pub fn wait_for_completion(&self, run_id: &str) -> Result<BackendRunStatus, ExecutionError> {
+        Ok(self.wait_for_outcome(run_id)?.status)
+    }
+
+    /// [`Self::wait_for_completion`] with the run's guest output alongside
+    /// its status: the typed [`crate::RunOutcome`], whose `output` holds the
+    /// bounded, sanitized, untrusted tails of a finished or failed run.
+    pub fn wait_for_outcome(&self, run_id: &str) -> Result<crate::RunOutcome, ExecutionError> {
         let mut completed = self.completed.lock();
         loop {
-            if let Some(status) = completed.remove(run_id) {
-                return Ok(status);
+            if let Some(outcome) = completed.remove(run_id) {
+                return Ok(outcome);
             }
             if !self.children.lock().contains_key(run_id) {
                 return Err(ExecutionError::invalid(format!(
@@ -281,7 +314,10 @@ impl Backend for KrunWorkerBackend {
             .arg("--run-root")
             .arg(rootfs.path())
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            // The guest's console. Read from spawn on, so a guest that
+            // prints never blocks on a full pipe, and kept bounded
+            // (`output::OutputCapture`).
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for path in &self.config.runtime_files {
             command.arg("--runtime-file").arg(path);
@@ -342,6 +378,14 @@ impl Backend for KrunWorkerBackend {
                 ));
             }
         };
+        // What the run prints, from its first byte. Both drains end at the
+        // worker's exit, when the process group is killed and its pipes
+        // close.
+        let capture = Arc::new(OutputCapture::new());
+        if let Some(stdout) = child.stdout.take() {
+            let capture = Arc::clone(&capture);
+            std::thread::spawn(move || capture.drain_guest(stdout));
+        }
         // The worker holds its end now; dropping ours makes the worker's
         // exit the share's end of stream, which ends the serving thread.
         if let Some((service, daemon_end, worker_end)) = share {
@@ -412,11 +456,15 @@ impl Backend for KrunWorkerBackend {
             }
         };
         let (event_tx, event_rx) = mpsc::sync_channel(1);
+        let worker_capture = Arc::clone(&capture);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             let result = read_readiness_line(&mut reader);
             let _ = event_tx.send(result);
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            // After readiness: the worker's terminal `failed` event, if it
+            // fails, and libkrun's diagnostics, kept bounded. The reader's
+            // buffer may already hold some of it.
+            worker_capture.drain_worker(reader);
         });
 
         let line = match event_rx.recv_timeout(self.config.ready_timeout) {
@@ -544,6 +592,9 @@ impl Backend for KrunWorkerBackend {
         let (cancel_tx, cancel_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let run_id = request.run_id.clone();
+        self.outputs
+            .lock()
+            .insert(run_id.clone(), Arc::clone(&capture));
         self.children.lock().insert(
             run_id.clone(),
             WorkerControl {
@@ -551,6 +602,7 @@ impl Backend for KrunWorkerBackend {
                 finished: finished_rx,
             },
         );
+        let outputs = Arc::clone(&self.outputs);
         let children = Arc::clone(&self.children);
         let cleanup_errors = Arc::clone(&self.cleanup_errors);
         let completed = Arc::clone(&self.completed);
@@ -566,6 +618,22 @@ impl Backend for KrunWorkerBackend {
             if let Err(error) = &result {
                 cleanup_errors.lock().push(error.clone());
             }
+            // What the guest printed, once its streams have ended, travels
+            // with the terminal status as a typed `RunOutcome`. A failure
+            // keeps the supervisor's classification and also carries the
+            // tails in its detail. The live capture is released.
+            let output = capture.settle();
+            let status = match result.clone() {
+                Ok(()) => BackendRunStatus::Succeeded,
+                Err(error) => {
+                    BackendRunStatus::Failed(super::output::failure_with_output(error, &output))
+                }
+            };
+            let outcome = crate::RunOutcome {
+                status,
+                output: Some(output),
+            };
+            outputs.lock().remove(&run_id);
             // Retire the run and publish its completion as one step, under
             // the lock `wait_for_completion` holds while it reads `children`
             // (the native backend explains the race; bead
@@ -573,13 +641,7 @@ impl Backend for KrunWorkerBackend {
             {
                 let mut completed = completed.lock();
                 children.lock().remove(&run_id);
-                completed.insert(
-                    run_id,
-                    match result.clone() {
-                        Ok(()) => BackendRunStatus::Succeeded,
-                        Err(error) => BackendRunStatus::Failed(error),
-                    },
-                );
+                completed.insert(run_id, outcome);
             }
             completion_cv.notify_all();
             let _ = finished_tx.send(result);
@@ -594,7 +656,16 @@ impl Backend for KrunWorkerBackend {
     }
 
     fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        Ok(self.poll_outcome(run_id)?.map(|outcome| outcome.status))
+    }
+
+    fn poll_outcome(&self, run_id: &str) -> Result<Option<crate::RunOutcome>, ExecutionError> {
         Ok(self.completed.lock().remove(run_id))
+    }
+
+    fn output(&self, run_id: &str) -> Option<GuestOutput> {
+        let capture = self.outputs.lock().get(run_id).cloned()?;
+        Some(capture.snapshot())
     }
 
     fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
@@ -637,10 +708,13 @@ mod tests {
             ready_timeout: Duration::from_secs(1),
             tsi_hijack_inet: false,
         });
-        backend
-            .completed
-            .lock()
-            .insert("run-1".into(), BackendRunStatus::Succeeded);
+        backend.completed.lock().insert(
+            "run-1".into(),
+            crate::RunOutcome {
+                status: BackendRunStatus::Succeeded,
+                output: None,
+            },
+        );
         assert!(matches!(
             Backend::poll(&backend, "run-1").expect("poll"),
             Some(BackendRunStatus::Succeeded)

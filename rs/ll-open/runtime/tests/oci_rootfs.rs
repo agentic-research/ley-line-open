@@ -19,6 +19,7 @@ use leyline_runtime::artifacts::oci::{
 };
 use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver};
 use leyline_runtime::backends::libkrun::volume::materialize_ephemeral_rootfs;
+use leyline_runtime::cas_volume::{FilesystemSensitivity, probe_sensitivity};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -1034,6 +1035,43 @@ fn the_fixture_rootfs_identity_is_a_known_answer() {
     assert_eq!(imported.rootfs.value, FIXTURE_ARM64_ROOTFS);
 }
 
+/// The rootfs digest's published known-answer vector (ADR-0047 §3, bead
+/// `ley-line-open-39309e`): its digest is σ_bytes over its manifest bytes,
+/// and the importer writes exactly those bytes for the checked-in fixture,
+/// so a second implementation can check its manifest serialization and its
+/// digest independently.
+#[test]
+fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ll-core/schema-spec/execution/v1/test-vectors/rootfs-manifest.json");
+    let vector: Value = serde_json::from_slice(&fs::read(&path).expect("the vector")).unwrap();
+    let cases = vector["cases"].as_array().expect("cases");
+    assert!(!cases.is_empty(), "the vector holds no case");
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let manifest = case["manifest"].as_str().expect("manifest bytes, as text");
+        let digest = case["digest"].as_str().expect("digest");
+        assert_eq!(
+            blake3::hash(manifest.as_bytes()).to_hex().as_str(),
+            digest,
+            "{name}: the digest is BLAKE3 over the manifest's exact bytes"
+        );
+        assert_eq!(
+            name, "oci-multilayer-linux-arm64",
+            "the one case is the fixture's"
+        );
+        assert_eq!(digest, FIXTURE_ARM64_ROOTFS, "{name}");
+        let cas = TempDir::new().expect("cas");
+        let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
+        let written = manifest_bytes(cas.path(), &imported.rootfs);
+        assert_eq!(
+            String::from_utf8(written).expect("UTF-8 manifest"),
+            manifest,
+            "{name}: the importer's manifest bytes"
+        );
+    }
+}
+
 #[test]
 fn provenance_reports_the_image_config_platform() {
     let scratch = TempDir::new().expect("scratch");
@@ -1687,8 +1725,10 @@ fn device_nodes_anywhere_else_are_still_refused_by_name() {
         (char_device("etc/console", 5, 1), "etc/console"),
         (block_device("var/disk", 8, 0), "var/disk"),
         (fifo("run/initctl"), "run/initctl"),
-        // `tmp` is not a kernel mount: init.c mounts nothing there on Linux.
-        (char_device("tmp/null", 1, 3), "tmp/null"),
+        // `var/tmp` is not `/tmp`: only the top-level directory is mounted.
+        (char_device("var/tmp/null", 1, 3), "var/tmp/null"),
+        // The tmpfs mount point itself.
+        (fifo("tmp"), "tmp"),
         // A name that merely begins with `dev` is not under /dev.
         (char_device("devices/null", 1, 3), "devices/null"),
         // The mount point itself: init could not mount over a device.
@@ -1719,6 +1759,42 @@ fn device_nodes_anywhere_else_are_still_refused_by_name() {
         Err(OciImportError::UnsafePath { path, .. }) => assert_eq!(path, "dev/console"),
         other => panic!("expected UnsafePath, got {other:?}"),
     }
+}
+
+/// The guest init mounts a tmpfs over /tmp before the workload runs (LLO
+/// patch 0012, bead ley-line-open-db5899), so `tmp/` follows the
+/// kernel-mounted rules: a device or FIFO beneath it is dropped, and a link
+/// into it (a distro's `var/tmp -> /tmp`) is dropped under resolve, since
+/// the guest's walk ends in the empty tmpfs, not in the image's bytes. A
+/// regular file beneath it is still imported, shadowed in the guest, as
+/// under `dev/`.
+#[test]
+fn tmp_is_kernel_mounted_for_devices_and_links() {
+    let (scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            file("tmp/seed", 0o644, b"image bytes"),
+            fifo("tmp/pipe"),
+            symlink("var/tmp", "/tmp"),
+            symlink("seed-link", "/tmp/seed"),
+        ])],
+        SymlinkPolicy::Resolve,
+    );
+    let imported = result.expect("an image with tmp/ entries imports under resolve");
+    assert_eq!(
+        dropped_entries(&imported),
+        [(0, "tmp/pipe", SpecialEntryKind::Fifo)]
+    );
+    assert_eq!(
+        dropped_links(&imported.links_dropped_kernel_mount),
+        [("seed-link", "/tmp/seed"), ("var/tmp", "/tmp")]
+    );
+    let files = manifest_files(&scratch.path().join("cas"), &imported.rootfs);
+    assert!(
+        files.contains_key("tmp/seed"),
+        "a regular file under tmp/ is imported: {files:?}"
+    );
+    assert!(!files.contains_key("seed-link") && !files.contains_key("var/tmp"));
 }
 
 #[test]
@@ -1922,6 +1998,126 @@ fn a_hard_link_to_a_dropped_device_is_refused() {
     }
 }
 
+/// A Zarf package's `images/` directory as oras-go writes it (bead
+/// `ley-line-open-97b636`): an OCI image layout holding several images
+/// whose blobs are shared, and an `index.json` naming each image manifest
+/// by its full reference (`org.opencontainers.image.ref.name`, plus Zarf's
+/// `org.opencontainers.image.base.name`). Returns the package root and
+/// each image's (reference, manifest digest).
+fn zarf_package(root: &Path) -> Vec<(String, String)> {
+    fs::create_dir_all(root).expect("package root");
+    fs::write(
+        root.join("zarf.yaml"),
+        "kind: ZarfPackageConfig\nmetadata:\n  name: fixture\ncomponents:\n  - name: app\n    images:\n      - ghcr.io/example/app:1.0\n      - ghcr.io/example/tool:2.0\n",
+    )
+    .expect("zarf.yaml");
+    let layout = Layout::create(&root.join("images"));
+    let shared = Layer::gzip(vec![
+        dir("etc/", 0o755),
+        file("etc/os-release", 0o644, b"ID=fixture\n"),
+    ]);
+    let app = layout.image(
+        "linux",
+        "arm64",
+        &[
+            Layer::gzip(shared.entries.clone()),
+            Layer::plain(vec![dir("bin/", 0o755), file("bin/app", 0o755, b"app\n")]),
+        ],
+        None,
+    );
+    let tool = layout.image(
+        "linux",
+        "arm64",
+        &[
+            Layer::gzip(shared.entries.clone()),
+            Layer::plain(vec![dir("bin/", 0o755), file("bin/tool", 0o755, b"tool\n")]),
+        ],
+        None,
+    );
+    let images = [
+        ("ghcr.io/example/app:1.0", app),
+        ("ghcr.io/example/tool:2.0", tool),
+    ];
+    let listed: Vec<Value> = images
+        .iter()
+        .map(|(reference, descriptor)| {
+            let mut value = descriptor.json();
+            value["annotations"] = serde_json::json!({
+                "org.opencontainers.image.base.name": reference,
+                "org.opencontainers.image.ref.name": reference,
+            });
+            value
+        })
+        .collect();
+    fs::write(
+        root.join("images/index.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX,
+            "manifests": listed,
+        }))
+        .unwrap(),
+    )
+    .expect("index.json");
+    images
+        .into_iter()
+        .map(|(reference, descriptor)| (reference.to_string(), descriptor.digest))
+        .collect()
+}
+
+#[test]
+fn a_zarf_package_images_directory_imports_as_a_layout() {
+    let scratch = TempDir::new().expect("scratch");
+    let package = scratch.path().join("package");
+    let images = zarf_package(&package);
+    // Both layers of each image are in one blobs/sha256, the first shared.
+    let blobs = fs::read_dir(package.join("images/blobs/sha256"))
+        .unwrap()
+        .count();
+    assert_eq!(blobs, 7, "two configs, two manifests, three layers");
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).expect("cas");
+    let mut rootfs = Vec::new();
+    for (reference, digest) in &images {
+        // The reference Zarf records, re-pinned by its digest: the name is a
+        // label, the digest selects.
+        let name = reference.rsplit_once(':').unwrap().0;
+        let pinned = format!("{name}@{digest}");
+        let imported = import(
+            &package.join("images"),
+            &pinned,
+            Platform::linux("arm64"),
+            SymlinkPolicy::Refuse,
+            &cas,
+        )
+        .unwrap_or_else(|error| panic!("{pinned}: {error}"));
+        assert_eq!(&imported.image.reference, digest);
+        assert_eq!(&imported.image.manifest, digest);
+        let files = manifest_files(&cas, &imported.rootfs);
+        assert!(files.contains_key("etc/os-release"), "{files:?}");
+        rootfs.push((
+            files.keys().cloned().collect::<Vec<_>>(),
+            imported.rootfs.value,
+        ));
+    }
+    assert_eq!(rootfs[0].0, vec!["bin/app", "etc/os-release"]);
+    assert_eq!(rootfs[1].0, vec!["bin/tool", "etc/os-release"]);
+    assert_ne!(rootfs[0].1, rootfs[1].1);
+    // The tags in index.json are never read: one is still refused.
+    let error = import(
+        &package.join("images"),
+        "ghcr.io/example/app:1.0",
+        Platform::linux("arm64"),
+        SymlinkPolicy::Refuse,
+        &cas,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, OciImportError::MutableReference(_)),
+        "{error}"
+    );
+}
+
 #[test]
 fn dropped_entries_are_reported_by_normalized_path_and_reuse_one_cas_entry() {
     let scratch = TempDir::new().expect("scratch");
@@ -2110,4 +2306,150 @@ fn first_party_images_import_deterministically_under_resolve() {
             "{name}: the known answer"
         );
     }
+}
+
+/// Debian's perl ships `Pod/` and `pod/` side by side (bead
+/// `ley-line-open-ba86d3`): two image paths that differ only by case.
+fn case_colliding_layers() -> Vec<Layer> {
+    vec![Layer::gzip(vec![
+        dir("usr", 0o755),
+        dir("usr/share", 0o755),
+        dir("usr/share/perl", 0o755),
+        dir("usr/share/perl/Pod", 0o755),
+        file(
+            "usr/share/perl/Pod/Usage.pm",
+            0o644,
+            b"package Pod::Usage;\n",
+        ),
+        dir("usr/share/perl/pod", 0o755),
+        file(
+            "usr/share/perl/pod/perlfunc.pod",
+            0o644,
+            b"=head1 perlfunc\n",
+        ),
+    ])]
+}
+
+/// What an import on `cas` must do with an image whose tree holds two
+/// names `cas`'s filesystem compares as one: refuse it by naming both and
+/// the CAS root's insensitivity, before writing anything, or (on a
+/// filesystem that tells them apart) import both. Each host asserts the
+/// branch its filesystem takes.
+fn assert_collision_refused_or_imported(
+    layers: Vec<Layer>,
+    first: &str,
+    second: &str,
+    insensitive: impl Fn(&FilesystemSensitivity) -> bool,
+    reason: &str,
+) {
+    let scratch = TempDir::new().expect("scratch");
+    let layout = scratch.path().join("oci");
+    let digest = single_image(&layout, layers);
+    let cas = scratch.path().join("cas");
+    fs::create_dir(&cas).expect("cas");
+    let filesystem = probe_sensitivity(&cas).expect("probe the CAS root");
+    let result = import(
+        &layout,
+        &digest,
+        Platform::linux("arm64"),
+        SymlinkPolicy::Refuse,
+        &cas,
+    );
+    if insensitive(&filesystem) {
+        let error = result.expect_err("a collision on this CAS root must be refused");
+        let message = error.to_string();
+        assert!(
+            matches!(&error, OciImportError::PathCollision { first: a, second: b, .. }
+                if (a.as_str(), b.as_str()) == (first, second)),
+            "{error:?}"
+        );
+        for needle in [first, second, reason, "the image is not at fault"] {
+            assert!(
+                message.contains(needle),
+                "{needle:?} missing from: {message}"
+            );
+        }
+        assert!(
+            message.contains(&cas.canonicalize().unwrap().display().to_string()),
+            "the refusal names the CAS root: {message}"
+        );
+        assert_eq!(
+            cas_entries(&cas),
+            Vec::<String>::new(),
+            "a refused import leaves nothing in the CAS root"
+        );
+    } else {
+        let imported = result.expect("a filesystem that tells them apart imports both");
+        let files = manifest_files(&cas, &imported.rootfs);
+        let holds = |name: &str| {
+            files
+                .keys()
+                .any(|path| path == name || path.starts_with(&format!("{name}/")))
+        };
+        assert!(holds(first) && holds(second), "{files:?}");
+    }
+}
+
+#[test]
+fn a_case_collision_is_refused_by_name_on_a_case_insensitive_cas_root() {
+    // A TempDir on macOS's default APFS is case-insensitive; on Linux CI it
+    // is case-sensitive, and the image imports.
+    if cfg!(target_os = "macos") {
+        let probe = TempDir::new().unwrap();
+        assert!(
+            !probe_sensitivity(probe.path()).unwrap().case_sensitive,
+            "this test expects macOS's default (case-insensitive) APFS for TMPDIR"
+        );
+    }
+    assert_collision_refused_or_imported(
+        case_colliding_layers(),
+        "usr/share/perl/Pod",
+        "usr/share/perl/pod",
+        |filesystem| !filesystem.case_sensitive,
+        "is case-insensitive",
+    );
+}
+
+#[test]
+fn a_normalization_collision_is_refused_by_name_on_a_normalization_insensitive_cas_root() {
+    // Every APFS volume, case-sensitive ones included, treats the NFC and
+    // NFD spellings of a name as one.
+    assert_collision_refused_or_imported(
+        vec![Layer::gzip(vec![
+            file("caf\u{e9}", 0o644, b"nfc\n"),
+            file("cafe\u{301}", 0o644, b"nfd\n"),
+        ])],
+        // Path (byte) order: `e` sorts before the first byte of U+00E9.
+        "cafe\u{301}",
+        "caf\u{e9}",
+        |filesystem| !filesystem.normalization_sensitive,
+        "is normalization-insensitive",
+    );
+}
+
+#[test]
+fn the_import_reports_the_cas_roots_name_sensitivity_and_static_images_still_import() {
+    let cas = TempDir::new().expect("cas");
+    let expected = probe_sensitivity(cas.path()).expect("probe");
+    if cfg!(target_os = "macos") {
+        assert!(!expected.case_sensitive, "TMPDIR is default APFS");
+    }
+    // The fixture has no two names that fold together, so it imports on a
+    // case-insensitive root as on any other: the preflight refuses nothing
+    // by itself.
+    let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
+    assert_eq!(imported.cas_root_filesystem, expected);
+    let json = serde_json::to_value(&imported).unwrap();
+    assert_eq!(
+        json["casRootFilesystem"],
+        serde_json::json!({
+            "caseSensitive": expected.case_sensitive,
+            "normalizationSensitive": expected.normalization_sensitive,
+        })
+    );
+    assert_eq!(
+        cas_entries(cas.path()),
+        vec![imported.rootfs.value.clone()],
+        "the probe leaves nothing behind"
+    );
 }

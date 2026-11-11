@@ -63,10 +63,13 @@ cannot serve one refuses the start before it spawns anything, with
 backend class can tell "this tier serves no workspace" from the
 `unsupportedBackend` refusals (egress, an unenforceable ceiling, another
 tier's grant) by code. The Rust `ExecutionError` carries it as `code`; the
-daemon, CLI and MCP replies carry it today only as the error text's prefix
-(`WorkspaceUnserved: …`), without a structured `code` or `retryable` field
-(bead `ley-line-open-e347ae`). Choosing another tier is the caller's policy;
-the runtime does not reroute a run.
+daemon's error envelope, on the control socket and over MCP alike, carries
+it as `executionError: {"code": "workspaceUnserved", "retryable": false,
+"message": "…"}` (`daemon.capnp` `ExecutionError`, bead
+`ley-line-open-e347ae`), beside
+the unchanged error text, whose `WorkspaceUnserved: …` prefix earlier
+consumers match. Choosing another tier is the caller's policy; the runtime
+does not reroute a run.
 
 The service also checks the backend's answer: the workspace shares the
 backend reports holding (the `workspaceShare` channels of its evidence
@@ -115,6 +118,13 @@ where `canonical_spec_digest` is the ASCII `blake3-256:<hex>` digest of the
 `RunSpec`'s Cap'n Proto **canonical** form. `test-vectors/run-id.json` pins
 the derivation; an implementation can compute a run's name locally without
 calling `start`.
+
+A run's rootfs is named by the rootfs digest, `RunReceipt.inputRoots[0]`:
+BLAKE3-256 over the exact bytes of its `rootfs.manifest.json`.
+`test-vectors/rootfs-manifest.json` states the canonical form those bytes
+take and pins one case, the checked-in OCI fixture's linux/arm64 manifest
+and its digest, checked against what `leyline rootfs import-oci` writes
+(ADR-0047 §3, bead `ley-line-open-39309e`).
 
 For in-toto/DSSE evidence, a statement authorizes field `F` of a run only if
 it carries a subject whose `name` is `F`'s field name and whose
@@ -184,6 +194,14 @@ verifier recomputes the document and compares digests.
 `capabilities`, `status`, and `inspect` are read-only. In particular, `status`
 must not create a volume or initialize a backend. `provision`, `start`,
 `cancel`, and `cleanup` are explicit idempotent mutations.
+
+`ProvisionOutput.casRoot` (appended 2026-11-10, bead `ley-line-open-ba86d3`)
+is the absolute host path of the content-addressed rootfs store the provider
+serves, made to exist by that provision: with `execution-daemon --cas-volume`,
+the CAS root of the case-sensitive volume it provisioned (on macOS, a
+sparsebundle it attached); with `--cas-root`, that directory. It is the
+directory `leyline rootfs import-oci --cas-root` writes to. Empty from a
+provider that reports none.
 
 Schema evolution is append-only within v1: add fields at new ordinals and add
 enum variants at the end. Removing or reinterpreting a field requires v2.

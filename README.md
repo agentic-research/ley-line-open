@@ -113,7 +113,7 @@ The execution/v1 API is exposed through the runtime crate, the explicit
 registry. Its schema version
 (`cloister/execution/v1`) is deliberately independent of the repository and
 crate release version; consumers must negotiate API compatibility rather than
-infer it from `v0.28.0`. The ordinary open `leyline daemon` command remains a
+infer it from `v0.29.0`. The ordinary open `leyline daemon` command remains a
 substrate daemon with no execution backend; an embedding application must opt
 into `run_execution_daemon` after constructing a trusted resolver/backend
 handler. The service currently proves schema binding,
@@ -159,8 +159,29 @@ leyline rootfs import-oci \
 
 It selects this host's Linux platform, verifies every blob, applies the layers
 with OCI whiteout semantics, and prints JSON whose `rootfs` is the catalog
-entry's `rootfs`. Tags are refused. The image format is never the isolation
-boundary; the backend is. See
+entry's `rootfs`. Tags are refused. A Zarf package's `images/` directory is
+such a layout. Or pull the image by digest over HTTPS, anonymously, with the
+same verification, rootfs digest and JSON:
+
+```bash
+leyline rootfs import-oci \
+  --from-registry ghcr.io/owner/app@sha256:<index or manifest digest> \
+  --cas-root /var/lib/leyline/cas \
+  --symlinks resolve
+```
+
+The image format is never the isolation boundary; the backend is.
+
+The CAS root must be on a case-sensitive filesystem to import an image whose
+paths differ only by case (Debian's perl ships `Pod/` and `pod/`). macOS's
+default APFS is not, and the import refuses such an image by naming both paths
+and saying the CAS root is case-insensitive; images without such a pair import
+anywhere. `leyline rootfs provision-cas` prints a CAS root that is: on macOS a
+grow-on-demand case-sensitive APFS sparsebundle it creates and attaches, with
+no sudo, beneath `~/.local/state/leyline/cas-volume/` (`$LEYLINE_STATE_DIR`
+moves it); on Linux it checks `<state>/cas`. `execution-daemon --cas-volume`
+serves that root instead of `--cas-root` and re-attaches the volume when it
+starts. See
 [`rs/ll-open/runtime/README.md`](rs/ll-open/runtime/README.md) "Container
 images" for the contract.
 
@@ -221,9 +242,9 @@ tests. The Taskfile fixture gate rejects Rust diffs that enumerate no mutants,
 focused scopes that run no matching slice, and baseline suites that cannot run
 inside cargo-mutants' scratch tree.
 
-The current release is `v0.28.0`. It publishes platform binaries, FFI
+The current release is `v0.29.0`. It publishes platform binaries, FFI
 staticlibs, and the Apache-2.0 Go schema module at
-`clients/go/leyline-schema/v0.28.0`. See
+`clients/go/leyline-schema/v0.29.0`. See
 [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest)
 for assets and [GETTING-STARTED.md](GETTING-STARTED.md) for download commands.
 
@@ -243,7 +264,7 @@ them per platform, so consuming one is a download rather than a Rust build:
 ```bash
 # capnp resolves `-o<plugin>` by PATH-searching `capnpc-<plugin>`, so the
 # schema-bridge assets must be installed under their unsuffixed names.
-curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.28.0/capnpc-schema-bridge-zod-darwin-arm64
+curl -fsSLO https://github.com/agentic-research/ley-line-open/releases/download/v0.29.0/capnpc-schema-bridge-zod-darwin-arm64
 install -m 0755 capnpc-schema-bridge-zod-darwin-arm64 ~/.local/bin/capnpc-schema-bridge-zod
 ```
 
@@ -261,18 +282,18 @@ dependency and build a build-tool from source — which meant a fix could be
 ## OCI image
 
 `task image` builds a local distroless OCI image tagged
-`localhost/leyline:v0.28.0`. It uses
+`localhost/leyline:v0.29.0`. It uses
 `cargo zigbuild` for the static musl binary
 and `cgr.dev/chainguard/static:latest` as the runtime base.
 
 Pushing a `v*` tag publishes the multi-arch image (linux/amd64 + linux/arm64)
-to `ghcr.io/agentic-research/ley-line-open:v0.28.0`, with a
+to `ghcr.io/agentic-research/ley-line-open:v0.29.0`, with a
 [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 recorded against the pushed digest:
 
 ```bash
-docker pull ghcr.io/agentic-research/ley-line-open:v0.28.0
-gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.28.0 \
+docker pull ghcr.io/agentic-research/ley-line-open:v0.29.0
+gh attestation verify oci://ghcr.io/agentic-research/ley-line-open:v0.29.0 \
   --repo agentic-research/ley-line-open
 ```
 

@@ -1,6 +1,6 @@
 [package]
 name = "leyline-runtime"
-version = "0.28.0"
+version = "0.29.0"
 edition = "2024"
 description = "Capability-resolved execution lifecycle and isolation backends for Leyline"
 repository = "https://github.com/agentic-research/ley-line-open"
@@ -23,13 +23,13 @@ capnp-json = { workspace = true }
 # writes to disk; the importer applies every entry to an in-memory tree.
 flate2 = "1.1.9"
 tar = { version = "0.4.45", default-features = false }
-leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.28.0" }
+leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.29.0" }
 libc = { workspace = true }
-leyline-core = { path = "../../ll-core/core", version = "0.28.0" }
-leyline-envelope = { path = "../envelope", version = "0.28.0" }
+leyline-core = { path = "../../ll-core/core", version = "0.29.0" }
+leyline-envelope = { path = "../envelope", version = "0.29.0" }
 # The ADR-012 canonical kid of each operator trust key. Features match
 # leyline-envelope's pin: `ffi` off, `root-signer` on.
-leyline-sign = { path = "../sign", version = "0.28.0", default-features = false, features = ["root-signer"] }
+leyline-sign = { path = "../sign", version = "0.29.0", default-features = false, features = ["root-signer"] }
 nono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -39,6 +39,18 @@ sha2 = { workspace = true }
 rustix = { version = "1.1.4", features = ["fs"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+# Folding image paths the way a normalization-insensitive CAS root (every
+# APFS volume) compares them, to refuse a pair it would merge (bead
+# ley-line-open-ba86d3). Already in the workspace's lock through idna.
+unicode-normalization = "0.1.25"
+# Unicode full case folding for the same comparison on a case-insensitive
+# root (`ß`/`ss`, `ς`/`σ`). Already in the lock through mime_guess.
+unicase = "2.9.0"
+# OCI registry pulls (artifacts::registry, bead ley-line-open-97b636):
+# synchronous HTTP over rustls, the workspace's pin (cli-lib's self-update
+# uses it), so no crate is added to the lockfile. Redirects, timeouts, the
+# scheme policy and every size bound are applied by the caller, not ureq.
+ureq = { workspace = true }
 
 [features]
 # Test-only hooks on KrunWorkerBackend that bypass or retarget the

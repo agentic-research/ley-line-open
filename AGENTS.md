@@ -40,7 +40,7 @@ Dispatch only the lenses the target actually needs. Specialists may run in paral
 
 Do not use “root,” “hash,” or “identity” without naming the domain and authoritative bytes.
 
-Every keyed fold below is the ADR-0032 partition fold (`BLAKE3_derive_key("leyline partition fold v1", …)` with the scheme named in the row, `rs/ll-core/core/src/partition.rs`) unless the row names its own `derive_key` context. Plain BLAKE3 over bytes (σ_bytes) is the one unkeyed construction: the blob hash, the CDC chunk hash, `current_root` and the rootfs digest are instances of it; every other construction is keyed, except `run_id` v1, which violates ADR-0047 law (c) until M3. ADR-0047 §3 is the conformance table for the constructions it lists (it has no rootfs-digest row).
+Every keyed fold below is the ADR-0032 partition fold (`BLAKE3_derive_key("leyline partition fold v1", …)` with the scheme named in the row, `rs/ll-core/core/src/partition.rs`) unless the row names its own `derive_key` context. Plain BLAKE3 over bytes (σ_bytes) is the one unkeyed construction: the blob hash, the CDC chunk hash, `current_root` and the rootfs digest are instances of it; every other construction is keyed, except `run_id` v1, which violates ADR-0047 law (c) until M3. ADR-0047 §3 is the conformance table for the constructions it lists, the rootfs digest among them, with its canonical bytes and known-answer vector (`execution/v1/test-vectors/rootfs-manifest.json`).
 
 | Name | Authoritative for | Construction | Status |
 | --- | --- | --- | --- |
@@ -55,7 +55,7 @@ Every keyed fold below is the ADR-0032 partition fold (`BLAKE3_derive_key("leyli
 | `run_id` v2 | The same run | `derive_key("cloister/execution/v1/run-id/v2", …)`, rendered `run-v2-<hex>` | Proposed only (ADR-0047 step M3, `ley-line-open-ab2093`) |
 | Rootfs digest | One execution rootfs: its file list with each file's mode and BLAKE3 | BLAKE3 over the exact bytes of `rootfs.manifest.json` (`{"version":1,"files":[{"path","mode","blake3"},…]}`), which is also the rootfs directory's name beneath the CAS root; verified on every resolve (`backends/libkrun/plan.rs`, `DirectoryRootfsResolver`) and named first in `RunReceipt.inputRoots`. `leyline rootfs import-oci` produces one; the image's OCI SHA-256 digests are provenance and never compared with it | Shipped |
 | `content_id`, `nid`, `file_id`, `dir_id`, `name_id`, `kind_id` | Nothing outside one arena generation: each is a locator, an integer row key the arena assigned | Arena-local SQLite integers, one newtype per kind (`rs/ll-core/schema/src/locator.rs`), with no serde or Cap'n Proto encoding; `content_id` is the `node_content` row key, and the subtree's address is that row's `node_hash` | Shipped; a locator, not an identity: never on the wire, in a signed claim or in a cache key |
-| SQL projection ABI | Consumer-visible relational shape and behavior | Tables, columns, constraints, semantics, fixtures (`projection-v12`) | Shipped; not an identity domain |
+| SQL projection ABI | Consumer-visible relational shape and behavior | Tables, columns, constraints, semantics, fixtures (`projection-v13`) | Shipped; not an identity domain |
 | Blob manifest address | A blob's CDC chunk list, as its own construction beside the blob hash | Keyed `ByteStream` fold `leyline/blob-manifest/v1` with the CDC parameters as params | Proposed only (ADR-0047 D-iv, step M4) |
 | `manifestRoot` | CDC transport/dedup structure | Defined by ADR-0032 | Proposed only |
 | `logicalRoot` | Derived-view validity | Defined by ADR-0032 | Proposed only |

@@ -67,7 +67,7 @@
 //!     unprivileged reader, the guest's virtio-fs server included, can read
 //!     it.
 //!   - Under `Resolve`, a link whose resolution goes beneath (or ends at)
-//!     `dev`, `proc` or `sys` ([`ImportedRootfs::links_dropped_kernel_mount`]),
+//!     `dev`, `proc`, `sys` or `tmp` ([`ImportedRootfs::links_dropped_kernel_mount`]),
 //!     and a link whose target the image does not hold
 //!     ([`ImportedRootfs::links_dropped_dangling`]). See below.
 //! - **Symbolic links.** The manifest admits none, so [`SymlinkPolicy`]
@@ -89,6 +89,14 @@
 //!   No image path reaches the host filesystem until the finished tree is
 //!   written beneath owner-only staging inside the CAS root; until then,
 //!   extracted file contents are stored only under their BLAKE3 names.
+//! - **Name collisions.** Before any layer is read, the CAS root's case and
+//!   normalization sensitivity is probed once
+//!   ([`crate::cas_volume::probe_sensitivity`]) and reported
+//!   ([`ImportedRootfs::cas_root_filesystem`]). Two paths of the finished
+//!   tree that the CAS root would store as one name refuse the import
+//!   ([`OciImportError::PathCollision`], naming both) before any image path
+//!   is written; they are never merged. `crate::cas_volume` provisions a
+//!   case-sensitive CAS root.
 //! - **Deterministic identity.** The manifest lists files in path order with
 //!   fixed field order, so the same image content gives the same rootfs
 //!   digest whatever the layers' archive order, the host, or the run. A
@@ -125,13 +133,14 @@ use super::rootfs_tree::{
 };
 use crate::DigestRef;
 use crate::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver, verify_manifest};
+use crate::cas_volume::{FilesystemSensitivity, probe_sensitivity};
 
 /// The default bound on what one import extracts and writes: 16 GiB.
 pub const DEFAULT_MAX_ROOTFS_BYTES: u64 = 16 << 30;
 
 /// Index, manifest and config documents larger than this are refused (the
 /// image spec's own guidance for manifests is 4 MiB).
-const MAX_DOCUMENT_BYTES: u64 = 4 << 20;
+pub(super) const MAX_DOCUMENT_BYTES: u64 = 4 << 20;
 
 /// Bound on the entries a `Resolve` expansion may produce.
 const MAX_RESOLVED_ENTRIES: usize = 1 << 20;
@@ -141,11 +150,11 @@ const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
 /// Linux's `PATH_MAX`: the longest archive path or link target accepted.
 const MAX_PATH_BYTES: usize = 4096;
 
-const INDEX_TYPES: [&str; 2] = [
+pub(super) const INDEX_TYPES: [&str; 2] = [
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 ];
-const MANIFEST_TYPES: [&str; 2] = [
+pub(super) const MANIFEST_TYPES: [&str; 2] = [
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 ];
@@ -173,7 +182,7 @@ pub enum SymlinkPolicy {
     #[default]
     Refuse,
     /// Replace each link with a copy of its in-image target. A link into
-    /// `dev`, `proc` or `sys`, or one whose target the image does not hold,
+    /// `dev`, `proc`, `sys` or `tmp`, or one whose target the image does not hold,
     /// is dropped and reported instead; one that loops or escapes the image
     /// root is refused.
     Resolve,
@@ -274,6 +283,20 @@ pub enum OciImportError {
     SymlinkRefused { path: String, target: String },
     #[error("symbolic link {path} cannot be resolved inside the image: {reason}")]
     SymlinkUnresolvable { path: String, reason: String },
+    /// Two paths of the finished rootfs that the CAS root's filesystem
+    /// compares as one name (bead `ley-line-open-ba86d3`). Detected in the
+    /// in-memory tree before any of it is written; never merged.
+    #[error(
+        "image paths {first} and {second} differ only by {kind}, and the CAS root {} is {kind}-insensitive, so writing both would merge them into one: the image is not at fault. {}",
+        .cas_root.display(), .kind.remedy()
+    )]
+    PathCollision {
+        /// The first of the two in path order, relative to the image root.
+        first: String,
+        second: String,
+        kind: NameCollision,
+        cas_root: PathBuf,
+    },
     #[error("unsupported: {0}")]
     Unsupported(String),
     #[error("malformed OCI image layout: {0}")]
@@ -282,12 +305,54 @@ pub enum OciImportError {
     TooLarge { limit: u64 },
     #[error("CAS: {0}")]
     Cas(String),
+    #[error("malformed registry reference {0:?}: expected [registry/]repository@sha256:<hex>")]
+    MalformedReference(String),
+    #[error("registry: {0}")]
+    Registry(String),
+    #[error("insecure transport refused: {0}")]
+    InsecureTransport(String),
+    #[error("the registry redirected more than {limit} times")]
+    TooManyRedirects { limit: u32 },
+    #[error("the image exceeds its {limit}-byte download limit")]
+    DownloadTooLarge { limit: u64 },
     #[error("{action}: {source}")]
     Io {
         action: &'static str,
         #[source]
         source: io::Error,
     },
+}
+
+/// How two names a filesystem merges differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NameCollision {
+    /// Only by letter case (`Pod`, `pod`).
+    Case,
+    /// Only by Unicode normalization (NFC and NFD `é`).
+    Normalization,
+}
+
+impl NameCollision {
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Case => {
+                "Import it into a CAS root on a case-sensitive volume: `leyline rootfs provision-cas` makes one on macOS"
+            }
+            Self::Normalization => {
+                "No APFS volume tells these apart, case-sensitive ones included: import it on a filesystem that compares names byte for byte (Linux ext4, xfs or btrfs)"
+            }
+        }
+    }
+}
+
+impl fmt::Display for NameCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Case => "case",
+            Self::Normalization => "normalization",
+        })
+    }
 }
 
 fn io_error(action: &'static str) -> impl FnOnce(io::Error) -> OciImportError {
@@ -359,7 +424,7 @@ pub struct ImportedRootfs {
     // import that reuses a CAS entry reports its own. None is part of the
     // rootfs identity.
     /// Device nodes and FIFOs strictly beneath a directory the guest init
-    /// mounts a kernel filesystem over (`dev`, `proc`, `sys`), in layer and
+    /// mounts a kernel filesystem over (`dev`, `proc`, `sys`, `tmp`), in layer and
     /// archive order, each as it was dropped: a later entry may still write
     /// a regular file at the same path. None is written.
     pub special_entries_dropped: Vec<DroppedEntry>,
@@ -376,6 +441,11 @@ pub struct ImportedRootfs {
     /// link or a resolved link to one is another). None is written.
     pub unreadable_files_dropped: Vec<DroppedFile>,
     pub image_config: ImageRuntimeConfig,
+    /// How the CAS root's filesystem compares names, probed once before any
+    /// layer is read. Provenance of this import, not of the rootfs: an image
+    /// with no two names that compare equal there imports to the same
+    /// digest on any filesystem.
+    pub cas_root_filesystem: FilesystemSensitivity,
 }
 
 /// A regular file an import dropped because its owner cannot read it.
@@ -427,6 +497,11 @@ pub fn import_oci_layout(
     let cas_root = cas_root
         .canonicalize()
         .map_err(io_error("open the CAS root"))?;
+    // Once, before any layer is read: how the CAS root compares names
+    // decides which image paths would merge there.
+    let cas_root_filesystem = probe_sensitivity(&cas_root).map_err(io_error(
+        "probe the CAS root's case and normalization sensitivity",
+    ))?;
 
     let top = layout.document(&reference, None)?;
     let (manifest_digest, manifest_bytes) = match classify(&top)? {
@@ -439,18 +514,7 @@ pub fn import_oci_layout(
         Document::Manifest => (reference.clone(), top),
     };
     let manifest: Manifest = parse(&manifest_bytes, "image manifest")?;
-    if !MANIFEST_TYPES.contains(&manifest.media_type.as_deref().unwrap_or(MANIFEST_TYPES[0])) {
-        return Err(OciImportError::Unsupported(format!(
-            "manifest media type {:?}",
-            manifest.media_type
-        )));
-    }
-    if !CONFIG_TYPES.contains(&manifest.config.media_type.as_str()) {
-        return Err(OciImportError::Unsupported(format!(
-            "config media type {:?}: not a container image",
-            manifest.config.media_type
-        )));
-    }
+    admit_manifest(&manifest)?;
     let config: ImageConfig = parse(
         &layout.document(&manifest.config.digest, Some(manifest.config.size))?,
         "image config",
@@ -545,6 +609,17 @@ pub fn import_oci_layout(
     // Rootfs manifest v1 lists files only, so a directory that holds none is
     // not part of the identity: write none, and one digest names one tree.
     let finished = finished.without_empty_directories();
+    // Before any image path is written: a pair the CAS root would merge is
+    // refused, never merged. Staging (content and layers only) is removed
+    // with `staging` on this return.
+    if let Some((first, second, kind)) = first_collision(&finished, cas_root_filesystem) {
+        return Err(OciImportError::PathCollision {
+            first,
+            second,
+            kind,
+            cas_root,
+        });
+    }
 
     let staged_root = staging.path().join("rootfs");
     let written = write_rootfs(&staged_root, &finished, &store, request.max_rootfs_bytes)?;
@@ -584,11 +659,41 @@ pub fn import_oci_layout(
             working_dir: runtime.working_dir.unwrap_or_default(),
             user: runtime.user.unwrap_or_default(),
         },
+        cas_root_filesystem,
     })
 }
 
+/// What a manifest must be before its config is read or its layers are
+/// fetched: an image manifest whose config is a container image config no
+/// larger than a document, and whose layers are all of a readable type.
+/// A registry pull applies it before requesting any blob.
+pub(super) fn admit_manifest(manifest: &Manifest) -> Result<(), OciImportError> {
+    if !MANIFEST_TYPES.contains(&manifest.media_type.as_deref().unwrap_or(MANIFEST_TYPES[0])) {
+        return Err(OciImportError::Unsupported(format!(
+            "manifest media type {:?}",
+            manifest.media_type
+        )));
+    }
+    if !CONFIG_TYPES.contains(&manifest.config.media_type.as_str()) {
+        return Err(OciImportError::Unsupported(format!(
+            "config media type {:?}: not a container image",
+            manifest.config.media_type
+        )));
+    }
+    if manifest.config.size > MAX_DOCUMENT_BYTES {
+        return Err(OciImportError::Unsupported(format!(
+            "document {} is larger than {MAX_DOCUMENT_BYTES} bytes",
+            manifest.config.digest
+        )));
+    }
+    for layer in &manifest.layers {
+        Compression::of(&layer.media_type)?;
+    }
+    Ok(())
+}
+
 /// The `sha256:<hex>` a reference pins, or why it pins nothing.
-fn parse_reference(reference: &str) -> Result<String, OciImportError> {
+pub(super) fn parse_reference(reference: &str) -> Result<String, OciImportError> {
     let pinned = reference
         .rsplit_once('@')
         .map_or(reference, |(_, digest)| digest);
@@ -615,6 +720,17 @@ fn parse_reference(reference: &str) -> Result<String, OciImportError> {
         )));
     }
     Err(OciImportError::MutableReference(reference.to_string()))
+}
+
+/// The hex of a well-formed descriptor digest. A digest is joined to a path
+/// (and, by a registry pull, to a URL), so it is never trusted to be a name.
+pub(super) fn sha256_hex(digest: &str) -> Result<&str, OciImportError> {
+    match digest.strip_prefix("sha256:") {
+        Some(hex) if is_lower_hex(hex, 64) => Ok(hex),
+        _ => Err(OciImportError::Unsupported(format!(
+            "descriptor digest {digest:?}: only sha256 digests are verified"
+        ))),
+    }
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -657,12 +773,7 @@ impl Layout {
     /// The blob file for a descriptor digest, which must be well formed: the
     /// digest is joined to a path, so it is never trusted to be a name.
     fn blob_path(&self, digest: &str) -> Result<PathBuf, OciImportError> {
-        match digest.strip_prefix("sha256:") {
-            Some(hex) if is_lower_hex(hex, 64) => Ok(self.blobs.join(hex)),
-            _ => Err(OciImportError::Unsupported(format!(
-                "descriptor digest {digest:?}: only sha256 digests are verified"
-            ))),
-        }
+        Ok(self.blobs.join(sha256_hex(digest)?))
     }
 
     /// Open the blob for `digest`, which must be a regular file: opening a
@@ -725,7 +836,7 @@ impl Layout {
     }
 }
 
-fn check_blob(
+pub(super) fn check_blob(
     digest: &str,
     size: Option<u64>,
     actual_size: u64,
@@ -753,17 +864,20 @@ fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn parse<'a, T: Deserialize<'a>>(bytes: &'a [u8], what: &str) -> Result<T, OciImportError> {
+pub(super) fn parse<'a, T: Deserialize<'a>>(
+    bytes: &'a [u8],
+    what: &str,
+) -> Result<T, OciImportError> {
     serde_json::from_slice(bytes)
         .map_err(|error| OciImportError::Malformed(format!("invalid {what}: {error}")))
 }
 
 #[derive(Deserialize)]
-struct Descriptor {
+pub(super) struct Descriptor {
     #[serde(rename = "mediaType")]
     media_type: String,
-    digest: String,
-    size: u64,
+    pub(super) digest: String,
+    pub(super) size: u64,
     #[serde(default)]
     platform: Option<DescriptorPlatform>,
 }
@@ -777,16 +891,16 @@ struct DescriptorPlatform {
 }
 
 #[derive(Deserialize)]
-struct Index {
+pub(super) struct Index {
     manifests: Vec<Descriptor>,
 }
 
 #[derive(Deserialize)]
-struct Manifest {
+pub(super) struct Manifest {
     #[serde(rename = "mediaType", default)]
     media_type: Option<String>,
-    config: Descriptor,
-    layers: Vec<Descriptor>,
+    pub(super) config: Descriptor,
+    pub(super) layers: Vec<Descriptor>,
 }
 
 #[derive(Deserialize)]
@@ -833,14 +947,14 @@ struct ConfigProcess {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Document {
+pub(super) enum Document {
     Index,
     Manifest,
 }
 
 /// Whether the pinned document is an index or a manifest: by its declared
 /// `mediaType`, or, when it declares none (the field is optional), by shape.
-fn classify(bytes: &[u8]) -> Result<Document, OciImportError> {
+pub(super) fn classify(bytes: &[u8]) -> Result<Document, OciImportError> {
     #[derive(Deserialize)]
     struct Probe {
         #[serde(rename = "schemaVersion", default)]
@@ -878,7 +992,7 @@ fn classify(bytes: &[u8]) -> Result<Document, OciImportError> {
     Ok(document)
 }
 
-fn select_platform<'a>(
+pub(super) fn select_platform<'a>(
     index: &'a Index,
     platform: &Platform,
 ) -> Result<&'a Descriptor, OciImportError> {
@@ -1252,7 +1366,7 @@ fn read_layer(
                     // anywhere else it would be a hole in the rootfs.
                     if !under_kernel_mount(&path) {
                         return Err(OciImportError::Unsupported(format!(
-                            "layer {layer} entry {raw}: {kind:?} entries are not expressible in rootfs manifest v1, and only those beneath dev/, proc/ or sys/ (which the guest init mounts kernel filesystems over) are dropped"
+                            "layer {layer} entry {raw}: {kind:?} entries are not expressible in rootfs manifest v1, and only those beneath dev/, proc/, sys/ or tmp/ (which the guest init mounts kernel filesystems over) are dropped"
                         )));
                     }
                     changes.dropped.push(DroppedEntry {
@@ -1276,6 +1390,68 @@ fn read_layer(
         return Err(OciImportError::DiffIdMismatch { layer });
     }
     Ok(changes)
+}
+
+/// The name a filesystem of `sensitivity` stores `name` under, as far as
+/// comparing two names goes: NFD when it ignores normalization, Unicode
+/// full case folding when it ignores case. The filesystem's own tables may
+/// differ in a corner (a Unicode version); a pair this misses still fails
+/// when the second is written, inside staging, before anything is published.
+fn folded(name: &str, sensitivity: FilesystemSensitivity) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let normalize = |name: &str| -> String {
+        if sensitivity.normalization_sensitive {
+            name.to_string()
+        } else {
+            name.nfd().collect()
+        }
+    };
+    let mut key = normalize(name);
+    if !sensitivity.case_sensitive {
+        // Full Unicode case folding (CaseFolding.txt C+F), as APFS folds:
+        // `ß` and `ss`, final `ς` and `σ`, `ſ` and `s` are one name there.
+        key = normalize(&unicase::UniCase::new(key).to_folded_case());
+    }
+    key
+}
+
+/// The first two paths of `tree`, in path order, that one directory of a
+/// filesystem of `sensitivity` would hold as one name, and how they differ.
+/// The root also holds `rootfs.manifest.json`, which the import writes.
+fn first_collision(
+    tree: &Final,
+    sensitivity: FilesystemSensitivity,
+) -> Option<(String, String, NameCollision)> {
+    use unicode_normalization::UnicodeNormalization;
+    fn walk(
+        entries: &BTreeMap<String, Final>,
+        prefix: &str,
+        sensitivity: FilesystemSensitivity,
+        extra: Option<&str>,
+    ) -> Option<(String, String, NameCollision)> {
+        let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+        for name in extra.into_iter().chain(entries.keys().map(String::as_str)) {
+            if let Some(earlier) = seen.insert(folded(name, sensitivity), name) {
+                let kind = if !sensitivity.normalization_sensitive && earlier.nfd().eq(name.nfd()) {
+                    NameCollision::Normalization
+                } else {
+                    NameCollision::Case
+                };
+                return Some((join(prefix, earlier), join(prefix, name), kind));
+            }
+        }
+        entries.iter().find_map(|(name, node)| match node {
+            Final::Dir(children) => walk(children, &join(prefix, name), sensitivity, None),
+            Final::File(_) => None,
+        })
+    }
+    if sensitivity == FilesystemSensitivity::EXACT {
+        return None;
+    }
+    match tree {
+        Final::Dir(entries) => walk(entries, "", sensitivity, Some(ROOTFS_MANIFEST)),
+        Final::File(_) => None,
+    }
 }
 
 struct Written {
@@ -1486,4 +1662,191 @@ fn publish(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEFAULT_APFS: FilesystemSensitivity = FilesystemSensitivity {
+        case_sensitive: false,
+        normalization_sensitive: false,
+    };
+    const CASE_SENSITIVE_APFS: FilesystemSensitivity = FilesystemSensitivity {
+        case_sensitive: true,
+        normalization_sensitive: false,
+    };
+    const CASE_ONLY: FilesystemSensitivity = FilesystemSensitivity {
+        case_sensitive: false,
+        normalization_sensitive: true,
+    };
+
+    fn file() -> Final {
+        Final::File(FileNode {
+            content: blake3::hash(b""),
+            size: 0,
+            mode: 0o644,
+        })
+    }
+
+    /// A tree holding a file at each path.
+    fn tree(paths: &[&str]) -> Final {
+        fn insert(entries: &mut BTreeMap<String, Final>, components: &[&str]) {
+            match components {
+                [] => {}
+                [name] => {
+                    entries.insert(name.to_string(), file());
+                }
+                [name, rest @ ..] => {
+                    let child = entries
+                        .entry(name.to_string())
+                        .or_insert_with(|| Final::Dir(BTreeMap::new()));
+                    let Final::Dir(children) = child else {
+                        panic!("{name} is a file")
+                    };
+                    insert(children, rest);
+                }
+            }
+        }
+        let mut root = BTreeMap::new();
+        for path in paths {
+            insert(&mut root, &path.split('/').collect::<Vec<_>>());
+        }
+        Final::Dir(root)
+    }
+
+    fn collision(
+        paths: &[&str],
+        sensitivity: FilesystemSensitivity,
+    ) -> Option<(String, String, NameCollision)> {
+        first_collision(&tree(paths), sensitivity)
+    }
+
+    #[test]
+    fn names_differing_only_by_case_collide_where_case_is_ignored() {
+        let perl = [
+            "usr/share/perl/Pod/Usage.pm",
+            "usr/share/perl/pod/perlfunc.pod",
+        ];
+        let expected = Some((
+            "usr/share/perl/Pod".to_string(),
+            "usr/share/perl/pod".to_string(),
+            NameCollision::Case,
+        ));
+        assert_eq!(collision(&perl, DEFAULT_APFS), expected);
+        assert_eq!(collision(&perl, CASE_ONLY), expected);
+        assert_eq!(collision(&perl, CASE_SENSITIVE_APFS), None);
+        assert_eq!(collision(&perl, FilesystemSensitivity::EXACT), None);
+        // Full case folding, as APFS folds (each pair verified to name one
+        // file on case-insensitive APFS): final sigma, long s, sharp s and
+        // the ff ligature.
+        for (a, b) in [
+            ("a\u{3c3}", "a\u{3c2}"),
+            ("x\u{3a3}", "x\u{3c3}"),
+            ("\u{17f}", "s"),
+            ("\u{df}", "ss"),
+            ("\u{fb00}", "ff"),
+        ] {
+            assert_eq!(
+                collision(&[a, b], DEFAULT_APFS).map(|found| found.2),
+                Some(NameCollision::Case),
+                "{a:?} and {b:?}"
+            );
+            assert_eq!(collision(&[a, b], CASE_SENSITIVE_APFS), None);
+        }
+        // A file and a directory collide as two files do.
+        assert_eq!(
+            collision(&["lib/Sys", "lib/sys/x"], DEFAULT_APFS),
+            Some(("lib/Sys".into(), "lib/sys".into(), NameCollision::Case))
+        );
+    }
+
+    #[test]
+    fn names_differing_only_by_normalization_collide_where_it_is_ignored() {
+        let cafe = ["caf\u{e9}", "cafe\u{301}"];
+        let expected = Some((
+            "cafe\u{301}".to_string(),
+            "caf\u{e9}".to_string(),
+            NameCollision::Normalization,
+        ));
+        assert_eq!(collision(&cafe, DEFAULT_APFS), expected);
+        assert_eq!(collision(&cafe, CASE_SENSITIVE_APFS), expected);
+        assert_eq!(collision(&cafe, CASE_ONLY), None);
+        // Case and normalization together fold where both are ignored.
+        assert_eq!(
+            collision(&["CAF\u{c9}", "cafe\u{301}"], DEFAULT_APFS).map(|found| found.2),
+            Some(NameCollision::Case)
+        );
+        assert_eq!(
+            collision(&["CAF\u{c9}", "cafe\u{301}"], CASE_SENSITIVE_APFS),
+            None
+        );
+    }
+
+    #[test]
+    fn an_image_file_that_folds_to_the_manifest_name_collides_at_the_root_only() {
+        assert_eq!(
+            collision(&["Rootfs.Manifest.json"], DEFAULT_APFS),
+            Some((
+                ROOTFS_MANIFEST.to_string(),
+                "Rootfs.Manifest.json".to_string(),
+                NameCollision::Case
+            ))
+        );
+        assert_eq!(
+            collision(&["Rootfs.Manifest.json"], CASE_SENSITIVE_APFS),
+            None
+        );
+        assert_eq!(collision(&["etc/Rootfs.Manifest.json"], DEFAULT_APFS), None);
+    }
+
+    #[test]
+    fn distinct_names_never_collide_and_deeper_pairs_are_found() {
+        assert_eq!(
+            collision(
+                &["bin/sh", "bin/bash", "etc/passwd", "etc/group"],
+                DEFAULT_APFS
+            ),
+            None
+        );
+        assert_eq!(
+            collision(&["a/b/c/X", "a/b/c/x", "z/Y", "z/y"], DEFAULT_APFS),
+            Some(("a/b/c/X".into(), "a/b/c/x".into(), NameCollision::Case))
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_both_paths_the_cas_root_and_its_insensitivity() {
+        let error = OciImportError::PathCollision {
+            first: "usr/share/perl/Pod".into(),
+            second: "usr/share/perl/pod".into(),
+            kind: NameCollision::Case,
+            cas_root: PathBuf::from("/cas"),
+        };
+        let message = error.to_string();
+        for needle in [
+            "usr/share/perl/Pod",
+            "usr/share/perl/pod",
+            "the CAS root /cas is case-insensitive",
+            "the image is not at fault",
+            "leyline rootfs provision-cas",
+        ] {
+            assert!(
+                message.contains(needle),
+                "{needle:?} missing from: {message}"
+            );
+        }
+        let message = OciImportError::PathCollision {
+            first: "a".into(),
+            second: "b".into(),
+            kind: NameCollision::Normalization,
+            cas_root: PathBuf::from("/cas"),
+        }
+        .to_string();
+        assert!(
+            message.contains("is normalization-insensitive"),
+            "{message}"
+        );
+        assert!(message.contains("No APFS volume"), "{message}");
+    }
 }

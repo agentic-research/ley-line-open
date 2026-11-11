@@ -275,6 +275,26 @@ type ProposeResponse struct {
 	Merged []string `json:"merged,omitempty"`
 }
 
+// ExecutionErrorResponse is the daemon's error envelope for a failed
+// execution/v1 op (`llo_execution_*`; daemon.capnp `ErrorResponse`). Branch
+// on ExecutionError.Code and Retryable, never on Error's text (LLO bead
+// ley-line-open-e347ae).
+type ExecutionErrorResponse struct {
+	OK             *bool           `json:"ok"`
+	Error          *string         `json:"error,omitempty"`
+	ExecutionError *ExecutionError `json:"executionError,omitempty"`
+}
+
+// ExecutionError is execution/v1's ExecutionError as the daemon carries it
+// (daemon.capnp `ExecutionError`). Code is execution.capnp's ErrorCode name
+// (camelCase, e.g. "workspaceUnserved"); the generated
+// daemon.ExecutionErrorCodeFromString parses it.
+type ExecutionError struct {
+	Code      *string `json:"code"`
+	Retryable *bool   `json:"retryable"`
+	Message   *string `json:"message,omitempty"`
+}
+
 // ListChildrenResponse is the wire shape of the `list_children` op response.
 type ListChildrenResponse struct {
 	OK       *bool  `json:"ok"`

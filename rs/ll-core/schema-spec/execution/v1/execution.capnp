@@ -153,9 +153,11 @@ struct RunGrant $Traits.doc("Authenticated, resolved execution authority bound t
   limits                     @10 :ResourceLimits        $Traits.doc("Resolved ceilings the run is held to; each may only narrow the spec's requestedLimits.");
   workspaces                 @11 :List(WorkspaceGrant)  $Traits.doc("Resolved Graph authority.");
   allowedEgress              @12 :List(Text)            $Traits.doc("Resolved egress endpoints or capability references.");
-  credentialBrokerRefs       @13 :List(Text)            $Traits.doc("Resolved credential brokers; never credential values.");
+  credentialBrokerRefs       @13 :List(Text)            $Traits.doc("The broker integrations the run requires, each named by contract id or broker reference; never a credential value. A daemon refuses any entry it does not implement. `cloister/connections/v1` is reserved: it marks a grant that carries connectionsDigest and connectionsDocument, and a grant carries it if and only if it carries both (ADR-0046 S3).");
   signature                  @14 :GrantSignature       $Traits.doc("Issuer signature binding every other field of this grant; absent only when the caller is the issuer. See wire/run-grant.md.") $Traits.optional;
   confinementManifest        @15 :Text                  $Traits.doc("The confinement/v1 document `confinementDigest` is taken over, as canonical JSON. Carrying the digest alone let an issuer commit to a policy the runner could never obtain, so a runner could verify a match and never learn WHAT was authorized. Absent means the issuer names a policy by digest only, and a runner that cannot otherwise obtain that document must refuse rather than guess.") $Traits.optional;
+  connectionsDigest          @16 :DigestRef             $Traits.doc("BLAKE3-256 over the canonical cloister/connections/v1 document in connectionsDocument; names those bytes only (not confinementDigest, a blob hash or any store root). Present only together with connectionsDocument and the credentialBrokerRefs entry `cloister/connections/v1`; a non-null value with an empty algorithm or value is malformed, never absent (ADR-0046 S3).") $Traits.optional;
+  connectionsDocument        @17 :Text                  $Traits.doc("The canonical cloister/connections/v1 document connectionsDigest is taken over. The runner recomputes the digest from these bytes and refuses a document that is not byte-equal to its own canonicalization; it never normalizes. A non-null empty text is malformed, never absent.") $Traits.optional;
 }
 
 struct ExecutionError $Traits.doc("Stable transport-independent execution error.") {
@@ -223,6 +225,20 @@ struct RunReceipt $Traits.doc("Terminal substrate evidence; may be embedded by a
   usage                      @12 :ResourceUsage         $Traits.doc("Terminal resource accounting.");
   startedAtUnixMs           @13 :UInt64                $Traits.doc("Substrate-observed start time.");
   completedAtUnixMs         @14 :UInt64                $Traits.doc("Substrate-observed terminal time.");
+  connectionsDigest         @15 :DigestRef               $Traits.doc("The connectionsDigest of the document the run's broker attested in its ready report; absent for a run without connections.") $Traits.optional;
+  connections               @16 :List(ConnectionOutcome) $Traits.doc("One outcome per declared connection, in document order; absent for a run without connections.") $Traits.optional;
+}
+
+struct ConnectionOutcome $Traits.doc("What one declared connection carried during a run, as the supervisor assembled it from the broker's per-connection records. No payload byte, guest address or peer pid.") {
+  name            @0 :Text   $Traits.doc("The connection's name.");
+  target          @1 :Text   $Traits.doc("The literal dialed: `127.0.0.1:30080`, or `[::1]:30080` for IPv6.");
+  accepted        @2 :UInt64 $Traits.doc("Connections accepted on this run's endpoint from this run's peer.");
+  dialed          @3 :UInt64 $Traits.doc("Of those, the ones whose upstream dial succeeded.");
+  refused         @4 :UInt64 $Traits.doc("Of those, the ones closed without an upstream (hold expired, dial error, connection cap).");
+  foreignPeers    @5 :UInt64 $Traits.doc("Connections closed at accept because the peer was not this run's; not counted in accepted.");
+  complete        @6 :Bool   $Traits.doc("True when every accepted connection has a final record, so accepted = dialed + refused; false (the broker crashed) makes every count a lower bound.");
+  bytesToTarget   @7 :UInt64 $Traits.doc("Bytes copied from the workload to the target.");
+  bytesFromTarget @8 :UInt64 $Traits.doc("Bytes copied from the target to the workload.");
 }
 
 struct CapabilityDescriptor $Traits.doc("One supported execution interface or backend class.") {

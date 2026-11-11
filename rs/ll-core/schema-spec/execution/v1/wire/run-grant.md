@@ -43,11 +43,21 @@ Two properties make this the signable form:
   sign; a verifier recomputes them from the grant it received, signature
   and all, and gets the same answer.
 
-A cleared `signature` canonicalizes to a null pointer in the trailing pointer
-slot, which canonicalization truncates. So `signing_bytes` for a signed grant
-are byte-identical to the canonical form of the same grant before the
-signature was attached — and identical to what a producer that predates the
-field would have emitted.
+**Cleared** means what `grant_signing_bytes` does: `signature` is set to an
+empty `GrantSignature`, a non-null pointer to a struct with no data and no
+pointers (canonically, the pointer word `0xfffffffc` followed by nothing), not a
+null pointer. So `signing_bytes` always carry that word in the `signature` slot,
+whether the received grant was signed, unsigned, or signed by a producer that
+wrote a null pointer, and a second signer MUST write it the same way: a signer
+that leaves `signature` null computes different bytes. The pinned grant vectors
+(`test-vectors/connections-grant.json`) carry these bytes so a second signer
+can check its own.
+
+Pointer fields after `signature` (`confinementManifest @15`,
+`connectionsDigest @16`, `connectionsDocument @17`) are covered like every
+other field. When they are null they are trailing null pointers, which
+canonicalization truncates, so a grant that sets none of them has the signing
+bytes it had before those fields existed.
 
 ## Fields
 

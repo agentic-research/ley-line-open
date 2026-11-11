@@ -49,11 +49,13 @@ use execution_fixture::{
     CompletingBackend, grant_bytes, grant_bytes_for, grant_json, spec_bytes, spec_json,
 };
 
-/// What a surface answered: the operation's JSON, or its error message.
+/// What a surface answered: the operation's JSON, or its error message and
+/// the execution/v1 classification it carries as a structured field
+/// (`executionError`: `code`, `retryable`), `Null` when it carries none.
 #[derive(Debug, Clone, PartialEq)]
 enum Outcome {
     Ok(Value),
-    Err(String),
+    Err(String, Value),
 }
 
 /// A daemon reply is an error when it is the `ErrorResponse` envelope.
@@ -64,6 +66,10 @@ fn outcome(response: Value) -> Outcome {
                 .as_str()
                 .expect("an error envelope carries its message")
                 .to_owned(),
+            response
+                .get("executionError")
+                .cloned()
+                .unwrap_or(Value::Null),
         )
     } else {
         Outcome::Ok(response)
@@ -228,7 +234,21 @@ impl Surfaces {
         };
         match result {
             Ok(json) => Outcome::Ok(serde_json::from_str(&json).expect("handler JSON")),
-            Err(error) => Outcome::Err(format!("{error:#}")),
+            // The in-process handler's error is the runtime's typed
+            // `ExecutionError`; its classification, spelled as the schema's
+            // `ErrorCode`, is what every transport must carry.
+            Err(error) => Outcome::Err(
+                format!("{error:#}"),
+                error
+                    .downcast_ref::<leyline_runtime::ExecutionError>()
+                    .map_or(Value::Null, |e| {
+                        json!({
+                            "code": e.code.wire_name(),
+                            "retryable": e.retryable,
+                            "message": e.detail,
+                        })
+                    }),
+            ),
         }
     }
 
@@ -343,7 +363,7 @@ impl Surfaces {
         let outcome = outcome(serde_json::from_str(text).expect("tool text is JSON"));
         assert_eq!(
             result["isError"],
-            Value::Bool(matches!(outcome, Outcome::Err(_))),
+            Value::Bool(matches!(outcome, Outcome::Err(..))),
             "MCP isError must say whether the operation failed: {reply}"
         );
         outcome
@@ -399,7 +419,7 @@ fn without_clock(outcome: &Outcome) -> Outcome {
 fn ok(outcome: &Outcome) -> &Value {
     match outcome {
         Outcome::Ok(value) => value,
-        Outcome::Err(error) => panic!("expected success, got {error}"),
+        Outcome::Err(error, _) => panic!("expected success, got {error}"),
     }
 }
 
@@ -490,7 +510,7 @@ async fn one_request_through_every_surface_yields_the_same_lifecycle_and_receipt
     for (label, outcome) in rust {
         match label.as_str() {
             "collect while running" => assert!(
-                matches!(outcome, Outcome::Err(error) if error.contains("not terminal")),
+                matches!(outcome, Outcome::Err(error, _) if error.contains("not terminal")),
                 "{label}: {outcome:?}"
             ),
             "collect" => {
@@ -533,7 +553,7 @@ async fn one_run_reads_identically_through_every_surface() {
     };
     for op in [&start, &wrong_tier] {
         assert_identical(&surfaces, op, |outcome| {
-            assert!(matches!(outcome, Outcome::Err(_)), "{op:?}: {outcome:?}");
+            assert!(matches!(outcome, Outcome::Err(..)), "{op:?}: {outcome:?}");
         })
         .await;
     }
@@ -556,10 +576,16 @@ async fn one_run_reads_identically_through_every_surface() {
         grant: grant_json(&grant_bytes_for(&spec, BackendClass::Native)),
     };
     assert_identical(&surfaces, &other, |outcome| {
-        assert!(
-            matches!(outcome, Outcome::Err(error) if error.contains("UnsupportedBackend")),
-            "{outcome:?}"
-        );
+        // Classified by a structured field, not by reading the message
+        // (bead `ley-line-open-e347ae`); the message keeps its
+        // `UnsupportedBackend:` prefix, which Cloister matches today.
+        let Outcome::Err(error, classification) = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(classification["code"], "unsupportedBackend", "{outcome:?}");
+        assert_eq!(classification["retryable"], false, "{outcome:?}");
+        let message = classification["message"].as_str().expect("a message");
+        assert_eq!(error, &format!("UnsupportedBackend: {message}"));
     })
     .await;
 
@@ -590,7 +616,7 @@ async fn one_run_reads_identically_through_every_surface() {
     })
     .await;
     assert_identical(&surfaces, &collect, |outcome| {
-        assert!(matches!(outcome, Outcome::Err(error) if error.contains("not terminal")));
+        assert!(matches!(outcome, Outcome::Err(error, _) if error.contains("not terminal")));
     })
     .await;
 

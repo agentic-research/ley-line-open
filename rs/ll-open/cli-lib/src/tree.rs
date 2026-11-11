@@ -179,15 +179,50 @@ pub fn exists(conn: &Connection) -> bool {
     conn.prepare("SELECT 1 FROM _tree LIMIT 1").is_ok()
 }
 
-fn decode(path: &str, mode: u32, blob: Option<Vec<u8>>) -> Result<Entry> {
+/// A `_tree` row whose `blob_hash` does not fit its mode (bead
+/// `ley-line-open-bbd7c8`). Returned inside the [`anyhow::Error`] of every
+/// `_tree` read, so a caller tells it apart with `downcast_ref`. Neither row
+/// is read leniently: a directory's blob would be silently ignored (its node
+/// folds from its children), and a file with none has no content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MalformedRow {
+    /// A directory-mode row that carries a `blob_hash`.
+    DirectoryWithBlob { path: String },
+    /// A file-mode (regular, executable or symlink) row with no `blob_hash`.
+    FileWithoutBlob { path: String },
+}
+
+impl std::fmt::Display for MalformedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MalformedRow::DirectoryWithBlob { path } => {
+                write!(f, "_tree directory entry {path:?} carries a blob_hash")
+            }
+            MalformedRow::FileWithoutBlob { path } => {
+                write!(f, "_tree file entry {path:?} has no blob_hash")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MalformedRow {}
+
+/// One `_tree` row as an [`Entry`], refusing a mode git does not store, a
+/// blob that does not fit the mode ([`MalformedRow`]) and a blob that is
+/// not 32 bytes. Every reader of `_tree` rows goes through it, here and in
+/// `leyline-storefs`.
+pub fn decode(path: &str, mode: u32, blob: Option<Vec<u8>>) -> Result<Entry> {
     let Some(git) = GitMode::from_git(mode) else {
         bail!("_tree entry {path:?} has mode {mode:o}, which git does not store");
     };
     let Some(mode) = git.file_mode() else {
+        if blob.is_some() {
+            return Err(MalformedRow::DirectoryWithBlob { path: path.into() }.into());
+        }
         return Ok(Entry::Dir);
     };
     let Some(bytes) = blob else {
-        bail!("_tree file entry {path:?} has no blob_hash");
+        return Err(MalformedRow::FileWithoutBlob { path: path.into() }.into());
     };
     let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
         anyhow::anyhow!(
@@ -493,6 +528,40 @@ mod tests {
         put_file(&c, "ab/y", Mode::Regular, h, None).unwrap();
         let paths: Vec<String> = under(&c, "a").unwrap().into_iter().map(|e| e.0).collect();
         assert_eq!(paths, ["a/x"]);
+    }
+
+    /// Bead `ley-line-open-bbd7c8`: a directory row carries no blob and a
+    /// file row carries one. Either malformed row is refused with a typed
+    /// error naming its path, on every read of `_tree`, and storeRoot
+    /// (what verify-head and rebuild recompute) fails closed on it.
+    #[test]
+    fn a_row_whose_blob_does_not_fit_its_mode_is_refused() {
+        let cases = [
+            (
+                "INSERT INTO _tree (path, mode, blob_hash) VALUES ('d', 16384, zeroblob(32));",
+                MalformedRow::DirectoryWithBlob { path: "d".into() },
+            ),
+            (
+                "INSERT INTO _tree (path, mode, blob_hash) VALUES ('f', 33188, NULL);",
+                MalformedRow::FileWithoutBlob { path: "f".into() },
+            ),
+        ];
+        for (insert, want) in cases {
+            let c = conn();
+            c.execute_batch(insert).unwrap();
+            let path = match &want {
+                MalformedRow::DirectoryWithBlob { path }
+                | MalformedRow::FileWithoutBlob { path } => path.clone(),
+            };
+            for err in [
+                entries(&c).unwrap_err(),
+                entry(&c, &path).unwrap_err(),
+                crate::store_root::store_root(&c).unwrap_err(),
+            ] {
+                assert_eq!(err.downcast_ref::<MalformedRow>(), Some(&want), "{err:#}");
+                assert!(format!("{err:#}").contains(&format!("{path:?}")), "{err:#}");
+            }
+        }
     }
 
     #[test]

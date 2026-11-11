@@ -402,6 +402,54 @@ fn det_known_answer_vectors() {
     }
 }
 
+/// The shared Head messages (bead `ley-line-open-a46711`): a v3 head's claim
+/// digests to its pinned value, and a head carrying `retiredTreeRoot @7` is
+/// refused as head digest v2, typed, by every reader. The Go module checks
+/// the same cases (`sigma.ClaimOf`, `ErrRetiredDigestV2`).
+#[test]
+fn head_message_vectors_are_read_or_refused_by_version() {
+    use leyline_cli_lib::head_claim::{HeadFormatError, claim_of, digest_of, stamp_of};
+    use leyline_schema_capnp::head_capnp::head;
+
+    let v = vectors();
+    let cases = cases(&v, "headMessage");
+    assert!(cases.iter().any(|c| c["refusal"].is_null()));
+    assert!(cases.iter().any(|c| c["refusal"] == "retiredDigestV2"));
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let bytes = hex::decode(case["messageHex"].as_str().expect("messageHex")).expect("hex");
+        let mut slice: &[u8] = &bytes;
+        let message =
+            capnp::serialize::read_message(&mut slice, capnp::message::ReaderOptions::new())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(slice.is_empty(), "{name}: one message, nothing after it");
+        let h = message.get_root::<head::Reader<'_>>().expect("a Head");
+        if case["refusal"] == "retiredDigestV2" {
+            let refused = |err: anyhow::Error| err.downcast_ref::<HeadFormatError>().copied();
+            assert_eq!(
+                refused(claim_of(h).unwrap_err()),
+                Some(HeadFormatError::RetiredDigestV2),
+                "{name}"
+            );
+            assert_eq!(
+                refused(stamp_of(h).unwrap_err()),
+                Some(HeadFormatError::RetiredDigestV2),
+                "{name}"
+            );
+            assert_eq!(
+                refused(digest_of(h).unwrap_err()),
+                Some(HeadFormatError::RetiredDigestV2),
+                "{name}"
+            );
+        } else {
+            let digest = digest_of(h)
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"))
+                .expect("a stamped head has a claim");
+            assert_eq!(digest, hash_of(&case["digest"]), "{name}");
+        }
+    }
+}
+
 /// A vector's leaves: `{path, mode, content}` for a file, `{path, mode:
 /// 16384}` (no content) for an empty directory.
 fn vector_leaves(case: &Value) -> Vec<StoreLeaf> {

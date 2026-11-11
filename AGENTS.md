@@ -40,7 +40,7 @@ Dispatch only the lenses the target actually needs. Specialists may run in paral
 
 Do not use “root,” “hash,” or “identity” without naming the domain and authoritative bytes.
 
-Every keyed fold below is the ADR-0032 partition fold (`BLAKE3_derive_key("leyline partition fold v1", …)` with the scheme named in the row, `rs/ll-core/core/src/partition.rs`) unless the row names its own `derive_key` context. Plain BLAKE3 over bytes (σ_bytes) is the one unkeyed construction: the blob hash, the CDC chunk hash, `current_root` and the rootfs digest are instances of it; every other construction is keyed, except `run_id` v1, which violates ADR-0047 law (c) until M3. ADR-0047 §3 is the conformance table for the constructions it lists (it has no rootfs-digest row).
+Every keyed fold below is the ADR-0032 partition fold (`BLAKE3_derive_key("leyline partition fold v1", …)` with the scheme named in the row, `rs/ll-core/core/src/partition.rs`) unless the row names its own `derive_key` context. Plain BLAKE3 over bytes (σ_bytes) is the one unkeyed construction: the blob hash, the CDC chunk hash, `current_root` and the rootfs digest are instances of it; every other construction is keyed, except `run_id` v1, which violates ADR-0047 law (c) until M3. ADR-0047 §3 is the conformance table for the constructions it lists, the rootfs digest among them, with its canonical bytes and known-answer vector (`execution/v1/test-vectors/rootfs-manifest.json`).
 
 | Name | Authoritative for | Construction | Status |
 | --- | --- | --- | --- |

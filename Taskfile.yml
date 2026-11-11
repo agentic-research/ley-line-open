@@ -432,6 +432,11 @@ tasks:
     cmds:
       - tools/test_release_tags.sh
 
+  release:schema-surface:fixture-test:
+    desc: Prove the release bump and the release verifier read one public schema surface (Go client plus schema-spec IDL and vectors), so a schema-spec-only change raises SCHEMA_VERSION and verifies
+    cmds:
+      - sh tools/test_schema_surface.sh
+
   release:publish:fixture-test:
     desc: Prove the outer operation watches only its exact tag workflow
     cmds:
@@ -483,7 +488,7 @@ tasks:
       - tools/test_go_schema_consumer.sh
 
   schema:go-sigma-vectors:
-    desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec, node_hash v3) the Rust tests check (73c6ee, 73add7)
+    desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec, node_hash v3) and refuses the v2 Head message by version, as the Rust tests do (73c6ee, 73add7, a46711)
     dir: clients/go/leyline-schema
     env:
       GOWORK: "off"
@@ -1421,11 +1426,25 @@ tasks:
   # from ll-open (Tier 2). A failure here means a Tier 1 crate has
   # gained a forbidden Tier 2 dep.
   # --------------------------------------------------------------------------
+  # Every ll-core crate, not three of them (bead ley-line-open-b42256):
+  # leyline-schema-capnp and the other five were never built here. The build
+  # alone does not prove isolation (cargo would compile an ll-open dependency
+  # in), so the dependency tree is also checked for an ll-open path.
   tier:isolation:
-    desc: Verify ll-core crates build without ll-open
+    desc: Verify every ll-core crate builds without ll-open
     dir: rs
+    vars:
+      LL_CORE: >-
+        -p leyline-core -p leyline-ffi-helpers -p leyline-mcp-descriptor
+        -p leyline-mcp-protocol-schema -p leyline-public-schema
+        -p leyline-schema -p leyline-schema-capnp -p leyline-schema-spec
     cmds:
-      - cargo build -p leyline-core -p leyline-schema -p leyline-public-schema
+      - cargo build {{.LL_CORE}}
+      - |
+        if cargo tree -e normal,build {{.LL_CORE}} --prefix none | grep -F '/ll-open/'; then
+          echo "an ll-core crate depends on an ll-open crate" >&2
+          exit 1
+        fi
 
   # --------------------------------------------------------------------------
   # Image build (cargo-zigbuild + docker → distroless OCI image)
@@ -1795,6 +1814,7 @@ tasks:
       - task: release:publication:fixture-test
       - task: release:workflow:fixture-test
       - task: release:tags:fixture-test
+      - task: release:schema-surface:fixture-test
       - task: release:publish:fixture-test
       - task: release:retry:fixture-test
       - task: release:hypervisor:fixture-test

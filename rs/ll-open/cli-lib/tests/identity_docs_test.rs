@@ -199,6 +199,54 @@ fn head_schema_describes_the_store_root_the_code_computes() {
     }
 }
 
+/// `Head.unboundFacts` is the producer's count, `node_refs` rows whose token
+/// has no `node_defs` row; head.capnp once described `fact_edges` rows with a
+/// NULL `dst` under a "W5" ratchet that does not exist (bead
+/// `ley-line-open-cc2130`).
+#[test]
+fn head_schema_describes_the_unbound_facts_the_code_counts() {
+    let schema = include_str!("../../../ll-core/schema-capnp/schemas/head.capnp");
+    let field = schema
+        .find("unboundFacts @4")
+        .expect("head.capnp declares unboundFacts @4");
+    // The field's own comment: the block between the previous field and it.
+    let start = schema[..field]
+        .rfind("segmentBytes @3")
+        .expect("segmentBytes precedes unboundFacts");
+    let doc = comment_prose(&schema[start..field]);
+    for claim in [
+        "`node_refs` rows whose `token` has no `node_defs` row",
+        "`_meta.unbound_facts`",
+        "extraction epoch",
+    ] {
+        assert!(
+            doc.contains(claim),
+            "head.capnp's unboundFacts description is missing: {claim}"
+        );
+    }
+    for stale in ["fact_edges", "W5", "ratchet gate", "<= baseline"] {
+        assert!(
+            !doc.contains(stale),
+            "head.capnp's unboundFacts description names `{stale}`"
+        );
+    }
+    // Tie the description to the producer and the table contract.
+    let parse = include_str!("../src/cmd_parse.rs");
+    assert!(
+        parse.contains(
+            "SELECT count(*) FROM node_refs WHERE token NOT IN (SELECT token FROM node_defs)"
+        ),
+        "cmd_parse changed its unbound_facts count; update head.capnp's unboundFacts"
+    );
+    let contract = normalized(include_str!("../../../../docs/TABLE_CONTRACT.md"));
+    assert!(
+        contract.contains(
+            "`unbound_facts` = the count of `node_refs` rows whose token has no `node_defs` row"
+        ),
+        "TABLE_CONTRACT's unbound_facts definition moved; update head.capnp's unboundFacts"
+    );
+}
+
 /// The SQLite projection is written beside the capnp segments by one parse; it
 /// is not derived from them. The only production reader of a segment hashes it.
 #[test]

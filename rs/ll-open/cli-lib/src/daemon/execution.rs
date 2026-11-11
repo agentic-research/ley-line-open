@@ -12,6 +12,12 @@ use leyline_runtime::{
 
 /// Transport-neutral execution operations. UDS and MCP call these methods;
 /// neither transport owns policy or lifecycle state.
+///
+/// A failure must be a [`leyline_runtime::ExecutionError`] (directly, or
+/// with context the `anyhow` chain still downcasts through): the daemon's
+/// error envelope classifies the failure from it as `executionError`
+/// (`code`, `retryable`, `message`; bead `ley-line-open-e347ae`). Any other
+/// error reaches callers unclassified.
 pub trait ExecutionHandler: Send + Sync {
     fn capabilities(&self) -> Result<String>;
     fn provision(&self, input: &Value) -> Result<String>;

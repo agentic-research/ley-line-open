@@ -228,6 +228,28 @@ fn status_before_start_is_read_only() {
     assert!(backend.calls().is_empty());
 }
 
+/// A backend that keeps no output reports none for any run: the trait's
+/// default is absence, never an empty capture that would read as "the run
+/// printed nothing" (bead ley-line-open-a26ad0).
+#[test]
+fn a_backend_without_output_reports_none() {
+    assert_eq!(Backend::output(&CompletingBackend, "any-run"), None);
+}
+
+/// The default `poll_outcome` is `poll` with no output: the status passes
+/// through unchanged.
+#[test]
+fn the_default_outcome_is_the_polled_status_without_output() {
+    let backend = CompletingBackend;
+    let outcome = Backend::poll_outcome(&backend, "run-01").expect("poll");
+    let polled = Backend::poll(&backend, "run-01").expect("poll");
+    assert_eq!(
+        outcome.as_ref().map(|outcome| &outcome.status),
+        polled.as_ref()
+    );
+    assert!(outcome.is_some_and(|outcome| outcome.output.is_none()));
+}
+
 /// A backend that is available only once its CAS root exists, as the
 /// native and libkrun backends are.
 struct NeedsCasRoot(std::path::PathBuf);

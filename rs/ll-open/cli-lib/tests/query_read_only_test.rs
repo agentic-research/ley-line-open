@@ -464,6 +464,39 @@ fn a_schema_virtual_table_is_unreadable() {
     );
 }
 
+/// A statement that opens the reader's temp database without SQLite asking
+/// the authorizer to read it is refused, and leaves every reader with one
+/// database (bead `ley-line-open-3befbc`): a `NATURAL` join reports no read
+/// of the joined `temp.sqlite_master`, and `pragma_table_info(.., 'temp')`
+/// opens the temp schema before its pragma is denied.
+#[test]
+fn a_statement_that_opens_the_temp_database_is_refused() {
+    let d = Daemon::start();
+    for _ in 0..2 {
+        assert_refused(
+            &d,
+            "SELECT q.name FROM (SELECT 'x' AS name) q NATURAL JOIN temp.sqlite_master",
+            "denied_action",
+            "read",
+        );
+        assert_refused(
+            &d,
+            "SELECT * FROM pragma_table_info('t', 'temp')",
+            "denied_action",
+            "pragma",
+        );
+    }
+    let readers = d.state()["readers"].clone();
+    for reader in readers.as_array().unwrap() {
+        assert_eq!(reader["attached"], 1, "{readers}");
+    }
+    assert_eq!(
+        d.over_socket("SELECT a FROM t ORDER BY a")["rows"],
+        json!([{"a": "1"}, {"a": "2"}]),
+        "the readers still serve"
+    );
+}
+
 /// The allowed modules still return rows over both transports.
 #[test]
 fn allowed_modules_return_rows() {

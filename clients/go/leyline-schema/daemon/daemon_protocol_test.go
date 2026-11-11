@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon"
 	"github.com/agentic-research/ley-line-open/clients/go/leyline-schema/daemon/wire"
 )
 
@@ -379,6 +380,24 @@ func decoderFor(name string) func([]byte) error {
 			}
 			var w wire.QueryResponse
 			return strictUnmarshal(b, &w)
+		}
+	case "ExecutionErrorResponse":
+		// LLO bead ley-line-open-e347ae: the classification decodes
+		// strictly, and its code is a name of the generated
+		// ExecutionErrorCode enum, the mirror of execution.capnp's ErrorCode.
+		return func(b []byte) error {
+			var w wire.ExecutionErrorResponse
+			if err := strictUnmarshal(b, &w); err != nil {
+				return err
+			}
+			if w.ExecutionError == nil || w.ExecutionError.Code == nil || w.ExecutionError.Retryable == nil {
+				return fmt.Errorf("executionError lacks code or retryable: %s", b)
+			}
+			code := daemon.ExecutionErrorCodeFromString(*w.ExecutionError.Code)
+			if code.String() != *w.ExecutionError.Code {
+				return fmt.Errorf("executionError code %q is not an ExecutionErrorCode", *w.ExecutionError.Code)
+			}
+			return nil
 		}
 	case "SheafSetTopologyResponse":
 		return func(b []byte) error { var v sheafSetTopologyResponse; return strictUnmarshal(b, &v) }

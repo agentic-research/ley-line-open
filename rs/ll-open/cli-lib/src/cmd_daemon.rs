@@ -904,7 +904,7 @@ pub async fn run_daemon_with_options(
 ///
 /// `foo.ctrl` → `foo.live.db`. Sibling of `<ctrl>.arena`,
 /// `<ctrl>.sock`, `<ctrl>.arena.lock`. Same naming convention
-/// as `sock_path` at line ~366 (`ctrl_path.with_extension("sock")`).
+/// as the daemon socket (`ctrl_path.with_extension("sock")`).
 ///
 /// Bead `ley-line-open-98fb67` (WAL adoption 15a).
 pub fn live_db_path_for(ctrl_path: &Path) -> std::path::PathBuf {

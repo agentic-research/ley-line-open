@@ -1062,10 +1062,7 @@ fn the_request_cannot_widen_reach() {
     // still crosses the relay (so init is LLO's), and 13307 stays closed.
     let mut booted = Run::new(&root, &libkrunfw, CLIENT, "widen-smuggled")
         .env("DB_ADDR", &format!("127.0.0.1:{DIAL_PORT}"))
-        .env(
-            "SMUGGLED",
-            "x\" KRUN_LOOPBACK_CHANNELS=\"dial:13307:65536",
-        )
+        .env("SMUGGLED", "x\" KRUN_LOOPBACK_CHANNELS=\"dial:13307:65536")
         .env("init", "/bin/guest")
         .env("OTHER_ADDR", "127.0.0.1:13307")
         .args(&["env:DB_ADDR", "env:OTHER_ADDR"])
@@ -1073,8 +1070,7 @@ fn the_request_cannot_widen_reach() {
         .boot();
     let stderr = booted.guest.end();
     assert_eq!(
-        booted.report,
-        "dialed DB_ADDR=host:hello-DB_ADDR OTHER_ADDR=ConnectionRefused",
+        booted.report, "dialed DB_ADDR=host:hello-DB_ADDR OTHER_ADDR=ConnectionRefused",
         "worker stderr:\n{stderr}"
     );
 

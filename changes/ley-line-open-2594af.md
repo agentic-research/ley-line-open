@@ -1,0 +1,3 @@
+Section: Security
+
+- **A microVM guest's init mounts only over a real directory** (bead `ley-line-open-2594af`, defence in depth for `ley-line-open-10b516`). mount(2) follows a link, so a rootfs holding `work -> bin` with a workspace attached at /work had the workspace mounted over /bin, covering the executable the run verified; a link at `dev`, `proc` or `sys` did the same with init's own mounts. Init (new LLO libkrun patch `0014`) now examines /dev, /proc, /sys and every virtio-fs share target without following links, component by component, and refuses anything but a real directory by name ("/work is not a directory, refusing to mount over it"), stopping the guest before the workload runs. The import and the rootfs manifest reader refuse such a link first.

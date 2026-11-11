@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Wed, 11 Nov 2026 12:00:00 -0600
+Subject: [PATCH] init: refuse a mount target that is not a real directory
+
+mount(2) and mkdir(2) follow a symbolic link anywhere in their path.
+Init creates /dev, /proc and /sys if they are missing and mounts over
+them, and creates and mounts each KRUN_VIRTIOFS_MOUNTS target, so a
+rootfs that holds a link at one of those names got the mount wherever
+the link pointed. A rootfs holding `work -> usr/bin` with a workspace
+attached at /work had the workspace mounted over usr/bin, covering the
+executable the embedder verified.
+
+Init now examines each of those targets without following links, every
+component with lstat, and mounts only over a real directory. For a
+virtio-fs target it walks the parent before creating the target and the
+whole target after. Anything else stops the guest with
+"<target> is not a directory, refusing to mount over it". A path with
+an empty component is refused too, since lstat follows a link named
+with a trailing slash. /tmp already had this check (patch 0012); /dev/pts,
+/dev/shm and /sys/fs/cgroup lie inside the kernel filesystems mounted
+just before them, which an image cannot populate.
+
+Nothing but init runs in the guest at this point, so no component can
+change between the walk and the mount.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+---
+diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
+--- a/src/init_blob/init/init.c
++++ b/src/init_blob/init/init.c
+@@ -537,7 +537,62 @@
+         return -1;
+     }
+     chroot(".");
++
++    return 0;
++}
++#endif
++
++#if __linux__
++/*
++ * Whether every component of the absolute `path` is a real directory, not
++ * a link or anything else, examined without following links (lstat). With
++ * `include_last` false the last component is left out, for a target that
++ * is about to be created. A path that is relative, too long to examine, or
++ * holds an empty component (`//`, a trailing `/`, on which lstat would
++ * follow a link) is not one.
++ *
++ * mount(2) and mkdir(2) follow a link anywhere in their path, so a rootfs
++ * that holds `work -> usr/bin` would get the mount over usr/bin, covering
++ * the very executable the run verified (ley-line-open-10b516). Nothing in
++ * the guest but init runs yet, so no one can swap a component between this
++ * walk and the mount.
++ */
++static bool real_directory_path(const char *path, bool include_last)
++{
++    char prefix[PATH_MAX];
++    size_t length = strlen(path);
++    size_t end = length;
++    size_t i;
++    struct stat existing;
++
++    if (path[0] != '/' || length >= sizeof(prefix) || strstr(path, "//") ||
++        (length > 1 && path[length - 1] == '/')) {
++        return false;
++    }
++    if (!include_last) {
++        /* The parent: up to, not including, the last '/' ("" for "/x"). */
++        end = (size_t)(strrchr(path, '/') - path);
++    }
++    for (i = 1; i <= end; i++) {
++        if (i < end && path[i] != '/') {
++            continue;
++        }
++        memcpy(prefix, path, i);
++        prefix[i] = '\0';
++        if (lstat(prefix, &existing) < 0 || !S_ISDIR(existing.st_mode)) {
++            return false;
++        }
++    }
++    return true;
++}
+
++/* Refuse, by name, to mount over `path` unless it is a real directory. */
++static int refuse_unless_real_directory(const char *path)
++{
++    if (!real_directory_path(path, true)) {
++        printf("%s is not a directory, refusing to mount over it\n", path);
++        return -1;
++    }
+     return 0;
+ }
+ #endif
+@@ -606,6 +661,14 @@
+             printf("Error creating directory (%s)\n", DIRS_LEVEL1[i]);
+             return -1;
+         }
++        /*
++         * mkdir leaves an existing link in place, and mount(2) would follow
++         * it. /dev/pts, /dev/shm and /sys/fs/cgroup sit inside the kernel's
++         * own filesystems mounted here, which an image cannot populate.
++         */
++        if (refuse_unless_real_directory(DIRS_LEVEL1[i]) < 0) {
++            return -1;
++        }
+     }
+
+     if (mount("devtmpfs", "/dev", "devtmpfs", MS_RELATIME, NULL) < 0 &&
+@@ -1403,8 +1466,21 @@
+             return -1;
+         }
+         *dir++ = '\0';
++        /*
++         * Neither the mkdir nor the mount may go through a link: walk the
++         * parent before creating the target, and the whole target after.
++         */
++        if (!real_directory_path(dir, false)) {
++            printf("%s is not a directory, refusing to mount over it\n", dir);
++            free(list);
++            return -1;
++        }
+         if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
+             perror("mkdir(KRUN_VIRTIOFS_MOUNTS)");
++            free(list);
++            return -1;
++        }
++        if (refuse_unless_real_directory(dir) < 0) {
+             free(list);
+             return -1;
+         }
+--
+2.50.1 (Apple Git-155)

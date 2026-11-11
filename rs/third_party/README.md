@@ -178,6 +178,18 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     digit was), so the case now takes that byte; upstream re-read the hex
     and came out right only because the main loop then copied that byte
     over its output. `hexToDigit` and `Utf32toUtf8` are removed.
+14. `0014` — **init: refuse a mount target that is not a real directory.**
+    mount(2) and mkdir(2) follow a link anywhere in their path, so a rootfs
+    holding `work -> usr/bin` with a workspace attached at /work had the
+    workspace mounted over usr/bin, covering the verified executable (bead
+    `ley-line-open-10b516`). Init now walks /dev, /proc, /sys and every
+    `KRUN_VIRTIOFS_MOUNTS` target with lstat, component by component (the
+    parent before creating a share target, the whole target after), and
+    mounts only over a real directory. Anything else, or a path with an
+    empty component, stops the guest with "`<target>` is not a directory,
+    refusing to mount over it" (bead `ley-line-open-2594af`). The import
+    and the manifest reader refuse such a link first; this is the in-guest
+    backstop.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

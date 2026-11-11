@@ -542,6 +542,61 @@ static int chroot_luks()
 }
 #endif
 
+#if __linux__
+/*
+ * Whether every component of the absolute `path` is a real directory, not
+ * a link or anything else, examined without following links (lstat). With
+ * `include_last` false the last component is left out, for a target that
+ * is about to be created. A path that is relative, too long to examine, or
+ * holds an empty component (`//`, a trailing `/`, on which lstat would
+ * follow a link) is not one.
+ *
+ * mount(2) and mkdir(2) follow a link anywhere in their path, so a rootfs
+ * that holds `work -> usr/bin` would get the mount over usr/bin, covering
+ * the very executable the run verified (ley-line-open-10b516). Nothing in
+ * the guest but init runs yet, so no one can swap a component between this
+ * walk and the mount.
+ */
+static bool real_directory_path(const char *path, bool include_last)
+{
+    char prefix[PATH_MAX];
+    size_t length = strlen(path);
+    size_t end = length;
+    size_t i;
+    struct stat existing;
+
+    if (path[0] != '/' || length >= sizeof(prefix) || strstr(path, "//") ||
+        (length > 1 && path[length - 1] == '/')) {
+        return false;
+    }
+    if (!include_last) {
+        /* The parent: up to, not including, the last '/' ("" for "/x"). */
+        end = (size_t)(strrchr(path, '/') - path);
+    }
+    for (i = 1; i <= end; i++) {
+        if (i < end && path[i] != '/') {
+            continue;
+        }
+        memcpy(prefix, path, i);
+        prefix[i] = '\0';
+        if (lstat(prefix, &existing) < 0 || !S_ISDIR(existing.st_mode)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Refuse, by name, to mount over `path` unless it is a real directory. */
+static int refuse_unless_real_directory(const char *path)
+{
+    if (!real_directory_path(path, true)) {
+        printf("%s is not a directory, refusing to mount over it\n", path);
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 #if __linux__ && !defined(TDX)
 /*
  * A writable /tmp for the workload, which POSIX programs assume and which a
@@ -604,6 +659,14 @@ static int mount_filesystems()
     for (i = 0; i < 3; ++i) {
         if (mkdir(DIRS_LEVEL1[i], 0755) < 0 && errno != EEXIST) {
             printf("Error creating directory (%s)\n", DIRS_LEVEL1[i]);
+            return -1;
+        }
+        /*
+         * mkdir leaves an existing link in place, and mount(2) would follow
+         * it. /dev/pts, /dev/shm and /sys/fs/cgroup sit inside the kernel's
+         * own filesystems mounted here, which an image cannot populate.
+         */
+        if (refuse_unless_real_directory(DIRS_LEVEL1[i]) < 0) {
             return -1;
         }
     }
@@ -1403,8 +1466,21 @@ static int mount_virtiofs_list()
             return -1;
         }
         *dir++ = '\0';
+        /*
+         * Neither the mkdir nor the mount may go through a link: walk the
+         * parent before creating the target, and the whole target after.
+         */
+        if (!real_directory_path(dir, false)) {
+            printf("%s is not a directory, refusing to mount over it\n", dir);
+            free(list);
+            return -1;
+        }
         if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
             perror("mkdir(KRUN_VIRTIOFS_MOUNTS)");
+            free(list);
+            return -1;
+        }
+        if (refuse_unless_real_directory(dir) < 0) {
             free(list);
             return -1;
         }

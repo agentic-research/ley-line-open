@@ -104,6 +104,109 @@ fn main() {
 }
 "#;
 
+/// Set in the child to the `KRUN_VIRTIOFS_MOUNTS` value to hand init
+/// verbatim (empty: none), for a rootfs whose mount target is a link.
+const LINKED_MOUNTS: &str = "LEYLINE_TEST_VIRTIOFS_LINKED_MOUNTS";
+
+/// Prints one line if it runs at all; init must stop before it does.
+const GUEST_THAT_MUST_NOT_RUN: &str = r#"
+fn main() {
+    println!("guest ran");
+}
+"#;
+
+/// Init mounts only over a real directory (LLO libkrun patch 0014, bead
+/// `ley-line-open-2594af`; defence in depth for `ley-line-open-10b516`).
+/// mount(2) follows a link, so a rootfs holding `work -> bin` with a
+/// workspace attached at /work would get the share over /bin, covering the
+/// executable the run verified. For a top-level share target, a nested one
+/// whose parent is a link, and one of init's own kernel mounts, init must
+/// refuse by name and stop the guest before the workload runs. Without the
+/// patch init mounts and prints no refusal, so the named refusal is what
+/// tells the two apart.
+#[test]
+fn the_guest_init_refuses_a_mount_target_that_is_a_link() {
+    if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
+        enter_guest(PathBuf::from(rootfs));
+    }
+    for (link, points_to, mounts, refused) in [
+        ("work", "bin", "llo:/work", "/work"),
+        ("srv", "bin", "llo:/srv/work", "/srv/work"),
+        ("dev", "bin", "", "/dev"),
+    ] {
+        let Some(console) = boot_refused(link, points_to, mounts) else {
+            return;
+        };
+        assert!(
+            console.contains(&format!(
+                "{refused} is not a directory, refusing to mount over it"
+            )),
+            "init names {refused} and refuses it:\n{console}"
+        );
+        assert!(
+            !console.contains("guest ran"),
+            "the workload never runs over a linked mount target:\n{console}"
+        );
+    }
+}
+
+/// Boot a rootfs whose `link` points at `points_to`, with init asked to
+/// mount `mounts`, and return the guest console once the VMM has exited
+/// unsuccessfully. `None` when there is no hypervisor here.
+fn boot_refused(link: &str, points_to: &str, mounts: &str) -> Option<String> {
+    let _serial = common::serial();
+    let libkrunfw = hypervisor::libkrunfw_or_skip()?;
+    let fixture = TempDir::new().expect("fixture");
+
+    let rootfs = fixture.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("bin")).expect("rootfs bin");
+    let source = fixture.path().join("guest.rs");
+    fs::write(&source, GUEST_THAT_MUST_NOT_RUN).expect("guest source");
+    let guest = rootfs.join("bin/guest");
+    hypervisor::compile_guest(&source, &guest);
+    fs::set_permissions(&guest, fs::Permissions::from_mode(0o755)).expect("guest mode");
+    std::os::unix::fs::symlink(points_to, rootfs.join(link)).expect("the linked mount target");
+
+    let vmm = fixture.path().join("vmm");
+    hypervisor::entitled_copy(&std::env::current_exe().expect("test binary"), &vmm);
+    let (library_var, library_dir) = hypervisor::library_path_env(&libkrunfw);
+    let mut child = Command::new(&vmm)
+        .args([
+            "the_guest_init_refuses_a_mount_target_that_is_a_link",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(VMM_CHILD, &rootfs)
+        .env(TOKEN, "unused")
+        .env(LINKED_MOUNTS, mounts)
+        .env(library_var, library_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the VMM");
+    let status = child
+        .wait_timeout(Duration::from_secs(30))
+        .expect("wait for the VMM");
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("VMM output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        status.is_some(),
+        "the guest did not stop within 30 seconds\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "init stops the guest with a failure: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    Some(stdout)
+}
+
 #[test]
 fn a_guest_reads_a_file_the_linked_vmm_serves_from_memory() {
     if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
@@ -210,6 +313,12 @@ fn enter_guest(rootfs: PathBuf) -> ! {
     let mut environment = vec![c(&format!("EXPECT={token}"))];
     if init_mounts {
         environment.push(c("KRUN_VIRTIOFS_MOUNTS=llo:/llo"));
+    }
+    match std::env::var(LINKED_MOUNTS) {
+        Ok(mounts) if !mounts.is_empty() => {
+            environment.push(c(&format!("KRUN_VIRTIOFS_MOUNTS={mounts}")));
+        }
+        _ => {}
     }
     let config = KrunConfig {
         run_id: "virtiofs-backend".into(),

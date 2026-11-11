@@ -200,7 +200,9 @@ fn the_guest_receives_its_argv_and_environment_byte_for_byte() {
             ..ResourceLimits::default()
         },
     };
-    backend.start(&request).expect("the guest starts");
+    backend
+        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .expect("the guest starts");
     let outcome = backend
         .wait_for_outcome("argv-probe")
         .expect("the guest completes");

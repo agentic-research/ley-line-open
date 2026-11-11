@@ -1225,11 +1225,21 @@ fn validate_workspaces(
                     })
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
+            let write_scope = workspace
+                .get_write_scope()
+                .map_err(|error| {
+                    ExecutionError::invalid(format!("invalid writeScope for {name}: {error}"))
+                })?
+                .iter()
+                .map(|entry| text(entry, "grant workspace writeScope entry"))
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            validate_write_scope(&name, &operations, &write_scope)?;
             Ok(WorkspaceGrant {
                 name,
                 graph_root,
                 expected_generation: workspace.get_expected_generation(),
                 operations,
+                write_scope,
             })
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
@@ -1256,6 +1266,74 @@ fn validate_workspaces(
         ));
     }
     Ok(grants)
+}
+
+/// The entry of `WorkspaceGrant.writeScope` that names the whole workspace.
+pub const WHOLE_WORKSPACE_WRITE_SCOPE: &str = "/";
+
+/// Hold a grant's `writeScope` to its operations and its entry grammar (bead
+/// `ley-line-open-483134`).
+///
+/// Write authority is never implied: a grant permitting `mutate` or `commit`
+/// names a non-empty scope, and a grant permitting neither names none. An
+/// entry is `/` alone (the whole workspace), or a workspace-relative path
+/// whose components are all ordinary names, ending in `/` when it is a
+/// directory prefix. No entry appears twice.
+fn validate_write_scope(
+    workspace: &str,
+    operations: &[WorkspaceOperation],
+    scope: &[String],
+) -> Result<(), ExecutionError> {
+    let writes = operations.iter().any(|operation| {
+        matches!(
+            operation,
+            WorkspaceOperation::Mutate | WorkspaceOperation::Commit
+        )
+    });
+    if writes && scope.is_empty() {
+        return Err(ExecutionError::invalid(format!(
+            "grant workspace {workspace} permits mutate or commit and names no writeScope; \
+             name the paths the run may write, or \"/\" for the whole workspace"
+        )));
+    }
+    if !writes && !scope.is_empty() {
+        return Err(ExecutionError::invalid(format!(
+            "grant workspace {workspace} names a writeScope and permits neither mutate \
+             nor commit; a scope without a write operation grants nothing"
+        )));
+    }
+    for (index, entry) in scope.iter().enumerate() {
+        if entry == WHOLE_WORKSPACE_WRITE_SCOPE {
+            if scope.len() != 1 {
+                return Err(ExecutionError::invalid(format!(
+                    "grant workspace {workspace} writeScope names \"/\", the whole \
+                     workspace, beside other entries; it stands alone"
+                )));
+            }
+            continue;
+        }
+        let path = entry.strip_suffix('/').unwrap_or(entry);
+        let ordinary = !path.is_empty()
+            && path.split('/').all(|component| {
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && !component.contains('\0')
+            });
+        if !ordinary {
+            return Err(ExecutionError::invalid(format!(
+                "grant workspace {workspace} writeScope entry {entry:?} is not a \
+                 workspace-relative path: no leading '/', no empty, '.' or '..' \
+                 component, and no NUL"
+            )));
+        }
+        if scope[..index].contains(entry) {
+            return Err(ExecutionError::invalid(format!(
+                "grant workspace {workspace} writeScope names {entry:?} twice"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn workspace_operation(operation: execution_capnp::WorkspaceOperation) -> WorkspaceOperation {

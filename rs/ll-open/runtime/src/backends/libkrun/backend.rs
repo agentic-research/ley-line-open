@@ -11,8 +11,8 @@ use parking_lot::{Condvar, Mutex};
 use tempfile::Builder as TempDirBuilder;
 
 use crate::{
-    Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus, ExecutionError,
-    ExecutionRequest, GuestOutput,
+    AttachedWorkspace, Backend, BackendCapabilities, BackendClass, BackendRun, BackendRunStatus,
+    ExecutionError, ExecutionRequest, GuestOutput, ServedWorkspace, ServedWorkspaces,
 };
 
 use super::output::OutputCapture;
@@ -21,7 +21,7 @@ use super::super::process::{
     SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
     finish_failed_start, read_readiness_line, supervise_worker,
 };
-use super::share::{FsService, WorkspaceShares, serve};
+use super::share::{FsService, serve};
 // The share's `worker_end` is created close-on-exec, as every descriptor
 // here is, so a process another thread spawns concurrently does not inherit
 // it; only the worker's child clears the flag, after its fork
@@ -59,9 +59,6 @@ pub struct KrunWorkerConfig {
 
 pub struct KrunWorkerBackend {
     config: KrunWorkerConfig,
-    /// Serves a run's granted workspace as the guest's `/work`. `None`: a
-    /// run granted a workspace is refused, since nothing could deliver it.
-    shares: Option<Arc<dyn WorkspaceShares>>,
     /// Whose hypervisor-entitlement rule applies to the worker: a
     /// [`std::env::consts::OS`] value, or `None` when the caller vouches for
     /// the worker. Only the `test-support` hooks below change it.
@@ -85,7 +82,6 @@ impl KrunWorkerBackend {
     pub fn new(config: KrunWorkerConfig) -> Self {
         Self {
             config,
-            shares: None,
             entitlement_platform: Some(std::env::consts::OS),
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
@@ -116,35 +112,31 @@ impl KrunWorkerBackend {
         Ok(capture.wait(until, Instant::now() + timeout))
     }
 
-    /// Serve each run's granted workspace from `shares` (ADR-0044 V5).
-    pub fn with_workspace_shares(mut self, shares: Arc<dyn WorkspaceShares>) -> Self {
-        self.shares = Some(shares);
-        self
-    }
-
-    /// The service for the run's granted workspace, if it has one. The tier
-    /// attaches one workspace, as the guest's `/work`; a grant nothing can
-    /// serve refuses the run rather than starting it without its workspace.
+    /// The share this tier attaches for the run, taken from the shares the
+    /// service materialized (bead `ley-line-open-1022a8`): none, or the one
+    /// workspace it mounts as the guest's `/work`. Refused before anything is
+    /// spawned when the request names workspaces other than the shares
+    /// handed over (the request is what the worker is told), or when there
+    /// are more shares than the tier attaches.
     fn workspace_share(
-        &self,
         request: &ExecutionRequest,
-    ) -> Result<Option<Arc<dyn FsService>>, ExecutionError> {
-        match request.workspaces.as_slice() {
-            [] => Ok(None),
-            [grant] => {
-                let shares = self.shares.as_ref().ok_or_else(|| {
-                    ExecutionError::workspace_unserved(format!(
-                        "the run is granted workspace {:?}, and this libkrun backend \
-                         serves no workspace shares (start the daemon with a source \
-                         tree)",
-                        grant.name
-                    ))
-                })?;
-                shares.open(&request.run_id, grant).map(Some)
-            }
-            grants => Err(ExecutionError::workspace_unserved(format!(
-                "the microVM tier attaches one workspace as /work; the run is granted {}",
-                grants.len()
+        workspaces: ServedWorkspaces,
+    ) -> Result<Option<ServedWorkspace>, ExecutionError> {
+        if !workspaces.serve_exactly(&request.workspaces) {
+            return Err(ExecutionError::workspace_unserved(format!(
+                "the request names {} workspace(s) and the service materialized {} \
+                 share(s) for it; a workspace is served only from a share the \
+                 execution service opened for a verified grant",
+                request.workspaces.len(),
+                workspaces.len()
+            )));
+        }
+        let mut shares = workspaces.into_shares();
+        match shares.len() {
+            0 => Ok(None),
+            1 => Ok(shares.pop()),
+            granted => Err(ExecutionError::workspace_unserved(format!(
+                "the microVM tier attaches one workspace as /work; the run is granted {granted}"
             ))),
         }
     }
@@ -268,7 +260,11 @@ impl Backend for KrunWorkerBackend {
         }
     }
 
-    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        request: &ExecutionRequest,
+        workspaces: ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
         // ADR-0035 §4 at the backend as well as the service, so a direct
         // call cannot route around it.
@@ -295,10 +291,14 @@ impl Backend for KrunWorkerBackend {
             });
         }
 
-        // The share is opened before anything is spawned or created: a
-        // refusal (no provider, a provider refusing the grant) leaves no
-        // run root and no worker.
-        let share = self.workspace_share(request)?;
+        // The share was opened by the service before this call; it is taken
+        // here, before anything is spawned or created, so a refusal (shares
+        // that are not the request's workspaces, more than the tier attaches)
+        // leaves no run root and no worker.
+        let (share, attached): (Option<Arc<dyn FsService>>, Option<AttachedWorkspace>) =
+            Self::workspace_share(request, workspaces)?
+                .map(ServedWorkspace::attach)
+                .unzip();
 
         let rootfs = TempDirBuilder::new()
             .prefix("leyline-run-")
@@ -651,10 +651,9 @@ impl Backend for KrunWorkerBackend {
         });
         Ok(BackendRun {
             backend_id: "libkrun/1".into(),
-            channels: declared
-                .into_iter()
-                .map(|descriptor| descriptor.channel)
-                .collect(),
+            // The share taken from the service's hand, which the worker's
+            // readiness declaration was held to above.
+            attached: attached.into_iter().collect(),
         })
     }
 

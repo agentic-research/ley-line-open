@@ -281,8 +281,9 @@ upper filesystem (xattrs, whiteouts, rename) are unmeasured.
 
 **How it is wired.** The VMM runs in the `leyline-krun-worker` process and the store lives in the
 daemon, so the share crosses a process boundary on one connected UNIX socket pair: the daemon's
-libkrun backend (`KrunWorkerBackend::with_workspace_shares`) opens the run's share before it
-spawns the worker and passes one end as an inherited descriptor (`--workspace-share-fd`); the
+execution service opens the run's share (`ExecutionService::with_workspace_shares`; at Phase C the
+libkrun backend opened it, until bead `ley-line-open-1022a8`) and hands it to the libkrun backend,
+which passes one end to the worker as an inherited descriptor (`--workspace-share-fd`); the
 worker's virtio-fs device (`ShareFs`, libkrun's `DynFileSystem`) forwards each FUSE request down
 it (`backends::libkrun::share`: a JSON header at Phase C, a Cap'n Proto header,
 `public-schema/capnp/share.capnp`, since `ley-line-open-39d3a4`; READ and WRITE bytes as raw

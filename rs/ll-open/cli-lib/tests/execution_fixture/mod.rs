@@ -34,10 +34,14 @@ impl Backend for CompletingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "transport-test/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 

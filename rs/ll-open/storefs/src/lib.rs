@@ -1952,6 +1952,15 @@ impl<S: Store> StoreFs<S> {
                 let prefix = join(dir, "");
                 paths.iter().any(|p| p.starts_with(&prefix))
             }
+            // A write scope reaches under the root when it names anything,
+            // and under any other directory the grant's own rule covers.
+            scoped @ Grant::Scoped { files, trees } => {
+                if dir.is_empty() {
+                    !(files.is_empty() && trees.is_empty())
+                } else {
+                    scoped.covers_dir(dir)
+                }
+            }
         }
     }
 

@@ -260,7 +260,10 @@ fn the_native_backend_called_directly_refuses_memory_and_cpu_it_cannot_apply() {
     });
     assert_eq!(backend.capabilities().enforced, native_without_cgroup());
     for field in ["memory.limit", "cpu.quota", "pids.limit"] {
-        let error = match backend.start(&native_request(only(field))) {
+        let error = match backend.start(
+            &native_request(only(field)),
+            leyline_runtime::ServedWorkspaces::none(),
+        ) {
             Ok(_) => panic!("{field} accepted by a tier that applies nothing"),
             Err(error) => error,
         };
@@ -269,7 +272,10 @@ fn the_native_backend_called_directly_refuses_memory_and_cpu_it_cannot_apply() {
     }
     // The wall clock alone gets past the ceiling check, to the configuration
     // check this fixture fails.
-    let error = match backend.start(&native_request(only("wallTimeMs"))) {
+    let error = match backend.start(
+        &native_request(only("wallTimeMs")),
+        leyline_runtime::ServedWorkspaces::none(),
+    ) {
         Ok(_) => panic!("an unconfigured backend cannot start"),
         Err(error) => error,
     };
@@ -293,10 +299,14 @@ impl Backend for VectorBackend {
             enforced: self.enforced,
         }
     }
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "vector/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
     fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
@@ -470,14 +480,20 @@ fn the_microvm_tier_refuses_an_unsized_guest() {
     });
     assert_eq!(backend.capabilities().enforced, microvm());
     for limits in [only("wallTimeMs"), only("memory.limit"), only("cpu.quota")] {
-        let error = match backend.start(&native_request(limits)) {
+        let error = match backend.start(
+            &native_request(limits),
+            leyline_runtime::ServedWorkspaces::none(),
+        ) {
             Ok(_) => panic!("an unsized microVM must not start"),
             Err(error) => error,
         };
         assert_eq!(error.code, ErrorCode::InvalidSpec, "{}", error.detail);
         assert!(error.detail.contains("sizes the guest"), "{}", error.detail);
     }
-    let error = match backend.start(&native_request(only("pids.limit"))) {
+    let error = match backend.start(
+        &native_request(only("pids.limit")),
+        leyline_runtime::ServedWorkspaces::none(),
+    ) {
         Ok(_) => panic!("pids on the microVM"),
         Err(error) => error,
     };

@@ -326,8 +326,12 @@ workspace it opens a `StoreShare` over a `StoreFs` on the daemon's own
 `DaemonContext` (so the share and the socket propose on one writer, and a
 landed share proposal reaches the checkout and the arena as a socket
 proposal does), when the store's `storeRoot` (ADR-0047 D-ii, the parser-free directory Merkle
-root of `_tree`) is the grant's `graphRoot` (`blake3-256:<storeRoot>`), scoped by `scope_for(operations)`: `read`/`list` see the whole
-tree, `mutate`/`commit` propose anywhere in it, `query` neither.
+root of `_tree`) is the grant's `graphRoot` (`blake3-256:<storeRoot>`), scoped by `scope_for(grant)`: `read`/`list` see the whole
+tree, `mutate`/`commit` propose inside the grant's `writeScope` and nowhere else, `query` neither.
+The `writeScope` (bead `ley-line-open-483134`) is exact files, `/`-terminated directory trees, or `/`
+for the whole workspace; it becomes `source_write::Grant::Scoped` (or `Whole`), so a write, create,
+rename or delete outside it is the typed `outside_grant` refusal, `EACCES` in the guest, and a
+grant that permits a write with no scope proposes nothing.
 `expectedGeneration` is carried and not consulted: it names ADR-0041's S1
 commit sequence `(epoch, seq)`, which is not implemented; the `graphRoot`
 check pins the share's tree.
@@ -379,5 +383,7 @@ The mapping:
 Dependency direction: this crate depends on `leyline-cli-lib`, which
 depends on `leyline-runtime`; neither links libkrun. The wire lives in the
 runtime and `ShareFs` in `leyline-krun-worker`; this crate implements the wire's `FsService` and
-`WorkspaceShares`; `leyline-cli` wires `DaemonShares` into the libkrun
-backend (`leyline execution-daemon --backend micro-vm --source <dir>`).
+`WorkspaceShares`; `leyline-cli` wires `DaemonShares` into the execution
+service (`ExecutionService::with_workspace_shares`), which opens a run's share
+and hands it to the libkrun backend
+(`leyline execution-daemon --backend micro-vm --source <dir>`).

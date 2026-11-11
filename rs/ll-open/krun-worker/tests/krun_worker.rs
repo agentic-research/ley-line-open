@@ -247,6 +247,7 @@ fn grant(name: &str) -> WorkspaceGrant {
         graph_root: format!("blake3-256:{}", "e".repeat(64)),
         expected_generation: 0,
         operations: vec![WorkspaceOperation::Read],
+        write_scope: Vec::new(),
     }
 }
 

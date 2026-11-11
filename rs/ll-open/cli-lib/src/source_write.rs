@@ -47,26 +47,69 @@ pub use crate::tree::Mode;
 pub enum Grant {
     Whole,
     Paths(BTreeSet<String>),
+    /// Exact files and whole directory trees: an execution/v1
+    /// `WorkspaceGrant.writeScope` (bead `ley-line-open-483134`). `trees`
+    /// holds each directory's path with no trailing `/`; a tree covers every
+    /// path beneath it, at any depth, whether or not it exists yet.
+    Scoped {
+        files: BTreeSet<String>,
+        trees: BTreeSet<String>,
+    },
+}
+
+/// Whether `path` lies strictly beneath the directory `dir`.
+fn beneath(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 impl Grant {
+    /// The grant an execution/v1 `writeScope` names. The single entry `/` is
+    /// the whole tree; an entry ending in `/` is a directory tree; any other
+    /// entry is one file. No entries grants nothing. Authorization has
+    /// already held the entries to that grammar
+    /// (`leyline_runtime::authorization`), so nothing is interpreted here.
+    pub fn from_write_scope(entries: &[String]) -> Self {
+        if entries.iter().any(|entry| entry == "/") {
+            return Grant::Whole;
+        }
+        let (mut files, mut trees) = (BTreeSet::new(), BTreeSet::new());
+        for entry in entries {
+            match entry.strip_suffix('/') {
+                Some(tree) => trees.insert(tree.to_owned()),
+                None => files.insert(entry.clone()),
+            };
+        }
+        Grant::Scoped { files, trees }
+    }
+
     /// Whether `path` (a `_source.id`, the file's path relative to the
     /// tree root) is inside this grant.
     pub fn covers(&self, path: &str) -> bool {
         match self {
             Grant::Whole => true,
             Grant::Paths(paths) => paths.contains(path),
+            Grant::Scoped { files, trees } => {
+                files.contains(path) || trees.iter().any(|tree| beneath(path, tree))
+            }
         }
     }
 
-    /// Whether the directory `dir` is inside this grant: the whole tree, or
-    /// a granted path under it.
+    /// Whether the directory `dir` is inside this grant: the whole tree, a
+    /// granted path under it, or, for a scoped grant, a granted tree or a
+    /// directory beneath one.
     pub fn covers_dir(&self, dir: &str) -> bool {
         match self {
             Grant::Whole => true,
             Grant::Paths(paths) => {
                 let prefix = format!("{dir}/");
                 paths.iter().any(|p| p.starts_with(&prefix))
+            }
+            Grant::Scoped { files, trees } => {
+                files.iter().any(|file| beneath(file, dir))
+                    || trees
+                        .iter()
+                        .any(|tree| tree == dir || beneath(dir, tree) || beneath(tree, dir))
             }
         }
     }
@@ -2105,6 +2148,48 @@ mod tests {
             Path::new(&recorded),
             a._src.path().canonicalize().unwrap().join("c.go")
         );
+    }
+
+    /// An execution/v1 `writeScope` (bead `ley-line-open-483134`): exact
+    /// files and `/`-terminated directory trees.
+    #[test]
+    fn a_write_scope_covers_its_files_and_everything_under_its_trees() {
+        let scope = |entries: &[&str]| {
+            Grant::from_write_scope(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>())
+        };
+        let g = scope(&["src/a.rs", "docs/"]);
+        // Files: the named one, and anything at any depth under a tree.
+        assert!(g.covers("src/a.rs"));
+        assert!(g.covers("docs/new.md"));
+        assert!(g.covers("docs/adr/0001.md"));
+        assert!(!g.covers("src/b.rs"));
+        assert!(!g.covers("new.md"));
+        // A tree is a directory: neither a file of that name nor a sibling
+        // sharing its spelling is inside it.
+        assert!(!g.covers("docs"));
+        assert!(!g.covers("docs2/x.md"));
+        assert!(!g.covers("src/a.rs/x"));
+        assert!(!g.covers("src/a.rsx"));
+
+        // Directories: a tree, anything under it, and the ancestors of a
+        // granted file or tree (so they can be created on the way to it).
+        assert!(g.covers_dir("docs"));
+        assert!(g.covers_dir("docs/adr"));
+        assert!(g.covers_dir("src"));
+        assert!(!g.covers_dir("src/a.rs"));
+        assert!(!g.covers_dir("other"));
+        assert!(!g.covers_dir("doc"));
+        assert!(!g.covers_dir("docs2"));
+        let deep = scope(&["a/b/c/"]);
+        assert!(deep.covers_dir("a"));
+        assert!(deep.covers_dir("a/b"));
+        assert!(deep.covers_dir("a/b/c/d"));
+        assert!(!deep.covers_dir("a/x"));
+
+        // "/" is the whole workspace; no entries is nothing.
+        assert_eq!(scope(&["/"]), Grant::Whole);
+        assert!(!scope(&[]).covers("a"));
+        assert!(!scope(&[]).covers_dir("a"));
     }
 
     #[test]

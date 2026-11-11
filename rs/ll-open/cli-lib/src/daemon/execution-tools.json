@@ -143,9 +143,10 @@
         "name": { "type": "string", "description": "RunSpec workspace name this grant resolves." },
         "graphRoot": { "$ref": "#/$defs/DigestRef", "description": "Authorized input Graph root." },
         "expectedGeneration": { "type": "integer", "minimum": 0, "description": "Optimistic-concurrency generation for mutation." },
-        "operations": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceOperation" }, "description": "Exact operations permitted on this workspace." }
+        "operations": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceOperation" }, "description": "Exact operations permitted on this workspace." },
+        "writeScope": { "type": "array", "items": { "type": "string" }, "description": "Paths the run may write, create, rename or delete, relative to the workspace root: an exact file path, or a directory prefix ending in '/'. The single entry '/' is the whole workspace. Non-empty exactly when operations include mutate or commit; reads stay governed by graphRoot." }
       },
-      "required": ["name", "graphRoot", "expectedGeneration", "operations"],
+      "required": ["name", "graphRoot", "expectedGeneration", "operations", "writeScope"],
       "additionalProperties": false
     },
     "CapabilityGrant": {
@@ -625,9 +626,10 @@
         "name": { "type": "string", "description": "RunSpec workspace name this grant resolves." },
         "graphRoot": { "$ref": "#/$defs/DigestRef", "description": "Authorized input Graph root." },
         "expectedGeneration": { "type": "integer", "minimum": 0, "description": "Optimistic-concurrency generation for mutation." },
-        "operations": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceOperation" }, "description": "Exact operations permitted on this workspace." }
+        "operations": { "type": "array", "items": { "$ref": "#/$defs/WorkspaceOperation" }, "description": "Exact operations permitted on this workspace." },
+        "writeScope": { "type": "array", "items": { "type": "string" }, "description": "Paths the run may write, create, rename or delete, relative to the workspace root: an exact file path, or a directory prefix ending in '/'. The single entry '/' is the whole workspace. Non-empty exactly when operations include mutate or commit; reads stay governed by graphRoot." }
       },
-      "required": ["name", "graphRoot", "expectedGeneration", "operations"],
+      "required": ["name", "graphRoot", "expectedGeneration", "operations", "writeScope"],
       "additionalProperties": false
     },
     "CapabilityGrant": {

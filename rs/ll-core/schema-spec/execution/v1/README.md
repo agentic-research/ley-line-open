@@ -47,10 +47,44 @@ with `identityPolicyMismatch` before the run starts, rather than running it
 against a generation nothing checked. When a store implements S1, it compares
 the claim with its `seq` instead.
 
+## Workspace write scope
+
+`WorkspaceGrant.writeScope` (field 4, bead `ley-line-open-483134`) names
+where the run may write, create, rename or delete. Each entry is relative to
+the workspace root:
+
+| entry | grants |
+| --- | --- |
+| `src/a.rs` | that one file |
+| `docs/` | everything beneath that directory, at any depth, existing or not |
+| `/` (alone) | the whole workspace |
+
+Rules an authorizer holds, each refused as `invalidSpec` naming the
+workspace:
+
+- A grant whose `operations` include `mutate` or `commit` names a non-empty
+  `writeScope`. Write authority is never implied, so a grant issued before
+  this field existed (`mutate` with no scope) is refused; reissue it with
+  `["/"]` to keep its old meaning.
+- A grant with neither operation names no `writeScope`.
+- An entry is `/` alone, or a path with no leading `/`, no empty, `.` or `..`
+  component and no NUL. No entry appears twice.
+
+The scope narrows writes only. What the run may read is the `graphRoot`, and
+`read` or `list` shows the whole tree. A change outside the scope is refused
+by the share with the typed `outside_grant` refusal, which the guest sees as
+`EACCES`; nothing lands. A rename needs both its names inside the scope.
+Creating a directory on the way to a granted path is inside the scope.
+
+The field is additive on the wire: a reader that predates it ignores it, and
+an older grant decodes with an empty scope.
+
 ## Workspace delivery
 
-A run never starts without a workspace its grant names. A backend that
-cannot serve one refuses the start before it spawns anything, with
+A run never starts without a workspace its grant names. The execution
+service opens each granted workspace itself, before it calls the backend,
+and hands the backend the open shares (bead `ley-line-open-1022a8`). A start
+that cannot be served is refused before anything is spawned, with
 `workspaceUnserved` (not retryable under the same grant):
 
 | tier | serves |
@@ -71,16 +105,24 @@ the unchanged error text, whose `WorkspaceUnserved: …` prefix earlier
 consumers match. Choosing another tier is the caller's policy; the runtime
 does not reroute a run.
 
-The service also checks the backend's answer: the workspace shares the
-backend reports holding (the `workspaceShare` channels of its evidence
-document, below) must be the granted workspaces exactly, by name and
-`graphRoot`. A backend that reports a start with a granted workspace missing,
-or with a share the grant never named, has its run cancelled and the start
-refused with `workspaceUnserved`; the run is never recorded, collected or
-receipted. If that cancel fails, the workload may still be running, so the
-run is recorded `failed` instead of forgotten: it has no receipt, its
-`runId` refuses another start with `resourceConflict`, and `cleanup`
-retries the cancel.
+Workspace authority is handed over, not reported back. In LLO's Rust
+embedding a backend receives `ServedWorkspaces`, which only the service can
+construct and only for a verified grant, and it names a share in its evidence
+document (the `workspaceShare` channels, below) only by taking one of those
+shares. So a backend cannot claim a share the grant never named. A request
+that names workspaces without a verified grant behind it (a direct
+`ExecutionService::start`, or a backend called with no shares) is refused
+with `workspaceUnserved`.
+
+One assertion remains: the shares a backend took must be the granted
+workspaces exactly. A backend that answers a start having dropped a share it
+was handed has its run cancelled and the start refused with
+`workspaceUnserved`; the run is never recorded, collected or receipted. If
+that cancel fails, the workload may still be running, so the run is recorded
+`failed` instead of forgotten: it has no receipt, its `runId` refuses
+another start with `resourceConflict`, and `cleanup` retries the cancel. No
+first-party tier reaches it: each attaches what it is handed or refuses
+before it spawns.
 
 `workspaceUnserved` was appended to `ErrorCode` at ordinal 12 (bead
 `ley-line-open-204a94`). Before it, the same refusals were

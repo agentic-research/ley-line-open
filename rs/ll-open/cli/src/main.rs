@@ -599,19 +599,21 @@ async fn main() -> Result<()> {
                         );
                     // With a source tree, a run's granted workspace is that
                     // tree's store, served from this daemon's context: the
-                    // share and the socket propose on one writer.
+                    // share and the socket propose on one writer. The
+                    // service opens the share for a verified grant, before
+                    // it calls the backend, and hands it over (bead
+                    // ley-line-open-1022a8).
                     let context = leyline_cli_lib::daemon::ContextSlot::default();
-                    let backend = if source.is_some() {
-                        backend.with_workspace_shares(Arc::new(leyline_storefs::DaemonShares::new(
+                    let service =
+                        leyline_runtime::ExecutionService::new(backend).with_cas_storage(storage);
+                    let service = Arc::new(if source.is_some() {
+                        service.with_workspace_shares(Arc::new(leyline_storefs::DaemonShares::new(
                             Arc::clone(&context),
                             workspace.freshness(),
                         )))
                     } else {
-                        backend
-                    };
-                    let service = Arc::new(
-                        leyline_runtime::ExecutionService::new(backend).with_cas_storage(storage),
-                    );
+                        service
+                    });
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::MicroVm,
                         ..Default::default()

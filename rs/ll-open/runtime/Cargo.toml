@@ -24,6 +24,9 @@ capnp-json = { workspace = true }
 flate2 = "1.1.9"
 tar = { version = "0.4.45", default-features = false }
 leyline-public-schema = { path = "../../ll-core/public-schema", version = "0.29.0" }
+# ADR-0046 S3: RunGrant.connectionsDocument is parsed and canonicalized by the
+# connections/v1 implementation its vectors test (bead ley-line-open-521deb).
+leyline-schema-spec = { path = "../../ll-core/schema-spec", version = "0.29.0" }
 libc = { workspace = true }
 leyline-core = { path = "../../ll-core/core", version = "0.29.0" }
 leyline-envelope = { path = "../envelope", version = "0.29.0" }

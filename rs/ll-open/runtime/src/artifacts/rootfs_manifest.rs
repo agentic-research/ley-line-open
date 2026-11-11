@@ -56,6 +56,14 @@ use super::rootfs_tree::KERNEL_MOUNTED;
 /// The manifest's file name, at the rootfs root.
 pub const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
 
+/// The one path the runtime itself writes into each run's rootfs copy: the
+/// libkrun worker creates it (`O_EXCL | O_NOFOLLOW`) after the copy is
+/// verified and before the VM starts, and the guest init unlinks it once
+/// read. No image and no manifest may name it, so a manifest that lists it
+/// at the root, as any kind of entry, is refused, and so is an import that
+/// would write it. The worker's exclusive create is the backstop.
+pub const RUN_EXEC_SPEC: &str = ".leyline-exec.json";
+
 /// The mode of a rootfs's root directory: it has no manifest entry.
 pub const ROOT_DIRECTORY_MODE: u32 = 0o755;
 
@@ -166,6 +174,11 @@ fn guest_relative(path: &str) -> bool {
 fn check_path(path: &str) -> Result<(), String> {
     if !guest_relative(path) {
         return Err(format!("rootfs manifest path is not guest-relative: {path}"));
+    }
+    if path == RUN_EXEC_SPEC {
+        return Err(format!(
+            "rootfs manifest lists /{path}, which is reserved: the runtime writes it into each run's rootfs"
+        ));
     }
     Ok(())
 }
@@ -620,6 +633,32 @@ mod tests {
         ] {
             RootfsSpec::parse(v2(&entries).as_bytes()).unwrap_or_else(|error| panic!("{entries}: {error}"));
         }
+    }
+
+    /// The runtime's own per-run file is no image's to name: a manifest
+    /// listing it at the root, as any kind of entry and under either
+    /// version, is refused by name. The same name elsewhere is ordinary.
+    #[test]
+    fn the_run_exec_spec_path_is_reserved_at_the_root() {
+        let entries = [
+            format!("{{\"type\":\"file\",\"path\":\"{RUN_EXEC_SPEC}\",\"mode\":420,\"blake3\":\"{HEX}\"}}"),
+            format!("{{\"type\":\"dir\",\"path\":\"{RUN_EXEC_SPEC}\",\"mode\":493}}"),
+            format!("{{\"type\":\"symlink\",\"path\":\"{RUN_EXEC_SPEC}\",\"target\":\"etc/x\"}}"),
+        ];
+        let v1 = format!(
+            "{{\"version\":1,\"files\":[{{\"path\":\"{RUN_EXEC_SPEC}\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+        );
+        for manifest in entries.iter().map(|entry| v2(entry)).chain([v1]) {
+            let error = refusal(&manifest);
+            assert!(
+                error.contains("reserved") && error.contains(RUN_EXEC_SPEC),
+                "{manifest}: {error}"
+            );
+        }
+        let nested = v2(&format!(
+            "{{\"type\":\"dir\",\"path\":\"etc\",\"mode\":493}},{{\"type\":\"file\",\"path\":\"etc/{RUN_EXEC_SPEC}\",\"mode\":420,\"blake3\":\"{HEX}\"}}"
+        ));
+        RootfsSpec::parse(nested.as_bytes()).expect("the name below the root");
     }
 
     /// Version 1 is frozen as it shipped: any byte form of the document

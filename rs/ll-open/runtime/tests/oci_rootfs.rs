@@ -17,7 +17,7 @@ use leyline_runtime::artifacts::oci::{
     DEFAULT_MAX_ROOTFS_BYTES, DroppedLink, ImportedRootfs, OciImport, OciImportError, Platform,
     SpecialEntryKind, SymlinkPolicy, import_oci_layout,
 };
-use leyline_runtime::artifacts::rootfs_manifest::RootfsSpec;
+use leyline_runtime::artifacts::rootfs_manifest::{RUN_EXEC_SPEC, RootfsSpec};
 use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver};
 use leyline_runtime::backends::libkrun::volume::materialize_ephemeral_rootfs;
 use leyline_runtime::cas_volume::{FilesystemSensitivity, probe_sensitivity};
@@ -74,25 +74,28 @@ fn manifest_bytes(cas: &Path, rootfs: &DigestRef) -> Vec<u8> {
     fs::read(cas.join(&rootfs.value).join("rootfs.manifest.json")).expect("rootfs manifest")
 }
 
+/// A published rootfs manifest, which the importer always writes as v2 in
+/// its canonical bytes.
+fn manifest_spec(cas: &Path, rootfs: &DigestRef) -> RootfsSpec {
+    let bytes = manifest_bytes(cas, rootfs);
+    let spec = RootfsSpec::parse(&bytes).expect("a valid manifest");
+    assert_eq!(spec.version, 2);
+    assert_eq!(spec.to_canonical_v2(), bytes, "canonical bytes");
+    spec
+}
+
 /// path → (mode, blake3) from a published rootfs manifest.
 fn manifest_files(cas: &Path, rootfs: &DigestRef) -> BTreeMap<String, (u32, String)> {
-    let manifest: Value =
-        serde_json::from_slice(&manifest_bytes(cas, rootfs)).expect("manifest JSON");
-    assert_eq!(manifest["version"], 1);
-    manifest["files"]
-        .as_array()
-        .expect("files")
-        .iter()
-        .map(|entry| {
-            (
-                entry["path"].as_str().unwrap().to_string(),
-                (
-                    entry["mode"].as_u64().unwrap() as u32,
-                    entry["blake3"].as_str().unwrap().to_string(),
-                ),
-            )
-        })
+    manifest_spec(cas, rootfs)
+        .files
+        .into_iter()
+        .map(|(path, file)| (path, (file.mode, file.blake3)))
         .collect()
+}
+
+/// path → target from a published rootfs manifest.
+fn manifest_links(cas: &Path, rootfs: &DigestRef) -> BTreeMap<String, String> {
+    manifest_spec(cas, rootfs).symlinks
 }
 
 /// Whatever an import left in the CAS root, staging directories included.
@@ -359,8 +362,9 @@ fn a_file_the_owner_cannot_read_is_dropped_and_reported() {
     assert_eq!(json["unreadableFilesDropped"][1]["path"], "etc/shadow");
     assert_eq!(json["unreadableFilesDropped"][1]["mode"], 0);
 
-    // A directory left holding only dropped files is not written either:
-    // one digest still names one tree on disk.
+    // A directory left holding only dropped files stays, empty: v2 lists
+    // every directory, so the manifest names it and the tree on disk holds
+    // it, and one digest still names one tree.
     let (scratch, result) = import_single(
         vec![Layer::plain(vec![
             file("bin/x", 0o755, b"x"),
@@ -369,28 +373,31 @@ fn a_file_the_owner_cannot_read_is_dropped_and_reported() {
         SymlinkPolicy::Refuse,
     );
     let imported = result.expect("import");
-    assert_eq!(imported.rootfs, {
-        let (_s, r) = import_single(
-            vec![Layer::plain(vec![file("bin/x", 0o755, b"x")])],
-            SymlinkPolicy::Refuse,
-        );
-        r.expect("import").rootfs
-    });
-    let root = scratch.path().join("cas").join(&imported.rootfs.value);
-    assert!(root.join("secret").symlink_metadata().is_err());
+    let cas = scratch.path().join("cas");
+    let spec = manifest_spec(&cas, &imported.rootfs);
+    assert!(spec.directories.contains_key("secret"));
+    assert!(!spec.files.contains_key("secret/only"));
+    let root = cas.join(&imported.rootfs.value);
+    assert!(root.join("secret").is_dir());
+    assert_eq!(fs::read_dir(root.join("secret")).unwrap().count(), 0);
 }
 
+/// v2 carries directory modes, so a directory the image made unreadable is
+/// kept with its mode, owner `rwx` forced (the importer, and each run's
+/// copy, must be able to fill it), never refused and never widened for
+/// group or other (bead `ley-line-open-4f08ea`).
 #[test]
-fn a_directory_the_owner_cannot_read_is_refused() {
-    // Directory modes are not carried (all are written 0755), so writing
-    // one the image made unreadable would expose the subtree it hides.
-    for (entry, named) in [
-        (dir("locked/", 0o000), "locked/"),
-        (dir("locked/", 0o311), "locked/"),
-        // Readable but not searchable hides contents as well.
-        (dir("locked/", 0o400), "locked/"),
-        (dir("locked/", 0o644), "locked/"),
-        (dir("./", 0o000), "./"),
+fn a_directory_the_owner_cannot_read_is_kept_with_owner_rwx() {
+    for (entry, path, mode) in [
+        (dir("locked/", 0o000), "locked", 0o700),
+        (dir("locked/", 0o311), "locked", 0o711),
+        (dir("locked/", 0o400), "locked", 0o700),
+        (dir("locked/", 0o644), "locked", 0o744),
+        (dir("locked/", 0o6750), "locked", 0o750),
+        (dir("locked/", 0o1777), "locked", 0o1777),
+        // The root has no entry of its own in the manifest: it is always
+        // ROOT_DIRECTORY_MODE, whatever the image's `./` says.
+        (dir("./", 0o000), "", 0o755),
     ] {
         let (scratch, result) = import_single(
             vec![Layer::plain(vec![
@@ -399,36 +406,24 @@ fn a_directory_the_owner_cannot_read_is_refused() {
             ])],
             SymlinkPolicy::Refuse,
         );
-        match result {
-            Err(OciImportError::UnsafePath { path, reason, .. }) => {
-                assert_eq!(path, named);
-                assert!(reason.contains("owner cannot read and search"), "{reason}");
-            }
-            other => panic!("expected {named} to be refused, got {other:?}"),
-        }
-        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+        let imported = result.expect("import");
+        let cas = scratch.path().join("cas");
+        let spec = manifest_spec(&cas, &imported.rootfs);
+        assert_eq!(spec.directories[path], mode, "{path:?}");
+        assert!(spec.files.contains_key("locked/inside"));
     }
-    // Owner-readable directories of any other mode import as before.
-    let (_scratch, result) = import_single(
-        vec![Layer::plain(vec![
-            dir("private/", 0o700),
-            dir("listable/", 0o500),
-            file("private/f", 0o644, b"x"),
-        ])],
-        SymlinkPolicy::Refuse,
-    );
-    assert_eq!(result.expect("import").files, 1);
 }
 
 #[test]
-fn symbolic_links_are_refused_by_default() {
+fn symbolic_links_are_refused_under_refuse() {
+    assert_eq!(SymlinkPolicy::default(), SymlinkPolicy::Preserve);
     let cas = TempDir::new().expect("cas");
     let fixture = fixture();
     let result = import(
         &checked_in_fixture(),
         &fixture.index.digest,
         Platform::linux("arm64"),
-        SymlinkPolicy::default(),
+        SymlinkPolicy::Refuse,
         cas.path(),
     );
     match result {
@@ -908,11 +903,12 @@ fn directories(root: &Path) -> Vec<(String, u32)> {
 
 #[test]
 fn one_rootfs_digest_names_one_tree_on_disk() {
-    // Rootfs manifest v1 lists files only. Directories that hold no file,
-    // and directory modes, are not in it, so the importer must not write
-    // them: otherwise two images with one digest differ on disk, and which
-    // tree a CAS holds depends on which image arrived first.
-    let (with_dirs, a) = import_single(
+    // Rootfs manifest v2 lists every directory with its mode, empty ones
+    // included, so the tree on disk is exactly the one the digest names:
+    // two layer histories that end in one tree mint one digest and write
+    // one tree, and a tree that differs only in an empty directory or a
+    // directory's mode has another digest (bead `ley-line-open-4f08ea`).
+    let (layered, a) = import_single(
         vec![
             Layer::plain(vec![
                 dir("tmp/", 0o1777),
@@ -926,20 +922,57 @@ fn one_rootfs_digest_names_one_tree_on_disk() {
         ],
         SymlinkPolicy::Refuse,
     );
-    let (without, b) = import_single(
-        vec![Layer::plain(vec![file("bin/x", 0o755, b"x")])],
+    let (flat, b) = import_single(
+        vec![Layer::plain(vec![
+            dir("bin/", 0o700),
+            file("bin/x", 0o755, b"x"),
+            dir("proc/", 0o555),
+            dir("tmp/", 0o1777),
+            dir("var/", 0o755),
+            dir("var/cache/", 0o755),
+        ])],
         SymlinkPolicy::Refuse,
     );
-    let (a, b) = (a.expect("import with empty dirs"), b.expect("import"));
+    let (a, b) = (a.expect("layered import"), b.expect("flat import"));
     assert_eq!(a.rootfs, b.rootfs);
     let tree = |scratch: &TempDir, imported: &ImportedRootfs| {
         directories(&scratch.path().join("cas").join(&imported.rootfs.value))
     };
-    assert_eq!(tree(&with_dirs, &a), tree(&without, &b));
-    assert_eq!(
-        tree(&with_dirs, &a),
-        vec![(String::new(), 0o755), ("bin".to_string(), 0o755)]
-    );
+    let expected = vec![
+        (String::new(), 0o755),
+        ("bin".to_string(), 0o700),
+        ("proc".to_string(), 0o755),
+        ("tmp".to_string(), 0o1777),
+        ("var".to_string(), 0o755),
+        ("var/cache".to_string(), 0o755),
+    ];
+    assert_eq!(tree(&layered, &a), expected);
+    assert_eq!(tree(&flat, &b), expected);
+    let declared: Vec<(String, u32)> = manifest_spec(&layered.path().join("cas"), &a.rootfs)
+        .directories
+        .into_iter()
+        .collect();
+    assert_eq!(declared, expected, "the manifest names the tree on disk");
+
+    for (what, layer) in [
+        (
+            "without the empty directories",
+            vec![dir("bin/", 0o700), file("bin/x", 0o755, b"x")],
+        ),
+        (
+            "with another directory mode",
+            vec![
+                dir("bin/", 0o750),
+                file("bin/x", 0o755, b"x"),
+                dir("proc/", 0o555),
+                dir("tmp/", 0o1777),
+                dir("var/cache/", 0o755),
+            ],
+        ),
+    ] {
+        let (_scratch, other) = import_single(vec![Layer::plain(layer)], SymlinkPolicy::Refuse);
+        assert_ne!(other.expect("import").rootfs, a.rootfs, "{what}");
+    }
 }
 
 #[test]
@@ -989,11 +1022,9 @@ fn a_tampered_cas_entry_is_not_reused() {
 
 #[test]
 fn a_cas_entry_with_tampered_directories_is_not_reused() {
-    // The manifest does not cover directories. The per-run copy no longer
-    // carries them into the guest (it is built from the manifest, bead
-    // ley-line-open-38ff59), but the importer still keeps its own entries
-    // exact: a reused entry must have exactly the directories the import
-    // would write, all 0755.
+    // A v2 manifest declares every directory and its mode (bead
+    // ley-line-open-4f08ea), so a reused entry must hold exactly the
+    // directories it declares, at those modes, the root at 0755.
     type Tamper = (&'static str, fn(&Path));
     let tamper: [Tamper; 3] = [
         ("a widened directory", |root| {
@@ -1028,14 +1059,24 @@ fn a_cas_entry_with_tampered_directories_is_not_reused() {
 /// The checked-in fixture's linux/arm64 rootfs identity, as a known answer:
 /// a change to manifest serialization, ordering or the identity
 /// construction changes it, on any host.
+/// Imported with links kept (`--symlinks preserve`, the default): the v2
+/// case of the shared vector.
 const FIXTURE_ARM64_ROOTFS: &str =
-    "be444e4e419e52df2b05c1bf04c748694afb774383b8138911f6e7d305880e07";
+    "0848a87ae7b0cea00419d9b80a4dd33729f74a3065fb9ca7b8f6f617e33437ac";
+/// The same image with its links resolved to copies (`--symlinks resolve`).
+const FIXTURE_ARM64_ROOTFS_RESOLVED: &str =
+    "dce8d7d43c319b82179ee75bedd38d616419a0ba31f91850980720de530f0c3a";
 
 #[test]
 fn the_fixture_rootfs_identity_is_a_known_answer() {
-    let cas = TempDir::new().expect("cas");
-    let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
-    assert_eq!(imported.rootfs.value, FIXTURE_ARM64_ROOTFS);
+    for (policy, expected) in [
+        (SymlinkPolicy::Preserve, FIXTURE_ARM64_ROOTFS),
+        (SymlinkPolicy::Resolve, FIXTURE_ARM64_ROOTFS_RESOLVED),
+    ] {
+        let cas = TempDir::new().expect("cas");
+        let imported = import_fixture(Platform::linux("arm64"), policy, cas.path());
+        assert_eq!(imported.rootfs.value, expected, "{policy:?}");
+    }
 }
 
 /// The rootfs digest's published known-answer vector (ADR-0047 §3, beads
@@ -1820,16 +1861,23 @@ fn device_nodes_under_kernel_mounted_directories_are_dropped_and_reported() {
         ]
     );
     let root = scratch.path().join("cas").join(&imported.rootfs.value);
-    for absent in ["dev", "proc", "sys"] {
-        assert!(
-            root.join(absent).symlink_metadata().is_err(),
-            "{absent} must not be written"
-        );
+    // The devices are not written; the directories their paths name are,
+    // empty, as v2 keeps every directory (bead `ley-line-open-4f08ea`).
+    for empty in ["dev", "proc", "sys/fs"] {
+        assert!(root.join(empty).is_dir(), "{empty} is a directory");
+        assert_eq!(fs::read_dir(root.join(empty)).unwrap().count(), 0, "{empty}");
     }
     // A dropped entry is as if the image never had it: the rootfs identity
-    // equals that of the same image without the devices.
+    // equals that of the same image without the devices, its directories
+    // kept.
     let (_scratch, without) = import_single(
-        vec![Layer::gzip(vec![file("bin/x", 0o755, b"x")])],
+        vec![Layer::gzip(vec![
+            file("bin/x", 0o755, b"x"),
+            dir("dev/", 0o755),
+            dir("proc/", 0o755),
+            dir("sys/", 0o755),
+            dir("sys/fs/", 0o755),
+        ])],
         SymlinkPolicy::Refuse,
     );
     let without = without.expect("import");
@@ -1943,6 +1991,46 @@ fn a_regular_file_at_a_kernel_mount_point_is_refused_by_name() {
         SymlinkPolicy::Refuse,
     );
     result.expect("a directory at a kernel mount point imports");
+}
+
+/// The libkrun worker writes `/.leyline-exec.json` into each run's copy
+/// itself, so an image whose tree holds that path at its root, as any kind
+/// of entry, is refused by name. A lower layer's one that a later layer
+/// whites out is gone from the tree and imports, and the name elsewhere is
+/// ordinary.
+#[test]
+fn the_run_exec_spec_path_is_refused_at_the_image_root() {
+    for (entry, policy) in [
+        (file(RUN_EXEC_SPEC, 0o644, b"{}"), SymlinkPolicy::Refuse),
+        (dir(&format!("{RUN_EXEC_SPEC}/"), 0o755), SymlinkPolicy::Refuse),
+        (symlink(RUN_EXEC_SPEC, "bin/x"), SymlinkPolicy::Preserve),
+        (symlink(RUN_EXEC_SPEC, "bin/x"), SymlinkPolicy::Resolve),
+    ] {
+        let (scratch, result) = import_single(
+            vec![Layer::plain(vec![file("bin/x", 0o755, b"x"), entry])],
+            policy,
+        );
+        match &result {
+            Err(error @ OciImportError::ReservedPath { path }) => {
+                assert_eq!(path, RUN_EXEC_SPEC);
+                assert!(error.to_string().contains("reserved"), "{error}");
+            }
+            other => panic!("{policy:?}: expected a refusal by name, got {other:?}"),
+        }
+        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+    }
+    let (_scratch, result) = import_single(
+        vec![
+            Layer::plain(vec![
+                file("bin/x", 0o755, b"x"),
+                file(RUN_EXEC_SPEC, 0o644, b"{}"),
+                file(&format!("etc/{RUN_EXEC_SPEC}"), 0o644, b"{}"),
+            ]),
+            Layer::plain(vec![file(&format!(".wh.{RUN_EXEC_SPEC}"), 0o644, b"")]),
+        ],
+        SymlinkPolicy::Refuse,
+    );
+    result.expect("whited out at the root, and kept below it");
 }
 
 #[test]
@@ -2111,11 +2199,14 @@ fn dangling_links_are_dropped_and_reported_under_resolve() {
         files.keys().map(String::as_str).collect::<Vec<_>>(),
         ["bin/x", "usr/share/doc/libapt/NEWS.Debian.gz"]
     );
-    // As if the image never had the links.
+    // As if the image never had the links; the directories they sat in
+    // stay, as v2 keeps every directory.
     let (_scratch, without) = import_single(
         vec![Layer::plain(vec![
             file("bin/x", 0o755, b"x"),
             file("usr/share/doc/libapt/NEWS.Debian.gz", 0o644, b"news"),
+            dir("usr/share/doc/apt/", 0o755),
+            dir("usr/share/zoneinfo/", 0o755),
         ])],
         SymlinkPolicy::Resolve,
     );
@@ -2357,9 +2448,14 @@ fn dropped_entries_are_reported_by_normalized_path_and_reuse_one_cas_entry() {
             file("etc/shadow", 0o000, b"s"),
         ])],
     );
+    // The dropped entries' directories stay, as v2 keeps every directory.
     let without = single_image(
         &scratch.path().join("without"),
-        vec![Layer::plain(vec![file("bin/x", 0o755, b"x")])],
+        vec![Layer::plain(vec![
+            file("bin/x", 0o755, b"x"),
+            dir("dev/", 0o755),
+            dir("etc/", 0o755),
+        ])],
     );
     let attempt = |layout: &str, digest: &str| {
         import(

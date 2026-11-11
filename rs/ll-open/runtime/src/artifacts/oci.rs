@@ -131,7 +131,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::rootfs_manifest::{
-    FileSpec, MANIFEST_FILE_MODE, ROOT_DIRECTORY_MODE, ROOTFS_MANIFEST, RootfsSpec,
+    FileSpec, MANIFEST_FILE_MODE, ROOT_DIRECTORY_MODE, ROOTFS_MANIFEST, RUN_EXEC_SPEC, RootfsSpec,
 };
 use super::rootfs_tree::{
     FileNode, Final, KERNEL_MOUNTED, Node, PathError, ResolveError, Resolved, Tree, join,
@@ -296,6 +296,12 @@ pub enum OciImportError {
         "{path} is not a directory, but the guest init mounts a filesystem over /{path} and mounts only over a real directory: the image would import and never boot"
     )]
     KernelMountPointNotDirectory { path: String },
+    /// An entry at the root path the runtime writes into each run's copy
+    /// itself ([`RUN_EXEC_SPEC`]).
+    #[error(
+        "/{path} is reserved: the runtime writes it into each run's rootfs, so no image may hold it"
+    )]
+    ReservedPath { path: String },
     #[error("symbolic link {path} cannot be resolved inside the image: {reason}")]
     SymlinkUnresolvable { path: String, reason: String },
     /// Two paths of the finished rootfs that the CAS root's filesystem
@@ -659,6 +665,16 @@ pub fn import_oci_layout(
     {
         return Err(OciImportError::KernelMountPointNotDirectory {
             path: (*name).to_string(),
+        });
+    }
+    // The worker writes this one path into each run's copy after the copy
+    // is verified, so the image's tree may not hold it as anything: refused
+    // by name here, and by every manifest reader.
+    if let Final::Dir(top) = &finished
+        && top.contains_key(RUN_EXEC_SPEC)
+    {
+        return Err(OciImportError::ReservedPath {
+            path: RUN_EXEC_SPEC.to_string(),
         });
     }
     // Before any image path is written: a pair the CAS root would merge is

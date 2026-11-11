@@ -38,6 +38,10 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   appear to an unmodified guest workload as TCP on guest loopback, in both
   directions, and a declared channel that can't be built refuses the start
   (`ley-line-open-be3711`, `ley-line-open-bb2143`).
+- ADR-0046 Slice 1 (accepted 2026-11-11, for v0.30.0): a per-run host broker
+  joins a declared guest connection to one loopback `127.0.0.1:port`, bytes
+  only, no credential; the parent-death fix ships with it (`e9d940`, `521deb`,
+  `52b5b3`, `5308b7`, `528525`, `52deb4`, `f963e6`; epic `e2c5ce`).
 
 **Next**
 - `18bfdd` — group commit: writes that land close together become one proposal,

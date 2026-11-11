@@ -158,16 +158,26 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     `--` cut the argv there, so `tini -- docker-entrypoint.sh` ran with no
     program; a double quote was consumed or ended its value; a word inside
     a value could be read as an init token (beads `ley-line-open-7410ec`,
-    `d4b07f`, `f7f862`). With `KRUN_CONFIG_ARGV=1`, init now execs the
-    config file's `Cmd` with its `Env`, and stops the guest if the file or
-    its `Cmd` is missing. It removes the file once read. The worker writes
-    that file (`/.leyline-exec.json`) into the run's own root and keeps the
-    workload's argv and environment off the command line. The patch also
-    fixes upstream's `\uXXXX` decoder, which read the hex from the `u`,
-    never advanced its output and copied the last hex digit through, so
-    every control character other than `\b \t \n \f \r` was mangled. And
-    it reads the file until all of it is in, since one `read(2)` on a
-    virtio-fs root may return less.
+    `d4b07f`, `f7f862`). With `KRUN_CONFIG_ARGV=1`, init now takes the
+    workload's argv and environment from the file `KRUN_CONFIG` names,
+    through a strict reader of its own (`config_parse_exec`): one JSON
+    object whose only keys are `Cmd` and `Env`, matched exactly, each at
+    most once, each an array of strings. The general config reader is not
+    used for it, because it matches its key names, without regard to case,
+    against every token of the file, so an argument `uid`, `gid` or
+    `entrypoint` would set init's uid or prepend to the argv. Anything
+    else, or a missing or empty `Cmd`, stops the guest. Init execs `Cmd`
+    (ignoring `KRUN_INIT`), removes the file, and unsets `KRUN_CONFIG` and
+    `KRUN_CONFIG_ARGV` before the workload runs. The worker writes that
+    file (`/.leyline-exec.json`) into the run's own root and keeps the
+    workload's argv and environment off the command line. The reader reads
+    the file until all of it is in, since one `read(2)` on a virtio-fs root
+    may return less. The patch also replaces the `\uXXXX` case of
+    `unescape_string`: jsmn has already decoded the escape in place (it
+    admits only `\u0000`-`\u007F` and stores the byte where the fourth hex
+    digit was), so the case now takes that byte; upstream re-read the hex
+    and came out right only because the main loop then copied that byte
+    over its output. `hexToDigit` and `Utf32toUtf8` are removed.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

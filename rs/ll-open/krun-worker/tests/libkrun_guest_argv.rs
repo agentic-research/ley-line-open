@@ -33,8 +33,9 @@ mod hypervisor;
 
 /// Prints `argv <hex>` for each argument after argv[0], `env <name> <hex>`
 /// (or `env <name> -`) for each variable named in its own first argument's
-/// list, and `dummy0 yes|no` for whether init brought up the TSI dummy
-/// interface.
+/// list, `dummy0 yes|no` for whether init brought up the TSI dummy
+/// interface, `uid <n>` for its own real uid, and `config yes|no` for
+/// whether the exec config is still in its root.
 const ARGV_PROBE: &str = r#"use std::os::unix::ffi::OsStrExt;
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -54,6 +55,15 @@ fn main() {
     }
     let dummy = std::path::Path::new("/sys/class/net/dummy0").exists();
     println!("dummy0 {}", if dummy { "yes" } else { "no" });
+    let status = std::fs::read_to_string("/proc/self/status").expect("its status");
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().next())
+        .expect("its uid");
+    println!("uid {uid}");
+    let config = std::path::Path::new("/.leyline-exec.json").exists();
+    println!("config {}", if config { "yes" } else { "no" });
 }
 "#;
 
@@ -80,6 +90,20 @@ fn hostile_arguments() -> Vec<String> {
         "x tsi_hijack y".into(),
         "".into(),
         every_ascii,
+        // The keys libkrun's general config reader looks for, as data. That
+        // reader matches them, without regard to case, against every token
+        // of the file, so these set init's uid and gid and prepended to the
+        // argv; the exec config reader takes only the object's own keys.
+        "uid".into(),
+        "1000".into(),
+        "GID".into(),
+        "65534".into(),
+        "Entrypoint".into(),
+        "/bin/false".into(),
+        "WorkingDir".into(),
+        "/etc".into(),
+        "Cmd".into(),
+        "Env".into(),
     ]
 }
 
@@ -132,7 +156,10 @@ fn the_guest_receives_its_argv_and_environment_byte_for_byte() {
     });
 
     let environment = hostile_environment();
-    let names: Vec<&str> = environment.keys().map(String::as_str).collect();
+    // The two variables that point init at the exec config are init's to
+    // read, never the workload's.
+    let mut names: Vec<&str> = environment.keys().map(String::as_str).collect();
+    names.extend(["KRUN_CONFIG", "KRUN_CONFIG_ARGV"]);
     let mut arguments = vec![names.join(",")];
     arguments.extend(hostile_arguments());
     let request = ExecutionRequest {
@@ -196,6 +223,23 @@ fn the_guest_receives_its_argv_and_environment_byte_for_byte() {
     // f7f862: a `tsi_hijack` word inside a value is the workload's data,
     // not an init token. Hijacking is off for this run, so init brings up
     // no dummy interface.
+    for unset in ["env KRUN_CONFIG -", "env KRUN_CONFIG_ARGV -"] {
+        assert!(
+            lines.contains(&unset),
+            "init unsets its own pointer to the exec config ({unset}):\n{}",
+            output.stdout_tail
+        );
+    }
+    assert!(
+        lines.contains(&"uid 0"),
+        "an argument naming uid or gid stays data:\n{}",
+        output.stdout_tail
+    );
+    assert!(
+        lines.contains(&"config no"),
+        "init removes the exec config before the workload runs:\n{}",
+        output.stdout_tail
+    );
     assert!(
         lines.contains(&"dummy0 no"),
         "a value cannot turn on init's TSI setup:\n{}",

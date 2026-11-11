@@ -4,7 +4,7 @@ Section: Added
   `ley-line-open-e9d940`, ADR-0046 Slice 1 S2). New spec directory
   `rs/ll-core/schema-spec/connections/v1/`: README, JSON Schema, canonical form,
   `connectionsDigest` (BLAKE3-256 over the canonical bytes) pinned for a one- and a
-  three-connection document, 11 accepted cases and 69 refusals, each refusal pinned by
+  three-connection document, 12 accepted cases and 87 refusals, each refusal pinned by
   connection, field and reason code. `leyline_schema_spec::connections` is the
   parser and canonicalizer the runtime will share. It is the crate's first Rust module
   and has no dependencies. An independent Python reference (standard library only,

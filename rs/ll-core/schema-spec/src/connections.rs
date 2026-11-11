@@ -11,7 +11,7 @@
 //! The reader is strict on purpose and hand-rolled for that reason: a general
 //! JSON library decodes escapes, merges duplicate keys and reads `30080.0` as
 //! a number, and each of those hides a refusal the spec requires
-//! (`connections/v1/README.md`, "Parse refusals"). Every refusal names the
+//! (`connections/v1/README.md`, "Fields"). Every refusal names the
 //! connection, the field and a stable [`Refusal`] code; the test vectors pin
 //! those three, and the independent Python reference
 //! (`connections/v1/ref-impl-py/connections_v1.py`) reaches the same ones.
@@ -427,10 +427,17 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn value(&mut self, depth: usize) -> Result<Json, ConnectionsError> {
-        if depth > MAX_DEPTH {
-            return Err(syntax(self.pos));
+    /// The depth inside a container opened at `depth`, or a syntax refusal
+    /// past [`MAX_DEPTH`].
+    fn enter(&self, depth: usize) -> Result<usize, ConnectionsError> {
+        if depth < MAX_DEPTH {
+            Ok(depth + 1)
+        } else {
+            Err(syntax(self.pos))
         }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Json, ConnectionsError> {
         match self.peek() {
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
@@ -453,6 +460,7 @@ impl<'a> Reader<'a> {
     }
 
     fn object(&mut self, depth: usize) -> Result<Json, ConnectionsError> {
+        let inner = self.enter(depth)?;
         self.expect(b'{')?;
         let mut members = Vec::new();
         self.ws();
@@ -469,7 +477,7 @@ impl<'a> Reader<'a> {
             self.ws();
             self.expect(b':')?;
             self.ws();
-            let value = self.value(depth + 1)?;
+            let value = self.value(inner)?;
             members.push((key, value));
             self.ws();
             match self.peek() {
@@ -484,6 +492,7 @@ impl<'a> Reader<'a> {
     }
 
     fn array(&mut self, depth: usize) -> Result<Json, ConnectionsError> {
+        let inner = self.enter(depth)?;
         self.expect(b'[')?;
         let mut items = Vec::new();
         self.ws();
@@ -493,7 +502,7 @@ impl<'a> Reader<'a> {
         }
         loop {
             self.ws();
-            items.push(self.value(depth + 1)?);
+            items.push(self.value(inner)?);
             self.ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -933,9 +942,7 @@ fn port(value: &Json) -> Result<u16, Refusal> {
     if text.contains(['.', 'e', 'E']) {
         return Err(Refusal::PortNotInteger);
     }
-    if text.starts_with('-') || text.len() > 5 {
-        return Err(Refusal::PortOutOfRange);
-    }
+    // A sign, or more digits than a u32 holds, fails the parse: out of range.
     match text.parse::<u32>() {
         Ok(n @ 1..=65535) => Ok(n as u16),
         _ => Err(Refusal::PortOutOfRange),
@@ -1089,6 +1096,36 @@ mod tests {
         let text = "[".repeat(10_000);
         let err = parse(text.as_bytes()).unwrap_err();
         assert_eq!(err.reason, Refusal::MalformedJson);
+    }
+
+    /// Exactly MAX_DEPTH containers are read (the shape check then refuses
+    /// the value); one more is a syntax refusal. Through arrays and objects.
+    #[test]
+    fn nesting_limit_is_exact() {
+        let arrays = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert_eq!(parse(arrays(MAX_DEPTH).as_bytes()).unwrap_err().reason, Refusal::WrongType);
+        assert_eq!(
+            parse(arrays(MAX_DEPTH + 1).as_bytes()).unwrap_err().reason,
+            Refusal::MalformedJson
+        );
+        let objects = |n: usize| format!("{}1{}", "{\"a\":".repeat(n), "}".repeat(n));
+        let err = parse(objects(MAX_DEPTH).as_bytes()).unwrap_err();
+        assert_eq!(err.reason, Refusal::MissingKey, "{err}");
+        assert_eq!(
+            parse(objects(MAX_DEPTH + 1).as_bytes()).unwrap_err().reason,
+            Refusal::MalformedJson
+        );
+    }
+
+    /// An octet of more than three digits is not a dotted quad even leniently,
+    /// so `127.0000.0.1` is not read as loopback.
+    #[test]
+    fn four_digit_octet_is_not_a_quad() {
+        assert_eq!(dotted_quad("127.0000.0.1", true), None);
+        assert_eq!(dotted_quad("127.000.0.1", true), Some([127, 0, 0, 1]));
+        assert_eq!(dotted_quad("127..0.1", true), None);
+        assert_eq!(dotted_quad("127.+1.0.1", true), None);
+        assert_eq!(loopback_host("127.0000.0.1"), Err(Refusal::HostIsName));
     }
 
     #[test]

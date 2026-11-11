@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/agentic-research/ley-line-open/rs/ll-core/schema-spec/connections/v1/connections.schema.json",
   "title": "cloister/connections/v1 (slice 1: credential-free relay)",
-  "description": "The connection broker's input document (ADR-0046 D2, Slice 1 S2). Slice 1 delivers a strict subset of D2: appProtocol art.tcp, endpoint {unix}, target {tcp: {host, port}} with a loopback IP literal, no credentialRef. JSON Schema cannot state every rule; the parser is the stricter side and README 'Parse refusals' is normative. Rules this schema cannot express: unique name and endpoint across connections, a key appearing twice, a port written as 30080.0 or 3.008e4, and a JSON escape (refused even when it decodes to an allowed character).",
+  "description": "The connection broker's input document (ADR-0046 D2, Slice 1 S2). Slice 1 delivers a strict subset of D2: appProtocol art.tcp, endpoint {unix}, target {tcp: {host, port}} with a loopback IP literal, no credentialRef. JSON Schema cannot state every rule; the parser is the stricter side and README 'Fields' is normative. Rules this schema cannot express: unique name and endpoint across connections, a key appearing twice, a port written as 30080.0 or 3.008e4, and a JSON escape (refused even when it decodes to an allowed character).",
   "type": "object",
   "additionalProperties": false,
   "required": ["connections", "version"],

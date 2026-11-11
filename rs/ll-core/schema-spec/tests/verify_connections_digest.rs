@@ -78,6 +78,58 @@ fn pinned_documents_reach_their_digest_and_are_canonical() {
     }
 }
 
+/// The fenced block between `<!-- <marker>:begin -->` and `<!-- <marker>:end -->`.
+fn readme_block(readme: &str, marker: &str) -> String {
+    let begin = format!("<!-- {marker}:begin -->");
+    let end = format!("<!-- {marker}:end -->");
+    let start = readme.find(&begin).unwrap_or_else(|| panic!("README lacks {begin}")) + begin.len();
+    let stop = readme[start..].find(&end).unwrap_or_else(|| panic!("README lacks {end}")) + start;
+    let block = readme[start..stop].trim();
+    let block = block
+        .strip_prefix("```text\n")
+        .and_then(|b| b.strip_suffix("\n```"))
+        .unwrap_or_else(|| panic!("{marker} is not one ```text block"));
+    block.to_owned()
+}
+
+/// The README's literal template, filled from each parsed document, is the
+/// pinned canonical file: a second implementation can reach the bytes from the
+/// README alone.
+#[test]
+fn the_readme_template_is_the_canonical_form() {
+    let readme = fs::read_to_string(spec_dir().join("README.md")).unwrap();
+    let connection = readme_block(&readme, "canonical-connection");
+    let document = readme_block(&readme, "canonical-document");
+    let cases = cases();
+    let mut texts: Vec<String> = pins()
+        .into_iter()
+        .map(|(_, rel)| fs::read_to_string(spec_dir().join(rel)).unwrap())
+        .collect();
+    texts.extend(
+        cases["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["canonical"].as_str().unwrap().to_owned()),
+    );
+    for text in texts {
+        let doc = connections::parse(text.as_bytes()).unwrap();
+        let filled: Vec<String> = doc
+            .connections()
+            .iter()
+            .map(|c| {
+                connection
+                    .replace("<unix>", &c.endpoint_unix)
+                    .replace("<name>", &c.name)
+                    .replace("<host>", &c.host_text())
+                    .replace("<port>", &c.port.to_string())
+            })
+            .collect();
+        let expected = document.replace("<connections>", &filled.join(",\n"));
+        assert_eq!(expected, text, "the README template disagrees with a pinned canonical document");
+    }
+}
+
 /// Every accepted case canonicalizes to its pinned bytes and digest, and the
 /// canonical bytes are a fixpoint.
 #[test]
@@ -174,6 +226,8 @@ fn the_python_reference_agrees() {
     let script = spec_dir().join("ref-impl-py/connections_v1.py");
     let output = Command::new("python3")
         .arg("-I")
+        // No bytecode: running a check must not write into the spec tree.
+        .arg("-B")
         .arg(&script)
         .arg("conformance")
         .arg(spec_dir())

@@ -178,9 +178,12 @@ class Reader:
             raise _syntax()
         return v
 
-    def value(self, depth):
-        if depth > MAX_DEPTH:
+    def enter(self, depth):
+        if depth >= MAX_DEPTH:
             raise _syntax()
+        return depth + 1
+
+    def value(self, depth):
         c = self.peek()
         if c == ord("{"):
             return self.obj(depth)
@@ -197,6 +200,7 @@ class Reader:
         raise _syntax()
 
     def obj(self, depth):
+        depth = self.enter(depth)
         self.expect(ord("{"))
         members = []
         self.ws()
@@ -211,7 +215,7 @@ class Reader:
             self.ws()
             self.expect(ord(":"))
             self.ws()
-            members.append((k, self.value(depth + 1)))
+            members.append((k, self.value(depth)))
             self.ws()
             c = self.peek()
             if c == ord(","):
@@ -223,6 +227,7 @@ class Reader:
                 raise _syntax()
 
     def arr(self, depth):
+        depth = self.enter(depth)
         self.expect(ord("["))
         items = []
         self.ws()
@@ -231,7 +236,7 @@ class Reader:
             return items
         while True:
             self.ws()
-            items.append(self.value(depth + 1))
+            items.append(self.value(depth))
             self.ws()
             c = self.peek()
             if c == ord(","):

@@ -77,18 +77,51 @@ directory per run; the runner chooses and derives no path.
 | `endpoint.unix` | absolute; at most 103 bytes; no empty component (`//`); no trailing `/`; no `.` or `..` component; unique | `endpoint-not-absolute`, `endpoint-too-long`, `endpoint-empty-component`, `endpoint-trailing-slash`, `endpoint-dot-component`, `duplicate-endpoint` |
 | `target` | `{"tcp": {...}}` only | `unix`, `https`, `cloudSql` (`target-not-delivered`) |
 | `target.tcp` | `host` and `port` only | `tls` (`tls-not-delivered`) |
-| `target.tcp.host` | a loopback IP literal in its one spelling: an IPv4 dotted quad in `127.0.0.0/8` with no leading zero in any octet, or exactly `::1` | a name, including `localhost` (`host-is-name`); an address outside loopback (`non-loopback-target`); loopback spelled another way, such as `127.000.0.1`, `0:0:0:0:0:0:0:1` or `::ffff:127.0.0.1` (`non-canonical-loopback`) |
-| `target.tcp.port` | a JSON integer 1–65535, with no sign, fraction or exponent | `30080.0`, `3.008e4`, `"30080"`, `true` (`port-not-integer`); `0`, `65536`, `-1` (`port-out-of-range`) |
+| `target.tcp.host` | a loopback IP literal in its one spelling: an IPv4 dotted quad in `127.0.0.0/8` with no leading zero in any octet, or exactly `::1` | see "Host classification" below: `host-is-name`, `non-loopback-target` or `non-canonical-loopback` |
+| `target.tcp.port` | a JSON integer 1–65535, with no sign, fraction or exponent | a fraction or exponent, checked first (`30080.0`, `3.008e4`, `-1.5`), a string or boolean (`port-not-integer`); then a sign or a value outside 1–65535 (`0`, `65536`, `-1`, `-0`, `12345678901234567890`: `port-out-of-range`) |
 | `credentialRef` | absent | present (`credential-ref-present`); D2 rule 4 already refuses it on `art.tcp` |
-| every string | printable ASCII, U+0020–U+007E, with no `"` and no `\` | a NUL, a control character, a non-ASCII byte or any escape, even one that decodes to an allowed character (`string-not-printable-ascii`) |
+| every string value | printable ASCII, U+0020–U+007E, with no `"` and no `\` | a NUL, a control character, a non-ASCII byte or any escape, even one that decodes to an allowed character (`string-not-printable-ascii`) |
 | every value | a JSON value of the type shown; `null` is never a value | `wrong-type` |
 
-Text that is not JSON, or JSON followed by more bytes, is `malformed-json`.
+Text that is not JSON (RFC 8259, so `030080` and a leading byte order mark are not
+JSON), JSON followed by more bytes, or JSON nesting more than 16 arrays and objects (a
+slice-1 document nests five) is `malformed-json`. The reader keeps every string's raw
+bytes: an escape is scanned past so `\"` does not end a string, but it is never decoded.
+
+**Keys are compared as raw bytes.** `"name"` is not `name`: it is an undefined key,
+not a duplicate. A key holding an escape, a control character or a non-ASCII byte is
+therefore an undefined key (`unknown-key`), never `string-not-printable-ascii`, which is
+for values. A refusal names a key as written, with each byte outside printable ASCII
+shown as `\xNN` (lower-case hex): `nämé` is named `n\xc3\xa4m\xc3\xa9`.
 
 **Every refusal names the connection and the field.** The connection is its `name` when
-that is a valid label, otherwise its position as `#<index>` (from 0); a document-level
-refusal names no connection. The field is dotted from the connection
-(`target.tcp.host`) or from the document (`version`). The reason codes above are stable.
+that is a valid label, otherwise its position as `#<index>` (from 0); when `name` appears
+twice, the first one labels it. A document-level refusal names no connection (`null` in
+the vectors). The field is dotted from the connection (`target.tcp.host`) or from the
+document (`version`); it is empty when the refusal is about the whole document or the
+whole connection (a syntax refusal, a document or connection that is not an object). The
+reason codes above are stable.
+
+**Host classification.** `target.tcp.host` is accepted only when it is exactly `::1` or
+a strict dotted quad (four decimal octets 0–255, none with a leading zero) whose first
+octet is 127. Anything else is refused with the first reason that applies:
+
+1. a strict dotted quad outside `127.0.0.0/8`: `non-loopback-target`;
+2. a lenient dotted quad, four groups of one to three decimal digits each at most 255
+   (so leading zeros are allowed): `non-canonical-loopback` when the first octet is 127,
+   otherwise `non-loopback-target` (`127.000.0.1`; `010.0.0.1`);
+3. an IPv6 text form of RFC 4291 §2.2 made only of hex digits, `:` and `.`: at most one
+   `::`, groups of one to four hex digits, and optionally an IPv4 tail in the last 32
+   bits written as a strict dotted quad; no zone index and no brackets. If it is
+   `0:0:0:0:0:0:0:1` written any way other than `::1`, or an IPv4-mapped address
+   (`::ffff:a.b.c.d`, `::ffff:7f00:1`) whose IPv4 part is in `127.0.0.0/8`, it is
+   `non-canonical-loopback`; any other address is `non-loopback-target` (`fe80::1`,
+   `::2`, the IPv4-compatible `::127.0.0.1`);
+4. anything else: `host-is-name` (`localhost`, a DNS name, `[::1]`, `fe80::1%en0`,
+   `127.0000.0.1`, `::ffff:127.000.0.1`).
+
+A general-purpose address parser is not a substitute: most accept zones, and some accept
+octal or short IPv4 forms. Implement these four steps.
 
 **Which refusal is reported** when a document breaks several rules is fixed, so two
 implementations report the same one:
@@ -96,16 +129,22 @@ implementations report the same one:
 1. syntax (`malformed-json`), over the whole text;
 2. the document is an object; `version`'s first occurrence: present, a clean string,
    equal to `cloister/connections/v1`;
-3. the document's keys, in input order: a duplicate, then an undefined key; then
-   `connections` and `version` present;
+3. the document's keys (see "Checking an object's keys"); then `connections` and
+   `version` present;
 4. `connections` is a non-empty list;
-5. each connection in list order: it is an object; its keys in input order (a duplicate,
-   then `credentialRef`, then an undefined key); `appProtocol`, `endpoint`, `name` and
-   `target` present, in that order; then their values in that order, each object's keys
-   checked the same way before its values (`endpoint`: `tcp` before an undefined key;
-   `target`: `cloudSql`, `https` and `unix` before an undefined key; `target.tcp`: `tls`
-   before an undefined key); within `endpoint.unix`, the path rules in the order of the
-   table; then whether its name, then its endpoint, repeats an earlier connection's.
+5. each connection in list order: it is an object; its keys; `appProtocol`, `endpoint`,
+   `name` and `target` present, in that order; then their values in that order, each
+   nested object's keys checked before its values; within `endpoint.unix`, the path rules
+   in the order of the table; then whether its name, then its endpoint, repeats an
+   earlier connection's.
+
+**Checking an object's keys.** One key at a time, in input order, and for each key all
+three checks before moving on: (a) it repeats an earlier key of this object
+(`duplicate-key`); (b) it is a D2 key slice 1 refuses by name (`credentialRef` in a
+connection, `tcp` in `endpoint`, `cloudSql`, `https` and `unix` in `target`, `tls` in
+`target.tcp`), with that key's reason; (c) it is not defined here (`unknown-key`). So
+`{"env": …, "credentialRef": …}` is refused for `env`, and `{"x": …, "y": …, "y": …}`
+for `x`. Required keys are checked only after every key passed.
 
 **Why loopback IP literals only.** No name is resolved, ever, so there is no resolver to
 poison and no answer that changes between check and dial: the dialled address is the
@@ -128,13 +167,53 @@ that checks it.
    unlike confinement/v1 §7 rule 5, no earlier document's digest needs the scalar form.
 3. An empty `connections` list is refused (a document with no connections does not
    exist).
-4. Every string is printable ASCII with no `"` and no `\`, so no JSON escape is ever
-   emitted, and serializers that differ on escaping reach the same bytes.
+4. Every string is printable ASCII with no `"` and no `\`, and is written raw, with no
+   escape. A serializer that escapes printable characters MUST be told not to: Go's
+   `encoding/json` escapes `&`, `<` and `>` unless `SetEscapeHTML(false)` is set, and
+   its output for a path containing them is refused (`endpoint-with-html-characters` in
+   the vectors is such a path, accepted).
 5. `port` is a decimal integer with no sign, fraction, exponent or leading zero.
 
-Python's `json.dumps(doc, sort_keys=True, indent=2)` writes these bytes for a document
-that passed the parse rules; the reference in `ref-impl-py/` writes them by hand instead,
-so that it does not depend on that library's choices.
+Because the shape is fixed, the canonical bytes are this template, with no byte outside
+it. `\n` is the only line ending (0x0A); indentation is spaces. Each connection, in name
+order, is:
+
+<!-- canonical-connection:begin -->
+```text
+    {
+      "appProtocol": "art.tcp",
+      "endpoint": {
+        "unix": "<unix>"
+      },
+      "name": "<name>",
+      "target": {
+        "tcp": {
+          "host": "<host>",
+          "port": <port>
+        }
+      }
+    }
+```
+<!-- canonical-connection:end -->
+
+The connections are joined with `,\n` and placed at `<connections>` in:
+
+<!-- canonical-document:begin -->
+```text
+{
+  "connections": [
+<connections>
+  ],
+  "version": "cloister/connections/v1"
+}
+```
+<!-- canonical-document:end -->
+
+The document ends at its last `}`, with no newline. Each `<…>` is the field's value as
+parsed: the strings verbatim, `<port>` in decimal. `verify_connections_digest` fills this
+template from the README and requires it to equal every pinned canonical file. Python's
+`json.dumps(doc, sort_keys=True, indent=2)` writes the same bytes for an accepted
+document; the reference in `ref-impl-py/` writes them by hand.
 
 A runner that receives a document as authority (ADR-0046 S3, `RunGrant.connectionsDocument`)
 requires the received bytes to equal their canonical form and refuses them otherwise; it

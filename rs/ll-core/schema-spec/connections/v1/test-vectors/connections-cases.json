@@ -77,6 +77,13 @@
       "connectionsDigest": "blake3-256:1efe2735a5c4cb167673dac3aa0b7a4ae13b4cf4758e060f92af4c82eebd6c9d"
     },
     {
+      "name": "endpoint-with-html-characters",
+      "description": "`&`, `<` and `>` are printable ASCII and written raw. A serializer that escapes them for HTML (Go's json.Marshal by default) emits an escape, which is refused; it must turn that off (SetEscapeHTML(false)).",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch&<x>/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch&<x>/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:e4c4e81cd4e68879e468dab55872871c95c3a6c09e8e84117c90499c36fd07e5"
+    },
+    {
       "name": "dot-prefixed-components-are-not-dot-components",
       "description": "`.hidden` and `..x` are names, not the `.` or `..` components the path rule refuses.",
       "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/.ch/..x/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
@@ -213,6 +220,94 @@
       "refusal": {
         "connection": null,
         "field": "version",
+        "reason": "duplicate-key"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "byte-order-mark",
+      "description": "UTF-8 without a BOM: a leading U+FEFF is not JSON whitespace.",
+      "input": "\ufeff{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": null,
+        "field": "",
+        "reason": "malformed-json"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "nesting-over-limit",
+      "description": "17 nested arrays and objects: one over the reader's limit of 16.",
+      "input": "{\"version\": \"cloister/connections/v1\", \"connections\": [[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]}",
+      "refusal": {
+        "connection": null,
+        "field": "",
+        "reason": "malformed-json"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "nesting-at-limit",
+      "description": "Exactly 16 nested arrays and objects are read; the shape check then refuses the connection.",
+      "input": "{\"version\": \"cloister/connections/v1\", \"connections\": [[[[[[[[[[[[[[[]]]]]]]]]]]]]]]}",
+      "refusal": {
+        "connection": "#0",
+        "field": "",
+        "reason": "wrong-type"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-key-before-credential-ref",
+      "description": "Keys are checked one at a time in input order, every check per key: the undefined `env` comes first, so it is the refusal.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"env\": \"dev\", \"credentialRef\": {\"vaultSlice\": \"orders\"}, \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "env",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-key-before-duplicate",
+      "description": "`x` is reached before the second `y`.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"x\": 1, \"y\": 1, \"y\": 2, \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "x",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "escaped-key-is-not-a-duplicate",
+      "description": "Keys compare as raw bytes, escapes undecoded: `na\\u006de` is not `name`, so it is an undefined key, named as written.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\", \"na\\u006de\": \"orders-db\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "na\\u006de",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "non-ascii-key",
+      "description": "A key with a non-ASCII byte is an undefined key, named with each such byte as \\xNN.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\", \"n\u00e4m\u00e9\": \"x\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "n\\xc3\\xa4m\\xc3\\xa9",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "duplicate-name-key",
+      "description": "`name` twice in one connection; the connection is labelled by the first.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\", \"name\": \"orders-db\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "name",
         "reason": "duplicate-key"
       },
       "schemaRefuses": false
@@ -768,6 +863,72 @@
       "schemaRefuses": true
     },
     {
+      "name": "host-ipv4-mapped-hex",
+      "description": "The same mapped address in hexadecimal groups.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"::ffff:7f00:1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-canonical-loopback"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv4-compatible",
+      "description": "An IPv4-compatible address (deprecated, RFC 4291 2.5.5.1) is not a mapped one and not loopback.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"::127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-loopback-target"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv6-zone",
+      "description": "A zone index is outside the grammar, so the text is not an IP literal.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"fe80::1%en0\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "host-is-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-four-digit-octet",
+      "description": "An octet of four digits is outside even the lenient dotted-quad grammar.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0000.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "host-is-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-mapped-leading-zeros",
+      "description": "An IPv4 tail inside IPv6 must use canonical octets.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"::ffff:127.000.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "host-is-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-lenient-non-loopback",
+      "description": "Leniently 10.0.0.1: not loopback.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"010.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-loopback-target"
+      },
+      "schemaRefuses": true
+    },
+    {
       "name": "port-zero",
       "description": "Port 0 is not dialable.",
       "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 0\n        }\n      }\n    }\n  ]\n}",
@@ -821,6 +982,50 @@
         "reason": "port-not-integer"
       },
       "schemaRefuses": false
+    },
+    {
+      "name": "port-leading-zero",
+      "description": "030080 is not JSON (RFC 8259 forbids leading zeros).",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 030080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": null,
+        "field": "",
+        "reason": "malformed-json"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "port-negative-zero",
+      "description": "-0 is an integer with a sign: out of range.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": -0\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-out-of-range"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "port-negative-fraction",
+      "description": "A fraction is checked before a sign.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": -1.5\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-not-integer"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "port-twenty-digits",
+      "description": "Larger than any integer type: out of range, not a parse failure.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 12345678901234567890\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-out-of-range"
+      },
+      "schemaRefuses": true
     },
     {
       "name": "port-string",

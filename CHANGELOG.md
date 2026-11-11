@@ -14,6 +14,289 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.29.0] — 2026-11-11
+
+**A breaking projection release: arenas must re-parse (`projection-v13`;
+v12 is refused).** Comments now appear in `_ast` as occurrence-only rows.
+`node_hash` is unchanged, but nid order is no longer document order;
+consumers adopt per mache-1e3d11. A function used as a value records a
+`node_refs` row (extraction epoch 7). `SCHEMA_VERSION` is 0.29.0, and
+`execution/v1` gains `ProvisionOutput.casRoot` and a structured
+`executionError` on daemon replies (both additive).
+
+For microVM users:
+- **Case-sensitive CAS volume:** `execution-daemon --cas-volume` provisions
+  one on macOS, so Debian-based images import on a stock Mac.
+- **Registry import:** `import-oci --from-registry name@sha256:…` pulls by
+  digest through the same verifier as `--layout`.
+- **Early connections:** a serve channel holds a connection that arrives
+  before the workload listens, for up to 10 s.
+- **`/tmp`:** every guest has a bounded tmpfs `/tmp`.
+- **Guest output:** bounded and typed (`GuestOutput`), reaching in-process
+  embedders through `poll_outcome` / `wait_for_outcome`.
+
+Also: one daemon per control block, read-only `query` refuses temp-database
+access, and release tooling shares one schema-surface definition.
+
+### Security
+
+- **Read-only `query` refuses a statement that opens the reader's temp
+  database** (bead `ley-line-open-3befbc`). SQLite reports no read of a
+  table joined by `NATURAL` or `USING`, so `… NATURAL JOIN
+  temp.sqlite_master` returned rows, and `pragma_table_info('t', 'temp')`
+  opened the temp schema before its pragma was denied; either left the
+  pooled reader with a second database. Such a statement is now refused as
+  `denied_action` / `read` on `sqlite_temp_master` (or its pragma refusal),
+  over the control socket and MCP alike, and the reader pool discards a
+  reader whose temp database is open when it returns, so every reader again
+  holds `main` alone.
+
+### Breaking
+
+- **Comments are `_ast` occurrences; `projection-v13`** (bead
+  `ley-line-open-aa1634`). `leyline parse` skipped every tree-sitter `extra`
+  node, so `_ast` held no comment and doc comments were unavailable to
+  consumers. Every comment is now an `_ast` occurrence and a leaf `nodes` row
+  with its grammar kind (`comment`, `line_comment`, `block_comment`, ...;
+  match `raw_kind LIKE '%comment%'`) and span, in source order under the
+  node tree-sitter attached it to. Its `content_id` names a leaf
+  `node_content` row whose `token` is the comment text. Comments stay out of
+  every other node's `node_hash`, so a comment-only edit changes no code
+  `node_hash`, and they add no def, ref or import rows. Other extras
+  (Python's `line_continuation`) still have no row; Swift's member-separator
+  `multiline_comment` and Scala's shebang `comment` are not extras and stay
+  folded, as before. A doc comment is the comment run directly above a
+  definition; `docs/TABLE_CONTRACT.md` gives the query. **Breaking:** no
+  table or column moves, but two consumer invariants do: a comment's `_ast`
+  row has no `node_edge` from its parent, and `nid` order is no longer
+  document order, because a file's comments take the ordinals after its code
+  (code `nid`s are unchanged, and a comment edit moves none of them;
+  `nodes.ord` counts comment siblings in source order; injected ids sit past
+  the comments). `PROJECTION_SCHEMA_VERSION` moves to `projection-v13`, and a
+  `projection-v12` arena is refused at parse open: delete it and reparse
+  cold. A consumer written against v12 must refuse v13. `EXTRACTION_EPOCH`
+  moves 6 → 7. Both move `parserId`. `merkle-ast-v3` and `storeRoot` are
+  unchanged; `Head.rootHash` moves for any file with a comment, because the
+  comment's `AstNode` record joins the `.ast.capnp` segment it folds.
+
+### Added
+
+- **The rootfs digest is in ADR-0047's identity inventory, with its
+  canonical bytes and a known-answer vector** (bead `ley-line-open-39309e`).
+  ADR-0047 §3 gains the rootfs digest row: BLAKE3-256 over the exact bytes
+  of `rootfs.manifest.json`, whose canonical form (compact JSON, key order,
+  decimal permission bits, lowercase hex, entries in component-wise path
+  order) is stated there. `execution/v1/test-vectors/rootfs-manifest.json`
+  publishes the checked-in OCI fixture's linux/arm64 manifest bytes and
+  digest; `leyline-runtime`'s `oci_rootfs` test checks the digest and that
+  the importer writes exactly those bytes.
+
+- **`leyline rootfs import-oci --from-registry [registry/]repository@sha256:<hex>`, and `leyline_runtime::artifacts::registry::pull_oci_image`, pull a digest-pinned image from a registry** (bead `ley-line-open-97b636`). Only the host platform's manifest, its config and its layers are fetched; each is checked against its digest and descriptor size before it is parsed, staged as an OCI image layout inside the CAS root, and imported by the unchanged `import_oci_layout`, so a pull and a `--layout` import of one digest publish the same rootfs digest and print the same JSON. HTTPS only (plain HTTP only to the loopback registry `--insecure-plain-http-registry HOST:PORT` names), anonymous bearer tokens for ghcr.io and Docker Hub sent to the registry only, and bounded by `RegistryLimits` (total download, redirects, connect and response timeouts, a minimum transfer rate). Tags are refused. `--layout` and `--image` are now optional flags, exactly one source required. `OciImportError` gains `MalformedReference`, `Registry`, `InsecureTransport`, `TooManyRedirects` and `DownloadTooLarge`: an exhaustive `match` on it must add them. A Zarf package's `images/` directory imports with `--layout` (acceptance test added). HTTP is ureq 3.3 over rustls, already the workspace's pin; no crate is added to `rs/Cargo.lock`.
+
+- **The Go schema module refuses a head digest v2 Head by version** (bead
+  `ley-line-open-a46711`). `sigma.ClaimOf(head.Head)` reads a Head's claim as
+  LLO's `head_claim::claim_of` does and returns `sigma.ErrRetiredDigestV2`
+  (`errors.Is`) for a Head carrying `retiredTreeRoot @7`. Before, a Go
+  consumer had no refusal and read such a head as unstamped. A shared vector,
+  `sigma/v1` `headMessage` (a v3 Head and the same Head with `@7` set, as
+  Cap'n Proto messages), is checked by the Rust tests (`RetiredDigestV2` from
+  `claim_of`, `stamp_of` and `digest_of`) and by the Go module
+  (`task schema:go-sigma-vectors`).
+
+- **A case-sensitive CAS root on macOS, and a by-name refusal where the CAS
+  root would merge image paths** (bead `ley-line-open-ba86d3`). Debian-based
+  images (Debian's perl ships `Pod/` and `pod/`) need a CAS root that tells
+  case apart, and macOS's default APFS does not.
+  - `leyline rootfs import-oci` probes the CAS root's case and normalization
+    sensitivity once, before reading any layer, and reports it as
+    `casRootFilesystem`. Before writing anything it refuses an image with two
+    paths the CAS root would store as one, with the new
+    `OciImportError::PathCollision`. The error names both paths and says the
+    CAS root is case-insensitive (or normalization-insensitive), so the image
+    isn't blamed. Before, the import failed with a bare `AlreadyExists` that
+    named no path. Images without such a pair still import on any root, to
+    the same digest.
+  - `leyline rootfs provision-cas [--state-dir DIR] [--size-cap-gib N]` and
+    `leyline_runtime::cas_volume::CasVolume` provide a CAS root on a
+    case-sensitive filesystem:
+    - **macOS:** a grow-on-demand, case-sensitive APFS sparsebundle, 64 GiB
+      cap by default. `hdiutil` creates it once and attaches it at
+      `<state>/cas-volume/mnt`, without sudo. The CAS root is
+      `<state>/cas-volume/mnt/cas`, under `~/.local/state/leyline` unless
+      `$LEYLINE_STATE_DIR` or `$XDG_STATE_HOME` says otherwise. Re-running
+      the command reuses the existing volume.
+    - **Linux:** checks that `<state>/cas` is case-sensitive.
+    - **Other hosts:** refused by name.
+  - `leyline execution-daemon --cas-volume [STATE_DIR]` serves that root in
+    place of `--cas-root`. It re-attaches the volume at start and never
+    creates one there. execution/v1 `ProvisionOutput` gains `casRoot`
+    (appended at `@2`), the CAS root the provision made exist.
+  - Consumers that validate provision responses against a pinned copy of
+    `execution-tools.json` with `additionalProperties: false` must re-sync
+    that copy.
+
+- **execution/v1 errors carry a structured `executionError` on the daemon
+  and MCP wire** (bead `ley-line-open-e347ae`). A failed `llo_execution_*`
+  op answered `{"ok": false, "error": "WorkspaceUnserved: …"}`, so a caller
+  could tell the error code only by parsing the text, and `retryable` was
+  dropped. The error envelope now also carries `executionError: {"code":
+  "workspaceUnserved", "retryable": false, "message": "…"}`: execution/v1's
+  `ExecutionError` without the optional `detailRef`, the code spelled as
+  execution.capnp's `ErrorCode` (camelCase, as in execution-tools.json), on
+  the control socket and in MCP's tool result alike (`daemon.capnp`
+  `ErrorResponse.executionError @2`, `ExecutionError`, `ExecutionErrorCode`).
+  Every failed execution op carries it: the runtime's own errors, a request
+  the op cannot decode (`invalidSpec`), and a daemon with no execution/v1
+  service (`unsupportedBackend`, whose text now reads `UnsupportedBackend:
+  execution/v1 service is not configured`). Go: regenerated bindings and
+  `wire.ExecutionErrorResponse`, checked by the daemon protocol fixture
+  gate. Additive: the `error` text otherwise keeps its wording, including
+  the `<Code>: ` prefix, and other errors carry no `executionError`.
+
+### Changed
+
+- **The daemon's LSP row mappers no longer carry a bare `nid` in JSON**
+  (bead `ley-line-open-765bd5`). `lsp_symbols` and `lsp_diagnostics` rows
+  were built as JSON holding the arena-local `nid` as an integer, stripped
+  before the reply left. The row's `nid` is now read as a typed `Nid`
+  beside the reply fields and rendered as `node_id`; the JSON never holds
+  it, and `Nid` has no serde encoding to put it there. `list_children` no
+  longer selects a `nid` it discarded. The wire is unchanged.
+
+- **The Go schema workflow runs on pull requests into `integration`**
+  (bead `ley-line-open-a4787a`). `leyline-schema-go.yml` triggered on `main`
+  only, so a change to `clients/go/leyline-schema` reached `integration`
+  without GitHub running its regeneration diff or `go test`, and the first
+  GitHub Go run was the promotion PR. Its push and pull-request filters now
+  name `integration` as well; the path filters are unchanged.
+
+### Fixed
+
+- **A control block has one daemon** (bead `ley-line-open-1d4003`). Two
+  daemons on one `--control` with different `--arena`s were both admitted:
+  each took the control lease (`<ctrl>.lock`) shared, the second published
+  into the arena the block names while holding only its own arena's lock,
+  and its socket bind replaced the first daemon's `<ctrl>.sock`. Every
+  daemon now also holds a daemon lock exclusively for its lifetime, keyed
+  like the socket and living db it derives from the control path
+  (`c.ctrl` -> `c.daemon-lock`, beside `c.sock` and `c.live.db`), and a
+  second daemon is refused ("another daemon serves the control block …")
+  before it touches the block, the living db or the socket. That covers
+  control paths that differ only in extension (`c.ctrl`, `c.other`), which
+  share `c.sock` and `c.live.db` (bead `ley-line-open-b0800d`). The lease
+  stays shared, so a long-lived reader holding `<ctrl>.lock` `LOCK_SH`
+  (mache's mapper) still runs beside the daemon, and `--reset-arena` still
+  refuses while any reader or daemon holds it.
+
+- **Two cost tests assert deterministic counts, not wall time** (beads
+  `ley-line-open-324f47`, `ley-line-open-40300f`). `leyline-cache`'s
+  `restriction_is_cheaper_than_review` compared millisecond timings at its
+  largest corpus, and `leyline-sheaf`'s `real_repo_sheaf_bench` compared
+  µs of simulated parsing; both failed under `task ci` load while their row
+  and eviction counts held. The restriction test now asserts that the
+  restriction touches the same substrate rows at every corpus size while the
+  review's rows grow (a restriction made O(n) fails it), and the sheaf bench
+  asserts the δ⁰ invalidation set is a strict subset of the heuristic's and
+  reparses strictly fewer source bytes.
+
+- **`--reset-arena` removes a crashed reset's staging file** (bead
+  `ley-line-open-40594e`). A reset stages the fresh control block at
+  `.<ctrl>.reinit.<pid>` and renames it into place; a crash between the two
+  left the file, and later resets, staging under their own pid, never
+  removed it. Every reset now removes `.<ctrl>.reinit.<digits>` siblings
+  while it holds the lease exclusively, whatever the block's version
+  (`leyline_core::control::remove_stale_reinit_staging`).
+
+- **A microVM run's output and its worker's failure reach the embedder, bounded and typed** (bead `ley-line-open-a26ad0`). `KrunWorkerBackend` used to send the guest's standard output to `/dev/null` and discard the worker's standard error after readiness. A failed guest then left only "libkrun worker exited with exit status: 1", and a serving guest left nothing.
+  - **Bounded tails.** The backend now keeps the last 16 KiB of the guest's standard output and the last 8 KiB of the post-readiness standard error, which interleaves the guest's standard error with the worker's diagnostics. Each tail counts the bytes it dropped.
+  - **The new `GuestOutput` type.** It is the one shape for guest output: `stdout_tail`, `stdout_dropped_bytes`, `stderr_tail`, `stderr_dropped_bytes`, `untrusted: true` and `reported_failure`, serialized camelCase.
+  - **Finished and failed runs.** `KrunWorkerBackend::wait_for_outcome(run_id)` and the new `Backend::poll_outcome(run_id)` return a `RunOutcome { status, output: Option<GuestOutput> }`. The `poll_outcome` default is `poll` with no output.
+  - **On failure.** `BackendRunStatus::Failed` also appends both tails to its detail. A reported `failed` event is included only as unverified text, because the guest shares that stream and could forge one. The code and `retryable` stay the supervisor's.
+  - **While a run is active.** `Backend::output(run_id)` (default `None`) and `KrunWorkerBackend::wait_for_output` return the tails.
+  - **Deny by default.** The bytes reach only the in-process embedder. The service's event log commits to a failure's detail by digest alone, and nothing is written to disk, logged, or sent over the wire. The daemon-socket exposure is `ley-line-open-eea8e1`.
+  - **Untrusted bytes.** Invalid UTF-8 and control characters other than newline and tab become U+FFFD.
+
+- **The release bump and the release verifier read one public schema
+  surface** (bead `ley-line-open-a4946a`). `tools/bump_release_version.sh`
+  decided whether `SCHEMA_VERSION` moves from `clients/go/leyline-schema`
+  alone, while `tools/verify_release_version.sh` also refused a release whose
+  `rs/ll-core/schema-spec` IDL or vectors had changed, so v0.27.0 and v0.28.0
+  (schema-spec vector changes only) were bumped into a state the verifier
+  refused and were fixed by hand. The bump, the verifier and
+  `tools/tag_release.sh` now decide through `release_schema_surface_unchanged`
+  in `tools/release_common.sh`: the Go client plus the schema-spec Cap'n
+  Proto IDL, JSON Schema IDL and conformance vectors. `tag_release.sh`, which
+  checked only the Go client, now refuses schema-spec drift too.
+  `task release:schema-surface:fixture-test` (run by `task ci`) proves a
+  vector, IDL or Go change raises `SCHEMA_VERSION` and verifies, a change
+  outside the surface leaves it and verifies, and a held-back surface change
+  is refused.
+
+- **A serve channel holds a connection that arrives before the workload listens, instead of closing it with no bytes** (bead `ley-line-open-a915e3`, libkrun patch `0010`). Previously, a host peer (or VM B's VMM, dialing the path VM A serves on) that connected before the guest workload bound `127.0.0.1:<guestPort>` was accepted and then closed with zero bytes, which a client cannot tell from a server hanging up. The guest relay now holds the connection and retries the workload's port. Only `ECONNREFUSED` is retried, with backoff from 5 ms to 200 ms, for at most 10 s in all (`SERVE_HOLD_MS`, the MySQL client's default `connect_timeout`). The hold ends early if the peer hangs up, and each connection is held in its own process. A client's first connection now works once the server is up. A workload that never listens, or has died, has the connection closed at the bound. On macOS the peer sees that as end-of-file, because a UNIX stream socket carries no reset. A refusal at `connect` is bead `ley-line-open-b00ae3`.
+
+- **A function used as a value records a `node_refs` row** (bead
+  `ley-line-open-a9ff82`). Before, only call targets (plus Go's bare
+  argument and keyed-literal identifiers) emitted, so a handler passed by
+  value — Go `var h = helper`, `cobra.Command{RunE: run}`,
+  `http.HandleFunc("/", s.serve)`, a Python decorator or `target=worker`,
+  a JS `onClick={handle}`, a Java `this::handle`, a C function pointer —
+  read as dead in mache's `dead_code`. Go, Rust, Python, JavaScript,
+  TypeScript, Java, C and C++ now emit a ref for a name in value position
+  (assignment and declaration right-hand sides, arguments, returns,
+  composite/initializer literals, method values and method references).
+  Qualified forms dual-emit like qualified calls (`s.serve` + `serve`
+  with qualifier `s`). The rows are additive: every call ref is unchanged.
+  A value ref is anchored at its value-position container, so its
+  `node_kind` / `kind_id` (`argument_list`, `var_spec`,
+  `return_statement`, ...) tells it apart from a call ref
+  (`call_expression`, `call`, `method_invocation`). Field reads in the
+  same positions are syntactically identical to method values and emit
+  too; their tokens stay unbound when no def carries them, so
+  `_meta.unbound_facts` rises. `EXTRACTION_EPOCH` moves 5 → 6, which moves
+  `parserId` and makes an existing arena re-derive its facts on the next
+  parse; `projection-v12` is unchanged (no table or column moves).
+
+- **Comments that contradicted the code now state what it does, and
+  `task tier:isolation` builds every ll-core crate** (bead
+  `ley-line-open-b42256`). The run-id σ-axiom test names M3 as
+  `ley-line-open-ab2093`; the `leyline-cas-ffi` module doc lists
+  `leyline_derive_key`'s empty or non-UTF-8 context refusal; the
+  `verify_vectors_sha256` doc stops counting two pin files (there are six)
+  and a new test fails when a `VECTORS.sha256` file is missing from its
+  list; the daemon auth doc names the socket `<ctrl>.sock` beside the
+  control file. `tier:isolation` built three of the eight ll-core crates
+  (not `leyline-schema-capnp`); it now builds all eight and fails when their
+  dependency tree reaches an ll-open crate.
+
+- **A `_tree` directory row that carries a `blob_hash` is refused** (bead
+  `ley-line-open-bbd7c8`). `tree::decode` read such a row as a directory
+  and silently ignored the hash. It is now refused, as a file row without
+  a `blob_hash` already was, with the typed `tree::MalformedRow`
+  (`DirectoryWithBlob` / `FileWithoutBlob`, naming the path) by
+  `tree::decode`, which every `_tree` reader now goes through, the storefs
+  filesystem's lookup and directory listing included (they read rows
+  directly and served a directory with a blob as a directory). So
+  `storeRoot`, `leyline verify-head`, `leyline rebuild` and the storefs
+  share fail closed (EIO for the share) on either row.
+
+- **head.capnp describes `unboundFacts` as the producer counts it** (bead
+  `ley-line-open-cc2130`). The schema said it counted `fact_edges` rows
+  with a NULL `dst` under a "W5" ratchet gate; the producer counts
+  `node_refs` rows whose token has no `node_defs` row, recorded as
+  `_meta.unbound_facts`, and no such gate exists. The field's text now says
+  that, and that the value depends on the extraction epoch (epoch 6 value
+  refs raise it). `identity_docs_test` fails if the description names
+  `fact_edges` or a W5 gate again, or if the producer's count or
+  TABLE_CONTRACT's definition moves.
+
+- **Every microVM guest has a writable, bounded `/tmp`** (bead `ley-line-open-db5899`, libkrun patch `0012`).
+  - **The problem.** Guest init mounted only `/dev`, `/proc` and `/sys`, and an OCI import drops an image's empty `tmp/`, so a guest such as Dolt's `sql-server` failed with "open /tmp: no such file or directory".
+  - **The fix.** Init now mounts a tmpfs on `/tmp` before the workload starts: mode 1777, `nosuid` and `nodev`, sized at 25 % of the guest's RAM. A write past that bound fails `ENOSPC`. The tmpfs is per-boot and memory-backed, so nothing written there reaches the host or outlives the run. Init mounts only over a real directory; a `/tmp` that is a link or a file stops the guest.
+  - **Import changes.** `leyline rootfs import-oci` now treats `tmp/` like `dev/`, `proc/` and `sys/`, because the tmpfs shadows whatever the image holds there.
+    - A device or FIFO beneath `tmp/` is dropped and reported. Such an image was refused before and now imports.
+    - Under `--symlinks resolve`, a link into `tmp/` is dropped and reported in `linksDroppedKernelMount`. Before, it was copied, or dropped as dangling.
+  - **Rootfs digests.** A digest changes only for an image where such a link resolved to files the image held under `tmp/`. A link that was dangling before, or `var/tmp -> /tmp` over an empty `tmp/`, keeps its digest, and only the report field it appears in changes. Regular files under `tmp/` are still imported, as under `dev/`.
+
 ## [0.28.0] — 2026-11-10
 
 **The declared-connections release (ADR-0046 Q7). Arenas from 0.27.0 carry

@@ -67,7 +67,10 @@ fn the_connections_grant_vector_holds() {
     }
 
     let base = &vector["withoutConnections"]["grant"];
-    assert_eq!(base, &run["grant"], "withoutConnections is canonical-run.json's grant");
+    assert_eq!(
+        base, &run["grant"],
+        "withoutConnections is canonical-run.json's grant"
+    );
     for absent in ["connectionsDigest", "connectionsDocument", "signature"] {
         assert!(base.get(absent).is_none(), "{absent} must be absent");
     }
@@ -79,9 +82,17 @@ fn the_connections_grant_vector_holds() {
         "exactly the marker"
     );
     let carried = grant["connectionsDocument"].as_str().unwrap();
-    assert_eq!(carried.as_bytes(), document.as_slice(), "the pinned canonical document");
+    assert_eq!(
+        carried.as_bytes(),
+        document.as_slice(),
+        "the pinned canonical document"
+    );
     let parsed = connections::parse(carried.as_bytes()).unwrap();
-    assert_eq!(parsed.canonical_bytes(), document, "carried bytes are canonical");
+    assert_eq!(
+        parsed.canonical_bytes(),
+        document,
+        "carried bytes are canonical"
+    );
     assert_eq!(grant["connectionsDigest"]["algorithm"], "blake3-256");
     assert_eq!(
         grant["connectionsDigest"]["value"].as_str().unwrap(),

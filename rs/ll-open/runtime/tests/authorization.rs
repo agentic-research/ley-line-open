@@ -3470,10 +3470,7 @@ fn connections_are_authorized_only_all_or_nothing() {
         match mask {
             0 => assert!(result.expect("none of the three").connections.is_none()),
             7 => {
-                let connections = result
-                    .expect("all three")
-                    .connections
-                    .expect("connections");
+                let connections = result.expect("all three").connections.expect("connections");
                 assert_eq!(connections.digest, format!("blake3-256:{hex}"));
                 assert_eq!(
                     connections.document.canonical_bytes(),
@@ -3539,7 +3536,10 @@ fn the_carried_document_must_match_its_digest_and_be_canonical() {
         brokers: &[MARKER],
     })
     .expect_err("digest mismatch");
-    assert_eq!(error.code, leyline_runtime::ErrorCode::IdentityPolicyMismatch);
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
 
     // The same document with one more space: valid, and refused because a
     // runner never normalizes, even when the digest names these bytes.
@@ -3646,8 +3646,7 @@ fn unhex(s: &str) -> Vec<u8> {
 /// without the fields.
 #[test]
 fn the_connections_grant_vector_matches_this_implementation() {
-    let vector: serde_json::Value =
-        serde_json::from_str(CONNECTIONS_GRANT_VECTOR).expect("vector");
+    let vector: serde_json::Value = serde_json::from_str(CONNECTIONS_GRANT_VECTOR).expect("vector");
     for key in ["connections", "withoutConnections"] {
         let entry = &vector[key];
         let mut message = Builder::new_default();

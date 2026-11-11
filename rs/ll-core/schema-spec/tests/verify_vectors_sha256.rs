@@ -41,6 +41,9 @@ const VECTORS_FILES: &[&str] = &[
     // lives in leyline-schema-capnp's tests/leyline_net_vectors.rs.
     "leyline-net/v1/test-vectors/VECTORS.sha256",
     "sigma/v1/VECTORS.sha256",
+    // Bead ley-line-open-e9d940: the connection broker's input contract
+    // (ADR-0046 Slice 1). The BLAKE3 half lives in verify_connections_digest.
+    "connections/v1/VECTORS.sha256",
 ];
 
 #[test]

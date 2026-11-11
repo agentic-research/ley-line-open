@@ -1,0 +1,11 @@
+# BLAKE3-256 connectionsDigest pins for cloister/connections/v1 canonical documents.
+#
+# connectionsDigest names the canonical bytes of one connections document
+# (README "Canonical form") and nothing else: not confinementDigest, not a
+# blob hash, not an arena or store root. Distinct from VECTORS.sha256, which
+# is a SHA-256 content-integrity pin. Line shape mirrors sha256sum.
+# Verified by tests/verify_connections_digest.rs, against both the Rust
+# parser and the independent Python reference (ref-impl-py/).
+
+9653bdf60e626486d61f63249853462e77dc74a7600d54848c6053bcd0470996  test-vectors/connections-canonical.json
+e6b50d69cdb34ed346939c4bebb808262e5fb8269353a4fd26c609790a2c92fe  test-vectors/connections-multi.json

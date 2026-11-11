@@ -1,0 +1,18 @@
+{
+  "connections": [
+    {
+      "appProtocol": "art.tcp",
+      "endpoint": {
+        "unix": "/private/tmp/cloister-ch-7Qm2/orders.api.sock"
+      },
+      "name": "orders-api",
+      "target": {
+        "tcp": {
+          "host": "127.0.0.1",
+          "port": 30080
+        }
+      }
+    }
+  ],
+  "version": "cloister/connections/v1"
+}

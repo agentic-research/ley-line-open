@@ -783,7 +783,10 @@ next:
 **Any failure after step 3** (a ready timeout or digest mismatch, a resolver error, a
 worker spawn or compile failure, a `workspaceUnserved` refusal, the failed-cancel path)
 kills the broker, unlinks its endpoints and removes the run from the registry before the
-start returns. **Cancel during start** acts on a starting run: today `service.cancel` looks
+start returns. One exception: on the failed-cancel path the run is recorded `failed` while
+its worker may still be alive, so its registry entry stays until `cleanup`'s cancel
+succeeds; dropping it at the terminal state would let another run claim an endpoint the
+old VMM can still dial. **Cancel during start** acts on a starting run: today `service.cancel` looks
 only at `state.runs`, and a starting run lives in `state.starting` until `backend.start`
 returns, so the service's cancel must also reach `starting` and kill the broker (and the
 worker, if spawned). `ley-line-open-f963e6` names the same window one layer down, in
@@ -871,7 +874,7 @@ loopback services; the receipt's accuracy. There is no credential.
 | workload steers the broker | an address in the stream | the broker parses nothing; the target is fixed per listener (S5) |
 | a name resolves elsewhere at dial time | DNS answer changes | no names: IP literals only (S2) |
 | endpoint squatting or a shared path | a process binds the path first; two runs share a directory | pre-existing path refused; parent must be a non-symlinked 0700 directory owned by the daemon's uid; bind before the workload's confinement compiles (S4) |
-| another run reaches this run's broker | its §6 grant names this run's endpoint (the S0 shared-path join), its VMM running under the daemon's uid | the endpoint registry refuses either run at start, whichever registers second (S4); on the microVM tier the broker accepts only its own worker's pid (S5) |
+| another run reaches this run's broker | its §6 grant names this run's endpoint (the S0 shared-path join), its VMM running under the daemon's uid | the endpoint registry refuses either run at start, whichever registers second (S4); on the microVM tier the broker accepts only its own worker's pid (S5). Residual: the registry covers the runs of one `ExecutionService`; a second service under the same uid (an in-process embedder beside the daemon) is not covered on native macOS, which has no pid check |
 | an unconfined local process uses the broker | connects to the endpoint | the parent is 0700 and the peer uid is checked; a same-uid unconfined process could already dial the loopback target itself, so it gains no reach (residual, accepted); on the microVM tier the pid check refuses it too |
 | the workload replaces the broker's socket | unlinks the endpoint and binds its own (native macOS) | no §6 bind-capable grant on or containing an endpoint and no §2 write grant on its parent (S2) |
 | upstream impersonation | another process holds the loopback port | not closed in slice 1: the edge is `policy` (S5); the receipt records the address, not the process |
@@ -929,7 +932,8 @@ enforcement.
 - **Profile** (closes S5; *macOS*): the whole relay suite runs again with the broker
   confined, as the positive control (accept and relay still work). Under the profile the
   broker gets `EPERM` connecting to an undeclared loopback port, opening any file,
-  `execve`, `fork`, connecting to mDNSResponder, and `getaddrinfo` fails.
+  `execve`, `fork`, connecting to mDNSResponder, and `getaddrinfo` fails. The test pins
+  the `mach-lookup` allow-set the spike fixes, so the set cannot grow without a test change.
 - **Lifecycle** (closes S7): SIGKILL the supervising process and the broker is gone within
   a bound; `ExecutionService::cancel` during a stalled ready wait leaves no broker and no
   endpoint; a forced failure at step 5 leaves no broker and no endpoint; a broker killed
@@ -965,9 +969,12 @@ Hypervisor-gated (`LEYLINE_REQUIRE_HYPERVISOR=1`, macOS, in the release hypervis
 - `leyline-runtime`: authorization (S3); the transport capability entry; `ExecutionService`
   start ordering, the endpoint registry, cancel of starting runs and failure teardown (S4,
   S7); `ExecutionRequest` carrying the document; a broker module (preflight, relay, profile,
-  control pipe, drain) and receipt assembly (S5, S8); spawn with
-  `POSIX_SPAWN_CLOEXEC_DEFAULT` for brokers and workers; a new LLO binary beside
+  control pipe, drain) and receipt assembly (S5, S8); a new LLO binary beside
   `leyline-native-worker`. The lifeline pipe is shared with `ley-line-open-f963e6`.
+- **Every daemon spawn moves to `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` (S7).**
+  `std::process::Command` cannot set that flag, so the existing spawn paths in
+  `native_backend.rs` and `libkrun/backend.rs` (`configure_process_group`) change too, not
+  only the broker's. This is the widest part of the slice.
 - **No libkrun patch.** Patch 0010's dial channel already joins guest loopback to the host
   path through vsock; the broker is the listener at that path.
 - Cloister: emit the document, the digest and the marker; check the capability; read

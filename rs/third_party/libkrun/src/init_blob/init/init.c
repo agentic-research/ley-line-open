@@ -549,14 +549,32 @@ static int chroot_luks()
  * `include_last` false the last component is left out, for a target that
  * is about to be created. A path that is relative, too long to examine, or
  * holds an empty component (`//`, a trailing `/`, on which lstat would
- * follow a link) is not one.
+ * follow a link) or a `.` or `..` component (each prefix would be a real
+ * directory, yet the path would name another) is not one.
  *
  * mount(2) and mkdir(2) follow a link anywhere in their path, so a rootfs
  * that holds `work -> usr/bin` would get the mount over usr/bin, covering
  * the very executable the run verified (ley-line-open-10b516). Nothing in
- * the guest but init runs yet, so no one can swap a component between this
- * walk and the mount.
+ * the guest but init runs yet, and the host side of the root and of each
+ * share is the embedder's, which is trusted, so no one can swap a
+ * component between this walk and the mount.
  */
+static bool has_dot_component(const char *path)
+{
+    const char *c = path;
+
+    while ((c = strchr(c, '/')) != NULL) {
+        c++;
+        if (c[0] == '.' && (c[1] == '/' || c[1] == '\0')) {
+            return true;
+        }
+        if (c[0] == '.' && c[1] == '.' && (c[2] == '/' || c[2] == '\0')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool real_directory_path(const char *path, bool include_last)
 {
     char prefix[PATH_MAX];
@@ -566,7 +584,7 @@ static bool real_directory_path(const char *path, bool include_last)
     struct stat existing;
 
     if (path[0] != '/' || length >= sizeof(prefix) || strstr(path, "//") ||
-        (length > 1 && path[length - 1] == '/')) {
+        (length > 1 && path[length - 1] == '/') || has_dot_component(path)) {
         return false;
     }
     if (!include_last) {

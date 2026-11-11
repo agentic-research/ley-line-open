@@ -104,9 +104,9 @@ fn main() {
 }
 "#;
 
-/// Set in the child to the `KRUN_VIRTIOFS_MOUNTS` value to hand init
-/// verbatim (empty: none), for a rootfs whose mount target is a link.
-const LINKED_MOUNTS: &str = "LEYLINE_TEST_VIRTIOFS_LINKED_MOUNTS";
+/// Set in the child to the extra environment entries (`KEY=value`, one per
+/// line) to hand the guest init, for a boot init must refuse.
+const INIT_ENV: &str = "LEYLINE_TEST_VIRTIOFS_INIT_ENV";
 
 /// Prints one line if it runs at all; init must stop before it does.
 const GUEST_THAT_MUST_NOT_RUN: &str = r#"
@@ -115,71 +115,144 @@ fn main() {
 }
 "#;
 
+/// The exit status init reports when it stops a guest before the workload
+/// runs (LLO libkrun patch 0015, bead `ley-line-open-7164ec`).
+const STOP_EXIT_CODE: i32 = 125;
+
+/// What a refused boot's rootfs holds beyond `bin/guest`.
+enum Plant {
+    Nothing,
+    /// A symbolic link at the first path, pointing at the second.
+    Link(&'static str, &'static str),
+    /// A regular file at this path.
+    File(&'static str),
+}
+
+/// One boot init must refuse: what the rootfs holds, the environment init
+/// is given, and the reason it must state where the host reads it (`None`
+/// when it stops before the krun console ports exist, so only the exit
+/// status reaches the host).
+struct Refusal {
+    plant: Plant,
+    init_env: &'static [&'static str],
+    says: Option<&'static str>,
+}
+
 /// Init mounts only over a real directory (LLO libkrun patch 0014, bead
 /// `ley-line-open-2594af`; defence in depth for `ley-line-open-10b516`).
 /// mount(2) follows a link, so a rootfs holding `work -> bin` with a
 /// workspace attached at /work would get the share over /bin, covering the
 /// executable the run verified. For a top-level share target, a nested one
 /// whose parent is a link, and one of init's own kernel mounts, init must
-/// refuse by name and stop the guest before the workload runs. Without the
-/// patch init mounts and prints no refusal, so the named refusal is what
-/// tells the two apart.
+/// refuse and stop the guest as a failure before the workload runs, and
+/// create nothing through the link.
 #[test]
 fn the_guest_init_refuses_a_mount_target_that_is_a_link() {
     if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
         enter_guest(PathBuf::from(rootfs));
     }
-    for (link, points_to, mounts, refused) in [
-        ("work", "bin", "llo:/work", "/work"),
-        ("srv", "bin", "llo:/srv/work", "/srv/work"),
-        ("dev", "bin", "", "/dev"),
+    for refusal in [
+        Refusal {
+            plant: Plant::Link("work", "bin"),
+            init_env: &["KRUN_VIRTIOFS_MOUNTS=llo:/work"],
+            says: Some("/work is not a directory, refusing to mount over it"),
+        },
+        Refusal {
+            plant: Plant::Link("srv", "bin"),
+            init_env: &["KRUN_VIRTIOFS_MOUNTS=llo:/srv/work"],
+            says: Some("/srv/work is not a directory, refusing to mount over it"),
+        },
+        // Refused before /sys and /dev are mounted, so before the krun
+        // console ports exist: the host sees the exit status alone.
+        Refusal {
+            plant: Plant::Link("dev", "bin"),
+            init_env: &[],
+            says: None,
+        },
     ] {
-        let Some(console) = boot_refused(link, points_to, mounts) else {
+        if boot_refused(
+            "the_guest_init_refuses_a_mount_target_that_is_a_link",
+            refusal,
+        )
+        .is_none()
+        {
             return;
-        };
-        assert!(
-            console.contains(&format!(
-                "{refused} is not a directory, refusing to mount over it"
-            )),
-            "init names {refused} and refuses it:\n{console}"
-        );
-        assert!(
-            !console.contains("guest ran"),
-            "the workload never runs over a linked mount target:\n{console}"
-        );
+        }
     }
 }
 
-/// Boot a rootfs whose `link` points at `points_to`, with init asked to
-/// mount `mounts`, and return the guest console once the VMM has exited
-/// unsuccessfully. `None` when there is no hypervisor here.
-fn boot_refused(link: &str, points_to: &str, mounts: &str) -> Option<String> {
+/// A guest init that refuses to start the workload stops the guest as a
+/// failure the host sees, with its reason on the console the host reads
+/// (LLO libkrun patch 0015, bead `ley-line-open-7164ec`). Upstream init
+/// called exit() from PID 1, the kernel panicked, and libkrun reported exit
+/// status 0 with an empty console: a refused boot read as a success. Each
+/// of LLO's own pre-workload refusals: a /tmp that is not a directory
+/// (patch 0012), a missing exec config (0013), and a channel list init
+/// cannot set up (0010).
+#[test]
+fn a_refused_boot_ends_as_a_failure_with_its_reason() {
+    if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
+        enter_guest(PathBuf::from(rootfs));
+    }
+    for refusal in [
+        Refusal {
+            plant: Plant::File("tmp"),
+            init_env: &[],
+            says: Some("/tmp is not a directory, refusing to mount over it"),
+        },
+        Refusal {
+            plant: Plant::Nothing,
+            init_env: &["KRUN_CONFIG=/no-such-exec.json", "KRUN_CONFIG_ARGV=1"],
+            says: Some("KRUN_CONFIG_ARGV is set and /no-such-exec.json is not a valid exec config"),
+        },
+        Refusal {
+            plant: Plant::Nothing,
+            init_env: &["KRUN_LOOPBACK_CHANNELS=sideways:1:2"],
+            says: Some("Couldn't set up KRUN_LOOPBACK_CHANNELS, bailing out"),
+        },
+    ] {
+        if boot_refused("a_refused_boot_ends_as_a_failure_with_its_reason", refusal).is_none() {
+            return;
+        }
+    }
+}
+
+/// Boot a rootfs holding `bin/guest` and `refusal.plant`, with init given
+/// `refusal.init_env`, through the entitled re-exec of test `name`. Asserts
+/// that the VMM exits with STOP_EXIT_CODE, that the workload never ran,
+/// that the console states the reason, and that nothing was created through
+/// a planted link. `None` when there is no hypervisor here.
+fn boot_refused(name: &str, refusal: Refusal) -> Option<()> {
     let _serial = common::serial();
     let libkrunfw = hypervisor::libkrunfw_or_skip()?;
     let fixture = TempDir::new().expect("fixture");
+    let fixture = fixture.path();
 
-    let rootfs = fixture.path().join("rootfs");
+    let rootfs = fixture.join("rootfs");
     fs::create_dir_all(rootfs.join("bin")).expect("rootfs bin");
-    let source = fixture.path().join("guest.rs");
+    let source = fixture.join("guest.rs");
     fs::write(&source, GUEST_THAT_MUST_NOT_RUN).expect("guest source");
     let guest = rootfs.join("bin/guest");
     hypervisor::compile_guest(&source, &guest);
     fs::set_permissions(&guest, fs::Permissions::from_mode(0o755)).expect("guest mode");
-    std::os::unix::fs::symlink(points_to, rootfs.join(link)).expect("the linked mount target");
+    match refusal.plant {
+        Plant::Nothing => {}
+        Plant::Link(at, to) => {
+            std::os::unix::fs::symlink(to, rootfs.join(at)).expect("the planted link");
+        }
+        Plant::File(at) => {
+            fs::write(rootfs.join(at), b"not a directory").expect("the planted file")
+        }
+    }
 
-    let vmm = fixture.path().join("vmm");
+    let vmm = fixture.join("vmm");
     hypervisor::entitled_copy(&std::env::current_exe().expect("test binary"), &vmm);
     let (library_var, library_dir) = hypervisor::library_path_env(&libkrunfw);
     let mut child = Command::new(&vmm)
-        .args([
-            "the_guest_init_refuses_a_mount_target_that_is_a_link",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env(VMM_CHILD, &rootfs)
         .env(TOKEN, "unused")
-        .env(LINKED_MOUNTS, mounts)
+        .env(INIT_ENV, refusal.init_env.join("\n"))
         .env(library_var, library_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -199,12 +272,32 @@ fn boot_refused(link: &str, points_to: &str, mounts: &str) -> Option<String> {
         status.is_some(),
         "the guest did not stop within 30 seconds\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert!(
-        !output.status.success(),
-        "init stops the guest with a failure: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    assert_eq!(
+        output.status.code(),
+        Some(STOP_EXIT_CODE),
+        "init stops the guest as a failure, not a panic that reads as exit 0: {:?}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
         output.status
     );
-    Some(stdout)
+    if let Some(reason) = refusal.says {
+        assert!(
+            stdout.contains(reason),
+            "init states why ({reason}) where the host reads it:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !stdout.contains("guest ran"),
+        "the workload never runs:\n{stdout}"
+    );
+    // A share target is walked before init creates it: nothing appears
+    // through a planted link.
+    for created in ["bin/work", "bin/llo"] {
+        assert!(
+            !rootfs.join(created).exists(),
+            "init created {created} through a link before refusing"
+        );
+    }
+    Some(())
 }
 
 #[test]
@@ -314,11 +407,8 @@ fn enter_guest(rootfs: PathBuf) -> ! {
     if init_mounts {
         environment.push(c("KRUN_VIRTIOFS_MOUNTS=llo:/llo"));
     }
-    match std::env::var(LINKED_MOUNTS) {
-        Ok(mounts) if !mounts.is_empty() => {
-            environment.push(c(&format!("KRUN_VIRTIOFS_MOUNTS={mounts}")));
-        }
-        _ => {}
+    if let Ok(entries) = std::env::var(INIT_ENV) {
+        environment.extend(entries.lines().filter(|e| !e.is_empty()).map(c));
     }
     let config = KrunConfig {
         run_id: "virtiofs-backend".into(),

@@ -422,6 +422,28 @@ pub fn git_dir_of(host: &Host, tree: &Path, dest: &Path) {
     git(tree, &["commit", "-q", "-m", "seed"]);
     git(tree, &["gc", "-q"]);
     copy_tree(&tree.join(".git"), dest);
+    // After `gc`, `refs/heads`, `refs/tags` and `objects/info` are empty,
+    // and git refuses a directory without `refs/` as a repository. Manifest
+    // v1 names files only, so the guest's per-run copy holds only the
+    // directories a file implies (bead `ley-line-open-38ff59`): give each
+    // empty directory a dotfile, which git's ref and object walks skip.
+    keep_empty_directories(dest);
+}
+
+/// Put an empty `.keep` in every directory beneath `dir` (itself included)
+/// that holds nothing.
+fn keep_empty_directories(dir: &Path) {
+    let mut empty = true;
+    for entry in fs::read_dir(dir).expect("read directory") {
+        let entry = entry.expect("entry");
+        empty = false;
+        if entry.file_type().expect("file type").is_dir() {
+            keep_empty_directories(&entry.path());
+        }
+    }
+    if empty {
+        fs::write(dir.join(".keep"), b"").expect(".keep");
+    }
 }
 
 fn set_digest(mut digest: execution_capnp::digest_ref::Builder<'_>, value: &str) {

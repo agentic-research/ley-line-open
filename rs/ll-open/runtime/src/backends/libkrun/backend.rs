@@ -537,8 +537,11 @@ impl Backend for KrunWorkerBackend {
                     ));
                 }
                 // Same check as the native tier: the worker attests the
-                // policy it applied, and a disagreement with the grant stops
-                // the run before it executes.
+                // policy it applied, and a disagreement with the grant is
+                // refused. Readiness is written immediately before
+                // `krun_start_enter`, so this cannot stop a drifting guest
+                // from starting; the worker's own comparison, before the
+                // rootfs is read, does (bead ley-line-open-7a3109).
                 if !request.confinement_digest.is_empty()
                     && confinement_digest != request.confinement_digest
                 {

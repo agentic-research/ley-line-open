@@ -95,9 +95,56 @@ fn a_manifest_matching_the_committed_digest_is_accepted() {
     let manifest = canonical_manifest();
     let committed = manifest.confinement_digest().expect("digest");
 
-    manifest
-        .assert_matches(&committed)
+    let bound = manifest
+        .commit(Some(&committed))
         .expect("a manifest that hashes to the committed digest must verify");
+    assert_eq!(bound.digest(), committed);
+}
+
+/// The applied policy is a projection of the digested BYTES, not of a value
+/// beside them (bead `ley-line-open-7a3109`).
+///
+/// A committed confinement carries three things: the canonical bytes, the
+/// BLAKE3 digest of exactly those bytes, and the policy parsed back from
+/// exactly those bytes. A tier compiles its `CapabilitySet` from the third, so
+/// what is applied is what the digest names by construction: a serializer that
+/// dropped or reshaped a dimension would change the applied policy along with
+/// the digest, never one without the other.
+#[test]
+fn a_committed_confinement_applies_the_policy_its_digested_bytes_describe() {
+    let manifest = canonical_manifest();
+    let committed = manifest.confinement_digest().expect("digest");
+    let bound = manifest.commit(Some(&committed)).expect("commit");
+
+    let canonical = std::fs::read_to_string(vector_path("test-vectors/manifest-canonical.json"))
+        .expect("the pinned canonical manifest");
+    assert_eq!(bound.canonical_json(), canonical);
+    assert_eq!(
+        bound.digest(),
+        format!(
+            "blake3-256:{}",
+            blake3::hash(bound.canonical_json().as_bytes())
+        ),
+        "the digest is over the exact bytes the committed confinement holds"
+    );
+    assert_eq!(
+        *bound.manifest(),
+        ConfinementManifest::parse(bound.canonical_json()).expect("parse"),
+        "the policy applied is the one those bytes describe"
+    );
+}
+
+/// A run with no commitment (a direct `Backend::start` embedder, whose request
+/// names no `confinementDigest`) still binds its policy to its bytes, and
+/// attests the digest; there is nothing to compare it with.
+#[test]
+fn an_uncommitted_run_binds_its_policy_without_a_comparison() {
+    let manifest = canonical_manifest();
+    let bound = manifest.commit(None).expect("commit without a commitment");
+    assert_eq!(
+        bound.digest(),
+        manifest.confinement_digest().expect("digest")
+    );
 }
 
 /// Cloister's `rejects_on_manifest_tamper`, with their exact widening: the
@@ -116,8 +163,12 @@ fn widening_the_enforced_policy_is_refused_as_drift() {
         .expect("valid fs grant");
 
     let error = widened
-        .assert_matches(&committed)
+        .commit(Some(&committed))
         .expect_err("a widened policy must not satisfy the narrower commitment");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
     assert!(
         format!("{error:?}").contains("confinement drift"),
         "the rejection must name drift so an operator knows the policy \
@@ -147,7 +198,7 @@ fn narrowing_the_enforced_policy_is_refused_too() {
         .expect("valid port");
 
     assert!(
-        narrowed.assert_matches(&committed).is_err(),
+        narrowed.commit(Some(&committed)).is_err(),
         "the commitment is an equality, not an upper bound"
     );
 }
@@ -779,5 +830,100 @@ fn an_empty_network_block_is_refused() {
     assert!(
         error.to_string().contains("network"),
         "the refusal must name the block: {error}"
+    );
+}
+
+fn request_carrying(digest: &str, document: Option<String>) -> leyline_runtime::ExecutionRequest {
+    leyline_runtime::ExecutionRequest {
+        run_id: "run".into(),
+        replay_key: "replay".into(),
+        rootfs: leyline_runtime::DigestRef {
+            algorithm: "blake3-256".into(),
+            value: "0".repeat(64),
+        },
+        executable: "bin/agent".into(),
+        arguments: Vec::new(),
+        public_environment: std::collections::BTreeMap::new(),
+        allowed_egress: Vec::new(),
+        confinement_digest: digest.into(),
+        confinement_manifest: document,
+        workspaces: Vec::new(),
+        limits: leyline_runtime::ResourceLimits::default(),
+    }
+}
+
+/// The confinement a worker applies for a request is one function on both
+/// tiers, and it holds the grant's commitment before anything is applied
+/// (bead `ley-line-open-7a3109`). Matching: bound, with the commitment as its
+/// digest. Drifting: refused by name, with both digests.
+#[test]
+fn a_request_binds_the_policy_its_grant_committed_to() {
+    use leyline_runtime::backends::libkrun::confinement::{
+        committed_confinement, confinement_manifest,
+    };
+
+    let runtime_files = [std::path::PathBuf::from("/usr/lib/libkrunfw.dylib")];
+    let devices = [std::path::PathBuf::from("/dev/kvm")];
+    let compiled = confinement_manifest(&runtime_files, &devices, None).expect("compile");
+    let digest = compiled.confinement_digest().expect("digest");
+
+    let bound = committed_confinement(&request_carrying(&digest, None), &runtime_files, &devices)
+        .expect("the committed policy binds");
+    assert_eq!(bound.digest(), digest);
+    assert_eq!(*bound.manifest(), compiled);
+
+    // The same document carried by the grant binds to the same digest.
+    let carried = committed_confinement(
+        &request_carrying(&digest, Some(compiled.to_canonical_json().expect("json"))),
+        &runtime_files,
+        &devices,
+    )
+    .expect("the carried document binds");
+    assert_eq!(carried.digest(), digest);
+
+    // A deployment that differs from the one the issuer committed to.
+    let error = committed_confinement(&request_carrying(&digest, None), &runtime_files, &[])
+        .expect_err("a different deployment policy must not satisfy the commitment");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
+    assert!(error.detail.contains("confinement drift"), "{error}");
+    assert!(error.detail.contains(&digest), "{error}");
+}
+
+/// A carried document with no commitment beside it is incoherent: the
+/// document would be folded into the applied policy with nothing for it to
+/// be checked against. Authorization never produces this shape (it refuses a
+/// grant whose document does not digest to its `confinementDigest`), so only a
+/// direct `Backend::start` embedder can, and it is refused by name.
+#[test]
+fn a_carried_document_without_a_commitment_is_refused() {
+    use leyline_runtime::backends::libkrun::confinement::{
+        committed_confinement, confinement_manifest,
+    };
+
+    let document = confinement_manifest(&[], &[], None)
+        .expect("compile")
+        .to_canonical_json()
+        .expect("json");
+    let error = committed_confinement(&request_carrying("", Some(document)), &[], &[])
+        .expect_err("a document without a commitment must be refused");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
+    assert!(error.detail.contains("confinementDigest"), "{error}");
+
+    // No document and no commitment: a direct embedder's run. It binds LLO's
+    // own policy and attests it.
+    let uncommitted = committed_confinement(&request_carrying("", None), &[], &[])
+        .expect("an uncommitted run binds the deployment policy");
+    assert_eq!(
+        uncommitted.digest(),
+        confinement_manifest(&[], &[], None)
+            .expect("compile")
+            .confinement_digest()
+            .expect("digest")
     );
 }

@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use nono::{AccessMode, CapabilitySet, Sandbox, UnixSocketMode};
 
 use crate::ExecutionError;
-use crate::confinement::{ConfinementManifest, Dimensions, FsGrant, UnixSocketGrant};
+use crate::confinement::{
+    CommittedConfinement, ConfinementManifest, Dimensions, FsGrant, UnixSocketGrant,
+};
 
 use super::plan::KrunConfig;
 
@@ -123,7 +125,7 @@ pub fn confinement_manifest(
     // The digest therefore changes when a listener is declared, and an issuer
     // has to predict it. That is achievable precisely because the other inputs
     // are stable: the rootfs is symbolic (ATTESTED_RUN_ROOTFS), and runtime
-    // files and devices come from `LibkrunBackendConfig` — deployment
+    // files and devices come from `KrunWorkerConfig` — deployment
     // configuration fixed when the backend is constructed, not per-run values.
     // An issuer configured for a deployment can compute this document exactly.
     //
@@ -744,29 +746,70 @@ fn unix_socket_mode(grant: &UnixSocketGrant) -> Result<UnixSocketMode, Execution
     Ok(mode)
 }
 
-/// Apply nono to the current worker process. This is irreversible and must be
-/// called only after the worker has loaded libkrun and resolved its rootfs.
-pub fn apply(config: &KrunConfig, resources: &VmmHostResources) -> Result<(), ExecutionError> {
-    apply_manifest(
-        &confinement_manifest(&resources.runtime_files, &resources.devices, None)?,
-        &config.rootfs.canonical_path,
-    )
+/// The confinement a worker applies for `request`, bound to the grant's
+/// commitment before anything is applied (bead `ley-line-open-7a3109`).
+///
+/// One function for both tiers. It compiles LLO's policy for this deployment
+/// (`runtime_files`, `devices`) with the grant-originated dimensions folded in
+/// from the carried document, then [`ConfinementManifest::commit`]s it to the
+/// request's `confinement_digest`:
+///
+/// - a digest that does not match is refused by name ("confinement drift"),
+///   in the worker, before the rootfs is read, the sandbox applied, the VM
+///   built or the child spawned. The supervisor's comparison of the readiness
+///   event stays as a second check, but readiness is written immediately
+///   before the workload starts, so it could not by itself stop a drifting
+///   run from starting;
+/// - a carried document with no digest is refused: there would be nothing to
+///   hold the folded dimensions to;
+/// - no document and no digest is a direct `Backend::start` embedder's run,
+///   which binds the deployment policy and attests it.
+pub fn committed_confinement(
+    request: &crate::ExecutionRequest,
+    runtime_files: &[PathBuf],
+    devices: &[PathBuf],
+) -> Result<CommittedConfinement, ExecutionError> {
+    let committed =
+        (!request.confinement_digest.is_empty()).then_some(request.confinement_digest.as_str());
+    // Re-parsed rather than carried as a value: the worker is a separate
+    // process, so the document crosses as JSON either way, and parsing it here
+    // means the worker applies the same builder invariants `authorization.rs`
+    // did instead of trusting a shape someone else validated.
+    let authorized = match &request.confinement_manifest {
+        Some(_) if committed.is_none() => {
+            return Err(ExecutionError::identity_mismatch(
+                "the request carries a confinement/v1 document but no \
+                 confinementDigest to hold it to; refusing to fold an \
+                 uncommitted document into the applied policy",
+            ));
+        }
+        Some(document) => Some(ConfinementManifest::parse(document).map_err(|error| {
+            ExecutionError::invalid(format!(
+                "RunGrant.confinementManifest did not survive the worker boundary: {error}"
+            ))
+        })?),
+        None => None,
+    };
+    confinement_manifest(runtime_files, devices, authorized.as_ref())?.commit(committed)
 }
 
-/// Apply the policy described by exactly this manifest.
+/// Apply exactly the committed policy to the current worker process. This is
+/// irreversible and must be called only after the worker has loaded libkrun
+/// and resolved its rootfs.
 ///
-/// Takes the manifest rather than the inputs it is built from, so a caller that
-/// attests a digest can apply *that* document instead of a second one derived
-/// from the same arguments. `apply` above keeps the old shape for callers with
-/// no digest to attest; the worker uses this one.
+/// Takes a [`CommittedConfinement`], not a manifest: the only way to hold one
+/// is through [`ConfinementManifest::commit`], so this tier cannot apply a
+/// policy that was not first compared with the run's commitment.
 ///
 /// Always the microVM projection: this confines the VMM HOST process, which is
 /// this module's whole subject. The native worker compiles its own profile
-/// through `capabilities_from_manifest(.., Tier::Native)` directly.
+/// through `capabilities_from_manifest(.., Tier::Native)` from the same kind
+/// of value.
 pub fn apply_manifest(
-    manifest: &ConfinementManifest,
+    committed: &CommittedConfinement,
     run_rootfs: &Path,
 ) -> Result<(), ExecutionError> {
+    let manifest = committed.manifest();
     let support = Sandbox::support_info();
     if !support.is_supported {
         return Err(ExecutionError::backend(format!(
@@ -1418,45 +1461,34 @@ mod tests {
         );
     }
 
-    /// `apply` must surface a manifest-construction failure, not swallow it.
-    ///
-    /// The mutant this kills replaces `apply`'s body with `Ok(())` — a worker
-    /// that reports itself confined without having applied anything, which is
-    /// the falsest possible state. A relative runtime file fails §2 validation
-    /// inside `confinement_manifest`, so the error path is reachable without
-    /// touching the real sandbox: the failure fires before any irreversible
-    /// `Sandbox::apply_auto`.
+    /// `committed_confinement` must surface a manifest-construction failure,
+    /// not swallow it. A relative runtime file fails §2 validation inside
+    /// `confinement_manifest`, so the error path is reachable without touching
+    /// the real sandbox: the failure fires before anything irreversible.
     #[test]
-    fn apply_refuses_before_the_sandbox_when_the_manifest_is_invalid() {
-        let config = KrunConfig {
+    fn committing_refuses_before_the_sandbox_when_the_manifest_is_invalid() {
+        let request = crate::ExecutionRequest {
             run_id: "run-apply-test".into(),
-            rootfs: super::super::plan::ResolvedRootfs {
-                digest: crate::DigestRef {
-                    algorithm: "blake3-256".into(),
-                    value: "a".repeat(64),
-                },
-                canonical_path: std::env::temp_dir(),
+            replay_key: "replay".into(),
+            rootfs: crate::DigestRef {
+                algorithm: "blake3-256".into(),
+                value: "a".repeat(64),
             },
-            executable: std::ffi::CString::new("/bin/true").expect("no NUL"),
+            executable: "bin/true".into(),
             arguments: Vec::new(),
-            environment: Vec::new(),
-            workdir: std::ffi::CString::new("/").expect("no NUL"),
-            vcpus: 1,
-            ram_mib: 64,
-            wall_time_ms: 1_000,
-            tsi_features: 0,
-            port_map: Vec::new(),
-            vsock_unix_map: Vec::new(),
+            public_environment: std::collections::BTreeMap::new(),
+            allowed_egress: Vec::new(),
+            confinement_digest: String::new(),
+            confinement_manifest: None,
+            workspaces: Vec::new(),
+            limits: crate::ResourceLimits::default(),
         };
-        let resources = VmmHostResources {
-            // Relative: §2 refuses it at grant time, inside
-            // `confinement_manifest`, before anything irreversible.
-            runtime_files: vec![PathBuf::from("relative/libkrun.dylib")],
-            devices: Vec::new(),
-        };
+        // Relative: §2 refuses it at grant time, inside
+        // `confinement_manifest`, before anything irreversible.
+        let runtime_files = [PathBuf::from("relative/libkrun.dylib")];
 
-        let error = apply(&config, &resources)
-            .expect_err("an invalid runtime file must fail apply, not be skipped");
+        let error = committed_confinement(&request, &runtime_files, &[])
+            .expect_err("an invalid runtime file must fail, not be skipped");
         assert!(
             error.to_string().contains("relative/libkrun.dylib"),
             "the failure must name the offending path: {error}"
@@ -1465,8 +1497,8 @@ mod tests {
 
     /// `apply_manifest` must surface a compile refusal, not swallow it.
     ///
-    /// Same mutant class as `apply` above — a body replaced with `Ok(())` is
-    /// a worker reporting itself confined having applied nothing. §3 is the
+    /// The mutant this kills replaces the body with `Ok(())`: a worker
+    /// reporting itself confined having applied nothing. §3 is the
     /// reachable error path on every platform and tier: `allowHosts` rides
     /// the proxy, never `apply_auto`, so the refusal fires inside
     /// `capabilities_from_manifest` before anything irreversible.
@@ -1478,7 +1510,8 @@ mod tests {
             .with_allowed_host("api.example.com")
             .expect("a legal §3 host");
 
-        let error = apply_manifest(&manifest, &std::env::temp_dir())
+        let committed = manifest.commit(None).expect("bind the manifest");
+        let error = apply_manifest(&committed, &std::env::temp_dir())
             .expect_err("§3 cannot take effect on this path and must refuse");
         assert!(
             error.to_string().contains("allowHosts"),

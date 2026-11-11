@@ -1125,20 +1125,77 @@ impl ConfinementManifest {
         Ok(format!("blake3-256:{}", canonical.as_bytes().hash()))
     }
 
-    /// Refuse unless this manifest is exactly what `committed` names.
+    /// Bind this manifest to its canonical bytes and, when a run carries one,
+    /// to the commitment those bytes must satisfy (bead `ley-line-open-7a3109`).
     ///
-    /// Equality, not containment. A narrower policy is refused as firmly as a
-    /// wider one: the commitment says *which* policy was authorized, and a
-    /// receipt attesting capabilities the workload never had is a false
-    /// attestation even though it is the operationally safe direction.
-    pub fn assert_matches(&self, committed: &str) -> Result<(), ExecutionError> {
-        let actual = self.confinement_digest()?;
-        if actual == committed {
-            return Ok(());
+    /// The digest is taken over the canonical bytes, and the policy the result
+    /// hands back for applying is parsed from those same bytes, so the applied
+    /// policy and the attested digest cannot describe different documents.
+    ///
+    /// `Some(committed)`: refused unless the digest equals it. Equality, not
+    /// containment. A narrower policy is refused as firmly as a wider one: the
+    /// commitment says *which* policy was authorized, and a receipt attesting
+    /// capabilities the workload never had is a false attestation even though
+    /// it is the operationally safe direction.
+    ///
+    /// `None`: the run names no commitment (a direct `Backend::start`
+    /// embedder), and the digest is attested with nothing to compare it with.
+    pub fn commit(&self, committed: Option<&str>) -> Result<CommittedConfinement, ExecutionError> {
+        let canonical = self.to_canonical_json()?;
+        let digest = format!("blake3-256:{}", canonical.as_bytes().hash());
+        let applied = Self::parse(&canonical)?;
+        if applied != *self {
+            return Err(ExecutionError::internal(format!(
+                "confinement/v1: the canonical bytes digesting to {digest} describe a \
+                 different policy than the one compiled; refusing to apply either"
+            )));
         }
-        Err(ExecutionError::identity_mismatch(format!(
-            "confinement drift: the policy this backend compiles digests to \
-             {actual}, but the grant commits to {committed}"
-        )))
+        if let Some(committed) = committed
+            && digest != committed
+        {
+            return Err(ExecutionError::identity_mismatch(format!(
+                "confinement drift: the policy this tier compiles digests to \
+                 {digest}, but the grant commits to {committed}; refused before \
+                 the workload starts"
+            )));
+        }
+        Ok(CommittedConfinement {
+            canonical,
+            digest,
+            manifest: applied,
+        })
+    }
+}
+
+/// A confinement policy bound to the exact bytes its digest covers (bead
+/// `ley-line-open-7a3109`).
+///
+/// Constructed only by [`ConfinementManifest::commit`], which has checked the
+/// run's commitment when it carries one. Both tiers apply
+/// [`CommittedConfinement::manifest`] and attest [`CommittedConfinement::digest`],
+/// so "the manifest a tier applies is the manifest the grant authorized" holds
+/// by construction: there is no way to apply a policy without first holding
+/// the value that compared its bytes with the grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedConfinement {
+    canonical: String,
+    digest: String,
+    manifest: ConfinementManifest,
+}
+
+impl CommittedConfinement {
+    /// The canonical `confinement/v1` bytes the digest is computed over.
+    pub fn canonical_json(&self) -> &str {
+        &self.canonical
+    }
+
+    /// The `blake3-256:<hex>` digest of [`Self::canonical_json`].
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// The policy to apply: parsed from [`Self::canonical_json`].
+    pub fn manifest(&self) -> &ConfinementManifest {
+        &self.manifest
     }
 }

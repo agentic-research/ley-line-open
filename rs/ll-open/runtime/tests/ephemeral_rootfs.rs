@@ -73,13 +73,16 @@ fn guest_writes_are_isolated_from_the_immutable_cas_root() {
             & 0o7777,
         0o755
     );
+    // The CAS entry's `usr/bin` is 0750, but manifest v1 names no directory
+    // modes: the guest gets the manifest's implied tree at 0755 (bead
+    // `ley-line-open-38ff59`).
     assert_eq!(
         fs::metadata(materialized.canonical_path.join("usr/bin"))
             .expect("directory metadata")
             .permissions()
             .mode()
             & 0o7777,
-        0o750
+        0o755
     );
 
     fs::write(&executable, b"guest-write").expect("write ephemeral rootfs");
@@ -94,6 +97,196 @@ fn guest_writes_are_isolated_from_the_immutable_cas_root() {
         b"probe-v1"
     );
     assert!(!source.canonical_path.join("guest-created").exists());
+}
+
+/// Every directory of a tree with its mode, rootfs-relative (`""` is the
+/// root), and every non-directory's path with its mode.
+fn tree_shape(root: &Path) -> (Vec<(String, u32)>, Vec<(String, u32)>) {
+    fn walk(root: &Path, dir: &Path, dirs: &mut Vec<(String, u32)>, rest: &mut Vec<(String, u32)>) {
+        let relative = dir
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mode = fs::symlink_metadata(dir).unwrap().permissions().mode() & 0o7777;
+        dirs.push((relative, mode));
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                walk(root, &path, dirs, rest);
+            } else {
+                rest.push((
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    metadata.permissions().mode() & 0o7777,
+                ));
+            }
+        }
+    }
+    let (mut dirs, mut rest) = (Vec::new(), Vec::new());
+    walk(root, root, &mut dirs, &mut rest);
+    (dirs, rest)
+}
+
+/// Bead `ley-line-open-38ff59`: manifest v1 authenticates files only, so a
+/// CAS entry's directory set and modes are not part of the rootfs digest. A
+/// directory someone widened (world-writable, setgid, sticky) or planted
+/// beside the listed files must not reach the guest: the per-run copy holds
+/// exactly the parents of the listed files, each at 0755, the root included.
+#[test]
+fn a_widened_or_planted_directory_never_reaches_the_guest() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let source = rootfs_fixture(fixture.path());
+    let cas = &source.canonical_path;
+    fs::set_permissions(cas.join("usr"), fs::Permissions::from_mode(0o3777)).unwrap();
+    fs::set_permissions(cas.join("usr/bin"), fs::Permissions::from_mode(0o1777)).unwrap();
+    for planted in ["etc/cron.d", "opt/x/y", "usr/share"] {
+        fs::create_dir_all(cas.join(planted)).unwrap();
+        fs::set_permissions(cas.join(planted), fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    fs::set_permissions(cas, fs::Permissions::from_mode(0o777)).unwrap();
+    let destination = fixture.path().join("run-root");
+    fs::create_dir(&destination).expect("run root");
+
+    let materialized =
+        materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+
+    let (dirs, files) = tree_shape(&materialized.canonical_path);
+    assert_eq!(
+        dirs,
+        [
+            (String::new(), 0o755),
+            ("usr".to_string(), 0o755),
+            ("usr/bin".to_string(), 0o755),
+        ]
+    );
+    assert_eq!(
+        files,
+        [
+            ("rootfs.manifest.json".to_string(), 0o644),
+            ("usr/bin/probe".to_string(), 0o755)
+        ]
+    );
+    verify_ephemeral_rootfs(&materialized).expect("the normalized copy verifies");
+}
+
+/// The manifest file's bytes are the digest; its mode in the CAS entry is
+/// not, so the copy's is fixed at 0644 and any other is refused before VM
+/// entry (execution-boundary review of 38ff59).
+#[test]
+fn the_manifest_files_mode_is_normalized_and_verified() {
+    let _serial = common::serial();
+    for cas_mode in [0o4777, 0o600, 0o1644] {
+        let fixture = TempDir::new().expect("fixture");
+        let source = rootfs_fixture(fixture.path());
+        let manifest = source.canonical_path.join("rootfs.manifest.json");
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(cas_mode)).unwrap();
+        let destination = fixture.path().join("run-root");
+        fs::create_dir(&destination).expect("run root");
+        let materialized =
+            materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+        let copied = materialized.canonical_path.join("rootfs.manifest.json");
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o7777,
+            0o644,
+            "{cas_mode:o}"
+        );
+        fs::set_permissions(&copied, fs::Permissions::from_mode(cas_mode)).unwrap();
+        let error = verify_ephemeral_rootfs(&materialized).expect_err("a re-moded manifest");
+        assert!(
+            error.detail.contains("manifest file mode"),
+            "{cas_mode:o}: {error:?}"
+        );
+    }
+}
+
+/// One digest names one guest tree: two CAS entries with the same manifest
+/// but different directory modes and planted directories give per-run
+/// copies of the same shape.
+#[test]
+fn one_digest_materializes_one_guest_tree() {
+    let _serial = common::serial();
+    let shape = |widen: bool| {
+        let fixture = TempDir::new().expect("fixture");
+        let source = rootfs_fixture(fixture.path());
+        if widen {
+            fs::set_permissions(
+                source.canonical_path.join("usr"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::create_dir(source.canonical_path.join("tmp")).unwrap();
+        }
+        let destination = fixture.path().join("run-root");
+        fs::create_dir(&destination).expect("run root");
+        let materialized =
+            materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+        (
+            source.digest.clone(),
+            tree_shape(&materialized.canonical_path),
+        )
+    };
+    let (plain_digest, plain) = shape(false);
+    let (widened_digest, widened) = shape(true);
+    assert_eq!(plain_digest, widened_digest);
+    assert_eq!(plain, widened);
+}
+
+/// The per-run copy is re-verified before VM entry with its directories:
+/// one planted or widened after materialization is refused by name.
+#[test]
+fn a_directory_changed_in_the_copy_is_refused_before_vm_entry() {
+    let _serial = common::serial();
+    for change in ["plant", "widen", "narrow-root"] {
+        let fixture = TempDir::new().expect("fixture");
+        let source = rootfs_fixture(fixture.path());
+        let destination = fixture.path().join("run-root");
+        fs::create_dir(&destination).expect("run root");
+        let materialized =
+            materialize_ephemeral_rootfs(&source, &destination).expect("materialize rootfs");
+        let root = &materialized.canonical_path;
+        match change {
+            "plant" => fs::create_dir(root.join("usr/lib")).unwrap(),
+            "widen" => {
+                fs::set_permissions(root.join("usr"), fs::Permissions::from_mode(0o777)).unwrap()
+            }
+            _ => fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap(),
+        }
+        let error = verify_ephemeral_rootfs(&materialized).expect_err(change);
+        assert!(
+            error.detail.contains("directory"),
+            "{change}: unexpected error: {error:?}"
+        );
+    }
+}
+
+/// A file the manifest does not list, in a directory it does not imply, is
+/// still refused (not silently left out), as `DirectoryRootfsResolver`
+/// refuses it.
+#[test]
+fn an_undeclared_file_in_a_planted_directory_is_refused() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let source = rootfs_fixture(fixture.path());
+    fs::create_dir_all(source.canonical_path.join("opt/x")).unwrap();
+    fs::write(source.canonical_path.join("opt/x/payload"), b"undeclared").unwrap();
+    let destination = fixture.path().join("run-root");
+    fs::create_dir(&destination).expect("run root");
+
+    let error = materialize_ephemeral_rootfs(&source, &destination)
+        .expect_err("an undeclared file must be refused");
+    assert!(
+        error.detail.contains("opt/x/payload"),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]

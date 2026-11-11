@@ -399,6 +399,68 @@ Not implemented here. It changes the readiness message, which is a
 worker/daemon contract, and belongs with §9's daemon-manifest work rather than
 bolted onto the compile-side change.
 
+*Since implemented:* the readiness event carries the digest, and both
+supervisors refuse a disagreement. The section below moves the decisive
+comparison into the worker.
+
+## Composition rule: the applied document is the authorized document
+
+*Added 2026-11-10 (bead `ley-line-open-7a3109`).*
+
+A tier applies two kinds of grant: the policy an issuer authorized, and LLO's
+host mechanism (the run rootfs, runtime libraries, device nodes) without which
+the worker cannot run at all. The rule that composes them is **one document,
+and equality with the grant**, not composition-and-attest-the-grant and not
+two digests:
+
+1. **What is applied.** The compiled document is LLO's deployment policy plus
+   the dimensions a grant may originate (§4 listeners, §6 sockets,
+   `connectLocal`), folded from the grant's carried document. Host mechanism
+   appears in it as ordinary §2 grants: the rootfs symbolically
+   (`ATTESTED_RUN_ROOTFS`), runtime files and devices by their deployment
+   paths.
+2. **What the digest covers.** All of it: the digest is BLAKE3 over the
+   canonical bytes of exactly that document. There is one digest, and
+   `RunReceipt.confinementDigest` names the policy the workload was confined
+   by, mechanism included. One operator setting stays outside it: the
+   microVM tier's `tsi_hijack_inet` changes how guest sockets reach the host
+   (the port map and loopback channels) but grants the VMM process nothing,
+   since the VMM is still bound by the committed nono profile.
+3. **Why an issuer can still predict it.** Every input is deployment
+   configuration (`KrunWorkerConfig`, `NativeWorkerConfig`) or symbolic,
+   never per run, so an issuer configured for the deployment computes the
+   document exactly (ADR-0036). When a grant carries a document, the fold's
+   equality contract refuses one that differs from the compiled document,
+   naming the differing dimensions.
+4. **Applied bytes, not a value beside them.** `ConfinementManifest::commit`
+   takes the canonical bytes, digests them, and parses the policy to apply
+   back from those same bytes. Both tiers compile their `CapabilitySet`, port
+   map, vsock mappings and loopback channels from that `CommittedConfinement`;
+   `capabilities_from_manifest` and `apply_manifest` accept nothing else, so
+   compiling a policy requires holding the value `commit` produced, which
+   compared its bytes with the grant whenever the run carries a commitment.
+   A worker request must state `confinementDigest`; "no commitment" is the
+   explicit empty string, never an omitted key.
+5. **Compared before the workload starts.** `committed_confinement` refuses a
+   digest that differs from the request's `confinement_digest` as
+   `identity-policy-mismatch` "confinement drift", naming both digests, in the
+   worker, before the rootfs is read, the sandbox applied, the VM built or the
+   child spawned. The supervisor's comparison of the readiness event stays as
+   a second check; on its own it could not stop a drifting run, because the
+   worker writes readiness immediately before it starts the workload.
+6. **What carries it.** The service refuses a resolver that changes either the
+   digest or the carried document. A request carrying a document but no
+   digest is refused by the worker. A request carrying neither is a direct
+   `Backend::start` embedder with no grant: the worker binds and attests the
+   deployment policy, and there is no commitment to compare with.
+
+The three candidates the bead weighed resolve as: (a) is rejected because the
+applied set would stop being a projection of one attested document; (c) is
+rejected because a receipt naming two policies cannot tell a verifier which
+one bound the workload; (b) is what shipped, with the symbolic name needed
+only for the rootfs, since every other host resource is deployment
+configuration an issuer already knows.
+
 ## Open questions
 
 - **Does libkrunfw's kernel enable Landlock?** Layer 3 requires `CONFIG_SECURITY_LANDLOCK`

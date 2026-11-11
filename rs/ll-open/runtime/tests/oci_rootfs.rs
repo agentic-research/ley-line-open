@@ -988,9 +988,11 @@ fn a_tampered_cas_entry_is_not_reused() {
 
 #[test]
 fn a_cas_entry_with_tampered_directories_is_not_reused() {
-    // The manifest does not cover directories, and the per-run copy carries
-    // their modes into the guest: a reused entry must have exactly the
-    // directories the import would write, all 0755.
+    // The manifest does not cover directories. The per-run copy no longer
+    // carries them into the guest (it is built from the manifest, bead
+    // ley-line-open-38ff59), but the importer still keeps its own entries
+    // exact: a reused entry must have exactly the directories the import
+    // would write, all 0755.
     type Tamper = (&'static str, fn(&Path));
     let tamper: [Tamper; 3] = [
         ("a widened directory", |root| {

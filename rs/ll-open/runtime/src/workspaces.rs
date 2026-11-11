@@ -149,14 +149,6 @@ impl ServedWorkspaces {
         Self::materialize(Some(provider), run_id, grants).map(|(shares, _)| shares)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.shares.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.shares.len()
-    }
-
     /// The grants these shares serve, in order.
     pub fn grants(&self) -> impl Iterator<Item = &WorkspaceGrant> {
         self.shares.iter().map(|share| &share.grant)
@@ -183,11 +175,6 @@ impl ServedWorkspace {
     /// The grant this share serves.
     pub fn grant(&self) -> &WorkspaceGrant {
         &self.grant
-    }
-
-    /// The run this share was opened for.
-    pub fn run_id(&self) -> &str {
-        &self.run_id
     }
 
     /// Take the share to attach to the worker: the service that answers its
@@ -220,6 +207,19 @@ impl Opened {
     /// exactly the shares opened for this run, each once, and each is still
     /// held. `workspaceUnserved` otherwise, naming the workspace.
     pub(crate) fn held(&self, attached: &[AttachedWorkspace]) -> Result<(), ExecutionError> {
+        // One proof per share. A proof cannot be copied, but a backend that
+        // kept the share of an earlier, refused start of this same run (same
+        // run id, same grant) holds a second proof for the same grant; both
+        // would pass the checks below, and the receipt would name the
+        // workspace twice.
+        if attached.len() > self.shares.len() {
+            return Err(ExecutionError::workspace_unserved(format!(
+                "the backend attached {} workspace shares and the run is granted {}; the \
+                 start is refused",
+                attached.len(),
+                self.shares.len()
+            )));
+        }
         for proof in attached {
             let ours = proof.run_id == self.run_id
                 && self.shares.iter().any(|(grant, _)| *grant == proof.grant);
@@ -241,13 +241,6 @@ impl Opened {
                     "the backend started the run without serving its granted workspace \
                      {:?} at {}; the start is refused",
                     grant.name, grant.graph_root
-                )));
-            }
-            if taken > 1 || attached.len() != self.shares.len() {
-                return Err(ExecutionError::workspace_unserved(format!(
-                    "the backend's workspace shares do not match the run's granted \
-                     workspaces one for one (workspace {:?}); the start is refused",
-                    grant.name
                 )));
             }
             if share.strong_count() == 0 {

@@ -1259,7 +1259,7 @@ fn a_granted_workspace_is_refused_before_spawn_where_no_share_can_serve_it() {
         .start(&one, ServedWorkspaces::none())
         .expect_err("a workspace grant with no share behind it");
     assert_eq!(error.code, leyline_runtime::ErrorCode::WorkspaceUnserved);
-    assert!(error.detail.contains("materialized 0"), "{error}");
+    assert!(error.detail.contains("no workspace"), "{error}");
 
     // A share for a workspace the request does not name: the request is
     // what the worker is told, so the two must agree.

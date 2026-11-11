@@ -1504,6 +1504,29 @@ fn a_write_scope_does_not_reach_the_directories_above_it() {
     assert_eq!(f.fs.rmdir(x, b"y"), Err(Errno::EACCES));
 }
 
+/// The workspace root is writable, as a directory, exactly when the scope
+/// names something: a file alone, a tree alone, or both. A scope naming
+/// nothing leaves the root, like everything else, read-only.
+#[test]
+fn the_root_is_writable_when_the_write_scope_names_anything() {
+    let root_mode = |scope: &[&str]| {
+        let f = fixture(Scope {
+            see: Grant::Whole,
+            propose: Grant::from_write_scope(
+                &scope
+                    .iter()
+                    .map(|entry| entry.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        });
+        f.fs.getattr(ROOT_INODE, None).unwrap().0.mode()
+    };
+    assert_eq!(root_mode(&["a.go"]), 0o040755, "a file alone");
+    assert_eq!(root_mode(&["pkg/sub/"]), 0o040755, "a tree alone");
+    assert_eq!(root_mode(&["a.go", "pkg/sub/"]), 0o040755, "both");
+    assert_eq!(root_mode(&[]), 0o040555, "nothing");
+}
+
 /// An execution/v1 write scope (bead `ley-line-open-483134`): one exact file
 /// and one directory tree. The guest sees the whole tree and may change only
 /// what the scope names; every write, create, rename and delete outside it

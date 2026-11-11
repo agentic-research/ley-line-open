@@ -132,11 +132,15 @@ impl KrunWorkerBackend {
     ) -> Result<Option<ServedWorkspace>, ExecutionError> {
         if !workspaces.serve_exactly(request) {
             return Err(ExecutionError::workspace_unserved(format!(
-                "the request names {} workspace(s) and the service materialized {} \
-                 share(s) for it; a workspace is served only from a share the \
-                 execution service opened for a verified grant",
+                "the request names {} workspace(s) and was handed shares opened for {} \
+                 other than exactly those; a workspace is served only from a share the \
+                 execution service opened for this run under a verified grant",
                 request.workspaces.len(),
-                workspaces.len()
+                if workspaces.grants().next().is_some() {
+                    "workspaces"
+                } else {
+                    "no workspace"
+                }
             )));
         }
         let mut shares = workspaces.into_shares();
@@ -748,6 +752,24 @@ mod tests {
             Backend::poll(&backend, "run-1").expect("poll"),
             Some(BackendRunStatus::Succeeded)
         ));
+    }
+
+    /// The tier serves exactly one workspace per run, its guest's `/work`:
+    /// the service opens a share for a run granted one, and refuses a run
+    /// granted two before opening anything. Zero would refuse every
+    /// workspace run; two would open a second share the tier then refuses.
+    #[test]
+    fn the_microvm_tier_serves_one_workspace_per_run() {
+        let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+            worker: PathBuf::new(),
+            cas_root: PathBuf::new(),
+            ephemeral_root: PathBuf::new(),
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            ready_timeout: Duration::from_secs(1),
+            tsi_hijack_inet: false,
+        });
+        assert_eq!(Backend::workspace_capacity(&backend), 1);
     }
 
     /// A worker that reports ready and exits at once (a guest that fails to

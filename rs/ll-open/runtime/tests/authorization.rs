@@ -2302,6 +2302,75 @@ fn a_share_kept_from_another_grant_cannot_stand_in_for_this_runs() {
     );
 }
 
+/// One proof per share. A backend that kept the share of an earlier, refused
+/// start of the same run (same run id, same grant) holds a second valid proof
+/// for the same workspace; presenting both is refused, so the receipt cannot
+/// name the workspace twice.
+#[test]
+fn two_proofs_for_one_granted_workspace_are_refused() {
+    #[derive(Clone, Default)]
+    struct Doubling {
+        kept: std::sync::Arc<std::sync::Mutex<Vec<leyline_runtime::ServedWorkspace>>>,
+        cancelled: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Backend for Doubling {
+        fn capabilities(&self) -> BackendCapabilities {
+            CompletingBackend.capabilities()
+        }
+        fn start(
+            &self,
+            _request: &ExecutionRequest,
+            workspaces: ServedWorkspaces,
+        ) -> Result<BackendRun, ExecutionError> {
+            let mut kept = self.kept.lock().unwrap();
+            if kept.is_empty() {
+                kept.extend(workspaces.into_shares());
+                return Err(ExecutionError::backend("the first start is refused"));
+            }
+            let attached = kept
+                .drain(..)
+                .chain(workspaces.into_shares())
+                .map(|share| {
+                    let (service, attached) = share.attach();
+                    HELD_SHARES.lock().unwrap().push(service);
+                    attached
+                })
+                .collect();
+            Ok(BackendRun {
+                backend_id: "doubling/1".into(),
+                attached,
+            })
+        }
+        fn workspace_capacity(&self) -> usize {
+            1
+        }
+        fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
+            self.cancelled.lock().unwrap().push(run_id.to_owned());
+            Ok(true)
+        }
+    }
+
+    let backend = Doubling::default();
+    let (service, _shares) = sharing_service(backend.clone());
+    service
+        .provision(BackendClass::MicroVm, "provision-doubling")
+        .expect("provision backend");
+    let (spec, grant) = workspace_spec_and_grant(&"a".repeat(64));
+    service
+        .start_authorized(&spec, &grant, &microvm_policy(), &TestResolver)
+        .expect_err("the backend refuses the first start and keeps its share");
+    let error = service
+        .start_authorized(&spec, &grant, &microvm_policy(), &TestResolver)
+        .expect_err("two proofs for one workspace");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::WorkspaceUnserved,
+        "{error:?}"
+    );
+    assert!(error.detail.contains("attached 2"), "{error:?}");
+    assert_eq!(backend.cancelled.lock().unwrap().len(), 1);
+}
+
 /// The proof stands for a share that is being served. A backend that takes
 /// the share and lets its service go has nothing answering its worker, so
 /// the start is refused even though it holds a proof for the right grant.

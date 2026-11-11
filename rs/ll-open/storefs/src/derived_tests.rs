@@ -380,6 +380,46 @@ fn a_derived_write_outside_the_proposal_scope_is_eacces() {
     );
 }
 
+/// Under a path grant a derived directory is judged as a directory: it may
+/// be made, changed and renamed when the grant names a path beneath it, even
+/// though the directory itself is not a granted file.
+#[test]
+fn a_derived_directory_under_a_path_grant_is_judged_as_a_directory() {
+    let scope = Scope {
+        see: Grant::Whole,
+        propose: Grant::Paths(
+            ["target/a/f", "target/b/f"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+        ),
+    };
+    let (f, _parent) = derived_fixture_scoped(scope, 64 * MIB);
+    let target = mkdir_p(&f, "target");
+    let a =
+        f.fs.mkdir(target, b"a")
+            .expect("a derived directory")
+            .attr
+            .inode;
+    // A mode change on the directory.
+    f.fs.setattr(
+        a,
+        None,
+        SetAttr {
+            mode: Some(0o700),
+            ..SetAttr::default()
+        },
+    )
+    .expect("the grant names a path beneath it");
+    // A rename to another directory the grant reaches beneath.
+    assert_eq!(f.fs.rename(target, b"a", target, b"b", 0), Ok(()));
+    // And not to one it does not.
+    assert_eq!(
+        f.fs.rename(target, b"b", target, b"c", 0),
+        Err(Errno::EACCES)
+    );
+}
+
 /// A write's behavior follows its path's class. An execution/v1 write scope
 /// (bead `ley-line-open-483134`) bounds authored paths, which are proposals.
 /// A derived path is never a proposal: it lives in the run's scratch, so a

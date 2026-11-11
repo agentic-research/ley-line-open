@@ -193,7 +193,20 @@ and apply unchanged to `v1.19.6`; `0007` to `0012` were written on top of
     empty component, stops the guest with "`<target>` is not a directory,
     refusing to mount over it" (bead `ley-line-open-2594af`). The import
     and the manifest reader refuse such a link first; this is the in-guest
-    backstop.
+    backstop. A `.` or `..` component is refused too.
+15. `0015` — **init: a refusal before the workload stops the guest as a
+    failure the host sees.** Upstream init bailed out with `exit()`: PID 1
+    exiting panics the kernel and libkrun reports exit status 0, so every
+    refusal before the workload (a mount, a 0014 mount target, a 0013
+    exec config, a 0010 channel list, the datagram filter) read on the
+    host as a success with an empty console (bead `ley-line-open-7164ec`).
+    Init now calls `stop_guest()`: it points stdout and stderr at the krun
+    console ports once /sys and /dev are mounted, prints the reason
+    (recorded by `record_stop_reason()` where the refusal is made), sets
+    exit status 125 through the root filesystem as it does for a workload,
+    and restarts. The host's supervisor then records the run as
+    `Failed`, with the reason in its `GuestOutput`. A refusal before /sys
+    is mounted (a link at /dev) reaches the host as exit status 125 alone.
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

@@ -17,6 +17,7 @@ use leyline_runtime::artifacts::oci::{
     DEFAULT_MAX_ROOTFS_BYTES, DroppedLink, ImportedRootfs, OciImport, OciImportError, Platform,
     SpecialEntryKind, SymlinkPolicy, import_oci_layout,
 };
+use leyline_runtime::artifacts::rootfs_manifest::RootfsSpec;
 use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver};
 use leyline_runtime::backends::libkrun::volume::materialize_ephemeral_rootfs;
 use leyline_runtime::cas_volume::{FilesystemSensitivity, probe_sensitivity};
@@ -1037,18 +1038,21 @@ fn the_fixture_rootfs_identity_is_a_known_answer() {
     assert_eq!(imported.rootfs.value, FIXTURE_ARM64_ROOTFS);
 }
 
-/// The rootfs digest's published known-answer vector (ADR-0047 §3, bead
-/// `ley-line-open-39309e`): its digest is σ_bytes over its manifest bytes,
-/// and the importer writes exactly those bytes for the checked-in fixture,
-/// so a second implementation can check its manifest serialization and its
-/// digest independently.
+/// The rootfs digest's published known-answer vector (ADR-0047 §3, beads
+/// `ley-line-open-39309e` and `ley-line-open-4f08ea`): each case's digest
+/// is σ_bytes over its manifest bytes. The v2 case is exactly what the
+/// importer writes for the checked-in fixture (links kept), and those are
+/// the only bytes a reader accepts for that tree. The v1 case, frozen, is
+/// the same fixture's files as v1 named them, which a v2 import with links
+/// resolved to copies still lists file for file. So a second implementation
+/// can check its serialization and its digest under both versions.
 #[test]
 fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../ll-core/schema-spec/execution/v1/test-vectors/rootfs-manifest.json");
     let vector: Value = serde_json::from_slice(&fs::read(&path).expect("the vector")).unwrap();
     let cases = vector["cases"].as_array().expect("cases");
-    assert!(!cases.is_empty(), "the vector holds no case");
+    let mut versions = Vec::new();
     for case in cases {
         let name = case["name"].as_str().expect("name");
         let manifest = case["manifest"].as_str().expect("manifest bytes, as text");
@@ -1058,20 +1062,38 @@ fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
             digest,
             "{name}: the digest is BLAKE3 over the manifest's exact bytes"
         );
-        assert_eq!(
-            name, "oci-multilayer-linux-arm64",
-            "the one case is the fixture's"
-        );
-        assert_eq!(digest, FIXTURE_ARM64_ROOTFS, "{name}");
-        let cas = TempDir::new().expect("cas");
-        let imported = import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
-        let written = manifest_bytes(cas.path(), &imported.rootfs);
-        assert_eq!(
-            String::from_utf8(written).expect("UTF-8 manifest"),
-            manifest,
-            "{name}: the importer's manifest bytes"
-        );
+        let spec = RootfsSpec::parse(manifest.as_bytes())
+            .unwrap_or_else(|error| panic!("{name}: the vector parses: {error}"));
+        versions.push(spec.version);
+        match spec.version {
+            2 => {
+                assert_eq!(name, "oci-multilayer-linux-arm64-v2");
+                assert_eq!(digest, FIXTURE_ARM64_ROOTFS, "{name}");
+                assert_eq!(spec.to_canonical_v2(), manifest.as_bytes(), "{name}: canonical");
+                let cas = TempDir::new().expect("cas");
+                let imported =
+                    import_fixture(Platform::linux("arm64"), SymlinkPolicy::Preserve, cas.path());
+                let written = manifest_bytes(cas.path(), &imported.rootfs);
+                assert_eq!(
+                    String::from_utf8(written).expect("UTF-8 manifest"),
+                    manifest,
+                    "{name}: the importer's manifest bytes"
+                );
+            }
+            1 => {
+                assert_eq!(name, "oci-multilayer-linux-arm64-v1");
+                let cas = TempDir::new().expect("cas");
+                let imported =
+                    import_fixture(Platform::linux("arm64"), SymlinkPolicy::Resolve, cas.path());
+                let resolved =
+                    RootfsSpec::parse(&manifest_bytes(cas.path(), &imported.rootfs)).unwrap();
+                assert_eq!(resolved.version, 2);
+                assert_eq!(resolved.files, spec.files, "{name}: the same files");
+            }
+            other => panic!("{name}: version {other}"),
+        }
     }
+    assert_eq!(versions, [1, 2], "a v1 and a v2 case, in that order");
 }
 
 #[test]

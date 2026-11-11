@@ -302,7 +302,9 @@ pub trait DiskImages: Send + Sync {
 /// carries `f_flags` on both, so one code path serves every host.
 pub fn mount_flags(path: &Path) -> Result<u64, CasVolumeError> {
     let stat = rustix::fs::statfs(path).map_err(|errno| {
-        io_error("inspect the mount flags of", path)(io::Error::from_raw_os_error(errno.raw_os_error()))
+        io_error("inspect the mount flags of", path)(io::Error::from_raw_os_error(
+            errno.raw_os_error(),
+        ))
     })?;
     #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
     Ok(stat.f_flags as u64)

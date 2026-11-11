@@ -315,9 +315,12 @@ pub fn mount_flags(path: &Path) -> Result<u64, CasVolumeError> {
 const MOUNT_NODEV: u64 = libc::MNT_NODEV as u64;
 #[cfg(target_os = "macos")]
 const MOUNT_NOSUID: u64 = libc::MNT_NOSUID as u64;
+// `ST_*` is already a `u64` on 64-bit Linux, not on every target.
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
 const MOUNT_NODEV: u64 = libc::ST_NODEV as u64;
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
 const MOUNT_NOSUID: u64 = libc::ST_NOSUID as u64;
 
 /// Whether mount flags include both `nodev` and `nosuid`.

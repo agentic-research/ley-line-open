@@ -106,9 +106,14 @@ enum Cmd {
         #[arg(long)]
         cas_volume_size_cap_gib: Option<u64>,
 
-        /// Parent directory for ephemeral per-run rootfs volumes.
-        #[arg(long)]
-        run_root: PathBuf,
+        /// Parent directory for ephemeral per-run rootfs volumes. Required
+        /// with `--cas-root`. With `--cas-volume` it defaults to the
+        /// volume's own (`<state>/cas-volume/mnt/runs` on macOS,
+        /// `<state>/runs` on Linux), and one given must be case-sensitive
+        /// like the CAS root, or start (and provision) refuses it: a rootfs
+        /// with `Pod/` beside `pod/` is copied there for each run.
+        #[arg(long, required_unless_present = "cas_volume")]
+        run_root: Option<PathBuf>,
 
         /// First-party worker executable: leyline-native-worker, or for
         /// `--backend micro-vm` leyline-krun-worker, which links libkrun.
@@ -354,12 +359,19 @@ struct Cli {
 /// The execution daemon's CAS root: an operator directory that must exist,
 /// or a case-sensitive volume (bead `ley-line-open-ba86d3`) re-attached
 /// here if an earlier provision created it. Start never creates a volume;
-/// `llo_execution_provision` does.
+/// `llo_execution_provision` does. Returns the storage and the run root,
+/// each run's ephemeral rootfs's parent.
+///
+/// With a volume, the run root is the volume's own unless `run_root` names
+/// one, which must be case-sensitive like the CAS root (bead
+/// `ley-line-open-741388`): one off the volume is checked here, before
+/// anything else starts, and every provision checks it again.
 fn execution_cas_storage(
     cas_root: Option<PathBuf>,
     cas_volume: Option<Option<PathBuf>>,
     size_cap_gib: Option<u64>,
-) -> Result<leyline_runtime::cas_volume::CasStorage> {
+    run_root: Option<PathBuf>,
+) -> Result<(leyline_runtime::cas_volume::CasStorage, PathBuf)> {
     use leyline_runtime::cas_volume::{CasStorage, CasVolume, default_state_dir};
     match (cas_root, cas_volume) {
         (Some(_), None) if size_cap_gib.is_some() => {
@@ -372,7 +384,10 @@ fn execution_cas_storage(
                     cas_root.display()
                 );
             }
-            Ok(CasStorage::Directory(cas_root))
+            let run_root = run_root.context("--run-root is required with --cas-root")?;
+            std::fs::create_dir_all(&run_root)
+                .with_context(|| format!("create execution run root {}", run_root.display()))?;
+            Ok((CasStorage::Directory(cas_root), run_root))
         }
         (None, Some(state_dir)) => {
             let state_dir = match state_dir {
@@ -386,6 +401,18 @@ fn execution_cas_storage(
                 None => leyline_runtime::cas_volume::DEFAULT_SIZE_CAP_BYTES,
             };
             let volume = CasVolume::new(state_dir, size_cap)?;
+            let volume = match run_root {
+                Some(run_root) => {
+                    let run_root = std::path::absolute(&run_root).with_context(|| {
+                        format!("resolve execution run root {}", run_root.display())
+                    })?;
+                    volume.with_run_root(run_root)?
+                }
+                None => volume,
+            };
+            volume
+                .check_run_root()
+                .context("check the execution run root")?;
             match volume
                 .attach_existing()
                 .context("re-attach the CAS volume")?
@@ -404,7 +431,8 @@ fn execution_cas_storage(
                     volume.cas_root().display()
                 ),
             }
-            Ok(CasStorage::Volume(volume))
+            let run_root = volume.run_root();
+            Ok((CasStorage::Volume(volume), run_root))
         }
         _ => bail!("pass exactly one of --cas-root and --cas-volume"),
     }
@@ -495,10 +523,10 @@ async fn main() -> Result<()> {
                     worker.display()
                 );
             }
-            let storage = execution_cas_storage(cas_root, cas_volume, cas_volume_size_cap_gib)?;
+            // Both tiers materialize each run's rootfs beneath `run_root`.
+            let (storage, run_root) =
+                execution_cas_storage(cas_root, cas_volume, cas_volume_size_cap_gib, run_root)?;
             let cas_root = storage.cas_root();
-            std::fs::create_dir_all(&run_root)
-                .with_context(|| format!("create execution run root {}", run_root.display()))?;
             let catalog_bytes = std::fs::read(&catalog)
                 .with_context(|| format!("read execution catalog {}", catalog.display()))?;
             let resolver = Arc::new(
@@ -812,7 +840,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(cas_root, Some(PathBuf::from("/var/lib/leyline/cas")));
-                assert_eq!(run_root, PathBuf::from("/var/lib/leyline/runs"));
+                assert_eq!(run_root, Some(PathBuf::from("/var/lib/leyline/runs")));
                 assert_eq!(worker, PathBuf::from("/usr/libexec/leyline-native-worker"));
                 assert_eq!(
                     catalog,
@@ -865,24 +893,100 @@ mod tests {
             "not both"
         );
         let cas = tempfile::TempDir::new().unwrap();
-        let error = execution_cas_storage(Some(cas.path().to_path_buf()), None, Some(8))
-            .expect_err("the size cap needs a volume");
+        let runs = Some(cas.path().join("runs"));
+        let error =
+            execution_cas_storage(Some(cas.path().to_path_buf()), None, Some(8), runs.clone())
+                .expect_err("the size cap needs a volume");
         assert!(
             error.to_string().contains("applies to --cas-volume"),
             "{error}"
         );
-        assert!(execution_cas_storage(Some(cas.path().to_path_buf()), None, None).is_ok());
+        let (_, run_root) =
+            execution_cas_storage(Some(cas.path().to_path_buf()), None, None, runs.clone())
+                .unwrap();
+        assert!(run_root.is_dir(), "an operator run root is made at start");
         assert!(
-            execution_cas_storage(Some(cas.path().join("missing")), None, None).is_err(),
+            execution_cas_storage(Some(cas.path().join("missing")), None, None, runs).is_err(),
             "an operator CAS root must exist"
         );
-        // A volume never provisioned: start creates nothing.
+        assert!(
+            execution_cas_storage(Some(cas.path().to_path_buf()), None, None, None).is_err(),
+            "--cas-root needs --run-root"
+        );
+        // A volume never provisioned: start creates nothing, and each run's
+        // rootfs defaults onto the volume (bead ley-line-open-741388).
         let state = tempfile::TempDir::new().unwrap();
-        let storage =
-            execution_cas_storage(None, Some(Some(state.path().to_path_buf())), Some(1)).unwrap();
+        let (storage, run_root) =
+            execution_cas_storage(None, Some(Some(state.path().to_path_buf())), Some(1), None)
+                .unwrap();
         if cfg!(target_os = "macos") {
             assert_eq!(storage.cas_root(), state.path().join("cas-volume/mnt/cas"));
+            assert_eq!(run_root, state.path().join("cas-volume/mnt/runs"));
             assert!(!state.path().join("cas-volume").exists());
+        } else {
+            assert_eq!(run_root, state.path().join("runs"));
+        }
+    }
+
+    /// Bead ley-line-open-741388: `--run-root` is optional with
+    /// `--cas-volume` and required with `--cas-root`; one given beside a
+    /// volume is refused at start, naming both paths, when its filesystem
+    /// is case-insensitive, and kept when it is on the volume.
+    #[test]
+    fn execution_daemon_run_root_follows_the_cas_volume() {
+        let tail = ["--worker", "/worker", "--catalog", "/catalog.json"];
+        let parse = |head: &[&str]| {
+            Cli::try_parse_from(
+                ["leyline", "execution-daemon"]
+                    .iter()
+                    .chain(head)
+                    .chain(&tail)
+                    .copied(),
+            )
+        };
+        assert!(parse(&["--cas-volume"]).is_ok(), "no --run-root needed");
+        assert!(
+            parse(&["--cas-root", "/cas"]).is_err(),
+            "--cas-root needs --run-root"
+        );
+
+        let state = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let explicit = elsewhere.path().join("runs");
+        let insensitive = !leyline_runtime::cas_volume::probe_sensitivity(elsewhere.path())
+            .unwrap()
+            .case_sensitive;
+        let result = execution_cas_storage(
+            None,
+            Some(Some(state.path().to_path_buf())),
+            Some(1),
+            Some(explicit.clone()),
+        );
+        if insensitive {
+            let error = format!("{:#}", result.expect_err("a case-insensitive run root"));
+            assert!(
+                error.contains(&format!(
+                    "the run root {} is case-insensitive",
+                    explicit.display()
+                )) && error.contains("cas-volume/mnt/cas"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(result.unwrap().1, explicit);
+        }
+        if cfg!(target_os = "macos") {
+            // On the volume (Cloister's choice): kept, and left for
+            // provisioning to make once the volume is attached.
+            let on_volume = state.path().join("cas-volume/mnt/runs-cloister");
+            let (_, run_root) = execution_cas_storage(
+                None,
+                Some(Some(state.path().to_path_buf())),
+                Some(1),
+                Some(on_volume.clone()),
+            )
+            .unwrap();
+            assert_eq!(run_root, on_volume);
+            assert!(!on_volume.exists());
         }
     }
 

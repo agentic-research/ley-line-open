@@ -110,9 +110,9 @@ fn storage_error(error: crate::cas_volume::CasVolumeError) -> ExecutionError {
     use crate::cas_volume::CasVolumeError;
     let detail = format!("provision the CAS root: {error}");
     match error {
-        CasVolumeError::UnsupportedHost { .. } | CasVolumeError::CaseInsensitive { .. } => {
-            ExecutionError::unsupported(detail)
-        }
+        CasVolumeError::UnsupportedHost { .. }
+        | CasVolumeError::CaseInsensitive { .. }
+        | CasVolumeError::RunRootCaseInsensitive { .. } => ExecutionError::unsupported(detail),
         CasVolumeError::Config(_)
         | CasVolumeError::Tool { .. }
         | CasVolumeError::Timeout { .. }

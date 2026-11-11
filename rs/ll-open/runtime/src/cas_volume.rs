@@ -65,7 +65,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -179,6 +179,18 @@ pub enum CasVolumeError {
     /// case-sensitive one this module creates.
     #[error("the CAS root {} is case-insensitive: {remedy}", .path.display())]
     CaseInsensitive { path: PathBuf, remedy: &'static str },
+    /// The CAS root is case-sensitive but the run root, where each run's
+    /// rootfs is copied, is not: a tree the CAS holds would merge there
+    /// (bead `ley-line-open-741388`).
+    #[error(
+        "the run root {} is case-insensitive, but the CAS root {} is case-sensitive: a rootfs holding names that differ only by case (Pod/ and pod/) cannot be copied there for a run; omit --run-root to use the volume's own, or name one on a case-sensitive filesystem",
+        .run_root.display(),
+        .cas_root.display()
+    )]
+    RunRootCaseInsensitive {
+        run_root: PathBuf,
+        cas_root: PathBuf,
+    },
     #[error("invalid CAS volume configuration: {0}")]
     Config(String),
     #[error("{command} failed: {detail}")]
@@ -738,6 +750,12 @@ pub struct VolumeLayout {
     pub mountpoint: PathBuf,
     /// `<state>/cas-volume/mnt/cas` on macOS; `<state>/cas` on Linux.
     pub cas_root: PathBuf,
+    /// The default parent of each run's ephemeral rootfs: on the same
+    /// case-sensitive filesystem as the CAS root, so a tree the CAS holds
+    /// (`Pod/` beside `pod/`) can be copied for a run (bead
+    /// `ley-line-open-741388`). `<state>/cas-volume/mnt/runs` on macOS;
+    /// `<state>/runs` on Linux.
+    pub run_root: PathBuf,
 }
 
 /// A case-sensitive CAS root beneath one state directory.
@@ -747,6 +765,8 @@ pub struct CasVolume {
     host: HostOs,
     images: Box<dyn DiskImages>,
     probe: fn(&Path) -> io::Result<FilesystemSensitivity>,
+    /// The run root an operator named instead of [`VolumeLayout::run_root`].
+    run_root: Option<PathBuf>,
     /// Serializes this process's provisioning: two `provision` calls must
     /// not both create the image.
     lock: Mutex<()>,
@@ -758,6 +778,7 @@ impl fmt::Debug for CasVolume {
             .field("state_dir", &self.state_dir)
             .field("size_cap_bytes", &self.size_cap_bytes)
             .field("host", &self.host)
+            .field("run_root", &self.run_root())
             .finish_non_exhaustive()
     }
 }
@@ -802,23 +823,96 @@ impl CasVolume {
             host,
             images,
             probe,
+            run_root: None,
             lock: Mutex::new(()),
         })
+    }
+
+    /// The same volume with each run's ephemeral rootfs beneath `run_root`
+    /// (an absolute path) instead of [`VolumeLayout::run_root`]. It must be
+    /// case-sensitive too: [`CasVolume::check_run_root`] and every provision
+    /// refuse it otherwise. It is refused here when it has a `..` component
+    /// (whether it lies on the mountpoint is then a fact about the path, not
+    /// its spelling; `components` already drops each `.`), or when it lies
+    /// inside, or holds, the CAS
+    /// root: each run's writable copy would land among content-addressed
+    /// entries, and a run's leftovers inside one would make it unrunnable.
+    pub fn with_run_root(mut self, run_root: PathBuf) -> Result<Self, CasVolumeError> {
+        if !run_root.is_absolute() {
+            return Err(CasVolumeError::Config(format!(
+                "the run root must be an absolute path, not {}",
+                run_root.display()
+            )));
+        }
+        if run_root
+            .components()
+            .any(|part| part == Component::ParentDir)
+        {
+            return Err(CasVolumeError::Config(format!(
+                "the run root must name no `..` component, not {}",
+                run_root.display()
+            )));
+        }
+        let cas_root = self.cas_root();
+        if run_root.starts_with(&cas_root) || cas_root.starts_with(&run_root) {
+            return Err(CasVolumeError::Config(format!(
+                "the run root {} must be apart from the CAS root {}",
+                run_root.display(),
+                cas_root.display()
+            )));
+        }
+        self.run_root = Some(run_root);
+        Ok(self)
     }
 
     pub fn layout(&self) -> VolumeLayout {
         let dir = self.state_dir.join("cas-volume");
         let mountpoint = dir.join("mnt");
-        let cas_root = match self.host {
-            HostOs::MacOs => mountpoint.join("cas"),
-            _ => self.state_dir.join("cas"),
+        let (cas_root, run_root) = match self.host {
+            HostOs::MacOs => (mountpoint.join("cas"), mountpoint.join("runs")),
+            _ => (self.state_dir.join("cas"), self.state_dir.join("runs")),
         };
         VolumeLayout {
             image: dir.join("cas.sparsebundle"),
             mountpoint,
             cas_root,
+            run_root,
             dir,
         }
+    }
+
+    /// Where each run's ephemeral rootfs is materialized: the run root an
+    /// operator named, else [`VolumeLayout::run_root`].
+    pub fn run_root(&self) -> PathBuf {
+        self.run_root
+            .clone()
+            .unwrap_or_else(|| self.layout().run_root)
+    }
+
+    /// What a daemon calls when it starts: refuse now a run root that is
+    /// not case-sensitive, unless it lies on the volume's mountpoint (macOS),
+    /// where it exists only once the volume is attached and every provision
+    /// checks it. Creates the run root when it is checked.
+    pub fn check_run_root(&self) -> Result<(), CasVolumeError> {
+        let run_root = self.run_root();
+        if self.host == HostOs::MacOs && run_root.starts_with(self.layout().mountpoint) {
+            return Ok(());
+        }
+        self.verify_run_root()
+    }
+
+    /// Make the run root exist and refuse it, naming it and the CAS root,
+    /// unless its filesystem is case-sensitive.
+    fn verify_run_root(&self) -> Result<(), CasVolumeError> {
+        let run_root = self.run_root();
+        fs::create_dir_all(&run_root).map_err(io_error("create", &run_root))?;
+        if !self.probe(&run_root)?.case_sensitive {
+            return Err(CasVolumeError::RunRootCaseInsensitive {
+                run_root,
+                cas_root: self.cas_root(),
+            });
+        }
+        Ok(())
     }
 
     /// The CAS root path this volume provides, whether or not it exists yet.
@@ -979,6 +1073,7 @@ impl CasVolume {
                 remedy: "what is mounted there is not the case-sensitive volume LLO creates; detach it and provision again",
             });
         }
+        self.verify_run_root()?;
         Ok(Some(ProvisionedCas {
             cas_root: layout.cas_root,
             mountpoint: Some(layout.mountpoint),
@@ -1027,6 +1122,7 @@ impl CasVolume {
                 remedy: "on Linux LLO makes no volume; put the state directory (LEYLINE_STATE_DIR) on a case-sensitive filesystem, without casefolding",
             });
         }
+        self.verify_run_root()?;
         Ok(Some(ProvisionedCas {
             cas_root,
             mountpoint: None,
@@ -1752,6 +1848,159 @@ mod tests {
             case_sensitive: false,
             normalization_sensitive: false,
         })
+    }
+
+    /// Case-insensitive beneath any directory named `host-disk`, sensitive
+    /// elsewhere: a volume beside the host's default filesystem.
+    fn host_disk_is_insensitive(path: &Path) -> io::Result<FilesystemSensitivity> {
+        Ok(FilesystemSensitivity {
+            case_sensitive: !path
+                .components()
+                .any(|part| part.as_os_str() == "host-disk"),
+            normalization_sensitive: false,
+        })
+    }
+
+    /// Bead ley-line-open-741388: with no run root named, each run's
+    /// rootfs goes on the volume, beside the CAS root, and provisioning
+    /// makes it exist.
+    #[test]
+    fn the_default_run_root_is_on_the_volume_and_made_by_provisioning() {
+        for (host, expected) in [
+            (HostOs::MacOs, "cas-volume/mnt/runs"),
+            (HostOs::Linux, "runs"),
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let volume = volume(
+                state.path(),
+                host,
+                &Fake::default(),
+                host_disk_is_insensitive,
+            );
+            assert_eq!(volume.run_root(), state.path().join(expected));
+            assert_eq!(volume.layout().run_root, state.path().join(expected));
+            volume.check_run_root().unwrap();
+            volume.provision().unwrap();
+            assert!(state.path().join(expected).is_dir(), "{host:?}");
+        }
+    }
+
+    /// An explicit run root on a case-insensitive filesystem is refused,
+    /// naming both paths: at start when it is off the volume, and by every
+    /// provision whatever it is.
+    #[test]
+    fn a_case_insensitive_run_root_is_refused_naming_both_paths() {
+        for host in [HostOs::MacOs, HostOs::Linux] {
+            let state = tempfile::tempdir().unwrap();
+            let run_root = state.path().join("host-disk/runs");
+            let volume = volume(
+                state.path(),
+                host,
+                &Fake::default(),
+                host_disk_is_insensitive,
+            )
+            .with_run_root(run_root.clone())
+            .unwrap();
+            for error in [
+                volume.check_run_root().unwrap_err(),
+                volume.provision().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(&error, CasVolumeError::RunRootCaseInsensitive { run_root: named, cas_root }
+                        if *named == run_root && *cas_root == volume.cas_root()),
+                    "{host:?}: {error}"
+                );
+                let message = error.to_string();
+                assert!(
+                    message.contains(&run_root.display().to_string())
+                        && message.contains(&volume.cas_root().display().to_string()),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// A case-sensitive run root the operator names is accepted: off the
+    /// volume, checked at start; on the macOS volume's mountpoint (where
+    /// Cloister puts it), left until the volume is attached, then checked
+    /// by every provision.
+    #[test]
+    fn a_case_sensitive_run_root_is_accepted_on_or_off_the_volume() {
+        let state = tempfile::tempdir().unwrap();
+        let elsewhere = state.path().join("fast-disk/runs");
+        let volume = volume(
+            state.path(),
+            HostOs::Linux,
+            &Fake::default(),
+            host_disk_is_insensitive,
+        )
+        .with_run_root(elsewhere.clone())
+        .unwrap();
+        volume.check_run_root().unwrap();
+        assert!(elsewhere.is_dir());
+
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let on_volume = state.path().join("cas-volume/mnt/cloister-runs");
+        // Even probed as insensitive, it is not checked (or created) at
+        // start: the volume is not attached yet, and a directory made now
+        // would be on the host's disk.
+        let volume = self::volume(state.path(), HostOs::MacOs, &fake, insensitive)
+            .with_run_root(on_volume.clone())
+            .unwrap();
+        volume.check_run_root().unwrap();
+        assert!(!on_volume.exists());
+        assert!(matches!(
+            volume.provision(),
+            Err(CasVolumeError::CaseInsensitive { .. })
+        ));
+        let volume = self::volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .with_run_root(on_volume.clone())
+            .unwrap();
+        volume.provision().unwrap();
+        assert!(on_volume.is_dir());
+        assert!(matches!(
+            volume.with_run_root(PathBuf::from("relative/runs")),
+            Err(CasVolumeError::Config(detail)) if detail.contains("absolute")
+        ));
+    }
+
+    /// A run root is refused when its name could make it something else:
+    /// a `..` component (so "on the mountpoint" is never a matter of
+    /// path text), or a path inside, or holding, the CAS root, where each
+    /// run's writable copy would land among content-addressed entries.
+    #[test]
+    fn a_run_root_that_escapes_by_dots_or_overlaps_the_cas_root_is_refused() {
+        for host in [HostOs::MacOs, HostOs::Linux] {
+            let state = tempfile::tempdir().unwrap();
+            let fake = Fake::default();
+            let volume = || volume(state.path(), host, &fake, sensitive);
+            let layout = volume().layout();
+            let cas_root = volume().cas_root();
+            for named in [
+                layout.mountpoint.join("../../elsewhere"),
+                cas_root.clone(),
+                cas_root.join("runs"),
+                cas_root.join("0f22c2d1dd70147e2c1de7139de10b7619e789334eae9a8b8c22c958994d913a"),
+                cas_root.parent().unwrap().to_path_buf(),
+                state.path().to_path_buf(),
+            ] {
+                let error = volume()
+                    .with_run_root(named.clone())
+                    .expect_err(&format!("{host:?}: {} is refused", named.display()));
+                assert!(
+                    matches!(&error, CasVolumeError::Config(detail)
+                        if detail.contains(&named.display().to_string())),
+                    "{host:?}: {error}"
+                );
+            }
+            volume()
+                .with_run_root(layout.mountpoint.join("cloister-runs"))
+                .unwrap();
+            volume()
+                .with_run_root(state.path().join("runs-elsewhere"))
+                .unwrap();
+        }
     }
 
     fn volume(

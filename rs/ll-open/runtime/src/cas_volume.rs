@@ -1278,13 +1278,18 @@ mod tests {
         assert!(!nodev_and_nosuid(MOUNT_NOSUID));
         assert!(!nodev_and_nosuid(0));
         // The real flags: the root filesystem is the root (macOS
-        // MNT_ROOTFS), a temporary directory is neither nodev nor nosuid,
-        // and a missing path is an error, for the tool's default too.
+        // MNT_ROOTFS), Linux mounts procfs nodev and nosuid, a temporary
+        // directory is neither nodev nor nosuid, and a missing path is an
+        // error, for the tool's default too.
         #[cfg(target_os = "macos")]
         assert_ne!(
             Hdiutil::default().mount_flags(Path::new("/")).unwrap() & libc::MNT_ROOTFS as u64,
             0
         );
+        #[cfg(target_os = "linux")]
+        assert!(nodev_and_nosuid(
+            Hdiutil::default().mount_flags(Path::new("/proc")).unwrap()
+        ));
         assert!(!nodev_and_nosuid(mount_flags(state.path()).unwrap()));
         assert!(mount_flags(&state.path().join("missing")).is_err());
         assert!(mount_flags(Path::new("a\0b")).is_err());

@@ -1,7 +1,7 @@
 # ADR-0044 — Agents see a filesystem served from userspace: an LLO virtio-fs device in a microVM
 
-**Status:** Accepted (2026-10-15); LLO carries nine libkrun patches
-(`rs/third_party/libkrun-patches/0001`–`0009`) until upstream takes them
+**Status:** Accepted (2026-10-15); LLO carries twelve libkrun patches
+(`rs/third_party/libkrun-patches/0001`–`0012`) until upstream takes them
 **Bead:** see "Beads" below
 **Related:**
 
@@ -156,7 +156,7 @@ filesystem substrate; cloister ADR-0050's substrate decision moves here.
 cloister owns policy: which refs and paths a run sees, whether it may propose, credentials, audit.
 The two meet at contracts LLO already owns:
 
-- **cloister → LLO:** the RunGrant's `WorkspaceGrant {graphRoot, expectedGeneration, operations}`
+- **cloister → LLO:** the RunGrant's `WorkspaceGrant {graphRoot, expectedGeneration, operations, writeScope}`
   (`execution/v1`) scopes the guest's filesystem. The backend serves only what it grants and refuses
   proposals it does not allow, with an errno the agent sees.
 - **LLO → cloister:** the run receipt carries, per proposal, `appliedTo`, `resultRoot` and
@@ -281,8 +281,9 @@ upper filesystem (xattrs, whiteouts, rename) are unmeasured.
 
 **How it is wired.** The VMM runs in the `leyline-krun-worker` process and the store lives in the
 daemon, so the share crosses a process boundary on one connected UNIX socket pair: the daemon's
-libkrun backend (`KrunWorkerBackend::with_workspace_shares`) opens the run's share before it
-spawns the worker and passes one end as an inherited descriptor (`--workspace-share-fd`); the
+execution service opens the run's share (`ExecutionService::with_workspace_shares`; at Phase C the
+libkrun backend opened it, until bead `ley-line-open-1022a8`) and hands it to the libkrun backend,
+which passes one end to the worker as an inherited descriptor (`--workspace-share-fd`); the
 worker's virtio-fs device (`ShareFs`, libkrun's `DynFileSystem`) forwards each FUSE request down
 it (`backends::libkrun::share`: a JSON header at Phase C, a Cap'n Proto header,
 `public-schema/capnp/share.capnp`, since `ley-line-open-39d3a4`; READ and WRITE bytes as raw

@@ -45,28 +45,34 @@ impl Store for DaemonContext {
     }
 }
 
-/// What a grant's operations let the guest do: `read` and `list` let it see
-/// the tree, `mutate` and `commit` let it propose. `query` names no file
-/// operation. `execution/v1` grants a workspace whole; it names no paths.
-pub fn scope_for(operations: &[WorkspaceOperation]) -> Scope {
+/// What a grant lets the guest do. `read` and `list` let it see the whole
+/// tree (reads are governed by the grant's `graphRoot`). `mutate` and
+/// `commit` let it propose, and only inside the grant's `writeScope` (bead
+/// `ley-line-open-483134`): exact files, directory trees, or `/` for the
+/// whole workspace. `query` names no file operation.
+///
+/// A grant that permits a write and names no scope proposes nothing.
+/// Authorization refuses that grant before a share is ever opened for it;
+/// this is the same answer for a grant built some other way.
+pub fn scope_for(grant: &WorkspaceGrant) -> Scope {
     let any = |wanted: [WorkspaceOperation; 2]| {
-        operations
+        grant
+            .operations
             .iter()
             .any(|operation| wanted.contains(operation))
     };
-    let whole_if = |granted: bool| {
-        if granted {
+    let nothing = || Grant::Paths(BTreeSet::new());
+    Scope {
+        see: if any([WorkspaceOperation::Read, WorkspaceOperation::List]) {
             Grant::Whole
         } else {
-            Grant::Paths(BTreeSet::new())
-        }
-    };
-    Scope {
-        see: whole_if(any([WorkspaceOperation::Read, WorkspaceOperation::List])),
-        propose: whole_if(any([
-            WorkspaceOperation::Mutate,
-            WorkspaceOperation::Commit,
-        ])),
+            nothing()
+        },
+        propose: if any([WorkspaceOperation::Mutate, WorkspaceOperation::Commit]) {
+            Grant::from_write_scope(&grant.write_scope)
+        } else {
+            nothing()
+        },
     }
 }
 
@@ -171,7 +177,7 @@ impl WorkspaceShares for DaemonShares {
         );
         Ok(Arc::new(StoreShare::new(StoreFs::new(
             Arc::clone(ctx),
-            scope_for(&grant.operations),
+            scope_for(grant),
             options,
         ))))
     }

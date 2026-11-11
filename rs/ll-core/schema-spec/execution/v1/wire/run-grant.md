@@ -43,21 +43,35 @@ Two properties make this the signable form:
   sign; a verifier recomputes them from the grant it received, signature
   and all, and gets the same answer.
 
-**Cleared** means what `grant_signing_bytes` does: `signature` is set to an
-empty `GrantSignature`, a non-null pointer to a struct with no data and no
-pointers (canonically, the pointer word `0xfffffffc` followed by nothing), not a
-null pointer. So `signing_bytes` always carry that word in the `signature` slot,
-whether the received grant was signed, unsigned, or signed by a producer that
-wrote a null pointer, and a second signer MUST write it the same way: a signer
-that leaves `signature` null computes different bytes. The pinned grant vectors
-(`test-vectors/connections-grant.json`) carry these bytes so a second signer
-can check its own.
+"Cleared" means **set to an empty `GrantSignature` struct**, not omitted: the
+`signature` pointer is non-null and points at a zero-size struct, whether or
+not the grant as received carried a signature. Canonicalization keeps that
+pointer, so `signing_bytes` are different bytes from the canonical form of
+the same grant with `signature` left unset, and a signer that omits the field
+instead produces a signature every verifier refuses. How they differ depends
+on the grant's layout: for the vector's grants, which set nothing after
+`signature`, they are 24 bytes longer (1056 bytes against 1032 for the first
+case); for a grant that also sets `confinementManifest`, the two forms are the
+same length and differ in 4 bytes. An earlier revision of this document said
+the cleared field canonicalizes to a truncated null pointer; that was wrong,
+and the bytes the implementation signs have not changed. In JSON-carrier
+terms the grant an issuer canonicalizes carries `"signature": {}`.
 
-Pointer fields after `signature` (`confinementManifest @15`,
-`connectionsDigest @16`, `connectionsDocument @17`) are covered like every
-other field. When they are null they are trailing null pointers, which
-canonicalization truncates, so a grant that sets none of them has the signing
-bytes it had before those fields existed.
+List presence is signed. An unset list field canonicalizes to a null pointer;
+an explicit zero-length list canonicalizes to a non-null pointer, so the two
+are different `signing_bytes`. Where a field's absence carries meaning, the
+contract fixes one encoding: `WorkspaceGrant.writeScope` is left unset for "no
+scope", and an authorizer refuses the empty list (README, "Workspace write
+scope"). `test-vectors/run-grant-signing.json` gives known answers for the
+signing bytes and the Ed25519 signature over them, including that pair.
+
+`connectionsDigest @16` and `connectionsDocument @17` (ADR-0046 S3, README
+"Broker integrations and connections") are pointer fields after `signature`,
+covered like every other field. A grant that sets neither has null pointers
+there, which canonicalization truncates, so its `signing_bytes` are the bytes
+it had before the fields existed. `test-vectors/connections-grant.json` pins
+the signing bytes of a grant that carries both, with the
+`credentialBrokerRefs` marker, and of the same grant without them.
 
 ## Fields
 

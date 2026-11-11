@@ -65,7 +65,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -831,12 +831,34 @@ impl CasVolume {
     /// The same volume with each run's ephemeral rootfs beneath `run_root`
     /// (an absolute path) instead of [`VolumeLayout::run_root`]. It must be
     /// case-sensitive too: [`CasVolume::check_run_root`] and every provision
-    /// refuse it otherwise.
+    /// refuse it otherwise. It is refused here when it has a `..` component
+    /// (whether it lies on the mountpoint is then a fact about the path, not
+    /// its spelling; `components` already drops each `.`), or when it lies
+    /// inside, or holds, the CAS
+    /// root: each run's writable copy would land among content-addressed
+    /// entries, and a run's leftovers inside one would make it unrunnable.
     pub fn with_run_root(mut self, run_root: PathBuf) -> Result<Self, CasVolumeError> {
         if !run_root.is_absolute() {
             return Err(CasVolumeError::Config(format!(
                 "the run root must be an absolute path, not {}",
                 run_root.display()
+            )));
+        }
+        if run_root
+            .components()
+            .any(|part| part == Component::ParentDir)
+        {
+            return Err(CasVolumeError::Config(format!(
+                "the run root must name no `..` component, not {}",
+                run_root.display()
+            )));
+        }
+        let cas_root = self.cas_root();
+        if run_root.starts_with(&cas_root) || cas_root.starts_with(&run_root) {
+            return Err(CasVolumeError::Config(format!(
+                "the run root {} must be apart from the CAS root {}",
+                run_root.display(),
+                cas_root.display()
             )));
         }
         self.run_root = Some(run_root);
@@ -1941,6 +1963,44 @@ mod tests {
             volume.with_run_root(PathBuf::from("relative/runs")),
             Err(CasVolumeError::Config(detail)) if detail.contains("absolute")
         ));
+    }
+
+    /// A run root is refused when its name could make it something else:
+    /// a `..` component (so "on the mountpoint" is never a matter of
+    /// path text), or a path inside, or holding, the CAS root, where each
+    /// run's writable copy would land among content-addressed entries.
+    #[test]
+    fn a_run_root_that_escapes_by_dots_or_overlaps_the_cas_root_is_refused() {
+        for host in [HostOs::MacOs, HostOs::Linux] {
+            let state = tempfile::tempdir().unwrap();
+            let fake = Fake::default();
+            let volume = || volume(state.path(), host, &fake, sensitive);
+            let layout = volume().layout();
+            let cas_root = volume().cas_root();
+            for named in [
+                layout.mountpoint.join("../../elsewhere"),
+                cas_root.clone(),
+                cas_root.join("runs"),
+                cas_root.join("0f22c2d1dd70147e2c1de7139de10b7619e789334eae9a8b8c22c958994d913a"),
+                cas_root.parent().unwrap().to_path_buf(),
+                state.path().to_path_buf(),
+            ] {
+                let error = volume()
+                    .with_run_root(named.clone())
+                    .expect_err(&format!("{host:?}: {} is refused", named.display()));
+                assert!(
+                    matches!(&error, CasVolumeError::Config(detail)
+                        if detail.contains(&named.display().to_string())),
+                    "{host:?}: {error}"
+                );
+            }
+            volume()
+                .with_run_root(layout.mountpoint.join("cloister-runs"))
+                .unwrap();
+            volume()
+                .with_run_root(state.path().join("runs-elsewhere"))
+                .unwrap();
+        }
     }
 
     fn volume(

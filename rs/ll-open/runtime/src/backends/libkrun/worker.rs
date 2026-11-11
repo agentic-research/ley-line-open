@@ -99,7 +99,9 @@ fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), Executi
 /// Where the worker writes the workload's argv and environment in the run's
 /// own root, and where the guest init reads them (`KRUN_CONFIG`; LLO libkrun
 /// patch 0013, beads `ley-line-open-7410ec`, `d4b07f`). Init removes it once
-/// read. A rootfs that holds this path is refused.
+/// read. A rootfs that holds this path is refused: the write is exclusive.
+// Same as rootfs_manifest::RUN_EXEC_SPEC (D3). Whichever branch lands second
+// replaces this literal with that shared const.
 pub const EXEC_CONFIG_PATH: &str = "/.leyline-exec.json";
 
 /// The most argv and environment strings one run carries: init's JSON

@@ -265,7 +265,8 @@ fn the_guest_receives_its_argv_and_environment_byte_for_byte() {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&token[i..i + 2], 16).expect("hex"))
                 .collect();
-            String::from_utf8_lossy(&bytes).into_owned()
+            // libkrun writes each variable quoted whole: "KEY=value".
+            String::from_utf8_lossy(&bytes).trim_matches('"').to_owned()
         })
         .collect();
     assert!(

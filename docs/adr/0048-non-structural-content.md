@@ -154,16 +154,38 @@ tree-sitter gives it no children at all** (`child_count() == 0`). A node whose c
 non-code is an internal node over an empty child list, `hash_internal(kind, [])`, and never
 hashes its span. This closes defect 2.
 
-**Hidden-token kinds hash their span (closes defect 6).** `child_count()` counts visible
-children only, so the leaf rule alone does not reach bytes held in hidden tokens. The inventory
-(N2) gets a second attribute per code kind, its hash shape: `fold` (the default, as today) or
-`span_leaf`. A `span_leaf` kind is hashed as a leaf over its full byte span, whatever its
-children, so every byte inside it is in its preimage. Its visible children still get occurrence
-rows and `node_content` rows, but they are not in its preimage. The generator proposes
-`span_leaf` for a kind whose grammar rule reaches a hidden terminal that is not trivia, and gate
-2 fails until a person confirms each one. The initial set is Markdown `inline`,
-`code_fence_content` and `html_block`. Byte sensitivity has its own closing test,
-`every_non_trivia_byte_is_in_some_node_hash_preimage`, over every compiled grammar's fixtures.
+**Hidden-token kinds hash their span and their children (closes defect 6).** `child_count()`
+counts visible children only, so the leaf rule alone does not reach bytes held in hidden tokens.
+The inventory (N2) gets a second attribute per code kind, its hash shape, published as
+`kinds.hash_shape` (`TEXT NOT NULL CHECK (hash_shape IN ('fold','span'))`): `fold` (the default,
+as today) or `span`. A `span` node is hashed under a fourth tag over both its full byte span and
+its folded children:
+
+```text
+NODE_TAG_SPAN = 0x03
+span_hash(kind, bytes, children) = derive_key("leyline/ast-node/v3",
+    0x03 ‖ uvarint(len(kind)) ‖ kind ‖ uvarint(len(bytes)) ‖ bytes
+         ‖ uvarint(child_count) ‖ child_hash[0..n])
+```
+
+Every byte inside the node is in its preimage, and so are its children. **Its visible children
+keep their `node_edge` rows and stay edge-reachable**: because the child hashes are in the
+preimage, the edges are a function of the parent's `node_hash`, as for any internal node
+(ADR-0047 D-iii). A leaf over the span alone was rejected for this reason: its edges would not be
+a function of its address, and two occurrences with equal bytes but different parses would share
+one `node_content` row with conflicting edges. The `node_content` row has `node_tag = 3`, `token`
+= the span when it is valid UTF-8 (else NULL), and `arity` = the child count. The generator
+proposes `span` for a kind whose grammar rule reaches a hidden terminal that is not trivia, and
+gate 2 fails until a person confirms each one. The set is per `(lang, kind, named)`, and the
+generator's output is authoritative. Known members at the locked tree-sitter-md 0.5.3 are as
+follows. In `markdown` (block): `inline`, `code_fence_content`, `html_block`, `info_string`,
+`language`, `pipe_table_cell`, `link_label`, `link_title` and `link_destination`. In
+`markdown-inline` (the guest grammar): its `inline` root and every inline kind that holds `_word`
+text beside visible punctuation, among them the link and emphasis kinds. Byte sensitivity has its
+own closing test,
+`every_non_trivia_byte_is_in_some_node_hash_preimage`, over every compiled grammar's fixtures,
+with pairs that differ only in a fence info string, a table cell, a link destination, and an
+inline-guest paragraph.
 
 **(b) Non-structural content.** Every node whose class is `comment`, `shebang` or `directive`,
 whether or not the grammar marks it `extra`. It has a position in the code and no meaning to the syntax tree.
@@ -211,11 +233,11 @@ region the depth limit refuses would hash differently from one it admits. The sh
 ("host structural identity is independent of the injected grammar's version", `fold_injected`)
 already takes this side. The invariant it rests on, stated as a test (N9): every non-trivia byte
 of a region lies inside its host's preimage. For a code host that is a code leaf or a
-`span_leaf` node of the host's fold; for a comment host (a doc comment holding Markdown, a later
+`span` node of the host's fold; for a comment host (a doc comment holding Markdown, a later
 S5 case) it is the comment's own tag-`0x02` preimage (N4). Editing a comment-hosted region
 therefore moves the comment's content row and no code `node_hash`, as any comment edit does. A
 host grammar that would drop a region's bytes must classify them first: as code, the way Q3
-does for PHP's `text_interpolation` (today a dropped extra), or as `span_leaf` for hidden tokens
+does for PHP's `text_interpolation` (today a dropped extra), or as `span` for hidden tokens
 (Markdown `inline`, today defect 6).
 
 **(d) AST-less content.** No projection identity: the blob hash over the file's exact bytes is
@@ -479,13 +501,13 @@ preimages that no reclassification touches are byte-for-byte unchanged, so those
 their `node_hash`. Consequence: unlike the v2-to-v3 move (ADR-0047 D-i), a v3 address and a v4
 address are equal exactly when their preimages are equal, so equality across the two lineages
 is never a false match. What does not carry across is presence or absence: under v4 some v3
-addresses are never produced (comment rows, Swift and Scala nodes holding comment children),
+addresses are never produced (comment rows, and every code shape in N5's moving-shape table),
 and a consumer must not conclude "hash X is gone, so that code was removed" across a lineage
 change. The `ir_schema_version` label is what tells it so. Renaming the context for consistency
 would move every address and is not done.
 
 `node_hash` is then one construction with two kinds of value: syntax subtrees (tags `0x00`,
-`0x01`) and non-code occurrences (tag `0x02`). The `AGENTS.md` vocabulary row, the ADR-0047 §3 row, the
+`0x01`, and `0x03` for `span` nodes) and non-code occurrences (tag `0x02`). The `AGENTS.md` vocabulary row, the ADR-0047 §3 row, the
 sigma v1 README's `astNode` row and `identity_docs_test.rs` are amended to say so.
 
 ### N5 — Versioning
@@ -494,9 +516,9 @@ One release carries three bumps, each on its own axis:
 
 | Axis | From | To | Why |
 | --- | --- | --- | --- |
-| `IR_SCHEMA_VERSION` (`node_hash` lineage) | `merkle-ast-v3` | `merkle-ast-v4` | The preimage's meaning changes: comment rows move to tag `0x02`; nodes holding a comment child, or holding only comments, fold differently (N1 leaf rule); shebang files; non-UTF-8 leaves; and with S2 Ruby heredocs, C# directives and PHP inline HTML (`text_interpolation`), so every PHP file with inline HTML gets new `node_hash`es. |
+| `IR_SCHEMA_VERSION` (`node_hash` lineage) | `merkle-ast-v3` | `merkle-ast-v4` | The preimage's meaning changes: non-code rows move to tag `0x02`, `span` nodes use tag `0x03`, and the code shapes in the moving-shape table below fold differently. |
 | `EXTRACTION_EPOCH` | `7` | `8` | It records which nodes become `_ast` occurrences, and that set now comes from the inventory. Forces re-derivation of every file. |
-| `PROJECTION_SCHEMA_VERSION` | `projection-v13` | `projection-v14` | `kinds.class` (`TEXT NOT NULL CHECK (class IN ('code','comment','shebang','directive','trivia'))`), `_comment_roles`, `v_comment_address`, `node_tag = 2` rows, the `node_edge` trigger, `_meta.content_classes`, `_content_spans`, `_regions` and `_region_ranges` (N9), `v_content_class`, `_blob_kind`, `_documents` (N8), and `_meta.derived_from` format `v3` (N8). |
+| `PROJECTION_SCHEMA_VERSION` | `projection-v13` | `projection-v14` | `kinds.class` (`TEXT NOT NULL CHECK (class IN ('code','comment','shebang','directive','trivia'))`), `_comment_roles`, `v_comment_address`, `node_tag = 2` rows, the `node_edge` trigger, `_meta.content_classes`, `_content_spans`, `_regions` and `_region_ranges` (N9), `node_defs.region_id` and `node_refs.region_id`, `kinds.hash_shape`, `v_content_class`, `_blob_kind`, `_documents` (N8), and `_meta.derived_from` format `v3` (N8). |
 
 **Refused.** A `projection-v13` arena is refused at parse open and rebuilt cold, like every
 earlier version; the refusal also gets a shape probe (a `kinds` table without `class` is
@@ -511,33 +533,45 @@ consumer was written for, and the shape probe
 `SELECT 1 FROM pragma_table_info('kinds') WHERE name = 'class'` returns a row (v14) or no row
 (v13). The label catches a stamped arena and the probe catches an unstamped one.
 
-**Code shapes whose `node_hash` moves from v3 to v4 (exhaustive).** This table is a contract:
-mache carries its `(rule, node_hash)` smell baseline across the bump with it, and any code
-`node_hash` that moves outside it is a defect.
+**The moving-shape table: code `node_hash`es that move from v3 to v4.** This table is a
+contract. mache carries its `(rule, node_hash)` smell baseline across the bump with it, and N4,
+N5 and N7 cite it rather than restate it. Each row is a predicate on v4 rows. A code occurrence's
+`node_hash` moves from v3 to v4 if and only if the occurrence, or one of its descendants,
+satisfies a row:
 
-| # | Shape | Why it moves | Bead |
+| # | Predicate on a v4 row (the occurrence or a descendant) | Derived from | Bead |
 | --- | --- | --- | --- |
-| 1 | A node whose children are all non-code (comments, shebangs, directives, trivia, or dropped extras), including a comment-only file's root | N1 leaf rule: `hash_internal(kind, [])` replaces a leaf hash of its span | 1b5f3c |
-| 2 | A Swift node holding a member-separator `multiline_comment`, and each ancestor | the comment leaves the fold | 1b5f3c |
-| 3 | A Scala `compilation_unit` holding a shebang (`comment`), and its ancestors | the comment leaves the fold | 1b5f3c |
-| 4 | A node holding a shebang kind (Rust, Kotlin, Groovy `shebang`; Swift `shebang_line`; JavaScript, TypeScript, Lua `hash_bang_line`; C# `shebang_directive`), and its ancestors | the shebang leaves the fold | 1b5f3c |
-| 5 | A leaf whose bytes are not valid UTF-8, and its ancestors | byte hashing replaces `hash_leaf(kind, "")` | 5b8445 |
-| 6 | A Ruby node holding a `heredoc_body`, and its ancestors | the extra enters the fold | 4cd459 |
-| 7 | A C# node holding a `preproc_*` other than the region markers, and its ancestors | the extra enters the fold | 4cd459 |
-| 8 | A PHP node holding `text_interpolation` (inline HTML), and its ancestors | the extra enters the fold (Q3) | 4cd459 |
-| 10 | A Markdown `inline`, `code_fence_content` or `html_block` holding a hidden token, and its ancestors; any further `span_leaf` kind the gate confirms | `span_leaf` hashing (N1, defect 6) | 8bcfa7 |
-| 9 | Any node whose κ kind moves, if `ley-line-open-5b9949` changes the κ map | κ is in the preimage; none is planned, so this row is empty unless that bead edits κ | 5b9949 |
+| 1 | a `node_content` row with `node_tag = 1` and `arity = 0`: an internal node over an empty child list, because every child is non-code or a dropped extra; this includes a comment-only file's root | the N1 leaf rule | 1b5f3c |
+| 2 | a non-code occurrence (effective class `comment`, `shebang` or `directive`) whose inventory row has `is_extra = false` | inventory: `is_extra = false` and class not `code` (Swift `multiline_comment` as a separator, Scala's shebang `comment`, every shebang kind) | 1b5f3c |
+| 3 | a code leaf row (`node_tag = 0`) with `token IS NULL`; a non-code row with a NULL token is in no code preimage and moves nothing | non-UTF-8 bytes (byte hashing) | 5b8445 |
+| 4 | a code occurrence, or a code token, whose inventory row has `is_extra = true` and class `code` | inventory: `is_extra = true` and class `code` (Ruby `heredoc_body`, C# `preproc_*` except the region markers, PHP `text_interpolation`) | 4cd459 |
+| 5 | a row with `node_tag = 3` | inventory: `hash_shape = 'span'` (the Markdown kinds listed in N1) | 8bcfa7 |
+| 6 | κ: none. `ley-line-open-5b9949` ships in v0.30.0 as a pin test only, with the κ map unchanged, so no row moves for κ; the release notes say "no κ change" | — | 5b9949 |
 
-Not in the table, by design: nested regions (a guest root never folds into its host, §(c)), so
-no host moves for injection reasons; comment, shebang and directive rows themselves (they are
-tag-`0x02` rows, not code); SQL `marginalia` and C# region markers (dropped extras that become
-non-code occurrences, so no code preimage changes); Go extraction (4624d9, 651909: fact rows
-only). Files the file-kind detector (60321f) newly projects gain `node_hash`es, and a file it
-newly classes as binary loses them; neither moves an existing value. The closing test is
-`v3_to_v4_moving_shapes_are_exactly_the_published_set`: a corpus with every shape once, plus
-each grammar's existing fixtures, hashed by the v0.29.0 binary into a checked-in golden file;
-every code `node_hash` that differs under v4 must be explained by one row of this table, and the
-test fails on any other.
+**The rows are derived, not enumerated.** Rows 2, 4 and 5 are computed from the inventory: the
+`(lang, kind, named)` rows where v3's treatment (`is_extra` decides: folded if false, dropped or
+a comment occurrence if true) differs from v4's (class and hash shape decide). The generator
+writes that derived set to `rs/ll-open/ts/src/content_classes_moving.json`, and
+`moving_shape_table_equals_inventory_derivation` asserts that it equals the kinds the table
+names. So a new inventory row that changes treatment changes the derived set and fails the test
+until the table is updated. Rows 1 and 3 are structural and not tied to any kind; their
+predicates are on v4 rows directly.
+
+**Not in the table, by design.** Nested regions (a guest root never folds into its host, §(c)),
+so no host moves for injection reasons. Non-code rows themselves (they are tag-`0x02` rows, not
+code). SQL `marginalia` and the C# region markers: they were dropped extras and become non-code
+occurrences, so no code preimage changes. Go extraction (4624d9, 651909), which changes fact rows
+only. Files the file-kind detector (60321f) newly projects gain `node_hash`es, and a file it newly
+classes as binary loses them; neither moves an existing value.
+
+**The golden test, `v3_to_v4_moving_shapes_are_exactly_the_published_set`.** The corpus has every
+derived kind once, plus every grammar's existing fixtures. The v0.29.0 binary hashes it into a
+checked-in golden file. A v3 code occurrence is matched to a v4 code occurrence by
+`(path, start_byte, end_byte, raw_kind)`; comment ordinals differ between the two lineages, so
+nids are never used to match. Then two assertions hold. Every matched pair whose `node_hash`
+differs has the v4 occurrence, or a descendant, satisfying a row. And every matched pair where
+that holds does differ. An occurrence that exists in only one lineage, such as a Swift separator
+comment that was code at v3 and is non-code at v4, must itself satisfy row 2 or row 4.
 
 **`class` is a closed enum per projection version.** A consumer refuses a value it does not
 know. Adding a value, or reclassifying a kind, is never silent: the gate-4 pin forces the IR and
@@ -607,7 +641,9 @@ SELECT path, start_byte, end_byte, class, NULL, NULL, NULL, NULL
 ```
 
 `v_content_class.class` takes the values `comment`, `shebang`, `directive`, `injected` and
-`opaque`; code is every `_ast` row not listed. `nid` is the row's own occurrence (comments,
+`opaque`; code is every `_ast` row not listed. An `injected` range is not non-code: its bytes are
+code of the host (§(c)), and it is listed so that a consumer can find the guest, never so that it
+folds the range out. `nid` is the row's own occurrence (comments,
 shebangs, directives), and `host_nid` is the occurrence hosting a region (NULL for a region
 deeper than 1 whose host has no occurrence). A region row gives its hull; its ranges are in
 `_region_ranges`. A region's bytes are listed twice on purpose: they are code of the host
@@ -634,18 +670,22 @@ filter is not AST-less and has no row (Q5, decided).
   recipe still walks back from a def over siblings whose effective class is `comment` (shebangs
   and directives are excluded by class, not by a byte test). Swift member-separator comments
   become attachable.
-- **Edges.** No `node_edge` reaches a comment row in any language (today a Swift separator
-  comment is reachable as a code child). Rows with `node_tag = 2` are comments.
+- **Edges.** No `node_edge` reaches a non-code row in any language (today a Swift separator
+  comment is reachable as a code child). Rows with `node_tag = 2` are non-code. The visible
+  children of a `span` node (`node_tag = 3`, `kinds.hash_shape = 'span'`) **are**
+  edge-reachable: each has a `node_edge` row from its parent, as under any internal node (N1).
+  So a field derivation over `node_edge` finds Markdown `block_continuation` under `inline`.
+- **Injected regions are host code.** The bytes of an `injected` range are code of their host
+  (§(c)). They are never folded out the way comment, shebang or directive bytes are; a consumer
+  that folds non-code must not fold a region's span.
 - **Unknown class values** are refused, never read as non-structural.
 - **DDL pin.** mache's byte-identical DDL pin, `internal/fixturedb/schema_leyline.go`, re-pins to
   v14 (`kinds.class`, the views, the trigger); it is mache's independent check of this ABI.
-- **Smell baseline.** `(rule_id, node_hash)` keys re-pin under `merkle-ast-v4`. Deltas are
-  confined to comment rows, comment-only nodes, Swift, Scala, shebang files, non-UTF-8 leaves and
-  (with S2) Ruby heredocs, C# directives and PHP files with inline HTML; mache enumerates them
-  rather than re-baselining blind.
-- **PHP inline HTML.** It becomes code (Q3): an inline-HTML-only edit now moves the PHP file's
-  `node_hash`, where at v13 it moved none. A consumer that cached PHP `node_hash`es sees them
-  move for every PHP file with inline HTML.
+- **Smell baseline.** `(rule_id, node_hash)` keys re-pin under `merkle-ast-v4`. The deltas are
+  exactly N5's moving-shape table, rows 1 to 5; mache enumerates them by its predicates rather
+  than re-baselining blind.
+- **PHP inline HTML.** It becomes code (Q3; moving-shape row 4): an inline-HTML-only edit now
+  moves the PHP file's `node_hash`, where at v13 it moved none.
 - **Version.** mache accepts `projection-v14` with `_meta.extraction_epoch = 8` and
   `_meta.ir_schema_version = merkle-ast-v4`, and refuses v13.
 
@@ -750,6 +790,7 @@ tree contains the matching host node, or the file itself:
 CREATE TABLE _regions (
     region_id        INTEGER PRIMARY KEY,                 -- arena-local locator, never cited outside
     path             TEXT    NOT NULL,                    -- the _tree path
+    file_id          INTEGER NOT NULL,                    -- the host file (_source.file_id; nid >> 24)
     parent_region_id INTEGER REFERENCES _regions(region_id),  -- NULL: the file is the parent
     depth            INTEGER NOT NULL CHECK (depth >= 1), -- 1: directly inside the file
     lang             TEXT    NOT NULL,                    -- the guest language
@@ -778,6 +819,9 @@ CREATE TABLE _region_ranges (
     end_byte   INTEGER NOT NULL,
     PRIMARY KEY (region_id, ord)
 );
+
+CREATE INDEX idx_regions_host ON _regions(host_nid);
+CREATE INDEX idx_regions_file ON _regions(file_id);
 ```
 
 A separate table, not more columns on `_content_spans`: a region needs a self-referencing parent
@@ -810,6 +854,12 @@ with the file's other projection rows (`delete_file_rows`).
   ordinal budget above closes that path, and the closing test pins it: a fixture whose injected
   nodes exceed the budget still parses, with host `node_hash`es equal to the
   `LLO_DISABLE_INJECTIONS=1` run.
+- **Facts reach their region directly.** `node_defs` and `node_refs` gain a nullable
+  `region_id` (NULL for a host fact). An injected fact names its region without a span join on
+  `_region_ranges`, and `idx_regions_host` finds a host occurrence's regions. `_regions.file_id`
+  joins to `_source.file_id` and to every occurrence through `nid >> 24`; `path` joins to
+  `_tree.path`. (`_content_spans` keeps only `path`, because an opaque file has no `_source` row
+  and no `file_id`.)
 - **Comments.** A guest region's comments are classified by the guest language (N2). Rows for
   guest comment occurrences are S4.
 - **Recursion.** `fold_injected_node` probes the guest language's injection engine as
@@ -853,8 +903,13 @@ it carries is one where gluing cannot fail, so the defect measures nothing about
   `regionHash(parserId, {node_hash(file root)})`. A refused or `opaque` region has no guest root
   and no stalk of its own. Its bytes are inside its host's preimage (§(c)), so its host's stalk
   (the parent region's, or the file's) moves when they change. That holds only for stalks LLO
-  defines. A client that supplies its own region stalks over the wire (`op_sheaf_set_topology`)
-  must include a member whose fold contains the enclosing leaf, such as the file root.
+  defines. For stalks a client supplies over the wire (`op_sheaf_set_topology`, as mache does
+  with community regions), coverage is **advisory, not enforced**. A client stalk is an opaque
+  hash: LLO cannot see its members, so it cannot check that one of them covers the enclosing
+  leaf. The sheaf cascade is advisory anyway, with `node_hash` as the correctness floor
+  (ADR-0030), so an uncovered region costs only invalidation precision. A client that wants
+  refused or opaque regions covered includes a member whose fold contains the enclosing leaf,
+  such as the file root.
 
 **Where it stops.**
 - **Two different objects.** Over bytes, the restriction maps are real, but gluing is vacuous:
@@ -916,6 +971,9 @@ Each invariant has a closing test. Unless named, tests go in
 | Regions: the host commits to the bytes, not the guest root (N9) | `every_region_byte_is_in_a_host_code_leaf` (every non-trivia byte of each region lies in a code leaf of its host's fold); `an_injection_query_change_moves_no_host_hash` (disable injections with `LLO_DISABLE_INJECTIONS=1`: host `node_hash`es equal, `_regions` empty) |
 | Nested regions (N9, when nested queries land) | a PHP → HTML → `<script>` JS fixture: one `_regions` row per level with the right `parent_region_id`, `depth`, file and relative spans; a JS-only edit moves the PHP file's `node_hash` and the JS guest root |
 | Every non-trivia byte is in a preimage (N1, defect 6) | `every_non_trivia_byte_is_in_some_node_hash_preimage` over every grammar's fixtures; `two_markdown_paragraphs_differing_in_one_word_have_different_hashes` (`Calls foo.` against `Calls bar.`, and two fenced code blocks) |
+| `span` children stay edge-reachable (N1) | `span_node_children_have_node_edges`: every `_ast` child of a Markdown `inline` (`block_continuation` included) has a `node_edge` row from its parent; `kinds.hash_shape` equals the inventory |
+| Moving shapes are derived (N5) | `moving_shape_table_equals_inventory_derivation` |
+| Injected facts name their region (N9) | every `node_defs`/`node_refs` row with a non-NULL `region_id` lies inside that region's `_region_ranges`, and every injected fact has one |
 | A comment-hosted region commits through the comment (S5) | a doc comment holding a Markdown region: editing the region moves the comment's content row and no code `node_hash` |
 | Combined regions (S5) | a PHP file with `<?php ?>` inside `<script>`: one HTML region with several `_region_ranges` rows, and the `<script>` → JavaScript region forms |
 | No region fails the run (N9) | a fixture whose injected nodes exceed the ordinal budget still parses, with `refused_count` rows and host `node_hash`es equal to the `LLO_DISABLE_INJECTIONS=1` run; a guest injecting its own span gets `refused_repeat` |
@@ -935,7 +993,7 @@ Decided by the owner: everything below marked v0.30.0 ships as **one** lineage b
 
 | Slice | Content | Bead | Release |
 | --- | --- | --- | --- |
-| S1 | N2 inventory, generator, four gates and `kinds.class` lifecycle; N1 leaf rule; N4 comment tag, byte hashing, trigger, witness variant; reclassify Swift `multiline_comment`, Scala shebang `comment`, SQL `marginalia`, the shebang kinds; `_comment_roles` (shebang and directive rules); `v_comment_address`; N5 bumps and every artifact listed there | `ley-line-open-1b5f3c`, `ley-line-open-5b8445`, `ley-line-open-8bcfa7` (`span_leaf`, defect 6) | v0.30.0 |
+| S1 | N2 inventory, generator, four gates and `kinds.class` lifecycle; N1 leaf rule; N4 comment tag, byte hashing, trigger, witness variant; reclassify Swift `multiline_comment`, Scala shebang `comment`, SQL `marginalia`, the shebang kinds; `_comment_roles` (shebang and directive rules); `v_comment_address`; N5 bumps and every artifact listed there | `ley-line-open-1b5f3c`, `ley-line-open-5b8445`, `ley-line-open-8bcfa7` (`span` shape, defect 6) | v0.30.0 |
 | S2 | Code-classed extras folded: Ruby `heredoc_body`, C# `preproc_*` other than the region markers (which are `directive`), PHP `text_interpolation` (Q3). They fold into whichever node tree-sitter attached them to, not into the construct that uses them; an ancestor's `node_hash` moves, a call's subtree need not | `ley-line-open-4cd459` | v0.30.0 |
 | S3 | `_content_spans` (opaque), `_regions` and `_region_ranges` with recursion, bounds (including the ordinal budget) and degradation (N9), populated by the shipped Go → SQL and Markdown injections; the bounds added to `current_injection_epoch`; `v_content_class` | `ley-line-open-4e0852` | v0.30.0 |
 | S3b | Pin κ to the IR lineage | `ley-line-open-5b9949` | v0.30.0 if it fits; otherwise the next lineage bump |

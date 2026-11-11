@@ -447,9 +447,21 @@ D3/D4 extend the schema without changing the digest of any document slice 1 acce
 
 Canonical form: D2's rules 1–3 (confinement/v1 §7 rules 1–4 verbatim; `connections`
 sorted by `name` in byte order; a one-element list stays a list; an empty list is
-refused). `connectionsDigest` is BLAKE3-256 over those canonical bytes, rendered
-`blake3-256:<hex>` as `DigestRef`. It names the connections document's bytes and nothing
-else; it is not `confinementDigest`, a blob hash or any arena or store root.
+refused), plus two rules a second implementation needs to reach the same bytes:
+
+- **Strings are printable ASCII.** Every string value is in U+0020–U+007E and contains no
+  `"` and no `\`, so no JSON escape is ever emitted and serializers that differ on escaping
+  (raw UTF-8 against `\uXXXX`) produce the same bytes. A string outside that set (a NUL, a
+  control character, a non-ASCII path) is refused at parse.
+- **Numbers are JSON integers.** `port` is written as a decimal integer with no sign,
+  fraction, exponent or leading zero; `30080.0`, `"30080"` and `3.008e4` are refused.
+
+`connectionsDigest` is BLAKE3-256 over those canonical bytes, carried as a `DigestRef`
+with `algorithm` = `blake3-256` and `value` = 64 lowercase hex characters (the form
+`read_digest` in `authorization.rs` accepts). It names the connections document's bytes
+and nothing else; it is not `confinementDigest`, a blob hash or any arena or store root.
+The two digests are both plain BLAKE3 over canonical JSON; the in-document `version`
+string and each parser's refusal of the other's keys keep them apart.
 
 Field rules (each refusal names the connection and the field):
 
@@ -462,8 +474,8 @@ Field rules (each refusal names the connection and the field):
 | `endpoint` | `{"unix": path}` only | `{"tcp": port}` (S6); any other key |
 | `endpoint.unix` | absolute; no `.` or `..` component, no `//`, no trailing `/`; at most 103 bytes; unique across connections | each violation, by name |
 | `target` | `{"tcp": {host, port}}` only | `unix`, `https`, `cloudSql` (D2 union members slice 1 does not deliver); a `tls` key |
-| `target.tcp.host` | an IP literal in loopback: IPv4 dotted-quad in `127.0.0.0/8` with no leading zeros, or exactly `::1` | any name, including `localhost`; any non-loopback address, named "non-loopback target" |
-| `target.tcp.port` | 1–65535 | 0 or out of range |
+| `target.tcp.host` | exactly `127.0.0.1` | any name, including `localhost`; any other address, named "non-loopback target" for a non-loopback one and "loopback address not delivered in slice 1" for `127.0.0.2`–`127.255.255.255` and `::1` (S-Q3) |
+| `target.tcp.port` | a JSON integer, 1–65535 | 0, out of range, or not an integer |
 | `credentialRef` | absent | present (D2 rule 4 already refuses it on `art.tcp`) |
 
 `appProtocol` is required although slice 1 accepts one value, so that a slice-1 document
@@ -481,21 +493,29 @@ vector's validity does not depend on the host that checks it *(cloister: at most
   target and offers no spelling to skip it. Slice 1 has no TLS client, so the only targets
   it can serve within D7 are local. Non-loopback is refused by name rather than relayed in
   plaintext *(cloister: refuse non-loopback by name)*.
-- **The OS profile can express it exactly.** Seatbelt scopes outbound TCP as
-  `remote tcp "localhost:N"`, so the broker's own sandbox can hold it to the declared
-  ports on loopback (S5). For an arbitrary host the profile could only scope by port,
-  and the broker's code would be the sole enforcement.
+- **The OS profile adds a second layer on loopback.** Seatbelt scopes outbound TCP as
+  `remote tcp "localhost:N"`: by port, on loopback, not by address. So the broker's
+  sandbox holds it to the declared ports on loopback, and the broker's code holds it to
+  the one address (S5). For a non-loopback host the profile could only scope by port, and
+  the code would be the sole enforcement. Slice 1 accepts only `127.0.0.1` because that is
+  the address kind publishes on and the one `localhost` in a Seatbelt filter is known to
+  match; `127.0.0.0/8` beyond it and `::1` wait on a probe of the filter (S-Q3), since a
+  document the profile then refuses would be a declared connection that never dials.
 
 **Cross-document rule, slice 1.** Checked at start, before the broker is spawned; a
-mismatch refuses the run naming the connection (`invalidGrant`):
+mismatch refuses the run naming the connection and the grant:
 
 - every `endpoint.unix` appears exactly once in the confinement manifest's §6 `allow` as a
   connect grant on that exact path: on the microVM tier the object form
   `{"path", "mode": "connect", "guestPort"}`, on native macOS the bare string;
-- no §6 grant on an endpoint path has `bind` or `connect-bind` (the workload never owns
-  the broker's socket);
-- a §6 connect grant that names no endpoint is not the broker's and is untouched (the
-  VM-to-VM shared-path joins of S0 keep working).
+- no §6 grant that can bind (`bind` or `connect-bind`) equals an endpoint path or is a
+  directory grant containing one, and no §2 `fs.allow` grant with write access covers an
+  endpoint's parent directory. Either would let the workload unlink the broker's socket
+  and bind its own in its place (the workload never owns the broker's socket);
+- a §6 connect grant that names none of this run's endpoints is not this run's broker's.
+  It must not name, and a directory grant must not contain, an endpoint of **another live
+  run** (S4, "endpoint registry"): the VM-to-VM shared-path joins of S0 keep working
+  between workload-owned paths, but no run reaches another run's broker.
 
 The guest address stays where Q7 put it: `guestPort` in the confinement manifest, committed
 by `confinementDigest`. The connections document does not repeat it.
@@ -516,25 +536,50 @@ runner recomputes the digest from `@17`, requires it to equal `@16`, and require
 be byte-equal to its own canonicalization (a non-canonical document is refused, never
 normalized).
 
+**Present** means: `@16` has a non-null pointer, and `@17` has a non-null pointer to
+non-empty text. A non-null `@16` with an empty `algorithm` or `value`, or a non-null empty
+`@17`, is malformed and refused, never read as absent (existing manifest code treats empty
+`@15` text as absent; these fields do not inherit that reading).
+
 **Signing bytes.** Both fields enter `signing_bytes = canonical(RunGrant with signature
 cleared)` (`wire/run-grant.md`) with no change to that rule: they are pointer fields in the
 signed struct, so a signature covers them. A grant that sets neither has null pointers in
 those slots, which canonicalization truncates, so its signing bytes are byte-identical to
 those of the same grant before the fields existed. Existing signatures stay valid.
 
-**What an old daemon does, and why a new field alone is not enough.** A shipped daemon
-skips an unknown pointer field in the binary form, and `capnp_json` skips an unknown key
-(`transport.rs`, `refuse_unknown_limit_keys` documents the same gap for limits). An old
-daemon handed only `@16`/`@17` would start the run without a broker, and the §6 connect
-grant would then reach whatever binds the endpoint path. Default deny requires a refusal,
-so the grant also carries a marker a shipped daemon already refuses:
+**What an old daemon does, and why a new field alone is not enough.** A shipped daemon's
+`capnp_json` decoder walks the schema's fields, so it drops the unknown
+`connectionsDigest` and `connectionsDocument` keys (`transport.rs`;
+`refuse_unknown_limit_keys` documents the same gap for limits). An in-process embedder that
+passes binary bytes keeps the unknown pointers but reads nothing from them. Either way an
+old daemon reads no connections document. What it does next depends on how it verifies:
+
+| old daemon configuration | what refuses the grant | error |
+|---|---|---|
+| `--evidence-store … --trust-key …` (production), JSON transport | the signature check, which runs first: the daemon rebuilds the grant without `@16`/`@17`, so its signing bytes differ from what the issuer signed | `unauthenticated`, "RunGrant signature is not by a trusted issuer" |
+| `--allow-unverified-evidence`, or an in-process embedder passing binary bytes | the marker below | `unsupportedBackend`, "credential broker authority requires a broker integration" |
+| no verifier flags | every start is refused | `unauthenticated` |
+
+A production daemon thus refuses on the signature before it reads the marker. That
+refusal is real but incidental, and it does not hold for an unverified daemon, so the
+grant also carries a marker every shipped daemon refuses whatever its verifier:
 
 - **`credentialBrokerRefs @13` = exactly `["cloister/connections/v1"]`.** Every daemon
-  since execution/v1 first shipped (PR #317) refuses a non-empty `credentialBrokerRefs`
-  with `unsupportedBackend`: "credential broker authority requires a broker integration"
-  (`authorization.rs`). The field is "resolved credential brokers; never credential
-  values", and the connection broker is that broker. The entry names the contract, not a
-  credential, and is inside the signing bytes.
+  since execution/v1 first shipped (PR #317; the text is unchanged at v0.15.0, v0.22.0 and
+  v0.29.0) refuses a non-empty `credentialBrokerRefs` with `unsupportedBackend`:
+  "credential broker authority requires a broker integration" (`authorization.rs`). The
+  check runs before the resolver and the backend, so nothing is spawned. The entry names
+  the contract, not a credential, and is inside the signing bytes.
+- **This gives `@13` a stated meaning, not a second one.** Today the field is documented as
+  "Resolved credential brokers; never credential values", and its only reader is that
+  refusal; the canonical vector carries a broker reference (`broker://claude/paid`). The
+  same change rewrites the field's `$Traits.doc` and the execution/v1 README to define its
+  entries as **the broker integrations the run requires, each named by contract id or
+  broker reference**; reserves `cloister/connections/v1`; and states that a daemon refuses
+  any entry it does not implement. D4 then adds credential-bearing entries under the same
+  meaning: a D4 grant carries the marker plus the brokers it names, and the "exactly the
+  marker" rule below becomes "the marker plus entries D4 defines". Until then the marker
+  plus a `broker://` entry is refused, which fails closed.
 - **The new daemon's rule is all-or-nothing.** `@16`, `@17` and the marker are present
   together or absent together; any other combination is refused with `invalidGrant`,
   naming the missing part. `credentialBrokerRefs` holding anything other than exactly the
@@ -554,14 +599,29 @@ and has a broker, whatever its tier; a tier that cannot serve a connection refus
 by name (S6). A client MUST find the entry before sending a grant with connections. Its
 absence means a daemon older than the first LLO release that ships this slice, and the
 client's refusal names that minimum version *(cloister: as the `casRoot` refusal does)*.
-The old daemon's own refusal is the fixed `credentialBrokerRefs` text above; it cannot name
-a version it predates, so the version is the client's to state.
+The old daemon's own refusal is one of the fixed texts in the table above; it cannot name
+a version it predates, so the version is the client's to state. The version string `"1"`
+follows the revision convention of `cloister/execution/v1/resource-limits` (`"2"`): it
+numbers this extension's layout, not the execution/v1 contract (`"v1"`).
 
-**Consumer surfaces.** The schema change regenerates every checked-in consumer of
-`execution.capnp` (Rust bindings, `execution.tools.json`, the Go and TypeScript fixtures,
-compatibility metadata). Cloister's emitter must reproduce `connectionsDigest` byte for
-byte from the `connections/v1` vectors (`ley-line-open-e9d940`) before it sends one
-*(cloister: conditional on those vectors)*.
+**Consumer surfaces.** The schema change touches:
+
+- `execution.capnp` (normative); the Rust bindings are generated at build time from it and
+  are not committed;
+- `rs/ll-open/cli-lib/src/daemon/execution-tools.json`, regenerated by
+  `task gen:execution-tools` (the `@13` doc text change regenerates it too);
+- the execution/v1 README (the `@13` meaning, the capability table) and `wire/run-grant.md`;
+- `test-vectors/` and `VECTORS.sha256`: a new pinned **connections grant vector**, a grant
+  that sets `@16`/`@17` and the marker, with its canonical bytes and signing-bytes digest,
+  checked by `leyline-schema-spec` and reproduced by cloister. This is the independent
+  oracle for cloister's signer; without it producer and consumer only confirm each other;
+- the published `execution.capnp` asset and the zod schemas built from it (S8 on receipt
+  readers).
+
+No Go execution/v1 consumer exists (`clients/go` mirrors only `ErrorCode`, which this change
+does not touch), and `compatibility.json` carries no execution version. Cloister's emitter
+must reproduce `connectionsDigest` byte for byte from the `connections/v1` vectors
+(`ley-line-open-e9d940`) before it sends one *(cloister: conditional on those vectors)*.
 
 ### S4. Q8 — endpoint allocation (proposed: the issuer allocates, LLO validates)
 
@@ -585,19 +645,44 @@ refuses the run by name with the connection and the reason:
 | the endpoint path does not exist (`lstat` gives `ENOENT`) | `resourceConflict`: "endpoint exists" (another run, a stale socket, a squatter) |
 | the parent exists and is a directory | `invalidGrant`: "endpoint parent missing" |
 | the parent's realpath equals the parent as written | `invalidGrant`: "endpoint parent is reached through a symlink" |
-| the parent is owned by the daemon's effective uid and its mode is exactly 0700 | `invalidGrant`: "endpoint parent not private" |
+| the parent is owned by the daemon's effective uid and its mode is exactly 0700 | `invalidGrant`: "endpoint parent not private". The issuer and the daemon therefore run as one uid in slice 1; an issuer under another uid cannot create a directory the daemon accepts, and is refused by this name rather than accommodated |
+| no live or starting run owns the endpoint or holds a §6 grant on it (the registry below) | `resourceConflict`: "endpoint held by another run" |
 | the full path fits this platform's `sun_path` | `invalidGrant`: "endpoint path too long" (the 103-byte parse rule makes this unreachable on the supported platforms; it stays as the platform check) |
 | no two connections share a path | refused at parse (S2) |
 
 The broker binds every endpoint before the run reports ready, and before the workload's
 confinement compiles, which §6's ordering rule requires of a connect grant *(cloister:
 `up` waits for the socket to exist)*. Slice 1 allocates nothing on the issuer's behalf, so
-`StartOutput` gains no field. The broker unlinks its sockets when it exits and the
-supervisor unlinks any it left; the channel directory is the issuer's to remove.
+`StartOutput` gains no field. The broker cannot unlink anything (its profile denies the
+filesystem, S5); the supervisor unlinks the endpoints at teardown. After a supervisor that
+was killed, the socket files stay, and the next run naming them is refused "endpoint
+exists": stale nodes fail closed. The channel directory is the issuer's to remove.
 
 Checking ownership and mode closes a gap the issuer's convention leaves to discipline: a
 0700 directory owned by another uid, or reached through a symlink, would let a process
 outside the run choose what the path resolves to between the issuer's check and the bind.
+The checks and the bind are by path, not by directory descriptor; a same-uid process could
+still swap the parent between them. That is the same-uid residual of S10; binding through
+a directory descriptor (`bindat` where the platform has it) would narrow it.
+
+**Endpoint registry.** The 0700 parent and a uid check stop other users, not other runs:
+every run's VMM, and on native macOS every workload, runs as the daemon's uid. Without a
+further rule, run B could carry a plain §6 connect grant (the S0 shared-path join) on run
+A's endpoint, reach A's target, which B's grant never named, and have its traffic counted
+in A's receipt. So the daemon keeps, under one lock, a registry of every live or starting
+run's broker endpoints and of every §6 path (and directory grant) each live or starting
+run's manifest names. At start, under that lock and before anything is spawned:
+
+- a run whose §6 grant names, or whose directory grant contains, an endpoint another run
+  owns is refused (`invalidGrant`, naming the path);
+- a run whose endpoint another run's §6 grant already names or contains is refused
+  (`resourceConflict`), which closes the ordering race in which B passes its check before A
+  registers and compiles after A binds.
+
+On the microVM tier the broker also checks the connecting peer's pid (`LOCAL_PEERPID` on
+macOS) against the run's worker, which hosts the VMM, and closes any other peer without a
+dial. The registry covers both tiers; the pid check is a second layer where the run has one
+peer process.
 
 ### S5. The relay: allow-list enforcement and failure behaviour (proposed)
 
@@ -609,19 +694,35 @@ outside the run choose what the path resolves to between the issuer's check and 
   no way to steer it.
 - One upstream dial per accepted connection; no pooling, no reuse across connections, no
   dial before a connection arrives.
+- **The document arrives over the control pipe, and the broker attests it.** The
+  supervisor writes the authorized canonical document to the broker's control pipe (not
+  argv, not a file). The broker's ready report echoes the `connectionsDigest` of what it
+  parsed, bound and confined to; the supervisor compares it with the grant's `@16` and
+  refuses the start on a mismatch. This is the worker precedent, whose ready event echoes
+  the applied confinement digest for the supervisor to compare (`backends/native.rs`, bead
+  `ley-line-open-7a3109`).
 - **Bind, then confine.** The broker binds every endpoint, then applies its LLO-internal
-  nono profile to itself, then reports ready. The profile denies the filesystem entirely
-  (accepting on an already-bound listener needs no path right), allows outbound TCP to
-  `localhost:<port>` for each declared port and nothing else, and allows no inbound TCP,
-  no listen, no exec. Two layers enforce the allow-list: the broker's code dials one
-  address per listener, and its sandbox refuses any other port.
-- The peer is checked on accept: `getpeereid` must give the daemon's effective uid (on the
-  microVM tier the peer is the run's VMM). Another uid is closed without a dial and counted
-  as a refusal.
+  nono profile to itself, then reports ready. Two layers enforce the allow-list: the
+  broker's code dials one address per listener, and its sandbox refuses any other port.
+  What nono emits on macOS is not "deny everything else": its base profile always allows
+  `process-exec*`, `process-fork`, `mach-lookup` (minus keychain services), the
+  mDNSResponder socket, `sysctl-read`, `ipc-posix-shm*` and `file-read*` on `/`. The broker
+  profile is therefore nono's base plus explicit `platform_rule` denies, which nono emits
+  after its allows so the deny wins: `process-exec*`, `process-fork`, the mDNSResponder
+  path (no resolver, matching "no names"), `file-read*` and `file-write*` everywhere, and
+  `mach-lookup` beyond the services the Rust runtime needs (the set is fixed by the spike).
+  Outbound TCP is allowed to `localhost:<port>` for each declared port and nothing else;
+  no inbound TCP, no TCP listen. Accepting on the already-bound UNIX listener needs no path
+  right; S11's positive control proves the confined broker still accepts and relays.
+- The peer is checked on accept: `getpeereid` must give the daemon's effective uid, and on
+  the microVM tier `LOCAL_PEERPID` must be the run's worker (S4, "endpoint registry"). Any
+  other peer is closed without a dial and counted in `foreignPeers` (S8).
 
 **Failure modes.** A guest connection is accepted by the guest init relay before it reaches
 the host (patch 0010), so a guest client never sees `ECONNREFUSED` from a declared port; it
-sees bytes or end-of-file *(cloister: refused or EOF)*.
+sees bytes or end-of-file *(cloister: refused or EOF)*. One exception: a guest that has
+written bytes the relay never read when the relay closes may get a reset from the guest
+kernel, and then sees `ECONNRESET` instead of end-of-file. Either way no byte arrives.
 
 | event | broker behaviour | the guest sees |
 |---|---|---|
@@ -651,23 +752,42 @@ cloister's build check owns `minStrength`.
 | microVM, Linux | refused by name | `guestPort` is refused off macOS until it runs live there (Q7) |
 | native Linux | refused by name | §6 is refused at Landlock ≤ ABI 7; `endpoint {"tcp"}` (D5's `connectLocal` form) is not delivered in slice 1 |
 
-Refusal is `unsupportedBackend`, naming the tier and the connection, before anything is
-spawned (D7 rule 3). Native macOS falls out because nothing in the broker is tier-specific:
-only the cross-document rule's expected §6 spelling differs.
+Refusal is `unsupportedBackend`, naming the tier and the connection, raised by the service
+before anything is spawned (S7 step 2; D7 rule 3). This is a new check: the existing
+`guestPort`-off-macOS and Landlock §6 refusals are `invalidSpec`, raised inside the worker
+after it is spawned, and stay as a second layer. Native macOS falls out because nothing in
+the broker is tier-specific: only the cross-document rule's expected §6 spelling differs.
 
 ### S7. Lifecycle (proposed)
 
-Ordering inside `start`, each step refusing the run on failure before the next:
+**The broker is owned by `ExecutionService`, not by a backend.** `ExecutionService::start`
+is the chokepoint the direct-request path cannot route around, and the broker is
+tier-agnostic (S6), so the service spawns and supervises it and the connections document
+travels on `ExecutionRequest` beside the confinement manifest. A backend sees only a
+confinement whose §6 paths are already bound.
+
+Ordering inside `ExecutionService::start`, each step refusing the run on failure before the
+next:
 
 1. authorize the grant, including S3's all-or-nothing rule and the digest check;
-2. parse the document (S2), run the cross-document rule (S2) and the endpoint checks (S4);
-3. spawn the broker and record it in the run's state **before** waiting for readiness, so
-   `cancel` in that window kills it (the second defect of `ley-line-open-f963e6`);
-4. the broker binds every endpoint, confines itself, and reports ready over its control
-   pipe; no ready report within a bound (proposed: 5 s) kills it, unlinks the endpoints and
-   fails the start on the existing failed-start path (D7 rule 4);
+2. parse the document (S2); check the tier (S6); run the cross-document rule (S2) and the
+   endpoint checks, registering the run in the endpoint registry under its lock (S4);
+3. spawn the broker and record the run as starting with its broker, **before** waiting
+   for readiness;
+4. send the document; the broker binds every endpoint, confines itself, and reports ready
+   with the digest it ran (S5); no matching ready report within a bound (proposed: 5 s)
+   fails the start (D7 rule 4);
 5. compile the workload's confinement (§6 connect paths now resolve) and start the
-   workload.
+   workload through the backend.
+
+**Any failure after step 3** (a ready timeout or digest mismatch, a resolver error, a
+worker spawn or compile failure, a `workspaceUnserved` refusal, the failed-cancel path)
+kills the broker, unlinks its endpoints and removes the run from the registry before the
+start returns. **Cancel during start** acts on a starting run: today `service.cancel` looks
+only at `state.runs`, and a starting run lives in `state.starting` until `backend.start`
+returns, so the service's cancel must also reach `starting` and kill the broker (and the
+worker, if spawned). `ley-line-open-f963e6` names the same window one layer down, in
+`KrunWorkerBackend::cancel`; the slice needs it at the service layer.
 
 **Owned by the run, including when the supervisor dies** *(cloister; `ley-line-open-f963e6`)*.
 The broker inherits the read end of a lifeline pipe whose only write end the supervising
@@ -676,36 +796,59 @@ closing its listeners and every connection. This works on macOS, which has no
 `PR_SET_PDEATHSIG`, and is the mechanism f963e6 asks for the krun worker; the two share one
 implementation. Slice 1 does not ship before f963e6's parent-death fix, or ships that fix
 with it: otherwise a broker outlives a killed supervisor exactly as a worker does today.
-At every terminal state the supervisor closes the lifeline, kills the broker's process
-group and unlinks the endpoints.
+
+The lifeline holds only if no other process inherits its write end. macOS has no `pipe2`,
+so close-on-exec is set after the pipe is created, and the daemon starts runs concurrently
+and spawns workers with `posix_spawn`: another run's worker spawned in that window would
+inherit run A's write end and keep A's broker alive after A's supervisor dies. Every spawn
+the daemon makes (brokers and workers) therefore uses `POSIX_SPAWN_CLOEXEC_DEFAULT` with an
+explicit list of inherited descriptors, so no descriptor crosses a spawn unless named. The
+broker's control pipe follows the same rule.
+
+**Teardown drains before it kills.** At every terminal state the supervisor asks the broker
+over the control pipe to stop accepting and report a final record for every connection,
+open ones included; it waits a bound (proposed: 1 s), then closes the lifeline, kills the
+broker's process group and unlinks the endpoints. A connection open for the run's whole
+life is thus in the receipt (S8).
 
 ### S8. The receipt (proposed)
 
 Additive `RunReceipt` fields:
 
 ```capnp
-connectionsDigest @15 :DigestRef               $Traits.optional;  # the document the broker ran
+connectionsDigest @15 :DigestRef               $Traits.optional;  # the document the broker attested in its ready report (S5)
 connections       @16 :List(ConnectionOutcome) $Traits.optional;  # one per connection, in document order
 
 struct ConnectionOutcome {
   name            @0 :Text;    # the connection's name
   target          @1 :Text;    # the literal dialled, "127.0.0.1:30080"
-  accepted        @2 :UInt64;  # connections accepted on the endpoint
-  dialled         @3 :UInt64;  # upstream dials that succeeded
-  refused         @4 :UInt64;  # accepted, closed without an upstream (refused, hold expired, dial error, cap, foreign peer)
-  bytesToTarget   @5 :UInt64;
-  bytesFromTarget @6 :UInt64;
+  accepted        @2 :UInt64;  # connections accepted on this run's endpoint from this run's peer
+  dialed          @3 :UInt64;  # of those, the ones whose upstream dial succeeded
+  refused         @4 :UInt64;  # of those, the ones closed without an upstream (hold expired, dial error, cap)
+  foreignPeers    @5 :UInt64;  # connections closed at accept because the peer was not this run's (S5); not in accepted
+  complete        @6 :Bool;    # true when every accepted connection has a final record
+  bytesToTarget   @7 :UInt64;
+  bytesFromTarget @8 :UInt64;
 }
 ```
 
-*(cloister: each upstream dialled, the connection count, and refusals.)* The broker reports
-each connection's record to the supervisor over its control pipe when the connection ends,
-so the receipt is assembled by the supervisor, not by the broker or the workload. After a
-broker crash, the receipt carries every record reported before it; connections open at the
-crash are absent, and the run's terminal state is `failed`. The receipt carries no payload
-byte, no guest address and no peer pid. A consumer that predates the fields reads a
-receipt without them; absence is "no connections", which is true of every run such a
-daemon produced.
+*(cloister: each upstream dialled, the connection count, and refusals.)* The counts mean:
+`accepted = dialed + refused` when `complete` is true; when it is false (the broker
+crashed), the counts are lower bounds. Every count is attributed to this run because only
+this run's peer is accepted (S4, S5). The broker reports each connection's record over its
+control pipe when the connection ends, and a final record for each open connection at the
+teardown drain (S7), so the receipt is assembled by the supervisor, not by the broker or
+the workload. After a broker crash the receipt carries every record reported before it,
+`complete` is false, and the run's terminal state is `failed`. The receipt carries no
+payload byte, no guest address and no peer pid.
+
+**Receipt readers.** A receipt from a run without connections is byte-identical to today's,
+in both the canonical Cap'n Proto form and the JSON carrier (null pointers are omitted).
+A receipt from a run with connections carries two new keys, and the strict consumers
+generated from the published asset (zod `.strict()`, JSON Schema
+`additionalProperties: false`) built from v0.29.0 or earlier reject it. The receipt change
+is therefore conditionally compatible: a reader must use the asset from the first release
+that ships this slice before it reads receipts from runs with connections.
 
 ### S9. macOS and kind (deployment note only)
 
@@ -728,56 +871,84 @@ loopback services; the receipt's accuracy. There is no credential.
 | workload steers the broker | an address in the stream | the broker parses nothing; the target is fixed per listener (S5) |
 | a name resolves elsewhere at dial time | DNS answer changes | no names: IP literals only (S2) |
 | endpoint squatting or a shared path | a process binds the path first; two runs share a directory | pre-existing path refused; parent must be a non-symlinked 0700 directory owned by the daemon's uid; bind before the workload's confinement compiles (S4) |
-| a local process uses the broker | connects to the endpoint | the parent is 0700 and the peer uid is checked; a same-uid process could already dial the loopback target itself, so it gains no reach (residual, accepted) |
+| another run reaches this run's broker | its §6 grant names this run's endpoint (the S0 shared-path join), its VMM running under the daemon's uid | the endpoint registry refuses either run at start, whichever registers second (S4); on the microVM tier the broker accepts only its own worker's pid (S5) |
+| an unconfined local process uses the broker | connects to the endpoint | the parent is 0700 and the peer uid is checked; a same-uid unconfined process could already dial the loopback target itself, so it gains no reach (residual, accepted); on the microVM tier the pid check refuses it too |
+| the workload replaces the broker's socket | unlinks the endpoint and binds its own (native macOS) | no §6 bind-capable grant on or containing an endpoint and no §2 write grant on its parent (S2) |
 | upstream impersonation | another process holds the loopback port | not closed in slice 1: the edge is `policy` (S5); the receipt records the address, not the process |
 | document tampered or swapped | config is ambient | `@16`/`@17` inside the signed grant; digest recomputed; non-canonical refused (S3) |
-| an old daemon ignores the fields | unknown fields skipped | the `credentialBrokerRefs` marker is refused by every shipped daemon; clients check the capability first (S3) |
+| an old daemon ignores the fields | unknown fields skipped | a verifying daemon refuses on the signature; every shipped daemon refuses the `credentialBrokerRefs` marker; clients check the capability first (S3) |
+| the broker runs a different document | wrong bytes delivered | the ready report echoes the digest it ran; the supervisor compares it with `@16` (S5) |
 | resource exhaustion | many connections, a stuck upstream | per-run connection cap; per-connection 10 s hold only on `ECONNREFUSED`; fixed buffers (S5) |
-| broker compromise | a bug in the copy loop | no parser, no credential; profile denies the filesystem and every port but the targets (S5) |
-| broker outlives the run | supervisor killed; cancel before ready | lifeline pipe; recorded before readiness wait (S7) |
+| broker compromise | a bug in the copy loop | no parser, no credential; profile denies the filesystem, exec, fork, the resolver and every port but the targets (S5) |
+| broker outlives the run | supervisor killed; cancel during start; a failure after spawn | lifeline pipe with no inherited copies of its write end; the service's cancel reaches starting runs; every failure after step 3 kills the broker (S7) |
 | descriptor passing | `SCM_RIGHTS` over the UNIX socket | `read(2)`/`write(2)` only (S5) |
 | a declared connection silently not delivered | tier cannot express it; broker fails to bind | the run is refused by name (S2, S4, S6, S7) |
 
 ### S11. Tests that close it
 
-Hermetic (no hypervisor; in `task ci`):
+Hermetic (no hypervisor). Hosted CI and the mutation job run on Linux, where slice 1 is
+only refusals, so the tests marked *macOS* run in the macOS gates: local `task ci` on macOS
+and the release dry-run's macOS job. Linux CI is not cited as evidence of macOS
+enforcement.
 
 - **Schema** (`leyline-schema-spec`, closes S2): the canonical vector and its pinned digest;
-  one vector per parse refusal in S2's table; a non-sorted input that canonicalizes to the
-  canonical vector.
+  one vector per parse refusal in S2's table, including a NUL, a control character and a
+  non-ASCII byte in a path, a float and a string port, `127.0.0.2`, `::1` and `localhost`;
+  a non-sorted input that canonicalizes to the canonical vector; an independent Python
+  canonicalizer that reaches the pinned digest.
+- **Grant vector** (closes S3): the pinned connections grant vector (S3, consumer
+  surfaces): canonical bytes and signing-bytes digest, checked by `leyline-schema-spec`;
+  a grant without the fields keeps its signing bytes (byte-equal to a pinned pre-field
+  fixture).
 - **Authorization** (closes S3): every combination of `@16`, `@17` and the marker (only
-  all-or-nothing is accepted); a digest mismatch; a non-canonical `@17`; a signed grant
-  without the fields keeps its signing bytes (byte-equal to a pinned pre-field fixture).
-- **Old daemon** (closes S3's default deny): a pinned fixture grant with the fields and the
-  marker, fed to the v0.29.0 release's `execution-daemon` once and recorded in the bead,
-  refuses with the `credentialBrokerRefs` text; in CI, the current daemon built without a
-  broker refuses the same fixture the same way.
+  all-or-nothing is accepted); a non-null empty `@16` or `@17`; a digest mismatch; a
+  non-canonical `@17`; the marker plus a `broker://` entry is refused; the binary path
+  through `authorize_with_verifier` with a trusted key refuses a fields-plus-marker grant
+  on a daemon built without a broker with the marker text.
+- **Old daemon** (closes S3's default deny): the pinned grant vector fed once to the
+  v0.29.0 release's `execution-daemon` in each verifier mode, recorded in the bead:
+  `--trust-key` gives the `unauthenticated` signature refusal, `--allow-unverified-evidence`
+  gives the `credentialBrokerRefs` text.
 - **Capabilities** (closes S3): `capabilities_json` carries the connections entry.
-- **Cross-document and endpoint checks** (closes S2, S4): matching and mismatching pairs;
-  existing path, missing parent, symlinked parent, mode 0755, foreign owner.
+- **Generated surfaces** (closes S3, S8): `execution-tools.json` shows the new fields and
+  the rewritten `@13` description; a zod schema from the v0.29.0 asset rejects a
+  connections receipt and the new asset accepts it; a receipt without connections is
+  byte-identical JSON.
+- **Cross-document and endpoint checks** (closes S2, S4): matching and mismatching pairs; a
+  `connect-bind` directory grant over the channel directory; a §2 write grant on the
+  parent; existing path, missing parent, symlinked parent, mode 0755, foreign owner.
+- **Registry** (closes S4's run isolation): run B whose only §6 grant names run A's endpoint
+  is refused, in both start orders (B before A registers, B after); A's receipt shows no
+  connection from B.
 - **Relay** (closes S5), a broker against a UNIX client and a TCP echo on loopback: bytes
   round-trip; half-close in each direction; upstream down then up within the hold; down
   past the hold gives end-of-file in no more than 10 s plus one backoff step; a client that
   hangs up ends the hold early; reset mid-stream; the cap; a second listener on another
   loopback port receives no connection; a passed `SCM_RIGHTS` descriptor never reaches the
-  target and is closed.
-- **Profile** (closes S5, macOS): the confined broker gets `EPERM` connecting to an
-  undeclared loopback port and opening any file.
+  target and is closed; a ready report whose digest differs from `@16` refuses the start.
+- **Profile** (closes S5; *macOS*): the whole relay suite runs again with the broker
+  confined, as the positive control (accept and relay still work). Under the profile the
+  broker gets `EPERM` connecting to an undeclared loopback port, opening any file,
+  `execve`, `fork`, connecting to mDNSResponder, and `getaddrinfo` fails.
 - **Lifecycle** (closes S7): SIGKILL the supervising process and the broker is gone within
-  a bound; cancel between spawn and ready leaves no broker and no endpoint; a broker killed
-  mid-run fails the run.
-- **Receipt** (closes S8): counts match a scripted sequence of accepted, dialled and refused
-  connections.
-- **Native macOS e2e** (closes S6 for that tier): a native workload dials the endpoint path
-  and reaches the echo.
+  a bound; `ExecutionService::cancel` during a stalled ready wait leaves no broker and no
+  endpoint; a forced failure at step 5 leaves no broker and no endpoint; a broker killed
+  mid-run fails the run; N concurrent starts leave each lifeline write end held only by
+  the supervisor (checked with `lsof`).
+- **Receipt** (closes S8): counts match a scripted sequence of accepted, dialed, refused and
+  foreign-peer connections; a connection held open across workload exit appears with
+  `complete` true; after a broker kill, `complete` is false.
+- **Native macOS e2e** (closes S6 for that tier; *macOS*): a native workload dials the
+  endpoint path and reaches the echo.
 
 Hypervisor-gated (`LEYLINE_REQUIRE_HYPERVISOR=1`, macOS, in the release hypervisor gate):
 
 - A host TCP echo on `127.0.0.1:E`; a document declaring one connection to `E`; a manifest
   with a §6 connect grant on the endpoint with `guestPort` G. A static guest binary dials
-  `127.0.0.1:G`, writes bytes and reads them back. It then dials `127.0.0.1:G'` (undeclared)
-  and gets `ECONNREFUSED`, and dials the host's echo directly and fails (I1). A second host
-  listener on `127.0.0.1:F` receives nothing. The receipt records one connection to
+  `127.0.0.1:G`, writes bytes and reads them back. It then dials `127.0.0.1:G'`
+  (undeclared) and gets `ECONNREFUSED`, and dials a non-loopback address of the host (its
+  LAN address, and the gateway address a NAT backend would use) and fails (I1). A second
+  host listener on `127.0.0.1:F` receives nothing. The receipt records one connection to
   `127.0.0.1:E`.
 - The echo starts 2 s after the guest dials: the connection works. The echo never starts:
   the guest reads end-of-file within the hold, and the receipt counts one refusal.
@@ -788,25 +959,45 @@ Hypervisor-gated (`LEYLINE_REQUIRE_HYPERVISOR=1`, macOS, in the release hypervis
 
 - `rs/ll-core/schema-spec/connections/v1/` (README, schema, vectors, digest pins) and the
   `leyline-schema-spec` tests: bead `ley-line-open-e9d940`, scoped to S2.
-- `execution.capnp`: `RunGrant @16 @17`, `RunReceipt @15 @16`, `ConnectionOutcome`;
-  regenerated bindings, `execution.tools.json`, consumer fixtures, compatibility metadata;
-  `run-grant.md` and the execution/v1 README.
-- `leyline-runtime`: authorization (S3), the transport capability entry, a broker module
-  (preflight, relay, profile, control pipe), the `start` ordering and receipt assembly
-  (S7, S8), the native and libkrun backends' spawn order; a new LLO binary beside
+- `execution.capnp`: `RunGrant @16 @17`, the `@13` doc text, `RunReceipt @15 @16`,
+  `ConnectionOutcome`; `execution-tools.json` regenerated; the execution/v1 README,
+  `run-grant.md`, the connections grant vector and `VECTORS.sha256`.
+- `leyline-runtime`: authorization (S3); the transport capability entry; `ExecutionService`
+  start ordering, the endpoint registry, cancel of starting runs and failure teardown (S4,
+  S7); `ExecutionRequest` carrying the document; a broker module (preflight, relay, profile,
+  control pipe, drain) and receipt assembly (S5, S8); spawn with
+  `POSIX_SPAWN_CLOEXEC_DEFAULT` for brokers and workers; a new LLO binary beside
   `leyline-native-worker`. The lifeline pipe is shared with `ley-line-open-f963e6`.
 - **No libkrun patch.** Patch 0010's dial channel already joins guest loopback to the host
   path through vsock; the broker is the listener at that path.
-- Cloister: emit the document, the digest and the marker; check the capability.
+- Cloister: emit the document, the digest and the marker; check the capability; read
+  receipts with the new asset.
 
 ### S13. Slice-1 questions for the owner
 
-- **S-Q1.** Accept the `credentialBrokerRefs` marker as the old-daemon refusal (S3), or
-  accept that only clients that check capabilities are protected.
+- **S-Q1.** Accept the `credentialBrokerRefs` marker and the restated meaning of `@13` as
+  the old-daemon refusal (S3), or accept that an unverified old daemon is protected only by
+  clients that check capabilities.
 - **S-Q2.** The per-run connection cap: a fixed 256, or a document field.
-- **S-Q3.** `::1` as a target, or IPv4 loopback only.
+- **S-Q3.** Targets beyond `127.0.0.1` (`127.0.0.0/8`, `::1`), once a probe shows whether
+  Seatbelt's `localhost` filter matches them; S8's `target` text would then need an IPv6
+  form (`[::1]:p`).
 - **S-Q4.** Per-connection outcomes as receipt fields (S8), or a content-addressed detail
   document the receipt names by digest.
+- **S-Q5.** Slice 1 ships with, not before, the f963e6 parent-death fix (S7).
+
+Out of scope for slice 1, recorded from review:
+
+- **D4 and `@13`.** When credentials arrive, the "exactly the marker" rule becomes "the
+  marker plus the broker entries D4 defines" (S3).
+- **Signing bytes of a cleared signature (pre-existing).** `wire/run-grant.md` says a
+  cleared `signature` canonicalizes to a null pointer that canonicalization drops, but
+  `grant_signing_bytes` clears it with `init_signature()`, which leaves a non-null pointer
+  to an empty struct, and `signature @14` is no longer the last pointer since `@15`. An
+  independent signer that writes a null pointer would get different bytes. Not caused by
+  this slice; it needs a test that pins one reading and a fix to whichever text is wrong.
+- **Path-based checks.** The endpoint checks and bind go by path; binding through a
+  directory descriptor would close the same-uid swap window (S4).
 
 ---
 

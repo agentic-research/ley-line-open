@@ -820,7 +820,8 @@ const GRANT_SIGNATURE_ALGORITHM: &str = "ed25519";
 /// "Cleared" is `init_signature()`: the field is set to an empty
 /// `GrantSignature` struct, a non-null pointer canonicalization keeps. These
 /// are therefore NOT the canonical bytes of the grant with `signature`
-/// omitted (they are 24 bytes longer), and an issuer outside this library
+/// omitted (different bytes; 24 longer when nothing after `signature` is
+/// set), and an issuer outside this library
 /// must sign this form (`wire/run-grant.md`;
 /// `test-vectors/run-grant-signing.json` pins it).
 pub fn grant_signing_bytes(grant_bytes: &[u8]) -> Result<Vec<u8>, ExecutionError> {

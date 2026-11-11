@@ -2886,8 +2886,9 @@ fn run_grant_signing_vector_pins_the_signed_bytes() {
         let signature =
             leyline_envelope::sign_payload(GRANT_SIGNATURE_PAYLOAD_TYPE, &signing, &signer);
         // The covered bytes are the canonical grant with `signature` set to
-        // an EMPTY struct, not omitted: 24 bytes longer than the canonical
-        // form of the grant as built above, which has no signature at all.
+        // an EMPTY struct, not omitted. For these grants, which set nothing
+        // after `signature`, that is 24 bytes longer than the canonical form
+        // of the grant as built above, which has no signature at all.
         let canonical = |empty_signature: bool| {
             let mut copy = Builder::new_default();
             copy.set_root(

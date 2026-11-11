@@ -5,7 +5,9 @@ use std::process::Command;
 
 use leyline_runtime::DigestRef;
 use leyline_runtime::artifacts::rootfs_manifest::{FileSpec, RootfsSpec, cas_directory_mode};
-use leyline_runtime::backends::libkrun::plan::ResolvedRootfs;
+use leyline_runtime::backends::libkrun::plan::{
+    DirectoryRootfsResolver, ResolvedRootfs, RootfsResolver,
+};
 use leyline_runtime::backends::libkrun::volume::{
     materialize_ephemeral_rootfs, verify_ephemeral_rootfs,
 };
@@ -570,6 +572,43 @@ fn a_cas_entrys_extended_attributes_never_reach_the_copy() {
             !names.contains(OVERRIDE),
             "/{relative} carries {OVERRIDE}: {names:?}"
         );
+    }
+}
+
+/// A CAS entry built by anything but the importer, whose own manifest puts
+/// a link at a guest mount point (`work -> usr/bin`, `proc -> etc`), is
+/// refused by the resolver and by the materializer, so it never reaches a
+/// VM (bead `ley-line-open-10b516`).
+#[test]
+fn a_hand_built_entry_with_a_link_at_a_mount_point_never_resolves() {
+    let _serial = common::serial();
+    for name in ["work", "proc"] {
+        let fixture = TempDir::new().expect("fixture");
+        let mut spec = RootfsSpec::empty_v2();
+        spec.directories.insert("usr".into(), 0o755);
+        spec.symlinks.insert(name.into(), "usr".into());
+        let manifest = spec.to_canonical_v2();
+        let digest = blake3::hash(&manifest).to_hex().to_string();
+        let cas = fixture.path().join("cas");
+        let root = cas.join(&digest);
+        fs::create_dir_all(root.join("usr")).unwrap();
+        symlink("usr", root.join(name)).unwrap();
+        fs::write(root.join("rootfs.manifest.json"), &manifest).unwrap();
+        let digest = DigestRef {
+            algorithm: "blake3-256".into(),
+            value: digest,
+        };
+        let error = DirectoryRootfsResolver::new(&cas)
+            .resolve(&digest)
+            .expect_err(name);
+        assert!(error.detail.contains(&format!("/{name}")), "{name}: {error:?}");
+        let source = ResolvedRootfs {
+            digest,
+            canonical_path: root.canonicalize().unwrap(),
+        };
+        let destination = fixture.path().join("run-root");
+        fs::create_dir(&destination).unwrap();
+        materialize_ephemeral_rootfs(&source, &destination).expect_err(name);
     }
 }
 

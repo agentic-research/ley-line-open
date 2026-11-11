@@ -44,10 +44,10 @@ pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
 /// workload's own bytes and is held only to what an environment can hold:
 ///
 /// - a key is non-empty, and holds neither `=` nor NUL; a value holds no NUL;
-/// - no key starts with `KRUN_`. Init applies the file's environment before
-///   it reads its own settings (its mounts, its loopback channels, its
-///   rlimits, `KRUN_CONFIG`, ...), so such a key would configure init: those
-///   are set by the worker or by no one.
+/// - no key starts with `KRUN_`. Init reads some of its settings from its
+///   environment after it applies the file's (`KRUN_RLIMITS`,
+///   `KRUN_WORKDIR`, `KRUN_INIT`, `KRUN_INIT_PID1`), so such a key would
+///   configure init: its settings are set by the worker or by no one.
 ///
 /// The executable still rides the command line, as libkrun's `KRUN_INIT`
 /// (required by `krun_set_exec`, ignored by init under `KRUN_CONFIG_ARGV`):

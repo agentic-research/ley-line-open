@@ -33,9 +33,10 @@ mod hypervisor;
 
 /// Prints `argv <hex>` for each argument after argv[0], `env <name> <hex>`
 /// (or `env <name> -`) for each variable named in its own first argument's
-/// list, `dummy0 yes|no` for whether init brought up the TSI dummy
-/// interface, `uid <n>` for its own real uid, and `config yes|no` for
-/// whether the exec config is still in its root.
+/// list, `dummy0 up|down|absent` for whether init's TSI setup brought up
+/// the dummy interface, `cmdline <hex>` for each kernel command-line token,
+/// `uid <n>` for its own real uid, and `config yes|no` for whether the exec
+/// config is still in its root.
 const ARGV_PROBE: &str = r#"use std::os::unix::ffi::OsStrExt;
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -53,8 +54,21 @@ fn main() {
             None => println!("env {} -", name.to_string_lossy()),
         }
     }
-    let dummy = std::path::Path::new("/sys/class/net/dummy0").exists();
-    println!("dummy0 {}", if dummy { "yes" } else { "no" });
+    // The kernel's dummy driver creates dummy0 by itself; what init's TSI
+    // setup does is bring it up (IFF_UP, bit 0 of its flags).
+    let dummy = match std::fs::read_to_string("/sys/class/net/dummy0/flags") {
+        Ok(flags) => {
+            let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16)
+                .expect("dummy0's flags");
+            if flags & 1 == 1 { "up" } else { "down" }
+        }
+        Err(_) => "absent",
+    };
+    println!("dummy0 {dummy}");
+    let cmdline = std::fs::read_to_string("/proc/cmdline").expect("the kernel command line");
+    for token in cmdline.split_whitespace() {
+        println!("cmdline {}", hex(token.as_bytes()));
+    }
     let status = std::fs::read_to_string("/proc/self/status").expect("its status");
     let uid = status
         .lines()
@@ -240,8 +254,38 @@ fn the_guest_receives_its_argv_and_environment_byte_for_byte() {
         "init removes the exec config before the workload runs:\n{}",
         output.stdout_tail
     );
+    // f7f862: the request's words never reach the kernel command line, so a
+    // `tsi_hijack` inside a value cannot turn on init's TSI setup. Hijacking
+    // is off for this run: no such token, and init leaves dummy0 down.
+    let cmdline: Vec<String> = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("cmdline "))
+        .map(|token| {
+            let bytes: Vec<u8> = (0..token.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&token[i..i + 2], 16).expect("hex"))
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .collect();
     assert!(
-        lines.contains(&"dummy0 no"),
+        cmdline.iter().any(|token| token == "KRUN_CONFIG_ARGV=1"),
+        "the probe read the kernel command line: {cmdline:?}"
+    );
+    for token in &cmdline {
+        assert!(
+            !token.contains("tsi_hijack"),
+            "no TSI token on the command line: {cmdline:?}"
+        );
+        for name in environment.keys() {
+            assert!(
+                !token.starts_with(&format!("{name}=")),
+                "the request's environment stays off the command line: {cmdline:?}"
+            );
+        }
+    }
+    assert!(
+        !lines.contains(&"dummy0 up"),
         "a value cannot turn on init's TSI setup:\n{}",
         output.stdout_tail
     );

@@ -13,14 +13,17 @@ const MAX_SYMLINK_HOPS: usize = 40;
 
 /// The top-level directories libkrun's guest init mounts a kernel
 /// filesystem over before the workload runs (`mount_filesystems` in
-/// `rs/third_party/libkrun/src/init_blob/init/init.c`): devtmpfs on `/dev`
-/// (init.c:559, then devpts on `/dev/pts` at :603 and tmpfs on `/dev/shm` at
-/// :610), proc on `/proc` (:575), sysfs on `/sys` (:582, then cgroup2 on
-/// `/sys/fs/cgroup` at :589). Each mount either succeeds, is already there
-/// (`EBUSY`), or makes init exit before anything runs (:1905-1908). Since
-/// LLO patch `0012` (bead `ley-line-open-db5899`), `mount_tmp`, called from
-/// the same function on every non-TDX boot, also mounts a tmpfs on `/tmp`
-/// or stops the guest. Nothing an image holds beneath these is visible to
+/// `rs/third_party/libkrun/src/init_blob/init/init.c`, cited by function
+/// name because LLO's patches move its lines): devtmpfs on `/dev` (then
+/// devpts on `/dev/pts` and tmpfs on `/dev/shm`), proc on `/proc`, and sysfs
+/// on `/sys` (then cgroup2 on `/sys/fs/cgroup`). Each mount either succeeds,
+/// is already there (`EBUSY`), or makes `mount_filesystems` fail, and `main`
+/// then exits before anything runs. Since LLO patch `0012` (bead
+/// `ley-line-open-db5899`), `mount_tmp`, called from `mount_filesystems` on
+/// every non-TDX boot, also mounts a tmpfs on `/tmp` or stops the guest. A
+/// granted workspace is mounted on `/work` by `mount_virtiofs_list`, which
+/// is why a link that reaches `/work` is refused (see
+/// `workspace_mount_point`). Nothing an image holds beneath these is visible to
 /// the workload, and nothing a link names beneath them is the image's to
 /// supply: an image's `tmp/` content is shadowed by the empty tmpfs just as
 /// its `dev/` nodes are by devtmpfs.

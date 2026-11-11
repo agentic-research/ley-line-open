@@ -70,7 +70,15 @@ pub enum Slow {
     Body,
     /// Send the body one byte at a time, this far apart.
     Drip(Duration),
+    /// Send the response headers one byte at a time and never finish them
+    /// (bead `ley-line-open-b1c18d`: a header trickle), bursting around the
+    /// client's header deadline, this long after the request arrives.
+    HeaderDrip(Duration),
 }
+
+/// How long a header trickle lasts before the server gives up on it: far
+/// longer than any test's bound, so only the client can end it sooner.
+pub const HEADER_TRICKLE_FOR: Duration = Duration::from_secs(20);
 
 impl Default for Behavior {
     fn default() -> Self {
@@ -222,6 +230,35 @@ fn handle(stream: TcpStream, state: &Mutex<State>, origin: &str) {
             let _ = stream.write_all(&bytes);
             let _ = stream.flush();
         }
+        Response::HeaderDrip(deadline) => {
+            if stream.write_all(b"HTTP/1.1 200 OK\r\nX-Trickle: ").is_err() {
+                return;
+            }
+            // The server side of a header trickle, timed against the
+            // client's header deadline (`deadline`, measured from here): a
+            // byte every millisecond until just after it, so a read may
+            // return a byte as the deadline passes, then one byte every half
+            // second, inside the one-second wait ureq falls back to per read
+            // once a deadline has passed. Whether a byte lands on the
+            // deadline is a race; once one does, only a deadline the client
+            // enforces itself ends the trickle. The timing is the behavior
+            // under test, not a wait for a condition a test could poll.
+            let started = std::time::Instant::now();
+            let burst_until = deadline + Duration::from_millis(300);
+            while started.elapsed() < HEADER_TRICKLE_FOR {
+                let _ = stream.flush();
+                let gap = if started.elapsed() < burst_until {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(500)
+                };
+                thread::sleep(gap);
+                if stream.write_all(b"a").is_err() {
+                    return;
+                }
+            }
+            return;
+        }
     }
     // Drain nothing further: one request per connection.
     let _ = reader.read(&mut [0; 1]);
@@ -231,6 +268,7 @@ enum Response {
     Full(Vec<u8>),
     Stall(String),
     Drip(String, Vec<u8>, Duration),
+    HeaderDrip(Duration),
 }
 
 fn reply(status: &str, headers: &[(&str, String)], body: &[u8]) -> Response {
@@ -275,6 +313,7 @@ fn serve_blob(layout: &Path, behavior: &Behavior, digest: &str, content_type: &s
             match behavior.slow_blobs {
                 Slow::Headers => Response::Stall(String::new()),
                 Slow::Drip(gap) => Response::Drip(headers, bytes, gap),
+                Slow::HeaderDrip(gap) => Response::HeaderDrip(gap),
                 _ => Response::Stall(headers),
             }
         }

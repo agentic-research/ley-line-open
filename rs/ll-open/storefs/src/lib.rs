@@ -836,10 +836,16 @@ impl<S: Store> StoreFs<S> {
             return Err(Errno::EISDIR);
         }
         let writable = flags & open_flags::O_ACCMODE != open_flags::O_RDONLY;
-        if writable && !self.scope.propose.covers(&path) {
+        let in_scratch = matches!(self.whereis(&path)?, Located::Scratch(_));
+        let may = if in_scratch {
+            self.may_change_derived(&path, false)
+        } else {
+            self.scope.propose.covers(&path)
+        };
+        if writable && !may {
             return Err(Errno::EACCES);
         }
-        if let Located::Scratch(_) = self.whereis(&path)? {
+        if in_scratch {
             let handle = self.open_scratch(&path, flags, false)?;
             return Ok(Opened {
                 handle,
@@ -1146,11 +1152,7 @@ impl<S: Store> StoreFs<S> {
         if set.mode.is_none() && set.size.is_none() {
             return Ok(());
         }
-        let may = match stat.kind {
-            Kind::Directory => self.may_propose_under(path),
-            Kind::File | Kind::Symlink => self.scope.propose.covers(path),
-        };
-        if !may {
+        if !self.may_change_derived(path, stat.kind == Kind::Directory) {
             return Err(Errno::EACCES);
         }
         let scratch = self.scratch()?;
@@ -1233,10 +1235,16 @@ impl<S: Store> StoreFs<S> {
         if !matches!(self.whereis(&path)?, Located::Absent) {
             return Err(Errno::EEXIST);
         }
-        if !self.scope.propose.covers(&path) {
+        let derived = self.derived_new(&path, false)?;
+        let may = if derived {
+            self.may_change_derived(&path, false)
+        } else {
+            self.scope.propose.covers(&path)
+        };
+        if !may {
             return Err(Errno::EACCES);
         }
-        if self.derived_new(&path, false)? {
+        if derived {
             self.scratch()?
                 .symlink(target, &path)
                 .map_err(|e| errno_of(&e))?;
@@ -1275,10 +1283,16 @@ impl<S: Store> StoreFs<S> {
         if !matches!(self.whereis(&path)?, Located::Absent) {
             return Err(Errno::EEXIST);
         }
-        if !self.scope.propose.covers(&path) {
+        let derived = self.derived_new(&path, false)?;
+        let may = if derived {
+            self.may_change_derived(&path, false)
+        } else {
+            self.scope.propose.covers(&path)
+        };
+        if !may {
             return Err(Errno::EACCES);
         }
-        if self.derived_new(&path, false)? {
+        if derived {
             let handle = self.open_scratch(&path, flags, true)?;
             let entry = self.entry(&path)?;
             self.tell(&entry.attr);
@@ -1307,10 +1321,16 @@ impl<S: Store> StoreFs<S> {
         if !matches!(self.whereis(&path)?, Located::Absent) {
             return Err(Errno::EEXIST);
         }
-        if !self.may_propose_under(&path) {
+        let derived = self.derived_new(&path, true)?;
+        let may = if derived {
+            self.may_change_derived(&path, true)
+        } else {
+            self.may_propose_under(&path)
+        };
+        if !may {
             return Err(Errno::EACCES);
         }
-        if self.derived_new(&path, true)? {
+        if derived {
             self.scratch()?.mkdir(&path).map_err(|e| errno_of(&e))?;
             return self.entry(&path);
         }
@@ -1337,7 +1357,12 @@ impl<S: Store> StoreFs<S> {
             Located::Stored(_) => false,
             Located::Scratch(_) => true,
         };
-        if !self.scope.propose.covers(&path) {
+        let may = if in_scratch {
+            self.may_change_derived(&path, false)
+        } else {
+            self.scope.propose.covers(&path)
+        };
+        if !may {
             return Err(Errno::EACCES);
         }
         if in_scratch {
@@ -1378,7 +1403,15 @@ impl<S: Store> StoreFs<S> {
         if !self.listing(&path)?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
-        if !self.may_propose_under(&path) {
+        // A stored directory is removed only where the grant reaches for
+        // removal: a scope reaches the directories above it to make them,
+        // never to take them away.
+        let may = if in_scratch {
+            self.may_change_derived(&path, true)
+        } else {
+            self.scope.propose.covers_rmdir(&path)
+        };
+        if !may {
             return Err(Errno::EACCES);
         }
         if in_scratch {
@@ -1456,10 +1489,7 @@ impl<S: Store> StoreFs<S> {
     /// (`ENOTEMPTY`, or `EEXIST` on Linux), and a file over a directory
     /// (`EISDIR`), as `rename(2)` does for the guest.
     fn rename_in_scratch(&self, from: &str, to: &str, kind: Kind) -> Result<(), Errno> {
-        let may = |path: &str| match kind {
-            Kind::Directory => self.may_propose_under(path),
-            Kind::File | Kind::Symlink => self.scope.propose.covers(path),
-        };
+        let may = |path: &str| self.may_change_derived(path, kind == Kind::Directory);
         if !may(from) || !may(to) {
             return Err(Errno::EACCES);
         }
@@ -1478,7 +1508,9 @@ impl<S: Store> StoreFs<S> {
         if target == Some(Kind::Directory) {
             return Err(Errno::EISDIR);
         }
-        if !self.scope.propose.covers(from) {
+        // `from` is scratch's; `to` is authored, and the proposal below
+        // holds it to the scope.
+        if !self.may_change_derived(from, false) {
             return Err(Errno::EACCES);
         }
         let scratch = self.scratch()?;
@@ -1521,7 +1553,8 @@ impl<S: Store> StoreFs<S> {
         if target == Some(Kind::Directory) {
             return Err(Errno::EISDIR);
         }
-        if !self.scope.propose.covers(from) || !self.scope.propose.covers(to) {
+        // `from` is authored and leaves the store; `to` is scratch's.
+        if !self.scope.propose.covers(from) || !self.may_change_derived(to, false) {
             return Err(Errno::EACCES);
         }
         let (base, bytes) = self.held(from)?.ok_or(Errno::ENOENT)?;
@@ -1942,6 +1975,23 @@ impl<S: Store> StoreFs<S> {
             attr,
             ttl: self.timeout(path),
         })
+    }
+
+    /// Whether the scope may change the derived path `path` (a directory
+    /// when `is_dir`), which lives in scratch and is never a proposal.
+    ///
+    /// A write's behavior follows its path's class. An execution/v1 write
+    /// scope (`Grant::Scoped`, bead `ley-line-open-483134`) bounds authored
+    /// paths, the ones that become proposals; a run that may write at all
+    /// may write its own scratch, so a narrow scope does not stop a build's
+    /// output or a derived temp file. A scope naming nothing writes nowhere.
+    /// The other grants keep their path rule for derived paths too.
+    fn may_change_derived(&self, path: &str, is_dir: bool) -> bool {
+        match &self.scope.propose {
+            Grant::Scoped { files, trees } => !(files.is_empty() && trees.is_empty()),
+            Grant::Whole | Grant::Paths(_) if is_dir => self.may_propose_under(path),
+            grant @ (Grant::Whole | Grant::Paths(_)) => grant.covers(path),
+        }
     }
 
     /// Whether the scope may propose some path under the directory `dir`.

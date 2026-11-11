@@ -122,7 +122,7 @@ impl KrunWorkerBackend {
         request: &ExecutionRequest,
         workspaces: ServedWorkspaces,
     ) -> Result<Option<ServedWorkspace>, ExecutionError> {
-        if !workspaces.serve_exactly(&request.workspaces) {
+        if !workspaces.serve_exactly(request) {
             return Err(ExecutionError::workspace_unserved(format!(
                 "the request names {} workspace(s) and the service materialized {} \
                  share(s) for it; a workspace is served only from a share the \
@@ -655,6 +655,11 @@ impl Backend for KrunWorkerBackend {
             // readiness declaration was held to above.
             attached: attached.into_iter().collect(),
         })
+    }
+
+    /// One: the workspace the tier mounts as the guest's `/work`.
+    fn workspace_capacity(&self) -> usize {
+        1
     }
 
     fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {

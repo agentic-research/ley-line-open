@@ -63,6 +63,14 @@ pub trait Backend: Send + Sync + 'static {
         workspaces: ServedWorkspaces,
     ) -> Result<BackendRun, ExecutionError>;
 
+    /// How many workspaces this backend serves one run. The service asks
+    /// before it opens any share: a run granted more is refused
+    /// `workspaceUnserved` with nothing opened and nothing started. The
+    /// default is none, so a backend serves workspaces only by saying so.
+    fn workspace_capacity(&self) -> usize {
+        0
+    }
+
     /// Observe a worker that may have completed without an explicit cancel.
     /// Backends that cannot report completion leave the result absent; the
     /// service still preserves the explicit-cancel lifecycle for them.
@@ -266,6 +274,23 @@ impl<B: Backend> ExecutionService<B> {
         self.start_run(request, false)
     }
 
+    /// Refuse, before any share is opened, a run granted more workspaces
+    /// than the backend serves ([`Backend::workspace_capacity`]).
+    fn workspaces_within_capacity(&self, request: &ExecutionRequest) -> Result<(), ExecutionError> {
+        let capacity = self.backend.workspace_capacity();
+        let Some(grant) = request.workspaces.get(capacity) else {
+            return Ok(());
+        };
+        Err(ExecutionError::workspace_unserved(format!(
+            "the run is granted {} workspace(s), and backend {} serves {capacity} per \
+             run; workspace {:?} cannot be served, so no share is opened and nothing \
+             is started",
+            request.workspaces.len(),
+            self.backend.capabilities().backend_id,
+            grant.name
+        )))
+    }
+
     /// `verified`: the request came from a verified grant, so its workspaces
     /// are materialized. Only `start_authorized_with_verifier` passes true.
     fn start_run(
@@ -339,39 +364,50 @@ impl<B: Backend> ExecutionService<B> {
         // graph root, refuses the start with no worker in existence. The
         // backend is handed the open shares and can start the run only with
         // them.
+        //
+        // The backend is asked first whether it serves that many workspaces
+        // at all, so a tier that serves none is refused with no share opened
+        // for it.
         let workspaces = if verified {
-            ServedWorkspaces::materialize(
-                self.shares.as_deref(),
-                &request.run_id,
-                &request.workspaces,
-            )
+            self.workspaces_within_capacity(&request).and_then(|()| {
+                ServedWorkspaces::materialize(
+                    self.shares.as_deref(),
+                    &request.run_id,
+                    &request.workspaces,
+                )
+            })
         } else {
             // `start` refused a request naming workspaces already.
-            Ok(ServedWorkspaces::none())
+            ServedWorkspaces::materialize(None, &request.run_id, &[])
         };
-        let started =
-            match workspaces.and_then(|workspaces| self.backend.start(&request, workspaces)) {
-                Ok(started) => started,
-                Err(error) => {
-                    self.state.write().starting.remove(&request.run_id);
-                    return Err(error);
-                }
-            };
+        let started = workspaces.and_then(|(workspaces, opened)| {
+            Ok((self.backend.start(&request, workspaces)?, opened))
+        });
+        let (started, opened) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                self.state.write().starting.remove(&request.run_id);
+                return Err(error);
+            }
+        };
         let channels: Vec<crate::WorkerChannel> = started
             .attached
             .iter()
             .map(crate::AttachedWorkspace::channel)
             .collect();
         // An assertion, not a comparison of two reports. A backend cannot
-        // forge an attached share, so `channels` holds only shares the
-        // service opened for this run; what remains is a backend that
-        // answered `Ok` having dropped one, which started the workload
+        // forge an attached share; `Opened::held` holds what it returned to
+        // the shares the service opened for THIS run (each proof names the
+        // run and the whole grant, so a share kept from another run, or from
+        // a wider grant of the same workspace, is refused) and to each share
+        // still being held. What it catches is a backend that answered `Ok`
+        // having dropped or swapped a share, which started the workload
         // without its workspace (bead ley-line-open-204a94). No first-party
         // tier can: each attaches what it is handed or refuses before spawn.
         // For one that does, the run is cancelled and never recorded, so it
         // cannot complete, be collected, or claim the workspace's graph root
         // as an input.
-        if let Err(error) = served_exactly(&request.workspaces, &channels) {
+        if let Err(error) = opened.held(&started.attached) {
             // The refusal is the answer either way; a cancel that also fails
             // is named in it rather than masking it.
             let cancel = self.backend.cancel(&request.run_id);
@@ -756,50 +792,6 @@ impl<B: Backend> ExecutionService<B> {
             .push(event_with_detail(sequence, terminal, detail_digest));
         Ok(())
     }
-}
-
-/// The workspace shares a backend reports must be exactly the run's granted
-/// workspaces, by name and graph root, each once: a granted workspace with
-/// no share ran the workload without it, and a share the grant never named
-/// is authority the run was not given. Either is `workspaceUnserved`.
-fn served_exactly(
-    granted: &[crate::WorkspaceGrant],
-    channels: &[crate::WorkerChannel],
-) -> Result<(), ExecutionError> {
-    let mut granted: Vec<(&str, &str)> = granted
-        .iter()
-        .map(|grant| (grant.name.as_str(), grant.graph_root.as_str()))
-        .collect();
-    let mut served: Vec<(&str, &str)> = channels
-        .iter()
-        .map(|channel| match channel {
-            crate::WorkerChannel::WorkspaceShare {
-                workspace,
-                graph_root,
-            } => (workspace.as_str(), graph_root.as_str()),
-        })
-        .collect();
-    granted.sort_unstable();
-    served.sort_unstable();
-    if granted == served {
-        return Ok(());
-    }
-    let detail = if let Some((name, root)) = granted.iter().find(|grant| !served.contains(grant)) {
-        format!(
-            "the backend started the run without serving its granted workspace {name:?} \
-             at {root}; the start is refused"
-        )
-    } else if let Some((name, root)) = served.iter().find(|share| !granted.contains(share)) {
-        format!(
-            "the backend served workspace {name:?} at {root}, which the run is not \
-             granted; the start is refused"
-        )
-    } else {
-        "the backend's workspace shares do not match the run's granted workspaces one \
-         for one; the start is refused"
-            .to_owned()
-    };
-    Err(ExecutionError::workspace_unserved(detail))
 }
 
 fn event(sequence: u64, state: RunState) -> RunEventRecord {

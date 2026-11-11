@@ -1442,6 +1442,68 @@ fn mkdir_outside_the_proposal_scope_is_eacces() {
     );
 }
 
+/// A write scope lets a run create the directories on the way to what it
+/// names, and never remove or move one of them: a directory above the scope
+/// is the store's, and taking it away changes `storeRoot` outside the grant.
+/// Only a granted tree, or a directory beneath one, may be removed or moved.
+#[test]
+fn a_write_scope_does_not_reach_the_directories_above_it() {
+    for (scope, ancestor, parent, name) in
+        [("x/y/z/", "x/y", "x", "y"), ("x/y/a.rs", "x/y", "x", "y")]
+    {
+        let f = fixture(Scope {
+            see: Grant::Whole,
+            propose: Grant::from_write_scope(&[scope.to_string()]),
+        });
+        // Another writer holds an empty directory above the scope.
+        f.fs.store()
+            .with_write(|conn| {
+                source_write::propose(
+                    conn,
+                    &Grant::Whole,
+                    vec![Proposed::mkdir("x"), Proposed::mkdir("x/y")],
+                )
+            })
+            .unwrap();
+        let (parent, x) = (ino(&f, parent), ino(&f, "x"));
+        assert_eq!(
+            f.fs.rmdir(parent, name.as_bytes()),
+            Err(Errno::EACCES),
+            "{scope}"
+        );
+        assert_eq!(
+            f.fs.rename(parent, name.as_bytes(), x, b"moved", 0),
+            Err(Errno::EACCES),
+            "{scope}"
+        );
+        assert_eq!(
+            f.fs.rmdir(ROOT_INODE, b"x"),
+            Err(Errno::ENOTEMPTY),
+            "{scope}"
+        );
+        assert!(
+            f.fs.lookup(x, b"y").is_ok(),
+            "{scope}: {ancestor} is still there"
+        );
+        assert!(f.fs.lookup(x, b"moved").is_err(), "{scope}");
+    }
+
+    // The granted tree itself, and a directory beneath it, are the run's.
+    let f = fixture(Scope {
+        see: Grant::Whole,
+        propose: Grant::from_write_scope(&["x/y/z/".to_string()]),
+    });
+    let x = f.fs.mkdir(ROOT_INODE, b"x").unwrap().attr.inode;
+    let y = f.fs.mkdir(x, b"y").unwrap().attr.inode;
+    let z = f.fs.mkdir(y, b"z").unwrap().attr.inode;
+    f.fs.mkdir(z, b"deep").unwrap();
+    assert_eq!(f.fs.rename(z, b"deep", z, b"deeper", 0), Ok(()));
+    assert_eq!(f.fs.rmdir(z, b"deeper"), Ok(()));
+    assert_eq!(f.fs.rmdir(y, b"z"), Ok(()));
+    // Having made them does not make the ancestors its own.
+    assert_eq!(f.fs.rmdir(x, b"y"), Err(Errno::EACCES));
+}
+
 /// An execution/v1 write scope (bead `ley-line-open-483134`): one exact file
 /// and one directory tree. The guest sees the whole tree and may change only
 /// what the scope names; every write, create, rename and delete outside it

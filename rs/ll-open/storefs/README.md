@@ -331,7 +331,12 @@ tree, `mutate`/`commit` propose inside the grant's `writeScope` and nowhere else
 The `writeScope` (bead `ley-line-open-483134`) is exact files, `/`-terminated directory trees, or `/`
 for the whole workspace; it becomes `source_write::Grant::Scoped` (or `Whole`), so a write, create,
 rename or delete outside it is the typed `outside_grant` refusal, `EACCES` in the guest, and a
-grant that permits a write with no scope proposes nothing.
+grant that permits a write with no scope proposes nothing. A scope reaches the directories above
+what it names only to create them (`Grant::covers_dir`); removing or moving a directory needs it to
+be a granted tree or beneath one (`Grant::covers_rmdir`). The scope bounds authored paths: a
+derived path (ADR-0045 T9) is scratch's and never a proposal, so a scoped run that may write
+anything may write it (`StoreFs::may_change_derived`), and a scope that names nothing writes
+nowhere.
 `expectedGeneration` is carried and not consulted: it names ADR-0041's S1
 commit sequence `(epoch, seq)`, which is not implemented; the `graphRoot`
 check pins the share's tree.

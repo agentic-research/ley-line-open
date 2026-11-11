@@ -107,7 +107,7 @@ struct WorkspaceGrant $Traits.doc("Resolved authority over one logical Graph wor
   graphRoot          @1 :DigestRef                $Traits.doc("Authorized input Graph root.");
   expectedGeneration @2 :UInt64                   $Traits.doc("Optimistic-concurrency generation for mutation.");
   operations         @3 :List(WorkspaceOperation) $Traits.doc("Exact operations permitted on this workspace.");
-  writeScope         @4 :List(Text)               $Traits.doc("Paths the run may write, create, rename or delete, relative to the workspace root: an exact file path, or a directory prefix ending in '/'. The single entry '/' is the whole workspace. Non-empty exactly when operations include mutate or commit; reads stay governed by graphRoot.");
+  writeScope         @4 :List(Text)               $Traits.doc("Paths the run may write, create, rename or delete, relative to the workspace root: an exact file path, or a directory prefix ending in '/'. The single entry '/' is the whole workspace. Present and non-empty exactly when operations include mutate or commit, and otherwise omitted: an explicit empty list is refused, so no scope has one encoding. Reads stay governed by graphRoot. A daemon that enforces it advertises cloister/execution/v1/workspace-write-scope.") $Traits.optional;
 }
 
 struct CapabilityGrant $Traits.doc("Verified authorization grant mapped to a versioned interface.") {

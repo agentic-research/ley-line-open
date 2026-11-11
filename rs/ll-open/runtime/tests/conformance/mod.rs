@@ -149,6 +149,10 @@ impl Backend for Observed {
         self.0.backend.start(request, workspaces)
     }
 
+    fn workspace_capacity(&self) -> usize {
+        self.0.backend.workspace_capacity()
+    }
+
     fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
         let settled = self
             .0
@@ -891,11 +895,14 @@ pub fn spec_and_grant(authority: &GrantSpec<'_>) -> (Vec<u8>, Vec<u8>) {
                     .expect("graphRoot prefix"),
             );
             entry.set_expected_generation(workspace.expected_generation);
-            let mut scope = entry
-                .reborrow()
-                .init_write_scope(workspace.write_scope.len() as u32);
-            for (slot, path) in workspace.write_scope.iter().enumerate() {
-                scope.set(slot as u32, path);
+            // No scope is the field left unset; an empty list is refused.
+            if !workspace.write_scope.is_empty() {
+                let mut scope = entry
+                    .reborrow()
+                    .init_write_scope(workspace.write_scope.len() as u32);
+                for (slot, path) in workspace.write_scope.iter().enumerate() {
+                    scope.set(slot as u32, path);
+                }
             }
             let mut operations = entry.init_operations(workspace.operations.len() as u32);
             for (slot, operation) in workspace.operations.iter().enumerate() {

@@ -1233,6 +1233,16 @@ fn validate_workspaces(
                 .iter()
                 .map(|entry| text(entry, "grant workspace writeScope entry"))
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
+            // "No scope" is the field left unset, and only that. A
+            // zero-length list is a non-null pointer in canonical Cap'n
+            // Proto, so it signs different bytes than an unset field;
+            // accepting both would give one grant two digests.
+            if workspace.has_write_scope() && write_scope.is_empty() {
+                return Err(ExecutionError::invalid(format!(
+                    "grant workspace {name} sets writeScope to an empty list; leave the \
+                     field unset when the grant names no write scope"
+                )));
+            }
             validate_write_scope(&name, &operations, &write_scope)?;
             Ok(WorkspaceGrant {
                 name,

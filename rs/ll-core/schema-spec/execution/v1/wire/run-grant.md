@@ -49,6 +49,14 @@ are byte-identical to the canonical form of the same grant before the
 signature was attached — and identical to what a producer that predates the
 field would have emitted.
 
+List presence is signed. An unset list field canonicalizes to a null pointer;
+an explicit zero-length list canonicalizes to a non-null pointer, so the two
+are different `signing_bytes`. Where a field's absence carries meaning, the
+contract fixes one encoding: `WorkspaceGrant.writeScope` is left unset for "no
+scope", and an authorizer refuses the empty list (README, "Workspace write
+scope"). `test-vectors/run-grant-signing.json` gives known answers for the
+signing bytes and the Ed25519 signature over them, including that pair.
+
 ## Fields
 
 ```capnp

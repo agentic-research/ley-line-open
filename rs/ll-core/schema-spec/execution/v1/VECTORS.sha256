@@ -3,4 +3,5 @@
 9500f410c78b182f1fb77022c3b4aff43a9950fcefb581968a79613d7afad1dc  test-vectors/canonical-run.json
 3fd5c0d35ade90dcf45a07de6de7c8809afc0b4db6e12d5db06614d4d5701271  test-vectors/oci-resources.json
 686746d71154836bd90395a6ef71a48edf49b56a0986865c52cb001a68c8ec06  test-vectors/rootfs-manifest.json
+742e921c159afa1061890f2d9efc2c44527dbb260743336dcd06817281ceb8d6  test-vectors/run-grant-signing.json
 a9cf1f268c254b2992f49a6778b0c5aa5e875581ba26ac1858245d21b13bf626  test-vectors/run-id.json

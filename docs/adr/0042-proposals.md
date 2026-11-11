@@ -10,7 +10,7 @@ delete, rename); amended by ADR-0045 (a moved base merges three ways; the host m
 - ADR-0041 (publication — snapshots show whole proposals; split from this ADR)
 - ADR-0034 (`node_hash`, and its amendment on twin constructs)
 - ADR-0031 (restriction-addressed keys — Proposed; P3 depends on it)
-- `schema-spec/execution/v1` (`WorkspaceGrant { graphRoot, expectedGeneration, operations }`)
+- `schema-spec/execution/v1` (`WorkspaceGrant { graphRoot, expectedGeneration, operations, writeScope }`)
 - cloister ADR-0046 (mediated capabilities), ADR-0049 (host runtime and mediator) — policy stays in
   cloister; this ADR is mechanism
 

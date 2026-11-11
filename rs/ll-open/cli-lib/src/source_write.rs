@@ -113,6 +113,20 @@ impl Grant {
             }
         }
     }
+
+    /// Whether the directory `dir` may be removed (or moved away) under this
+    /// grant. A scoped grant may make the directories on the way to what it
+    /// names ([`Grant::covers_dir`]) and may not take one away: only a
+    /// granted tree, or a directory beneath one, is its to remove. The other
+    /// grants keep `covers_dir`'s rule.
+    pub fn covers_rmdir(&self, dir: &str) -> bool {
+        match self {
+            Grant::Whole | Grant::Paths(_) => self.covers_dir(dir),
+            Grant::Scoped { trees, .. } => {
+                trees.iter().any(|tree| tree == dir || beneath(dir, tree))
+            }
+        }
+    }
 }
 
 /// What a write produced.
@@ -514,7 +528,10 @@ fn granted(grant: &Grant, writes: &[Proposed]) -> Result<()> {
     // A directory change is inside a path grant when the grant names a path
     // under the directory.
     let covered = |w: &Proposed| match w.change {
-        Change::Mkdir | Change::Rmdir => grant.covers_dir(&w.path),
+        Change::Mkdir => grant.covers_dir(&w.path),
+        // Removing a directory is not making one: a scoped grant reaches
+        // the ancestors of what it names only to create them.
+        Change::Rmdir => grant.covers_rmdir(&w.path),
         Change::Write { .. } | Change::Delete => grant.covers(&w.path),
     };
     if let Some(w) = writes.iter().find(|w| !covered(w)) {
@@ -2185,6 +2202,17 @@ mod tests {
         assert!(deep.covers_dir("a/b"));
         assert!(deep.covers_dir("a/b/c/d"));
         assert!(!deep.covers_dir("a/x"));
+
+        // Removal: a granted tree and what is beneath it, never an ancestor
+        // of a granted file or tree.
+        assert!(g.covers_rmdir("docs"));
+        assert!(g.covers_rmdir("docs/adr"));
+        assert!(!g.covers_rmdir("src"));
+        assert!(deep.covers_rmdir("a/b/c"));
+        assert!(deep.covers_rmdir("a/b/c/d"));
+        assert!(!deep.covers_rmdir("a/b"));
+        assert!(!deep.covers_rmdir("a"));
+        assert!(Grant::Whole.covers_rmdir("a"));
 
         // "/" is the whole workspace; no entries is nothing.
         assert_eq!(scope(&["/"]), Grant::Whole);

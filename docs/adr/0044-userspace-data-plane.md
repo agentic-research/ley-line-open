@@ -156,7 +156,7 @@ filesystem substrate; cloister ADR-0050's substrate decision moves here.
 cloister owns policy: which refs and paths a run sees, whether it may propose, credentials, audit.
 The two meet at contracts LLO already owns:
 
-- **cloister → LLO:** the RunGrant's `WorkspaceGrant {graphRoot, expectedGeneration, operations}`
+- **cloister → LLO:** the RunGrant's `WorkspaceGrant {graphRoot, expectedGeneration, operations, writeScope}`
   (`execution/v1`) scopes the guest's filesystem. The backend serves only what it grants and refuses
   proposals it does not allow, with an errno the agent sees.
 - **LLO → cloister:** the run receipt carries, per proposal, `appliedTo`, `resultRoot` and

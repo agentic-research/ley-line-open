@@ -66,18 +66,53 @@ workspace:
   `writeScope`. Write authority is never implied, so a grant issued before
   this field existed (`mutate` with no scope) is refused; reissue it with
   `["/"]` to keep its old meaning.
-- A grant with neither operation names no `writeScope`.
+- A grant with neither operation leaves `writeScope` unset.
+- **"No scope" has one encoding: the field left unset.** An explicit empty
+  list (`"writeScope": []`) is refused. Cap'n Proto canonicalization keeps a
+  zero-length list as a non-null pointer, so the empty list and the unset
+  field are different signed bytes (`test-vectors/run-grant-signing.json`);
+  accepting both would give one grant two digests.
 - An entry is `/` alone, or a path with no leading `/`, no empty, `.` or `..`
   component and no NUL. No entry appears twice.
 
-The scope narrows writes only. What the run may read is the `graphRoot`, and
-`read` or `list` shows the whole tree. A change outside the scope is refused
-by the share with the typed `outside_grant` refusal, which the guest sees as
-`EACCES`; nothing lands. A rename needs both its names inside the scope.
-Creating a directory on the way to a granted path is inside the scope.
+The scope bounds authored paths, the ones a write turns into a proposal. What
+the run may read is the `graphRoot`, and `read` or `list` shows the whole
+tree. A change outside the scope is refused by the share with the typed
+`outside_grant` refusal, which the guest sees as `EACCES`; nothing lands.
 
-The field is additive on the wire: a reader that predates it ignores it, and
-an older grant decodes with an empty scope.
+- A rename needs both its names inside the scope.
+- Creating a directory on the way to a granted path is inside the scope.
+  Removing or moving a directory is inside it only when the directory is a
+  granted tree or lies beneath one: a directory above the scope is never the
+  run's to take away.
+- Derived paths are outside the scope's subject. A path the tree's ignore
+  rules match (build output such as `target/`, and the editor and OS temp
+  names the share treats as derived) is never a proposal: it lives in the
+  run's scratch and never reaches the store, so a run with any write scope
+  may write it, whatever the scope names. A temp name the ignore rules do
+  not match is an authored path and is held to the scope; an editor that
+  saves by writing such a name beside a granted file needs the directory in
+  scope.
+
+### A daemon says whether it enforces the scope
+
+The field is additive on the wire, and that is a hazard in one direction. A
+daemon that predates it decodes a scoped grant, ignores the scope, and lets
+`mutate` write anywhere in the workspace; nothing in its replies says so. So
+support is advertised and required:
+
+- A daemon that enforces `writeScope` lists
+  `{name: "cloister/execution/v1/workspace-write-scope", version: "1"}` in
+  `llo_execution_capabilities`.
+- An issuer MUST find that entry before it issues a grant whose `writeScope`
+  is narrower than `/`, and MUST refuse to issue one to a daemon that does
+  not list it.
+
+Inside one deployment the daemon and its worker binary may be different
+builds. Either skew is safe: the scope is enforced in the daemon, by the
+share it serves, so an older worker has nothing to ignore; and a newer worker
+refuses an older daemon's request for a run with a workspace, which lacks the
+field.
 
 ## Workspace delivery
 
@@ -114,9 +149,19 @@ that names workspaces without a verified grant behind it (a direct
 `ExecutionService::start`, or a backend called with no shares) is refused
 with `workspaceUnserved`.
 
-One assertion remains: the shares a backend took must be the granted
-workspaces exactly. A backend that answers a start having dropped a share it
-was handed has its run cancelled and the start refused with
+The service asks the backend how many workspaces it serves a run before it
+opens anything, so a tier that serves none is refused with no share opened.
+
+One assertion remains when a backend answers a start. Each share it took
+must have been opened for this run under this run's grant, whole (name,
+`graphRoot`, operations and `writeScope`), each granted workspace once; and
+each must still be held by whatever the backend gave it to. That proves the
+backend took the run's own shares and something is serving them. It does not
+prove the worker's descriptor is wired to the share, which is each backend's
+contract with its worker (the libkrun tier holds its worker's readiness
+declaration to the descriptor it handed over). A backend that answers a
+start having dropped, let go of, or swapped a share has its run cancelled
+and the start refused with
 `workspaceUnserved`; the run is never recorded, collected or receipted. If
 that cancel fails, the workload may still be running, so the run is recorded
 `failed` instead of forgotten: it has no receipt, its `runId` refuses

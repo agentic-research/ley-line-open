@@ -761,7 +761,21 @@ fn capabilities_advertise_the_resource_limits_revision() {
                 .iter()
                 .any(|entry| entry["name"] == "cloister/execution/v1")
         );
-        assert_eq!(entries.len(), 3, "{output}");
+        // A daemon that enforces `WorkspaceGrant.writeScope` says so (bead
+        // `ley-line-open-483134`). One that predates the field ignores it
+        // and lets a `mutate` grant write anywhere, and advertises no such
+        // entry: an issuer MUST find it before it issues a grant whose
+        // `writeScope` is narrower than "/".
+        let scope = entries
+            .iter()
+            .find(|entry| entry["name"] == transport::WORKSPACE_WRITE_SCOPE_CAPABILITY)
+            .unwrap_or_else(|| panic!("no workspace-write-scope entry in {output}"));
+        assert_eq!(scope["version"], "1");
+        assert_eq!(
+            transport::WORKSPACE_WRITE_SCOPE_CAPABILITY,
+            "cloister/execution/v1/workspace-write-scope"
+        );
+        assert_eq!(entries.len(), 4, "{output}");
     }
 }
 

@@ -1,8 +1,9 @@
 # ADR-0046 — The connection broker: the data plane for cloister's declared connections
 
-**Status:** Proposed (2026-10-27; Slice 1 amendment proposed 2026-11-11). Acceptance is the
-user's decision. See *Open questions*. Q7 is decided; every other answer in this document,
-including all of *Slice 1*, is a proposal.
+**Status:** Proposed (2026-10-27). Acceptance of the whole ADR is the user's decision; see
+*Open questions*. Decided so far: Q7 (2026-11-10) and *Slice 1* (Accepted 2026-11-11, which
+answers Q1, Q3 and Q8 for the credential-free relay). D3, D4 and Q2, Q4, Q5, Q6 remain
+proposals.
 **Bead:** `ley-line-open-e2c5ce`
 **Related:**
 - cloister ADR-0069 (Proposed; bead `cloister-77870d`): declared connections, the declaration half
@@ -374,12 +375,13 @@ Fail-closed rules, in one place:
 
 ---
 
-## Slice 1: credential-free relay (proposed for v0.30.0)
+## Slice 1: credential-free relay (v0.30.0)
 
-**Status of this section: proposed, not accepted.** The only owner decision it builds on is
-Q7 (decided 2026-11-10, implemented by `ley-line-open-be3711`). Every S-numbered decision
-below is a proposal. The constraints cloister supplied as the consumer (2026-11-11) are
-marked *(cloister)*; where this section departs from one, it says so and why.
+**Status of this section: Accepted (owner, 2026-11-11).** The owner accepted the full
+design, S0–S12, with the answers recorded in S13. It builds on Q7 (decided 2026-11-10,
+implemented by `ley-line-open-be3711`). The constraints cloister supplied as the consumer
+(2026-11-11) are marked *(cloister)*; where this section departs from one, it says so and
+why. ADR-0046 as a whole stays Proposed for D3 and D4.
 
 ### S0. What the slice is for, and what it is not
 
@@ -474,7 +476,7 @@ Field rules (each refusal names the connection and the field):
 | `endpoint` | `{"unix": path}` only | `{"tcp": port}` (S6); any other key |
 | `endpoint.unix` | absolute; no `.` or `..` component, no `//`, no trailing `/`; at most 103 bytes; unique across connections | each violation, by name |
 | `target` | `{"tcp": {host, port}}` only | `unix`, `https`, `cloudSql` (D2 union members slice 1 does not deliver); a `tls` key |
-| `target.tcp.host` | exactly `127.0.0.1` | any name, including `localhost`; any other address, named "non-loopback target" for a non-loopback one and "loopback address not delivered in slice 1" for `127.0.0.2`–`127.255.255.255` and `::1` (S-Q3) |
+| `target.tcp.host` | a loopback IP literal: IPv4 dotted-quad in `127.0.0.0/8` (four decimal octets, no leading zeros), or exactly `::1` (that spelling only) | any name, including `localhost`; any non-loopback address, named "non-loopback target"; any other spelling of a loopback address (`127.000.0.1`, `0:0:0:0:0:0:0:1`, `::ffff:127.0.0.1`) |
 | `target.tcp.port` | a JSON integer, 1–65535 | 0, out of range, or not an integer |
 | `credentialRef` | absent | present (D2 rule 4 already refuses it on `art.tcp`) |
 
@@ -497,10 +499,19 @@ vector's validity does not depend on the host that checks it *(cloister: at most
   `remote tcp "localhost:N"`: by port, on loopback, not by address. So the broker's
   sandbox holds it to the declared ports on loopback, and the broker's code holds it to
   the one address (S5). For a non-loopback host the profile could only scope by port, and
-  the code would be the sole enforcement. Slice 1 accepts only `127.0.0.1` because that is
-  the address kind publishes on and the one `localhost` in a Seatbelt filter is known to
-  match; `127.0.0.0/8` beyond it and `::1` wait on a probe of the filter (S-Q3), since a
-  document the profile then refuses would be a declared connection that never dials.
+  the code would be the sole enforcement.
+
+**The schema represents the loopback range; the runtime delivers `127.0.0.1` (S-Q3,
+decided).** The document type and canonical form above already accept every loopback
+literal, `127.0.0.0/8` and `::1`, with pinned vectors, so widening never changes the schema
+or any digest. Delivery is a separate runtime check, run at start before anything is
+spawned: slice 1 delivers only `127.0.0.1`, the address kind publishes on and the one
+`localhost` in a Seatbelt filter is known to match. Any other loopback target is refused
+by name, "loopback address not delivered by this runtime" (`unsupportedBackend`), because
+a document the broker's profile then blocked would be a declared connection that never
+dials. The delivered set is one constant beside the broker profile; widening it is a gate
+flip that the loopback probe (S11a) justifies when it passes for that address on every
+delivering platform.
 
 **Cross-document rule, slice 1.** Checked at start, before the broker is spawned; a
 mismatch refuses the run naming the connection and the grant:
@@ -824,7 +835,7 @@ connections       @16 :List(ConnectionOutcome) $Traits.optional;  # one per conn
 
 struct ConnectionOutcome {
   name            @0 :Text;    # the connection's name
-  target          @1 :Text;    # the literal dialled, "127.0.0.1:30080"
+  target          @1 :Text;    # the literal dialed: "127.0.0.1:30080", or "[::1]:30080" for IPv6
   accepted        @2 :UInt64;  # connections accepted on this run's endpoint from this run's peer
   dialed          @3 :UInt64;  # of those, the ones whose upstream dial succeeded
   refused         @4 :UInt64;  # of those, the ones closed without an upstream (hold expired, dial error, cap)
@@ -896,7 +907,9 @@ enforcement.
 
 - **Schema** (`leyline-schema-spec`, closes S2): the canonical vector and its pinned digest;
   one vector per parse refusal in S2's table, including a NUL, a control character and a
-  non-ASCII byte in a path, a float and a string port, `127.0.0.2`, `::1` and `localhost`;
+  non-ASCII byte in a path, a float and a string port, `localhost`, a non-loopback address
+  and a non-canonical loopback spelling; accepted vectors with `127.0.0.2` and `::1`
+  targets and their pinned digests (the schema already represents the range);
   a non-sorted input that canonicalizes to the canonical vector; an independent Python
   canonicalizer that reaches the pinned digest.
 - **Grant vector** (closes S3): the pinned connections grant vector (S3, consumer
@@ -907,7 +920,9 @@ enforcement.
   all-or-nothing is accepted); a non-null empty `@16` or `@17`; a digest mismatch; a
   non-canonical `@17`; the marker plus a `broker://` entry is refused; the binary path
   through `authorize_with_verifier` with a trusted key refuses a fields-plus-marker grant
-  on a daemon built without a broker with the marker text.
+  on a daemon built without a broker with the marker text; a `127.0.0.2` or `::1` target
+  is refused at start, "loopback address not delivered by this runtime", before anything is
+  spawned.
 - **Old daemon** (closes S3's default deny): the pinned grant vector fed once to the
   v0.29.0 release's `execution-daemon` in each verifier mode, recorded in the bead:
   `--trust-key` gives the `unauthenticated` signature refusal, `--allow-unverified-evidence`
@@ -959,6 +974,55 @@ Hypervisor-gated (`LEYLINE_REQUIRE_HYPERVISOR=1`, macOS, in the release hypervis
 - Two concurrent runs of one bundle with distinct channel directories both reach the echo;
   the same directory refuses the second by name.
 
+### S11a. The loopback probe: the evidence for widening the delivered set
+
+Slice 1 ships the probe that decides S-Q3's widening, so the widening is a gate flip and
+not a new design. For each candidate address A in `127.0.0.1`, `127.0.0.2`,
+`127.255.255.254` and `::1`, on each platform:
+
+1. **Availability.** Bind a TCP listener on `A:P`. `EADDRNOTAVAIL` (for example `::1` in a
+   container whose network namespace has no IPv6 loopback) records the row **unavailable**.
+   Unavailable is never a pass: the runtime keeps refusing that address on that platform.
+2. **Allowed.** In a child confined by the broker's profile with port P allowed, connect
+   to `A:P`. Success records **scoped-allowed**; `EPERM` records **profile-blocks**, which
+   means a document naming A would never dial under the profile.
+3. **Port control.** With port Q ≠ P allowed instead, connect to `A:P`. It must fail with
+   `EPERM`; success records **port-unscoped**, which fails the probe outright (the filter
+   would be a wildcard).
+4. **Address control.** With port P allowed for `127.0.0.1` only, connect to `A:P`. Success
+   records the platform as **port-scoped only**: the profile cannot tell loopback addresses
+   apart, and the broker's code alone holds the address (S2).
+
+The test asserts a pinned expectation table per platform and prints the observed one. An
+address joins the delivered set (S2) only when its row is scoped-allowed with the port
+control passing on every platform that delivers slice 1 (today macOS). Changing the
+delivered set changes that constant and the pinned table in one commit, and no schema,
+vector or digest.
+
+Expected findings, to be confirmed rather than assumed: on macOS, Seatbelt's
+`remote tcp "localhost:N"` is port-scoped only, and whether it matches `127.0.0.2` and `::1`
+is the open row. On Linux, Landlock `ConnectTcp` scopes by port only, so the address
+control reads port-scoped only by construction; the Linux run matters for `::1`
+availability and for the port control, because Linux CI is where a future Linux tier would
+be proven.
+
+**What CI needs.**
+
+- **A macOS job on pull requests.** `ci.yml` runs only on `ubuntu-latest`; the one macOS
+  runner today is in `release-dryrun.yml`. Slice 1 adds a `macos-latest` job to `ci.yml`
+  that runs the probe and the other *macOS* tests of S11 (profile, native macOS end to end)
+  through one task, `task runtime:broker-macos`, so local and CI run the same target. The
+  probe extends `confinement_local_connect_probe.rs` (re-exec a child that confines itself
+  and reports what it reached) and keeps its contract: the job sets
+  `LEYLINE_REQUIRE_SANDBOX=1`, so a runner that cannot apply the profile fails by name
+  instead of printing `SKIPPED (NOT a pass)` and going green.
+- **The Linux probe in the existing job.** `ubuntu-latest` runs the probe on the host
+  network, where `::1` is normally present, and a second run inside a container started
+  with IPv6 disabled, which must record `::1` as unavailable. That proves the unavailable
+  path refuses instead of passing.
+- **Landlock ABI.** The Linux run records the kernel's Landlock ABI; below ABI 4 (no
+  `ConnectTcp`) the port control is unexpressible and the row records that, by name.
+
 ### S12. Implementation outline (estimate)
 
 - `rs/ll-core/schema-spec/connections/v1/` (README, schema, vectors, digest pins) and the
@@ -970,7 +1034,10 @@ Hypervisor-gated (`LEYLINE_REQUIRE_HYPERVISOR=1`, macOS, in the release hypervis
   start ordering, the endpoint registry, cancel of starting runs and failure teardown (S4,
   S7); `ExecutionRequest` carrying the document; a broker module (preflight, relay, profile,
   control pipe, drain) and receipt assembly (S5, S8); a new LLO binary beside
-  `leyline-native-worker`. The lifeline pipe is shared with `ley-line-open-f963e6`.
+  `leyline-native-worker`. The lifeline pipe is shared with `ley-line-open-f963e6`, which
+  ships in the same release (S-Q5).
+- The loopback probe and a `macos-latest` job in `ci.yml` running `task runtime:broker-macos`
+  (S11a).
 - **Every daemon spawn moves to `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` (S7).**
   `std::process::Command` cannot set that flag, so the existing spawn paths in
   `native_backend.rs` and `libkrun/backend.rs` (`configure_process_group`) change too, not
@@ -980,18 +1047,31 @@ Hypervisor-gated (`LEYLINE_REQUIRE_HYPERVISOR=1`, macOS, in the release hypervis
 - Cloister: emit the document, the digest and the marker; check the capability; read
   receipts with the new asset.
 
-### S13. Slice-1 questions for the owner
+### S13. Slice-1 decisions (DECIDED 2026-11-11, owner)
 
-- **S-Q1.** Accept the `credentialBrokerRefs` marker and the restated meaning of `@13` as
-  the old-daemon refusal (S3), or accept that an unverified old daemon is protected only by
-  clients that check capabilities.
-- **S-Q2.** The per-run connection cap: a fixed 256, or a document field.
-- **S-Q3.** Targets beyond `127.0.0.1` (`127.0.0.0/8`, `::1`), once a probe shows whether
-  Seatbelt's `localhost` filter matches them; S8's `target` text would then need an IPv6
-  form (`[::1]:p`).
-- **S-Q4.** Per-connection outcomes as receipt fields (S8), or a content-addressed detail
-  document the receipt names by digest.
-- **S-Q5.** Slice 1 ships with, not before, the f963e6 parent-death fix (S7).
+The owner's answers, recorded as given:
+
+- **S-Q1. DECIDED:** "accept as proposed. Accept the marker and the restated meaning of
+  `credentialBrokerRefs`. Also accept the full design, including moving daemon spawns to
+  posix_spawn."
+- **S-Q2. DECIDED:** "a fixed cap of 256 simultaneous connections per run in Slice 1. A
+  document field may come later as an additive change."
+- **S-Q3. DECIDED:** "Feels like we should allow the whole probe now. Or at least plan for
+  it and do just localhost for now. As we will need it for it to work in ci and stuff."
+  Applied as: slice 1 enforces `127.0.0.1` only; the schema type and canonical form already
+  represent `127.0.0.0/8` and `::1` (S2); slice 1 ships the loopback probe on macOS and on
+  Linux CI (S11a); widening is a gate flip that a passing probe justifies. The receipt's
+  IPv6 form is `[::1]:<port>` (S8).
+- **S-Q4. DECIDED (delegated to this ADR; the owner leaned toward receipt fields):**
+  per-connection outcomes are `RunReceipt` fields (S8). Reasons: the receipt is the
+  digest-bound evidence a run produces, and an attester that includes the receipt's digest
+  then covers the counts with no second object to fetch, store or retain; a separate
+  detail document would need its own CAS storage and resolution, and a reader holding the
+  receipt but not the document could not check it. The counts are a few fixed-size
+  integers per declared connection, bounded by the document's length, so the receipt does
+  not grow with traffic.
+- **S-Q5. DECIDED:** "ship with the f963e6 fix in the same release: the broker and
+  supervisor die together."
 
 Out of scope for slice 1, recorded from review:
 
@@ -1012,7 +1092,7 @@ Out of scope for slice 1, recorded from review:
 
 - **Q1. Per-run or per-daemon broker?** D1 proposes per run. Per daemon is one process per
   trust domain with cross-run pooling, at the cost of co-locating every run's credentials.
-  *Proposed answer: per run (Slice 1, S1).*
+  *Decided for Slice 1 (2026-11-11): per run (S1).*
 - **Q2. Native Linux with credentials.** D5 refuses credential-bearing connections there.
   Alternatives: accept loopback TCP as a development-only tier with a named acknowledgment;
   give each run its own network namespace so its loopback is single-tenant; or wait for the
@@ -1020,8 +1100,8 @@ Out of scope for slice 1, recorded from review:
 - **Q3. Authorize the document through a new `RunGrant` field (`connectionsDigest`)?** It is
   an additive execution/v1 wire change. The alternative is folding the connections into the
   confinement manifest, which mixes a broker's configuration into the workload's
-  confinement digest. *Proposed answer: yes, as `@16`/`@17` plus a `credentialBrokerRefs`
-  marker so a shipped daemon refuses (Slice 1, S3; S-Q1).*
+  confinement digest. *Decided for Slice 1 (2026-11-11): yes, as `@16`/`@17` plus a
+  `credentialBrokerRefs` marker so a shipped daemon refuses (S3; S-Q1).*
 - **Q4. How the subject token reaches the broker.** Cloister obtains a notme token for the
   run's identity and delivers it with the grant (then a run longer than its lifetime needs
   a refresh path), or the broker authenticates to notme as the run directly (then the
@@ -1056,8 +1136,8 @@ Out of scope for slice 1, recorded from review:
   must predict them for the digest (ADR-0036 equality contract), so a path cannot contain
   the run id. Either a deployment-configured broker root plus bundle and connection name
   (two concurrent runs of one bundle collide), or a run-unique component the issuer can
-  predict. *Proposed answer: the issuer allocates a per-run 0700 channel directory and
-  commits each path; LLO validates and chooses nothing (Slice 1, S4).*
+  predict. *Decided for Slice 1 (2026-11-11): the issuer allocates a per-run 0700
+  channel directory and commits each path; LLO validates and chooses nothing (S4).*
 - **Q9. Accept this ADR**, with or without amendments from the answers above.
 
 ---
@@ -1077,6 +1157,21 @@ Out of scope for slice 1, recorded from review:
   remaining acceptance condition on the LLO side.
 
 ## Follow-up work (beads to file on acceptance)
+
+Slice 1 (Accepted 2026-11-11), filed for v0.30.0, each blocking `ley-line-open-e2c5ce`:
+
+- `ley-line-open-e9d940`: the `connections/v1` spec, schema, vectors and digests (S2).
+- `ley-line-open-521deb`: the execution/v1 fields, the `@13` meaning, the capability
+  entry, the grant vector and authorization (S3, S8).
+- `ley-line-open-52b5b3`: the broker binary and module, its profile, preflight, the
+  endpoint registry and the peer-pid check (S4, S5).
+- `ley-line-open-5308b7`: `ExecutionService` start order, teardown, receipt assembly and
+  the hypervisor end-to-end test (S2, S6, S7, S8).
+- `ley-line-open-528525`: daemon spawns through `posix_spawn` (S7).
+- `ley-line-open-52deb4`: the loopback probe and the macOS CI job (S11a).
+- `ley-line-open-f963e6`: the parent-death fix, same release (S-Q5).
+
+Earlier entries:
 
 - `schema-spec/connections/v1`: README, schema, vectors, `CONNECTIONS_DIGESTS.blake3`, the
   schema-spec crate tests. Filed as `ley-line-open-e9d940`, blocked on this ADR (Q2–Q5, Q8).

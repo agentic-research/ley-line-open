@@ -437,8 +437,11 @@ fn rootfs_fixture_v2(parent: &Path) -> ResolvedRootfs {
     fs::create_dir_all(rootfs.join("usr/bin")).expect("rootfs directories");
     fs::create_dir(rootfs.join("etc")).expect("etc");
     fs::write(rootfs.join("usr/bin/probe"), content).expect("rootfs executable");
-    fs::set_permissions(rootfs.join("usr/bin/probe"), fs::Permissions::from_mode(0o755))
-        .expect("executable mode");
+    fs::set_permissions(
+        rootfs.join("usr/bin/probe"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("executable mode");
     for (path, target) in V2_LINKS {
         symlink(target, rootfs.join(path)).expect("rootfs link");
     }
@@ -476,7 +479,11 @@ fn links_are_recreated_verbatim_and_never_followed_on_the_host() {
     for (path, target) in V2_LINKS {
         let metadata = fs::symlink_metadata(root.join(path)).expect(path);
         assert!(metadata.file_type().is_symlink(), "{path} is a link");
-        assert_eq!(fs::read_link(root.join(path)).unwrap(), Path::new(target), "{path}");
+        assert_eq!(
+            fs::read_link(root.join(path)).unwrap(),
+            Path::new(target),
+            "{path}"
+        );
     }
     let (directories, files) = tree_shape(root);
     assert!(
@@ -486,7 +493,13 @@ fn links_are_recreated_verbatim_and_never_followed_on_the_host() {
     let names: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
     assert_eq!(
         names,
-        ["bin", "etc/passwd", "etc/up", "rootfs.manifest.json", "usr/bin/probe"],
+        [
+            "bin",
+            "etc/passwd",
+            "etc/up",
+            "rootfs.manifest.json",
+            "usr/bin/probe"
+        ],
         "the links, the manifest and the one file; nothing reached through a link"
     );
     verify_ephemeral_rootfs(&materialized).expect("the copy verifies");
@@ -543,8 +556,12 @@ fn a_cas_entrys_extended_attributes_never_reach_the_copy() {
         source.canonical_path.join("usr/bin"),
     ];
     for path in &planted {
-        match rustix::fs::setxattr(path, OVERRIDE, b"0:0:04755", rustix::fs::XattrFlags::empty())
-        {
+        match rustix::fs::setxattr(
+            path,
+            OVERRIDE,
+            b"0:0:04755",
+            rustix::fs::XattrFlags::empty(),
+        ) {
             Ok(()) => {}
             Err(rustix::io::Errno::NOTSUP) => {
                 eprintln!(
@@ -601,7 +618,10 @@ fn a_hand_built_entry_with_a_link_at_a_mount_point_never_resolves() {
         let error = DirectoryRootfsResolver::new(&cas)
             .resolve(&digest)
             .expect_err(name);
-        assert!(error.detail.contains(&format!("/{name}")), "{name}: {error:?}");
+        assert!(
+            error.detail.contains(&format!("/{name}")),
+            "{name}: {error:?}"
+        );
         let source = ResolvedRootfs {
             digest,
             canonical_path: root.canonicalize().unwrap(),

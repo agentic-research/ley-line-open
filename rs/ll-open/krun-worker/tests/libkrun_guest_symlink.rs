@@ -116,7 +116,8 @@ fn a_v2_link_to_proc_mounts_opens_in_the_guest() {
             blake3: blake3::hash(&probe).to_hex().to_string(),
         },
     );
-    spec.symlinks.insert("etc/mtab".into(), "/proc/mounts".into());
+    spec.symlinks
+        .insert("etc/mtab".into(), "/proc/mounts".into());
     spec.symlinks.insert("bin".into(), "usr/bin".into());
     let cas = root.join("cas");
     let rootfs = publish_v2(&cas, &spec, &BTreeMap::from([("usr/bin/probe", probe)]));
@@ -192,7 +193,11 @@ fn a_v2_link_to_proc_mounts_opens_in_the_guest() {
         .filter_map(|field| field.split_once('='))
         .collect();
     assert_eq!(fields.get("link"), Some(&"/proc/mounts"), "{report}");
-    assert_eq!(fields.get("opened"), Some(&"true"), "open(\"/etc/mtab\"): {report}");
+    assert_eq!(
+        fields.get("opened"),
+        Some(&"true"),
+        "open(\"/etc/mtab\"): {report}"
+    );
     assert_eq!(fields.get("open_error"), Some(&"none"), "{report}");
     // Directory modes and an empty directory reach the guest as declared.
     assert_eq!(fields.get("spool"), Some(&"1777"), "{report}");
@@ -200,7 +205,9 @@ fn a_v2_link_to_proc_mounts_opens_in_the_guest() {
     // The per-run copy holds the link as a link, never followed on the host.
     let copied = run_root.join("rootfs/etc/mtab");
     assert_eq!(
-        fs::read_link(&copied).expect("the copy holds a link").to_str(),
+        fs::read_link(&copied)
+            .expect("the copy holds a link")
+            .to_str(),
         Some("/proc/mounts")
     );
 }

@@ -157,7 +157,9 @@ fn copy_directory_fd(
                 return Err(ExecutionError::invalid(if plan.version == 1 {
                     "rootfs symbolic links are not supported by rootfs manifest v1".to_string()
                 } else {
-                    format!("rootfs symbolic link is not in the content-addressed manifest: {entry_relative}")
+                    format!(
+                        "rootfs symbolic link is not in the content-addressed manifest: {entry_relative}"
+                    )
                 }));
             };
             let on_disk = readlinkat(source, name, Vec::new())

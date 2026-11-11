@@ -135,8 +135,7 @@ use super::rootfs_manifest::{
     cas_directory_mode, guest_mount_point,
 };
 use super::rootfs_tree::{
-    FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join,
-    under_kernel_mount,
+    FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join, under_kernel_mount,
 };
 use crate::DigestRef;
 use crate::backends::libkrun::plan::{
@@ -1368,9 +1367,7 @@ fn read_layer(
                     .map_err(io_error("read an entry mode"))?
                     & 0o7777;
                 if !path.is_empty() {
-                    changes
-                        .entries
-                        .push((raw, Change::Directory(path, mode)));
+                    changes.entries.push((raw, Change::Directory(path, mode)));
                 }
                 continue;
             }
@@ -1503,7 +1500,11 @@ fn first_collision(
         extra: &[&str],
     ) -> Option<(String, String, NameCollision)> {
         let mut seen: BTreeMap<String, &str> = BTreeMap::new();
-        for name in extra.iter().copied().chain(entries.keys().map(String::as_str)) {
+        for name in extra
+            .iter()
+            .copied()
+            .chain(entries.keys().map(String::as_str))
+        {
             if let Some(earlier) = seen.insert(folded(name, sensitivity), name) {
                 let kind = if !sensitivity.normalization_sensitive && earlier.nfd().eq(name.nfd()) {
                     NameCollision::Normalization
@@ -1689,8 +1690,11 @@ fn write_rootfs(
     let manifest = writer.spec.to_canonical_v2();
     let manifest_path = root.join(ROOTFS_MANIFEST);
     fs::write(&manifest_path, &manifest).map_err(io_error("write the rootfs manifest"))?;
-    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(MANIFEST_FILE_MODE))
-        .map_err(io_error("set the rootfs manifest's mode"))?;
+    fs::set_permissions(
+        &manifest_path,
+        fs::Permissions::from_mode(MANIFEST_FILE_MODE),
+    )
+    .map_err(io_error("set the rootfs manifest's mode"))?;
     Ok(Written {
         // σ_bytes over the manifest: the identity `verify_manifest` checks.
         digest: manifest.as_slice().hash().to_string(),
@@ -1875,7 +1879,10 @@ mod tests {
                 NameCollision::Case
             ))
         );
-        assert_eq!(collision(&[".LEYLINE-EXEC.JSON"], CASE_SENSITIVE_APFS), None);
+        assert_eq!(
+            collision(&[".LEYLINE-EXEC.JSON"], CASE_SENSITIVE_APFS),
+            None
+        );
         assert_eq!(collision(&["etc/.LEYLINE-EXEC.JSON"], DEFAULT_APFS), None);
     }
 

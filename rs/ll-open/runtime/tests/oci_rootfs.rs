@@ -1092,8 +1092,11 @@ fn a_cas_entry_with_tampered_links_is_not_reused() {
     ];
     for (what, tamper) in tamper {
         let cas = TempDir::new().expect("cas");
-        let imported =
-            import_fixture(Platform::linux("arm64"), SymlinkPolicy::Preserve, cas.path());
+        let imported = import_fixture(
+            Platform::linux("arm64"),
+            SymlinkPolicy::Preserve,
+            cas.path(),
+        );
         tamper(&cas.path().join(&imported.rootfs.value));
         match import(
             &checked_in_fixture(),
@@ -1165,17 +1168,28 @@ fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
             2 if name == "escapes-v2" => {
                 // The string escaping a second implementation must match
                 // (identity review F2): one spelling per string.
-                assert_eq!(spec.to_canonical_v2(), manifest.as_bytes(), "{name}: canonical");
+                assert_eq!(
+                    spec.to_canonical_v2(),
+                    manifest.as_bytes(),
+                    "{name}: canonical"
+                );
                 assert!(manifest.contains('\u{e9}') && manifest.contains('\u{7f}'));
                 assert!(manifest.contains("\\u0001") && manifest.contains("\\t"));
             }
             2 => {
                 assert_eq!(name, "oci-multilayer-linux-arm64-v2");
                 assert_eq!(digest, FIXTURE_ARM64_ROOTFS, "{name}");
-                assert_eq!(spec.to_canonical_v2(), manifest.as_bytes(), "{name}: canonical");
+                assert_eq!(
+                    spec.to_canonical_v2(),
+                    manifest.as_bytes(),
+                    "{name}: canonical"
+                );
                 let cas = TempDir::new().expect("cas");
-                let imported =
-                    import_fixture(Platform::linux("arm64"), SymlinkPolicy::Preserve, cas.path());
+                let imported = import_fixture(
+                    Platform::linux("arm64"),
+                    SymlinkPolicy::Preserve,
+                    cas.path(),
+                );
                 let written = manifest_bytes(cas.path(), &imported.rootfs);
                 assert_eq!(
                     String::from_utf8(written).expect("UTF-8 manifest"),
@@ -1187,8 +1201,7 @@ fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
                 // The shipped v1 case keeps the name it shipped under.
                 assert_eq!(name, "oci-multilayer-linux-arm64");
                 assert_eq!(
-                    digest,
-                    "be444e4e419e52df2b05c1bf04c748694afb774383b8138911f6e7d305880e07",
+                    digest, "be444e4e419e52df2b05c1bf04c748694afb774383b8138911f6e7d305880e07",
                     "{name}: frozen"
                 );
                 let cas = TempDir::new().expect("cas");
@@ -1936,7 +1949,11 @@ fn device_nodes_under_kernel_mounted_directories_are_dropped_and_reported() {
     // empty, as v2 keeps every directory (bead `ley-line-open-4f08ea`).
     for empty in ["dev", "proc", "sys/fs"] {
         assert!(root.join(empty).is_dir(), "{empty} is a directory");
-        assert_eq!(fs::read_dir(root.join(empty)).unwrap().count(), 0, "{empty}");
+        assert_eq!(
+            fs::read_dir(root.join(empty)).unwrap().count(),
+            0,
+            "{empty}"
+        );
     }
     // A dropped entry is as if the image never had it: the rootfs identity
     // equals that of the same image without the devices, its directories
@@ -2106,7 +2123,10 @@ fn a_kept_link_or_a_file_at_a_mount_point_is_refused_by_name() {
 fn the_run_exec_spec_path_is_refused_at_the_image_root() {
     for (entry, policy) in [
         (file(RUN_EXEC_SPEC, 0o644, b"{}"), SymlinkPolicy::Refuse),
-        (dir(&format!("{RUN_EXEC_SPEC}/"), 0o755), SymlinkPolicy::Refuse),
+        (
+            dir(&format!("{RUN_EXEC_SPEC}/"), 0o755),
+            SymlinkPolicy::Refuse,
+        ),
         (symlink(RUN_EXEC_SPEC, "bin/x"), SymlinkPolicy::Preserve),
         (symlink(RUN_EXEC_SPEC, "bin/x"), SymlinkPolicy::Resolve),
     ] {

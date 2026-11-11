@@ -193,7 +193,9 @@ fn guest_relative(path: &str) -> bool {
 
 fn check_path(path: &str) -> Result<(), String> {
     if !guest_relative(path) {
-        return Err(format!("rootfs manifest path is not guest-relative: {path}"));
+        return Err(format!(
+            "rootfs manifest path is not guest-relative: {path}"
+        ));
     }
     if path == RUN_EXEC_SPEC {
         return Err(format!(
@@ -425,7 +427,9 @@ impl RootfsSpec {
                 }
                 return Ok(here);
             } else if !self.directories.contains_key(&here) {
-                return Err(format!("{path} names nothing in the rootfs manifest ({here})"));
+                return Err(format!(
+                    "{path} names nothing in the rootfs manifest ({here})"
+                ));
             }
         }
         Err(format!("{path} names a directory, not a regular file"))
@@ -460,7 +464,12 @@ mod tests {
 
     fn sample() -> RootfsSpec {
         let mut spec = RootfsSpec::empty_v2();
-        for (path, mode) in [("bin", 0o755), ("etc", 0o755), ("var", 0o755), ("var/tmp", 0o1777)] {
+        for (path, mode) in [
+            ("bin", 0o755),
+            ("etc", 0o755),
+            ("var", 0o755),
+            ("var/tmp", 0o1777),
+        ] {
             spec.directories.insert(path.into(), mode);
         }
         for (path, mode) in [("bin/busybox", 0o755), ("etc/hostname", 0o644)] {
@@ -550,7 +559,8 @@ mod tests {
     /// refused, whatever the difference.
     #[test]
     fn a_v2_manifest_in_any_other_byte_form_is_refused() {
-        let canonical = "{\"version\":2,\"entries\":[{\"type\":\"dir\",\"path\":\"etc\",\"mode\":493}]}";
+        let canonical =
+            "{\"version\":2,\"entries\":[{\"type\":\"dir\",\"path\":\"etc\",\"mode\":493}]}";
         RootfsSpec::parse(canonical.as_bytes()).expect("the canonical form");
         for other in [
             // Whitespace, inside and after.
@@ -576,7 +586,10 @@ mod tests {
             "{\"version\":2,\"entries\":[{\"type\":\"dir\",\"path\":\"etc\"}]}",
             "{\"version\":2}",
         ] {
-            assert!(refusal(invalid).contains("invalid rootfs manifest"), "{invalid}");
+            assert!(
+                refusal(invalid).contains("invalid rootfs manifest"),
+                "{invalid}"
+            );
         }
     }
 
@@ -604,7 +617,9 @@ mod tests {
     #[test]
     fn v2_entries_are_validated() {
         let file = |path: &str, mode: u32, blake3: &str| {
-            format!("{{\"type\":\"file\",\"path\":\"{path}\",\"mode\":{mode},\"blake3\":\"{blake3}\"}}")
+            format!(
+                "{{\"type\":\"file\",\"path\":\"{path}\",\"mode\":{mode},\"blake3\":\"{blake3}\"}}"
+            )
         };
         let dir = |path: &str, mode: u32| {
             format!("{{\"type\":\"dir\",\"path\":\"{path}\",\"mode\":{mode}}}")
@@ -623,17 +638,35 @@ mod tests {
             (dir("a//b", 0o755), "not guest-relative"),
             (dir(".", 0o755), "not guest-relative"),
             (dir("..", 0o755), "not guest-relative"),
-            (format!("{},{}", dir("a", 0o755), dir("a/..", 0o755)), "not guest-relative"),
+            (
+                format!("{},{}", dir("a", 0o755), dir("a/..", 0o755)),
+                "not guest-relative",
+            ),
             (dir("a\\u0000b", 0o755), "not guest-relative"),
             (file(ROOTFS_MANIFEST, 0o644, HEX), "its own name"),
             // Order and duplicates.
-            (format!("{},{}", dir("b", 0o755), dir("a", 0o755)), "strict path order"),
-            (format!("{},{}", dir("a", 0o755), dir("a", 0o755)), "strict path order"),
-            (format!("{},{}", dir("a", 0o755), link("a", "x")), "strict path order"),
+            (
+                format!("{},{}", dir("b", 0o755), dir("a", 0o755)),
+                "strict path order",
+            ),
+            (
+                format!("{},{}", dir("a", 0o755), dir("a", 0o755)),
+                "strict path order",
+            ),
+            (
+                format!("{},{}", dir("a", 0o755), link("a", "x")),
+                "strict path order",
+            ),
             // Parents are listed directories.
             (file("a/b", 0o644, HEX), "parent is not a listed directory"),
-            (format!("{},{}", file("a", 0o644, HEX), file("a/b", 0o644, HEX)), "parent is not a listed directory"),
-            (format!("{},{}", link("a", "x"), file("a/b", 0o644, HEX)), "parent is not a listed directory"),
+            (
+                format!("{},{}", file("a", 0o644, HEX), file("a/b", 0o644, HEX)),
+                "parent is not a listed directory",
+            ),
+            (
+                format!("{},{}", link("a", "x"), file("a/b", 0o644, HEX)),
+                "parent is not a listed directory",
+            ),
             // Directory modes.
             (dir("a", 0o2755), "directory mode"),
             (dir("a", 0o4755), "directory mode"),
@@ -648,7 +681,10 @@ mod tests {
             (file("a", 0o244, HEX), "file mode"),
             (file("a", 0o644, &HEX[1..]), "content digest"),
             (file("a", 0o644, &upper), "content digest"),
-            (file("a", 0o644, &format!("{}g", &HEX[1..])), "content digest"),
+            (
+                file("a", 0o644, &format!("{}g", &HEX[1..])),
+                "content digest",
+            ),
             // Link targets.
             (link("a", ""), "link target"),
             (link("a", &long), "link target"),
@@ -668,7 +704,8 @@ mod tests {
             link("a", "../../../outside"),
             link("a", "/"),
         ] {
-            RootfsSpec::parse(v2(&entries).as_bytes()).unwrap_or_else(|error| panic!("{entries}: {error}"));
+            RootfsSpec::parse(v2(&entries).as_bytes())
+                .unwrap_or_else(|error| panic!("{entries}: {error}"));
         }
     }
 
@@ -689,8 +726,10 @@ mod tests {
                 blake3: HEX.into(),
             },
         );
-        spec.symlinks
-            .insert("\u{e9}/l".into(), "\u{1}x\u{7f}/\u{e9}\u{8}\u{c}\n\r".into());
+        spec.symlinks.insert(
+            "\u{e9}/l".into(),
+            "\u{1}x\u{7f}/\u{e9}\u{8}\u{c}\n\r".into(),
+        );
         let expected = format!(
             "{{\"version\":2,\"entries\":[\
              {{\"type\":\"dir\",\"path\":\"\u{e9}\",\"mode\":493}},\
@@ -726,7 +765,9 @@ mod tests {
         for name in ["dev", "proc", "sys", "tmp", "work"] {
             for entry in [
                 format!("{{\"type\":\"symlink\",\"path\":\"{name}\",\"target\":\"usr/bin\"}}"),
-                format!("{{\"type\":\"file\",\"path\":\"{name}\",\"mode\":420,\"blake3\":\"{HEX}\"}}"),
+                format!(
+                    "{{\"type\":\"file\",\"path\":\"{name}\",\"mode\":420,\"blake3\":\"{HEX}\"}}"
+                ),
             ] {
                 let error = refusal(&v2(&entry));
                 assert!(
@@ -757,7 +798,9 @@ mod tests {
     #[test]
     fn the_run_exec_spec_path_is_reserved_at_the_root() {
         let entries = [
-            format!("{{\"type\":\"file\",\"path\":\"{RUN_EXEC_SPEC}\",\"mode\":420,\"blake3\":\"{HEX}\"}}"),
+            format!(
+                "{{\"type\":\"file\",\"path\":\"{RUN_EXEC_SPEC}\",\"mode\":420,\"blake3\":\"{HEX}\"}}"
+            ),
             format!("{{\"type\":\"dir\",\"path\":\"{RUN_EXEC_SPEC}\",\"mode\":493}}"),
             format!("{{\"type\":\"symlink\",\"path\":\"{RUN_EXEC_SPEC}\",\"target\":\"etc/x\"}}"),
         ];
@@ -807,17 +850,53 @@ mod tests {
         // Still refused, as before: a path that is not guest-relative, a
         // duplicate, an unknown key, and v2's `entries` under version 1.
         for (manifest, reason) in [
-            (format!("{{\"version\":1,\"files\":[{{\"path\":\"../x\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
-            (format!("{{\"version\":1,\"files\":[{{\"path\":\"/x\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
-            (format!("{{\"version\":1,\"files\":[{{\"path\":\"x\",\"mode\":420,\"blake3\":\"{HEX}\"}},{{\"path\":\"x\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "duplicate rootfs manifest path: x"),
-            ("{\"version\":1,\"files\":[],\"entries\":[]}".to_string(), "invalid rootfs manifest"),
-            ("{\"version\":1,\"entries\":[]}".to_string(), "invalid rootfs manifest"),
+            (
+                format!(
+                    "{{\"version\":1,\"files\":[{{\"path\":\"../x\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+                ),
+                "not guest-relative",
+            ),
+            (
+                format!(
+                    "{{\"version\":1,\"files\":[{{\"path\":\"/x\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+                ),
+                "not guest-relative",
+            ),
+            (
+                format!(
+                    "{{\"version\":1,\"files\":[{{\"path\":\"x\",\"mode\":420,\"blake3\":\"{HEX}\"}},{{\"path\":\"x\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+                ),
+                "duplicate rootfs manifest path: x",
+            ),
+            (
+                "{\"version\":1,\"files\":[],\"entries\":[]}".to_string(),
+                "invalid rootfs manifest",
+            ),
+            (
+                "{\"version\":1,\"entries\":[]}".to_string(),
+                "invalid rootfs manifest",
+            ),
             // The narrowing from the reader v1 shipped with (identity
             // review of 4f08ea, F4): it normalized these; none came from an
             // LLO producer.
-            (format!("{{\"version\":1,\"files\":[{{\"path\":\"a//b\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
-            (format!("{{\"version\":1,\"files\":[{{\"path\":\"a/./b\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
-            (format!("{{\"version\":1,\"files\":[{{\"path\":\"a/\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
+            (
+                format!(
+                    "{{\"version\":1,\"files\":[{{\"path\":\"a//b\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+                ),
+                "not guest-relative",
+            ),
+            (
+                format!(
+                    "{{\"version\":1,\"files\":[{{\"path\":\"a/./b\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+                ),
+                "not guest-relative",
+            ),
+            (
+                format!(
+                    "{{\"version\":1,\"files\":[{{\"path\":\"a/\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+                ),
+                "not guest-relative",
+            ),
         ] {
             let error = refusal(&manifest);
             assert!(error.contains(reason), "{manifest}: {error}");
@@ -870,7 +949,10 @@ mod tests {
             ("loop-a", "too many levels"),
             ("dangling", "names nothing"),
             ("bin/absent", "names nothing"),
-            ("through-file", "continues through the regular file etc/hostname"),
+            (
+                "through-file",
+                "continues through the regular file etc/hostname",
+            ),
             ("etc/hostname/x", "continues through the regular file"),
             ("bin", "names a directory"),
             ("to-dir", "names a directory"),

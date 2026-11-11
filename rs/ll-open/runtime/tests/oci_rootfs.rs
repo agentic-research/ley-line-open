@@ -1162,6 +1162,13 @@ fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
             .unwrap_or_else(|error| panic!("{name}: the vector parses: {error}"));
         versions.push(spec.version);
         match spec.version {
+            2 if name == "escapes-v2" => {
+                // The string escaping a second implementation must match
+                // (identity review F2): one spelling per string.
+                assert_eq!(spec.to_canonical_v2(), manifest.as_bytes(), "{name}: canonical");
+                assert!(manifest.contains('\u{e9}') && manifest.contains('\u{7f}'));
+                assert!(manifest.contains("\\u0001") && manifest.contains("\\t"));
+            }
             2 => {
                 assert_eq!(name, "oci-multilayer-linux-arm64-v2");
                 assert_eq!(digest, FIXTURE_ARM64_ROOTFS, "{name}");
@@ -1195,7 +1202,11 @@ fn the_rootfs_manifest_vector_is_what_the_importer_writes() {
             other => panic!("{name}: version {other}"),
         }
     }
-    assert_eq!(versions, [1, 2], "a v1 and a v2 case, in that order");
+    assert_eq!(
+        versions,
+        [1, 2, 2],
+        "the fixture as v1 and v2, then the escapes case"
+    );
 }
 
 #[test]

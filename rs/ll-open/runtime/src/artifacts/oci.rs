@@ -1500,10 +1500,10 @@ fn first_collision(
         entries: &BTreeMap<String, Final>,
         prefix: &str,
         sensitivity: FilesystemSensitivity,
-        extra: Option<&str>,
+        extra: &[&str],
     ) -> Option<(String, String, NameCollision)> {
         let mut seen: BTreeMap<String, &str> = BTreeMap::new();
-        for name in extra.into_iter().chain(entries.keys().map(String::as_str)) {
+        for name in extra.iter().copied().chain(entries.keys().map(String::as_str)) {
             if let Some(earlier) = seen.insert(folded(name, sensitivity), name) {
                 let kind = if !sensitivity.normalization_sensitive && earlier.nfd().eq(name.nfd()) {
                     NameCollision::Normalization
@@ -1514,7 +1514,7 @@ fn first_collision(
             }
         }
         entries.iter().find_map(|(name, node)| match node {
-            Final::Dir(children) => walk(children, &join(prefix, name), sensitivity, None),
+            Final::Dir(children) => walk(children, &join(prefix, name), sensitivity, &[]),
             Final::File(_) | Final::Symlink(_) => None,
         })
     }
@@ -1522,7 +1522,9 @@ fn first_collision(
         return None;
     }
     match tree {
-        Final::Dir(entries) => walk(entries, "", sensitivity, Some(ROOTFS_MANIFEST)),
+        // The two root names the runtime writes itself: the manifest, and
+        // each run's exec spec.
+        Final::Dir(entries) => walk(entries, "", sensitivity, &[ROOTFS_MANIFEST, RUN_EXEC_SPEC]),
         Final::File(_) | Final::Symlink(_) => None,
     }
 }
@@ -1858,6 +1860,23 @@ mod tests {
             None
         );
         assert_eq!(collision(&["etc/Rootfs.Manifest.json"], DEFAULT_APFS), None);
+    }
+
+    /// The runtime's per-run file folds the same way: on a filesystem that
+    /// ignores case, `.LEYLINE-EXEC.JSON` would be the worker's own file
+    /// (identity review of `ley-line-open-4f08ea`, F5).
+    #[test]
+    fn an_image_file_that_folds_to_the_run_exec_spec_collides_at_the_root_only() {
+        assert_eq!(
+            collision(&[".LEYLINE-EXEC.JSON"], DEFAULT_APFS),
+            Some((
+                RUN_EXEC_SPEC.to_string(),
+                ".LEYLINE-EXEC.JSON".to_string(),
+                NameCollision::Case
+            ))
+        );
+        assert_eq!(collision(&[".LEYLINE-EXEC.JSON"], CASE_SENSITIVE_APFS), None);
+        assert_eq!(collision(&["etc/.LEYLINE-EXEC.JSON"], DEFAULT_APFS), None);
     }
 
     #[test]

@@ -126,7 +126,8 @@ the canonical form of each version and pins the checked-in OCI fixture's
 linux/arm64 manifest and digest under both: v2, which `leyline rootfs
 import-oci` writes and a reader accepts only in those bytes (bead
 `ley-line-open-4f08ea`, `ley-line-open-faba8f`), and v1, frozen (ADR-0047
-§3, bead `ley-line-open-39309e`).
+§3, bead `ley-line-open-39309e`). Its `escapes-v2` case pins the one way v2
+escapes strings, which a second implementation must match byte for byte.
 
 For in-toto/DSSE evidence, a statement authorizes field `F` of a run only if
 it carries a subject whose `name` is `F`'s field name and whose

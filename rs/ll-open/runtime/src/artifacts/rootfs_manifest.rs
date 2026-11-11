@@ -23,11 +23,17 @@
 //! digest:
 //!
 //! - one compact JSON object, keys in the order `version`, `entries`; each
-//!   entry's keys in the order shown; strings escaped as `serde_json`
-//!   writes them (the parsed document, written again, must be the bytes
-//!   read);
+//!   entry's keys in the order shown; strings escaped one way: `\"` and
+//!   `\\`, the short forms `\b \f \n \r \t`, any other character below
+//!   U+0020 as `\u00xx` in lowercase hex, and everything else raw (U+007F,
+//!   `/` and non-ASCII UTF-8 included), as `serde_json` writes them (the
+//!   parsed document, written again, must be the bytes read; the shared
+//!   vector's `escapes-v2` case pins it);
 //! - `path` is relative, `/`-separated UTF-8, without empty, `.` or `..`
-//!   components or NUL, and never the root's `rootfs.manifest.json`;
+//!   components or NUL, and at the root never `rootfs.manifest.json` or
+//!   [`RUN_EXEC_SPEC`];
+//! - only a `dir` may be at the top-level `dev`, `proc`, `sys`, `tmp` or
+//!   `work`: the guest init mounts over each, and `mount(2)` follows a link;
 //! - entries are in component-wise byte order of their paths, so a
 //!   directory precedes what it holds, and no path appears twice;
 //! - every entry's parent is a `dir` entry (the root, which has no entry,
@@ -41,11 +47,15 @@
 //!   followed on the host, compared byte for byte, recreated verbatim.
 //!
 //! **Version 1** (`{"version":1,"files":[{"path","mode","blake3"},…]}`)
-//! lists regular files only. It stays readable and is frozen as it shipped:
-//! its bytes are not required to be canonical (hand-built producers wrote
-//! other key orders, and tightening it would orphan every such CAS entry),
-//! its directories are the listed files' ancestors at `0755`, and it can
-//! express no link. New producers write version 2.
+//! lists regular files only. It stays readable and keeps its rules: its
+//! bytes are not required to be canonical (hand-built producers wrote other
+//! key orders, and tightening it would orphan every such CAS entry), its
+//! directories are the listed files' ancestors at `0755`, and it can
+//! express no link. One narrowing from the reader it shipped with: each
+//! path must be relative and `/`-separated without empty, `.` or `..`
+//! components (the old reader normalized `a//b`, `a/./b` and a trailing
+//! `/`, which no LLO producer wrote) and not [`RUN_EXEC_SPEC`]. New
+//! producers write version 2.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -662,6 +672,49 @@ mod tests {
         }
     }
 
+    /// The v2 string escaping, as a second implementation must write it
+    /// (identity review of 4f08ea, F2): `"` and `\` escaped, the short
+    /// forms `\b \f \n \r \t`, any other control character below U+0020 as
+    /// `\u00xx` in lowercase hex, and everything else raw: U+007F, `/` and
+    /// non-ASCII UTF-8 included. Any other spelling of the same strings is
+    /// refused. The same bytes are the shared vector's escapes case.
+    #[test]
+    fn v2_strings_are_escaped_one_way() {
+        let mut spec = RootfsSpec::empty_v2();
+        spec.directories.insert("\u{e9}".into(), 0o755);
+        spec.files.insert(
+            "\u{e9}/q\"b\\s\tt".into(),
+            FileSpec {
+                mode: 0o644,
+                blake3: HEX.into(),
+            },
+        );
+        spec.symlinks
+            .insert("\u{e9}/l".into(), "\u{1}x\u{7f}/\u{e9}\u{8}\u{c}\n\r".into());
+        let expected = format!(
+            "{{\"version\":2,\"entries\":[\
+             {{\"type\":\"dir\",\"path\":\"\u{e9}\",\"mode\":493}},\
+             {{\"type\":\"symlink\",\"path\":\"\u{e9}/l\",\"target\":\"\\u0001x\u{7f}/\u{e9}\\b\\f\\n\\r\"}},\
+             {{\"type\":\"file\",\"path\":\"\u{e9}/q\\\"b\\\\s\\tt\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"
+        );
+        assert_eq!(String::from_utf8(spec.to_canonical_v2()).unwrap(), expected);
+        assert_eq!(RootfsSpec::parse(expected.as_bytes()).unwrap(), spec);
+        for (raw, other) in [
+            ("\u{e9}/l", "\\u00e9/l"),
+            ("\\t", "\\u0009"),
+            ("\\b", "\\u0008"),
+            ("\u{7f}", "\\u007f"),
+            ("/\u{e9}\\b", "\\/\u{e9}\\b"),
+        ] {
+            let respelled = expected.replacen(raw, other, 1);
+            assert_ne!(respelled, expected, "{raw} -> {other}");
+            assert!(
+                refusal(&respelled).contains("canonical"),
+                "{raw} -> {other}: {respelled}"
+            );
+        }
+    }
+
     /// The guest init mounts over `dev`, `proc`, `sys`, `tmp` and (with a
     /// workspace) `work`, and `mount(2)` follows a link at its target: a
     /// link there would move the mount over the tree the digest names (a
@@ -759,6 +812,12 @@ mod tests {
             (format!("{{\"version\":1,\"files\":[{{\"path\":\"x\",\"mode\":420,\"blake3\":\"{HEX}\"}},{{\"path\":\"x\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "duplicate rootfs manifest path: x"),
             ("{\"version\":1,\"files\":[],\"entries\":[]}".to_string(), "invalid rootfs manifest"),
             ("{\"version\":1,\"entries\":[]}".to_string(), "invalid rootfs manifest"),
+            // The narrowing from the reader v1 shipped with (identity
+            // review of 4f08ea, F4): it normalized these; none came from an
+            // LLO producer.
+            (format!("{{\"version\":1,\"files\":[{{\"path\":\"a//b\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
+            (format!("{{\"version\":1,\"files\":[{{\"path\":\"a/./b\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
+            (format!("{{\"version\":1,\"files\":[{{\"path\":\"a/\",\"mode\":420,\"blake3\":\"{HEX}\"}}]}}"), "not guest-relative"),
         ] {
             let error = refusal(&manifest);
             assert!(error.contains(reason), "{manifest}: {error}");

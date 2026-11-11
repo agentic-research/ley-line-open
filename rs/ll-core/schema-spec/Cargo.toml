@@ -23,6 +23,11 @@ readme = "README.md"
 # -s` at move time.
 
 [dependencies]
+# Bead ley-line-open-e9d940: `connections::ConnectionsDocument::digest_hex`
+# computes `connectionsDigest` (BLAKE3-256 over the canonical connections/v1
+# bytes), so an issuer digests with the same code the vectors test. Also used by
+# the tests below (verify_confinement_digest and the connections tests).
+blake3 = { workspace = true }
 
 [dev-dependencies]
 # Used by the VECTORS.sha256 verification test only. Version matches the two
@@ -40,9 +45,3 @@ serde_json = { workspace = true }
 # against its own reading of the schema, not against the schema. Already in
 # the lock as a transitive dependency, so this adds no closure.
 jsonschema = "0.33"
-# Bead ley-line-open-193170: `verify_confinement_digest` computes the
-# BLAKE3-256 `confinementDigest` per confinement/v1 README §7 and asserts
-# it matches the pin in `CONFINEMENT_DIGESTS.blake3`. Distinct from the
-# SHA-256 content-integrity pin — this is the substrate's Σ hash used for
-# identity commitment. Workspace-declared dep.
-blake3 = { workspace = true }

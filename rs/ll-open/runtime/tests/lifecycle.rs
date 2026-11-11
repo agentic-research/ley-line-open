@@ -75,10 +75,14 @@ impl Backend for CompletingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -102,10 +106,14 @@ impl Backend for FailingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "failing/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -133,7 +141,11 @@ impl Backend for BlockingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         if self.starts.fetch_add(1, Ordering::SeqCst) != 0 {
             return Err(ExecutionError {
                 code: ErrorCode::BackendFailed,
@@ -149,7 +161,7 @@ impl Backend for BlockingBackend {
         }
         Ok(BackendRun {
             backend_id: "blocking/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -175,14 +187,18 @@ impl Backend for RecordingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         self.calls
             .lock()
             .expect("recording backend lock")
             .push("start");
         Ok(BackendRun {
             backend_id: "recording/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -266,7 +282,11 @@ impl Backend for NeedsCasRoot {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         unreachable!("provision tests start nothing")
     }
 
@@ -677,10 +697,14 @@ impl Backend for JustFinishedBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "just-finished/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 

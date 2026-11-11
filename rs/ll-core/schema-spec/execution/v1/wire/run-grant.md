@@ -43,11 +43,27 @@ Two properties make this the signable form:
   sign; a verifier recomputes them from the grant it received, signature
   and all, and gets the same answer.
 
-A cleared `signature` canonicalizes to a null pointer in the trailing pointer
-slot, which canonicalization truncates. So `signing_bytes` for a signed grant
-are byte-identical to the canonical form of the same grant before the
-signature was attached — and identical to what a producer that predates the
-field would have emitted.
+"Cleared" means **set to an empty `GrantSignature` struct**, not omitted: the
+`signature` pointer is non-null and points at a zero-size struct, whether or
+not the grant as received carried a signature. Canonicalization keeps that
+pointer, so `signing_bytes` are different bytes from the canonical form of
+the same grant with `signature` left unset, and a signer that omits the field
+instead produces a signature every verifier refuses. How they differ depends
+on the grant's layout: for the vector's grants, which set nothing after
+`signature`, they are 24 bytes longer (1056 bytes against 1032 for the first
+case); for a grant that also sets `confinementManifest`, the two forms are the
+same length and differ in 4 bytes. An earlier revision of this document said
+the cleared field canonicalizes to a truncated null pointer; that was wrong,
+and the bytes the implementation signs have not changed. In JSON-carrier
+terms the grant an issuer canonicalizes carries `"signature": {}`.
+
+List presence is signed. An unset list field canonicalizes to a null pointer;
+an explicit zero-length list canonicalizes to a non-null pointer, so the two
+are different `signing_bytes`. Where a field's absence carries meaning, the
+contract fixes one encoding: `WorkspaceGrant.writeScope` is left unset for "no
+scope", and an authorizer refuses the empty list (README, "Workspace write
+scope"). `test-vectors/run-grant-signing.json` gives known answers for the
+signing bytes and the Ed25519 signature over them, including that pair.
 
 ## Fields
 

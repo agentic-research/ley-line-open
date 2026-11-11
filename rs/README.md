@@ -36,7 +36,7 @@ The Rust workspace for ley-line-open. Two tiers: `ll-core/` (infrastructure) and
 | [`leyline-chat-embed`](ll-open/chat-embed/) | CLI binary: semantic search over Claude Code chat databases via fastembed/MiniLM |
 | [`leyline-cli-lib`](ll-open/cli-lib/) | Daemon: living SQLite db + arena flip + Σ root advance + MCP/UDS surfaces; hosts every enrichment pass |
 | [`leyline-storefs`](ll-open/storefs/) | Store-backed filesystem core for the virtio-fs device (ADR-0044 V2) and the host mount (ADR-0045 T8, `mount` feature: FUSE and loopback NFSv3 adapters): FUSE-shaped requests answered from the store, writes landed as ADR-0042 proposals at FLUSH/FSYNC, refusals as Linux errno values |
-| [`leyline-cli`](ll-open/cli/) | `leyline` binary — `parse`, `daemon`, `execution-daemon`, `execution`, `lsp`, `inspect`, `load`, `cdc`, `verify-head`, `rebuild`, `rootfs` (`import-oci`), `splice`, `doctor`, `self` subcommands |
+| [`leyline-cli`](ll-open/cli/) | `leyline` binary — `parse`, `daemon`, `execution-daemon`, `execution`, `lsp`, `inspect`, `load`, `cdc`, `verify-head`, `rebuild`, `rootfs` (`import-oci`, `provision-cas`), `splice`, `doctor`, `self` subcommands |
 | [`leyline-krun-worker`](ll-open/krun-worker/) | The microVM worker binary: links the vendored libkrun (`../third_party/`) and runs one guest per process for `leyline-runtime`'s libkrun backend. Not published |
 | [`leyline-perf-sample`](ll-open/perf-sample/) | Wall-clock sampling for perf gates (minimum of N, interleaved arms). Test support only, not published |
 
@@ -115,7 +115,7 @@ graph TD
 
 ## Tier-isolation gate
 
-`ll-core/*` crates MUST compile without `ll-open/*`. CI gate: `task tier:isolation` builds `leyline-core`, `leyline-schema` and `leyline-public-schema` in isolation. If a `ll-core/*` Cargo.toml gains a `ll-open/*` path dep, the gate fails.
+`ll-core/*` crates MUST compile without `ll-open/*`. CI gate: `task tier:isolation` builds every `ll-core/*` crate (`leyline-core`, `leyline-ffi-helpers`, `leyline-mcp-descriptor`, `leyline-mcp-protocol-schema`, `leyline-public-schema`, `leyline-schema`, `leyline-schema-capnp`, `leyline-schema-spec`) and fails if their normal or build dependency tree reaches an `ll-open/*` crate.
 
 ## Build
 
@@ -127,7 +127,7 @@ cargo test --workspace
 # Or via the Taskfile from the repo root (preferred — wires pkg-config for macFUSE-T on macOS):
 cd .. && task ci             # the full CI gate (Taskfile.yml `ci:`), including audit, FFI staticlib, tier isolation and test
 cd .. && task install:full   # release + codesign + install to ~/.local/bin — recommended for consumers
-# See ../README.md#install for the full three-path matrix (install / install:full / install:full+mount).
+# See ../README.md#install-and-build for the full three-path matrix (install / install:full / install:full+mount).
 ```
 
 ## Cap'n Proto toolchain

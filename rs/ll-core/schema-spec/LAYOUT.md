@@ -103,6 +103,7 @@ signed digest is computed over:
 |---|---|---|
 | Cap'n Proto canonical bytes | `<cap>.capnp` | `execution/v1` — `runSpecDigest`, `run_id` |
 | Canonical JSON | `<cap>.schema.json` | `confinement/v1` — `confinementDigest` (ADR-0035 §8) |
+| Canonical JSON | `<cap>.schema.json` | `connections/v1` — `connectionsDigest` (ADR-0046 S2) |
 
 The failure this prevents is two sources of truth for one signed surface.
 `capnpc-schema-bridge-jsonschema` will happily emit a JSON Schema from a

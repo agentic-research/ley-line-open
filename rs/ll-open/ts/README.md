@@ -4,7 +4,7 @@ Tree-sitter AST projection and bidirectional splice.
 
 ## What's here
 
-- **Parse** — feed source bytes + language → walk the CST → write `nodes` table + `_ast` table (byte ranges, node kinds) + `_source` table (original source text).
+- **Parse** — feed source bytes + language → walk the CST → write `nodes` + `_ast` (byte ranges, node kinds; since extraction epoch 7 a comment is a row too) + `_source` (original source text), and the fact tables `node_defs`, `node_refs` and `_imports`, with `_meta.extraction_epoch` recording which emission rules produced the facts.
 - **Splice** — edit an AST node's text content → patch the original source at the tracked byte range → re-parse → atomically update all tables. Batch splice handles multiple edits with byte-range overlap detection.
 - **Reproject** — after splice, re-parse the patched source and replace the old AST. Syntax errors are attributed to the responsible node.
 - **Languages** — feature-gated grammars:

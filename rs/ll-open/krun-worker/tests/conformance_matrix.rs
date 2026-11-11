@@ -41,7 +41,7 @@ mod conformance;
 mod hypervisor;
 
 use conformance::{
-    ChannelKind, Column, ColumnSpec, Denial, Fixture, GraphFixture, Holder, Waitable,
+    ChannelKind, Column, ColumnSpec, Denial, Fixture, GraphFixture, Holder, ScopeFixture, Waitable,
 };
 
 const GUEST_EXECUTABLE: &str = "bin/guest";
@@ -71,14 +71,9 @@ fn undeliverable(manifest: ConfinementManifest) -> Result<ConfinementManifest, E
     manifest.with_connect_local(7532)
 }
 
+/// The libkrun column. `None` when the host has no hypervisor (a named skip,
+/// or a failure under `LEYLINE_REQUIRE_HYPERVISOR`).
 fn libkrun() -> Option<Column> {
-    libkrun_with(|backend| backend)
-}
-
-/// The libkrun column, its backend configured by `configure`. `None` when
-/// the host has no hypervisor (a named skip, or a failure under
-/// `LEYLINE_REQUIRE_HYPERVISOR`).
-fn libkrun_with(configure: impl FnOnce(KrunWorkerBackend) -> KrunWorkerBackend) -> Option<Column> {
     let libkrunfw = hypervisor::libkrunfw_or_skip()?;
     // The system temp directory, not CARGO_TARGET_TMPDIR: the channel is a
     // UNIX socket under the fixture, and a socket path is capped near 104
@@ -98,7 +93,7 @@ fn libkrun_with(configure: impl FnOnce(KrunWorkerBackend) -> KrunWorkerBackend) 
     // it reads the environment concurrently.
     unsafe { std::env::set_var(library_var, library_dir) };
     let runtime_files = vec![libkrunfw];
-    let backend = configure(KrunWorkerBackend::new(KrunWorkerConfig {
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
         worker,
         cas_root: fixture.cas.clone(),
         ephemeral_root: fixture.runs.clone(),
@@ -106,7 +101,7 @@ fn libkrun_with(configure: impl FnOnce(KrunWorkerBackend) -> KrunWorkerBackend) 
         devices: Vec::new(),
         ready_timeout: Duration::from_secs(30),
         tsi_hijack_inet: false,
-    }));
+    });
     Some(Column::new(
         fixture,
         ColumnSpec {
@@ -161,7 +156,8 @@ fn graph_io_goes_through_the_mediated_workspace_share() {
 const A: &str = "package a\n\nfunc A() int { return 1 }\n";
 const A_EDIT: &str = "package a\n\nfunc A() int { return 2 }\n";
 
-/// A real store: a living database cold-parsed from a one-file tree.
+/// A real store: a living database cold-parsed from a small tree, `a.go`
+/// beside the files the write-scope row names.
 struct GraphStore {
     _dir: TempDir,
     live: Arc<LiveDb>,
@@ -175,6 +171,13 @@ impl GraphStore {
         let source = dir.path().join("src");
         std::fs::create_dir(&source).expect("source tree");
         std::fs::write(source.join("a.go"), A).expect("source file");
+        std::fs::write(
+            source.join(conformance::SCOPE_OUTSIDE),
+            "package a\n\nfunc B() int { return 1 }\n",
+        )
+        .expect("a second source file");
+        std::fs::create_dir(source.join("docs")).expect("docs directory");
+        std::fs::write(source.join(conformance::SCOPE_KEPT), "kept\n").expect("a kept file");
         let live_db = dir.path().join("graph.live.db");
         let live = Arc::new(LiveDb::open_fresh_for_test(&live_db));
         live.with_write(|conn| {
@@ -235,10 +238,38 @@ impl WorkspaceShares for StoreShares {
         }
         Ok(Arc::new(StoreShare::new(StoreFs::new(
             Arc::clone(&self.live),
-            scope_for(&grant.operations),
+            scope_for(grant),
             Options::default(),
         ))))
     }
+}
+
+#[test]
+fn a_write_scope_bounds_what_the_guest_writes() {
+    let _serial = common::serial();
+    let store = GraphStore::new();
+    let grant = WorkspaceGrant {
+        write_scope: vec![
+            conformance::SCOPE_FILE.into(),
+            conformance::SCOPE_TREE.into(),
+        ],
+        ..conformance::workspace_grant(&store.store_root)
+    };
+    let shares = Arc::new(StoreShares {
+        live: Arc::clone(&store.live),
+        graph_root: grant.graph_root.clone(),
+    });
+    let Some(column) = libkrun().map(|column| column.with_workspace_shares(shares)) else {
+        return;
+    };
+    let live = Arc::clone(&store.live);
+    conformance::row_a_write_scope_bounds_what_the_guest_writes(
+        column,
+        ScopeFixture {
+            grant,
+            stored: Box::new(move |path| GraphStore::stored(&live, path)),
+        },
+    );
 }
 
 fn graph_io() {
@@ -248,7 +279,9 @@ fn graph_io() {
         live: Arc::clone(&store.live),
         graph_root: grant.graph_root.clone(),
     });
-    let Some(column) = libkrun_with(|backend| backend.with_workspace_shares(shares)) else {
+    // The service opens the granted workspace from `shares` and hands the
+    // open share to the backend (bead ley-line-open-1022a8).
+    let Some(column) = libkrun().map(|column| column.with_workspace_shares(shares)) else {
         return;
     };
     let live = Arc::clone(&store.live);

@@ -1,6 +1,8 @@
 # ADR-0046 — The connection broker: the data plane for cloister's declared connections
 
-**Status:** Proposed (2026-10-27). Acceptance is the user's decision. See *Open questions*.
+**Status:** Proposed (2026-10-27; Slice 1 amendment proposed 2026-11-11). Acceptance is the
+user's decision. See *Open questions*. Q7 is decided; every other answer in this document,
+including all of *Slice 1*, is a proposal.
 **Bead:** `ley-line-open-e2c5ce`
 **Related:**
 - cloister ADR-0069 (Proposed; bead `cloister-77870d`): declared connections, the declaration half
@@ -372,10 +374,447 @@ Fail-closed rules, in one place:
 
 ---
 
+## Slice 1: credential-free relay (proposed for v0.30.0)
+
+**Status of this section: proposed, not accepted.** The only owner decision it builds on is
+Q7 (decided 2026-11-10, implemented by `ley-line-open-be3711`). Every S-numbered decision
+below is a proposal. The constraints cloister supplied as the consumer (2026-11-11) are
+marked *(cloister)*; where this section departs from one, it says so and why.
+
+### S0. What the slice is for, and what it is not
+
+Cloister's demo: an agent in a libkrun microVM on macOS dials `127.0.0.1:<guestPort>` and
+reaches an API that runs as a Service in a kind cluster on the same Mac. The guest half
+ships: patch 0010 presents a §6 `connect` grant carrying `guestPort` as TCP on guest
+loopback, and the VMM joins it over vsock to a host UNIX socket (Q7). VM-to-VM already works
+with no broker, by two VMs sharing one bind path (cloister live run, comment on
+`ley-line-open-e2c5ce`, 2026-11-10). What is missing is the host-side process that listens
+on that UNIX socket and joins each connection to one allow-listed TCP `host:port`.
+
+Slice 1 is that process and nothing more: it copies bytes. In scope are D1 (per-run host
+broker), a minimal D2, D5 for the microVM tier on macOS (and native macOS, S6), and D7's
+fail-closed rules as they apply to a relay that holds no credential.
+
+Out of scope and deferred, unchanged: D3 (per-`appProtocol` handling beyond opaque bytes),
+D4 (credential injection), Q2 (native Linux with credentials), Q4 (subject token), Q5
+(static secrets). A slice-1 broker has no TLS client, no parser and no credential.
+
+### S1. Q1 — per-run broker (proposed)
+
+One broker process per run whose grant carries a connections document; none otherwise.
+
+- **Its OS profile can name exactly one run's upstreams.** The broker's LLO-internal
+  profile allows outbound TCP to the declared upstream ports and nothing else (S5). A
+  per-daemon broker's profile would be the union of every concurrent run's upstreams, so
+  each run's broker would hold reach that only some other run was granted. That widens
+  reach, which default deny forbids.
+- **The lifecycle is the run's.** "No channel outlives its run" (Q7 invariant I9) holds by
+  construction when the broker is torn down with the run (S7). A shared broker must
+  instead remove one run's listeners from a live process, which is state that can drift.
+- **Failure is isolated.** A broker exit fails one run (D7 rule 5), not every run on the
+  daemon.
+- **D4 inherits it.** When credentials arrive, a per-run broker holds exactly one run's
+  (D1). Choosing per-daemon now would have to be undone then.
+
+The cost is one process and its startup per run with connections. D6's argument for
+revisiting Pingora applies only to a shared broker, so it does not arise.
+
+### S2. The minimal `connections/v1` document (proposed)
+
+Slice 1 delivers a strict subset of D2. Every slice-1 document is a valid D2 document, so
+D3/D4 extend the schema without changing the digest of any document slice 1 accepts.
+
+```json
+{
+  "connections": [
+    {
+      "appProtocol": "art.tcp",
+      "endpoint": {
+        "unix": "/private/tmp/cloister-ch-7Qm2/orders.api.sock"
+      },
+      "name": "orders-api",
+      "target": {
+        "tcp": {
+          "host": "127.0.0.1",
+          "port": 30080
+        }
+      }
+    }
+  ],
+  "version": "cloister/connections/v1"
+}
+```
+
+Canonical form: D2's rules 1–3 (confinement/v1 §7 rules 1–4 verbatim; `connections`
+sorted by `name` in byte order; a one-element list stays a list; an empty list is
+refused). `connectionsDigest` is BLAKE3-256 over those canonical bytes, rendered
+`blake3-256:<hex>` as `DigestRef`. It names the connections document's bytes and nothing
+else; it is not `confinementDigest`, a blob hash or any arena or store root.
+
+Field rules (each refusal names the connection and the field):
+
+| field | slice-1 rule | refused at parse |
+|---|---|---|
+| `version` | exactly `cloister/connections/v1` | any other value |
+| any object | only the keys shown | an unknown key at any level (D2 extends the schema; a slice-1 runner never ignores a key it does not deliver) |
+| `name` | `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, unique | a duplicate |
+| `appProtocol` | `art.tcp` only | any other closed-set value, named as "not delivered in slice 1"; any value outside the set |
+| `endpoint` | `{"unix": path}` only | `{"tcp": port}` (S6); any other key |
+| `endpoint.unix` | absolute; no `.` or `..` component, no `//`, no trailing `/`; at most 103 bytes; unique across connections | each violation, by name |
+| `target` | `{"tcp": {host, port}}` only | `unix`, `https`, `cloudSql` (D2 union members slice 1 does not deliver); a `tls` key |
+| `target.tcp.host` | an IP literal in loopback: IPv4 dotted-quad in `127.0.0.0/8` with no leading zeros, or exactly `::1` | any name, including `localhost`; any non-loopback address, named "non-loopback target" |
+| `target.tcp.port` | 1–65535 | 0 or out of range |
+| `credentialRef` | absent | present (D2 rule 4 already refuses it on `art.tcp`) |
+
+`appProtocol` is required although slice 1 accepts one value, so that a slice-1 document
+never relies on a default a later slice would have to keep. 103 bytes is the smallest
+`sun_path` capacity among the supported platforms (macOS: 104 including the NUL), so a
+vector's validity does not depend on the host that checks it *(cloister: at most 103)*.
+
+**Why loopback IP literals only.**
+
+- **No name is resolved, ever.** With a literal there is no resolver to poison and no
+  answer that changes between check and dial (DNS rebinding). The dialled address is the
+  committed bytes, so the receipt records exactly what the digest authorized
+  *(cloister: no DNS, no re-resolution)*.
+- **No TLS in slice 1, so no network hop.** D7 requires verified TLS to every non-local
+  target and offers no spelling to skip it. Slice 1 has no TLS client, so the only targets
+  it can serve within D7 are local. Non-loopback is refused by name rather than relayed in
+  plaintext *(cloister: refuse non-loopback by name)*.
+- **The OS profile can express it exactly.** Seatbelt scopes outbound TCP as
+  `remote tcp "localhost:N"`, so the broker's own sandbox can hold it to the declared
+  ports on loopback (S5). For an arbitrary host the profile could only scope by port,
+  and the broker's code would be the sole enforcement.
+
+**Cross-document rule, slice 1.** Checked at start, before the broker is spawned; a
+mismatch refuses the run naming the connection (`invalidGrant`):
+
+- every `endpoint.unix` appears exactly once in the confinement manifest's §6 `allow` as a
+  connect grant on that exact path: on the microVM tier the object form
+  `{"path", "mode": "connect", "guestPort"}`, on native macOS the bare string;
+- no §6 grant on an endpoint path has `bind` or `connect-bind` (the workload never owns
+  the broker's socket);
+- a §6 connect grant that names no endpoint is not the broker's and is untouched (the
+  VM-to-VM shared-path joins of S0 keep working).
+
+The guest address stays where Q7 put it: `guestPort` in the confinement manifest, committed
+by `confinementDigest`. The connections document does not repeat it.
+
+### S3. Q3 — authorizing the document (proposed wire change)
+
+**Additive `RunGrant` fields, on the `confinementDigest @8` / `confinementManifest @15`
+model:**
+
+```capnp
+connectionsDigest   @16 :DigestRef $Traits.optional;  # blake3-256 over canonical connections/v1
+connectionsDocument @17 :Text      $Traits.optional;  # the canonical document the digest is taken over
+```
+
+`@16` carries the authority, `@17` the document. Carrying only the digest repeats the defect
+`@15` fixed: a runner could verify a match without learning what was authorized. The
+runner recomputes the digest from `@17`, requires it to equal `@16`, and requires `@17` to
+be byte-equal to its own canonicalization (a non-canonical document is refused, never
+normalized).
+
+**Signing bytes.** Both fields enter `signing_bytes = canonical(RunGrant with signature
+cleared)` (`wire/run-grant.md`) with no change to that rule: they are pointer fields in the
+signed struct, so a signature covers them. A grant that sets neither has null pointers in
+those slots, which canonicalization truncates, so its signing bytes are byte-identical to
+those of the same grant before the fields existed. Existing signatures stay valid.
+
+**What an old daemon does, and why a new field alone is not enough.** A shipped daemon
+skips an unknown pointer field in the binary form, and `capnp_json` skips an unknown key
+(`transport.rs`, `refuse_unknown_limit_keys` documents the same gap for limits). An old
+daemon handed only `@16`/`@17` would start the run without a broker, and the §6 connect
+grant would then reach whatever binds the endpoint path. Default deny requires a refusal,
+so the grant also carries a marker a shipped daemon already refuses:
+
+- **`credentialBrokerRefs @13` = exactly `["cloister/connections/v1"]`.** Every daemon
+  since execution/v1 first shipped (PR #317) refuses a non-empty `credentialBrokerRefs`
+  with `unsupportedBackend`: "credential broker authority requires a broker integration"
+  (`authorization.rs`). The field is "resolved credential brokers; never credential
+  values", and the connection broker is that broker. The entry names the contract, not a
+  credential, and is inside the signing bytes.
+- **The new daemon's rule is all-or-nothing.** `@16`, `@17` and the marker are present
+  together or absent together; any other combination is refused with `invalidGrant`,
+  naming the missing part. `credentialBrokerRefs` holding anything other than exactly the
+  marker is still refused as today.
+
+This is the critical-extension pattern (X.509 `critical`) built from a field old readers
+already treat as critical. The rejected alternative, folding the connections into the
+confinement manifest, also gets an old-daemon refusal (an unknown confinement/v1 dimension
+is refused) but puts upstream ports into `confinementDigest` and so into the workload
+identity (§8), mixing a broker's configuration into the workload's confinement, as Q3
+already notes.
+
+**Capability discovery.** `llo_execution_capabilities` adds the entry
+`{name: "cloister/execution/v1/connections", version: "1"}` (constant beside
+`RESOURCE_LIMITS_CAPABILITY` in `transport.rs`), advertised by a daemon that reads `@16`/`@17`
+and has a broker, whatever its tier; a tier that cannot serve a connection refuses at start
+by name (S6). A client MUST find the entry before sending a grant with connections. Its
+absence means a daemon older than the first LLO release that ships this slice, and the
+client's refusal names that minimum version *(cloister: as the `casRoot` refusal does)*.
+The old daemon's own refusal is the fixed `credentialBrokerRefs` text above; it cannot name
+a version it predates, so the version is the client's to state.
+
+**Consumer surfaces.** The schema change regenerates every checked-in consumer of
+`execution.capnp` (Rust bindings, `execution.tools.json`, the Go and TypeScript fixtures,
+compatibility metadata). Cloister's emitter must reproduce `connectionsDigest` byte for
+byte from the `connections/v1` vectors (`ley-line-open-e9d940`) before it sends one
+*(cloister: conditional on those vectors)*.
+
+### S4. Q8 — endpoint allocation (proposed: the issuer allocates, LLO validates)
+
+The issuer chooses every endpoint path and commits it in the document, so in
+`connectionsDigest`. LLO chooses no path and derives none *(cloister)*. Cloister's
+convention is `<channelDir>/<bundle>.<portName>.sock` in a fresh, realpath'd, mode-0700
+channel directory per run.
+
+This answers both halves of Q8. The issuer predicts the path because it chose it; the
+ADR-0036 equality contract needs nothing LLO derives. Two concurrent runs of one bundle do
+not collide because each has its own channel directory. The path need not contain the run
+id (which would be circular: `run_id` derives from the grant), only an issuer-chosen
+component unique per run. And if an issuer does reuse a directory, the collision is a
+refusal, not a shared socket:
+
+Checked at start, after authorization and before the broker is spawned; each failure
+refuses the run by name with the connection and the reason:
+
+| check | refusal |
+|---|---|
+| the endpoint path does not exist (`lstat` gives `ENOENT`) | `resourceConflict`: "endpoint exists" (another run, a stale socket, a squatter) |
+| the parent exists and is a directory | `invalidGrant`: "endpoint parent missing" |
+| the parent's realpath equals the parent as written | `invalidGrant`: "endpoint parent is reached through a symlink" |
+| the parent is owned by the daemon's effective uid and its mode is exactly 0700 | `invalidGrant`: "endpoint parent not private" |
+| the full path fits this platform's `sun_path` | `invalidGrant`: "endpoint path too long" (the 103-byte parse rule makes this unreachable on the supported platforms; it stays as the platform check) |
+| no two connections share a path | refused at parse (S2) |
+
+The broker binds every endpoint before the run reports ready, and before the workload's
+confinement compiles, which §6's ordering rule requires of a connect grant *(cloister:
+`up` waits for the socket to exist)*. Slice 1 allocates nothing on the issuer's behalf, so
+`StartOutput` gains no field. The broker unlinks its sockets when it exits and the
+supervisor unlinks any it left; the channel directory is the issuer's to remove.
+
+Checking ownership and mode closes a gap the issuer's convention leaves to discipline: a
+0700 directory owned by another uid, or reached through a symlink, would let a process
+outside the run choose what the path resolves to between the issuer's check and the bind.
+
+### S5. The relay: allow-list enforcement and failure behaviour (proposed)
+
+**The broker dials exactly the committed target and nothing else.**
+
+- Each listener is bound to one connection; the target is fixed when the broker starts
+  from the authorized document, as a `SocketAddr` built from the literal. The broker reads
+  no address from the stream, parses no protocol and follows nothing, so the workload has
+  no way to steer it.
+- One upstream dial per accepted connection; no pooling, no reuse across connections, no
+  dial before a connection arrives.
+- **Bind, then confine.** The broker binds every endpoint, then applies its LLO-internal
+  nono profile to itself, then reports ready. The profile denies the filesystem entirely
+  (accepting on an already-bound listener needs no path right), allows outbound TCP to
+  `localhost:<port>` for each declared port and nothing else, and allows no inbound TCP,
+  no listen, no exec. Two layers enforce the allow-list: the broker's code dials one
+  address per listener, and its sandbox refuses any other port.
+- The peer is checked on accept: `getpeereid` must give the daemon's effective uid (on the
+  microVM tier the peer is the run's VMM). Another uid is closed without a dial and counted
+  as a refusal.
+
+**Failure modes.** A guest connection is accepted by the guest init relay before it reaches
+the host (patch 0010), so a guest client never sees `ECONNREFUSED` from a declared port; it
+sees bytes or end-of-file *(cloister: refused or EOF)*.
+
+| event | broker behaviour | the guest sees |
+|---|---|---|
+| upstream `ECONNREFUSED` (nothing listening yet, e.g. kind still starting) | holds the accepted connection and retries, backing off from 5 ms to 200 ms, for at most 10 s, ending early when the guest side hangs up; the same bound as a serve channel's hold (patch 0010, #554) *(cloister)* | the connection works once the upstream is up within 10 s; otherwise end-of-file without a byte |
+| any other dial error (`ECONNRESET`, `ETIMEDOUT`, `EHOSTUNREACH`, profile `EPERM`) | closes at once, no retry | end-of-file |
+| upstream resets mid-stream | closes both directions | end-of-file (a UNIX stream peer on macOS observes no reset, and the vsock hop carries none) |
+| half-close: one side ends its writes | `shutdown(SHUT_WR)` toward the other side; the other direction keeps copying until it ends | the same half-close |
+| more concurrent connections than the run's cap (proposed: 256 per run) | closes the new connection without a dial; counted as a refusal | end-of-file |
+| broker exits or crashes during the run | the supervisor fails the run (D7 rule 5): cancels the workload, terminal state `failed`, receipt written from what the supervisor holds | end-of-file on open connections; new dials end at once (nothing listens at the path) |
+
+There is no unbounded retry anywhere: the 10 s hold is per connection and only for
+`ECONNREFUSED`. Each direction has a fixed buffer (64 KiB) and is copied with `read(2)` and
+`write(2)` only, so no ancillary data is received or sent (D7, `SCM_RIGHTS`).
+
+**Strength.** The guest side is capability-shaped: an undeclared guest port has no
+listener (Q7). The host hop is `policy` at best *(cloister)*: the broker guarantees which
+address it dials, not which process holds it, because a loopback port is whoever bound it
+first (ADR-0037). Slice 1's obligation is never to widen past the committed target;
+cloister's build check owns `minStrength`.
+
+### S6. Tiers (proposed)
+
+| tier | slice 1 | why |
+|---|---|---|
+| microVM, macOS | delivered | §6 connect with `guestPort` (Q7) is the channel; the broker listens at its path |
+| native macOS | delivered | the same broker; the workload dials the §6 path itself (a bare-string connect grant, enforced per path by Seatbelt). A workload that cannot dial a UNIX socket needs the microVM tier |
+| microVM, Linux | refused by name | `guestPort` is refused off macOS until it runs live there (Q7) |
+| native Linux | refused by name | §6 is refused at Landlock ≤ ABI 7; `endpoint {"tcp"}` (D5's `connectLocal` form) is not delivered in slice 1 |
+
+Refusal is `unsupportedBackend`, naming the tier and the connection, before anything is
+spawned (D7 rule 3). Native macOS falls out because nothing in the broker is tier-specific:
+only the cross-document rule's expected §6 spelling differs.
+
+### S7. Lifecycle (proposed)
+
+Ordering inside `start`, each step refusing the run on failure before the next:
+
+1. authorize the grant, including S3's all-or-nothing rule and the digest check;
+2. parse the document (S2), run the cross-document rule (S2) and the endpoint checks (S4);
+3. spawn the broker and record it in the run's state **before** waiting for readiness, so
+   `cancel` in that window kills it (the second defect of `ley-line-open-f963e6`);
+4. the broker binds every endpoint, confines itself, and reports ready over its control
+   pipe; no ready report within a bound (proposed: 5 s) kills it, unlinks the endpoints and
+   fails the start on the existing failed-start path (D7 rule 4);
+5. compile the workload's confinement (§6 connect paths now resolve) and start the
+   workload.
+
+**Owned by the run, including when the supervisor dies** *(cloister; `ley-line-open-f963e6`)*.
+The broker inherits the read end of a lifeline pipe whose only write end the supervising
+process holds; end-of-file on it means the supervisor is gone, and the broker exits at once,
+closing its listeners and every connection. This works on macOS, which has no
+`PR_SET_PDEATHSIG`, and is the mechanism f963e6 asks for the krun worker; the two share one
+implementation. Slice 1 does not ship before f963e6's parent-death fix, or ships that fix
+with it: otherwise a broker outlives a killed supervisor exactly as a worker does today.
+At every terminal state the supervisor closes the lifeline, kills the broker's process
+group and unlinks the endpoints.
+
+### S8. The receipt (proposed)
+
+Additive `RunReceipt` fields:
+
+```capnp
+connectionsDigest @15 :DigestRef               $Traits.optional;  # the document the broker ran
+connections       @16 :List(ConnectionOutcome) $Traits.optional;  # one per connection, in document order
+
+struct ConnectionOutcome {
+  name            @0 :Text;    # the connection's name
+  target          @1 :Text;    # the literal dialled, "127.0.0.1:30080"
+  accepted        @2 :UInt64;  # connections accepted on the endpoint
+  dialled         @3 :UInt64;  # upstream dials that succeeded
+  refused         @4 :UInt64;  # accepted, closed without an upstream (refused, hold expired, dial error, cap, foreign peer)
+  bytesToTarget   @5 :UInt64;
+  bytesFromTarget @6 :UInt64;
+}
+```
+
+*(cloister: each upstream dialled, the connection count, and refusals.)* The broker reports
+each connection's record to the supervisor over its control pipe when the connection ends,
+so the receipt is assembled by the supervisor, not by the broker or the workload. After a
+broker crash, the receipt carries every record reported before it; connections open at the
+crash are absent, and the run's terminal state is `failed`. The receipt carries no payload
+byte, no guest address and no peer pid. A consumer that predates the fields reads a
+receipt without them; absence is "no connections", which is true of every run such a
+daemon produced.
+
+### S9. macOS and kind (deployment note only)
+
+LLO dials a `host:port`. How the kind cluster's Service becomes reachable there is the
+deployment's: on macOS, kind runs in Docker Desktop's VM, and a NodePort mapped with kind's
+`extraPortMappings` (`listenAddress: 127.0.0.1`, a `hostPort` cloister picks) or a
+`kubectl port-forward` that cloister runs appears on the Mac's `127.0.0.1:<hostPort>`. The
+connections document carries that address. Nothing in LLO names a cluster, a Service, a
+namespace or a kubeconfig, so LLO stays free of Kubernetes knowledge; if the cluster is not
+up, the broker sees `ECONNREFUSED` and S5's bounded hold applies.
+
+### S10. Threat model for slice 1
+
+Assets: the authority to reach the declared targets and only them; the host's other
+loopback services; the receipt's accuracy. There is no credential.
+
+| threat | mechanism | rule |
+|---|---|---|
+| workload reaches an undeclared host port | dials another guest port, or the host directly | no guest listener exists for an undeclared port and hijack is off (Q7, I1/I2); the broker dials only its targets; its sandbox refuses other ports (S5) |
+| workload steers the broker | an address in the stream | the broker parses nothing; the target is fixed per listener (S5) |
+| a name resolves elsewhere at dial time | DNS answer changes | no names: IP literals only (S2) |
+| endpoint squatting or a shared path | a process binds the path first; two runs share a directory | pre-existing path refused; parent must be a non-symlinked 0700 directory owned by the daemon's uid; bind before the workload's confinement compiles (S4) |
+| a local process uses the broker | connects to the endpoint | the parent is 0700 and the peer uid is checked; a same-uid process could already dial the loopback target itself, so it gains no reach (residual, accepted) |
+| upstream impersonation | another process holds the loopback port | not closed in slice 1: the edge is `policy` (S5); the receipt records the address, not the process |
+| document tampered or swapped | config is ambient | `@16`/`@17` inside the signed grant; digest recomputed; non-canonical refused (S3) |
+| an old daemon ignores the fields | unknown fields skipped | the `credentialBrokerRefs` marker is refused by every shipped daemon; clients check the capability first (S3) |
+| resource exhaustion | many connections, a stuck upstream | per-run connection cap; per-connection 10 s hold only on `ECONNREFUSED`; fixed buffers (S5) |
+| broker compromise | a bug in the copy loop | no parser, no credential; profile denies the filesystem and every port but the targets (S5) |
+| broker outlives the run | supervisor killed; cancel before ready | lifeline pipe; recorded before readiness wait (S7) |
+| descriptor passing | `SCM_RIGHTS` over the UNIX socket | `read(2)`/`write(2)` only (S5) |
+| a declared connection silently not delivered | tier cannot express it; broker fails to bind | the run is refused by name (S2, S4, S6, S7) |
+
+### S11. Tests that close it
+
+Hermetic (no hypervisor; in `task ci`):
+
+- **Schema** (`leyline-schema-spec`, closes S2): the canonical vector and its pinned digest;
+  one vector per parse refusal in S2's table; a non-sorted input that canonicalizes to the
+  canonical vector.
+- **Authorization** (closes S3): every combination of `@16`, `@17` and the marker (only
+  all-or-nothing is accepted); a digest mismatch; a non-canonical `@17`; a signed grant
+  without the fields keeps its signing bytes (byte-equal to a pinned pre-field fixture).
+- **Old daemon** (closes S3's default deny): a pinned fixture grant with the fields and the
+  marker, fed to the v0.29.0 release's `execution-daemon` once and recorded in the bead,
+  refuses with the `credentialBrokerRefs` text; in CI, the current daemon built without a
+  broker refuses the same fixture the same way.
+- **Capabilities** (closes S3): `capabilities_json` carries the connections entry.
+- **Cross-document and endpoint checks** (closes S2, S4): matching and mismatching pairs;
+  existing path, missing parent, symlinked parent, mode 0755, foreign owner.
+- **Relay** (closes S5), a broker against a UNIX client and a TCP echo on loopback: bytes
+  round-trip; half-close in each direction; upstream down then up within the hold; down
+  past the hold gives end-of-file in no more than 10 s plus one backoff step; a client that
+  hangs up ends the hold early; reset mid-stream; the cap; a second listener on another
+  loopback port receives no connection; a passed `SCM_RIGHTS` descriptor never reaches the
+  target and is closed.
+- **Profile** (closes S5, macOS): the confined broker gets `EPERM` connecting to an
+  undeclared loopback port and opening any file.
+- **Lifecycle** (closes S7): SIGKILL the supervising process and the broker is gone within
+  a bound; cancel between spawn and ready leaves no broker and no endpoint; a broker killed
+  mid-run fails the run.
+- **Receipt** (closes S8): counts match a scripted sequence of accepted, dialled and refused
+  connections.
+- **Native macOS e2e** (closes S6 for that tier): a native workload dials the endpoint path
+  and reaches the echo.
+
+Hypervisor-gated (`LEYLINE_REQUIRE_HYPERVISOR=1`, macOS, in the release hypervisor gate):
+
+- A host TCP echo on `127.0.0.1:E`; a document declaring one connection to `E`; a manifest
+  with a §6 connect grant on the endpoint with `guestPort` G. A static guest binary dials
+  `127.0.0.1:G`, writes bytes and reads them back. It then dials `127.0.0.1:G'` (undeclared)
+  and gets `ECONNREFUSED`, and dials the host's echo directly and fails (I1). A second host
+  listener on `127.0.0.1:F` receives nothing. The receipt records one connection to
+  `127.0.0.1:E`.
+- The echo starts 2 s after the guest dials: the connection works. The echo never starts:
+  the guest reads end-of-file within the hold, and the receipt counts one refusal.
+- Two concurrent runs of one bundle with distinct channel directories both reach the echo;
+  the same directory refuses the second by name.
+
+### S12. Implementation outline (estimate)
+
+- `rs/ll-core/schema-spec/connections/v1/` (README, schema, vectors, digest pins) and the
+  `leyline-schema-spec` tests: bead `ley-line-open-e9d940`, scoped to S2.
+- `execution.capnp`: `RunGrant @16 @17`, `RunReceipt @15 @16`, `ConnectionOutcome`;
+  regenerated bindings, `execution.tools.json`, consumer fixtures, compatibility metadata;
+  `run-grant.md` and the execution/v1 README.
+- `leyline-runtime`: authorization (S3), the transport capability entry, a broker module
+  (preflight, relay, profile, control pipe), the `start` ordering and receipt assembly
+  (S7, S8), the native and libkrun backends' spawn order; a new LLO binary beside
+  `leyline-native-worker`. The lifeline pipe is shared with `ley-line-open-f963e6`.
+- **No libkrun patch.** Patch 0010's dial channel already joins guest loopback to the host
+  path through vsock; the broker is the listener at that path.
+- Cloister: emit the document, the digest and the marker; check the capability.
+
+### S13. Slice-1 questions for the owner
+
+- **S-Q1.** Accept the `credentialBrokerRefs` marker as the old-daemon refusal (S3), or
+  accept that only clients that check capabilities are protected.
+- **S-Q2.** The per-run connection cap: a fixed 256, or a document field.
+- **S-Q3.** `::1` as a target, or IPv4 loopback only.
+- **S-Q4.** Per-connection outcomes as receipt fields (S8), or a content-addressed detail
+  document the receipt names by digest.
+
+---
+
 ## Open questions — the decisions the user must make
 
 - **Q1. Per-run or per-daemon broker?** D1 proposes per run. Per daemon is one process per
   trust domain with cross-run pooling, at the cost of co-locating every run's credentials.
+  *Proposed answer: per run (Slice 1, S1).*
 - **Q2. Native Linux with credentials.** D5 refuses credential-bearing connections there.
   Alternatives: accept loopback TCP as a development-only tier with a named acknowledgment;
   give each run its own network namespace so its loopback is single-tenant; or wait for the
@@ -383,7 +822,8 @@ Fail-closed rules, in one place:
 - **Q3. Authorize the document through a new `RunGrant` field (`connectionsDigest`)?** It is
   an additive execution/v1 wire change. The alternative is folding the connections into the
   confinement manifest, which mixes a broker's configuration into the workload's
-  confinement digest.
+  confinement digest. *Proposed answer: yes, as `@16`/`@17` plus a `credentialBrokerRefs`
+  marker so a shipped daemon refuses (Slice 1, S3; S-Q1).*
 - **Q4. How the subject token reaches the broker.** Cloister obtains a notme token for the
   run's identity and delivers it with the grant (then a run longer than its lifetime needs
   a refresh path), or the broker authenticates to notme as the run directly (then the
@@ -418,7 +858,8 @@ Fail-closed rules, in one place:
   must predict them for the digest (ADR-0036 equality contract), so a path cannot contain
   the run id. Either a deployment-configured broker root plus bundle and connection name
   (two concurrent runs of one bundle collide), or a run-unique component the issuer can
-  predict.
+  predict. *Proposed answer: the issuer allocates a per-run 0700 channel directory and
+  commits each path; LLO validates and chooses nothing (Slice 1, S4).*
 - **Q9. Accept this ADR**, with or without amendments from the answers above.
 
 ---

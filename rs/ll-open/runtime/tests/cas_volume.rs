@@ -263,7 +263,7 @@ fn hdiutil_says_only_the_pinned_deprecations_and_diskutil_still_lacks_case_sensi
         mnt.as_os_str(),
         image.as_os_str(),
     ]);
-    run(&["info".as_ref()]);
+    run(&["info".as_ref(), "-plist".as_ref()]);
     run(&["detach".as_ref(), mnt.as_os_str()]);
 
     // `diskutil image` exists from macOS 27; where it does, its blank-image

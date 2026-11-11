@@ -34,6 +34,8 @@
 //!   loopback, private, link-local, CGNAT and the other ranges [`is_public`]
 //!   lists are refused ([`OciImportError::NonPublicDestination`]) before a
 //!   socket is opened, on the addresses ureq resolved for that connection.
+//!   The registry itself may be private, but once it has resolved to public
+//!   addresses it may not resolve to a non-public one later in the pull.
 //! - **Anonymous.** The bearer-token flow ghcr.io and Docker Hub use for
 //!   public images: a `401` whose `WWW-Authenticate: Bearer realm=…` names a
 //!   token endpoint, one anonymous token for `repository:<name>:pull`, sent
@@ -430,11 +432,44 @@ struct Guard {
     /// plain-HTTP opt-in names. Everything else must resolve to public
     /// addresses only.
     admitted: Vec<(String, u16)>,
+    /// Admitted endpoints that have resolved to public addresses only. One
+    /// that later resolves to a non-public address is refused: a registry
+    /// reached on the internet may not move its own name onto the host's
+    /// network between requests.
+    seen_public: Vec<(String, u16)>,
     /// When the current request's phase must end: its headers (connecting
     /// and the TLS handshake included), then its body.
     deadline: Option<Instant>,
     /// The non-public address the last refused connection resolved to.
     refused: Option<IpAddr>,
+}
+
+impl Guard {
+    /// Whether a connection to `endpoint`, resolved to `addresses`, may be
+    /// opened; the first non-public address when it may not.
+    fn admit(
+        &mut self,
+        endpoint: Option<(String, u16)>,
+        addresses: impl IntoIterator<Item = IpAddr>,
+    ) -> Result<(), IpAddr> {
+        let non_public = addresses.into_iter().find(|address| !is_public(*address));
+        let admitted = endpoint
+            .as_ref()
+            .is_some_and(|endpoint| self.admitted.contains(endpoint));
+        match (non_public, endpoint) {
+            (None, Some(endpoint)) if admitted => {
+                if !self.seen_public.contains(&endpoint) {
+                    self.seen_public.push(endpoint);
+                }
+                Ok(())
+            }
+            (None, _) => Ok(()),
+            (Some(_), Some(endpoint)) if admitted && !self.seen_public.contains(&endpoint) => {
+                Ok(())
+            }
+            (Some(address), _) => Err(address),
+        }
+    }
 }
 
 fn guard(shared: &Mutex<Guard>) -> std::sync::MutexGuard<'_, Guard> {
@@ -444,9 +479,11 @@ fn guard(shared: &Mutex<Guard>) -> std::sync::MutexGuard<'_, Guard> {
 }
 
 /// The first connector of the chain: refuses, before any socket is opened, a
-/// connection to an endpoint that is not admitted and resolves to any
-/// non-public address. Resolution is ureq's, done once per connection, so
-/// the addresses checked are the addresses connected to.
+/// connection [`Guard::admit`] does not allow: one to an endpoint that is
+/// not admitted and resolves to any non-public address, or to an admitted
+/// endpoint that resolved to public addresses before and now does not.
+/// Resolution is ureq's, done once per connection, so the addresses checked
+/// are the addresses connected to.
 #[derive(Debug)]
 struct AddressGuard(Arc<Mutex<Guard>>);
 
@@ -459,15 +496,9 @@ impl Connector<()> for AddressGuard {
         chained: Option<()>,
     ) -> Result<Option<()>, ureq::Error> {
         let mut guard = guard(&self.0);
-        let admitted =
-            endpoint(details.uri).is_some_and(|endpoint| guard.admitted.contains(&endpoint));
-        if !admitted
-            && let Some(address) = details
-                .addrs
-                .iter()
-                .find(|address| !is_public(address.ip()))
-        {
-            guard.refused = Some(address.ip());
+        let addresses = details.addrs.iter().map(|address| address.ip());
+        if let Err(address) = guard.admit(endpoint(details.uri), addresses) {
+            guard.refused = Some(address);
             return Err(ureq::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "a non-public destination",
@@ -590,6 +621,17 @@ struct Client<'a> {
 
 impl<'a> Client<'a> {
     fn new(target: &Target, plain: Option<String>, limits: &'a RegistryLimits) -> Self {
+        Self::over(target, plain, limits, TcpConnector::default())
+    }
+
+    /// A client whose connections are opened by `tcp`: ureq's TCP connector,
+    /// or a test's stand-in for the network.
+    fn over<T: Transport>(
+        target: &Target,
+        plain: Option<String>,
+        limits: &'a RegistryLimits,
+        tcp: impl Connector<(), Out = T>,
+    ) -> Self {
         let scheme = if plain.as_deref() == Some(target.registry.as_str()) {
             "http"
         } else {
@@ -614,7 +656,7 @@ impl<'a> Client<'a> {
         // TCP stream, beneath TLS.
         let connector =
             ().chain(AddressGuard(Arc::clone(&guard)))
-                .chain(TcpConnector::default())
+                .chain(tcp)
                 .chain(DeadlineConnector(Arc::clone(&guard)))
                 .chain(RustlsConnector::default());
         let config = ureq::Agent::config_builder()
@@ -1583,6 +1625,145 @@ mod tests {
         wrapped.await_input(one_second()).unwrap();
         assert!(!wrapped.is_open());
         assert!(near.is_tls());
+    }
+
+    /// Review of b1c18d (N1): the registry and the opt-in are admitted
+    /// whatever they resolve to, but a registry that has resolved to public
+    /// addresses may not move its name onto a non-public one afterwards.
+    #[test]
+    fn the_guard_admits_public_addresses_and_its_own_endpoints_without_rebinding() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let (public, private, loopback) = (ip("1.1.1.1"), ip("10.0.0.1"), ip("127.0.0.1"));
+        let registry = ("r.example".to_string(), 443);
+        let cdn = ("cdn.example".to_string(), 443);
+        let mut guard = Guard {
+            admitted: vec![registry.clone()],
+            ..Guard::default()
+        };
+        // Not admitted: public addresses only, the first other one named.
+        assert_eq!(guard.admit(Some(cdn.clone()), [public]), Ok(()));
+        assert_eq!(
+            guard.admit(Some(cdn.clone()), [public, private]),
+            Err(private)
+        );
+        assert_eq!(
+            guard.admit(Some(cdn.clone()), [loopback, private]),
+            Err(loopback)
+        );
+        assert_eq!(guard.admit(None, [private]), Err(private));
+        assert_eq!(guard.admit(None, [public]), Ok(()));
+        assert_eq!(guard.admit(Some(cdn), []), Ok(()));
+        // Another port of the registry's host is another endpoint.
+        assert_eq!(
+            guard.admit(Some(("r.example".to_string(), 8443)), [private]),
+            Err(private)
+        );
+        assert!(guard.seen_public.is_empty());
+        // A registry on a private network stays admitted.
+        for _ in 0..2 {
+            assert_eq!(guard.admit(Some(registry.clone()), [private]), Ok(()));
+        }
+        assert!(guard.seen_public.is_empty());
+        // Once it has resolved to public addresses only, it may not move.
+        for _ in 0..2 {
+            assert_eq!(guard.admit(Some(registry.clone()), [public]), Ok(()));
+        }
+        assert_eq!(guard.seen_public, [registry.clone()]);
+        assert_eq!(
+            guard.admit(Some(registry.clone()), [public, loopback]),
+            Err(loopback)
+        );
+        assert_eq!(guard.admit(Some(registry.clone()), [private]), Err(private));
+        assert_eq!(guard.admit(Some(registry), [public]), Ok(()));
+    }
+
+    /// A network stand-in whose connections answer every request with
+    /// response headers that never end: one byte per millisecond, each well
+    /// inside any wait ureq asks for, so ureq's own timeouts never fire.
+    #[derive(Debug)]
+    struct EndlessHeaders;
+
+    #[derive(Debug)]
+    struct EndlessHeaderStream {
+        buffers: ureq::unversioned::transport::LazyBuffers,
+        sent: usize,
+    }
+
+    impl Connector<()> for EndlessHeaders {
+        type Out = EndlessHeaderStream;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            _: Option<()>,
+        ) -> Result<Option<Self::Out>, ureq::Error> {
+            Ok(Some(EndlessHeaderStream {
+                buffers: ureq::unversioned::transport::LazyBuffers::new(1 << 16, 1 << 16),
+                sent: 0,
+            }))
+        }
+    }
+
+    impl Transport for EndlessHeaderStream {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq::Error> {
+            Ok(())
+        }
+
+        fn await_input(&mut self, _: NextTimeout) -> Result<bool, ureq::Error> {
+            const START: &[u8] = b"HTTP/1.1 200 OK\r\nX-Trickle: ";
+            let until = Instant::now() + Duration::from_millis(1);
+            while Instant::now() < until {
+                std::thread::yield_now();
+            }
+            let byte = START.get(self.sent).copied().unwrap_or(b'a');
+            self.sent += 1;
+            self.buffers.input_append_buf()[0] = byte;
+            self.buffers.input_appended(1);
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// Review of b1c18d (N5), the deterministic form of the header-trickle
+    /// bound through the whole connector chain and a real ureq call: with
+    /// the deadline connector in the chain the request ends at the header
+    /// deadline; without it, ureq would read on for a minute, until its
+    /// 64 KiB header limit.
+    #[test]
+    fn a_header_trickle_through_the_connector_chain_ends_at_the_header_deadline() {
+        let limits = RegistryLimits {
+            connect_timeout: Duration::from_millis(100),
+            response_timeout: Duration::from_millis(100),
+            ..RegistryLimits::default()
+        };
+        let authority = "127.0.0.1:9";
+        let mut client = Client::over(
+            &pinned(authority, "a"),
+            Some(authority.to_string()),
+            &limits,
+            EndlessHeaders,
+        );
+        let started = Instant::now();
+        let error = match client.get(format!("http://{authority}/v2/"), None, 0, true) {
+            Ok(_) => panic!("headers that never end are no response"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, OciImportError::Registry(detail) if detail.contains(PAST_DEADLINE)),
+            "{error}"
+        );
+        assert!(
+            elapsed >= client.header_timeout() && elapsed < Duration::from_secs(5),
+            "{elapsed:?}"
+        );
     }
 
     #[test]

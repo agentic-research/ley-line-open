@@ -41,7 +41,7 @@
 //!   by name ([`CasVolumeError::Timeout`]). Provisioning takes a file lock
 //!   (`<state>/cas-volume/provision.lock`) across processes, removes the
 //!   `partial-<pid>.sparsebundle` a crashed provider left (only when that
-//!   process is gone), and uses a volume at `mnt/` only when `hdiutil info`
+//!   process is gone), and uses a volume at `mnt/` only when `hdiutil info -plist`
 //!   names `cas.sparsebundle` as its image ([`CasVolumeError::ForeignVolume`]
 //!   otherwise) (bead `ley-line-open-167b29`).
 //!
@@ -445,31 +445,215 @@ impl Hdiutil {
     }
 }
 
-/// The image `hdiutil info` lists as mounted at `mountpoint`, from its text
-/// output: one block per image, separated by `=` rules, each naming its
-/// `image-path` and then its devices as tab-separated lines whose third
-/// field is a mount point. Paths are compared canonicalized.
-fn attached_image_in_info(info: &str, mountpoint: &Path) -> Option<PathBuf> {
-    let wanted = mountpoint.canonicalize().ok()?;
-    info.split("\n=")
-        .filter_map(|block| {
-            let image = block.lines().find_map(|line| {
-                let (key, value) = line.split_once(':')?;
-                (key.trim() == "image-path").then(|| PathBuf::from(value.trim()))
-            })?;
-            let mounted_here = block.lines().any(|line| {
-                line.starts_with("/dev/")
-                    && line.split('\t').nth(2).is_some_and(|mount| {
-                        let mount = mount.trim();
-                        !mount.is_empty()
-                            && Path::new(mount)
-                                .canonicalize()
-                                .is_ok_and(|mount| mount == wanted)
-                    })
+/// A property-list value, as far as `hdiutil info -plist` needs reading:
+/// dictionaries, arrays and strings. Anything else (numbers, booleans,
+/// dates, data) is [`Plist::Other`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Plist {
+    Dict(Vec<(String, Plist)>),
+    Array(Vec<Plist>),
+    String(String),
+    Other,
+}
+
+impl Plist {
+    /// The value of `key` in a dictionary.
+    fn get(&self, key: &str) -> Option<&Plist> {
+        match self {
+            Self::Dict(pairs) => pairs
+                .iter()
+                .find_map(|(name, value)| (name == key).then_some(value)),
+            _ => None,
+        }
+    }
+
+    fn items(&self) -> &[Plist] {
+        match self {
+            Self::Array(items) => items,
+            _ => &[],
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// One piece of an XML property list.
+#[derive(Debug, PartialEq, Eq)]
+enum XmlToken<'a> {
+    Open(&'a str),
+    Close(&'a str),
+    /// `<name/>`.
+    Empty(&'a str),
+    Text(String),
+}
+
+/// The five predefined entities and numeric character references, decoded.
+/// An unknown or malformed reference is no text at all.
+fn xml_unescape(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let end = rest[start..].find(';')? + start;
+        let entity = &rest[start + 1..end];
+        out.push(match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => {
+                let code = match entity.strip_prefix("#x") {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                    None => entity.strip_prefix('#')?.parse().ok()?,
+                };
+                char::from_u32(code)?
+            }
+        });
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The tags and text of `xml`, declarations and comments left out. `None`
+/// when a tag is not closed or a reference is malformed.
+fn xml_tokens(xml: &str) -> Option<Vec<XmlToken<'_>>> {
+    let mut tokens = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find('<') {
+        if open > 0 {
+            tokens.push(XmlToken::Text(xml_unescape(&rest[..open])?));
+        }
+        let close = rest[open..].find('>')? + open;
+        let tag = &rest[open + 1..close];
+        rest = &rest[close + 1..];
+        if tag.starts_with('?') || tag.starts_with('!') {
+            continue;
+        }
+        tokens.push(if let Some(tag) = tag.strip_prefix('/') {
+            XmlToken::Close(tag_name(tag))
+        } else if let Some(tag) = tag.strip_suffix('/') {
+            XmlToken::Empty(tag_name(tag))
+        } else {
+            XmlToken::Open(tag_name(tag))
+        });
+    }
+    Some(tokens)
+}
+
+/// A tag's name, without its attributes.
+fn tag_name(tag: &str) -> &str {
+    tag.split_whitespace().next().unwrap_or("")
+}
+
+/// How deeply a property list may nest before it is refused.
+const MAX_PLIST_DEPTH: usize = 32;
+
+/// The root value of an XML property list. Structure comes from the tags
+/// alone, so no string's content (a path holding a newline, a `=` rule or
+/// the text of another entry) can pass for another entry.
+fn parse_plist(xml: &str) -> Option<Plist> {
+    fn text<'t, 'a>(tokens: &mut std::slice::Iter<'t, XmlToken<'a>>, tag: &str) -> Option<String> {
+        match tokens.next()? {
+            XmlToken::Close(name) if *name == tag => Some(String::new()),
+            XmlToken::Text(value) => match tokens.next()? {
+                XmlToken::Close(name) if *name == tag => Some(value.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// The value an already-read opening token starts.
+    fn value<'t, 'a>(
+        first: &'t XmlToken<'a>,
+        tokens: &mut std::slice::Iter<'t, XmlToken<'a>>,
+        depth: usize,
+    ) -> Option<Plist> {
+        if depth > MAX_PLIST_DEPTH {
+            return None;
+        }
+        match first {
+            XmlToken::Open("dict") => {
+                let mut pairs = Vec::new();
+                loop {
+                    match tokens.next()? {
+                        XmlToken::Close("dict") => return Some(Plist::Dict(pairs)),
+                        XmlToken::Open("key") => {
+                            let key = text(tokens, "key")?;
+                            let next = tokens.next()?;
+                            pairs.push((key, value(next, tokens, depth + 1)?));
+                        }
+                        XmlToken::Text(space) if space.trim().is_empty() => {}
+                        _ => return None,
+                    }
+                }
+            }
+            XmlToken::Open("array") => {
+                let mut items = Vec::new();
+                loop {
+                    match tokens.next()? {
+                        XmlToken::Close("array") => return Some(Plist::Array(items)),
+                        XmlToken::Text(space) if space.trim().is_empty() => {}
+                        next => items.push(value(next, tokens, depth + 1)?),
+                    }
+                }
+            }
+            XmlToken::Open("string") => text(tokens, "string").map(Plist::String),
+            XmlToken::Empty("string") => Some(Plist::String(String::new())),
+            XmlToken::Empty("dict") => Some(Plist::Dict(Vec::new())),
+            XmlToken::Empty("array") => Some(Plist::Array(Vec::new())),
+            // A scalar this reader does not need: its text, then its close.
+            XmlToken::Open(tag) => text(tokens, tag).map(|_| Plist::Other),
+            XmlToken::Empty(_) => Some(Plist::Other),
+            XmlToken::Text(space) if space.trim().is_empty() => {
+                value(tokens.next()?, tokens, depth)
+            }
+            XmlToken::Close(_) | XmlToken::Text(_) => None,
+        }
+    }
+    let tokens = xml_tokens(xml)?;
+    let mut tokens = tokens.iter();
+    loop {
+        match tokens.next()? {
+            XmlToken::Open("plist") => return value(tokens.next()?, &mut tokens, 0),
+            XmlToken::Text(space) if space.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+}
+
+/// The image `hdiutil info -plist` lists as mounted at `mountpoint`: the
+/// `image-path` of the `images` entry one of whose `system-entities` has
+/// that `mount-point`. Paths are compared canonicalized. `Err` when the
+/// output is not a property list of that shape.
+fn attached_image_in_plist(xml: &str, mountpoint: &Path) -> Result<Option<PathBuf>, &'static str> {
+    let root = parse_plist(xml).ok_or("its output is not an XML property list")?;
+    let Some(Plist::Array(images)) = root.get("images") else {
+        return Err("its output has no `images` array");
+    };
+    let Ok(wanted) = mountpoint.canonicalize() else {
+        return Ok(None);
+    };
+    Ok(images.iter().find_map(|image| {
+        let mounted_here = image
+            .get("system-entities")
+            .map_or(&[][..], Plist::items)
+            .iter()
+            .filter_map(|entity| entity.get("mount-point")?.as_str())
+            .any(|mount| {
+                Path::new(mount)
+                    .canonicalize()
+                    .is_ok_and(|mount| mount == wanted)
             });
-            mounted_here.then_some(image)
-        })
-        .next()
+        let path = image.get("image-path")?.as_str()?;
+        mounted_here.then(|| PathBuf::from(path))
+    }))
 }
 
 /// `hdiutil -size` in mebibytes, rounding up.
@@ -517,11 +701,13 @@ impl DiskImages for Hdiutil {
     }
 
     fn attached_image(&self, mountpoint: &Path) -> Result<Option<PathBuf>, CasVolumeError> {
-        let info = self.output(&["info".as_ref()])?;
-        Ok(attached_image_in_info(
-            &String::from_utf8_lossy(&info),
-            mountpoint,
-        ))
+        let info = self.output(&["info".as_ref(), "-plist".as_ref()])?;
+        let unusable = |detail: &str| CasVolumeError::Tool {
+            command: format!("{} info -plist", self.program.display()),
+            detail: detail.to_string(),
+        };
+        let xml = std::str::from_utf8(&info).map_err(|_| unusable("its output is not UTF-8"))?;
+        attached_image_in_plist(xml, mountpoint).map_err(unusable)
     }
 }
 
@@ -1104,28 +1290,83 @@ mod tests {
         assert!(mount_flags(Path::new("a\0b")).is_err());
     }
 
-    /// The real tool's `attached_image` reads `hdiutil info`.
+    /// `hdiutil info -plist` as macOS 27.2 prints it for the images given as
+    /// `(image path, mount point)`, each with an unmounted whole-disk entity
+    /// before its mounted volume.
+    fn info_plist(images: &[(&str, &str)]) -> String {
+        let escape = |text: &str| {
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n<dict>\n\t<key>framework</key>\n\t<string>710</string>\n\t<key>images</key>\n\t<array>\n",
+        );
+        for (image, mount) in images {
+            xml.push_str(&format!(
+                "\t\t<dict>\n\t\t\t<key>autodiskmount</key>\n\t\t\t<true/>\n\
+                 \t\t\t<key>blockcount</key>\n\t\t\t<integer>2097152</integer>\n\
+                 \t\t\t<key>image-path</key>\n\t\t\t<string>{}</string>\n\
+                 \t\t\t<key>system-entities</key>\n\t\t\t<array>\n\
+                 \t\t\t\t<dict>\n\t\t\t\t\t<key>content-hint</key>\n\t\t\t\t\t<string>GUID_partition_scheme</string>\n\
+                 \t\t\t\t\t<key>dev-entry</key>\n\t\t\t\t\t<string>/dev/disk4</string>\n\t\t\t\t</dict>\n\
+                 \t\t\t\t<dict>\n\t\t\t\t\t<key>dev-entry</key>\n\t\t\t\t\t<string>/dev/disk5s1</string>\n\
+                 \t\t\t\t\t<key>mount-point</key>\n\t\t\t\t\t<string>{}</string>\n\t\t\t\t</dict>\n\
+                 \t\t\t</array>\n\t\t\t<key>writeable</key>\n\t\t\t<true/>\n\t\t</dict>\n",
+                escape(image),
+                escape(mount)
+            ));
+        }
+        xml.push_str(
+            "\t</array>\n\t<key>revision</key>\n\t<string>710</string>\n</dict>\n</plist>\n",
+        );
+        xml
+    }
+
+    /// The real tool's `attached_image` reads `hdiutil info -plist`.
     #[test]
     fn the_real_tools_attached_image_comes_from_hdiutil_info() {
         let scratch = tempfile::tempdir().unwrap();
         let mnt = scratch.path().join("mnt");
         fs::create_dir(&mnt).unwrap();
-        let tool = Hdiutil {
-            program: script(
-                scratch.path(),
-                "hdiutil-info",
-                &format!(
-                    "[ \"$1\" = info ] || exit 9\nprintf 'image-path      : /a/cas.sparsebundle\\n/dev/disk7s1\\tx\\t{}\\n'",
-                    mnt.display()
-                ),
-            ),
+        let plist = scratch.path().join("info.plist");
+        fs::write(
+            &plist,
+            info_plist(&[("/a/cas.sparsebundle", &mnt.to_string_lossy())]),
+        )
+        .unwrap();
+        let tool = |body: String| Hdiutil {
+            program: script(scratch.path(), "hdiutil-info", &body),
             timeout: Duration::from_secs(20),
         };
+        let real = tool(format!(
+            "[ \"$1 $2\" = 'info -plist' ] || exit 9\ncat '{}'",
+            plist.display()
+        ));
         assert_eq!(
-            tool.attached_image(&mnt).unwrap(),
+            real.attached_image(&mnt).unwrap(),
             Some(PathBuf::from("/a/cas.sparsebundle"))
         );
-        assert_eq!(tool.attached_image(scratch.path()).unwrap(), None);
+        assert_eq!(real.attached_image(scratch.path()).unwrap(), None);
+        // Output that is no property list refuses; it never reads as
+        // "nothing is attached".
+        for (body, reason) in [
+            (
+                "echo 'image-path : /a/cas.sparsebundle'",
+                "not an XML property list",
+            ),
+            ("printf '<plist><dict></dict></plist>'", "no `images` array"),
+            ("printf '\\377'", "not UTF-8"),
+        ] {
+            let error = tool(body.to_string()).attached_image(&mnt).unwrap_err();
+            assert!(
+                matches!(&error, CasVolumeError::Tool { command, detail }
+                    if command.ends_with("info -plist") && detail.contains(reason)),
+                "{body}: {error}"
+            );
+        }
     }
 
     /// Review of 167b29 (C2): a tool that exits while something it started
@@ -1319,34 +1560,119 @@ mod tests {
         let other = scratch.path().join("other");
         fs::create_dir(&mnt).unwrap();
         fs::create_dir(&other).unwrap();
-        let info = format!(
-            "framework       : 710\n\
-             ================================================\n\
-             image-path      : /a/other.dmg\n\
-             /dev/disk4\tGUID_partition_scheme\t\n\
-             /dev/disk5s1\t41504653\t{}\n\
-             ================================================\n\
-             image-path      : /a/cas.sparsebundle\n\
-             image-alias     : /a/cas.sparsebundle\n\
-             /dev/disk6\tGUID_partition_scheme\t\n\
-             /dev/disk7s1\t41504653\t{}\n",
-            other.display(),
-            mnt.display()
+        let (mnt_text, other_text) = (mnt.to_string_lossy(), other.to_string_lossy());
+        let info = info_plist(&[
+            ("/a/other & <more>.dmg", &other_text),
+            ("/a/cas.sparsebundle", &mnt_text),
+        ]);
+        let image = |mountpoint: &Path| attached_image_in_plist(&info, mountpoint).unwrap();
+        assert_eq!(image(&mnt), Some(PathBuf::from("/a/cas.sparsebundle")));
+        assert_eq!(image(&other), Some(PathBuf::from("/a/other & <more>.dmg")));
+        assert_eq!(image(scratch.path()), None);
+        assert_eq!(image(&scratch.path().join("gone")), None);
+        assert_eq!(attached_image_in_plist(&info_plist(&[]), &mnt), Ok(None));
+        for (broken, reason) in [
+            ("", "not an XML property list"),
+            ("framework : 710\n", "not an XML property list"),
+            ("<plist><dict><key>images</key>", "not an XML property list"),
+            (
+                "<plist><dict><key>images</key><string>x</string></dict></plist>",
+                "no `images` array",
+            ),
+            ("<plist><array/></plist>", "no `images` array"),
+        ] {
+            let error = attached_image_in_plist(broken, &mnt).expect_err(broken);
+            assert!(error.contains(reason), "{broken}: {error}");
+        }
+    }
+
+    /// Review of 167b29 (N3): the text form of `hdiutil info` let an
+    /// attached image whose path holds a newline and the text of another
+    /// entry pass for the CAS image mounted at the CAS mountpoint. In the
+    /// property list that text is one string's content, never structure.
+    #[test]
+    fn a_crafted_image_path_cannot_pass_for_another_images_entry() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mnt = scratch.path().join("mnt");
+        let theirs = scratch.path().join("theirs");
+        fs::create_dir(&mnt).unwrap();
+        fs::create_dir(&theirs).unwrap();
+        let forged = format!(
+            "/tmp/x\n================================================\n\
+             image-path      : /state/cas-volume/cas.sparsebundle\n\
+             /dev/disk9s1\t41504653\t{mnt}\n\
+             </string><key>mount-point</key><string>{mnt}",
+            mnt = mnt.display()
         );
+        let info = info_plist(&[(&forged, &theirs.to_string_lossy())]);
+        assert_eq!(attached_image_in_plist(&info, &mnt), Ok(None));
         assert_eq!(
-            attached_image_in_info(&info, &mnt),
-            Some(PathBuf::from("/a/cas.sparsebundle"))
+            attached_image_in_plist(&info, &theirs),
+            Ok(Some(PathBuf::from(&forged)))
         );
+    }
+
+    #[test]
+    fn property_lists_are_read_by_structure() {
+        let parsed = parse_plist(
+            "<?xml version=\"1.0\"?><!-- c --><plist version=\"1.0\"> <dict>\
+             <key>s</key><string>a &amp; b &lt;&gt;&quot;&apos;&#65;&#x42;</string>\
+             <key>empty</key><string></string><key>none</key><string/>\
+             <key>n</key><integer>7</integer><key>t</key><true/>\
+             <key>a</key><array><string>x</string><dict/><array/><real>1.5</real></array>\
+             </dict> </plist>",
+        )
+        .unwrap();
         assert_eq!(
-            attached_image_in_info(&info, &other),
-            Some(PathBuf::from("/a/other.dmg"))
+            parsed.get("s").and_then(Plist::as_str),
+            Some("a & b <>\"'AB")
         );
-        assert_eq!(attached_image_in_info(&info, scratch.path()), None);
+        assert_eq!(parsed.get("empty"), Some(&Plist::String(String::new())));
+        assert_eq!(parsed.get("none"), Some(&Plist::String(String::new())));
+        assert_eq!(parsed.get("n"), Some(&Plist::Other));
+        assert_eq!(parsed.get("t"), Some(&Plist::Other));
         assert_eq!(
-            attached_image_in_info(&info, &scratch.path().join("gone")),
-            None
+            parsed.get("a").map(Plist::items),
+            Some(
+                &[
+                    Plist::String("x".into()),
+                    Plist::Dict(Vec::new()),
+                    Plist::Array(Vec::new()),
+                    Plist::Other
+                ][..]
+            )
         );
-        assert_eq!(attached_image_in_info("", &mnt), None);
+        assert_eq!(parsed.get("absent"), None);
+        // Accessors on the wrong kind of value.
+        assert_eq!(Plist::Other.get("s"), None);
+        assert!(Plist::String("x".into()).items().is_empty());
+        assert_eq!(Plist::Other.as_str(), None);
+        for malformed in [
+            "<plist><dict><key>k</key></dict></plist>",
+            "<plist><dict><string>v</string></dict></plist>",
+            "<plist><dict><key>k</key><string>v</dict></plist>",
+            "<plist><dict><key>k<string>v</string></key></dict></plist>",
+            "<plist><string>a &bogus; b</string></plist>",
+            "<plist><string>a &#xD800; b</string></plist>",
+            "<plist><string>a & b</string></plist>",
+            "<plist><string>unclosed",
+            "<plist></plist>",
+            "<dict></dict>",
+            "text<plist><dict/></plist>",
+            "<plist></dict></plist>",
+        ] {
+            assert_eq!(parse_plist(malformed), None, "{malformed}");
+        }
+        // Nesting is bounded.
+        let nested = |depth: usize| {
+            format!(
+                "<plist>{}{}</plist>",
+                "<array>".repeat(depth),
+                "</array>".repeat(depth)
+            )
+        };
+        assert!(parse_plist(&nested(MAX_PLIST_DEPTH + 1)).is_some());
+        assert_eq!(parse_plist(&nested(MAX_PLIST_DEPTH + 2)), None);
     }
 
     #[test]

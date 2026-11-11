@@ -1,6 +1,6 @@
 # ADR-0046 — The connection broker: the data plane for cloister's declared connections
 
-**Status:** Proposed (2026-10-27). Acceptance is the user's decision. See *Open questions*.
+**Status:** Proposed (2026-10-27). Acceptance is the user's decision. See *Open questions*. Q7 is decided and implemented (`ley-line-open-be3711`), and D5's microVM channel shipped with it; no broker exists.
 **Bead:** `ley-line-open-e2c5ce`
 **Related:**
 - cloister ADR-0069 (Proposed; bead `cloister-77870d`): declared connections, the declaration half
@@ -40,7 +40,7 @@ What LLO has today:
 
 | Piece | State |
 |---|---|
-| confinement/v1 §6 `unixSocket.allow` | Shipped. Seatbelt per-path on native macOS; vsock↔UNIX mappings on the microVM tier (ADR-0036 O2); refused on native Linux (Landlock ≤ ABI 7 has no AF_UNIX right). |
+| confinement/v1 §6 `unixSocket.allow` | Shipped. Seatbelt per-path on native macOS; vsock↔UNIX mappings on the microVM tier (ADR-0036 O2), and a grant carrying `guestPort` is presented to the workload as TCP on the guest's loopback (Q7, libkrun patch 0010; macOS only); refused on native Linux (Landlock ≤ ABI 7 has no AF_UNIX right). |
 | confinement/v1 §3 `network.connectLocal` | Shipped, list-valued since #494. Landlock `ConnectTcp` on Linux, `network-outbound (remote tcp "localhost:N")` on macOS; refused on the microVM tier. |
 | confinement/v1 §3 `network.allowHosts` | Refused on the native tiers ("route host-scoped egress through the proxy"). |
 | A proxy that §3 and §5 point at | None. |
@@ -301,7 +301,8 @@ connection is never offered over loopback TCP on the host.**
   them to vsock mappings. A guest-side relay, part of LLO's guest init, listens on the
   guest's loopback and forwards each port to its vsock mapping. This keeps the unmodified
   TCP client: inside the VM, loopback is single-tenant, so the VM boundary authenticates
-  the peer that the host loopback cannot. The relay is new work (follow-up bead).
+  the peer that the host loopback cannot. The relay shipped as
+  libkrun patch 0010 (Q7, `ley-line-open-be3711`).
 - **native macOS.** §6 sockets in a per-run 0700 directory, the broker checking the peer
   uid. Clients that cannot dial a socket (`net/http` without a dialer) need a code change
   or the microVM tier.
@@ -400,7 +401,10 @@ Fail-closed rules, in one place:
     unmodified workload as TCP on the guest's loopback, in both directions. Dial: the
     workload connects to `127.0.0.1:N` and reaches exactly its declared peer. Serve: the
     workload listens on its declared port, and only the declared peer, through the §6
-    socket, reaches it. Init binds every dial port before the workload starts, so loopback
+    socket, reaches it. A connection that arrives before the workload listens is held:
+    the relay retries the workload's port on `ECONNREFUSED`, backing off from 5 ms to
+    200 ms, for at most 10 s (`SERVE_HOLD_MS`, `ley-line-open-a915e3`), and closes the
+    connection at that bound if nothing listens. Init binds every dial port before the workload starts, so loopback
     first-binder semantics confer nothing.
   - The connection-to-guest-address mapping is computed by the emitter and committed in
     the attested digest: confinement/v1 §6 `guestPort` (additive within v1). The worker and

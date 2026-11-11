@@ -51,7 +51,7 @@ curl -L https://github.com/agentic-research/ley-line-open/releases/latest/downlo
   -o ~/.local/bin/leyline && chmod +x ~/.local/bin/leyline
 ```
 
-Ensure `~/.local/bin` is on your `PATH` (or drop the binary anywhere else on `PATH`). That's the whole install — the binary is statically linked, no runtime deps for `leyline parse` / `leyline daemon`.
+Ensure `~/.local/bin` is on your `PATH` (or drop the binary anywhere else on `PATH`). That's the whole install — the binary links only libraries a stock system ships, and needs nothing else for `leyline parse` / `leyline daemon`. Checked on the v0.29.0 assets: on Linux, glibc (`libc.so.6`, `libm.so.6`) and `libgcc_s.so.1`; on macOS, `libSystem`, `libiconv`, and the Security and CoreFoundation frameworks.
 
 **Feature set of the released binary**: default features only (`lsp` +
 `validate` + `hdc` + `cdc` + `sheaf`). Enough for structural analysis, validation, HDC
@@ -78,7 +78,7 @@ cd ley-line-open
 task install:full   # everything portable (--features all, no mount)
 ```
 
-Three install shapes to choose from (see [README §Install](README.md#install) for the full matrix):
+Three install shapes to choose from (see [README §Install and build](README.md#install-and-build) for the full matrix):
 
 - **`task install`** — same feature set as the released binary (`lsp` + `validate` + `hdc` + `cdc` + `sheaf`). Use the released binary instead unless you need a specific commit.
 - **`task install:full`** — everything portable (`--features all`, no mount). Adds `vec` (fastembed model, ~100MB cache at `~/.cache/fastembed/` on first `vec_search`) and `text-search`.
@@ -90,7 +90,7 @@ The NFS mount alone is the `mount` feature and links no libfuse: `cd rs && cargo
 
 Runtime deps:
 - **None** for the `leyline parse` + `leyline daemon` happy path (daemon default is UDS-only on the control socket; MCP HTTP is opt-in via `--mcp-port`).
-- **None** for the NFS mount (`mount` feature) — on macOS `leyline daemon --mount /path` uses the kernel's native NFS client (`--backend nfs` is the macOS default; `--backend fuse` needs a `fuse` build and `fuse-t`). The NFS mount refuses macOS Tahoe before 26.7 and Sequoia before 15.8, whose NFS client corrupts kernel memory (CVE-2026-43686, CVE-2026-84549): update macOS, or use `--backend fuse` from a `fuse` build.
+- **None** for the NFS mount (`mount` feature) — on macOS `leyline daemon --mount /path` uses the kernel's native NFS client (`--backend nfs` is the macOS default; `--backend fuse` needs a `fuse` build and `fuse-t`). The NFS mount refuses every macOS release before Sequoia 15.8, and Tahoe before 26.7, whose NFS client corrupts kernel memory (CVE-2026-43686, CVE-2026-84549): update macOS, or use `--backend fuse` from a `fuse` build.
 - **libfuse3** on Linux for `fuse` builds (`install:full+mount`) — Linux's default backend is FUSE (`--backend fuse`), so a Linux `mount`-only build mounts only with `--backend nfs` and refuses the default naming the `fuse` feature.
 - **A fastembed model cache** at `~/.cache/fastembed/` (~100 MB, downloaded on first `vec_search` use, only present under `install:full` and up). Skip if you don't use `vec_search`.
 
@@ -140,11 +140,11 @@ The daemon hosts a living SQLite database with an arena snapshot loop — parses
 
 **Only the default instance owns `~/.mache/default.sock`.** A daemon on `~/.mache/default.arena` with `~/.mache/default.ctrl` (the CLI's defaults, and what mache passes) binds it. A daemon on any other `--arena`/`--control` serves at its own `<ctrl>.sock` and never creates, replaces or removes `default.sock`; point mache at it with `LEYLINE_SOCKET=<ctrl>.sock`. An explicit `--arena` with the default `--control` is refused, since its socket would be `default.sock`.
 
-**Every daemon leases its control block.** A running daemon holds `<ctrl>.lock` shared. A control block written by another control-block VERSION is refused on a normal start. `--reset-arena` reinitialises it at the current VERSION, logging the old one, but only when no other process holds it: no daemon or reader holds `<ctrl>.lock`, nothing locks the `.ctrl`, and no daemon still serves the arena it names. Otherwise the reset is refused, naming what holds the block. A daemon started with `--reset-arena` keeps the lease exclusive for its lifetime.
+**Every daemon leases its control block.** A running daemon holds `<ctrl>.lock` shared. It also holds the daemon lock (the control path with its extension replaced by `daemon-lock`: `c.ctrl` → `c.daemon-lock`) exclusively for its lifetime, so a second daemon on the same control block is refused before it touches the block, the living db or the socket. A control block written by another control-block VERSION is refused on a normal start. `--reset-arena` reinitialises it at the current VERSION, logging the old one, but only when no other process holds it: no daemon or reader holds `<ctrl>.lock`, nothing locks the `.ctrl`, and no daemon still serves the arena it names. Otherwise the reset is refused, naming what holds the block. A daemon started with `--reset-arena` keeps the lease exclusive for its lifetime.
 
 **MCP HTTP transport is opt-in** — pass `--mcp-port <port>` to enable it. Without that flag the daemon runs UDS-only, which is what mache's auto-spawn expects. When you DO enable it, the token gate is on by default (ADR-0022): the token lives at `~/.local/share/leyline/daemon.token` on Linux (`~/Library/Application Support/leyline/daemon.token` on macOS). Pass `--mcp-no-auth` to disable for localhost-only debugging. Public-bind (`0.0.0.0` etc.) is refused unless you also pass `--mcp-allow-public`.
 
-MCP serves only the tools `tools/list` advertises; a daemon op that is not an MCP tool (`load`, `sheaf_update_topology`, `sheaf_reap`, ...) is refused with JSON-RPC error `-32601`. `--mcp-groups query,lsp` grants the MCP listeners' callers only those Cloister groups (the `groups[].name`s in `server.json`): a call outside the grant is refused with `-32001`, `tools/list` lists only the granted tools, and an unknown group name refuses startup. Without the flag every group is granted. `query` is read-side only; raw SQL (the `query` tool) is its own group, `sql`. The `query` op runs one read-only `SELECT` (on a reader, under a deny-by-default SQLite authorizer): a write, DDL, `ATTACH`, `VACUUM`, a pragma or a second statement is refused with a typed `refusal` (`reason`, `action`, `subject`) and changes nothing. It reads the tables and views of the `main` schema. The daemon's readers hold only the table-valued functions `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`, `dbstat` and sqlite-vec's `vec_each`, plus the schema pragmas (`pragma_table_info`, ...): any other one does not exist for `query`, and a virtual table in the schema built on another module (FTS, R-tree) fails with `no such module`.
+MCP serves only the tools `tools/list` advertises; a daemon op that is not an MCP tool (`load`, `sheaf_update_topology`, `sheaf_reap`, ...) is refused with JSON-RPC error `-32601`. `--mcp-groups query,lsp` grants the MCP listeners' callers only those Cloister groups (the `groups[].name`s in `server.json`): a call outside the grant is refused with `-32001`, `tools/list` lists only the granted tools, and an unknown group name refuses startup. Without the flag every group is granted. `query` is read-side only; raw SQL (the `query` tool) is its own group, `sql`. The `query` op runs one read-only `SELECT` (on a reader, under a deny-by-default SQLite authorizer): a write, DDL, `ATTACH`, `VACUUM`, a pragma or a second statement is refused with a typed `refusal` (`reason`, `action`, `subject`) and changes nothing. It reads the tables and views of the `main` schema; a statement that opens the reader's temp database (`… NATURAL JOIN temp.sqlite_master`, `pragma_table_info('t', 'temp')`) is refused. The daemon's readers hold only the table-valued functions `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`, `dbstat` and sqlite-vec's `vec_each`, plus the schema pragmas (`pragma_table_info`, ...): any other one does not exist for `query`, and a virtual table in the schema built on another module (FTS, R-tree) fails with `no such module`.
 
 ### Quick query against a .db
 
@@ -153,7 +153,7 @@ sqlite3 /tmp/my-code.db "SELECT k.lang, k.raw_kind, COUNT(*) FROM _ast a JOIN ki
 sqlite3 /tmp/my-code.db "SELECT language, COUNT(*) FROM _source GROUP BY language;"
 ```
 
-For agent-facing queries (find_definition / find_callers / find_callees / hdc_search / vec_search / `query`), use the daemon's MCP/UDS surface or — preferably — let mache mediate (mache's MCP tools wrap LLO's daemon ops with a smarter consumer-facing API surface).
+For agent-facing queries (find_defs / find_callers / find_callees / hdc_search / vec_search / `query`), use the daemon's MCP/UDS surface or — preferably — let mache mediate (mache's MCP tools wrap LLO's daemon ops with a smarter consumer-facing API surface).
 
 ---
 
@@ -167,10 +167,10 @@ You're here if you want to send PRs back.
 brew install capnp go-task        # capnp ≥1.3.0 (build.rs codegen); go-task is the build entry point
 rustup install stable             # current toolchain
 brew install fuse-t               # OPTIONAL — only for a `fuse` build (--backend fuse on macOS; the default --backend nfs needs nothing extra)
-brew install sccache              # Optional; Taskfile auto-detects + uses as RUSTC_WRAPPER for faster rebuilds (bead 488440)
+# sccache needs no install: `task ci` installs the pinned 0.15.0 to .tools/bin and uses it as RUSTC_WRAPPER; `task audit` installs its pinned cargo-deny
 ```
 
-Linux equivalents: `apt-get install capnproto libfuse3-dev` + `cargo install task` (or whatever your distro packages). FUSE is the Linux default backend, so libfuse3 is the load-bearing dep of a Linux `fuse` build.
+Linux equivalents: `apt-get install capnproto libcapnp-dev pkg-config` (plus `libfuse3-dev` for a `fuse` build) + `cargo install task` (or whatever your distro packages). FUSE is the Linux default backend, so libfuse3 is the load-bearing dep of a Linux `fuse` build.
 
 ### Build + test
 
@@ -186,7 +186,7 @@ The `task ci` target IS what CI runs — passing it locally guarantees the PR's 
 ### Where things live
 
 - **`rs/ll-core/`** — infrastructure tier: arena, capnp schemas, schema, control block (`current_root`).
-- **`rs/ll-open/`** — projection engine: parse (`leyline-ts`), LSP ingest (`leyline-lsp`), HDC, sheaf, FUSE/NFS mount, CMS sign, the daemon (`leyline-cli-lib`), the binary (`leyline-cli`).
+- **`rs/ll-open/`** — projection engine and execution: parse (`leyline-ts`), LSP ingest (`leyline-lsp`), HDC, sheaf, the store filesystem behind the FUSE/NFS mount (`leyline-storefs`), CMS sign, execution/v1 (`leyline-runtime`, and the microVM worker `leyline-krun-worker`), the daemon (`leyline-cli-lib`), the binary (`leyline-cli`).
 - **`clients/go/leyline-schema/`** — nested Go module for mache + other Go consumers (pure-Go capnp deserialization, no cgo).
 - **`docs/adr/`** — architectural decisions, numbered. Worth reading: [ADR-0014](docs/adr/0014-capnp-as-protocol.md) (wire), [ADR-0016](docs/adr/0016-ai-native-query-surface.md) (query surface), [ADR-0022](docs/adr/0022-mcp-wire-auth-shared-secret.md) (wire auth), [ADR-0024](docs/adr/0024-hdc-substrate-identity-rewrite.md) (HDC), [ADR-0025](docs/adr/0025-hdc-compositional-validation.md) (HDC next).
 - **`docs/ARCHITECTURE.md`** — three-layer overview (infra / projection / consumer surface), runtime model, cross-runtime consumer pattern.
@@ -223,7 +223,7 @@ Where to read next:
 - **GitHub releases** (primary channel, actively used): cut on every `v*` tag via [.github/workflows/release.yml](.github/workflows/release.yml). Each release attaches the assets named in [tools/release-assets.txt](tools/release-assets.txt) plus `SHA256SUMS`: 4 `leyline-{darwin,linux}-{amd64,arm64}` binaries (default features — `lsp` + `validate` + `hdc` + `cdc` + `sheaf`; no `vec`, no mount), `leyline-krun-worker-darwin-arm64` (the microVM worker, ad-hoc signed with the hypervisor entitlement; staging checks the entitlement on the staged bytes), 4 `leyline-mcp-descriptor-*`, 16 `capnpc-schema-bridge-{go,jsonschema,tooldefs,zod}-*` generators, 3 `libleyline_fs-*.a` FFI staticlibs + `leyline_fs.h`, 3 wasm modules (`leyline_sign`, `leyline_cas_ffi`, `leyline_envelope`), and the execution/v1 schema (`execution.capnp`, `traits.capnp`, `execution.tools.json`). The workflow verifies the published set against that list before it reports success. Latest at [releases/latest](https://github.com/agentic-research/ley-line-open/releases/latest). Mache's auto-downloader pulls `leyline-{GOOS}-{GOARCH}` from `/releases/latest/download/` — that's the load-bearing consumer path.
 - **Distroless OCI image**: `task image` builds `localhost/leyline:v<VERSION>` locally (~20 MB, headless MCP daemon on `:8384`) via `cargo zigbuild` static musl. A `v*` tag also publishes the multi-arch image (linux/amd64 + linux/arm64) to `ghcr.io/agentic-research/ley-line-open:vVERSION` with a build-provenance attestation, which is what `server.json` advertises.
 - **Homebrew**: legacy `homebrew-tap/Formula/leyline.rb` exists but points at the pre-LLO-extraction private repo (v0.2.0, private URLs, `license :cannot_represent`). Not actively maintained; the tap source (`kiln`) has been archived. **Don't `brew install`** today; use the binary-download install above.
-- **crates.io**: [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) runs only when started by hand with a release tag (`workflow_dispatch`); a `v*` tag publishes binaries and the image, never crates. No release through v0.27.0 has published crates. Consumers link to the binary or the FFI staticlib, not the source crates.
+- **crates.io**: [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) runs only when started by hand with a release tag (`workflow_dispatch`); a `v*` tag publishes binaries and the image, never crates. crates.io holds version 0.14.0 of `leyline-core`, `leyline-schema`, `leyline-fs`, `leyline-ts`, `leyline-cdc` and `leyline-sign` (checked 2026-11-11); no release after v0.14.0, through v0.29.0, has published crates (`ley-line-open-c3e8c6`). Consumers link to the binary or the FFI staticlib, not the source crates.
 
 - **Release gate: the hypervisor suite** (bead `ley-line-open-16a994`). No hosted runner can boot a guest (GitHub's macOS runners lack nested Hypervisor.framework), so CI skips every test that boots one. Before a tag, the real-guest suite (`task runtime:test` with `LEYLINE_REQUIRE_HYPERVISOR=1`, `agent_in_guest` included) is run by hand on an Apple-silicon host against the exact tree being released, and it records a receipt for that tree:
 

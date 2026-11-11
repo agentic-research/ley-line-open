@@ -342,12 +342,13 @@ what kind of grant it is, so a reader of the JSON can tell:
 
 - **Bare string ⇒ `connect` only.** As in §2, the cheaper spelling is
   the safer one: a plain path grants `connect(2)` and nothing else.
-- **`mode` is closed: `"bind"` | `"connect-bind"`.** It appears only on
+- **`mode` is closed: `"bind"` | `"connect-bind"`, plus `"connect"`
+  beside a `guestPort` (below).** It appears only on
   the object form, and is **required** there. Connect-only has no
   spelling as a `mode` because it *is* the bare-string form — one
   grant, one spelling, so two documents cannot differ only in how they
   write the same grant and digest differently. An explicit
-  `"mode": "connect"` is rejected, exactly as §2 rejects `"mode": "ro"`.
+  `"mode": "connect"` without a `guestPort` is rejected, exactly as §2 rejects `"mode": "ro"`.
 - **Trailing slash ⇒ directory.** `/run/llo/shims/` grants the sockets
   directly inside that directory; a path with no trailing slash names
   one socket. Same distinction §2 draws, encoded the same way.
@@ -454,7 +455,10 @@ unmodified workload:
   MUST refuse a grant carrying `guestPort` (§9 condition 6): the workload
   there dials the socket itself. A runner that carries the guest's ordinary
   sockets out of the guest (libkrun's socket impersonation) MUST refuse it
-  too, because the guest loopback is then not the guest's alone.
+  too, because the guest loopback is then not the guest's alone. LLO's
+  microVM runner also refuses a `guestPort` grant off macOS, naming the
+  platform, until the presentation has run live there; that is the state of
+  one implementation, not a rule of this specification.
 
 A document that carries no `guestPort` is unchanged by the extension and
 digests as it did.
@@ -558,7 +562,9 @@ A second implementation is conformant when:
    For `manifest-port-list.json`, it reaches every `canonical` and
    `confinementDigest` from each case's input, computes every pinned
    meet in both operand orders, and refuses every `rejects` input and
-   every `meetRefusals` pair.
+   every `meetRefusals` pair. For `manifest-guest-port.json`, it reaches
+   every case's `canonical` and `confinementDigest` from its `input` and
+   refuses every `rejects` input.
 3. Independently, its stored bytes match the SHA-256 content-integrity
    pin in `VECTORS.sha256` (a cross-cutting spec-tree convention;
    distinct concern from §8's identity digest).

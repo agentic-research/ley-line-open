@@ -68,7 +68,10 @@ it as `executionError: {"code": "workspaceUnserved", "retryable": false,
 "message": "…"}` (`daemon.capnp` `ExecutionError`, bead
 `ley-line-open-e347ae`), beside
 the unchanged error text, whose `WorkspaceUnserved: …` prefix earlier
-consumers match. Choosing another tier is the caller's policy; the runtime
+consumers match. Every failed `llo_execution_*` op carries
+`executionError` with its own code, including `invalidSpec` for a request
+the op cannot decode and `unsupportedBackend` from a daemon with no
+execution/v1 service; `detailRef` is not carried. Choosing another tier is the caller's policy; the runtime
 does not reroute a run.
 
 The service also checks the backend's answer: the workspace shares the

@@ -1,7 +1,7 @@
 # leyline-schema
 
 Shared SQLite schema — the contract between ley-line crates. This README
-describes `projection-v10` (ADR-0045; ADR-0040 D5 removed the pointer store; bead `9b7d28` interned the merkle-AST edges; bead `738dd9` interned the occurrence tables' subtree pointer to `content_id`). The full table-by-table contract,
+describes `projection-v13` (ADR-0045; ADR-0040 D5 removed the pointer store; bead `9b7d28` interned the merkle-AST edges; bead `738dd9` interned the occurrence tables' subtree pointer to `content_id`; ADR-0047 M1 replaced `treeRoot` with the parser-free `storeRoot`, and `derived_from` with its v2 form, `storeRoot` plus `parserId`; M2 moved `lang`/`raw_kind` from `node_content` to the occurrence; bead `aa1634` made comments `_ast` and `nodes` occurrences). The full table-by-table contract,
 including the sidecar tables other crates add, is `docs/TABLE_CONTRACT.md`.
 
 ## Node ids
@@ -20,6 +20,11 @@ file is `nid >> 24` and a file's rows are `nid BETWEEN (file_id << 24) AND
 index. Helpers: `file_nid`, `dir_nid`, `nid_file_id`, `nid_dir_id`,
 `nid_ordinal`, `file_nid_range`; the constants are `NID_ORDINAL_BITS` (24)
 and `NID_ORDINAL_MASK`.
+
+Within a file the ordinals are the code occurrences in pre-order, then the
+comment occurrences in source order, then the injected ids (extraction
+epoch 7, `projection-v13`), so `nid` order is not document order; read
+sibling order from `nodes.ord`.
 
 ## What's here
 
@@ -70,7 +75,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     parent_nid  INTEGER,
     name_id     INTEGER,            -- filesystem rows; NULL for AST rows
     kind_id     INTEGER,            -- AST rows and the file row; NULL for directories
-    kind        INTEGER NOT NULL,   -- 0 = file, 1 = directory
+    kind        INTEGER NOT NULL,   -- 1 = presented as a directory (a directory, a parsed file, an AST node with named children); 0 = presented as a file (a token, a comment, an AST node with no named children)
     ord         INTEGER NOT NULL DEFAULT 0,
     size        INTEGER DEFAULT 0,  -- the file's real size on its file row
     mtime       INTEGER NOT NULL,   -- the file's real mtime on its file row
@@ -98,5 +103,5 @@ manifest `_tree` (every stored path with its git mode, every directory)
 and `_parse_diagnostics`; `_tree` rows belong to the store, not to a
 file's projection, so they are not in `FILE_KEYED_TABLES` and outlive a
 file leaving the projection (ADR-0045). `_meta.projection_schema_version`
-is `projection-v10`; a binary refuses an older label at parse open and
+is `projection-v13`; a binary refuses any other label at parse open and
 asks for a cold reparse.

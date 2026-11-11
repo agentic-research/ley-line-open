@@ -1,11 +1,15 @@
 # ADR-0048 — Non-structural content: comments, embedded regions and AST-less data
 
-**Status:** Proposed (2026-11-11). Nothing in the Thesis or the "Decisions" sections is shipped.
-The "Context" section describes what ships; every later section separates **Shipped** from
-**Proposed** where both appear.
+**Status:** Accepted (owner, 2026-11-11), not yet implemented. The owner's decisions on the open
+questions are recorded under "Decided questions". Nothing in the Thesis or the "Decisions"
+sections is shipped: the "Context" section describes what ships, and every later section
+separates **Shipped** from **Proposed** where both appear. Implementation ships in v0.30.0 as one
+lineage bump (`projection-v14`, `EXTRACTION_EPOCH` 8, `merkle-ast-v4`; see "Scope").
 **Bead:** `ley-line-open-1b5f3c` (first implementation slice). Filed from this ADR and its
 review: `ley-line-open-4cd459` (code-kind extras), `ley-line-open-4e0852` (the content-class
 marker), `ley-line-open-5b8445` (non-UTF-8 leaves), `ley-line-open-5b9949` (κ not pinned).
+Carried in the same bump by owner decision: `ley-line-open-60321f` (content-derived file kind and
+shebang parser selection), `ley-line-open-4624d9` and `ley-line-open-651909` (Go extraction).
 Consumer half: `mache-48123a`.
 **Amends:** ADR-0027 and ADR-0047 D-i (the `node_hash` fold gains a classification step, a
 leaf rule and a comment tag); the ADR-0047 §3 `node_hash` row; the `node_hash` row of the
@@ -20,11 +24,11 @@ Tree cited throughout: `origin/integration` at `9d41b225` (v0.29.0 plus #568):
 `IR_SCHEMA_VERSION = "merkle-ast-v3"`. Grammar facts are read from the `grammar.json` and
 `node-types.json` of the exact grammar crate versions in `rs/Cargo.lock`. Reviewed by
 `identity-domain-auditor` and `cross-runtime-contract-auditor` (findings folded in below; the
-rest are the open questions).
+questions they raised are recorded under "Decided questions").
 
 ______________________________________________________________________
 
-## Thesis (proposed)
+## Thesis (accepted, not yet implemented)
 
 Every file's bytes have a blob hash: plain BLAKE3 over the whole file, named by `storeRoot`
 through `_tree`. On top of that, the parse projection should put each byte range of a file
@@ -33,7 +37,7 @@ into exactly one of four categories, each with one projection-side identity:
 | | Category | Projection identity and its authoritative bytes | Where it is |
 | --- | --- | --- | --- |
 | (a) | Code structure | `node_hash` code variants (tags `0x00`, `0x01`): κ kind, terminal bytes, child `node_hash`es | `_ast` occurrence |
-| (b) | Non-structural content attached to code: comments, doc comments, shebangs | `node_hash` comment variant (tag `0x02`): grammar kind and the comment's exact bytes | `_ast` occurrence with a comment address |
+| (b) | Non-structural content attached to code: comments, doc comments, shebangs, comment-borne directives | `node_hash` comment variant (tag `0x02`): grammar kind and the comment's exact bytes | `_ast` occurrence with a comment address |
 | (c) | Embedded foreign-language regions (injections) | The host string's bytes are (a) of the host; the region's parse is (a) of the guest language under its own root `node_hash` | Host occurrence plus injection site |
 | (d) | Content with no AST: no grammar, binary, oversized, unparseable | None beyond the blob hash | `_tree.path`, byte range `[0, size)` |
 
@@ -143,8 +147,8 @@ tree-sitter gives it no children at all** (`child_count() == 0`). A node whose c
 non-code is an internal node over an empty child list, `hash_internal(kind, [])`, and never
 hashes its span. This closes defect 2.
 
-**(b) Non-structural content.** Every node whose class is `comment` or `shebang`, whether or not
-the grammar marks it `extra`. It has a position in the code and no meaning to the syntax tree.
+**(b) Non-structural content.** Every node whose class is `comment`, `shebang` or `directive`,
+whether or not the grammar marks it `extra`. It has a position in the code and no meaning to the syntax tree.
 Identity: the comment variant of `node_hash` (N4) over its grammar kind and exact bytes.
 Addressed by its comment address (N3). It is in no other `node_hash` preimage, so editing,
 adding or removing it changes no code `node_hash`; only its own occurrence and content row
@@ -154,11 +158,19 @@ Whitespace and line continuations (Python and Containerfile `line_continuation`,
 newline extras) are class `trivia`: no row, no hash, as today. Their bytes stay in the blob and
 inside their ancestors' spans; nothing addresses them separately.
 
-Comment-borne directives are comments: Go `//go:build`, Scala `//> using` (`using_directive`
-inside `comment`), Python `# type:` and encoding lines. `node_hash` is the identity of the
-syntax tree, not of a build. A consumer that needs build semantics reads the comment
-occurrences or the blob hash. A shebang changes which interpreter runs the file but not the
-tree, so it is non-structural by the same argument.
+Comment-borne directives (Go `//go:build`, `//go:generate`, `// +build`; Python coding cookies
+and `# type:`; TypeScript `// @ts-ignore`, `// @ts-expect-error`, `// @ts-nocheck`; Scala
+`//> using`) are class `directive` (Q4, decided): out of every `node_hash` preimage like a
+comment, and marked so a consumer can find them. `node_hash` is the identity of the syntax tree,
+not of a build; a consumer that needs build semantics reads the directive occurrences or the blob
+hash. A shebang changes which interpreter runs the file but not the tree, so it is class
+`shebang`, non-structural by the same argument (Q1, decided).
+
+A directive is usually not a grammar kind of its own: `//go:build` is a Go `comment`. So the
+class has two carriers (N2): the kind-level class in `kinds.class`, and a per-occurrence role
+that refines a `comment` occurrence to `directive` or `shebang` by a per-language rule over its
+bytes. The role never changes a `node_hash`: the occurrence is outside the fold in either case,
+and its content row is the same tag-`0x02` row.
 
 **(c) Embedded regions.** The host's bytes stay (a) of the host: the string literal is a code
 leaf, and editing the region moves the host `node_hash`. The region's parse is (a) of the guest
@@ -172,12 +184,40 @@ its only identity. Addressed by `_tree.path` and the byte range `[0, size)`. No 
 row may name it, and ADR-0047 law (c) already guarantees that no blob hash equals a
 `node_hash`.
 
+**Content-derived file kind (`ley-line-open-60321f`, decided for v0.30.0).** What a file *is*
+is decided from its bytes as well as its name, by an established detector rather than rules
+LLO invents:
+- **Detection.** A pure-Rust signature detector with a compiled-in rule set (the `infer` crate is
+  the candidate; the implementation records the final choice after `cargo deny` and
+  `task audit`) plus a byte-order-mark and UTF-8 validity check. A detector that reads a host
+  database (libmagic, the freedesktop shared-mime-info store) is excluded, because the result
+  must be a function of the bytes and the binary alone, the same on every host.
+- **Key.** The result is keyed by blob hash, since it is a function of the bytes:
+  `_blob_kind(blob_hash PRIMARY KEY, is_text, encoding, mime)`. Two paths with the same bytes
+  share a row; the row says nothing about the path.
+- **Parser selection.** Extension, then file name (shipped), then the shebang's interpreter for a
+  text file with neither: an extensionless `#!/usr/bin/env python3` parses as Python, `#!/bin/sh`
+  as Bash. A detected MIME kind alone never selects a grammar: a `.txt` file holding JSON gets a
+  JSON MIME kind and stays unparsed unless a rule says otherwise.
+- **Unknown stays opaque.** A file the detector cannot classify, a binary, and a file no rule
+  selects a grammar for remain (d), with a `_content_spans` `opaque` row (N6) and a `_blob_kind`
+  row where detection succeeded. The binary test moves from "a NUL byte in the first 8 KiB" to
+  the detector's text/binary verdict, so a UTF-16 text file is text, not binary.
+- **Versioning.** The detector's crate version, its rule set and the shebang interpreter map are
+  projection rules: they decide which category a file falls in. They are pinned with the
+  inventory (gate 4, N2) to `EXTRACTION_EPOCH`, so changing any of them forces re-derivation. A
+  file moving from (d) to (a) gains `node_hash`es; no existing `node_hash` changes meaning.
+
 ### N2 — Classification by grammar kind, from a checked-in inventory
 
 **Decision.** The class of a node is a function of `(lang, grammar kind, named)` alone, read
 from a per-language inventory, `rs/ll-open/ts/src/content_classes.json`, compiled into
 `leyline-ts` and exposed as `content_class(lang, kind, named)`. `is_extra()` decides nothing.
-Classes: `code`, `comment`, `shebang`, `trivia`. The key includes `named` because tree-sitter
+Classes at v14: `code`, `comment`, `shebang`, `directive`, `trivia`. The set is discovered, not
+hand-enumerated (Q1, decided): the owner expects more classes than these, and the mechanism for
+finding them is the generated per-grammar inventory and its gates. A grammar kind that fits no
+existing class appears as an `unclassified` row and fails gate 2; a new class enters the set only
+through such a failure, with a projection bump for the CHECK. The key includes `named` because tree-sitter
 kind strings collide between named and anonymous nodes (HTML has both a named and an anonymous
 `doctype`; C# has an anonymous `#pragma`), and an anonymous token must never leave the fold
 because it shares a name with a comment kind.
@@ -206,7 +246,8 @@ one row for each kind that is an extra or matches
    `tree_sitter::Language` (`node_kind_count`, `node_kind_for_id`, `node_kind_is_named`) and
    fails if a row names a `(kind, named)` pair, or a language, that the compiled grammar lacks.
 4. `content_classes_are_pinned_to_the_ir_lineage` pins
-   `(IR_SCHEMA_VERSION, EXTRACTION_EPOCH, BLAKE3(content_classes.json))`, modelled on
+   `(IR_SCHEMA_VERSION, EXTRACTION_EPOCH, BLAKE3(content_classes.json))`, and the occurrence-role
+   rules and the file-kind rules (N1 (d)) beside it, modelled on
    `compiled_queries_are_pinned_to_the_extraction_epoch`. Any edit to the inventory moves which
    nodes enter the fold, so it must move both labels, and through them `parserId`. Adding the
    inventory digest as a new `parserId` input kind was considered and not taken: a new input kind
@@ -224,13 +265,26 @@ comment as code makes a `node_hash` move when it need not; misclassing code as a
   `multiline_comment` (Swift, extra or not); `js_comment` (CSS); `marginalia` (SQL).
 - `shebang`: Rust, Kotlin, Groovy `shebang`; Swift `shebang_line`; JavaScript, TypeScript, Lua
   `hash_bang_line`; C# `shebang_directive`. A grammar with no shebang kind (Bash, Python, Ruby,
-  Elixir, and Scala, which aliases its shebang to `comment`) yields a `comment`; a kind cannot
-  tell them apart. So `class = 'shebang'` does not mean "every shebang"; doc-comment lookup
-  (N7) also skips a comment that starts at byte 0 with `#!`.
+  Elixir, and Scala, which aliases its shebang to `comment`) yields a `comment` occurrence, which
+  the occurrence rule below refines to `shebang`.
+- `directive`: C# `preproc_region` and `preproc_endregion` (Q2, decided).
 - `trivia`: Python and Containerfile `line_continuation`.
 - `code`, listed so that the generator's name match does not catch them: SQL `keyword_comment`,
-  `comment_statement`; Ruby `heredoc_body`; C# `preproc_*` except the region markers (Q2); PHP
-  `text_interpolation` until it becomes an injection (Q3).
+  `comment_statement`; Ruby `heredoc_body`; C# `preproc_*` other than the region markers; PHP
+  `text_interpolation` pending Q3.
+
+**Occurrence roles.** A `comment` occurrence is refined by a per-language rule over its bytes,
+stored in `_comment_roles(nid PRIMARY KEY, role CHECK (role IN ('shebang','directive')),
+rule TEXT NOT NULL)`, where `rule` names the rule that matched. Initial rules: any language, a
+`comment` at byte 0 that starts with `#!` is `shebang`; Go `//go:` and `// +build` at the start
+of a line comment; Python a coding cookie (PEP 263's regular expression, on line 1 or 2) and
+`# type:`; TypeScript and JavaScript `// @ts-ignore`, `// @ts-expect-error`, `// @ts-nocheck`,
+`/// <reference`; Scala a `comment` holding a `using_directive`. Each rule cites the language's
+own documentation in the rule table. A role is a function of the occurrence's language, kind and
+bytes, so it never moves a `node_hash`; the rule table is pinned with the inventory (gate 4) to
+`EXTRACTION_EPOCH`, so a rule change re-derives the roles. The effective class of an occurrence
+is its role if it has one, else `kinds.class`; `v_comment_address` and `v_content_class` expose
+the effective class.
 
 **`kinds.class` lifecycle.** `kinds` rows are interned with `INSERT OR IGNORE`, never deleted,
 and survive epoch re-derivation, so a class written once could outlive the inventory that wrote
@@ -243,7 +297,7 @@ it. Three rules close this:
 - `class` is immutable after interning. `_meta.content_classes` stamps the inventory digest; an
   arena whose stamp differs from the binary's is refused at open and rebuilt cold, as a
   projection-version mismatch is.
-- The CHECK admits all four classes, because `project.rs` may intern a trivia kind; the parse
+- The CHECK admits all five classes, because `project.rs` may intern a trivia kind; the parse
   producer never writes a `trivia` row (`no_parse_written_kind_is_trivia`).
 
 ### N3 — The comment address
@@ -264,29 +318,35 @@ column span. Its nid ordinal follows every code occurrence, so a comment edit mo
 - `gap`: the number of named `code` siblings before it under that parent. `0` is the leading
   position, before the first code sibling; `n` is after the last. Anonymous tokens have no rows
   and are not counted.
-- `rank`: its index, from 0, among the `comment` and `shebang` siblings in the same gap, in
-  source order.
+- `rank`: its index, from 0, among the non-code siblings (`comment`, `shebang`, `directive`)
+  in the same gap, in source order.
 - `start_byte`, `end_byte`: tree-sitter's span in the file's bytes.
 
+**The address is factual (Q6, decided).** It records where tree-sitter attached the comment, and
+LLO does not reinterpret it: no re-parenting, no "this comment belongs to that function". Which
+declaration a comment documents is a separate, derived question, answered by N8.
+
 The prose above is the contract. It is published as a view, because `gap` and `rank` are
-functions of `nodes.ord` and `kinds.class`; the shipped form uses window functions, so the cost
-is one pass per parent:
+functions of `nodes.ord` and the effective class; the shipped form uses window functions, so the
+cost is one pass per parent:
 
 ```sql
 CREATE VIEW v_comment_address AS
 WITH sib AS (
-    SELECT n.nid, n.parent_nid, n.ord, k.class, a.start_byte, a.end_byte,
+    SELECT n.nid, n.parent_nid, n.ord, COALESCE(r.role, k.class) AS class,
+           a.start_byte, a.end_byte,
            SUM(k.class = 'code') OVER (PARTITION BY n.parent_nid ORDER BY n.ord
                                        ROWS UNBOUNDED PRECEDING) AS gap
       FROM nodes n
       JOIN _ast a ON a.nid = n.nid
       JOIN kinds k ON k.kind_id = a.kind_id
+      LEFT JOIN _comment_roles r ON r.nid = n.nid
 )
-SELECT nid, parent_nid, gap,
+SELECT nid, parent_nid, class, gap,
        ROW_NUMBER() OVER (PARTITION BY parent_nid, gap ORDER BY ord) - 1 AS rank,
        start_byte, end_byte
   FROM sib
- WHERE class IN ('comment', 'shebang');
+ WHERE class IN ('comment', 'shebang', 'directive');
 ```
 
 A predicate on `nid` cannot be pushed through the window functions, so a consumer filters the
@@ -379,7 +439,7 @@ One release carries three bumps, each on its own axis:
 | --- | --- | --- | --- |
 | `IR_SCHEMA_VERSION` (`node_hash` lineage) | `merkle-ast-v3` | `merkle-ast-v4` | The preimage's meaning changes: comment rows move to tag `0x02`; nodes holding a comment child, or holding only comments, fold differently (N1 leaf rule); shebang files; non-UTF-8 leaves; and with S2 Ruby heredocs and C# directives. |
 | `EXTRACTION_EPOCH` | `7` | `8` | It records which nodes become `_ast` occurrences, and that set now comes from the inventory. Forces re-derivation of every file. |
-| `PROJECTION_SCHEMA_VERSION` | `projection-v13` | `projection-v14` | `kinds.class` (`TEXT NOT NULL CHECK (class IN ('code','comment','shebang','trivia'))`), `v_comment_address`, `node_tag = 2` rows, the `node_edge` trigger, `_meta.content_classes`, and with S3 `_content_spans` and `v_content_class`. |
+| `PROJECTION_SCHEMA_VERSION` | `projection-v13` | `projection-v14` | `kinds.class` (`TEXT NOT NULL CHECK (class IN ('code','comment','shebang','directive','trivia'))`), `_comment_roles`, `v_comment_address`, `node_tag = 2` rows, the `node_edge` trigger, `_meta.content_classes`, `_content_spans`, `v_content_class`, `_blob_kind` and `_documents` (N8). |
 
 **Refused.** A `projection-v13` arena is refused at parse open and rebuilt cold, like every
 earlier version; the refusal also gets a shape probe (a `kinds` table without `class` is
@@ -444,7 +504,7 @@ CREATE TABLE _content_spans (
 );
 
 CREATE VIEW v_content_class AS
-SELECT s.path, c.start_byte, c.end_byte, k.class, k.lang, c.nid
+SELECT s.path, c.start_byte, c.end_byte, c.class, k.lang, c.nid
   FROM v_comment_address c
   JOIN _ast a ON a.nid = c.nid
   JOIN kinds k ON k.kind_id = a.kind_id
@@ -454,27 +514,30 @@ SELECT path, start_byte, end_byte, class, lang, host_nid
   FROM _content_spans;
 ```
 
-`v_content_class.class` takes the values `comment`, `shebang`, `injected` and `opaque`; code is
-every `_ast` row not listed. An `opaque` row spans `[0, size)`, and every `_parse_diagnostics`
-row with `projected = 0` has exactly one. Rows are written and deleted with the file's other
-projection rows (`delete_file_rows`), in the same transaction, on removal, rename and scoped
-reparse. An opaque row is a function of the bytes, the path and the projection's rules: the
-compiled grammar set (folded into `parserId`), and the extension map, the NUL heuristic and
-`MAX_PARSE_FILE_SIZE`, which `parserId` does not fold; a change to any of the last three is
-therefore a projection bump, pinned by a test. A file excluded by a parse's language filter is
-not AST-less and has no row (Q5).
+`v_content_class.class` takes the values `comment`, `shebang`, `directive`, `injected` and
+`opaque`; code is every `_ast` row not listed. An `opaque` row spans `[0, size)`, and every
+`_parse_diagnostics` row with `projected = 0` has exactly one, as does every `_tree` file no rule
+selected a grammar for. Rows are written and deleted with the file's other projection rows
+(`delete_file_rows`), in the same transaction, on removal, rename and scoped reparse. An opaque
+row is a function of the bytes, the path and the projection's rules: the compiled grammar set
+(folded into `parserId`), and the extension and file-name maps, the file-kind detector and
+shebang map (N1 (d)) and `MAX_PARSE_FILE_SIZE`, which `parserId` does not fold directly; they
+are pinned to `EXTRACTION_EPOCH` (gate 4), which it does. A file excluded by a parse's language
+filter is not AST-less and has no row (Q5, decided).
 
 ### N7 — Consumer effects (mache, `mache-48123a`)
 
-- **Fold by kind.** Replace `raw_kind LIKE '%comment%'` with `kinds.class IN ('comment',
-  'shebang')`. The LIKE matches SQL `keyword_comment` and `comment_statement` (code) and misses
-  `marginalia` and every shebang kind.
+- **Fold by kind.** Replace `raw_kind LIKE '%comment%'` with the effective class from
+  `v_comment_address` (or `kinds.class` for kind-level classes): `comment`, `shebang` and
+  `directive` fold. The LIKE matches SQL `keyword_comment` and `comment_statement` (code) and
+  misses `marginalia` and every shebang kind.
 - **`dead_code`.** Only `class = 'code'` occurrences are candidates. A comment has no
   `node_defs` row, so today's results hold; the class makes the rule explicit.
-- **Doc-comment lookup.** The TABLE_CONTRACT recipe walks back from a def over siblings with
-  `class = 'comment'`, skipping a comment at byte 0 that starts with `#!`. Swift member-separator
-  comments become attachable. The opener rule for Rust, Java, JavaScript, TypeScript, C and C++
-  is unchanged; Python docstrings stay string occurrences (code).
+- **Doc-comment lookup.** Read `_documents` (N8) for the languages it covers, and drop mache's
+  own rule for each language as `_documents` covers it. For other languages, the TABLE_CONTRACT
+  recipe still walks back from a def over siblings whose effective class is `comment` (shebangs
+  and directives are excluded by class, not by a byte test). Swift member-separator comments
+  become attachable.
 - **Edges.** No `node_edge` reaches a comment row in any language (today a Swift separator
   comment is reachable as a code child). Rows with `node_tag = 2` are comments.
 - **Unknown class values** are refused, never read as non-structural.
@@ -486,6 +549,43 @@ not AST-less and has no row (Q5).
   blind.
 - **Version.** mache accepts `projection-v14` with `_meta.extraction_epoch = 8` and
   `_meta.ir_schema_version = merkle-ast-v4`, and refuses v13.
+
+### N8 — `_documents`: which declaration a comment documents (derived, separately versioned)
+
+Decided by the owner as the second layer of Q6. N3's address says where a comment *is*; this
+layer says what it *documents*, and it is a derivation over the occurrence rows, not part of
+any identity.
+
+```sql
+CREATE TABLE _documents (
+    doc_nid  INTEGER NOT NULL,   -- the comment occurrence, or the Python docstring's string occurrence
+    decl_nid INTEGER NOT NULL,   -- the declaration it documents (a code occurrence)
+    rule     TEXT    NOT NULL,   -- the rule that produced the row, e.g. 'go/line-run-above'
+    PRIMARY KEY (doc_nid, decl_nid)
+);
+```
+
+- **Only unambiguous conventions.** v1 rules:
+  - Go: the run of `//` comments directly above a declaration, with no blank line inside the run
+    or between it and the declaration (`go/line-run-above`).
+  - Rust: `///` and `/** */` outer doc comments to the next item, skipping attributes
+    (`rust/outer-doc`); `//!` and `/*! */` inner doc comments to the enclosing item or the module
+    (`rust/inner-doc`).
+  - JavaScript and TypeScript: a `/** */` block directly above a declaration, or above its
+    `export` wrapper (`js/jsdoc-above`).
+  - Python: the first statement of a module, class or function body, when it is a string
+    expression (`python/docstring`); the documenting occurrence is that string, which stays code.
+- **An ambiguous case gets no row, never a guess.** A comment that is directive or shebang
+  class, a comment separated by a blank line, a comment above two declarations on one line,
+  or a language with no rule here has no row.
+- **Each row names its rule**, so a consumer can trust or ignore a rule independently.
+- **Versioned on its own axis.** `_meta.documents_version` (`documents-v1` at v14). A rule fix or
+  a new language bumps it and rebuilds `_documents` from `_ast`, `nodes`, `kinds`,
+  `_comment_roles` and the source bytes, with no re-parse. It never moves `IR_SCHEMA_VERSION`,
+  `EXTRACTION_EPOCH` or any `node_hash`: no row of `_documents` is in a preimage. Adding the
+  table is part of `projection-v14`; later rule changes are not projection bumps, because the
+  table's shape does not change.
+- **mache** drops its own doc-comment rule for each language once `_documents` covers it (N7).
 
 ## Test plan
 
@@ -506,6 +606,9 @@ Each invariant has a closing test. Unless named, tests go in
 | The inventory stays true and versioned | `task gen:content-classes:check`; `content_classes_has_no_unclassified_rows`; `every_inventory_kind_exists_in_its_compiled_grammar` (`rs/ll-open/ts`); `content_classes_are_pinned_to_the_ir_lineage` |
 | An unknown kind is code | `an_uninventoried_kind_is_folded` |
 | `kinds.class` matches the binary | `every_producer_interns_the_inventory_class` (parse and `project.rs`); `an_arena_with_a_stale_content_class_stamp_is_refused` |
+| Directives and shebangs are marked, outside the fold | `a_go_build_line_is_a_directive_and_moves_no_code_hash`; `a_python_coding_cookie_and_ts_ignore_are_directives`; `a_python_shebang_comment_has_the_shebang_role`; `a_csharp_region_marker_is_a_directive` |
+| Content-derived file kind (60321f) | an extensionless `#!/usr/bin/env python3` file parses as Python and `#!/bin/sh` as Bash; a `.txt` holding JSON gets a JSON MIME kind and stays unparsed; a PNG and a UTF-16 text file are classified correctly; an unknown binary stays opaque; two paths with the same bytes share one `_blob_kind` row |
+| `_documents` (N8) | one fixture per rule (Go run above, Rust `///` past an attribute and `//!`, JSDoc above an `export`, Python docstring), each asserting the `rule` value; `an_ambiguous_comment_documents_nothing` (blank line, two declarations on one line, a directive above a function); `a_documents_rule_change_moves_no_node_hash` |
 | Versioning | `projection_schema_version_is_stamped_and_pinned` (v14); the refusal test extended to v13 and the `kinds`-without-`class` shape; `extraction_epoch` 8; `ir_schema_version` `merkle-ast-v4`; `parserId` moves; `Head.rootHash` differs for a Swift separator fixture |
 | (c) Injected comments | `an_injected_sql_comment_is_outside_both_folds` |
 | (d) and the marker (S3) | `every_unprojected_file_has_one_opaque_span` (binary, unknown extension, oversized, parse failure; again after a removal and a scoped reparse); `an_injection_site_has_one_injected_span`; `v_content_class_lists_comments_and_no_code` |
@@ -518,46 +621,66 @@ address fixture and mache's DDL pin.
 
 ## Scope
 
+Decided by the owner: everything below marked v0.30.0 ships as **one** lineage bump
+(`projection-v14`, `EXTRACTION_EPOCH` 8, `merkle-ast-v4`), so consumers re-pin once.
+
 | Slice | Content | Bead | Release |
 | --- | --- | --- | --- |
-| S1 | N2 inventory, generator, four gates and `kinds.class` lifecycle; N1 leaf rule; N4 comment tag, byte hashing, trigger, witness variant; reclassify Swift `multiline_comment`, Scala shebang `comment`, SQL `marginalia`, the shebang kinds; `v_comment_address`; N5 bumps and every artifact listed there | `ley-line-open-1b5f3c`, `ley-line-open-5b8445` | v0.30.0 |
-| S2 | Code-classed extras folded: Ruby `heredoc_body`, C# `preproc_*`. They fold into whichever node tree-sitter attached them to, not into the construct that uses them; an ancestor's `node_hash` moves, a call's subtree need not | `ley-line-open-4cd459` | v0.30.0, so that `merkle-ast-v4` is one lineage bump and not two |
-| S3 | `_content_spans` (opaque and injected), `v_content_class` | `ley-line-open-4e0852` | v0.30.0, inside `projection-v14` |
-| S3b | Pin κ to the IR lineage | `ley-line-open-5b9949` | v0.30.0 if it rides the same bump; otherwise its own |
+| S1 | N2 inventory, generator, four gates and `kinds.class` lifecycle; N1 leaf rule; N4 comment tag, byte hashing, trigger, witness variant; reclassify Swift `multiline_comment`, Scala shebang `comment`, SQL `marginalia`, the shebang kinds; `_comment_roles` (shebang and directive rules); `v_comment_address`; N5 bumps and every artifact listed there | `ley-line-open-1b5f3c`, `ley-line-open-5b8445` | v0.30.0 |
+| S2 | Code-classed extras folded: Ruby `heredoc_body`, C# `preproc_*` other than the region markers (which are `directive`). They fold into whichever node tree-sitter attached them to, not into the construct that uses them; an ancestor's `node_hash` moves, a call's subtree need not | `ley-line-open-4cd459` | v0.30.0 |
+| S3 | `_content_spans` (opaque and injected), `v_content_class` | `ley-line-open-4e0852` | v0.30.0 |
+| S3b | Pin κ to the IR lineage | `ley-line-open-5b9949` | v0.30.0 if it fits; otherwise the next lineage bump |
+| S3c | Content-derived file kind (`_blob_kind`) and shebang parser selection (N1 (d)) | `ley-line-open-60321f` | v0.30.0 |
+| S3d | Go extraction: composite-literal type refs; package-level `const`/`var` defs and qualified selector argument refs. Fact rows only, no `node_hash` effect; they ride `EXTRACTION_EPOCH` 8 | `ley-line-open-4624d9`, `ley-line-open-651909` | v0.30.0 |
+| S3e | `_documents` v1 (N8): Go, Rust, JSDoc, Python | to file before implementation | v0.30.0 |
 | S4 | Comment occurrences for injected trees (they have no `_ast` rows today) | to file | later |
 | S5 | PHP `text_interpolation` as an HTML injection; Markdown injection into doc comments | to file | later |
-| S6 | A portable structural comment locator; a per-occurrence doc-comment flag | to file | later |
+| S6 | A portable structural comment locator; more `_documents` languages | to file | later |
 
 S1 estimate: the classification lookup replaces `is_comment_extra` in `fold_children` and
 `fold_injected_node`; the leaf rule in both; `hash_comment`, byte hashing and the tag constant;
-the trigger and witness variant; the inventory module, generator and four gates; the
-`intern_kind` signature and its callers; the `kinds` DDL column, stamp and view; three version
-constants, the refusal probe and the tests that pin them; the Go sigma tag and vectors; the
-documentation rows. Roughly 1,000 to 1,400 changed lines with tests, one implementing agent, two
-or three full `task ci` runs.
+the trigger and witness variant; the inventory module, generator and four gates; the occurrence
+role rules; the `intern_kind` signature and its callers; the `kinds` DDL column, stamp and view;
+three version constants, the refusal probe and the tests that pin them; the Go sigma tag and
+vectors; the documentation rows. Roughly 1,000 to 1,400 changed lines with tests. The whole
+v0.30.0 bump (S1 to S3e) is several agents in separate worktrees with disjoint file scopes,
+merged into one integration branch before one release.
 
-## Open questions for the owner
+## Decided questions (owner, 2026-11-11)
 
-- **Q1.** Is `shebang` its own class, or is it `comment`? This ADR keeps it separate so that
-  consumers can tell one when the grammar has the kind; it cannot be complete (N2), and both are
-  out of the fold either way.
-- **Q2.** C# `#region` / `#endregion` are editor folding markers with no compile meaning. Class
-  `comment` (out of the fold) or `code` (with the other directives)?
-- **Q3.** PHP `text_interpolation` is dropped today. Until S5 makes it an HTML injection, should
-  S2 fold it as code so that an inline-HTML edit moves the file's `node_hash`?
-- **Q4.** Comment-borne directives (`//go:build`, `//> using`) are comments by N1. If a consumer
-  needs a build-sensitive identity, is that a separate construction over the comment occurrences,
-  or out of scope for LLO?
-- **Q5.** Should a file excluded by a language filter get an explicit row in `_content_spans`
-  (a third class, `filtered`), or is its absence acceptable because the filter is a property of
-  the parse invocation?
-- **Q6.** Tree-sitter can re-parent a comment after an edit elsewhere (N3). Should LLO
-  re-attach comments by its own rule (for example, to the nearest enclosing code node by span)
-  so that the address depends on LLO's rule and not on parser state? That would make the address
-  more stable and is a larger change than S1.
-- **Q7.** `kinds.class` is immutable and a stale stamp refuses the arena (N2). The alternative is
-  an upsert on interning. Refusal is chosen because a reclassification also changes `node_hash`
-  for every file, so the whole arena is re-derived anyway.
+- **Q1 — DECIDED: `shebang` is its own class.** The owner expects more classes than the ones
+  named here ("there is more than just this but it might be a discovery problem"). So the class
+  set is discovered, not enumerated: the generated per-grammar inventory and its gate
+  (no `unclassified` rows) are the mechanism, and a new class appears through a gate failure
+  that a person resolves by reading the grammar (N2). A shebang in a grammar with no shebang kind
+  gets the `shebang` role by the byte-0 `#!` rule.
+- **Q2 — DECIDED: C# `#region` / `#endregion` are class `directive`.** They are editor directives
+  with no compile meaning. Today they are dropped extras, so no `node_hash` sees them; as
+  `directive` they stay out of the fold and gain a marked row. No identity changes relative to
+  today.
+- **Q3 — PENDING (flagged to the coordinator, not decided here).** PHP `text_interpolation`
+  (inline HTML outside `<?php ?>`) is dropped today, so an inline-HTML edit moves no `node_hash`.
+  The default this ADR recommends is N2's fail direction: fold it as code until S5 makes it an
+  HTML injection. That default changes identity (PHP `node_hash`es move for files with inline
+  HTML), so per the owner's instruction it is flagged rather than taken. The alternative with no
+  identity change is to leave it out of the fold and mark it with a `_content_spans` row
+  (`class = 'injected'`, `lang = 'html'`) once S5 exists, accepting the missed change meanwhile.
+- **Q4 — DECIDED: comment-borne build directives are class `directive`.** `//go:build`,
+  `//go:generate`, coding cookies, `@ts-ignore` and the like are out of `node_hash` and marked
+  through `_comment_roles` (N1 (b), N2). A build-sensitive identity is not part of this ADR.
+- **Q5 — DECIDED: no row for a file a language filter excluded.** The filter is a property of the
+  parse invocation, not of the file; a filtered file is not AST-less. No identity change.
+- **Q6 — DECIDED: two layers.** (1) The address is factual: parent, gap, rank and byte span as
+  tree-sitter attaches the comment; LLO does not reinterpret it (N3). (2) A separate, versioned,
+  derived table, `_documents`, maps a comment to the declaration it documents only for languages
+  with an unambiguous convention (first: Go `//` directly above, Rust `///` and `//!`, JSDoc
+  `/** */`, Python docstrings). Each row carries the rule that produced it; an ambiguous case gets
+  no row. Rule fixes version the table (`documents-vN`), never the identity domain (N8). mache
+  drops its own rules per language as `_documents` covers them.
+- **Q7 — DECIDED: `kinds.class` is immutable after interning, and a stale
+  `_meta.content_classes` stamp refuses the arena.** A reclassification changes `node_hash` across
+  the arena, so the arena is re-derived in full anyway; an upsert would only hide the mismatch.
+  No identity change beyond the bump that carries the reclassification.
 
 ## Non-goals
 

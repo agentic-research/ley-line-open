@@ -8,6 +8,10 @@ Section: Breaking
   - **What is refused.** A link at a kernel mount point (`dev`, `proc`, `sys`, `tmp`) is refused by name, as a regular file there already was. `/.leyline-exec.json`, which the runtime writes into each run's copy, is reserved: an image holding it at its root is refused as the new `OciImportError::ReservedPath`, and a manifest of either version listing it is refused (`rootfs_manifest::RUN_EXEC_SPEC`). An exhaustive `match` on `OciImportError` must add the new variant.
   - **The executable.** A run's executable is resolved through the manifest's own links as the guest's kernel resolves it (`bin/sh` through `bin -> usr/bin`), never through a host link. The native tier runs the resolved file.
   - **The import JSON** gains `directories` and `symlinks` counts.
-  - **The first-party acceptance images' digests:** `llo` `9d0c…`, `mache` `…`, `rosary` `…`, `hello` `…` (see `tests/oci_rootfs.rs`).
+  - **New known answers, links kept.**
+    - The checked-in fixture: `0848a87a…`.
+    - The first-party acceptance images: `llo` `6b217ac0…`, `mache` `644574cf…`, `rosary` `bc4f1fca…`, `hello-world` `6fbd5b6c…`.
+    - `dolthub/dolt-sql-server` arm64: `11cf2e25…`. Its 14 dangling links, which `resolve` dropped, are kept.
+    - Each is recorded in full in `tests/oci_rootfs.rs` and `tests/oci_registry_pull.rs`. An importer at an earlier version minted different digests for the same images.
   - **Shared vectors.** `execution/v1/test-vectors/rootfs-manifest.json` pins the v2 bytes and digest beside v1's.
   - **Cloister** adopts it under `cloister-b74da4`.

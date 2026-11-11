@@ -84,7 +84,7 @@ fn import(layout: &Path, digest: &str, cas_root: &Path) -> String {
             layout,
             reference: digest,
             platform: Platform::linux("arm64"),
-            symlinks: SymlinkPolicy::Resolve,
+            symlinks: SymlinkPolicy::Preserve,
             max_rootfs_bytes: DEFAULT_MAX_ROOTFS_BYTES,
         },
         cas_root,
@@ -299,18 +299,19 @@ fn first_party_images_import_into_a_provisioned_volume_with_their_known_digests(
     };
     let provisioned = Provisioned::new();
     let cas_root = provisioned.volume.provision().expect("provision").cas_root;
-    // The digests recorded on bead ley-line-open-fe3d26, imported there on
-    // a case-insensitive TMPDIR.
+    // The rootfs manifest v2 digests (links kept) that tests/oci_rootfs.rs
+    // records for these images on a temporary directory: the volume names
+    // the same trees.
     for (name, digest, expected) in [
         (
             "mache",
             "sha256:8620a0dc2d4c2ae7f6cc1f0ee68d6823a8bc9af6a8cf01d332c08738d9203ac7",
-            "dd52c667ff1c44e151bd8f05392607b0760b204dfe5d8e66d92fd76857ea4810",
+            "644574cf881c0751a9025fb910cdb2abfa616ff4cc2894829bbb885ba12741cf",
         ),
         (
             "rosary",
             "sha256:38aadea5d94b5f96ea43d9decd3c6f46f97c71a765fc73afd5f44387c21800ad",
-            "2982e7d59b5d33d5f1ef26af332e2963f6bbb7596017bc0be0ff0b57b25b6a23",
+            "bc4f1fca6acde26c2636999ccf4fc91720b9e11738a7c168753e0beedb87b9ee",
         ),
     ] {
         let rootfs = import(&Path::new(&dir).join(name), digest, &cas_root);

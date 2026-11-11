@@ -1367,7 +1367,8 @@ fn absolute_entry_names_are_read_from_the_image_root() {
 /// Opt-in (network): set `LEYLINE_OCI_NIX_IMAGE` to
 /// `[registry/]repository@sha256:<hex>` of an image built with Nix
 /// `dockerTools` (its layers name `/nix/store/...` absolutely). Its links
-/// need `--symlinks resolve` under rootfs manifest v1. A Nix closure often
+/// are kept (`--symlinks preserve`, rootfs manifest v2): none is copied
+/// and none dropped, dangling or not. A Nix closure often
 /// holds names that differ only by case (ncurses' `terminfo/A` and
 /// `terminfo/a`), so set `LEYLINE_OCI_NIX_CAS_DIR` to a directory on a
 /// case-sensitive volume for the CAS root (the default is a temporary
@@ -1390,7 +1391,7 @@ fn a_nix_built_image_imports_from_its_registry() {
         &leyline_runtime::artifacts::registry::RegistryPull {
             reference: &reference,
             platform: Platform::host().expect("a host platform"),
-            symlinks: SymlinkPolicy::Resolve,
+            symlinks: SymlinkPolicy::Preserve,
             max_rootfs_bytes: DEFAULT_MAX_ROOTFS_BYTES,
             limits: Default::default(),
             insecure_plain_http: None,
@@ -1404,13 +1405,17 @@ fn a_nix_built_image_imports_from_its_registry() {
         "a Nix image holds store paths"
     );
     eprintln!(
-        "{reference}: rootfs blake3-256:{} files={} symlinksResolved={} \
-         linksDroppedKernelMount={} linksDroppedDangling={}",
-        a.rootfs.value,
-        a.files,
-        a.symlinks_resolved,
-        a.links_dropped_kernel_mount.len(),
-        a.links_dropped_dangling.len()
+        "{reference}: rootfs blake3-256:{} files={} directories={} symlinks={}",
+        a.rootfs.value, a.files, a.directories, a.symlinks
+    );
+    assert!(a.symlinks > 0, "a Nix image's store links are kept");
+    assert_eq!(
+        (
+            a.symlinks_resolved,
+            a.links_dropped_kernel_mount.len(),
+            a.links_dropped_dangling.len()
+        ),
+        (0, 0, 0)
     );
 }
 
@@ -2481,29 +2486,32 @@ fn dropped_entries_are_reported_by_normalized_path_and_reuse_one_cas_entry() {
     assert_eq!(cas_entries(&cas), vec![a.rootfs.value.clone()]);
 }
 
-/// One first-party image and what importing it under `--symlinks resolve`
-/// gives, as a known answer.
+/// One first-party image and what importing it under the default
+/// `--symlinks preserve` gives, as a known answer (rootfs manifest v2,
+/// bead `ley-line-open-4f08ea`).
 struct Acceptance {
     name: &'static str,
     image: &'static str,
     expected: Outcome,
 }
 
-/// An import's rootfs digest and counts: files, links copied, then the
-/// special entries, kernel-mount links, dangling links and unreadable files
-/// dropped.
+/// An import's rootfs digest and counts: files, directories, links kept,
+/// links copied, then the special entries, kernel-mount links, dangling
+/// links and unreadable files dropped.
 #[derive(Debug, PartialEq, Eq)]
 struct Outcome {
     rootfs: &'static str,
-    counts: [usize; 6],
+    counts: [usize; 8],
 }
 
 impl Outcome {
-    fn of(imported: &ImportedRootfs) -> (String, [usize; 6]) {
+    fn of(imported: &ImportedRootfs) -> (String, [usize; 8]) {
         (
             imported.rootfs.value.clone(),
             [
                 imported.files,
+                imported.directories,
+                imported.symlinks,
                 imported.symlinks_resolved,
                 imported.special_entries_dropped.len(),
                 imported.links_dropped_kernel_mount.len(),
@@ -2521,45 +2529,47 @@ impl Outcome {
 /// index and its linux/arm64 manifest, config and layers.
 const ACCEPTANCE_IMAGES: [Acceptance; 4] = [
     Acceptance {
-        // LLO v0.27.0. Its dev/ devices, its etc/mtab -> /proc/mounts and
-        // its chainguard base's etc/shadow (mode 0000) are dropped.
+        // LLO v0.27.0. Its dev/ devices and its chainguard base's
+        // etc/shadow (mode 0000) are dropped; its etc/mtab -> /proc/mounts
+        // is kept.
         name: "llo",
         image: "sha256:6eca7788899f5bd96cd2fca373ef44fa9247542810f1fc91092650ee599153c5",
         expected: Outcome {
-            rootfs: "c5017ae629d0e499662c2b07a34cf366e1ea216f8e6699cdbd0898d564494b37",
-            counts: [1248, 14, 5, 1, 0, 1],
+            rootfs: "6b217ac0e1f83b85125621c036fd47496771e8a0932f01cfbb1c7e6bbfc85284",
+            counts: [1230, 91, 15, 0, 5, 0, 0, 1],
         },
     },
     Acceptance {
+        // Its 51 links whose targets a dpkg path-exclude removed, dropped
+        // as dangling under `resolve`, are kept.
         name: "mache",
         image: "sha256:8620a0dc2d4c2ae7f6cc1f0ee68d6823a8bc9af6a8cf01d332c08738d9203ac7",
         expected: Outcome {
-            rootfs: "dd52c667ff1c44e151bd8f05392607b0760b204dfe5d8e66d92fd76857ea4810",
-            counts: [5169, 982, 0, 0, 51, 0],
+            rootfs: "644574cf881c0751a9025fb910cdb2abfa616ff4cc2894829bbb885ba12741cf",
+            counts: [2748, 677, 445, 0, 0, 0, 0, 0],
         },
     },
     Acceptance {
         name: "rosary",
         image: "sha256:38aadea5d94b5f96ea43d9decd3c6f46f97c71a765fc73afd5f44387c21800ad",
         expected: Outcome {
-            rootfs: "2982e7d59b5d33d5f1ef26af332e2963f6bbb7596017bc0be0ff0b57b25b6a23",
-            counts: [1869, 487, 0, 0, 1, 0],
+            rootfs: "bc4f1fca6acde26c2636999ccf4fc91720b9e11738a7c168753e0beedb87b9ee",
+            counts: [963, 101, 370, 0, 0, 0, 0, 0],
         },
     },
     Acceptance {
         name: "hello",
-        // The control: imported before these rules at the same digest
-        // (Cloister's measurement on v0.27.0).
+        // The control: one file, no link.
         image: "sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef",
         expected: Outcome {
-            rootfs: "8597bea8e4baf11379489ff6eb118e21af4127718e465920d328326be727e4ec",
-            counts: [1, 0, 0, 0, 0, 0],
+            rootfs: "6fbd5b6c842ee54f7461384badeefb0b922be7fcb5e9f0a3b593431888c1ba63",
+            counts: [1, 0, 0, 0, 0, 0, 0, 0],
         },
     },
 ];
 
 #[test]
-fn first_party_images_import_deterministically_under_resolve() {
+fn first_party_images_import_deterministically_with_links_kept() {
     let Some(dir) = std::env::var_os("LEYLINE_OCI_ACCEPTANCE_DIR") else {
         eprintln!(
             "SKIPPED (NOT a pass): LEYLINE_OCI_ACCEPTANCE_DIR is unset; the first-party \
@@ -2581,7 +2591,7 @@ fn first_party_images_import_deterministically_under_resolve() {
                 &layout,
                 digest,
                 Platform::linux("arm64"),
-                SymlinkPolicy::Resolve,
+                SymlinkPolicy::Preserve,
                 cas,
             )
             .unwrap_or_else(|error| panic!("{name} ({digest}) must import: {error}"))
@@ -2597,10 +2607,19 @@ fn first_party_images_import_deterministically_under_resolve() {
         assert_eq!(a, b, "{name}: two imports, one report");
         let (rootfs, counts) = Outcome::of(&a);
         eprintln!(
-            "{name} {digest}: rootfs blake3-256:{rootfs} [files, symlinksResolved, \
-             specialEntriesDropped, linksDroppedKernelMount, linksDroppedDangling, \
-             unreadableFilesDropped] = {counts:?}"
+            "{name} {digest}: rootfs blake3-256:{rootfs} [files, directories, symlinks, \
+             symlinksResolved, specialEntriesDropped, linksDroppedKernelMount, \
+             linksDroppedDangling, unreadableFilesDropped] = {counts:?}"
         );
+        // Links kept: none copied, none dropped, and the manifest is v2 in
+        // its canonical bytes.
+        assert_eq!(
+            (counts[3], counts[5], counts[6]),
+            (0, 0, 0),
+            "{name}: no link copied, none dropped at a kernel mount, none dangling"
+        );
+        let spec = manifest_spec(first.path(), &a.rootfs);
+        assert_eq!(spec.symlinks.len(), a.symlinks, "{name}");
         for file in &a.unreadable_files_dropped {
             eprintln!("  dropped unreadable {} mode {:04o}", file.path, file.mode);
         }

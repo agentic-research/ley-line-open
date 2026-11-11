@@ -810,7 +810,7 @@ pub const FILE_KEYED_TABLES: &[FileKeyedTable] = &[
             column: "source_id",
         },
     ),
-    // CFG projection (`cfg` feature): keyed by rel path.
+    // CFG projection (`leyline-ts` `cfg.rs`, always built): keyed by rel path.
     keyed(
         "_cfg",
         FileKey::SourcePath {

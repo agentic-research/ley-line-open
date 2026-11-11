@@ -12,7 +12,8 @@ source files → tree-sitter + language servers → code facts
 The project has three layers:
 
 1. **Storage and publication** maintain SQLite snapshots, content hashes,
-   arenas, generations, and reader-safe publication.
+   arenas, the arena snapshot root (`current_root`), and reader-safe
+   publication.
 2. **Projection** parses and enriches source files, then materializes tables
    such as `nodes`, `_ast`, and `_source`.
 3. **Consumer APIs** expose queries over the daemon and typed cross-language
@@ -32,8 +33,10 @@ The SQL table and column shape is a consumer contract documented in
 
 ## Snapshot and arena publication
 
-The writer constructs a complete SQLite snapshot, verifies its root, and
-publishes it as an active arena buffer with a generation. Readers validate the
+The writer constructs a complete SQLite snapshot, writes it into the arena's
+inactive buffer, flips the active index, and publishes the snapshot's BLAKE3
+`current_root` under the control block's seqlock. The arena has no public
+generation number; `current_root` is its identity. Readers validate the
 published metadata before opening the active slice and keep that mapping alive
 for the lifetime of their connection. A reader must never observe a partially
 written snapshot.
@@ -59,6 +62,13 @@ These identities are intentionally distinct:
 - **Node hash** (`node_hash`): identifies one deduplicated syntax subtree,
   independent of where it occurs.
 - **Blob/chunk hash**: identifies an individual payload or CDC chunk.
+- **Head digest** (head digest v3): the signed claim that binds the segment
+  root, store root, parser identity and the previous claim.
+- **Rootfs digest**: identifies one execution rootfs, as BLAKE3 over the exact
+  bytes of its `rootfs.manifest.json`. An OCI image's SHA-256 digests are
+  provenance and are never compared with it.
+- **Run id** (`run_id`): identifies one authorized run from its `RunSpec`
+  digest, grant id and replay key.
 - **SQL projection ABI**: identifies the table/column compatibility promise; it
   is not a hash.
 
@@ -87,6 +97,14 @@ consumer boundary. Event fields must follow the live wire contract (including
 numeric `seq` values); compatibility handling belongs at that boundary rather
 than in every caller.
 
+Execution is a separate, opt-in boundary. `leyline execution-daemon` serves
+the `execution/v1` lifecycle from `leyline-runtime`: a signed grant authorizes
+a run, a resolver picks a rootfs by digest from a content-addressed store, and
+a first-party backend (a native `nono` sandbox or a libkrun microVM) runs it
+under a `confinement/v1` manifest whose digest the grant commits to. The
+ordinary `leyline daemon` has no execution backend. `leyline rootfs
+import-oci` fills the rootfs store from a digest-pinned OCI image.
+
 Identity responsibilities are layered: LLO can produce local, unsigned
 observations; Cloister defines portable observation envelopes and ledger
 receipts; notme supplies stable principals and capabilities; canonical-hours
@@ -94,7 +112,8 @@ projects observations; Rosary composes work and lifecycle records.
 
 ## Optional facilities
 
-HDC, sheaf analysis, vector/text search, FUSE, and CDC-backed distribution are
+HDC, sheaf analysis, vector/text search, the FUSE/NFS host mount, and
+CDC-backed distribution are
 additional projections or transport optimizations. They are not prerequisites
 for parsing, SQLite querying, snapshot publication, or daemon operation.
 
@@ -103,7 +122,7 @@ for parsing, SQLite querying, snapshot publication, or daemon operation.
 | Term | Meaning |
 | --- | --- |
 | Arena | File/buffer containing a published SQLite snapshot |
-| Arena flip | Atomic reader switch to a newer generation |
+| Arena flip | Atomic switch of the arena's active buffer, published as a new `current_root` |
 | Canonical bytes | Deterministic encoding used for hashing or interchange |
 | CAS | Content-addressed storage keyed by a content hash |
 | CDC | Content-defined chunking for deduplication and partial reads |

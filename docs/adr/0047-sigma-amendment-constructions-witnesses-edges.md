@@ -118,8 +118,10 @@ has no witness of its own; it resolves inside a version (§2.2, Locates).
 
 **Locators are valid only as `(version Ref, local key)`.** A bare locator replayed against
 another generation resolves to a different row without error. No wire field, signed claim or
-cache key carries a bare locator; one that does is a defect (`rs/ll-open/cli-lib/src/daemon/ops.rs:1480`
-emits a raw `nid` as `node_id`, 80f037 F3).
+cache key carries a bare locator; one that does is a defect. At `e4690505` the daemon emitted a
+raw `nid` as `node_id` for a node whose file has no `_source` row; since v0.25.0 it refuses that
+row (`rs/ll-open/cli-lib/src/daemon/ops.rs`, `unpathed_node_id`, 80f037 F3), and `Nid` has no
+serde encoding.
 
 ### 2.3 Type shape (normative for new code)
 
@@ -158,15 +160,16 @@ updated for M2 (`73add7`, `b5d354`).
 | `run_id` | plain σ over `"cloister/execution/v1/run-id" ‖ 0x00 ‖ …` (`authorization.rs:864,912-925`) | yes | **no**: prefix-in-preimage | pinned cross-repo by `execution/v1/test-vectors/run-id.json` | **Violates (c)** → D-i |
 | `Head.storeRoot` | directory Merkle tree, one keyed `RowSet` fold `leyline/store-tree/v1` per directory, params empty (`store_root.rs`, `StoreTree::root`) | yes (proptests in `store_root.rs`; known-answer vectors per node) | yes | parameter independent (no parser input); one edit refolds the nodes on its path (240 entries for the 50,000-file fixture, bound 300) | **Complies** (M1). It replaced `Head.treeRoot` (`leyline/tree-root/v1`, `params = parserId`, flat over 2n entries), which violated parameter independence and Σ §1.3 and is removed |
 | blob manifest | rootless rows keyed by `blob_hash` (`rs/ll-open/fs/src/blob_chunked.rs:53-64`) | — | — | no address; sub-floor blobs never enter the pool (619a99 F3: 572 of 954 blobs on `rs/`) | **Not an identity yet** → D-iv |
-| locators (`nid`, `content_id`, interned ids) | arena-local integers (`rs/ll-core/schema/src/lib.rs:86-98,138-143`) | n/a | n/a | one bare-`nid` wire leak (`daemon/ops.rs:1480`) | **Complies except the leak** (80f037) |
+| locators (`nid`, `content_id`, interned ids) | arena-local integers (`rs/ll-core/schema/src/lib.rs:86-98,138-143`) | n/a | n/a | the one bare-`nid` wire leak at `e4690505` (`daemon/ops.rs:1480` there) is closed: `unpathed_node_id` refuses the row (80f037 F3, v0.25.0), and the newtypes have no serde or Cap'n Proto encoding | **Complies** (80f037) |
 
-**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after M1, 12 after M2
+**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after M1, 12 after M2,
+and 13 counting the locators, whose wire leak 80f037 F3 closed
 (the rootfs digest, added to this table later by `ley-line-open-39309e`, is a 16th and complies
 only while one producer serializes it, until `ley-line-open-faba8f`);
 `run_id` violates construction separation (prefix-in-preimage) until M3, as `node_hash` did until
 M2; `treeRoot` violated parameter independence and §1.3 (parser in params, flat fold) until M1
 replaced it with `storeRoot`; `node_content`'s `lang`/`raw_kind` violated (a) until M2 removed
-them; the blob manifest has no address; one locator leaks bare onto the wire. Plain `blob_hash`
+them; the blob manifest has no address. Plain `blob_hash`
 is the single unkeyed base case and stays so.
 
 ## 4. Decisions
@@ -366,7 +369,7 @@ merges.
 | M1 | D-ii: `storeRoot` (`store-tree/v1`), head digest v3, wire `store_root`, `derived_from` v2 — **implemented** (`73c6ee`) | `projection-v11`, head digest v3, release | `treeRoot` removed, `storeRoot` added |
 | M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin — **implemented** (`73add7`, `b5d354`); wire format major unchanged (2). Of `9c1af2`'s R3, the `lang`/`raw_kind` half lands here (its option (b)); `node_content.kind` stays TEXT and the dbstat measurement is still open on `9c1af2` | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
 | M3 | D-i `run_id` v2 | run-id vector v2, release | `run_id` |
-| M4 | D-iv: rooted blob manifests, one-chunk sub-floor manifests | `projection-v13` | none moved; manifest address added |
+| M4 | D-iv: rooted blob manifests, one-chunk sub-floor manifests | the projection version after the one current when it lands (`projection-v13` was taken by the comments change, `ley-line-open-aa1634`) | none moved; manifest address added |
 
 M1 precedes M2 so that the `IR_SCHEMA_VERSION` bump in M2 does not rename the store. M3 is
 independent of M1/M2 and may run in parallel with them. Law (c)'s test lands green at the end

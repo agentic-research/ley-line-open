@@ -5,8 +5,8 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-11-11, at the `integration` tree `c80330e2` (latest tag
-v0.29.0, plus #566).
+Last updated: 2026-11-11, at the `integration` tree `8318d9d2` (latest tag
+v0.29.0, plus #566 and #562).
 
 ## v1.0: single host, portable
 
@@ -48,8 +48,9 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
     `workspaceInputs`), `e592ef` (cancel of a finished run), `f7bcb3` (a
     worker-event channel the guest cannot write), `eea8e1` (a run's
     `GuestOutput` on the execution-daemon socket).
-  - **D (image import and storage).** `38ff59` (the rootfs verifier ignores
-    directories), `4f08ea` (rootfs manifest v2: directories with modes, and
+  - **D (image import and storage).** `38ff59` is merged (#562): the per-run
+    rootfs holds only the directories the manifest implies, at `0755`. Open:
+    `4f08ea` (rootfs manifest v2: directories with modes, and
     symbolic links), `faba8f` (canonical manifest bytes are checked),
     `18a7a2`, `b1c18d` (registry pull refuses before it downloads),
     `cffbb5` (absolute tar entry names, as Nix images write them), and the
@@ -189,6 +190,7 @@ an ordinary repository to git, CI, review, editors and build tools.
 | PR | Change | Bead |
 |---|---|---|
 | #566 | A worker compares the confinement it will apply with the grant before the workload starts, on both tiers (`committed_confinement`); the applied policy is parsed from the digested bytes | `7a3109` |
+| #562 | Gap queue D2: the per-run rootfs copy is built from the manifest, holding exactly the directories the files imply, each at `0755`, so a rootfs digest names one guest tree | `38ff59` |
 
 ## Shipped in v0.29.0 (2026-11-11)
 

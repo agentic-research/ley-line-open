@@ -9,7 +9,7 @@ Canonical architecture overview for ley-line-open (LLO). Companion to the [root 
 | Field | Value |
 |---|---|
 | LLO version | v0.29.0 |
-| Last verified | 2026-11-11, against the `integration` tree `c80330e2` (v0.29.0 plus #566; docs audit `ley-line-open-538c5a`) |
+| Last verified | 2026-11-11, against the `integration` tree `8318d9d2` (v0.29.0 plus #566 and #562; docs audit `ley-line-open-538c5a`) |
 | Direction | [ROADMAP.md](ROADMAP.md): v1.0 is single host, portable (epic `ley-line-open-b2e687`); latest tag v0.29.0 |
 | Authority model | [ADR-0032](adr/0032-declared-decompositions.md) §D4 — see [Authority model](#authority-model) |
 | Source of truth files | `rs/ll-core/`, `rs/ll-open/`, `rs/ll-open/cli-lib/src/daemon/`, `docs/adr/*.md`, `docs/decades/*.md`, `CHANGELOG.md` |

@@ -47,7 +47,7 @@ tree, the patches or the script, and weekly (bead `ley-line-open-396d77`).
 
 Prepared as an upstream pull request; not yet submitted. Each is one
 `git format-patch` commit. `0001`–`0006` were written on top of `v1.19.4`
-and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
+and apply unchanged to `v1.19.6`; `0007` to `0012` were written on top of
 `v1.19.6`:
 
 1. `0001` — **libkrun/macos: start the mapping worker for virtio-fs DAX
@@ -125,7 +125,9 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     be bound stops the guest before the workload runs. Init also installs a
     seccomp filter every guest process inherits: `AF_INET`/`AF_INET6`
     sockets may only be TCP streams, `AF_PACKET` and `io_uring_setup` are
-    refused, and another ABI's system call ends the process; a kernel that
+    refused with `EACCES`, another architecture's system call (the i386
+    ABI on x86_64) ends the process, and an x32 call is refused with
+    `EACCES`; a kernel that
     refuses the filter stops the guest. The worker computes the list from
     the attested confinement document (§6 `guestPort`; ADR-0046 Q7, bead
     `ley-line-open-be3711`). A host peer that connects to a serve channel
@@ -149,8 +151,10 @@ and apply unchanged to `v1.19.6`; `0007` to `0011` were written on top of
     or directory" (bead `ley-line-open-db5899`). On every non-TDX boot,
     init now mounts a tmpfs on `/tmp` before the workload starts. It has
     mode 1777, `nosuid` and `nodev`, and is sized at 25 % of the guest's
-    RAM (`TMP_SIZE_PERCENT`), so a write past that fails `ENOSPC`. A mount
-    that fails stops the guest.
+    RAM (`TMP_SIZE_PERCENT`), so a write past that fails `ENOSPC`. Init
+    creates `/tmp` when the rootfs has none and mounts only over a real
+    directory: `mount(2)` follows a link in its target, so a `/tmp` that is
+    a link or a file stops the guest, as does a mount that fails.
 13. `0013` — **init: exec the workload's argv and environment from the
     config file, decoded exactly.** libkrun hands a workload's arguments
     (after ` -- `) and environment (`KEY="value"`) to the guest on the
@@ -202,8 +206,8 @@ libkrun embeds `/init.krun`, the first process of every guest, at build time
 at `tools/krun_init_cc.sh`: the host `cc` (static glibc) on a Linux host
 building for its own architecture, otherwise `zig cc` against musl for the
 target's architecture. Nothing is taken from an installed libkrun. With zig
-0.15.2 the aarch64 init is 88,072 bytes (with patch `0010`) and
-byte-identical across builds.
+0.15.2 the aarch64 init is 89,160 bytes (with patches `0001` to `0012`)
+and byte-identical across builds.
 
 ### What stays installed
 

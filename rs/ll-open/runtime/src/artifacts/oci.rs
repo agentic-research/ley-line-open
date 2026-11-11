@@ -84,7 +84,9 @@
 //!   that contains itself are refused. A layer entry whose path passes
 //!   through a link (`link/passwd` after `link -> /etc`) is refused under
 //!   either policy.
-//! - **No traversal.** Absolute paths, `..` components, entries under a
+//! - **No traversal.** An absolute entry name or hard-link target is read
+//!   from the image root (`/nix/store/x` is `nix/store/x`, as containerd
+//!   reads it). `..` components, in an absolute name too, entries under a
 //!   regular file, and `rootfs.manifest.json` at the image root are refused.
 //!   No image path reaches the host filesystem until the finished tree is
 //!   written beneath owner-only staging inside the CAS root; until then,
@@ -129,7 +131,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::rootfs_tree::{
-    FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join, under_kernel_mount,
+    FileNode, Final, KERNEL_MOUNTED, Node, PathError, ResolveError, Resolved, Tree, join,
+    under_kernel_mount,
 };
 use crate::DigestRef;
 use crate::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver, verify_manifest};
@@ -281,6 +284,12 @@ pub enum OciImportError {
         "symbolic link {path} -> {target:?} refused: rootfs manifest v1 cannot express links (import with symlink resolution to copy link targets)"
     )]
     SymlinkRefused { path: String, target: String },
+    /// A regular file (or, under `Resolve`, a link to one) where the guest
+    /// init mounts a kernel filesystem (bead `ley-line-open-2aa5d3`).
+    #[error(
+        "{path} is a regular file, but the guest init mounts a filesystem over /{path} and can mount only over a directory: the image would import and never boot"
+    )]
+    KernelMountPointNotDirectory { path: String },
     #[error("symbolic link {path} cannot be resolved inside the image: {reason}")]
     SymlinkUnresolvable { path: String, reason: String },
     /// Two paths of the finished rootfs that the CAS root's filesystem
@@ -311,6 +320,13 @@ pub enum OciImportError {
     Registry(String),
     #[error("insecure transport refused: {0}")]
     InsecureTransport(String),
+    /// A token realm or redirect that would reach a loopback, private,
+    /// link-local or otherwise non-public address (bead
+    /// `ley-line-open-b1c18d`). Refused before connecting.
+    #[error(
+        "{url} resolves to the non-public address {address}: a token realm or redirect may reach only public addresses, the registry itself, or the loopback registry the insecure opt-in names"
+    )]
+    NonPublicDestination { url: String, address: String },
     #[error("the registry redirected more than {limit} times")]
     TooManyRedirects { limit: u32 },
     #[error("the image exceeds its {limit}-byte download limit")]
@@ -606,6 +622,20 @@ pub fn import_oci_layout(
         .into_iter()
         .map(|(path, mode)| DroppedFile { path, mode })
         .collect();
+    // The guest init mounts a kernel filesystem over each of these and
+    // cannot mount over a regular file (mount(2) fails ENOTDIR), so an image
+    // with one there would import and then never boot: refused by name now
+    // (bead `ley-line-open-2aa5d3`). A device or FIFO there is refused
+    // earlier, a link into a kernel mount dropped under `Resolve`.
+    if let Final::Dir(top) = &finished
+        && let Some(name) = KERNEL_MOUNTED
+            .iter()
+            .find(|name| matches!(top.get(**name), Some(Final::File(_))))
+    {
+        return Err(OciImportError::KernelMountPointNotDirectory {
+            path: (*name).to_string(),
+        });
+    }
     // Rootfs manifest v1 lists files only, so a directory that holds none is
     // not part of the identity: write none, and one digest names one tree.
     let finished = finished.without_empty_directories();
@@ -1191,17 +1221,18 @@ fn unsafe_path(layer: usize, raw: &str, reason: &str) -> OciImportError {
     }
 }
 
-/// The components of an archive path, relative to the image root. `.` and
-/// empty components (`./a//b/`) are dropped; an absolute path or a `..`
-/// component is refused, never normalized.
+/// The components of an archive path (an entry's name or a hard link's
+/// target), relative to the image root. `.` and empty components
+/// (`./a//b/`) are dropped, so a leading `/` is the image root, as
+/// containerd and Docker read an absolute name (Nix `dockerTools` writes
+/// `/nix/store/...`; bead `ley-line-open-cffbb5`): that changes how a name
+/// is read, never where an entry may land. A `..` component is refused,
+/// never normalized, in an absolute name as in a relative one.
 fn guest_path(raw: &str) -> Result<Vec<String>, &'static str> {
     // PATH_MAX. Also bounds the tree's depth, which every pass over it
     // recurses through.
     if raw.len() > MAX_PATH_BYTES {
         return Err("paths longer than 4096 bytes are refused");
-    }
-    if raw.starts_with('/') {
-        return Err("absolute paths are refused");
     }
     let mut components = Vec::new();
     for component in raw.split('/') {

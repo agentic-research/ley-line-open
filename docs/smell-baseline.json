@@ -104,7 +104,7 @@
     {
       "rule_id": "sleep_in_tests",
       "source_id": "rs/ll-open/runtime/tests/oci_registry/mod.rs",
-      "count": 1
+      "count": 2
     },
     {
       "rule_id": "sleep_in_tests",

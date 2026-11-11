@@ -71,12 +71,15 @@ impl Host {
         CasVolume::new(self.path("state"), DEFAULT_SIZE_CAP_BYTES).expect("volume")
     }
 
-    fn daemon(&self) -> Daemon {
-        let sock = self.path("daemon.sock");
-        let _ = std::fs::remove_file(&sock);
-        let log = std::fs::File::create(self.path("daemon.log")).expect("log");
-        let child = Command::new(env!("CARGO_BIN_EXE_leyline"))
-            .arg("execution-daemon")
+    /// `leyline execution-daemon` over this host's volume, with `run_root`
+    /// as `--run-root` (none: the volume's own).
+    fn command(&self, run_root: Option<&Path>) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_leyline"));
+        command.arg("execution-daemon");
+        if let Some(run_root) = run_root {
+            command.arg("--run-root").arg(run_root);
+        }
+        command
             .arg("--backend")
             .arg("native")
             .arg("--arena")
@@ -87,14 +90,21 @@ impl Host {
             .arg(self.path("state"))
             .arg("--cas-volume-size-cap-gib")
             .arg("2")
-            .arg("--run-root")
-            .arg(self.path("runs"))
             .arg("--worker")
             .arg(self.path("worker"))
             .arg("--catalog")
             .arg(self.path("catalog.json"))
             .env("HOME", self.path("home"))
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn daemon(&self) -> Daemon {
+        let sock = self.path("daemon.sock");
+        let _ = std::fs::remove_file(&sock);
+        let log = std::fs::File::create(self.path("daemon.log")).expect("log");
+        let child = self
+            .command(None)
             .stdout(log.try_clone().expect("log"))
             .stderr(log)
             .spawn()
@@ -163,6 +173,54 @@ fn cas_root_of(reply: &Value) -> PathBuf {
     PathBuf::from(cas_root)
 }
 
+/// Bead ley-line-open-741388: beside a case-sensitive volume, a
+/// `--run-root` on a case-insensitive filesystem would merge `Pod/` and
+/// `pod/` when a run's rootfs is copied there, so start refuses it, naming
+/// both paths, before the socket exists. A case-sensitive one is kept.
+/// Needs no volume: the check runs before any is attached.
+#[test]
+fn start_refuses_a_case_insensitive_run_root_beside_a_volume() {
+    let host = Host::new();
+    let run_root = host.path("runs");
+    let insensitive = !probe_sensitivity(&run_root).unwrap().case_sensitive;
+    let mut child = host
+        .command(Some(&run_root))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn leyline execution-daemon");
+    if !insensitive {
+        // Accepted: the daemon serves. Nothing more to show here.
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().expect("poll the daemon").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the daemon started with a case-insensitive run root");
+        }
+        std::thread::yield_now();
+    }
+    let output = child.wait_with_output().expect("wait for the daemon");
+    assert!(!output.status.success(), "start must refuse");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "the run root {} is case-insensitive",
+            run_root.display()
+        )) && stderr.contains(&host.volume().cas_root().display().to_string()),
+        "{stderr}"
+    );
+    assert!(!host.path("daemon.sock").exists());
+    assert!(
+        !host.path("state/cas-volume").exists(),
+        "a refused start creates no volume"
+    );
+}
+
 #[test]
 fn provision_over_the_socket_reports_a_case_sensitive_cas_root_and_restart_reattaches_it() {
     if cfg!(target_os = "macos")
@@ -187,6 +245,10 @@ fn provision_over_the_socket_reports_a_case_sensitive_cas_root_and_restart_reatt
     assert_eq!(cas_root, expected, "{reply}");
     assert!(cas_root.is_dir());
     assert!(probe_sensitivity(&cas_root).unwrap().case_sensitive);
+    // Each run's rootfs goes on the volume too (bead ley-line-open-741388).
+    let run_root = host.volume().run_root();
+    assert!(run_root.is_dir(), "provisioning made the default run root");
+    assert!(probe_sensitivity(&run_root).unwrap().case_sensitive);
     assert_eq!(cas_root_of(&host.provision()), expected, "idempotent");
     drop(daemon);
 

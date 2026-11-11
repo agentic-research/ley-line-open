@@ -27,6 +27,15 @@
 //!   names that exact `host:port`, which must be a loopback address: the
 //!   opt-in exists for a local test registry and admits nothing reachable.
 //!   No proxy from the environment is used.
+//! - **Public destinations only** (bead `ley-line-open-b1c18d`). A token
+//!   realm or redirect is the registry's to choose, so a connection to any
+//!   endpoint other than the registry the reference names and the loopback
+//!   authority the opt-in names must resolve to public addresses only:
+//!   loopback, private, link-local, CGNAT and the other ranges [`is_public`]
+//!   lists are refused ([`OciImportError::NonPublicDestination`]) before a
+//!   socket is opened, on the addresses ureq resolved for that connection.
+//!   The registry itself may be private, but once it has resolved to public
+//!   addresses it may not resolve to a non-public one later in the pull.
 //! - **Anonymous.** The bearer-token flow ghcr.io and Docker Hub use for
 //!   public images: a `401` whose `WWW-Authenticate: Bearer realm=…` names a
 //!   token endpoint, one anonymous token for `repository:<name>:pull`, sent
@@ -38,22 +47,31 @@
 //! - **Bounded.** [`RegistryLimits`]: the bytes downloaded in total (the
 //!   documents as they arrive, then the descriptors' sizes before any blob is
 //!   requested), the redirects one request may follow, the connect
-//!   timeout, the time to a response's headers and the longest a body may
-//!   go without a byte, and each request's deadline: that time plus the
-//!   descriptor's size at a minimum transfer rate.
+//!   timeout, the longest a body may go without a byte, each request's
+//!   header deadline (connecting, the TLS handshake, sending and the
+//!   response headers: twice the connect timeout plus the response
+//!   timeout), and each body's deadline: the response timeout plus the
+//!   descriptor's size at a minimum transfer rate. Both deadlines are
+//!   enforced on every read and write of the connection.
 //!
 //! [OCI distribution API]: https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ureq::http::Uri;
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::time as ureq_time;
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, NextTimeout, RustlsConnector, TcpConnector, Transport,
+};
 
 use super::oci::{
     DEFAULT_MAX_ROOTFS_BYTES, Document, INDEX_TYPES, ImportedRootfs, Index, MANIFEST_TYPES,
@@ -342,6 +360,252 @@ struct TokenReply {
     access_token: Option<String>,
 }
 
+/// Whether a connection to `ip` stays off the host's own and its networks'
+/// private services: not loopback, unspecified, RFC 1918 private, link-local,
+/// shared (CGNAT, `100.64.0.0/10`), IETF-assigned (`192.0.0.0/24`),
+/// benchmarking, documentation, multicast, broadcast or reserved; for IPv6
+/// also not unique-local (`fc00::/7`), link-local, site-local or
+/// documentation, and an IPv4-mapped or NAT64 address is judged by the IPv4
+/// address it carries (bead `ley-line-open-b1c18d`).
+fn is_public(ip: IpAddr) -> bool {
+    fn public_v4(ip: Ipv4Addr) -> bool {
+        let [a, b, c, _] = ip.octets();
+        !(a == 0
+            || ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || (a == 100 && (64..128).contains(&b))
+            || (a == 192 && b == 0 && c == 0)
+            || (a == 198 && (18..20).contains(&b))
+            || ip.is_documentation()
+            || a >= 224)
+    }
+    match ip {
+        IpAddr::V4(ip) => public_v4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return public_v4(mapped);
+            }
+            let segments = ip.segments();
+            // NAT64: the well-known prefix (64:ff9b::/96) and the local-use
+            // one (64:ff9b:1::/48, RFC 8215, which may translate to private
+            // space) carry an IPv4 address in their last 32 bits; so does
+            // the deprecated IPv4-compatible form (::a.b.c.d).
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+                || segments[..3] == [0x64, 0xff9b, 1]
+                || (segments[..6] == [0, 0, 0, 0, 0, 0]
+                    && !ip.is_loopback()
+                    && !ip.is_unspecified())
+            {
+                let [.., a, b, c, d] = ip.octets();
+                return public_v4(Ipv4Addr::new(a, b, c, d));
+            }
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || segments[0] & 0xfe00 == 0xfc00
+                || segments[0] & 0xffc0 == 0xfe80
+                || segments[0] & 0xffc0 == 0xfec0
+                || segments[0] & 0xff00 == 0xff00
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        }
+    }
+}
+
+/// `(host, port)` a URI reaches, the port defaulted by scheme.
+fn endpoint(uri: &Uri) -> Option<(String, u16)> {
+    let host = uri.host()?.to_ascii_lowercase();
+    let port = uri.port_u16().or(match uri.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    })?;
+    Some((host, port))
+}
+
+/// What the pull's connections are held to, shared between the [`Client`]
+/// and the connectors ureq calls. One pull runs on one thread, one request
+/// at a time.
+#[derive(Debug, Default)]
+struct Guard {
+    /// Endpoints a connection may reach whatever their addresses: the
+    /// registry the reference names, and the loopback registry the
+    /// plain-HTTP opt-in names. Everything else must resolve to public
+    /// addresses only.
+    admitted: Vec<(String, u16)>,
+    /// Admitted endpoints that have resolved to public addresses only. One
+    /// that later resolves to a non-public address is refused: a registry
+    /// reached on the internet may not move its own name onto the host's
+    /// network between requests.
+    seen_public: Vec<(String, u16)>,
+    /// When the current request's phase must end: its headers (connecting
+    /// and the TLS handshake included), then its body.
+    deadline: Option<Instant>,
+    /// The non-public address the last refused connection resolved to.
+    refused: Option<IpAddr>,
+}
+
+impl Guard {
+    /// Whether a connection to `endpoint`, resolved to `addresses`, may be
+    /// opened; the first non-public address when it may not.
+    fn admit(
+        &mut self,
+        endpoint: Option<(String, u16)>,
+        addresses: impl IntoIterator<Item = IpAddr>,
+    ) -> Result<(), IpAddr> {
+        let non_public = addresses.into_iter().find(|address| !is_public(*address));
+        let admitted = endpoint
+            .as_ref()
+            .is_some_and(|endpoint| self.admitted.contains(endpoint));
+        match (non_public, endpoint) {
+            (None, Some(endpoint)) if admitted => {
+                if !self.seen_public.contains(&endpoint) {
+                    self.seen_public.push(endpoint);
+                }
+                Ok(())
+            }
+            (None, _) => Ok(()),
+            (Some(_), Some(endpoint)) if admitted && !self.seen_public.contains(&endpoint) => {
+                Ok(())
+            }
+            (Some(address), _) => Err(address),
+        }
+    }
+}
+
+fn guard(shared: &Mutex<Guard>) -> std::sync::MutexGuard<'_, Guard> {
+    // A poisoned guard only means a panic elsewhere on this thread; its
+    // fields are still the policy.
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The first connector of the chain: refuses, before any socket is opened, a
+/// connection [`Guard::admit`] does not allow: one to an endpoint that is
+/// not admitted and resolves to any non-public address, or to an admitted
+/// endpoint that resolved to public addresses before and now does not.
+/// Resolution is ureq's, done once per connection, so the addresses checked
+/// are the addresses connected to.
+#[derive(Debug)]
+struct AddressGuard(Arc<Mutex<Guard>>);
+
+impl Connector<()> for AddressGuard {
+    type Out = ();
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<()>,
+    ) -> Result<Option<()>, ureq::Error> {
+        let mut guard = guard(&self.0);
+        let addresses = details.addrs.iter().map(|address| address.ip());
+        if let Err(address) = guard.admit(endpoint(details.uri), addresses) {
+            guard.refused = Some(address);
+            return Err(ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a non-public destination",
+            )));
+        }
+        Ok(chained)
+    }
+}
+
+/// Wraps the TCP transport so every read and write, the TLS handshake's
+/// included, ends at [`Guard::deadline`]. ureq's own phase timeouts do not
+/// end there: once a phase deadline has passed it waits up to a second per
+/// read instead of failing, so a server sending a header byte at a time
+/// would otherwise be bounded only by the 64 KiB header limit.
+#[derive(Debug)]
+struct DeadlineConnector(Arc<Mutex<Guard>>);
+
+impl<In: Transport> Connector<In> for DeadlineConnector {
+    type Out = Deadline<In>;
+
+    fn connect(
+        &self,
+        _details: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| Deadline {
+            inner,
+            guard: Arc::clone(&self.0),
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct Deadline<T> {
+    inner: T,
+    guard: Arc<Mutex<Guard>>,
+}
+
+/// The error a transport returns once [`Guard::deadline`] has passed.
+const PAST_DEADLINE: &str = "the response did not arrive within its deadline";
+
+fn past_deadline() -> ureq::Error {
+    ureq::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        PAST_DEADLINE,
+    ))
+}
+
+impl<T> Deadline<T> {
+    /// What remains before the deadline, `None` without one.
+    fn remaining(&self) -> Option<Duration> {
+        guard(&self.guard)
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// `timeout`, shortened to what remains before the deadline, or the
+    /// deadline's error once nothing remains.
+    fn bound(&self, timeout: NextTimeout) -> Result<NextTimeout, ureq::Error> {
+        match self.remaining() {
+            None => Ok(timeout),
+            Some(remaining) if remaining.is_zero() => Err(past_deadline()),
+            Some(remaining) => Ok(NextTimeout {
+                after: ureq_time::Duration::Exact(remaining.min(*timeout.after)),
+                reason: timeout.reason,
+            }),
+        }
+    }
+
+    /// The inner transport's result, its timeout reported as the deadline's
+    /// once the deadline has passed.
+    fn within<R>(&self, result: Result<R, ureq::Error>) -> Result<R, ureq::Error> {
+        match result {
+            Err(ureq::Error::Timeout(_)) if self.remaining().is_some_and(|left| left.is_zero()) => {
+                Err(past_deadline())
+            }
+            other => other,
+        }
+    }
+}
+
+impl<T: Transport> Transport for Deadline<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        let timeout = self.bound(timeout)?;
+        let result = self.inner.transmit_output(amount, timeout);
+        self.within(result)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let timeout = self.bound(timeout)?;
+        let result = self.inner.await_input(timeout);
+        self.within(result)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
 struct Client<'a> {
     agent: ureq::Agent,
     /// `scheme://host[:port]` of the registry.
@@ -352,16 +616,50 @@ struct Client<'a> {
     limits: &'a RegistryLimits,
     token: Option<String>,
     downloaded: u64,
+    guard: Arc<Mutex<Guard>>,
 }
 
 impl<'a> Client<'a> {
     fn new(target: &Target, plain: Option<String>, limits: &'a RegistryLimits) -> Self {
+        Self::over(target, plain, limits, TcpConnector::default())
+    }
+
+    /// A client whose connections are opened by `tcp`: ureq's TCP connector,
+    /// or a test's stand-in for the network.
+    fn over<T: Transport>(
+        target: &Target,
+        plain: Option<String>,
+        limits: &'a RegistryLimits,
+        tcp: impl Connector<(), Out = T>,
+    ) -> Self {
         let scheme = if plain.as_deref() == Some(target.registry.as_str()) {
             "http"
         } else {
             "https"
         };
-        let agent = ureq::Agent::config_builder()
+        let admitted = [
+            Some(format!("{scheme}://{}/", target.registry)),
+            plain
+                .as_ref()
+                .map(|authority| format!("http://{authority}/")),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|url| url.parse::<Uri>().ok().as_ref().and_then(endpoint))
+        .collect();
+        let guard = Arc::new(Mutex::new(Guard {
+            admitted,
+            ..Guard::default()
+        }));
+        // ureq's default chain without its proxy connectors (no proxy is
+        // used), with the address check first and the deadline around the
+        // TCP stream, beneath TLS.
+        let connector =
+            ().chain(AddressGuard(Arc::clone(&guard)))
+                .chain(tcp)
+                .chain(DeadlineConnector(Arc::clone(&guard)))
+                .chain(RustlsConnector::default());
+        let config = ureq::Agent::config_builder()
             .https_only(plain.is_none())
             .http_status_as_error(false)
             .max_redirects(0)
@@ -373,15 +671,17 @@ impl<'a> Client<'a> {
             // also bounds the wait for the response headers, while
             // `recv_response` is left unset: set, it would also end every
             // body that takes longer than it, a large layer's included.
-            // `recv_body` is measured from each read (an idle bound). The
-            // body's deadline is `Deadlined`'s: once a ureq deadline has
-            // passed, ureq waits up to a second per read instead of failing.
+            // `recv_body` is measured from each read (an idle bound). Once a
+            // ureq deadline has passed, ureq waits up to a second per read
+            // instead of failing, so the absolute bounds are the guard's:
+            // [`Guard::deadline`] on every read and write of the stream, and
+            // `Deadlined` on the body.
             .timeout_resolve(Some(limits.connect_timeout))
             .timeout_connect(Some(limits.connect_timeout))
             .timeout_send_request(Some(limits.response_timeout))
             .timeout_recv_body(Some(limits.response_timeout))
-            .build()
-            .new_agent();
+            .build();
+        let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
         Self {
             agent,
             origin: format!("{scheme}://{}", target.registry),
@@ -390,7 +690,17 @@ impl<'a> Client<'a> {
             limits,
             token: None,
             downloaded: 0,
+            guard,
         }
+    }
+
+    /// The bound on one request's headers: resolving, connecting (the TLS
+    /// handshake included), sending the request and receiving the headers.
+    fn header_timeout(&self) -> Duration {
+        self.limits
+            .connect_timeout
+            .saturating_mul(2)
+            .saturating_add(self.limits.response_timeout)
     }
 
     /// Account for `bytes` more downloaded, or refuse.
@@ -458,9 +768,23 @@ impl<'a> Client<'a> {
             if to_registry && let Some(token) = &self.token {
                 builder = builder.header("Authorization", format!("Bearer {token}"));
             }
-            let response = builder.call().map_err(|error| {
-                OciImportError::Registry(format!("GET {}: {error}", redact(&url)))
-            })?;
+            {
+                let mut guard = guard(&self.guard);
+                guard.refused = None;
+                guard.deadline = Some(Instant::now() + self.header_timeout());
+            }
+            let response =
+                builder
+                    .call()
+                    .map_err(|error| match guard(&self.guard).refused.take() {
+                        Some(address) => OciImportError::NonPublicDestination {
+                            url: redact(&url).to_string(),
+                            address: address.to_string(),
+                        },
+                        None => OciImportError::Registry(format!("GET {}: {error}", redact(&url))),
+                    })?;
+            // The headers are in: the body is held to its own deadline.
+            guard(&self.guard).deadline = Some(deadline);
             let status = response.status().as_u16();
             match status {
                 200 => {
@@ -1033,6 +1357,413 @@ mod tests {
                 "{unsupported:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_public_addresses_are_public() {
+        let non_public = [
+            "0.0.0.0",
+            "0.1.2.3",
+            "127.0.0.1",
+            "127.255.255.254",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.255",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "239.255.255.250",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "febf::1",
+            "fec0::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.1.2.3",
+            "64:ff9b::a00:1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1:2::c0a8:101",
+            "::a00:1",
+            "::7f00:1",
+        ];
+        for address in non_public {
+            assert!(!is_public(address.parse().unwrap()), "{address}");
+        }
+        let public = [
+            "1.1.1.1",
+            "8.8.8.8",
+            "11.0.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "126.255.255.255",
+            "128.0.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "192.0.1.1",
+            "192.169.0.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "223.255.255.255",
+            "2606:4700:4700::1111",
+            "2001:db9::1",
+            "2002::1",
+            "fbff::1",
+            "fe00::1",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+            "64:ff9c::a00:1",
+            "64:ff9b:1::808:808",
+            "64:ff9b:2::a00:1",
+            "::808:808",
+        ];
+        for address in public {
+            assert!(is_public(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_defaults_its_port_by_scheme() {
+        let endpoint_of = |url: &str| endpoint(&url.parse::<Uri>().unwrap());
+        assert_eq!(
+            endpoint_of("https://GHCR.io/v2/"),
+            Some(("ghcr.io".into(), 443))
+        );
+        assert_eq!(
+            endpoint_of("http://127.0.0.1/x"),
+            Some(("127.0.0.1".into(), 80))
+        );
+        assert_eq!(
+            endpoint_of("https://127.0.0.1:5000/"),
+            Some(("127.0.0.1".into(), 5000))
+        );
+        assert_eq!(endpoint_of("ftp://h.io/"), None);
+    }
+
+    #[test]
+    fn the_registry_and_the_opt_in_are_the_admitted_endpoints() {
+        let limits = RegistryLimits::default();
+        let client = Client::new(&pinned("ghcr.io", "a"), None, &limits);
+        assert_eq!(
+            guard(&client.guard).admitted,
+            [("ghcr.io".to_string(), 443)]
+        );
+        let client = Client::new(
+            &pinned("127.0.0.1:5000", "a"),
+            Some("127.0.0.1:5000".into()),
+            &limits,
+        );
+        assert_eq!(
+            guard(&client.guard).admitted,
+            [
+                ("127.0.0.1".to_string(), 5000),
+                ("127.0.0.1".to_string(), 5000)
+            ]
+        );
+        assert_eq!(
+            client.header_timeout(),
+            limits.connect_timeout * 2 + limits.response_timeout
+        );
+    }
+
+    /// A transport that always makes progress: one byte per wait, whatever
+    /// the timeout, as a server trickling bytes inside ureq's one-second
+    /// per-read fallback looks to ureq. `timeout_after` makes it report a
+    /// timeout instead once it has been waited on that often.
+    #[derive(Debug)]
+    struct Trickle {
+        buffers: ureq::unversioned::transport::LazyBuffers,
+        waits: usize,
+        timeout_after: Option<usize>,
+        last_timeout: Option<Duration>,
+    }
+
+    impl Trickle {
+        fn new(timeout_after: Option<usize>) -> Self {
+            Self {
+                buffers: ureq::unversioned::transport::LazyBuffers::new(1 << 16, 1 << 10),
+                waits: 0,
+                timeout_after,
+                last_timeout: None,
+            }
+        }
+    }
+
+    impl Transport for Trickle {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, _: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+            self.last_timeout = Some(*timeout.after);
+            Ok(())
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            self.last_timeout = Some(*timeout.after);
+            self.waits += 1;
+            if self.timeout_after.is_some_and(|after| self.waits > after) {
+                // A real transport times out once its wait has elapsed.
+                let until = Instant::now() + *timeout.after;
+                while Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                return Err(ureq::Error::Timeout(timeout.reason));
+            }
+            self.buffers.input_append_buf()[0] = b'a';
+            self.buffers.input_appended(1);
+            self.buffers.input_consume(1);
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.waits % 2 == 0
+        }
+
+        fn is_tls(&self) -> bool {
+            self.timeout_after.is_some()
+        }
+    }
+
+    fn one_second() -> NextTimeout {
+        NextTimeout {
+            after: ureq_time::Duration::from_secs(1),
+            reason: ureq::Timeout::RecvResponse,
+        }
+    }
+
+    fn deadline_over(inner: Trickle, deadline: Option<Instant>) -> Deadline<Trickle> {
+        Deadline {
+            inner,
+            guard: Arc::new(Mutex::new(Guard {
+                deadline,
+                ..Guard::default()
+            })),
+        }
+    }
+
+    fn is_past_deadline(error: &ureq::Error) -> bool {
+        matches!(error, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut && io.to_string() == PAST_DEADLINE)
+    }
+
+    /// The deterministic form of the header-trickle bound: a transport that
+    /// always makes progress is cut at the deadline, not by its own pace.
+    #[test]
+    fn a_transport_that_always_progresses_ends_at_the_deadline() {
+        let started = Instant::now();
+        let mut transport = deadline_over(
+            Trickle::new(None),
+            Some(started + Duration::from_millis(50)),
+        );
+        let error = loop {
+            match transport.await_input(one_second()) {
+                Ok(progress) => assert!(progress),
+                Err(error) => break error,
+            }
+            assert!(started.elapsed() < Duration::from_secs(2), "never ended");
+        };
+        assert!(is_past_deadline(&error), "{error}");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(transport.inner.waits > 1);
+        // A write past the deadline is refused the same way.
+        let error = transport.transmit_output(0, one_second()).unwrap_err();
+        assert!(is_past_deadline(&error), "{error}");
+
+        // Without a deadline the same transport is not cut.
+        let mut unbounded = deadline_over(Trickle::new(None), None);
+        for _ in 0..40 {
+            assert!(unbounded.await_input(one_second()).unwrap());
+        }
+        assert_eq!(unbounded.inner.last_timeout, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_wait_is_shortened_to_the_deadline_and_its_timeout_named_as_the_deadline() {
+        // Far deadline: the wait keeps ureq's own timeout, and a timeout the
+        // inner transport reports stays ureq's.
+        let mut far = deadline_over(
+            Trickle::new(Some(0)),
+            Some(Instant::now() + Duration::from_secs(60)),
+        );
+        let error = far.await_input(one_second()).unwrap_err();
+        assert!(matches!(error, ureq::Error::Timeout(_)), "{error}");
+        assert_eq!(far.inner.last_timeout, Some(Duration::from_secs(1)));
+        far.transmit_output(0, one_second()).unwrap();
+        assert_eq!(far.inner.last_timeout, Some(Duration::from_secs(1)));
+
+        // Near deadline: the wait is at most what remains, and the inner
+        // timeout is the deadline's.
+        let mut near = deadline_over(
+            Trickle::new(Some(0)),
+            Some(Instant::now() + Duration::from_millis(100)),
+        );
+        let error = near.await_input(one_second()).unwrap_err();
+        assert!(is_past_deadline(&error), "{error}");
+        let waited = near.inner.last_timeout.unwrap();
+        assert!(waited <= Duration::from_millis(100), "{waited:?}");
+        // Past the deadline, a write is refused before the inner transport.
+        let error = near.transmit_output(0, one_second()).unwrap_err();
+        assert!(is_past_deadline(&error), "{error}");
+
+        // The wrapper reports the inner transport's state as it is.
+        let mut wrapped = deadline_over(Trickle::new(None), None);
+        assert!(wrapped.is_open() && !wrapped.is_tls());
+        wrapped.await_input(one_second()).unwrap();
+        assert!(!wrapped.is_open());
+        assert!(near.is_tls());
+    }
+
+    /// Review of b1c18d (N1): the registry and the opt-in are admitted
+    /// whatever they resolve to, but a registry that has resolved to public
+    /// addresses may not move its name onto a non-public one afterwards.
+    #[test]
+    fn the_guard_admits_public_addresses_and_its_own_endpoints_without_rebinding() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let (public, private, loopback) = (ip("1.1.1.1"), ip("10.0.0.1"), ip("127.0.0.1"));
+        let registry = ("r.example".to_string(), 443);
+        let cdn = ("cdn.example".to_string(), 443);
+        let mut guard = Guard {
+            admitted: vec![registry.clone()],
+            ..Guard::default()
+        };
+        // Not admitted: public addresses only, the first other one named.
+        assert_eq!(guard.admit(Some(cdn.clone()), [public]), Ok(()));
+        assert_eq!(
+            guard.admit(Some(cdn.clone()), [public, private]),
+            Err(private)
+        );
+        assert_eq!(
+            guard.admit(Some(cdn.clone()), [loopback, private]),
+            Err(loopback)
+        );
+        assert_eq!(guard.admit(None, [private]), Err(private));
+        assert_eq!(guard.admit(None, [public]), Ok(()));
+        assert_eq!(guard.admit(Some(cdn), []), Ok(()));
+        // Another port of the registry's host is another endpoint.
+        assert_eq!(
+            guard.admit(Some(("r.example".to_string(), 8443)), [private]),
+            Err(private)
+        );
+        assert!(guard.seen_public.is_empty());
+        // A registry on a private network stays admitted.
+        for _ in 0..2 {
+            assert_eq!(guard.admit(Some(registry.clone()), [private]), Ok(()));
+        }
+        assert!(guard.seen_public.is_empty());
+        // Once it has resolved to public addresses only, it may not move.
+        for _ in 0..2 {
+            assert_eq!(guard.admit(Some(registry.clone()), [public]), Ok(()));
+        }
+        assert_eq!(guard.seen_public, [registry.clone()]);
+        assert_eq!(
+            guard.admit(Some(registry.clone()), [public, loopback]),
+            Err(loopback)
+        );
+        assert_eq!(guard.admit(Some(registry.clone()), [private]), Err(private));
+        assert_eq!(guard.admit(Some(registry), [public]), Ok(()));
+    }
+
+    /// A network stand-in whose connections answer every request with
+    /// response headers that never end: one byte per millisecond, each well
+    /// inside any wait ureq asks for, so ureq's own timeouts never fire.
+    #[derive(Debug)]
+    struct EndlessHeaders;
+
+    #[derive(Debug)]
+    struct EndlessHeaderStream {
+        buffers: ureq::unversioned::transport::LazyBuffers,
+        sent: usize,
+    }
+
+    impl Connector<()> for EndlessHeaders {
+        type Out = EndlessHeaderStream;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            _: Option<()>,
+        ) -> Result<Option<Self::Out>, ureq::Error> {
+            Ok(Some(EndlessHeaderStream {
+                buffers: ureq::unversioned::transport::LazyBuffers::new(1 << 16, 1 << 16),
+                sent: 0,
+            }))
+        }
+    }
+
+    impl Transport for EndlessHeaderStream {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq::Error> {
+            Ok(())
+        }
+
+        fn await_input(&mut self, _: NextTimeout) -> Result<bool, ureq::Error> {
+            const START: &[u8] = b"HTTP/1.1 200 OK\r\nX-Trickle: ";
+            let until = Instant::now() + Duration::from_millis(1);
+            while Instant::now() < until {
+                std::thread::yield_now();
+            }
+            let byte = START.get(self.sent).copied().unwrap_or(b'a');
+            self.sent += 1;
+            self.buffers.input_append_buf()[0] = byte;
+            self.buffers.input_appended(1);
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// Review of b1c18d (N5), the deterministic form of the header-trickle
+    /// bound through the whole connector chain and a real ureq call: with
+    /// the deadline connector in the chain the request ends at the header
+    /// deadline; without it, ureq would read on for a minute, until its
+    /// 64 KiB header limit.
+    #[test]
+    fn a_header_trickle_through_the_connector_chain_ends_at_the_header_deadline() {
+        let limits = RegistryLimits {
+            connect_timeout: Duration::from_millis(100),
+            response_timeout: Duration::from_millis(100),
+            ..RegistryLimits::default()
+        };
+        let authority = "127.0.0.1:9";
+        let mut client = Client::over(
+            &pinned(authority, "a"),
+            Some(authority.to_string()),
+            &limits,
+            EndlessHeaders,
+        );
+        let started = Instant::now();
+        let error = match client.get(format!("http://{authority}/v2/"), None, 0, true) {
+            Ok(_) => panic!("headers that never end are no response"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, OciImportError::Registry(detail) if detail.contains(PAST_DEADLINE)),
+            "{error}"
+        );
+        assert!(
+            elapsed >= client.header_timeout() && elapsed < Duration::from_secs(5),
+            "{elapsed:?}"
+        );
     }
 
     #[test]

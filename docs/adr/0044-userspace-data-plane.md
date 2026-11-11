@@ -1,7 +1,7 @@
 # ADR-0044 — Agents see a filesystem served from userspace: an LLO virtio-fs device in a microVM
 
-**Status:** Accepted (2026-10-15); LLO carries nine libkrun patches
-(`rs/third_party/libkrun-patches/0001`–`0009`) until upstream takes them
+**Status:** Accepted (2026-10-15); LLO carries twelve libkrun patches
+(`rs/third_party/libkrun-patches/0001`–`0012`) until upstream takes them
 **Bead:** see "Beads" below
 **Related:**
 

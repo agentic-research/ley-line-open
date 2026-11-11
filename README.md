@@ -77,7 +77,7 @@ task install              # released/default feature set
 task install:full         # portable full feature set, no mount backend
 task install:full+mount   # add NFS and FUSE mounts (FUSE links libfuse)
 task ci                   # check, clippy, formatting, tests, FFI gates, cargo-deny audit
-task runtime:test        # embedded libkrun runtime contract tests (fake worker)
+task runtime:test         # runtime, krun-worker and agent-in-guest tests (fake worker; real guests when LEYLINE_LIBKRUNFW_PATH is set)
 ```
 
 ### Embedded execution runtime
@@ -104,8 +104,8 @@ hypervisor. The tests that boot a real guest run where
 `LEYLINE_LIBKRUNFW_PATH` names libkrunfw and report a skip otherwise (set
 `LEYLINE_REQUIRE_HYPERVISOR` to make that skip fail); on macOS they ad-hoc
 sign the VMM with the Hypervisor.framework entitlement. See
-[`libkrun_guest_write.rs`](rs/ll-open/runtime/tests/libkrun_guest_write.rs),
-[`libkrun_virtiofs_backend.rs`](rs/ll-open/runtime/tests/libkrun_virtiofs_backend.rs)
+[`libkrun_guest_write.rs`](rs/ll-open/krun-worker/tests/libkrun_guest_write.rs),
+[`libkrun_virtiofs_backend.rs`](rs/ll-open/krun-worker/tests/libkrun_virtiofs_backend.rs)
 and bead `ley-line-open-16a994` for the CI/release gate.
 
 The execution/v1 API is exposed through the runtime crate, the explicit
@@ -317,7 +317,11 @@ example `-p 127.0.0.1:18384:8384`) unless an authenticated proxy is in front.
 - `rs/ll-core` — arena, hashes, schemas, and shared infrastructure.
 - `rs/ll-open/ts` — tree-sitter parsing and AST projections.
 - `rs/ll-open/lsp` — language-server enrichment.
-- `rs/ll-open/fs` — SQLite graph, arena reader, CDC, FFI, and mount adapters.
+- `rs/ll-open/fs` — SQLite graph, arena reader, CDC, and FFI.
+- `rs/ll-open/storefs` — the store-backed filesystem behind the virtio-fs
+  share and the host NFS/FUSE mount.
+- `rs/ll-open/krun-worker` — the microVM worker binary, which links the
+  vendored libkrun.
 - `rs/ll-open/runtime` — execution/v1 lifecycle, private rootfs materialization,
   native nono and embedded libkrun worker backends, and confinement policy.
 - `rs/ll-open/cli-lib` — daemon lifecycle and UDS/MCP dispatch.

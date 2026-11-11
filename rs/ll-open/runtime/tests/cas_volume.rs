@@ -114,6 +114,12 @@ fn provision_creates_attaches_and_reattaches_a_case_sensitive_volume() {
         "the volume is mounted"
     );
     assert!(state.join("cas-volume/cas.sparsebundle").is_dir());
+    // An unprivileged attach mounts nodev and nosuid (bead
+    // ley-line-open-1665c9): nothing in the CAS can be a device or gain
+    // privilege on the host, whatever an image held.
+    let flags = mount_flags(&mountpoint);
+    assert_ne!(flags & libc::MNT_NODEV as u32, 0, "nodev: {flags:#x}");
+    assert_ne!(flags & libc::MNT_NOSUID as u32, 0, "nosuid: {flags:#x}");
     // Probed independently of provisioning's own probe.
     let filesystem = probe_sensitivity(&first.cas_root).unwrap();
     assert!(filesystem.case_sensitive, "{filesystem:?}");
@@ -180,6 +186,102 @@ fn provision_creates_attaches_and_reattaches_a_case_sensitive_volume() {
         tree.join("usr/share/perl/Pod/Usage.pm").is_file(),
         "what was imported is still there"
     );
+}
+
+/// `statfs(2)`'s mount flags for the filesystem holding `path`.
+#[cfg(target_os = "macos")]
+fn mount_flags(path: &Path) -> u32 {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` is NUL-terminated and `stat` is written by the call.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statfs(path.as_ptr(), &mut stat) }, 0);
+    stat.f_flags
+}
+
+/// The deprecation warnings `/usr/bin/hdiutil` prints on macOS 27 (bead
+/// `ley-line-open-168a65`), pinned. LLO keeps `hdiutil` because `diskutil
+/// image create blank` cannot make a case-sensitive APFS volume (its `--fs`
+/// takes APFS, ExFAT, MS-DOS or None); getting one through `diskutil`
+/// takes a create, an attach without mounting, a `diskutil apfs
+/// deleteVolume` and `addVolume "Case-sensitive APFS"` on the device node
+/// the attach printed, then a detach. When a warning changes (Apple
+/// announcing a removal date, say) or `diskutil image` gains a
+/// case-sensitive filesystem, this test fails and says to revisit that.
+const PINNED_HDIUTIL_WARNINGS: [&str; 3] = [
+    "hdiutil: WARNING: 'hdiutil create -size -volname ...' is deprecated. Please use 'diskutil image create from/blank -size --volumeName ...' instead.",
+    "hdiutil: WARNING: 'hdiutil attach -nobrowse -owners -mountpoint ...' is deprecated. Please use 'diskutil image attach --mountOptions nobrowse --mountOptions owners --mountPoint ...' instead.",
+    "hdiutil: WARNING: 'hdiutil detach ...' is deprecated. Please use 'diskutil eject ...' instead.",
+];
+
+#[test]
+#[cfg(target_os = "macos")]
+fn hdiutil_says_only_the_pinned_deprecations_and_diskutil_still_lacks_case_sensitive_apfs() {
+    use std::process::Command;
+    if !macos_tests_enabled() {
+        return;
+    }
+    let scratch = TempDir::new().unwrap();
+    let image = scratch.path().join("pin.sparsebundle");
+    let mnt = scratch.path().join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    let run = |args: &[&std::ffi::OsStr]| {
+        let output = Command::new("/usr/bin/hdiutil")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "hdiutil {args:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                PINNED_HDIUTIL_WARNINGS.contains(&line.trim()),
+                "hdiutil {args:?} printed an unpinned message: {line:?}. Revisit bead \
+                 ley-line-open-168a65 (stay on hdiutil, or move to diskutil image)."
+            );
+        }
+    };
+    run(&[
+        "create".as_ref(),
+        "-size".as_ref(),
+        "1g".as_ref(),
+        "-type".as_ref(),
+        "SPARSEBUNDLE".as_ref(),
+        "-fs".as_ref(),
+        "Case-sensitive APFS".as_ref(),
+        "-volname".as_ref(),
+        "Pin".as_ref(),
+        "-nospotlight".as_ref(),
+        image.as_os_str(),
+    ]);
+    run(&[
+        "attach".as_ref(),
+        "-nobrowse".as_ref(),
+        "-noautoopen".as_ref(),
+        "-owners".as_ref(),
+        "on".as_ref(),
+        "-mountpoint".as_ref(),
+        mnt.as_os_str(),
+        image.as_os_str(),
+    ]);
+    run(&["info".as_ref(), "-plist".as_ref()]);
+    run(&["detach".as_ref(), mnt.as_os_str()]);
+
+    // `diskutil image` exists from macOS 27; where it does, its blank-image
+    // filesystems still exclude a case-sensitive one.
+    if let Ok(help) = Command::new("/usr/sbin/diskutil")
+        .args(["image", "create", "blank", "--help"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&help.stdout).to_string()
+            + &String::from_utf8_lossy(&help.stderr);
+        if text.contains("--fs") {
+            assert!(
+                !text.to_ascii_lowercase().contains("case-sensitive"),
+                "diskutil image create blank can now make a case-sensitive volume: \
+                 move CasVolume to it (bead ley-line-open-168a65)\n{text}"
+            );
+        }
+    }
 }
 
 #[test]

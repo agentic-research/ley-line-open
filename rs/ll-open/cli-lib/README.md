@@ -4,29 +4,31 @@ The ley-line daemon — living SQLite database + arena snapshot loop + UDS/MCP s
 
 ## What's here
 
-- **`cmd_daemon`** — daemon entry point. Owns the living db (in-memory SQLite), the Σ snapshot loop (arena flip + BLAKE3 root advance), and lifecycle phases (`Initializing` → `Parsing` → `Enriching` → `Ready`).
+- **`cmd_daemon`** — daemon entry point. Owns the living db (file-backed SQLite beside the control block, `<stem>.live.db`, WAL), the Σ snapshot loop (arena flip + BLAKE3 root advance), and lifecycle phases (`Initializing` → `Parsing` → `Enriching` → `Ready`). One daemon serves a control block: it holds `<ctrl>.lock` shared and `<stem>.daemon-lock` exclusively (`daemon::control_lease`).
 - **`daemon::ops`** — request dispatch. Base substrate ops and the
   schema-owned `llo_execution_*` operations share this table. Execution
   requests are authorized and lifecycle-managed by `leyline-runtime`; the
   daemon does not duplicate policy or shell out to `krunvm`/Taskfile. Adding a
-  new op: variant in `BaseRequest`, arm in `dispatch_typed`, entry in
-  `is_known_base_op`, and the generated execution schema when applicable.
+  new op: variant in `BaseRequest`, name in `NATIVE_OP_NAMES` (`wire.rs`), arm
+  in `dispatch_typed`, optionally an `McpTool` in `daemon::mcp`'s
+  `tool_registry`, and the generated execution schema when applicable.
 - **`daemon::wire`** — request-side serde dispatch (`BaseRequest` tagged enum + `LspPosition`/`LspFile` typed args). The response side is generated from `daemon.capnp` via the capnp-json codec; there is no hand-written response mirror after b0ea2e.
 - **`daemon::socket`** — UDS read loop, dispatch chain (event ops → base ops → extension async → extension sync → unknown).
-- **`daemon::mcp`** — MCP HTTP transport. Maps each base op to an `McpTool` and routes through the same `handle_base_op_value` entry as the UDS path.
+- **`daemon::mcp`** — MCP transport over HTTP (`--mcp-port`) and a Unix socket (`--mcp-uds`). `tools/call` dispatches only a tool `tools/list` advertises, inside the Cloister groups the listener grants (`--mcp-groups`), through the same `handle_base_op_value` entry as the UDS path; a daemon op that is not an MCP tool is refused.
 - **`daemon::events`** — pub/sub event router. Handlers emit `daemon.{op}` events for state-changing ops (reparse, snapshot, enrich, load); the router fans out to subscribed UDS connections.
 - **`daemon::enrichment`** — extension-pass orchestration. LSP, embeddings, HDC each register as `EnrichmentPass`; `run_pass` resolves dependencies and runs them in order. Stats reported via the `enrich` op.
 - **`daemon::ext`** — extension trait. Private LLO consumers (ley-line proper) implement `DaemonExt` to add custom ops and enrichment passes without forking.
 - **`run_execution_daemon`** — explicit first-party entry point that installs an `ExecutionDaemonExt` around a trusted `ExecutionHandler`. Embedders construct the handler with their own resolver and backend policy; UDS/MCP requests carry only signed execution intent and never host paths. The ordinary `run_daemon`/`leyline daemon` path remains `NoExt` for compatibility.
 - **`daemon::client::ExecutionClient`** — public Rust client for the execution UDS. Cloister and other trusted embedders can call the generated execution operations directly; it never spawns `krunvm`, Taskfile, or a repository helper. The first-party CLI delegates to this client.
 - **`cmd_parse`** — tree-sitter parse pass. Walks source dirs, emits AST + source segment files + populates `nodes`/`_ast`/`_source`/`node_refs`/`node_defs`.
-- **`cmd_load`** — restore from arena: BLAKE3-verify the buffer, `sqlite3_deserialize` into the living db.
+- **`cmd_load`** — write a .db file into an arena: write the inactive buffer, flip the active index, and publish its BLAKE3 `current_root` through the Controller. It does not check the projection version; parse open does.
+- **`cmd_rootfs`** — `rootfs import-oci` (a digest-pinned OCI image, from `--layout` or `--from-registry`, into a content-addressed rootfs) and `rootfs provision-cas` (a case-sensitive CAS root: an APFS sparsebundle on macOS, a checked `<state>/cas` on Linux).
 
 ## Wire protocol
 
 Two transports, single dispatch table:
 - **UDS** (`default.sock`) — line-delimited JSON; shell-debuggable (`echo '{"op":"status"}' | nc -U`).
-- **MCP HTTP** (`:8384/mcp`) — JSON-RPC; consumed by cloister + agentic clients.
+- **MCP** (HTTP `/mcp` on `--mcp-port`, which the OCI image sets to 8384; or `--mcp-uds`) — JSON-RPC; consumed by cloister + agentic clients.
 
 Every base-op response except `query`/`lsp_*`/`vec_search` is typed against `daemon.capnp` via [`daemon/wire.rs`](src/daemon/wire.rs) and emitted by `capnp_json::to_json`. The three carve-outs emit ad-hoc JSON (row payloads with method-specific shapes — typing them would add ceremony without buying drift detection beyond what the fixture gate already provides). See [ADR-0014's interim status](../../../docs/adr/0014-capnp-as-protocol.md) for the JSON-as-carrier doctrine; bead `ley-line-open-40df83` tracks the planned binary-capnp wire as the natural step 4.
 

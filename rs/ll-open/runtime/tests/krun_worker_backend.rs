@@ -8,9 +8,9 @@ use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerC
 use leyline_runtime::backends::libkrun::output::GUEST_OUTPUT_TAIL_BYTES;
 use leyline_runtime::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
 use leyline_runtime::{
-    Backend, BackendClass, BackendRunStatus, CpuLimits, DigestRef, ErrorCode, ExecutionError,
-    ExecutionRequest, GuestOutput, MemoryLimits, ResourceLimits, WorkerChannel, WorkspaceGrant,
-    WorkspaceOperation,
+    AttachedWorkspace, Backend, BackendClass, BackendRunStatus, CpuLimits, DigestRef, ErrorCode,
+    ExecutionError, ExecutionRequest, GuestOutput, MemoryLimits, ResourceLimits, ServedWorkspaces,
+    WorkerChannel, WorkspaceGrant, WorkspaceOperation,
 };
 use tempfile::TempDir;
 
@@ -125,7 +125,9 @@ fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     let capabilities = backend.capabilities();
     assert!(capabilities.available);
     assert_eq!(capabilities.backend_class, BackendClass::MicroVm);
-    let started = backend.start(&request()).expect("ready worker");
+    let started = backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
 
     assert_eq!(started.backend_id, "libkrun/1");
     let observed: ExecutionRequest =
@@ -162,7 +164,9 @@ fn backend_removes_the_run_root_when_a_worker_exits() {
         tsi_hijack_inet: false,
     });
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     assert_eq!(run_root_count(&ephemeral_root), 1);
     let run_root = fs::read_dir(&ephemeral_root)
         .expect("run roots")
@@ -188,7 +192,9 @@ fn backend_reports_a_nonzero_worker_exit_as_failed() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexit 7\n",
     );
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     let completion = backend
         .wait_for_completion("run-backend-01")
         .expect("worker completion");
@@ -223,7 +229,9 @@ fn a_failed_run_reports_its_terminal_event_and_what_the_guest_printed() {
         ),
     );
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     let outcome = backend
         .wait_for_outcome("run-backend-01")
         .expect("worker completion");
@@ -306,7 +314,9 @@ fn a_reported_event_cannot_carry_control_bytes() {
     );
     let _ = ephemeral_root;
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     let seen = backend
         .wait_for_output(
             "run-backend-01",
@@ -348,7 +358,9 @@ fn a_failed_run_keeps_only_the_tail_of_a_large_output() {
         ),
     );
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     let BackendRunStatus::Failed(error) = backend
         .wait_for_completion("run-backend-01")
         .expect("worker completion")
@@ -402,7 +414,9 @@ fn an_active_run_exposes_its_output_to_the_embedder() {
         ),
     );
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     let opened = std::cell::Cell::new(false);
     let seen = backend
         .wait_for_output(
@@ -444,7 +458,9 @@ fn a_cancel_after_observed_failure_is_a_no_op() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexit 7\n",
     );
     for _ in 0..200 {
-        backend.start(&request()).expect("ready worker");
+        backend
+            .start(&request(), ServedWorkspaces::none())
+            .expect("ready worker");
         assert!(matches!(
             backend
                 .wait_for_completion("run-backend-01")
@@ -484,7 +500,9 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
         tsi_hijack_inet: false,
     });
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     assert_eq!(run_root_count(&ephemeral_root), 1);
     assert!(Backend::cancel(&backend, "run-backend-01").expect("cancel worker"));
 
@@ -519,7 +537,9 @@ fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
     let mut request = request();
     request.limits.wall_time_ms = 50;
 
-    backend.start(&request).expect("ready worker");
+    backend
+        .start(&request, ServedWorkspaces::none())
+        .expect("ready worker");
     let completion = backend
         .wait_for_completion("run-backend-01")
         .expect("worker completion");
@@ -559,7 +579,9 @@ fn backend_cleanup_handles_guest_created_restrictive_directories() {
         tsi_hijack_inet: false,
     });
 
-    backend.start(&request()).expect("ready worker");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     let run_root = fs::read_dir(&ephemeral_root)
         .expect("run roots")
         .next()
@@ -610,7 +632,9 @@ printf '%s\n' '{"type":"failed","error":{"code":"backend-failed","retryable":fal
         tsi_hijack_inet: false,
     });
 
-    let error = backend.start(&request()).expect_err("worker setup failure");
+    let error = backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect_err("worker setup failure");
 
     assert!(error.detail.contains("injected setup failure"));
     assert_eq!(run_root_count(&ephemeral_root), 0);
@@ -641,8 +665,12 @@ fn backend_rejects_a_duplicate_run_id_without_replacing_the_live_worker() {
         tsi_hijack_inet: false,
     });
 
-    backend.start(&request()).expect("first worker");
-    let error = backend.start(&request()).expect_err("duplicate run ID");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("first worker");
+    let error = backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect_err("duplicate run ID");
 
     assert!(error.detail.contains("run_id already active"));
     assert_eq!(run_root_count(&ephemeral_root), 1);
@@ -680,7 +708,7 @@ fn concurrent_starts_reserve_a_run_id_before_spawning() {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                backend.start(&request())
+                backend.start(&request(), ServedWorkspaces::none())
             })
         })
         .collect();
@@ -741,7 +769,9 @@ fn the_hijack_opt_in_reaches_the_worker_and_is_absent_by_default() {
             ready_timeout: READY_TIMEOUT,
             tsi_hijack_inet: hijack,
         });
-        backend.start(&request()).expect("worker readiness");
+        backend
+            .start(&request(), ServedWorkspaces::none())
+            .expect("worker readiness");
 
         let argv = fs::read_to_string(&argv_log).expect("worker argv");
         assert_eq!(
@@ -778,7 +808,7 @@ fn a_worker_attesting_an_unauthorized_policy_never_reaches_running() {
     request.confinement_digest = format!("blake3-256:{}", "a".repeat(64));
 
     let error = backend
-        .start(&request)
+        .start(&request, ServedWorkspaces::none())
         .expect_err("a worker attesting an unauthorized policy must not start");
     assert!(
         format!("{error:?}").contains("confinement drift"),
@@ -810,7 +840,7 @@ fn a_grant_authorizing_no_policy_does_not_constrain_what_the_worker_attests() {
 
     // `request()` leaves `confinement_digest` empty: nothing was authorized.
     backend
-        .start(&request())
+        .start(&request(), ServedWorkspaces::none())
         .expect("an unauthorized-policy grant must not refuse an attesting worker");
     assert!(backend.cancel("run-backend-01").expect("cancel worker"));
 }
@@ -829,7 +859,7 @@ fn readiness_announcing_another_run_is_rejected() {
     );
 
     let error = backend
-        .start(&request())
+        .start(&request(), ServedWorkspaces::none())
         .expect_err("readiness must bind to the requested run");
     assert!(
         format!("{error:?}").contains("unexpected run"),
@@ -952,7 +982,7 @@ fn rejection_kills_the_workers_grandchildren_too() {
     let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
 
     backend
-        .start(&request())
+        .start(&request(), ServedWorkspaces::none())
         .expect_err("readiness must bind to the requested run");
 
     let raw = fs::read_to_string(&grandchild_pid_file).expect("grandchild pid file");
@@ -1037,6 +1067,7 @@ fn workspace(name: &str) -> WorkspaceGrant {
         graph_root: format!("blake3-256:{}", "e".repeat(64)),
         expected_generation: 0,
         operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+        write_scope: vec!["/".into()],
     }
 }
 
@@ -1045,6 +1076,15 @@ fn request_with(workspaces: Vec<WorkspaceGrant>) -> ExecutionRequest {
         workspaces,
         ..request()
     }
+}
+
+/// The shares the execution service hands the backend for `request`: each of
+/// its workspaces, opened from `shares` (bead `ley-line-open-1022a8`). Only
+/// the service can build them in a shipping build; this file drives the
+/// backend directly, through the `test-support` constructor.
+fn served(shares: &Shares, request: &ExecutionRequest) -> ServedWorkspaces {
+    ServedWorkspaces::materialize_unverified(shares, &request.run_id, &request.workspaces)
+        .expect("the provider opens the granted workspaces")
 }
 
 /// A fake worker that logs its arguments to `args_log`, then reports ready
@@ -1094,10 +1134,10 @@ eval "printf '\040\000\000\000\000\000\000\000\000\000\000\000\003\000\000\000\0
     );
     let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
     let (shares, seen) = Shares::new(None);
-    let backend = backend.with_workspace_shares(shares.clone());
 
+    let request = request_with(vec![workspace("repo")]);
     let started = backend
-        .start(&request_with(vec![workspace("repo")]))
+        .start(&request, served(&shares, &request))
         .expect("a ready worker with its share");
     assert_eq!(
         seen.recv_timeout(READY_TIMEOUT)
@@ -1109,9 +1149,13 @@ eval "printf '\040\000\000\000\000\000\000\000\000\000\000\000\003\000\000\000\0
         vec![("run-backend-01".to_owned(), workspace("repo"))],
         "the provider opens the run's one granted workspace"
     );
-    // The run names the share it holds, for the receipt.
+    // The run names the share it took, for the receipt.
     assert_eq!(
-        started.channels,
+        started
+            .attached
+            .iter()
+            .map(AttachedWorkspace::channel)
+            .collect::<Vec<_>>(),
         vec![WorkerChannel::WorkspaceShare {
             workspace: "repo".into(),
             graph_root: format!("blake3-256:{}", "e".repeat(64)),
@@ -1130,9 +1174,9 @@ fn a_worker_declaring_other_descriptors_than_it_was_handed_never_reaches_running
     // Handed a share, declares none.
     let (backend, ephemeral_root) = backend_with_worker(&fixture, &share_worker(":", ""));
     let (shares, _seen) = Shares::new(None);
-    let backend = backend.with_workspace_shares(shares);
+    let granted = request_with(vec![workspace("repo")]);
     let error = backend
-        .start(&request_with(vec![workspace("repo")]))
+        .start(&granted, served(&shares, &granted))
         .expect_err("an undeclared share");
     assert_eq!(
         error.code,
@@ -1147,7 +1191,7 @@ fn a_worker_declaring_other_descriptors_than_it_was_handed_never_reaches_running
     let (backend, ephemeral_root) =
         backend_with_worker(&fixture, &share_worker("fd=7", DECLARED_SHARE));
     let error = backend
-        .start(&request())
+        .start(&request(), ServedWorkspaces::none())
         .expect_err("a declared share nothing handed");
     assert_eq!(
         error.code,
@@ -1177,7 +1221,7 @@ fn a_descriptor_the_backend_holds_open_across_exec_does_not_reach_the_worker() {
         "#!/bin/sh\nIFS= read -r _\n[ -e /dev/fd/{fd} ] && exit 9\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n"
     );
     let (backend, _ephemeral_root) = backend_with_worker(&fixture, &script);
-    let started = backend.start(&request());
+    let started = backend.start(&request(), ServedWorkspaces::none());
     drop(leaked);
     started.expect("the worker did not inherit the backend's open descriptor");
 }
@@ -1188,17 +1232,16 @@ fn a_run_without_workspaces_is_handed_no_share() {
     let fixture = TempDir::new().expect("fixture");
     let args_log = fixture.path().join("args.log");
     let (backend, _ephemeral_root) = backend_with_worker(&fixture, &arg_logging_worker(&args_log));
-    let (shares, _seen) = Shares::new(None);
-    let backend = backend.with_workspace_shares(shares.clone());
 
-    let started = backend.start(&request()).expect("ready worker");
+    let started = backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
     let args = fs::read_to_string(&args_log).expect("worker arguments");
     assert!(
         !args.contains("--workspace-share-fd"),
         "no workspace, no share: {args}"
     );
-    assert_eq!(started.channels, Vec::new(), "no workspace, no channel");
-    assert!(shares.opened.lock().unwrap().is_empty());
+    assert!(started.attached.is_empty(), "no workspace, no channel");
 }
 
 #[test]
@@ -1207,36 +1250,50 @@ fn a_granted_workspace_is_refused_before_spawn_where_no_share_can_serve_it() {
     let fixture = TempDir::new().expect("fixture");
     let args_log = fixture.path().join("args.log");
 
-    // No provider: the grant cannot be delivered, so the run does not start
-    // without it.
+    // A request naming a workspace, and no share handed over: what a direct
+    // embedder, who cannot build a share, gets. The run does not start
+    // without its workspace.
     let (backend, ephemeral_root) = backend_with_worker(&fixture, &arg_logging_worker(&args_log));
+    let one = request_with(vec![workspace("repo")]);
     let error = backend
-        .start(&request_with(vec![workspace("repo")]))
-        .expect_err("a workspace grant with nothing to serve it");
+        .start(&one, ServedWorkspaces::none())
+        .expect_err("a workspace grant with no share behind it");
     assert_eq!(error.code, leyline_runtime::ErrorCode::WorkspaceUnserved);
-    assert!(error.detail.contains("repo"), "{error}");
+    assert!(error.detail.contains("no workspace"), "{error}");
+
+    // A share for a workspace the request does not name: the request is
+    // what the worker is told, so the two must agree.
+    let (shares, _seen) = Shares::new(None);
+    let other = request_with(vec![workspace("docs")]);
+    let error = backend
+        .start(&one, served(&shares, &other))
+        .expect_err("a share for another workspace");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::WorkspaceUnserved);
+    let error = backend
+        .start(&request(), served(&shares, &other))
+        .expect_err("a share the request does not name");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::WorkspaceUnserved);
 
     // Two workspaces: the tier attaches one.
-    let (shares, _seen) = Shares::new(None);
-    let backend = backend.with_workspace_shares(shares.clone());
+    let two = request_with(vec![workspace("repo"), workspace("docs")]);
     let error = backend
-        .start(&request_with(vec![workspace("repo"), workspace("docs")]))
+        .start(&two, served(&shares, &two))
         .expect_err("two workspaces");
     assert_eq!(error.code, leyline_runtime::ErrorCode::WorkspaceUnserved);
-    assert!(shares.opened.lock().unwrap().is_empty());
+    assert!(error.detail.contains("attaches one"), "{error}");
 
-    // The provider refuses: its error is the run's.
+    // The provider refuses: its error is the run's, raised where the shares
+    // are materialized, before any backend is called.
     let refusal = ExecutionError {
         code: leyline_runtime::ErrorCode::IdentityPolicyMismatch,
         retryable: false,
         detail: "the store no longer holds the granted root".into(),
     };
-    let (shares, _seen) = Shares::new(Some(refusal.clone()));
-    let backend = backend.with_workspace_shares(shares);
+    let (refusing, _seen) = Shares::new(Some(refusal.clone()));
     assert_eq!(
-        backend
-            .start(&request_with(vec![workspace("repo")]))
-            .expect_err("the provider refused"),
+        ServedWorkspaces::materialize_unverified(refusing.as_ref(), &one.run_id, &one.workspaces)
+            .err()
+            .expect("the provider refused"),
         refusal
     );
 
@@ -1329,7 +1386,9 @@ fn a_worker_without_the_hypervisor_entitlement_is_unavailable() {
         // A run is never accepted: neither by direct start, which would
         // otherwise spawn the worker and die inside krun_start_enter, nor
         // by capability negotiation through the service.
-        let error = backend.start(&request()).expect_err("unentitled start");
+        let error = backend
+            .start(&request(), ServedWorkspaces::none())
+            .expect_err("unentitled start");
         assert!(
             error.detail.contains("com.apple.security.hypervisor"),
             "{error}"

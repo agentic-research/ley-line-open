@@ -72,12 +72,21 @@ fn store_root(ctx: &DaemonContext) -> String {
     format!("blake3-256:{root}")
 }
 
+/// A grant of `repo`; one that permits a write is scoped to the whole
+/// workspace.
 fn grant(graph_root: String, operations: Vec<WorkspaceOperation>) -> WorkspaceGrant {
+    let writes = operations.iter().any(|operation| {
+        matches!(
+            operation,
+            WorkspaceOperation::Mutate | WorkspaceOperation::Commit
+        )
+    });
     WorkspaceGrant {
         name: "repo".into(),
         graph_root,
         expected_generation: 0,
         operations,
+        write_scope: if writes { vec!["/".into()] } else { Vec::new() },
     }
 }
 
@@ -114,8 +123,42 @@ fn a_grants_operations_resolve_to_what_the_guest_sees_and_proposes() {
         (vec![Read, Mutate], scope(Grant::Whole, Grant::Whole)),
         (vec![List, Commit], scope(Grant::Whole, Grant::Whole)),
     ] {
-        assert_eq!(scope_for(&operations), expected, "{operations:?}");
+        assert_eq!(
+            scope_for(&grant(String::new(), operations.clone())),
+            expected,
+            "{operations:?}"
+        );
     }
+}
+
+/// A grant's `writeScope` is what its share lets the guest propose (bead
+/// `ley-line-open-483134`): the named files and trees and nothing else, and
+/// nothing at all without a write operation or without a scope.
+#[test]
+fn a_grants_write_scope_bounds_what_the_guest_proposes() {
+    use WorkspaceOperation::*;
+    let scoped = |operations: Vec<WorkspaceOperation>, scope: &[&str]| {
+        scope_for(&WorkspaceGrant {
+            write_scope: scope.iter().map(|entry| entry.to_string()).collect(),
+            ..grant(String::new(), operations)
+        })
+    };
+    let propose = scoped(vec![Read, Mutate], &["src/a.rs", "docs/"]).propose;
+    assert_eq!(
+        propose,
+        Grant::Scoped {
+            files: BTreeSet::from(["src/a.rs".to_string()]),
+            trees: BTreeSet::from(["docs".to_string()]),
+        }
+    );
+    assert!(propose.covers("docs/new.md") && !propose.covers("src/b.rs"));
+    assert_eq!(scoped(vec![Commit], &["/"]).propose, Grant::Whole);
+    // The scope narrows writes only: the guest still sees the whole tree.
+    assert_eq!(scoped(vec![Read, Mutate], &["docs/"]).see, Grant::Whole);
+    // No write operation, or no scope: nothing may be proposed.
+    assert!(!scoped(vec![Read], &["docs/"]).propose.covers("docs/x"));
+    assert!(!scoped(vec![Mutate], &[]).propose.covers("docs/x"));
+    assert!(!scoped(vec![Mutate], &[]).propose.covers_dir("docs"));
 }
 
 #[tokio::test]

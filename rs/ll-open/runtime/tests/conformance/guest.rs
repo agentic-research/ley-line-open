@@ -34,6 +34,7 @@
 //! - `read:<path>` reads a file;
 //! - `write:<path>:<hex bytes>` writes a file and reads it back;
 //! - `list:<path>` lists a directory, names sorted and joined by `,`;
+//! - `rename:<from>:<to>` renames a file;
 //! - `connect:<host>:<port>` opens a TCP connection.
 //!
 //! A report line is `probe <name> ok <detail>` or
@@ -120,6 +121,10 @@ fn run_probe(probe: &str) -> String {
             names.sort();
             Ok(names.join(","))
         }),
+        Some(("rename", rest)) => match rest.split_once(':') {
+            Some((from, to)) => std::fs::rename(from, to).map(|()| "renamed".to_owned()),
+            None => Err(std::io::Error::other("rename needs <from>:<to>")),
+        },
         Some(("connect", address)) => {
             std::net::TcpStream::connect(address).map(|_| "connected".to_owned())
         }

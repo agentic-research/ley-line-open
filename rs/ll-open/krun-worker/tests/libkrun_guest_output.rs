@@ -127,7 +127,9 @@ fn a_failed_guest_reports_what_it_printed() {
     let fixture = TempDir::new().expect("fixture");
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, FAILING, "output-failing");
-    backend.start(&request).expect("the guest starts");
+    backend
+        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .expect("the guest starts");
     let outcome = backend
         .wait_for_outcome(&request.run_id)
         .expect("the run completes");
@@ -175,7 +177,9 @@ fn a_finished_guest_reports_what_it_printed() {
     let fixture = TempDir::new().expect("fixture");
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, SUCCEEDING, "output-ok");
-    backend.start(&request).expect("the guest starts");
+    backend
+        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .expect("the guest starts");
     let outcome = backend
         .wait_for_outcome(&request.run_id)
         .expect("the run completes");
@@ -216,7 +220,9 @@ fn a_guest_cannot_classify_its_own_failure() {
     let fixture = TempDir::new().expect("fixture");
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, FORGING, "output-forging");
-    backend.start(&request).expect("the guest starts");
+    backend
+        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .expect("the guest starts");
     let status = backend
         .wait_for_completion(&request.run_id)
         .expect("the run completes");
@@ -248,7 +254,9 @@ fn a_serving_guest_announcement_is_readable_while_it_runs() {
     let fixture = TempDir::new().expect("fixture");
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, SERVING, "output-serving");
-    backend.start(&request).expect("the guest starts");
+    backend
+        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .expect("the guest starts");
     let seen = backend
         .wait_for_output(
             &request.run_id,

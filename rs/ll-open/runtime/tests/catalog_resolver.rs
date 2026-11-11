@@ -55,6 +55,7 @@ fn authorized() -> AuthorizedExecution {
             graph_root: "blake3-256:graph".into(),
             expected_generation: 4,
             operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+            write_scope: vec!["src/".into()],
         }],
     }
 }

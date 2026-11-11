@@ -34,9 +34,11 @@ The SQL table and column shape is a consumer contract documented in
 ## Snapshot and arena publication
 
 The writer constructs a complete SQLite snapshot, writes it into the arena's
-inactive buffer, flips the active index, and publishes the snapshot's BLAKE3
-`current_root` under the control block's seqlock. The arena has no public
-generation number; `current_root` is its identity. Readers validate the
+inactive buffer and flips the active index (or, when the snapshot outgrows the
+arena, writes a larger arena file beside it and renames it into place), and
+publishes the snapshot's BLAKE3 `current_root` under the control block's
+seqlock. The substrate API exposes no generation number; `current_root` is the
+arena's identity. Readers validate the
 published metadata before opening the active slice and keep that mapping alive
 for the lifetime of their connection. A reader must never observe a partially
 written snapshot.
@@ -62,8 +64,9 @@ These identities are intentionally distinct:
 - **Node hash** (`node_hash`): identifies one deduplicated syntax subtree,
   independent of where it occurs.
 - **Blob/chunk hash**: identifies an individual payload or CDC chunk.
-- **Head digest** (head digest v3): the signed claim that binds the segment
-  root, store root, parser identity and the previous claim.
+- **Head digest** (head digest v3): the signed claim that binds the generation,
+  the segment root and the previous one, the store root, the parser identity
+  and the previous claim.
 - **Rootfs digest**: identifies one execution rootfs, as BLAKE3 over the exact
   bytes of its `rootfs.manifest.json`. An OCI image's SHA-256 digests are
   provenance and are never compared with it.
@@ -99,7 +102,7 @@ than in every caller.
 
 Execution is a separate, opt-in boundary. `leyline execution-daemon` serves
 the `execution/v1` lifecycle from `leyline-runtime`: a signed grant authorizes
-a run, a resolver picks a rootfs by digest from a content-addressed store, and
+a run (`--allow-unverified-evidence`, for local fixtures, checks no signature), a resolver picks a rootfs by digest from a content-addressed store, and
 a first-party backend (a native `nono` sandbox or a libkrun microVM) runs it
 under a `confinement/v1` manifest whose digest the grant commits to. The
 ordinary `leyline daemon` has no execution backend. `leyline rootfs
@@ -122,7 +125,7 @@ for parsing, SQLite querying, snapshot publication, or daemon operation.
 | Term | Meaning |
 | --- | --- |
 | Arena | File/buffer containing a published SQLite snapshot |
-| Arena flip | Atomic switch of the arena's active buffer, published as a new `current_root` |
+| Arena flip | Atomic switch of the arena's active buffer (or rename of a grown arena into place), published as a new `current_root` |
 | Canonical bytes | Deterministic encoding used for hashing or interchange |
 | CAS | Content-addressed storage keyed by a content hash |
 | CDC | Content-defined chunking for deduplication and partial reads |

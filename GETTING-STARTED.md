@@ -51,7 +51,7 @@ curl -L https://github.com/agentic-research/ley-line-open/releases/latest/downlo
   -o ~/.local/bin/leyline && chmod +x ~/.local/bin/leyline
 ```
 
-Ensure `~/.local/bin` is on your `PATH` (or drop the binary anywhere else on `PATH`). That's the whole install — the binary needs only the platform C library (glibc on Linux, libSystem on macOS) for `leyline parse` / `leyline daemon`.
+Ensure `~/.local/bin` is on your `PATH` (or drop the binary anywhere else on `PATH`). That's the whole install — the binary links only libraries a stock system ships, and needs nothing else for `leyline parse` / `leyline daemon`. Checked on the v0.29.0 assets: on Linux, glibc (`libc.so.6`, `libm.so.6`) and `libgcc_s.so.1`; on macOS, `libSystem`, `libiconv`, and the Security and CoreFoundation frameworks.
 
 **Feature set of the released binary**: default features only (`lsp` +
 `validate` + `hdc` + `cdc` + `sheaf`). Enough for structural analysis, validation, HDC

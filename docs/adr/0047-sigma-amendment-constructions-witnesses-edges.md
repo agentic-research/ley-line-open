@@ -162,8 +162,8 @@ updated for M2 (`73add7`, `b5d354`).
 | blob manifest | rootless rows keyed by `blob_hash` (`rs/ll-open/fs/src/blob_chunked.rs:53-64`) | — | — | no address; sub-floor blobs never enter the pool (619a99 F3: 572 of 954 blobs on `rs/`) | **Not an identity yet** → D-iv |
 | locators (`nid`, `content_id`, interned ids) | arena-local integers (`rs/ll-core/schema/src/lib.rs:86-98,138-143`) | n/a | n/a | the one bare-`nid` wire leak at `e4690505` (`daemon/ops.rs:1480` there) is closed: `unpathed_node_id` refuses the row (80f037 F3, v0.25.0), and the newtypes have no serde or Cap'n Proto encoding | **Complies** (80f037) |
 
-**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after M1, 12 after M2,
-and 13 counting the locators, whose wire leak 80f037 F3 closed
+**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after 80f037 F3 closed
+the locators' wire leak (v0.25.0), 12 after M1, 13 after M2
 (the rootfs digest, added to this table later by `ley-line-open-39309e`, is a 16th and complies
 only while one producer serializes it, until `ley-line-open-faba8f`);
 `run_id` violates construction separation (prefix-in-preimage) until M3, as `node_hash` did until

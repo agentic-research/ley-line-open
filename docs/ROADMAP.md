@@ -63,8 +63,8 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
     `1b5f3c`, `fa9ec8`, `ff385b`, and ADR-0047 M3 (`ab2093`, breaking: the
     cloister issue is filed first).
   - Waiting for a Linux/KVM host: `381b1d` (guest UDP egress under TSI hijack
-    on Linux) and `c4480a` (the pre-console stall). Until then Linux keeps TSI
-    hijack off, and nothing claims Linux microVM evidence.
+    on Linux). Until then Linux keeps TSI hijack off, and nothing claims Linux
+    microVM evidence.
 - For mache: `69305e`, `view(family, target, at)`. The daemon computes a
   restriction-addressed key for a derived view from a dependency predicate the
   consumer sends (names, import sites, a file), so a view is recomputed only
@@ -139,10 +139,12 @@ quoting a single figure.
   holds across separate sessions (the VM path) — `5ec040`.
 - The store excludes `.git`, so git does not run inside the mount or the share —
   `5ee38a`.
-- A guest intermittently stalls before its program runs, with TSI hijack on or
-  off. The rate rises with host load, and the stall fails closed as a timeout,
-  so the release hypervisor gate runs on a quiet host — `c4480a`.
-- The host NFS mount is refused on macOS Tahoe below 26.7 and Sequoia below 15.8
+- A load-driven pre-console stall: a macOS guest intermittently stalls before
+  its program prints anything, and the stall fails closed as a timeout. The
+  quiet-host rule for the release hypervisor gate mitigates it; the root cause
+  is open — `c4480a`.
+- The host NFS mount is refused on every macOS release below Sequoia 15.8, and
+  on Tahoe below 26.7
   (Apple NFS-client CVE-2026-43686 and CVE-2026-84549; `2d49ce`).
 
 ## Design direction: one control plane, n data planes

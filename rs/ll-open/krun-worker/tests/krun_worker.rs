@@ -68,7 +68,7 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     //
     // The worker must fail before it reaches the VMM, on any host: a relative
     // `--runtime-file` is refused when the confinement manifest is built,
-    // after the rootfs is materialized and before `krun_create_ctx`.
+    // before the rootfs is materialized and before `krun_create_ctx`.
     let cas = TempDir::new().expect("CAS");
     let request = request_fixture(&cas);
     let run_root = TempDir::new().expect("run root");
@@ -116,9 +116,11 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
         "the refusal must name the path: {error:?}"
     );
     assert!(!marker.exists(), "worker invoked the krunvm PATH trap");
-    assert_eq!(
-        fs::read(run_root.path().join("rootfs/usr/bin/probe")).expect("ephemeral executable"),
-        b"probe-v1"
+    // The confinement is compiled and bound before the rootfs is read (bead
+    // ley-line-open-7a3109), so a refused policy materializes nothing.
+    assert!(
+        !run_root.path().join("rootfs").exists(),
+        "the worker materialized a rootfs for a run whose confinement it refused"
     );
     assert_eq!(
         fs::read(cas.path().join(&request.rootfs.value).join("usr/bin/probe"))

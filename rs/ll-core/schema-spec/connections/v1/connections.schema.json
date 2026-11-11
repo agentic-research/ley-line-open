@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/agentic-research/ley-line-open/rs/ll-core/schema-spec/connections/v1/connections.schema.json",
+  "title": "cloister/connections/v1 (slice 1: credential-free relay)",
+  "description": "The connection broker's input document (ADR-0046 D2, Slice 1 S2). Slice 1 delivers a strict subset of D2: appProtocol art.tcp, endpoint {unix}, target {tcp: {host, port}} with a loopback IP literal, no credentialRef. JSON Schema cannot state every rule; the parser is the stricter side and README 'Parse refusals' is normative. Rules this schema cannot express: unique name and endpoint across connections, a key appearing twice, a port written as 30080.0 or 3.008e4, and a JSON escape (refused even when it decodes to an allowed character).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["connections", "version"],
+  "properties": {
+    "version": {"const": "cloister/connections/v1"},
+    "connections": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/connection"}
+    }
+  },
+  "$defs": {
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["appProtocol", "endpoint", "name", "target"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "appProtocol": {
+          "description": "D2's closed set is art.http, art.grpc, art.postgres, art.mysql, art.redis, art.tcp; slice 1 delivers art.tcp only.",
+          "const": "art.tcp"
+        },
+        "endpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unix"],
+          "properties": {
+            "unix": {"$ref": "#/$defs/endpointPath"}
+          }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tcp"],
+          "properties": {
+            "tcp": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["host", "port"],
+              "properties": {
+                "host": {"$ref": "#/$defs/loopbackLiteral"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+              }
+            }
+          }
+        }
+      }
+    },
+    "endpointPath": {
+      "description": "An absolute path of printable ASCII without '\"' or '\\', with no empty, '.' or '..' component and no trailing '/', at most 103 bytes (the smallest sun_path among the supported platforms, less its NUL).",
+      "type": "string",
+      "maxLength": 103,
+      "pattern": "^(/[ !#-.0-\\[\\]-~]+)+$",
+      "not": {"pattern": "(^|/)\\.\\.?(/|$)"}
+    },
+    "loopbackLiteral": {
+      "description": "The one canonical spelling of a loopback address: an IPv4 dotted quad in 127.0.0.0/8 with no leading zeros, or exactly ::1. The schema represents the whole range; which addresses a runtime delivers is a runtime check.",
+      "type": "string",
+      "pattern": "^(127\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|::1)$"
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "connections": [
+    {
+      "appProtocol": "art.tcp",
+      "endpoint": {
+        "unix": "/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.api.sock"
+      },
+      "name": "orders-api",
+      "target": {
+        "tcp": {
+          "host": "127.0.0.1",
+          "port": 30080
+        }
+      }
+    },
+    {
+      "appProtocol": "art.tcp",
+      "endpoint": {
+        "unix": "/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.cache-1.sock"
+      },
+      "name": "orders-cache-1",
+      "target": {
+        "tcp": {
+          "host": "127.0.0.1",
+          "port": 30379
+        }
+      }
+    },
+    {
+      "appProtocol": "art.tcp",
+      "endpoint": {
+        "unix": "/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.db.sock"
+      },
+      "name": "orders-db",
+      "target": {
+        "tcp": {
+          "host": "127.0.0.1",
+          "port": 30432
+        }
+      }
+    }
+  ],
+  "version": "cloister/connections/v1"
+}

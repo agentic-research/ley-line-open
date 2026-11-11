@@ -24,6 +24,11 @@ that any second implementation can conform to.
 - **`confinement/v1/`** — the kernel-confinement manifest
   (`ConfinementManifest`): its JSON Schema, canonical serialization and
   BLAKE3 identity pins (ADR-0035).
+- **`connections/v1/`** — the connection broker's input document
+  (ADR-0046 Slice 1): JSON Schema, canonical form, `connectionsDigest`
+  pins, one vector per parse refusal, and an independent Python
+  reference under `ref-impl-py/`. Parsed by the crate's one Rust module,
+  `leyline_schema_spec::connections`.
 - **`build-cache/v1/`** — OCI-shaped remote build cache transport
   (manifest shape, digest encoding, push/pull protocols). Ships a
   5-file vector bundle under `vectors/`.
@@ -50,6 +55,7 @@ These spec dirs pin their vector bundles with a `VECTORS.sha256` file:
 - `credential-isolation/v1/VECTORS.sha256` — 10 vectors under `test-vectors/`
 - `build-cache/v1/vectors/VECTORS.sha256` — 5 vectors alongside it
 - `confinement/v1/VECTORS.sha256` — the canonical `ConfinementManifest` vector and the §3/§4 port-list vector
+- `connections/v1/VECTORS.sha256` — the two canonical connections documents and the cases/rejects file
 - `leyline-net/v1/test-vectors/VECTORS.sha256` — 24 frame vectors + digests.json + fixtures.capnp
 - `execution/v1/VECTORS.sha256` — the canonical intent/grant/receipt carrier, the OCI resource-limit case, and the `run_id` derivation vectors
 - `sigma/v1/VECTORS.sha256` — the Σ construction known-answer vectors

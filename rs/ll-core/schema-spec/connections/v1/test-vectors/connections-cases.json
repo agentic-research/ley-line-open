@@ -1,0 +1,848 @@
+{
+  "version": "cloister/connections/v1",
+  "description": "cloister/connections/v1 vectors (ADR-0046 Slice 1 S2, ley-line-open-e9d940). Every `input` is the document text, byte for byte after JSON-decoding this file's string. `cases` pin the canonical bytes and connectionsDigest (BLAKE3-256 over the canonical bytes); a case with `canonicalFile` canonicalizes to that pinned file. Every `rejects` input is refused, and `refusal` pins the connection (its name, or #<index> when the name is not a valid label; null at document level), the field and the reason code; `schemaRefuses` says whether connections.schema.json refuses it too.",
+  "cases": [
+    {
+      "name": "adr-example",
+      "description": "The ADR-0046 S2 example: one connection from cloister's channel socket to a kind NodePort on 127.0.0.1. The input is the canonical document.",
+      "input": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:9653bdf60e626486d61f63249853462e77dc74a7600d54848c6053bcd0470996",
+      "canonicalFile": "test-vectors/connections-canonical.json"
+    },
+    {
+      "name": "adr-example-keys-reversed-compact",
+      "description": "The same document with every object's keys in reverse order and no whitespace: it canonicalizes to the pinned file.",
+      "input": "{\"version\":\"cloister/connections/v1\",\"connections\":[{\"target\":{\"tcp\":{\"port\":30080,\"host\":\"127.0.0.1\"}},\"name\":\"orders-api\",\"endpoint\":{\"unix\":\"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"},\"appProtocol\":\"art.tcp\"}]}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:9653bdf60e626486d61f63249853462e77dc74a7600d54848c6053bcd0470996",
+      "canonicalFile": "test-vectors/connections-canonical.json"
+    },
+    {
+      "name": "cloister-three-connections",
+      "description": "Cloister's shape: three ports of bundle `orders`, each at <channelDir>/<bundle>.<port>.sock in one realpath'd macOS channel directory, each to 127.0.0.1:<hostPort>. The input is the canonical document.",
+      "input": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    },\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.cache-1.sock\"\n      },\n      \"name\": \"orders-cache-1\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30379\n        }\n      }\n    },\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.db.sock\"\n      },\n      \"name\": \"orders-db\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30432\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    },\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.cache-1.sock\"\n      },\n      \"name\": \"orders-cache-1\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30379\n        }\n      }\n    },\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.db.sock\"\n      },\n      \"name\": \"orders-db\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30432\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:e6b50d69cdb34ed346939c4bebb808262e5fb8269353a4fd26c609790a2c92fe",
+      "canonicalFile": "test-vectors/connections-multi.json"
+    },
+    {
+      "name": "cloister-three-connections-unsorted",
+      "description": "The same three connections in emit order (db, api, cache-1), keys in insertion order, tab and CRLF whitespace: sorted by name, they reach the pinned file.",
+      "input": "{\r\n\t\"version\": \"cloister/connections/v1\",\r\n\t\"connections\": [\r\n\t\t{\r\n\t\t\t\"name\": \"orders-db\",\r\n\t\t\t\"appProtocol\": \"art.tcp\",\r\n\t\t\t\"endpoint\": {\r\n\t\t\t\t\"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.db.sock\"\r\n\t\t\t},\r\n\t\t\t\"target\": {\r\n\t\t\t\t\"tcp\": {\r\n\t\t\t\t\t\"host\": \"127.0.0.1\",\r\n\t\t\t\t\t\"port\": 30432\r\n\t\t\t\t}\r\n\t\t\t}\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"name\": \"orders-api\",\r\n\t\t\t\"appProtocol\": \"art.tcp\",\r\n\t\t\t\"endpoint\": {\r\n\t\t\t\t\"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.api.sock\"\r\n\t\t\t},\r\n\t\t\t\"target\": {\r\n\t\t\t\t\"tcp\": {\r\n\t\t\t\t\t\"host\": \"127.0.0.1\",\r\n\t\t\t\t\t\"port\": 30080\r\n\t\t\t\t}\r\n\t\t\t}\r\n\t\t},\r\n\t\t{\r\n\t\t\t\"name\": \"orders-cache-1\",\r\n\t\t\t\"appProtocol\": \"art.tcp\",\r\n\t\t\t\"endpoint\": {\r\n\t\t\t\t\"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.cache-1.sock\"\r\n\t\t\t},\r\n\t\t\t\"target\": {\r\n\t\t\t\t\"tcp\": {\r\n\t\t\t\t\t\"host\": \"127.0.0.1\",\r\n\t\t\t\t\t\"port\": 30379\r\n\t\t\t\t}\r\n\t\t\t}\r\n\t\t}\r\n\t]\r\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    },\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.cache-1.sock\"\n      },\n      \"name\": \"orders-cache-1\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30379\n        }\n      }\n    },\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/orders.db.sock\"\n      },\n      \"name\": \"orders-db\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30432\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:e6b50d69cdb34ed346939c4bebb808262e5fb8269353a4fd26c609790a2c92fe",
+      "canonicalFile": "test-vectors/connections-multi.json"
+    },
+    {
+      "name": "one-element-list-stays-a-list",
+      "description": "Unlike confinement/v1 rule 5, a one-element connections list is never written as its element.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch/api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 8080\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch/api.sock\"\n      },\n      \"name\": \"api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 8080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:3b1c49fd14bc170b81d6780a315c10fb6d31009071331a80f40b4fbada45b8bc"
+    },
+    {
+      "name": "target-127-0-0-2",
+      "description": "The type represents all of 127.0.0.0/8; slice 1's runtime delivers only 127.0.0.1 and refuses this at start, not at parse.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.2\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.2\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:e4c66e9cc2cf25696e5374f5b38f930f532aa3bed13d4f5536f3562355c55df2"
+    },
+    {
+      "name": "target-127-255-255-254",
+      "description": "The top of 127.0.0.0/8 short of the broadcast address, as the loopback probe tests it.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.255.255.254\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.255.255.254\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:1a9b51a552153cff196c19d47002ba6112738880c73c94580fa98c595b756b08"
+    },
+    {
+      "name": "target-ipv6-loopback",
+      "description": "::1, the one IPv6 spelling the type admits. The receipt writes it [::1]:30080.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"::1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"::1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:6981da274fd1e698fda9adacba69012556e344afb2104a1bea6b28065031dbf9"
+    },
+    {
+      "name": "endpoint-at-103-bytes",
+      "description": "An endpoint of exactly 103 bytes, the most a sun_path holds on macOS less its NUL.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/aaaaaaaaaaaaaaaaaaaaaaa.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/aaaaaaaaaaaaaaaaaaaaaaa.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:3734f3eda8675144dbe9dec45af3cfa029ec272490204212fc1534a687b77b20"
+    },
+    {
+      "name": "port-bounds-and-name-bounds",
+      "description": "Ports 1 and 65535, a one-character name and a 63-character name.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"a\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch/a.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 1\n        }\n      }\n    },\n    {\n      \"name\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch/b.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 65535\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch/a.sock\"\n      },\n      \"name\": \"a\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 1\n        }\n      }\n    },\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/ch/b.sock\"\n      },\n      \"name\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 65535\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:1efe2735a5c4cb167673dac3aa0b7a4ae13b4cf4758e060f92af4c82eebd6c9d"
+    },
+    {
+      "name": "dot-prefixed-components-are-not-dot-components",
+      "description": "`.hidden` and `..x` are names, not the `.` or `..` components the path rule refuses.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/.ch/..x/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "canonical": "{\n  \"connections\": [\n    {\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/run/llo/.ch/..x/orders.api.sock\"\n      },\n      \"name\": \"orders-api\",\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"version\": \"cloister/connections/v1\"\n}",
+      "connectionsDigest": "blake3-256:3ba6acffec70bc98fb3bd56f87a28e8ef36349a3eb6064a68d50eeb7e9aa8188"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "not-json",
+      "description": "Truncated text.",
+      "input": "{\"version\": \"cloister/connections/v1\", \"connections\": [",
+      "refusal": {
+        "connection": null,
+        "field": "",
+        "reason": "malformed-json"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "trailing-data",
+      "description": "A second value after the document.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n} {}",
+      "refusal": {
+        "connection": null,
+        "field": "",
+        "reason": "malformed-json"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "top-level-array",
+      "description": "The document is an object.",
+      "input": "[]",
+      "refusal": {
+        "connection": null,
+        "field": "",
+        "reason": "wrong-type"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "missing-version",
+      "description": "`version` is required.",
+      "input": "{\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": null,
+        "field": "version",
+        "reason": "missing-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "other-version",
+      "description": "A document for another version is not read under these rules.",
+      "input": "{\n  \"version\": \"cloister/connections/v2\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": null,
+        "field": "version",
+        "reason": "bad-version"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "confinement-version",
+      "description": "A confinement/v1 manifest is not a connections document: the version strings keep the two digest domains apart.",
+      "input": "{\n  \"version\": \"cloister/confinement/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": null,
+        "field": "version",
+        "reason": "bad-version"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "version-not-string",
+      "description": "`version` is a string.",
+      "input": "{\n  \"version\": 1,\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": null,
+        "field": "version",
+        "reason": "wrong-type"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "missing-connections",
+      "description": "`connections` is required.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\"\n}",
+      "refusal": {
+        "connection": null,
+        "field": "connections",
+        "reason": "missing-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "connections-not-list",
+      "description": "`connections` is a list.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": {}\n}",
+      "refusal": {
+        "connection": null,
+        "field": "connections",
+        "reason": "wrong-type"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "empty-connections",
+      "description": "An empty list is refused; a bundle with no connections emits no document.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": []\n}",
+      "refusal": {
+        "connection": null,
+        "field": "connections",
+        "reason": "empty-connections"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-top-level-key",
+      "description": "A key this version does not define is refused, never ignored.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ],\n  \"connectionsDigest\": \"blake3-256:00\"\n}",
+      "refusal": {
+        "connection": null,
+        "field": "connectionsDigest",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "duplicate-key",
+      "description": "One object holding `version` twice; a reader that keeps the last would disagree with one that keeps the first.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\", \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": null,
+        "field": "version",
+        "reason": "duplicate-key"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "null-value",
+      "description": "`null` is never a value; an absent key is spelled by omission.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"target\": null,\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target",
+        "reason": "wrong-type"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "connection-not-object",
+      "description": "Each connection is an object; refused by position.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    \"orders-api\"\n  ]\n}",
+      "refusal": {
+        "connection": "#0",
+        "field": "",
+        "reason": "wrong-type"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-connection-key",
+      "description": "D2 extends the schema; a slice-1 reader never ignores a key it does not deliver.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      },\n      \"env\": \"dev\"\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "env",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "credential-ref",
+      "description": "Slice 1 carries no credential, and D2 rule 4 refuses credentialRef on art.tcp.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      },\n      \"credentialRef\": {\n        \"vaultSlice\": \"orders\"\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "credentialRef",
+        "reason": "credential-ref-present"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "missing-app-protocol",
+      "description": "appProtocol is required although slice 1 accepts one value, so no document relies on a default.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "appProtocol",
+        "reason": "missing-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "app-protocol-http",
+      "description": "art.http is in D2's closed set but not delivered in slice 1.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.http\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "appProtocol",
+        "reason": "app-protocol-not-delivered"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "app-protocol-postgres",
+      "description": "art.postgres is in D2's closed set but not delivered in slice 1.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.postgres\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "appProtocol",
+        "reason": "app-protocol-not-delivered"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "app-protocol-unknown",
+      "description": "A value outside the closed set.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.ftp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "appProtocol",
+        "reason": "unknown-app-protocol"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-tcp",
+      "description": "endpoint {tcp} (D5's connectLocal form) is not delivered in slice 1.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"tcp\": 15432\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.tcp",
+        "reason": "endpoint-tcp-not-delivered"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-unknown-key",
+      "description": "Only `unix`.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\",\n        \"mode\": \"0600\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.mode",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-relative",
+      "description": "The path is absolute.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "endpoint-not-absolute"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-dot",
+      "description": "No `.` component.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/./orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "endpoint-dot-component"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-dot-dot",
+      "description": "No `..` component.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/../orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "endpoint-dot-component"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-double-slash",
+      "description": "No empty component.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2//orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "endpoint-empty-component"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-trailing-slash",
+      "description": "A socket path names a file, not a directory.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "endpoint-trailing-slash"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-104-bytes",
+      "description": "One byte over the 103-byte limit.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/var/folders/7q/r2k1xg0n5bz8c3d4f6h7j9l0000gn/T/cloister-ch-Jx4P2m/aaaaaaaaaaaaaaaaaaaaaaaa.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "endpoint-too-long"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-nul",
+      "description": "A NUL, written as the escape JSON requires.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders\\u0000.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "string-not-printable-ascii"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-control-character",
+      "description": "A control character (U+001F), escaped.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders\\u001f.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "string-not-printable-ascii"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-raw-tab",
+      "description": "A raw tab inside a string: invalid JSON to a general parser, refused by name here.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders\t.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "string-not-printable-ascii"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "endpoint-non-ascii",
+      "description": "A non-ASCII path (U+00E9 as raw UTF-8): serializers differ on escaping it, so it is refused.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders\u00e9.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "string-not-printable-ascii"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-escape-of-ascii",
+      "description": "`\\u0061` decodes to `a`, an allowed character, but an escape is never canonical and is refused; the schema sees only the decoded string.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.\\u0061pi.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "string-not-printable-ascii"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "endpoint-quote",
+      "description": "A `\"` cannot be written without an escape.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders\\\".api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "string-not-printable-ascii"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "endpoint-backslash",
+      "description": "A `\\` cannot be written without an escape.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders\\\\.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "endpoint.unix",
+        "reason": "string-not-printable-ascii"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "duplicate-endpoint",
+      "description": "Two connections, one socket: refused at parse, naming the second.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    },\n    {\n      \"name\": \"orders-db\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30432\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-db",
+        "field": "endpoint.unix",
+        "reason": "duplicate-endpoint"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "name-uppercase",
+      "description": "A DNS label is lower case; refused by position, since the name is not a label.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"Orders-API\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "#0",
+        "field": "name",
+        "reason": "bad-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "name-leading-hyphen",
+      "description": "A label starts with a letter or digit.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"-orders\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "#0",
+        "field": "name",
+        "reason": "bad-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "name-64-characters",
+      "description": "A label is at most 63 characters.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "#0",
+        "field": "name",
+        "reason": "bad-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "name-empty",
+      "description": "A label is not empty.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "#0",
+        "field": "name",
+        "reason": "bad-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "name-dot",
+      "description": "cloister joins bundle and port with `.` in the path, never in the name.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders.api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "#0",
+        "field": "name",
+        "reason": "bad-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "name-not-string",
+      "description": "A name is a string.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": 7,\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "#0",
+        "field": "name",
+        "reason": "wrong-type"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "duplicate-name",
+      "description": "Two connections, one name: refused, never merged.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    },\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.db.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30432\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "name",
+        "reason": "duplicate-name"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "target-unix",
+      "description": "target {unix} is a D2 member slice 1 does not deliver.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"unix\": \"/run/db.sock\"\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.unix",
+        "reason": "target-not-delivered"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "target-https",
+      "description": "target {https} is a D2 member slice 1 does not deliver.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"https\": {\n          \"url\": \"https://payments-xyz.a.run.app\"\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.https",
+        "reason": "target-not-delivered"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "target-cloud-sql",
+      "description": "target {cloudSql} is a D2 member slice 1 does not deliver.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"cloudSql\": {\n          \"instance\": \"proj:us-central1:orders\"\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.cloudSql",
+        "reason": "target-not-delivered"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "target-unknown-key",
+      "description": "A target kind outside D2's union.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"udp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 53\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.udp",
+        "reason": "unknown-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "target-missing-tcp",
+      "description": "The target names its kind.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {}\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp",
+        "reason": "missing-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "target-tls",
+      "description": "Slice 1 has no TLS client.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080,\n          \"tls\": {\n            \"serverName\": \"orders\"\n          }\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.tls",
+        "reason": "tls-not-delivered"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "target-missing-port",
+      "description": "`port` is required.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\"\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "missing-key"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-localhost",
+      "description": "No name is resolved, ever, including localhost.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"localhost\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "host-is-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-cluster-dns",
+      "description": "A Service name is the deployment's to resolve, never the broker's.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"orders.default.svc.cluster.local\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "host-is-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-bracketed-ipv6",
+      "description": "Brackets belong to the receipt's host:port form, not to the host.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"[::1]\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "host-is-name"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv4-non-loopback",
+      "description": "Slice 1 has no TLS, so it serves no network hop.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"10.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-loopback-target"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-unspecified",
+      "description": "The unspecified address is not a target.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"0.0.0.0\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-loopback-target"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-lan",
+      "description": "The host's LAN address is not loopback.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"192.168.1.20\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-loopback-target"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv6-link-local",
+      "description": "Not loopback.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"fe80::1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-loopback-target"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv6-other",
+      "description": "Not loopback.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"::2\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-loopback-target"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv4-leading-zeros",
+      "description": "Loopback, but not its one spelling.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.000.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-canonical-loopback"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv6-expanded",
+      "description": "::1 written out: loopback, but not its one spelling.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"0:0:0:0:0:0:0:1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-canonical-loopback"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv6-zero-compressed",
+      "description": "::1 written another way.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"0::1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-canonical-loopback"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "host-ipv4-mapped",
+      "description": "An IPv4-mapped loopback address is not the IPv4 literal.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"::ffff:127.0.0.1\",\n          \"port\": 30080\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.host",
+        "reason": "non-canonical-loopback"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "port-zero",
+      "description": "Port 0 is not dialable.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 0\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-out-of-range"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "port-65536",
+      "description": "A TCP port is 16 bits.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 65536\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-out-of-range"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "port-negative",
+      "description": "No sign.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": -1\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-out-of-range"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "port-float",
+      "description": "30080.0 is a JSON number, not a JSON integer; JSON Schema's integer type admits it, the parser does not.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 30080.0\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-not-integer"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "port-exponent",
+      "description": "3.008e4 equals 30080 but is not an integer spelling.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": 3.008e4\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-not-integer"
+      },
+      "schemaRefuses": false
+    },
+    {
+      "name": "port-string",
+      "description": "A string is not a port.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": \"30080\"\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-not-integer"
+      },
+      "schemaRefuses": true
+    },
+    {
+      "name": "port-bool",
+      "description": "A boolean is not a port.",
+      "input": "{\n  \"version\": \"cloister/connections/v1\",\n  \"connections\": [\n    {\n      \"name\": \"orders-api\",\n      \"appProtocol\": \"art.tcp\",\n      \"endpoint\": {\n        \"unix\": \"/private/tmp/cloister-ch-7Qm2/orders.api.sock\"\n      },\n      \"target\": {\n        \"tcp\": {\n          \"host\": \"127.0.0.1\",\n          \"port\": true\n        }\n      }\n    }\n  ]\n}",
+      "refusal": {
+        "connection": "orders-api",
+        "field": "target.tcp.port",
+        "reason": "port-not-integer"
+      },
+      "schemaRefuses": true
+    }
+  ]
+}

@@ -26,14 +26,16 @@
 //! ├── credential-isolation/v1/     (README, QUICKSTART, wire/, test-vectors/, ref-impl-py/, VECTORS.sha256)
 //! ├── build-cache/v1/              (README, wire/, vectors/ with VECTORS.sha256)
 //! ├── mcp-tool/v1/                 (README, wire/, vectors/)
-//! └── execution/v1/                (Cap'n Proto IDL, README, vectors)
+//! ├── execution/v1/                (Cap'n Proto IDL, README, vectors)
+//! └── connections/v1/              (JSON Schema, README, vectors, Python reference)
 //! ```
 //!
 //! # Rust API
 //!
-//! There is none yet. Future beads may fold in generated capnp bindings
-//! from `_traits.capnp` or emit typed rustdoc for each capability; those
-//! are out of scope for the move.
+//! One module: [`connections`], the parser and canonicalizer for
+//! `cloister/connections/v1` (ADR-0046 Slice 1). It lives beside its spec so
+//! the runtime and the vectors share one reading of the document, and it has
+//! no dependency (the digest is the caller's BLAKE3 over the canonical bytes).
 
 /// Root of the schema-spec directory tree, evaluated at compile time.
 ///
@@ -41,3 +43,5 @@
 /// path relative to this. Prefer the tests in this crate for validating
 /// spec artifacts — this constant is a courtesy for tooling.
 pub const SPEC_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+pub mod connections;

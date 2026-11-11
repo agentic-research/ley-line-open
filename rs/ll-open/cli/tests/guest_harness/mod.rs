@@ -422,6 +422,28 @@ pub fn git_dir_of(host: &Host, tree: &Path, dest: &Path) {
     git(tree, &["commit", "-q", "-m", "seed"]);
     git(tree, &["gc", "-q"]);
     copy_tree(&tree.join(".git"), dest);
+    // After `gc`, `refs/heads`, `refs/tags` and `objects/info` are empty,
+    // and git refuses a directory without `refs/` as a repository. Manifest
+    // v1 names files only, so the guest's per-run copy holds only the
+    // directories a file implies (bead `ley-line-open-38ff59`): give each
+    // empty directory a dotfile, which git's ref and object walks skip.
+    keep_empty_directories(dest);
+}
+
+/// Put an empty `.keep` in every directory beneath `dir` (itself included)
+/// that holds nothing.
+fn keep_empty_directories(dir: &Path) {
+    let mut empty = true;
+    for entry in fs::read_dir(dir).expect("read directory") {
+        let entry = entry.expect("entry");
+        empty = false;
+        if entry.file_type().expect("file type").is_dir() {
+            keep_empty_directories(&entry.path());
+        }
+    }
+    if empty {
+        fs::write(dir.join(".keep"), b"").expect(".keep");
+    }
 }
 
 fn set_digest(mut digest: execution_capnp::digest_ref::Builder<'_>, value: &str) {
@@ -570,15 +592,16 @@ pub fn host(
     })
 }
 
-/// Stage a guest rootfs: the tools fragment, `/bin/agent` compiled from
-/// `agent_source` for the guest, and `/tmp`. Returns the staging directory
-/// (publish it with [`Host::publish_rootfs`] once complete) and the agent
-/// binary's BLAKE3.
+/// Stage a guest rootfs: the tools fragment and `/bin/agent` compiled from
+/// `agent_source` for the guest. `/tmp` is the guest init's tmpfs (LLO
+/// patch 0012); an empty `tmp/` here would not reach the guest anyway, since
+/// manifest v1 names no directory (bead `ley-line-open-38ff59`). Returns the
+/// staging directory (publish it with [`Host::publish_rootfs`] once
+/// complete) and the agent binary's BLAKE3.
 pub fn stage_rootfs(host: &Host, tools: &Path, agent_source: &str) -> (PathBuf, String) {
     let staging = host.path("rootfs");
     copy_tree(tools, &staging);
     fs::create_dir_all(staging.join("bin")).expect("bin");
-    fs::create_dir_all(staging.join("tmp")).expect("tmp");
     let source = host.path("agent.rs");
     fs::write(&source, agent_source).expect("guest source");
     let agent = staging.join("bin/agent");

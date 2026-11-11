@@ -277,6 +277,9 @@ impl RootfsSpec {
                     }
                     spec.directories.insert(path.to_string(), *mode);
                 }
+                EntryV2::File { .. } | EntryV2::Symlink { .. } if guest_mount_point(path) => {
+                    return Err(mount_point_refusal(path));
+                }
                 EntryV2::File { mode, blake3, .. } => {
                     if mode & !0o777 != 0 || mode & 0o400 == 0 {
                         return Err(format!(
@@ -377,7 +380,7 @@ impl RootfsSpec {
                 }
                 _ => stack.push(component),
             }
-            if KERNEL_MOUNTED.contains(&stack[0].as_str()) || stack[0] == workspace_mount_point() {
+            if guest_mount_point(&stack[0]) {
                 return Err(format!(
                     "{path} reaches /{}, which the guest mounts over: the rootfs does not decide what is there",
                     stack[0]
@@ -413,6 +416,20 @@ impl RootfsSpec {
 /// workspace.
 fn workspace_mount_point() -> &'static str {
     crate::backends::libkrun::worker::WORKSPACE_DIR.trim_start_matches('/')
+}
+
+/// Whether the top-level `name` is one the guest init mounts a filesystem
+/// over: [`KERNEL_MOUNTED`] and the workspace's `work`. `mount(2)` follows a
+/// link at its target and cannot mount over a file, so the rootfs may hold
+/// only a directory there (bead `ley-line-open-10b516`).
+pub(crate) fn guest_mount_point(name: &str) -> bool {
+    KERNEL_MOUNTED.contains(&name) || name == workspace_mount_point()
+}
+
+fn mount_point_refusal(path: &str) -> String {
+    format!(
+        "rootfs manifest v2 holds a non-directory at /{path}, which the guest mounts over: only a directory may be there"
+    )
 }
 
 #[cfg(test)]
@@ -632,6 +649,42 @@ mod tests {
             link("a", "/"),
         ] {
             RootfsSpec::parse(v2(&entries).as_bytes()).unwrap_or_else(|error| panic!("{entries}: {error}"));
+        }
+    }
+
+    /// The guest init mounts over `dev`, `proc`, `sys`, `tmp` and (with a
+    /// workspace) `work`, and `mount(2)` follows a link at its target: a
+    /// link there would move the mount over the tree the digest names (a
+    /// `work -> usr/bin` puts the workspace over the executable), and a file
+    /// there never mounts. So a v2 manifest holds only a directory at each,
+    /// whoever wrote it; below one, and elsewhere, the names are ordinary.
+    #[test]
+    fn a_mount_point_is_a_directory_or_absent() {
+        for name in ["dev", "proc", "sys", "tmp", "work"] {
+            for entry in [
+                format!("{{\"type\":\"symlink\",\"path\":\"{name}\",\"target\":\"usr/bin\"}}"),
+                format!("{{\"type\":\"file\",\"path\":\"{name}\",\"mode\":420,\"blake3\":\"{HEX}\"}}"),
+            ] {
+                let error = refusal(&v2(&entry));
+                assert!(
+                    error.contains("mounts over") && error.contains(&format!("/{name}")),
+                    "{entry}: {error}"
+                );
+            }
+            RootfsSpec::parse(
+                v2(&format!(
+                    "{{\"type\":\"dir\",\"path\":\"{name}\",\"mode\":493}},{{\"type\":\"symlink\",\"path\":\"{name}/x\",\"target\":\"/\"}}"
+                ))
+                .as_bytes(),
+            )
+            .unwrap_or_else(|error| panic!("{name}: a directory there: {error}"));
+            RootfsSpec::parse(
+                v2(&format!(
+                    "{{\"type\":\"dir\",\"path\":\"etc\",\"mode\":493}},{{\"type\":\"symlink\",\"path\":\"etc/{name}\",\"target\":\"/\"}}"
+                ))
+                .as_bytes(),
+            )
+            .unwrap_or_else(|error| panic!("{name}: the name below the root: {error}"));
         }
     }
 

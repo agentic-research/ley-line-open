@@ -132,9 +132,10 @@ use sha2::{Digest, Sha256};
 
 use super::rootfs_manifest::{
     FileSpec, MANIFEST_FILE_MODE, ROOT_DIRECTORY_MODE, ROOTFS_MANIFEST, RUN_EXEC_SPEC, RootfsSpec,
+    guest_mount_point,
 };
 use super::rootfs_tree::{
-    FileNode, Final, KERNEL_MOUNTED, Node, PathError, ResolveError, Resolved, Tree, join,
+    FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join,
     under_kernel_mount,
 };
 use crate::DigestRef;
@@ -652,20 +653,17 @@ pub fn import_oci_layout(
     // cannot mount over a regular file (mount(2) fails ENOTDIR), so an image
     // with one there would import and then never boot: refused by name now
     // (bead `ley-line-open-2aa5d3`). A link there is refused too: mount(2)
-    // follows it, and init's `mount_tmp` refuses one. A device or FIFO
-    // there is refused earlier, a link into a kernel mount dropped under
-    // `Resolve`.
+    // follows it, and init's `mount_tmp` refuses one. The workspace's
+    // `work` is one too: a kept `work -> usr/bin` would put the workspace
+    // over the image's executables (bead `ley-line-open-10b516`). A device
+    // or FIFO there is refused earlier, a link into a kernel mount dropped
+    // under `Resolve`.
     if let Final::Dir(top) = &finished
-        && let Some(name) = KERNEL_MOUNTED.iter().find(|name| {
-            matches!(
-                top.get(**name),
-                Some(Final::File(_) | Final::Symlink(_))
-            )
+        && let Some((name, _)) = top.iter().find(|(name, node)| {
+            guest_mount_point(name) && matches!(node, Final::File(_) | Final::Symlink(_))
         })
     {
-        return Err(OciImportError::KernelMountPointNotDirectory {
-            path: (*name).to_string(),
-        });
+        return Err(OciImportError::KernelMountPointNotDirectory { path: name.clone() });
     }
     // The worker writes this one path into each run's copy after the copy
     // is verified, so the image's tree may not hold it as anything: refused

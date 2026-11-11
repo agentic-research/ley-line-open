@@ -1998,6 +1998,39 @@ fn a_regular_file_at_a_kernel_mount_point_is_refused_by_name() {
     result.expect("a directory at a kernel mount point imports");
 }
 
+/// Under the default `preserve`, a kept link at a mount point is refused by
+/// name, `work` (the workspace mount) included: `mount(2)` follows it, so
+/// `work -> usr/bin` would put the workspace over the image's executables
+/// (review of bead `ley-line-open-4f08ea`, bead `ley-line-open-10b516`). A
+/// regular file at `work` is refused as at the kernel mount points.
+#[test]
+fn a_kept_link_or_a_file_at_a_mount_point_is_refused_by_name() {
+    for name in ["dev", "proc", "sys", "tmp", "work"] {
+        for entry in [symlink(name, "usr/bin"), file(name, 0o644, b"")] {
+            let (scratch, result) = import_single(
+                vec![Layer::plain(vec![file("usr/bin/x", 0o755, b"x"), entry])],
+                SymlinkPolicy::Preserve,
+            );
+            match &result {
+                Err(OciImportError::KernelMountPointNotDirectory { path }) => {
+                    assert_eq!(path, name)
+                }
+                other => panic!("{name}: expected a refusal by name, got {other:?}"),
+            }
+            assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+        }
+    }
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("usr/bin/x", 0o755, b"x"),
+            dir("work/", 0o755),
+            symlink("etc/work", "/usr/bin"),
+        ])],
+        SymlinkPolicy::Preserve,
+    );
+    result.expect("a directory at work, and the name below the root, import");
+}
+
 /// The libkrun worker writes `/.leyline-exec.json` into each run's copy
 /// itself, so an image whose tree holds that path at its root, as any kind
 /// of entry, is refused by name. A lower layer's one that a later layer

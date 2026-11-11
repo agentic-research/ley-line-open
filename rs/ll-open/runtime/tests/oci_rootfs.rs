@@ -1228,6 +1228,123 @@ fn a_root_directory_entry_is_accepted() {
     assert_eq!(result.expect("`./` names the image root").files, 1);
 }
 
+/// Bead `ley-line-open-cffbb5`: Nix `dockerTools` writes its store-path
+/// layers with absolute entry names (`/nix/store/...`). A leading `/` is the
+/// image root, as containerd and Docker read it, so an absolute-name layer
+/// is the same tree, and the same rootfs digest, as the relative-name one.
+/// Hard-link targets are read the same way, and whiteouts apply.
+#[test]
+fn absolute_entry_names_are_read_from_the_image_root() {
+    let store = "nix/store/abc-hello-2.12/bin/hello";
+    let layers = |root: &str| {
+        vec![
+            Layer::plain(vec![
+                dir(&format!("{root}nix"), 0o755),
+                dir(&format!("{root}nix/store"), 0o755),
+                file(&format!("{root}{store}"), 0o555, b"#!hello"),
+                file(&format!("{root}etc/gone"), 0o644, b"lower"),
+                // A hard link whose target is absolute too.
+                hardlink(&format!("{root}bin/hello"), &format!("{root}{store}")),
+            ]),
+            Layer::plain(vec![
+                file(&format!("{root}etc/.wh.gone"), 0o644, b""),
+                file(&format!("{root}etc/kept"), 0o644, b"upper"),
+            ]),
+        ]
+    };
+    let (relative_scratch, relative) = import_single(layers(""), SymlinkPolicy::Refuse);
+    let relative = relative.expect("the relative-name layers import");
+    for root in ["/", "//", "/./"] {
+        let (scratch, absolute) = import_single(layers(root), SymlinkPolicy::Refuse);
+        let absolute = absolute.unwrap_or_else(|error| panic!("{root:?} names import: {error}"));
+        assert_eq!(
+            absolute.rootfs, relative.rootfs,
+            "{root:?}: one tree, one digest"
+        );
+        let cas = scratch.path().join("cas");
+        assert_eq!(
+            manifest_bytes(&cas, &absolute.rootfs),
+            manifest_bytes(&relative_scratch.path().join("cas"), &relative.rootfs)
+        );
+        let files = manifest_files(&cas, &absolute.rootfs);
+        assert_eq!(
+            files.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["bin/hello", "etc/kept", store],
+            "{root:?}"
+        );
+        assert_eq!(files["bin/hello"], files[store], "the hard link's target");
+        // Nothing was written outside the CAS entry.
+        assert_eq!(cas_entries(&cas), vec![absolute.rootfs.value.clone()]);
+        assert!(!scratch.path().join("nix").exists());
+    }
+    // A mixed layer: an absolute hard-link target for a relative name.
+    let (_scratch, mixed) = import_single(
+        vec![Layer::plain(vec![
+            file("usr/bin/real", 0o755, b"real"),
+            hardlink("usr/bin/alias", "/usr/bin/real"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    assert_eq!(mixed.expect("an absolute hard-link target").files, 2);
+    // `/` alone is the image root, as `./` is.
+    let (_scratch, root) = import_single(
+        vec![Layer::plain(vec![dir("/", 0o755), file("/a", 0o644, b"a")])],
+        SymlinkPolicy::Refuse,
+    );
+    assert_eq!(root.expect("`/` names the image root").files, 1);
+}
+
+/// A real Nix-built image, pinned by digest, pulled from its registry.
+/// Opt-in (network): set `LEYLINE_OCI_NIX_IMAGE` to
+/// `[registry/]repository@sha256:<hex>` of an image built with Nix
+/// `dockerTools` (its layers name `/nix/store/...` absolutely). Its links
+/// need `--symlinks resolve` under rootfs manifest v1. A Nix closure often
+/// holds names that differ only by case (ncurses' `terminfo/A` and
+/// `terminfo/a`), so set `LEYLINE_OCI_NIX_CAS_DIR` to a directory on a
+/// case-sensitive volume for the CAS root (the default is a temporary
+/// directory).
+#[test]
+fn a_nix_built_image_imports_from_its_registry() {
+    let Some(reference) = std::env::var_os("LEYLINE_OCI_NIX_IMAGE") else {
+        eprintln!(
+            "SKIPPED (NOT a pass): LEYLINE_OCI_NIX_IMAGE is unset; this test pulls a \
+             Nix-built image, pinned by digest, from its registry"
+        );
+        return;
+    };
+    let reference = reference.to_string_lossy().into_owned();
+    let cas = match std::env::var_os("LEYLINE_OCI_NIX_CAS_DIR") {
+        Some(dir) => TempDir::new_in(dir).expect("a CAS root in LEYLINE_OCI_NIX_CAS_DIR"),
+        None => TempDir::new().unwrap(),
+    };
+    let a = leyline_runtime::artifacts::registry::pull_oci_image(
+        &leyline_runtime::artifacts::registry::RegistryPull {
+            reference: &reference,
+            platform: Platform::host().expect("a host platform"),
+            symlinks: SymlinkPolicy::Resolve,
+            max_rootfs_bytes: DEFAULT_MAX_ROOTFS_BYTES,
+            limits: Default::default(),
+            insecure_plain_http: None,
+        },
+        cas.path(),
+    )
+    .unwrap_or_else(|error| panic!("{reference} must import: {error}"));
+    let files = manifest_files(cas.path(), &a.rootfs);
+    assert!(
+        files.keys().any(|path| path.starts_with("nix/store/")),
+        "a Nix image holds store paths"
+    );
+    eprintln!(
+        "{reference}: rootfs blake3-256:{} files={} symlinksResolved={} \
+         linksDroppedKernelMount={} linksDroppedDangling={}",
+        a.rootfs.value,
+        a.files,
+        a.symlinks_resolved,
+        a.links_dropped_kernel_mount.len(),
+        a.links_dropped_dangling.len()
+    );
+}
+
 #[test]
 fn documents_are_classified_by_media_type_or_shape() {
     let scratch = TempDir::new().expect("scratch");
@@ -1404,8 +1521,25 @@ fn hostile_paths_are_refused_and_nothing_escapes() {
     let cases: Vec<(Vec<Entry>, &str)> = vec![
         (vec![file("../evil", 0o644, b"x")], "../evil"),
         (vec![file("a/../../evil", 0o644, b"x")], "a/../../evil"),
-        (vec![file("/abs/evil", 0o644, b"x")], "/abs/evil"),
-        (vec![dir("/", 0o755)], "/"),
+        // An absolute name is read from the image root (bead
+        // ley-line-open-cffbb5); the same `..` refusal then applies to it.
+        (vec![file("/../evil", 0o644, b"x")], "/../evil"),
+        (vec![file("/../etc/passwd", 0o644, b"x")], "/../etc/passwd"),
+        (vec![file("/a/../../evil", 0o644, b"x")], "/a/../../evil"),
+        (vec![file("//../evil", 0o644, b"x")], "//../evil"),
+        (vec![file("/", 0o644, b"x")], "/"),
+        (
+            vec![symlink("link", "/etc"), file("/link/passwd", 0o644, b"x")],
+            "/link/passwd",
+        ),
+        (vec![hardlink("h", "/../outside")], "h"),
+        (vec![hardlink("/h", "/a/../../outside")], "/h"),
+        (vec![hardlink("h", "/missing")], "h"),
+        (
+            vec![file("/rootfs.manifest.json", 0o644, b"{}")],
+            "/rootfs.manifest.json",
+        ),
+        (vec![file("/x/.wh..wh.plnk", 0o644, b"")], "/x/.wh..wh.plnk"),
         (
             vec![symlink("link", "/etc"), file("link/passwd", 0o644, b"x")],
             "link/passwd",
@@ -1719,6 +1853,68 @@ fn a_dropped_device_removes_what_a_lower_layer_had_at_its_path() {
         files.keys().map(String::as_str).collect::<Vec<_>>(),
         ["dev/console"]
     );
+}
+
+/// Bead `ley-line-open-2aa5d3`: the guest init mounts a kernel filesystem
+/// over each kernel mount point and cannot mount over a regular file, so an
+/// image with a regular file there (or, under `Resolve`, a link that becomes
+/// a copy of one) would import and then never boot. Refused by name.
+#[test]
+fn a_regular_file_at_a_kernel_mount_point_is_refused_by_name() {
+    let mut cases = vec![
+        (
+            vec![file("bin/x", 0o755, b"x"), file("dev", 0o644, b"not a dir")],
+            SymlinkPolicy::Refuse,
+            "dev",
+        ),
+        (
+            vec![file("bin/x", 0o755, b"x"), file("proc", 0o644, b"")],
+            SymlinkPolicy::Refuse,
+            "proc",
+        ),
+        (
+            vec![file("bin/x", 0o755, b"x"), file("sys", 0o755, b"#!/bin/sh")],
+            SymlinkPolicy::Resolve,
+            "sys",
+        ),
+    ];
+    // `tmp` is one of them: init mounts a tmpfs there (patch 0012,
+    // ley-line-open-db5899), and refuses to when it is not a directory.
+    cases.push((
+        vec![file("bin/x", 0o755, b"x"), file("tmp", 0o644, b"")],
+        SymlinkPolicy::Refuse,
+        "tmp",
+    ));
+    cases.push((
+        vec![
+            file("etc/hostname", 0o644, b"host\n"),
+            symlink("tmp", "/etc/hostname"),
+        ],
+        SymlinkPolicy::Resolve,
+        "tmp",
+    ));
+    for (entries, policy, named) in cases {
+        let (scratch, result) = import_single(vec![Layer::plain(entries)], policy);
+        match &result {
+            Err(error @ OciImportError::KernelMountPointNotDirectory { path }) => {
+                assert_eq!(path, named);
+                assert!(error.to_string().contains("never boot"), "{error}");
+            }
+            other => panic!("expected {named} to be refused by name, got {other:?}"),
+        }
+        assert!(cas_entries(&scratch.path().join("cas")).is_empty());
+    }
+    // A directory there, and a regular file elsewhere with the same name,
+    // are fine.
+    let (_scratch, result) = import_single(
+        vec![Layer::plain(vec![
+            file("dev/.keep", 0o644, b""),
+            file("etc/sys", 0o644, b""),
+            file("bin/x", 0o755, b"x"),
+        ])],
+        SymlinkPolicy::Refuse,
+    );
+    result.expect("a directory at a kernel mount point imports");
 }
 
 #[test]

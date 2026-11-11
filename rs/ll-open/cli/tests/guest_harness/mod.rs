@@ -568,15 +568,16 @@ pub fn host(
     })
 }
 
-/// Stage a guest rootfs: the tools fragment, `/bin/agent` compiled from
-/// `agent_source` for the guest, and `/tmp`. Returns the staging directory
-/// (publish it with [`Host::publish_rootfs`] once complete) and the agent
-/// binary's BLAKE3.
+/// Stage a guest rootfs: the tools fragment and `/bin/agent` compiled from
+/// `agent_source` for the guest. `/tmp` is the guest init's tmpfs (LLO
+/// patch 0012); an empty `tmp/` here would not reach the guest anyway, since
+/// manifest v1 names no directory (bead `ley-line-open-38ff59`). Returns the
+/// staging directory (publish it with [`Host::publish_rootfs`] once
+/// complete) and the agent binary's BLAKE3.
 pub fn stage_rootfs(host: &Host, tools: &Path, agent_source: &str) -> (PathBuf, String) {
     let staging = host.path("rootfs");
     copy_tree(tools, &staging);
     fs::create_dir_all(staging.join("bin")).expect("bin");
-    fs::create_dir_all(staging.join("tmp")).expect("tmp");
     let source = host.path("agent.rs");
     fs::write(&source, agent_source).expect("guest source");
     let agent = staging.join("bin/agent");

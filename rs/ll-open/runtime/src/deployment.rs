@@ -22,14 +22,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use leyline_schema_spec::deployment_config::{
+    self as spec, BackendSettings, CasSettings, Document, EvidenceSettings, ExecutionDaemonConfig,
+    Kind,
+};
 pub use leyline_schema_spec::deployment_config::{
     ConfigRefusal, Diagnostics as DiagnosticsSettings, Enrichment as EnrichmentSettings,
     HeadSettings, HostFacts, Os, ParserSettings, REMOVED_VARIABLES_JSON, Reason, RemovedVariable,
     RemovedVariables, Syntax, check_removed_environment, removed_variables, test_seams_set,
-};
-use leyline_schema_spec::deployment_config::{
-    self as spec, BackendSettings, CasSettings, Document, EvidenceSettings, ExecutionDaemonConfig,
-    Kind,
 };
 
 use crate::backends::libkrun::backend::KrunWorkerConfig;
@@ -79,7 +79,10 @@ impl ExecutionDeployment {
 
     /// `configDigest` as text: `blake3-256:<hex>`.
     pub fn config_digest_text(&self) -> String {
-        format!("{}:{}", self.config_digest.algorithm, self.config_digest.value)
+        format!(
+            "{}:{}",
+            self.config_digest.algorithm, self.config_digest.value
+        )
     }
 
     /// The CAS root: the directory's, or the volume layout's (not attached).
@@ -394,7 +397,10 @@ pub fn check_execution_host(deployment: &ExecutionDeployment) -> HostCheck {
     }
     if let EvidenceDeployment::Verified { trust_keys, store } = &deployment.evidence {
         if let Err(error) = crate::cas_evidence::load_trust_keys(trust_keys) {
-            refuse(host_refusal("evidence.verified.trustKeys", error.to_string()));
+            refuse(host_refusal(
+                "evidence.verified.trustKeys",
+                error.to_string(),
+            ));
         }
         if !store.is_dir() {
             refuse(host_refusal(
@@ -435,9 +441,11 @@ pub fn check_execution_host(deployment: &ExecutionDeployment) -> HostCheck {
             ));
         }
     }
-    check
-        .refusals
-        .sort_by(|a, b| a.field.cmp(&b.field).then_with(|| a.message.cmp(&b.message)));
+    check.refusals.sort_by(|a, b| {
+        a.field
+            .cmp(&b.field)
+            .then_with(|| a.message.cmp(&b.message))
+    });
     check
 }
 
@@ -462,7 +470,8 @@ mod tests {
     #[test]
     fn a_volume_resolves_to_the_layout_cas_volume_computes() {
         for os in [Os::MacOs, Os::Linux] {
-            let d = resolve_execution_deployment(MINIMAL.as_bytes(), Syntax::Json, &host(os)).unwrap();
+            let d =
+                resolve_execution_deployment(MINIMAL.as_bytes(), Syntax::Json, &host(os)).unwrap();
             let state = PathBuf::from("/Users/fixture/.local/state/leyline");
             let host_os = match os {
                 Os::MacOs => crate::cas_volume::HostOs::MacOs,
@@ -502,13 +511,25 @@ mod tests {
             );
             assert!(d.cdc);
             assert_eq!(d.state_dir, state);
-            assert_eq!(d.arena, PathBuf::from("/Users/fixture/.mache/execution.arena"));
-            assert_eq!(d.control, PathBuf::from("/Users/fixture/.mache/execution.ctrl"));
+            assert_eq!(
+                d.arena,
+                PathBuf::from("/Users/fixture/.mache/execution.arena")
+            );
+            assert_eq!(
+                d.control,
+                PathBuf::from("/Users/fixture/.mache/execution.ctrl")
+            );
             assert_eq!(d.catalog, PathBuf::from("/c"));
             assert_eq!(ExecutionDeployment::ARENA_SIZE_MIB, 64);
             assert_eq!(d.config_digest.algorithm, "blake3-256");
-            assert_eq!(d.config_digest.value, blake3::hash(&d.resolved).to_hex().to_string());
-            assert_eq!(d.config_digest_text(), format!("blake3-256:{}", d.config_digest.value));
+            assert_eq!(
+                d.config_digest.value,
+                blake3::hash(&d.resolved).to_hex().to_string()
+            );
+            assert_eq!(
+                d.config_digest_text(),
+                format!("blake3-256:{}", d.config_digest.value)
+            );
         }
     }
 
@@ -551,7 +572,8 @@ mod tests {
             seed = p("seed"),
             tk = p("tk.pub"),
         );
-        let d = resolve_execution_deployment(doc.as_bytes(), Syntax::Json, &host(Os::MacOs)).unwrap();
+        let d =
+            resolve_execution_deployment(doc.as_bytes(), Syntax::Json, &host(Os::MacOs)).unwrap();
         let check = check_execution_host(&d);
         let fields: Vec<&str> = check.refusals.iter().map(|r| r.field.as_str()).collect();
         assert_eq!(
@@ -570,7 +592,10 @@ mod tests {
             ]
         );
         assert_eq!(check.deferred.len(), 1, "{:?}", check.deferred);
-        assert!(!dir.path().join("runs").exists(), "the run root is never created");
+        assert!(
+            !dir.path().join("runs").exists(),
+            "the run root is never created"
+        );
 
         // Make every check pass.
         std::fs::create_dir(dir.path().join("cas")).unwrap();
@@ -606,14 +631,16 @@ mod tests {
 
     #[test]
     fn a_volume_defers_the_writing_checks() {
-        let d = resolve_execution_deployment(MINIMAL.as_bytes(), Syntax::Json, &host(Os::MacOs)).unwrap();
+        let d = resolve_execution_deployment(MINIMAL.as_bytes(), Syntax::Json, &host(Os::MacOs))
+            .unwrap();
         let check = check_execution_host(&d);
         assert_eq!(check.deferred.len(), 2, "{:?}", check.deferred);
     }
 
     #[test]
     fn removed_variables_are_reexported_for_embedders() {
-        let err = check_removed_environment([("LEYLINE_STATE_DIR".into(), "/x".into())]).unwrap_err();
+        let err =
+            check_removed_environment([("LEYLINE_STATE_DIR".into(), "/x".into())]).unwrap_err();
         assert_eq!(err.offenders[0].replacement, "stateDir");
         assert!(REMOVED_VARIABLES_JSON.contains("LEYLINE_STATE_DIR"));
         assert_eq!(removed_variables().len(), 19);

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use leyline_runtime::deployment::{
-    BackendDeployment, HostFacts, Os, REMOVED_VARIABLES_JSON, Syntax,
-    check_removed_environment, resolve_execution_deployment,
+    BackendDeployment, HostFacts, Os, REMOVED_VARIABLES_JSON, Syntax, check_removed_environment,
+    resolve_execution_deployment,
 };
 use serde_json::Value;
 
@@ -28,7 +28,11 @@ fn host(file: &Value, name: &str) -> HostFacts {
         home: opt("home"),
         xdg_state_home: opt("xdgStateHome"),
         data_dir: opt("dataDir"),
-        os: if h["os"] == "macos" { Os::MacOs } else { Os::Linux },
+        os: if h["os"] == "macos" {
+            Os::MacOs
+        } else {
+            Os::Linux
+        },
     }
 }
 
@@ -52,35 +56,89 @@ fn every_execution_vector_builds_the_pinned_backend() {
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let host = host(&file, case["host"].as_str().unwrap());
-        let d = resolve_execution_deployment(case["input"].as_str().unwrap().as_bytes(), Syntax::Json, &host)
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let d = resolve_execution_deployment(
+            case["input"].as_str().unwrap().as_bytes(),
+            Syntax::Json,
+            &host,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(
             std::str::from_utf8(&d.resolved).unwrap(),
             case["canonical"].as_str().unwrap(),
             "{name}"
         );
-        assert_eq!(d.config_digest_text(), case["configDigest"].as_str().unwrap(), "{name}");
+        assert_eq!(
+            d.config_digest_text(),
+            case["configDigest"].as_str().unwrap(),
+            "{name}"
+        );
         let b = &case["backend"];
         match (&d.backend, b["kind"].as_str().unwrap()) {
-            (BackendDeployment::Native { config, cgroup_root }, "native") => {
-                assert_eq!(config.worker, PathBuf::from(b["worker"].as_str().unwrap()), "{name}");
-                assert_eq!(config.cas_root, PathBuf::from(b["casRoot"].as_str().unwrap()), "{name}");
-                assert_eq!(config.ephemeral_root, PathBuf::from(b["ephemeralRoot"].as_str().unwrap()), "{name}");
+            (
+                BackendDeployment::Native {
+                    config,
+                    cgroup_root,
+                },
+                "native",
+            ) => {
+                assert_eq!(
+                    config.worker,
+                    PathBuf::from(b["worker"].as_str().unwrap()),
+                    "{name}"
+                );
+                assert_eq!(
+                    config.cas_root,
+                    PathBuf::from(b["casRoot"].as_str().unwrap()),
+                    "{name}"
+                );
+                assert_eq!(
+                    config.ephemeral_root,
+                    PathBuf::from(b["ephemeralRoot"].as_str().unwrap()),
+                    "{name}"
+                );
                 assert_eq!(config.runtime_files, paths(&b["runtimeFiles"]), "{name}");
                 assert_eq!(config.ready_timeout, ms(&b["readyTimeoutMs"]), "{name}");
-                assert_eq!(cgroup_root.as_deref(), b["cgroupRoot"].as_str().map(Path::new), "{name}");
+                assert_eq!(
+                    cgroup_root.as_deref(),
+                    b["cgroupRoot"].as_str().map(Path::new),
+                    "{name}"
+                );
             }
             (BackendDeployment::MicroVm { config, workspace }, "microVm") => {
-                assert_eq!(config.worker, PathBuf::from(b["worker"].as_str().unwrap()), "{name}");
-                assert_eq!(config.cas_root, PathBuf::from(b["casRoot"].as_str().unwrap()), "{name}");
-                assert_eq!(config.ephemeral_root, PathBuf::from(b["ephemeralRoot"].as_str().unwrap()), "{name}");
+                assert_eq!(
+                    config.worker,
+                    PathBuf::from(b["worker"].as_str().unwrap()),
+                    "{name}"
+                );
+                assert_eq!(
+                    config.cas_root,
+                    PathBuf::from(b["casRoot"].as_str().unwrap()),
+                    "{name}"
+                );
+                assert_eq!(
+                    config.ephemeral_root,
+                    PathBuf::from(b["ephemeralRoot"].as_str().unwrap()),
+                    "{name}"
+                );
                 assert_eq!(config.runtime_files, paths(&b["runtimeFiles"]), "{name}");
                 assert_eq!(config.devices, paths(&b["devices"]), "{name}");
                 assert_eq!(config.ready_timeout, ms(&b["readyTimeoutMs"]), "{name}");
-                assert_eq!(config.tsi_hijack_inet, b["tsiHijackInet"].as_bool().unwrap(), "{name}");
+                assert_eq!(
+                    config.tsi_hijack_inet,
+                    b["tsiHijackInet"].as_bool().unwrap(),
+                    "{name}"
+                );
                 assert_eq!(workspace.settled, ms(&b["workspace"]["ttlMs"]), "{name}");
-                assert_eq!(workspace.changed, ms(&b["workspace"]["changedTtlMs"]), "{name}");
-                assert_eq!(workspace.window, ms(&b["workspace"]["changeWindowMs"]), "{name}");
+                assert_eq!(
+                    workspace.changed,
+                    ms(&b["workspace"]["changedTtlMs"]),
+                    "{name}"
+                );
+                assert_eq!(
+                    workspace.window,
+                    ms(&b["workspace"]["changeWindowMs"]),
+                    "{name}"
+                );
             }
             (other, kind) => panic!("{name}: built {other:?}, pinned {kind}"),
         }
@@ -93,12 +151,19 @@ fn every_execution_reject_is_refused_by_the_library_entry() {
     for case in file["rejects"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let host = host(&file, case["host"].as_str().unwrap());
-        let e = resolve_execution_deployment(case["input"].as_str().unwrap().as_bytes(), Syntax::Json, &host)
-            .err()
-            .unwrap_or_else(|| panic!("{name}: accepted"));
+        let e = resolve_execution_deployment(
+            case["input"].as_str().unwrap().as_bytes(),
+            Syntax::Json,
+            &host,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{name}: accepted"));
         assert_eq!(
             (e.field.as_str(), e.reason.code()),
-            (case["field"].as_str().unwrap(), case["reason"].as_str().unwrap()),
+            (
+                case["field"].as_str().unwrap(),
+                case["reason"].as_str().unwrap()
+            ),
             "{name}"
         );
     }

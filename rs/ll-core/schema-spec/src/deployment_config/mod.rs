@@ -62,9 +62,9 @@ pub const DIGEST_ALGORITHM: &str = "blake3-256";
 /// released (`deployment-config/v1/published/`).
 pub fn published_schema(kind: Kind) -> &'static str {
     match kind {
-        Kind::Daemon => include_str!(
-            "../../deployment-config/v1/published/leyline-daemon-config.schema.json"
-        ),
+        Kind::Daemon => {
+            include_str!("../../deployment-config/v1/published/leyline-daemon-config.schema.json")
+        }
         Kind::ExecutionDaemon => include_str!(
             "../../deployment-config/v1/published/leyline-execution-daemon-config.schema.json"
         ),
@@ -202,9 +202,11 @@ impl HostFacts {
         };
         let home = std::env::var_os("HOME");
         let data_dir = match os {
-            Os::MacOs => home
-                .as_ref()
-                .map(|h| Path::new(h).join("Library/Application Support").into_os_string()),
+            Os::MacOs => home.as_ref().map(|h| {
+                Path::new(h)
+                    .join("Library/Application Support")
+                    .into_os_string()
+            }),
             Os::Linux => std::env::var_os("XDG_DATA_HOME")
                 .filter(|d| Path::new(d).is_absolute())
                 .map(|d| d.to_owned())
@@ -492,7 +494,13 @@ impl fmt::Display for ConfigRefusal {
         if self.field.is_empty() {
             write!(f, "{}: {}", self.reason.code(), self.message)
         } else {
-            write!(f, "{}: {}: {}", self.field, self.reason.code(), self.message)
+            write!(
+                f,
+                "{}: {}: {}",
+                self.field,
+                self.reason.code(),
+                self.message
+            )
         }
     }
 }
@@ -743,9 +751,15 @@ mod tests {
         }
         assert_eq!(Kind::from_name("FooConfig"), None);
         assert_eq!(Kind::Daemon.short_name(), "daemon-config");
-        assert_eq!(Kind::ExecutionDaemon.short_name(), "execution-daemon-config");
+        assert_eq!(
+            Kind::ExecutionDaemon.short_name(),
+            "execution-daemon-config"
+        );
         assert_eq!(Kind::SignHelper.short_name(), "sign-helper-config");
-        assert_eq!(Syntax::for_path(Path::new("a/b.json")).unwrap(), Syntax::Json);
+        assert_eq!(
+            Syntax::for_path(Path::new("a/b.json")).unwrap(),
+            Syntax::Json
+        );
         assert_eq!(Syntax::for_path(Path::new("b.toml")).unwrap(), Syntax::Toml);
         for bad in ["b.yaml", "b", "b.JSON"] {
             assert_eq!(
@@ -764,10 +778,16 @@ mod tests {
             r.to_json_line(),
             r#"{"field":"mcp.http.bind","message":"a \"q\"\n","reason":"public-bind-without-opt-in"}"#
         );
-        assert_eq!(r.to_string(), "mcp.http.bind: public-bind-without-opt-in: a \"q\"\n");
+        assert_eq!(
+            r.to_string(),
+            "mcp.http.bind: public-bind-without-opt-in: a \"q\"\n"
+        );
         let whole = ConfigRefusal::new("", Reason::Malformed, "m");
         assert_eq!(whole.to_string(), "malformed: m");
-        assert_eq!(json_escape("\u{1}\u{7f}\u{2028}\t\r\\é"), "\"\\u0001\\u007f\\u2028\\t\\r\\\\é\"");
+        assert_eq!(
+            json_escape("\u{1}\u{7f}\u{2028}\t\r\\é"),
+            "\"\\u0001\\u007f\\u2028\\t\\r\\\\é\""
+        );
     }
 
     #[test]
@@ -775,8 +795,14 @@ mod tests {
         let v = Value::object([
             ("b", Value::Array(vec![])),
             ("a", Value::object::<_, String>([])),
-            ("c", Value::Array(vec![Value::Int(1), Value::Null, Value::Bool(false)])),
-            ("d", Value::object([("x", Value::Bool(true)), ("é", Value::str("ü"))])),
+            (
+                "c",
+                Value::Array(vec![Value::Int(1), Value::Null, Value::Bool(false)]),
+            ),
+            (
+                "d",
+                Value::object([("x", Value::Bool(true)), ("é", Value::str("ü"))]),
+            ),
         ]);
         assert_eq!(
             String::from_utf8(v.canonical_bytes()).unwrap(),

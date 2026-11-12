@@ -346,7 +346,11 @@ fn toml_value(value: &toml::Value, field: &str, depth: usize) -> Result<Json, Co
                 Reason::TomlTypeNotMapped,
                 format!(
                     "a TOML {} has no v1 field type",
-                    if value.is_float() { "float" } else { "datetime" }
+                    if value.is_float() {
+                        "float"
+                    } else {
+                        "datetime"
+                    }
                 ),
             ));
         }
@@ -451,14 +455,22 @@ mod tests {
 
     #[test]
     fn clean_refuses_every_listed_character() {
-        for c in ['\u{0}', '\u{1f}', '\u{7f}', '\u{85}', '\u{9f}', '\u{2028}', '\u{2029}', '"', '\\'] {
+        for c in [
+            '\u{0}', '\u{1f}', '\u{7f}', '\u{85}', '\u{9f}', '\u{2028}', '\u{2029}', '"', '\\',
+        ] {
             assert!(!allowed_char(c), "{c:?}");
         }
         for c in [' ', '~', '\u{a0}', '\u{ff61}', '\u{1f600}', 'é'] {
             assert!(allowed_char(c), "{c:?}");
         }
         assert_eq!(Str { raw: vec![0xff] }.clean(), None);
-        assert_eq!(Str { raw: b"a\x01".to_vec() }.display(), "a\\u{1}");
+        assert_eq!(
+            Str {
+                raw: b"a\x01".to_vec()
+            }
+            .display(),
+            "a\\u{1}"
+        );
     }
 
     #[test]
@@ -467,14 +479,35 @@ mod tests {
         let Json::Object(members) = doc else { panic!() };
         assert_eq!(members.len(), 4);
         let float = read_toml(b"[a]\nb = 1.5\n").unwrap_err();
-        assert_eq!((float.field.as_str(), float.reason), ("a.b", Reason::TomlTypeNotMapped));
+        assert_eq!(
+            (float.field.as_str(), float.reason),
+            ("a.b", Reason::TomlTypeNotMapped)
+        );
         let date = read_toml(b"a = [1979-05-27]\n").unwrap_err();
-        assert_eq!((date.field.as_str(), date.reason), ("a[0]", Reason::TomlTypeNotMapped));
-        assert_eq!(read_toml(b"a = 1\na = 2\n").unwrap_err().reason, Reason::Malformed);
+        assert_eq!(
+            (date.field.as_str(), date.reason),
+            ("a[0]", Reason::TomlTypeNotMapped)
+        );
+        assert_eq!(
+            read_toml(b"a = 1\na = 2\n").unwrap_err().reason,
+            Reason::Malformed
+        );
         assert_eq!(read_toml(b"\xff").unwrap_err().reason, Reason::Malformed);
-        let deep = format!("a = {}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
-        assert_eq!(read_toml(deep.as_bytes()).unwrap_err().reason, Reason::Malformed);
-        let deep_tables: String = (0..MAX_DEPTH + 1).map(|i| format!("[{}]\n", vec!["t"; i + 1].join("."))).collect();
-        assert_eq!(read_toml(deep_tables.as_bytes()).unwrap_err().reason, Reason::Malformed);
+        let deep = format!(
+            "a = {}{}",
+            "[".repeat(MAX_DEPTH + 1),
+            "]".repeat(MAX_DEPTH + 1)
+        );
+        assert_eq!(
+            read_toml(deep.as_bytes()).unwrap_err().reason,
+            Reason::Malformed
+        );
+        let deep_tables: String = (0..MAX_DEPTH + 1)
+            .map(|i| format!("[{}]\n", vec!["t"; i + 1].join(".")))
+            .collect();
+        assert_eq!(
+            read_toml(deep_tables.as_bytes()).unwrap_err().reason,
+            Reason::Malformed
+        );
     }
 }

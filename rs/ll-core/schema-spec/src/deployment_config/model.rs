@@ -106,7 +106,10 @@ impl ParserSettings {
                 Value::strs(self.trusted_query_hashes.iter().cloned()),
             ),
             ("queryMatchLimit", Value::Int(self.query_match_limit.into())),
-            ("queryProgressBudget", Value::Int(self.query_progress_budget)),
+            (
+                "queryProgressBudget",
+                Value::Int(self.query_progress_budget),
+            ),
         ])
     }
 }
@@ -125,8 +128,14 @@ pub struct HeadSettings {
 impl HeadSettings {
     fn value(&self) -> Value {
         Value::object([
-            ("signingKey", Value::opt(self.signing_key.as_ref(), SecretRef::value)),
-            ("trustedKeys", Value::strs(self.trusted_keys.iter().cloned())),
+            (
+                "signingKey",
+                Value::opt(self.signing_key.as_ref(), SecretRef::value),
+            ),
+            (
+                "trustedKeys",
+                Value::strs(self.trusted_keys.iter().cloned()),
+            ),
             ("requireSignature", Value::Bool(self.require_signature)),
         ])
     }
@@ -212,8 +221,14 @@ impl DaemonConfig {
                 ]),
             ),
             ("control", Value::str(&self.control)),
-            ("mount", Value::opt(self.mount.as_ref(), MountSettings::value)),
-            ("source", Value::opt(self.source.as_ref(), SourceSettings::value)),
+            (
+                "mount",
+                Value::opt(self.mount.as_ref(), MountSettings::value),
+            ),
+            (
+                "source",
+                Value::opt(self.source.as_ref(), SourceSettings::value),
+            ),
             (
                 "shutdownAfterSeconds",
                 Value::opt(self.shutdown_after_seconds, Value::Int),
@@ -241,7 +256,10 @@ impl DaemonConfig {
     pub fn loosenings(&self) -> Vec<(&'static str, &'static str)> {
         let mut out = Vec::new();
         if self.mcp.no_auth {
-            out.push(("mcp.noAuth", "the ADR-0022 token gate is off on every MCP listener"));
+            out.push((
+                "mcp.noAuth",
+                "the ADR-0022 token gate is off on every MCP listener",
+            ));
         }
         if self.mcp.http.as_ref().is_some_and(|h| h.allow_public) {
             out.push((
@@ -384,7 +402,10 @@ pub const EXECUTION_ARENA_SIZE_MIB: u64 = 64;
 impl ExecutionDaemonConfig {
     fn members(&self) -> BTreeMap<String, Value> {
         let Value::Object(members) = Value::object([
-            ("arena", Value::object([("path", Value::str(&self.arena_path))])),
+            (
+                "arena",
+                Value::object([("path", Value::str(&self.arena_path))]),
+            ),
             ("control", Value::str(&self.control)),
             ("stateDir", Value::str(&self.state_dir)),
             ("cas", self.cas.value()),
@@ -396,7 +417,10 @@ impl ExecutionDaemonConfig {
                 Value::object([("enabled", Value::Bool(self.cdc_enabled))]),
             ),
             ("evidence", self.evidence.value()),
-            ("source", Value::opt(self.source.as_ref(), SourceSettings::value)),
+            (
+                "source",
+                Value::opt(self.source.as_ref(), SourceSettings::value),
+            ),
             ("parser", self.parser.value()),
             ("head", self.head.value()),
             ("diagnostics", self.diagnostics.value()),
@@ -524,7 +548,10 @@ impl WorkerSettings {
     fn value(&self) -> Value {
         Value::object([
             ("path", Value::str(&self.path)),
-            ("runtimeFiles", Value::strs(self.runtime_files.iter().cloned())),
+            (
+                "runtimeFiles",
+                Value::strs(self.runtime_files.iter().cloned()),
+            ),
             ("readyTimeoutMs", Value::Int(self.ready_timeout_ms)),
         ])
     }
@@ -696,7 +723,10 @@ impl SignHelperConfig {
                     ),
                 ]),
             ),
-            ("resolveAllow", Value::strs(self.resolve_allow.iter().cloned())),
+            (
+                "resolveAllow",
+                Value::strs(self.resolve_allow.iter().cloned()),
+            ),
             (
                 "resolveCache",
                 Value::object([

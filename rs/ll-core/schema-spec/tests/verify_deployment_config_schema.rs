@@ -24,8 +24,10 @@ fn spec_dir() -> PathBuf {
 }
 
 fn read_json(path: &Path) -> Value {
-    serde_json::from_str(&fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    serde_json::from_str(
+        &fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 const COMMON_REF: &str = "common.schema.json#/$defs/";
@@ -81,7 +83,8 @@ fn generate_schema(kind: Kind) -> String {
         }
         let mut more = BTreeSet::new();
         let def = localize(
-            defs.get(&name).unwrap_or_else(|| panic!("no common def {name}")),
+            defs.get(&name)
+                .unwrap_or_else(|| panic!("no common def {name}")),
             &mut more,
         );
         inlined.insert(name, def);
@@ -115,9 +118,17 @@ fn published_artifacts_are_generated_from_the_sources() {
     let regen = std::env::var_os("LEYLINE_REGEN_DEPLOYMENT_CONFIG").is_some();
     let mut outputs: Vec<(String, String)> = Kind::ALL
         .iter()
-        .map(|k| (format!("leyline-{}.schema.json", k.short_name()), generate_schema(*k)))
+        .map(|k| {
+            (
+                format!("leyline-{}.schema.json", k.short_name()),
+                generate_schema(*k),
+            )
+        })
         .collect();
-    outputs.push(("leyline-removed-variables.json".into(), generate_removed_variables()));
+    outputs.push((
+        "leyline-removed-variables.json".into(),
+        generate_removed_variables(),
+    ));
     for (name, want) in outputs {
         let path = published_path(&name);
         if regen {
@@ -201,7 +212,11 @@ fn compare_defaults(
     };
     let mut compared = 0;
     for (key, prop) in props {
-        let field = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+        let field = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
         let given = input.and_then(|i| i.get(key));
         let value = &resolved[key];
         let prop_d = deref(schema, prop);
@@ -209,12 +224,16 @@ fn compare_defaults(
             let default = prop.get("default").or_else(|| prop_d.get("default"));
             match default {
                 Some(d) if !d.is_object() => {
-                    assert_eq!(value, d, "{field}: the resolver's default differs from the schema's");
+                    assert_eq!(
+                        value, d,
+                        "{field}: the resolver's default differs from the schema's"
+                    );
                     compared += 1;
                 }
                 _ => {}
             }
-            if prop.get("x-leyline-default").is_some() || prop_d.get("x-leyline-default").is_some() {
+            if prop.get("x-leyline-default").is_some() || prop_d.get("x-leyline-default").is_some()
+            {
                 assert!(!value.is_null(), "{field}: a host default resolved to null");
                 compared += 1;
             }
@@ -240,7 +259,10 @@ fn resolve_value(kind: Kind, input: &Value) -> Value {
 fn verify_deployment_config_defaults() {
     let api = deployment_config::API_VERSION;
     let documents = [
-        (Kind::Daemon, json!({"apiVersion": api, "kind": "DaemonConfig"})),
+        (
+            Kind::Daemon,
+            json!({"apiVersion": api, "kind": "DaemonConfig"}),
+        ),
         (
             Kind::Daemon,
             json!({"apiVersion": api, "kind": "DaemonConfig", "mount": {"path": "/m"},
@@ -280,7 +302,12 @@ fn verify_deployment_config_defaults() {
 fn every_optional_field_states_a_default() {
     fn walk(schema: &Value, node: &Value, path: &str, missing: &mut Vec<String>) {
         let node = deref(schema, node);
-        for branch in node.get("oneOf").and_then(Value::as_array).into_iter().flatten() {
+        for branch in node
+            .get("oneOf")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             walk(schema, branch, path, missing);
         }
         let Some(props) = node.get("properties").and_then(Value::as_object) else {
@@ -293,7 +320,11 @@ fn every_optional_field_states_a_default() {
             .map(|r| r.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         for (key, prop) in props {
-            let field = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+            let field = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
             let d = deref(schema, prop);
             let stated = ["default", "x-leyline-default"]
                 .iter()
@@ -310,7 +341,11 @@ fn every_optional_field_states_a_default() {
         walk(&schema, &schema, "", &mut missing);
         // `evidence.unverified` and `evidence.verified` sit in a union; the
         // branches carry no default by design.
-        assert!(missing.is_empty(), "{}: no default stated for {missing:?}", kind.name());
+        assert!(
+            missing.is_empty(),
+            "{}: no default stated for {missing:?}",
+            kind.name()
+        );
     }
 }
 
@@ -319,11 +354,25 @@ fn every_optional_field_states_a_default() {
 fn fail_closed_defaults(schema: &Value) -> Vec<(String, Value)> {
     fn walk(schema: &Value, node: &Value, path: &str, out: &mut Vec<(String, Value)>) {
         let node = deref(schema, node);
-        for branch in node.get("oneOf").and_then(Value::as_array).into_iter().flatten() {
+        for branch in node
+            .get("oneOf")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             walk(schema, branch, path, out);
         }
-        for (key, prop) in node.get("properties").and_then(Value::as_object).into_iter().flatten() {
-            let field = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+        for (key, prop) in node
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let field = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
             if prop.get("x-leyline-fail-closed") == Some(&json!(true)) {
                 out.push((field.clone(), prop["default"].clone()));
             }
@@ -344,7 +393,10 @@ fn fail_closed_violations(baseline: &Value, kind: Kind, schema: &Value) -> Vec<S
     let pinned = &baseline["kinds"][kind.name()];
     for (field, default) in fail_closed_defaults(schema) {
         let Some(entry) = pinned.get(&field) else {
-            out.push(format!("{}: {field} is fail-closed but has no baseline", kind.name()));
+            out.push(format!(
+                "{}: {field} is fail-closed but has no baseline",
+                kind.name()
+            ));
             continue;
         };
         if entry["default"] != default {
@@ -378,9 +430,17 @@ fn fail_closed_defaults_never_loosen_within_v1() {
         assert!(violations.is_empty(), "{violations:#?}");
         total += fail_closed_defaults(&schema).len();
         let pinned = baseline["kinds"][kind.name()].as_object().unwrap();
-        assert_eq!(pinned.len(), fail_closed_defaults(&schema).len(), "{}: stale baseline entry", kind.name());
+        assert_eq!(
+            pinned.len(),
+            fail_closed_defaults(&schema).len(),
+            "{}: stale baseline entry",
+            kind.name()
+        );
     }
-    assert_eq!(total, 5, "mcp.noAuth, mcp.http.allowPublic, backend.microVm.tsiHijackInet, auth.required, signAllow.required");
+    assert_eq!(
+        total, 5,
+        "mcp.noAuth, mcp.http.allowPublic, backend.microVm.tsiHijackInet, auth.required, signAllow.required"
+    );
 
     // A fixture whose fail-closed default loosened fails the gate.
     let mut loosened: Value = serde_json::from_str(published_schema(Kind::Daemon)).unwrap();
@@ -390,5 +450,8 @@ fn fail_closed_defaults_never_loosen_within_v1() {
     assert!(violations[0].contains("loosened"), "{violations:?}");
     let mut loosened: Value = serde_json::from_str(published_schema(Kind::SignHelper)).unwrap();
     loosened["properties"]["auth"]["properties"]["required"]["default"] = json!(false);
-    assert_eq!(fail_closed_violations(&baseline, Kind::SignHelper, &loosened).len(), 1);
+    assert_eq!(
+        fail_closed_violations(&baseline, Kind::SignHelper, &loosened).len(),
+        1
+    );
 }

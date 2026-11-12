@@ -128,7 +128,10 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
-        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
     }
 
     #[test]
@@ -136,16 +139,25 @@ mod tests {
         let list = removed_variables();
         assert_eq!(list.len(), 19);
         assert!(list.windows(2).all(|w| w[0].name < w[1].name));
-        assert!(list.iter().any(|v| v.name == "LEYLINE_PROFILE" && v.replacement == "diagnostics.profile"));
+        assert!(
+            list.iter()
+                .any(|v| v.name == "LEYLINE_PROFILE" && v.replacement == "diagnostics.profile")
+        );
         for seam in TEST_SEAM_VARIABLES {
-            assert!(list.iter().all(|v| v.name != *seam), "a test seam is not removed");
+            assert!(
+                list.iter().all(|v| v.name != *seam),
+                "a test seam is not removed"
+            );
         }
         assert!(list.iter().all(|v| v.name != "LEYLINE_INSTALL_DIR"));
     }
 
     #[test]
     fn every_offender_is_named_with_its_key() {
-        assert_eq!(check_removed_environment(env(&[("PATH", "/bin"), ("HOME", "/h")])), Ok(()));
+        assert_eq!(
+            check_removed_environment(env(&[("PATH", "/bin"), ("HOME", "/h")])),
+            Ok(())
+        );
         let err = check_removed_environment(env(&[
             ("LLO_TRUSTED_QUERY_HASHES", "x"),
             ("PATH", "/bin"),
@@ -154,8 +166,15 @@ mod tests {
         ]))
         .unwrap_err();
         assert_eq!(
-            err.offenders.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
-            ["KEYCHAIN_ACCOUNT", "LEYLINE_PROFILE", "LLO_TRUSTED_QUERY_HASHES"]
+            err.offenders
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "KEYCHAIN_ACCOUNT",
+                "LEYLINE_PROFILE",
+                "LLO_TRUSTED_QUERY_HASHES"
+            ]
         );
         assert_eq!(
             err.message("leyline"),
@@ -170,9 +189,16 @@ mod tests {
 
     #[test]
     fn test_seams_are_reported_not_refused() {
-        let vars = env(&[("LLO_INJECTIONS_SCM", "1"), ("LLO_EXTRACTION_EPOCH", "9"), ("X", "")]);
+        let vars = env(&[
+            ("LLO_INJECTIONS_SCM", "1"),
+            ("LLO_EXTRACTION_EPOCH", "9"),
+            ("X", ""),
+        ]);
         assert_eq!(check_removed_environment(vars.clone()), Ok(()));
-        assert_eq!(test_seams_set(vars), ["LLO_EXTRACTION_EPOCH", "LLO_INJECTIONS_SCM"]);
+        assert_eq!(
+            test_seams_set(vars),
+            ["LLO_EXTRACTION_EPOCH", "LLO_INJECTIONS_SCM"]
+        );
         assert!(test_seams_set(env(&[])).is_empty());
     }
 
@@ -191,7 +217,10 @@ mod tests {
         }
         assert_eq!(
             parse_list(b"{\"variables\": [{\"name\": \"A\", \"replacement\": \"b\"}]}"),
-            Some(vec![RemovedVariable { name: "A".into(), replacement: "b".into() }])
+            Some(vec![RemovedVariable {
+                name: "A".into(),
+                replacement: "b".into()
+            }])
         );
     }
 }

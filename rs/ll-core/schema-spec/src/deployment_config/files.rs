@@ -97,11 +97,7 @@ pub fn read_secret_file_if_present(
 /// against the working directory.
 pub fn read_config_file(path: &Path) -> Result<Vec<u8>, ConfigRefusal> {
     let absolute = std::path::absolute(path).map_err(|e| {
-        ConfigRefusal::new(
-            "",
-            Reason::Unreadable,
-            format!("{}: {e}", path.display()),
-        )
+        ConfigRefusal::new("", Reason::Unreadable, format!("{}: {e}", path.display()))
     })?;
     read_checked("", &absolute, FileRule::Document)?.ok_or_else(|| {
         ConfigRefusal::new(
@@ -131,13 +127,22 @@ pub fn read_checked(
     imp::read(field, path, rule)
 }
 
-fn split(field: &str, path: &Path, rule: FileRule) -> Result<(PathBuf, std::ffi::OsString), ConfigRefusal> {
+fn split(
+    field: &str,
+    path: &Path,
+    rule: FileRule,
+) -> Result<(PathBuf, std::ffi::OsString), ConfigRefusal> {
     match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) if path.is_absolute() => Ok((parent.to_path_buf(), name.to_owned())),
+        (Some(parent), Some(name)) if path.is_absolute() => {
+            Ok((parent.to_path_buf(), name.to_owned()))
+        }
         _ => Err(ConfigRefusal::new(
             field,
             rule.reason(),
-            format!("{} does not name a file in an absolute directory", path.display()),
+            format!(
+                "{} does not name a file in an absolute directory",
+                path.display()
+            ),
         )),
     }
 }
@@ -155,12 +160,24 @@ mod imp {
         CString::new(s.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
     }
 
-    fn openat(dir: Option<&OwnedFd>, name: &OsStr, flags: libc::c_int, mode: libc::mode_t) -> io::Result<OwnedFd> {
+    fn openat(
+        dir: Option<&OwnedFd>,
+        name: &OsStr,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> io::Result<OwnedFd> {
         let name = cstr(name)?;
         let dirfd = dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
         // SAFETY: `name` is a NUL-terminated C string that outlives the call;
         // `dirfd` is AT_FDCWD or a descriptor `dir` owns.
-        let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags | libc::O_CLOEXEC, mode as libc::c_uint) };
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -201,7 +218,11 @@ mod imp {
             } else {
                 rule.reason()
             };
-            ConfigRefusal::new(field, reason, format!("directory {}: {e}", parent.display()))
+            ConfigRefusal::new(
+                field,
+                reason,
+                format!("directory {}: {e}", parent.display()),
+            )
         })?;
         let me = euid();
         let mut sticky_writable = false;
@@ -220,7 +241,12 @@ mod imp {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
                 0,
             )
-            .map_err(|e| refuse(format!("directory {} cannot be opened without following a symlink: {e}", shown.display())))?;
+            .map_err(|e| {
+                refuse(format!(
+                    "directory {} cannot be opened without following a symlink: {e}",
+                    shown.display()
+                ))
+            })?;
             let st = fstat(&fd).map_err(|e| refuse(format!("{}: {e}", shown.display())))?;
             let mode = st.st_mode as u32;
             if st.st_uid != 0 && st.st_uid != me {
@@ -248,7 +274,11 @@ mod imp {
         })
     }
 
-    pub(super) fn read(field: &str, path: &Path, rule: FileRule) -> Result<Option<Vec<u8>>, ConfigRefusal> {
+    pub(super) fn read(
+        field: &str,
+        path: &Path,
+        rule: FileRule,
+    ) -> Result<Option<Vec<u8>>, ConfigRefusal> {
         let (parent, name) = split(field, path, rule)?;
         let refuse = |why: String| ConfigRefusal::new(field, rule.reason(), why);
         let walk = walk(field, &parent, rule)?;
@@ -275,7 +305,11 @@ mod imp {
                 "{} is owned by uid {}, not this user{}",
                 path.display(),
                 st.st_uid,
-                if walk.sticky_writable { " (in a shared sticky directory)" } else { "" }
+                if walk.sticky_writable {
+                    " (in a shared sticky directory)"
+                } else {
+                    ""
+                }
             )));
         }
         if mode & rule.forbidden_bits() != 0 {
@@ -347,10 +381,18 @@ mod imp {
     use super::*;
 
     fn unsupported(field: &str) -> ConfigRefusal {
-        ConfigRefusal::new(field, Reason::UnsupportedOs, "the D4 file rules need a Unix host")
+        ConfigRefusal::new(
+            field,
+            Reason::UnsupportedOs,
+            "the D4 file rules need a Unix host",
+        )
     }
 
-    pub(super) fn read(field: &str, _: &Path, _: FileRule) -> Result<Option<Vec<u8>>, ConfigRefusal> {
+    pub(super) fn read(
+        field: &str,
+        _: &Path,
+        _: FileRule,
+    ) -> Result<Option<Vec<u8>>, ConfigRefusal> {
         Err(unsupported(field))
     }
 
@@ -391,7 +433,11 @@ mod tests {
         for mode in [0o640, 0o604, 0o644, 0o700 | 0o010] {
             write(&f, b"seed", mode);
             let e = read_secret_file("head.signingKey", s(&f)).unwrap_err();
-            assert_eq!((e.field.as_str(), e.reason), ("head.signingKey", Reason::SecretFilePermissions), "{mode:o}");
+            assert_eq!(
+                (e.field.as_str(), e.reason),
+                ("head.signingKey", Reason::SecretFilePermissions),
+                "{mode:o}"
+            );
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
     }
@@ -407,7 +453,10 @@ mod tests {
         }
         for mode in [0o664, 0o646] {
             write(&f, b"{}", mode);
-            assert_eq!(read_config_file(&f).unwrap_err().reason, Reason::ConfigFilePermissions);
+            assert_eq!(
+                read_config_file(&f).unwrap_err().reason,
+                Reason::ConfigFilePermissions
+            );
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let e = read_config_file(&d.path().join("missing.json")).unwrap_err();
@@ -424,8 +473,14 @@ mod tests {
         write(&target, b"seed", 0o600);
         let link = d.path().join("link");
         symlink(&target, &link).unwrap();
-        assert_eq!(read_secret_file("f", s(&link)).unwrap_err().reason, Reason::SecretFilePermissions);
-        assert_eq!(read_config_file(&link).unwrap_err().reason, Reason::ConfigFilePermissions);
+        assert_eq!(
+            read_secret_file("f", s(&link)).unwrap_err().reason,
+            Reason::SecretFilePermissions
+        );
+        assert_eq!(
+            read_config_file(&link).unwrap_err().reason,
+            Reason::ConfigFilePermissions
+        );
     }
 
     #[test]
@@ -439,10 +494,15 @@ mod tests {
         symlink(&real, &alias).unwrap();
         // The parent is realpath'd: a symlinked directory (macOS /tmp) is
         // accepted when the directories it resolves to pass.
-        assert_eq!(read_secret_file("f", s(&alias.join("key"))).unwrap(), b"seed");
+        assert_eq!(
+            read_secret_file("f", s(&alias.join("key"))).unwrap(),
+            b"seed"
+        );
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(
-            read_secret_file("f", s(&alias.join("key"))).unwrap_err().reason,
+            read_secret_file("f", s(&alias.join("key")))
+                .unwrap_err()
+                .reason,
             Reason::SecretFilePermissions,
             "the resolved directory's group write bit is checked"
         );
@@ -455,10 +515,15 @@ mod tests {
         std::fs::create_dir(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
         write(&shared.join("key"), b"seed", 0o600);
-        assert_eq!(read_secret_file("f", s(&shared.join("key"))).unwrap(), b"seed");
+        assert_eq!(
+            read_secret_file("f", s(&shared.join("key"))).unwrap(),
+            b"seed"
+        );
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(
-            read_secret_file("f", s(&shared.join("key"))).unwrap_err().reason,
+            read_secret_file("f", s(&shared.join("key")))
+                .unwrap_err()
+                .reason,
             Reason::SecretFilePermissions
         );
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -468,20 +533,37 @@ mod tests {
     fn missing_empty_and_non_regular_secrets() {
         let d = dir();
         let missing = d.path().join("missing");
-        assert_eq!(read_secret_file("f", s(&missing)).unwrap_err().reason, Reason::HostCheckFailed);
+        assert_eq!(
+            read_secret_file("f", s(&missing)).unwrap_err().reason,
+            Reason::HostCheckFailed
+        );
         assert_eq!(read_secret_file_if_present("f", s(&missing)).unwrap(), None);
         let empty = d.path().join("empty");
         write(&empty, b"", 0o600);
-        assert_eq!(read_secret_file("f", s(&empty)).unwrap_err().reason, Reason::SecretFileInvalid);
-        assert_eq!(read_secret_file_if_present("f", s(&empty)).unwrap_err().reason, Reason::SecretFileInvalid);
+        assert_eq!(
+            read_secret_file("f", s(&empty)).unwrap_err().reason,
+            Reason::SecretFileInvalid
+        );
+        assert_eq!(
+            read_secret_file_if_present("f", s(&empty))
+                .unwrap_err()
+                .reason,
+            Reason::SecretFileInvalid
+        );
         let sub = d.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
-        assert_eq!(read_secret_file("f", s(&sub)).unwrap_err().reason, Reason::SecretFilePermissions);
+        assert_eq!(
+            read_secret_file("f", s(&sub)).unwrap_err().reason,
+            Reason::SecretFilePermissions
+        );
         assert_eq!(
             read_secret_file("f", "relative/key").unwrap_err().reason,
             Reason::SecretFilePermissions
         );
-        assert_eq!(read_secret_file("f", "/").unwrap_err().reason, Reason::SecretFilePermissions);
+        assert_eq!(
+            read_secret_file("f", "/").unwrap_err().reason,
+            Reason::SecretFilePermissions
+        );
     }
 
     #[test]
@@ -491,18 +573,35 @@ mod tests {
         assert!(create_secret_file("mcp.tokenFile", s(&token), b"t0k").unwrap());
         let meta = std::fs::metadata(&token).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(token.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
-        assert!(!create_secret_file("mcp.tokenFile", s(&token), b"other").unwrap(), "exists: not rewritten");
+        assert_eq!(
+            std::fs::metadata(token.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(
+            !create_secret_file("mcp.tokenFile", s(&token), b"other").unwrap(),
+            "exists: not rewritten"
+        );
         assert_eq!(read_secret_file("f", s(&token)).unwrap(), b"t0k");
         let victim = d.path().join("victim");
         write(&victim, b"keep", 0o600);
         let planted = d.path().join("leyline/planted");
         symlink(&victim, &planted).unwrap();
         assert!(!create_secret_file("mcp.tokenFile", s(&planted), b"x").unwrap());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"keep", "never written through");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep",
+            "never written through"
+        );
         let dangling = d.path().join("leyline/dangling");
         symlink(d.path().join("nowhere"), &dangling).unwrap();
         assert!(!create_secret_file("mcp.tokenFile", s(&dangling), b"x").unwrap());
-        assert!(!d.path().join("nowhere").exists(), "a dangling symlink is not created through");
+        assert!(
+            !d.path().join("nowhere").exists(),
+            "a dangling symlink is not created through"
+        );
     }
 }

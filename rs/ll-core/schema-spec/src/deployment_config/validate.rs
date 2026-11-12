@@ -59,7 +59,11 @@ impl<'j> Obj<'j> {
                         Reason::UnknownKey,
                         format!(
                             "not a key of {}",
-                            if field.is_empty() { "the document" } else { field }
+                            if field.is_empty() {
+                                "the document"
+                            } else {
+                                field
+                            }
                         ),
                     );
                 }
@@ -76,7 +80,10 @@ impl<'j> Obj<'j> {
     }
 
     fn get(&self, key: &str) -> Option<&'j Json> {
-        self.members.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+        self.members
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
     }
 
     /// A field whose default is not `null`: absent gives `None` (use the
@@ -104,7 +111,11 @@ impl<'j> Obj<'j> {
     fn required(&self, key: &str) -> R<&'j Json> {
         match self.non_null(key)? {
             Some(v) => Ok(v),
-            None => refuse(&self.child(key), Reason::MissingKey, "a required key is absent"),
+            None => refuse(
+                &self.child(key),
+                Reason::MissingKey,
+                "a required key is absent",
+            ),
         }
     }
 
@@ -217,8 +228,7 @@ pub(crate) fn is_label(s: &str) -> bool {
     let b = s.as_bytes();
     (1..=64).contains(&b.len())
         && b[0].is_ascii_alphanumeric()
-        && b
-            .iter()
+        && b.iter()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
@@ -267,7 +277,11 @@ fn url_prefix(field: &str, value: &Json) -> R<String> {
     if is_url_prefix(s) {
         Ok(s.to_owned())
     } else {
-        refuse(field, Reason::BadUrlPrefix, format!("{s:?} is not a URL prefix"))
+        refuse(
+            field,
+            Reason::BadUrlPrefix,
+            format!("{s:?} is not a URL prefix"),
+        )
     }
 }
 
@@ -302,7 +316,11 @@ fn ip_text(field: &str, s: &str) -> R<IpAddr> {
             Reason::NonCanonicalAddress,
             format!("{s:?}: an IPv4 octet has a leading zero"),
         ),
-        None => refuse(field, Reason::BadAddress, format!("{s:?} is not an IP literal")),
+        None => refuse(
+            field,
+            Reason::BadAddress,
+            format!("{s:?} is not an IP literal"),
+        ),
     }
 }
 
@@ -557,7 +575,11 @@ fn secret(field: &str, value: &Json, host: &HostFacts) -> R<SecretRef> {
 fn union<'j>(field: &str, value: &'j Json, allowed: &[&str]) -> R<(&'j str, &'j Json)> {
     let obj = Obj::new(field, value, allowed)?;
     match obj.members.as_slice() {
-        [] => refuse(field, Reason::UnionEmpty, format!("name one of {allowed:?}")),
+        [] => refuse(
+            field,
+            Reason::UnionEmpty,
+            format!("name one of {allowed:?}"),
+        ),
         [one] => Ok(*one),
         _ => refuse(
             field,
@@ -584,7 +606,11 @@ fn top_level<'j>(members: &'j [(Str, Json)], key: &str) -> R<Option<&'j Json>> {
     let mut found = members.iter().filter(|(k, _)| k.raw == key.as_bytes());
     let first = found.next().map(|(_, v)| v);
     if found.next().is_some() {
-        return refuse(key, Reason::DuplicateKey, "a key appears twice in one object");
+        return refuse(
+            key,
+            Reason::DuplicateKey,
+            "a key appears twice in one object",
+        );
     }
     Ok(first)
 }
@@ -658,7 +684,11 @@ fn source(top: &Obj, host: &HostFacts) -> R<Option<SourceSettings>> {
 fn parser(top: &Obj) -> R<ParserSettings> {
     let obj = top.section(
         "parser",
-        &["trustedQueryHashes", "queryMatchLimit", "queryProgressBudget"],
+        &[
+            "trustedQueryHashes",
+            "queryMatchLimit",
+            "queryProgressBudget",
+        ],
     )?;
     let trusted_query_hashes = match obj.non_null("trustedQueryHashes")? {
         Some(v) => set(&obj.child("trustedQueryHashes"), v, 0, query_hash)?,
@@ -810,7 +840,11 @@ fn daemon(tree: &Json, host: &HostFacts) -> R<DaemonConfig> {
         Some(v) => secret("mcp.tokenFile", v, host)?,
         None => SecretRef {
             file: under(
-                &host_dir("mcp.tokenFile", "the platform data directory", host.data_dir.as_deref())?,
+                &host_dir(
+                    "mcp.tokenFile",
+                    "the platform data directory",
+                    host.data_dir.as_deref(),
+                )?,
                 "/leyline/daemon.token",
             ),
         },
@@ -990,7 +1024,11 @@ fn execution(tree: &Json, host: &HostFacts) -> R<ExecutionDaemonConfig> {
     let cdc = top.section("cdc", &["enabled"])?;
     let cdc_enabled = bool_or(&cdc, "enabled", false)?;
 
-    let (branch, body) = union("evidence", top.required("evidence")?, &["unverified", "verified"])?;
+    let (branch, body) = union(
+        "evidence",
+        top.required("evidence")?,
+        &["unverified", "verified"],
+    )?;
     let evidence = if branch == "unverified" {
         Obj::new("evidence.unverified", body, &[])?;
         EvidenceSettings::Unverified
@@ -1099,7 +1137,11 @@ fn sign_helper(tree: &Json, host: &HostFacts) -> R<SignHelperConfig> {
         for (key, prefixes) in members {
             let field = join("signAllow.callers", &key.display());
             if seen.contains(&key.raw.as_slice()) {
-                return refuse(&field, Reason::DuplicateKey, "a key appears twice in one object");
+                return refuse(
+                    &field,
+                    Reason::DuplicateKey,
+                    "a key appears twice in one object",
+                );
             }
             seen.push(&key.raw);
             let name = clean(&field, key)?;
@@ -1253,12 +1295,27 @@ mod tests {
 
     #[test]
     fn ip_spellings() {
-        assert_eq!(ip_text("f", "127.0.0.1").unwrap(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(ip_text("f", "::1").unwrap(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            ip_text("f", "127.0.0.1").unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            ip_text("f", "::1").unwrap(),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
         assert!(ip_text("f", "0.0.0.0").is_ok());
-        assert_eq!(reason(ip_text("f", "127.000.0.1")), Reason::NonCanonicalAddress);
-        assert_eq!(reason(ip_text("f", "0:0:0:0:0:0:0:1")), Reason::NonCanonicalAddress);
-        assert_eq!(reason(ip_text("f", "::FFFF:1.2.3.4")), Reason::NonCanonicalAddress);
+        assert_eq!(
+            reason(ip_text("f", "127.000.0.1")),
+            Reason::NonCanonicalAddress
+        );
+        assert_eq!(
+            reason(ip_text("f", "0:0:0:0:0:0:0:1")),
+            Reason::NonCanonicalAddress
+        );
+        assert_eq!(
+            reason(ip_text("f", "::FFFF:1.2.3.4")),
+            Reason::NonCanonicalAddress
+        );
         assert_eq!(reason(ip_text("f", "localhost")), Reason::BadAddress);
         assert_eq!(reason(ip_text("f", "256.0.0.1")), Reason::BadAddress);
         assert_eq!(reason(ip_text("f", "1.2.3")), Reason::BadAddress);
@@ -1275,13 +1332,39 @@ mod tests {
         assert_eq!(ok("127.0.0.1:8786").to_string(), "127.0.0.1:8786");
         assert_eq!(ok("[::1]:1").to_string(), "[::1]:1");
         assert_eq!(ok("127.0.0.2:65535").port(), 65535);
-        assert_eq!(reason(socket("bind", &s("0.0.0.0:8786"))), Reason::BindNotLoopback);
-        assert_eq!(reason(socket("bind", &s("[::2]:8786"))), Reason::BindNotLoopback);
-        assert_eq!(reason(socket("bind", &s("127.0.0.1:0"))), Reason::OutOfRange);
-        assert_eq!(reason(socket("bind", &s("127.0.0.1:65536"))), Reason::OutOfRange);
-        assert_eq!(reason(socket("bind", &s("127.0.0.1:08786"))), Reason::NonCanonicalAddress);
-        assert_eq!(reason(socket("bind", &s("127.00.0.1:8786"))), Reason::NonCanonicalAddress);
-        for bad in ["127.0.0.1", "127.0.0.1:", "127.0.0.1:x", "::1:8786", "[127.0.0.1]:1", "[::1]8786", "a:1"] {
+        assert_eq!(
+            reason(socket("bind", &s("0.0.0.0:8786"))),
+            Reason::BindNotLoopback
+        );
+        assert_eq!(
+            reason(socket("bind", &s("[::2]:8786"))),
+            Reason::BindNotLoopback
+        );
+        assert_eq!(
+            reason(socket("bind", &s("127.0.0.1:0"))),
+            Reason::OutOfRange
+        );
+        assert_eq!(
+            reason(socket("bind", &s("127.0.0.1:65536"))),
+            Reason::OutOfRange
+        );
+        assert_eq!(
+            reason(socket("bind", &s("127.0.0.1:08786"))),
+            Reason::NonCanonicalAddress
+        );
+        assert_eq!(
+            reason(socket("bind", &s("127.00.0.1:8786"))),
+            Reason::NonCanonicalAddress
+        );
+        for bad in [
+            "127.0.0.1",
+            "127.0.0.1:",
+            "127.0.0.1:x",
+            "::1:8786",
+            "[127.0.0.1]:1",
+            "[::1]8786",
+            "a:1",
+        ] {
             assert_eq!(reason(socket("bind", &s(bad))), Reason::BadAddress, "{bad}");
         }
     }
@@ -1311,13 +1394,23 @@ mod tests {
             ..host()
         };
         assert_eq!(path("f", &s("~/a"), &root).unwrap(), "/a");
-        for home in [None, Some("rel"), Some("/a/"), Some("/a\u{2028}"), Some("/a/../b")] {
+        for home in [
+            None,
+            Some("rel"),
+            Some("/a/"),
+            Some("/a\u{2028}"),
+            Some("/a/../b"),
+        ] {
             let h = HostFacts {
                 home: home.map(Into::into),
                 ..host()
             };
             let e = path("f", &s("~/a"), &h).unwrap_err();
-            assert_eq!((e.field.as_str(), e.reason), ("f", Reason::BadHostDefault), "{home:?}");
+            assert_eq!(
+                (e.field.as_str(), e.reason),
+                ("f", Reason::BadHostDefault),
+                "{home:?}"
+            );
         }
         #[cfg(unix)]
         {
@@ -1350,9 +1443,15 @@ mod tests {
     #[test]
     fn state_dir_default_prefers_an_absolute_xdg_state_home() {
         let mut h = host();
-        assert_eq!(state_dir_default(&h).unwrap(), "/Users/fixture/.local/state/leyline");
+        assert_eq!(
+            state_dir_default(&h).unwrap(),
+            "/Users/fixture/.local/state/leyline"
+        );
         h.xdg_state_home = Some("relative".into());
-        assert_eq!(state_dir_default(&h).unwrap(), "/Users/fixture/.local/state/leyline");
+        assert_eq!(
+            state_dir_default(&h).unwrap(),
+            "/Users/fixture/.local/state/leyline"
+        );
         h.xdg_state_home = Some("/xdg/state".into());
         assert_eq!(state_dir_default(&h).unwrap(), "/xdg/state/leyline");
         h.xdg_state_home = Some("/xdg/state/".into());

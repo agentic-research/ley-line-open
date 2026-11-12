@@ -113,10 +113,22 @@ fn every_kind_vector_resolves_or_refuses_as_pinned() {
         let rejects = file["rejects"].as_array().unwrap();
         assert!(!cases.is_empty() && !rejects.is_empty(), "{file_name}");
         for case in cases {
-            check_accept(&file, kind, case, case["input"].as_str().unwrap(), syntax(case));
+            check_accept(
+                &file,
+                kind,
+                case,
+                case["input"].as_str().unwrap(),
+                syntax(case),
+            );
         }
         for case in rejects {
-            check_reject(&file, kind, case, case["input"].as_str().unwrap(), syntax(case));
+            check_reject(
+                &file,
+                kind,
+                case,
+                case["input"].as_str().unwrap(),
+                syntax(case),
+            );
         }
     }
 }
@@ -126,11 +138,23 @@ fn canonical_strings_hold() {
     let file = vectors("canonical-strings.json");
     for case in file["cases"].as_array().unwrap() {
         let kind = kind_of(case["kind"].as_str().unwrap());
-        check_accept(&file, kind, case, case["input"].as_str().unwrap(), Syntax::Json);
+        check_accept(
+            &file,
+            kind,
+            case,
+            case["input"].as_str().unwrap(),
+            Syntax::Json,
+        );
     }
     for case in file["rejects"].as_array().unwrap() {
         let kind = kind_of(case["kind"].as_str().unwrap());
-        check_reject(&file, kind, case, case["input"].as_str().unwrap(), Syntax::Json);
+        check_reject(
+            &file,
+            kind,
+            case,
+            case["input"].as_str().unwrap(),
+            Syntax::Json,
+        );
     }
     // The pinned list tells UTF-8 order from UTF-16 order: U+FF61 sorts
     // before U+1F600 here, where JavaScript's default sort puts it after.
@@ -145,12 +169,30 @@ fn toml_and_json_twins_resolve_to_the_same_bytes() {
     let file = vectors("toml-equivalence.json");
     for case in file["cases"].as_array().unwrap() {
         let kind = kind_of(case["kind"].as_str().unwrap());
-        check_accept(&file, kind, case, case["toml"].as_str().unwrap(), Syntax::Toml);
-        check_accept(&file, kind, case, case["json"].as_str().unwrap(), Syntax::Json);
+        check_accept(
+            &file,
+            kind,
+            case,
+            case["toml"].as_str().unwrap(),
+            Syntax::Toml,
+        );
+        check_accept(
+            &file,
+            kind,
+            case,
+            case["json"].as_str().unwrap(),
+            Syntax::Json,
+        );
     }
     for case in file["rejects"].as_array().unwrap() {
         let kind = kind_of(case["kind"].as_str().unwrap());
-        check_reject(&file, kind, case, case["toml"].as_str().unwrap(), Syntax::Toml);
+        check_reject(
+            &file,
+            kind,
+            case,
+            case["toml"].as_str().unwrap(),
+            Syntax::Toml,
+        );
     }
 }
 
@@ -183,11 +225,17 @@ fn the_published_schemas_agree_with_the_vectors() {
                 .as_bool()
                 .unwrap_or_else(|| panic!("{name} has no schemaRefuses"));
             let Ok(doc) = serde_json::from_str::<Value>(case["input"].as_str().unwrap()) else {
-                assert!(!refuses, "{name} is not JSON but claims the schema refuses it");
+                assert!(
+                    !refuses,
+                    "{name} is not JSON but claims the schema refuses it"
+                );
                 continue;
             };
             let valid = validator.validate(&doc).is_ok();
-            assert_eq!(!valid, refuses, "{file_name} {name}: schemaRefuses is {refuses}");
+            assert_eq!(
+                !valid, refuses,
+                "{file_name} {name}: schemaRefuses is {refuses}"
+            );
         }
     }
 }
@@ -216,7 +264,8 @@ fn the_python_reference_agrees() {
 /// resolve, for HOME=/Users/fixture on macOS, to the pinned resolved file.
 #[test]
 fn the_standalone_example_resolves_to_its_pinned_file() {
-    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/examples/deployment-config");
+    let examples =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/examples/deployment-config");
     let pinned = fs::read(examples.join("daemon-mount-macos.resolved.json")).unwrap();
     let host = HostFacts {
         home: Some("/Users/fixture".into()),
@@ -266,6 +315,9 @@ fn every_document_reason_has_a_vector() {
         if not_resolution.contains(reason) {
             continue;
         }
-        assert!(seen.contains(reason.code()), "no vector refuses with {reason}");
+        assert!(
+            seen.contains(reason.code()),
+            "no vector refuses with {reason}"
+        );
     }
 }

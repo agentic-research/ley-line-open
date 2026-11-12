@@ -1,12 +1,14 @@
 # ADR-0049 — Deployment configuration: one versioned document per daemon kind
 
-**Status:** Proposed (2026-11-12). Design only; nothing in "Decisions" ships. Acceptance is the
-owner's decision; see "Open questions". Targeted at v0.30.0.
+**Status:** Accepted (owner, 2026-11-12), not yet implemented. Nothing in "Decisions" ships;
+implementation is v0.30.0. The owner's answers are recorded under "Decided questions", and the
+cloister and mache consumer reviews of the proposed draft (`06cf7501`) are folded in.
 **Bead:** `ley-line-open-52c177`
-**Consumers:** cloister `cloister-55e6cd` (emits `leyline/execution-daemon-config/v1` and
-`leyline/daemon-config/v1` from `cluster.toml`), cloister `cloister-0bc3d5` (runs
-`leyline-sign-helper` from `leyline/sign-helper-config/v1`), mache `mache-0be425` (the managed
-daemon inherits removed variables from the user's environment). See D12.
+**Consumers:** cloister `cloister-55e6cd` (emits `ExecutionDaemonConfig` and `DaemonConfig`
+from `cluster.toml`, or resolves `ExecutionDaemonConfig` in-process through the library entry,
+D13), cloister `cloister-0bc3d5` (runs `leyline-sign-helper` from a `SignHelperConfig`), mache
+`mache-0be425` (the managed daemon inherits removed variables from the user's environment).
+See D12.
 **Related:** ADR-0019 (sign-only trust-anchor helper), ADR-0022 (MCP shared-secret token gate),
 ADR-0035 (policy in cloister, mechanism in LLO), ADR-0044 (workspace shares, read freshness),
 ADR-0046 (`connections/v1`, whose canonical-JSON rules D6 reuses), `schema-spec/LAYOUT.md`
@@ -15,6 +17,19 @@ ADR-0046 (`connections/v1`, whose canonical-JSON rules D6 reuses), `schema-spec/
 Tree cited throughout: `origin/integration` at `e6142dd4`.
 
 ---
+
+## Decided questions (owner, 2026-11-12)
+
+- **Q1 — Discriminator:** `apiVersion` + `kind` (D1).
+- **Q2 — Precedence:** the document or flags, never both (D3). Flags stay as an adapter.
+- **Q3 — `mount` in release binaries:** yes, in v0.30.0; the release-gate and asset changes are
+  in the implementation slice. `fuse` stays opt-in (it links libfuse).
+- **Q4 — `mcp.groups` default:** delegated to this ADR; the default stays "every group" (D5,
+  "Q4"), for the reason recorded there.
+- **Q5 — Sign helper:** deny by default: `auth.required` and `signAllow.required` default to
+  `true` (D5).
+- **Q6 — `configDigest` on the wire:** yes. It goes in the daemon's `status` reply, the
+  `RunReceipt` (`@17`) and the in-process `RunOutcome` (D6, "Where `configDigest` appears").
 
 ## Context: what ships today
 
@@ -59,17 +74,22 @@ default filled in (`--print-config`), so a consumer that writes only the fields 
 declarations for can test against exactly what will run. The document configures mechanism; it
 carries no per-run authority (ADR-0035).
 
-## Decisions (proposed)
+## Decisions (accepted, not yet implemented)
 
 ### D1 — Kinds: one document per daemon kind, one document per file
 
-Three kinds, one per long-running process that has flags:
+Three kinds, one per long-running process that has flags. Every document begins with the
+Kubernetes ComponentConfig pair (owner, Q1):
 
-| Kind (`version` value) | Process | Today's flags |
-|---|---|---|
-| `leyline/daemon-config/v1` | `leyline daemon` | 18 |
-| `leyline/execution-daemon-config/v1` | `leyline execution-daemon` | 23 |
-| `leyline/sign-helper-config/v1` | `leyline-sign-helper` | 5 |
+```json
+{"apiVersion": "config.leyline/v1", "kind": "DaemonConfig", ...}
+```
+
+| `kind` (with `apiVersion` `config.leyline/v1`) | Process | Today's flags | Short name in this ADR |
+|---|---|---|---|
+| `DaemonConfig` | `leyline daemon` | 18 | `daemon-config` |
+| `ExecutionDaemonConfig` | `leyline execution-daemon` | 23 | `execution-daemon-config` |
+| `SignHelperConfig` | `leyline-sign-helper` | 5 | `sign-helper-config` |
 
 **One file holds exactly one document.** A file with several documents (the Kubernetes `---`
 stream) needs a selection rule, lets one process read another's secret references, and gives a
@@ -90,10 +110,17 @@ name. The worker binaries
 (`leyline-native-worker`, `leyline-krun-worker`) are spawned by the execution daemon with argv
 it builds, and are not deployment-configured.
 
-**Discriminator.** One key, `version`, whose value names the kind and its major version, checked
-before anything else. This is the convention `cloister/connections/v1` and `confinement/v1`
-already use, and one string cannot disagree with itself the way an `apiVersion` and a `kind`
-can (see Q1).
+**Discriminator.** Two keys, checked before anything else and in this order: `apiVersion`
+(absent `missing-key`, not a string `wrong-type`, any value other than `config.leyline/v1`
+`bad-api-version`, naming the value found and the one this binary accepts), then `kind` (absent
+`missing-key`, not a string `wrong-type`, a value that is no kind `unknown-kind`, and a real kind
+for another process `wrong-kind`, naming both, so a `DaemonConfig` handed to the execution daemon
+is refused by name). The major version lives in `apiVersion` and covers all three kinds, so a
+v2 of one kind is a new `apiVersion` for that kind only (`config.leyline/v2` with the same
+`kind`); the pair is the discriminator, and a pair this binary does not know is refused. This
+departs from the single `version` string `connections/v1` uses, by the owner's choice (Q1):
+the pair is the convention operators know from Kubernetes, and refusing every unknown pair
+closes the "pair disagrees with itself" case the single string avoided.
 
 ### D2 — Schema home: JSON-first in schema-spec, with vectors
 
@@ -119,8 +146,14 @@ rs/ll-core/schema-spec/deployment-config/v1/
 │   ├── sign-helper-config-cases.json
 │   ├── canonical-strings.json         non-ASCII paths, astral-plane characters, empty lists and objects
 │   └── toml-equivalence.json          TOML text → the same resolved bytes as its JSON twin
+├── removed-variables.source.json     the D3 removed-variable list: name → replacement key (normative source)
 ├── ref-impl-py/
-│   └── deployment_config_v1.py        independent resolver-free canonical writer and digest (standard library only)
+│   └── deployment_config_v1.py        independent canonical writer and digest (standard library only)
+├── published/                         generated, checked in, drift-gated, released (below)
+│   ├── leyline-daemon-config.schema.json
+│   ├── leyline-execution-daemon-config.schema.json
+│   ├── leyline-sign-helper-config.schema.json
+│   └── leyline-removed-variables.json
 └── VECTORS.sha256
 ```
 
@@ -131,9 +164,11 @@ the digest are what a second runtime must reproduce) and must reach every pinned
 string and `configDigest`. `verify_deployment_config_digest` runs it, so the vectors are checked
 by two implementations, not confirmed by the writer that produced them.
 
-Rust types live in a `deployment_config` module of `leyline-schema-spec`, beside
-`connections`, so the parser, resolver, canonical writer and digest are tested against the
-vectors by the crate that owns them. Every default appears twice and must agree: as the JSON
+The document's Rust types, parser, resolver, canonical writer and digest live in a
+`deployment_config` module of `leyline-schema-spec`, beside `connections`. Turning a resolved
+`ExecutionDaemonConfig` into the structs the execution daemon builds is the public library entry
+in `leyline-runtime` (D13), and the execution vectors test that entry, so an embedder and the
+daemon share one semantics. Every default appears twice and must agree: as the JSON
 Schema `default` keyword, and in the resolver. A test (`verify_deployment_config_defaults`)
 resolves the empty document of each kind and compares every leaf with the schema's `default`.
 Where a default depends on the host (a path under `$HOME`, the mount backend per OS), the
@@ -164,6 +199,14 @@ cloister's llo-bump regenerates from a `git archive` of `schema-spec` with the p
 are checked in already generated, so llo-bump takes them from the same `git archive` of
 `schema-spec` at the release tag and pins each by SHA-256. The release asset is the same bytes,
 for consumers without a checkout. The SHA-256 pin is file integrity, not an LLO identity domain.
+
+`leyline-removed-variables.json` is published the same way (generated from
+`removed-variables.source.json`, checked in, drift-gated, embedded, released). It is the D3
+refusal list as data: `{"apiVersion": "config.leyline/v1", "variables": [{"name":
+"LEYLINE_PROFILE", "replacement": "diagnostics.profile"}, ...]}`, sorted by name. The
+binaries' refusal and the library's `check_removed_environment` (D13) read the embedded copy,
+and a consumer that spawns or embeds LLO derives its scrub or check list from the pinned file,
+never from a copy of its own.
 
 ### D3 — Precedence: the document or flags, never both
 
@@ -213,12 +256,26 @@ There is no third source and no merge:
   Without this, a deployment that still exports `LEYLINE_HEAD_SIGNING_KEY` would silently write
   unsigned heads after the upgrade, and one that exports `LEYLINE_SIGN_CALLER_TOKENS` would
   believe its helper authenticated callers. The refusal list is every variable in the Migration
-  table marked "removed". It is one check at process start, before subcommand dispatch, in both
-  binaries (`leyline` and `leyline-sign-helper`), so no entry point can miss it: `rebuild`,
-  `lsp` and `splice` reach parse paths too. A process that inherits its environment from a
-  user shell, such as the daemon mache spawns, refuses when that shell still exports a removed
-  variable; the refusal is on stderr, which mache already surfaces on a failed spawn
-  (`mache-e70109`), and the CHANGELOG fragment says so.
+  table marked "removed", published as data (`leyline-removed-variables.json`, D2). It is one
+  check at process start, before subcommand dispatch, in both binaries (`leyline` and
+  `leyline-sign-helper`), so no entry point can miss it: `rebuild`, `lsp` and `splice` reach
+  parse paths too. It runs before the config file is read and before any socket, lock, arena or
+  control file is touched, and the process exits at once with status 78. The message is on
+  stderr and names **every** offending variable, each with its replacement key, one per line,
+  not only the first:
+
+  ```text
+  leyline: refusing to start: removed environment variables are set (ADR-0049):
+    LEYLINE_PROFILE: use diagnostics.profile in the config document
+    LLO_TRUSTED_QUERY_HASHES: use parser.trustedQueryHashes in the config document
+  ```
+
+  A process that inherits its environment from a user shell, such as the daemon mache spawns,
+  refuses when that shell still exports a removed variable. mache surfaces the refusal rather
+  than scrubbing (`mache-0be425`): because the exit is immediate and precedes all socket work,
+  mache's start timeout never decides the outcome, and its spawn-failure log already carries
+  the child's stderr (`mache-e70109`). The CHANGELOG fragment says so. Embedders that link LLO
+  in-process call the same check through the library (D13).
 
 ### D4 — Secrets by reference only
 
@@ -233,7 +290,16 @@ group or other permission bits (mode `0600` or `0400`), in a directory that is n
 group or other; otherwise `--check-config` and start refuse it (`secret-file-permissions`,
 naming the field and path). The check and the read use one descriptor: the file is opened with
 no-follow, the open descriptor is `fstat`ed, and its bytes are read from it, so what was checked
-is what is read. The file is read at start, never copied into the resolved document, and
+is what is read.
+
+**Symlinks: the file is `lstat`ed, its directory is `realpath`ed.** The final component is
+never followed (`O_NOFOLLOW`; a symlink there is refused). The parent directory is resolved
+with `realpath` first, and the directory checks run on every directory of the resolved path:
+each is owned by root or the process's user, and has no group or other write bit unless its
+sticky bit is set (as on `/private/tmp`) and the file itself is owned by the process's user, so a path under macOS's `/tmp` or `/var` (symlinks to `/private/tmp` and
+`/private/var`) is checked where it really lives, and a parent swapped for a symlink after the
+check cannot redirect the read, because the read opens the resolved directory's descriptor and
+then the file relative to it (`openat` with `O_NOFOLLOW`). The file is read at start, never copied into the resolved document, and
 `--print-config` prints the reference, not the value.
 
 `mcp.tokenFile` keeps today's "generate if absent", with two tightenings: generation creates the
@@ -255,9 +321,14 @@ dotted name, before any other check of that field. There is no other place to pu
 every non-secret string field has a constrained type (an absolute path, an enum, a label, an IP
 address, or 64 lowercase hex characters for a query hash), and no field is free text.
 
-Other reference kinds (`keychain`, `op`) are not in v1. Adding one adds a variant to
-`secretRef`; a v1 binary refuses a document that uses it (`unknown-key`), which is the correct
-failure. The sign helper already resolves `keychain://`, `op://` and `apple-password://` URLs
+**`secretRef` is a union with reserved variants.** v1 defines `file` and reserves two more
+names, `keychain` (the macOS Keychain or a Secret Service item) and `vault` (a secret-store
+reference), whose shapes are not yet fixed. A v1 binary refuses a reserved variant by name
+(`secret-ref-not-delivered`, naming the field and the variant), not as an unknown key, so the
+schema already lists the names and delivering one later is an additive change within v1: the
+variant's body gains a schema, a binary that delivers it accepts it, and every document a
+v1 binary accepted keeps its meaning and its `configDigest`. Any other key in a `secretRef` is
+`unknown-key`. The sign helper already resolves `keychain://`, `op://` and `apple-password://` URLs
 for its callers; those are the helper's request surface, not its own configuration.
 
 **Fields that hold a secret today:**
@@ -283,9 +354,8 @@ sign helper passes through an allowlist to the `op` subprocess it spawns
 
 - The text is JSON (RFC 8259) or a supported adapter's syntax (D7). JSON nesting deeper than
   16 is `malformed`.
-- `version` is checked first: absent (`missing-key`), not a string (`wrong-type`), another kind
-  or another major version (`bad-version`, naming the value found and the one this binary
-  accepts).
+- `apiVersion`, then `kind`, are checked first, wherever they appear in the text, with the
+  refusals D1 lists (`bad-api-version`, `unknown-kind`, `wrong-kind`).
 - An undefined key at any level is refused (`unknown-key`); a key twice in one object is
   refused (`duplicate-key`).
 - Every string is UTF-8 and contains none of: U+0000-U+001F, U+007F, U+0080-U+009F, U+2028,
@@ -335,6 +405,39 @@ schema default, and loosening it takes the same explicit field the flag took:
 non-loopback bind needs `mcp.http.allowPublic: true`; `mcp.noAuth` defaults to `false`;
 `backend.microVm.tsiHijackInet` defaults to `false`; `sign-helper` `auth.required` and
 `signAllow.required` default to `true` (changed from today's flag defaults; Q5).
+
+**Q4: `mcp.groups` defaults to every group (`null`), as today.** The MCP surface is already
+off by default, and each step that exposes it is its own explicit field: a listener
+(`mcp.http` or `mcp.uds`, both `null` by default), loopback-only binding unless
+`allowPublic`, and the ADR-0022 token gate unless `noAuth`. A default of `[]` would add a fourth
+step whose only effect is a listener that exposes nothing, which cloister's e2e smoke (which
+enables `--mcp-port` and expects the `lsp_*` tools) and every standalone user would then have
+to undo by naming every group; and an empty grant is not a safer state but a broken one, since
+the listener still binds and still answers `tools/list`. The opt-in is the listener, not the
+group list. Narrowing the default later is allowed within v1 (D9), so this choice does not
+lock it in.
+
+**`worker.readyTimeoutMs` defaults to 60000 (60 s), not today's 5000.** 5 s is shorter than
+every value LLO and its consumers actually run with: all of LLO's live microVM suites use 30 s
+(`krun-worker/tests/*.rs`, `ready_timeout: Duration::from_secs(30)`, and the guest harness
+passes `--ready-timeout-ms 30000`, `cli/tests/guest_harness/mod.rs:182`), cloister's in-process
+host runtime uses 30 s (cloister `rs/crates/host-runtime/src/main.rs:77` at `80ef046`), and
+cloister reports readiness above 30 s under host load, the condition `ley-line-open-c4480a`
+documents and `AGENTS.md` ties to load. 60 s is twice the value every working deployment uses,
+and still bounds a guest that never becomes ready: the c4480a stall prints nothing in 60 s and
+fails closed as a timeout either way. The timeout is a liveness bound, not an authority, so a
+longer default weakens no refusal. The flag's default moves with it (the adapter maps an absent
+`--ready-timeout-ms` to the document default), a `Changed` entry.
+
+**Broker Slice 1 knobs are constants in v1, not keys** (cloister review F8). The broker that
+ships in the same release has two limits: 256 simultaneous connections per run and delivery to
+`127.0.0.1` only (ADR-0046 S-Q2 and S-Q3). Neither belongs in this document. The owner fixed
+the cap as a constant and placed any future variation in the per-run `connections/v1` document
+("a document field may come later as an additive change", S-Q2), which is cloister's per-run
+policy, not deployment configuration; and widening the delivered loopback set is a runtime gate
+that a passing loopback probe justifies (S-Q3), a code change with evidence, not an operator
+choice. So the broker needs no key in v1, and none of its later changes is a breaking change
+to this document.
 
 **Loosening is visible.** `--check-config`, `--print-config` and start each write a stderr
 notice for every field set to its loosening value: `evidence.unverified`, `mcp.noAuth`,
@@ -453,9 +556,10 @@ Integers are written in decimal with no sign, fraction, exponent or leading zero
 `configDigest` is BLAKE3-256 over those bytes (σ_bytes), written `blake3-256:<hex>`. It names
 one resolved configuration of one LLO release on one host: a home directory, an OS default or a
 new field in a later release changes it, as it should. **It is not an authority.** It is never
-signed, never carried in a grant, receipt or head, and nothing is admitted or refused by
-comparing it, except by `--expect-config-digest`, which compares a launcher's own earlier
-result and grants nothing. Its text form is the one CAS addresses use, but it is never resolved
+signed by LLO on its own, never carried in a grant or a head, and nothing is admitted or refused
+by comparing it, except by `--expect-config-digest`, which compares a launcher's own earlier
+result and grants nothing. It is *recorded* as evidence (below): a receipt that names it says
+which configuration the run executed under, and grants nothing by doing so. Its text form is the one CAS addresses use, but it is never resolved
 against or admitted into any CAS. It covers the document only, not the bytes of the files the
 document names (catalog, trust keys, worker binary, evidence store): two starts with one
 `configDigest` and a replaced catalog run differently. It is a fingerprint: cloister compares
@@ -463,7 +567,25 @@ the digest it got from `--print-config` with the one the daemon logs (or passes 
 `--expect-config-digest`), to know the running document is the checked one. A
 cloister-emitted document and a hand-written one that resolve to the same configuration have
 the same `configDigest`, whatever each spelled out or omitted, and whichever syntax (D7) each
-used. On implementation it gets a row in the `AGENTS.md` vocabulary table.
+used. On implementation it gets a row in the `AGENTS.md` vocabulary table, which also states
+that it is never resolved against a CAS.
+
+**Where `configDigest` appears** (owner, Q6; cloister review F7). Three places, each additive:
+
+| Surface | Field | Contract change |
+|---|---|---|
+| Daemon `status` reply | `StatusResponse.configDigest @13 :Text $Json.name("config_digest")`, `blake3-256:<hex>` | `rs/ll-core/public-schema/capnp/daemon.capnp`, next free ordinal after `rootPublished @12`; regenerated Go and TypeScript clients; `compatibility.json`; consumer fixture. Both daemon kinds set it. |
+| `RunReceipt` | `configDigest @17 :DigestRef $Traits.optional`, `algorithm` `blake3-256` | `execution/v1/execution.capnp`. `@15` and `@16` were taken by ADR-0046 Slice 1 (`connectionsDigest`, `connections`, PR #576), so `@17` is the next free ordinal on `origin/integration` at `e6142dd4`, and no open branch claims it. Regenerated `execution.tools.json`, Go and TypeScript bindings, `compatibility.json` and the receipt vectors. |
+| In-process `RunOutcome` | `config_digest: Option<DigestRef>` (`runtime/src/model.rs:671`) | A Rust API addition for embedders such as cloister's host runtime, which read the outcome rather than a receipt. |
+
+The receipt and the outcome carry it when the service or backend was built from a resolved
+document, through the daemon or the library entry (D13); a daemon always is (flags become a
+document), so every daemon receipt names its configuration. An embedder that builds a backend
+by hand, without a document, gets none, and the field is absent rather than invented. Because
+the receipt is the digest-bound evidence a run produces (ADR-0046 S-Q4), an attester that
+covers the receipt's digest covers the configuration's name with it; the configuration's own
+named files (catalog, trust keys, worker) are covered only to the extent the receipt already
+names them (the rootfs digest in `inputRoots`, the evidence it verified).
 
 ### D7 — Adapters: TOML in v0.30.0; YAML and HCL later
 
@@ -490,7 +612,8 @@ an extension and a vector file, and changes no schema, field or digest. Cloister
 `docs/examples/deployment-config/daemon-mount-macos.toml`, hand-written and checked in:
 
 ```toml
-version = "leyline/daemon-config/v1"
+apiVersion = "config.leyline/v1"
+kind = "DaemonConfig"
 
 [source]
 path = "~/src/my-project"
@@ -509,14 +632,19 @@ Tests (`rs/ll-open/cli/tests/deployment_config.rs`):
 - `--print-config` of the TOML and of the JSON, with `HOME=/Users/fixture`, both equal the
   pinned resolved file byte for byte (runs on every platform: resolution is pure; the test
   sets the platform the resolver assumes).
-- `--check-config` of the example on a binary without the `mount` feature exits 78 with
-  `mount-feature-not-built` (the release build today).
+- `--check-config` of the example on a source build without the `mount` feature exits 78 with
+  `mount-feature-not-built`; on a release-configured build it exits 0.
 - On macOS with a `mount` build, a gated test starts `leyline daemon --config` from the example
   pointed at a temporary source and mount directory, reads one file through the mount, and
   stops the daemon. It runs in the existing mount smoke tier (`cli-lib:smoke:dev`) under its
   platform gate, which refuses macOS releases whose NFS client is unsafe.
 
-The example only works from a release download if release binaries carry `mount` (Q3).
+The example runs from a release download because v0.30.0 release binaries carry `mount` (owner,
+Q3): `release.yml` builds `leyline` with `--features mount` on every target (the feature is pure
+Rust and links no system library, `cli/Cargo.toml:18-20`), `fuse` stays opt-in, and the release
+gate checks that a staged binary's `leyline capabilities` reports the mount backend
+(implementation slice). The `--check-config` refusal `mount-feature-not-built` remains for
+source builds without the feature.
 
 ### D9 — Versioning and breaking changes
 
@@ -532,18 +660,22 @@ The example only works from a release download if release binaries carry `mount`
 - **Loosening a default** is v2, never a v1 change. A document that omitted `mcp.noAuth`,
   `mcp.http.allowPublic`, `backend.microVm.tsiHijackInet`, sign-helper `auth.required` or
   `signAllow.required`, or any other field whose default refuses or narrows, would otherwise
-  be weakened under an unchanged `version`. The schema marks such fields
+  be weakened under an unchanged `apiVersion`. The schema marks such fields
   `"x-leyline-fail-closed": true`, and a schema-spec test compares each one's default with the
   previous release's published schema and fails when it loosened without a major version.
-- **Removing, renaming or retyping a field, or changing a field's meaning,** is v2. A v2 binary
-  refuses a v1 document with `bad-version` naming both; there is no reading of two versions, and
-  no conversion.
+- **Removing, renaming or retyping a field, or changing a field's meaning,** is v2 for that
+  kind (`apiVersion` `config.leyline/v2`, same `kind`). A binary that has moved a kind to v2
+  refuses its v1 documents with `bad-api-version` naming both; there is no reading of two
+  versions, and no conversion.
+- **Delivering a reserved `secretRef` variant** (`keychain`, `vault`, D4) is additive within
+  v1: the names are already in the schema and refused by name until delivered.
 - **Removed environment variables** are removed in v0.30.0, not deprecated, each listed under
   `Removed` in the CHANGELOG fragment with its replacement key, and refused when still set (D3).
 
 ### D10 — Flags: kept as the flags adapter, not overrides, not deprecated
 
-Recommendation: keep every configuration flag in v0.30.0, as the adapter D3 describes. Reasons:
+Decided (owner, Q2): every configuration flag stays in v0.30.0 as the adapter D3 describes, and
+`--config` with a configuration flag is refused. Reasons:
 
 - mache spawns `leyline daemon --arena … --arena-size-mib 64 --control … [--source …]
   [--cdc --cdc-target source-blobs] [--reset-arena]` (mache `internal/leyline/socket.go:407-460`,
@@ -553,8 +685,8 @@ Recommendation: keep every configuration flag in v0.30.0, as the adapter D3 desc
   through the adapter.
 - "Remove, don't deprecate" applies to what this ADR removes (the environment variables and the
   vestigial `--foreground`, below), cleanly and in one release. The flags are not deprecated:
-  they are a supported second spelling of the same document. Whether to remove them later is a
-  separate decision once no consumer spawns with them (Q2).
+  they are a supported second spelling of the same document. Removing them later is a separate
+  owner decision, taken once no consumer spawns with them.
 
 Adapter rules that change flag behaviour, each a `Changed` CHANGELOG entry:
 
@@ -597,43 +729,120 @@ each item:
 | 4 | Secrets by reference only | D4: `{"file": …}` only; an inlined value is refused as `secret-inlined`, naming the field. |
 | 5 | The migration table covers every flag and variable cloister passes today | Below, and the "Migration table". |
 | 6 | The schema is a digest-pinnable artifact like `execution.tools.json` | D2 "Published artifact": generated, checked in, drift-gated, embedded, released, pinned by SHA-256 at llo-bump. |
+| 7 | An embedder that links `leyline-runtime` in-process gets the same semantics as the daemon (F1) | D13: a public library entry resolves an `ExecutionDaemonConfig` into the structs the daemon builds; the vectors test it; the daemon uses it. |
+| 8 | The removed-variable check and list are usable without the binary (F2) | D13 `check_removed_environment`; D2 `leyline-removed-variables.json`. |
+| 9 | Symlinked directories such as macOS `/tmp` are handled (F3) | D4: `lstat` the file, `realpath` the directory, check every resolved directory. |
+| 10 | A ready timeout that survives load (F4) | D5: `worker.readyTimeoutMs` defaults to 60000. |
+| 11 | `secretRef` extensible without a break (F5) | D4: `keychain` and `vault` reserved, refused by name in v1. |
+| 12 | Start pinned to the checked document (F6) | D5 `--expect-config-digest`. |
+| 13 | Each run's evidence names its configuration (F7) | D6: `RunReceipt.configDigest @17`, `RunOutcome.config_digest`, `StatusResponse.configDigest @13`. |
+| 14 | No breaking config change when the broker ships (F8) | D5: the Slice 1 cap and delivered loopback set are constants, not keys. |
 
-**What cloister passes today** (read at cloister `c2bc862`, read-only):
+**What cloister uses today** (read at cloister `main` = `80ef046`, read-only, through the GitHub
+API; an earlier draft read a stale side branch). Cloister does not launch `leyline
+execution-daemon`. Its host runtime, `cloister-host-runtime`, links `leyline_runtime`
+in-process and builds the backend itself:
+
+| Cloister site (`rs/crates/host-runtime/src/`) | What it sets today | `ExecutionDaemonConfig` key |
+|---|---|---|
+| `main.rs:54-84` `krun_config()` | backend is `KrunWorkerBackend` (microVM) | `backend.microVm` |
+| `main.rs:61-64` | `worker` from `CLOISTER_KRUN_WORKER`, default `/usr/local/libexec/leyline-krun-worker` | `worker.path` |
+| `main.rs:65` | `cas_root` from `CLOISTER_CAS_ROOT`, default `/var/lib/cloister/cas` | `cas.directory.root`, or derived from `cas.volume` (below) |
+| `main.rs:66` | `ephemeral_root` from `CLOISTER_EPHEMERAL_ROOT`, default `/var/lib/cloister/run` | `cas.directory.runRoot` / `cas.volume.runRoot` |
+| `main.rs:72-75` | `runtime_files` = `[CLOISTER_LIBKRUNFW]` if set | `worker.runtimeFiles` |
+| `main.rs:76` | `devices` = `[]` | `backend.microVm.devices` (default `[]`) |
+| `main.rs:77` | `ready_timeout` = 30 s | `worker.readyTimeoutMs` (default now 60000, D5) |
+| `main.rs:82` | `tsi_hijack_inet` = `false`, deliberately not an env var | `backend.microVm.tsiHijackInet` (default `false`) |
+| `main.rs:358-361`, `446-450` | `CasVolume::new(<state dir>, DEFAULT_SIZE_CAP_BYTES)`, state dir from `cas-attach --state-dir` or `CLOISTER_CAS_STATE_DIR`; `attach_existing` checks the attached root equals `cas_root` | `stateDir` + `cas.volume` (`sizeCapGib` default 64); the CAS root is the volume's, so the equality check becomes unrepresentable rather than checked |
+| `main.rs:222`, `297-314` | `Platform::host()` for `import_oci_layout` / `pull_oci_image` | none: image import is a one-shot operation, not deployment configuration |
+| `execution.rs:17-24` | `KrunWorkerBackend`, `RunOutcome`, `confinement_manifest` | `RunOutcome.config_digest` (D6) when built through D13 |
+
+Cloister's verifier, catalog and authorization live in cloister on this path; the
+`evidence`, `catalog` and `control` keys matter to cloister only if it moves onto the daemon,
+which is its owner's decision (F1) and is not blocked by D13. The `CLOISTER_*` variables are
+cloister's own configuration; LLO reads none of them.
+
+Cloister's launches of LLO binaries on `80ef046` are unchanged from the earlier read:
 
 | Cloister site | LLO process and argv | v1 key |
 |---|---|---|
-| `scripts/e2e-smoke.sh:75-80` | `leyline daemon --arena <work>/test.arena` | `arena.path` |
+| `scripts/e2e-smoke.sh:76-81` | `leyline daemon --arena <work>/test.arena` | `arena.path` |
 | same | `--control <work>/test.ctrl` | `control` |
 | same | `--mcp-port <port>` | `mcp.http.port` |
 | same | `--mcp-no-auth` | `mcp.noAuth` |
 | same | `--timeout 120s` | `shutdownAfterSeconds` = `120` |
-| `Taskfile.yml:604` (`helper:start`) | `leyline-sign-helper --bind 127.0.0.1:8786` | `bind` |
+| `Taskfile.yml:617` (`helper:start`) | `leyline-sign-helper --bind 127.0.0.1:8786` | `bind` |
 | same | `--foreground` | removed (D10); `helper:start` must drop it |
-| `GETTING-STARTED.md:497-614` | `--require-auth`, `--require-sign-allow`, `LEYLINE_SIGN_CALLER_TOKENS`, `LEYLINE_SIGN_SIGN_ALLOW`, `LEYLINE_SIGN_RESOLVE_ALLOW`, `LEYLINE_SIGN_OP_BIN`, `LEYLINE_SIGN_SECURITY_BIN` (documented for operators) | `auth.required`, `signAllow.required`, `auth.callerTokens`, `signAllow.callers`, `resolveAllow`, `subprocess.opBin`, `subprocess.securityBin` |
+| `GETTING-STARTED.md:677-772` | `--require-auth`, `--require-sign-allow`, `LEYLINE_SIGN_CALLER_TOKENS`, `LEYLINE_SIGN_SIGN_ALLOW`, `LEYLINE_SIGN_OP_BIN`, `LEYLINE_SIGN_SECURITY_BIN` (documented for operators) | `auth.required`, `signAllow.required`, `auth.callerTokens`, `signAllow.callers`, `subprocess.opBin`, `subprocess.securityBin` |
 
-No cloister code path launches `leyline execution-daemon` today, and none sets
-`LEYLINE_STATE_DIR` (a search for `execution-daemon`, `--cas-root`, `--cas-volume`,
-`--run-root`, `--worker`, `--catalog`, `--trust-key`, `--evidence-store` and `LEYLINE_STATE_DIR`
-across cloister's tree finds none). `cloister-55e6cd` adds that launch, from a document, with
-these fields from its declarations: the CAS volume (`cas.volume`, with `stateDir`, which
-replaces both `--cas-volume`'s value and `LEYLINE_STATE_DIR`) or a CAS directory
-(`cas.directory.root`, `--cas-root`); the run root (`cas.volume.runRoot` or
-`cas.directory.runRoot`, `--run-root`); the worker (`worker.path`, `--worker`); the control
-socket (`control`, `--control`: cloister's `runtime-plan.mjs:55` defaults the socket it dials
-to `/tmp/cloister-host-runtime/<bundle>.sock`, so it states `control` explicitly rather than
-inheriting `<arena>.ctrl`); the catalog (`catalog`) and the evidence verifier (`evidence`), both
-required; and the backend from each placement (`backend`). Cloister's own
-`runtime-storage-init` (`--image`, `--mountpoint`, `--size`) prepares storage in cloister and
-passes nothing to LLO; whether it is replaced by LLO's `llo_execution_provision` is cloister's
-decision and outside this ADR.
+No cloister file on `80ef046` passes `--cas-root`, `--cas-volume`, `--run-root`, `--worker`,
+`--catalog`, `--trust-key` or `--evidence-store`, or sets `LEYLINE_STATE_DIR`.
 
 ### D12 — Consumer beads
 
 | Repo | Bead | What it needs |
 |---|---|---|
-| cloister | `cloister-55e6cd` (exists) | Emit `execution-daemon-config/v1` and `daemon-config/v1` from `cluster.toml`, pin the schema at llo-bump, test against `--print-config`, start from `--config`. |
-| cloister | `cloister-0bc3d5` (filed with this ADR) | `task helper:start`, the supervisor templates and `GETTING-STARTED.md` (lines 497-614 set `LEYLINE_SIGN_*` and pass `--require-auth`; `Taskfile.yml:604` passes the removed `--foreground`) move to `--config`; the caller-tokens file replaces the env value; dev mode states `auth.required = false` explicitly. Must land at the same pin bump as LLO's sign-helper slice, or the helper refuses to start (D3, removed variables). |
-| mache | `mache-0be425` (filed with this ADR) | mache's spawn argv (`internal/leyline/socket.go:405-460`) uses only flags v0.30.0 keeps, and mache's own code sets no variable LLO reads as configuration (`LEYLINE_SOCKET` is mache's; LLO reads it only in `cli/tests/daemon_startup.rs:71`). Its tests' `LLO_EXTRACTION_EPOCH` keeps working (D3, test seams). What changes: the daemon mache spawns inherits the user's shell, so a still-exported removed variable makes it refuse to start. mache decides whether to scrub the removed set from the child environment or surface the refusal, and adds a test. Moving the spawn to `--config` is optional. |
+| cloister | `cloister-55e6cd` (exists) | Emit `ExecutionDaemonConfig` (and `DaemonConfig` for the e2e smoke) from `cluster.toml`, pin the schemas and `leyline-removed-variables.json` at llo-bump, and either resolve the document in-process through D13 (building `KrunWorkerBackend` from its result instead of `krun_config()`) or move onto the daemon with `--config`; test against `--print-config`. |
+| cloister | `cloister-0bc3d5` (filed with this ADR) | `task helper:start`, the supervisor templates and `GETTING-STARTED.md` (lines 677-772 at `80ef046` set `LEYLINE_SIGN_*` and pass `--require-auth`; `Taskfile.yml:617` passes the removed `--foreground`) move to `--config`; the caller-tokens file replaces the env value; dev mode states `auth.required = false` explicitly. Must land at the same pin bump as LLO's sign-helper slice, or the helper refuses to start (D3, removed variables). |
+| mache | `mache-0be425` (filed with this ADR) | mache's spawn argv (`internal/leyline/socket.go:405-460`) uses only flags v0.30.0 keeps, and mache's own code sets no variable LLO reads as configuration (`LEYLINE_SOCKET` is mache's; LLO reads it only in `cli/tests/daemon_startup.rs:71`). Its tests' `LLO_EXTRACTION_EPOCH` keeps working (D3, test seams). What changes: the daemon mache spawns inherits the user's shell, so a still-exported removed variable makes it refuse to start. mache surfaces the refusal (its choice, recorded on the bead) rather than scrubbing; D3 gives it an immediate exit before any socket work, with every offending variable and its replacement named on stderr. Moving the spawn to `--config` is optional. |
+
+### D13 — The library entry: one semantics for the daemon and embedders
+
+Cloister's host runtime links `leyline-runtime` and builds `KrunWorkerConfig` itself (D11).
+If only the daemon understood the document, an embedder would re-derive the defaults and
+mapping by hand and drift. So the execution document has a public library entry in
+`leyline-runtime`, and the daemon uses the same entry:
+
+```rust
+// leyline_runtime::deployment
+pub struct HostFacts { home, xdg_state_home, data_dir, os }   // injected, so resolution is pure
+impl HostFacts { pub fn current() -> Result<Self, ConfigRefusal> }
+
+pub fn resolve_execution_deployment(
+    text: &[u8], syntax: Syntax /* Json | Toml */, host: &HostFacts,
+) -> Result<ExecutionDeployment, ConfigRefusal>;
+
+pub struct ExecutionDeployment {
+    pub backend: BackendDeployment,          // Native { config: NativeWorkerConfig, cgroup_root: Option<PathBuf> }
+                                             // | MicroVm { config: KrunWorkerConfig, workspace: Freshness }
+    pub cas: CasDeployment,                  // Directory { root } | Volume { state_dir, size_cap_bytes, run_root }
+    pub catalog: PathBuf,
+    pub evidence: EvidenceDeployment,        // Unverified | Verified { trust_keys, store }
+    pub arena: PathBuf, pub control: PathBuf,
+    pub source: Option<SourceDeployment>, pub cdc: bool,
+    pub parser: ParserSettings, pub head: HeadSettings, pub diagnostics: Diagnostics,
+    pub resolved: Vec<u8>,                   // the canonical resolved bytes (D6)
+    pub config_digest: DigestRef,            // blake3-256 over `resolved`
+}
+
+pub fn check_removed_environment(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<(), RemovedVariables>;           // every offender with its replacement key
+pub const REMOVED_VARIABLES_JSON: &str;     // the embedded leyline-removed-variables.json
+```
+
+- **What it returns is exactly what the daemon builds.** `KrunWorkerConfig` and
+  `NativeWorkerConfig` are filled with the same `worker`, `cas_root`, `ephemeral_root`,
+  `runtime_files`, `devices`, `ready_timeout` and `tsi_hijack_inet` the daemon passes today
+  (`main.rs:564-627`); for `cas.volume`, `cas_root` is the volume layout's CAS root, computed
+  without attaching. The function is pure, with no filesystem access; host checks (D5) are a
+  separate `check_execution_host(&ExecutionDeployment)` that is read-only
+  and that `--check-config` and embedders both call. Writing steps (attach, create the run root)
+  stay where they are today.
+- **The vectors test this function.** `execution-daemon-config-cases.json` pins, per accept
+  case, the resolved bytes, the `configDigest`, and the backend struct values; a
+  `leyline-runtime` test runs every case through `resolve_execution_deployment`, so the daemon
+  path and the embedder path are tested by one test. The daemon's `--config` calls it, then
+  builds the verifier from `evidence` with `EvidenceVerifierConfig::build` as today.
+- **Removed variables.** The library never reads the process environment on its own:
+  `HostFacts::current()` reads only `HOME`, `XDG_STATE_HOME` and the platform data directory.
+  An embedder calls `check_removed_environment(std::env::vars_os())` at its own start, and
+  gets the same refusal, naming every offender, that the binaries print. A backend built from
+  an `ExecutionDeployment` sets `RunOutcome.config_digest` (D6).
+- **Layering.** The data model, parser and canonical writer stay in `leyline-schema-spec`
+  (`leyline-runtime` already depends on it, `runtime/Cargo.toml:29`); `leyline-runtime` adds
+  only the mapping into its own structs. `DaemonConfig` and `SignHelperConfig` have no embedder
+  and get no runtime entry.
 
 ## Migration table
 
@@ -641,7 +850,7 @@ Every configuration flag of the three processes, and every environment variable 
 binary reads at runtime. Keys are dotted from the document root. "Host default" means the
 schema states a rule (D2 `x-leyline-default`) and `--print-config` shows its value.
 
-### `leyline daemon` → `leyline/daemon-config/v1` (18 flags)
+### `leyline daemon` → `DaemonConfig` (18 flags)
 
 | Flag | Key | Type | Default | Notes |
 |---|---|---|---|---|
@@ -659,12 +868,12 @@ schema states a rule (D2 `x-leyline-default`) and `--print-config` shows its val
 | `--mcp-allow-public` | `mcp.http.allowPublic` | boolean | `false` | Required for a non-loopback bind (D5). |
 | `--mcp-no-auth` | `mcp.noAuth` | boolean | `false` | ADR-0022. Covers both listeners, as today. |
 | `--mcp-uds` | `mcp.uds` | path | `null` (no UDS listener) | |
-| `--mcp-groups` | `mcp.groups` | list of labels, sorted | `null` (every group) | Comma list becomes an array. See Q4 on the default. |
+| `--mcp-groups` | `mcp.groups` | list of labels, sorted | `null` (every group) | Comma list becomes an array. Default reasoned in D5 ("Q4"). |
 | `--reset-arena` | (none) | | | **CLI-only**: an action on one start (D3). Combines with `--config`. |
 | `--cdc` | `cdc.enabled` | boolean | `false` | |
 | `--cdc-target` | `cdc.target` | `"source-blobs"` | `"source-blobs"` | Inert when `cdc.enabled` is false (`main.rs:807-817`). |
 
-### `leyline execution-daemon` → `leyline/execution-daemon-config/v1` (23 flags)
+### `leyline execution-daemon` → `ExecutionDaemonConfig` (23 flags)
 
 | Flag | Key | Type | Default | Notes |
 |---|---|---|---|---|
@@ -677,7 +886,7 @@ schema states a rule (D2 `x-leyline-default`) and `--print-config` shows its val
 | `--cas-volume-size-cap-gib` | `cas.volume.sizeCapGib` | integer ≥ 1 | `64` | `DEFAULT_SIZE_CAP_BYTES`. Unrepresentable under `directory` (today a hand check, `main.rs:377`). |
 | `--worker` | `worker.path` | path | **required** | |
 | `--runtime-file` | `worker.runtimeFiles` | list of paths, sorted | `[]` | |
-| `--ready-timeout-ms` | `worker.readyTimeoutMs` | integer ≥ 1 | `5000` | |
+| `--ready-timeout-ms` | `worker.readyTimeoutMs` | integer ≥ 1 | `60000` (today `5000`) | D5: every live suite and cloister run with 30 s; readiness exceeds 30 s under load. |
 | `--catalog` | `catalog` | path | **required** | The trusted catalog stays its own document; this names it. |
 | `--backend` | `backend` (union key) | `{"native": {…}}` \| `{"microVm": {…}}` | `{"native": {}}` | |
 | `--device` | `backend.microVm.devices` | list of paths, sorted | `[]` | Unrepresentable under `native` (today `main.rs:561`). |
@@ -693,7 +902,7 @@ schema states a rule (D2 `x-leyline-default`) and `--print-config` shows its val
 | `--workspace-changed-ttl-ms` | `backend.microVm.workspace.changedTtlMs` | integer ≥ 0 | `1000` | |
 | `--workspace-change-window-ms` | `backend.microVm.workspace.changeWindowMs` | integer ≥ 0 | `60000` | |
 
-### `leyline-sign-helper` → `leyline/sign-helper-config/v1` (5 flags)
+### `leyline-sign-helper` → `SignHelperConfig` (5 flags)
 
 | Flag | Key | Type | Default | Notes |
 |---|---|---|---|---|
@@ -782,11 +991,12 @@ Vectors (schema-spec, `deployment-config/v1/test-vectors/`, pinned by `VECTORS.s
    express fails both, and every case it cannot (cross-field rules, `bad-string` escapes,
    duplicate keys) fails the Rust parser with the pinned field and reason.
 2. **Unknown-key refusal** at the top level and in every nested object of every kind, including
-   a key that differs only by case (`Version`) and one from another kind.
-3. **Version discriminator:** absent, wrong type, another kind's value, `v2`, and `version`
-   not first in the text (still checked first).
-4. **Defaults resolution:** the minimal document of each kind (only `version`, plus the four
-   required execution fields) resolves to pinned bytes and `configDigest` for
+   a key that differs only by case (`Kind`) and one from another kind.
+3. **Discriminator:** `apiVersion` and `kind` each absent, of the wrong type, unknown
+   (`config.leyline/v2`, `FooConfig`), another process's kind (`wrong-kind`), and both placed
+   last in the text (still checked first, `apiVersion` before `kind`).
+4. **Defaults resolution:** the minimal document of each kind (only `apiVersion` and `kind`,
+   plus the four required execution fields) resolves to pinned bytes and `configDigest` for
    `HOME=/Users/fixture` on macOS and `HOME=/home/fixture` on Linux, with and without
    `XDG_STATE_HOME`; `verify_deployment_config_defaults` checks every schema `default` against
    the resolver. `null` accepted where the default is `null`, refused elsewhere.
@@ -806,6 +1016,19 @@ Vectors (schema-spec, `deployment-config/v1/test-vectors/`, pinned by `VECTORS.s
    `[mcp.http]`) is refused; an unknown extension is refused.
 9. **Fail-closed default gate:** a published-schema fixture whose `x-leyline-fail-closed`
    default loosened under the same major version fails the check.
+9a. **Reserved secret variants:** `{"keychain": …}` and `{"vault": …}` in each secret field are
+   refused as `secret-ref-not-delivered` naming the variant; `{"other": …}` is `unknown-key`.
+9b. **Library entry** (`leyline-runtime`): every `ExecutionDaemonConfig` accept case run through
+   `resolve_execution_deployment` yields the pinned resolved bytes, `configDigest` and backend
+   struct values (`worker`, `cas_root`, `ephemeral_root`, `runtime_files`, `devices`,
+   `ready_timeout`, `tsi_hijack_inet`), with an injected `HostFacts`; the daemon's `--config`
+   path and this test call the same function. `check_removed_environment` with three removed
+   variables returns all three with their keys; its list equals
+   `leyline-removed-variables.json`, which equals the generated file (drift gate).
+9c. **Symlinked directories:** a secret file and a config file under `/tmp` on macOS (a symlink
+   to `/private/tmp`) are checked at the resolved path and accepted when the resolved
+   directories pass; a parent directory replaced by a symlink between the check and the read is
+   not followed (the read is `openat` on the resolved directory with `O_NOFOLLOW`).
 
 CLI tests (`rs/ll-open/cli/tests/deployment_config.rs`):
 
@@ -820,7 +1043,9 @@ CLI tests (`rs/ll-open/cli/tests/deployment_config.rs`):
     `--cas-volume-size-cap-gib` with `--cas-root`); `--timeout 0s` resolves to `0`;
     `a_partial_or_invalid_verifier_configuration_refuses_startup` passes unchanged.
 12. **Removed variables:** for every subcommand of both binaries, each removed variable set
-    refuses, naming it and its key; unset, they run. `LLO_EXTRACTION_EPOCH` set starts with a
+    refuses, naming it and its key, with status 78, within one second, and before any socket,
+    lock, arena or control file exists (asserted by checking the configured paths afterwards);
+    with two set, both are named; unset, they run. `LLO_EXTRACTION_EPOCH` set starts with a
     warning and moves `parserId`. A release-build smoke test sets `LLO_DISABLE_INJECTIONS` and
     asserts output and `parserId` are unchanged.
 13. **`--check-config` and `--print-config` write nothing:** snapshot `HOME`, the state
@@ -845,7 +1070,17 @@ CLI tests (`rs/ll-open/cli/tests/deployment_config.rs`):
 18. **Startup log and pin:** the daemon logs the same `configDigest` `--check-config` printed;
     `--expect-config-digest` with a different digest exits 78 before binding anything.
 19. **Published schema:** `--print-config-schema` equals the checked-in published file, and
-    `test_release_publication.sh` asserts each release asset equals it.
+    `test_release_publication.sh` asserts each release asset equals it, and that
+    `leyline-removed-variables.json` is published.
+20. **`configDigest` on the wire:** the daemon's `status` reply carries the digest
+    `--print-config` reports; a run's `RunReceipt.configDigest` (`@17`) and its `RunOutcome`
+    carry it; a backend built by hand carries none; `task compat:check` and
+    `task schema:consumer-fixture-test` pass with the regenerated clients.
+21. **Defaults that moved:** `worker.readyTimeoutMs` resolves to 60000 and `--ready-timeout-ms`
+    absent gives the same; the sign helper's minimal document resolves `auth.required` and
+    `signAllow.required` to `true`.
+22. **`mount` in releases:** the release workflow's staged `leyline` reports the NFS mount
+    backend in `leyline capabilities`, checked by the release gate before publication.
 
 ## Implementation slice for v0.30.0
 
@@ -861,8 +1096,11 @@ Two pull requests, both in v0.30.0; the second depends on the first's schema-spe
 | Spec tests | `schema-spec/tests/verify_deployment_config_*.rs` (vectors, defaults, digest via the reference implementation, fail-closed default gate, published-schema drift) | ~550 |
 | CLI | `cli/src/main.rs`: `--config`, `--check-config`, `--print-config`, `--print-config-schema`, `--expect-config-digest`, flags→document adapter (`value_source`), document→`DaemonConfig`/backend mapping, read-only host checks split from start's writing steps, exit codes | ~750 changed |
 | Settings plumbing | `cli-lib`: `head_claim.rs`, `cmd_parse.rs` (signing key from a file, trusted keys, trusted query hashes), `cmd_rebuild.rs`, `daemon/ops.rs`, `daemon/auth.rs` (exclusive no-follow creation, empty file refused), `session_observation_pass.rs`, `sheaf_ablation.rs`, `cmd_daemon.rs`, `cmd_rootfs.rs`, `cmd_self.rs`; `ts`: `query_engine.rs`, `injections.rs` (`test-seams` for `LLO_DISABLE_INJECTIONS`); `runtime/cas_volume.rs` | ~600 |
-| Published schema | generator task `gen:deployment-config-schema`, checked-in `deployment-config/v1/published/leyline-*.schema.json`, `include_str!`, `tools/stage_release_artifacts.sh`, `release.yml`, `tools/test_release_publication.sh`, `tools/release-assets.txt` | ~150 + generated JSON |
-| Removed-variable refusal and seam warnings | `cli-lib` (before dispatch) | ~80 |
+| Published schema and removed-variable list | generator task `gen:deployment-config-schema`, checked-in `deployment-config/v1/published/` (three schemas and `leyline-removed-variables.json`), `include_str!`, `tools/stage_release_artifacts.sh`, `release.yml`, `tools/test_release_publication.sh`, `tools/release-assets.txt` | ~170 + generated JSON |
+| Library entry | `runtime/src/deployment.rs` (`HostFacts`, `resolve_execution_deployment`, `check_execution_host`, `check_removed_environment`, `REMOVED_VARIABLES_JSON`), its vector test; `cli/src/main.rs` builds the execution daemon from it | ~450 |
+| `configDigest` on the wire | `public-schema/capnp/daemon.capnp` (`StatusResponse.configDigest @13`), `execution/v1/execution.capnp` (`RunReceipt.configDigest @17`), `runtime/src/model.rs` (`RunOutcome.config_digest`), receipt producer; regenerated Go/TypeScript clients, `execution.tools.json`, `compatibility.json`, consumer fixtures, receipt vectors | ~250 + generated |
+| `mount` in releases | `.github/workflows/release.yml` (`--features mount` for `leyline` on every target), `tools/stage_release_artifacts.sh` / the release gate (staged binary reports the mount backend), `README.md` and `GETTING-STARTED.md` (release binaries mount) | ~60 |
+| Removed-variable refusal and seam warnings | `cli-lib` (before dispatch, through `check_removed_environment`) | ~60 |
 | CLI tests | `cli/tests/deployment_config.rs`; rewrite `execution_evidence.rs:374`; tests that set removed variables move to documents (`cache/tests/common/mod.rs`, `cli-lib/tests/{arena_query_blobs_test,injection_extraction_test,markdown_inline_injection_test,head_policy_env}.rs`, `cli/tests/daemon_startup.rs`); `f6_extraction_epoch_invalidation.rs` and `f7_injection_epoch_invalidation.rs` keep their seams | ~800 |
 | Docs | `docs/examples/deployment-config/` (3 files), `GETTING-STARTED.md`, `AGENTS.md` vocabulary row, `changes/52c177-*.md` (Breaking, Removed, Changed) | ~150 |
 
@@ -871,33 +1109,34 @@ in `deployment_config.rs` (~250), `sign/src/bin/helper.rs`, `host/keystore.rs`,
 `host/health.rs` read a settings struct instead of the environment, every refusal before
 binding (~350), tests (~300). Lands with the cloister sign-helper bead (D12).
 
-Total: about 4,700 lines of Rust, Python and tests, and 2,000 lines of JSON and prose. Gates:
-`task check`, `task compat:check`, `task schema:consumer-fixture-test`, `task rs:mutants:pr`,
-`task ci`.
+Total: about 5,400 lines of Rust, Python and tests, and 2,100 lines of JSON and prose, plus
+regenerated bindings. Gates: `task check`, `task compat:check`, `task gen:server-json:check`,
+`task schema:consumer-fixture-test`, `task runtime:test`, `task rs:mutants:pr`, `task ci`, and
+a release dry run for the `mount` and asset changes. The receipt and status fields are wire
+changes, so their consumer beads (cloister reads `RunOutcome`; mache reads `status`) are named
+on the implementation PR before merge; neither consumer must act, since both fields are
+additive and optional.
 
-## Open questions for the owner
+## Review record
 
-- **Q1 — `version` or `apiVersion` + `kind`.** The owner's direction named the Kubernetes
-  `apiVersion`/`kind` pair. D1 uses one `version` string, LLO's existing convention, because a
-  pair can disagree with itself. Either is a one-line schema change now and a v2 later.
-- **Q2 — Precedence.** D3 refuses `--config` with configuration flags; the owner's direction
-  said "flags become overrides". The alternative that keeps one checked configuration is
-  "flags may fill only fields the document omits, and a flag naming a field the document sets
-  is refused", with `--print-config` showing the merged result. D3 is simpler and is
-  recommended; this needs the owner's call. Also: remove the daemon flags in a later release
-  once no consumer spawns with them, or keep the adapter permanently?
-- **Q3 — `mount` in release binaries.** The standalone leyline-fs user cannot run the example
-  from a release download, because release builds omit `mount` (`release.yml:16-17`). `mount`
-  is pure Rust and links no system library (`cli/Cargo.toml:18-20`). Recommended: add it to
-  the release build in v0.30.0, keeping `fuse` opt-in.
-- **Q4 — `mcp.groups` default.** Today an absent `--mcp-groups` grants every group. Default
-  deny would make the default `[]`, so a listener exposes nothing until groups are named. Both
-  listeners are off by default, so this only matters once one is enabled. Kept as today in D5.
-  Flipping it is a narrowing (D9), so it can happen within v1 as a `Breaking` entry; after
-  v0.30.0 it cannot be flipped back without v2.
-- **Q5 — Sign-helper defaults.** D5 flips `auth.required` and `signAllow.required` to `true`
-  (today's flags default `false`). This is the default-deny reading and breaks the dev flow
-  until cloister's `task helper:start` states `false`.
-- **Q6 — `configDigest` on the wire.** D6 logs it and prints it but does not add it to the
-  daemon's `status` reply, which would be a daemon wire change. Cloister can compare logs; a
-  `status` field is the stronger check. Add it in v0.30.0 or later?
+**LLO specialist reviews of the proposed draft** (`cross-runtime-contract-auditor`,
+`execution-boundary-adversary`): every in-scope finding is folded into the draft at `06cf7501`
+(summarized on bead `ley-line-open-52c177`).
+
+**Consumer reviews of `06cf7501`, and their dispositions:**
+
+| Item | Disposition |
+|---|---|
+| cloister F1 (blocking): cloister links `leyline-runtime` in-process; inventory was read from a stale branch | Accepted: D13 adds the public library entry `resolve_execution_deployment`, tested by the vectors and used by the daemon; D11 is redone against cloister `main` `80ef046`. |
+| cloister F2: what the library does about removed variables; publish the list as data | Accepted: D13 `check_removed_environment` (embedders call it); D2 publishes `leyline-removed-variables.json`, generated and drift-gated. |
+| cloister F3: does the directory check follow symlinks | Accepted: D4 `lstat`s the file, `realpath`s the directory, checks every resolved directory, reads through `openat` with `O_NOFOLLOW`. |
+| cloister F4: 5 s ready timeout too low | Accepted: D5 sets 60000, from the live suites' and cloister's 30 s and readiness above 30 s under load. |
+| cloister F5: keep `secretRef` extensible | Accepted: D4 reserves `keychain` and `vault`, refused by name in v1; D9 makes delivering one additive. |
+| cloister F6: `--expect-config-digest` | Already in the draft (D5); kept. |
+| cloister F7: `configDigest` in the receipt and `RunOutcome` | Accepted with Q6: D6 adds `RunReceipt.configDigest @17` (after Slice 1's `@15`/`@16`, #576), `RunOutcome.config_digest` and `StatusResponse.configDigest @13`. |
+| cloister F8: broker Slice 1 knobs | Decided: constants in v1, not keys (D5), following ADR-0046 S-Q2 and S-Q3. |
+| mache (`mache-0be425`): surface, not scrub; name each variable; exit before socket work | Accepted: D3 exits 78 before any socket, lock, arena or control file, naming every offending variable with its replacement; `LLO_EXTRACTION_EPOCH` stays a test seam. |
+
+No open questions remain. Two later decisions are named, not deferred work: removing the
+daemon flags once no consumer spawns with them (D10), and delivering a reserved `secretRef`
+variant (D4).

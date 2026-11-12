@@ -8,4 +8,6 @@ Section: Added
     - `arm64` without a variant is `arm64/v8`;
     - an empty variant is no variant.
   - `Platform::select(&[candidates])` returns the index of the one platform string this platform runs. It refuses none or several as the new `PlatformError::{NoMatch, Ambiguous}`, naming the candidates, and refuses a malformed string as `PlatformError::Malformed`.
-  - An image config or index entry with an empty `variant` is now treated as having none.
+  - `PlatformError` is `#[non_exhaustive]`. `Ambiguous` advises naming a variant only to a platform that names none.
+  - An empty `variant` is now no variant everywhere: `with_variant("")`, `Display`, and the import's selection and config check.
+  - As a result, an index with an `arm64` entry whose variant is `""` beside an `arm64/v8` entry is now refused as `AmbiguousPlatform` under a `--platform`-style `arm64/v8` request, as `arm64` beside `arm64/v8` already was. A config whose variant is `""` is now admitted for `arm64/v8`. `import-oci` requests no variant, so its outcomes are unchanged.

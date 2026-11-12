@@ -216,8 +216,9 @@ impl Platform {
         }
     }
 
+    /// This platform with `variant`; an empty variant is none.
     pub fn with_variant(mut self, variant: &str) -> Self {
-        self.variant = Some(variant.into());
+        self.variant = (!variant.is_empty()).then(|| variant.into());
         self
     }
 
@@ -310,13 +311,21 @@ impl Platform {
             several => Err(PlatformError::Ambiguous {
                 platform: self.to_string(),
                 candidates: named(several),
+                advice: if self.variant.as_deref().is_some_and(|v| !v.is_empty()) {
+                    "pin one of them"
+                } else {
+                    "name a variant, or pin one of them"
+                },
             }),
         }
     }
 }
 
-/// `os/architecture[/variant]`, each part non-empty, as [`Platform`]
-/// prints it.
+/// `os/architecture[/variant]`, each part non-empty and without whitespace,
+/// as [`Platform`] prints it: parsing what a platform prints gives a
+/// platform that admits it and that it admits (an empty variant prints as
+/// none; a part holding `/` or whitespace, which no OCI platform has, does
+/// not round-trip).
 impl std::str::FromStr for Platform {
     type Err = PlatformError;
 
@@ -343,7 +352,10 @@ impl std::str::FromStr for Platform {
 }
 
 /// Why a platform string, or a choice among several, was refused.
+/// Non-exhaustive: a later rule (`os.version`, `os.features`) may add a
+/// reason.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PlatformError {
     #[error("{0:?} is not an OCI platform os/architecture[/variant]")]
     Malformed(String),
@@ -352,19 +364,20 @@ pub enum PlatformError {
         platform: String,
         candidates: Vec<String>,
     },
-    #[error(
-        "several of the candidates are for platform {platform}: {candidates:?}; name a variant"
-    )]
+    #[error("several of the candidates are for platform {platform}: {candidates:?}; {advice}")]
     Ambiguous {
         platform: String,
         candidates: Vec<String>,
+        /// What would resolve it: naming a variant helps only a platform
+        /// that names none.
+        advice: &'static str,
     },
 }
 
 impl fmt::Display for Platform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.os, self.architecture)?;
-        if let Some(variant) = &self.variant {
+        if let Some(variant) = self.variant.as_deref().filter(|v| !v.is_empty()) {
             write!(f, "/{variant}")?;
         }
         Ok(())
@@ -1912,6 +1925,66 @@ mod tests {
         }
     }
 
+    /// An empty variant is no variant everywhere: printing a platform and
+    /// parsing it back gives the same platform, and a `v8` host's index
+    /// with both an `arm64` entry whose variant is empty and an `arm64/v8`
+    /// entry is ambiguous, as one with `arm64` and `arm64/v8` already was
+    /// (contract review of 370b41, F1 and F2).
+    #[test]
+    fn an_empty_variant_is_no_variant_when_printed_parsed_and_selected() {
+        let empty = Platform::linux("arm64").with_variant("");
+        assert_eq!(empty, Platform::linux("arm64"));
+        assert_eq!(empty.to_string(), "linux/arm64");
+        let raw = Platform {
+            variant: Some(String::new()),
+            ..Platform::linux("arm64")
+        };
+        assert_eq!(raw.to_string(), "linux/arm64");
+        for p in [
+            Platform::linux("arm64"),
+            Platform::linux("arm64").with_variant("v8"),
+            Platform::linux("amd64"),
+            raw.clone(),
+        ] {
+            let back: Platform = p.to_string().parse().unwrap();
+            assert!(back.admits(&p) && p.admits(&back), "{p:?}");
+        }
+        let index: Index = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "digest": format!("sha256:{}", "a".repeat(64)), "size": 1,
+                 "platform": {"os": "linux", "architecture": "arm64", "variant": ""}},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "digest": format!("sha256:{}", "b".repeat(64)), "size": 1,
+                 "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}}
+            ]
+        }))
+        .expect("an index");
+        assert!(matches!(
+            select_platform(&index, &Platform::linux("arm64").with_variant("v8")),
+            Err(OciImportError::AmbiguousPlatform(_))
+        ));
+    }
+
+    /// Ambiguity under a host that already names its variant cannot be
+    /// resolved by naming one: the message says to pin the candidate.
+    #[test]
+    fn the_ambiguity_message_fits_the_host() {
+        let unnamed = Platform::linux("arm64")
+            .select(&["linux/arm64", "linux/arm64/v8"])
+            .unwrap_err()
+            .to_string();
+        assert!(unnamed.contains("name a variant"), "{unnamed}");
+        let named = Platform::linux("arm64")
+            .with_variant("v8")
+            .select(&["linux/arm64", "linux/arm64/v8"])
+            .unwrap_err()
+            .to_string();
+        assert!(!named.contains("name a variant"), "{named}");
+        assert!(named.contains("pin one"), "{named}");
+    }
+
     /// `select` names the one candidate a host runs, and refuses none or
     /// several by name, never picking one of several.
     #[test]
@@ -1933,6 +2006,7 @@ mod tests {
             Err(PlatformError::Ambiguous {
                 platform: "linux/arm64".into(),
                 candidates: vec!["linux/arm64".into(), "linux/arm64/v8".into()],
+                advice: "name a variant, or pin one of them",
             })
         );
         assert_eq!(

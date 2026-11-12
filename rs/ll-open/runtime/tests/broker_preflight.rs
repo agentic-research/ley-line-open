@@ -48,6 +48,23 @@ fn an_existing_path_is_a_resource_conflict() {
     assert_eq!(refusal(&path, euid()).0, ErrorCode::ResourceConflict);
 }
 
+/// An endpoint whose existence cannot be determined (no search permission on
+/// the parent) is refused as uninspectable, never treated as absent.
+#[test]
+fn an_endpoint_that_cannot_be_inspected_is_refused() {
+    if euid() == 0 {
+        return; // root ignores the missing search permission
+    }
+    let (_dir, real) = private_dir();
+    let locked = real.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = check_endpoint("orders-api", &locked.join("orders.api.sock"), euid());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.expect_err("uninspectable");
+    assert!(error.detail.contains("cannot inspect"), "{}", error.detail);
+}
+
 #[test]
 fn a_missing_parent_is_refused() {
     let (_dir, real) = private_dir();

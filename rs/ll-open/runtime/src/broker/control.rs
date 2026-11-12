@@ -42,9 +42,10 @@ use crate::ExecutionError;
 /// The fd number the lifeline read end has in the broker.
 pub const LIFELINE_FD: i32 = 3;
 
-/// Descriptors the broker needs: four per dialed connection (two sockets,
-/// each cloned for its copy direction) at the 256-connection cap, plus its
-/// listeners and standard streams.
+/// Descriptors the broker may need: a dialed connection holds two (the client
+/// and upstream sockets, borrowed by both copy directions), and a passed right
+/// is open briefly before it is closed; four per connection at the
+/// 256-connection cap leaves that headroom, plus listeners and standard streams.
 pub const FILE_LIMIT: u64 = 4 * super::MAX_CONNECTIONS as u64 + 64;
 
 /// Supervisor to broker.
@@ -518,7 +519,7 @@ impl BrokerProcess {
             command.pre_exec(move || {
                 if raw_read == LIFELINE_FD {
                     clear_cloexec(LIFELINE_FD)?;
-                } else if libc::dup2(raw_read, LIFELINE_FD) < 0 {
+                } else if libc::dup2(raw_read, LIFELINE_FD) != LIFELINE_FD {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())

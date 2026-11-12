@@ -116,7 +116,9 @@ fn two_runs_cannot_own_one_endpoint_and_removal_frees_it() {
         ErrorCode::ResourceConflict,
         "one run registers once"
     );
+    assert!(registry.contains("run-a"));
     assert!(registry.remove("run-a"));
+    assert!(!registry.contains("run-a"));
     assert!(!registry.remove("run-a"));
     registry.register("run-b", &a_endpoints(), &[]).unwrap();
 }

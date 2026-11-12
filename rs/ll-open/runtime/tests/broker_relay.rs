@@ -476,31 +476,92 @@ fn identity(fd: i32) -> Option<(u64, u64)> {
 }
 
 fn send_with_fd(stream: &UnixStream, data: &[u8], fd: i32) {
+    send_with_fds(stream, data, &[fd]);
+}
+
+fn send_with_fds(stream: &UnixStream, data: &[u8], fds: &[i32]) {
     let mut iov = libc::iovec {
         iov_base: data.as_ptr() as *mut libc::c_void,
         iov_len: data.len(),
     };
+    let bytes = std::mem::size_of_val(fds) as u32;
     // SAFETY: CMSG_SPACE is a pure size computation.
-    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
-    let mut control = vec![0u8; space];
+    let space = unsafe { libc::CMSG_SPACE(bytes) } as usize;
+    let mut control = vec![0u64; space.div_ceil(8)];
     // SAFETY: a zeroed msghdr filled with valid pointers below.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = space as _;
-    // SAFETY: the control buffer holds one cmsg carrying one fd.
+    // SAFETY: the control buffer holds one cmsg carrying the descriptors.
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<i32>(), fd);
+        (*header).cmsg_len = libc::CMSG_LEN(bytes) as _;
+        std::ptr::copy_nonoverlapping(
+            fds.as_ptr().cast::<u8>(),
+            libc::CMSG_DATA(header),
+            bytes as usize,
+        );
         assert_eq!(
             libc::sendmsg(stream.as_raw_fd(), &message, 0),
             data.len() as isize
         );
     }
+}
+
+/// One message carrying a hundred rights: every one is closed, the byte still
+/// reaches the target, and nothing else in the process is closed.
+#[test]
+fn a_hundred_passed_descriptors_are_all_closed_and_the_bytes_still_cross() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).unwrap();
+        got
+    });
+    let running = run(port, None, Limits::default());
+    let client = running.connect();
+    // A sentinel descriptor that must survive the broker's closes.
+    let sentinel = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let mut pipe = [0; 2];
+    // SAFETY: a valid out array.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let (pipe_read, pipe_write) = (pipe[0], pipe[1]);
+    send_with_fds(&client, b"y", &[pipe_write; 100]);
+    // SAFETY: closing our own copy of the write end.
+    unsafe { libc::close(pipe_write) };
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server.join().unwrap(), b"y", "the connection carried on");
+    drop(client);
+    assert_eq!(running.record().outcome, Outcome::Dialed);
+    let mut pollfd = libc::pollfd {
+        fd: pipe_read,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    assert!(
+        unsafe { libc::poll(&mut pollfd, 1, 5_000) } > 0,
+        "a passed copy is still open"
+    );
+    let mut byte = 0u8;
+    // SAFETY: one-byte read into a valid buffer.
+    assert_eq!(
+        unsafe { libc::read(pipe_read, (&mut byte as *mut u8).cast(), 1) },
+        0
+    );
+    // SAFETY: closing our read end.
+    unsafe { libc::close(pipe_read) };
+    assert!(
+        identity(sentinel.as_raw_fd()).is_some(),
+        "an unrelated descriptor was closed"
+    );
+    assert!(identity(0).is_some(), "standard input was closed");
 }
 
 #[test]
@@ -646,9 +707,10 @@ fn an_awaited_peer_is_refused_until_named_and_named_once() {
 /// The production cap: 256 held connections, and the 257th is refused.
 #[test]
 fn the_cap_is_256_simultaneous_connections() {
-    let limit = leyline_runtime::broker::control::raise_fd_limit(
-        leyline_runtime::broker::control::FILE_LIMIT,
-    );
+    // This test shares its process with every other relay test, which run in
+    // parallel: give the whole process room for the 512-odd descriptors the
+    // held connections take, not just the broker's own budget.
+    let limit = leyline_runtime::broker::control::raise_fd_limit(8192);
     assert!(limit >= leyline_runtime::broker::control::FILE_LIMIT);
     let running = run(free_port(), None, limits(Duration::from_secs(20)));
     // The listen backlog (128 on macOS) refuses a burst before the broker
@@ -658,7 +720,13 @@ fn the_cap_is_256_simultaneous_connections() {
             loop {
                 match UnixStream::connect(&running.path) {
                     Ok(stream) => break stream,
-                    Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                    // A full backlog: refused on Linux, EAGAIN on macOS.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::ConnectionRefused | ErrorKind::WouldBlock
+                        ) =>
+                    {
                         thread::sleep(Duration::from_millis(5));
                     }
                     Err(error) => panic!("connect: {error}"),
@@ -667,7 +735,20 @@ fn the_cap_is_256_simultaneous_connections() {
         })
         .collect();
     thread::sleep(Duration::from_millis(500));
-    let mut over = running.connect();
+    let mut over = loop {
+        match UnixStream::connect(&running.path) {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::WouldBlock
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("connect: {error}"),
+        }
+    };
     let mut back = Vec::new();
     over.read_to_end(&mut back).unwrap();
     assert_eq!(running.record().outcome, Outcome::Refused, "the 257th");

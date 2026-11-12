@@ -1,0 +1,3 @@
+Section: Fixed
+
+- **Both tiers refuse the same unrepresentable environment, by name, before a worker exists** (bead `ley-line-open-9d75c9`). A `publicEnvironment` key that is empty or holds `=` or NUL, or a value that holds NUL, is refused (`invalidSpec`) by `ExecutionRequest::validate`, so the service, both backends and the plan compiler share one rule. The native tier used to format `KEY=VALUE` and let the platform split at the first `=`, so `{"A=B": "1"}` ran there as `A="B=1"` and an empty key ran too, while the microVM tier refused both. The microVM tier keeps its own reservations on top: `KRUN_` keys and the size bounds.

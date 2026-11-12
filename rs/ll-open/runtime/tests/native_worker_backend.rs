@@ -299,6 +299,50 @@ fn native_cleanup_restores_guest_created_permissions() {
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
 }
 
+/// An environment key or value no environment can carry is refused by name,
+/// with the same code on both tiers, before a worker exists (bead
+/// `ley-line-open-9d75c9`). The native tier used to format `KEY=VALUE` and
+/// let the platform split at the first `=`, so `{"A=B": "1"}` ran with
+/// `A="B=1"` and an empty key ran too, while the microVM tier refused both.
+#[test]
+fn an_environment_no_tier_can_carry_is_refused_by_name_before_spawn() {
+    let _serial = common::serial();
+    for (key, value, named) in [
+        ("A=B", "1", "`=`"),
+        ("", "1", "empty"),
+        ("K\0EY", "1", "NUL"),
+        ("KEY", "v\0", "NUL"),
+    ] {
+        let fixture = TempDir::new().expect("fixture");
+        let spawned = fixture.path().join("spawned");
+        let (backend, _runs) = backend(
+            &fixture,
+            &format!(
+                "#!/bin/sh\n: > '{}'\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"native-run-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+                spawned.display()
+            ),
+        );
+        let mut request = request();
+        request
+            .public_environment
+            .insert(key.to_owned(), value.to_owned());
+        let error = backend
+            .start(&request, ServedWorkspaces::none())
+            .expect_err("an environment no tier can carry is refused");
+        assert_eq!(
+            error.code,
+            leyline_runtime::ErrorCode::InvalidSpec,
+            "{key:?}"
+        );
+        assert!(
+            error.detail.contains("publicEnvironment") && error.detail.contains(named),
+            "{key:?} is refused by name: {}",
+            error.detail
+        );
+        assert!(!spawned.exists(), "{key:?}: no worker was spawned");
+    }
+}
+
 #[test]
 fn cancel_kills_worker_and_removes_run_root() {
     let _serial = common::serial();

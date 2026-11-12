@@ -480,6 +480,7 @@ impl ExecutionRequest {
             return Err(ExecutionError::invalid("wall_time_ms must be non-zero"));
         }
         self.limits.validate()?;
+        refuse_unrepresentable_environment(&self.public_environment)?;
         if !self.allowed_egress.is_empty() {
             return Err(ExecutionError::unsupported(
                 "the configured execution backend does not yet support egress grants",
@@ -487,6 +488,32 @@ impl ExecutionRequest {
         }
         Ok(())
     }
+}
+
+/// Refuse, by name, an environment no tier can give a workload: a key that
+/// is empty or holds `=` or NUL, or a value that holds NUL. Every tier
+/// passes `KEY=VALUE` to the workload, where the first `=` ends the key and
+/// NUL ends the string, so such an entry would arrive as some other
+/// variable, or not at all. One rule for every tier (bead
+/// `ley-line-open-9d75c9`); a tier adds its own reservations on top (the
+/// microVM tier's `KRUN_` keys and size bounds).
+pub(crate) fn refuse_unrepresentable_environment(
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<(), ExecutionError> {
+    for (key, value) in environment {
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment key {key:?} cannot name an environment variable: it is \
+                 empty or holds `=` or NUL"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment value of {key:?} holds NUL, which no environment can carry"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_guest_path(value: &str) -> Result<(), ExecutionError> {

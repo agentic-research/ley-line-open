@@ -62,22 +62,13 @@ fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), Executi
             )));
         }
     }
-    for (key, value) in &request.public_environment {
-        if key.is_empty() || key.contains('=') || key.contains('\0') {
-            return Err(ExecutionError::invalid(format!(
-                "publicEnvironment key {key:?} cannot name an environment variable: it is \
-                 empty or holds `=` or NUL"
-            )));
-        }
+    // The rule every tier shares, then this tier's own reservation.
+    crate::model::refuse_unrepresentable_environment(&request.public_environment)?;
+    for key in request.public_environment.keys() {
         if key.starts_with("KRUN_") {
             return Err(ExecutionError::invalid(format!(
                 "publicEnvironment may not set {key}: KRUN_ variables configure the guest \
                  init, and the worker sets the ones a run has"
-            )));
-        }
-        if value.contains('\0') {
-            return Err(ExecutionError::invalid(format!(
-                "publicEnvironment value of {key:?} holds NUL, which no environment can carry"
             )));
         }
     }

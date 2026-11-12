@@ -12,4 +12,5 @@
 
 pub mod oci;
 pub mod registry;
+pub mod rootfs_manifest;
 mod rootfs_tree;

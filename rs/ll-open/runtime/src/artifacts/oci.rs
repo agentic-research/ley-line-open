@@ -119,7 +119,7 @@
 //! [OCI image layout]: https://github.com/opencontainers/image-spec/blob/v1.1.0/image-layout.md
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
@@ -130,12 +130,17 @@ use leyline_core::ContentAddressed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::rootfs_manifest::{
+    FileSpec, MANIFEST_FILE_MODE, ROOT_DIRECTORY_MODE, ROOTFS_MANIFEST, RUN_EXEC_SPEC, RootfsSpec,
+    cas_directory_mode, guest_mount_point,
+};
 use super::rootfs_tree::{
-    FileNode, Final, KERNEL_MOUNTED, Node, PathError, ResolveError, Resolved, Tree, join,
-    under_kernel_mount,
+    FileNode, Final, Node, PathError, ResolveError, Resolved, Tree, join, under_kernel_mount,
 };
 use crate::DigestRef;
-use crate::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver, verify_manifest};
+use crate::backends::libkrun::plan::{
+    DirectoryRootfsResolver, Placement, RootfsResolver, verify_manifest,
+};
 use crate::cas_volume::{FilesystemSensitivity, probe_sensitivity};
 
 /// The default bound on what one import extracts and writes: 16 GiB.
@@ -147,8 +152,6 @@ pub(super) const MAX_DOCUMENT_BYTES: u64 = 4 << 20;
 
 /// Bound on the entries a `Resolve` expansion may produce.
 const MAX_RESOLVED_ENTRIES: usize = 1 << 20;
-
-const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
 
 /// Linux's `PATH_MAX`: the longest archive path or link target accepted.
 const MAX_PATH_BYTES: usize = 4096;
@@ -177,12 +180,16 @@ const GZIP_LAYER_TYPES: [&str; 3] = [
 ];
 
 /// What to do with the symbolic links an image's root filesystem contains.
-/// Rootfs manifest v1 has no way to express one (bead
-/// `ley-line-open-5f8c37` proposes authenticated link entries).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SymlinkPolicy {
-    /// Refuse the import, naming the first link in path order.
+    /// Keep each link as a link: rootfs manifest v2 authenticates its target
+    /// bytes, which are never followed at import, and the per-run copy
+    /// recreates it (bead `ley-line-open-4f08ea`). `etc/mtab ->
+    /// /proc/mounts` stays a link the guest's kernel follows, and a link
+    /// whose target appears only at run time works once it does.
     #[default]
+    Preserve,
+    /// Refuse the import, naming the first link in path order.
     Refuse,
     /// Replace each link with a copy of its in-image target. A link into
     /// `dev`, `proc`, `sys` or `tmp`, or one whose target the image does not hold,
@@ -284,12 +291,19 @@ pub enum OciImportError {
         "symbolic link {path} -> {target:?} refused: rootfs manifest v1 cannot express links (import with symlink resolution to copy link targets)"
     )]
     SymlinkRefused { path: String, target: String },
-    /// A regular file (or, under `Resolve`, a link to one) where the guest
-    /// init mounts a kernel filesystem (bead `ley-line-open-2aa5d3`).
+    /// A regular file (or, under `Resolve`, a link that becomes one) or a
+    /// kept symbolic link where the guest init mounts a kernel filesystem
+    /// (beads `ley-line-open-2aa5d3`, `ley-line-open-4f08ea`).
     #[error(
-        "{path} is a regular file, but the guest init mounts a filesystem over /{path} and can mount only over a directory: the image would import and never boot"
+        "{path} is not a directory, but the guest init mounts a filesystem over /{path} and mounts only over a real directory: the image would import and never boot"
     )]
     KernelMountPointNotDirectory { path: String },
+    /// An entry at the root path the runtime writes into each run's copy
+    /// itself ([`RUN_EXEC_SPEC`]).
+    #[error(
+        "/{path} is reserved: the runtime writes it into each run's rootfs, so no image may hold it"
+    )]
+    ReservedPath { path: String },
     #[error("symbolic link {path} cannot be resolved inside the image: {reason}")]
     SymlinkUnresolvable { path: String, reason: String },
     /// Two paths of the finished rootfs that the CAS root's filesystem
@@ -430,7 +444,14 @@ pub struct ImportedRootfs {
     pub image: ImageProvenance,
     /// Regular files in the rootfs manifest.
     pub files: usize,
-    /// Files whose setuid, setgid or sticky bit was cleared.
+    /// Directories in the rootfs manifest (v2), the root left out, empty
+    /// ones included.
+    pub directories: usize,
+    /// Symbolic links kept as links in the rootfs manifest (v2), each with
+    /// its target bytes (`SymlinkPolicy::Preserve`).
+    pub symlinks: usize,
+    /// Files whose setuid, setgid or sticky bit was cleared, and directories
+    /// whose setuid or setgid bit was (a directory keeps its sticky bit).
     pub special_mode_bits_cleared: usize,
     /// Links replaced by copies of their targets (`SymlinkPolicy::Resolve`),
     /// counting a copy later dropped as unreadable.
@@ -584,17 +605,23 @@ pub fn import_oci_layout(
         special_entries_dropped.extend(changes.apply(index, &mut tree)?);
     }
 
+    let as_it_is = |tree: Tree| {
+        let (tree, directory_modes) = tree.into_final();
+        Resolved {
+            tree,
+            copied: 0,
+            kernel_mount: Vec::new(),
+            dangling: Vec::new(),
+            directory_modes,
+        }
+    };
     let resolved = match request.symlinks {
+        SymlinkPolicy::Preserve => as_it_is(tree),
         SymlinkPolicy::Refuse => {
             if let Some((path, target)) = tree.first_symlink() {
                 return Err(OciImportError::SymlinkRefused { path, target });
             }
-            Resolved {
-                tree: tree.into_final(),
-                copied: 0,
-                kernel_mount: Vec::new(),
-                dangling: Vec::new(),
-            }
+            as_it_is(tree)
         }
         SymlinkPolicy::Resolve => tree
             .resolve_symlinks(MAX_RESOLVED_ENTRIES)
@@ -617,6 +644,7 @@ pub fn import_oci_layout(
     let links_dropped_kernel_mount = dropped_links(resolved.kernel_mount);
     let links_dropped_dangling = dropped_links(resolved.dangling);
     let symlinks_resolved = resolved.copied;
+    let directory_modes = resolved.directory_modes;
     let (finished, unreadable) = resolved.tree.without_unreadable_files();
     let unreadable_files_dropped = unreadable
         .into_iter()
@@ -625,20 +653,29 @@ pub fn import_oci_layout(
     // The guest init mounts a kernel filesystem over each of these and
     // cannot mount over a regular file (mount(2) fails ENOTDIR), so an image
     // with one there would import and then never boot: refused by name now
-    // (bead `ley-line-open-2aa5d3`). A device or FIFO there is refused
-    // earlier, a link into a kernel mount dropped under `Resolve`.
+    // (bead `ley-line-open-2aa5d3`). A link there is refused too: mount(2)
+    // follows it, and init's `mount_tmp` refuses one. The workspace's
+    // `work` is one too: a kept `work -> usr/bin` would put the workspace
+    // over the image's executables (bead `ley-line-open-10b516`). A device
+    // or FIFO there is refused earlier, a link into a kernel mount dropped
+    // under `Resolve`.
     if let Final::Dir(top) = &finished
-        && let Some(name) = KERNEL_MOUNTED
-            .iter()
-            .find(|name| matches!(top.get(**name), Some(Final::File(_))))
+        && let Some((name, _)) = top.iter().find(|(name, node)| {
+            guest_mount_point(name) && matches!(node, Final::File(_) | Final::Symlink(_))
+        })
     {
-        return Err(OciImportError::KernelMountPointNotDirectory {
-            path: (*name).to_string(),
+        return Err(OciImportError::KernelMountPointNotDirectory { path: name.clone() });
+    }
+    // The worker writes this one path into each run's copy after the copy
+    // is verified, so the image's tree may not hold it as anything: refused
+    // by name here, and by every manifest reader.
+    if let Final::Dir(top) = &finished
+        && top.contains_key(RUN_EXEC_SPEC)
+    {
+        return Err(OciImportError::ReservedPath {
+            path: RUN_EXEC_SPEC.to_string(),
         });
     }
-    // Rootfs manifest v1 lists files only, so a directory that holds none is
-    // not part of the identity: write none, and one digest names one tree.
-    let finished = finished.without_empty_directories();
     // Before any image path is written: a pair the CAS root would merge is
     // refused, never merged. Staging (content and layers only) is removed
     // with `staging` on this return.
@@ -652,18 +689,24 @@ pub fn import_oci_layout(
     }
 
     let staged_root = staging.path().join("rootfs");
-    let written = write_rootfs(&staged_root, &finished, &store, request.max_rootfs_bytes)?;
+    let written = write_rootfs(
+        &staged_root,
+        &finished,
+        &directory_modes,
+        &store,
+        request.max_rootfs_bytes,
+    )?;
     let rootfs = DigestRef {
         algorithm: "blake3-256".into(),
         value: written.digest.clone(),
     };
-    verify_manifest(&staged_root, &rootfs).map_err(|error| {
+    verify_manifest(&staged_root, &rootfs, Placement::Cas).map_err(|error| {
         OciImportError::Cas(format!(
             "the staged rootfs does not verify against its own manifest: {}",
             error.detail
         ))
     })?;
-    publish(&cas_root, &staged_root, &rootfs, &written.directories)?;
+    publish(&cas_root, &staged_root, &rootfs)?;
 
     let platform = config.platform();
     let runtime = config.config.unwrap_or_default();
@@ -676,6 +719,8 @@ pub fn import_oci_layout(
             platform,
         },
         files: written.files,
+        directories: written.directories,
+        symlinks: written.symlinks,
         special_mode_bits_cleared: written.special_mode_bits_cleared,
         symlinks_resolved,
         special_entries_dropped,
@@ -1175,6 +1220,9 @@ impl<R: Read> Read for DiffIdReader<'_, R> {
 
 enum Change {
     Node(Vec<String>, Node),
+    /// A directory entry and its mode: a directory over an existing one
+    /// keeps its children and takes this mode.
+    Directory(Vec<String>, u32),
     Hardlink(Vec<String>, Vec<String>),
     /// An entry that is not written: it replaces whatever a lower layer (or
     /// an earlier entry of this one) had at its path, and leaves nothing.
@@ -1204,6 +1252,9 @@ impl LayerChanges {
         for (raw, change) in self.entries {
             match change {
                 Change::Node(path, node) => tree.insert(&path, node),
+                Change::Directory(path, mode) => tree
+                    .insert(&path, Node::Dir(Default::default()))
+                    .map(|()| tree.set_dir_mode(&path, mode)),
                 Change::Hardlink(path, target) => tree.hardlink(&path, &target),
                 Change::Drop(path) => tree.remove(&path),
             }
@@ -1308,27 +1359,15 @@ fn read_layer(
                 continue;
             }
             if kind == tar::EntryType::Directory {
-                // Directory modes are not carried (each is written 0755), so
-                // one whose owner cannot both list it and reach into it
-                // would expose what it hides.
+                // Rootfs manifest v2 carries the mode (with owner rwx set;
+                // see `manifest_directory_mode`). The root's is fixed.
                 let mode = entry
                     .header()
                     .mode()
-                    .map_err(io_error("read an entry mode"))?;
-                if mode & 0o500 != 0o500 {
-                    return Err(unsafe_path(
-                        layer,
-                        &raw,
-                        &format!(
-                            "a directory its owner cannot read and search (mode {:04o}) would be written 0755, exposing what it hides",
-                            mode & 0o7777
-                        ),
-                    ));
-                }
+                    .map_err(io_error("read an entry mode"))?
+                    & 0o7777;
                 if !path.is_empty() {
-                    changes
-                        .entries
-                        .push((raw, Change::Node(path, Node::Dir(Default::default()))));
+                    changes.entries.push((raw, Change::Directory(path, mode)));
                 }
                 continue;
             }
@@ -1458,10 +1497,14 @@ fn first_collision(
         entries: &BTreeMap<String, Final>,
         prefix: &str,
         sensitivity: FilesystemSensitivity,
-        extra: Option<&str>,
+        extra: &[&str],
     ) -> Option<(String, String, NameCollision)> {
         let mut seen: BTreeMap<String, &str> = BTreeMap::new();
-        for name in extra.into_iter().chain(entries.keys().map(String::as_str)) {
+        for name in extra
+            .iter()
+            .copied()
+            .chain(entries.keys().map(String::as_str))
+        {
             if let Some(earlier) = seen.insert(folded(name, sensitivity), name) {
                 let kind = if !sensitivity.normalization_sensitive && earlier.nfd().eq(name.nfd()) {
                     NameCollision::Normalization
@@ -1472,47 +1515,51 @@ fn first_collision(
             }
         }
         entries.iter().find_map(|(name, node)| match node {
-            Final::Dir(children) => walk(children, &join(prefix, name), sensitivity, None),
-            Final::File(_) => None,
+            Final::Dir(children) => walk(children, &join(prefix, name), sensitivity, &[]),
+            Final::File(_) | Final::Symlink(_) => None,
         })
     }
     if sensitivity == FilesystemSensitivity::EXACT {
         return None;
     }
     match tree {
-        Final::Dir(entries) => walk(entries, "", sensitivity, Some(ROOTFS_MANIFEST)),
-        Final::File(_) => None,
+        // The two root names the runtime writes itself: the manifest, and
+        // each run's exec spec.
+        Final::Dir(entries) => walk(entries, "", sensitivity, &[ROOTFS_MANIFEST, RUN_EXEC_SPEC]),
+        Final::File(_) | Final::Symlink(_) => None,
     }
 }
 
 struct Written {
     digest: String,
     files: usize,
+    /// Directories written, the root left out.
+    directories: usize,
+    /// Symbolic links written as links.
+    symlinks: usize,
     special_mode_bits_cleared: usize,
-    /// Every directory written, relative, the root as "". All are `0755`.
-    directories: BTreeSet<String>,
 }
 
-#[derive(Serialize)]
-struct ManifestDocument<'a> {
-    version: u32,
-    files: &'a [ManifestFile],
-}
-
-#[derive(Serialize)]
-struct ManifestFile {
-    path: String,
-    mode: u32,
-    blake3: String,
+/// A directory's mode in rootfs manifest v2, from the mode its archive
+/// entry gave it (`0755` for one only a deeper entry implies): permission
+/// bits and the sticky bit (`/tmp` and `/var/tmp` are `1777`); setuid and
+/// setgid are cleared, and whether they were is returned; owner read, write
+/// and search are always set, since the unprivileged host user writes and
+/// removes every copy of the tree, and the guest's root ignores owner bits.
+fn manifest_directory_mode(mode: Option<u32>) -> (u32, bool) {
+    let mode = mode.unwrap_or(0o755);
+    let cleared = mode & 0o6000 != 0;
+    ((mode & 0o1777) | 0o700, cleared)
 }
 
 struct Writer<'a> {
     store: &'a ContentStore,
     limit: u64,
     written: u64,
-    files: Vec<ManifestFile>,
+    /// Each directory's mode from its archive entry, by written path.
+    entry_modes: &'a BTreeMap<String, u32>,
+    spec: RootfsSpec,
     special_mode_bits_cleared: usize,
-    directories: BTreeSet<String>,
 }
 
 impl Writer<'_> {
@@ -1528,10 +1575,33 @@ impl Writer<'_> {
             match node {
                 Final::Dir(children) => {
                     create_directory(&path)?;
-                    self.directories.insert(relative.clone());
                     self.directory(&path, &relative, children)?;
+                    let (mode, cleared) =
+                        manifest_directory_mode(self.entry_modes.get(&relative).copied());
+                    self.special_mode_bits_cleared += usize::from(cleared);
+                    // Set after its children are written. The manifest
+                    // keeps the declared mode; the shared CAS entry never
+                    // lets group or other write (see `cas_directory_mode`).
+                    fs::set_permissions(
+                        &path,
+                        fs::Permissions::from_mode(cas_directory_mode(mode)),
+                    )
+                    .map_err(io_error("set a rootfs directory's mode"))?;
+                    self.spec.directories.insert(relative, mode);
                 }
                 Final::File(file) => self.file(&path, relative, file)?,
+                Final::Symlink(target) => {
+                    if target.is_empty() {
+                        return Err(OciImportError::SymlinkUnresolvable {
+                            path: relative,
+                            reason: "the link's target is empty".into(),
+                        });
+                    }
+                    std::os::unix::fs::symlink(target, &path).map_err(io_error(
+                        "write a rootfs link (a case- or normalization-insensitive host filesystem merges image paths that differ only in case)",
+                    ))?;
+                    self.spec.symlinks.insert(relative, target.clone());
+                }
             }
         }
         Ok(())
@@ -1570,28 +1640,34 @@ impl Writer<'_> {
         io::copy(&mut source, &mut destination).map_err(io_error("write a rootfs file"))?;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(io_error("set a rootfs file's mode"))?;
-        self.files.push(ManifestFile {
-            path: relative,
-            mode,
-            blake3: file.content.to_hex().to_string(),
-        });
+        self.spec.files.insert(
+            relative,
+            FileSpec {
+                mode,
+                blake3: file.content.to_hex().to_string(),
+            },
+        );
         Ok(())
     }
 }
 
+/// Create a directory owner-only; its manifest mode is set once its
+/// children are written.
 fn create_directory(path: &Path) -> Result<(), OciImportError> {
     fs::create_dir(path).map_err(io_error(
         "create a rootfs directory (a case- or normalization-insensitive host filesystem merges image paths that differ only in case)",
     ))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(io_error("set a rootfs directory's mode"))
 }
 
-/// Write the finished tree and its manifest at `root`, returning the
-/// manifest's BLAKE3.
+/// Write the finished tree and its rootfs manifest v2 at `root`, returning
+/// the manifest's BLAKE3. `entry_modes` holds each directory's archive mode
+/// by written path.
 fn write_rootfs(
     root: &Path,
     finished: &Final,
+    entry_modes: &BTreeMap<String, u32>,
     store: &ContentStore,
     limit: u64,
 ) -> Result<Written, OciImportError> {
@@ -1603,95 +1679,54 @@ fn write_rootfs(
         store,
         limit,
         written: 0,
-        files: Vec::new(),
+        entry_modes,
+        spec: RootfsSpec::empty_v2(),
         special_mode_bits_cleared: 0,
-        directories: BTreeSet::from([String::new()]),
     };
     writer.directory(root, "", entries)?;
-    let manifest = serde_json::to_vec(&ManifestDocument {
-        version: 1,
-        files: &writer.files,
-    })
-    .expect("a rootfs manifest serializes");
+    fs::set_permissions(root, fs::Permissions::from_mode(ROOT_DIRECTORY_MODE))
+        .map_err(io_error("set the rootfs root's mode"))?;
+    // The canonical bytes: the only ones a reader accepts for this tree.
+    let manifest = writer.spec.to_canonical_v2();
     let manifest_path = root.join(ROOTFS_MANIFEST);
     fs::write(&manifest_path, &manifest).map_err(io_error("write the rootfs manifest"))?;
-    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644))
-        .map_err(io_error("set the rootfs manifest's mode"))?;
+    fs::set_permissions(
+        &manifest_path,
+        fs::Permissions::from_mode(MANIFEST_FILE_MODE),
+    )
+    .map_err(io_error("set the rootfs manifest's mode"))?;
     Ok(Written {
         // σ_bytes over the manifest: the identity `verify_manifest` checks.
         digest: manifest.as_slice().hash().to_string(),
-        files: writer.files.len(),
+        files: writer.spec.files.len(),
+        directories: writer.spec.directories.len() - 1,
+        symlinks: writer.spec.symlinks.len(),
         special_mode_bits_cleared: writer.special_mode_bits_cleared,
-        directories: writer.directories,
     })
 }
 
-/// Every directory under `root`, relative, the root as "", with its mode.
-/// Links are not followed (and a verified rootfs holds none).
-fn directories_on_disk(root: &Path) -> Result<BTreeMap<String, u32>, OciImportError> {
-    fn walk(
-        dir: &Path,
-        prefix: &str,
-        out: &mut BTreeMap<String, u32>,
-    ) -> Result<(), OciImportError> {
-        for entry in fs::read_dir(dir).map_err(io_error("enumerate a CAS entry"))? {
-            let entry = entry.map_err(io_error("enumerate a CAS entry"))?;
-            let metadata = entry
-                .path()
-                .symlink_metadata()
-                .map_err(io_error("inspect a CAS entry"))?;
-            if metadata.is_dir() {
-                let relative = join(prefix, &entry.file_name().to_string_lossy());
-                out.insert(relative.clone(), metadata.permissions().mode() & 0o7777);
-                walk(&entry.path(), &relative, out)?;
-            }
-        }
-        Ok(())
-    }
-    let mode = fs::symlink_metadata(root)
-        .map_err(io_error("inspect a CAS entry"))?
-        .permissions()
-        .mode()
-        & 0o7777;
-    let mut out = BTreeMap::from([(String::new(), mode)]);
-    walk(root, "", &mut out)?;
-    Ok(out)
-}
-
 /// Rename the verified staged tree to `<cas-root>/<digest>`. An entry that
-/// is already there is reused only if the CAS resolver verifies its files
-/// and its directories are exactly the ones this import wrote, all `0755`:
-/// the manifest does not cover directories, and the per-run copy carries
-/// them into the guest.
-fn publish(
-    cas_root: &Path,
-    staged: &Path,
-    rootfs: &DigestRef,
-    directories: &BTreeSet<String>,
-) -> Result<(), OciImportError> {
+/// is already there is reused only if the CAS resolver verifies it, which
+/// under rootfs manifest v2 covers every file, directory (with its mode)
+/// and link: it is then this tree, and it is never overwritten.
+fn publish(cas_root: &Path, staged: &Path, rootfs: &DigestRef) -> Result<(), OciImportError> {
     let destination = cas_root.join(&rootfs.value);
     if destination.symlink_metadata().is_err() && fs::rename(staged, &destination).is_ok() {
         return Ok(());
     }
-    let refuse = |detail: String| {
-        OciImportError::Cas(format!(
-            "{} already exists and does not verify as rootfs {}; refusing to replace it: {detail}",
-            destination.display(),
-            rootfs.value,
-        ))
-    };
-    let resolved = DirectoryRootfsResolver::new(cas_root)
+    // Rootfs manifest v2 names every directory with its mode and every
+    // link, so the resolver's verification is exact: an entry that passes
+    // it is this tree.
+    DirectoryRootfsResolver::new(cas_root)
         .resolve(rootfs)
-        .map_err(|error| refuse(error.detail))?;
-    let expected: BTreeMap<String, u32> = directories
-        .iter()
-        .map(|directory| (directory.clone(), 0o755))
-        .collect();
-    if directories_on_disk(&resolved.canonical_path)? != expected {
-        return Err(refuse(
-            "its directories or their modes differ from the ones its manifest implies".into(),
-        ));
-    }
+        .map_err(|error| {
+            OciImportError::Cas(format!(
+                "{} already exists and does not verify as rootfs {}; refusing to replace it: {}",
+                destination.display(),
+                rootfs.value,
+                error.detail
+            ))
+        })?;
     Ok(())
 }
 
@@ -1829,6 +1864,26 @@ mod tests {
             None
         );
         assert_eq!(collision(&["etc/Rootfs.Manifest.json"], DEFAULT_APFS), None);
+    }
+
+    /// The runtime's per-run file folds the same way: on a filesystem that
+    /// ignores case, `.LEYLINE-EXEC.JSON` would be the worker's own file
+    /// (identity review of `ley-line-open-4f08ea`, F5).
+    #[test]
+    fn an_image_file_that_folds_to_the_run_exec_spec_collides_at_the_root_only() {
+        assert_eq!(
+            collision(&[".LEYLINE-EXEC.JSON"], DEFAULT_APFS),
+            Some((
+                RUN_EXEC_SPEC.to_string(),
+                ".LEYLINE-EXEC.JSON".to_string(),
+                NameCollision::Case
+            ))
+        );
+        assert_eq!(
+            collision(&[".LEYLINE-EXEC.JSON"], CASE_SENSITIVE_APFS),
+            None
+        );
+        assert_eq!(collision(&["etc/.LEYLINE-EXEC.JSON"], DEFAULT_APFS), None);
     }
 
     #[test]

@@ -153,8 +153,7 @@ or podman; none is needed afterwards) and import it by digest:
 leyline rootfs import-oci \
   --layout ./app-oci \
   --image sha256:<index or manifest digest> \
-  --cas-root /var/lib/leyline/cas \
-  --symlinks resolve
+  --cas-root /var/lib/leyline/cas
 ```
 
 It selects this host's Linux platform, verifies every blob, applies the layers
@@ -166,9 +165,12 @@ same verification, rootfs digest and JSON:
 ```bash
 leyline rootfs import-oci \
   --from-registry ghcr.io/owner/app@sha256:<index or manifest digest> \
-  --cas-root /var/lib/leyline/cas \
-  --symlinks resolve
+  --cas-root /var/lib/leyline/cas
 ```
+
+Symbolic links are kept as links by default (rootfs manifest v2 authenticates
+each link's target bytes; `--symlinks resolve` copies their targets instead,
+`refuse` refuses an image with any).
 
 The image format is never the isolation boundary; the backend is.
 

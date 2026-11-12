@@ -85,6 +85,15 @@ impl ExecutionError {
         }
     }
 
+    /// Authority that is malformed or inconsistent ([`ErrorCode::InvalidGrant`]).
+    pub(crate) fn invalid_grant(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::InvalidGrant,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
+
     pub(crate) fn unsupported(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::UnsupportedBackend,

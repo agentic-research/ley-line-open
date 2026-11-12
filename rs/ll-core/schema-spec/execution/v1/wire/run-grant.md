@@ -65,6 +65,14 @@ scope", and an authorizer refuses the empty list (README, "Workspace write
 scope"). `test-vectors/run-grant-signing.json` gives known answers for the
 signing bytes and the Ed25519 signature over them, including that pair.
 
+`connectionsDigest @16` and `connectionsDocument @17` (ADR-0046 S3, README
+"Broker integrations and connections") are pointer fields after `signature`,
+covered like every other field. A grant that sets neither has null pointers
+there, which canonicalization truncates, so its `signing_bytes` are the bytes
+it had before the fields existed. `test-vectors/connections-grant.json` pins
+the signing bytes of a grant that carries both, with the
+`credentialBrokerRefs` marker, and of the same grant without them.
+
 ## Fields
 
 ```capnp

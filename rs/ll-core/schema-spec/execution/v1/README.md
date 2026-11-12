@@ -354,6 +354,79 @@ advertised.
 The canonical vector in `test-vectors/canonical-run.json` pins the JSON carrier
 shape used by conformance tests. JSON is a carrier; Cap'n Proto remains the IDL.
 
+## Broker integrations and connections
+
+`RunGrant.credentialBrokerRefs` (`@13`) lists **the broker integrations the run
+requires, each named by contract id or broker reference**; never a credential
+value. A daemon refuses any entry it does not implement, with
+`unsupportedBackend`: "credential broker authority requires a broker
+integration". Every daemon since execution/v1 first shipped refuses a non-empty
+list that way, before the resolver and the backend, so an entry is a critical
+extension: a daemon that does not know it fails closed.
+
+One contract id is reserved: `cloister/connections/v1` (ADR-0046 Slice 1). It
+marks a grant that authorizes a connection broker for the run, and comes with two
+fields:
+
+| field | carries |
+|---|---|
+| `connectionsDigest @16` | BLAKE3-256 over the canonical `cloister/connections/v1` document (`../../connections/v1/README.md`), as a `DigestRef` with `algorithm` `blake3-256`. It names that document's bytes only: not `confinementDigest`, a blob hash, or any store root. |
+| `connectionsDocument @17` | The canonical document the digest is taken over. |
+
+The rule is all-or-nothing. A daemon that implements connections accepts a grant
+only when `@16`, `@17` and `credentialBrokerRefs = ["cloister/connections/v1"]`
+are present together, or all absent; any other combination is `invalidGrant`,
+naming the missing part. **Present** means a non-null pointer, and for `@17`
+non-empty text; a non-null `@16` with an empty `algorithm` or `value`, or a
+non-null empty `@17`, is malformed and refused, never read as absent (unlike
+`confinementManifest @15`). The daemon recomputes the digest from `@17`, requires
+it to equal `@16`, and requires `@17` to be byte-equal to its own
+canonicalization; it never normalizes. Until ADR-0046 D4 defines
+credential-bearing entries, the marker beside any other entry is refused.
+
+Both fields are inside the signing bytes (`wire/run-grant.md`). A grant that sets
+neither has null pointers in those slots, which canonicalization truncates, so its
+signing bytes are unchanged from before the fields existed.
+
+**Old daemons.** A daemon that predates these fields refuses such a grant, for one
+of two reasons (ADR-0046 S3, recorded against v0.29.0 on bead
+`ley-line-open-521deb`):
+
+| old daemon | what refuses the grant | error |
+|---|---|---|
+| verifying (`--trust-key`), JSON transport | the signature: the JSON decoder drops `@16`/`@17`, so the signing bytes it rebuilds differ from what the issuer signed | `unauthenticated` |
+| unverified (`--allow-unverified-evidence`), or an in-process embedder passing binary bytes (which keeps the unknown pointers, so its signature check passes) | the marker in `credentialBrokerRefs` | `unsupportedBackend`, "credential broker authority requires a broker integration" |
+
+**Error codes.** A partial combination, a present but empty field, an invalid
+document or a non-canonical one is `invalidGrant`. A document whose digest is not
+`connectionsDigest` is `identityPolicyMismatch`. The marker beside any other entry,
+`broker://` references included, keeps the `unsupportedBackend` refusal above.
+
+**Until a broker ships.** A daemon that reads these fields but has no connection
+broker authorizes them and then refuses the start with `unsupportedBackend`, "RunGrant
+carries connections (cloister/connections/v1), but this daemon has no connection
+broker", before anything is resolved or spawned. It does not advertise the capability
+below. A client therefore gates on the capability entry, never on an LLO version.
+
+**Capability.** A daemon that reads `@16`/`@17` and has a broker advertises
+`{name: "cloister/execution/v1/connections", version: "1"}` in
+`llo_execution_capabilities`, whatever its tier; a tier that cannot serve a
+connection refuses at start by name. A client MUST find the entry before sending a
+grant with connections, and its absence means a daemon older than the first LLO
+release that ships them. `"1"` numbers this extension's layout, as `"2"` does for
+`resource-limits`.
+
+**Receipt.** A run with connections adds `RunReceipt.connectionsDigest @15` (the
+digest the broker attested in its ready report) and `connections @16`, one
+`ConnectionOutcome` per connection in document order. A receipt from a run without
+connections is byte-identical to before, in Cap'n Proto and in JSON. A strict
+reader generated from an older release's assets rejects a receipt with
+connections, so read those with the assets of the release that ships them.
+
+`test-vectors/connections-grant.json` pins a grant carrying all three: its
+canonical bytes and the digest of its signing bytes, so a second signer can check
+its bytes against LLO's.
+
 ## Release assets
 
 Every LLO release publishes this contract in two forms, each listed with its

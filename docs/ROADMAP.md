@@ -39,6 +39,13 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   joins a declared guest connection to one loopback `127.0.0.1:port`, bytes
   only, no credential; the parent-death fix ships with it (`e9d940`, `521deb`,
   `52b5b3`, `5308b7`, `528525`, `52deb4`, `f963e6`; epic `e2c5ce`).
+- ADR-0049 (accepted 2026-11-12, for v0.30.0): each daemon is configured by one
+  versioned document (`apiVersion` `config.leyline/v1`) with a published JSON
+  Schema, `--check-config` and `--print-config`; runtime `LEYLINE_*`/`LLO_*`
+  configuration is removed; `configDigest` is recorded in `status`, the
+  `RunReceipt` and `RunOutcome`; release binaries carry the NFS `mount`, so a
+  release download can run the leyline-fs mount (`52c177`; consumers
+  `cloister-55e6cd`, `cloister-0bc3d5`, `mache-0be425`).
 - The follow-up gap queue (epic `ley-line-open-1262af`): every open design or
   correctness follow-up from the v0.26 to v0.29 releases is worked to zero, in
   groups whose files do not overlap. A pull request files a follow-up only for

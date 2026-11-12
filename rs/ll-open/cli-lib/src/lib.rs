@@ -101,10 +101,12 @@ pub enum CdcCommands {
     },
 }
 
-/// What `rootfs import-oci` does with an image's symbolic links, which
-/// rootfs manifest v1 cannot express.
+/// What `rootfs import-oci` does with an image's symbolic links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SymlinkMode {
+    /// Keep each link as a link: rootfs manifest v2 authenticates its
+    /// target bytes, never followed at import.
+    Preserve,
     /// Refuse the import, naming the first link.
     Refuse,
     /// Replace each link with a copy of its in-image target.
@@ -159,8 +161,10 @@ pub enum RootfsCommands {
         #[arg(long)]
         cas_root: PathBuf,
 
-        /// Symbolic-link policy.
-        #[arg(long, value_enum, default_value_t = SymlinkMode::Refuse)]
+        /// Symbolic-link policy: `preserve` (the default) keeps each link
+        /// as a link in rootfs manifest v2, `refuse` refuses an image with
+        /// any, `resolve` copies each link's in-image target.
+        #[arg(long, value_enum, default_value_t = SymlinkMode::Preserve)]
         symlinks: SymlinkMode,
     },
 

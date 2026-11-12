@@ -712,15 +712,23 @@ impl<B: Backend> ExecutionService<B> {
             .ok_or_else(|| ExecutionError::invalid("run_id not found"))?;
 
         // Cancellation asks for "this run is not executing". A run that
-        // already reached a terminal state satisfies that, so cancelling it
-        // is an idempotent no-op rather than an error.
-        if matches!(
-            existing.state,
-            RunState::Cancelled | RunState::Succeeded | RunState::Failed
-        ) {
+        // already reached a terminal state, or was cleaned up, satisfies
+        // that, so cancelling it is an idempotent no-op rather than an error.
+        if !is_active(existing.state) {
             return Ok(existing);
         }
         if !self.backend.cancel(run_id)? {
+            // The worker finished after the refresh above and before the
+            // backend saw the cancel: project its completion and return the
+            // terminal record, as for a run that finished before the cancel.
+            self.refresh_run(run_id)?;
+            let current =
+                self.state.read().runs.get(run_id).cloned().ok_or_else(|| {
+                    ExecutionError::internal("run disappeared during cancellation")
+                })?;
+            if !is_active(current.state) {
+                return Ok(current);
+            }
             return Err(ExecutionError::backend(
                 "backend no longer owns the active run",
             ));
@@ -732,6 +740,13 @@ impl<B: Backend> ExecutionService<B> {
                 .runs
                 .get_mut(run_id)
                 .ok_or_else(|| ExecutionError::internal("run disappeared during cancellation"))?;
+            // The state lock is not held across `backend.cancel`, so a read
+            // in that window may already have projected the run's own
+            // terminal state. A run has one terminal event: return it rather
+            // than append `Cancelled` after it (bead ley-line-open-9c6a8f).
+            if !is_active(record.state) {
+                return Ok(record.clone());
+            }
             record.state = RunState::Cancelled;
             record.clone()
         };
@@ -805,6 +820,14 @@ impl<B: Backend> ExecutionService<B> {
             .push(event_with_detail(sequence, terminal, detail_digest));
         Ok(())
     }
+}
+
+/// Whether a run is still executing: not yet terminal and not cleaned up.
+fn is_active(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running
+    )
 }
 
 fn event(sequence: u64, state: RunState) -> RunEventRecord {

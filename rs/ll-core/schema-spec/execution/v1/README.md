@@ -285,6 +285,15 @@ verifier recomputes the document and compares digests.
 must not create a volume or initialize a backend. `provision`, `start`,
 `cancel`, and `cleanup` are explicit idempotent mutations.
 
+Lifecycle: a run has at most one terminal event (`succeeded`, `failed` or
+`cancelled`); events are appended, never rewritten. `cancel` asks for "this
+run is not executing". `CancelOutput.state` is the state the run is in after
+the request: `cancelled` when the cancel stopped it, or the run's own state
+when it had already finished, including when it finished while the cancel
+was in flight (`succeeded`, `failed`) or had been cleaned up (`cleaned`).
+Each of those is a successful cancel reply, not a refusal. A cancelled run
+is never reported `succeeded` (bead `ley-line-open-9c6a8f`).
+
 `ProvisionOutput.casRoot` (appended 2026-11-10, bead `ley-line-open-ba86d3`)
 is the absolute host path of the content-addressed rootfs store the provider
 serves, made to exist by that provision: with `execution-daemon --cas-volume`,

@@ -26,36 +26,10 @@ pub const SUN_PATH_BYTES: usize = {
 /// Whether `path` carries an access-control list beyond its mode bits.
 pub fn has_acl(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(text) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return true;
-    };
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn acl_get_link_np(path: *const libc::c_char, kind: libc::c_int) -> *mut libc::c_void;
-            fn acl_free(object: *mut libc::c_void) -> libc::c_int;
-        }
-        const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
-        // SAFETY: a NUL-terminated path; the returned ACL is freed below.
-        let acl = unsafe { acl_get_link_np(text.as_ptr(), ACL_TYPE_EXTENDED) };
-        if acl.is_null() {
-            return false;
-        }
-        // SAFETY: freeing the ACL acl_get_link_np returned.
-        unsafe { acl_free(acl) };
-        true
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        ["system.posix_acl_access", "system.posix_acl_default"]
-            .iter()
-            .any(|name| {
-                let name = std::ffi::CString::new(*name).expect("static name");
-                // SAFETY: size query (null buffer, length 0) on a NUL-terminated path.
-                unsafe {
-                    libc::lgetxattr(text.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) > 0
-                }
-            })
+    match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(text) => super::sys::has_acl(&text),
+        // A path with an interior NUL cannot be checked: not private.
+        Err(_) => true,
     }
 }
 

@@ -404,3 +404,196 @@ fn teardown_unlinks_only_the_sockets_the_broker_bound() {
         assert_eq!(std::fs::read(&endpoint).unwrap(), b"replaced");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The process entry (`run_broker`) through the shipped binary, which refuses
+// before its profile on every platform, and the supervisor's protocol through
+// the test-only unconfined binary (`test-support`), which runs everywhere.
+
+const UNCONFINED: &str = env!("CARGO_BIN_EXE_leyline-conn-broker-unconfined");
+
+/// Run the shipped broker with descriptor limits (soft, hard) and a lifeline
+/// held open; return its first stdout line, or None if it is still waiting
+/// for a start request after 500 ms.
+fn first_line_under_limits(args: &[&str], soft: u64, hard: u64) -> Option<String> {
+    use std::os::unix::process::CommandExt;
+    let mut fds = [0; 2];
+    // SAFETY: a valid out array.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (lifeline_read, lifeline_write) = (fds[0], fds[1]);
+    let mut command = std::process::Command::new(BROKER);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    // SAFETY: async-signal-safe setrlimit/dup2 in the child before exec.
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: soft as libc::rlim_t,
+                rlim_max: hard as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0
+                || libc::dup2(lifeline_read, 3) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    // SAFETY: the child holds its own copy now.
+    unsafe { libc::close(lifeline_read) };
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_millis(500))
+        .ok()
+        .filter(|l| !l.is_empty());
+    let _ = child.kill();
+    let _ = child.wait();
+    // SAFETY: closing our end.
+    unsafe { libc::close(lifeline_write) };
+    line
+}
+
+fn hard_limit() -> u64 {
+    // SAFETY: a zeroed rlimit filled by getrlimit.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out-pointer.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+    #[allow(clippy::unnecessary_cast)]
+    let hard = limit.rlim_max as u64;
+    hard
+}
+
+#[test]
+fn the_shipped_broker_refuses_bad_arguments_and_a_short_descriptor_limit() {
+    use leyline_runtime::broker::control::FILE_LIMIT;
+    let error = |line: Option<String>| match line.map(|l| serde_json::from_str::<Event>(&l)) {
+        Some(Ok(Event::Error { detail })) => detail,
+        other => panic!("expected an error event, got {other:?}"),
+    };
+    assert!(
+        error(first_line_under_limits(&["--bogus"], 4096, hard_limit()))
+            .contains("unknown argument")
+    );
+    let args = ["--lifeline-fd", "3"];
+    // A hard limit below what the cap needs: refused by name, at once.
+    assert!(
+        error(first_line_under_limits(&args, FILE_LIMIT - 1, FILE_LIMIT - 1))
+            .contains("descriptor limit")
+    );
+    // Exactly enough, or a low soft limit it can raise: it waits for start.
+    assert_eq!(first_line_under_limits(&args, FILE_LIMIT, FILE_LIMIT), None);
+    if hard_limit() > FILE_LIMIT {
+        assert_eq!(first_line_under_limits(&args, 256, hard_limit()), None);
+    }
+}
+
+fn unconfined(peer: PeerPid) -> BrokerProcess {
+    BrokerProcess::spawn(Path::new(UNCONFINED), peer).expect("spawn")
+}
+
+#[test]
+fn the_supervisor_handle_starts_relays_drains_and_unlinks() {
+    let (_dir, real) = channel_dir();
+    let doc = document(&real, "127.0.0.1", echo());
+    let endpoint = doc.connections()[0].endpoint_unix.clone();
+    let digest = format!("blake3-256:{}", doc.digest_hex());
+
+    let mut broker = unconfined(PeerPid::Any);
+    broker
+        .start(&doc, &digest, Duration::from_secs(5))
+        .expect("ready");
+    let mut client = UnixStream::connect(&endpoint).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    client.write_all(b"hi").unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut back = Vec::new();
+    client.read_to_end(&mut back).unwrap();
+    assert_eq!(back, b"hi");
+    assert!(broker.drain(Duration::from_secs(5)), "drained");
+    assert!(
+        broker.events().iter().any(|e| matches!(
+            e,
+            Event::Connection {
+                outcome: WireOutcome::Dialed,
+                bytes_to_target: 2,
+                ..
+            }
+        )),
+        "{:?}",
+        broker.events()
+    );
+    broker.shutdown();
+    assert!(!Path::new(&endpoint).exists(), "the bound socket is unlinked");
+
+    // A ready digest that is not the grant's refuses the start.
+    let mut broker = unconfined(PeerPid::Any);
+    let error = broker
+        .start(
+            &doc,
+            &format!("blake3-256:{}", "0".repeat(64)),
+            Duration::from_secs(5),
+        )
+        .expect_err("mismatch");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
+    broker.shutdown();
+    assert!(!Path::new(&endpoint).exists());
+}
+
+#[test]
+fn an_awaiting_broker_refuses_every_peer_until_the_supervisor_names_it() {
+    let (_dir, real) = channel_dir();
+    let doc = document(&real, "127.0.0.1", echo());
+    let endpoint = doc.connections()[0].endpoint_unix.clone();
+    let mut broker = unconfined(PeerPid::Awaiting);
+    broker
+        .start(
+            &doc,
+            &format!("blake3-256:{}", doc.digest_hex()),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let round_trip = || {
+        let mut client = UnixStream::connect(&endpoint).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let _ = client.write_all(b"x");
+        let _ = client.shutdown(Shutdown::Write);
+        let mut back = Vec::new();
+        let _ = client.read_to_end(&mut back);
+        back
+    };
+    assert!(round_trip().is_empty(), "refused before the peer is named");
+    broker.set_peer(std::process::id() as i32).unwrap();
+    // The naming is asynchronous to the next connect: retry briefly.
+    let started = Instant::now();
+    while round_trip() != b"x" {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the named peer is never admitted"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(broker.drain(Duration::from_secs(5)));
+    assert!(broker.events().iter().any(|e| matches!(
+        e,
+        Event::Connection {
+            outcome: WireOutcome::ForeignPeer,
+            ..
+        }
+    )));
+}

@@ -32,6 +32,15 @@ pub mod profile;
 pub mod registry;
 pub mod relay;
 
+// Platform queries, one file per platform so the mutation gate can mutate each
+// where it compiles (tools/mutants_diff.sh excludes the other).
+#[cfg(target_os = "macos")]
+#[path = "sys_macos.rs"]
+mod sys;
+#[cfg(not(target_os = "macos"))]
+#[path = "sys_other.rs"]
+mod sys;
+
 /// The target addresses this runtime delivers (ADR-0046 S2, S-Q3). The
 /// connections type represents every loopback literal; delivery is this one
 /// constant, widened only when the loopback probe passes for an address on

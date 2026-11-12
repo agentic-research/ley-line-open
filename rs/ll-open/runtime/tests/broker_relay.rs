@@ -584,18 +584,13 @@ fn a_drain_racing_closes_reports_each_connection_exactly_once_before_drained() {
         running.handle.take().unwrap().drain();
         closer.join().unwrap();
         let mut records = 0;
-        loop {
-            match running
-                .records
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-            {
-                Report::Record(record) => {
-                    assert_eq!(record.outcome, Outcome::Dialed);
-                    records += 1;
-                }
-                Report::Drained => break,
-            }
+        while let Report::Record(record) = running
+            .records
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+        {
+            assert_eq!(record.outcome, Outcome::Dialed);
+            records += 1;
         }
         assert_eq!(
             records, 16,
@@ -656,7 +651,21 @@ fn the_cap_is_256_simultaneous_connections() {
     );
     assert!(limit >= leyline_runtime::broker::control::FILE_LIMIT);
     let running = run(free_port(), None, limits(Duration::from_secs(20)));
-    let held: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| running.connect()).collect();
+    // The listen backlog (128 on macOS) refuses a burst before the broker
+    // sees it, so each connect retries until the broker has accepted it.
+    let held: Vec<UnixStream> = (0..MAX_CONNECTIONS)
+        .map(|_| {
+            loop {
+                match UnixStream::connect(&running.path) {
+                    Ok(stream) => break stream,
+                    Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("connect: {error}"),
+                }
+            }
+        })
+        .collect();
     thread::sleep(Duration::from_millis(500));
     let mut over = running.connect();
     let mut back = Vec::new();

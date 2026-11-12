@@ -605,49 +605,5 @@ fn wait_readable(fd: i32, wait: Duration) -> bool {
 
 /// The connecting peer's effective uid, and its pid where the platform says.
 pub fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, Option<i32>)> {
-    let fd = stream.as_raw_fd();
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let (mut uid, mut gid) = (0, 0);
-        // SAFETY: valid out-pointers on a connected AF_UNIX socket.
-        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut pid: libc::pid_t = 0;
-        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-        // SAFETY: valid out-pointer and length for LOCAL_PEERPID.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERPID,
-                (&mut pid as *mut libc::pid_t).cast(),
-                &mut len,
-            )
-        };
-        Ok((uid, (rc == 0).then_some(pid)))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    {
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: valid out-pointer and length for SO_PEERCRED.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credentials as *mut libc::ucred).cast(),
-                &mut len,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((credentials.uid, Some(credentials.pid)))
-    }
+    super::sys::peer_credentials(stream.as_raw_fd())
 }

@@ -256,20 +256,57 @@ pub fn raise_fd_limit(wanted: u64) -> u64 {
 /// returns end-of-file (or fails) once no process holds it.
 pub fn watch_lifeline(fd: i32) {
     thread::spawn(move || {
-        let mut byte = 0u8;
+        // SAFETY: the broker owns the lifeline descriptor for its whole life;
+        // ManuallyDrop keeps this handle from closing it.
+        let mut lifeline =
+            std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        let mut byte = [0u8; 1];
         loop {
-            // SAFETY: a one-byte read into a valid buffer.
-            let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-            let result = if n < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            };
-            if lifeline_ended(&result) {
+            if lifeline_ended(&std::io::Read::read(&mut *lifeline, &mut byte)) {
                 std::process::exit(0);
             }
         }
     });
+}
+
+/// The broker process, after its program name: parse `args`, watch the
+/// lifeline, secure the descriptor limit, then [`serve`] stdin/stdout with
+/// `confine`. Returns the exit status. The shipped `leyline-conn-broker`
+/// passes [`super::profile::apply`].
+pub fn run_broker<C>(args: impl IntoIterator<Item = String>, confine: C) -> u8
+where
+    C: FnOnce(&ConnectionsDocument) -> Result<(), ExecutionError>,
+{
+    let refuse = |detail: String| {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(line(&Event::Error { detail }).as_bytes());
+        let _ = stdout.flush();
+        2
+    };
+    let args = match parse_args(args) {
+        Ok(args) => args,
+        Err(detail) => return refuse(detail),
+    };
+    // The lifeline first: from here on, a vanished supervisor ends us.
+    watch_lifeline(args.lifeline_fd);
+    // Enough descriptors for the connection cap, or refuse to start rather
+    // than refuse connections by EMFILE later.
+    let limit = raise_fd_limit(FILE_LIMIT);
+    if limit < FILE_LIMIT {
+        return refuse(format!(
+            "descriptor limit {limit} is below the {FILE_LIMIT} the connection cap needs"
+        ));
+    }
+    match serve(
+        std::io::stdin().lock(),
+        std::io::stdout(),
+        args.peer,
+        Limits::default(),
+        confine,
+    ) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 /// Whether one read of the lifeline means the supervisor is gone: end-of-file
@@ -287,10 +324,12 @@ pub fn lifeline_ended(read: &std::io::Result<usize>) -> bool {
 pub fn clear_cloexec(fd: i32) -> std::io::Result<()> {
     // SAFETY: fcntl on a descriptor number; failure is reported.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    // SAFETY: as above.
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+    if flags < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: F_SETFD on the descriptor F_GETFD just read; it cannot fail on
+    // an open descriptor.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
     Ok(())
 }
 
@@ -659,12 +698,14 @@ mod tests {
         let mut fds = [0; 2];
         // SAFETY: a valid out array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        set_cloexec(fds[0]);
+        // Already clear: clearing succeeds (flags 0 is not an error).
+        clear_cloexec(fds[0]).unwrap();
         // SAFETY: fcntl on our own descriptor.
-        assert_ne!(
-            unsafe { libc::fcntl(fds[0], libc::F_GETFD) } & libc::FD_CLOEXEC,
-            0
-        );
+        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, 0);
+        set_cloexec(fds[0]);
+        set_cloexec(fds[0]);
+        // SAFETY: as above. Setting twice keeps exactly the one flag.
+        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, libc::FD_CLOEXEC);
         clear_cloexec(fds[0]).unwrap();
         // SAFETY: as above.
         assert_eq!(

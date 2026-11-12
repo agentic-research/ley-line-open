@@ -103,6 +103,18 @@ impl EndpointRegistry {
         endpoints: &[PathBuf],
         grants: &[SocketGrant],
     ) -> Result<(), ExecutionError> {
+        // A case-insensitive volume folds Unicode case too (U+017F long s and
+        // `s`, the Kelvin sign and `k`), and a path that does not exist yet
+        // cannot be folded through realpath. Endpoints are printable ASCII
+        // (connections/v1), so refusing non-ASCII §6 grants is exact: no
+        // grant that could name an endpoint is compared by a fold this
+        // registry cannot perform.
+        if let Some(grant) = grants.iter().find(|g| !g.0.is_ascii()) {
+            return Err(ExecutionError::invalid_grant(format!(
+                "confinement §6 grant {:?} is not ASCII, so it cannot be compared with broker endpoints; refused",
+                grant.0
+            )));
+        }
         let mut runs = self.runs.lock();
         if runs.contains_key(run_id) {
             return Err(ExecutionError::resource_conflict(format!(

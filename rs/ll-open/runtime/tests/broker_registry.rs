@@ -138,14 +138,16 @@ fn a_grant_spelled_through_a_symlink_is_refused_in_both_orders() {
         registry.register("run-a", &endpoint, &[]).unwrap();
         assert_eq!(
             registry
-                .register("run-b", &[], &[b_grant.clone()])
+                .register("run-b", &[], std::slice::from_ref(&b_grant))
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidGrant,
             "B after A: {b_grant:?}"
         );
         let registry = EndpointRegistry::new();
-        registry.register("run-b", &[], &[b_grant.clone()]).unwrap();
+        registry
+            .register("run-b", &[], std::slice::from_ref(&b_grant))
+            .unwrap();
         assert_eq!(
             registry.register("run-a", &endpoint, &[]).unwrap_err().code,
             ErrorCode::ResourceConflict,
@@ -183,7 +185,7 @@ fn a_grant_differing_only_in_case_is_refused_in_both_orders() {
     registry.register("run-a", &endpoint, &[]).unwrap();
     assert_eq!(
         registry
-            .register("run-b", &[], &[upper.clone()])
+            .register("run-b", &[], std::slice::from_ref(&upper))
             .unwrap_err()
             .code,
         ErrorCode::InvalidGrant
@@ -194,6 +196,37 @@ fn a_grant_differing_only_in_case_is_refused_in_both_orders() {
         registry.register("run-a", &endpoint, &[]).unwrap_err().code,
         ErrorCode::ResourceConflict
     );
+}
+
+/// A grant that differs from an endpoint only by a Unicode case fold
+/// (U+017F long s) names the same node on a case-insensitive volume once the
+/// socket exists. Before it exists no realpath can fold it, so a non-ASCII
+/// grant is refused outright, in either start order.
+#[test]
+fn a_non_ascii_grant_is_refused_in_both_orders() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    let endpoint = vec![real.join("kafka.sock")];
+    let folded = grant(real.join("kafka.\u{17f}ock").to_str().unwrap());
+
+    let registry = EndpointRegistry::new();
+    registry.register("run-a", &endpoint, &[]).unwrap();
+    let error = registry
+        .register("run-b", &[], std::slice::from_ref(&folded))
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidGrant);
+    assert!(error.detail.contains("not ASCII"), "{}", error.detail);
+
+    let registry = EndpointRegistry::new();
+    assert_eq!(
+        registry
+            .register("run-b", &[], std::slice::from_ref(&folded))
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidGrant,
+        "refused before A registers too"
+    );
+    registry.register("run-a", &endpoint, &[]).unwrap();
 }
 
 #[test]

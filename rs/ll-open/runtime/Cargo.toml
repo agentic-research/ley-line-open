@@ -55,6 +55,15 @@ unicase = "2.9.0"
 # scheme policy and every size bound are applied by the caller, not ureq.
 ureq = { workspace = true }
 
+# TEST ONLY: the connection broker with no OS profile, so the supervisor's
+# side of the broker protocol runs as a real child process on every platform
+# (bead ley-line-open-52b5b3). Built only with `test-support`, which no
+# shipping configuration enables.
+[[bin]]
+name = "leyline-conn-broker-unconfined"
+path = "src/bin/leyline-conn-broker-unconfined.rs"
+required-features = ["test-support"]
+
 [features]
 # Test-only hooks on KrunWorkerBackend that bypass or retarget the
 # hypervisor-entitlement capability check (bead ley-line-open-831bf1):

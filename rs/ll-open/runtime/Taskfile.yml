@@ -60,6 +60,50 @@ tasks:
       - cargo test -p leyline-runtime --test cas_volume
       - cargo test -p leyline-cli --test execution_cas_volume
 
+  broker-macos:
+    desc: >-
+      The connection broker's macOS evidence (ADR-0046 Slice 1 S11, S11a; beads
+      ley-line-open-52b5b3, ley-line-open-52deb4): the confined broker binary
+      relays under its profile (the positive control) and the profile refuses
+      every undeclared port, file, exec, fork and the resolver; the loopback
+      probe measures per-address scoping against its pinned table; plus the
+      portable broker suites. LEYLINE_REQUIRE_SANDBOX=1, so a host that cannot
+      apply the profile fails by name instead of reporting a skip. The same
+      target runs locally and in ci.yml's macos-latest job.
+    platforms: [darwin]
+    dir: '{{.TASKFILE_DIR}}/../..'
+    env:
+      RUSTC_WRAPPER: ''
+      LEYLINE_REQUIRE_SANDBOX: '1'
+    cmds:
+      - >-
+        cargo test -p leyline-runtime --test broker_profile --test broker_loopback_probe
+        --test broker_control --test broker_relay --test broker_preflight --test broker_registry
+
+  broker-probe:
+    desc: >-
+      The loopback probe on Linux (ADR-0046 S11a, bead ley-line-open-52deb4):
+      once on the host network, then in a fresh network namespace with IPv6
+      disabled, where ::1 must read unavailable (an unavailable row is never a
+      pass). Records the Landlock ABI. Needs passwordless sudo for
+      `unshare --net`; ci.yml's ubuntu job runs it after `task ci`.
+    platforms: [linux]
+    dir: '{{.TASKFILE_DIR}}/../..'
+    env:
+      RUSTC_WRAPPER: ''
+      LEYLINE_REQUIRE_SANDBOX: '1'
+    cmds:
+      - cargo test -p leyline-runtime --test broker_loopback_probe -- --nocapture
+      - |
+        set -eu
+        bin=$(cargo test -p leyline-runtime --test broker_loopback_probe --no-run 2>&1 \
+          | sed -n 's/.*Executable tests\/broker_loopback_probe\.rs (\(.*\))$/\1/p' | tail -n 1)
+        test -x "$bin" || { echo "broker-probe: cannot find the probe test binary" >&2; exit 1; }
+        sudo unshare --net sh -c "
+          ip link set lo up &&
+          sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 net.ipv6.conf.lo.disable_ipv6=1 &&
+          LEYLINE_PROBE_NO_IPV6=1 LEYLINE_REQUIRE_SANDBOX=1 $(pwd)/$bin --exact the_loopback_table_matches_this_platform --nocapture"
+
   oci-fixture:
     desc: >-
       Regenerate the checked-in OCI image-layout fixture

@@ -167,6 +167,12 @@ jobs:
       - name: Run task ci (check + clippy + fmt + FFI staticlib + tier isolation + test)
         run: task ci
 
+      # ADR-0046 S11a (bead ley-line-open-52deb4): the loopback probe on the
+      # host network and again in a network namespace without IPv6, where ::1
+      # must read unavailable. Reuses what `task ci` just compiled.
+      - name: Loopback probe (host network and no-IPv6 namespace)
+        run: task runtime:broker-probe
+
       - name: Report sccache statistics
         if: always()
         run: task cache:sccache:stats
@@ -207,3 +213,40 @@ jobs:
           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
           (github.event_name == 'pull_request' && github.base_ref == 'main')
         run: task release:version-check
+
+  # ADR-0046 Slice 1 is delivered on macOS, and Linux CI shows only its
+  # refusals, so macOS enforcement needs a macOS runner (S11, S11a; beads
+  # ley-line-open-52b5b3, ley-line-open-52deb4). `task runtime:broker-macos`
+  # is the same target a developer runs: the confined broker relays (the
+  # positive control), its profile refuses every undeclared port, file, exec,
+  # fork and the resolver, and the loopback probe matches its pinned table.
+  # LEYLINE_REQUIRE_SANDBOX=1 inside the task makes a runner that cannot apply
+  # the profile fail by name rather than print a skip and go green.
+  broker-macos:
+    name: Connection broker profile + loopback probe (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+          cache-targets: false
+
+      - name: Install system deps
+        run: task deps:capnp
+
+      - name: Broker profile, loopback probe and broker suites
+        run: task runtime:broker-macos

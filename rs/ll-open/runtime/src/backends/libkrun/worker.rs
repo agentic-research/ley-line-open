@@ -90,9 +90,10 @@ fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), Executi
 /// Where the worker writes the workload's argv and environment in the run's
 /// own root, and where the guest init reads them (`KRUN_CONFIG`; LLO libkrun
 /// patch 0013, beads `ley-line-open-7410ec`, `d4b07f`). Init removes it once
-/// read. A rootfs that holds this path is refused: the write is exclusive.
-// Same as rootfs_manifest::RUN_EXEC_SPEC (D3). Whichever branch lands second
-// replaces this literal with that shared const.
+/// read. A rootfs that holds this path is refused: the write is exclusive,
+/// and the import and manifest reader reserve the same name,
+/// [`crate::artifacts::rootfs_manifest::RUN_EXEC_SPEC`] (pinned equal by a
+/// test).
 pub const EXEC_CONFIG_PATH: &str = "/.leyline-exec.json";
 
 /// The most argv and environment strings one run carries: init's JSON
@@ -1086,6 +1087,16 @@ mod tests {
     /// and without following a link: a rootfs that already holds the path
     /// (a file, a directory, or a link pointing at a host file) is refused
     /// by name, and nothing is written through it.
+    /// The path the worker writes is the one the import and the manifest
+    /// reader reserve, so no rootfs that passed them holds it.
+    #[test]
+    fn the_exec_config_path_is_the_reserved_rootfs_name() {
+        assert_eq!(
+            EXEC_CONFIG_PATH.strip_prefix('/'),
+            Some(crate::artifacts::rootfs_manifest::RUN_EXEC_SPEC)
+        );
+    }
+
     #[test]
     fn the_exec_config_is_written_once_and_never_through_a_link() {
         let mut request = request();

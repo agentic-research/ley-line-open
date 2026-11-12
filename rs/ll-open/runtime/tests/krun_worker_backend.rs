@@ -510,6 +510,47 @@ fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     assert!(!Backend::cancel(&backend, "run-backend-01").expect("repeat cancel"));
 }
 
+/// A reader of a run that is being cancelled never sees it complete (bead
+/// `ley-line-open-9c6a8f`). The supervisor used to publish `Succeeded` for
+/// a cancelled worker and the cancel removed it only afterwards, so a read
+/// in between collected a success for a run that was cancelled. The reader
+/// polls without pause for the whole cancel, so it sees anything published
+/// during it; repeated to cover the scheduling.
+#[test]
+fn a_reader_of_a_cancelled_run_never_sees_it_complete() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _serial = common::serial();
+    for _ in 0..25 {
+        let fixture = TempDir::new().expect("fixture");
+        let (backend, _runs) = backend_with_worker(
+            &fixture,
+            "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+        );
+        backend
+            .start(&request(), ServedWorkspaces::none())
+            .expect("ready worker");
+        let done = AtomicBool::new(false);
+        let seen = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut seen = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    if let Some(status) = Backend::poll(&backend, "run-backend-01").expect("poll") {
+                        seen.push(status);
+                    }
+                }
+                seen
+            });
+            assert!(Backend::cancel(&backend, "run-backend-01").expect("cancel"));
+            done.store(true, Ordering::Release);
+            reader.join().expect("reader")
+        });
+        assert!(
+            seen.is_empty(),
+            "a cancelled run was published as complete: {seen:?}"
+        );
+    }
+}
+
 #[test]
 fn backend_enforces_the_wall_clock_limit_and_cleans_up() {
     let _serial = common::serial();

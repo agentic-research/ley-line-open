@@ -4781,6 +4781,7 @@ dependencies = [
  "leyline-envelope",
  "leyline-public-schema",
  "leyline-runtime",
+ "leyline-schema-spec",
  "leyline-sign",
  "libc",
  "nono",

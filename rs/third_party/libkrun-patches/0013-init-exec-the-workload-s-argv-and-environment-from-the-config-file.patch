@@ -1,0 +1,333 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Gardner <jamestexasgardner@gmail.com>
+Date: Wed, 11 Nov 2026 12:00:00 -0600
+Subject: [PATCH] init: exec the workload's argv and environment from a strict
+ exec config, decoded exactly
+
+libkrun hands the workload's arguments and environment to the guest on
+the kernel command line: the arguments after " -- ", each variable as
+KEY="value". The kernel and init then parse that line again. Quotes are
+consumed, the first "--" ends the parameters, and whitespace splits
+words, so an argument or value carrying a double quote, a "--" or a
+space-separated token did not reach the workload as written.
+
+With KRUN_CONFIG_ARGV=1, init now takes the workload's argv and
+environment from the file KRUN_CONFIG names, and from nowhere else:
+
+- A strict reader, config_parse_exec. The file is one JSON object whose
+  only keys are "Cmd" and "Env", matched exactly, each at most once and
+  each an array of strings. Only the object's own keys are keys. The
+  general config reader matches its key names, without regard to case,
+  against every token, so an argument "uid", "gid" or "entrypoint"
+  would set init's uid or prepend to the argv. Anything else, or a
+  missing or empty Cmd, stops the guest rather than run something else.
+  The file is read until all of it is in, since one read(2) on a
+  virtio-fs root may return fewer bytes than asked. Init execs Cmd,
+  ignoring the command line's argv and KRUN_INIT. It removes the file
+  and unsets KRUN_CONFIG and KRUN_CONFIG_ARGV before the workload runs.
+- An explicit \uXXXX decoder. jsmn admits only \u0000-\u007F and has
+  already stored the decoded byte where the fourth hex digit was. The
+  upstream decoder re-read the hex from the 'u' and wrote garbage, and
+  came out right only because the main loop then copied that byte over
+  it. It now takes the byte jsmn stored. hexToDigit and Utf32toUtf8 are
+  no longer used and are removed.
+
+Without KRUN_CONFIG_ARGV, init reads its config as before.
+
+Signed-off-by: James Gardner <jamestexasgardner@gmail.com>
+---
+diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
+--- a/src/init_blob/init/init.c
++++ b/src/init_blob/init/init.c
+@@ -679,7 +679,7 @@
+ }
+
+ /*
+- * hexToDigit, Utf32toUtf8 and parts of unescape_string are taken from libyajl:
++ * Parts of unescape_string are taken from libyajl:
+  *
+  * Copyright (c) 2007-2014, Lloyd Hilaiel <me@lloyd.io>
+  *
+@@ -695,44 +695,6 @@
+  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+-static void hexToDigit(unsigned int *val, const unsigned char *hex)
+-{
+-    unsigned int i;
+-    for (i = 0; i < 4; i++) {
+-        unsigned char c = hex[i];
+-        if (c >= 'A')
+-            c = (c & ~0x20) - 7;
+-        c -= '0';
+-        *val = (*val << 4) | c;
+-    }
+-}
+-
+-static void Utf32toUtf8(unsigned int codepoint, char *utf8Buf)
+-{
+-    if (codepoint < 0x80) {
+-        utf8Buf[0] = (char)codepoint;
+-        utf8Buf[1] = 0;
+-    } else if (codepoint < 0x0800) {
+-        utf8Buf[0] = (char)((codepoint >> 6) | 0xC0);
+-        utf8Buf[1] = (char)((codepoint & 0x3F) | 0x80);
+-        utf8Buf[2] = 0;
+-    } else if (codepoint < 0x10000) {
+-        utf8Buf[0] = (char)((codepoint >> 12) | 0xE0);
+-        utf8Buf[1] = (char)(((codepoint >> 6) & 0x3F) | 0x80);
+-        utf8Buf[2] = (char)((codepoint & 0x3F) | 0x80);
+-        utf8Buf[3] = 0;
+-    } else if (codepoint < 0x200000) {
+-        utf8Buf[0] = (char)((codepoint >> 18) | 0xF0);
+-        utf8Buf[1] = (char)(((codepoint >> 12) & 0x3F) | 0x80);
+-        utf8Buf[2] = (char)(((codepoint >> 6) & 0x3F) | 0x80);
+-        utf8Buf[3] = (char)((codepoint & 0x3F) | 0x80);
+-        utf8Buf[4] = 0;
+-    } else {
+-        utf8Buf[0] = '?';
+-        utf8Buf[1] = 0;
+-    }
+-}
+-
+ /* Do not worry about invalid JSON, it was already parsed by jsmn.  */
+ static void unescape_string(char *string, int len)
+ {
+@@ -779,38 +741,27 @@
+             string[i++] = '/';
+             val++;
+             break;
+-        case 'u': {
+-            const char *unescaped = "?";
+-            char utf8Buf[5];
+-            unsigned int codepoint = 0;
+-            hexToDigit(&codepoint, val++);
+-            val += 3;
+-            /* check if this is a surrogate */
+-            if ((codepoint & 0xFC00) == 0xD800) {
+-                val++;
+-                if (val[0] == '\\' && val[1] == 'u') {
+-                    unsigned int surrogate = 0;
+-                    hexToDigit(&surrogate, val + 2);
+-                    codepoint = (((codepoint & 0x3F) << 10) |
+-                                 ((((codepoint >> 6) & 0xF) + 1) << 16) |
+-                                 (surrogate & 0x3FF));
+-                    val += 5;
+-                } else {
+-                    unescaped = "?";
+-                    break;
+-                }
+-            }
+-
+-            Utf32toUtf8(codepoint, utf8Buf);
+-            unescaped = utf8Buf;
+-
+-            if (codepoint == 0) {
+-                memcpy(&string[i++], unescaped, 1);
+-                continue;
++        case 'u':
++            /*
++             * jsmn (jsmn_parse_string) has already decoded this escape in
++             * place: it admits only \u0000-\u007F and stores the byte where
++             * the fourth hex digit was, at val[4], so the hex is no longer
++             * there to read. Take that byte and step past the escape. The
++             * upstream decoder re-read the hex from the 'u' and wrote nothing
++             * useful; its output came right only because the main loop then
++             * copied val[4] over it.
++             */
++            if (end - val < 5) {
++                val = end;
++                break;
+             }
+-            memcpy(&string[i], unescaped, (unsigned int)strlen(unescaped));
++            string[i++] = val[4];
++            val += 5;
+             break;
+-        }
++        default:
++            /* jsmn admits no other escape; copy it rather than loop. */
++            string[i++] = '\\';
++            break;
+         }
+     }
+     string[i] = '\0';
+@@ -1088,7 +1039,122 @@
+     free(data);
+ cleanup_fd:
+     close(fd);
++
++    return ret;
++}
++
++/* Whether `tok` is the JSON string `s`, byte for byte (no escapes). */
++static int json_key_is(const char *json, const jsmntok_t *tok, const char *s)
++{
++    size_t len = strlen(s);
++    return tok->type == JSMN_STRING && (size_t)(tok->end - tok->start) == len &&
++           memcmp(json + tok->start, s, len) == 0;
++}
++
++/*
++ * The exec config LLO's worker writes for KRUN_CONFIG_ARGV=1: one JSON
++ * object whose only keys are "Cmd" (the workload's argv) and "Env"
++ * ("KEY=VALUE" entries), each an array of strings, matched exactly and each
++ * at most once. Only the object's own keys are keys: walking the top level
++ * pair by pair, an argv element such as "uid" or "entrypoint" stays data.
++ * Any other key, a value of another type, or a missing or empty Cmd refuses
++ * the file. The file is read until all of it is in, since one read(2) on a
++ * virtio-fs root may return fewer bytes than asked. On success *argv holds
++ * Cmd and Env has been applied; returns 0, or -1.
++ */
++static int config_parse_exec(char ***argv, const char *config_file)
++{
++    jsmn_parser parser;
++    jsmntok_t *tokens = NULL;
++    jsmntok_t *cmd = NULL, *env = NULL;
++    struct stat stat;
++    char *data = NULL;
++    off_t got = 0;
++    int num_tokens, idx, pair, element;
++    int ret = -1;
++    int fd;
++
++    fd = open(config_file, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (fd < 0) {
++        perror("open exec config");
++        return -1;
++    }
++    if (fstat(fd, &stat) != 0 || !S_ISREG(stat.st_mode) || stat.st_size <= 0) {
++        printf("exec config is not a non-empty regular file\n");
++        goto out;
++    }
++    data = malloc(stat.st_size);
++    if (!data) {
++        perror("malloc exec config");
++        goto out;
++    }
++    while (got < stat.st_size) {
++        ssize_t n = read(fd, data + got, stat.st_size - got);
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n <= 0) {
++            perror("read exec config");
++            goto out;
++        }
++        got += n;
++    }
++
++    tokens = malloc(MAX_TOKENS * sizeof(jsmntok_t));
++    if (!tokens) {
++        perror("malloc exec config tokens");
++        goto out;
++    }
++    jsmn_init(&parser);
++    num_tokens = jsmn_parse(&parser, data, stat.st_size, tokens, MAX_TOKENS);
++    if (num_tokens < 1 || tokens[0].type != JSMN_OBJECT) {
++        printf("exec config is not one JSON object\n");
++        goto out;
++    }
++
++    idx = 1;
++    for (pair = 0; pair < tokens[0].size; pair++) {
++        jsmntok_t *key, *value;
++        if (idx + 1 >= num_tokens) {
++            goto refused;
++        }
++        key = &tokens[idx];
++        value = &tokens[idx + 1];
++        if (value->type != JSMN_ARRAY || idx + 2 + value->size > num_tokens) {
++            goto refused;
++        }
++        for (element = 0; element < value->size; element++) {
++            if (tokens[idx + 2 + element].type != JSMN_STRING) {
++                goto refused;
++            }
++        }
++        if (json_key_is(data, key, "Cmd") && !cmd) {
++            cmd = value;
++        } else if (json_key_is(data, key, "Env") && !env) {
++            env = value;
++        } else {
++            goto refused;
++        }
++        idx += 2 + value->size;
++    }
++    if (idx != num_tokens || !cmd || cmd->size == 0) {
++        goto refused;
++    }
+
++    if (env) {
++        config_parse_env(data, env);
++    }
++    *argv = config_parse_args(data, cmd);
++    ret = *argv ? 0 : -1;
++    goto out;
++
++refused:
++    printf("exec config holds something other than a Cmd and an Env array of "
++           "strings\n");
++out:
++    free(tokens);
++    free(data);
++    close(fd);
+     return ret;
+ }
+
+@@ -2078,6 +2144,8 @@
+     char *config_uid, *config_gid;
+     char **config_argv, **exec_argv;
+     const char *config_file;
++    char *env_config_argv;
++    bool exec_from_config;
+ #if __FreeBSD__
+     bool config_file_mounted = false;
+
+@@ -2240,8 +2308,32 @@
+         config_file = CONFIG_FILE_PATH;
+     }
+
+-    config_parse_file(&config_argv, &config_workdir, &config_uid, &config_gid,
+-                      config_file);
++    /*
++     * KRUN_CONFIG_ARGV=1: the workload's argv and environment come from the
++     * exec config alone (config_parse_exec), never from the kernel command
++     * line, which is parsed (quotes are consumed, the first "--" ends the
++     * parameters, whitespace splits), so an argument or value carried there
++     * does not reach the workload byte for byte. The general config parser
++     * is not used: it matches its keys against every token, so an argument
++     * such as "uid" or "entrypoint" would configure init. Without a valid
++     * exec config the guest stops rather than run something else. The file
++     * is removed once read, so the workload's root holds only its image.
++     */
++    env_config_argv = getenv("KRUN_CONFIG_ARGV");
++    exec_from_config = env_config_argv && strcmp(env_config_argv, "1") == 0;
++    if (exec_from_config) {
++        if (config_parse_exec(&config_argv, config_file) < 0) {
++            printf("KRUN_CONFIG_ARGV is set and %s is not a valid exec config\n",
++                   config_file);
++            exit(-1);
++        }
++        unlink(config_file);
++        unsetenv("KRUN_CONFIG");
++        unsetenv("KRUN_CONFIG_ARGV");
++    } else {
++        config_parse_file(&config_argv, &config_workdir, &config_uid,
++                          &config_gid, config_file);
++    }
+
+ #if __FreeBSD__
+     if (config_file_mounted) {
+@@ -2280,7 +2372,9 @@
+
+     exec_argv = argv;
+     krun_init = getenv("KRUN_INIT");
+-    if (krun_init) {
++    if (exec_from_config) {
++        exec_argv = config_argv;
++    } else if (krun_init) {
+         exec_argv[0] = clone_str(krun_init);
+     } else if (config_argv) {
+         exec_argv = config_argv;
+--
+2.50.1 (Apple Git-155)

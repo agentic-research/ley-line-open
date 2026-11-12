@@ -155,6 +155,68 @@ and apply unchanged to `v1.19.6`; `0007` to `0012` were written on top of
     creates `/tmp` when the rootfs has none and mounts only over a real
     directory: `mount(2)` follows a link in its target, so a `/tmp` that is
     a link or a file stops the guest, as does a mount that fails.
+13. `0013` — **init: exec the workload's argv and environment from the
+    config file, decoded exactly.** libkrun hands a workload's arguments
+    (after ` -- `) and environment (`KEY="value"`) to the guest on the
+    kernel command line, which the kernel and init re-parse. An argument
+    `--` cut the argv there, so `tini -- docker-entrypoint.sh` ran with no
+    program; a double quote was consumed or ended its value; a word inside
+    a value could be read as an init token (beads `ley-line-open-7410ec`,
+    `d4b07f`, `f7f862`). With `KRUN_CONFIG_ARGV=1`, init now takes the
+    workload's argv and environment from the file `KRUN_CONFIG` names,
+    through a strict reader of its own (`config_parse_exec`): one JSON
+    object whose only keys are `Cmd` and `Env`, matched exactly, each at
+    most once, each an array of strings. The general config reader is not
+    used for it, because it matches its key names, without regard to case,
+    against every token of the file, so an argument `uid`, `gid` or
+    `entrypoint` would set init's uid or prepend to the argv. Anything
+    else, or a missing or empty `Cmd`, stops the guest. Init execs `Cmd`
+    (ignoring `KRUN_INIT`), removes the file, and unsets `KRUN_CONFIG` and
+    `KRUN_CONFIG_ARGV` before the workload runs. The worker writes that
+    file (`/.leyline-exec.json`) into the run's own root and keeps the
+    workload's argv and environment off the command line. The reader reads
+    the file until all of it is in, since one `read(2)` on a virtio-fs root
+    may return less. The patch also replaces the `\uXXXX` case of
+    `unescape_string`: jsmn has already decoded the escape in place (it
+    admits only `\u0000`-`\u007F` and stores the byte where the fourth hex
+    digit was), so the case now takes that byte; upstream re-read the hex
+    and came out right only because the main loop then copied that byte
+    over its output. `hexToDigit` and `Utf32toUtf8` are removed.
+14. `0014` — **init: refuse a mount target that is not a real directory.**
+    mount(2) and mkdir(2) follow a link anywhere in their path, so a rootfs
+    holding `work -> usr/bin` with a workspace attached at /work had the
+    workspace mounted over usr/bin, covering the verified executable (bead
+    `ley-line-open-10b516`). Init now walks /dev, /proc, /sys and every
+    `KRUN_VIRTIOFS_MOUNTS` target with lstat, component by component (the
+    parent before creating a share target, the whole target after), and
+    mounts only over a real directory. Anything else, or a path with an
+    empty component, stops the guest with "`<target>` is not a directory,
+    refusing to mount over it" (bead `ley-line-open-2594af`). The import
+    and the manifest reader refuse such a link first; this is the in-guest
+    backstop. A `.` or `..` component is refused too.
+15. `0015` — **init: a refusal before the workload stops the guest as a
+    failure the host sees.** Upstream init bailed out with `exit()`: PID 1
+    exiting panics the kernel and libkrun reports exit status 0, so every
+    refusal before the workload (a mount, a 0014 mount target, a 0013
+    exec config, a 0010 channel list, the datagram filter) read on the
+    host as a success with an empty console (bead `ley-line-open-7164ec`).
+    Init now calls `stop_guest()`: it points stdout and stderr at the krun
+    console ports once /sys and /dev are mounted, prints the reason
+    (recorded by `record_stop_reason()` where the refusal is made), sets
+    exit status 125 through the root filesystem as it does for a workload,
+    and restarts. The host's supervisor then records the run as
+    `Failed`, with the reason in its `GuestOutput`. The console ports are
+    used only once the kernel's sysfs and devtmpfs are mounted (checked by
+    filesystem magic); a refusal before that (a link at /dev) reaches the
+    host as exit status 125 alone.
+16. `0016` — **vmm: a guest that records no exit status does not exit 0.**
+    When the VM stops and the guest recorded no status through the root
+    virtio-fs device, libkrun fell back to the vcpu's code, "OK" whenever
+    the guest merely restarted: after a kernel panic, after init died, or
+    after a workload run as PID 1 exited. The VMM now exits 125
+    (`NO_GUEST_EXIT_STATUS`) in that case and says so on stderr; a status
+    the guest recorded, 0 included, still wins (bead
+    `ley-line-open-7164ec`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

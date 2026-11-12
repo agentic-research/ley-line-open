@@ -39,6 +39,13 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   joins a declared guest connection to one loopback `127.0.0.1:port`, bytes
   only, no credential; the parent-death fix ships with it (`e9d940`, `521deb`,
   `52b5b3`, `5308b7`, `528525`, `52deb4`, `f963e6`; epic `e2c5ce`).
+- ADR-0049 (accepted 2026-11-12, for v0.30.0): each daemon is configured by one
+  versioned document (`apiVersion` `config.leyline/v1`) with a published JSON
+  Schema, `--check-config` and `--print-config`; runtime `LEYLINE_*`/`LLO_*`
+  configuration is removed; `configDigest` is recorded in `status`, the
+  `RunReceipt` and `RunOutcome`; release binaries carry the NFS `mount`, so a
+  release download can run the leyline-fs mount (`52c177`; consumers
+  `cloister-55e6cd`, `cloister-0bc3d5`, `mache-0be425`).
 - The follow-up gap queue (epic `ley-line-open-1262af`): every open design or
   correctness follow-up from the v0.26 to v0.29 releases is worked to zero, in
   groups whose files do not overlap. A pull request files a follow-up only for
@@ -57,9 +64,13 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
     D1 (#568: `b1c18d`, `167b29`, `1665c9`, `168a65`, `2aa5d3`, `cffbb5`).
     Open: `4f08ea` (rootfs manifest v2: directories with modes, and symbolic
     links), `faba8f` (canonical manifest bytes are checked) and `18a7a2`.
-  - **B (guest and libkrun).** `d4b07f` with `f7f862` first: argv and the
-    environment reach the guest init through a channel nothing parses, so the
-    kernel command line carries fixed tokens only. Then the loopback relay
+  - **B (guest and libkrun).** In the argv PR (group C, with `7410ec`):
+    `d4b07f` and `f7f862`, argv and the environment reach the guest init in an
+    exec config file (libkrun patch `0013`), so the kernel command line
+    carries only worker-chosen tokens and the executable; `2594af`, init
+    mounts only over a real directory (`0014`); and `7164ec`, a boot init
+    refuses, or a guest that records no exit status, ends `Failed` with exit
+    status 125 instead of reading as a success (`0015`, `0016`). Then the loopback relay
     (`ebc78e`, `bb3395`, `156d83`, `b00ae3`), the evidence gaps (`eba800`,
     `3839c9`, `eb8d81`) and `eb3411`.
   - **E (parse and identity).** `cc56e6`, `0ed720`, `1e64c4`, `1e76ba`,

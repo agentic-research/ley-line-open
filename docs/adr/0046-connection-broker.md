@@ -920,16 +920,20 @@ enforcement.
   fixture).
 - **Authorization** (closes S3): every combination of `@16`, `@17` and the marker (only
   all-or-nothing is accepted); a non-null empty `@16` or `@17`; a digest mismatch; a
-  non-canonical `@17`; the marker plus a `broker://` entry is refused; the binary path
-  through `authorize_with_verifier` with a trusted key refuses a fields-plus-marker grant
-  on a daemon built without a broker with the marker text; a `127.0.0.2` or `::1` target
-  is refused at start, "loopback address not delivered by this runtime", before anything is
-  spawned.
+  non-canonical `@17`; the marker plus a `broker://` entry is refused; a daemon that
+  reads the fields but has no broker yet refuses a fields-plus-marker grant at start with
+  `unsupportedBackend`, "this daemon has no connection broker", before the resolver runs,
+  over binary and over JSON (amended 2026-11-11, `ley-line-open-521deb`: the wire half
+  ships before the broker, and the old-daemon refusals are the next bullet's); a
+  `127.0.0.2` or `::1` target is refused at start, "loopback address not delivered by this
+  runtime", before anything is spawned (with the broker, `ley-line-open-52b5b3`).
 - **Old daemon** (closes S3's default deny): the pinned grant vector fed once to the
   v0.29.0 release's `execution-daemon` in each verifier mode, recorded in the bead:
   `--trust-key` gives the `unauthenticated` signature refusal, `--allow-unverified-evidence`
   gives the `credentialBrokerRefs` text.
-- **Capabilities** (closes S3): `capabilities_json` carries the connections entry.
+- **Capabilities** (closes S3): `capabilities_json` carries the connections entry once the
+  daemon serves connections, and not before (a daemon never advertises what it cannot
+  serve; until then it asserts the entry's absence).
 - **Generated surfaces** (closes S3, S8): `execution-tools.json` shows the new fields and
   the rewritten `@13` description; a zod schema from the v0.29.0 asset rejects a
   connections receipt and the new asset accepts it; a receipt without connections is

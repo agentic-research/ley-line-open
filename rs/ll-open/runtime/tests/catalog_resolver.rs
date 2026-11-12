@@ -17,6 +17,7 @@ fn authorized() -> AuthorizedExecution {
         // Committed by digest alone — this exercises the resolver, not the
         // grant reader that verifies a carried document against its digest.
         confinement_manifest: None,
+        connections: None,
         backend: leyline_runtime::BackendClass::Native,
         allowed_egress: Vec::new(),
         intent: SchemaIntent {

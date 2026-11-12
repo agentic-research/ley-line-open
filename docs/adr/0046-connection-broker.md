@@ -697,6 +697,25 @@ macOS) against the run's worker, which hosts the VMM, and closes any other peer 
 dial. The registry covers both tiers; the pid check is a second layer where the run has one
 peer process.
 
+*Implementation notes (2026-11-12, `ley-line-open-52b5b3`, from execution-boundary review):*
+
+- **Registry: resolved paths.** The registry compares paths as the sandbox resolves them,
+  not as they are spelled. nono canonicalizes a §6 grant before Seatbelt sees it, so both
+  sides are resolved through the realpath of their longest existing ancestor, and
+  case-folded on macOS. A non-ASCII §6 grant is refused at registration: a
+  case-insensitive volume folds Unicode case, and a not-yet-bound endpoint cannot be
+  folded through realpath. Endpoints are printable ASCII, so this never refuses a grant
+  that could not name one.
+- **Peer pid.** The broker is spawned before the worker exists (S7 step 3, then step 5),
+  so on the microVM tier it starts with `--await-peer`. It refuses every peer until the
+  supervisor names the worker's pid once over the control pipe (`{"op":"peer"}`), and the
+  pid can never be changed.
+- **Preflight.** A parent carrying an ACL is refused, and so is any ancestor that someone
+  other than root or the daemon's uid owns, or that others can write without the sticky
+  bit; either lets another user swap the parent.
+- **Teardown.** `ready` reports each bound socket's device and inode, and teardown unlinks
+  a path only while it is still that socket.
+
 ### S5. The relay: allow-list enforcement and failure behaviour (proposed)
 
 **The broker dials exactly the committed target and nothing else.**

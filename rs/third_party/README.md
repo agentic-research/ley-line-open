@@ -205,8 +205,18 @@ and apply unchanged to `v1.19.6`; `0007` to `0012` were written on top of
     (recorded by `record_stop_reason()` where the refusal is made), sets
     exit status 125 through the root filesystem as it does for a workload,
     and restarts. The host's supervisor then records the run as
-    `Failed`, with the reason in its `GuestOutput`. A refusal before /sys
-    is mounted (a link at /dev) reaches the host as exit status 125 alone.
+    `Failed`, with the reason in its `GuestOutput`. The console ports are
+    used only once the kernel's sysfs and devtmpfs are mounted (checked by
+    filesystem magic); a refusal before that (a link at /dev) reaches the
+    host as exit status 125 alone.
+16. `0016` — **vmm: a guest that records no exit status does not exit 0.**
+    When the VM stops and the guest recorded no status through the root
+    virtio-fs device, libkrun fell back to the vcpu's code, "OK" whenever
+    the guest merely restarted: after a kernel panic, after init died, or
+    after a workload run as PID 1 exited. The VMM now exits 125
+    (`NO_GUEST_EXIT_STATUS`) in that case and says so on stderr; a status
+    the guest recorded, 0 included, still wins (bead
+    `ley-line-open-7164ec`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).

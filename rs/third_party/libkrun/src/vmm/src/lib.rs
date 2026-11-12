@@ -67,6 +67,11 @@ use vm_memory::GuestMemoryMmap;
 
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
+/// The process exit status when the guest stopped without recording one
+/// (its init records the workload's status, or its own refusal, through the
+/// root virtio-fs device). Init's code for a failure of the runtime itself,
+/// as podman and crun use it.
+pub const NO_GUEST_EXIT_STATUS: i32 = 125;
 /// Generic error exit code.
 pub const FC_EXIT_CODE_GENERIC_ERROR: u8 = 1;
 /// Generic exit code for an error considered not possible to occur if the program logic is sound.
@@ -423,6 +428,16 @@ impl Subscriber for Vmm {
             let exit_code = if vmm_exit_code != i32::MAX {
                 debug!("using vmm exit code: {vmm_exit_code}");
                 vmm_exit_code
+            } else if vcpu_exit_code == FC_EXIT_CODE_OK {
+                // The guest recorded no exit status: init died, the kernel
+                // panicked, or the VM stopped before the workload's status
+                // was recorded. An "OK" from the vcpu here only means the
+                // guest restarted, so it is not reported as success.
+                eprintln!(
+                    "libkrun: the guest stopped without recording an exit status; \
+                     exiting {NO_GUEST_EXIT_STATUS}"
+                );
+                NO_GUEST_EXIT_STATUS
             } else {
                 debug!("using vcpu exit code: {vcpu_exit_code}");
                 vcpu_exit_code as i32

@@ -388,10 +388,25 @@ Both fields are inside the signing bytes (`wire/run-grant.md`). A grant that set
 neither has null pointers in those slots, which canonicalization truncates, so its
 signing bytes are unchanged from before the fields existed.
 
-**Old daemons.** A daemon that predates these fields drops them (JSON) or reads
-nothing from them (binary). A verifying daemon then refuses the grant on its
-signature, since the bytes it rebuilt differ from what the issuer signed
-(`unauthenticated`); an unverified one refuses the marker (`unsupportedBackend`).
+**Old daemons.** A daemon that predates these fields refuses such a grant, for one
+of two reasons (ADR-0046 S3, recorded against v0.29.0 on bead
+`ley-line-open-521deb`):
+
+| old daemon | what refuses the grant | error |
+|---|---|---|
+| verifying (`--trust-key`), JSON transport | the signature: the JSON decoder drops `@16`/`@17`, so the signing bytes it rebuilds differ from what the issuer signed | `unauthenticated` |
+| unverified (`--allow-unverified-evidence`), or an in-process embedder passing binary bytes (which keeps the unknown pointers, so its signature check passes) | the marker in `credentialBrokerRefs` | `unsupportedBackend`, "credential broker authority requires a broker integration" |
+
+**Error codes.** A partial combination, a present but empty field, an invalid
+document or a non-canonical one is `invalidGrant`. A document whose digest is not
+`connectionsDigest` is `identityPolicyMismatch`. The marker beside any other entry,
+`broker://` references included, keeps the `unsupportedBackend` refusal above.
+
+**Until a broker ships.** A daemon that reads these fields but has no connection
+broker authorizes them and then refuses the start with `unsupportedBackend`, "RunGrant
+carries connections (cloister/connections/v1), but this daemon has no connection
+broker", before anything is resolved or spawned. It does not advertise the capability
+below. A client therefore gates on the capability entry, never on an LLO version.
 
 **Capability.** A daemon that reads `@16`/`@17` and has a broker advertises
 `{name: "cloister/execution/v1/connections", version: "1"}` in

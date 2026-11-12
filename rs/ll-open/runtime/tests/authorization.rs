@@ -2559,6 +2559,15 @@ fn json_adapter_uses_generated_input_and_output_shapes() {
     let receipt = collect_json(&service, &json!({"runId": run_id}).to_string())
         .expect("collect receipt JSON");
     let receipt: serde_json::Value = serde_json::from_str(&receipt).expect("receipt JSON");
+    // ADR-0046 S8: a run without connections writes neither new receipt
+    // field, so its JSON is what a pre-connections reader expects (strict zod
+    // readers built from older assets reject unknown keys).
+    for key in ["connectionsDigest", "connections"] {
+        assert!(
+            receipt["receipt"].get(key).is_none(),
+            "a receipt without connections carries no {key}: {receipt}"
+        );
+    }
     assert_eq!(
         receipt["receipt"]["eventLogRoot"]["algorithm"],
         "blake3-256"
@@ -3632,6 +3641,70 @@ fn the_service_refuses_connections_before_resolving_until_a_broker_exists() {
         !capabilities.contains("cloister/execution/v1/connections"),
         "a daemon must not advertise what it cannot serve: {capabilities}"
     );
+}
+
+/// The JSON carrier end to end: the current decoder keeps `connectionsDigest`
+/// and `connectionsDocument`, authorization verifies them, and the service
+/// refuses the start because no broker exists yet.
+#[test]
+fn a_connections_grant_over_json_reaches_the_no_broker_refusal() {
+    let hex = connections_digest_hex();
+    let spec = spec_bytes();
+    let grant = with_connections(
+        &grant_bytes(&spec, true, 2_000, 0),
+        &Connections {
+            digest: Some(("blake3-256", &hex)),
+            document: Some(CONNECTIONS_DOCUMENT),
+            brokers: &[MARKER],
+        },
+    );
+    let grant_value: serde_json::Value = serde_json::from_str(&grant_json(&grant)).unwrap();
+    assert_eq!(
+        grant_value["connectionsDocument"], CONNECTIONS_DOCUMENT,
+        "the JSON carrier keeps the document"
+    );
+    let input = json!({
+        "spec": serde_json::from_str::<serde_json::Value>(&spec_json(&spec)).unwrap(),
+        "grant": grant_value,
+    })
+    .to_string();
+    let service = ExecutionService::new(RecordingBackend);
+    leyline_runtime::transport::provision_json(
+        &service,
+        r#"{"backendClass":"microVm","idempotencyKey":"provision-01"}"#,
+    )
+    .expect("provision JSON");
+    let error = start_json_with_verifier(
+        &service,
+        &input,
+        &connections_policy(),
+        &TestResolver,
+        &MetadataOnlyEvidenceVerifier,
+    )
+    .expect_err("no broker");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
+    assert!(
+        error.detail.contains("no connection broker"),
+        "{}",
+        error.detail
+    );
+
+    // Dropping the document from the JSON (what an old decoder does) is a
+    // partial grant here, never a grant without connections.
+    let mut partial: serde_json::Value = serde_json::from_str(&input).unwrap();
+    partial["grant"]
+        .as_object_mut()
+        .unwrap()
+        .remove("connectionsDocument");
+    let error = start_json_with_verifier(
+        &service,
+        &partial.to_string(),
+        &connections_policy(),
+        &TestResolver,
+        &MetadataOnlyEvidenceVerifier,
+    )
+    .expect_err("partial");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::InvalidGrant);
 }
 
 fn unhex(s: &str) -> Vec<u8> {

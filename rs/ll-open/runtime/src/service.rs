@@ -732,6 +732,16 @@ impl<B: Backend> ExecutionService<B> {
                 .runs
                 .get_mut(run_id)
                 .ok_or_else(|| ExecutionError::internal("run disappeared during cancellation"))?;
+            // The state lock is not held across `backend.cancel`, so a read
+            // in that window may already have projected the run's own
+            // terminal state. A run has one terminal event: return it rather
+            // than append `Cancelled` after it (bead ley-line-open-9c6a8f).
+            if !matches!(
+                record.state,
+                RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running
+            ) {
+                return Ok(record.clone());
+            }
             record.state = RunState::Cancelled;
             record.clone()
         };

@@ -731,3 +731,124 @@ fn cancelling_a_run_that_just_completed_returns_its_terminal_record() {
         .expect("cancelling a completed run must project its terminal state");
     assert_eq!(cancelled.state, RunState::Succeeded);
 }
+
+/// A backend whose run reaches a terminal state while `cancel` is in flight:
+/// its supervisor publishes a completion between the cancel request and the
+/// cancel's return, and a concurrent status read projects it. `cancel`
+/// blocks inside the backend until the test has made that read.
+struct CompletesDuringCancelBackend {
+    in_cancel: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+    published: Mutex<bool>,
+    completion: BackendRunStatus,
+}
+
+impl Backend for CompletesDuringCancelBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "completes-during-cancel/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+            unavailable_reason: None,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
+        }
+    }
+
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "completes-during-cancel/1".into(),
+            attached: Vec::new(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        let mut published = self.published.lock().expect("published lock");
+        if *published {
+            *published = false;
+            return Ok(Some(self.completion.clone()));
+        }
+        Ok(None)
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        *self.published.lock().expect("published lock") = true;
+        let entered = self.in_cancel.lock().expect("in_cancel lock").take();
+        let release = self.release.lock().expect("release lock").take();
+        if let (Some(entered), Some(release)) = (entered, release) {
+            entered.send(()).expect("signal cancel entered");
+            release.recv().expect("wait for the concurrent read");
+        }
+        Ok(true)
+    }
+}
+
+/// A run that reaches a terminal state while its cancel is in flight has
+/// exactly one terminal event: the cancel returns the terminal record a
+/// concurrent read projected, and never appends `Cancelled` after it (bead
+/// `ley-line-open-9c6a8f`). Before the fix the lifecycle held two terminal
+/// events, the projected one and then `Cancelled`, the run's state changed
+/// after it was terminal, and the record a reader had seen was overwritten.
+#[test]
+fn a_run_that_ends_while_its_cancel_is_in_flight_has_one_terminal_event() {
+    for completion in [
+        BackendRunStatus::Succeeded,
+        BackendRunStatus::Failed(ExecutionError::backend("worker exited with exit status: 1")),
+    ] {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let service = Arc::new(ExecutionService::new(CompletesDuringCancelBackend {
+            in_cancel: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+            published: Mutex::new(false),
+            completion: completion.clone(),
+        }));
+        let record = service.start(request("cancel-in-flight")).expect("start");
+        let run_id = record.run_id.clone();
+
+        let canceller = {
+            let service = Arc::clone(&service);
+            let run_id = run_id.clone();
+            std::thread::spawn(move || service.cancel(&run_id))
+        };
+        entered_rx.recv().expect("cancel reached the backend");
+        // The concurrent read: it projects the completion the backend
+        // published while the cancel is still in flight.
+        let seen = service
+            .status(&run_id)
+            .expect("status")
+            .expect("record")
+            .state;
+        release_tx.send(()).expect("release the cancel");
+        let cancelled = canceller
+            .join()
+            .expect("cancel thread")
+            .expect("cancel returns the terminal record");
+
+        assert_eq!(
+            cancelled.state, seen,
+            "the cancel returns the terminal state a reader already saw ({completion:?})"
+        );
+        let terminal: Vec<RunState> = service
+            .inspect(&run_id, 0)
+            .expect("events")
+            .events
+            .iter()
+            .map(|event| event.state)
+            .filter(|state| {
+                matches!(
+                    state,
+                    RunState::Succeeded | RunState::Failed | RunState::Cancelled
+                )
+            })
+            .collect();
+        assert_eq!(
+            terminal,
+            vec![seen],
+            "exactly one terminal event ({completion:?})"
+        );
+    }
+}

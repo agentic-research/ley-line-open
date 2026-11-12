@@ -1210,9 +1210,11 @@ fn network_tests_enabled(what: &str) -> bool {
 
 /// A Debian-based image (Cloister's request): dolthub/dolt-sql-server's
 /// index, pinned by the digest Docker Hub served for `latest` on
-/// 2026-11-10, imported twice under `--symlinks resolve`. Exercises the
-/// dangling-link drop rule; the identity and the drop counts are known
-/// answers. Opt-in: it needs the network and about 3 GB of temporary space.
+/// 2026-11-10, imported twice with its links kept (`--symlinks preserve`,
+/// rootfs manifest v2, bead `ley-line-open-4f08ea`): the 14 links
+/// `resolve` dropped as dangling are kept. The identity and the counts are
+/// known answers. Opt-in: it needs the network and about 3 GB of temporary
+/// space.
 ///
 /// The image holds paths that differ only in case
 /// (`usr/share/perl/5.36.0/Pod` and `…/pod`, `…/perl/5.36.0/Sys` and
@@ -1227,7 +1229,7 @@ fn dolt_sql_server_from_docker_hub_is_a_known_answer() {
     let reference = "dolthub/dolt-sql-server@sha256:4208ed89253c9d6a36af78f0129a293dc892681b5aca50ae66b943704b8fe052";
     let request = RegistryPull {
         platform: Platform::linux("arm64"),
-        symlinks: SymlinkPolicy::Resolve,
+        symlinks: SymlinkPolicy::Preserve,
         ..pull(reference, None)
     };
     let (_first_cas, first) = pull_into(&request);
@@ -1235,19 +1237,21 @@ fn dolt_sql_server_from_docker_hub_is_a_known_answer() {
     let (_second_cas, second) = pull_into(&request);
     let second = second.expect("pull dolt-sql-server again");
     assert_eq!(first, second, "two pulls of one digest");
-    let counts = (
+    let counts = [
         first.files,
+        first.directories,
+        first.symlinks,
         first.special_mode_bits_cleared,
         first.symlinks_resolved,
         first.special_entries_dropped.len(),
         first.links_dropped_kernel_mount.len(),
         first.links_dropped_dangling.len(),
         first.unreadable_files_dropped.len(),
-    );
+    ];
     eprintln!(
-        "dolt-sql-server arm64: rootfs blake3-256:{} manifest {} [files, specialModeBitsCleared, \
-         symlinksResolved, specialEntriesDropped, linksDroppedKernelMount, linksDroppedDangling, \
-         unreadableFilesDropped] = {counts:?}",
+        "dolt-sql-server arm64: rootfs blake3-256:{} manifest {} [files, directories, symlinks, \
+         specialModeBitsCleared, symlinksResolved, specialEntriesDropped, \
+         linksDroppedKernelMount, linksDroppedDangling, unreadableFilesDropped] = {counts:?}",
         first.rootfs.value, first.image.manifest
     );
     assert_eq!(
@@ -1258,11 +1262,11 @@ fn dolt_sql_server_from_docker_hub_is_a_known_answer() {
     assert_eq!(counts, DOLT_ARM64_COUNTS);
 }
 
-const DOLT_ARM64_ROOTFS: &str = "bfe91967c44c9ca5ea71fbf6136d29f093e6791b18e5c8669047817298653b39";
-/// files, specialModeBitsCleared, symlinksResolved, specialEntriesDropped,
-/// linksDroppedKernelMount, linksDroppedDangling, unreadableFilesDropped.
-const DOLT_ARM64_COUNTS: (usize, usize, usize, usize, usize, usize, usize) =
-    (11697, 24, 2002, 0, 0, 14, 0);
+const DOLT_ARM64_ROOTFS: &str = "11cf2e2525b9c36526269b9ebd7bfe01f176b24db0a076843223746369e23436";
+/// files, directories, symlinks, specialModeBitsCleared, symlinksResolved,
+/// specialEntriesDropped, linksDroppedKernelMount, linksDroppedDangling,
+/// unreadableFilesDropped.
+const DOLT_ARM64_COUNTS: [usize; 9] = [5362, 900, 1015, 13, 0, 0, 0, 0, 0];
 
 /// The bead's known answer, against Docker Hub. Opt-in: it needs the network.
 #[test]
@@ -1281,8 +1285,10 @@ fn hello_world_from_docker_hub_is_a_known_answer() {
     };
     let (_cas, result) = pull_into(&request);
     let imported = result.expect("pull hello-world from Docker Hub");
+    // Rootfs manifest v2 (bead ley-line-open-4f08ea); the layout import of
+    // the same digest in tests/oci_rootfs.rs records the same answer.
     assert_eq!(
         imported.rootfs.value,
-        "8597bea8e4baf11379489ff6eb118e21af4127718e465920d328326be727e4ec"
+        "6fbd5b6c842ee54f7461384badeefb0b922be7fcb5e9f0a3b593431888c1ba63"
     );
 }

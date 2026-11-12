@@ -120,6 +120,16 @@ impl ExecutionError {
         }
     }
 
+    /// A host resource the run needs is short, such as free space under the
+    /// run root ([`ErrorCode::ResourceExhausted`]); retryable once it frees.
+    pub(crate) fn resource_exhausted(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::ResourceExhausted,
+            retryable: true,
+            detail: detail.into(),
+        }
+    }
+
     pub(crate) fn not_provisioned(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::NotProvisioned,

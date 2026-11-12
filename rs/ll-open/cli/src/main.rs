@@ -366,6 +366,25 @@ struct Cli {
 /// one, which must be case-sensitive like the CAS root (bead
 /// `ley-line-open-741388`): one off the volume is checked here, before
 /// anything else starts, and every provision checks it again.
+/// Remove the run directories a gone daemon left beneath `run_root` (a
+/// crash, a kill, a reboot), naming each, and return how many (bead
+/// `ley-line-open-dac894`). A run root that does not exist yet (an
+/// unattached volume's) has none.
+fn sweep_run_root(run_root: &std::path::Path) -> anyhow::Result<usize> {
+    if !run_root.is_dir() {
+        return Ok(0);
+    }
+    let removed = leyline_runtime::backends::run_root::sweep_stale_runs(run_root)
+        .map_err(|error| anyhow::anyhow!("sweep the run root: {}", error.detail))?;
+    for path in &removed {
+        eprintln!(
+            "execution-daemon: removed stale run directory {}",
+            path.display()
+        );
+    }
+    Ok(removed.len())
+}
+
 fn execution_cas_storage(
     cas_root: Option<PathBuf>,
     cas_volume: Option<Option<PathBuf>>,
@@ -526,6 +545,7 @@ async fn main() -> Result<()> {
             // Both tiers materialize each run's rootfs beneath `run_root`.
             let (storage, run_root) =
                 execution_cas_storage(cas_root, cas_volume, cas_volume_size_cap_gib, run_root)?;
+            sweep_run_root(&run_root)?;
             let cas_root = storage.cas_root();
             let catalog_bytes = std::fs::read(&catalog)
                 .with_context(|| format!("read execution catalog {}", catalog.display()))?;
@@ -735,6 +755,27 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// At start the daemon removes the run directories a gone daemon left
+    /// (bead `ley-line-open-dac894`), keeps a live one's, and starts on a
+    /// run root that does not exist yet (an unattached volume's).
+    #[test]
+    fn execution_daemon_sweeps_a_gone_daemons_runs_at_start() {
+        let runs = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let stale = runs.path().join(format!("leyline-run-{dead}-abc123"));
+        let live = runs
+            .path()
+            .join(format!("leyline-native-run-{}-abc123", std::process::id()));
+        std::fs::create_dir_all(stale.join("rootfs")).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        assert_eq!(sweep_run_root(runs.path()).unwrap(), 1);
+        assert!(!stale.exists());
+        assert!(live.is_dir());
+        assert_eq!(sweep_run_root(&runs.path().join("not-yet")).unwrap(), 0);
+    }
 
     #[test]
     fn default_arena_size_is_64_mib_known_scale_limit() {

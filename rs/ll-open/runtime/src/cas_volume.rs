@@ -905,8 +905,23 @@ impl CasVolume {
     /// unless its filesystem is case-sensitive.
     fn verify_run_root(&self) -> Result<(), CasVolumeError> {
         let run_root = self.run_root();
+        // The directories this check creates, deepest first, so a refused
+        // run root is not left behind (bead `ley-line-open-dac894`).
+        let created: Vec<PathBuf> = run_root
+            .ancestors()
+            .take_while(|dir| !dir.exists())
+            .map(Path::to_path_buf)
+            .collect();
         fs::create_dir_all(&run_root).map_err(io_error("create", &run_root))?;
-        if !self.probe(&run_root)?.case_sensitive {
+        let sensitive = match self.probe(&run_root) {
+            Ok(sensitivity) => sensitivity.case_sensitive,
+            Err(error) => {
+                remove_created(&created);
+                return Err(error);
+            }
+        };
+        if !sensitive {
+            remove_created(&created);
             return Err(CasVolumeError::RunRootCaseInsensitive {
                 run_root,
                 cas_root: self.cas_root(),
@@ -1214,9 +1229,17 @@ fn remove_stale_partials(dir: &Path) -> Result<(), CasVolumeError> {
     Ok(())
 }
 
+/// Remove `created`, deepest first: empty directories this process made and
+/// is giving back. One that is no longer empty is left.
+fn remove_created(created: &[PathBuf]) {
+    for dir in created {
+        let _ = fs::remove_dir(dir);
+    }
+}
+
 /// Whether process `pid` exists: `kill(pid, 0)` succeeds, or fails only
 /// because it belongs to another user.
-fn process_exists(pid: libc::pid_t) -> bool {
+pub(crate) fn process_exists(pid: libc::pid_t) -> bool {
     // SAFETY: signal 0 performs only the existence and permission checks.
     let signalled = unsafe { libc::kill(pid, 0) } == 0;
     signalled || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -1916,7 +1939,17 @@ mod tests {
                         && message.contains(&volume.cas_root().display().to_string()),
                     "{message}"
                 );
+                // What the check created to probe is removed with the
+                // refusal (bead ley-line-open-dac894).
+                assert!(
+                    !state.path().join("host-disk").exists(),
+                    "{host:?}: the refused run root was left behind"
+                );
             }
+            // A run root that already existed is left as it was.
+            std::fs::create_dir_all(&run_root).unwrap();
+            volume.check_run_root().unwrap_err();
+            assert!(run_root.is_dir());
         }
     }
 

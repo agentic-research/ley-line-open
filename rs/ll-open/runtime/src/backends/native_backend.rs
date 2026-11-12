@@ -21,6 +21,7 @@ use super::process::{
     Supervised, SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
     finish_failed_start, published_status, read_readiness_line, supervise_worker,
 };
+use super::run_root;
 
 const LABELS: SupervisionLabels = SupervisionLabels {
     worker: "native worker",
@@ -42,6 +43,9 @@ pub struct NativeWorkerBackend {
     /// this tier enforces the wall clock only, and refuses memory, CPU and
     /// pids ceilings by name (ADR-0035, "OCI resources on execution/v1").
     cgroup: Option<CgroupRoot>,
+    /// The free space the run root must have before a run's copy is made
+    /// ([`run_root::RUN_ROOT_FREE_FLOOR_BYTES`] unless set).
+    free_floor: u64,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
@@ -59,6 +63,7 @@ impl NativeWorkerBackend {
         Self {
             config,
             cgroup: None,
+            free_floor: run_root::RUN_ROOT_FREE_FLOOR_BYTES,
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
@@ -72,6 +77,13 @@ impl NativeWorkerBackend {
     /// `root`, which also makes teardown `cgroup.kill` of the whole tree.
     pub fn with_cgroup_root(mut self, root: CgroupRoot) -> Self {
         self.cgroup = Some(root);
+        self
+    }
+
+    /// Refuse a run, before anything is created or spawned, when the run
+    /// root has fewer than `bytes` free (bead `ley-line-open-dac894`).
+    pub fn with_run_root_free_floor(mut self, bytes: u64) -> Self {
+        self.free_floor = bytes;
         self
     }
 
@@ -189,6 +201,8 @@ impl Backend for NativeWorkerBackend {
             });
         }
 
+        run_root::ensure_free_space(&self.config.ephemeral_root, self.free_floor)?;
+
         // Created before the worker exists, so a ceiling the kernel refuses
         // (an out-of-range value, a root that stopped being writable) fails
         // the start with nothing to tear down but the directory. Dropped on
@@ -199,7 +213,7 @@ impl Backend for NativeWorkerBackend {
             .map(|root| root.create_run(&request.run_id, &request.limits))
             .transpose()?;
         let run_root = TempDirBuilder::new()
-            .prefix("leyline-native-run-")
+            .prefix(&run_root::run_dir_prefix("leyline-native-run-"))
             .tempdir_in(&self.config.ephemeral_root)
             .map_err(|error| ExecutionError::backend(format!("create native run root: {error}")))?;
         let mut command = Command::new(&self.config.worker);

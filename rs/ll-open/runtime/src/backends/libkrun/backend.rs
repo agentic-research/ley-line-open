@@ -63,6 +63,9 @@ pub struct KrunWorkerBackend {
     /// [`std::env::consts::OS`] value, or `None` when the caller vouches for
     /// the worker. Only the `test-support` hooks below change it.
     entitlement_platform: Option<&'static str>,
+    /// The free space the run root must have before a run's copy is made
+    /// ([`crate::backends::run_root::RUN_ROOT_FREE_FLOOR_BYTES`] unless set).
+    free_floor: u64,
     start_lock: Mutex<()>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
@@ -90,6 +93,7 @@ impl KrunWorkerBackend {
         Self {
             config,
             entitlement_platform: Some(std::env::consts::OS),
+            free_floor: super::super::run_root::RUN_ROOT_FREE_FLOOR_BYTES,
             start_lock: Mutex::new(()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
@@ -151,6 +155,13 @@ impl KrunWorkerBackend {
                 "the microVM tier attaches one workspace as /work; the run is granted {granted}"
             ))),
         }
+    }
+
+    /// Refuse a run, before anything is created or spawned, when the run
+    /// root has fewer than `bytes` free (bead `ley-line-open-dac894`).
+    pub fn with_run_root_free_floor(mut self, bytes: u64) -> Self {
+        self.free_floor = bytes;
+        self
     }
 
     /// Skip the worker's hypervisor-entitlement check, for a fake worker that
@@ -307,6 +318,8 @@ impl Backend for KrunWorkerBackend {
             });
         }
 
+        super::super::run_root::ensure_free_space(&self.config.ephemeral_root, self.free_floor)?;
+
         // The share was opened by the service before this call; it is taken
         // here, before anything is spawned or created, so a refusal (shares
         // that are not the request's workspaces, more than the tier attaches)
@@ -319,7 +332,7 @@ impl Backend for KrunWorkerBackend {
         let held_share = share.clone();
 
         let rootfs = TempDirBuilder::new()
-            .prefix("leyline-run-")
+            .prefix(&super::super::run_root::run_dir_prefix("leyline-run-"))
             .tempdir_in(&self.config.ephemeral_root)
             .map_err(|error| {
                 ExecutionError::backend(format!("create ephemeral rootfs volume: {error}"))

@@ -108,7 +108,11 @@ pub trait Backend: Send + Sync + 'static {
 /// a failed tool or filesystem call is the backend's.
 fn storage_error(error: crate::cas_volume::CasVolumeError) -> ExecutionError {
     use crate::cas_volume::CasVolumeError;
-    let detail = format!("provision the CAS root: {error}");
+    let what = match error {
+        CasVolumeError::RunRootCaseInsensitive { .. } => "check the run root",
+        _ => "provision the CAS root",
+    };
+    let detail = format!("{what}: {error}");
     match error {
         CasVolumeError::UnsupportedHost { .. }
         | CasVolumeError::CaseInsensitive { .. }
@@ -847,5 +851,38 @@ fn event_with_detail(
             .unwrap_or_default()
             .as_millis() as u64,
         detail_digest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cas_volume::CasVolumeError;
+    use std::path::PathBuf;
+
+    /// A refused run root is named as the run root, not as the CAS root's
+    /// provisioning (bead `ley-line-open-dac894`); both are the host's.
+    #[test]
+    fn a_storage_refusal_names_what_was_refused() {
+        let run_root = storage_error(CasVolumeError::RunRootCaseInsensitive {
+            run_root: PathBuf::from("/runs"),
+            cas_root: PathBuf::from("/cas"),
+        });
+        assert!(
+            run_root.detail.starts_with("check the run root: "),
+            "{run_root:?}"
+        );
+        assert_eq!(run_root.code, crate::ErrorCode::UnsupportedBackend);
+        let cas = storage_error(CasVolumeError::CaseInsensitive {
+            path: PathBuf::from("/cas"),
+            remedy: "use a volume",
+        });
+        assert!(
+            cas.detail.starts_with("provision the CAS root: "),
+            "{cas:?}"
+        );
+        assert_eq!(cas.code, crate::ErrorCode::UnsupportedBackend);
+        let config = storage_error(CasVolumeError::Config("x".into()));
+        assert_eq!(config.code, crate::ErrorCode::BackendFailed);
     }
 }

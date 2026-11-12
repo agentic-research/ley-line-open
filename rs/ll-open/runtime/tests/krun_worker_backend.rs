@@ -85,6 +85,50 @@ fn backend_with_worker(
     (backend, ephemeral_root)
 }
 
+/// The microVM tier's run directory names its daemon too, and a run root
+/// below the free-space floor refuses the start before anything is created
+/// or spawned (bead `ley-line-open-dac894`).
+#[test]
+fn a_run_directory_names_its_daemon_and_the_free_floor_refuses_first() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, runs) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+    );
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
+    let names: Vec<String> = fs::read_dir(&runs)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1);
+    assert!(
+        names[0].starts_with(&format!("leyline-run-{}-", std::process::id())),
+        "{names:?}"
+    );
+    drop(backend);
+
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    let (backend, runs) = backend_with_worker(
+        &fixture,
+        &format!("#!/bin/sh\ntouch '{}'\n", spawned.display()),
+    );
+    let error = backend
+        .with_run_root_free_floor(u64::MAX)
+        .start(&request(), ServedWorkspaces::none())
+        .expect_err("no space for the run");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::ResourceExhausted);
+    assert!(
+        error.detail.contains(&runs.display().to_string()),
+        "{error:?}"
+    );
+    assert_eq!(run_root_count(&runs), 0, "nothing created");
+    assert!(!spawned.exists(), "no worker spawned");
+}
+
 #[test]
 fn backend_spawns_the_explicit_first_party_worker_and_waits_for_ready() {
     let _serial = common::serial();

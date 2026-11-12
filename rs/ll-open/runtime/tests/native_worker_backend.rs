@@ -139,6 +139,64 @@ fn every_native_resource_is_required_independently() {
     }
 }
 
+/// A run directory names the daemon that made it, so a later daemon can
+/// sweep the ones a gone daemon left (bead `ley-line-open-dac894`).
+#[test]
+fn a_run_directory_names_the_daemon_that_made_it() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let seen = fixture.path().join("run-root-seen");
+    let (backend, _runs) = backend(
+        &fixture,
+        &format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = --run-root ] && printf '%s' \"$2\" > '{}'; shift; done\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"native-run-01\"}}' >&2\n",
+            seen.display()
+        ),
+    );
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("worker readiness");
+    backend
+        .wait_for_completion("native-run-01")
+        .expect("worker completion");
+    let run_root = fs::read_to_string(&seen).expect("the worker saw its run root");
+    let name = std::path::Path::new(&run_root)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        name.starts_with(&format!("leyline-native-run-{}-", std::process::id())),
+        "{name}"
+    );
+}
+
+/// A run root below the free-space floor refuses the run before anything
+/// is created or spawned, as retryable resource exhaustion naming the run
+/// root (bead `ley-line-open-dac894`).
+#[test]
+fn a_run_root_below_the_free_space_floor_refuses_the_start() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    let (backend, runs) = backend(
+        &fixture,
+        &format!("#!/bin/sh\ntouch '{}'\n", spawned.display()),
+    );
+    let backend = backend.with_run_root_free_floor(u64::MAX);
+    let error = backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect_err("no space for the run");
+    assert_eq!(error.code, leyline_runtime::ErrorCode::ResourceExhausted);
+    assert!(error.retryable);
+    assert!(
+        error.detail.contains(&runs.display().to_string()),
+        "{error:?}"
+    );
+    assert_eq!(fs::read_dir(&runs).unwrap().count(), 0, "nothing created");
+    assert!(!spawned.exists(), "no worker spawned");
+}
+
 #[test]
 fn worker_exit_is_observable_and_run_root_is_removed() {
     let _serial = common::serial();

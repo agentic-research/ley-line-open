@@ -48,12 +48,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use leyline_runtime::artifacts::rootfs_manifest::{FileSpec, RootfsSpec};
+use leyline_runtime::backends::libkrun::plan::{DirectoryRootfsResolver, RootfsResolver};
 use leyline_runtime::backends::native::WorkerEvent;
 use leyline_runtime::backends::native_backend::{NativeWorkerBackend, NativeWorkerConfig};
 use leyline_runtime::{
@@ -88,6 +89,9 @@ const PREFIX_SIBLING: &str = "rootfs-sibling";
 const ENV_PROBE: &str = "LEYLINE_CONFINEMENT_PROBE";
 const ENV_DECOY: &str = "LEYLINE_PROBE_DECOY";
 const ENV_RUN_SIBLING: &str = "LEYLINE_PROBE_RUN_SIBLING";
+/// A file of the CAS entry the run was copied from, on the same filesystem
+/// as the run root (as on a CAS volume, `mnt/cas` beside `mnt/runs`).
+const ENV_CAS_FILE: &str = "LEYLINE_PROBE_CAS_FILE";
 const ENV_CONNECT: &str = "LEYLINE_PROBE_CONNECT";
 const ENV_SSH: &str = "LEYLINE_PROBE_SSH";
 const ENV_WAIT: &str = "LEYLINE_PROBE_WAIT_FOR_GO";
@@ -148,6 +152,9 @@ fn violations(observations: &[Observation], required: &[&str]) -> Vec<String> {
             )),
             Expect::KernelDenied => match observation.errno {
                 Some(errno) if errno == libc::EPERM || errno == libc::EACCES => {}
+                // Landlock's refusal of a link across hierarchies (no REFER
+                // right); the CAS and run root share one filesystem here.
+                Some(errno) if errno == libc::EXDEV && observation.probe == "cas_hardlink" => {}
                 Some(errno) if errno == libc::ENOENT => problems.push(format!(
                     "{} failed with ENOENT: the target looked absent rather than denied, \
                      so this proves nothing about the sandbox: {observation:?}",
@@ -239,6 +246,17 @@ fn confined_guest_entry_point() {
     // (a) an existing out-of-grant decoy.
     let decoy = std::env::var(ENV_DECOY).expect("decoy path");
     record("decoy_read", fs::read_to_string(&decoy));
+
+    // (a') a hard link to a CAS file. With the run root on the CAS's own
+    // filesystem (the CAS volume's default, bead ley-line-open-741388),
+    // link(2) no longer fails EXDEV; the sandbox must deny it, or the guest
+    // could rewrite a content-addressed file in place (bead
+    // ley-line-open-dab663).
+    let cas_file = std::env::var(ENV_CAS_FILE).expect("CAS file path");
+    record(
+        "cas_hardlink",
+        fs::hard_link(&cas_file, "stolen-cas-link").map(|()| "linked".into()),
+    );
 
     // (b) siblings of the granted root.
     let run_sibling = std::env::var(ENV_RUN_SIBLING).expect("run sibling path");
@@ -380,6 +398,14 @@ impl Fixture {
         let mut public_environment = BTreeMap::from([
             (ENV_PROBE.to_owned(), "1".to_owned()),
             (ENV_DECOY.to_owned(), self.decoy.display().to_string()),
+            (
+                ENV_CAS_FILE.to_owned(),
+                self.cas
+                    .join(&self.digest)
+                    .join(GRANTED_FILE)
+                    .display()
+                    .to_string(),
+            ),
             (
                 ENV_RUN_SIBLING.to_owned(),
                 self.run_sibling.display().to_string(),
@@ -623,6 +649,49 @@ fn an_existing_file_outside_the_grant_is_kernel_denied_not_absent() {
         "an existing decoy outside the grant must be EPERM/EACCES: {decoy:?}"
     );
     fixture.assert_decoys_intact();
+}
+
+/// The run root and the CAS share one filesystem here, as on a CAS volume,
+/// so only the sandbox stands between a guest and a hard link to a CAS file
+/// it could then rewrite in place. It denies it: the CAS is outside every
+/// grant (bead `ley-line-open-dab663`). The entry still resolves afterwards.
+#[test]
+fn a_hard_link_to_a_cas_file_on_the_run_roots_filesystem_is_kernel_denied() {
+    let _serial = common::serial();
+    let fixture = Fixture::new();
+    assert_eq!(
+        fs::metadata(&fixture.cas).unwrap().dev(),
+        fs::metadata(&fixture.runs).unwrap().dev(),
+        "the fixture puts the CAS and the run root on one filesystem"
+    );
+    let Some(DirectRun {
+        observations,
+        run_root,
+    }) = run_worker_directly(&fixture)
+    else {
+        return;
+    };
+    assert_observations(&observations, &["cas_hardlink"]);
+    let link = observation(&observations, "cas_hardlink");
+    // Seatbelt denies with EPERM; Landlock refuses a link across
+    // hierarchies without its REFER right with EXDEV, which here (one
+    // filesystem, asserted above) is the sandbox, not the filesystem.
+    assert!(
+        !link.ok
+            && matches!(link.errno, Some(errno)
+                if errno == libc::EPERM || errno == libc::EACCES || errno == libc::EXDEV),
+        "a hard link to a CAS file must be refused by the sandbox: {link:?}"
+    );
+    assert!(
+        fs::symlink_metadata(run_root.join("rootfs").join("stolen-cas-link")).is_err(),
+        "no link was made"
+    );
+    DirectoryRootfsResolver::new(&fixture.cas)
+        .resolve(&DigestRef {
+            algorithm: "blake3-256".into(),
+            value: fixture.digest.clone(),
+        })
+        .expect("the CAS entry still verifies");
 }
 
 #[test]

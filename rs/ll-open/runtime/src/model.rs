@@ -774,7 +774,36 @@ pub struct RunRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendEvidenceDocument, WorkerChannel};
+    use super::{BackendEvidenceDocument, WorkerChannel, refuse_unrepresentable_environment};
+
+    /// The tier-neutral environment rule refuses only what no environment
+    /// can carry, and admits everything else, `=` inside a value included
+    /// (bead `ley-line-open-9d75c9`; execution/v1 README "Public
+    /// environment").
+    #[test]
+    fn the_environment_rule_refuses_only_the_unrepresentable() {
+        let one = |key: &str, value: &str| {
+            std::collections::BTreeMap::from([(key.to_owned(), value.to_owned())])
+        };
+        for (key, value) in [
+            ("TOKEN", "a=b"),
+            ("lower.case", "v"),
+            ("A B", "\"quoted\" -- \n"),
+            ("KRUN_X", "1"),
+            ("K", ""),
+        ] {
+            assert_eq!(
+                refuse_unrepresentable_environment(&one(key, value)),
+                Ok(()),
+                "{key:?}={value:?} is admitted on every tier"
+            );
+        }
+        for (key, value) in [("", "1"), ("A=B", "1"), ("K\0", "1"), ("K", "v\0")] {
+            let error = refuse_unrepresentable_environment(&one(key, value)).expect_err("refused");
+            assert_eq!(error.code, crate::ErrorCode::InvalidSpec, "{key:?}");
+            assert!(error.detail.starts_with("publicEnvironment"), "{error}");
+        }
+    }
 
     /// The canonical bytes the execution/v1 README's "Backend evidence"
     /// section specifies, pinned: keys in ASCII order at every level

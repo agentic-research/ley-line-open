@@ -310,6 +310,23 @@ enum variants at the end. Removing or reinterpreting a field requires v2.
 the user's decision; see "Resource limits" below and ADR-0035 "OCI resources
 on execution/v1". The rule above holds for every other change.
 
+## Public environment
+
+`RunSpec.publicEnvironment` reaches the workload as `KEY=VALUE` entries, byte
+for byte. Every tier refuses, as `invalidSpec` and before a worker exists, an
+entry no environment can carry: a key that is empty or holds `=` or NUL, or a
+value that holds NUL (bead `ley-line-open-9d75c9`). Anything else is
+admitted: lowercase keys, dots, quotes, newlines and `=` inside a value.
+
+The microVM tier adds its own refusals, also `invalidSpec` and named: any key
+beginning `KRUN_` (the guest init's settings, `KRUN_VIRTIOFS_MOUNTS` and
+`KRUN_LOOPBACK_CHANNELS` among them), more than 16,000 argv and environment
+strings in all, any single string of 128 KiB or more (an entry measured as
+`KEY=VALUE`), more than 1 MiB in all, an argument holding NUL, and an
+executable that is not printable ASCII without a space or double quote (it
+rides the guest kernel command line). A consumer that mirrors admission at
+build time mirrors the microVM set, the stricter one.
+
 ## Resource limits
 
 `ResourceLimits` carries OCI runtime-spec `linux.resources` `memory.limit`

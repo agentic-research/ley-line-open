@@ -18,8 +18,8 @@ use crate::{
 use super::cgroup::{CgroupRoot, RunCgroup};
 use super::native::WorkerEvent;
 use super::process::{
-    SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
-    finish_failed_start, read_readiness_line, supervise_worker,
+    Supervised, SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
+    finish_failed_start, published_status, read_readiness_line, supervise_worker,
 };
 
 const LABELS: SupervisionLabels = SupervisionLabels {
@@ -434,19 +434,17 @@ impl Backend for NativeWorkerBackend {
             // completion find the run still active, collect this result, and
             // report the worker's own failure as the cleanup's (bead
             // ley-line-open-f8ebcf).
+            // A cancelled run publishes nothing: the shared lifecycle records
+            // it `Cancelled` (bead ley-line-open-9c6a8f).
             {
                 let mut completed = completed.lock();
                 children.lock().remove(&run_id);
-                completed.insert(
-                    run_id,
-                    match result.clone() {
-                        Ok(()) => BackendRunStatus::Succeeded,
-                        Err(error) => BackendRunStatus::Failed(error),
-                    },
-                );
+                if let Some(status) = published_status(&result) {
+                    completed.insert(run_id, status);
+                }
             }
             completion_cv.notify_all();
-            let _ = finished_tx.send(result);
+            let _ = finished_tx.send(result.map(|_| ()));
         });
         Ok(BackendRun {
             backend_id: "native-nono/1".into(),
@@ -469,11 +467,11 @@ impl Backend for NativeWorkerBackend {
 /// a cgroup teardown failure reported rather than dropped. When both failed,
 /// the supervision error keeps its code and the teardown failure is appended.
 fn with_cgroup_cleanup(
-    supervised: Result<(), ExecutionError>,
+    supervised: Result<Supervised, ExecutionError>,
     removed: Result<(), ExecutionError>,
-) -> Result<(), ExecutionError> {
+) -> Result<Supervised, ExecutionError> {
     match (supervised, removed) {
-        (Ok(()), removed) => removed,
+        (Ok(ended), removed) => removed.map(|()| ended),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(ExecutionError {
             detail: format!(
@@ -530,14 +528,19 @@ mod tests {
             "execution exceeded wall-clock limit; cgroup cleanup also failed: run cgroup still holds processes"
         );
         assert_eq!(
-            super::with_cgroup_cleanup(Ok(()), Err(teardown.clone())).expect_err("teardown"),
+            super::with_cgroup_cleanup(Ok(super::Supervised::Exited), Err(teardown.clone()))
+                .expect_err("teardown"),
             teardown
         );
         assert_eq!(
             super::with_cgroup_cleanup(Err(run.clone()), Ok(())).expect_err("run"),
             run
         );
-        assert!(super::with_cgroup_cleanup(Ok(()), Ok(())).is_ok());
+        // The supervision's own ending survives a clean teardown: a cancel
+        // stays a cancel.
+        for ended in [super::Supervised::Exited, super::Supervised::Cancelled] {
+            assert_eq!(super::with_cgroup_cleanup(Ok(ended), Ok(())), Ok(ended));
+        }
     }
 
     #[test]

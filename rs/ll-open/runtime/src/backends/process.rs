@@ -19,7 +19,7 @@ use std::time::Instant;
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
-use crate::ExecutionError;
+use crate::{BackendRunStatus, ExecutionError};
 
 /// Operator-facing names for one backend's worker and ephemeral tree. Only
 /// diagnostics differ between the native and libkrun supervisors; the
@@ -345,6 +345,31 @@ pub(super) fn read_readiness_line(reader: &mut impl BufRead) -> Result<Option<St
     }
 }
 
+/// How a supervised worker ended when nothing failed: it exited 0, or the
+/// run was cancelled and the worker was terminated. The two are different
+/// outcomes; only the first is a successful run (bead
+/// `ley-line-open-9c6a8f`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Supervised {
+    Exited,
+    Cancelled,
+}
+
+/// The completion a backend's supervisor publishes for a run: `Succeeded`
+/// for a worker that exited 0, `Failed` for any error, and nothing for a
+/// cancelled run, whose terminal state the shared lifecycle records as
+/// `Cancelled`. Publishing `Succeeded` for a cancel let a read that raced
+/// the cancel record the cancelled run as a success.
+pub(super) fn published_status(
+    result: &Result<Supervised, ExecutionError>,
+) -> Option<BackendRunStatus> {
+    match result {
+        Ok(Supervised::Exited) => Some(BackendRunStatus::Succeeded),
+        Ok(Supervised::Cancelled) => None,
+        Err(error) => Some(BackendRunStatus::Failed(error.clone())),
+    }
+}
+
 /// Supervise one started worker until a terminal event, then terminate its
 /// process group and release the parent-owned ephemeral tree.
 ///
@@ -360,7 +385,7 @@ pub(super) fn supervise_worker(
     cancel: mpsc::Receiver<()>,
     deadline: Instant,
     labels: SupervisionLabels,
-) -> Result<(), ExecutionError> {
+) -> Result<Supervised, ExecutionError> {
     // `Child::try_wait` plus a short timeout is scheduler polling. Instead,
     // dedicate one thread to the blocking wait and merge its exit event with
     // cancellation events. The only timed wait below is the actual deadline;
@@ -418,9 +443,11 @@ pub(super) fn supervise_worker(
         Event::Cancelled => {
             signal.terminate();
             let _ = event_rx.recv();
-            cleanup_tempdir(run_root, labels)
+            cleanup_tempdir(run_root, labels).map(|()| Supervised::Cancelled)
         }
-        Event::Exited(Ok(status)) if status.success() => cleanup_tempdir(run_root, labels),
+        Event::Exited(Ok(status)) if status.success() => {
+            cleanup_tempdir(run_root, labels).map(|()| Supervised::Exited)
+        }
         Event::Exited(Ok(status)) => cleanup_with_error(
             run_root,
             labels,
@@ -444,11 +471,11 @@ fn wall_clock_exceeded() -> ExecutionError {
 
 /// Release the ephemeral tree while preserving an already-observed failure.
 /// A cleanup failure is appended rather than replacing the original cause.
-pub(super) fn cleanup_with_error(
+pub(super) fn cleanup_with_error<T>(
     run_root: TempDir,
     labels: SupervisionLabels,
     error: ExecutionError,
-) -> Result<(), ExecutionError> {
+) -> Result<T, ExecutionError> {
     Err(finish_failed_start(run_root, labels, error))
 }
 
@@ -539,11 +566,12 @@ pub(super) fn make_tree_removable(
 #[cfg(test)]
 mod tests {
     use super::{
-        READINESS_PREAMBLE_LINES, SupervisionLabels, WorkerProcess, await_exit_without_reaping,
-        cleanup_tempdir, configure_process_group, finish_failed_start, make_tree_removable,
-        read_readiness_line, read_request, retry_while_interrupted, supervise_worker,
-        terminate_process_group,
+        READINESS_PREAMBLE_LINES, Supervised, SupervisionLabels, WorkerProcess,
+        await_exit_without_reaping, cleanup_tempdir, configure_process_group, finish_failed_start,
+        make_tree_removable, published_status, read_readiness_line, read_request,
+        retry_while_interrupted, supervise_worker, terminate_process_group,
     };
+    use crate::BackendRunStatus;
     use crate::ExecutionError;
     use std::fs;
     use std::io;
@@ -634,6 +662,44 @@ mod tests {
         worker: "test worker",
         ephemeral: "test ephemeral rootfs",
     };
+
+    /// A cancelled worker is reported as cancelled, not as a clean exit, and
+    /// its supervisor publishes no completion: the shared lifecycle records
+    /// `Cancelled`. Before, a cancelled supervision returned the same `Ok` as
+    /// a worker that exited 0, the supervisor published `Succeeded`, and a
+    /// read racing the cancel could record the cancelled run as a success
+    /// (bead `ley-line-open-9c6a8f`).
+    #[test]
+    fn a_cancelled_worker_is_reported_cancelled_and_publishes_no_completion() {
+        let run_root = tempfile::tempdir().expect("run root");
+        let mut command = Command::new("cat");
+        command.stdin(Stdio::piped()).stdout(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn a worker that waits");
+        // Held open: the worker never ends by itself, only by the cancel.
+        let _stdin = child.stdin.take().expect("worker stdin");
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        cancel_tx.send(()).expect("request cancel");
+        let outcome = supervise_worker(
+            WorkerProcess::new(child),
+            run_root,
+            cancel_rx,
+            Instant::now() + Duration::from_secs(30),
+            LABELS,
+        );
+        assert_eq!(outcome, Ok(Supervised::Cancelled));
+        assert_eq!(published_status(&outcome), None);
+
+        assert_eq!(
+            published_status(&Ok(Supervised::Exited)),
+            Some(BackendRunStatus::Succeeded)
+        );
+        let failed = ExecutionError::backend("test worker exited with exit status: 125");
+        assert_eq!(
+            published_status(&Err(failed.clone())),
+            Some(BackendRunStatus::Failed(failed))
+        );
+    }
 
     /// The pid-safety invariant, proved directly.
     ///

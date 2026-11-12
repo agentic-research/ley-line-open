@@ -155,6 +155,157 @@ pub fn line<T: Serialize>(message: &T) -> String {
     text
 }
 
+/// The broker process's arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Args {
+    pub lifeline_fd: i32,
+    pub peer_pid: Option<i32>,
+}
+
+/// Parse `--lifeline-fd <fd> [--peer-pid <pid>]`, in any order.
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut lifeline_fd = None;
+    let mut peer_pid = None;
+    let mut iter = args.into_iter();
+    while let Some(flag) = iter.next() {
+        let slot = match flag.as_str() {
+            "--lifeline-fd" => &mut lifeline_fd,
+            "--peer-pid" => &mut peer_pid,
+            _ => return Err(format!("unknown argument {flag}")),
+        };
+        let value = iter.next().ok_or(format!("{flag} needs a value"))?;
+        let number: i32 = value
+            .parse()
+            .map_err(|_| format!("{flag} {value:?} is not a number"))?;
+        if slot.replace(number).is_some() {
+            return Err(format!("{flag} given twice"));
+        }
+    }
+    Ok(Args {
+        lifeline_fd: lifeline_fd.ok_or("--lifeline-fd is required")?,
+        peer_pid,
+    })
+}
+
+/// End this process the moment the lifeline's write end is gone: a read
+/// returns end-of-file (or fails) once no process holds it.
+pub fn watch_lifeline(fd: i32) {
+    thread::spawn(move || {
+        let mut byte = 0u8;
+        loop {
+            // SAFETY: a one-byte read into a valid buffer.
+            let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if n <= 0 {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+/// Everything the broker does after its arguments are read: take the start
+/// request, verify the document, bind, `confine`, relay, report, drain.
+///
+/// `confine` is [`super::profile::apply`] in the binary. It runs after every
+/// endpoint is bound and before ready is reported (bind, then confine).
+/// Returns when the supervisor drains or closes the control pipe; an error is
+/// also reported on `output` as an `error` event.
+pub fn serve<R, W, C>(
+    input: R,
+    output: W,
+    peer_pid: Option<i32>,
+    limits: super::relay::Limits,
+    confine: C,
+) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write + Send + 'static,
+    C: FnOnce(&ConnectionsDocument) -> Result<(), ExecutionError>,
+{
+    let output = std::sync::Arc::new(parking_lot::Mutex::new(output));
+    let emit = {
+        let output = std::sync::Arc::clone(&output);
+        move |event: &Event| {
+            let mut output = output.lock();
+            let _ = output.write_all(line(event).as_bytes());
+            let _ = output.flush();
+        }
+    };
+    let fail = |detail: String| {
+        emit(&Event::Error {
+            detail: detail.clone(),
+        });
+        Err(detail)
+    };
+    let mut requests = input.lines();
+    let document = match requests.next() {
+        Some(Ok(text)) => match serde_json::from_str::<Request>(&text) {
+            Ok(Request::Start { document }) => document,
+            Ok(other) => return fail(format!("expected start, got {other:?}")),
+            Err(error) => return fail(format!("unreadable start request: {error}")),
+        },
+        _ => return fail("control pipe closed before start".into()),
+    };
+    let parsed = match leyline_schema_spec::connections::parse(document.as_bytes()) {
+        Ok(parsed) => parsed,
+        Err(error) => return fail(error.to_string()),
+    };
+    if parsed.canonical_bytes() != document.as_bytes() {
+        return fail("connections document is not canonical".into());
+    }
+    if let Err(error) = super::check_delivered(&parsed) {
+        return fail(error.detail);
+    }
+    let endpoints = match super::relay::bind(&parsed) {
+        Ok(endpoints) => endpoints,
+        Err(error) => return fail(format!("bind endpoint: {error}")),
+    };
+    if let Err(error) = confine(&parsed) {
+        return fail(error.detail);
+    }
+    // SAFETY: geteuid cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let (sender, records) = mpsc::channel();
+    let handle = match super::relay::start(
+        endpoints,
+        super::relay::PeerPolicy { uid, pid: peer_pid },
+        limits,
+        sender,
+    ) {
+        Ok(handle) => handle,
+        Err(error) => return fail(format!("start relay: {error}")),
+    };
+    emit(&Event::Ready {
+        connections_digest: format!("blake3-256:{}", parsed.digest_hex()),
+    });
+    {
+        let emit = emit.clone();
+        thread::spawn(move || {
+            for record in records {
+                emit(&Event::from(&record));
+            }
+        });
+    }
+    loop {
+        match requests.next() {
+            Some(Ok(text)) => {
+                if let Ok(Request::Drain) = serde_json::from_str::<Request>(&text) {
+                    break;
+                }
+            }
+            // End-of-file on the control pipe ends the run without a drain.
+            _ => return Ok(()),
+        }
+    }
+    for record in handle.drain() {
+        emit(&Event::from(&record));
+    }
+    emit(&Event::Drained);
+    Ok(())
+}
+
 /// The supervisor's handle on one broker process.
 pub struct BrokerProcess {
     child: Child,

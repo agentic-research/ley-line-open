@@ -55,39 +55,42 @@ pub fn ports(document: &ConnectionsDocument) -> Vec<u16> {
         .collect()
 }
 
-/// The broker's capability set for `document`.
-pub fn capabilities(document: &ConnectionsDocument) -> Result<CapabilitySet, ExecutionError> {
+/// The Seatbelt rule that admits one further outbound port, exactly as nono's
+/// ProxyOnly emits it for its own (as confinement's connectLocal list does,
+/// `ley-line-open-e2c33f`).
+pub fn egress_rule(port: u16) -> String {
+    format!("(allow network-outbound (remote tcp \"localhost:{port}\"))")
+}
+
+/// Every platform rule the profile adds, in emission order: one egress rule
+/// per declared port after the first (which ProxyOnly carries), then the
+/// denies. Split out so it is tested on every platform.
+pub fn platform_rules(document: &ConnectionsDocument) -> Result<(u16, Vec<String>), ExecutionError> {
     let ports = ports(document);
     let Some((first, further)) = ports.split_first() else {
         return Err(ExecutionError::invalid_grant(
             "a connections document names at least one connection",
         ));
     };
-    #[cfg(target_os = "macos")]
-    {
-        // ProxyOnly carries one destination; each further port is the exact
-        // rule ProxyOnly emits for its own (as confinement's connectLocal
-        // list does, ley-line-open-e2c33f).
-        let mut capabilities = CapabilitySet::new().proxy_only(*first);
-        for port in further {
-            capabilities = capabilities
-                .platform_rule(format!(
-                    "(allow network-outbound (remote tcp \"localhost:{port}\"))"
-                ))
-                .map_err(nono_error)?;
-        }
-        for rule in deny_rules() {
-            capabilities = capabilities.platform_rule(rule).map_err(nono_error)?;
-        }
-        Ok(capabilities)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (first, further);
-        Err(ExecutionError::unsupported(
+    let mut rules: Vec<String> = further.iter().map(|port| egress_rule(*port)).collect();
+    rules.extend(deny_rules());
+    Ok((*first, rules))
+}
+
+/// The broker's capability set for `document`. macOS only: elsewhere the
+/// broker refuses by name (ADR-0046 S6).
+pub fn capabilities(document: &ConnectionsDocument) -> Result<CapabilitySet, ExecutionError> {
+    let (first, rules) = platform_rules(document)?;
+    if !cfg!(target_os = "macos") {
+        return Err(ExecutionError::unsupported(
             "the connection broker's profile is delivered on macOS only (ADR-0046 S6)",
-        ))
+        ));
     }
+    let mut capabilities = CapabilitySet::new().proxy_only(first);
+    for rule in rules {
+        capabilities = capabilities.platform_rule(rule).map_err(nono_error)?;
+    }
+    Ok(capabilities)
 }
 
 /// Confine the calling process. Irreversible.
@@ -100,4 +103,68 @@ pub fn apply(document: &ConnectionsDocument) -> Result<(), ExecutionError> {
 
 fn nono_error(error: nono::NonoError) -> ExecutionError {
     ExecutionError::unsupported(format!("connection broker profile: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leyline_schema_spec::connections::Connection;
+
+    fn document(ports: &[u16]) -> ConnectionsDocument {
+        ConnectionsDocument::new(
+            ports
+                .iter()
+                .enumerate()
+                .map(|(i, port)| Connection {
+                    name: format!("c{i}"),
+                    endpoint_unix: format!("/run/c{i}.sock"),
+                    host: "127.0.0.1".parse().unwrap(),
+                    port: *port,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ports_are_unique_and_ascending() {
+        assert_eq!(ports(&document(&[30432, 30080, 30432])), vec![30080, 30432]);
+    }
+
+    #[test]
+    fn rules_admit_each_further_port_then_deny_in_a_fixed_order() {
+        let (first, rules) = platform_rules(&document(&[9, 7, 8])).unwrap();
+        assert_eq!(first, 7, "ProxyOnly carries the lowest port");
+        assert_eq!(
+            rules,
+            vec![
+                "(allow network-outbound (remote tcp \"localhost:8\"))".to_owned(),
+                "(allow network-outbound (remote tcp \"localhost:9\"))".to_owned(),
+                "(deny process-exec*)".to_owned(),
+                "(deny process-fork)".to_owned(),
+                "(deny file-read*)".to_owned(),
+                "(deny file-write*)".to_owned(),
+                "(deny network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"
+                    .to_owned(),
+                "(deny mach-lookup)".to_owned(),
+            ],
+            "the mach-lookup allow-set is pinned empty: growing it is a test change"
+        );
+        assert!(MACH_LOOKUP_ALLOW.is_empty());
+        let (_, single) = platform_rules(&document(&[7])).unwrap();
+        assert_eq!(single, deny_rules(), "one port needs no further egress rule");
+    }
+
+    #[test]
+    fn capabilities_are_built_on_macos_and_refused_elsewhere() {
+        let result = capabilities(&document(&[7, 8]));
+        if cfg!(target_os = "macos") {
+            let caps = result.expect("macOS profile");
+            assert_eq!(caps.platform_rules(), platform_rules(&document(&[7, 8])).unwrap().1);
+        } else {
+            let error = result.expect_err("not delivered");
+            assert_eq!(error.code, crate::ErrorCode::UnsupportedBackend);
+            assert!(error.detail.contains("macOS only"), "{}", error.detail);
+        }
+    }
 }

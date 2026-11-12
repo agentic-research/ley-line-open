@@ -16,10 +16,10 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use leyline_runtime::broker::control::{BrokerProcess, Event, WireOutcome};
-use leyline_runtime::broker::profile::{self, MACH_LOOKUP_ALLOW};
+use leyline_runtime::broker::profile;
 use leyline_schema_spec::connections::{Connection, ConnectionsDocument};
 
 const BROKER: &str = env!("CARGO_BIN_EXE_leyline-conn-broker");
@@ -162,41 +162,6 @@ fn a_ready_digest_other_than_the_grants_refuses_the_start() {
         return;
     }
     assert_eq!(error.code, leyline_runtime::ErrorCode::IdentityPolicyMismatch);
-}
-
-#[test]
-fn the_broker_exits_when_its_lifeline_ends() {
-    let (_dir, real) = channel_dir();
-    let doc = document(&real, &[echo()]);
-    let Some(mut broker) = started(&doc) else {
-        return;
-    };
-    broker.close_lifeline();
-    let started = Instant::now();
-    while !broker.exited() {
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the broker outlived its supervisor's lifeline"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-#[test]
-fn the_mach_lookup_allow_set_is_pinned() {
-    // Changing the set the confined broker may reach is a test change.
-    assert_eq!(MACH_LOOKUP_ALLOW, &[] as &[&str]);
-    let rules = profile::deny_rules();
-    for rule in [
-        "(deny process-exec*)",
-        "(deny process-fork)",
-        "(deny file-read*)",
-        "(deny file-write*)",
-        "(deny mach-lookup)",
-    ] {
-        assert!(rules.iter().any(|r| r == rule), "missing {rule}");
-    }
-    assert!(rules.iter().any(|r| r.contains(profile::MDNS_RESPONDER)));
 }
 
 /// The confined half, run by the parent below.

@@ -433,8 +433,7 @@ fn first_line_under_limits(args: &[&str], soft: u64, hard: u64) -> Option<String
                 rlim_cur: soft as libc::rlim_t,
                 rlim_max: hard as libc::rlim_t,
             };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0
-                || libc::dup2(lifeline_read, 3) < 0
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 || libc::dup2(lifeline_read, 3) < 0
             {
                 return Err(std::io::Error::last_os_error());
             }
@@ -466,7 +465,10 @@ fn hard_limit() -> u64 {
     // SAFETY: a zeroed rlimit filled by getrlimit.
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
     // SAFETY: valid out-pointer.
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
     #[allow(clippy::unnecessary_cast)]
     let hard = limit.rlim_max as u64;
     hard
@@ -486,8 +488,12 @@ fn the_shipped_broker_refuses_bad_arguments_and_a_short_descriptor_limit() {
     let args = ["--lifeline-fd", "3"];
     // A hard limit below what the cap needs: refused by name, at once.
     assert!(
-        error(first_line_under_limits(&args, FILE_LIMIT - 1, FILE_LIMIT - 1))
-            .contains("descriptor limit")
+        error(first_line_under_limits(
+            &args,
+            FILE_LIMIT - 1,
+            FILE_LIMIT - 1
+        ))
+        .contains("descriptor limit")
     );
     // Exactly enough, or a low soft limit it can raise: it waits for start.
     assert_eq!(first_line_under_limits(&args, FILE_LIMIT, FILE_LIMIT), None);
@@ -534,7 +540,10 @@ fn the_supervisor_handle_starts_relays_drains_and_unlinks() {
         broker.events()
     );
     broker.shutdown();
-    assert!(!Path::new(&endpoint).exists(), "the bound socket is unlinked");
+    assert!(
+        !Path::new(&endpoint).exists(),
+        "the bound socket is unlinked"
+    );
 
     // A ready digest that is not the grant's refuses the start.
     let mut broker = unconfined(PeerPid::Any);

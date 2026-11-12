@@ -258,8 +258,7 @@ pub fn watch_lifeline(fd: i32) {
     thread::spawn(move || {
         // SAFETY: the broker owns the lifeline descriptor for its whole life;
         // ManuallyDrop keeps this handle from closing it.
-        let mut lifeline =
-            std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        let mut lifeline = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         let mut byte = [0u8; 1];
         loop {
             if lifeline_ended(&std::io::Read::read(&mut *lifeline, &mut byte)) {
@@ -705,7 +704,10 @@ mod tests {
         set_cloexec(fds[0]);
         set_cloexec(fds[0]);
         // SAFETY: as above. Setting twice keeps exactly the one flag.
-        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, libc::FD_CLOEXEC);
+        assert_eq!(
+            unsafe { libc::fcntl(fds[0], libc::F_GETFD) },
+            libc::FD_CLOEXEC
+        );
         clear_cloexec(fds[0]).unwrap();
         // SAFETY: as above.
         assert_eq!(

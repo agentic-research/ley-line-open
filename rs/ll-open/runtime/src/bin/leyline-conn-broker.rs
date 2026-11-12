@@ -16,5 +16,8 @@ use std::process::ExitCode;
 use leyline_runtime::broker::{control, profile};
 
 fn main() -> ExitCode {
-    ExitCode::from(control::run_broker(std::env::args().skip(1), profile::apply))
+    ExitCode::from(control::run_broker(
+        std::env::args().skip(1),
+        profile::apply,
+    ))
 }

@@ -36,7 +36,8 @@
       "syntax": "json",
       "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}}",
       "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"auth\": {\n    \"callerTokens\": {\n      \"file\": \"/etc/leyline/caller-tokens\"\n    },\n    \"required\": true\n  },\n  \"bind\": \"127.0.0.1:8786\",\n  \"health\": {\n    \"probeUrl\": null\n  },\n  \"keychainAccount\": \"cloister\",\n  \"kind\": \"SignHelperConfig\",\n  \"rateLimitPerSecond\": 1000,\n  \"resolveAllow\": [],\n  \"resolveCache\": {\n    \"maxEntries\": 1024,\n    \"ttlMs\": null\n  },\n  \"signAllow\": {\n    \"callers\": {\n      \"cloister\": [\n        \"keychain://com.cloister/\"\n      ]\n    },\n    \"required\": true\n  },\n  \"subprocess\": {\n    \"opBin\": null,\n    \"securityBin\": null\n  }\n}",
-      "configDigest": "blake3-256:b32e139852a8fdd566ea44cb3c474e479389aae038fa01ccd36e63b302613861"
+      "configDigest": "blake3-256:b32e139852a8fdd566ea44cb3c474e479389aae038fa01ccd36e63b302613861",
+      "resolved": "{\"subprocess\":{\"securityBin\":null,\"opBin\":null},\"signAllow\":{\"required\":true,\"callers\":{\"cloister\":[\"keychain://com.cloister/\"]}},\"resolveCache\":{\"ttlMs\":null,\"maxEntries\":1024},\"resolveAllow\":[],\"rateLimitPerSecond\":1000,\"kind\":\"SignHelperConfig\",\"keychainAccount\":\"cloister\",\"health\":{\"probeUrl\":null},\"bind\":\"127.0.0.1:8786\",\"auth\":{\"required\":true,\"callerTokens\":{\"file\":\"/etc/leyline/caller-tokens\"}},\"apiVersion\":\"config.leyline/v1\"}"
     },
     {
       "name": "dev-mode",
@@ -45,7 +46,8 @@
       "syntax": "json",
       "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"required\": false}, \"signAllow\": {\"required\": false}}",
       "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"auth\": {\n    \"callerTokens\": null,\n    \"required\": false\n  },\n  \"bind\": \"127.0.0.1:8786\",\n  \"health\": {\n    \"probeUrl\": null\n  },\n  \"keychainAccount\": \"cloister\",\n  \"kind\": \"SignHelperConfig\",\n  \"rateLimitPerSecond\": 1000,\n  \"resolveAllow\": [],\n  \"resolveCache\": {\n    \"maxEntries\": 1024,\n    \"ttlMs\": null\n  },\n  \"signAllow\": {\n    \"callers\": {},\n    \"required\": false\n  },\n  \"subprocess\": {\n    \"opBin\": null,\n    \"securityBin\": null\n  }\n}",
-      "configDigest": "blake3-256:74667c826432cd8027f3260daf923780f18c907aeb4156feb092640be76b8e43"
+      "configDigest": "blake3-256:74667c826432cd8027f3260daf923780f18c907aeb4156feb092640be76b8e43",
+      "resolved": "{\"subprocess\":{\"securityBin\":null,\"opBin\":null},\"signAllow\":{\"required\":false,\"callers\":{}},\"resolveCache\":{\"ttlMs\":null,\"maxEntries\":1024},\"resolveAllow\":[],\"rateLimitPerSecond\":1000,\"kind\":\"SignHelperConfig\",\"keychainAccount\":\"cloister\",\"health\":{\"probeUrl\":null},\"bind\":\"127.0.0.1:8786\",\"auth\":{\"required\":false,\"callerTokens\":null},\"apiVersion\":\"config.leyline/v1\"}"
     },
     {
       "name": "every-field",
@@ -54,7 +56,8 @@
       "syntax": "json",
       "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"bind\": \"[::1]:9000\", \"rateLimitPerSecond\": 4294967295, \"auth\": {\"callerTokens\": {\"file\": \"~/.config/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"rosary\": [], \"cloister\": [\"op://vault/item\", \"keychain://com.cloister/sk-\"]}}, \"resolveAllow\": [\"keychain://com.cloister/vault-kek-\", \"apple-password://com.cloister/kek-\"], \"resolveCache\": {\"maxEntries\": 1, \"ttlMs\": 0}, \"subprocess\": {\"opBin\": \"/opt/homebrew/bin/op\", \"securityBin\": \"/usr/bin/security\"}, \"health\": {\"probeUrl\": \"keychain://com.cloister/health-probe\"}, \"keychainAccount\": \"cloister-dev\"}",
       "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"auth\": {\n    \"callerTokens\": {\n      \"file\": \"/Users/fixture/.config/leyline/caller-tokens\"\n    },\n    \"required\": true\n  },\n  \"bind\": \"[::1]:9000\",\n  \"health\": {\n    \"probeUrl\": \"keychain://com.cloister/health-probe\"\n  },\n  \"keychainAccount\": \"cloister-dev\",\n  \"kind\": \"SignHelperConfig\",\n  \"rateLimitPerSecond\": 4294967295,\n  \"resolveAllow\": [\n    \"apple-password://com.cloister/kek-\",\n    \"keychain://com.cloister/vault-kek-\"\n  ],\n  \"resolveCache\": {\n    \"maxEntries\": 1,\n    \"ttlMs\": 0\n  },\n  \"signAllow\": {\n    \"callers\": {\n      \"cloister\": [\n        \"keychain://com.cloister/sk-\",\n        \"op://vault/item\"\n      ],\n      \"rosary\": []\n    },\n    \"required\": true\n  },\n  \"subprocess\": {\n    \"opBin\": \"/opt/homebrew/bin/op\",\n    \"securityBin\": \"/usr/bin/security\"\n  }\n}",
-      "configDigest": "blake3-256:b80a23210356bdb749d73135959ffe8b7c0fcf67713eebe5f05b01e6d53b0be6"
+      "configDigest": "blake3-256:b80a23210356bdb749d73135959ffe8b7c0fcf67713eebe5f05b01e6d53b0be6",
+      "resolved": "{\"subprocess\":{\"securityBin\":\"/usr/bin/security\",\"opBin\":\"/opt/homebrew/bin/op\"},\"signAllow\":{\"required\":true,\"callers\":{\"rosary\":[],\"cloister\":[\"op://vault/item\",\"keychain://com.cloister/sk-\"]}},\"resolveCache\":{\"ttlMs\":0,\"maxEntries\":1},\"resolveAllow\":[\"keychain://com.cloister/vault-kek-\",\"apple-password://com.cloister/kek-\"],\"rateLimitPerSecond\":4294967295,\"kind\":\"SignHelperConfig\",\"keychainAccount\":\"cloister-dev\",\"health\":{\"probeUrl\":\"keychain://com.cloister/health-probe\"},\"bind\":\"[::1]:9000\",\"auth\":{\"required\":true,\"callerTokens\":{\"file\":\"/Users/fixture/.config/leyline/caller-tokens\"}},\"apiVersion\":\"config.leyline/v1\"}"
     }
   ],
   "rejects": [

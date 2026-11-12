@@ -226,7 +226,11 @@ impl HostFacts {
 
 /// Why a document, or this host's ability to run it, was refused. The codes
 /// are stable within v1 (`deployment-config/v1/README.md`, "Refusals").
+///
+/// Non-exhaustive: a later v1 release may add a reason (a new field brings
+/// new refusals); match with a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Reason {
     /// Not JSON (or TOML) this reader accepts, or nested deeper than 16.
     Malformed,

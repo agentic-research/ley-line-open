@@ -395,18 +395,31 @@ pub fn check_execution_host(deployment: &ExecutionDeployment) -> HostCheck {
             ));
         }
     }
+    // The resolver's overlap check is on spellings. On the host, two
+    // spellings can name one directory: the /var and /tmp symlinks, and on
+    // macOS case and Unicode normalization. Re-check the resolved paths.
+    if let Some(field) = resolved_overlap(deployment) {
+        refuse(ConfigRefusal::new(
+            field,
+            Reason::RunRootOverlapsCasRoot,
+            format!(
+                "the run root {} and the CAS root {} name overlapping directories on this host",
+                run_root.display(),
+                deployment.cas_root().display()
+            ),
+        ));
+    }
     if let EvidenceDeployment::Verified { trust_keys, store } = &deployment.evidence {
+        // The two halves of the gate start installs
+        // (`cas_evidence::operator_verifier`), each reported by field.
         if let Err(error) = crate::cas_evidence::load_trust_keys(trust_keys) {
             refuse(host_refusal(
                 "evidence.verified.trustKeys",
                 error.to_string(),
             ));
         }
-        if !store.is_dir() {
-            refuse(host_refusal(
-                "evidence.verified.store",
-                format!("{} is not an existing directory", store.display()),
-            ));
+        if let Err(error) = crate::cas_evidence::CasEvidenceStore::open(store) {
+            refuse(host_refusal("evidence.verified.store", error.to_string()));
         }
     }
     if let Some(source) = &deployment.source
@@ -434,11 +447,8 @@ pub fn check_execution_host(deployment: &ExecutionDeployment) -> HostCheck {
         }
     }
     for key in &deployment.head.trusted_keys {
-        if !Path::new(key).is_file() {
-            refuse(host_refusal(
-                "head.trustedKeys",
-                format!("{key} is not an existing file"),
-            ));
+        if let Err(error) = crate::cas_evidence::load_trust_key(Path::new(key)) {
+            refuse(host_refusal("head.trustedKeys", error.to_string()));
         }
     }
     check.refusals.sort_by(|a, b| {
@@ -449,9 +459,96 @@ pub fn check_execution_host(deployment: &ExecutionDeployment) -> HostCheck {
     check
 }
 
+/// `path` as the host names it: the deepest existing ancestor
+/// `realpath`ed, the rest appended. On macOS, case-folded and NFC-normalized
+/// as APFS compares names by default.
+fn host_spelling(path: &Path) -> String {
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    let resolved = loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(r) => break r,
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(up), Some(name)) => {
+                    rest.push(name.to_owned());
+                    existing = up.to_path_buf();
+                }
+                _ => break existing,
+            },
+        }
+    };
+    let mut full = resolved;
+    for name in rest.iter().rev() {
+        full.push(name);
+    }
+    let text = full.to_string_lossy().into_owned();
+    if cfg!(target_os = "macos") {
+        use unicode_normalization::UnicodeNormalization;
+        text.nfc().collect::<String>().to_lowercase()
+    } else {
+        text
+    }
+}
+
+/// The field of a run root that overlaps the CAS root once both are named
+/// as the host names them, if they do.
+fn resolved_overlap(deployment: &ExecutionDeployment) -> Option<&'static str> {
+    let run = host_spelling(deployment.run_root());
+    let cas = host_spelling(deployment.cas_root());
+    let beneath = |x: &str, y: &str| x.strip_prefix(y).is_some_and(|r| r.starts_with('/'));
+    (run == cas || beneath(&run, &cas) || beneath(&cas, &run)).then_some(match deployment.cas {
+        CasDeployment::Directory { .. } => "cas.directory.runRoot",
+        CasDeployment::Volume { .. } => "cas.volume.runRoot",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two spellings of one directory that the resolver's spelling check
+    /// accepts are refused once the host names them: a symlinked parent, and
+    /// on macOS a case variant.
+    #[test]
+    fn an_overlap_through_another_spelling_is_refused_on_the_host() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cas = dir.path().join("Cas");
+        std::fs::create_dir(&cas).unwrap();
+        std::os::unix::fs::symlink(&cas, dir.path().join("alias")).unwrap();
+        let doc = |root: &Path, run_root: &Path| {
+            format!(
+                r#"{{"apiVersion": "config.leyline/v1", "kind": "ExecutionDaemonConfig",
+                "cas": {{"directory": {{"root": "{}", "runRoot": "{}"}}}},
+                "worker": {{"path": "/w"}}, "catalog": "/c", "evidence": {{"unverified": {{}}}}}}"#,
+                root.display(),
+                run_root.display()
+            )
+        };
+        let through_symlink = doc(&cas, &dir.path().join("alias/runs"));
+        let d = resolve_execution_deployment(
+            through_symlink.as_bytes(),
+            Syntax::Json,
+            &host(Os::MacOs),
+        )
+        .expect("the spellings differ, so the resolver accepts it");
+        assert_eq!(resolved_overlap(&d), Some("cas.directory.runRoot"));
+        assert!(
+            check_execution_host(&d)
+                .refusals
+                .iter()
+                .any(|r| r.reason == Reason::RunRootOverlapsCasRoot)
+        );
+        let apart = doc(&cas, &dir.path().join("runs"));
+        let d =
+            resolve_execution_deployment(apart.as_bytes(), Syntax::Json, &host(Os::MacOs)).unwrap();
+        assert_eq!(resolved_overlap(&d), None);
+        if cfg!(target_os = "macos") {
+            let case = doc(&cas, &dir.path().join("cas/runs"));
+            let d = resolve_execution_deployment(case.as_bytes(), Syntax::Json, &host(Os::MacOs))
+                .unwrap();
+            assert_eq!(resolved_overlap(&d), Some("cas.directory.runRoot"));
+        }
+    }
 
     fn host(os: Os) -> HostFacts {
         HostFacts {
@@ -601,15 +698,26 @@ mod tests {
         std::fs::create_dir(dir.path().join("cas")).unwrap();
         std::fs::create_dir(dir.path().join("store")).unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
-        for f in ["worker", "rt", "dev", "tk.pub"] {
+        for f in ["worker", "rt", "dev"] {
             write(&dir.path().join(f), b"x");
         }
         write(&dir.path().join("catalog.json"), br#"{"entries":[]}"#);
-        // RFC 8032 test 1's public key.
-        write(
-            &dir.path().join("key.pub"),
-            b"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        // RFC 8032 test 1's public key; a trust key file is parsed, not
+        // only found.
+        let key = b"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        write(&dir.path().join("key.pub"), key);
+        write(&dir.path().join("tk.pub"), b"x");
+        let check = check_execution_host(&d);
+        assert_eq!(
+            check
+                .refusals
+                .iter()
+                .map(|r| r.field.as_str())
+                .collect::<Vec<_>>(),
+            ["head.signingKey", "head.trustedKeys"],
+            "a malformed head trust key is refused; the seed is not yet written"
         );
+        write(&dir.path().join("tk.pub"), key);
         let seed = dir.path().join("seed");
         write(&seed, "ab".repeat(32).as_bytes());
         {

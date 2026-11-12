@@ -223,11 +223,13 @@ fn enum_value<'a>(field: &str, value: &Json, allowed: &[&'a str]) -> R<&'a str> 
     })
 }
 
-/// A label: 1-64 of `[A-Za-z0-9._-]`, starting with a letter or digit.
+/// A label: 1-64 of `[A-Za-z0-9._-]`, starting with a letter. Never all
+/// digits, so a JavaScript consumer (which orders integer-like object keys
+/// first) orders `signAllow.callers` keys by their bytes.
 pub(crate) fn is_label(s: &str) -> bool {
     let b = s.as_bytes();
     (1..=64).contains(&b.len())
-        && b[0].is_ascii_alphanumeric()
+        && b[0].is_ascii_alphabetic()
         && b.iter()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
@@ -1252,6 +1254,12 @@ mod tests {
         assert!(!is_label(&"a".repeat(65)));
         assert!(!is_label(""));
         assert!(!is_label("-a"));
+        assert!(
+            !is_label("9"),
+            "an integer-like key sorts first in JavaScript"
+        );
+        assert!(!is_label("10a"));
+        assert!(is_label("a10"));
         assert!(!is_label(".a"));
         assert!(!is_label("a b"));
         assert!(!is_label("é"));

@@ -83,8 +83,10 @@ Field rules:
   (only `~/`: `~user` and relative paths are `path-not-absolute`). No
   empty, `.` or `..` component and no trailing `/` (`bad-path`).
 - **Labels** (`source.language`, `mcp.groups`, `signAllow.callers` keys,
-  `keychainAccount`): 1–64 of `[A-Za-z0-9._-]`, starting with a letter or
-  digit (`bad-label`).
+  `keychainAccount`): 1–64 of `[A-Za-z0-9._-]`, starting with a letter
+  (`bad-label`). A label is never all digits: JavaScript orders integer-like
+  object keys before every other key, so an all-digit `signAllow.callers`
+  key would make a Node consumer's key order differ from byte order.
 - **Query hashes**: 64 lowercase hex characters (`bad-query-hash`).
 - **URL prefixes** (`resolveAllow`, `signAllow` prefixes, `health.probeUrl`):
   a lowercase scheme, `://`, then printable ASCII without space, `"` or `\`,
@@ -187,7 +189,11 @@ Chosen by the `.toml` extension (`.json` is JSON; any other extension is
 booleans map directly, integers keep their value. A float or datetime is
 `toml-type-not-mapped`, naming its field. TOML has no `null`; omit the key.
 TOML's duplicate-key rule refuses a repeat as `malformed`. A TOML document
-and its JSON twin have the same resolved bytes and `configDigest`.
+and its JSON twin have the same resolved bytes and `configDigest`. The TOML
+adapter does not keep key order, so in rule 3 ("keys in input order") a
+TOML document's keys are scanned in byte order: with two refusable keys in
+one table, a TOML document and its JSON twin can report different first
+refusals, though both are refused.
 
 ## File rules (D4)
 
@@ -234,6 +240,15 @@ Every refusal is `{"field": <dotted, empty for the document>, "reason":
 | 65 (document refused) | `malformed`, `duplicate-key`, `bad-string`, `wrong-type`, `missing-key`, `unknown-key`, `bad-api-version`, `unknown-kind`, `wrong-kind`, `out-of-range`, `not-an-integer`, `non-canonical-address`, `bad-address`, `null-not-allowed`, `union-empty`, `union-ambiguous`, `not-in-enum`, `path-not-absolute`, `bad-path`, `duplicate-entry`, `secret-inlined`, `secret-ref-not-delivered`, `bad-label`, `bad-query-hash`, `bad-url-prefix`, `public-bind-without-opt-in`, `unknown-mcp-group`, `run-root-overlaps-cas-root`, `caller-tokens-required`, `sign-allow-required`, `bind-not-loopback`, `resolve-allow-signing-key`, `toml-type-not-mapped`, `unknown-config-syntax` |
 | 66 (file unreadable) | `unreadable` |
 | 78 (valid, but this host or binary cannot run it) | `cgroup-root-linux-only`, `bad-host-default`, `unsupported-os`, `secret-file-permissions`, `secret-file-invalid`, `config-file-permissions`, `config-digest-mismatch`, `mount-feature-not-built`, `fuse-feature-not-built`, `host-check-failed` |
+
+## Rust API
+
+`leyline_schema_spec::deployment_config` and
+`leyline_runtime::deployment` expose the resolved configuration as plain
+structs. They are built only by resolution; a consumer reads them and does
+not construct them with struct literals. Adding an optional v1 field adds a
+public field to the matching struct, which breaks no reader. `Reason` and
+`Document` are non-exhaustive: match them with a wildcard arm.
 
 ## Versioning
 

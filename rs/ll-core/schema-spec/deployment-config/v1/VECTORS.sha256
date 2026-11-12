@@ -4,7 +4,7 @@
 # verify_deployment_config_vectors (Rust) and ref-impl-py (Python).
 
 8455da94ec31681e7f254b9239f1ce83bb178cb93b9494456239f4c1098be567  test-vectors/canonical-strings.json
-c5db46e17462d045021625f7af21f60bb0efaa05882b5dc44d8a19f6983970c2  test-vectors/daemon-config-cases.json
-b711859c9dc3074c856d3b6ea80be514917d7aac9e2c9900ebd7f9d1fa3d3966  test-vectors/execution-daemon-config-cases.json
-8403c6a493043af2c27cf82dd6c3387da402db78ea9f8671e29fcfbae22d52bc  test-vectors/sign-helper-config-cases.json
+b2f8d2594df42fae90dd720895aa86d11d817b43f62ddf7f1258b4ffe19c0eca  test-vectors/daemon-config-cases.json
+c78eaca6e7523f6c908646e4bcefb5feed16c4093ca1f63f59000ddc170468f1  test-vectors/execution-daemon-config-cases.json
+7041d1aa3591fc2dafca66b44799176333c7cd411c04391948ecb29382921cb5  test-vectors/sign-helper-config-cases.json
 2410cc799ac25f5872808ba3b0589db87d2ea97767b0fc3e854b879bac469909  test-vectors/toml-equivalence.json

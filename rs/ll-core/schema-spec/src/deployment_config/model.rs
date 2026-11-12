@@ -11,7 +11,14 @@ use std::net::{IpAddr, SocketAddr};
 use super::{API_VERSION, Kind, Value};
 
 /// A resolved document of one kind.
+///
+/// Rust API rule (ADR-0049 D9): adding an optional field to a v1 kind is
+/// additive for documents, and adds a public field to the struct here. A
+/// consumer reads these structs (they are built only by resolution) and
+/// never constructs them with a struct literal outside tests, so the
+/// addition breaks no reader; this enum is non-exhaustive for a later kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Document {
     /// `DaemonConfig`.
     Daemon(DaemonConfig),

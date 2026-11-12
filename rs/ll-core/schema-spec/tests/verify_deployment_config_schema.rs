@@ -423,6 +423,16 @@ fn fail_closed_violations(baseline: &Value, kind: Kind, schema: &Value) -> Vec<S
 fn fail_closed_defaults_never_loosen_within_v1() {
     let baseline = read_json(&spec_dir().join("fail-closed-defaults.json"));
     assert_eq!(baseline["apiVersion"], deployment_config::API_VERSION);
+    // The baseline cannot be loosened in the same change: every entry's
+    // default is its strict value, never its loose one.
+    for (kind, entries) in baseline["kinds"].as_object().unwrap() {
+        for (field, entry) in entries.as_object().unwrap() {
+            assert_ne!(
+                entry["default"], entry["loose"],
+                "{kind} {field}: the baseline records the loose value as the default"
+            );
+        }
+    }
     let mut total = 0;
     for kind in Kind::ALL {
         let schema: Value = serde_json::from_str(published_schema(*kind)).unwrap();

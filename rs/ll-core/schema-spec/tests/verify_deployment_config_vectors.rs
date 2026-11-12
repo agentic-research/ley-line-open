@@ -240,10 +240,201 @@ fn the_published_schemas_agree_with_the_vectors() {
     }
 }
 
-/// The independent Python reference reaches every pinned canonical byte
-/// string and `configDigest`, and refuses the resolved rejects.
+/// The `schemaRefuses` flags of `canonical-strings.json`'s rejects hold
+/// against their kind's published schema too.
 #[test]
-fn the_python_reference_agrees() {
+fn canonical_string_rejects_agree_with_the_schema() {
+    let file = vectors("canonical-strings.json");
+    for case in file["rejects"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let validator = validator(kind_of(case["kind"].as_str().unwrap()));
+        let refuses = case["schemaRefuses"].as_bool().unwrap();
+        let doc: Value = serde_json::from_str(case["input"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            validator.validate(&doc).is_err(),
+            refuses,
+            "canonical-strings {name}: schemaRefuses is {refuses}"
+        );
+    }
+}
+
+/// The resolved document of the accept case of `file` with the most fields
+/// set: the base the sweeps below mutate.
+fn richest_case(file: &Value) -> (Value, String) {
+    let case = file["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["syntax"].as_str().unwrap_or("json") == "json")
+        .max_by_key(|c| c["input"].as_str().unwrap().len())
+        .unwrap();
+    (
+        // The resolved document: every section present, and itself a valid
+        // input (canonical bytes are a fixpoint).
+        serde_json::from_str(case["canonical"].as_str().unwrap()).unwrap(),
+        case["host"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// Every object path in `v`, dotted from the root ("" for the root), except
+/// the label-keyed `signAllow.callers` map, whose keys are data.
+fn object_paths(v: &Value, path: &str, out: &mut Vec<String>) {
+    if let Value::Object(m) = v {
+        if path != "signAllow.callers" {
+            out.push(path.to_owned());
+        }
+        for (k, child) in m {
+            let p = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}.{k}")
+            };
+            object_paths(child, &p, out);
+        }
+    }
+}
+
+fn at_mut<'v>(v: &'v mut Value, path: &str) -> &'v mut Value {
+    if path.is_empty() {
+        return v;
+    }
+    path.split('.').fold(v, |v, k| &mut v[k])
+}
+
+fn refusal_of(kind: Kind, host: &HostFacts, doc: &Value) -> (String, Reason) {
+    let text = serde_json::to_vec(doc).unwrap();
+    let e = deployment_config::resolve(&text, Syntax::Json, &[kind], host)
+        .err()
+        .unwrap_or_else(|| panic!("accepted {doc}"));
+    (e.field, e.reason)
+}
+
+/// ADR-0049 test plan 2: an undefined key is refused in every object of
+/// every kind — the root, every section, every union and union branch, and
+/// every secret reference — naming its full dotted field.
+#[test]
+fn an_unknown_key_is_refused_in_every_object() {
+    let mut swept = 0;
+    for file_name in KIND_FILES {
+        let file = vectors(file_name);
+        let kind = kind_of(file["kind"].as_str().unwrap());
+        let (base, host_name) = richest_case(&file);
+        let host = host(&file, &host_name);
+        let mut paths = Vec::new();
+        object_paths(&base, "", &mut paths);
+        assert!(paths.len() > 5, "{file_name}: {paths:?}");
+        for path in paths {
+            let mut doc = base.clone();
+            at_mut(&mut doc, &path)
+                .as_object_mut()
+                .unwrap()
+                .insert("zzUnknown".into(), Value::Bool(true));
+            let want = if path.is_empty() {
+                "zzUnknown".to_owned()
+            } else {
+                format!("{path}.zzUnknown")
+            };
+            assert_eq!(
+                refusal_of(kind, &host, &doc),
+                (want, Reason::UnknownKey),
+                "{file_name}: an unknown key in {path:?}"
+            );
+            swept += 1;
+        }
+    }
+    // Every object of the three resolved documents: 35 today. A smaller
+    // count means a section stopped being swept.
+    assert!(swept >= 35, "only {swept} objects swept");
+}
+
+/// ADR-0049 test plan 7 and 9a: in every secret field of every kind, a
+/// string, a number, an array and `{"value": …}` are `secret-inlined`;
+/// `keychain` and `vault` are `secret-ref-not-delivered`; any other key is
+/// `unknown-key`.
+#[test]
+fn every_secret_field_refuses_every_inline_form() {
+    let secret_fields: &[(&str, &[&str])] = &[
+        (
+            "daemon-config-cases.json",
+            &["head.signingKey", "mcp.tokenFile"],
+        ),
+        ("execution-daemon-config-cases.json", &["head.signingKey"]),
+        ("sign-helper-config-cases.json", &["auth.callerTokens"]),
+    ];
+    for (file_name, fields) in secret_fields {
+        let file = vectors(file_name);
+        let kind = kind_of(file["kind"].as_str().unwrap());
+        let (base, host_name) = richest_case(&file);
+        let host = host(&file, &host_name);
+        for field in *fields {
+            let (parent, leaf) = field.rsplit_once('.').unwrap();
+            for (value, want_field, want) in [
+                (
+                    serde_json::json!("0303"),
+                    field.to_string(),
+                    Reason::SecretInlined,
+                ),
+                (
+                    serde_json::json!(7),
+                    field.to_string(),
+                    Reason::SecretInlined,
+                ),
+                (
+                    serde_json::json!(true),
+                    field.to_string(),
+                    Reason::SecretInlined,
+                ),
+                (
+                    serde_json::json!(["/k"]),
+                    field.to_string(),
+                    Reason::SecretInlined,
+                ),
+                (
+                    serde_json::json!({"value": "0303"}),
+                    field.to_string(),
+                    Reason::SecretInlined,
+                ),
+                (
+                    serde_json::json!({"keychain": "x"}),
+                    field.to_string(),
+                    Reason::SecretRefNotDelivered,
+                ),
+                (
+                    serde_json::json!({"vault": {"path": "kv/x"}}),
+                    field.to_string(),
+                    Reason::SecretRefNotDelivered,
+                ),
+                (
+                    serde_json::json!({"other": "x"}),
+                    format!("{field}.other"),
+                    Reason::UnknownKey,
+                ),
+            ] {
+                let mut doc = base.clone();
+                let section = at_mut(&mut doc, parent);
+                if !section.is_object() {
+                    *section = serde_json::json!({});
+                }
+                section
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(leaf.into(), value.clone());
+                assert_eq!(
+                    refusal_of(kind, &host, &doc),
+                    (want_field, want),
+                    "{file_name}: {field} = {value}"
+                );
+            }
+        }
+    }
+}
+
+/// `verify_deployment_config_digest` (ADR-0049 D2): the independent Python
+/// reference reaches every pinned canonical byte string and `configDigest`,
+/// from the canonical bytes and from a shuffled resolved document per case,
+/// and refuses the resolved rejects.
+#[test]
+fn verify_deployment_config_digest() {
     let output = Command::new("python3")
         .arg("-I")
         .arg(spec_dir().join("ref-impl-py/deployment_config_v1.py"))

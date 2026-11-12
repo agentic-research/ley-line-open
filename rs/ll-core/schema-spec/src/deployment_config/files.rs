@@ -208,10 +208,80 @@ mod imp {
         sticky_writable: bool,
     }
 
+    /// Refuse a symlink on `path` owned by neither root nor this user.
+    /// `realpath` discards the symlinks it crosses, so without this check
+    /// another user could plant `/tmp/x -> <somewhere>` in a sticky directory
+    /// and redirect where a secret is read or created (the rule Linux's
+    /// `protected_symlinks` applies, which macOS lacks). Each prefix of
+    /// `path` is `lstat`ed, so every symlink named on the path is checked.
+    fn check_symlink_owners(field: &str, path: &Path, rule: FileRule) -> Result<(), ConfigRefusal> {
+        use std::os::unix::fs::MetadataExt;
+        let me = euid();
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            prefix.push(component);
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(meta)
+                    if meta.file_type().is_symlink() && meta.uid() != 0 && meta.uid() != me =>
+                {
+                    return Err(ConfigRefusal::new(
+                        field,
+                        rule.reason(),
+                        format!(
+                            "{} is a symlink owned by uid {}, neither root nor this user",
+                            prefix.display(),
+                            meta.uid()
+                        ),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(ConfigRefusal::new(
+                        field,
+                        rule.reason(),
+                        format!("{}: {e}", prefix.display()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a directory descriptor `walk` opened: owned by root or this
+    /// user, no group or other write bit unless sticky. Returns whether it is
+    /// a shared sticky directory.
+    fn check_dir(
+        fd: &OwnedFd,
+        shown: &Path,
+        refuse: &dyn Fn(String) -> ConfigRefusal,
+    ) -> Result<bool, ConfigRefusal> {
+        let st = fstat(fd).map_err(|e| refuse(format!("{}: {e}", shown.display())))?;
+        let mode = st.st_mode as u32;
+        if st.st_uid != 0 && st.st_uid != euid() {
+            return Err(refuse(format!(
+                "directory {} is owned by uid {}, neither root nor this user",
+                shown.display(),
+                st.st_uid
+            )));
+        }
+        if mode & 0o022 != 0 {
+            if mode & (libc::S_ISVTX as u32) == 0 {
+                return Err(refuse(format!(
+                    "directory {} is writable by group or others",
+                    shown.display()
+                )));
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// `realpath` the parent, then open it one component at a time from `/`
     /// with no-follow, checking each directory's descriptor.
     fn walk(field: &str, parent: &Path, rule: FileRule) -> Result<Walk, ConfigRefusal> {
         let refuse = |why: String| ConfigRefusal::new(field, rule.reason(), why);
+        check_symlink_owners(field, parent, rule)?;
         let resolved = std::fs::canonicalize(parent).map_err(|e| {
             let reason = if e.kind() == io::ErrorKind::NotFound {
                 rule.missing()
@@ -224,7 +294,6 @@ mod imp {
                 format!("directory {}: {e}", parent.display()),
             )
         })?;
-        let me = euid();
         let mut sticky_writable = false;
         let mut current: Option<OwnedFd> = None;
         let mut shown = PathBuf::from("/");
@@ -247,24 +316,7 @@ mod imp {
                     shown.display()
                 ))
             })?;
-            let st = fstat(&fd).map_err(|e| refuse(format!("{}: {e}", shown.display())))?;
-            let mode = st.st_mode as u32;
-            if st.st_uid != 0 && st.st_uid != me {
-                return Err(refuse(format!(
-                    "directory {} is owned by uid {}, neither root nor this user",
-                    shown.display(),
-                    st.st_uid
-                )));
-            }
-            if mode & 0o022 != 0 {
-                if mode & (libc::S_ISVTX as u32) == 0 {
-                    return Err(refuse(format!(
-                        "directory {} is writable by group or others",
-                        shown.display()
-                    )));
-                }
-                sticky_writable = true;
-            }
+            sticky_writable |= check_dir(&fd, &shown, &refuse)?;
             current = Some(fd);
         }
         Ok(Walk {
@@ -285,7 +337,7 @@ mod imp {
         let fd = match openat(
             Some(&walk.dir),
             &name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
             0,
         ) {
             Ok(fd) => fd,
@@ -310,6 +362,15 @@ mod imp {
                 } else {
                     ""
                 }
+            )));
+        }
+        // A second hard link to a secret (macOS has no protected_hardlinks)
+        // is a name for it outside the checked directory: refused.
+        if rule == FileRule::Secret && st.st_nlink != 1 {
+            return Err(refuse(format!(
+                "{} has {} hard links; a secret file has exactly one",
+                path.display(),
+                st.st_nlink
             )));
         }
         if mode & rule.forbidden_bits() != 0 {
@@ -349,17 +410,50 @@ mod imp {
         let rule = FileRule::Secret;
         let (parent, name) = split(field, path, rule)?;
         let refuse = |why: String| ConfigRefusal::new(field, rule.reason(), why);
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&parent)
-                .map_err(|e| refuse(format!("create directory {}: {e}", parent.display())))?;
+        // Check the deepest existing ancestor, then make each missing
+        // directory with mkdirat relative to the checked descriptor: nothing
+        // is created before a check, and nothing through a symlink.
+        let mut existing = parent.clone();
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        while std::fs::symlink_metadata(&existing).is_err() {
+            let (Some(up), Some(name)) = (existing.parent(), existing.file_name()) else {
+                return Err(refuse(format!(
+                    "{} has no existing ancestor",
+                    parent.display()
+                )));
+            };
+            missing.push(name.to_owned());
+            existing = up.to_path_buf();
         }
-        let walk = walk(field, &parent, rule)?;
+        let mut dir = walk(field, &existing, rule)?.dir;
+        let mut shown = existing.clone();
+        for name in missing.iter().rev() {
+            shown.push(name);
+            let c = cstr(name).map_err(|e| refuse(format!("{}: {e}", shown.display())))?;
+            // SAFETY: `c` is NUL-terminated and outlives the call; `dir` is open.
+            if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) } < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(refuse(format!("create directory {}: {e}", shown.display())));
+                }
+            }
+            let next = openat(
+                Some(&dir),
+                name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                0,
+            )
+            .map_err(|e| {
+                refuse(format!(
+                    "directory {} cannot be opened without following a symlink: {e}",
+                    shown.display()
+                ))
+            })?;
+            check_dir(&next, &shown, &refuse)?;
+            dir = next;
+        }
         let fd = match openat(
-            Some(&walk.dir),
+            Some(&dir),
             &name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
             0o600,
@@ -563,6 +657,51 @@ mod tests {
         assert_eq!(
             read_secret_file("f", "/").unwrap_err().reason,
             Reason::SecretFilePermissions
+        );
+    }
+
+    /// A second hard link is a name for the secret outside the checked
+    /// directory: refused. A document may have one.
+    #[test]
+    fn a_hard_linked_secret_is_refused() {
+        let d = dir();
+        let f = d.path().join("key");
+        write(&f, b"seed", 0o600);
+        std::fs::hard_link(&f, d.path().join("alias")).unwrap();
+        let e = read_secret_file("f", s(&f)).unwrap_err();
+        assert!(e.message.contains("hard links"), "{e}");
+        assert_eq!(e.reason, Reason::SecretFilePermissions);
+    }
+
+    /// Missing directories are made one at a time, each relative to the
+    /// checked descriptor of its parent, owner-only; a symlinked parent this
+    /// user owns is followed through realpath and checked where it lives.
+    #[test]
+    fn creation_makes_missing_directories_through_checked_descriptors() {
+        let d = dir();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = d.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let token = alias.join("a/b/daemon.token");
+        assert!(create_secret_file("mcp.tokenFile", s(&token), b"t").unwrap());
+        for sub in ["a", "a/b"] {
+            let mode = std::fs::metadata(real.join(sub))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{sub}");
+        }
+        assert_eq!(std::fs::read(real.join("a/b/daemon.token")).unwrap(), b"t");
+        // A group-writable existing ancestor is refused before anything is made.
+        let open = d.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(create_secret_file("f", s(&open.join("x/t")), b"t").is_err());
+        assert!(
+            !open.join("x").exists(),
+            "nothing is created before the check"
         );
     }
 

@@ -92,8 +92,8 @@
       "type": "string"
     },
     "label": {
-      "description": "1 to 64 characters of ASCII letters, digits, `.`, `_` and `-`, starting with a letter or digit.",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "1 to 64 characters of ASCII letters, digits, `.`, `_` and `-`, starting with a letter. A label is never all digits, so a JavaScript consumer, which orders integer-like object keys first, orders label keys (signAllow.callers) by their bytes.",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
       "type": "string"
     },
     "parser": {

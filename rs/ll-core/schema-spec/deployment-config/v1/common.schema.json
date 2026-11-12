@@ -11,9 +11,9 @@
       "not": {"pattern": "(^|/)\\.\\.?(/|$)"}
     },
     "label": {
-      "description": "1 to 64 characters of ASCII letters, digits, `.`, `_` and `-`, starting with a letter or digit.",
+      "description": "1 to 64 characters of ASCII letters, digits, `.`, `_` and `-`, starting with a letter. A label is never all digits, so a JavaScript consumer, which orders integer-like object keys first, orders label keys (signAllow.callers) by their bytes.",
       "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
     },
     "ipAddress": {
       "description": "An IP literal in its one spelling: IPv4 as a dotted quad with no leading zero, IPv6 in RFC 5952 canonical text. The parser refuses any other spelling of a valid address (`non-canonical-address`); this pattern states the alphabet only.",

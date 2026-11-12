@@ -98,9 +98,7 @@ impl InProcess {
     }
 
     fn send(&mut self, request: &Request) {
-        self.to_broker
-            .write_all(line(request).as_bytes())
-            .unwrap();
+        self.to_broker.write_all(line(request).as_bytes()).unwrap();
     }
 
     fn start(&mut self, text: &str) {
@@ -142,7 +140,10 @@ fn arguments_parse_in_either_order_and_refuse_by_name() {
         (&["--peer-pid", "1"][..], "--lifeline-fd is required"),
         (&["--lifeline-fd"][..], "needs a value"),
         (&["--lifeline-fd", "x"][..], "is not a number"),
-        (&["--lifeline-fd", "3", "--lifeline-fd", "4"][..], "given twice"),
+        (
+            &["--lifeline-fd", "3", "--lifeline-fd", "4"][..],
+            "given twice",
+        ),
         (&["--other", "3"][..], "unknown argument"),
     ] {
         let error = parse(args).expect_err(why);
@@ -176,7 +177,9 @@ fn serve_binds_then_confines_then_attests_relays_and_drains() {
     );
 
     let mut client = UnixStream::connect(&endpoint).unwrap();
-    client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     client.write_all(b"ping").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut back = Vec::new();
@@ -197,7 +200,8 @@ fn serve_binds_then_confines_then_attests_relays_and_drains() {
     let mut open = UnixStream::connect(&endpoint).unwrap();
     open.write_all(b"x").unwrap();
     let mut one = [0u8; 1];
-    open.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    open.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     open.read_exact(&mut one).unwrap();
     broker.send(&Request::Drain);
     assert_eq!(
@@ -247,9 +251,11 @@ fn refused(input: &str, confine_fails: bool) -> String {
 fn serve_refuses_every_bad_start_by_name() {
     let (_dir, real) = channel_dir();
     let doc = document(&real, "127.0.0.1", 9);
-    let start = |text: &str| line(&Request::Start {
-        document: text.to_owned(),
-    });
+    let start = |text: &str| {
+        line(&Request::Start {
+            document: text.to_owned(),
+        })
+    };
 
     assert!(refused("", false).contains("closed before start"));
     assert!(refused("not json\n", false).contains("unreadable start request"));
@@ -278,7 +284,10 @@ fn the_broker_process_exits_when_its_lifeline_ends() {
     let mut broker = BrokerProcess::spawn(Path::new(BROKER), &doc, None).expect("spawn");
     // Nothing sent: the broker sits in its first read until the lifeline ends.
     thread::sleep(Duration::from_millis(100));
-    assert!(!broker.exited(), "the broker waits while its supervisor lives");
+    assert!(
+        !broker.exited(),
+        "the broker waits while its supervisor lives"
+    );
     broker.close_lifeline();
     let started = Instant::now();
     while !broker.exited() {

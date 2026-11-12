@@ -47,7 +47,9 @@ pub enum Request {
 #[serde(tag = "event", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Event {
     #[serde(rename_all = "camelCase")]
-    Ready { connections_digest: String },
+    Ready {
+        connections_digest: String,
+    },
     #[serde(rename_all = "camelCase")]
     Connection {
         name: String,
@@ -57,7 +59,9 @@ pub enum Event {
         open: bool,
     },
     Drained,
-    Error { detail: String },
+    Error {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,9 +367,9 @@ impl BrokerProcess {
                 Ok(())
             });
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| ExecutionError::backend(format!("spawn connection broker: {error}")))?;
+        let mut child = command.spawn().map_err(|error| {
+            ExecutionError::backend(format!("spawn connection broker: {error}"))
+        })?;
         drop(read_end);
         let stdout = child.stdout.take().expect("piped stdout");
         let (sender, events) = mpsc::channel();
@@ -406,7 +410,8 @@ impl BrokerProcess {
         expected: &str,
         timeout: Duration,
     ) -> Result<(), ExecutionError> {
-        let text = String::from_utf8(document.canonical_bytes()).expect("canonical bytes are ASCII");
+        let text =
+            String::from_utf8(document.canonical_bytes()).expect("canonical bytes are ASCII");
         self.send(&Request::Start { document: text })?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -421,7 +426,9 @@ impl BrokerProcess {
                     )));
                 }
                 Ok(Event::Error { detail }) => {
-                    return Err(ExecutionError::backend(format!("connection broker: {detail}")));
+                    return Err(ExecutionError::backend(format!(
+                        "connection broker: {detail}"
+                    )));
                 }
                 Ok(other) => self.seen.push(other),
                 Err(_) => {
@@ -488,7 +495,9 @@ impl BrokerProcess {
         stdin
             .write_all(line(request).as_bytes())
             .and_then(|()| stdin.flush())
-            .map_err(|error| ExecutionError::backend(format!("connection broker control pipe: {error}")))
+            .map_err(|error| {
+                ExecutionError::backend(format!("connection broker control pipe: {error}"))
+            })
     }
 }
 

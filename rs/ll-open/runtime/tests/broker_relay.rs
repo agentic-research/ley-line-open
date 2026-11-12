@@ -60,7 +60,9 @@ struct Running {
 impl Running {
     fn connect(&self) -> UnixStream {
         let stream = UnixStream::connect(&self.path).expect("connect endpoint");
-        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
         stream
     }
 
@@ -199,7 +201,10 @@ fn half_close_from_the_upstream_keeps_the_client_direction_open() {
     assert_eq!(&banner, b"banner");
     let mut rest = Vec::new();
     client.read_to_end(&mut rest).unwrap();
-    assert!(rest.is_empty(), "the upstream's half-close reaches the client");
+    assert!(
+        rest.is_empty(),
+        "the upstream's half-close reaches the client"
+    );
     client.write_all(b"still talking").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(server.join().unwrap(), b"still talking");
@@ -222,6 +227,8 @@ fn an_upstream_that_comes_up_within_the_hold_is_reached() {
     let mut back = Vec::new();
     client.read_to_end(&mut back).unwrap();
     assert_eq!(back, b"late");
+    // The client side is still open (half-close): the record comes when it ends.
+    drop(client);
     assert_eq!(running.record().outcome, Outcome::Dialed);
 }
 
@@ -289,7 +296,10 @@ fn an_upstream_reset_mid_stream_is_end_of_file_to_the_client() {
     let mut back = Vec::new();
     let result = client.read_to_end(&mut back);
     server.join().unwrap();
-    assert!(result.is_ok(), "the client sees end-of-file, not an error: {result:?}");
+    assert!(
+        result.is_ok(),
+        "the client sees end-of-file, not an error: {result:?}"
+    );
     assert_eq!(back, b"partial");
     assert_eq!(running.record().outcome, Outcome::Dialed);
 }
@@ -311,7 +321,11 @@ fn connections_past_the_cap_are_closed_without_a_dial() {
     third.read_to_end(&mut back).unwrap();
     assert!(back.is_empty());
     let record = running.record();
-    assert_eq!(record.outcome, Outcome::Refused, "the third is refused at once");
+    assert_eq!(
+        record.outcome,
+        Outcome::Refused,
+        "the third is refused at once"
+    );
     drop(held);
     for _ in 0..2 {
         assert_eq!(running.record().outcome, Outcome::Refused);
@@ -354,37 +368,106 @@ fn a_passed_descriptor_never_reaches_the_target_and_is_closed() {
     // SAFETY: a valid out array.
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
     let (pipe_read, pipe_write) = (pipe[0], pipe[1]);
+    let passed = identity(pipe_write);
     send_with_fd(&client, b"x", pipe_write);
     // SAFETY: closing our own copy of the write end.
     unsafe { libc::close(pipe_write) };
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(server.join().unwrap(), b"x", "only the byte crosses");
+    drop(client);
+    assert_eq!(running.record().outcome, Outcome::Dialed);
 
-    // Every write end is closed once the broker discarded the in-flight copy.
-    let started = Instant::now();
-    loop {
-        let mut pollfd = libc::pollfd {
-            fd: pipe_read,
-            events: libc::POLLIN,
-            revents: 0,
+    // The relay (this process) read the message: it must hold no descriptor
+    // for the passed pipe end. `read(2)` never installs a passed right.
+    for entry in std::fs::read_dir("/dev/fd").unwrap() {
+        let Ok(fd) = entry.unwrap().file_name().to_string_lossy().parse::<i32>() else {
+            continue;
         };
-        // SAFETY: one valid pollfd.
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
-        if ready > 0 {
-            let mut byte = 0u8;
-            // SAFETY: one-byte read into a valid buffer.
-            let n = unsafe { libc::read(pipe_read, (&mut byte as *mut u8).cast(), 1) };
-            assert_eq!(n, 0, "end-of-file: no process holds the passed descriptor");
-            break;
+        if fd != pipe_read {
+            assert_ne!(
+                identity(fd),
+                passed,
+                "descriptor {fd} is the passed pipe end: the relay received the right"
+            );
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the passed descriptor is still open somewhere"
-        );
+    }
+    // The relay closed the right it received, and ours is closed, so no
+    // process holds the write end: the pipe reads end-of-file. (A plain
+    // read(2) would not do: macOS installs the right in the reader anyway.)
+    {
+        let started = Instant::now();
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: pipe_read,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd.
+            if unsafe { libc::poll(&mut pollfd, 1, 100) } > 0 {
+                let mut byte = 0u8;
+                // SAFETY: one-byte read into a valid buffer.
+                let n = unsafe { libc::read(pipe_read, (&mut byte as *mut u8).cast(), 1) };
+                assert_eq!(n, 0, "end-of-file: no process holds the passed descriptor");
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the passed descriptor is still open somewhere"
+            );
+        }
     }
     // SAFETY: closing our read end.
     unsafe { libc::close(pipe_read) };
+}
+
+/// A descriptor passed while the connection is held for its dial is never
+/// read (the hang-up check uses FIONREAD, not a peek, which would install it
+/// on macOS), and is released when the broker closes the connection.
+#[test]
+fn a_descriptor_passed_during_the_hold_is_released_with_the_connection() {
+    let running = run(free_port(), None, limits(Duration::from_secs(10)));
+    let client = running.connect();
+    let mut pipe = [0; 2];
+    // SAFETY: a valid out array.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let (pipe_read, pipe_write) = (pipe[0], pipe[1]);
+    send_with_fd(&client, b"x", pipe_write);
+    // SAFETY: closing our own copy of the write end.
+    unsafe { libc::close(pipe_write) };
+    // Several hold rounds pass with the message queued.
+    thread::sleep(Duration::from_millis(300));
     drop(client);
+    assert_eq!(running.record().outcome, Outcome::Refused);
+    let mut pollfd = libc::pollfd {
+        fd: pipe_read,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    assert!(
+        unsafe { libc::poll(&mut pollfd, 1, 5_000) } > 0,
+        "the passed write end is still open somewhere"
+    );
+    let mut byte = 0u8;
+    // SAFETY: one-byte read into a valid buffer.
+    assert_eq!(
+        unsafe { libc::read(pipe_read, (&mut byte as *mut u8).cast(), 1) },
+        0
+    );
+    // SAFETY: closing our read end.
+    unsafe { libc::close(pipe_read) };
+}
+
+/// `(st_dev, st_ino)` of an open descriptor, or `None` when it is not open.
+fn identity(fd: i32) -> Option<(u64, u64)> {
+    // SAFETY: a zeroed stat filled by fstat.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat on a descriptor number with a valid out-pointer.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Some((stat.st_dev as u64, stat.st_ino as u64))
 }
 
 fn send_with_fd(stream: &UnixStream, data: &[u8], fd: i32) {

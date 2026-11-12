@@ -7,7 +7,10 @@
 //! nono's macOS base profile always allows `process-exec*`, `process-fork`,
 //! `mach-lookup`, the mDNSResponder socket, `sysctl-read`, `ipc-posix-shm*` and
 //! `file-read*` on `/`. So the profile is that base plus explicit
-//! `platform_rule` denies, which nono emits after its allows so the deny wins.
+//! `platform_rule` denies, which nono emits after those allows so the deny
+//! wins. One allow comes after the platform rules: the network block's
+//! mDNSResponder rule, so that socket stays reachable ([`MDNS_RESPONDER`],
+//! bead `ley-line-open-fb5c4b`); name resolution is still refused.
 //! Outbound TCP is allowed to `localhost:<port>` per declared port and nothing
 //! else; there is no inbound TCP and no listen. Accepting on the already-bound
 //! UNIX listener needs no path right.
@@ -25,7 +28,15 @@ use crate::ExecutionError;
 /// `broker_profile` pins this list, so it cannot grow without a test change.
 pub const MACH_LOOKUP_ALLOW: &[&str] = &[];
 
-/// The mDNSResponder socket, denied so the broker has no resolver ("no names").
+/// The mDNSResponder socket. The broker cannot deny it: nono 0.71 emits its
+/// ProxyOnly/Blocked network block (which allows this path, for DNS) after
+/// every platform rule, and the later allow wins, measured by
+/// `broker_profile` (`mdns=ok`). The broker still has no resolver: name
+/// resolution fails under the profile (`resolve=denied`, via the
+/// `mach-lookup` and file-read denies), and reaching the socket adds no
+/// reach, since outbound TCP stays limited to the declared localhost ports.
+/// Closing it needs nono to let a platform rule follow its network block
+/// (bead ley-line-open-fb5c4b).
 pub const MDNS_RESPONDER: &str = "/private/var/run/mDNSResponder";
 
 /// The Seatbelt denies the broker adds to nono's base profile, in emission order.
@@ -35,7 +46,6 @@ pub fn deny_rules() -> Vec<String> {
         "(deny process-fork)".to_owned(),
         "(deny file-read*)".to_owned(),
         "(deny file-write*)".to_owned(),
-        format!("(deny network-outbound (remote unix-socket (path-literal \"{MDNS_RESPONDER}\")))"),
         "(deny mach-lookup)".to_owned(),
     ];
     for service in MACH_LOOKUP_ALLOW {
@@ -65,7 +75,9 @@ pub fn egress_rule(port: u16) -> String {
 /// Every platform rule the profile adds, in emission order: one egress rule
 /// per declared port after the first (which ProxyOnly carries), then the
 /// denies. Split out so it is tested on every platform.
-pub fn platform_rules(document: &ConnectionsDocument) -> Result<(u16, Vec<String>), ExecutionError> {
+pub fn platform_rules(
+    document: &ConnectionsDocument,
+) -> Result<(u16, Vec<String>), ExecutionError> {
     let ports = ports(document);
     let Some((first, further)) = ports.split_first() else {
         return Err(ExecutionError::invalid_grant(
@@ -144,15 +156,17 @@ mod tests {
                 "(deny process-fork)".to_owned(),
                 "(deny file-read*)".to_owned(),
                 "(deny file-write*)".to_owned(),
-                "(deny network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"
-                    .to_owned(),
                 "(deny mach-lookup)".to_owned(),
             ],
             "the mach-lookup allow-set is pinned empty: growing it is a test change"
         );
         assert!(MACH_LOOKUP_ALLOW.is_empty());
         let (_, single) = platform_rules(&document(&[7])).unwrap();
-        assert_eq!(single, deny_rules(), "one port needs no further egress rule");
+        assert_eq!(
+            single,
+            deny_rules(),
+            "one port needs no further egress rule"
+        );
     }
 
     #[test]
@@ -160,7 +174,10 @@ mod tests {
         let result = capabilities(&document(&[7, 8]));
         if cfg!(target_os = "macos") {
             let caps = result.expect("macOS profile");
-            assert_eq!(caps.platform_rules(), platform_rules(&document(&[7, 8])).unwrap().1);
+            assert_eq!(
+                caps.platform_rules(),
+                platform_rules(&document(&[7, 8])).unwrap().1
+            );
         } else {
             let error = result.expect_err("not delivered");
             assert_eq!(error.code, crate::ErrorCode::UnsupportedBackend);

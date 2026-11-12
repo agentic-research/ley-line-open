@@ -4,7 +4,8 @@ Section: Added
   `leyline_runtime::broker`** (bead `ley-line-open-52b5b3`, ADR-0046 Slice 1 S4, S5).
   One broker per run listens on each declared UNIX endpoint and joins every accepted
   connection to that connection's one committed loopback target. It copies bytes with
-  `read(2)`/`write(2)` only, so no passed descriptor crosses. It has no parser, no
+  every descriptor a client passes closed on arrival: it reads with `recvmsg(2)`,
+  because macOS installs an `SCM_RIGHTS` descriptor even on a plain `read(2)`. It has no parser, no
   resolver and no credential.
   - **Peers:** it accepts only the daemon's uid, and on the microVM tier only the run's
     worker pid. Any other peer is closed and counted as foreign.
@@ -13,7 +14,9 @@ Section: Added
     connections.
   - **Bind, then confine:** it binds every endpoint, then confines itself on macOS with
     nono's base profile plus denies (exec, fork, all file reads and writes, the
-    mDNSResponder socket, `mach-lookup`), with outbound TCP only to the declared ports.
+    `mach-lookup`), so name resolution fails, with outbound TCP only to the declared
+    ports. The mDNSResponder socket stays reachable, because nono emits its DNS allow
+    after every platform rule (`ley-line-open-fb5c4b`).
     Then it reports ready with the `connectionsDigest` it bound, which the supervisor
     compares with the grant's.
   - **Lifecycle:** it exits the moment its lifeline pipe ends, and drains open

@@ -2,7 +2,8 @@
 //! macOS): the real `leyline-conn-broker` binary relays under its profile (the
 //! positive control), attests the digest it bound, dies with its lifeline, and
 //! under the profile a process is refused every port but the declared ones,
-//! every file, exec, fork and the resolver.
+//! every file, exec, fork and name resolution (the mDNSResponder socket
+//! itself stays reachable: bead `ley-line-open-fb5c4b`).
 //!
 //! Fail closed like `confinement_local_connect_probe`: a host that cannot apply
 //! the profile prints a named `SKIPPED (NOT a pass)`, and
@@ -103,7 +104,9 @@ fn started(document: &ConnectionsDocument) -> Option<BrokerProcess> {
 
 fn round_trip(path: &str, bytes: &[u8]) -> Vec<u8> {
     let mut client = UnixStream::connect(path).expect("connect endpoint");
-    client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
     client.write_all(bytes).unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut back = Vec::new();
@@ -120,7 +123,10 @@ fn the_confined_broker_relays_every_connection_and_reports_it() {
         return;
     };
     for connection in doc.connections() {
-        assert_eq!(round_trip(&connection.endpoint_unix, b"confined"), b"confined");
+        assert_eq!(
+            round_trip(&connection.endpoint_unix, b"confined"),
+            b"confined"
+        );
     }
     assert!(broker.drain(Duration::from_secs(5)), "the broker drained");
     let dialed = broker
@@ -161,7 +167,10 @@ fn a_ready_digest_other_than_the_grants_refuses_the_start() {
         sandbox_unavailable(&error.detail);
         return;
     }
-    assert_eq!(error.code, leyline_runtime::ErrorCode::IdentityPolicyMismatch);
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch
+    );
 }
 
 /// The confined half, run by the parent below.
@@ -170,7 +179,8 @@ fn a_ready_digest_other_than_the_grants_refuses_the_start() {
 fn profile_probe_child() {
     let spec = std::env::var(PROBE_ENV).expect("probe ports");
     let (declared, undeclared) = spec.split_once(',').expect("two ports");
-    let (declared, undeclared): (u16, u16) = (declared.parse().unwrap(), undeclared.parse().unwrap());
+    let (declared, undeclared): (u16, u16) =
+        (declared.parse().unwrap(), undeclared.parse().unwrap());
     let doc = ConnectionsDocument::new(vec![Connection {
         name: "c0".into(),
         endpoint_unix: "/private/tmp/unused.sock".into(),
@@ -201,7 +211,10 @@ fn profile_probe_child() {
             "write={}",
             outcome(std::fs::write("/private/tmp/llo-broker-probe", b"x").is_ok())
         ),
-        format!("exec={}", outcome(Command::new("/usr/bin/true").status().is_ok())),
+        format!(
+            "exec={}",
+            outcome(Command::new("/usr/bin/true").status().is_ok())
+        ),
         format!(
             "mdns={}",
             outcome(UnixStream::connect(profile::MDNS_RESPONDER).is_ok())
@@ -257,7 +270,10 @@ fn the_profile_refuses_everything_but_the_declared_ports() {
     }
     assert_eq!(
         line,
-        "declared=ok undeclared=eperm read=denied write=denied exec=denied mdns=denied \
+        // mdns=ok is measured, not intended: nono emits its DNS allow after
+        // every platform rule (bead ley-line-open-fb5c4b). Resolution itself
+        // is still refused, and the row flips here when that bead lands.
+        "declared=ok undeclared=eperm read=denied write=denied exec=denied mdns=ok \
          resolve=denied fork=denied"
     );
 }

@@ -22,7 +22,11 @@ impl SocketGrant {
     fn covers(&self, endpoint: &Path) -> bool {
         let grant = self.0.as_str();
         if let Some(directory) = grant.strip_suffix('/') {
-            endpoint.starts_with(Path::new(if directory.is_empty() { "/" } else { directory }))
+            endpoint.starts_with(Path::new(if directory.is_empty() {
+                "/"
+            } else {
+                directory
+            }))
         } else {
             Path::new(grant) == endpoint
         }
@@ -72,7 +76,9 @@ impl EndpointRegistry {
                 }
             }
             for endpoint in endpoints {
-                if other.endpoints.contains(endpoint) || other.grants.iter().any(|g| g.covers(endpoint)) {
+                if other.endpoints.contains(endpoint)
+                    || other.grants.iter().any(|g| g.covers(endpoint))
+                {
                     return Err(ExecutionError::resource_conflict(format!(
                         "endpoint {}: endpoint held by another run ({other_id})",
                         endpoint.display()

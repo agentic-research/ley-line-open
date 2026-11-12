@@ -34,7 +34,9 @@ fn a_run_whose_grant_names_a_registered_endpoint_is_refused() {
 fn a_run_whose_endpoint_another_runs_grant_already_names_is_refused() {
     // The ordering race: B registers first, then A.
     let registry = EndpointRegistry::new();
-    registry.register("run-b", &[], &[grant(A_ENDPOINT)]).unwrap();
+    registry
+        .register("run-b", &[], &[grant(A_ENDPOINT)])
+        .unwrap();
     let error = registry
         .register("run-a", &a_endpoints(), &[grant(A_ENDPOINT)])
         .expect_err("A after B");
@@ -65,9 +67,14 @@ fn a_directory_grant_containing_an_endpoint_counts_in_both_orders() {
         ErrorCode::InvalidGrant
     );
     let other = EndpointRegistry::new();
-    other.register("run-b", &[], &[grant("/private/tmp/ch-a/")]).unwrap();
+    other
+        .register("run-b", &[], &[grant("/private/tmp/ch-a/")])
+        .unwrap();
     assert_eq!(
-        other.register("run-a", &a_endpoints(), &[]).unwrap_err().code,
+        other
+            .register("run-a", &a_endpoints(), &[])
+            .unwrap_err()
+            .code,
         ErrorCode::ResourceConflict
     );
 }
@@ -98,7 +105,10 @@ fn two_runs_cannot_own_one_endpoint_and_removal_frees_it() {
     let registry = EndpointRegistry::new();
     registry.register("run-a", &a_endpoints(), &[]).unwrap();
     assert_eq!(
-        registry.register("run-b", &a_endpoints(), &[]).unwrap_err().code,
+        registry
+            .register("run-b", &a_endpoints(), &[])
+            .unwrap_err()
+            .code,
         ErrorCode::ResourceConflict
     );
     assert_eq!(
@@ -116,7 +126,10 @@ fn a_root_directory_grant_covers_everything() {
     let registry = EndpointRegistry::new();
     registry.register("run-a", &a_endpoints(), &[]).unwrap();
     assert_eq!(
-        registry.register("run-b", &[], &[grant("/")]).unwrap_err().code,
+        registry
+            .register("run-b", &[], &[grant("/")])
+            .unwrap_err()
+            .code,
         ErrorCode::InvalidGrant
     );
 }

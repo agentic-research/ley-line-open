@@ -82,8 +82,13 @@ fn a_parent_reached_through_a_symlink_is_refused() {
 #[test]
 fn a_parent_that_is_not_private_is_refused() {
     let (_dir, real) = private_dir();
-    for mode in [0o755, 0o750, 0o701, 0o1700, 0o2700] {
+    for mode in [0o755, 0o750, 0o701, 0o710, 0o1700, 0o2700] {
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(mode)).unwrap();
+        let applied = std::fs::metadata(&real).unwrap().permissions().mode() & 0o7777;
+        if applied == 0o700 {
+            // macOS drops setgid a non-member sets: nothing to refuse.
+            continue;
+        }
         let (code, detail) = refusal(&real.join("orders.api.sock"), euid());
         assert_eq!(code, ErrorCode::InvalidGrant, "mode {mode:o}");
         assert!(detail.contains("endpoint parent not private"), "{detail}");

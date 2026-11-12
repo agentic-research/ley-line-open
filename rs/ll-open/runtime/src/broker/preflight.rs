@@ -39,7 +39,11 @@ pub fn check_endpoint(name: &str, endpoint: &Path, euid: u32) -> Result<(), Exec
                 endpoint.display()
             )));
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        // ENOTDIR: a component of the parent is not a directory, which the
+        // parent checks below refuse by name.
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOTDIR) => {}
         Err(error) => return Err(refuse(&format!("cannot inspect the endpoint: {error}"))),
     }
     let parent = endpoint

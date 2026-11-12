@@ -1,5 +1,6 @@
 //! The relay (ADR-0046 S5): one listener per connection, one dial per accepted
-//! connection to the committed target, bytes copied with `read(2)`/`write(2)`.
+//! connection to the committed target, bytes copied and every passed
+//! descriptor closed on arrival ([`DiscardRights`]).
 //!
 //! The broker reads no address from the stream and parses nothing, so the
 //! workload cannot steer it. Each listener's target is a `SocketAddr` built
@@ -252,7 +253,7 @@ fn serve(name: &str, client: UnixStream, target: SocketAddr, context: &Context) 
         (Ok(client_writer), Ok(upstream_writer)) => {
             let inbound = {
                 let to_target = Arc::clone(&to_target);
-                thread::spawn(move || copy(client, upstream_writer, &to_target))
+                thread::spawn(move || copy(DiscardRights(client), upstream_writer, &to_target))
             };
             copy(upstream, client_writer, &from_target);
             let _ = inbound.join();
@@ -316,17 +317,12 @@ fn client_hung_up(client: &UnixStream, wait: Duration) -> bool {
     if pollfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
         return true;
     }
-    let mut byte = 0u8;
-    // SAFETY: a one-byte peek into a valid buffer on a valid socket.
-    let peeked = unsafe {
-        libc::recv(
-            fd,
-            (&mut byte as *mut u8).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    if peeked == 0 {
+    // Readable with nothing queued is end-of-file. FIONREAD reads no message,
+    // so a descriptor the client passed during the hold is never installed
+    // here (a peek would install it on macOS); the copy loop closes it.
+    let mut queued: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int through a valid pointer.
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } != 0 || queued == 0 {
         return true;
     }
     // Data is waiting for the upstream: keep holding, without spinning.
@@ -363,6 +359,85 @@ where
     }
     from.shutdown_both();
     to.shutdown_both();
+}
+
+/// The client side of a connection, read so that a passed descriptor never
+/// stays with the broker.
+///
+/// `read(2)` is not enough: macOS installs an `SCM_RIGHTS` descriptor in the
+/// receiving process even when it reads with `read(2)` or `recv(2)` and no
+/// control buffer (measured; Linux discards it). So the client direction is
+/// read with `recvmsg(2)` and a control buffer, and every received right is
+/// closed at once; a truncated control message (rights the buffer could not
+/// hold, which macOS may leave installed) ends the connection.
+pub struct DiscardRights(pub UnixStream);
+
+/// Room for more rights than one message carries on either platform (Linux
+/// caps one message at 253).
+const CONTROL_BYTES: usize = 4096;
+
+impl Read for DiscardRights {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut iov = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.len(),
+        };
+        // u64 words keep the control buffer aligned for cmsghdr.
+        let mut control = [0u64; CONTROL_BYTES / 8];
+        // SAFETY: a zeroed msghdr filled with valid pointers below.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = CONTROL_BYTES as _;
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        // SAFETY: valid socket, iovec and control buffer for the call.
+        let received = unsafe { libc::recvmsg(self.0.as_raw_fd(), &mut message, flags) };
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let closed = close_rights(&message);
+        if message.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::other(format!(
+                "client passed more descriptors than the broker reads ({closed} closed); ending the connection"
+            )));
+        }
+        Ok(received as usize)
+    }
+}
+
+impl ShutdownBoth for DiscardRights {
+    fn shutdown_write(&self) {
+        self.0.shutdown_write();
+    }
+    fn shutdown_both(&self) {
+        self.0.shutdown_both();
+    }
+}
+
+/// Close every descriptor an `SCM_RIGHTS` message in `message` carried;
+/// returns how many.
+fn close_rights(message: &libc::msghdr) -> usize {
+    let mut closed = 0;
+    // SAFETY: walking the control buffer recvmsg filled, within msg_controllen.
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(message);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let payload = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(header).cast::<i32>();
+                for index in 0..payload / std::mem::size_of::<i32>() {
+                    libc::close(std::ptr::read_unaligned(data.add(index)));
+                    closed += 1;
+                }
+            }
+            header = libc::CMSG_NXTHDR(message, header);
+        }
+    }
+    closed
 }
 
 /// The two socket kinds the relay joins.

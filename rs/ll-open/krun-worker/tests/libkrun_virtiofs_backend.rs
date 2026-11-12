@@ -138,6 +138,77 @@ struct Refusal {
     says: Option<&'static str>,
 }
 
+/// A guest that stops without recording an exit status does not read as a
+/// success (LLO libkrun patch 0016, bead `ley-line-open-7164ec`). With
+/// KRUN_INIT_PID1 the workload runs as PID 1: it prints and exits 0, the
+/// kernel panics, and nothing records a status. Upstream libkrun then took
+/// the vcpu's "OK" and exited 0, as it did after any init crash or kernel
+/// panic. The VMM must exit 125 and say why on its stderr.
+#[test]
+fn a_guest_that_records_no_exit_status_ends_as_a_failure() {
+    if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
+        enter_guest(PathBuf::from(rootfs));
+    }
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    let fixture = TempDir::new().expect("fixture");
+    let rootfs = fixture.path().join("rootfs");
+    fs::create_dir_all(rootfs.join("bin")).expect("rootfs bin");
+    let source = fixture.path().join("guest.rs");
+    fs::write(&source, GUEST_THAT_MUST_NOT_RUN).expect("guest source");
+    let guest = rootfs.join("bin/guest");
+    hypervisor::compile_guest(&source, &guest);
+    fs::set_permissions(&guest, fs::Permissions::from_mode(0o755)).expect("guest mode");
+    let vmm = fixture.path().join("vmm");
+    hypervisor::entitled_copy(&std::env::current_exe().expect("test binary"), &vmm);
+    let (library_var, library_dir) = hypervisor::library_path_env(&libkrunfw);
+    let mut child = Command::new(&vmm)
+        .args([
+            "a_guest_that_records_no_exit_status_ends_as_a_failure",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(VMM_CHILD, &rootfs)
+        .env(TOKEN, "unused")
+        .env(INIT_ENV, "KRUN_INIT_PID1=1")
+        .env(library_var, library_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the VMM");
+    let status = child
+        .wait_timeout(Duration::from_secs(30))
+        .expect("wait for the VMM");
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("VMM output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        status.is_some(),
+        "the guest did not stop within 30 seconds\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("guest ran"),
+        "the workload ran as PID 1, so its exit is what stops the guest:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(STOP_EXIT_CODE),
+        "no recorded status is not a success: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("the guest stopped without recording an exit status"),
+        "the VMM says why it exits 125:\n{stderr}"
+    );
+}
+
 /// Init mounts only over a real directory (LLO libkrun patch 0014, bead
 /// `ley-line-open-2594af`; defence in depth for `ley-line-open-10b516`).
 /// mount(2) follows a link, so a rootfs holding `work -> bin` with a

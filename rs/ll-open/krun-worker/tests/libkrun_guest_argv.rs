@@ -1,6 +1,8 @@
-//! A live guest receives exactly the argv and environment its request
-//! names (beads `ley-line-open-7410ec`, `ley-line-open-d4b07f`,
-//! `ley-line-open-f7f862`).
+//! A live guest receives exactly the argv its request names, and each
+//! variable its request names byte for byte (beads `ley-line-open-7410ec`,
+//! `ley-line-open-d4b07f`, `ley-line-open-f7f862`). The guest init adds its
+//! own `HOME`, `TERM` and `KRUN_` settings; this probe checks the named
+//! variables only.
 //!
 //! libkrun used to hand both to the guest on the kernel command line, which
 //! the kernel and init re-parse: an argument `--` cut the argv there

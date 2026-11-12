@@ -14,15 +14,18 @@ message went to the console init inherits from the kernel, which does
 not reach the host, so the run's output was empty as well.
 
 Init now stops the guest through stop_guest(). It points stdout and
-stderr at the krun console ports when they exist (once /sys and /dev
-are mounted), prints why, records exit status 125 (STOP_EXIT_CODE,
-podman's and crun's code for a failure of the runtime rather than of
-the workload) through the root filesystem as it records a workload's
-status, and restarts, which ends the VM. A refusal made inside a helper
-is recorded with record_stop_reason() so stop_guest() can repeat it
-where the host reads it. A refusal before /sys and /dev are mounted (a
-link at /dev, say) still reaches the host as exit status 125; only its
-text stays on the kernel's console.
+stderr at the krun console ports once the kernel's sysfs is on /sys and
+devtmpfs on /dev (checked by filesystem magic, so ports the rootfs
+pretends to hold are never written), prints why, records exit status
+125 (STOP_EXIT_CODE, podman's and crun's code for a failure of the
+runtime rather than of the workload) through the root filesystem as it
+records a workload's status, and restarts, which ends the VM. The
+refusals LLO's patches make (a mount target that is not a real
+directory, a /tmp that is not one) are recorded with
+record_stop_reason() and stated in full; the others state the stage
+that failed ("Couldn't mount KRUN_VIRTIOFS_MOUNTS, bailing out"). A
+refusal before /sys and /dev are mounted (a link at /dev, say) still
+reaches the host as exit status 125; only its text does not.
 
 Builds without __linux__ keep exit().
 
@@ -39,7 +42,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
  #include <stdbool.h>
  #include <stdint.h>
  #include <stdio.h>
-@@ -541,7 +542,28 @@
+@@ -541,6 +542,26 @@
      return 0;
  }
  #endif
@@ -51,7 +54,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 + * once /sys and /dev are mounted.
 + */
 +static char stop_reason[512];
-
++
 +static void record_stop_reason(const char *format, ...)
 +    __attribute__((format(printf, 1, 2)));
 +
@@ -62,13 +65,11 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 +    va_start(args, format);
 +    vsnprintf(stop_reason, sizeof(stop_reason), format, args);
 +    va_end(args);
-+    printf("%s\n", stop_reason);
 +}
-+
+ 
  #if __linux__
  /*
-  * Whether every component of the absolute `path` is a real directory, not
-@@ -608,7 +630,8 @@
+@@ -608,7 +629,8 @@
  static int refuse_unless_real_directory(const char *path)
  {
      if (!real_directory_path(path, true)) {
@@ -78,7 +79,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
          return -1;
      }
      return 0;
-@@ -654,7 +677,7 @@
+@@ -654,7 +676,7 @@
       * real directory is mounted over; anything else stops the guest.
       */
      if (lstat("/tmp", &existing) < 0 || !S_ISDIR(existing.st_mode)) {
@@ -87,9 +88,9 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
          return -1;
      }
      snprintf(options, sizeof(options), "mode=1777,size=%d%%", TMP_SIZE_PERCENT);
-@@ -1411,8 +1434,53 @@
+@@ -1411,8 +1433,66 @@
      }
-
+ 
      close(fd);
 +}
 +
@@ -108,17 +109,30 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 + * and libkrun then reports exit status 0, so a refusal read on the host as
 + * a run that succeeded, and its message, printed to the console init
 + * inherits from the kernel, did not reach the host either. Instead: point
-+ * stdout and stderr at the krun console ports when they exist (once /sys
-+ * and /dev are mounted), say why, record STOP_EXIT_CODE through the root
-+ * filesystem as a workload's exit status is recorded, and restart, which
-+ * ends the VM.
++ * stdout and stderr at the krun console ports when they exist, say why,
++ * record STOP_EXIT_CODE through the root filesystem as a workload's exit
++ * status is recorded, and restart, which ends the VM.
++ *
++ * The ports exist once the kernel's own sysfs is on /sys and devtmpfs on
++ * /dev. Before that, /sys and /dev are whatever the rootfs holds, so the
++ * port names and nodes would be the image's, and the reason would be
++ * written into the rootfs rather than to the host: the status alone then
++ * reaches the host.
 + */
++static bool kernel_fs_at(const char *path, unsigned long magic)
++{
++    struct statfs fs;
++
++    return statfs(path, &fs) == 0 && (unsigned long)fs.f_type == magic;
++}
++
++#define SYSFS_FS_MAGIC 0x62656572UL
++#define DEVTMPFS_FS_MAGIC 0x01021994UL
++
 +static void __attribute__((noreturn)) stop_guest(const char *fallback)
 +{
-+    DIR *ports = opendir("/sys/class/virtio-ports");
-+
-+    if (ports != NULL) {
-+        closedir(ports);
++    if (kernel_fs_at("/sys", SYSFS_FS_MAGIC) &&
++        kernel_fs_at("/dev", DEVTMPFS_FS_MAGIC)) {
 +        setup_redirects();
 +    }
 +    printf("%s\n", stop_reason[0] ? stop_reason : fallback);
@@ -128,7 +142,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 +    reboot(LINUX_REBOOT_CMD_RESTART);
 +    _exit(STOP_EXIT_CODE);
  }
-
+ 
 +#define STOP_GUEST(message, code) stop_guest(message)
 +#else
 +#define STOP_GUEST(message, code)                                              \
@@ -141,7 +155,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
  #if __linux__
  int try_mount(const char *source, const char *target, const char *fstype,
                unsigned long mountflags, const void *data)
-@@ -1489,7 +1557,8 @@
+@@ -1489,7 +1569,8 @@
           * parent before creating the target, and the whole target after.
           */
          if (!real_directory_path(dir, false)) {
@@ -151,7 +165,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
              free(list);
              return -1;
          }
-@@ -2275,8 +2344,7 @@
+@@ -2275,8 +2356,7 @@
      }
  #endif
      if (mount_filesystems() < 0) {
@@ -159,9 +173,9 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 -        exit(-2);
 +        STOP_GUEST("Couldn't mount filesystems, bailing out", -2);
      }
-
+ 
  #if __linux__
-@@ -2285,8 +2353,8 @@
+@@ -2285,8 +2365,8 @@
      krun_root = clone_str(getenv("KRUN_BLOCK_ROOT_DEVICE"));
      if (krun_root) {
          if (mkdir("/newroot", 0755) < 0 && errno != EEXIST) {
@@ -170,10 +184,10 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 +            record_stop_reason("mkdir(/newroot): %s", strerror(errno));
 +            stop_guest("Couldn't create /newroot");
          }
-
+ 
          krun_root_fstype = clone_str(getenv("KRUN_BLOCK_ROOT_FSTYPE"));
-@@ -2294,8 +2362,9 @@
-
+@@ -2294,8 +2374,9 @@
+ 
          if (try_mount(krun_root, "/newroot", krun_root_fstype, 0,
                        krun_root_options) < 0) {
 -            perror("mount KRUN_BLOCK_ROOT_DEVICE");
@@ -184,9 +198,9 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
          }
          free(krun_root);
          free(krun_root_fstype);
-@@ -2304,26 +2373,26 @@
+@@ -2304,26 +2385,26 @@
          chdir("/newroot");
-
+ 
          if (mount(".", "/", NULL, MS_MOVE, NULL) < 0) {
 -            perror("remount root");
 -            exit(-1);
@@ -194,7 +208,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 +            stop_guest("Couldn't remount root");
          }
          chroot(".");
-
+ 
          // we must mount filesystems again after chrooting
          if (mount_filesystems() < 0) {
 -            printf("Couldn't mount filesystems, bailing out\n");
@@ -202,7 +216,7 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 +            stop_guest("Couldn't mount filesystems, bailing out");
          }
      }
-
+ 
      if (mount(NULL, "/", NULL, MS_REC | MS_SHARED, NULL) < 0) {
 -        perror("Couldn't set shared propagation on the root mount");
 -        exit(-1);
@@ -211,15 +225,15 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 +            strerror(errno));
 +        stop_guest("Couldn't set shared propagation on the root mount");
      }
-
+ 
      if (mount_virtiofs_list() < 0) {
 -        printf("Couldn't mount KRUN_VIRTIOFS_MOUNTS, bailing out\n");
 -        exit(-1);
 +        stop_guest("Couldn't mount KRUN_VIRTIOFS_MOUNTS, bailing out");
      }
  #endif
-
-@@ -2375,13 +2444,11 @@
+ 
+@@ -2375,13 +2456,11 @@
       * the filter.
       */
      if (deny_datagram_sockets() < 0) {
@@ -227,15 +241,15 @@ diff --git a/src/init_blob/init/init.c b/src/init_blob/init/init.c
 -        exit(-1);
 +        stop_guest("Couldn't deny datagram sockets, bailing out");
      }
-
+ 
      if (start_loopback_channels() < 0) {
 -        printf("Couldn't set up KRUN_LOOPBACK_CHANNELS, bailing out\n");
 -        exit(-1);
 +        stop_guest("Couldn't set up KRUN_LOOPBACK_CHANNELS, bailing out");
      }
  #endif
-
-@@ -2417,9 +2484,10 @@
+ 
+@@ -2417,9 +2496,10 @@
      exec_from_config = env_config_argv && strcmp(env_config_argv, "1") == 0;
      if (exec_from_config) {
          if (config_parse_exec(&config_argv, config_file) < 0) {

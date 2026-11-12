@@ -561,7 +561,6 @@ static void record_stop_reason(const char *format, ...)
     va_start(args, format);
     vsnprintf(stop_reason, sizeof(stop_reason), format, args);
     va_end(args);
-    printf("%s\n", stop_reason);
 }
 
 #if __linux__
@@ -1451,17 +1450,30 @@ void set_exit_code(int code)
  * and libkrun then reports exit status 0, so a refusal read on the host as
  * a run that succeeded, and its message, printed to the console init
  * inherits from the kernel, did not reach the host either. Instead: point
- * stdout and stderr at the krun console ports when they exist (once /sys
- * and /dev are mounted), say why, record STOP_EXIT_CODE through the root
- * filesystem as a workload's exit status is recorded, and restart, which
- * ends the VM.
+ * stdout and stderr at the krun console ports when they exist, say why,
+ * record STOP_EXIT_CODE through the root filesystem as a workload's exit
+ * status is recorded, and restart, which ends the VM.
+ *
+ * The ports exist once the kernel's own sysfs is on /sys and devtmpfs on
+ * /dev. Before that, /sys and /dev are whatever the rootfs holds, so the
+ * port names and nodes would be the image's, and the reason would be
+ * written into the rootfs rather than to the host: the status alone then
+ * reaches the host.
  */
+static bool kernel_fs_at(const char *path, unsigned long magic)
+{
+    struct statfs fs;
+
+    return statfs(path, &fs) == 0 && (unsigned long)fs.f_type == magic;
+}
+
+#define SYSFS_FS_MAGIC 0x62656572UL
+#define DEVTMPFS_FS_MAGIC 0x01021994UL
+
 static void __attribute__((noreturn)) stop_guest(const char *fallback)
 {
-    DIR *ports = opendir("/sys/class/virtio-ports");
-
-    if (ports != NULL) {
-        closedir(ports);
+    if (kernel_fs_at("/sys", SYSFS_FS_MAGIC) &&
+        kernel_fs_at("/dev", DEVTMPFS_FS_MAGIC)) {
         setup_redirects();
     }
     printf("%s\n", stop_reason[0] ? stop_reason : fallback);

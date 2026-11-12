@@ -230,10 +230,19 @@ pub fn write_exec_config(
         .mode(0o400)
         .open(&path)
         .map_err(|error| {
-            ExecutionError::invalid(format!(
-                "write the workload's exec config at {EXEC_CONFIG_PATH} in the run's root: \
-                 {error}; the path is the worker's, and a rootfs may not hold it"
-            ))
+            // Only an existing entry is the rootfs's fault; ENOSPC, EACCES,
+            // EIO and the like are the host's, and are not the spec's.
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ExecutionError::invalid(format!(
+                    "write the workload's exec config at {EXEC_CONFIG_PATH} in the run's \
+                     root: {error}; the path is the worker's, and a rootfs may not hold it"
+                ))
+            } else {
+                ExecutionError::backend(format!(
+                    "write the workload's exec config at {EXEC_CONFIG_PATH} in the run's \
+                     root: {error}"
+                ))
+            }
         })?;
     file.write_all(config.to_json().as_bytes())
         .and_then(|()| file.sync_all())
@@ -1106,9 +1115,15 @@ mod tests {
                 & 0o777,
             0o400
         );
-        // Twice: the path exists now, and is refused.
+        // Twice: the path exists now, and is refused as the rootfs's fault.
         let error = write_exec_config(root.path(), &config).unwrap_err();
         assert!(error.detail.contains(EXEC_CONFIG_PATH), "{error}");
+        assert_eq!(error.code, crate::ErrorCode::InvalidSpec, "{error}");
+
+        // A root that cannot be written is the host's failure, not the spec's.
+        let missing = root.path().join("no-such-root");
+        let error = write_exec_config(&missing, &config).unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::BackendFailed, "{error}");
 
         let host = tempfile::tempdir().unwrap();
         let target = host.path().join("host-file");

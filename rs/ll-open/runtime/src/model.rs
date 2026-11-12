@@ -597,6 +597,19 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
 /// Terminal result observed by a backend supervisor.  The service projects
 /// this into the shared execution/v1 lifecycle and receipt stream instead of
 /// leaving a run permanently `Running` after its worker exits.
+///
+/// On the libkrun tier a worker that exits nonzero is `Failed`, its detail
+/// naming the status ("exited with exit status: N"). Status 125 also means
+/// the guest never ran its workload to a recorded end: the guest init
+/// refused to start it (LLO libkrun patch 0015: a mount target that is not
+/// a real directory, a `/tmp` that is not one, a missing exec config), or
+/// the guest stopped without recording any status (patch 0016: init died,
+/// the kernel panicked). Init's reason, when it could state one, is in the
+/// run's [`GuestOutput::stdout_tail`]. A workload that itself exits 125
+/// looks the same, and the reason text is the guest's own untrusted output:
+/// neither authenticates "the runtime refused" (bead
+/// `ley-line-open-7164ec`; a channel the guest cannot write is bead
+/// `ley-line-open-f7bcb3`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendRunStatus {
     Succeeded,

@@ -510,6 +510,16 @@ impl Default for AuthorizationPolicy {
     }
 }
 
+/// A grant's `connectionsDigest @16` and the `connectionsDocument @17` it was
+/// verified against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedConnections {
+    /// `blake3-256:<hex>`, equal to the digest of `document`'s canonical bytes.
+    pub digest: String,
+    /// The parsed document; its canonical bytes are the bytes the grant carried.
+    pub document: leyline_schema_spec::connections::ConnectionsDocument,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedExecution {
     /// Generated from the bound spec/grant, never accepted from the caller.
@@ -528,6 +538,9 @@ pub struct AuthorizedExecution {
     /// that cannot otherwise obtain that document knows only whether what it
     /// applied matched, never what was authorized.
     pub confinement_manifest: Option<String>,
+    /// The connections the grant authorizes (ADR-0046 S3), verified at
+    /// authorization; `None` for a grant without them.
+    pub connections: Option<AuthorizedConnections>,
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
     pub intent: SchemaIntent,
@@ -749,14 +762,7 @@ pub fn authorize_with_verifier(
         .iter()
         .map(|value| text(value, "allowedEgress entry"))
         .collect::<Result<Vec<_>, _>>()?;
-    let credential_brokers = grant.get_credential_broker_refs().map_err(|error| {
-        ExecutionError::invalid(format!("invalid credentialBrokerRefs: {error}"))
-    })?;
-    if !credential_brokers.is_empty() {
-        return Err(ExecutionError::unsupported(
-            "credential broker authority requires a broker integration",
-        ));
-    }
+    let connections = read_connections(&grant)?;
 
     Ok(AuthorizedExecution {
         run_id,
@@ -766,12 +772,103 @@ pub fn authorize_with_verifier(
         grant_digest,
         confinement_digest,
         confinement_manifest,
+        connections,
         backend,
         allowed_egress,
         intent,
         limits,
         workspaces,
     })
+}
+
+/// The `credentialBrokerRefs` entry that marks a grant carrying
+/// `connectionsDigest @16` and `connectionsDocument @17` (ADR-0046 S3). Every
+/// daemon that predates those fields refuses a non-empty `credentialBrokerRefs`,
+/// so the marker makes the fields a critical extension.
+pub const CONNECTIONS_BROKER_REF: &str = "cloister/connections/v1";
+
+/// The connections a grant authorizes, verified: `@16`, `@17` and the marker
+/// present together or absent together; the digest recomputed from the
+/// document; the document byte-equal to its canonical form.
+fn read_connections(
+    grant: &execution_capnp::run_grant::Reader<'_>,
+) -> Result<Option<AuthorizedConnections>, ExecutionError> {
+    let brokers = grant
+        .get_credential_broker_refs()
+        .map_err(|error| ExecutionError::invalid(format!("invalid credentialBrokerRefs: {error}")))?
+        .iter()
+        .map(|value| text(value, "credentialBrokerRefs entry"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let marker = match brokers.as_slice() {
+        [] => false,
+        [only] if only == CONNECTIONS_BROKER_REF => true,
+        // Any entry this daemon does not implement, including the marker
+        // beside a credential broker D4 has not defined yet. The text is the
+        // one every daemon since execution/v1 shipped returns.
+        _ => {
+            return Err(ExecutionError::unsupported(
+                "credential broker authority requires a broker integration",
+            ));
+        }
+    };
+    let has_digest = grant.has_connections_digest();
+    let has_document = grant.has_connections_document();
+    if !marker && !has_digest && !has_document {
+        return Ok(None);
+    }
+    let missing: Vec<&str> = [
+        (has_digest, "connectionsDigest"),
+        (has_document, "connectionsDocument"),
+        (marker, "credentialBrokerRefs entry cloister/connections/v1"),
+    ]
+    .into_iter()
+    .filter_map(|(present, name)| (!present).then_some(name))
+    .collect();
+    if !missing.is_empty() {
+        return Err(ExecutionError::invalid_grant(format!(
+            "RunGrant connections are all-or-nothing: missing {}",
+            missing.join(", ")
+        )));
+    }
+
+    // Present means non-null AND non-empty: a non-null empty field is
+    // malformed, never read as absent (unlike confinementManifest).
+    let digest = read_digest(grant.get_connections_digest(), "RunGrant.connectionsDigest")
+        .map_err(|error| ExecutionError::invalid_grant(error.detail))?;
+    let document = text(
+        grant.get_connections_document(),
+        "RunGrant.connectionsDocument",
+    )
+    .map_err(|error| ExecutionError::invalid_grant(error.detail))?;
+    if document.is_empty() {
+        return Err(ExecutionError::invalid_grant(
+            "RunGrant.connectionsDocument is present but empty",
+        ));
+    }
+    let parsed = leyline_schema_spec::connections::parse(document.as_bytes()).map_err(|error| {
+        ExecutionError::invalid_grant(format!(
+            "RunGrant.connectionsDocument is not a valid cloister/connections/v1 document: {error}"
+        ))
+    })?;
+    if parsed.canonical_bytes() != document.as_bytes() {
+        return Err(ExecutionError::invalid_grant(
+            "RunGrant.connectionsDocument is not in canonical form; a runner refuses it rather than normalize",
+        ));
+    }
+    let carried = format!(
+        "{}:{}",
+        leyline_schema_spec::connections::DIGEST_ALGORITHM,
+        parsed.digest_hex()
+    );
+    if carried != digest {
+        return Err(ExecutionError::identity_mismatch(format!(
+            "RunGrant carries a connections document digesting to {carried}, but connectionsDigest names {digest}"
+        )));
+    }
+    Ok(Some(AuthorizedConnections {
+        digest,
+        document: parsed,
+    }))
 }
 
 fn read_message(

@@ -524,6 +524,17 @@ impl<B: Backend> ExecutionService<B> {
             policy,
             verifier,
         )?;
+        // ADR-0046 S3: a grant may now carry verified connections, but this
+        // daemon has no connection broker yet (bead ley-line-open-52b5b3), so
+        // a declared connection would never be served. Refuse by name before
+        // the resolver or the backend runs, rather than start a run whose
+        // connections silently do not exist. The daemon does not advertise
+        // `cloister/execution/v1/connections` until it can serve them.
+        if authorized.connections.is_some() {
+            return Err(ExecutionError::unsupported(
+                "RunGrant carries connections (cloister/connections/v1), but this daemon has no connection broker",
+            ));
+        }
         let request = resolver.resolve(&authorized)?;
         if request.run_id != authorized.run_id {
             return Err(ExecutionError::identity_mismatch(

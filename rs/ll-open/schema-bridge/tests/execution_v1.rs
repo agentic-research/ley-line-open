@@ -241,4 +241,28 @@ fn canonical_carrier_vector_conforms_to_generated_schema() {
             field,
         );
     }
+
+    // ADR-0046 S3 (bead ley-line-open-521deb): the grant carrying
+    // connectionsDigest @16, connectionsDocument @17 and the marker, with and
+    // without the fields, conforms to the same generated schema.
+    let connections_path = vector_path.with_file_name("connections-grant.json");
+    let connections: Value = serde_json::from_slice(
+        &std::fs::read(&connections_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", connections_path.display())),
+    )
+    .expect("parse connections grant vector");
+    for case in ["connections", "withoutConnections"] {
+        assert_conforms(
+            &connections[case]["grant"],
+            &json_schema["$defs"]["RunGrant"],
+            &json_schema,
+            case,
+        );
+    }
+    assert!(
+        connections["connections"]["grant"]
+            .get("connectionsDocument")
+            .is_some(),
+        "the vector exercises the new fields"
+    );
 }

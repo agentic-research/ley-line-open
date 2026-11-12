@@ -852,3 +852,120 @@ fn a_run_that_ends_while_its_cancel_is_in_flight_has_one_terminal_event() {
         );
     }
 }
+
+/// A worker that finishes after `cancel` has refreshed the run but before it
+/// reaches the backend: the backend no longer owns the run (`cancel` returns
+/// false), and its completion is published only then.
+struct FinishesBeforeBackendCancel {
+    cancelled: Mutex<bool>,
+}
+
+impl Backend for FinishesBeforeBackendCancel {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "finishes-before-backend-cancel/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+            unavailable_reason: None,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
+        }
+    }
+
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "finishes-before-backend-cancel/1".into(),
+            attached: Vec::new(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        let mut cancelled = self.cancelled.lock().expect("cancelled lock");
+        if *cancelled {
+            *cancelled = false;
+            return Ok(Some(BackendRunStatus::Succeeded));
+        }
+        Ok(None)
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        *self.cancelled.lock().expect("cancelled lock") = true;
+        Ok(false)
+    }
+}
+
+/// Cancelling a run that finished a moment before the backend saw the
+/// cancel returns the run's own terminal record, not a hard
+/// "backend no longer owns the active run" error, whichever side of the
+/// cancel's first refresh the worker finished on.
+#[test]
+fn cancelling_a_run_that_finished_during_the_cancel_returns_its_terminal_record() {
+    let service = ExecutionService::new(FinishesBeforeBackendCancel {
+        cancelled: Mutex::new(false),
+    });
+    let record = service.start(request("finished-in-cancel")).expect("start");
+    let cancelled = service
+        .cancel(&record.run_id)
+        .expect("a run that finished during the cancel is not an error");
+    assert_eq!(cancelled.state, RunState::Succeeded);
+    let terminal: Vec<RunState> = service
+        .inspect(&record.run_id, 0)
+        .expect("events")
+        .events
+        .iter()
+        .map(|event| event.state)
+        .filter(|state| {
+            matches!(
+                state,
+                RunState::Succeeded | RunState::Failed | RunState::Cancelled
+            )
+        })
+        .collect();
+    assert_eq!(terminal, vec![RunState::Succeeded]);
+}
+
+/// The daemon's cancel reply carries the state the run is in after the
+/// request, which for a run that finished first is its own terminal state,
+/// not `cancelled` (execution/v1 README, "Lifecycle"; bead
+/// `ley-line-open-9c6a8f`).
+#[test]
+fn the_cancel_reply_names_a_finished_runs_own_terminal_state() {
+    let service = ExecutionService::new(JustFinishedBackend);
+    let record = service.start(request("cancel-reply")).expect("start");
+    let reply: serde_json::Value = serde_json::from_str(
+        &leyline_runtime::transport::cancel_json(
+            &service,
+            &serde_json::json!({"runId": record.run_id, "idempotencyKey": "cancel-reply-01"})
+                .to_string(),
+        )
+        .expect("cancel JSON"),
+    )
+    .expect("cancel output JSON");
+    assert_eq!(reply["runId"], record.run_id.as_str());
+    assert_eq!(reply["state"], "succeeded");
+}
+
+/// Cancelling a run that was already cleaned up returns its record, as
+/// cancelling any finished run does, instead of asking the backend for a run
+/// it no longer holds.
+#[test]
+fn cancelling_a_cleaned_run_returns_its_record() {
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+    service.start(request("cancel-cleaned")).expect("start");
+    service.cleanup("run-01").expect("cleanup");
+    let calls = backend.calls().len();
+
+    let cancelled = service
+        .cancel("run-01")
+        .expect("cancelling a cleaned run is not an error");
+    assert_eq!(cancelled.state, RunState::Cleaned);
+    assert_eq!(
+        backend.calls().len(),
+        calls,
+        "the backend is not asked to cancel a cleaned run"
+    );
+}

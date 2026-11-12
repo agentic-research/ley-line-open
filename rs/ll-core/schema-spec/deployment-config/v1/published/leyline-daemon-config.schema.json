@@ -1,0 +1,397 @@
+{
+  "$defs": {
+    "diagnostics": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "Diagnostic output. Changes what is recorded, not what is computed.",
+      "properties": {
+        "profile": {
+          "default": false,
+          "description": "Log per-phase timings. Replaces LEYLINE_PROFILE.",
+          "type": "boolean"
+        },
+        "sheafAblationLog": {
+          "default": null,
+          "description": "Append sheaf ablation records to this file. Replaces LEYLINE_SHEAF_ABLATION_LOG.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/path"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "enrichment": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "Optional enrichment passes.",
+      "properties": {
+        "sessionCorpus": {
+          "default": null,
+          "description": "The session corpus the session-observation pass reads. `null`: the pass does nothing. Replaces LEYLINE_SESSION_CORPUS.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/path"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "head": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "How heads are signed and verified.",
+      "properties": {
+        "requireSignature": {
+          "default": false,
+          "description": "Refuse an unsigned head. Replaces LEYLINE_HEAD_REQUIRE_SIGNATURE.",
+          "type": "boolean"
+        },
+        "signingKey": {
+          "default": null,
+          "description": "The Ed25519 seed that signs heads, as a file holding 64 hex characters. `null`: heads are written unsigned. Replaces LEYLINE_HEAD_SIGNING_KEY.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/secretRef"
+            }
+          ],
+          "x-leyline-secret": true
+        },
+        "trustedKeys": {
+          "default": [],
+          "description": "Ed25519 public key files a head signature is verified against. A set. Replaces LEYLINE_HEAD_TRUSTED_KEYS.",
+          "items": {
+            "$ref": "#/$defs/path"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ipAddress": {
+      "anyOf": [
+        {
+          "pattern": "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
+        },
+        {
+          "pattern": "^[0-9a-f:.]*:[0-9a-f:.]*$"
+        }
+      ],
+      "description": "An IP literal in its one spelling: IPv4 as a dotted quad with no leading zero, IPv6 in RFC 5952 canonical text. The parser refuses any other spelling of a valid address (`non-canonical-address`); this pattern states the alphabet only.",
+      "type": "string"
+    },
+    "label": {
+      "description": "1 to 64 characters of ASCII letters, digits, `.`, `_` and `-`, starting with a letter or digit.",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "type": "string"
+    },
+    "parser": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "What the parser runs, shared by both daemon kinds and read by `parse`, `verify-head` and `rebuild` from `--config`.",
+      "properties": {
+        "queryMatchLimit": {
+          "default": 4096,
+          "description": "The tree-sitter query match limit. Replaces LLO_QUERY_MATCH_LIMIT.",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "queryProgressBudget": {
+          "default": 100000,
+          "description": "The query progress budget. Replaces LLO_QUERY_PROGRESS_BUDGET.",
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "trustedQueryHashes": {
+          "default": [],
+          "description": "BLAKE3 digests of tree-sitter query files the parser may load beyond the compiled set. A set: sorted in the resolved document, a duplicate refused. Replaces LLO_TRUSTED_QUERY_HASHES.",
+          "items": {
+            "$ref": "#/$defs/queryHash"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "path": {
+      "description": "An absolute path, or one beginning `~/`, which resolves against HOME. No empty, `.` or `..` component and no trailing `/`. UTF-8 without U+0000-U+001F, U+007F-U+009F, U+2028, U+2029, `\"` or `\\`.",
+      "not": {
+        "pattern": "(^|/)\\.\\.?(/|$)"
+      },
+      "pattern": "^~?(/[^/\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\"\\\\]+)+$",
+      "type": "string"
+    },
+    "queryHash": {
+      "description": "A BLAKE3 digest of a tree-sitter query file: 64 lowercase hex characters.",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "secretRef": {
+      "additionalProperties": false,
+      "description": "A reference to a secret; never its value (ADR-0049 D4). v1 delivers `file`. `keychain` and `vault` are reserved: a v1 binary refuses them by name (`secret-ref-not-delivered`). Any other key is `unknown-key`; a string, number, array or other object in a secret field is `secret-inlined`.",
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/path"
+        }
+      },
+      "required": [
+        "file"
+      ],
+      "type": "object",
+      "x-leyline-reserved": [
+        "keychain",
+        "vault"
+      ]
+    },
+    "source": {
+      "additionalProperties": false,
+      "description": "The source tree the daemon's store is parsed from. `null` (the default) means none.",
+      "properties": {
+        "language": {
+          "default": null,
+          "description": "A language filter. `null` detects the language per file.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/label"
+            }
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/agentic-research/ley-line-open/rs/ll-core/schema-spec/deployment-config/v1/published/leyline-daemon-config.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The deployment configuration of `leyline daemon` (ADR-0049). Every optional field states its default; an omitted field means that default, never \"unset\". Rules this schema cannot state, and which the parser enforces (README \"Rules\"): a key twice in one object, a JSON escape in a string, a non-canonical IP spelling, a duplicate set entry, the cross-field rules, and the host checks.",
+  "properties": {
+    "apiVersion": {
+      "const": "config.leyline/v1"
+    },
+    "arena": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/path",
+          "description": "The arena file. Replaces --arena.",
+          "x-leyline-default": "<HOME>/.mache/default.arena"
+        },
+        "sizeMib": {
+          "default": 64,
+          "description": "The arena size in MiB. Replaces --arena-size-mib.",
+          "maximum": 1048576,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "cdc": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Activate or resume the private CDC index over source_blobs. Replaces --cdc.",
+          "type": "boolean"
+        },
+        "target": {
+          "const": "source-blobs",
+          "default": "source-blobs",
+          "description": "The CDC target. Inert when `enabled` is false. Replaces --cdc-target."
+        }
+      },
+      "type": "object"
+    },
+    "control": {
+      "$ref": "#/$defs/path",
+      "description": "The controller (.ctrl) file. Replaces --control.",
+      "x-leyline-default": "arena.path with its extension replaced by .ctrl"
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/diagnostics"
+    },
+    "enrichment": {
+      "$ref": "#/$defs/enrichment"
+    },
+    "head": {
+      "$ref": "#/$defs/head"
+    },
+    "kind": {
+      "const": "DaemonConfig"
+    },
+    "mcp": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "The MCP surface. Off unless a listener is configured.",
+      "properties": {
+        "groups": {
+          "default": null,
+          "description": "The Cloister groups the listeners' callers are granted. A set. `null`: every group. Replaces --mcp-groups.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "items": {
+                "$ref": "#/$defs/label"
+              },
+              "type": "array"
+            }
+          ]
+        },
+        "http": {
+          "default": null,
+          "description": "An MCP HTTP listener. `null`: none. Replaces --mcp-port, --mcp-bind and --mcp-allow-public.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "allowPublic": {
+                  "default": false,
+                  "description": "Required for a non-loopback bind (`public-bind-without-opt-in`).",
+                  "type": "boolean",
+                  "x-leyline-fail-closed": true
+                },
+                "bind": {
+                  "$ref": "#/$defs/ipAddress",
+                  "default": "127.0.0.1"
+                },
+                "port": {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "port"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "noAuth": {
+          "default": false,
+          "description": "Disable the ADR-0022 token gate on both listeners. Replaces --mcp-no-auth.",
+          "type": "boolean",
+          "x-leyline-fail-closed": true
+        },
+        "tokenFile": {
+          "$ref": "#/$defs/secretRef",
+          "description": "The ADR-0022 shared-secret token, generated (exclusively, never through a symlink) when absent.",
+          "x-leyline-default": "{\"file\": \"<data_dir>/leyline/daemon.token\"}",
+          "x-leyline-secret": true
+        },
+        "uds": {
+          "default": null,
+          "description": "An MCP listener on this Unix socket. `null`: none. Replaces --mcp-uds.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/path"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "mount": {
+      "default": null,
+      "description": "Serve the store as a filesystem here. `null` (the default) runs headless. Replaces --mount, --backend and --nfs-port.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "backend": {
+              "enum": [
+                "nfs",
+                "fuse"
+              ],
+              "x-leyline-default": "nfs on macOS, fuse on Linux"
+            },
+            "nfsPort": {
+              "default": 0,
+              "description": "The NFS listen port; 0 lets the kernel pick.",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "parser": {
+      "$ref": "#/$defs/parser"
+    },
+    "shutdownAfterSeconds": {
+      "default": null,
+      "description": "Shut down after this many seconds; 0 shuts down at once. `null`: no automatic shutdown. Replaces --timeout.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      ]
+    },
+    "source": {
+      "default": null,
+      "description": "Replaces --source and --language.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/source"
+        }
+      ]
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind"
+  ],
+  "title": "DaemonConfig (config.leyline/v1)",
+  "type": "object"
+}

@@ -1,0 +1,297 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "kind": "DaemonConfig",
+  "description": "deployment-config/v1 vectors for DaemonConfig (ADR-0049). Every `input` is the document text, byte for byte. `cases` pin the canonical resolved bytes and configDigest (BLAKE3-256 over them) under the named host; ExecutionDaemonConfig cases also pin the backend struct values the runtime library entry builds. Every `rejects` input is refused with the pinned field and reason (the first refusal in README order); `schemaRefuses` says whether the published JSON Schema refuses it too. `hosts` are the injected HostFacts each case resolves under (home, XDG_STATE_HOME, the platform data directory, the OS); a null member is unset.",
+  "hosts": {
+    "macos": {
+      "home": "/Users/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/Users/fixture/Library/Application Support",
+      "os": "macos"
+    },
+    "linux": {
+      "home": "/home/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "linux-xdg": {
+      "home": "/home/fixture",
+      "xdgStateHome": "/home/fixture/.state",
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "no-home": {
+      "home": null,
+      "xdgStateHome": null,
+      "dataDir": null,
+      "os": "linux"
+    }
+  },
+  "cases": [
+    {
+      "name": "minimal-macos",
+      "description": "apiVersion and kind only: headless, no MCP listener, every default.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\"}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/default.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/Users/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": null,\n    \"http\": null,\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/Users/fixture/Library/Application Support/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": null,\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": null\n}",
+      "configDigest": "blake3-256:257876ceeb2c2be4e4305d45008ec5587e2fcd3326d4ec8141bc469cc084d507"
+    },
+    {
+      "name": "minimal-linux",
+      "description": "apiVersion and kind only: headless, no MCP listener, every default.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\"}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/default.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/home/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": null,\n    \"http\": null,\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/home/fixture/.local/share/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": null,\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": null\n}",
+      "configDigest": "blake3-256:fb1c920029eb2fb3d3180c8b6f321a0b3efdc4439c8e44de85d1d4e3a0b0218e"
+    },
+    {
+      "name": "standalone-mount-macos",
+      "description": "The standalone example (ADR-0049 D8): the mount backend defaults per OS.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"source\": {\"path\": \"~/src/my-project\"}, \"mount\": {\"path\": \"~/mnt/my-project\"}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/default.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/Users/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": null,\n    \"http\": null,\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/Users/fixture/Library/Application Support/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": {\n    \"backend\": \"nfs\",\n    \"nfsPort\": 0,\n    \"path\": \"/Users/fixture/mnt/my-project\"\n  },\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": {\n    \"language\": null,\n    \"path\": \"/Users/fixture/src/my-project\"\n  }\n}",
+      "configDigest": "blake3-256:8a1f0fd7f73d4e764351742f2ef6ffe5779f2e609a165453d59631da5c394516"
+    },
+    {
+      "name": "standalone-mount-linux",
+      "description": "The standalone example (ADR-0049 D8): the mount backend defaults per OS.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"source\": {\"path\": \"~/src/my-project\"}, \"mount\": {\"path\": \"~/mnt/my-project\"}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/default.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/home/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": null,\n    \"http\": null,\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/home/fixture/.local/share/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": {\n    \"backend\": \"fuse\",\n    \"nfsPort\": 0,\n    \"path\": \"/home/fixture/mnt/my-project\"\n  },\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": {\n    \"language\": null,\n    \"path\": \"/home/fixture/src/my-project\"\n  }\n}",
+      "configDigest": "blake3-256:cb39a07c780e884938a559617d61c02a1b0aa27ba3b7918135f4a3bacc29bf22"
+    },
+    {
+      "name": "mache-spawn",
+      "description": "What mache's spawn argv (--arena --arena-size-mib 64 --control --source --cdc --cdc-target source-blobs) translates to.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"arena\": {\"path\": \"/Users/fixture/.mache/7f3a.arena\", \"sizeMib\": 64}, \"control\": \"/Users/fixture/.mache/7f3a.ctrl\", \"source\": {\"path\": \"/Users/fixture/src/repo\"}, \"cdc\": {\"enabled\": true, \"target\": \"source-blobs\"}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/7f3a.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": true,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/Users/fixture/.mache/7f3a.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": null,\n    \"http\": null,\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/Users/fixture/Library/Application Support/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": null,\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": {\n    \"language\": null,\n    \"path\": \"/Users/fixture/src/repo\"\n  }\n}",
+      "configDigest": "blake3-256:6810cfab12012b5f97ead1c4ee23ac30219a8a2e38ee1d6849669c8cefd68341"
+    },
+    {
+      "name": "cloister-e2e-smoke",
+      "description": "Cloister's e2e smoke argv: --arena --control --mcp-port --mcp-no-auth --timeout 120s.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"arena\": {\"path\": \"/tmp/work/test.arena\"}, \"control\": \"/tmp/work/test.ctrl\", \"mcp\": {\"http\": {\"port\": 8384}, \"noAuth\": true}, \"shutdownAfterSeconds\": 120}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/tmp/work/test.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/tmp/work/test.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": null,\n    \"http\": {\n      \"allowPublic\": false,\n      \"bind\": \"127.0.0.1\",\n      \"port\": 8384\n    },\n    \"noAuth\": true,\n    \"tokenFile\": {\n      \"file\": \"/home/fixture/.local/share/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": null,\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": 120,\n  \"source\": null\n}",
+      "configDigest": "blake3-256:5f1e26bc23fbb06ac13209bdd818d68255f3f44ef0278cf0535d07b2092709ac"
+    },
+    {
+      "name": "every-field",
+      "description": "A public bind with its opt-in, groups as a sorted set, an explicit token file, shutdownAfterSeconds 0 (shut down at once).",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"arena\": {\"sizeMib\": 1048576}, \"mount\": {\"path\": \"/Volumes/project\", \"backend\": \"fuse\", \"nfsPort\": 65535}, \"shutdownAfterSeconds\": 0, \"mcp\": {\"http\": {\"port\": 1, \"bind\": \"0.0.0.0\", \"allowPublic\": true}, \"uds\": \"~/.mache/mcp.sock\", \"groups\": [\"query\", \"lsp\"], \"tokenFile\": {\"file\": \"~/.config/leyline/daemon.token\"}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/default.arena\",\n    \"sizeMib\": 1048576\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/Users/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": [\n      \"lsp\",\n      \"query\"\n    ],\n    \"http\": {\n      \"allowPublic\": true,\n      \"bind\": \"0.0.0.0\",\n      \"port\": 1\n    },\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/Users/fixture/.config/leyline/daemon.token\"\n    },\n    \"uds\": \"/Users/fixture/.mache/mcp.sock\"\n  },\n  \"mount\": {\n    \"backend\": \"fuse\",\n    \"nfsPort\": 65535,\n    \"path\": \"/Volumes/project\"\n  },\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": 0,\n  \"source\": null\n}",
+      "configDigest": "blake3-256:effa76b86607173f56f6d83d885b8e628d9ac449465984816b21a565e46a43ea"
+    },
+    {
+      "name": "ipv6-loopback-and-empty-groups",
+      "description": "::1 is loopback; an empty group list stays an empty list.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"http\": {\"port\": 8384, \"bind\": \"::1\"}, \"groups\": []}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/default.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/home/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": [],\n    \"http\": {\n      \"allowPublic\": false,\n      \"bind\": \"::1\",\n      \"port\": 8384\n    },\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/home/fixture/.local/share/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": null,\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": null\n}",
+      "configDigest": "blake3-256:22b22ee931f9c9d1cc23fc45c14c3e8a78fac635d8bbac9c1d0d313d472b7254"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "public-bind-without-opt-in",
+      "description": "A non-loopback bind needs mcp.http.allowPublic.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"http\": {\"port\": 8384, \"bind\": \"0.0.0.0\"}}}",
+      "field": "mcp.http.bind",
+      "reason": "public-bind-without-opt-in",
+      "schemaRefuses": false
+    },
+    {
+      "name": "non-canonical-ipv4",
+      "description": "A leading zero.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"http\": {\"port\": 1, \"bind\": \"127.000.0.1\"}}}",
+      "field": "mcp.http.bind",
+      "reason": "non-canonical-address",
+      "schemaRefuses": true
+    },
+    {
+      "name": "non-canonical-ipv6",
+      "description": "Not RFC 5952 text.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"http\": {\"port\": 1, \"bind\": \"0:0:0:0:0:0:0:1\"}}}",
+      "field": "mcp.http.bind",
+      "reason": "non-canonical-address",
+      "schemaRefuses": false
+    },
+    {
+      "name": "bind-not-an-address",
+      "description": "A name is not an IP literal.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"http\": {\"port\": 1, \"bind\": \"localhost\"}}}",
+      "field": "mcp.http.bind",
+      "reason": "bad-address",
+      "schemaRefuses": true
+    },
+    {
+      "name": "mount-without-path",
+      "description": "An empty mount object (an empty TOML [mount]) lacks its required path.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mount\": {}}",
+      "field": "mount.path",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "mount-backend-unknown",
+      "description": "Not nfs or fuse.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mount\": {\"path\": \"/m\", \"backend\": \"smb\"}}",
+      "field": "mount.backend",
+      "reason": "not-in-enum",
+      "schemaRefuses": true
+    },
+    {
+      "name": "nfs-port-above",
+      "description": "Above 65535.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mount\": {\"path\": \"/m\", \"nfsPort\": 65536}}",
+      "field": "mount.nfsPort",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "mcp-http-without-port",
+      "description": "An empty mcp.http lacks its port.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"http\": {}}}",
+      "field": "mcp.http.port",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "mcp-port-zero",
+      "description": "Port 0.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"http\": {\"port\": 0}}}",
+      "field": "mcp.http.port",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "token-file-null",
+      "description": "tokenFile's default is a reference, not null.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"tokenFile\": null}}",
+      "field": "mcp.tokenFile",
+      "reason": "null-not-allowed",
+      "schemaRefuses": true
+    },
+    {
+      "name": "token-file-inlined",
+      "description": "A token value in the document.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"tokenFile\": \"0123abcd\"}}",
+      "field": "mcp.tokenFile",
+      "reason": "secret-inlined",
+      "schemaRefuses": true
+    },
+    {
+      "name": "groups-duplicate",
+      "description": "A set lists one group twice.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"groups\": [\"query\", \"query\"]}}",
+      "field": "mcp.groups",
+      "reason": "duplicate-entry",
+      "schemaRefuses": false
+    },
+    {
+      "name": "cdc-target-nodes",
+      "description": "The removed nodes target.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"cdc\": {\"target\": \"nodes\"}}",
+      "field": "cdc.target",
+      "reason": "not-in-enum",
+      "schemaRefuses": true
+    },
+    {
+      "name": "arena-size-zero",
+      "description": "sizeMib is at least 1.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"arena\": {\"sizeMib\": 0}}",
+      "field": "arena.sizeMib",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "shutdown-negative",
+      "description": "A negative timeout.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"shutdownAfterSeconds\": -1}",
+      "field": "shutdownAfterSeconds",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "execution-key-in-daemon",
+      "description": "worker is an ExecutionDaemonConfig key.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"worker\": {}}",
+      "field": "worker",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "wrong-kind",
+      "description": "An ExecutionDaemonConfig handed to the daemon.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\"}",
+      "field": "kind",
+      "reason": "wrong-kind",
+      "schemaRefuses": true
+    },
+    {
+      "name": "home-unset",
+      "description": "The arena default needs HOME.",
+      "host": "no-home",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\"}",
+      "field": "arena.path",
+      "reason": "bad-host-default",
+      "schemaRefuses": false
+    },
+    {
+      "name": "data-dir-unset",
+      "description": "The token default needs the platform data directory.",
+      "host": "no-home",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"arena\": {\"path\": \"/a/default.arena\"}}",
+      "field": "mcp.tokenFile",
+      "reason": "bad-host-default",
+      "schemaRefuses": false
+    }
+  ]
+}

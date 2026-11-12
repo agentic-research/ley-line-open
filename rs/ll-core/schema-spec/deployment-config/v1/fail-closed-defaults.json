@@ -1,0 +1,17 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "description": "ADR-0049 D9: the default of every `x-leyline-fail-closed` field as last released, and its loosening value. `verify_deployment_config_schema` fails when a schema's default differs from this baseline; moving a default to its `loose` value is `config.leyline/v2`, never a v1 change. A narrowing updates this file in the same pull request, with a Breaking CHANGELOG entry.",
+  "kinds": {
+    "DaemonConfig": {
+      "mcp.http.allowPublic": {"default": false, "loose": true},
+      "mcp.noAuth": {"default": false, "loose": true}
+    },
+    "ExecutionDaemonConfig": {
+      "backend.microVm.tsiHijackInet": {"default": false, "loose": true}
+    },
+    "SignHelperConfig": {
+      "auth.required": {"default": true, "loose": false},
+      "signAllow.required": {"default": true, "loose": false}
+    }
+  }
+}

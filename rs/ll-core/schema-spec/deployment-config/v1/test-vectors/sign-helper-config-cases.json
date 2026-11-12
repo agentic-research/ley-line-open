@@ -1,0 +1,222 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "kind": "SignHelperConfig",
+  "description": "deployment-config/v1 vectors for SignHelperConfig (ADR-0049). Every `input` is the document text, byte for byte. `cases` pin the canonical resolved bytes and configDigest (BLAKE3-256 over them) under the named host; ExecutionDaemonConfig cases also pin the backend struct values the runtime library entry builds. Every `rejects` input is refused with the pinned field and reason (the first refusal in README order); `schemaRefuses` says whether the published JSON Schema refuses it too. `hosts` are the injected HostFacts each case resolves under (home, XDG_STATE_HOME, the platform data directory, the OS); a null member is unset.",
+  "hosts": {
+    "macos": {
+      "home": "/Users/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/Users/fixture/Library/Application Support",
+      "os": "macos"
+    },
+    "linux": {
+      "home": "/home/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "linux-xdg": {
+      "home": "/home/fixture",
+      "xdgStateHome": "/home/fixture/.state",
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "no-home": {
+      "home": null,
+      "xdgStateHome": null,
+      "dataDir": null,
+      "os": "linux"
+    }
+  },
+  "cases": [
+    {
+      "name": "deny-by-default",
+      "description": "Only caller tokens and one caller's allow-list: auth.required and signAllow.required resolve to true.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"auth\": {\n    \"callerTokens\": {\n      \"file\": \"/etc/leyline/caller-tokens\"\n    },\n    \"required\": true\n  },\n  \"bind\": \"127.0.0.1:8786\",\n  \"health\": {\n    \"probeUrl\": null\n  },\n  \"keychainAccount\": \"cloister\",\n  \"kind\": \"SignHelperConfig\",\n  \"rateLimitPerSecond\": 1000,\n  \"resolveAllow\": [],\n  \"resolveCache\": {\n    \"maxEntries\": 1024,\n    \"ttlMs\": null\n  },\n  \"signAllow\": {\n    \"callers\": {\n      \"cloister\": [\n        \"keychain://com.cloister/\"\n      ]\n    },\n    \"required\": true\n  },\n  \"subprocess\": {\n    \"opBin\": null,\n    \"securityBin\": null\n  }\n}",
+      "configDigest": "blake3-256:b32e139852a8fdd566ea44cb3c474e479389aae038fa01ccd36e63b302613861"
+    },
+    {
+      "name": "dev-mode",
+      "description": "Dev mode states auth.required and signAllow.required false explicitly.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"required\": false}, \"signAllow\": {\"required\": false}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"auth\": {\n    \"callerTokens\": null,\n    \"required\": false\n  },\n  \"bind\": \"127.0.0.1:8786\",\n  \"health\": {\n    \"probeUrl\": null\n  },\n  \"keychainAccount\": \"cloister\",\n  \"kind\": \"SignHelperConfig\",\n  \"rateLimitPerSecond\": 1000,\n  \"resolveAllow\": [],\n  \"resolveCache\": {\n    \"maxEntries\": 1024,\n    \"ttlMs\": null\n  },\n  \"signAllow\": {\n    \"callers\": {},\n    \"required\": false\n  },\n  \"subprocess\": {\n    \"opBin\": null,\n    \"securityBin\": null\n  }\n}",
+      "configDigest": "blake3-256:74667c826432cd8027f3260daf923780f18c907aeb4156feb092640be76b8e43"
+    },
+    {
+      "name": "every-field",
+      "description": "Every field: an IPv6 loopback bind, sorted allow-lists, a caller with an empty list beside one with prefixes.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"bind\": \"[::1]:9000\", \"rateLimitPerSecond\": 4294967295, \"auth\": {\"callerTokens\": {\"file\": \"~/.config/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"rosary\": [], \"cloister\": [\"op://vault/item\", \"keychain://com.cloister/sk-\"]}}, \"resolveAllow\": [\"keychain://com.cloister/vault-kek-\", \"apple-password://com.cloister/kek-\"], \"resolveCache\": {\"maxEntries\": 1, \"ttlMs\": 0}, \"subprocess\": {\"opBin\": \"/opt/homebrew/bin/op\", \"securityBin\": \"/usr/bin/security\"}, \"health\": {\"probeUrl\": \"keychain://com.cloister/health-probe\"}, \"keychainAccount\": \"cloister-dev\"}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"auth\": {\n    \"callerTokens\": {\n      \"file\": \"/Users/fixture/.config/leyline/caller-tokens\"\n    },\n    \"required\": true\n  },\n  \"bind\": \"[::1]:9000\",\n  \"health\": {\n    \"probeUrl\": \"keychain://com.cloister/health-probe\"\n  },\n  \"keychainAccount\": \"cloister-dev\",\n  \"kind\": \"SignHelperConfig\",\n  \"rateLimitPerSecond\": 4294967295,\n  \"resolveAllow\": [\n    \"apple-password://com.cloister/kek-\",\n    \"keychain://com.cloister/vault-kek-\"\n  ],\n  \"resolveCache\": {\n    \"maxEntries\": 1,\n    \"ttlMs\": 0\n  },\n  \"signAllow\": {\n    \"callers\": {\n      \"cloister\": [\n        \"keychain://com.cloister/sk-\",\n        \"op://vault/item\"\n      ],\n      \"rosary\": []\n    },\n    \"required\": true\n  },\n  \"subprocess\": {\n    \"opBin\": \"/opt/homebrew/bin/op\",\n    \"securityBin\": \"/usr/bin/security\"\n  }\n}",
+      "configDigest": "blake3-256:b80a23210356bdb749d73135959ffe8b7c0fcf67713eebe5f05b01e6d53b0be6"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "no-auth",
+      "description": "The minimal document: auth.required defaults true and no caller tokens are named.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\"}",
+      "field": "auth.callerTokens",
+      "reason": "caller-tokens-required",
+      "schemaRefuses": false
+    },
+    {
+      "name": "no-sign-allow",
+      "description": "signAllow.required defaults true and no caller has a prefix.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {}}}",
+      "field": "signAllow.callers",
+      "reason": "sign-allow-required",
+      "schemaRefuses": false
+    },
+    {
+      "name": "sign-allow-only-empty-lists",
+      "description": "A caller with an empty list does not satisfy signAllow.required.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"a\": []}}}",
+      "field": "signAllow.callers",
+      "reason": "sign-allow-required",
+      "schemaRefuses": false
+    },
+    {
+      "name": "bind-public",
+      "description": "0.0.0.0 is not loopback (ADR-0019 requirement 2): refused at parse, before any bind.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"bind\": \"0.0.0.0:8786\"}",
+      "field": "bind",
+      "reason": "bind-not-loopback",
+      "schemaRefuses": true
+    },
+    {
+      "name": "bind-no-port",
+      "description": "bind is IP:port.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"bind\": \"127.0.0.1\"}",
+      "field": "bind",
+      "reason": "bad-address",
+      "schemaRefuses": true
+    },
+    {
+      "name": "bind-port-zero",
+      "description": "Port 0.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"bind\": \"127.0.0.1:0\"}",
+      "field": "bind",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "bind-name",
+      "description": "A name is not an IP literal.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"bind\": \"localhost:8786\"}",
+      "field": "bind",
+      "reason": "bad-address",
+      "schemaRefuses": true
+    },
+    {
+      "name": "bind-non-canonical",
+      "description": "A leading zero in the port.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"bind\": \"127.0.0.1:08786\"}",
+      "field": "bind",
+      "reason": "non-canonical-address",
+      "schemaRefuses": true
+    },
+    {
+      "name": "rate-limit-above-u32",
+      "description": "Above 4294967295.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"rateLimitPerSecond\": 4294967296}",
+      "field": "rateLimitPerSecond",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "caller-not-a-label",
+      "description": "A caller is a label.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"a b\": [\"op://x\"]}}}",
+      "field": "signAllow.callers.a b",
+      "reason": "bad-label",
+      "schemaRefuses": true
+    },
+    {
+      "name": "caller-tokens-inlined",
+      "description": "The token map in the document.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": \"cloister=tok\"}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}}",
+      "field": "auth.callerTokens",
+      "reason": "secret-inlined",
+      "schemaRefuses": true
+    },
+    {
+      "name": "caller-tokens-keychain",
+      "description": "A reserved reference.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"keychain\": \"x\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}}",
+      "field": "auth.callerTokens",
+      "reason": "secret-ref-not-delivered",
+      "schemaRefuses": true
+    },
+    {
+      "name": "resolve-allow-not-a-url",
+      "description": "Not a URL prefix.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"resolveAllow\": [\"nope\"]}",
+      "field": "resolveAllow[0]",
+      "reason": "bad-url-prefix",
+      "schemaRefuses": true
+    },
+    {
+      "name": "resolve-allow-duplicate",
+      "description": "A set lists one prefix twice.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"resolveAllow\": [\"op://a\", \"op://a\"]}",
+      "field": "resolveAllow",
+      "reason": "duplicate-entry",
+      "schemaRefuses": false
+    },
+    {
+      "name": "keychain-account-empty",
+      "description": "An empty label.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"keychainAccount\": \"\"}",
+      "field": "keychainAccount",
+      "reason": "bad-label",
+      "schemaRefuses": true
+    },
+    {
+      "name": "foreground-removed",
+      "description": "--foreground has no key.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"auth\": {\"callerTokens\": {\"file\": \"/etc/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"keychain://com.cloister/\"]}}, \"foreground\": true}",
+      "field": "foreground",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    }
+  ]
+}

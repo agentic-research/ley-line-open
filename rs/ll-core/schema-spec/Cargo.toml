@@ -28,8 +28,17 @@ readme = "README.md"
 # bytes), so an issuer digests with the same code the vectors test. Also used by
 # the tests below (verify_confinement_digest and the connections tests).
 blake3 = { workspace = true }
+# Bead ley-line-open-52c177 (ADR-0049 D4): the deployment-config file rules
+# open each directory and the file with openat(O_NOFOLLOW) and fstat the
+# descriptors they read through.
+libc = { workspace = true }
+# ADR-0049 D7: the TOML adapter onto the deployment-config data model. Already
+# in the lock (leyline-ts's optional pyproject reader uses the same major).
+toml = "1"
 
 [dev-dependencies]
+# deployment_config::files tests build temporary directories.
+tempfile = { workspace = true }
 # Used by the VECTORS.sha256 verification test only. Version matches the two
 # existing workspace consumers (leyline-sheaf, leyline-sign) so cargo resolves
 # a single copy across the workspace.

@@ -1706,6 +1706,20 @@ tasks:
         cp "$out/execution.tools.json" ll-open/cli-lib/src/daemon/execution-tools.json
         echo "regenerated ll-open/cli-lib/src/daemon/execution-tools.json"
 
+  gen:deployment-config-schema:
+    desc: |
+      Regenerate deployment-config/v1/published/ (ADR-0049 D2): the three
+      self-contained kind schemas, with common.schema.json's definitions
+      inlined, and leyline-removed-variables.json from
+      removed-variables.source.json. The generator is the drift test
+      itself (verify_deployment_config_schema), so the files it writes are
+      the bytes it checks; run after editing any schema source or the
+      removed-variable list.
+    dir: rs
+    cmds:
+      - LEYLINE_REGEN_DEPLOYMENT_CONFIG=1 cargo test --quiet -p leyline-schema-spec --test verify_deployment_config_schema published_artifacts_are_generated_from_the_sources
+      - echo "regenerated ll-core/schema-spec/deployment-config/v1/published/"
+
   gen:server-json:
     desc: |
       Regenerate server.json from leyline-cli-lib::daemon::mcp

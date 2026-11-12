@@ -1,0 +1,215 @@
+{
+  "$defs": {
+    "label": {
+      "description": "1 to 64 characters of ASCII letters, digits, `.`, `_` and `-`, starting with a letter or digit.",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "type": "string"
+    },
+    "path": {
+      "description": "An absolute path, or one beginning `~/`, which resolves against HOME. No empty, `.` or `..` component and no trailing `/`. UTF-8 without U+0000-U+001F, U+007F-U+009F, U+2028, U+2029, `\"` or `\\`.",
+      "not": {
+        "pattern": "(^|/)\\.\\.?(/|$)"
+      },
+      "pattern": "^~?(/[^/\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\"\\\\]+)+$",
+      "type": "string"
+    },
+    "secretRef": {
+      "additionalProperties": false,
+      "description": "A reference to a secret; never its value (ADR-0049 D4). v1 delivers `file`. `keychain` and `vault` are reserved: a v1 binary refuses them by name (`secret-ref-not-delivered`). Any other key is `unknown-key`; a string, number, array or other object in a secret field is `secret-inlined`.",
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/path"
+        }
+      },
+      "required": [
+        "file"
+      ],
+      "type": "object",
+      "x-leyline-reserved": [
+        "keychain",
+        "vault"
+      ]
+    },
+    "urlPrefix": {
+      "description": "A keystore URL or URL prefix: a lowercase scheme, `://`, then printable ASCII without space, `\"` or `\\`. At most 2048 bytes.",
+      "maxLength": 2048,
+      "pattern": "^[a-z][a-z0-9+.-]*://[!#-\\[\\]-~]*$",
+      "type": "string"
+    }
+  },
+  "$id": "https://github.com/agentic-research/ley-line-open/rs/ll-core/schema-spec/deployment-config/v1/published/leyline-sign-helper-config.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The deployment configuration of `leyline-sign-helper` (ADR-0019, ADR-0049). Deny by default: `auth.required` and `signAllow.required` default to true. Rules this schema cannot state, and which the parser enforces (README \"Rules\"): a key twice in one object, a JSON escape in a string, a non-canonical or non-loopback bind, a duplicate set entry, `sign-allow-required`, and the host checks (`caller-tokens-required` reads the caller-tokens file).",
+  "properties": {
+    "apiVersion": {
+      "const": "config.leyline/v1"
+    },
+    "auth": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "callerTokens": {
+          "default": null,
+          "description": "A file holding the bearer tokens as `name=token,...`. Replaces LEYLINE_SIGN_CALLER_TOKENS.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/secretRef"
+            }
+          ],
+          "x-leyline-secret": true
+        },
+        "required": {
+          "default": true,
+          "description": "Refuse to start without a non-empty caller map (`caller-tokens-required`). Dev mode states false. Replaces --require-auth (whose default was false).",
+          "type": "boolean",
+          "x-leyline-fail-closed": true
+        }
+      },
+      "type": "object"
+    },
+    "bind": {
+      "default": "127.0.0.1:8786",
+      "description": "The loopback socket address the helper listens on (ADR-0019 requirement 2): `127.x.y.z:port` or `[::1]:port`, port 1-65535. Replaces --bind.",
+      "pattern": "^(127\\.((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){2}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|\\[::1\\]):(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})$",
+      "type": "string"
+    },
+    "health": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "probeUrl": {
+          "default": null,
+          "description": "The keystore URL `/healthz?deep=1` resolves. `null`: deep health reports unconfigured. Replaces LEYLINE_SIGN_HEALTHZ_PROBE_URL.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/urlPrefix"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "keychainAccount": {
+      "$ref": "#/$defs/label",
+      "default": "cloister",
+      "description": "The keychain account. Replaces KEYCHAIN_ACCOUNT."
+    },
+    "kind": {
+      "const": "SignHelperConfig"
+    },
+    "rateLimitPerSecond": {
+      "default": 1000,
+      "description": "Per-UID signatures per second (ADR-0019 requirement 10). Replaces --rate-limit.",
+      "maximum": 4294967295,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "resolveAllow": {
+      "default": [],
+      "description": "URL prefixes `/resolve` may serve. A set; empty denies all. A prefix that would authorize a signing-key URL is refused at start. Replaces LEYLINE_SIGN_RESOLVE_ALLOW.",
+      "items": {
+        "$ref": "#/$defs/urlPrefix"
+      },
+      "type": "array"
+    },
+    "resolveCache": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "maxEntries": {
+          "default": 1024,
+          "description": "Replaces LEYLINE_SIGN_RESOLVE_CACHE_MAX.",
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "ttlMs": {
+          "default": null,
+          "description": "`null`: per scheme (60000 for op:// and apple-password://, 0 otherwise). Replaces LEYLINE_SIGN_RESOLVE_TTL_MS.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "signAllow": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "callers": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/urlPrefix"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "description": "Caller label to the URL prefixes it may ask `/sign` for. Each list is a set. Replaces LEYLINE_SIGN_SIGN_ALLOW.",
+          "propertyNames": {
+            "$ref": "#/$defs/label"
+          },
+          "type": "object"
+        },
+        "required": {
+          "default": true,
+          "description": "Refuse to start unless some caller has a non-empty prefix list (`sign-allow-required`). Replaces --require-sign-allow (whose default was false).",
+          "type": "boolean",
+          "x-leyline-fail-closed": true
+        }
+      },
+      "type": "object"
+    },
+    "subprocess": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "opBin": {
+          "default": null,
+          "description": "The `op` binary. `null`: op:// is unavailable. Replaces LEYLINE_SIGN_OP_BIN.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/path"
+            }
+          ]
+        },
+        "securityBin": {
+          "default": null,
+          "description": "The `security` binary. `null`: apple-password:// is unavailable. Replaces LEYLINE_SIGN_SECURITY_BIN.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/path"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind"
+  ],
+  "title": "SignHelperConfig (config.leyline/v1)",
+  "type": "object"
+}

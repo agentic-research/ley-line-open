@@ -1,0 +1,10 @@
+# SHA-256 content-integrity pins for deployment-config/v1 vectors (ADR-0049).
+# Verified by the `verify_vectors_sha256` cargo test in the schema-spec crate.
+# The BLAKE3-256 configDigest pins live in the vectors and are checked by
+# verify_deployment_config_vectors (Rust) and ref-impl-py (Python).
+
+8455da94ec31681e7f254b9239f1ce83bb178cb93b9494456239f4c1098be567  test-vectors/canonical-strings.json
+c5db46e17462d045021625f7af21f60bb0efaa05882b5dc44d8a19f6983970c2  test-vectors/daemon-config-cases.json
+b711859c9dc3074c856d3b6ea80be514917d7aac9e2c9900ebd7f9d1fa3d3966  test-vectors/execution-daemon-config-cases.json
+8403c6a493043af2c27cf82dd6c3387da402db78ea9f8671e29fcfbae22d52bc  test-vectors/sign-helper-config-cases.json
+2410cc799ac25f5872808ba3b0589db87d2ea97767b0fc3e854b879bac469909  test-vectors/toml-equivalence.json

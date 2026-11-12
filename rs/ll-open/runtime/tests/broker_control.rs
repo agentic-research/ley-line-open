@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -19,7 +19,7 @@ use leyline_runtime::ExecutionError;
 use leyline_runtime::broker::control::{
     Args, BrokerProcess, Event, Request, WireOutcome, line, parse_args, serve,
 };
-use leyline_runtime::broker::relay::Limits;
+use leyline_runtime::broker::relay::{Limits, PeerPid};
 use leyline_schema_spec::connections::{Connection, ConnectionsDocument};
 
 const BROKER: &str = env!("CARGO_BIN_EXE_leyline-conn-broker");
@@ -85,7 +85,7 @@ impl InProcess {
             serve(
                 BufReader::new(broker_in),
                 broker_out,
-                None,
+                PeerPid::Any,
                 Limits::default(),
                 confine,
             )
@@ -125,14 +125,21 @@ fn arguments_parse_in_either_order_and_refuse_by_name() {
         parse(&["--lifeline-fd", "3"]),
         Ok(Args {
             lifeline_fd: 3,
-            peer_pid: None
+            peer: PeerPid::Any
         })
     );
     assert_eq!(
         parse(&["--peer-pid", "42", "--lifeline-fd", "3"]),
         Ok(Args {
             lifeline_fd: 3,
-            peer_pid: Some(42)
+            peer: PeerPid::Exactly(42)
+        })
+    );
+    assert_eq!(
+        parse(&["--await-peer", "--lifeline-fd", "3"]),
+        Ok(Args {
+            lifeline_fd: 3,
+            peer: PeerPid::Awaiting
         })
     );
     for (args, why) in [
@@ -145,6 +152,22 @@ fn arguments_parse_in_either_order_and_refuse_by_name() {
             "given twice",
         ),
         (&["--other", "3"][..], "unknown argument"),
+        (
+            &["--lifeline-fd", "3", "--peer-pid", "0"][..],
+            "not a process id",
+        ),
+        (
+            &["--lifeline-fd", "3", "--peer-pid", "-4"][..],
+            "not a process id",
+        ),
+        (
+            &["--lifeline-fd", "3", "--await-peer", "--peer-pid", "7"][..],
+            "name the peer once",
+        ),
+        (
+            &["--lifeline-fd", "3", "--await-peer", "--await-peer"][..],
+            "name the peer once",
+        ),
     ] {
         let error = parse(args).expect_err(why);
         assert!(error.contains(why), "{args:?}: {error}");
@@ -172,7 +195,12 @@ fn serve_binds_then_confines_then_attests_relays_and_drains() {
     assert_eq!(
         broker.event(),
         Event::Ready {
-            connections_digest: format!("blake3-256:{}", doc.digest_hex())
+            connections_digest: format!("blake3-256:{}", doc.digest_hex()),
+            bound: vec![leyline_runtime::broker::control::Bound {
+                path: endpoint.clone(),
+                device: std::fs::symlink_metadata(&endpoint).unwrap().dev(),
+                inode: std::fs::symlink_metadata(&endpoint).unwrap().ino(),
+            }],
         }
     );
 
@@ -225,7 +253,8 @@ fn closing_the_control_pipe_ends_serve_without_a_drain() {
     let mut broker = InProcess::new(|_| Ok(()));
     broker.start(&canonical(&doc));
     assert!(matches!(broker.event(), Event::Ready { .. }));
-    broker.to_broker.shutdown(Shutdown::Write).unwrap();
+    // serve may already have refused and closed its end.
+    let _ = broker.to_broker.shutdown(Shutdown::Write);
     assert_eq!(broker.served.join().unwrap(), Ok(()));
 }
 
@@ -239,7 +268,8 @@ fn refused(input: &str, confine_fails: bool) -> String {
         }
     });
     broker.to_broker.write_all(input.as_bytes()).unwrap();
-    broker.to_broker.shutdown(Shutdown::Write).unwrap();
+    // serve may already have refused and closed its end.
+    let _ = broker.to_broker.shutdown(Shutdown::Write);
     let Event::Error { detail } = broker.event() else {
         panic!("expected an error event");
     };
@@ -269,8 +299,9 @@ fn serve_refuses_every_bad_start_by_name() {
             .contains("loopback address not delivered by this runtime")
     );
     assert!(refused(&start(&canonical(&doc)), true).contains("profile refused"));
-    // The endpoint the refused start bound is the supervisor's to unlink.
-    std::fs::remove_file(&doc.connections()[0].endpoint_unix).unwrap();
+    // A broker that bound and then could not confine removes its own sockets:
+    // no ready report tells the supervisor what it bound.
+    assert!(!Path::new(&doc.connections()[0].endpoint_unix).exists());
 
     let blocker = real.join("b.api.sock");
     std::fs::write(&blocker, b"").unwrap();
@@ -280,8 +311,8 @@ fn serve_refuses_every_bad_start_by_name() {
 #[test]
 fn the_broker_process_exits_when_its_lifeline_ends() {
     let (_dir, real) = channel_dir();
-    let doc = document(&real, "127.0.0.1", 9);
-    let mut broker = BrokerProcess::spawn(Path::new(BROKER), &doc, None).expect("spawn");
+    let _doc = document(&real, "127.0.0.1", 9);
+    let mut broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).expect("spawn");
     // Nothing sent: the broker sits in its first read until the lifeline ends.
     thread::sleep(Duration::from_millis(100));
     assert!(
@@ -303,15 +334,22 @@ fn the_broker_process_exits_when_its_lifeline_ends() {
 fn the_broker_process_refuses_off_macos_and_reports_ready_on_it() {
     let (_dir, real) = channel_dir();
     let doc = document(&real, "127.0.0.1", echo());
-    let mut broker = BrokerProcess::spawn(Path::new(BROKER), &doc, None).expect("spawn");
+    let mut broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).expect("spawn");
     let digest = format!("blake3-256:{}", doc.digest_hex());
     let result = broker.start(&doc, &digest, Duration::from_secs(5));
     if cfg!(target_os = "macos") {
         match result {
             Ok(()) => {}
-            // An outer sandbox can refuse the profile; broker_profile owns
-            // the LEYLINE_REQUIRE_SANDBOX gate for that.
-            Err(error) => assert!(error.detail.contains("profile"), "{error:?}"),
+            // An outer sandbox can refuse the profile: a named skip, unless the
+            // host claims it can sandbox.
+            Err(error) => {
+                assert!(
+                    std::env::var_os("LEYLINE_REQUIRE_SANDBOX").is_none(),
+                    "LEYLINE_REQUIRE_SANDBOX is set but the broker did not start: {error:?}"
+                );
+                assert!(error.detail.contains("profile"), "{error:?}");
+                eprintln!("SKIPPED (NOT a pass): {}", error.detail);
+            }
         }
     } else {
         let error = result.expect_err("not delivered off macOS");
@@ -319,4 +357,50 @@ fn the_broker_process_refuses_off_macos_and_reports_ready_on_it() {
     }
     broker.shutdown();
     assert!(!Path::new(&doc.connections()[0].endpoint_unix).exists());
+}
+
+/// Dropping the handle kills and reaps the broker.
+#[test]
+fn dropping_the_handle_ends_the_broker() {
+    let broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).unwrap();
+    let pid = broker.pid() as i32;
+    assert!(pid > 1);
+    // SAFETY: signal 0 only checks that the process exists.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the broker is running");
+    drop(broker);
+    // SAFETY: as above.
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the broker is gone and reaped"
+    );
+}
+
+/// The supervisor unlinks only sockets the broker reported binding, and only
+/// while the path is still that socket: a node someone else put at an endpoint
+/// path survives teardown.
+#[test]
+fn teardown_unlinks_only_the_sockets_the_broker_bound() {
+    let (_dir, real) = channel_dir();
+    let doc = document(&real, "127.0.0.1", 9);
+    let endpoint = doc.connections()[0].endpoint_unix.clone();
+
+    // A squatter's node at the path: the broker's bind fails, it reports no
+    // ready, and teardown leaves the node alone.
+    std::fs::write(&endpoint, b"squatter").unwrap();
+    let mut broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).unwrap();
+    let digest = format!("blake3-256:{}", doc.digest_hex());
+    assert!(broker.start(&doc, &digest, Duration::from_secs(5)).is_err());
+    broker.shutdown();
+    assert_eq!(std::fs::read(&endpoint).unwrap(), b"squatter");
+    std::fs::remove_file(&endpoint).unwrap();
+
+    // The broker's own socket, replaced after ready by another node: kept.
+    let mut broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).unwrap();
+    if broker.start(&doc, &digest, Duration::from_secs(5)).is_ok() {
+        std::fs::remove_file(&endpoint).unwrap();
+        std::fs::write(&endpoint, b"replaced").unwrap();
+        broker.shutdown();
+        assert_eq!(std::fs::read(&endpoint).unwrap(), b"replaced");
+    }
 }

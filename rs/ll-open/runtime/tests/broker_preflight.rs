@@ -99,6 +99,45 @@ fn a_parent_that_is_not_private_is_refused() {
     assert!(detail.contains("endpoint parent not private"), "{detail}");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn a_parent_carrying_an_acl_is_refused() {
+    let (_dir, real) = private_dir();
+    check_endpoint("orders-api", &real.join("orders.api.sock"), euid()).expect("no ACL yet");
+    let status = std::process::Command::new("/bin/chmod")
+        .args(["+a", "group:everyone allow list,add_file,delete_child"])
+        .arg(&real)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (code, detail) = refusal(&real.join("orders.api.sock"), euid());
+    assert_eq!(code, ErrorCode::InvalidGrant);
+    assert!(detail.contains("ACL"), "{detail}");
+}
+
+#[test]
+fn an_ancestor_others_can_rename_in_is_refused() {
+    let (_dir, real) = private_dir();
+    let open_ancestor = real.join("open");
+    std::fs::create_dir(&open_ancestor).unwrap();
+    let parent = open_ancestor.join("ch");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&open_ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let (code, detail) = refusal(&parent.join("orders.api.sock"), euid());
+    assert_eq!(code, ErrorCode::InvalidGrant);
+    assert!(detail.contains("can be renamed by others"), "{detail}");
+    // Sticky, as /tmp is: others cannot rename what they do not own.
+    std::fs::set_permissions(&open_ancestor, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    check_endpoint("orders-api", &parent.join("orders.api.sock"), euid()).expect("sticky");
+    // Group-writable without sticky is open too.
+    std::fs::set_permissions(&open_ancestor, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        refusal(&parent.join("orders.api.sock"), euid()).0,
+        ErrorCode::InvalidGrant
+    );
+}
+
 #[test]
 fn a_path_longer_than_sun_path_is_refused() {
     let (_dir, real) = private_dir();

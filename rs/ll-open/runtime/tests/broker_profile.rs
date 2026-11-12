@@ -17,10 +17,11 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use leyline_runtime::broker::control::{BrokerProcess, Event, WireOutcome};
 use leyline_runtime::broker::profile;
+use leyline_runtime::broker::relay::PeerPid;
 use leyline_schema_spec::connections::{Connection, ConnectionsDocument};
 
 const BROKER: &str = env!("CARGO_BIN_EXE_leyline-conn-broker");
@@ -91,7 +92,7 @@ fn digest(document: &ConnectionsDocument) -> String {
 
 /// Spawn and start the real broker; `None` when the host cannot sandbox.
 fn started(document: &ConnectionsDocument) -> Option<BrokerProcess> {
-    let mut broker = BrokerProcess::spawn(Path::new(BROKER), document, None).expect("spawn");
+    let mut broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).expect("spawn");
     match broker.start(document, &digest(document), Duration::from_secs(5)) {
         Ok(()) => Some(broker),
         Err(error) if error.detail.contains("profile") => {
@@ -158,7 +159,7 @@ fn the_confined_broker_relays_every_connection_and_reports_it() {
 fn a_ready_digest_other_than_the_grants_refuses_the_start() {
     let (_dir, real) = channel_dir();
     let doc = document(&real, &[echo()]);
-    let mut broker = BrokerProcess::spawn(Path::new(BROKER), &doc, None).unwrap();
+    let mut broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).unwrap();
     let wrong = format!("blake3-256:{}", "0".repeat(64));
     let error = broker
         .start(&doc, &wrong, Duration::from_secs(5))
@@ -173,14 +174,33 @@ fn a_ready_digest_other_than_the_grants_refuses_the_start() {
     );
 }
 
+#[test]
+fn the_confined_broker_exits_when_its_lifeline_ends() {
+    let (_dir, real) = channel_dir();
+    let doc = document(&real, &[echo()]);
+    let Some(mut broker) = started(&doc) else {
+        return;
+    };
+    broker.close_lifeline();
+    let started = Instant::now();
+    while !broker.exited() {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the confined broker outlived its supervisor's lifeline"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The confined half, run by the parent below.
 #[test]
 #[ignore = "the confined child of the_profile_refuses_everything_but_the_declared_ports"]
 fn profile_probe_child() {
     let spec = std::env::var(PROBE_ENV).expect("probe ports");
-    let (declared, undeclared) = spec.split_once(',').expect("two ports");
-    let (declared, undeclared): (u16, u16) =
-        (declared.parse().unwrap(), undeclared.parse().unwrap());
+    let mut parts = spec.split(',');
+    let declared: u16 = parts.next().unwrap().parse().unwrap();
+    let undeclared: u16 = parts.next().unwrap().parse().unwrap();
+    let other_socket = parts.next().unwrap().to_owned();
     let doc = ConnectionsDocument::new(vec![Connection {
         name: "c0".into(),
         endpoint_unix: "/private/tmp/unused.sock".into(),
@@ -220,6 +240,14 @@ fn profile_probe_child() {
             outcome(UnixStream::connect(profile::MDNS_RESPONDER).is_ok())
         ),
         format!(
+            "unix={}",
+            outcome(UnixStream::connect(&other_socket).is_ok())
+        ),
+        format!(
+            "listen={}",
+            outcome(TcpListener::bind(("127.0.0.1", 0)).is_ok())
+        ),
+        format!(
             "resolve={}",
             outcome(std::net::ToSocketAddrs::to_socket_addrs("example.com:80").is_ok())
         ),
@@ -238,10 +266,14 @@ fn profile_probe_child() {
 fn the_profile_refuses_everything_but_the_declared_ports() {
     let declared = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let undeclared = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let (_dir, real) = channel_dir();
+    let other_socket = real.join("other.sock");
+    let _other = std::os::unix::net::UnixListener::bind(&other_socket).unwrap();
     let ports = format!(
-        "{},{}",
+        "{},{},{}",
         declared.local_addr().unwrap().port(),
-        undeclared.local_addr().unwrap().port()
+        undeclared.local_addr().unwrap().port(),
+        other_socket.display()
     );
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -274,6 +306,6 @@ fn the_profile_refuses_everything_but_the_declared_ports() {
         // every platform rule (bead ley-line-open-fb5c4b). Resolution itself
         // is still refused, and the row flips here when that bead lands.
         "declared=ok undeclared=eperm read=denied write=denied exec=denied mdns=ok \
-         resolve=denied fork=denied"
+         unix=denied listen=denied resolve=denied fork=denied"
     );
 }

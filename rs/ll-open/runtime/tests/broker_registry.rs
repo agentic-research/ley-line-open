@@ -1,7 +1,7 @@
 //! The endpoint registry (ADR-0046 S4; S11 "Registry"): run B whose §6 grant
 //! names run A's endpoint is refused in both start orders.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use leyline_runtime::ErrorCode;
 use leyline_runtime::broker::registry::{EndpointRegistry, SocketGrant};
@@ -119,6 +119,81 @@ fn two_runs_cannot_own_one_endpoint_and_removal_frees_it() {
     assert!(registry.remove("run-a"));
     assert!(!registry.remove("run-a"));
     registry.register("run-b", &a_endpoints(), &[]).unwrap();
+}
+
+/// A grant spelled through a symlink names the same node the sandbox will
+/// resolve it to, so it is refused in both start orders.
+#[test]
+fn a_grant_spelled_through_a_symlink_is_refused_in_both_orders() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir(real.join("ch-a")).unwrap();
+    std::os::unix::fs::symlink(real.join("ch-a"), real.join("alias")).unwrap();
+    let endpoint = vec![real.join("ch-a/orders.api.sock")];
+    let spelled = |leaf: &str| grant(real.join("alias").join(leaf).to_str().unwrap());
+    let directory = format!("{}/", real.join("alias").display());
+
+    for b_grant in [spelled("orders.api.sock"), grant(&directory)] {
+        let registry = EndpointRegistry::new();
+        registry.register("run-a", &endpoint, &[]).unwrap();
+        assert_eq!(
+            registry
+                .register("run-b", &[], &[b_grant.clone()])
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidGrant,
+            "B after A: {b_grant:?}"
+        );
+        let registry = EndpointRegistry::new();
+        registry.register("run-b", &[], &[b_grant.clone()]).unwrap();
+        assert_eq!(
+            registry.register("run-a", &endpoint, &[]).unwrap_err().code,
+            ErrorCode::ResourceConflict,
+            "A after B: {b_grant:?}"
+        );
+    }
+    // /tmp itself is a symlink on macOS: the same node spelled both ways.
+    if std::fs::canonicalize("/tmp").unwrap() != Path::new("/tmp") {
+        let registry = EndpointRegistry::new();
+        let tmp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let real_endpoint = std::fs::canonicalize(tmp.path()).unwrap().join("x.sock");
+        registry.register("run-a", &[real_endpoint], &[]).unwrap();
+        let via_tmp = tmp.path().join("x.sock");
+        assert_eq!(
+            registry
+                .register("run-b", &[], &[grant(via_tmp.to_str().unwrap())])
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidGrant
+        );
+    }
+}
+
+/// macOS volumes are case-insensitive by default: a grant differing only in
+/// case names the same node, and is refused in both orders.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_grant_differing_only_in_case_is_refused_in_both_orders() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir(real.join("ch-a")).unwrap();
+    let endpoint = vec![real.join("ch-a/orders.api.sock")];
+    let upper = grant(real.join("CH-A/ORDERS.API.SOCK").to_str().unwrap());
+    let registry = EndpointRegistry::new();
+    registry.register("run-a", &endpoint, &[]).unwrap();
+    assert_eq!(
+        registry
+            .register("run-b", &[], &[upper.clone()])
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidGrant
+    );
+    let registry = EndpointRegistry::new();
+    registry.register("run-b", &[], &[upper]).unwrap();
+    assert_eq!(
+        registry.register("run-a", &endpoint, &[]).unwrap_err().code,
+        ErrorCode::ResourceConflict
+    );
 }
 
 #[test]

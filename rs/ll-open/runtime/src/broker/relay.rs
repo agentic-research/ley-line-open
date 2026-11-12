@@ -47,12 +47,25 @@ pub fn bind(document: &ConnectionsDocument) -> io::Result<Vec<Endpoint>> {
         .collect()
 }
 
-/// Who may connect: the daemon's effective uid always, and on the microVM tier
-/// exactly the run's worker process.
+/// Which process may connect, besides the uid check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerPid {
+    /// Any process of the daemon's uid (native tier: the workload's processes
+    /// vary).
+    Any,
+    /// The microVM tier before the worker exists: every peer is refused until
+    /// [`RelayHandle::set_peer_pid`] names it (the broker is spawned at ADR-0046
+    /// S7 step 3, the worker at step 5).
+    Awaiting,
+    /// Exactly this process: the run's worker, which hosts the VMM.
+    Exactly(i32),
+}
+
+/// Who may connect: the daemon's effective uid always, and per [`PeerPid`].
 #[derive(Debug, Clone, Copy)]
 pub struct PeerPolicy {
     pub uid: u32,
-    pub pid: Option<i32>,
+    pub pid: PeerPid,
 }
 
 /// Tunables, fixed by the ADR in production and shortened only by tests.
@@ -93,6 +106,15 @@ pub struct Record {
     pub open: bool,
 }
 
+/// What the relay reports, in one ordered queue: every record, then, after a
+/// drain, `Drained`. Nothing is sent after `Drained`, and nothing sent before
+/// it can arrive after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Report {
+    Record(Record),
+    Drained,
+}
+
 /// An accepted connection not yet reported: held for its dial, or copying.
 struct Live {
     name: String,
@@ -106,47 +128,66 @@ pub struct RelayHandle {
     stop: Arc<AtomicBool>,
     live: Arc<Mutex<BTreeMap<u64, Live>>>,
     acceptors: Vec<JoinHandle<()>>,
+    reports: mpsc::Sender<Report>,
+    peer_pid: Arc<Mutex<PeerPid>>,
 }
 
 impl RelayHandle {
-    /// Stop accepting and report every accepted connection that has no final
-    /// record yet: copying ones as dialed, held ones as refused, each with
-    /// `open: true` and its bytes so far. Each connection is reported exactly
-    /// once: drain takes the entries, and a connection that ends afterwards
-    /// finds its entry gone and reports nothing.
-    pub fn drain(self) -> Vec<Record> {
+    /// Name the one process that may connect, once, on a relay started with
+    /// [`PeerPid::Awaiting`]. Refused otherwise, so a running broker's peer
+    /// can never be changed or widened.
+    pub fn set_peer_pid(&self, pid: i32) -> Result<(), String> {
+        let mut current = self.peer_pid.lock();
+        match *current {
+            PeerPid::Awaiting if pid > 0 => {
+                *current = PeerPid::Exactly(pid);
+                Ok(())
+            }
+            PeerPid::Awaiting => Err(format!("peer pid {pid} is not a process id")),
+            other => Err(format!("peer pid is not awaited (it is {other:?})")),
+        }
+    }
+
+    /// Stop accepting, then report every accepted connection that has no final
+    /// record yet (copying ones as dialed, held ones as refused, `open: true`,
+    /// bytes so far), then `Drained`. Exactly once per connection: a
+    /// connection's final record is sent under the same lock drain takes the
+    /// entries under, and every acceptor has stopped before drain starts.
+    pub fn drain(self) {
         self.stop.store(true, Ordering::SeqCst);
         for acceptor in self.acceptors {
             let _ = acceptor.join();
         }
-        std::mem::take(&mut *self.live.lock())
-            .into_values()
-            .map(|live| Record {
-                name: live.name,
-                outcome: if live.dialed.load(Ordering::SeqCst) {
+        let mut live = self.live.lock();
+        for entry in std::mem::take(&mut *live).into_values() {
+            let _ = self.reports.send(Report::Record(Record {
+                name: entry.name,
+                outcome: if entry.dialed.load(Ordering::SeqCst) {
                     Outcome::Dialed
                 } else {
                     Outcome::Refused
                 },
-                bytes_to_target: live.to_target.load(Ordering::SeqCst),
-                bytes_from_target: live.from_target.load(Ordering::SeqCst),
+                bytes_to_target: entry.to_target.load(Ordering::SeqCst),
+                bytes_from_target: entry.from_target.load(Ordering::SeqCst),
                 open: true,
-            })
-            .collect()
+            }));
+        }
+        let _ = self.reports.send(Report::Drained);
     }
 }
 
-/// Start one acceptor per endpoint. Every final record is sent on `records`.
+/// Start one acceptor per endpoint. Every report is sent on `reports`.
 pub fn start(
     endpoints: Vec<Endpoint>,
     peers: PeerPolicy,
     limits: Limits,
-    records: mpsc::Sender<Record>,
+    reports: mpsc::Sender<Report>,
 ) -> io::Result<RelayHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let live = Arc::new(Mutex::new(BTreeMap::new()));
     let active = Arc::new(AtomicUsize::new(0));
     let ids = Arc::new(AtomicU64::new(0));
+    let peer_pid = Arc::new(Mutex::new(peers.pid));
     let mut acceptors = Vec::with_capacity(endpoints.len());
     for endpoint in endpoints {
         endpoint.listener.set_nonblocking(true)?;
@@ -155,16 +196,23 @@ pub fn start(
             live: Arc::clone(&live),
             active: Arc::clone(&active),
             ids: Arc::clone(&ids),
-            records: records.clone(),
-            peers,
+            reports: reports.clone(),
+            uid: peers.uid,
+            peer_pid: Arc::clone(&peer_pid),
             limits,
         };
-        acceptors.push(thread::spawn(move || accept_loop(endpoint, context)));
+        acceptors.push(
+            thread::Builder::new()
+                .name(format!("broker-accept-{}", endpoint.name))
+                .spawn(move || accept_loop(endpoint, context))?,
+        );
     }
     Ok(RelayHandle {
         stop,
         live,
         acceptors,
+        reports,
+        peer_pid,
     })
 }
 
@@ -174,22 +222,59 @@ struct Context {
     live: Arc<Mutex<BTreeMap<u64, Live>>>,
     active: Arc<AtomicUsize>,
     ids: Arc<AtomicU64>,
-    records: mpsc::Sender<Record>,
-    peers: PeerPolicy,
+    reports: mpsc::Sender<Report>,
+    uid: u32,
+    peer_pid: Arc<Mutex<PeerPid>>,
     limits: Limits,
 }
 
 impl Context {
-    fn record(&self, name: &str, outcome: Outcome, to: u64, from: u64) {
-        let _ = self.records.send(Record {
+    /// A record for a connection that never entered `live`.
+    fn record(&self, name: &str, outcome: Outcome) {
+        let _ = self.reports.send(Report::Record(Record {
             name: name.to_owned(),
             outcome,
-            bytes_to_target: to,
-            bytes_from_target: from,
+            bytes_to_target: 0,
+            bytes_from_target: 0,
             open: false,
-        });
+        }));
+    }
+
+    /// A tracked connection's final record, sent under the `live` lock and
+    /// only if drain has not already reported it.
+    fn finish(&self, id: u64, name: &str, outcome: Outcome, to: u64, from: u64) {
+        let mut live = self.live.lock();
+        if live.remove(&id).is_some() {
+            let _ = self.reports.send(Report::Record(Record {
+                name: name.to_owned(),
+                outcome,
+                bytes_to_target: to,
+                bytes_from_target: from,
+                open: false,
+            }));
+        }
+    }
+
+    fn peer_permitted(&self, stream: &UnixStream) -> bool {
+        let expected = *self.peer_pid.lock();
+        match peer_credentials(stream) {
+            Ok((uid, pid)) => {
+                uid == self.uid
+                    && match expected {
+                        PeerPid::Any => true,
+                        PeerPid::Awaiting => false,
+                        PeerPid::Exactly(expected) => pid == Some(expected),
+                    }
+            }
+            Err(_) => false,
+        }
     }
 }
+
+/// How long an acceptor waits after an accept error other than "nothing
+/// pending" (`EMFILE`, `ENFILE`, `ECONNABORTED`), so a persistent error is a
+/// slow retry, never a spin.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 fn accept_loop(endpoint: Endpoint, context: Context) {
     let Endpoint {
@@ -204,73 +289,111 @@ fn accept_loop(endpoint: Endpoint, context: Context) {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
-            Err(_) => continue,
+            Err(_) => {
+                thread::sleep(ACCEPT_ERROR_BACKOFF);
+                continue;
+            }
         };
-        if !peer_permitted(&stream, context.peers) {
+        if !context.peer_permitted(&stream) {
             drop(stream);
-            context.record(&name, Outcome::ForeignPeer, 0, 0);
+            context.record(&name, Outcome::ForeignPeer);
             continue;
         }
         // The cap counts connections in flight, held or copying.
         if context.active.fetch_add(1, Ordering::SeqCst) >= context.limits.max_connections {
             context.active.fetch_sub(1, Ordering::SeqCst);
             drop(stream);
-            context.record(&name, Outcome::Refused, 0, 0);
+            context.record(&name, Outcome::Refused);
             continue;
         }
         let _ = stream.set_nonblocking(false);
-        let context = context.clone();
-        let name = name.clone();
-        thread::spawn(move || {
-            serve(&name, stream, target, &context);
+        // Tracked before its thread exists, so a drain never misses it.
+        let id = context.ids.fetch_add(1, Ordering::SeqCst);
+        let tracked = Tracked {
+            dialed: Arc::new(AtomicBool::new(false)),
+            to_target: Arc::new(AtomicU64::new(0)),
+            from_target: Arc::new(AtomicU64::new(0)),
+        };
+        context.live.lock().insert(
+            id,
+            Live {
+                name: name.clone(),
+                dialed: Arc::clone(&tracked.dialed),
+                to_target: Arc::clone(&tracked.to_target),
+                from_target: Arc::clone(&tracked.from_target),
+            },
+        );
+        let spawned = {
+            let context = context.clone();
+            let name = name.clone();
+            thread::Builder::new().spawn(move || {
+                serve(id, &name, stream, target, tracked, &context);
+                context.active.fetch_sub(1, Ordering::SeqCst);
+            })
+        };
+        if spawned.is_err() {
+            // The stream went down with the closure; nothing was dialed.
             context.active.fetch_sub(1, Ordering::SeqCst);
-        });
+            context.finish(id, &name, Outcome::Refused, 0, 0);
+        }
     }
 }
 
-fn serve(name: &str, client: UnixStream, target: SocketAddr, context: &Context) {
-    let id = context.ids.fetch_add(1, Ordering::SeqCst);
-    let dialed = Arc::new(AtomicBool::new(false));
-    let to_target = Arc::new(AtomicU64::new(0));
-    let from_target = Arc::new(AtomicU64::new(0));
-    context.live.lock().insert(
-        id,
-        Live {
-            name: name.to_owned(),
-            dialed: Arc::clone(&dialed),
-            to_target: Arc::clone(&to_target),
-            from_target: Arc::clone(&from_target),
-        },
-    );
+/// A tracked connection's shared state.
+struct Tracked {
+    dialed: Arc<AtomicBool>,
+    to_target: Arc<AtomicU64>,
+    from_target: Arc<AtomicU64>,
+}
+
+fn serve(
+    id: u64,
+    name: &str,
+    client: UnixStream,
+    target: SocketAddr,
+    tracked: Tracked,
+    context: &Context,
+) {
     let Some(upstream) = dial(&client, target, context.limits.hold) else {
-        if context.live.lock().remove(&id).is_some() {
-            context.record(name, Outcome::Refused, 0, 0);
-        }
+        context.finish(id, name, Outcome::Refused, 0, 0);
         return;
     };
-    dialed.store(true, Ordering::SeqCst);
+    tracked.dialed.store(true, Ordering::SeqCst);
+    let Tracked {
+        to_target,
+        from_target,
+        ..
+    } = tracked;
     match (client.try_clone(), upstream.try_clone()) {
         (Ok(client_writer), Ok(upstream_writer)) => {
             let inbound = {
                 let to_target = Arc::clone(&to_target);
-                thread::spawn(move || copy(DiscardRights(client), upstream_writer, &to_target))
+                let client = DiscardRights(client);
+                thread::Builder::new().spawn(move || copy(client, upstream_writer, &to_target))
             };
-            copy(upstream, client_writer, &from_target);
-            let _ = inbound.join();
+            match inbound {
+                Ok(inbound) => {
+                    copy(upstream, client_writer, &from_target);
+                    let _ = inbound.join();
+                }
+                Err(_) => {
+                    client_writer.shutdown_both();
+                    upstream.shutdown_both();
+                }
+            }
         }
         _ => {
             client.shutdown_both();
             upstream.shutdown_both();
         }
     }
-    if context.live.lock().remove(&id).is_some() {
-        context.record(
-            name,
-            Outcome::Dialed,
-            to_target.load(Ordering::SeqCst),
-            from_target.load(Ordering::SeqCst),
-        );
-    }
+    context.finish(
+        id,
+        name,
+        Outcome::Dialed,
+        to_target.load(Ordering::SeqCst),
+        from_target.load(Ordering::SeqCst),
+    );
 }
 
 /// Dial the target once per attempt. `ECONNREFUSED` is held with backoff for at
@@ -280,7 +403,12 @@ fn dial(client: &UnixStream, target: SocketAddr, hold: Duration) -> Option<TcpSt
     let started = Instant::now();
     let mut backoff = BACKOFF_START;
     loop {
-        match TcpStream::connect(target) {
+        // Every attempt is bounded by what is left of the hold (and at least
+        // a millisecond), so a full upstream backlog cannot outlast it.
+        let left = hold
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(1));
+        match TcpStream::connect_timeout(&target, left) {
             Ok(stream) => return Some(stream),
             Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
                 let elapsed = started.elapsed();
@@ -521,14 +649,5 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, Option<i32>)> {
             return Err(io::Error::last_os_error());
         }
         Ok((credentials.uid, Some(credentials.pid)))
-    }
-}
-
-fn peer_permitted(stream: &UnixStream, policy: PeerPolicy) -> bool {
-    match peer_credentials(stream) {
-        Ok((uid, pid)) => {
-            uid == policy.uid && policy.pid.is_none_or(|expected| pid == Some(expected))
-        }
-        Err(_) => false,
     }
 }

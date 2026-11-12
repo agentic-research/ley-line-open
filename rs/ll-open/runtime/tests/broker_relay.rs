@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use leyline_runtime::broker::control::{Event, WireOutcome, summarize};
-use leyline_runtime::broker::relay::{self, Limits, Outcome, PeerPolicy, Record};
+use leyline_runtime::broker::relay::{self, Limits, Outcome, PeerPid, PeerPolicy, Record, Report};
 use leyline_runtime::broker::{MAX_CONNECTIONS, check_delivered};
 use leyline_schema_spec::connections::{Connection, ConnectionsDocument};
 
@@ -53,7 +53,7 @@ fn euid() -> u32 {
 struct Running {
     _dir: tempfile::TempDir,
     path: PathBuf,
-    records: mpsc::Receiver<Record>,
+    records: mpsc::Receiver<Report>,
     handle: Option<relay::RelayHandle>,
 }
 
@@ -67,9 +67,14 @@ impl Running {
     }
 
     fn record(&self) -> Record {
-        self.records
+        match self
+            .records
             .recv_timeout(Duration::from_secs(20))
             .expect("a record")
+        {
+            Report::Record(record) => record,
+            Report::Drained => panic!("drained before the expected record"),
+        }
     }
 }
 
@@ -82,7 +87,7 @@ fn run(port: u16, peers: Option<PeerPolicy>, limits: Limits) -> Running {
         endpoints,
         peers.unwrap_or(PeerPolicy {
             uid: euid(),
-            pid: None,
+            pid: PeerPid::Any,
         }),
         limits,
         sender,
@@ -506,7 +511,7 @@ fn a_peer_that_is_not_the_runs_is_closed_without_a_dial() {
         Some(PeerPolicy {
             uid: euid(),
             // Not this test process: the microVM tier's worker-pid check.
-            pid: Some(1),
+            pid: PeerPid::Exactly(1),
         }),
         Limits::default(),
     );
@@ -520,7 +525,7 @@ fn a_peer_that_is_not_the_runs_is_closed_without_a_dial() {
         port,
         Some(PeerPolicy {
             uid: euid().wrapping_add(1),
-            pid: None,
+            pid: PeerPid::Any,
         }),
         Limits::default(),
     );
@@ -537,13 +542,17 @@ fn drain_reports_every_unfinished_connection_once() {
     open.write_all(b"abc").unwrap();
     let mut buffer = [0u8; 3];
     open.read_exact(&mut buffer).unwrap();
-    let drained = running.handle.take().unwrap().drain();
-    assert_eq!(drained.len(), 1);
-    assert_eq!(drained[0].outcome, Outcome::Dialed);
-    assert!(drained[0].open);
+    running.handle.take().unwrap().drain();
+    let drained = running.record();
+    assert_eq!(drained.outcome, Outcome::Dialed);
+    assert!(drained.open);
+    assert_eq!((drained.bytes_to_target, drained.bytes_from_target), (3, 3));
     assert_eq!(
-        (drained[0].bytes_to_target, drained[0].bytes_from_target),
-        (3, 3)
+        running
+            .records
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        Report::Drained
     );
     // Ending it now reports nothing more: drain took it.
     drop(open);
@@ -553,6 +562,110 @@ fn drain_reports_every_unfinished_connection_once() {
             .recv_timeout(Duration::from_millis(500))
             .is_err()
     );
+}
+
+/// Connections ending while the drain runs are reported exactly once each,
+/// and every report precedes `Drained`, so a drained receipt is complete.
+#[test]
+fn a_drain_racing_closes_reports_each_connection_exactly_once_before_drained() {
+    for round in 0..10 {
+        let (port, _echo) = echo();
+        let mut running = run(port, None, Limits::default());
+        let clients: Vec<UnixStream> = (0..16)
+            .map(|_| {
+                let mut client = running.connect();
+                client.write_all(b"z").unwrap();
+                let mut one = [0u8; 1];
+                client.read_exact(&mut one).unwrap();
+                client
+            })
+            .collect();
+        let closer = thread::spawn(move || drop(clients));
+        running.handle.take().unwrap().drain();
+        closer.join().unwrap();
+        let mut records = 0;
+        loop {
+            match running
+                .records
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+            {
+                Report::Record(record) => {
+                    assert_eq!(record.outcome, Outcome::Dialed);
+                    records += 1;
+                }
+                Report::Drained => break,
+            }
+        }
+        assert_eq!(
+            records, 16,
+            "round {round}: one report per accepted connection"
+        );
+        assert!(
+            running
+                .records
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "round {round}: nothing after Drained"
+        );
+    }
+}
+
+/// The microVM tier names its peer after the broker starts: until then every
+/// peer is refused, and the pid can be named once, never changed.
+#[test]
+fn an_awaited_peer_is_refused_until_named_and_named_once() {
+    let (port, _echo) = echo();
+    let running = run(
+        port,
+        Some(PeerPolicy {
+            uid: euid(),
+            pid: PeerPid::Awaiting,
+        }),
+        Limits::default(),
+    );
+    let mut early = running.connect();
+    let mut back = Vec::new();
+    early.read_to_end(&mut back).unwrap();
+    assert_eq!(running.record().outcome, Outcome::ForeignPeer);
+
+    let handle = running.handle.as_ref().unwrap();
+    assert!(handle.set_peer_pid(0).is_err(), "not a pid");
+    handle.set_peer_pid(std::process::id() as i32).unwrap();
+    assert!(handle.set_peer_pid(1).is_err(), "named once");
+    let mut client = running.connect();
+    client.write_all(b"now").unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    back.clear();
+    client.read_to_end(&mut back).unwrap();
+    assert_eq!(back, b"now");
+    assert_eq!(running.record().outcome, Outcome::Dialed);
+
+    let any = run(port, None, Limits::default());
+    assert!(
+        any.handle.as_ref().unwrap().set_peer_pid(1).is_err(),
+        "a peer that was never awaited cannot be narrowed or widened later"
+    );
+}
+
+/// The production cap: 256 held connections, and the 257th is refused.
+#[test]
+fn the_cap_is_256_simultaneous_connections() {
+    let limit = leyline_runtime::broker::control::raise_fd_limit(
+        leyline_runtime::broker::control::FILE_LIMIT,
+    );
+    assert!(limit >= leyline_runtime::broker::control::FILE_LIMIT);
+    let running = run(free_port(), None, limits(Duration::from_secs(20)));
+    let held: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| running.connect()).collect();
+    thread::sleep(Duration::from_millis(500));
+    let mut over = running.connect();
+    let mut back = Vec::new();
+    over.read_to_end(&mut back).unwrap();
+    assert_eq!(running.record().outcome, Outcome::Refused, "the 257th");
+    drop(held);
+    for _ in 0..MAX_CONNECTIONS {
+        assert_eq!(running.record().outcome, Outcome::Refused);
+    }
 }
 
 #[test]

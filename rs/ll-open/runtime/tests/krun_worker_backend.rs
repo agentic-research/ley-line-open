@@ -475,6 +475,44 @@ fn a_cancel_after_observed_failure_is_a_no_op() {
     assert_eq!(run_root_count(&ephemeral_root), 0);
 }
 
+/// The microVM twin of the native test: the same keys and values are refused
+/// with the same code and the same wording, before a worker exists (bead
+/// `ley-line-open-9d75c9`).
+#[test]
+fn an_environment_no_tier_can_carry_is_refused_by_name_before_spawn() {
+    let _serial = common::serial();
+    for (key, value, named) in [
+        ("A=B", "1", "`=`"),
+        ("", "1", "empty"),
+        ("K\0EY", "1", "NUL"),
+        ("KEY", "v\0", "NUL"),
+    ] {
+        let fixture = TempDir::new().expect("fixture");
+        let spawned = fixture.path().join("spawned");
+        let (backend, _runs) = backend_with_worker(
+            &fixture,
+            &format!(
+                "#!/bin/sh\n: > '{}'\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+                spawned.display()
+            ),
+        );
+        let mut request = request();
+        request
+            .public_environment
+            .insert(key.to_owned(), value.to_owned());
+        let error = backend
+            .start(&request, ServedWorkspaces::none())
+            .expect_err("an environment no tier can carry is refused");
+        assert_eq!(error.code, ErrorCode::InvalidSpec, "{key:?}");
+        assert!(
+            error.detail.contains("publicEnvironment") && error.detail.contains(named),
+            "{key:?} is refused by name: {}",
+            error.detail
+        );
+        assert!(!spawned.exists(), "{key:?}: no worker was spawned");
+    }
+}
+
 #[test]
 fn backend_cancel_terminates_the_worker_and_removes_its_run_root() {
     let _serial = common::serial();

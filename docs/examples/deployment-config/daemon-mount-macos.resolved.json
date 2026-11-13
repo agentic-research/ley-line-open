@@ -1,0 +1,49 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "arena": {
+    "path": "/Users/fixture/.mache/default.arena",
+    "sizeMib": 64
+  },
+  "cdc": {
+    "enabled": false,
+    "target": "source-blobs"
+  },
+  "control": "/Users/fixture/.mache/default.ctrl",
+  "diagnostics": {
+    "profile": false,
+    "sheafAblationLog": null
+  },
+  "enrichment": {
+    "sessionCorpus": null
+  },
+  "head": {
+    "requireSignature": false,
+    "signingKey": null,
+    "trustedKeys": []
+  },
+  "kind": "DaemonConfig",
+  "mcp": {
+    "groups": null,
+    "http": null,
+    "noAuth": false,
+    "tokenFile": {
+      "file": "/Users/fixture/Library/Application Support/leyline/daemon.token"
+    },
+    "uds": null
+  },
+  "mount": {
+    "backend": "nfs",
+    "nfsPort": 0,
+    "path": "/Users/fixture/mnt/my-project"
+  },
+  "parser": {
+    "queryMatchLimit": 4096,
+    "queryProgressBudget": 100000,
+    "trustedQueryHashes": []
+  },
+  "shutdownAfterSeconds": null,
+  "source": {
+    "language": null,
+    "path": "/Users/fixture/src/my-project"
+  }
+}

@@ -49,7 +49,7 @@ test -f "$DIFF" || { echo "DIFF file not found: $DIFF" >&2; exit 1; }
 # same drift class `ley-line-open-cb1e29` collapsed the feature ledger to fix.
 #
 # Format: `<scope>=<package>[,<package>...]`. Everything below derives from it.
-MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime,ll-open/krun-worker cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge storefs=ll-open/storefs'
+MUTATION_SCOPE_PACKAGES='fs=ll-open/fs runtime=ll-open/runtime,ll-open/krun-worker cli=ll-open/cli-lib,ll-open/cli schema-bridge=ll-open/schema-bridge schema-spec=ll-core/schema-spec storefs=ll-open/storefs'
 
 # Every package owned by SOME package slice — i.e. exactly what the generic
 # slice must exclude. Each MUST be claimed by a slice of its own below. A
@@ -612,6 +612,17 @@ fi
 if { [ "$SCOPE" = all ] || [ "$SCOPE" = schema-bridge ]; } && package_changed_in_diff ll-open/schema-bridge; then
     claim_package ll-open/schema-bridge
     run_slice integration --package leyline-schema-bridge --test-workspace=false
+fi
+
+# schema-spec is a spec-artifact crate whose behavior is asserted against its
+# vectors: `tests/verify_*` read the spec directories beside `src/` and run the
+# independent Python references there. The lib-only generic slice ran none of
+# them, so every parser and resolver mutant the vectors kill read as missed
+# (bead ley-line-open-52c177: 154 of them on deployment_config). Every file
+# those tests read lives inside the crate, so the scratch copy holds it.
+if { [ "$SCOPE" = all ] || [ "$SCOPE" = schema-spec ]; } && package_changed_in_diff ll-core/schema-spec; then
+    claim_package ll-core/schema-spec
+    run_slice integration --package leyline-schema-spec --test-workspace=false
 fi
 
 if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then

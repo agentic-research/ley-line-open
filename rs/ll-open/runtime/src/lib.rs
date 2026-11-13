@@ -11,6 +11,7 @@ pub mod cas_evidence;
 pub mod cas_volume;
 mod catalog;
 pub mod confinement;
+pub mod deployment;
 mod error;
 mod model;
 mod service;

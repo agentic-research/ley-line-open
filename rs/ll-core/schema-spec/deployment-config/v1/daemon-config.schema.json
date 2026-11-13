@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/agentic-research/ley-line-open/rs/ll-core/schema-spec/deployment-config/v1/daemon-config.schema.json",
+  "title": "DaemonConfig (config.leyline/v1)",
+  "description": "The deployment configuration of `leyline daemon` (ADR-0049). Every optional field states its default; an omitted field means that default, never \"unset\". Rules this schema cannot state, and which the parser enforces (README \"Rules\"): a key twice in one object, a JSON escape in a string, a non-canonical IP spelling, a duplicate set entry, the cross-field rules, and the host checks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind"],
+  "properties": {
+    "apiVersion": {"const": "config.leyline/v1"},
+    "kind": {"const": "DaemonConfig"},
+    "arena": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "path": {
+          "description": "The arena file. Replaces --arena.",
+          "$ref": "common.schema.json#/$defs/path",
+          "x-leyline-default": "<HOME>/.mache/default.arena"
+        },
+        "sizeMib": {
+          "description": "The arena size in MiB. Replaces --arena-size-mib.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576,
+          "default": 64
+        }
+      }
+    },
+    "control": {
+      "description": "The controller (.ctrl) file. Replaces --control.",
+      "$ref": "common.schema.json#/$defs/path",
+      "x-leyline-default": "arena.path with its extension replaced by .ctrl"
+    },
+    "mount": {
+      "description": "Serve the store as a filesystem here. `null` (the default) runs headless. Replaces --mount, --backend and --nfs-port.",
+      "default": null,
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {
+            "path": {"$ref": "common.schema.json#/$defs/path"},
+            "backend": {
+              "enum": ["nfs", "fuse"],
+              "x-leyline-default": "nfs on macOS, fuse on Linux"
+            },
+            "nfsPort": {
+              "description": "The NFS listen port; 0 lets the kernel pick.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535,
+              "default": 0
+            }
+          }
+        }
+      ]
+    },
+    "source": {
+      "description": "Replaces --source and --language.",
+      "default": null,
+      "oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/source"}]
+    },
+    "shutdownAfterSeconds": {
+      "description": "Shut down after this many seconds; 0 shuts down at once. `null`: no automatic shutdown. Replaces --timeout.",
+      "default": null,
+      "oneOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+      ]
+    },
+    "mcp": {
+      "description": "The MCP surface. Off unless a listener is configured.",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "http": {
+          "description": "An MCP HTTP listener. `null`: none. Replaces --mcp-port, --mcp-bind and --mcp-allow-public.",
+          "default": null,
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["port"],
+              "properties": {
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "bind": {
+                  "$ref": "common.schema.json#/$defs/ipAddress",
+                  "default": "127.0.0.1"
+                },
+                "allowPublic": {
+                  "description": "Required for a non-loopback bind (`public-bind-without-opt-in`).",
+                  "type": "boolean",
+                  "default": false,
+                  "x-leyline-fail-closed": true
+                }
+              }
+            }
+          ]
+        },
+        "noAuth": {
+          "description": "Disable the ADR-0022 token gate on both listeners. Replaces --mcp-no-auth.",
+          "type": "boolean",
+          "default": false,
+          "x-leyline-fail-closed": true
+        },
+        "uds": {
+          "description": "An MCP listener on this Unix socket. `null`: none. Replaces --mcp-uds.",
+          "default": null,
+          "oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/path"}]
+        },
+        "groups": {
+          "description": "The Cloister groups the listeners' callers are granted. A set. `null`: every group. Replaces --mcp-groups.",
+          "default": null,
+          "oneOf": [
+            {"type": "null"},
+            {"type": "array", "items": {"$ref": "common.schema.json#/$defs/label"}}
+          ]
+        },
+        "tokenFile": {
+          "description": "The ADR-0022 shared-secret token, generated (exclusively, never through a symlink) when absent.",
+          "$ref": "common.schema.json#/$defs/secretRef",
+          "x-leyline-secret": true,
+          "x-leyline-default": "{\"file\": \"<data_dir>/leyline/daemon.token\"}"
+        }
+      }
+    },
+    "cdc": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "enabled": {
+          "description": "Activate or resume the private CDC index over source_blobs. Replaces --cdc.",
+          "type": "boolean",
+          "default": false
+        },
+        "target": {
+          "description": "The CDC target. Inert when `enabled` is false. Replaces --cdc-target.",
+          "const": "source-blobs",
+          "default": "source-blobs"
+        }
+      }
+    },
+    "parser": {"$ref": "common.schema.json#/$defs/parser"},
+    "head": {"$ref": "common.schema.json#/$defs/head"},
+    "diagnostics": {"$ref": "common.schema.json#/$defs/diagnostics"},
+    "enrichment": {"$ref": "common.schema.json#/$defs/enrichment"}
+  }
+}

@@ -45,7 +45,11 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
   configuration is removed; `configDigest` is recorded in `status`, the
   `RunReceipt` and `RunOutcome`; release binaries carry the NFS `mount`, so a
   release download can run the leyline-fs mount (`52c177`; consumers
-  `cloister-55e6cd`, `cloister-0bc3d5`, `mache-0be425`).
+  `cloister-55e6cd`, `cloister-0bc3d5`, `mache-0be425`). The spec, vectors,
+  Python reference and the `leyline-runtime` library entry
+  (`resolve_execution_deployment`, `check_removed_environment`) land first;
+  the daemons, the wire fields, the sign helper and the release changes
+  follow.
 - The follow-up gap queue (epic `ley-line-open-1262af`): every open design or
   correctness follow-up from the v0.26 to v0.29 releases is worked to zero, in
   groups whose files do not overlap. A pull request files a follow-up only for

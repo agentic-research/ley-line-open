@@ -1,0 +1,25 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "description": "ADR-0049 D3: the environment variables removed in v0.30.0, each with the config-document key that replaces it. A process that finds one set refuses to start (exit 78), naming every one. Normative source of published/leyline-removed-variables.json.",
+  "variables": [
+    {"name": "LEYLINE_STATE_DIR", "replacement": "stateDir"},
+    {"name": "LEYLINE_HEAD_SIGNING_KEY", "replacement": "head.signingKey"},
+    {"name": "LEYLINE_HEAD_TRUSTED_KEYS", "replacement": "head.trustedKeys"},
+    {"name": "LEYLINE_HEAD_REQUIRE_SIGNATURE", "replacement": "head.requireSignature"},
+    {"name": "LEYLINE_PROFILE", "replacement": "diagnostics.profile"},
+    {"name": "LEYLINE_SESSION_CORPUS", "replacement": "enrichment.sessionCorpus"},
+    {"name": "LEYLINE_SHEAF_ABLATION_LOG", "replacement": "diagnostics.sheafAblationLog"},
+    {"name": "LEYLINE_SIGN_CALLER_TOKENS", "replacement": "auth.callerTokens"},
+    {"name": "LEYLINE_SIGN_RESOLVE_ALLOW", "replacement": "resolveAllow"},
+    {"name": "LEYLINE_SIGN_SIGN_ALLOW", "replacement": "signAllow.callers"},
+    {"name": "LEYLINE_SIGN_RESOLVE_CACHE_MAX", "replacement": "resolveCache.maxEntries"},
+    {"name": "LEYLINE_SIGN_RESOLVE_TTL_MS", "replacement": "resolveCache.ttlMs"},
+    {"name": "LEYLINE_SIGN_OP_BIN", "replacement": "subprocess.opBin"},
+    {"name": "LEYLINE_SIGN_SECURITY_BIN", "replacement": "subprocess.securityBin"},
+    {"name": "LEYLINE_SIGN_HEALTHZ_PROBE_URL", "replacement": "health.probeUrl"},
+    {"name": "KEYCHAIN_ACCOUNT", "replacement": "keychainAccount"},
+    {"name": "LLO_TRUSTED_QUERY_HASHES", "replacement": "parser.trustedQueryHashes"},
+    {"name": "LLO_QUERY_MATCH_LIMIT", "replacement": "parser.queryMatchLimit"},
+    {"name": "LLO_QUERY_PROGRESS_BUDGET", "replacement": "parser.queryProgressBudget"}
+  ]
+}

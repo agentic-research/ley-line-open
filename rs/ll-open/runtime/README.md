@@ -10,7 +10,7 @@ Capability-resolved execution lifecycle and isolation backends (`execution/v1`).
 - **`artifacts::registry`** — pulls a digest-pinned image from a registry into a staged layout and imports it through `artifacts::oci` (bead `ley-line-open-97b636`); see "Registry pulls" below.
 - **`cas_volume`** — `CasVolume`, a CAS root on a case-sensitive filesystem (a case-sensitive APFS sparsebundle on macOS, a checked `<state>/cas` on Linux, refused elsewhere), and `default_state_dir` (bead `ley-line-open-ba86d3`); see "Case-sensitive CAS volume" below.
 - **`backends`** — isolation backend implementations: `native` (process), `native_backend`, `libkrun` (microVM). `Backend` is the trait each implements; `BackendCapabilities` / `BackendClass` describe what a backend can enforce.
-- **`backends::libkrun`** — the microVM tier. `KrunWorkerBackend` supervises the `leyline-krun-worker` binary, which the unpublished [`leyline-krun-worker`](../krun-worker/) crate builds (bead `ley-line-open-395e43`). That crate is the only one that links libkrun, from [`third_party/libkrun`](../../../third_party/README.md) (upstream v1.19.6 plus LLO's patches, ADR-0044); this crate has no libkrun dependency and stays publishable. `worker::prepare` is everything the worker does before the VMM: after refusing reserved environment keys, it commits the confinement manifest (`committed_confinement`, bead `ley-line-open-7a3109`), refusing as `IdentityPolicyMismatch` ("confinement drift") a policy whose digest is not the request's `confinementDigest` (an empty `confinementDigest` is the explicit "no commitment"), then checks the share and the inherited descriptors, compiles the plan, materializes the ephemeral rootfs and, after its last verification, writes the workload's argv and environment into it as `/.leyline-exec.json` (`worker::write_exec_config`; created exclusively, mode 0400, never through a link; the guest init execs exactly that and removes it, libkrun patch `0013`, bead `ley-line-open-7410ec`), applies the committed manifest, and returns a `PreparedRun` (the VM's `KrunConfig`, the share socket, the applied manifest's digest and the inherited descriptors; `PreparedRun::ready` builds the readiness event). The kernel command line carries only worker-chosen tokens and the executable. `/.leyline-exec.json` is reserved: a rootfs that holds it is refused (`invalidSpec`) when a microVM run is prepared. The worker crate builds the VM from it through `api::LinkedKrunApi`, attaches the share as a `DynFileSystem` and enters the VM.
+- **`backends::libkrun`** — the microVM tier. `KrunWorkerBackend` supervises the `leyline-krun-worker` binary, which the unpublished [`leyline-krun-worker`](../krun-worker/) crate builds (bead `ley-line-open-395e43`). That crate is the only one that links libkrun, from [`third_party/libkrun`](../../third_party/README.md) (upstream v1.19.6 plus LLO's patches, ADR-0044); this crate has no libkrun dependency and stays publishable. `worker::prepare` is everything the worker does before the VMM: after refusing reserved environment keys, it commits the confinement manifest (`committed_confinement`, bead `ley-line-open-7a3109`), refusing as `IdentityPolicyMismatch` ("confinement drift") a policy whose digest is not the request's `confinementDigest` (an empty `confinementDigest` is the explicit "no commitment"), then checks the share and the inherited descriptors, compiles the plan, materializes the ephemeral rootfs and, after its last verification, writes the workload's argv and environment into it as `/.leyline-exec.json` (`worker::write_exec_config`; created exclusively, mode 0400, never through a link; the guest init execs exactly that and removes it, libkrun patch `0013`, bead `ley-line-open-7410ec`), applies the committed manifest, and returns a `PreparedRun` (the VM's `KrunConfig`, the share socket, the applied manifest's digest and the inherited descriptors; `PreparedRun::ready` builds the readiness event). The kernel command line carries only worker-chosen tokens and the executable. `/.leyline-exec.json` is reserved: a rootfs that holds it is refused (`invalidSpec`) when a microVM run is prepared. The worker crate builds the VM from it through `api::LinkedKrunApi`, attaches the share as a `DynFileSystem` and enters the VM.
 - **`backends::libkrun::share`** — a run's workspace as the guest's working tree (ADR-0044 phase C, bead `ley-line-open-f210c2`). A run whose RunGrant carries a `WorkspaceGrant` reaches the backend with `ExecutionRequest.workspaces` (carried by the resolver; the service refuses one that changes them). `ExecutionService::with_workspace_shares` takes the embedder's `WorkspaceShares`. For a run started from a verified grant, the service opens an `FsService` for each granted workspace before it calls the backend, and passes them to `Backend::start` as `ServedWorkspaces` (bead `ley-line-open-1022a8`). Only the service can construct that value, so a backend can serve only shares it was handed, and a request naming workspaces without a verified grant (`ExecutionService::start`, or a direct `Backend::start`) is refused `workspaceUnserved`. The libkrun backend takes the one share it attaches (`ServedWorkspace::attach`), passes one end of a socket pair as `--workspace-share-fd`, and `serve`s the other end. Each share is scoped by its grant, including the grant's `writeScope` (bead `ley-line-open-483134`). The worker checks the descriptor is a socket matching the grant, attaches `ShareFs(RemoteFs)` (`leyline-krun-worker`; libkrun's `DynFileSystem` transcribing each FUSE request onto the wire) under tag `work`, and sets `KRUN_VIRTIOFS_MOUNTS=work:/work` and the working directory `/work`: the guest init (libkrun patch `0005`) mounts the share before the workload runs. The service first asks the backend how many workspaces it serves a run (`Backend::workspace_capacity`, default 0, libkrun 1): more than that, no provider, or a provider refusal refuses the run in the service, with no share opened for a tier that cannot use it and the backend never called. When `start` returns, the service holds the proofs to this run's own shares (each names the run and the whole grant) and to each share still being held; a share kept from another run or let go is refused. The share descriptor is a channel the worker holds outside its `confinement/v1` manifest (nono confines what the process may open, not what it inherits open), so it is declared instead (bead `ley-line-open-b83347`): `worker::declared_descriptors` derives, from the grant and the descriptor number, the descriptors a worker holds beyond its standard streams (the share for a run granted a workspace, none otherwise); the backend spawns the worker through `worker::inherit_only`, which marks every other descriptor it holds close-on-exec in the child (a descriptor the daemon inherited open from its own parent included); the worker lists its open descriptors (`/dev/fd`) before it reads the rootfs and refuses to start holding any it does not declare (`IdentityPolicyMismatch`, naming the descriptors); its readiness event carries the declaration (`inherited`), which the backend refuses unless it equals what it handed the worker; and `BackendRun.attached`, the proof of each share the backend took (a backend cannot write one itself), reaches the receipt, whose `backend.evidence` is the digest of a `BackendEvidenceDocument` (`application/vnd.leyline.execution.backend-evidence+json`, execution/v1 README "Backend evidence") naming the backend and each `WorkerChannel::WorkspaceShare {workspace, graphRoot}`. `WorkspaceGrant.expectedGeneration` is ADR-0041 S1's commit `seq`, which no store records yet, so the store's share refuses a grant whose `expectedGeneration` is nonzero (bead `ley-line-open-39abfa`); the share is pinned by the `graphRoot` check. The wire is one frame per request and reply: two little-endian `u32` lengths, a Cap'n Proto header (`leyline-public-schema`'s `capnp/share.capnp`, bead `ley-line-open-39d3a4`), and READ/WRITE bytes as raw payload. `leyline-storefs`'s `DaemonShares` is the store-backed provider; `rs/ll-open/cli/tests/agent_in_guest.rs` runs an agent in a guest against it (`task runtime:test`, with `LEYLINE_LIBKRUNFW_PATH` and `LEYLINE_GUEST_TOOLS` from `tools/guest_tools.sh`).
 
 - **`backends::libkrun::output`** — what a microVM run printed, kept bounded (bead `ley-line-open-a26ad0`). libkrun connects the guest's standard output to the worker's standard output (its `krun-stdout` console port) and the guest's standard error to the worker's standard error (`krun-stderr`). The worker's standard error also carries the worker's own events and libkrun's diagnostics. The backend keeps the last 16 KiB of the standard output (`GUEST_OUTPUT_TAIL_BYTES`) and the last 8 KiB of the post-readiness standard error (`WORKER_STDERR_TAIL_BYTES`), each with a count of the bytes it dropped, plus the last line there shaped like a `failed` event. Memory per run is fixed however much the guest prints.
@@ -21,6 +21,173 @@ Capability-resolved execution lifecycle and isolation backends (`execution/v1`).
   - **Where the bytes go: deny by default.** They reach only the in-process embedder that started the run. `ExecutionService` records a failure's detail only as the BLAKE3 digest in the terminal event's `detailDigest`, so the event log commits to the output without carrying it. Nothing writes the output to disk, logs it, or sends it over the daemon's wire.
   - **Trust.** The bytes are the workload's own, untrusted, and may hold anything it printed; LLO adds nothing to them. Invalid UTF-8 and control characters other than newline and tab become U+FFFD, so a terminal showing a detail cannot be driven by the guest's escape sequences. That includes a reported event's decoded detail. The section headings are framing, not authority: guest bytes keep their newlines and can imitate a heading or the "(unverified)" line. A classification an embedder can trust needs a worker-event channel the guest cannot write, which stderr is not. `wait_for_output`'s condition runs under the run's capture lock, so it must not read the same run's output again.
   - **`outputBytes` is unaffected.** The tail is a diagnostic, not the `outputBytes` ceiling, which stays unenforced and refused.
+
+## Running the execution daemon
+
+This section moved here from the repository README, which now gives the
+overview and links here for operation.
+
+The experimental `leyline-runtime` crate owns the execution/v1 lifecycle and
+the first-party `libkrun` and native-`nono` worker backends. Both verify a
+content-addressed rootfs and copy it into a private per-run userspace volume;
+the native backend applies `nono` before launching the guest-relative
+executable, while the libkrun backend enters a microVM. Neither worker invokes
+`krunvm`, Taskfile, or repository scripts. The immutable CAS source remains
+outside the guest's writable boundary. Embedders select a backend explicitly
+when constructing `run_execution_daemon`; the ordinary daemon remains backend-
+free for compatibility.
+
+LLO builds the VMM it runs: the libkrun worker links libkrun from
+[`rs/third_party/libkrun`](../../third_party/README.md) (upstream v1.19.6 plus LLO's
+patches, ADR-0044) instead of loading an installed libkrun. The guest kernel,
+libkrunfw, is still an installed library. Building the worker compiles
+libkrun's guest init for Linux; on macOS that needs `zig`
+(`brew install zig`; see `tools/krun_init_cc.sh`).
+
+The portable runtime tests use a fake worker or the linked library without a
+hypervisor. The tests that boot a real guest run where
+`LEYLINE_LIBKRUNFW_PATH` names libkrunfw and report a skip otherwise (set
+`LEYLINE_REQUIRE_HYPERVISOR` to make that skip fail); on macOS they ad-hoc
+sign the VMM with the Hypervisor.framework entitlement. See
+[`libkrun_guest_write.rs`](../krun-worker/tests/libkrun_guest_write.rs),
+[`libkrun_virtiofs_backend.rs`](../krun-worker/tests/libkrun_virtiofs_backend.rs)
+and bead `ley-line-open-16a994` for the CI/release gate.
+
+The execution/v1 API is exposed through the runtime crate, the explicit
+`run_execution_daemon` UDS entry point, first-party CLI client, and MCP
+registry. Its schema version
+(`cloister/execution/v1`) is deliberately independent of the repository and
+crate release version; consumers must negotiate API compatibility rather than
+infer it from the release version. The ordinary open `leyline daemon` command remains a
+substrate daemon with no execution backend; an embedding application must opt
+into `run_execution_daemon` after constructing a trusted resolver/backend
+handler. The service currently proves schema binding,
+provisioning, ordered lifecycle events, cancellation, cleanup, and
+content-addressed receipt assembly. The native nono backend's confinement is
+checked at the kernel by `rs/ll-open/runtime/tests/native_confinement.rs`
+(Seatbelt on macOS, Landlock on Linux; `LEYLINE_REQUIRE_SANDBOX=1` turns a
+host that cannot sandbox from a named skip into a failure). Mmap-backed CAS
+projection remains a follow-on gate in bead `ley-line-open-16c953`.
+
+For embedders that keep an explicit artifact catalog, `CatalogResolver` binds
+the authorized executable artifact and workspace graph identities to a
+content-addressed rootfs digest and guest-relative entrypoint. It rejects
+unknown or duplicate identities, workspace drift, path traversal, and output
+limits that the backend cannot enforce; it never accepts host paths from the
+execution wire request.
+
+The open binary can host the native surface directly when those resources are
+provisioned explicitly:
+
+```bash
+leyline execution-daemon \
+  --cas-root /var/lib/leyline/cas \
+  --run-root /var/lib/leyline/runs \
+  --worker /usr/libexec/leyline-native-worker \
+  --catalog /etc/leyline/execution-catalog.json \
+  --evidence-store /var/lib/leyline/evidence \
+  --trust-key /etc/leyline/trust/issuer.pub
+```
+
+`--cas-root` holds rootfs trees named by the BLAKE3 of their
+`rootfs.manifest.json`. To make one from a container image, write the image as
+an OCI image layout (skopeo, crane, `docker buildx --output type=oci`, buildah
+or podman; none is needed afterwards) and import it by digest:
+
+```bash
+leyline rootfs import-oci \
+  --layout ./app-oci \
+  --image sha256:<index or manifest digest> \
+  --cas-root /var/lib/leyline/cas
+```
+
+It selects this host's Linux platform, verifies every blob, applies the layers
+with OCI whiteout semantics, and prints JSON whose `rootfs` is the catalog
+entry's `rootfs`. Tags are refused. A Zarf package's `images/` directory is
+such a layout. Or pull the image by digest over HTTPS, anonymously, with the
+same verification, rootfs digest and JSON:
+
+```bash
+leyline rootfs import-oci \
+  --from-registry ghcr.io/owner/app@sha256:<index or manifest digest> \
+  --cas-root /var/lib/leyline/cas
+```
+
+Symbolic links are kept as links by default (rootfs manifest v2 authenticates
+each link's target bytes; `--symlinks resolve` copies their targets instead,
+`refuse` refuses an image with any).
+
+The image format is never the isolation boundary; the backend is.
+
+The CAS root must be on a case-sensitive filesystem to import an image whose
+paths differ only by case (Debian's perl ships `Pod/` and `pod/`). macOS's
+default APFS is not, and the import refuses such an image by naming both paths
+and saying the CAS root is case-insensitive; images without such a pair import
+anywhere. `leyline rootfs provision-cas` prints a CAS root that is: on macOS a
+grow-on-demand case-sensitive APFS sparsebundle it creates and attaches, with
+no sudo, beneath `~/.local/state/leyline/cas-volume/` (`$LEYLINE_STATE_DIR`
+moves it); on Linux it checks `<state>/cas`. `execution-daemon --cas-volume`
+serves that root instead of `--cas-root` and re-attaches the volume when it
+starts. See "Container images" below for the contract.
+
+The catalog is local trusted configuration; it is not a substitute for the
+signed `RunSpec`/`RunGrant` wire contract. Signet/NotMe/Interlace trust roots
+remain embedding-owned: production callers must pass an `EvidenceVerifier` to
+`start_authorized_with_verifier`, which resolves each content-addressed
+evidence reference and verifies its signed envelope or certificate chain. The
+legacy `start_authorized` path uses a metadata-only fixture verifier and is not
+a production trust boundary. The daemon owns the worker and UDS lifecycle,
+while callers provide logical intent and the verifier's configuration.
+
+LLO ships `CasDsseEvidenceVerifier`, which verifies the `RunGrant` issuer
+signature and APAS `application/vnd.in-toto+json` evidence envelopes from a
+content-addressed store against supplied Ed25519 trust keys. It requires the
+APAS Handoff/v1 predicate as well as the in-toto envelope type. Cloister may
+use that adapter or supply its own verifier for Interlace certificate/lease
+evidence; key distribution and rotation remain outside LLO.
+
+`leyline execution-daemon` selects its verifier from three flags, and fails
+closed:
+
+| Flags | Verifier |
+| --- | --- |
+| `--evidence-store DIR` and one or more `--trust-key FILE` | `CasDsseEvidenceVerifier` over the CAS blob store at `DIR` (`<DIR>/<aa>/<62 hex>`, BLAKE3-addressed, verified on read), trusting exactly those keys |
+| none | `RejectUnverifiedEvidence`: every start is refused |
+| `--allow-unverified-evidence` | `MetadataOnlyEvidenceVerifier`: authenticates nothing; local fixtures only |
+
+LLO ships no trust keys. A trust-key file holds one Ed25519 public key, as
+64 hex characters or a PEM `PUBLIC KEY` block in canonical RFC 8410 SPKI form;
+the daemon logs each key's ADR-012 canonical kid
+(`lowercasehex(SHA-256(SPKI DER)[:16])`). Startup is refused when only one of
+`--trust-key`/`--evidence-store` is given, when a key file is unreadable,
+malformed or repeated, when the store directory does not exist, or when
+`--allow-unverified-evidence` is combined with either. Evidence is addressed
+`blake3-256:<hex>` over the exact envelope bytes; that digest names content and
+a kid names a key, and neither stands in for the other. A refused start reports
+`Unauthenticated` with a detail that begins with a stable rejection token
+(`grant-unsigned`, `untrusted-signer`, `signature-invalid`,
+`evidence-missing`, …; `EvidenceRejection` in `leyline-runtime`).
+
+To select the embedded VM path, use `--backend micro-vm --worker
+/path/to/leyline-krun-worker` (the release's `leyline-krun-worker-darwin-arm64`,
+or `task krun-worker:install`; on macOS the worker must carry
+`com.apple.security.hypervisor`, and the backend reports itself unavailable
+when it does not), grant libkrunfw with `--runtime-file`, and
+repeat `--device` only for explicitly granted device paths. This selects LLO's `KrunWorkerBackend`; it does not invoke the
+`krunvm` CLI.
+
+### Mutation testing
+
+Mutation testing is invoked through the repository Taskfile. Run
+`task mutants:pr` to exercise the same diff-scoped slices as CI against the
+working tree, including uncommitted changes. For a shorter local feedback loop,
+`task mutants:pr MUTANTS_SCOPE=runtime` and `MUTANTS_SCOPE=cli` select the
+corresponding package, while CI always runs every slice. Runtime behavior is
+mutated with its integration tests enabled; CLI-library execution mutations
+run the library plus the `execution_client` and `execution_transport` contract
+tests. The Taskfile fixture gate rejects Rust diffs that enumerate no mutants,
+focused scopes that run no matching slice, and baseline suites that cannot run
+inside cargo-mutants' scratch tree.
 
 ## Container images
 

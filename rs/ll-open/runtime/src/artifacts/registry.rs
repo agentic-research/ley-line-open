@@ -561,9 +561,12 @@ impl<T> Deadline<T> {
         match self.remaining() {
             None => Ok(timeout),
             Some(remaining) if remaining.is_zero() => Err(past_deadline()),
+            // Struct update keeps every other field ureq carries, so a newer
+            // ureq that adds fields (3.5 added per_read and per_write) still
+            // compiles for a consumer whose resolve picks it.
             Some(remaining) => Ok(NextTimeout {
                 after: ureq_time::Duration::Exact(remaining.min(*timeout.after)),
-                reason: timeout.reason,
+                ..timeout
             }),
         }
     }

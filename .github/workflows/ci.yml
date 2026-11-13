@@ -167,6 +167,11 @@ jobs:
       - name: Run task ci (check + clippy + fmt + FFI staticlib + tier isolation + test)
         run: task ci
 
+      # After task ci, never inside it: this rewrites rs/Cargo.lock for its
+      # duration (restored on exit), which task ci's tree attestation refuses.
+      - name: Build leyline-runtime on a fresh dependency resolve
+        run: task deps:fresh-resolve-check
+
       - name: Report sccache statistics
         if: always()
         run: task cache:sccache:stats

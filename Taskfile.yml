@@ -329,6 +329,25 @@ tasks:
     cmds:
       - tools/vendor_libkrun.sh sync
 
+  deps:fresh-resolve-check:
+    desc: |
+      Build leyline-runtime against the newest semver-compatible
+      dependencies, the resolve a downstream git consumer gets
+      (`ley-line-open-d4ba4b`). LLO's own builds use the committed lock, so
+      a dependency release that breaks a consumer (ureq 3.5's new
+      NextTimeout fields) is invisible to `task ci`. Kept out of `task ci`
+      because it rewrites rs/Cargo.lock for the duration; the lock is
+      restored on every exit path.
+    dir: rs
+    cmds:
+      - |
+        set -eu
+        saved=$(mktemp)
+        cp Cargo.lock "$saved"
+        trap 'cp "$saved" Cargo.lock; rm -f "$saved"' EXIT
+        cargo update --quiet
+        cargo check -p leyline-runtime
+
   deps:cargo-mutants:
     desc: |
       cargo-mutants from source with --locked — installed from source rather

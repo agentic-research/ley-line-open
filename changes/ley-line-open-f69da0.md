@@ -1,0 +1,2 @@
+Section: Fixed
+- **A daemon whose state directory was removed now shuts down at once instead of after 30 s.** The final publish checked out a reader connection, the pool tried to reopen the vanished `live.db`, and r2d2 blocked for its default 30 s `connection_timeout`. Shutdown now skips the final publish with `warn: final snapshot skipped: the live db … no longer exists`, and otherwise bounds its reader checkout to 2 s (`ley-line-open-f69da0`).

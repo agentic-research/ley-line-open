@@ -229,6 +229,9 @@ pub enum GrowRefused {
     /// The target exceeds the filesystem's free space less
     /// [`GROW_FREE_MARGIN`].
     BeyondFreeSpace { target: u64, available: u64 },
+    /// The arena path is empty or relative, so it names a file only
+    /// relative to the process's cwd (`ley-line-open-f68a3a`).
+    PathNotAbsolute,
 }
 
 impl std::fmt::Display for GrowRefused {
@@ -301,6 +304,13 @@ fn available_bytes(path: &std::path::Path) -> Option<u64> {
 pub fn write_grown_arena(path: &std::path::Path, arena_size: u64, data: &[u8]) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Read;
+    // The grown arena is built at `path + ".grow"`: an empty or relative
+    // path would build it in the process's cwd, wherever that is
+    // (`ley-line-open-f68a3a`). Refused before any file is created.
+    if !path.is_absolute() {
+        return Err(anyhow::Error::new(GrowRefused::PathNotAbsolute)
+            .context(format!("refuse to grow the arena at {path:?}")));
+    }
     // A target the image does not justify, or the disk cannot hold, is
     // refused before any file is created (bead `ley-line-open-8c8ded`).
     // The free space is that of the filesystem holding the arena being
@@ -587,6 +597,35 @@ mod tests {
             1,
             "no grown arena was created beside it"
         );
+    }
+
+    /// `ley-line-open-f68a3a`: the grown arena is built at `path + ".grow"`,
+    /// so an empty path built `.grow` in the process's cwd (mache found one
+    /// in its source tree). A path that is empty or relative names a file
+    /// only relative to wherever the process happens to run; it is refused
+    /// before any file exists.
+    #[test]
+    fn write_grown_arena_refuses_an_empty_or_relative_path_and_writes_nothing() {
+        for path in ["", "relative.arena", "dir/relative.arena"] {
+            let err =
+                write_grown_arena(std::path::Path::new(path), 4096 + 4096 * 2, b"x").unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref::<GrowRefused>(),
+                    Some(GrowRefused::PathNotAbsolute)
+                ),
+                "{path:?}: {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("PathNotAbsolute"),
+                "the refusal names its reason: {err:#}"
+            );
+            let grow = format!("{path}.grow");
+            assert!(
+                !std::path::Path::new(&grow).exists(),
+                "{grow} must not be created"
+            );
+        }
     }
 
     #[test]

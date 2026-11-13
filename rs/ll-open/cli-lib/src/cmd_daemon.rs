@@ -1497,6 +1497,19 @@ pub fn snapshot_to_arena(conn: &mut rusqlite::Connection, ctrl_path: &Path) -> R
         leyline_core::Controller::open_or_create(ctrl_path).context("open controller")?;
     let arena_path = ctrl.arena_path();
     let arena_size = ctrl.arena_size();
+    // The arena is written at the RECORDED path. Empty (no arena
+    // registered) or relative, it resolves against the daemon's cwd, which
+    // is the caller's directory, not the daemon's state
+    // (`ley-line-open-f68a3a`). `setup_arena` records an absolute path.
+    if !Path::new(&arena_path).is_absolute() {
+        anyhow::bail!(
+            "the controller at {} records arena path {arena_path:?}, which is not an \
+             absolute path; refusing to write an arena relative to the working directory \
+             (start the daemon with --arena, or remove the controller so it is \
+             registered afresh)",
+            ctrl_path.display(),
+        );
+    }
 
     let new_size = arena_size_for(arena_size, db_bytes.len() as u64);
 
@@ -2920,6 +2933,44 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(live_mode.to_lowercase(), "wal", "the live db stays WAL");
+    }
+
+    /// `ley-line-open-f68a3a`: the publish writes the arena at the
+    /// controller's RECORDED path. Recorded empty (no arena registered) or
+    /// relative, that path resolves against the daemon's cwd, and mache
+    /// found a 2 MiB `.grow` in its source tree. Both are refused by name,
+    /// before any arena file is written, on both the same-size and the
+    /// grow branch.
+    #[test]
+    fn snapshot_to_arena_refuses_an_unregistered_or_relative_arena_path() {
+        for (recorded, size) in [("", 0u64), ("rel.arena", 2 * 1024 * 1024)] {
+            let dir = TempDir::new().unwrap();
+            let ctrl_path = dir.path().join("f68a3a.ctrl");
+            {
+                let mut c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+                if !recorded.is_empty() {
+                    c.set_arena(recorded, size).unwrap();
+                }
+            }
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+                .unwrap();
+
+            let err = snapshot_to_arena(&mut conn, &ctrl_path).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not an absolute path"),
+                "{recorded:?}: the refusal names the cause: {msg}"
+            );
+            for stray in [".grow", "rel.arena", "rel.arena.grow"] {
+                assert!(
+                    !std::path::Path::new(stray).exists(),
+                    "{recorded:?}: {stray} was created in the cwd"
+                );
+            }
+            let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+            assert_eq!(c.current_root(), [0u8; 32], "nothing was published");
+        }
     }
 
     #[test]

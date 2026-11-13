@@ -885,7 +885,9 @@ crashed), the counts are lower bounds. Every count is attributed to this run bec
 this run's peer is accepted (S4, S5). The broker reports each connection's record over its
 control pipe when the connection ends, and a final record for each open connection at the
 teardown drain (S7), so the receipt is assembled by the supervisor, not by the broker or
-the workload. After a broker crash the receipt carries every record reported before it,
+the workload. An open connection's byte counts at the drain are lower bounds: the broker
+counts a chunk after its write returns, so the workload may already hold a chunk the
+drain has not counted. A connection that ended before the drain has exact counts. After a broker crash the receipt carries every record reported before it,
 `complete` is false, and the run's terminal state is `failed`. The receipt carries no
 payload byte, no guest address and no peer pid.
 

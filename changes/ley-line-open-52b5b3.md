@@ -20,7 +20,8 @@ Section: Added
     Then it reports ready with the `connectionsDigest` it bound, which the supervisor
     compares with the grant's.
   - **Lifecycle:** it exits the moment its lifeline pipe ends, and drains open
-    connections into its records on request.
+    connections into its records on request; an open connection's byte counts there are
+    lower bounds.
   - **Supporting pieces:** the endpoint preflight (path absent, parent a private,
     non-symlinked directory owned by the daemon, `sun_path` fits), the endpoint registry
     that refuses whichever of two overlapping runs registers second, the delivered-target

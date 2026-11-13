@@ -1,9 +1,9 @@
 # ley-line-open
 
-Ley-line-open (LLO) keeps data as immutable, content-addressed values: a tree
-of files under a directory Merkle root (`storeRoot`), an image's root
-filesystem named by its rootfs digest, signed evidence by its BLAKE3 digest. It
-serves projections of those values:
+Ley-line-open (LLO) keeps data as immutable, content-addressed values: each
+version of a tree of files under a directory Merkle root (`storeRoot`), an
+image's root filesystem named by its rootfs digest, signed evidence by its
+BLAKE3 digest. It serves projections of those values:
 
 - **structured facts**: a tree is parsed into a queryable SQLite projection,
   with tree-sitter and language servers for the files that have a grammar,

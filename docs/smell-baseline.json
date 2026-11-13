@@ -63,6 +63,11 @@
     },
     {
       "rule_id": "sleep_in_tests",
+      "source_id": "rs/ll-core/core/src/control.rs",
+      "count": 1
+    },
+    {
+      "rule_id": "sleep_in_tests",
       "source_id": "rs/ll-open/cli-lib/benches/wal_concurrent_readers.rs",
       "count": 1
     },
@@ -95,16 +100,6 @@
       "rule_id": "sleep_in_tests",
       "source_id": "rs/ll-open/cli-lib/tests/wal_pool_concurrent_readers_daemon_test.rs",
       "count": 1
-    },
-    {
-      "rule_id": "sleep_in_tests",
-      "source_id": "rs/ll-open/runtime/tests/broker_control.rs",
-      "count": 1
-    },
-    {
-      "rule_id": "sleep_in_tests",
-      "source_id": "rs/ll-open/runtime/tests/broker_relay.rs",
-      "count": 6
     },
     {
       "rule_id": "sleep_in_tests",

@@ -136,6 +136,22 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Wait for a real condition the relay exposes, with a bounded deadline
+/// (never a sleep standing in for the event).
+fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::yield_now();
+    }
+}
+
+impl Running {
+    fn handle(&self) -> &relay::RelayHandle {
+        self.handle.as_ref().expect("relay running")
+    }
+}
+
 fn limits(hold: Duration) -> Limits {
     Limits {
         max_connections: MAX_CONNECTIONS,
@@ -221,7 +237,8 @@ fn an_upstream_that_comes_up_within_the_hold_is_reached() {
     let running = run(port, None, Limits::default());
     let mut client = running.connect();
     client.write_all(b"early").unwrap();
-    thread::sleep(Duration::from_millis(400));
+    // The upstream comes up only after the broker has found it down.
+    until("a refused dial", || running.handle().refused_dials() >= 1);
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("rebind the port");
     let (mut stream, _) = listener.accept().unwrap();
     let mut buffer = [0u8; 5];
@@ -259,7 +276,9 @@ fn a_hold_that_expires_ends_in_end_of_file_within_the_bound() {
 fn a_client_that_hangs_up_ends_the_hold_early() {
     let running = run(free_port(), None, limits(Duration::from_secs(10)));
     let client = running.connect();
-    thread::sleep(Duration::from_millis(100));
+    until("the hold to begin", || {
+        running.handle().refused_dials() >= 1
+    });
     let started = Instant::now();
     drop(client);
     let record = running.record();
@@ -275,10 +294,13 @@ fn a_client_that_hangs_up_ends_the_hold_early() {
 fn an_upstream_reset_mid_stream_is_end_of_file_to_the_client() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (delivered, received) = std::sync::mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream.write_all(b"partial").unwrap();
-        thread::sleep(Duration::from_millis(100));
+        // Reset only once the client holds the bytes, so the reset tests
+        // the end of the stream, not the loss of unread data.
+        received.recv().unwrap();
         // SO_LINGER 0: close sends a reset.
         let linger = libc::linger {
             l_onoff: 1,
@@ -298,6 +320,10 @@ fn an_upstream_reset_mid_stream_is_end_of_file_to_the_client() {
     });
     let running = run(port, None, Limits::default());
     let mut client = running.connect();
+    let mut first = [0u8; 7];
+    client.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"partial");
+    delivered.send(()).unwrap();
     let mut back = Vec::new();
     let result = client.read_to_end(&mut back);
     server.join().unwrap();
@@ -305,7 +331,7 @@ fn an_upstream_reset_mid_stream_is_end_of_file_to_the_client() {
         result.is_ok(),
         "the client sees end-of-file, not an error: {result:?}"
     );
-    assert_eq!(back, b"partial");
+    assert!(back.is_empty(), "nothing after the reset");
     assert_eq!(running.record().outcome, Outcome::Dialed);
 }
 
@@ -320,7 +346,9 @@ fn connections_past_the_cap_are_closed_without_a_dial() {
         },
     );
     let held: Vec<UnixStream> = (0..2).map(|_| running.connect()).collect();
-    thread::sleep(Duration::from_millis(300));
+    until("two connections in flight", || {
+        running.handle().in_flight() == 2
+    });
     let mut third = running.connect();
     let mut back = Vec::new();
     third.read_to_end(&mut back).unwrap();
@@ -440,7 +468,9 @@ fn a_descriptor_passed_during_the_hold_is_released_with_the_connection() {
     // SAFETY: closing our own copy of the write end.
     unsafe { libc::close(pipe_write) };
     // Several hold rounds pass with the message queued.
-    thread::sleep(Duration::from_millis(300));
+    until("three refused dials", || {
+        running.handle().refused_dials() >= 3
+    });
     drop(client);
     assert_eq!(running.record().outcome, Outcome::Refused);
     let mut pollfd = libc::pollfd {
@@ -528,6 +558,8 @@ fn a_hundred_passed_descriptors_are_all_closed_and_the_bytes_still_cross() {
     let client = running.connect();
     // A sentinel descriptor that must survive the broker's closes.
     let sentinel = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    // Whatever fd 0 is now; an over-read of the rights would close it.
+    let stdin_before = identity(0);
     let mut pipe = [0; 2];
     // SAFETY: a valid out array.
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -561,7 +593,7 @@ fn a_hundred_passed_descriptors_are_all_closed_and_the_bytes_still_cross() {
         identity(sentinel.as_raw_fd()).is_some(),
         "an unrelated descriptor was closed"
     );
-    assert!(identity(0).is_some(), "standard input was closed");
+    assert_eq!(identity(0), stdin_before, "descriptor 0 was closed or replaced");
 }
 
 #[test]
@@ -734,7 +766,9 @@ fn the_cap_is_256_simultaneous_connections() {
             }
         })
         .collect();
-    thread::sleep(Duration::from_millis(500));
+    until("256 connections in flight", || {
+        running.handle().in_flight() == MAX_CONNECTIONS
+    });
     let mut over = loop {
         match UnixStream::connect(&running.path) {
             Ok(stream) => break stream,

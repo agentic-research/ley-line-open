@@ -90,6 +90,10 @@ struct Event {
   data   @3 :Text;   # JSON-encoded payload (flexible per topic)
 }
 
+# Retired (bead `ley-line-open-0a18bc`): the row type of
+# `QueryResponse.retiredRows`, which is never emitted. Kept because that
+# field still names it; schema evolution never removes a type a field
+# references.
 struct QueryRow {
   values @0 :List(Text);
 }
@@ -298,9 +302,33 @@ struct QueryRequest {
 struct QueryResponse {
   ok      @0 :Bool;
   columns @1 :List(Text);
-  rows    @2 :List(QueryRow);
+  # Retired, never emitted (bead `ley-line-open-0a18bc`, ADR-0014 §2). It
+  # declared rows as `{"values": [...]}` structs while the daemon sent
+  # objects keyed by column name, and a keyed row drops a value whenever two
+  # columns share a name. The ordinal stays reserved; `rows` @5 carries the
+  # rows.
+  retiredRows @2 :List(QueryRow)  $Json.name("retired_rows");
   error   @3 :Text;
   refusal @4 :QueryRefusal;
+  # One element per result row; each row holds one `QueryCell` per entry of
+  # `columns`, in `columns` order (bead `ley-line-open-0a18bc`).
+  rows    @5 :List(List(QueryCell));
+}
+
+# One value of a `query` result row. The member names the SQLite value, so
+# SQL NULL is carried by the schema itself, distinct from the empty string.
+# On the JSON wire a cell is `{"null": null}` or `{"text": "..."}`.
+#
+# `text` carries every non-NULL value as text: an integer or real in
+# decimal, text as itself, a blob as lowercase hex. Typed members
+# (`integer`, `real`, `blob`) are the intended extension; adding one is
+# additive, and a reader that meets a member it does not know must refuse
+# the cell rather than guess.
+struct QueryCell {
+  union {
+    null @0 :Void;
+    text @1 :Text;
+  }
 }
 
 # Why a `query` statement was refused.

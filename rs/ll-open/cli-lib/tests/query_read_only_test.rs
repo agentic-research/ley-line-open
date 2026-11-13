@@ -377,6 +377,63 @@ fn the_protocol_fixture_refusal_is_what_the_daemon_sends() {
     assert_eq!(d.over_mcp(sql).0, fixture["response"]);
 }
 
+/// The protocol fixtures' row bodies are exactly what the daemon sends over
+/// both transports, so the Go decode of those fixtures checks the real wire:
+/// a repeated column name keeps both values, and SQL NULL stays distinct
+/// from the empty string (bead `ley-line-open-0a18bc`).
+#[test]
+fn the_protocol_fixture_rows_are_what_the_daemon_sends() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/daemon-protocol.json");
+    let fixtures: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let d = Daemon::start();
+    for name in ["query", "query_duplicate_columns", "query_null"] {
+        let fixture = &fixtures[name];
+        let sql = fixture["request"]["sql"].as_str().unwrap();
+        assert_eq!(d.over_socket(sql), fixture["response"], "socket: {name}");
+        assert_eq!(d.over_mcp(sql).0, fixture["response"], "mcp: {name}");
+    }
+}
+
+/// The schema carries NULL itself: the `query_null` and
+/// `query_duplicate_columns` fixtures decode through `daemon.capnp` with the
+/// Rust capnp-json codec into `QueryCell` unions, the NULL cell as its `null`
+/// member and the empty string as `text`, and both repeated columns survive
+/// in order (bead `ley-line-open-0a18bc`).
+#[test]
+fn the_protocol_fixture_rows_decode_through_the_schema() {
+    use leyline_public_schema::daemon_capnp::{query_cell, query_response};
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/daemon-protocol.json");
+    let fixtures: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let decode = |name: &str| -> Vec<Vec<Option<String>>> {
+        let mut message = capnp::message::Builder::new_default();
+        let root: query_response::Builder = message.init_root();
+        capnp_json::from_json(&fixtures[name]["response"].to_string(), root)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let reader = message
+            .get_root_as_reader::<query_response::Reader>()
+            .unwrap();
+        reader
+            .get_rows()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.unwrap()
+                    .iter()
+                    .map(|cell| match cell.which().unwrap() {
+                        query_cell::Null(()) => None,
+                        query_cell::Text(text) => Some(text.unwrap().to_string().unwrap()),
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(decode("query_null"), vec![vec![None, Some(String::new())]]);
+    assert_eq!(
+        decode("query_duplicate_columns"),
+        vec![vec![Some("1".to_string()), Some("2".to_string())]]
+    );
+}
+
 /// A virtual-table module the build did not have, registered on every
 /// reader after the pool restricted its modules (as an extension might),
 /// makes `query` refuse every statement on the reader, the join that names
@@ -460,7 +517,7 @@ fn a_schema_virtual_table_is_unreadable() {
     // The table's own storage is a plain table and is read as one.
     assert_eq!(
         d.over_socket("SELECT count(*) AS n FROM docs_content")["rows"],
-        json!([{"n": "1"}])
+        json!([[{"text": "1"}]])
     );
 }
 
@@ -492,7 +549,7 @@ fn a_statement_that_opens_the_temp_database_is_refused() {
     }
     assert_eq!(
         d.over_socket("SELECT a FROM t ORDER BY a")["rows"],
-        json!([{"a": "1"}, {"a": "2"}]),
+        json!([[{"text": "1"}], [{"text": "2"}]]),
         "the readers still serve"
     );
 }
@@ -504,31 +561,31 @@ fn allowed_modules_return_rows() {
     let mut cases = vec![
         (
             "SELECT value FROM json_each('[1, 2]')",
-            json!([{"value": "1"}, {"value": "2"}]),
+            json!([[{"text": "1"}], [{"text": "2"}]]),
         ),
         (
             "SELECT key FROM json_tree('{\"k\": 1}') WHERE key IS NOT NULL",
-            json!([{"key": "k"}]),
+            json!([[{"text": "k"}]]),
         ),
         (
             "SELECT count(*) AS n FROM jsonb_each(jsonb('[1, 2]'))",
-            json!([{"n": "2"}]),
+            json!([[{"text": "2"}]]),
         ),
         (
             "SELECT name FROM dbstat WHERE name = 't'",
-            json!([{"name": "t"}]),
+            json!([[{"text": "t"}]]),
         ),
         // A full join's merged column is reported as a read of the
         // subquery's name, which is not a table of the schema.
         (
             "SELECT a FROM (SELECT 1 AS a) AS s FULL JOIN t USING (a) ORDER BY a",
-            json!([{"a": "1"}, {"a": "2"}]),
+            json!([[{"text": "1"}], [{"text": "2"}]]),
         ),
     ];
     if cfg!(feature = "vec") {
         cases.push((
             "SELECT count(*) AS n FROM vec_each('[1.0, 2.0, 3.0]')",
-            json!([{"n": "3"}]),
+            json!([[{"text": "3"}]]),
         ));
     }
     for (sql, want) in cases {
@@ -607,7 +664,7 @@ fn a_select_still_returns_its_rows() {
     let want = json!({
         "ok": true,
         "columns": ["a", "b"],
-        "rows": [{"a": "1", "b": "one"}, {"a": "2", "b": "two"}],
+        "rows": [[{"text": "1"}, {"text": "one"}], [{"text": "2"}, {"text": "two"}]],
     });
     let sql = "SELECT a, b FROM t ORDER BY a";
     assert_eq!(d.over_socket(sql), want);
@@ -620,11 +677,15 @@ fn a_select_still_returns_its_rows() {
         "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 3) \
          SELECT count(*) AS n, upper(group_concat(b)) AS bs FROM n JOIN t ON t.a = n.x",
     );
-    assert_eq!(cte["rows"], json!([{"n": "2", "bs": "ONE,TWO"}]), "{cte}");
+    assert_eq!(
+        cte["rows"],
+        json!([[{"text": "2"}, {"text": "ONE,TWO"}]]),
+        "{cte}"
+    );
     let cols = d.over_socket("SELECT name FROM pragma_table_info('t') ORDER BY cid");
     assert_eq!(
         cols["rows"],
-        json!([{"name": "a"}, {"name": "b"}]),
+        json!([[{"text": "a"}], [{"text": "b"}]]),
         "{cols}"
     );
 }

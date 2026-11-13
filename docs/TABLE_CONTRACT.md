@@ -584,11 +584,29 @@ Composing the two yields **handler ↔ schema** transitively. Either half
 failing means the chain broke. The fixture file is the deliberate
 intermediate artifact, not an artifact of the implementation.
 
-One op, `query`, is SKIPPED in the Go half, with the drift reason as the
-skip message: the schema declares positional `rows: List(QueryRow)` and the
-handler emits column-keyed maps, which no additive schema change reconciles.
-The Rust half still runs it. Every other fixture's `go_drift_skip` is null;
-bead A-2 (`b631c8`) reconciled the others additively.
+No fixture is skipped in the Go half: every `go_drift_skip` is null. Bead
+A-2 (`b631c8`) reconciled the other ops additively. `query` was the last
+skip, because its handler sent rows as objects keyed by column name while
+the schema declared positional rows; a keyed row also lost a value whenever
+two columns shared a name. Bead `ley-line-open-0a18bc` retyped the rows, a
+wire break that moved `wire_format_major` to 3: `QueryResponse.rows` (@5,
+`List(List(QueryCell))`) is one list per row in `columns` order, each cell
+`{"null": null}` for SQL NULL or `{"text": "..."}`, and the old @2 field is
+retired as `retiredRows` and never emitted. The `query`,
+`query_duplicate_columns` and `query_null` fixtures are checked for exact
+equality against the daemon over both transports
+(`tests/query_read_only_test.rs`).
+
+A third gate closes the chain from the schema's side: `task
+schema:daemon-fixture-codec` (`tools/check_daemon_fixture_codec.py`, run by
+`task ci`) round-trips every fixture `response` through `daemon.capnp` with
+the reference capnp JSON codec (`capnp convert`) as the struct its
+`capnp_struct`, else its `go_binding`, names, and requires the result to
+equal the fixture. The codec drops a field the schema does not declare, so a
+key the schema lacks fails too. Neither mirror proves this: a bare JSON
+`null` in a `List(Text)` row satisfied both hand-written mirrors and no
+schema reader. `task schema:daemon-fixture-codec:fixture-test` proves the
+gate refuses each drift it exists to catch.
 
 ## Rules
 

@@ -103,11 +103,6 @@ type Ref struct {
 	SourceID *string `json:"source_id"`
 }
 
-// QueryRow is one row in a `query` op response.
-type QueryRow struct {
-	Values []string `json:"values"`
-}
-
 // ReadContentResponse is the wire shape of the `read_content` op response.
 type ReadContentResponse struct {
 	OK      *bool   `json:"ok"`
@@ -374,9 +369,11 @@ type QueryRefusal struct {
 // one read-only SELECT: OK false with Refusal means the statement was
 // refused, OK false without it is an error running an allowed statement.
 type QueryResponse struct {
-	OK      *bool         `json:"ok"`
-	Columns []string      `json:"columns"`
-	Rows    []QueryRow    `json:"rows"`
+	OK      *bool    `json:"ok"`
+	Columns []string `json:"columns"`
+	// Rows holds one entry per result row, each with one QueryCell per entry
+	// of Columns, in Columns order (LLO bead ley-line-open-0a18bc).
+	Rows    [][]QueryCell `json:"rows"`
 	Error   *string       `json:"error,omitempty"`
 	Refusal *QueryRefusal `json:"refusal,omitempty"`
 }

@@ -506,6 +506,16 @@ tasks:
     cmds:
       - tools/test_go_schema_consumer.sh
 
+  schema:daemon-fixture-codec:
+    desc: Every daemon-protocol.json response round-trips through daemon.capnp under the reference capnp JSON codec, against its go_binding (or capnp_struct) struct (0a18bc)
+    cmds:
+      - python3 -I tools/check_daemon_fixture_codec.py
+
+  schema:daemon-fixture-codec:fixture-test:
+    desc: Prove the daemon fixture codec gate refuses a bare null cell, an undeclared key, an omitted default and a binding that is no struct (0a18bc)
+    cmds:
+      - python3 -I tools/check_daemon_fixture_codec.py --self-test
+
   schema:go-sigma-vectors:
     desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec, node_hash v3) and refuses the v2 Head message by version, as the Rust tests do (73c6ee, 73add7, a46711)
     dir: clients/go/leyline-schema
@@ -1853,6 +1863,8 @@ tasks:
       - task: release:hypervisor:fixture-test
       - task: guest-tools:fixture-test
       - task: schema:consumer-fixture-test
+      - task: schema:daemon-fixture-codec:fixture-test
+      - task: schema:daemon-fixture-codec
       - task: schema:go-sigma-vectors
       - task: schema:execution-asset-consumer-test
       - task: schema:mcp-protocol-pin-test

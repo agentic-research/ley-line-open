@@ -3684,11 +3684,11 @@ mod tests {
         );
         assert_eq!(
             conflict_rows(&ctx, "a.go"),
-            vec![serde_json::json!({
-                "path": "a.go",
-                "disk": upper_hex(CHECKOUT_EDITED),
-                "stored": upper_hex(CHECKOUT_PROPOSED),
-            })],
+            vec![serde_json::json!([
+                {"text": "a.go"},
+                {"text": upper_hex(CHECKOUT_EDITED)},
+                {"text": upper_hex(CHECKOUT_PROPOSED)},
+            ])],
         );
         drop(ctx);
 
@@ -3773,7 +3773,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|row| row["path"].as_str().unwrap().to_string())
+            .map(|row| row[0]["text"].as_str().unwrap().to_string())
             .collect()
     }
 

@@ -1,0 +1,964 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "kind": "ExecutionDaemonConfig",
+  "description": "deployment-config/v1 vectors for ExecutionDaemonConfig (ADR-0049). Every `input` is the document text, byte for byte. `cases` pin the canonical resolved bytes and configDigest (BLAKE3-256 over them) under the named host; ExecutionDaemonConfig cases also pin the backend struct values the runtime library entry builds. Every `rejects` input is refused with the pinned field and reason (the first refusal in README order); `schemaRefuses` says whether the published JSON Schema refuses it too. `hosts` are the injected HostFacts each case resolves under (home, XDG_STATE_HOME, the platform data directory, the OS); a null member is unset.",
+  "hosts": {
+    "macos": {
+      "home": "/Users/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/Users/fixture/Library/Application Support",
+      "os": "macos"
+    },
+    "linux": {
+      "home": "/home/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "linux-xdg": {
+      "home": "/home/fixture",
+      "xdgStateHome": "/home/fixture/.state",
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "no-home": {
+      "home": null,
+      "xdgStateHome": null,
+      "dataDir": null,
+      "os": "linux"
+    }
+  },
+  "cases": [
+    {
+      "name": "minimal-directory-macos",
+      "description": "The four required fields only (cas, worker.path, catalog, evidence); every other field is its default on this host.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"directory\": {\n      \"root\": \"/var/lib/leyline/cas\",\n      \"runRoot\": \"/var/lib/leyline/runs\"\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/Users/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/Users/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:515ab5d1af9e14185f04e429785217e4bb15d10140cf47d7806a03e8dfdb3c6d",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/Users/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/Users/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"directory\":{\"runRoot\":\"/var/lib/leyline/runs\",\"root\":\"/var/lib/leyline/cas\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/Users/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/var/lib/leyline/cas",
+        "ephemeralRoot": "/var/lib/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "minimal-directory-linux",
+      "description": "The four required fields only (cas, worker.path, catalog, evidence); every other field is its default on this host.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"directory\": {\n      \"root\": \"/var/lib/leyline/cas\",\n      \"runRoot\": \"/var/lib/leyline/runs\"\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/home/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/home/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:62335f4aa9482270b8ef8aebadee9881d1be96774384b0dc1ce21704248b226b",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/home/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/home/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"directory\":{\"runRoot\":\"/var/lib/leyline/runs\",\"root\":\"/var/lib/leyline/cas\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/home/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/var/lib/leyline/cas",
+        "ephemeralRoot": "/var/lib/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "minimal-directory-linux-xdg",
+      "description": "The four required fields only (cas, worker.path, catalog, evidence); every other field is its default on this host.",
+      "host": "linux-xdg",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"directory\": {\n      \"root\": \"/var/lib/leyline/cas\",\n      \"runRoot\": \"/var/lib/leyline/runs\"\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/home/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/home/fixture/.state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:003039b3ba8cf44e63ccfcd97aa1d94498d9ef9b77ebcd8eb623b17ca8efbbd2",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/home/fixture/.state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/home/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"directory\":{\"runRoot\":\"/var/lib/leyline/runs\",\"root\":\"/var/lib/leyline/cas\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/home/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/var/lib/leyline/cas",
+        "ephemeralRoot": "/var/lib/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "minimal-volume-macos",
+      "description": "cas.volume with every default: the run root is the volume's own, beneath stateDir, per OS.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"volume\": {\n      \"runRoot\": \"/Users/fixture/.local/state/leyline/cas-volume/mnt/runs\",\n      \"sizeCapGib\": 64\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/Users/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/Users/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:52c6bbe7b5e839073c8469953cae294345e519c9be73afe6abf84178a62d243e",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/Users/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/Users/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"volume\":{\"sizeCapGib\":64,\"runRoot\":\"/Users/fixture/.local/state/leyline/cas-volume/mnt/runs\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/Users/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/Users/fixture/.local/state/leyline/cas-volume/mnt/cas",
+        "ephemeralRoot": "/Users/fixture/.local/state/leyline/cas-volume/mnt/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "minimal-volume-linux",
+      "description": "cas.volume with every default: the run root is the volume's own, beneath stateDir, per OS.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"volume\": {\n      \"runRoot\": \"/home/fixture/.local/state/leyline/runs\",\n      \"sizeCapGib\": 64\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/home/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/home/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:09336479fe153a0428a155cd8be0a442041a018164d63b128000edf0d86fd878",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/home/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/home/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"volume\":{\"sizeCapGib\":64,\"runRoot\":\"/home/fixture/.local/state/leyline/runs\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/home/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/home/fixture/.local/state/leyline/cas",
+        "ephemeralRoot": "/home/fixture/.local/state/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "minimal-volume-linux-xdg",
+      "description": "cas.volume with every default: the run root is the volume's own, beneath stateDir, per OS.",
+      "host": "linux-xdg",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"volume\": {\n      \"runRoot\": \"/home/fixture/.state/leyline/runs\",\n      \"sizeCapGib\": 64\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/home/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/home/fixture/.state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:2d48d176c0c35b003fa15026bc188fec2442142a36bbcf61f8f7f63e18abab33",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/home/fixture/.state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/home/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"volume\":{\"sizeCapGib\":64,\"runRoot\":\"/home/fixture/.state/leyline/runs\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/home/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/home/fixture/.state/leyline/cas",
+        "ephemeralRoot": "/home/fixture/.state/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "minimal-keys-shuffled",
+      "description": "The minimal document with keys reversed and CRLF/tab whitespace, apiVersion and kind last: the same resolved bytes.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\r\n\t\"evidence\" : {\"unverified\":{}},\"catalog\":\"/etc/leyline/execution-catalog.json\",\n \"worker\":{\"path\":\"/usr/libexec/leyline-native-worker\"},\"cas\":{\"directory\":{\"runRoot\":\"/var/lib/leyline/runs\",\"root\":\"/var/lib/leyline/cas\"}},\"kind\":\"ExecutionDaemonConfig\",\"apiVersion\":\"config.leyline/v1\"}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"directory\": {\n      \"root\": \"/var/lib/leyline/cas\",\n      \"runRoot\": \"/var/lib/leyline/runs\"\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/Users/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/Users/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:515ab5d1af9e14185f04e429785217e4bb15d10140cf47d7806a03e8dfdb3c6d",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/Users/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/Users/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"directory\":{\"runRoot\":\"/var/lib/leyline/runs\",\"root\":\"/var/lib/leyline/cas\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/Users/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/var/lib/leyline/cas",
+        "ephemeralRoot": "/var/lib/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "nulls-where-the-default-is-null",
+      "description": "null where the default is null means the same as omitting the field.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"source\": null, \"backend\": {\"native\": {\"cgroupRoot\": null}}, \"head\": {\"signingKey\": null}, \"diagnostics\": {\"sheafAblationLog\": null}, \"enrichment\": {\"sessionCorpus\": null}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"directory\": {\n      \"root\": \"/var/lib/leyline/cas\",\n      \"runRoot\": \"/var/lib/leyline/runs\"\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/Users/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/Users/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:515ab5d1af9e14185f04e429785217e4bb15d10140cf47d7806a03e8dfdb3c6d",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/Users/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/Users/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"directory\":{\"runRoot\":\"/var/lib/leyline/runs\",\"root\":\"/var/lib/leyline/cas\"}},\"backend\":{\"native\":{\"cgroupRoot\":null}},\"arena\":{\"path\":\"/Users/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/var/lib/leyline/cas",
+        "ephemeralRoot": "/var/lib/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": null
+      }
+    },
+    {
+      "name": "microvm-every-field",
+      "description": "Every field set: ~/ paths expand against HOME, set lists sort by UTF-8 bytes, and a partial workspace object fills its defaults.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {\"sizeCapGib\": 128, \"runRoot\": \"~/state/cas-volume/mnt/runs-cloister\"}}, \"worker\": {\"path\": \"/usr/local/libexec/leyline-krun-worker\", \"runtimeFiles\": [\"~/lib/libkrunfw.5.dylib\", \"/opt/homebrew/lib/libkrun.dylib\"], \"readyTimeoutMs\": 30000}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"verified\": {\"trustKeys\": [\"~/keys/issuer-b.pub\", \"/etc/leyline/keys/issuer-a.pub\"], \"store\": \"/var/lib/leyline/evidence\"}}, \"arena\": {\"path\": \"~/state/exec.arena\"}, \"control\": \"/run/leyline/exec.ctrl\", \"stateDir\": \"~/state\", \"backend\": {\"microVm\": {\"devices\": [\"/dev/zero\", \"/dev/null\"], \"tsiHijackInet\": true, \"workspace\": {\"ttlMs\": 0}}}, \"cdc\": {\"enabled\": true}, \"source\": {\"path\": \"~/src/project\", \"language\": \"rust\"}, \"parser\": {\"trustedQueryHashes\": [\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\", \"0000000000000000000000000000000000000000000000000000000000000000\"], \"queryMatchLimit\": 65536, \"queryProgressBudget\": 1}, \"head\": {\"signingKey\": {\"file\": \"~/.config/leyline/head-signing.key\"}, \"trustedKeys\": [\"~/keys/head.pub\"], \"requireSignature\": true}, \"diagnostics\": {\"profile\": true, \"sheafAblationLog\": \"~/logs/sheaf.jsonl\"}, \"enrichment\": {\"sessionCorpus\": \"~/corpus\"}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/state/exec.arena\"\n  },\n  \"backend\": {\n    \"microVm\": {\n      \"devices\": [\n        \"/dev/null\",\n        \"/dev/zero\"\n      ],\n      \"tsiHijackInet\": true,\n      \"workspace\": {\n        \"changeWindowMs\": 60000,\n        \"changedTtlMs\": 1000,\n        \"ttlMs\": 0\n      }\n    }\n  },\n  \"cas\": {\n    \"volume\": {\n      \"runRoot\": \"/Users/fixture/state/cas-volume/mnt/runs-cloister\",\n      \"sizeCapGib\": 128\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": true\n  },\n  \"control\": \"/run/leyline/exec.ctrl\",\n  \"diagnostics\": {\n    \"profile\": true,\n    \"sheafAblationLog\": \"/Users/fixture/logs/sheaf.jsonl\"\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": \"/Users/fixture/corpus\"\n  },\n  \"evidence\": {\n    \"verified\": {\n      \"store\": \"/var/lib/leyline/evidence\",\n      \"trustKeys\": [\n        \"/Users/fixture/keys/issuer-b.pub\",\n        \"/etc/leyline/keys/issuer-a.pub\"\n      ]\n    }\n  },\n  \"head\": {\n    \"requireSignature\": true,\n    \"signingKey\": {\n      \"file\": \"/Users/fixture/.config/leyline/head-signing.key\"\n    },\n    \"trustedKeys\": [\n      \"/Users/fixture/keys/head.pub\"\n    ]\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 65536,\n    \"queryProgressBudget\": 1,\n    \"trustedQueryHashes\": [\n      \"0000000000000000000000000000000000000000000000000000000000000000\",\n      \"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"\n    ]\n  },\n  \"source\": {\n    \"language\": \"rust\",\n    \"path\": \"/Users/fixture/src/project\"\n  },\n  \"stateDir\": \"/Users/fixture/state\",\n  \"worker\": {\n    \"path\": \"/usr/local/libexec/leyline-krun-worker\",\n    \"readyTimeoutMs\": 30000,\n    \"runtimeFiles\": [\n      \"/Users/fixture/lib/libkrunfw.5.dylib\",\n      \"/opt/homebrew/lib/libkrun.dylib\"\n    ]\n  }\n}",
+      "configDigest": "blake3-256:2d834a58cbef7a418d36f6289ea0a7a51857485026b2b59fcdbe679f6babc016",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[\"/opt/homebrew/lib/libkrun.dylib\",\"/Users/fixture/lib/libkrunfw.5.dylib\"],\"readyTimeoutMs\":30000,\"path\":\"/usr/local/libexec/leyline-krun-worker\"},\"stateDir\":\"/Users/fixture/state\",\"source\":{\"path\":\"/Users/fixture/src/project\",\"language\":\"rust\"},\"parser\":{\"trustedQueryHashes\":[\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"0000000000000000000000000000000000000000000000000000000000000000\"],\"queryProgressBudget\":1,\"queryMatchLimit\":65536},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[\"/Users/fixture/keys/head.pub\"],\"signingKey\":{\"file\":\"/Users/fixture/.config/leyline/head-signing.key\"},\"requireSignature\":true},\"evidence\":{\"verified\":{\"trustKeys\":[\"/etc/leyline/keys/issuer-a.pub\",\"/Users/fixture/keys/issuer-b.pub\"],\"store\":\"/var/lib/leyline/evidence\"}},\"enrichment\":{\"sessionCorpus\":\"/Users/fixture/corpus\"},\"diagnostics\":{\"sheafAblationLog\":\"/Users/fixture/logs/sheaf.jsonl\",\"profile\":true},\"control\":\"/run/leyline/exec.ctrl\",\"cdc\":{\"enabled\":true},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"volume\":{\"sizeCapGib\":128,\"runRoot\":\"/Users/fixture/state/cas-volume/mnt/runs-cloister\"}},\"backend\":{\"microVm\":{\"workspace\":{\"ttlMs\":0,\"changedTtlMs\":1000,\"changeWindowMs\":60000},\"tsiHijackInet\":true,\"devices\":[\"/dev/zero\",\"/dev/null\"]}},\"arena\":{\"path\":\"/Users/fixture/state/exec.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/local/libexec/leyline-krun-worker",
+        "casRoot": "/Users/fixture/state/cas-volume/mnt/cas",
+        "ephemeralRoot": "/Users/fixture/state/cas-volume/mnt/runs-cloister",
+        "runtimeFiles": [
+          "/Users/fixture/lib/libkrunfw.5.dylib",
+          "/opt/homebrew/lib/libkrun.dylib"
+        ],
+        "readyTimeoutMs": 30000,
+        "kind": "microVm",
+        "devices": [
+          "/dev/null",
+          "/dev/zero"
+        ],
+        "tsiHijackInet": true,
+        "workspace": {
+          "ttlMs": 0,
+          "changedTtlMs": 1000,
+          "changeWindowMs": 60000
+        }
+      }
+    },
+    {
+      "name": "cloister-host-runtime-shape",
+      "description": "Cloister's in-process host runtime: a microVM backend over a CAS volume, one runtime file, no devices, TSI off.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {}}, \"worker\": {\"path\": \"/usr/local/libexec/leyline-krun-worker\", \"runtimeFiles\": [\"/usr/local/lib/libkrunfw.so.5\"]}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"microVm\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"microVm\": {\n      \"devices\": [],\n      \"tsiHijackInet\": false,\n      \"workspace\": {\n        \"changeWindowMs\": 60000,\n        \"changedTtlMs\": 1000,\n        \"ttlMs\": 60000\n      }\n    }\n  },\n  \"cas\": {\n    \"volume\": {\n      \"runRoot\": \"/home/fixture/.local/state/leyline/runs\",\n      \"sizeCapGib\": 64\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/home/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/home/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/local/libexec/leyline-krun-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": [\n      \"/usr/local/lib/libkrunfw.so.5\"\n    ]\n  }\n}",
+      "configDigest": "blake3-256:1756bb994122a5c2f2a3516cc2ffc93b14d4ff8213a4238bf4ae6581481afe97",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[\"/usr/local/lib/libkrunfw.so.5\"],\"readyTimeoutMs\":60000,\"path\":\"/usr/local/libexec/leyline-krun-worker\"},\"stateDir\":\"/home/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/home/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"volume\":{\"sizeCapGib\":64,\"runRoot\":\"/home/fixture/.local/state/leyline/runs\"}},\"backend\":{\"microVm\":{\"workspace\":{\"ttlMs\":60000,\"changedTtlMs\":1000,\"changeWindowMs\":60000},\"tsiHijackInet\":false,\"devices\":[]}},\"arena\":{\"path\":\"/home/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/local/libexec/leyline-krun-worker",
+        "casRoot": "/home/fixture/.local/state/leyline/cas",
+        "ephemeralRoot": "/home/fixture/.local/state/leyline/runs",
+        "runtimeFiles": [
+          "/usr/local/lib/libkrunfw.so.5"
+        ],
+        "readyTimeoutMs": 60000,
+        "kind": "microVm",
+        "devices": [],
+        "tsiHijackInet": false,
+        "workspace": {
+          "ttlMs": 60000,
+          "changedTtlMs": 1000,
+          "changeWindowMs": 60000
+        }
+      }
+    },
+    {
+      "name": "native-cgroup-root-linux",
+      "description": "A delegated cgroup v2 root on the native backend (Linux).",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"native\": {\"cgroupRoot\": \"/sys/fs/cgroup/leyline.slice/runs\"}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": \"/sys/fs/cgroup/leyline.slice/runs\"\n    }\n  },\n  \"cas\": {\n    \"directory\": {\n      \"root\": \"/var/lib/leyline/cas\",\n      \"runRoot\": \"/var/lib/leyline/runs\"\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/home/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/home/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/libexec/leyline-native-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": []\n  }\n}",
+      "configDigest": "blake3-256:186777ea81843a237bc06475c69ef534fe18efeddc7f1e1da3bc7830c6d91222",
+      "resolved": "{\"worker\":{\"runtimeFiles\":[],\"readyTimeoutMs\":60000,\"path\":\"/usr/libexec/leyline-native-worker\"},\"stateDir\":\"/home/fixture/.local/state/leyline\",\"source\":null,\"parser\":{\"trustedQueryHashes\":[],\"queryProgressBudget\":100000,\"queryMatchLimit\":4096},\"kind\":\"ExecutionDaemonConfig\",\"head\":{\"trustedKeys\":[],\"signingKey\":null,\"requireSignature\":false},\"evidence\":{\"unverified\":{}},\"enrichment\":{\"sessionCorpus\":null},\"diagnostics\":{\"sheafAblationLog\":null,\"profile\":false},\"control\":\"/home/fixture/.mache/execution.ctrl\",\"cdc\":{\"enabled\":false},\"catalog\":\"/etc/leyline/execution-catalog.json\",\"cas\":{\"directory\":{\"runRoot\":\"/var/lib/leyline/runs\",\"root\":\"/var/lib/leyline/cas\"}},\"backend\":{\"native\":{\"cgroupRoot\":\"/sys/fs/cgroup/leyline.slice/runs\"}},\"arena\":{\"path\":\"/home/fixture/.mache/execution.arena\"},\"apiVersion\":\"config.leyline/v1\"}",
+      "backend": {
+        "worker": "/usr/libexec/leyline-native-worker",
+        "casRoot": "/var/lib/leyline/cas",
+        "ephemeralRoot": "/var/lib/leyline/runs",
+        "runtimeFiles": [],
+        "readyTimeoutMs": 60000,
+        "kind": "native",
+        "cgroupRoot": "/sys/fs/cgroup/leyline.slice/runs"
+      }
+    }
+  ],
+  "rejects": [
+    {
+      "name": "missing-cas",
+      "description": "A required field is absent.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "cas",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "missing-worker",
+      "description": "A required field is absent.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "missing-catalog",
+      "description": "A required field is absent.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "missing-evidence",
+      "description": "A required field is absent.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\"}",
+      "field": "evidence",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "missing-worker-path",
+      "description": "worker.path is required within worker.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"runtimeFiles\": []}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker.path",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "evidence-union-empty",
+      "description": "An evidence object with no branch.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {}}",
+      "field": "evidence",
+      "reason": "union-empty",
+      "schemaRefuses": true
+    },
+    {
+      "name": "evidence-union-ambiguous",
+      "description": "Both evidence branches.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}, \"verified\": {\"trustKeys\": [\"/k\"], \"store\": \"/s\"}}}",
+      "field": "evidence",
+      "reason": "union-ambiguous",
+      "schemaRefuses": true
+    },
+    {
+      "name": "verified-without-store",
+      "description": "evidence.verified needs store.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"verified\": {\"trustKeys\": [\"/k\"]}}}",
+      "field": "evidence.verified.store",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "verified-no-trust-keys",
+      "description": "trustKeys holds at least one key.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"verified\": {\"trustKeys\": [], \"store\": \"/s\"}}}",
+      "field": "evidence.verified.trustKeys",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "cas-union-empty",
+      "description": "A cas object with no branch.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "cas",
+      "reason": "union-empty",
+      "schemaRefuses": true
+    },
+    {
+      "name": "cas-union-ambiguous",
+      "description": "Both cas branches.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}, \"volume\": {}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "cas",
+      "reason": "union-ambiguous",
+      "schemaRefuses": true
+    },
+    {
+      "name": "backend-union-empty",
+      "description": "{} (an empty TOML [backend]) names no backend.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {}}",
+      "field": "backend",
+      "reason": "union-empty",
+      "schemaRefuses": true
+    },
+    {
+      "name": "backend-union-ambiguous",
+      "description": "Both backends.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"native\": {}, \"microVm\": {}}}",
+      "field": "backend",
+      "reason": "union-ambiguous",
+      "schemaRefuses": true
+    },
+    {
+      "name": "devices-under-native",
+      "description": "devices exists only under microVm: unrepresentable under native.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"native\": {\"devices\": [\"/dev/null\"]}}}",
+      "field": "backend.native.devices",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "size-cap-under-directory",
+      "description": "sizeCapGib exists only under volume.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\", \"sizeCapGib\": 8}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "cas.directory.sizeCapGib",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "run-root-inside-cas-root",
+      "description": "A run root inside the directory CAS root.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/x\", \"runRoot\": \"/x/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "cas.directory.runRoot",
+      "reason": "run-root-overlaps-cas-root",
+      "schemaRefuses": false
+    },
+    {
+      "name": "run-root-equals-cas-root",
+      "description": "A run root equal to the CAS root.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/x\", \"runRoot\": \"/x\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "cas.directory.runRoot",
+      "reason": "run-root-overlaps-cas-root",
+      "schemaRefuses": false
+    },
+    {
+      "name": "run-root-parent-of-cas-root",
+      "description": "A run root that contains the CAS root.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/x/cas\", \"runRoot\": \"/x\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "cas.directory.runRoot",
+      "reason": "run-root-overlaps-cas-root",
+      "schemaRefuses": false
+    },
+    {
+      "name": "volume-run-root-inside-cas-root",
+      "description": "Under cas.volume the CAS root is the volume's; a run root inside it is refused.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {\"runRoot\": \"/s/cas-volume/mnt/cas/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"stateDir\": \"/s\"}",
+      "field": "cas.volume.runRoot",
+      "reason": "run-root-overlaps-cas-root",
+      "schemaRefuses": false
+    },
+    {
+      "name": "volume-run-root-inside-cas-root-linux",
+      "description": "On Linux the volume's CAS root is <stateDir>/cas.",
+      "host": "linux",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {\"runRoot\": \"/s/cas\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"stateDir\": \"/s\"}",
+      "field": "cas.volume.runRoot",
+      "reason": "run-root-overlaps-cas-root",
+      "schemaRefuses": false
+    },
+    {
+      "name": "cgroup-root-on-macos",
+      "description": "cgroupRoot is Linux only.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"native\": {\"cgroupRoot\": \"/sys/fs/cgroup/x\"}}}",
+      "field": "backend.native.cgroupRoot",
+      "reason": "cgroup-root-linux-only",
+      "schemaRefuses": false
+    },
+    {
+      "name": "relative-path",
+      "description": "A relative path.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"etc/catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "path-not-absolute",
+      "schemaRefuses": true
+    },
+    {
+      "name": "tilde-user",
+      "description": "Only ~/ is expanded; ~user is refused.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"~root/catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "path-not-absolute",
+      "schemaRefuses": true
+    },
+    {
+      "name": "trailing-slash",
+      "description": "A trailing /.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-path",
+      "schemaRefuses": true
+    },
+    {
+      "name": "dot-dot-component",
+      "description": "A .. component.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/../catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-path",
+      "schemaRefuses": true
+    },
+    {
+      "name": "empty-component",
+      "description": "An empty component.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc//catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-path",
+      "schemaRefuses": true
+    },
+    {
+      "name": "duplicate-device-after-expansion",
+      "description": "~/d and /Users/fixture/d name one device: a duplicate after resolution.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"microVm\": {\"devices\": [\"~/d\", \"/Users/fixture/d\"]}}}",
+      "field": "backend.microVm.devices",
+      "reason": "duplicate-entry",
+      "schemaRefuses": false
+    },
+    {
+      "name": "duplicate-runtime-file",
+      "description": "A set lists one entry twice.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\", \"runtimeFiles\": [\"/a\", \"/a\"]}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker.runtimeFiles",
+      "reason": "duplicate-entry",
+      "schemaRefuses": false
+    },
+    {
+      "name": "ready-timeout-zero",
+      "description": "readyTimeoutMs is at least 1.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\", \"readyTimeoutMs\": 0}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker.readyTimeoutMs",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "ready-timeout-negative",
+      "description": "A negative integer.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\", \"readyTimeoutMs\": -1}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker.readyTimeoutMs",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "ready-timeout-above-2-53",
+      "description": "Above 2^53 - 1.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"ExecutionDaemonConfig\",\"cas\":{\"directory\":{\"root\":\"/var/lib/leyline/cas\",\"runRoot\":\"/var/lib/leyline/runs\"}},\"worker\":{\"path\":\"/w\",\"readyTimeoutMs\":9007199254740992},\"catalog\":\"/c\",\"evidence\":{\"unverified\":{}}}",
+      "field": "worker.readyTimeoutMs",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "ready-timeout-fraction",
+      "description": "60000.0 is a JSON number with a fraction: refused, though JSON Schema reads it as an integer.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"ExecutionDaemonConfig\",\"cas\":{\"directory\":{\"root\":\"/var/lib/leyline/cas\",\"runRoot\":\"/var/lib/leyline/runs\"}},\"worker\":{\"path\":\"/w\",\"readyTimeoutMs\":60000.0},\"catalog\":\"/c\",\"evidence\":{\"unverified\":{}}}",
+      "field": "worker.readyTimeoutMs",
+      "reason": "not-an-integer",
+      "schemaRefuses": false
+    },
+    {
+      "name": "ready-timeout-exponent",
+      "description": "6e4 has an exponent.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"ExecutionDaemonConfig\",\"cas\":{\"directory\":{\"root\":\"/var/lib/leyline/cas\",\"runRoot\":\"/var/lib/leyline/runs\"}},\"worker\":{\"path\":\"/w\",\"readyTimeoutMs\":6e4},\"catalog\":\"/c\",\"evidence\":{\"unverified\":{}}}",
+      "field": "worker.readyTimeoutMs",
+      "reason": "not-an-integer",
+      "schemaRefuses": false
+    },
+    {
+      "name": "tsi-wrong-type",
+      "description": "A string where a boolean belongs.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"microVm\": {\"tsiHijackInet\": \"true\"}}}",
+      "field": "backend.microVm.tsiHijackInet",
+      "reason": "wrong-type",
+      "schemaRefuses": true
+    },
+    {
+      "name": "null-worker",
+      "description": "null in a field whose default is not null.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": null, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker",
+      "reason": "null-not-allowed",
+      "schemaRefuses": true
+    },
+    {
+      "name": "null-ready-timeout",
+      "description": "null in a field with a non-null default.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\", \"readyTimeoutMs\": null}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker.readyTimeoutMs",
+      "reason": "null-not-allowed",
+      "schemaRefuses": true
+    },
+    {
+      "name": "null-backend",
+      "description": "backend's default is {\"native\": {}}, not null.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": null}",
+      "field": "backend",
+      "reason": "null-not-allowed",
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-key-case",
+      "description": "Kind (capital K) is not kind.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"Kind\": \"ExecutionDaemonConfig\"}",
+      "field": "Kind",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-key-other-kind",
+      "description": "mcp is a DaemonConfig key.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"mcp\": {}}",
+      "field": "mcp",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-key-nested",
+      "description": "An undefined key inside worker.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\", \"readyTimeout\": 5}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "worker.readyTimeout",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "unknown-key-workspace",
+      "description": "An undefined key inside backend.microVm.workspace.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"microVm\": {\"workspace\": {\"ttl\": 1}}}}",
+      "field": "backend.microVm.workspace.ttl",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "duplicate-key",
+      "description": "worker twice in one object; JSON Schema validators keep the last and accept it.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"ExecutionDaemonConfig\",\"cas\":{\"directory\":{\"root\":\"/var/lib/leyline/cas\",\"runRoot\":\"/var/lib/leyline/runs\"}},\"worker\":{\"path\":\"/w\"},\"worker\":{\"path\":\"/w\"},\"catalog\":\"/c\",\"evidence\":{\"unverified\":{}}}",
+      "field": "worker",
+      "reason": "duplicate-key",
+      "schemaRefuses": false
+    },
+    {
+      "name": "escape-in-path",
+      "description": "A JSON escape, refused even when it decodes to an allowed character.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"ExecutionDaemonConfig\",\"cas\":{\"directory\":{\"root\":\"/var/lib/leyline/cas\",\"runRoot\":\"/var/lib/leyline/runs\"}},\"worker\":{\"path\":\"/w\"},\"catalog\":\"/\\u0063\",\"evidence\":{\"unverified\":{}}}",
+      "field": "catalog",
+      "reason": "bad-string",
+      "schemaRefuses": false
+    },
+    {
+      "name": "raw-u2028-in-path",
+      "description": "A raw refused character in a string.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/a b\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-string",
+      "schemaRefuses": true
+    },
+    {
+      "name": "raw-del-in-path",
+      "description": "A raw refused character in a string.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/ab\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-string",
+      "schemaRefuses": true
+    },
+    {
+      "name": "raw-c1-in-path",
+      "description": "A raw refused character in a string.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/ab\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-string",
+      "schemaRefuses": true
+    },
+    {
+      "name": "label-bad",
+      "description": "source.language is a label.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"source\": {\"path\": \"/src\", \"language\": \"c sharp\"}}",
+      "field": "source.language",
+      "reason": "bad-label",
+      "schemaRefuses": true
+    },
+    {
+      "name": "query-hash-uppercase",
+      "description": "A query hash is lowercase hex.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"parser\": {\"trustedQueryHashes\": [\"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\"]}}",
+      "field": "parser.trustedQueryHashes[0]",
+      "reason": "bad-query-hash",
+      "schemaRefuses": true
+    },
+    {
+      "name": "query-match-limit-above",
+      "description": "queryMatchLimit is at most 65536.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"parser\": {\"queryMatchLimit\": 65537}}",
+      "field": "parser.queryMatchLimit",
+      "reason": "out-of-range",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-string",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": \"deadbeef\"}}",
+      "field": "head.signingKey",
+      "reason": "secret-inlined",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-number",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": 7}}",
+      "field": "head.signingKey",
+      "reason": "secret-inlined",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-array",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": [\"/k\"]}}",
+      "field": "head.signingKey",
+      "reason": "secret-inlined",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-value-object",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": {\"value\": \"deadbeef\"}}}",
+      "field": "head.signingKey",
+      "reason": "secret-inlined",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-keychain",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": {\"keychain\": \"leyline/head\"}}}",
+      "field": "head.signingKey",
+      "reason": "secret-ref-not-delivered",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-vault",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": {\"vault\": {\"path\": \"kv/leyline\"}}}}",
+      "field": "head.signingKey",
+      "reason": "secret-ref-not-delivered",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-other-key",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": {\"other\": \"x\"}}}",
+      "field": "head.signingKey.other",
+      "reason": "unknown-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "signing-key-empty-object",
+      "description": "head.signingKey takes a reference, never a value.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"head\": {\"signingKey\": {}}}",
+      "field": "head.signingKey.file",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "api-version-missing",
+      "description": "No apiVersion.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "apiVersion",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "api-version-wrong-type",
+      "description": "apiVersion is a string.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": 1, \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "apiVersion",
+      "reason": "wrong-type",
+      "schemaRefuses": true
+    },
+    {
+      "name": "api-version-v2",
+      "description": "A version this binary does not read.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v2\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "apiVersion",
+      "reason": "bad-api-version",
+      "schemaRefuses": true
+    },
+    {
+      "name": "kind-missing",
+      "description": "No kind.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "kind",
+      "reason": "missing-key",
+      "schemaRefuses": true
+    },
+    {
+      "name": "kind-wrong-type",
+      "description": "kind is a string.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": 7, \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "kind",
+      "reason": "wrong-type",
+      "schemaRefuses": true
+    },
+    {
+      "name": "kind-unknown",
+      "description": "No such kind.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"FooConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "kind",
+      "reason": "unknown-kind",
+      "schemaRefuses": true
+    },
+    {
+      "name": "kind-of-another-process",
+      "description": "A DaemonConfig handed to the execution daemon is refused by name.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "kind",
+      "reason": "wrong-kind",
+      "schemaRefuses": true
+    },
+    {
+      "name": "discriminator-checked-first",
+      "description": "apiVersion and kind placed last, after an unknown key: apiVersion is still checked first.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"zzz\": 1, \"kind\": \"FooConfig\", \"apiVersion\": \"config.leyline/v2\"}",
+      "field": "apiVersion",
+      "reason": "bad-api-version",
+      "schemaRefuses": true
+    },
+    {
+      "name": "kind-checked-before-fields",
+      "description": "kind is checked before any field, wherever it appears.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"zzz\": 1, \"apiVersion\": \"config.leyline/v1\", \"kind\": \"FooConfig\"}",
+      "field": "kind",
+      "reason": "unknown-kind",
+      "schemaRefuses": true
+    },
+    {
+      "name": "not-an-object",
+      "description": "A document is an object.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "[]",
+      "field": "",
+      "reason": "wrong-type",
+      "schemaRefuses": true
+    },
+    {
+      "name": "malformed",
+      "description": "Not JSON.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": ",
+      "field": "",
+      "reason": "malformed",
+      "schemaRefuses": false
+    },
+    {
+      "name": "nested-too-deep",
+      "description": "Nesting deeper than 16 is malformed.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"ExecutionDaemonConfig\",\"x\":[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]}",
+      "field": "",
+      "reason": "malformed",
+      "schemaRefuses": true
+    },
+    {
+      "name": "home-unset",
+      "description": "The arena default needs HOME, which is unset: refused, never replaced by '.'.",
+      "host": "no-home",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "field": "arena.path",
+      "reason": "bad-host-default",
+      "schemaRefuses": false
+    }
+  ]
+}

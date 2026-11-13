@@ -118,8 +118,10 @@ has no witness of its own; it resolves inside a version (§2.2, Locates).
 
 **Locators are valid only as `(version Ref, local key)`.** A bare locator replayed against
 another generation resolves to a different row without error. No wire field, signed claim or
-cache key carries a bare locator; one that does is a defect (`rs/ll-open/cli-lib/src/daemon/ops.rs:1480`
-emits a raw `nid` as `node_id`, 80f037 F3).
+cache key carries a bare locator; one that does is a defect. At `e4690505` the daemon emitted a
+raw `nid` as `node_id` for a node whose file has no `_source` row; since v0.25.0 it refuses that
+row (`rs/ll-open/cli-lib/src/daemon/ops.rs`, `unpathed_node_id`, 80f037 F3), and `Nid` has no
+serde encoding.
 
 ### 2.3 Type shape (normative for new code)
 
@@ -148,7 +150,7 @@ updated for M2 (`73add7`, `b5d354`).
 | `Controller.current_root` | σ_bytes over the arena image (`rs/ll-core/core/src/control.rs:68`) | yes | base case | — | **Complies** |
 | spec digest (`blake3-256:`) | σ_bytes ∘ Cap'n Proto canonical form (`rs/ll-open/runtime/src/authorization.rs:343`) | yes | base case | typed by `DigestRef` | **Complies** |
 | `confinementDigest` | σ_bytes ∘ canonical JSON (`rs/ll-core/schema-spec/confinement/v1/README.md:80`) | yes | base case | — | **Complies** |
-| rootfs digest | σ_bytes over the exact bytes of `rootfs.manifest.json`: one compact JSON object `{"version":1,"files":[{"path","mode","blake3"},…]}`, keys in that order, `mode` the permission bits as a decimal integer (special bits cleared, so at most 0o777), `blake3` the content's lowercase hex BLAKE3-256, files only (directories are neither listed nor covered), entries in component-wise byte order of their paths (`rs/ll-open/runtime/src/artifacts/oci.rs`, `write_rootfs`; verified on every resolve by `backends/libkrun/plan.rs`, `verify_manifest`); it names the rootfs directory beneath the CAS root and is `RunReceipt.inputRoots[0]` | yes for this producer; the verifier hashes whatever bytes it reads, so a producer that serializes one tree another way mints another digest | base case | known-answer vector `execution/v1/test-vectors/rootfs-manifest.json`, checked against the importer's bytes (`runtime/tests/oci_rootfs.rs`); the image's OCI SHA-256 digests are provenance, never compared with it (bead `ley-line-open-39309e`) | **Conditional**: (a)'s "every presentation of one value gives one address" holds only while the importer is the sole producer, since `verify_manifest` accepts any bytes (a second serialization of one tree verifies under another digest; no digest names the wrong tree). Complies once `verify_manifest` refuses non-canonical bytes (`ley-line-open-faba8f`) |
+| rootfs digest | σ_bytes over the exact bytes of `rootfs.manifest.json`, versioned by its `version` field (`rs/ll-open/runtime/src/artifacts/rootfs_manifest.rs`). **v2** (bead `ley-line-open-4f08ea`), what `leyline rootfs import-oci` writes (`oci.rs`, `write_rootfs`): one compact JSON object `{"version":2,"entries":[…]}`, keys in that order; each entry `{"type":"dir","path","mode"}`, `{"type":"file","path","mode","blake3"}` or `{"type":"symlink","path","target"}`, keys in that order; every directory (mode: permission bits and sticky, owner rwx set), regular file (mode: permission bits, owner read set; `blake3` lowercase hex) and symbolic link (target bytes, never followed) listed, in component-wise byte order of their paths, each entry's parent a listed directory, the root `0755` and unlisted. **v1**, frozen: `{"version":1,"files":[{"path","mode","blake3"},…]}`, files only, directories implied at `0755`, no links. Verified on every resolve by `backends/libkrun/plan.rs`, `verify_manifest`; it names the rootfs directory beneath the CAS root and is `RunReceipt.inputRoots[0]` | **v2: yes**: `RootfsSpec::parse` refuses v2 bytes that are not the ones its parsed content serializes to, so one tree has exactly one v2 address (`ley-line-open-faba8f`). **v1: no**: any byte form of a v1 document verifies, so one tree can have several v1 addresses; v1 is frozen, read for entries that already exist, and written by no LLO producer | base case | known-answer vector `execution/v1/test-vectors/rootfs-manifest.json`: the checked-in fixture as a v1 and a v2 case, each checked against the importer's bytes under the rules of its version, and an `escapes-v2` case pinning the one string escaping (`runtime/tests/oci_rootfs.rs`); the image's OCI SHA-256 digests are provenance, never compared with it (beads `ley-line-open-39309e`, `ley-line-open-4f08ea`) | **Complies for v2** (a) by the canonical-bytes refusal. **v1: Conditional, frozen**: a second serialization of one v1 tree verifies under another digest (no digest names the wrong tree); tightening v1 would orphan entries hand-built producers already wrote in another key order (the guest harness's `json!` sorts keys), so v1 is documented lenient and left frozen |
 | `parserId` | keyed `RowSet` fold `leyline/parser-id/v1` (`rs/ll-open/cli-lib/src/store_root.rs`, `ParserInputs::parser_id`) | yes | yes | — | **Complies** |
 | grammar digest | keyed fold `leyline/grammar-digest/v1` (`rs/ll-open/ts/src/languages.rs:166,288`) | yes | yes | — | **Complies** |
 | `Head.rootHash` | keyed fold `leyline/segment-root/v1` (`rs/ll-open/cli-lib/src/cmd_parse.rs:2644,2725`) | yes, over segments | yes | a run receipt, not a store identity (carries absolute paths and mtimes) | **Complies** |
@@ -158,15 +160,17 @@ updated for M2 (`73add7`, `b5d354`).
 | `run_id` | plain σ over `"cloister/execution/v1/run-id" ‖ 0x00 ‖ …` (`authorization.rs:864,912-925`) | yes | **no**: prefix-in-preimage | pinned cross-repo by `execution/v1/test-vectors/run-id.json` | **Violates (c)** → D-i |
 | `Head.storeRoot` | directory Merkle tree, one keyed `RowSet` fold `leyline/store-tree/v1` per directory, params empty (`store_root.rs`, `StoreTree::root`) | yes (proptests in `store_root.rs`; known-answer vectors per node) | yes | parameter independent (no parser input); one edit refolds the nodes on its path (240 entries for the 50,000-file fixture, bound 300) | **Complies** (M1). It replaced `Head.treeRoot` (`leyline/tree-root/v1`, `params = parserId`, flat over 2n entries), which violated parameter independence and Σ §1.3 and is removed |
 | blob manifest | rootless rows keyed by `blob_hash` (`rs/ll-open/fs/src/blob_chunked.rs:53-64`) | — | — | no address; sub-floor blobs never enter the pool (619a99 F3: 572 of 954 blobs on `rs/`) | **Not an identity yet** → D-iv |
-| locators (`nid`, `content_id`, interned ids) | arena-local integers (`rs/ll-core/schema/src/lib.rs:86-98,138-143`) | n/a | n/a | one bare-`nid` wire leak (`daemon/ops.rs:1480`) | **Complies except the leak** (80f037) |
+| locators (`nid`, `content_id`, interned ids) | arena-local integers (`rs/ll-core/schema/src/lib.rs:86-98,138-143`) | n/a | n/a | the one bare-`nid` wire leak at `e4690505` (`daemon/ops.rs:1480` there) is closed: `unpathed_node_id` refuses the row (80f037 F3, v0.25.0), and the newtypes have no serde or Cap'n Proto encoding | **Complies** (80f037) |
 
-**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after M1, 12 after M2
-(the rootfs digest, added to this table later by `ley-line-open-39309e`, is a 16th and complies
-only while one producer serializes it, until `ley-line-open-faba8f`);
+**Headline.** Of 15 shipped identities, 10 complied at `e4690505`, 11 after 80f037 F3 closed
+the locators' wire leak (v0.25.0), 12 after M1, 13 after M2
+(the rootfs digest, added to this table later by `ley-line-open-39309e`, is a 16th; its v2,
+which every LLO producer writes, complies since `ley-line-open-4f08ea`/`faba8f`, and its v1 is
+frozen and lenient);
 `run_id` violates construction separation (prefix-in-preimage) until M3, as `node_hash` did until
 M2; `treeRoot` violated parameter independence and §1.3 (parser in params, flat fold) until M1
 replaced it with `storeRoot`; `node_content`'s `lang`/`raw_kind` violated (a) until M2 removed
-them; the blob manifest has no address; one locator leaks bare onto the wire. Plain `blob_hash`
+them; the blob manifest has no address. Plain `blob_hash`
 is the single unkeyed base case and stays so.
 
 ## 4. Decisions
@@ -366,7 +370,7 @@ merges.
 | M1 | D-ii: `storeRoot` (`store-tree/v1`), head digest v3, wire `store_root`, `derived_from` v2 — **implemented** (`73c6ee`) | `projection-v11`, head digest v3, release | `treeRoot` removed, `storeRoot` added |
 | M2 | D-i `node_hash` + D-iii, **one bump**: both rewrite `node_content`, both need one mache re-pin — **implemented** (`73add7`, `b5d354`); wire format major unchanged (2). Of `9c1af2`'s R3, the `lang`/`raw_kind` half lands here (its option (b)); `node_content.kind` stays TEXT and the dbstat measurement is still open on `9c1af2` | `merkle-ast-v3`, `projection-v12` | `node_hash`, `parserId` (not `storeRoot`, since M1 made it parser-free) |
 | M3 | D-i `run_id` v2 | run-id vector v2, release | `run_id` |
-| M4 | D-iv: rooted blob manifests, one-chunk sub-floor manifests | `projection-v13` | none moved; manifest address added |
+| M4 | D-iv: rooted blob manifests, one-chunk sub-floor manifests | the projection version after the one current when it lands (`projection-v13` was taken by the comments change, `ley-line-open-aa1634`) | none moved; manifest address added |
 
 M1 precedes M2 so that the `IR_SCHEMA_VERSION` bump in M2 does not rename the store. M3 is
 independent of M1/M2 and may run in parallel with them. Law (c)'s test lands green at the end

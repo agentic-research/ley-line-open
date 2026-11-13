@@ -17,8 +17,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use leyline_runtime::backends::libkrun::backend::{KrunWorkerBackend, KrunWorkerConfig};
 use leyline_runtime::backends::libkrun::worker::inherit_only;
-use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
+use leyline_runtime::{Backend, BackendRunStatus, DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
@@ -206,4 +207,106 @@ fn every_guest_has_a_bounded_tmpfs_tmp() {
         .collect();
     assert!(left.is_empty(), "/tmp's files reached the host: {left:?}");
     assert!(!cas.join(&rootfs).join("tmp").exists());
+}
+
+/// A rootfs whose `tmp` is a file: init refuses to mount over it (patch
+/// 0012) and stops the guest. The run must end as a typed failure on the
+/// host, with init's reason in the run's `GuestOutput`, never as a success
+/// (bead `ley-line-open-7164ec`). Before patch 0015 init exited PID 1, the
+/// kernel panicked, libkrun reported exit 0, and this run was recorded as
+/// `Succeeded` with an empty console.
+#[test]
+fn a_run_init_refuses_ends_failed_with_the_reason_in_its_output() {
+    let _serial = common::serial();
+    let Some(libkrunfw) = hypervisor::libkrunfw_or_skip() else {
+        return;
+    };
+    let fixture = TempDir::new().expect("fixture");
+    let root = fixture.path().canonicalize().expect("canonical fixture");
+    let source = root.join("ran.rs");
+    fs::write(&source, "fn main() { println!(\"guest ran\"); }\n").expect("guest source");
+    let binary = root.join("ran");
+    hypervisor::compile_guest(&source, &binary);
+    let bytes = fs::read(&binary).expect("guest bytes");
+    let cas = root.join("cas");
+    let rootfs = conformance::publish_rootfs(
+        &cas,
+        &[
+            ("bin/ran", &bytes, 0o755),
+            ("tmp", b"not a directory", 0o644),
+        ],
+    );
+    let worker = hypervisor::worker_under_test(
+        Path::new(env!("CARGO_BIN_EXE_leyline-krun-worker")),
+        &root.join("refused-worker"),
+    );
+    let (library_var, library_dir) = hypervisor::library_path_env(&libkrunfw);
+    // SAFETY: the tests here are serialized and nothing else reads the
+    // environment concurrently.
+    unsafe { std::env::set_var(library_var, library_dir) };
+    let ephemeral_root = root.join("refused-runs");
+    fs::create_dir_all(&ephemeral_root).expect("ephemeral root");
+    let backend = KrunWorkerBackend::new(KrunWorkerConfig {
+        worker,
+        cas_root: cas,
+        ephemeral_root,
+        runtime_files: vec![libkrunfw.clone()],
+        devices: Vec::new(),
+        ready_timeout: Duration::from_secs(30),
+        tsi_hijack_inet: false,
+    });
+    let request = ExecutionRequest {
+        run_id: "refused-tmp".into(),
+        replay_key: "refused-tmp-replay".into(),
+        rootfs: DigestRef {
+            algorithm: "blake3-256".into(),
+            value: rootfs,
+        },
+        executable: "bin/ran".into(),
+        arguments: vec!["ran".into()],
+        public_environment: BTreeMap::new(),
+        allowed_egress: Vec::new(),
+        confinement_digest: String::new(),
+        confinement_manifest: None,
+        workspaces: Vec::new(),
+        limits: ResourceLimits {
+            wall_time_ms: 60_000,
+            memory: leyline_runtime::MemoryLimits { limit: GUEST_RAM },
+            cpu: leyline_runtime::CpuLimits {
+                quota: 100_000,
+                period: 100_000,
+            },
+            ..ResourceLimits::default()
+        },
+    };
+    backend
+        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .expect("the worker starts the VM");
+    let outcome = backend
+        .wait_for_outcome("refused-tmp")
+        .expect("the run ends");
+    let output = outcome.output.expect("the run's output");
+    let BackendRunStatus::Failed(error) = &outcome.status else {
+        panic!(
+            "a run init refused is recorded as {:?}, not a failure:\n{}",
+            outcome.status, output.stdout_tail
+        );
+    };
+    assert!(
+        error.detail.contains("125"),
+        "the failure names init's stop status (125): {}",
+        error.detail
+    );
+    assert!(
+        output
+            .stdout_tail
+            .contains("/tmp is not a directory, refusing to mount over it"),
+        "init's reason reaches the run's GuestOutput:\n{}",
+        output.stdout_tail
+    );
+    assert!(
+        !output.stdout_tail.contains("guest ran"),
+        "the workload never runs:\n{}",
+        output.stdout_tail
+    );
 }

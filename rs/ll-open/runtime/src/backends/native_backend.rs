@@ -18,8 +18,8 @@ use crate::{
 use super::cgroup::{CgroupRoot, RunCgroup};
 use super::native::WorkerEvent;
 use super::process::{
-    SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
-    finish_failed_start, read_readiness_line, supervise_worker,
+    Supervised, SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
+    finish_failed_start, published_status, read_readiness_line, supervise_worker,
 };
 
 const LABELS: SupervisionLabels = SupervisionLabels {
@@ -147,7 +147,11 @@ impl Backend for NativeWorkerBackend {
         }
     }
 
-    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        request: &ExecutionRequest,
+        workspaces: crate::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
         // ADR-0035 §4 again, at the backend: `ExecutionService::start` checks
         // too, but this is a public type an embedder can call directly, and a
@@ -165,7 +169,11 @@ impl Backend for NativeWorkerBackend {
         // (bead ley-line-open-f8ebcf). The code is `workspaceUnserved`, not
         // the generic `unsupportedBackend`, so a caller can route the run to
         // a tier that serves workspaces (bead ley-line-open-204a94).
-        if let Some(grant) = request.workspaces.first() {
+        //
+        // Refused whether the workspace is named by the request or handed
+        // over as an open share (bead ley-line-open-1022a8): the tier
+        // attaches none, so it takes none.
+        if let Some(grant) = request.workspaces.first().or(workspaces.grants().next()) {
             return Err(ExecutionError::workspace_unserved(format!(
                 "the run is granted workspace {:?}, and the native tier serves no \
                  workspace shares; run it on the microVM tier",
@@ -324,8 +332,12 @@ impl Backend for NativeWorkerBackend {
             }) if run_id == request.run_id => {
                 // ADR-0035: the worker attests the policy it compiled, and a
                 // run whose attestation disagrees with the grant never
-                // reaches Running. Checked here, before the worker is
-                // allowed to proceed, because after this point it executes.
+                // reaches Running. The worker writes readiness immediately
+                // before it spawns the workload, so this second check cannot
+                // stop a drifting run from starting: the worker's own
+                // comparison (`committed_confinement`, before the rootfs is
+                // read) is the one that does (bead ley-line-open-7a3109).
+                // This one refuses a worker that attests something else.
                 if !request.confinement_digest.is_empty()
                     && confinement_digest != request.confinement_digest
                 {
@@ -422,25 +434,23 @@ impl Backend for NativeWorkerBackend {
             // completion find the run still active, collect this result, and
             // report the worker's own failure as the cleanup's (bead
             // ley-line-open-f8ebcf).
+            // A cancelled run publishes nothing: the shared lifecycle records
+            // it `Cancelled` (bead ley-line-open-9c6a8f).
             {
                 let mut completed = completed.lock();
                 children.lock().remove(&run_id);
-                completed.insert(
-                    run_id,
-                    match result.clone() {
-                        Ok(()) => BackendRunStatus::Succeeded,
-                        Err(error) => BackendRunStatus::Failed(error),
-                    },
-                );
+                if let Some(status) = published_status(&result) {
+                    completed.insert(run_id, status);
+                }
             }
             completion_cv.notify_all();
-            let _ = finished_tx.send(result);
+            let _ = finished_tx.send(result.map(|_| ()));
         });
         Ok(BackendRun {
             backend_id: "native-nono/1".into(),
             // The native worker inherits its standard streams and nothing
             // else.
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -457,11 +467,11 @@ impl Backend for NativeWorkerBackend {
 /// a cgroup teardown failure reported rather than dropped. When both failed,
 /// the supervision error keeps its code and the teardown failure is appended.
 fn with_cgroup_cleanup(
-    supervised: Result<(), ExecutionError>,
+    supervised: Result<Supervised, ExecutionError>,
     removed: Result<(), ExecutionError>,
-) -> Result<(), ExecutionError> {
+) -> Result<Supervised, ExecutionError> {
     match (supervised, removed) {
-        (Ok(()), removed) => removed,
+        (Ok(ended), removed) => removed.map(|()| ended),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(ExecutionError {
             detail: format!(
@@ -518,14 +528,19 @@ mod tests {
             "execution exceeded wall-clock limit; cgroup cleanup also failed: run cgroup still holds processes"
         );
         assert_eq!(
-            super::with_cgroup_cleanup(Ok(()), Err(teardown.clone())).expect_err("teardown"),
+            super::with_cgroup_cleanup(Ok(super::Supervised::Exited), Err(teardown.clone()))
+                .expect_err("teardown"),
             teardown
         );
         assert_eq!(
             super::with_cgroup_cleanup(Err(run.clone()), Ok(())).expect_err("run"),
             run
         );
-        assert!(super::with_cgroup_cleanup(Ok(()), Ok(())).is_ok());
+        // The supervision's own ending survives a clean teardown: a cancel
+        // stays a cancel.
+        for ended in [super::Supervised::Exited, super::Supervised::Cancelled] {
+            assert_eq!(super::with_cgroup_cleanup(Ok(ended), Ok(())), Ok(ended));
+        }
     }
 
     #[test]

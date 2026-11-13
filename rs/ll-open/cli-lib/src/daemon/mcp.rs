@@ -8,9 +8,10 @@
 //! - `POST /mcp` — JSON-RPC requests (`initialize`, `tools/list`, `tools/call`)
 //! - `GET /mcp`  — SSE stream for server→client notifications (stub for now)
 //!
-//! Tool surface = base daemon ops, 1:1. The tool's `name` is the op's name;
-//! the tool's `arguments` object is the request JSON the op already expects.
-//! No new protocol; this is a transport wrapper.
+//! Every tool is one base daemon op: the tool's `name` is the op's name and
+//! its `arguments` object is the request JSON the op already expects. Not
+//! every op is a tool (see "Call scope" below). No new protocol; this is a
+//! transport wrapper.
 //!
 //! Mirrors the pattern in `rosary/src/serve/mod.rs::run_http`.
 //!

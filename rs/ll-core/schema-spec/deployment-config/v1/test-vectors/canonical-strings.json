@@ -1,0 +1,117 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "description": "String and ordering rules of the canonical form (README \"Canonical form\"). Each case's `input` resolves under its host to `canonical`; its `resolved` is the same resolved document with keys and set lists out of order, which the Python reference canonicalizes to the same bytes. `rejects` are refused by the Rust resolver; `resolvedRejects` by the Python reference. `hosts` are the injected HostFacts each case resolves under (home, XDG_STATE_HOME, the platform data directory, the OS); a null member is unset.",
+  "hosts": {
+    "macos": {
+      "home": "/Users/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/Users/fixture/Library/Application Support",
+      "os": "macos"
+    },
+    "linux": {
+      "home": "/home/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "linux-xdg": {
+      "home": "/home/fixture",
+      "xdgStateHome": "/home/fixture/.state",
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "no-home": {
+      "home": null,
+      "xdgStateHome": null,
+      "dataDir": null,
+      "os": "linux"
+    }
+  },
+  "cases": [
+    {
+      "name": "utf8-order-not-utf16-order",
+      "description": "Non-ASCII and astral-plane paths. runtimeFiles sorts é (C3 A9) < ｡ U+FF61 (EF BD A1) < 😀 U+1F600 (F0 9F 98 80) by UTF-8 bytes; UTF-16 code-unit order (JavaScript's default sort) would put 😀 (D83D) before ｡ (FF61). Strings are written raw, never escaped.",
+      "host": "macos",
+      "kind": "ExecutionDaemonConfig",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"~/Bücher/cas\", \"runRoot\": \"~/Bücher/runs\"}}, \"worker\": {\"path\": \"~/𝄞/worker\", \"runtimeFiles\": [\"/opt/😀/lib\", \"/opt/｡/lib\", \"/opt/é/lib\"]}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}}",
+      "resolved": "{\"enrichment\": {\"sessionCorpus\": null}, \"diagnostics\": {\"profile\": false, \"sheafAblationLog\": null}, \"head\": {\"signingKey\": null, \"trustedKeys\": [], \"requireSignature\": false}, \"parser\": {\"trustedQueryHashes\": [], \"queryMatchLimit\": 4096, \"queryProgressBudget\": 100000}, \"source\": null, \"evidence\": {\"unverified\": {}}, \"cdc\": {\"enabled\": false}, \"backend\": {\"native\": {\"cgroupRoot\": null}}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"worker\": {\"path\": \"/Users/fixture/𝄞/worker\", \"runtimeFiles\": [\"/opt/😀/lib\", \"/opt/｡/lib\", \"/opt/é/lib\"], \"readyTimeoutMs\": 60000}, \"cas\": {\"directory\": {\"root\": \"/Users/fixture/Bücher/cas\", \"runRoot\": \"/Users/fixture/Bücher/runs\"}}, \"stateDir\": \"/Users/fixture/.local/state/leyline\", \"control\": \"/Users/fixture/.mache/execution.ctrl\", \"arena\": {\"path\": \"/Users/fixture/.mache/execution.arena\"}, \"kind\": \"ExecutionDaemonConfig\", \"apiVersion\": \"config.leyline/v1\"}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"native\": {\n      \"cgroupRoot\": null\n    }\n  },\n  \"cas\": {\n    \"directory\": {\n      \"root\": \"/Users/fixture/Bücher/cas\",\n      \"runRoot\": \"/Users/fixture/Bücher/runs\"\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/Users/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/Users/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/Users/fixture/𝄞/worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": [\n      \"/opt/é/lib\",\n      \"/opt/｡/lib\",\n      \"/opt/😀/lib\"\n    ]\n  }\n}",
+      "configDigest": "blake3-256:112ea37837f8577ae7695e90d162ba5d62ab94619a7353dcbe521f3123badf16"
+    },
+    {
+      "name": "empty-list-and-object",
+      "description": "An empty list is [] and an empty object {}, nothing between the brackets.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"mcp\": {\"groups\": []}}",
+      "resolved": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"DaemonConfig\",\"arena\":{\"path\":\"/Users/fixture/.mache/default.arena\",\"sizeMib\":64},\"control\":\"/Users/fixture/.mache/default.ctrl\",\"mount\":null,\"source\":null,\"shutdownAfterSeconds\":null,\"mcp\":{\"http\":null,\"noAuth\":false,\"uds\":null,\"groups\":[],\"tokenFile\":{\"file\":\"/Users/fixture/Library/Application Support/leyline/daemon.token\"}},\"cdc\":{\"enabled\":false,\"target\":\"source-blobs\"},\"parser\":{\"trustedQueryHashes\":[],\"queryMatchLimit\":4096,\"queryProgressBudget\":100000},\"head\":{\"signingKey\":null,\"trustedKeys\":[],\"requireSignature\":false},\"diagnostics\":{\"profile\":false,\"sheafAblationLog\":null},\"enrichment\":{\"sessionCorpus\":null}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/default.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/Users/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": [],\n    \"http\": null,\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/Users/fixture/Library/Application Support/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": null,\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": null\n}",
+      "configDigest": "blake3-256:a14191cf269a458771c31e1b8aa4208f7e9d1c41abe545e7998e94f33f8749f0"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "u2028",
+      "description": "U+2028 is refused.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/a b\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-string",
+      "schemaRefuses": true,
+      "kind": "ExecutionDaemonConfig"
+    },
+    {
+      "name": "u007f",
+      "description": "U+007F is refused.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/ab\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-string",
+      "schemaRefuses": true,
+      "kind": "ExecutionDaemonConfig"
+    },
+    {
+      "name": "c1-control",
+      "description": "U+0085 (a C1 control) is refused.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"directory\": {\"root\": \"/var/lib/leyline/cas\", \"runRoot\": \"/var/lib/leyline/runs\"}}, \"worker\": {\"path\": \"/usr/libexec/leyline-native-worker\"}, \"catalog\": \"/ab\", \"evidence\": {\"unverified\": {}}}",
+      "field": "catalog",
+      "reason": "bad-string",
+      "schemaRefuses": true,
+      "kind": "ExecutionDaemonConfig"
+    },
+    {
+      "name": "above-2-53",
+      "description": "An integer above 2^53 - 1.",
+      "host": "macos",
+      "syntax": "json",
+      "input": "{\"apiVersion\":\"config.leyline/v1\",\"kind\":\"DaemonConfig\",\"shutdownAfterSeconds\":9007199254740992}",
+      "field": "shutdownAfterSeconds",
+      "reason": "out-of-range",
+      "schemaRefuses": true,
+      "kind": "DaemonConfig"
+    }
+  ],
+  "resolvedRejects": [
+    {
+      "name": "escape",
+      "description": "A resolved document never holds an escape.",
+      "resolved": "{\"a\": \"\\u0041\"}"
+    },
+    {
+      "name": "u2028",
+      "description": "Nor a refused character.",
+      "resolved": "{\"a\": \"x \"}"
+    },
+    {
+      "name": "duplicate-set-entry",
+      "description": "Nor a set entry twice.",
+      "resolved": "{\"devices\": [\"/a\", \"/a\"]}"
+    }
+  ]
+}

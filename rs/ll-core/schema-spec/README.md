@@ -24,6 +24,23 @@ that any second implementation can conform to.
 - **`confinement/v1/`** — the kernel-confinement manifest
   (`ConfinementManifest`): its JSON Schema, canonical serialization and
   BLAKE3 identity pins (ADR-0035).
+- **`connections/v1/`** — the connection broker's input document
+  (ADR-0046 Slice 1): JSON Schema, canonical form, `connectionsDigest`
+  pins, one vector per parse refusal, and an independent Python
+  reference under `ref-impl-py/`. Its normative implementation is the
+  crate's one Rust module, `leyline_schema_spec::connections`: an issuer
+  builds with `ConnectionsDocument::new`, writes `canonical_bytes()` and
+  digests with `digest_hex()` (`DIGEST_ALGORITHM` = `blake3-256`); a runner
+  reads with `parse`. Depend on `leyline-schema-spec` at the LLO release's
+  version rather than reimplementing the canonical form.
+- **`deployment-config/v1/`** — the deployment configuration documents of
+  LLO's daemons, apiVersion `config.leyline/v1` (ADR-0049): three kind
+  schemas over shared definitions, their generated self-contained published
+  forms and the removed-variable list (released as assets), vectors per
+  kind with canonical bytes and `configDigest`, and an independent Python
+  reference. Its implementation is `leyline_schema_spec::deployment_config`;
+  `leyline_runtime::deployment` maps an execution document into the
+  structs the execution daemon builds.
 - **`build-cache/v1/`** — OCI-shaped remote build cache transport
   (manifest shape, digest encoding, push/pull protocols). Ships a
   5-file vector bundle under `vectors/`.
@@ -50,6 +67,8 @@ These spec dirs pin their vector bundles with a `VECTORS.sha256` file:
 - `credential-isolation/v1/VECTORS.sha256` — 10 vectors under `test-vectors/`
 - `build-cache/v1/vectors/VECTORS.sha256` — 5 vectors alongside it
 - `confinement/v1/VECTORS.sha256` — the canonical `ConfinementManifest` vector and the §3/§4 port-list vector
+- `connections/v1/VECTORS.sha256` — the two canonical connections documents and the cases/rejects file
+- `deployment-config/v1/VECTORS.sha256` — the per-kind cases, canonical-strings and TOML-equivalence files
 - `leyline-net/v1/test-vectors/VECTORS.sha256` — 24 frame vectors + digests.json + fixtures.capnp
 - `execution/v1/VECTORS.sha256` — the canonical intent/grant/receipt carrier, the OCI resource-limit case, and the `run_id` derivation vectors
 - `sigma/v1/VECTORS.sha256` — the Σ construction known-answer vectors

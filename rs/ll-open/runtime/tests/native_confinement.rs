@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use leyline_runtime::artifacts::rootfs_manifest::{FileSpec, RootfsSpec};
 use leyline_runtime::backends::native::WorkerEvent;
 use leyline_runtime::backends::native_backend::{NativeWorkerBackend, NativeWorkerConfig};
 use leyline_runtime::{
@@ -69,6 +70,10 @@ use native_guest::{guest_runtime_files, home_ssh, is_apply_failure};
 const WORKER: &str = env!("CARGO_BIN_EXE_leyline-native-worker");
 const RUN_ID: &str = "native-confinement-01";
 const GUEST_EXECUTABLE: &str = "bin/probe";
+/// What the request names: a rootfs manifest v2 link to
+/// [`GUEST_EXECUTABLE`], so every run here reaches its executable through a
+/// manifest link, as `bin/sh -> busybox` does (bead `ley-line-open-4f08ea`).
+const GUEST_LINK: &str = "bin/run";
 const GRANTED_FILE: &str = "granted.txt";
 const GRANTED_CONTENT: &str = "granted-rootfs-content";
 const SECRET: &str = "SIMULATED PRIVATE KEY - must never be readable confined";
@@ -111,7 +116,8 @@ enum Expect {
 
 fn expectation(probe: &str) -> Expect {
     match probe {
-        "granted_read" | "granted_write" => Expect::Allowed,
+        // `argv0` reads nothing: it reports the name the guest started under.
+        "granted_read" | "granted_write" | "argv0" => Expect::Allowed,
         _ => Expect::KernelDenied,
     }
 }
@@ -202,6 +208,17 @@ fn confined_guest_entry_point() {
         observations.push(observation);
     };
 
+    // The name the workload was started under: the guest's path of what
+    // the request named, as the microVM tier's kernel gives it, not the
+    // host path of the file a link reaches (ley-line-open-10c9d0).
+    record(
+        "argv0",
+        Ok(std::env::args_os()
+            .next()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()),
+    );
+
     // (d) positive control. The cwd is the materialized rootfs.
     record(
         "granted_read",
@@ -287,17 +304,31 @@ impl Fixture {
         let guest = fs::read(std::env::current_exe().expect("test executable"))
             .expect("read test executable");
         let granted = GRANTED_CONTENT.as_bytes();
-        let manifest = format!(
-            "{{\"version\":1,\"files\":[\
-             {{\"path\":\"{GUEST_EXECUTABLE}\",\"mode\":493,\"blake3\":\"{}\"}},\
-             {{\"path\":\"{GRANTED_FILE}\",\"mode\":420,\"blake3\":\"{}\"}}]}}",
-            blake3::hash(&guest).to_hex(),
-            blake3::hash(granted).to_hex(),
-        );
-        let digest = blake3::hash(manifest.as_bytes()).to_hex().to_string();
+        let mut spec = RootfsSpec::empty_v2();
+        spec.directories.insert("bin".into(), 0o755);
+        for (path, mode, bytes) in [
+            (GUEST_EXECUTABLE, 0o755, guest.as_slice()),
+            (GRANTED_FILE, 0o644, granted),
+        ] {
+            spec.files.insert(
+                path.into(),
+                FileSpec {
+                    mode,
+                    blake3: blake3::hash(bytes).to_hex().to_string(),
+                },
+            );
+        }
+        spec.symlinks.insert(GUEST_LINK.into(), "probe".into());
+        let manifest = spec.to_canonical_v2();
+        let digest = blake3::hash(&manifest).to_hex().to_string();
         let cas = root.join("cas");
         let rootfs = cas.join(&digest);
         fs::create_dir_all(rootfs.join("bin")).expect("rootfs directories");
+        for directory in [&rootfs, &rootfs.join("bin")] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
+                .expect("rootfs directory mode");
+        }
+        std::os::unix::fs::symlink("probe", rootfs.join(GUEST_LINK)).expect("guest link");
         let executable = rootfs.join(GUEST_EXECUTABLE);
         fs::write(&executable, &guest).expect("guest executable");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
@@ -374,7 +405,7 @@ impl Fixture {
                 algorithm: "blake3-256".into(),
                 value: self.digest.clone(),
             },
-            executable: GUEST_EXECUTABLE.into(),
+            executable: GUEST_LINK.into(),
             arguments: vec![
                 "--ignored".into(),
                 "--exact".into(),
@@ -650,6 +681,12 @@ fn the_granted_rootfs_stays_readable_and_writable() {
     };
     assert_observations(&observations, &["granted_read", "granted_write"]);
     assert!(observation(&observations, "granted_read").ok);
+    // Reached through the manifest link `bin/run -> probe`, it runs under
+    // the guest's name for what the request named, as in the microVM.
+    assert_eq!(
+        observation(&observations, "argv0").detail,
+        format!("/{GUEST_LINK}")
+    );
     assert_eq!(
         observation(&observations, "granted_write").detail,
         "written-confined"
@@ -680,7 +717,7 @@ fn the_lifecycle_backend_runs_the_guest_under_the_same_confinement() {
         ready_timeout: Duration::from_secs(60),
     });
     let request = fixture.request(&[(ENV_STRICT, "1")]);
-    match backend.start(&request) {
+    match backend.start(&request, leyline_runtime::ServedWorkspaces::none()) {
         Ok(_) => {}
         Err(error) if is_apply_failure(&error) => {
             sandbox_unavailable(&error);

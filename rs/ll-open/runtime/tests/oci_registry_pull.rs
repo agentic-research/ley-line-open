@@ -706,6 +706,186 @@ fn a_credentials_challenge_is_refused() {
     }
 }
 
+/// The non-public HTTPS destinations a registry may name as its token realm
+/// or as a redirect (bead `ley-line-open-b1c18d`, R4), each paired with the
+/// address the refusal must name. `port` is a loopback listener that must
+/// never see a connection.
+fn non_public_destinations(port: u16) -> Vec<(String, &'static str)> {
+    vec![
+        (format!("https://127.0.0.1:{port}/"), "127.0.0.1"),
+        (format!("https://[::1]:{port}/"), "::1"),
+        // A name, not a literal: refused on what it resolves to (either
+        // loopback address, whichever the resolver lists first).
+        (format!("https://localhost:{port}/"), LOOPBACK),
+        ("https://10.0.0.1/".to_string(), "10.0.0.1"),
+        ("https://172.16.5.4/".to_string(), "172.16.5.4"),
+        ("https://192.168.1.1/".to_string(), "192.168.1.1"),
+        ("https://169.254.169.254/".to_string(), "169.254.169.254"),
+        ("https://100.64.0.1/".to_string(), "100.64.0.1"),
+        ("https://0.0.0.0/".to_string(), "0.0.0.0"),
+        ("https://[fd00::1]/".to_string(), "fd00::1"),
+        ("https://[fe80::1]/".to_string(), "fe80::1"),
+        ("https://[::ffff:10.0.0.1]/".to_string(), "10.0.0.1"),
+    ]
+}
+
+/// A listener no destination in `non_public_destinations` may reach.
+fn untouched_listener() -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    listener
+}
+
+fn assert_never_connected(listener: &std::net::TcpListener, what: &str) {
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("{what}: the non-public destination was connected to: {other:?}"),
+    }
+}
+
+/// The expected address of a name that resolves to loopback.
+const LOOPBACK: &str = "loopback";
+
+fn assert_non_public(error: &OciImportError, expected: &str, what: &str) {
+    match error {
+        OciImportError::NonPublicDestination { address, url } => {
+            let matched = if expected == LOOPBACK {
+                address == "127.0.0.1" || address == "::1"
+            } else {
+                address == expected || address.ends_with(expected)
+            };
+            assert!(matched, "{what}: named {address}, expected {expected}");
+            assert!(
+                error.to_string().contains(address.as_str()) && !url.contains('?'),
+                "{error}"
+            );
+        }
+        other => panic!("{what}: expected a non-public destination refusal, got {other}"),
+    }
+}
+
+/// A redirect to a loopback, private, link-local or CGNAT address is refused
+/// before any connection, whatever the scheme the registry chose (HTTPS here,
+/// so the plain-HTTP rule does not apply), and quickly: no connect timeout is
+/// waited out.
+#[test]
+fn a_redirect_to_a_non_public_address_is_refused_without_a_connection() {
+    let fixture = fixture();
+    let listener = untouched_listener();
+    let port = listener.local_addr().unwrap().port();
+    for (destination, address) in non_public_destinations(port) {
+        let registry = registry(Behavior {
+            redirect_blobs_to: Some(destination.clone()),
+            ..Behavior::default()
+        });
+        let reference = registry.reference(&fixture.index.digest);
+        let started = std::time::Instant::now();
+        let (cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+        let error = result.expect_err(&destination);
+        assert_non_public(&error, address, &destination);
+        assert_no_token(&error);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{destination}: {:?}",
+            started.elapsed()
+        );
+        assert!(cas_entries(cas.path()).is_empty());
+        assert_never_connected(&listener, &destination);
+    }
+}
+
+/// A token realm naming a non-public address is refused before the token
+/// request, so the registry cannot use the anonymous-token flow to make the
+/// host GET an internal HTTPS service.
+#[test]
+fn a_token_realm_at_a_non_public_address_is_refused_without_a_connection() {
+    let fixture = fixture();
+    let listener = untouched_listener();
+    let port = listener.local_addr().unwrap().port();
+    for (destination, address) in non_public_destinations(port) {
+        let registry = registry(Behavior {
+            challenge: Some(format!(
+                "Bearer realm=\"{destination}token\",service=\"internal\""
+            )),
+            ..Behavior::default()
+        });
+        let reference = registry.reference(&fixture.index.digest);
+        let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+        let error = result.expect_err(&destination);
+        assert_non_public(&error, address, &destination);
+        assert_never_connected(&listener, &destination);
+    }
+}
+
+/// The insecure opt-in admits the one loopback authority it names, as a
+/// realm and as a redirect target, and no other loopback port.
+#[test]
+fn the_opt_in_admits_its_own_authority_and_no_other_loopback_port() {
+    let fixture = fixture();
+    // The default behavior's realm and CDN are the opted-in authority.
+    let registry = registry(Behavior::default());
+    let reference = registry.reference(&fixture.index.digest);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    result.expect("realm and redirects at the opted-in authority");
+
+    // Another loopback port is not the opted-in one, over HTTPS either.
+    let listener = untouched_listener();
+    let port = listener.local_addr().unwrap().port();
+    let registry = self::registry(Behavior {
+        redirect_blobs_to: Some(format!("https://127.0.0.1:{port}/cdn/")),
+        ..Behavior::default()
+    });
+    let reference = registry.reference(&fixture.index.digest);
+    let (_cas, result) = pull_into(&pull(&reference, Some(&registry.authority)));
+    assert_non_public(
+        &result.expect_err("another loopback port"),
+        "127.0.0.1",
+        "another loopback port",
+    );
+    assert_never_connected(&listener, "another loopback port");
+}
+
+/// A server that sends its response headers one byte at a time, each byte
+/// within any per-read timeout, is bounded by the header deadline
+/// (`connect_timeout + response_timeout`), not by the 64 KiB header cap at
+/// up to a second per byte (bead `ley-line-open-b1c18d`). Whether ureq alone
+/// is caught depends on a byte landing as its deadline passes, so the
+/// trickle is tried several times; the client's own deadline bounds every
+/// attempt. `registry.rs`'s unit test pins the same bound deterministically.
+#[test]
+fn a_header_trickle_is_bounded_by_the_header_deadline() {
+    let fixture = fixture();
+    for attempt in 0..5 {
+        let registry = registry(Behavior {
+            slow_blobs: Slow::HeaderDrip(Duration::from_millis(500)),
+            ..Behavior::default()
+        });
+        let reference = registry.reference(&fixture.index.digest);
+        let request = RegistryPull {
+            limits: RegistryLimits {
+                connect_timeout: Duration::from_millis(500),
+                response_timeout: Duration::from_millis(500),
+                min_bytes_per_second: u64::MAX,
+                ..RegistryLimits::default()
+            },
+            ..pull(&reference, Some(&registry.authority))
+        };
+        let started = std::time::Instant::now();
+        let (cas, result) = pull_into(&request);
+        let error = result.expect_err("a header trickle");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, OciImportError::Registry(_)),
+            "attempt {attempt}: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "attempt {attempt}: {elapsed:?}: {error}"
+        );
+        assert!(cas_entries(cas.path()).is_empty());
+    }
+}
+
 #[test]
 fn a_registry_error_status_is_reported() {
     let fixture = fixture();
@@ -1030,9 +1210,11 @@ fn network_tests_enabled(what: &str) -> bool {
 
 /// A Debian-based image (Cloister's request): dolthub/dolt-sql-server's
 /// index, pinned by the digest Docker Hub served for `latest` on
-/// 2026-11-10, imported twice under `--symlinks resolve`. Exercises the
-/// dangling-link drop rule; the identity and the drop counts are known
-/// answers. Opt-in: it needs the network and about 3 GB of temporary space.
+/// 2026-11-10, imported twice with its links kept (`--symlinks preserve`,
+/// rootfs manifest v2, bead `ley-line-open-4f08ea`): the 14 links
+/// `resolve` dropped as dangling are kept. The identity and the counts are
+/// known answers. Opt-in: it needs the network and about 3 GB of temporary
+/// space.
 ///
 /// The image holds paths that differ only in case
 /// (`usr/share/perl/5.36.0/Pod` and `…/pod`, `…/perl/5.36.0/Sys` and
@@ -1047,7 +1229,7 @@ fn dolt_sql_server_from_docker_hub_is_a_known_answer() {
     let reference = "dolthub/dolt-sql-server@sha256:4208ed89253c9d6a36af78f0129a293dc892681b5aca50ae66b943704b8fe052";
     let request = RegistryPull {
         platform: Platform::linux("arm64"),
-        symlinks: SymlinkPolicy::Resolve,
+        symlinks: SymlinkPolicy::Preserve,
         ..pull(reference, None)
     };
     let (_first_cas, first) = pull_into(&request);
@@ -1055,19 +1237,21 @@ fn dolt_sql_server_from_docker_hub_is_a_known_answer() {
     let (_second_cas, second) = pull_into(&request);
     let second = second.expect("pull dolt-sql-server again");
     assert_eq!(first, second, "two pulls of one digest");
-    let counts = (
+    let counts = [
         first.files,
+        first.directories,
+        first.symlinks,
         first.special_mode_bits_cleared,
         first.symlinks_resolved,
         first.special_entries_dropped.len(),
         first.links_dropped_kernel_mount.len(),
         first.links_dropped_dangling.len(),
         first.unreadable_files_dropped.len(),
-    );
+    ];
     eprintln!(
-        "dolt-sql-server arm64: rootfs blake3-256:{} manifest {} [files, specialModeBitsCleared, \
-         symlinksResolved, specialEntriesDropped, linksDroppedKernelMount, linksDroppedDangling, \
-         unreadableFilesDropped] = {counts:?}",
+        "dolt-sql-server arm64: rootfs blake3-256:{} manifest {} [files, directories, symlinks, \
+         specialModeBitsCleared, symlinksResolved, specialEntriesDropped, \
+         linksDroppedKernelMount, linksDroppedDangling, unreadableFilesDropped] = {counts:?}",
         first.rootfs.value, first.image.manifest
     );
     assert_eq!(
@@ -1078,11 +1262,11 @@ fn dolt_sql_server_from_docker_hub_is_a_known_answer() {
     assert_eq!(counts, DOLT_ARM64_COUNTS);
 }
 
-const DOLT_ARM64_ROOTFS: &str = "bfe91967c44c9ca5ea71fbf6136d29f093e6791b18e5c8669047817298653b39";
-/// files, specialModeBitsCleared, symlinksResolved, specialEntriesDropped,
-/// linksDroppedKernelMount, linksDroppedDangling, unreadableFilesDropped.
-const DOLT_ARM64_COUNTS: (usize, usize, usize, usize, usize, usize, usize) =
-    (11697, 24, 2002, 0, 0, 14, 0);
+const DOLT_ARM64_ROOTFS: &str = "11cf2e2525b9c36526269b9ebd7bfe01f176b24db0a076843223746369e23436";
+/// files, directories, symlinks, specialModeBitsCleared, symlinksResolved,
+/// specialEntriesDropped, linksDroppedKernelMount, linksDroppedDangling,
+/// unreadableFilesDropped.
+const DOLT_ARM64_COUNTS: [usize; 9] = [5362, 900, 1015, 13, 0, 0, 0, 0, 0];
 
 /// The bead's known answer, against Docker Hub. Opt-in: it needs the network.
 #[test]
@@ -1101,8 +1285,10 @@ fn hello_world_from_docker_hub_is_a_known_answer() {
     };
     let (_cas, result) = pull_into(&request);
     let imported = result.expect("pull hello-world from Docker Hub");
+    // Rootfs manifest v2 (bead ley-line-open-4f08ea); the layout import of
+    // the same digest in tests/oci_rootfs.rs records the same answer.
     assert_eq!(
         imported.rootfs.value,
-        "8597bea8e4baf11379489ff6eb118e21af4127718e465920d328326be727e4ec"
+        "6fbd5b6c842ee54f7461384badeefb0b922be7fcb5e9f0a3b593431888c1ba63"
     );
 }

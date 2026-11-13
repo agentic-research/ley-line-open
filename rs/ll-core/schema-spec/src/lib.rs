@@ -26,14 +26,22 @@
 //! ├── credential-isolation/v1/     (README, QUICKSTART, wire/, test-vectors/, ref-impl-py/, VECTORS.sha256)
 //! ├── build-cache/v1/              (README, wire/, vectors/ with VECTORS.sha256)
 //! ├── mcp-tool/v1/                 (README, wire/, vectors/)
-//! └── execution/v1/                (Cap'n Proto IDL, README, vectors)
+//! ├── execution/v1/                (Cap'n Proto IDL, README, vectors)
+//! ├── connections/v1/              (JSON Schema, README, vectors, Python reference)
+//! └── deployment-config/v1/        (JSON Schemas, published/, README, vectors, Python reference)
 //! ```
 //!
 //! # Rust API
 //!
-//! There is none yet. Future beads may fold in generated capnp bindings
-//! from `_traits.capnp` or emit typed rustdoc for each capability; those
-//! are out of scope for the move.
+//! Two modules, each beside its spec so producers, consumers and the
+//! conformance vectors share one implementation:
+//!
+//! - [`connections`]: the normative builder, parser, canonicalizer and digest
+//!   for `cloister/connections/v1` (ADR-0046 Slice 1).
+//! - [`deployment_config`]: the deployment configuration documents of LLO's
+//!   daemons, apiVersion `config.leyline/v1` (ADR-0049): parser, resolver,
+//!   canonical writer, `configDigest`, the TOML adapter, the D4 file rules
+//!   and the removed-variable check.
 
 /// Root of the schema-spec directory tree, evaluated at compile time.
 ///
@@ -41,3 +49,6 @@
 /// path relative to this. Prefer the tests in this crate for validating
 /// spec artifacts — this constant is a courtesy for tooling.
 pub const SPEC_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+pub mod connections;
+pub mod deployment_config;

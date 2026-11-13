@@ -8,14 +8,12 @@ use std::process::Command;
 
 use rustix::fs::FileType;
 
-use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest, WorkerChannel};
 use serde::{Deserialize, Serialize};
 
 use super::confinement::{
-    LOOPBACK_CHANNELS_ENV, VmmHostResources, apply_manifest, check_channel_host_ends,
-    confinement_manifest, guest_loopback_channels, guest_port_map, loopback_channels_env,
-    vsock_unix_mappings,
+    LOOPBACK_CHANNELS_ENV, apply_manifest, check_channel_host_ends, committed_confinement,
+    guest_loopback_channels, guest_port_map, loopback_channels_env, vsock_unix_mappings,
 };
 use super::plan::{DirectoryRootfsResolver, KRUN_TSI_HIJACK_INET, KrunConfig, compile_plan};
 use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
@@ -35,31 +33,26 @@ pub const WORKSPACE_DIR: &str = "/work";
 /// `tag:directory` pairs init mounts as virtio-fs before the workload runs.
 pub const VIRTIOFS_MOUNTS_ENV: &str = "KRUN_VIRTIOFS_MOUNTS";
 
-/// Refuse a workload environment that names the guest init's mount list or
-/// its loopback channels: which shares the guest mounts, and which declared
-/// connections it presents where, are the worker's decision, taken from the
-/// attested document.
+/// Refuse a workload environment entry that cannot be one, or that names the
+/// guest init's own settings, and an executable the kernel command line
+/// cannot carry.
 ///
-/// libkrun hands the environment and the executable to the guest on the
-/// kernel command line, and the guest kernel parses every `key=value` there
-/// as a boot parameter before init sees what is left. So the request's part
-/// of that line is held to what the kernel's quote-aware parser cannot read
-/// as anything else (bead `ley-line-open-eb5e4e`). Readers that split the
-/// line on whitespace and ignore quotes (init's `tsi_enabled`, arm64's
-/// id-register overrides) can still see a word inside a quoted value; none
-/// of them widens reach, and the gap is bead `ley-line-open-f7f862`:
+/// The workload's argv and environment reach the guest through the exec
+/// config file ([`EXEC_CONFIG_PATH`], LLO libkrun patch 0013), never through
+/// the kernel command line, which the kernel and init re-parse (beads
+/// `ley-line-open-7410ec`, `d4b07f`, `f7f862`). So a key or value is the
+/// workload's own bytes and is held only to what an environment can hold:
 ///
-/// - a key is `[A-Z_][A-Z0-9_]*`. Kernel boot parameters are lowercase
-///   (`init=`, `rdinit=`, `console=`) or dotted module parameters, so an
-///   uppercase key is never one: `{"init": "/bin/x"}` would otherwise replace
-///   the guest init, and with it the datagram filter and the relay;
-/// - no key starts with `KRUN_`: those are the guest init's own settings
-///   (its mounts, its channels, `KRUN_INIT`, `KRUN_CONFIG`, ...), set by the
-///   worker or by no one;
-/// - no value contains a double quote, which would end the entry and start
-///   another;
-/// - the executable has no whitespace, quote or control character, because
-///   libkrun writes it unquoted (`KRUN_INIT=<executable>`).
+/// - a key is non-empty, and holds neither `=` nor NUL; a value holds no NUL;
+/// - no key starts with `KRUN_`. Init reads some of its settings from its
+///   environment after it applies the file's (`KRUN_RLIMITS`,
+///   `KRUN_WORKDIR`, `KRUN_INIT`, `KRUN_INIT_PID1`), so such a key would
+///   configure init: its settings are set by the worker or by no one.
+///
+/// The executable still rides the command line, as libkrun's `KRUN_INIT`
+/// (required by `krun_set_exec`, ignored by init under `KRUN_CONFIG_ARGV`):
+/// it is printable ASCII with no space or quote, which libkrun writes
+/// unquoted and whose command-line builder accepts.
 fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), ExecutionError> {
     for reserved in [VIRTIOFS_MOUNTS_ENV, LOOPBACK_CHANNELS_ENV] {
         if request.public_environment.contains_key(reserved) {
@@ -69,48 +62,187 @@ fn refuse_reserved_environment(request: &ExecutionRequest) -> Result<(), Executi
             )));
         }
     }
-    for (key, value) in &request.public_environment {
-        let well_formed = key
-            .bytes()
-            .next()
-            .is_some_and(|first| first.is_ascii_uppercase() || first == b'_')
-            && key
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
-        if !well_formed {
-            return Err(ExecutionError::invalid(format!(
-                "publicEnvironment key {key:?} is not [A-Z_][A-Z0-9_]*: the microVM tier \
-                 passes the environment on the guest kernel command line, where any other \
-                 key could be read as a kernel parameter (init=, console=, a module's)"
-            )));
-        }
+    // The rule every tier shares, then this tier's own reservation.
+    crate::model::refuse_unrepresentable_environment(&request.public_environment)?;
+    for key in request.public_environment.keys() {
         if key.starts_with("KRUN_") {
             return Err(ExecutionError::invalid(format!(
                 "publicEnvironment may not set {key}: KRUN_ variables configure the guest \
                  init, and the worker sets the ones a run has"
             )));
         }
-        if value.contains('"') {
-            return Err(ExecutionError::invalid(format!(
-                "publicEnvironment entry {key:?} contains a double quote, which would end its \
-                 entry on the guest kernel command line and start another; the microVM tier \
-                 refuses it"
-            )));
-        }
     }
-    if request
+    if !request
         .executable
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || c == '"')
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && byte != b'"')
     {
         return Err(ExecutionError::invalid(format!(
-            "executable {:?} contains whitespace, a quote or a control character; libkrun \
-             writes it unquoted on the guest kernel command line, where it would split \
-             into further parameters",
+            "executable {:?} contains whitespace, a quote, a control or a non-ASCII \
+             character; libkrun writes it unquoted on the guest kernel command line, where \
+             it would split into further parameters",
             request.executable
         )));
     }
     Ok(())
+}
+
+/// Where the worker writes the workload's argv and environment in the run's
+/// own root, and where the guest init reads them (`KRUN_CONFIG`; LLO libkrun
+/// patch 0013, beads `ley-line-open-7410ec`, `d4b07f`). Init removes it once
+/// read. A rootfs that holds this path is refused: the write is exclusive,
+/// and the import and manifest reader reserve the same name,
+/// [`crate::artifacts::rootfs_manifest::RUN_EXEC_SPEC`] (pinned equal by a
+/// test).
+pub const EXEC_CONFIG_PATH: &str = "/.leyline-exec.json";
+
+/// The most argv and environment strings one run carries: init's JSON
+/// reader holds 16384 tokens, five of them the file's own structure.
+pub const MAX_EXEC_STRINGS: usize = 16_000;
+
+/// The longest one argv or environment string may be, in bytes: the
+/// kernel's per-string execve limit (`MAX_ARG_STRLEN`, 32 pages) holds the
+/// terminating NUL too.
+pub const MAX_EXEC_STRING_BYTES: usize = 128 * 1024;
+
+/// The most bytes argv and environment may take together, NULs included:
+/// well inside the kernel's execve limit (a quarter of the guest's stack
+/// limit, 2 MiB by default).
+pub const MAX_EXEC_TOTAL_BYTES: usize = 1024 * 1024;
+
+/// The workload's argv (the executable, then the request's arguments) and
+/// environment (`KEY=VALUE`), as the guest init execs them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecConfig {
+    pub cmd: Vec<String>,
+    pub env: Vec<String>,
+}
+
+impl ExecConfig {
+    /// The file's bytes: `{"Cmd": [...], "Env": [...]}`. serde_json writes
+    /// `"` and `\` escaped, `\b \t \n \f \r` as two-character escapes, every
+    /// other C0 control as `\u00XX`, and every other character as its own
+    /// UTF-8: exactly the set the guest init decodes.
+    pub fn to_json(&self) -> String {
+        serde_json::json!({ "Cmd": self.cmd, "Env": self.env }).to_string()
+    }
+}
+
+/// The workload's argv and environment for `request`, whose executable the
+/// guest resolves as `executable`, held to what the guest can exec:
+/// bounded in count, per-string length and total size, each refused by name.
+pub fn exec_config(
+    request: &ExecutionRequest,
+    executable: &str,
+) -> Result<ExecConfig, ExecutionError> {
+    let cmd: Vec<String> = std::iter::once(executable.to_owned())
+        .chain(request.arguments.iter().cloned())
+        .collect();
+    let env: Vec<String> = request
+        .public_environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    if cmd.len() + env.len() > MAX_EXEC_STRINGS {
+        return Err(ExecutionError::invalid(format!(
+            "the run's argv and environment hold {} strings; the microVM tier carries at \
+             most {MAX_EXEC_STRINGS}",
+            cmd.len() + env.len()
+        )));
+    }
+    for argument in &request.arguments {
+        if argument.contains('\0') {
+            return Err(ExecutionError::invalid(
+                "an argument holds NUL, which no argv can carry",
+            ));
+        }
+        if argument.len() >= MAX_EXEC_STRING_BYTES {
+            return Err(ExecutionError::invalid(format!(
+                "an argument is {} bytes; the guest kernel takes at most {} per string",
+                argument.len(),
+                MAX_EXEC_STRING_BYTES - 1
+            )));
+        }
+    }
+    for (key, value) in &request.public_environment {
+        if key.len() + 1 + value.len() >= MAX_EXEC_STRING_BYTES {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment entry {key:?} is {} bytes; the guest kernel takes at most \
+                 {} per string",
+                key.len() + 1 + value.len(),
+                MAX_EXEC_STRING_BYTES - 1
+            )));
+        }
+    }
+    let total: usize = cmd.iter().chain(&env).map(|string| string.len() + 1).sum();
+    if total > MAX_EXEC_TOTAL_BYTES {
+        return Err(ExecutionError::invalid(format!(
+            "the run's argv and environment take {total} bytes; the microVM tier carries at \
+             most {MAX_EXEC_TOTAL_BYTES}"
+        )));
+    }
+    Ok(ExecConfig { cmd, env })
+}
+
+/// Take the workload's argv and environment off the kernel command line:
+/// libkrun writes the plan's arguments after ` -- ` and its environment as
+/// `KEY="value"`, both re-parsed by the guest kernel and init. The plan
+/// keeps the executable (libkrun requires one) and, as its environment,
+/// only the tokens that point init at the exec config file. Everything the
+/// worker adds afterwards (the workspace mount, the loopback channels) is
+/// its own token.
+pub fn move_exec_off_the_kernel_line(config: &mut KrunConfig) {
+    config.arguments.clear();
+    config.environment = vec![
+        std::ffi::CString::new(format!("KRUN_CONFIG={EXEC_CONFIG_PATH}"))
+            .expect("static entry has no NUL"),
+        std::ffi::CString::new("KRUN_CONFIG_ARGV=1").expect("static entry has no NUL"),
+    ];
+}
+
+/// Write `config` at [`EXEC_CONFIG_PATH`] under the run's root `rootfs`:
+/// created exclusively, never through a link, read-only. The root is the
+/// per-run copy, a fresh directory; a rootfs that already holds the path
+/// (an image file there, a link to a host file) is refused by name, and
+/// nothing is written through it.
+pub fn write_exec_config(
+    rootfs: &std::path::Path,
+    config: &ExecConfig,
+) -> Result<(), ExecutionError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = rootfs.join(EXEC_CONFIG_PATH.trim_start_matches('/'));
+    // `create_new` is O_CREAT|O_EXCL, which fails on any existing entry and
+    // does not follow a symbolic link at the final component (POSIX), so a
+    // link the rootfs placed there is refused rather than written through.
+    // std opens close-on-exec.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(&path)
+        .map_err(|error| {
+            // Only an existing entry is the rootfs's fault; ENOSPC, EACCES,
+            // EIO and the like are the host's, and are not the spec's.
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ExecutionError::invalid(format!(
+                    "write the workload's exec config at {EXEC_CONFIG_PATH} in the run's \
+                     root: {error}; the path is the worker's, and a rootfs may not hold it"
+                ))
+            } else {
+                ExecutionError::backend(format!(
+                    "write the workload's exec config at {EXEC_CONFIG_PATH} in the run's \
+                     root: {error}"
+                ))
+            }
+        })?;
+    file.write_all(config.to_json().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            ExecutionError::backend(format!(
+                "write the workload's exec config at {EXEC_CONFIG_PATH}: {error}"
+            ))
+        })
 }
 
 /// The run's workspace share: the inherited socket named by
@@ -487,6 +619,13 @@ pub fn prepare(
     // run's granted workspace or nothing, and the guest init's mount list
     // is the worker's alone.
     refuse_reserved_environment(request)?;
+    // ONE manifest, applied and attested, and compared with the grant's
+    // commitment here: before the rootfs is read, before the sandbox, and
+    // long before the VM. Every projection below (the port map, the vsock
+    // mappings, the loopback channels, the VMM's own nono profile) is taken
+    // from `committed`, whose policy is parsed from the bytes its digest is
+    // computed over (bead ley-line-open-7a3109).
+    let committed = committed_confinement(request, &options.runtime_files, &options.devices)?;
     let share = workspace_share(request, options.workspace_share_fd)?;
     // Before the rootfs is read or anything else is opened: what this
     // process holds is its standard streams and the declared share.
@@ -494,6 +633,18 @@ pub fn prepare(
     refuse_undeclared_descriptors(&inherited)?;
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
     let mut config = compile_plan(&resolver, request)?;
+    // The workload's argv and environment, bounded and refused by name here,
+    // before anything is materialized, then taken off the kernel command
+    // line (beads ley-line-open-7410ec, d4b07f, f7f862). They reach the
+    // guest as the exec config file, written below.
+    let exec = exec_config(
+        request,
+        config
+            .executable
+            .to_str()
+            .map_err(|_| ExecutionError::invalid("executable is not UTF-8"))?,
+    )?;
+    move_exec_off_the_kernel_line(&mut config);
     if share.is_some() {
         mount_workspace(&mut config);
     }
@@ -510,39 +661,12 @@ pub fn prepare(
     // applied — so libkrunfw must be among the `--runtime-file` grants. All VM
     // configuration and execution happen after ambient authority is dropped.
     verify_ephemeral_rootfs(&config.rootfs)?;
-    let resources = VmmHostResources {
-        runtime_files: options.runtime_files,
-        devices: options.devices,
-    };
-    // ONE manifest, applied and attested. The previous version built a manifest
-    // here and then called `apply(&config, &resources)`, which built a SECOND
-    // one from the same inputs — and its comment claimed the digest described
-    // "the policy this process is actually confined by", which held only because
-    // the arguments happened to match. Change which path `apply` derives from
-    // and the worker would attest a digest for a policy it did not apply, with
-    // nothing to catch it: the digest's only consumer is a comparison against
-    // the grant, not against the applied set.
-    //
-    // `native.rs` already did it this way, and its comment — "Deriving both from
-    // `manifest` is what makes the attestation true by construction rather than
-    // by discipline" — was accurate there and inaccurate one directory over.
-    // Re-parsed rather than carried as a value: the worker is a separate
-    // process, so the document crosses as JSON either way, and parsing it here
-    // means the worker applies the same builder invariants `authorization.rs`
-    // did instead of trusting a shape someone else validated.
-    let authorized = match &request.confinement_manifest {
-        Some(document) => Some(ConfinementManifest::parse(document).map_err(|error| {
-            ExecutionError::invalid(format!(
-                "RunGrant.confinementManifest did not survive the worker boundary: {error}"
-            ))
-        })?),
-        None => None,
-    };
-    let manifest = confinement_manifest(
-        &resources.runtime_files,
-        &resources.devices,
-        authorized.as_ref(),
-    )?;
+    // After the last verification of the per-run root ("the declared tree
+    // and nothing else"), before the sandbox and long before the VM: the one
+    // file the worker adds there. Nothing verifies the root again, and the
+    // guest exists only once the VM is entered, so nothing can race it.
+    write_exec_config(&config.rootfs.canonical_path, &exec)?;
+    let manifest = committed.manifest();
 
     // §4 on the microVM tier. `apply_manifest` below confines the VMM HOST
     // process; the guest's own listener is governed by the port map, which is a
@@ -596,14 +720,14 @@ pub fn prepare(
     // Since ley-line-open-e2c33f, §4 is a list: every declared listener maps
     // `N:N`, through the pure `guest_port_map` so the refusal and the mapping
     // are testable without a VMM.
-    config.port_map = guest_port_map(&manifest, config.tsi_features)?;
+    config.port_map = guest_port_map(manifest, config.tsi_features)?;
 
     // §6 on this tier: the folded socket grants compile to vsock↔socket
     // mappings, consumed by `prepare_vm`. Derived from the same manifest the
     // digest below attests, through the pure function documented at
     // `vsock_unix_mappings` — so the receipt already covers every mapping and
     // the issuer can compute every port from the document they signed.
-    config.vsock_unix_map = vsock_unix_mappings(&manifest)?;
+    config.vsock_unix_map = vsock_unix_mappings(manifest)?;
 
     // ADR-0046 Q7: the grants carrying a `guestPort` are presented to the
     // workload as TCP on the guest's loopback, by the guest init (LLO libkrun
@@ -611,7 +735,7 @@ pub fn prepare(
     // (`guest_loopback_channels`), handed to init in a variable the request
     // cannot set (`refuse_reserved_environment`), so the guest-visible set is
     // exactly what the digest below commits to.
-    let channels = guest_loopback_channels(&manifest, config.tsi_features, std::env::consts::OS)?;
+    let channels = guest_loopback_channels(manifest, config.tsi_features, std::env::consts::OS)?;
     if let Some(variable) = loopback_channels_env(&channels) {
         config.environment.push(variable);
     }
@@ -621,10 +745,10 @@ pub fn prepare(
     // (invariant I4; bead ley-line-open-bb2143).
     check_channel_host_ends(&config.vsock_unix_map)?;
 
-    apply_manifest(&manifest, &config.rootfs.canonical_path)?;
+    apply_manifest(&committed, &config.rootfs.canonical_path)?;
 
     Ok(PreparedRun {
-        confinement_digest: manifest.confinement_digest()?,
+        confinement_digest: committed.digest().to_owned(),
         config,
         share,
         inherited,
@@ -712,6 +836,7 @@ mod tests {
             graph_root: format!("blake3-256:{}", "1".repeat(64)),
             expected_generation: 0,
             operations: vec![WorkspaceOperation::Read],
+            write_scope: Vec::new(),
         }
     }
 
@@ -752,33 +877,33 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidSpec);
         assert!(error.detail.contains(LOOPBACK_CHANNELS_ENV), "{error}");
 
-        let mut smuggled = request();
-        smuggled.public_environment.insert(
+        // A value is delivered as the workload's own bytes through the exec
+        // config file (beads ley-line-open-7410ec, d4b07f), never through
+        // the kernel command line, so a quote cannot end it and start a
+        // channel: it is data, and it is admitted.
+        let mut quoted = request();
+        quoted.public_environment.insert(
             "DB_ADDR".into(),
             "x\" KRUN_LOOPBACK_CHANNELS=\"dial:80:65536".into(),
         );
-        let error = refuse_reserved_environment(&smuggled).unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidSpec);
-        assert!(error.detail.contains("double quote"), "{error}");
+        assert!(refuse_reserved_environment(&quoted).is_ok());
+        assert_eq!(
+            exec_config(&quoted, "/bin/agent").unwrap().env,
+            vec!["DB_ADDR=x\" KRUN_LOOPBACK_CHANNELS=\"dial:80:65536".to_owned()]
+        );
 
-        // A key the guest kernel would read as its own parameter (bead
-        // ley-line-open-eb5e4e): `init=` replaces the guest init, and with it
-        // the datagram filter and the relay. Any key outside [A-Z_][A-Z0-9_]*
-        // is refused, and so is every KRUN_ variable.
+        // What cannot be an environment entry at all, and the guest init's
+        // own settings (KRUN_*: its mounts, its channels, its config file,
+        // its rlimits), which the worker sets or no one does.
         for key in [
-            "init",
-            "rdinit",
-            "console",
-            "virtio_vsock.x",
-            "A\" tsi_hijack \"B",
-            "A B",
             "A=B",
-            "1ADDR",
             "",
-            "http_proxy",
+            "A\0B",
             "KRUN_INIT",
             "KRUN_CONFIG",
+            "KRUN_CONFIG_ARGV",
             "KRUN_INIT_PID1",
+            "KRUN_RLIMITS",
         ] {
             let mut injected = request();
             injected.public_environment.insert(key.into(), "1".into());
@@ -790,18 +915,37 @@ mod tests {
                 "{key:?}: {error}"
             );
         }
-        for key in ["_A", "A1", "DB_ADDR", "Z"] {
+        // Off the kernel command line, a key is any name an environment can
+        // hold: the kernel never sees it, so `init` or `console` is the
+        // workload's own variable, not a boot parameter.
+        for key in [
+            "_A",
+            "A1",
+            "DB_ADDR",
+            "Z",
+            "init",
+            "rdinit",
+            "console",
+            "virtio_vsock.x",
+            "http_proxy",
+            "1ADDR",
+            "A B",
+            "A\" tsi_hijack \"B",
+        ] {
             let mut fine = request();
             fine.public_environment.insert(key.into(), "1".into());
             assert!(refuse_reserved_environment(&fine).is_ok(), "{key:?}");
         }
 
-        // libkrun writes the executable unquoted.
+        // The executable still rides the kernel command line (libkrun's
+        // KRUN_INIT, which init ignores under KRUN_CONFIG_ARGV but libkrun
+        // requires), unquoted and printable ASCII only.
         for executable in [
             "bin/x init=/bin/y",
             "bin/x\tinit=/bin/y",
             "bin/\"x",
             "bin/x\n",
+            "bin/caf\u{e9}",
         ] {
             let mut hostile = request();
             hostile.executable = executable.into();
@@ -819,6 +963,275 @@ mod tests {
             .public_environment
             .insert("DB_ADDR".into(), "127.0.0.1:13306".into());
         assert!(refuse_reserved_environment(&address).is_ok());
+    }
+
+    /// Every byte an argv or environment string can hold (0x01-0x7F, and
+    /// multi-byte UTF-8), with the shapes that broke on the kernel command
+    /// line: `--`, `--x`, quotes, a backslash, a newline, `a, b`.
+    fn hostile_strings() -> Vec<String> {
+        let mut every_ascii: String = (1u8..=0x7f).map(char::from).collect();
+        every_ascii.push_str(" caf\u{e9} \u{1F600} \u{4e2d}");
+        vec![
+            "a".into(),
+            "--".into(),
+            "b".into(),
+            "--x".into(),
+            "\"".into(),
+            "\\".into(),
+            "'".into(),
+            "line1\nline2".into(),
+            "a, b".into(),
+            "x=\"ab\"; exit 93".into(),
+            "caf\u{e9}".into(),
+            "".into(),
+            every_ascii,
+        ]
+    }
+
+    /// Beads ley-line-open-7410ec, d4b07f: the workload's argv and
+    /// environment are the exec config's, verbatim, and the JSON the worker
+    /// writes uses only escapes the guest init decodes (LLO libkrun patch
+    /// 0013): `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\u00XX` for the
+    /// other C0 controls. Every other character is its own UTF-8.
+    #[test]
+    fn the_exec_config_carries_argv_and_environment_verbatim() {
+        let mut request = request();
+        request.arguments = hostile_strings();
+        request
+            .public_environment
+            .insert("MULTI".into(), "l1\nl2\t\"q\"\\".into());
+        request
+            .public_environment
+            .insert("lower.case".into(), hostile_strings().pop().unwrap());
+        let config = exec_config(&request, "/bin/agent").unwrap();
+        let mut argv = vec!["/bin/agent".to_owned()];
+        argv.extend(hostile_strings());
+        assert_eq!(config.cmd, argv);
+        assert_eq!(
+            config.env,
+            vec![
+                "MULTI=l1\nl2\t\"q\"\\".to_owned(),
+                format!("lower.case={}", hostile_strings().pop().unwrap()),
+            ]
+        );
+
+        let json = config.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["Cmd"], serde_json::json!(argv));
+        // Only the escapes init decodes appear.
+        let bytes = json.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] == b'\\' {
+                let escape = bytes[at + 1];
+                assert!(
+                    b"\"\\bfnrtu".contains(&escape),
+                    "escape \\{} in {json}",
+                    escape as char
+                );
+                if escape == b'u' {
+                    let hex = std::str::from_utf8(&bytes[at + 2..at + 6]).unwrap();
+                    let code = u32::from_str_radix(hex, 16).unwrap();
+                    assert!(code < 0x20, "\\u{hex} is not a C0 control");
+                    at += 6;
+                } else {
+                    at += 2;
+                }
+            } else {
+                assert!(bytes[at] >= 0x20, "a raw control byte in {json}");
+                at += 1;
+            }
+        }
+    }
+
+    /// The kernel command line carries only worker-chosen tokens: the plan's
+    /// argv moves into the exec config, and the request's environment never
+    /// reaches the line.
+    #[test]
+    fn the_workloads_argv_and_environment_leave_the_kernel_command_line() {
+        let mut config = KrunConfig {
+            run_id: "run".into(),
+            rootfs: ResolvedRootfs {
+                digest: DigestRef {
+                    algorithm: "blake3-256".into(),
+                    value: "0".repeat(64),
+                },
+                canonical_path: PathBuf::from("/rootfs"),
+            },
+            executable: CString::new("/bin/agent").unwrap(),
+            arguments: vec![CString::new("--").unwrap(), CString::new("b").unwrap()],
+            environment: vec![CString::new("A=\"x\"").unwrap()],
+            workdir: CString::new("/").unwrap(),
+            vcpus: 1,
+            ram_mib: 256,
+            wall_time_ms: 1_000,
+            tsi_features: 0,
+            port_map: Vec::new(),
+            vsock_unix_map: Vec::new(),
+        };
+        move_exec_off_the_kernel_line(&mut config);
+        assert!(config.arguments.is_empty());
+        assert_eq!(
+            config.environment,
+            vec![
+                CString::new(format!("KRUN_CONFIG={EXEC_CONFIG_PATH}")).unwrap(),
+                CString::new("KRUN_CONFIG_ARGV=1").unwrap(),
+            ]
+        );
+        // The workspace mount the worker adds afterwards is its own token.
+        mount_workspace(&mut config);
+        assert_eq!(config.environment.len(), 3);
+    }
+
+    /// The exec config is written into the run's own fresh root, exclusively
+    /// and without following a link: a rootfs that already holds the path
+    /// (a file, a directory, or a link pointing at a host file) is refused
+    /// by name, and nothing is written through it.
+    /// The path the worker writes is the one the import and the manifest
+    /// reader reserve, so no rootfs that passed them holds it.
+    #[test]
+    fn the_exec_config_path_is_the_reserved_rootfs_name() {
+        assert_eq!(
+            EXEC_CONFIG_PATH.strip_prefix('/'),
+            Some(crate::artifacts::rootfs_manifest::RUN_EXEC_SPEC)
+        );
+    }
+
+    #[test]
+    fn the_exec_config_is_written_once_and_never_through_a_link() {
+        let mut request = request();
+        request.arguments = vec!["--".into(), "\"".into()];
+        let config = exec_config(&request, "/bin/agent").unwrap();
+        let name = EXEC_CONFIG_PATH.trim_start_matches('/');
+
+        let root = tempfile::tempdir().unwrap();
+        write_exec_config(root.path(), &config).unwrap();
+        let written = std::fs::read_to_string(root.path().join(name)).unwrap();
+        assert_eq!(written, config.to_json());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(root.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        // Twice: the path exists now, and is refused as the rootfs's fault.
+        let error = write_exec_config(root.path(), &config).unwrap_err();
+        assert!(error.detail.contains(EXEC_CONFIG_PATH), "{error}");
+        assert_eq!(error.code, crate::ErrorCode::InvalidSpec, "{error}");
+
+        // A root that cannot be written is the host's failure, not the spec's.
+        let missing = root.path().join("no-such-root");
+        let error = write_exec_config(&missing, &config).unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::BackendFailed, "{error}");
+
+        let host = tempfile::tempdir().unwrap();
+        let target = host.path().join("host-file");
+        std::fs::write(&target, b"host").unwrap();
+        let linked = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&target, linked.path().join(name)).unwrap();
+        let error = write_exec_config(linked.path(), &config).unwrap_err();
+        assert!(error.detail.contains(EXEC_CONFIG_PATH), "{error}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"host",
+            "not written through"
+        );
+    }
+
+    /// What can exist in an exec argv or environment but not in the guest:
+    /// more strings than init's JSON reader holds, one string longer than
+    /// the kernel's per-string limit, or more bytes in all than execve takes.
+    /// Each is refused by name before anything runs.
+    #[test]
+    fn an_argv_or_environment_past_the_guests_bounds_is_refused_by_name() {
+        let mut many = request();
+        many.arguments = vec!["a".into(); MAX_EXEC_STRINGS];
+        let error = exec_config(&many, "/bin/agent").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("strings"), "{error}");
+
+        let mut long = request();
+        long.arguments = vec!["a".repeat(MAX_EXEC_STRING_BYTES)];
+        let error = exec_config(&long, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("argument"), "{error}");
+        let mut long_env = request();
+        long_env
+            .public_environment
+            .insert("A".into(), "a".repeat(MAX_EXEC_STRING_BYTES));
+        let error = exec_config(&long_env, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("\"A\""), "{error}");
+
+        let mut total = request();
+        total.arguments = vec![
+            "a".repeat(MAX_EXEC_STRING_BYTES - 1);
+            MAX_EXEC_TOTAL_BYTES / MAX_EXEC_STRING_BYTES + 1
+        ];
+        let error = exec_config(&total, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("bytes"), "{error}");
+
+        // NUL cannot exist in an exec argv or environment: refused by name,
+        // in an argument and in a value.
+        let mut nul_argument = request();
+        nul_argument.arguments = vec!["a\0b".into()];
+        let error = exec_config(&nul_argument, "/bin/agent").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("NUL"), "{error}");
+        let mut nul_value = request();
+        nul_value
+            .public_environment
+            .insert("A".into(), "a\0b".into());
+        let error = refuse_reserved_environment(&nul_value).unwrap_err();
+        assert!(
+            error.detail.contains("NUL") && error.detail.contains("\"A\""),
+            "{error}"
+        );
+
+        // The bounds themselves are admitted.
+        let mut edge = request();
+        edge.arguments = vec!["a".repeat(MAX_EXEC_STRING_BYTES - 1)];
+        exec_config(&edge, "/bin/agent").unwrap();
+    }
+
+    /// Each bound at its exact edge: one under it is admitted, the edge is
+    /// refused. The per-string bound is the kernel's `MAX_ARG_STRLEN`
+    /// (32 pages, the NUL included).
+    #[test]
+    fn the_exec_bounds_hold_at_their_exact_edges() {
+        assert_eq!(MAX_EXEC_STRING_BYTES, 131_072);
+
+        // Strings: argv[0] plus arguments plus environment entries.
+        let mut at = request();
+        at.arguments = vec!["a".into(); MAX_EXEC_STRINGS - 2];
+        at.public_environment.insert("A".into(), "1".into());
+        exec_config(&at, "/bin/agent").expect("exactly the most strings");
+        at.arguments.push("a".into());
+        let error = exec_config(&at, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("strings"), "{error}");
+
+        // One environment entry, `KEY=VALUE` with its NUL under the bound.
+        let mut entry = request();
+        entry
+            .public_environment
+            .insert("AB".into(), "v".repeat(MAX_EXEC_STRING_BYTES - 4));
+        exec_config(&entry, "/bin/agent").expect("an entry one byte under the bound");
+        entry
+            .public_environment
+            .insert("AB".into(), "v".repeat(MAX_EXEC_STRING_BYTES - 3));
+        let error = exec_config(&entry, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("\"AB\""), "{error}");
+
+        // In all, NULs included: "/bin/agent" (11) + 8 x 131,070 + 5 is
+        // exactly 1 MiB.
+        let mut total = request();
+        total.arguments = vec!["a".repeat(131_069); 8];
+        total.arguments.push("abcd".into());
+        exec_config(&total, "/bin/agent").expect("exactly the most bytes");
+        total.arguments.last_mut().unwrap().push('e');
+        let error = exec_config(&total, "/bin/agent").unwrap_err();
+        assert!(error.detail.contains("bytes"), "{error}");
     }
 
     #[test]
@@ -956,6 +1369,56 @@ mod tests {
         .unwrap();
         assert_eq!(options.workspace_share_fd, Some(0));
         assert!(!options.tsi_hijack_inet);
+    }
+
+    /// The worker compares the confinement it will apply with the grant's
+    /// commitment BEFORE the VM exists (bead `ley-line-open-7a3109`).
+    ///
+    /// The supervisor's comparison reads the readiness event, which the worker
+    /// writes immediately before `krun_start_enter`, so on its own it refused
+    /// a drifting run only after the guest was already running. Here the
+    /// refusal comes first: the CAS root does not exist, so a worker that
+    /// reached the rootfs, the VMM or the sandbox would fail on that instead,
+    /// and the drift error proves none of them was reached.
+    #[test]
+    fn a_worker_refuses_a_drifting_commitment_before_it_reads_the_rootfs() {
+        let options = WorkerOptions {
+            cas_root: PathBuf::from("/nonexistent/leyline-cas"),
+            run_root: PathBuf::from("/nonexistent/leyline-runs"),
+            runtime_files: Vec::new(),
+            devices: Vec::new(),
+            tsi_hijack_inet: false,
+            workspace_share_fd: None,
+        };
+        let mut drifting = request();
+        drifting.limits.wall_time_ms = 1_000;
+        drifting.confinement_digest = format!("blake3-256:{}", "f".repeat(64));
+        let error = prepare(options, &drifting).unwrap_err();
+        assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch, "{error}");
+        assert!(error.detail.contains("confinement drift"), "{error}");
+        assert!(
+            error.detail.contains(&drifting.confinement_digest),
+            "{error}"
+        );
+    }
+
+    /// "No commitment" is stated, never defaulted: a worker request that
+    /// omits `confinementDigest` is refused, so a producer that forgot the
+    /// field cannot reach the attest-with-nothing-to-compare mode by accident.
+    /// An empty string is the explicit spelling of that mode.
+    #[test]
+    fn a_worker_request_without_a_confinement_digest_key_is_refused() {
+        let mut value = serde_json::to_value(request()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("confinementDigest")
+            .expect("the request serializes the key");
+        let error = read_request(value.to_string().as_bytes()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains("confinementDigest"), "{error}");
+        // Present and empty: accepted.
+        read_request(serde_json::to_string(&request()).unwrap().as_bytes()).unwrap();
     }
 
     #[test]

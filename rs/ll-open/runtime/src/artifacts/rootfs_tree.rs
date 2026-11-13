@@ -13,14 +13,17 @@ const MAX_SYMLINK_HOPS: usize = 40;
 
 /// The top-level directories libkrun's guest init mounts a kernel
 /// filesystem over before the workload runs (`mount_filesystems` in
-/// `rs/third_party/libkrun/src/init_blob/init/init.c`): devtmpfs on `/dev`
-/// (init.c:559, then devpts on `/dev/pts` at :603 and tmpfs on `/dev/shm` at
-/// :610), proc on `/proc` (:575), sysfs on `/sys` (:582, then cgroup2 on
-/// `/sys/fs/cgroup` at :589). Each mount either succeeds, is already there
-/// (`EBUSY`), or makes init exit before anything runs (:1905-1908). Since
-/// LLO patch `0012` (bead `ley-line-open-db5899`), `mount_tmp`, called from
-/// the same function on every non-TDX boot, also mounts a tmpfs on `/tmp`
-/// or stops the guest. Nothing an image holds beneath these is visible to
+/// `rs/third_party/libkrun/src/init_blob/init/init.c`, cited by function
+/// name because LLO's patches move its lines): devtmpfs on `/dev` (then
+/// devpts on `/dev/pts` and tmpfs on `/dev/shm`), proc on `/proc`, and sysfs
+/// on `/sys` (then cgroup2 on `/sys/fs/cgroup`). Each mount either succeeds,
+/// is already there (`EBUSY`), or makes `mount_filesystems` fail, and `main`
+/// then exits before anything runs. Since LLO patch `0012` (bead
+/// `ley-line-open-db5899`), `mount_tmp`, called from `mount_filesystems` on
+/// every non-TDX boot, also mounts a tmpfs on `/tmp` or stops the guest. A
+/// granted workspace is mounted on `/work` by `mount_virtiofs_list`, which
+/// is why a link that reaches `/work` is refused (see
+/// `workspace_mount_point`). Nothing an image holds beneath these is visible to
 /// the workload, and nothing a link names beneath them is the image's to
 /// supply: an image's `tmp/` content is shadowed by the empty tmpfs just as
 /// its `dev/` nodes are by devtmpfs.
@@ -70,11 +73,16 @@ impl PathError {
     }
 }
 
-/// The finished tree: what the rootfs manifest can express.
+/// The finished tree: what the rootfs manifest can express. A directory's
+/// mode is kept beside the tree ([`Tree::directory_modes`], or
+/// [`Resolved::directory_modes`]), by its written path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Final {
     Dir(BTreeMap<String, Final>),
     File(FileNode),
+    /// A symbolic link, written as itself (rootfs manifest v2): its target
+    /// verbatim, never followed.
+    Symlink(String),
 }
 
 impl Final {
@@ -95,11 +103,11 @@ impl Final {
                         dropped.push((join(prefix, &name), file.mode));
                         None
                     }
-                    Final::File(file) => Some((name, Final::File(file))),
                     Final::Dir(children) => {
                         let children = filter(children, &join(prefix, &name), dropped);
                         Some((name, Final::Dir(children)))
                     }
+                    other => Some((name, other)),
                 })
                 .collect()
         }
@@ -109,27 +117,6 @@ impl Final {
             file => file,
         };
         (tree, dropped)
-    }
-
-    /// The tree without any directory that holds no regular file, at any
-    /// depth. The root directory is kept.
-    pub(crate) fn without_empty_directories(self) -> Final {
-        fn prune(entries: BTreeMap<String, Final>) -> BTreeMap<String, Final> {
-            entries
-                .into_iter()
-                .filter_map(|(name, node)| match node {
-                    Final::File(file) => Some((name, Final::File(file))),
-                    Final::Dir(children) => {
-                        let children = prune(children);
-                        (!children.is_empty()).then_some((name, Final::Dir(children)))
-                    }
-                })
-                .collect()
-        }
-        match self {
-            Final::Dir(entries) => Final::Dir(prune(entries)),
-            file => file,
-        }
     }
 }
 
@@ -143,9 +130,36 @@ pub(crate) struct Unresolvable {
 #[derive(Debug, Default)]
 pub(crate) struct Tree {
     root: Dir,
+    /// The mode each directory's own archive entry gave it, by real path.
+    /// A directory only a deeper entry implies has none.
+    modes: BTreeMap<Vec<String>, u32>,
 }
 
 impl Tree {
+    /// Record the mode a directory entry at `path` carries: the last one
+    /// applied wins, as a later layer's entry replaces a lower one's.
+    pub(crate) fn set_dir_mode(&mut self, path: &[String], mode: u32) {
+        self.modes.insert(path.to_vec(), mode);
+    }
+
+    /// Forget the modes of `path` and everything beneath it (`strictly`:
+    /// beneath it only), whose entries are gone.
+    fn forget_modes(&mut self, path: &[String], strictly: bool) {
+        self.modes.retain(|recorded, _| {
+            !(recorded.starts_with(path) && (!strictly || recorded.len() > path.len()))
+        });
+    }
+
+    /// Every directory's recorded mode, by `/`-joined path. A directory
+    /// that is not listed had no entry of its own.
+    pub(crate) fn directory_modes(&self) -> BTreeMap<String, u32> {
+        self.modes
+            .iter()
+            .filter(|(path, _)| matches!(self.lookup(path), Some(Node::Dir(_))))
+            .map(|(path, mode)| (path.join("/"), *mode))
+            .collect()
+    }
+
     /// The directory at `path`, if it exists and is one. A symbolic link
     /// anywhere on the way is an error, never followed.
     fn dir_mut(&mut self, path: &[String]) -> Result<Option<&mut Dir>, PathError> {
@@ -182,14 +196,18 @@ impl Tree {
     pub(crate) fn whiteout(&mut self, parent: &[String], name: &str) -> Result<(), PathError> {
         if let Some(dir) = self.dir_mut(parent)? {
             dir.remove(name);
+            let mut path = parent.to_vec();
+            path.push(name.to_string());
+            self.forget_modes(&path, false);
         }
         Ok(())
     }
 
     /// `.wh..wh..opq` in `dir`: remove every child a lower layer gave it.
-    pub(crate) fn opaque(&mut self, dir: &[String]) -> Result<(), PathError> {
-        if let Some(dir) = self.dir_mut(dir)? {
+    pub(crate) fn opaque(&mut self, path: &[String]) -> Result<(), PathError> {
+        if let Some(dir) = self.dir_mut(path)? {
             dir.clear();
+            self.forget_modes(path, true);
         }
         Ok(())
     }
@@ -204,6 +222,7 @@ impl Tree {
             return Ok(());
         }
         dir.insert(name.clone(), node);
+        self.forget_modes(path, false);
         Ok(())
     }
 
@@ -213,6 +232,7 @@ impl Tree {
     pub(crate) fn remove(&mut self, path: &[String]) -> Result<(), PathError> {
         let (name, parent) = path.split_last().expect("remove names a non-root path");
         self.ensure_dir(parent)?.remove(name);
+        self.forget_modes(path, false);
         Ok(())
     }
 
@@ -275,21 +295,23 @@ impl Tree {
         find(&self.root, "")
     }
 
-    /// The tree with no symbolic links, which must have none.
-    pub(crate) fn into_final(self) -> Final {
+    /// The tree as it is, each symbolic link kept as a link (its target
+    /// verbatim, never followed), and every directory's recorded mode.
+    pub(crate) fn into_final(self) -> (Final, BTreeMap<String, u32>) {
         fn convert(dir: Dir) -> BTreeMap<String, Final> {
             dir.into_iter()
                 .map(|(name, node)| {
                     let node = match node {
                         Node::Dir(child) => Final::Dir(convert(child)),
                         Node::File(file) => Final::File(file),
-                        Node::Symlink(_) => unreachable!("caller refused symbolic links"),
+                        Node::Symlink(target) => Final::Symlink(target),
                     };
                     (name, node)
                 })
                 .collect()
         }
-        Final::Dir(convert(self.root))
+        let modes = self.directory_modes();
+        (Final::Dir(convert(self.root)), modes)
     }
 
     /// The tree with every symbolic link replaced by a copy of what it
@@ -317,6 +339,7 @@ impl Tree {
             copied: 0,
             kernel_mount: Vec::new(),
             dangling: Vec::new(),
+            directory_modes: BTreeMap::new(),
         };
         let root = state.expand(&[])?;
         Ok(Resolved {
@@ -324,6 +347,7 @@ impl Tree {
             copied: state.copied,
             kernel_mount: state.kernel_mount,
             dangling: state.dangling,
+            directory_modes: state.directory_modes,
         })
     }
 
@@ -454,6 +478,10 @@ pub(crate) struct Resolved {
     pub copied: usize,
     pub kernel_mount: Vec<Dropped>,
     pub dangling: Vec<Dropped>,
+    /// Each written directory's mode, by written path: a copied directory
+    /// takes its real directory's. A directory that is not listed had no
+    /// entry of its own.
+    pub directory_modes: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +499,7 @@ struct Expansion<'a> {
     copied: usize,
     kernel_mount: Vec<Dropped>,
     dangling: Vec<Dropped>,
+    directory_modes: BTreeMap<String, u32>,
 }
 
 impl Expansion<'_> {
@@ -548,6 +577,9 @@ impl Expansion<'_> {
         real: Vec<String>,
         written: &str,
     ) -> Result<BTreeMap<String, Final>, ResolveError> {
+        if let Some(mode) = self.tree.modes.get(&real) {
+            self.directory_modes.insert(written.to_string(), *mode);
+        }
         self.active.push(real.clone());
         let expanded = self.expand_at(&real, written);
         self.active.pop();

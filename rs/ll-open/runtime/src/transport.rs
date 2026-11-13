@@ -27,6 +27,21 @@ pub const RESOURCE_LIMITS_CAPABILITY: &str = "cloister/execution/v1/resource-lim
 /// cpuMillis, outputBytes}` (never advertised), `2` is the OCI layout.
 pub const RESOURCE_LIMITS_REVISION: &str = "2";
 
+/// The capability a daemon advertises when it enforces
+/// `WorkspaceGrant.writeScope` (bead `ley-line-open-483134`).
+///
+/// The field is additive, so a daemon that predates it decodes a scoped
+/// grant, ignores the scope, and lets `mutate` write anywhere in the
+/// workspace; nothing in its replies says so. It advertises no such entry.
+/// An issuer MUST find this name at [`WORKSPACE_WRITE_SCOPE_REVISION`] in
+/// `llo_execution_capabilities` before it issues a grant whose `writeScope`
+/// is narrower than the whole workspace, and refuse to issue one otherwise.
+pub const WORKSPACE_WRITE_SCOPE_CAPABILITY: &str = "cloister/execution/v1/workspace-write-scope";
+
+/// The `writeScope` grammar revision: `1` is exact paths, `/`-terminated
+/// directory trees, and `/` alone for the whole workspace.
+pub const WORKSPACE_WRITE_SCOPE_REVISION: &str = "1";
+
 pub fn capabilities_json<B: crate::Backend>(
     service: &ExecutionService<B>,
 ) -> Result<String, ExecutionError> {
@@ -35,7 +50,15 @@ pub fn capabilities_json<B: crate::Backend>(
     let capabilities = service.capabilities();
     // Advertise only backends actually owned by this service. A placeholder
     // native entry would make capability discovery lie to Cloister.
-    let mut entries = output.reborrow().init_capabilities(3);
+    let mut entries = output.reborrow().init_capabilities(4);
+    entries
+        .reborrow()
+        .get(3)
+        .set_name(WORKSPACE_WRITE_SCOPE_CAPABILITY);
+    entries
+        .reborrow()
+        .get(3)
+        .set_version(WORKSPACE_WRITE_SCOPE_REVISION);
     entries
         .reborrow()
         .get(2)

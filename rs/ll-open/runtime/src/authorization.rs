@@ -510,6 +510,16 @@ impl Default for AuthorizationPolicy {
     }
 }
 
+/// A grant's `connectionsDigest @16` and the `connectionsDocument @17` it was
+/// verified against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedConnections {
+    /// `blake3-256:<hex>`, equal to the digest of `document`'s canonical bytes.
+    pub digest: String,
+    /// The parsed document; its canonical bytes are the bytes the grant carried.
+    pub document: leyline_schema_spec::connections::ConnectionsDocument,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedExecution {
     /// Generated from the bound spec/grant, never accepted from the caller.
@@ -528,6 +538,9 @@ pub struct AuthorizedExecution {
     /// that cannot otherwise obtain that document knows only whether what it
     /// applied matched, never what was authorized.
     pub confinement_manifest: Option<String>,
+    /// The connections the grant authorizes (ADR-0046 S3), verified at
+    /// authorization; `None` for a grant without them.
+    pub connections: Option<AuthorizedConnections>,
     pub backend: BackendClass,
     pub allowed_egress: Vec<String>,
     pub intent: SchemaIntent,
@@ -749,14 +762,7 @@ pub fn authorize_with_verifier(
         .iter()
         .map(|value| text(value, "allowedEgress entry"))
         .collect::<Result<Vec<_>, _>>()?;
-    let credential_brokers = grant.get_credential_broker_refs().map_err(|error| {
-        ExecutionError::invalid(format!("invalid credentialBrokerRefs: {error}"))
-    })?;
-    if !credential_brokers.is_empty() {
-        return Err(ExecutionError::unsupported(
-            "credential broker authority requires a broker integration",
-        ));
-    }
+    let connections = read_connections(&grant)?;
 
     Ok(AuthorizedExecution {
         run_id,
@@ -766,12 +772,103 @@ pub fn authorize_with_verifier(
         grant_digest,
         confinement_digest,
         confinement_manifest,
+        connections,
         backend,
         allowed_egress,
         intent,
         limits,
         workspaces,
     })
+}
+
+/// The `credentialBrokerRefs` entry that marks a grant carrying
+/// `connectionsDigest @16` and `connectionsDocument @17` (ADR-0046 S3). Every
+/// daemon that predates those fields refuses a non-empty `credentialBrokerRefs`,
+/// so the marker makes the fields a critical extension.
+pub const CONNECTIONS_BROKER_REF: &str = "cloister/connections/v1";
+
+/// The connections a grant authorizes, verified: `@16`, `@17` and the marker
+/// present together or absent together; the digest recomputed from the
+/// document; the document byte-equal to its canonical form.
+fn read_connections(
+    grant: &execution_capnp::run_grant::Reader<'_>,
+) -> Result<Option<AuthorizedConnections>, ExecutionError> {
+    let brokers = grant
+        .get_credential_broker_refs()
+        .map_err(|error| ExecutionError::invalid(format!("invalid credentialBrokerRefs: {error}")))?
+        .iter()
+        .map(|value| text(value, "credentialBrokerRefs entry"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let marker = match brokers.as_slice() {
+        [] => false,
+        [only] if only == CONNECTIONS_BROKER_REF => true,
+        // Any entry this daemon does not implement, including the marker
+        // beside a credential broker D4 has not defined yet. The text is the
+        // one every daemon since execution/v1 shipped returns.
+        _ => {
+            return Err(ExecutionError::unsupported(
+                "credential broker authority requires a broker integration",
+            ));
+        }
+    };
+    let has_digest = grant.has_connections_digest();
+    let has_document = grant.has_connections_document();
+    if !marker && !has_digest && !has_document {
+        return Ok(None);
+    }
+    let missing: Vec<&str> = [
+        (has_digest, "connectionsDigest"),
+        (has_document, "connectionsDocument"),
+        (marker, "credentialBrokerRefs entry cloister/connections/v1"),
+    ]
+    .into_iter()
+    .filter_map(|(present, name)| (!present).then_some(name))
+    .collect();
+    if !missing.is_empty() {
+        return Err(ExecutionError::invalid_grant(format!(
+            "RunGrant connections are all-or-nothing: missing {}",
+            missing.join(", ")
+        )));
+    }
+
+    // Present means non-null AND non-empty: a non-null empty field is
+    // malformed, never read as absent (unlike confinementManifest).
+    let digest = read_digest(grant.get_connections_digest(), "RunGrant.connectionsDigest")
+        .map_err(|error| ExecutionError::invalid_grant(error.detail))?;
+    let document = text(
+        grant.get_connections_document(),
+        "RunGrant.connectionsDocument",
+    )
+    .map_err(|error| ExecutionError::invalid_grant(error.detail))?;
+    if document.is_empty() {
+        return Err(ExecutionError::invalid_grant(
+            "RunGrant.connectionsDocument is present but empty",
+        ));
+    }
+    let parsed = leyline_schema_spec::connections::parse(document.as_bytes()).map_err(|error| {
+        ExecutionError::invalid_grant(format!(
+            "RunGrant.connectionsDocument is not a valid cloister/connections/v1 document: {error}"
+        ))
+    })?;
+    if parsed.canonical_bytes() != document.as_bytes() {
+        return Err(ExecutionError::invalid_grant(
+            "RunGrant.connectionsDocument is not in canonical form; a runner refuses it rather than normalize",
+        ));
+    }
+    let carried = format!(
+        "{}:{}",
+        leyline_schema_spec::connections::DIGEST_ALGORITHM,
+        parsed.digest_hex()
+    );
+    if carried != digest {
+        return Err(ExecutionError::identity_mismatch(format!(
+            "RunGrant carries a connections document digesting to {carried}, but connectionsDigest names {digest}"
+        )));
+    }
+    Ok(Some(AuthorizedConnections {
+        digest,
+        document: parsed,
+    }))
 }
 
 fn read_message(
@@ -817,9 +914,13 @@ const GRANT_SIGNATURE_ALGORITHM: &str = "ed25519";
 /// bytes from the grant it is about to sign, and a verifier recomputes them
 /// from the grant it received, signature and all.
 ///
-/// A cleared `signature` canonicalizes to a null pointer in the trailing
-/// pointer slot, which canonicalization truncates — so these bytes are also
-/// what a producer that predates the field would have emitted.
+/// "Cleared" is `init_signature()`: the field is set to an empty
+/// `GrantSignature` struct, a non-null pointer canonicalization keeps. These
+/// are therefore NOT the canonical bytes of the grant with `signature`
+/// omitted (different bytes; 24 longer when nothing after `signature` is
+/// set), and an issuer outside this library
+/// must sign this form (`wire/run-grant.md`;
+/// `test-vectors/run-grant-signing.json` pins it).
 pub fn grant_signing_bytes(grant_bytes: &[u8]) -> Result<Vec<u8>, ExecutionError> {
     let message = read_message(grant_bytes, "RunGrant")?;
     let grant = message
@@ -1225,11 +1326,31 @@ fn validate_workspaces(
                     })
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?;
+            let write_scope = workspace
+                .get_write_scope()
+                .map_err(|error| {
+                    ExecutionError::invalid(format!("invalid writeScope for {name}: {error}"))
+                })?
+                .iter()
+                .map(|entry| text(entry, "grant workspace writeScope entry"))
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            // "No scope" is the field left unset, and only that. A
+            // zero-length list is a non-null pointer in canonical Cap'n
+            // Proto, so it signs different bytes than an unset field;
+            // accepting both would give one grant two digests.
+            if workspace.has_write_scope() && write_scope.is_empty() {
+                return Err(ExecutionError::invalid(format!(
+                    "grant workspace {name} sets writeScope to an empty list; leave the \
+                     field unset when the grant names no write scope"
+                )));
+            }
+            validate_write_scope(&name, &operations, &write_scope)?;
             Ok(WorkspaceGrant {
                 name,
                 graph_root,
                 expected_generation: workspace.get_expected_generation(),
                 operations,
+                write_scope,
             })
         })
         .collect::<Result<Vec<_>, ExecutionError>>()?;
@@ -1256,6 +1377,74 @@ fn validate_workspaces(
         ));
     }
     Ok(grants)
+}
+
+/// The entry of `WorkspaceGrant.writeScope` that names the whole workspace.
+pub const WHOLE_WORKSPACE_WRITE_SCOPE: &str = "/";
+
+/// Hold a grant's `writeScope` to its operations and its entry grammar (bead
+/// `ley-line-open-483134`).
+///
+/// Write authority is never implied: a grant permitting `mutate` or `commit`
+/// names a non-empty scope, and a grant permitting neither names none. An
+/// entry is `/` alone (the whole workspace), or a workspace-relative path
+/// whose components are all ordinary names, ending in `/` when it is a
+/// directory prefix. No entry appears twice.
+fn validate_write_scope(
+    workspace: &str,
+    operations: &[WorkspaceOperation],
+    scope: &[String],
+) -> Result<(), ExecutionError> {
+    let writes = operations.iter().any(|operation| {
+        matches!(
+            operation,
+            WorkspaceOperation::Mutate | WorkspaceOperation::Commit
+        )
+    });
+    if writes && scope.is_empty() {
+        return Err(ExecutionError::invalid(format!(
+            "grant workspace {workspace} permits mutate or commit and names no writeScope; \
+             name the paths the run may write, or \"/\" for the whole workspace"
+        )));
+    }
+    if !writes && !scope.is_empty() {
+        return Err(ExecutionError::invalid(format!(
+            "grant workspace {workspace} names a writeScope and permits neither mutate \
+             nor commit; a scope without a write operation grants nothing"
+        )));
+    }
+    for (index, entry) in scope.iter().enumerate() {
+        if entry == WHOLE_WORKSPACE_WRITE_SCOPE {
+            if scope.len() != 1 {
+                return Err(ExecutionError::invalid(format!(
+                    "grant workspace {workspace} writeScope names \"/\", the whole \
+                     workspace, beside other entries; it stands alone"
+                )));
+            }
+            continue;
+        }
+        let path = entry.strip_suffix('/').unwrap_or(entry);
+        let ordinary = !path.is_empty()
+            && path.split('/').all(|component| {
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && !component.contains('\0')
+            });
+        if !ordinary {
+            return Err(ExecutionError::invalid(format!(
+                "grant workspace {workspace} writeScope entry {entry:?} is not a \
+                 workspace-relative path: no leading '/', no empty, '.' or '..' \
+                 component, and no NUL"
+            )));
+        }
+        if scope[..index].contains(entry) {
+            return Err(ExecutionError::invalid(format!(
+                "grant workspace {workspace} writeScope names {entry:?} twice"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn workspace_operation(operation: execution_capnp::WorkspaceOperation) -> WorkspaceOperation {

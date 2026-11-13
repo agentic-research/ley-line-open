@@ -17,6 +17,7 @@ fn authorized() -> AuthorizedExecution {
         // Committed by digest alone — this exercises the resolver, not the
         // grant reader that verifies a carried document against its digest.
         confinement_manifest: None,
+        connections: None,
         backend: leyline_runtime::BackendClass::Native,
         allowed_egress: Vec::new(),
         intent: SchemaIntent {
@@ -55,6 +56,7 @@ fn authorized() -> AuthorizedExecution {
             graph_root: "blake3-256:graph".into(),
             expected_generation: 4,
             operations: vec![WorkspaceOperation::Read, WorkspaceOperation::Mutate],
+            write_scope: vec!["src/".into()],
         }],
     }
 }

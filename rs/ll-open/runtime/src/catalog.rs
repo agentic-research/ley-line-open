@@ -245,6 +245,7 @@ mod tests {
             // authorization — and this fixture exercises the resolver, not the
             // grant reader.
             confinement_manifest: None,
+            connections: None,
             backend: crate::BackendClass::Native,
             allowed_egress: Vec::new(),
             intent: SchemaIntent {

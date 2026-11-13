@@ -47,10 +47,79 @@ with `identityPolicyMismatch` before the run starts, rather than running it
 against a generation nothing checked. When a store implements S1, it compares
 the claim with its `seq` instead.
 
+## Workspace write scope
+
+`WorkspaceGrant.writeScope` (field 4, bead `ley-line-open-483134`) names
+where the run may write, create, rename or delete. Each entry is relative to
+the workspace root:
+
+| entry | grants |
+| --- | --- |
+| `src/a.rs` | that one file |
+| `docs/` | everything beneath that directory, at any depth, existing or not |
+| `/` (alone) | the whole workspace |
+
+Rules an authorizer holds, each refused as `invalidSpec` naming the
+workspace:
+
+- A grant whose `operations` include `mutate` or `commit` names a non-empty
+  `writeScope`. Write authority is never implied, so a grant issued before
+  this field existed (`mutate` with no scope) is refused; reissue it with
+  `["/"]` to keep its old meaning.
+- A grant with neither operation leaves `writeScope` unset.
+- **"No scope" has one encoding: the field left unset.** An explicit empty
+  list (`"writeScope": []`) is refused. Cap'n Proto canonicalization keeps a
+  zero-length list as a non-null pointer, so the empty list and the unset
+  field are different signed bytes (`test-vectors/run-grant-signing.json`);
+  accepting both would give one grant two digests.
+- An entry is `/` alone, or a path with no leading `/`, no empty, `.` or `..`
+  component and no NUL. No entry appears twice.
+
+The scope bounds authored paths, the ones a write turns into a proposal. What
+the run may read is the `graphRoot`, and `read` or `list` shows the whole
+tree. A change outside the scope is refused by the share with the typed
+`outside_grant` refusal, which the guest sees as `EACCES`; nothing lands.
+
+- A rename needs both its names inside the scope.
+- Creating a directory on the way to a granted path is inside the scope.
+  Removing or moving a directory is inside it only when the directory is a
+  granted tree or lies beneath one: a directory above the scope is never the
+  run's to take away.
+- Derived paths are outside the scope's subject. A path the tree's ignore
+  rules match (build output such as `target/`, and the editor and OS temp
+  names the share treats as derived) is never a proposal: it lives in the
+  run's scratch and never reaches the store, so a run with any write scope
+  may write it, whatever the scope names. A temp name the ignore rules do
+  not match is an authored path and is held to the scope; an editor that
+  saves by writing such a name beside a granted file needs the directory in
+  scope.
+
+### A daemon says whether it enforces the scope
+
+The field is additive on the wire, and that is a hazard in one direction. A
+daemon that predates it decodes a scoped grant, ignores the scope, and lets
+`mutate` write anywhere in the workspace; nothing in its replies says so. So
+support is advertised and required:
+
+- A daemon that enforces `writeScope` lists
+  `{name: "cloister/execution/v1/workspace-write-scope", version: "1"}` in
+  `llo_execution_capabilities`.
+- An issuer MUST find that entry before it issues a grant whose `writeScope`
+  is narrower than `/`, and MUST refuse to issue one to a daemon that does
+  not list it.
+
+Inside one deployment the daemon and its worker binary may be different
+builds. Either skew is safe: the scope is enforced in the daemon, by the
+share it serves, so an older worker has nothing to ignore; and a newer worker
+refuses an older daemon's request for a run with a workspace, which lacks the
+field.
+
 ## Workspace delivery
 
-A run never starts without a workspace its grant names. A backend that
-cannot serve one refuses the start before it spawns anything, with
+A run never starts without a workspace its grant names. The execution
+service opens each granted workspace itself, before it calls the backend,
+and hands the backend the open shares (bead `ley-line-open-1022a8`). A start
+that cannot be served is refused before anything is spawned, with
 `workspaceUnserved` (not retryable under the same grant):
 
 | tier | serves |
@@ -68,19 +137,40 @@ it as `executionError: {"code": "workspaceUnserved", "retryable": false,
 "message": "…"}` (`daemon.capnp` `ExecutionError`, bead
 `ley-line-open-e347ae`), beside
 the unchanged error text, whose `WorkspaceUnserved: …` prefix earlier
-consumers match. Choosing another tier is the caller's policy; the runtime
+consumers match. Every failed `llo_execution_*` op carries
+`executionError` with its own code, including `invalidSpec` for a request
+the op cannot decode and `unsupportedBackend` from a daemon with no
+execution/v1 service; `detailRef` is not carried. Choosing another tier is the caller's policy; the runtime
 does not reroute a run.
 
-The service also checks the backend's answer: the workspace shares the
-backend reports holding (the `workspaceShare` channels of its evidence
-document, below) must be the granted workspaces exactly, by name and
-`graphRoot`. A backend that reports a start with a granted workspace missing,
-or with a share the grant never named, has its run cancelled and the start
-refused with `workspaceUnserved`; the run is never recorded, collected or
-receipted. If that cancel fails, the workload may still be running, so the
-run is recorded `failed` instead of forgotten: it has no receipt, its
-`runId` refuses another start with `resourceConflict`, and `cleanup`
-retries the cancel.
+Workspace authority is handed over, not reported back. In LLO's Rust
+embedding a backend receives `ServedWorkspaces`, which only the service can
+construct and only for a verified grant, and it names a share in its evidence
+document (the `workspaceShare` channels, below) only by taking one of those
+shares. So a backend cannot claim a share the grant never named. A request
+that names workspaces without a verified grant behind it (a direct
+`ExecutionService::start`, or a backend called with no shares) is refused
+with `workspaceUnserved`.
+
+The service asks the backend how many workspaces it serves a run before it
+opens anything, so a tier that serves none is refused with no share opened.
+
+One assertion remains when a backend answers a start. Each share it took
+must have been opened for this run under this run's grant, whole (name,
+`graphRoot`, operations and `writeScope`), each granted workspace once; and
+each must still be held by whatever the backend gave it to. That proves the
+backend took the run's own shares and something is serving them. It does not
+prove the worker's descriptor is wired to the share, which is each backend's
+contract with its worker (the libkrun tier holds its worker's readiness
+declaration to the descriptor it handed over). A backend that answers a
+start having dropped, let go of, or swapped a share has its run cancelled
+and the start refused with
+`workspaceUnserved`; the run is never recorded, collected or receipted. If
+that cancel fails, the workload may still be running, so the run is recorded
+`failed` instead of forgotten: it has no receipt, its `runId` refuses
+another start with `resourceConflict`, and `cleanup` retries the cancel. No
+first-party tier reaches it: each attaches what it is handed or refuses
+before it spawns.
 
 `workspaceUnserved` was appended to `ErrorCode` at ordinal 12 (bead
 `ley-line-open-204a94`). Before it, the same refusals were
@@ -120,11 +210,14 @@ the derivation; an implementation can compute a run's name locally without
 calling `start`.
 
 A run's rootfs is named by the rootfs digest, `RunReceipt.inputRoots[0]`:
-BLAKE3-256 over the exact bytes of its `rootfs.manifest.json`.
-`test-vectors/rootfs-manifest.json` states the canonical form those bytes
-take and pins one case, the checked-in OCI fixture's linux/arm64 manifest
-and its digest, checked against what `leyline rootfs import-oci` writes
-(ADR-0047 §3, bead `ley-line-open-39309e`).
+BLAKE3-256 over the exact bytes of its `rootfs.manifest.json`, whose
+`version` field names its form. `test-vectors/rootfs-manifest.json` states
+the canonical form of each version and pins the checked-in OCI fixture's
+linux/arm64 manifest and digest under both: v2, which `leyline rootfs
+import-oci` writes and a reader accepts only in those bytes (bead
+`ley-line-open-4f08ea`, `ley-line-open-faba8f`), and v1, frozen (ADR-0047
+§3, bead `ley-line-open-39309e`). Its `escapes-v2` case pins the one way v2
+escapes strings, which a second implementation must match byte for byte.
 
 For in-toto/DSSE evidence, a statement authorizes field `F` of a run only if
 it carries a subject whose `name` is `F`'s field name and whose
@@ -195,6 +288,15 @@ verifier recomputes the document and compares digests.
 must not create a volume or initialize a backend. `provision`, `start`,
 `cancel`, and `cleanup` are explicit idempotent mutations.
 
+Lifecycle: a run has at most one terminal event (`succeeded`, `failed` or
+`cancelled`); events are appended, never rewritten. `cancel` asks for "this
+run is not executing". `CancelOutput.state` is the state the run is in after
+the request: `cancelled` when the cancel stopped it, or the run's own state
+when it had already finished, including when it finished while the cancel
+was in flight (`succeeded`, `failed`) or had been cleaned up (`cleaned`).
+Each of those is a successful cancel reply, not a refusal. A cancelled run
+is never reported `succeeded` (bead `ley-line-open-9c6a8f`).
+
 `ProvisionOutput.casRoot` (appended 2026-11-10, bead `ley-line-open-ba86d3`)
 is the absolute host path of the content-addressed rootfs store the provider
 serves, made to exist by that provision: with `execution-daemon --cas-volume`,
@@ -210,6 +312,23 @@ enum variants at the end. Removing or reinterpreting a field requires v2.
 `ResourceLimits` and `EnforcedCeilings` were replaced in place, pre-1.0, by
 the user's decision; see "Resource limits" below and ADR-0035 "OCI resources
 on execution/v1". The rule above holds for every other change.
+
+## Public environment
+
+`RunSpec.publicEnvironment` reaches the workload as `KEY=VALUE` entries, byte
+for byte. Every tier refuses, as `invalidSpec` and before a worker exists, an
+entry no environment can carry: a key that is empty or holds `=` or NUL, or a
+value that holds NUL (bead `ley-line-open-9d75c9`). Anything else is
+admitted: lowercase keys, dots, quotes, newlines and `=` inside a value.
+
+The microVM tier adds its own refusals, also `invalidSpec` and named: any key
+beginning `KRUN_` (the guest init's settings, `KRUN_VIRTIOFS_MOUNTS` and
+`KRUN_LOOPBACK_CHANNELS` among them), more than 16,000 argv and environment
+strings in all, any single string of 128 KiB or more (an entry measured as
+`KEY=VALUE`), more than 1 MiB in all, an argument holding NUL, and an
+executable that is not printable ASCII without a space or double quote (it
+rides the guest kernel command line). A consumer that mirrors admission at
+build time mirrors the microVM set, the stricter one.
 
 ## Resource limits
 
@@ -263,6 +382,79 @@ advertised.
 
 The canonical vector in `test-vectors/canonical-run.json` pins the JSON carrier
 shape used by conformance tests. JSON is a carrier; Cap'n Proto remains the IDL.
+
+## Broker integrations and connections
+
+`RunGrant.credentialBrokerRefs` (`@13`) lists **the broker integrations the run
+requires, each named by contract id or broker reference**; never a credential
+value. A daemon refuses any entry it does not implement, with
+`unsupportedBackend`: "credential broker authority requires a broker
+integration". Every daemon since execution/v1 first shipped refuses a non-empty
+list that way, before the resolver and the backend, so an entry is a critical
+extension: a daemon that does not know it fails closed.
+
+One contract id is reserved: `cloister/connections/v1` (ADR-0046 Slice 1). It
+marks a grant that authorizes a connection broker for the run, and comes with two
+fields:
+
+| field | carries |
+|---|---|
+| `connectionsDigest @16` | BLAKE3-256 over the canonical `cloister/connections/v1` document (`../../connections/v1/README.md`), as a `DigestRef` with `algorithm` `blake3-256`. It names that document's bytes only: not `confinementDigest`, a blob hash, or any store root. |
+| `connectionsDocument @17` | The canonical document the digest is taken over. |
+
+The rule is all-or-nothing. A daemon that implements connections accepts a grant
+only when `@16`, `@17` and `credentialBrokerRefs = ["cloister/connections/v1"]`
+are present together, or all absent; any other combination is `invalidGrant`,
+naming the missing part. **Present** means a non-null pointer, and for `@17`
+non-empty text; a non-null `@16` with an empty `algorithm` or `value`, or a
+non-null empty `@17`, is malformed and refused, never read as absent (unlike
+`confinementManifest @15`). The daemon recomputes the digest from `@17`, requires
+it to equal `@16`, and requires `@17` to be byte-equal to its own
+canonicalization; it never normalizes. Until ADR-0046 D4 defines
+credential-bearing entries, the marker beside any other entry is refused.
+
+Both fields are inside the signing bytes (`wire/run-grant.md`). A grant that sets
+neither has null pointers in those slots, which canonicalization truncates, so its
+signing bytes are unchanged from before the fields existed.
+
+**Old daemons.** A daemon that predates these fields refuses such a grant, for one
+of two reasons (ADR-0046 S3, recorded against v0.29.0 on bead
+`ley-line-open-521deb`):
+
+| old daemon | what refuses the grant | error |
+|---|---|---|
+| verifying (`--trust-key`), JSON transport | the signature: the JSON decoder drops `@16`/`@17`, so the signing bytes it rebuilds differ from what the issuer signed | `unauthenticated` |
+| unverified (`--allow-unverified-evidence`), or an in-process embedder passing binary bytes (which keeps the unknown pointers, so its signature check passes) | the marker in `credentialBrokerRefs` | `unsupportedBackend`, "credential broker authority requires a broker integration" |
+
+**Error codes.** A partial combination, a present but empty field, an invalid
+document or a non-canonical one is `invalidGrant`. A document whose digest is not
+`connectionsDigest` is `identityPolicyMismatch`. The marker beside any other entry,
+`broker://` references included, keeps the `unsupportedBackend` refusal above.
+
+**Until a broker ships.** A daemon that reads these fields but has no connection
+broker authorizes them and then refuses the start with `unsupportedBackend`, "RunGrant
+carries connections (cloister/connections/v1), but this daemon has no connection
+broker", before anything is resolved or spawned. It does not advertise the capability
+below. A client therefore gates on the capability entry, never on an LLO version.
+
+**Capability.** A daemon that reads `@16`/`@17` and has a broker advertises
+`{name: "cloister/execution/v1/connections", version: "1"}` in
+`llo_execution_capabilities`, whatever its tier; a tier that cannot serve a
+connection refuses at start by name. A client MUST find the entry before sending a
+grant with connections, and its absence means a daemon older than the first LLO
+release that ships them. `"1"` numbers this extension's layout, as `"2"` does for
+`resource-limits`.
+
+**Receipt.** A run with connections adds `RunReceipt.connectionsDigest @15` (the
+digest the broker attested in its ready report) and `connections @16`, one
+`ConnectionOutcome` per connection in document order. A receipt from a run without
+connections is byte-identical to before, in Cap'n Proto and in JSON. A strict
+reader generated from an older release's assets rejects a receipt with
+connections, so read those with the assets of the release that ships them.
+
+`test-vectors/connections-grant.json` pins a grant carrying all three: its
+canonical bytes and the digest of its signing bytes, so a second signer can check
+its bytes against LLO's.
 
 ## Release assets
 

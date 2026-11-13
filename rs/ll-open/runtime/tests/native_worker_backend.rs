@@ -4,7 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use leyline_runtime::backends::native_backend::{NativeWorkerBackend, NativeWorkerConfig};
-use leyline_runtime::{Backend, BackendClass, DigestRef, ExecutionRequest, ResourceLimits};
+use leyline_runtime::{
+    Backend, BackendClass, DigestRef, ExecutionRequest, ResourceLimits, ServedWorkspaces,
+};
 use tempfile::TempDir;
 
 mod common;
@@ -145,7 +147,9 @@ fn worker_exit_is_observable_and_run_root_is_removed() {
         &fixture,
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
     );
-    backend.start(&request()).expect("worker readiness");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("worker readiness");
     let status = backend
         .wait_for_completion("native-run-01")
         .expect("worker completion");
@@ -164,7 +168,9 @@ fn failed_worker_is_reported_and_cleaned() {
         &fixture,
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
     );
-    backend.start(&request()).expect("worker readiness");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("worker readiness");
     let status = backend
         .wait_for_completion("native-run-01")
         .expect("worker completion");
@@ -200,7 +206,9 @@ fn a_cancel_after_observed_failure_is_a_no_op() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
     );
     for _ in 0..200 {
-        backend.start(&request()).expect("worker readiness");
+        backend
+            .start(&request(), ServedWorkspaces::none())
+            .expect("worker readiness");
         assert!(matches!(
             backend
                 .wait_for_completion("native-run-01")
@@ -224,7 +232,7 @@ fn readiness_for_another_run_is_rejected_and_cleaned() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"other-run\"}' >&2\n",
     );
     let error = backend
-        .start(&request())
+        .start(&request(), ServedWorkspaces::none())
         .expect_err("worker readiness must bind to the requested run");
     assert!(error.detail.contains("unexpected run"));
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
@@ -252,9 +260,10 @@ fn a_granted_workspace_is_refused_before_the_worker_is_spawned() {
         graph_root: format!("blake3-256:{}", "e".repeat(64)),
         expected_generation: 0,
         operations: vec![leyline_runtime::WorkspaceOperation::Read],
+        write_scope: Vec::new(),
     }];
     let error = backend
-        .start(&request)
+        .start(&request, ServedWorkspaces::none())
         .expect_err("a workspace grant the native tier cannot serve");
     // Typed, not the generic `unsupportedBackend`: the code alone tells
     // Cloister to route the run to a tier that serves workspaces (bead
@@ -281,11 +290,57 @@ fn native_cleanup_restores_guest_created_permissions() {
         &fixture,
         "#!/bin/sh\nIFS= read -r _\nmkdir -p \"$4/locked\"\nprintf x > \"$4/locked/file\"\nchmod 000 \"$4/locked\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
     );
-    backend.start(&request()).expect("worker readiness");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("worker readiness");
     backend
         .wait_for_completion("native-run-01")
         .expect("worker completion");
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
+}
+
+/// An environment key or value no environment can carry is refused by name,
+/// with the same code on both tiers, before a worker exists (bead
+/// `ley-line-open-9d75c9`). The native tier used to format `KEY=VALUE` and
+/// let the platform split at the first `=`, so `{"A=B": "1"}` ran with
+/// `A="B=1"` and an empty key ran too, while the microVM tier refused both.
+#[test]
+fn an_environment_no_tier_can_carry_is_refused_by_name_before_spawn() {
+    let _serial = common::serial();
+    for (key, value, named) in [
+        ("A=B", "1", "`=`"),
+        ("", "1", "empty"),
+        ("K\0EY", "1", "NUL"),
+        ("KEY", "v\0", "NUL"),
+    ] {
+        let fixture = TempDir::new().expect("fixture");
+        let spawned = fixture.path().join("spawned");
+        let (backend, _runs) = backend(
+            &fixture,
+            &format!(
+                "#!/bin/sh\n: > '{}'\nIFS= read -r _\nprintf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"native-run-01\"}}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+                spawned.display()
+            ),
+        );
+        let mut request = request();
+        request
+            .public_environment
+            .insert(key.to_owned(), value.to_owned());
+        let error = backend
+            .start(&request, ServedWorkspaces::none())
+            .expect_err("an environment no tier can carry is refused");
+        assert_eq!(
+            error.code,
+            leyline_runtime::ErrorCode::InvalidSpec,
+            "{key:?}"
+        );
+        assert!(
+            error.detail.contains("publicEnvironment") && error.detail.contains(named),
+            "{key:?} is refused by name: {}",
+            error.detail
+        );
+        assert!(!spawned.exists(), "{key:?}: no worker was spawned");
+    }
 }
 
 #[test]
@@ -301,7 +356,9 @@ fn cancel_kills_worker_and_removes_run_root() {
         &fixture,
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
-    backend.start(&request()).expect("worker readiness");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("worker readiness");
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
     assert!(backend.cancel("native-run-01").expect("cancel"));
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
@@ -314,6 +371,47 @@ fn cancel_kills_worker_and_removes_run_root() {
     assert!(!backend.cancel("native-run-01").expect("repeat cancel"));
 }
 
+/// A reader of a run that is being cancelled never sees it complete (bead
+/// `ley-line-open-9c6a8f`). The supervisor used to publish `Succeeded` for
+/// a cancelled worker and the cancel removed it only afterwards, so a read
+/// in between collected a success for a run that was cancelled. The reader
+/// polls without pause for the whole cancel, so it sees anything published
+/// during it; repeated to cover the scheduling.
+#[test]
+fn a_reader_of_a_cancelled_run_never_sees_it_complete() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _serial = common::serial();
+    for _ in 0..25 {
+        let fixture = TempDir::new().expect("fixture");
+        let (backend, _runs) = backend(
+            &fixture,
+            "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
+        );
+        backend
+            .start(&request(), ServedWorkspaces::none())
+            .expect("worker readiness");
+        let done = AtomicBool::new(false);
+        let seen = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut seen = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    if let Some(status) = backend.poll("native-run-01").expect("poll") {
+                        seen.push(status);
+                    }
+                }
+                seen
+            });
+            assert!(backend.cancel("native-run-01").expect("cancel"));
+            done.store(true, Ordering::Release);
+            reader.join().expect("reader")
+        });
+        assert!(
+            seen.is_empty(),
+            "a cancelled run was published as complete: {seen:?}"
+        );
+    }
+}
+
 #[test]
 fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
     let _serial = common::serial();
@@ -322,11 +420,15 @@ fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
         &fixture,
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
-    backend.start(&request()).expect("worker readiness");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("worker readiness");
     assert!(Backend::cancel(&backend, "native-run-01").expect("trait cancel"));
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 0);
 
-    backend.start(&request()).expect("second worker readiness");
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("second worker readiness");
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
     drop(backend);
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
@@ -363,7 +465,7 @@ sleep 30
     request.confinement_digest = format!("blake3-256:{}", "a".repeat(64));
 
     let error = backend
-        .start(&request)
+        .start(&request, ServedWorkspaces::none())
         .expect_err("a worker attesting an unauthorized policy must not start");
     assert!(
         format!("{error:?}").contains("confinement drift"),
@@ -397,7 +499,7 @@ sleep 30
 
     // `request()` leaves `confinement_digest` empty: nothing was authorized.
     backend
-        .start(&request())
+        .start(&request(), ServedWorkspaces::none())
         .expect("an unauthorized-policy grant must not refuse an attesting worker");
     assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
 }
@@ -433,7 +535,7 @@ sleep 30
     request.confinement_digest = authorized;
 
     backend
-        .start(&request)
+        .start(&request, ServedWorkspaces::none())
         .expect("a worker attesting exactly the authorized policy must start");
     assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
 }
@@ -462,7 +564,7 @@ exit 1
 "#,
     );
     let error = backend
-        .start(&request())
+        .start(&request(), ServedWorkspaces::none())
         .expect_err("a worker that could not confine must not start");
     assert!(
         error.detail.contains("apply native nono confinement"),

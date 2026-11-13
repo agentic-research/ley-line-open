@@ -4,9 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use leyline_core::ContentAddressed;
 use parking_lot::RwLock;
 
+use crate::backends::libkrun::share::WorkspaceShares;
 use crate::{
     BackendCapabilities, BackendRun, BackendRunStatus, ExecutionError, ExecutionRequest,
     ReceiptContext, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
+    ServedWorkspaces,
     authorization::{AuthorizationPolicy, AuthorizedExecution},
 };
 
@@ -44,8 +46,30 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
-    /// Start one already validated execution.
-    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError>;
+    /// Start one already validated execution, with the workspace shares the
+    /// service materialized for it (bead `ley-line-open-1022a8`).
+    ///
+    /// `workspaces` is the run's whole workspace authority: one open share
+    /// per granted workspace, or [`ServedWorkspaces::none`]. A backend takes
+    /// each share it attaches ([`crate::ServedWorkspace::attach`]) and
+    /// returns the proofs in [`BackendRun::attached`]; one that cannot use a
+    /// share refuses with `workspaceUnserved` before it spawns anything. It
+    /// must also refuse a `request` whose `workspaces` differ from the shares
+    /// it is handed ([`ServedWorkspaces::serve_exactly`]), since the request
+    /// is what its worker is told.
+    fn start(
+        &self,
+        request: &ExecutionRequest,
+        workspaces: ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError>;
+
+    /// How many workspaces this backend serves one run. The service asks
+    /// before it opens any share: a run granted more is refused
+    /// `workspaceUnserved` with nothing opened and nothing started. The
+    /// default is none, so a backend serves workspaces only by saying so.
+    fn workspace_capacity(&self) -> usize {
+        0
+    }
 
     /// Observe a worker that may have completed without an explicit cancel.
     /// Backends that cannot report completion leave the result absent; the
@@ -86,12 +110,14 @@ fn storage_error(error: crate::cas_volume::CasVolumeError) -> ExecutionError {
     use crate::cas_volume::CasVolumeError;
     let detail = format!("provision the CAS root: {error}");
     match error {
-        CasVolumeError::UnsupportedHost { .. } | CasVolumeError::CaseInsensitive { .. } => {
-            ExecutionError::unsupported(detail)
-        }
-        CasVolumeError::Config(_) | CasVolumeError::Tool { .. } | CasVolumeError::Io { .. } => {
-            ExecutionError::backend(detail)
-        }
+        CasVolumeError::UnsupportedHost { .. }
+        | CasVolumeError::CaseInsensitive { .. }
+        | CasVolumeError::RunRootCaseInsensitive { .. } => ExecutionError::unsupported(detail),
+        CasVolumeError::Config(_)
+        | CasVolumeError::Tool { .. }
+        | CasVolumeError::Timeout { .. }
+        | CasVolumeError::ForeignVolume { .. }
+        | CasVolumeError::Io { .. } => ExecutionError::backend(detail),
     }
 }
 
@@ -122,6 +148,9 @@ pub struct ExecutionService<B> {
     /// Where the backend's CAS root comes from. `provision` makes it exist
     /// before the backend checks its readiness (bead `ley-line-open-ba86d3`).
     storage: Option<crate::cas_volume::CasStorage>,
+    /// Where a granted workspace is served from. `None`: a run granted a
+    /// workspace is refused before the backend is called.
+    shares: Option<std::sync::Arc<dyn WorkspaceShares>>,
     state: RwLock<ServiceState>,
 }
 
@@ -130,8 +159,17 @@ impl<B: Backend> ExecutionService<B> {
         Self {
             backend,
             storage: None,
+            shares: None,
             state: RwLock::new(ServiceState::default()),
         }
+    }
+
+    /// Serve each authorized run's granted workspaces from `shares`
+    /// (ADR-0044 V5). The service opens them before it calls the backend and
+    /// hands them over as [`ServedWorkspaces`] (bead `ley-line-open-1022a8`).
+    pub fn with_workspace_shares(mut self, shares: std::sync::Arc<dyn WorkspaceShares>) -> Self {
+        self.shares = Some(shares);
+        self
     }
 
     /// The CAS root `provision` makes exist and reports. It must be the
@@ -223,7 +261,45 @@ impl<B: Backend> ExecutionService<B> {
         })
     }
 
+    /// Start a request no grant was verified for. Such a run holds no
+    /// workspace: workspace shares are materialized only for a verified grant
+    /// ([`Self::start_authorized_with_verifier`]), so a request naming
+    /// workspaces here is refused before anything is reserved or started.
     pub fn start(&self, request: ExecutionRequest) -> Result<RunRecord, ExecutionError> {
+        if let Some(grant) = request.workspaces.first() {
+            return Err(ExecutionError::workspace_unserved(format!(
+                "the request names workspace {:?} without a verified grant; a workspace \
+                 share is opened only for a run started through `start_authorized`",
+                grant.name
+            )));
+        }
+        self.start_run(request, false)
+    }
+
+    /// Refuse, before any share is opened, a run granted more workspaces
+    /// than the backend serves ([`Backend::workspace_capacity`]).
+    fn workspaces_within_capacity(&self, request: &ExecutionRequest) -> Result<(), ExecutionError> {
+        let capacity = self.backend.workspace_capacity();
+        let Some(grant) = request.workspaces.get(capacity) else {
+            return Ok(());
+        };
+        Err(ExecutionError::workspace_unserved(format!(
+            "the run is granted {} workspace(s), and backend {} serves {capacity} per \
+             run; workspace {:?} cannot be served, so no share is opened and nothing \
+             is started",
+            request.workspaces.len(),
+            self.backend.capabilities().backend_id,
+            grant.name
+        )))
+    }
+
+    /// `verified`: the request came from a verified grant, so its workspaces
+    /// are materialized. Only `start_authorized_with_verifier` passes true.
+    fn start_run(
+        &self,
+        request: ExecutionRequest,
+        verified: bool,
+    ) -> Result<RunRecord, ExecutionError> {
         request.validate()?;
         // ADR-0035 §4: a ceiling the selected tier cannot enforce is a
         // rejection, not a no-op. This sits on `start` rather than on
@@ -283,22 +359,57 @@ impl<B: Backend> ExecutionService<B> {
         // the service lock.  The reservation above keeps identity uniqueness
         // intact while allowing status/inspect/cancel for other runs to make
         // progress.
-        let started = match self.backend.start(&request) {
+        //
+        // The run's workspace shares are opened here, by the service, before
+        // the backend is asked to start anything (bead ley-line-open-1022a8):
+        // a grant nothing serves, or a store that does not hold the granted
+        // graph root, refuses the start with no worker in existence. The
+        // backend is handed the open shares and can start the run only with
+        // them.
+        //
+        // The backend is asked first whether it serves that many workspaces
+        // at all, so a tier that serves none is refused with no share opened
+        // for it.
+        let workspaces = if verified {
+            self.workspaces_within_capacity(&request).and_then(|()| {
+                ServedWorkspaces::materialize(
+                    self.shares.as_deref(),
+                    &request.run_id,
+                    &request.workspaces,
+                )
+            })
+        } else {
+            // `start` refused a request naming workspaces already.
+            ServedWorkspaces::materialize(None, &request.run_id, &[])
+        };
+        let started = workspaces.and_then(|(workspaces, opened)| {
+            Ok((self.backend.start(&request, workspaces)?, opened))
+        });
+        let (started, opened) = match started {
             Ok(started) => started,
             Err(error) => {
                 self.state.write().starting.remove(&request.run_id);
                 return Err(error);
             }
         };
-        // A backend reports each workspace share its worker holds. Every
-        // tier refuses a grant it cannot serve before it spawns anything,
-        // but `Backend` is a public trait, and a tier that answered `Ok`
-        // without a share for a granted workspace has started the workload
-        // without it (bead ley-line-open-204a94). The service holds that
-        // line at the seam: the run is cancelled and never recorded, so it
-        // cannot complete, be collected, or claim the workspace's graph
-        // root as an input.
-        if let Err(error) = served_exactly(&request.workspaces, &started.channels) {
+        let channels: Vec<crate::WorkerChannel> = started
+            .attached
+            .iter()
+            .map(crate::AttachedWorkspace::channel)
+            .collect();
+        // An assertion, not a comparison of two reports. A backend cannot
+        // forge an attached share; `Opened::held` holds what it returned to
+        // the shares the service opened for THIS run (each proof names the
+        // run and the whole grant, so a share kept from another run, or from
+        // a wider grant of the same workspace, is refused) and to each share
+        // still being held. What it catches is a backend that answered `Ok`
+        // having dropped or swapped a share, which started the workload
+        // without its workspace (bead ley-line-open-204a94). No first-party
+        // tier can: each attaches what it is handed or refuses before spawn.
+        // For one that does, the run is cancelled and never recorded, so it
+        // cannot complete, be collected, or claim the workspace's graph root
+        // as an input.
+        if let Err(error) = opened.held(&started.attached) {
             // The refusal is the answer either way; a cancel that also fails
             // is named in it rather than masking it.
             let cancel = self.backend.cancel(&request.run_id);
@@ -355,9 +466,7 @@ impl<B: Backend> ExecutionService<B> {
         state
             .replay
             .insert(request.replay_key, request.run_id.clone());
-        state
-            .channels
-            .insert(request.run_id.clone(), started.channels);
+        state.channels.insert(request.run_id.clone(), channels);
         state.runs.insert(request.run_id, record.clone());
         let run_id = record.run_id.clone();
         state.events.insert(
@@ -415,6 +524,17 @@ impl<B: Backend> ExecutionService<B> {
             policy,
             verifier,
         )?;
+        // ADR-0046 S3: a grant may now carry verified connections, but this
+        // daemon has no connection broker yet (bead ley-line-open-52b5b3), so
+        // a declared connection would never be served. Refuse by name before
+        // the resolver or the backend runs, rather than start a run whose
+        // connections silently do not exist. The daemon does not advertise
+        // `cloister/execution/v1/connections` until it can serve them.
+        if authorized.connections.is_some() {
+            return Err(ExecutionError::unsupported(
+                "RunGrant carries connections (cloister/connections/v1), but this daemon has no connection broker",
+            ));
+        }
         let request = resolver.resolve(&authorized)?;
         if request.run_id != authorized.run_id {
             return Err(ExecutionError::identity_mismatch(
@@ -447,6 +567,15 @@ impl<B: Backend> ExecutionService<B> {
                 "resolver changed the grant's confinement digest",
             ));
         }
+        // The document the digest was taken over is held to the same rule
+        // (bead ley-line-open-7a3109): a resolver that dropped or swapped it
+        // would have the worker fold a policy the issuer never signed, and
+        // only a digest difference would catch that, after a worker started.
+        if request.confinement_manifest != authorized.confinement_manifest {
+            return Err(ExecutionError::identity_mismatch(
+                "resolver changed the grant's carried confinement document",
+            ));
+        }
         // The fifth: a resolver that dropped a workspace grant would run the
         // workload without the share it was granted, and one that widened
         // its operations would let it propose where it may only read.
@@ -461,7 +590,7 @@ impl<B: Backend> ExecutionService<B> {
         // backends verify the materialized tree against this digest before
         // the workload runs), not from anything the caller asked for.
         let rootfs = format!("{}:{}", request.rootfs.algorithm, request.rootfs.value);
-        let record = self.start(request)?;
+        let record = self.start_run(request, true)?;
         // A replayed start answers an existing run, possibly under other
         // authority (another spec, grant or input roots sharing its replay
         // key). That run's receipt stays the one it was started under: it is
@@ -583,15 +712,23 @@ impl<B: Backend> ExecutionService<B> {
             .ok_or_else(|| ExecutionError::invalid("run_id not found"))?;
 
         // Cancellation asks for "this run is not executing". A run that
-        // already reached a terminal state satisfies that, so cancelling it
-        // is an idempotent no-op rather than an error.
-        if matches!(
-            existing.state,
-            RunState::Cancelled | RunState::Succeeded | RunState::Failed
-        ) {
+        // already reached a terminal state, or was cleaned up, satisfies
+        // that, so cancelling it is an idempotent no-op rather than an error.
+        if !is_active(existing.state) {
             return Ok(existing);
         }
         if !self.backend.cancel(run_id)? {
+            // The worker finished after the refresh above and before the
+            // backend saw the cancel: project its completion and return the
+            // terminal record, as for a run that finished before the cancel.
+            self.refresh_run(run_id)?;
+            let current =
+                self.state.read().runs.get(run_id).cloned().ok_or_else(|| {
+                    ExecutionError::internal("run disappeared during cancellation")
+                })?;
+            if !is_active(current.state) {
+                return Ok(current);
+            }
             return Err(ExecutionError::backend(
                 "backend no longer owns the active run",
             ));
@@ -603,6 +740,13 @@ impl<B: Backend> ExecutionService<B> {
                 .runs
                 .get_mut(run_id)
                 .ok_or_else(|| ExecutionError::internal("run disappeared during cancellation"))?;
+            // The state lock is not held across `backend.cancel`, so a read
+            // in that window may already have projected the run's own
+            // terminal state. A run has one terminal event: return it rather
+            // than append `Cancelled` after it (bead ley-line-open-9c6a8f).
+            if !is_active(record.state) {
+                return Ok(record.clone());
+            }
             record.state = RunState::Cancelled;
             record.clone()
         };
@@ -678,48 +822,12 @@ impl<B: Backend> ExecutionService<B> {
     }
 }
 
-/// The workspace shares a backend reports must be exactly the run's granted
-/// workspaces, by name and graph root, each once: a granted workspace with
-/// no share ran the workload without it, and a share the grant never named
-/// is authority the run was not given. Either is `workspaceUnserved`.
-fn served_exactly(
-    granted: &[crate::WorkspaceGrant],
-    channels: &[crate::WorkerChannel],
-) -> Result<(), ExecutionError> {
-    let mut granted: Vec<(&str, &str)> = granted
-        .iter()
-        .map(|grant| (grant.name.as_str(), grant.graph_root.as_str()))
-        .collect();
-    let mut served: Vec<(&str, &str)> = channels
-        .iter()
-        .map(|channel| match channel {
-            crate::WorkerChannel::WorkspaceShare {
-                workspace,
-                graph_root,
-            } => (workspace.as_str(), graph_root.as_str()),
-        })
-        .collect();
-    granted.sort_unstable();
-    served.sort_unstable();
-    if granted == served {
-        return Ok(());
-    }
-    let detail = if let Some((name, root)) = granted.iter().find(|grant| !served.contains(grant)) {
-        format!(
-            "the backend started the run without serving its granted workspace {name:?} \
-             at {root}; the start is refused"
-        )
-    } else if let Some((name, root)) = served.iter().find(|share| !granted.contains(share)) {
-        format!(
-            "the backend served workspace {name:?} at {root}, which the run is not \
-             granted; the start is refused"
-        )
-    } else {
-        "the backend's workspace shares do not match the run's granted workspaces one \
-         for one; the start is refused"
-            .to_owned()
-    };
-    Err(ExecutionError::workspace_unserved(detail))
+/// Whether a run is still executing: not yet terminal and not cleaned up.
+fn is_active(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Accepted | RunState::Provisioning | RunState::Ready | RunState::Running
+    )
 }
 
 fn event(sequence: u64, state: RunState) -> RunEventRecord {

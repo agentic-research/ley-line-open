@@ -1,15 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use leyline_core::ContentAddressed;
-use serde::Deserialize;
 
+pub(crate) use crate::artifacts::rootfs_manifest::ROOTFS_MANIFEST;
+use crate::artifacts::rootfs_manifest::{FileSpec, RootfsSpec, cas_directory_mode};
 use crate::{DigestRef, ExecutionError, ExecutionRequest};
-
-const ROOTFS_MANIFEST: &str = "rootfs.manifest.json";
 
 pub trait RootfsResolver: Send + Sync {
     fn resolve(&self, digest: &DigestRef) -> Result<ResolvedRootfs, ExecutionError>;
@@ -51,7 +50,7 @@ impl RootfsResolver for DirectoryRootfsResolver {
             ));
         }
 
-        verify_manifest(&rootfs, digest)?;
+        verify_manifest(&rootfs, digest, Placement::Cas)?;
         Ok(ResolvedRootfs {
             digest: digest.clone(),
             canonical_path: rootfs,
@@ -109,20 +108,7 @@ pub fn compile_plan(
 ) -> Result<KrunConfig, ExecutionError> {
     request.validate()?;
     let rootfs = resolver.resolve(&request.rootfs)?;
-    let executable_path = rootfs.canonical_path.join(&request.executable);
-    let executable_meta = executable_path
-        .symlink_metadata()
-        .map_err(|error| invalid_io("resolve rootfs executable", error))?;
-    if executable_meta.file_type().is_symlink() {
-        return Err(ExecutionError::invalid(
-            "rootfs executable must not be a symbolic link",
-        ));
-    }
-    if !executable_meta.is_file() {
-        return Err(ExecutionError::invalid(
-            "rootfs executable must be a manifest-verified regular file",
-        ));
-    }
+    executable_in_manifest(&rootfs, &request.executable)?;
 
     Ok(KrunConfig {
         run_id: request.run_id.clone(),
@@ -173,22 +159,52 @@ pub fn compile_plan(
     })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RootfsManifest {
-    version: u32,
-    files: Vec<ManifestFile>,
+/// The executable must be a regular file the manifest lists, reached as the
+/// guest's kernel reaches it: through the manifest's own links (an
+/// absolute target is the guest's `/`), never through the host's. Returns
+/// its real path, rootfs-relative. Nothing a link names is looked up on the
+/// host; only the final regular file is, beneath directories the resolver
+/// verified are real.
+pub(crate) fn executable_in_manifest(
+    rootfs: &ResolvedRootfs,
+    executable: &str,
+) -> Result<String, ExecutionError> {
+    let spec = read_manifest(&rootfs.canonical_path, &rootfs.digest)?;
+    let real = spec.resolve_file(executable).map_err(|reason| {
+        ExecutionError::invalid(format!(
+            "rootfs executable must be a manifest-verified regular file: {reason}"
+        ))
+    })?;
+    let metadata = rootfs
+        .canonical_path
+        .join(&real)
+        .symlink_metadata()
+        .map_err(|error| invalid_io("resolve rootfs executable", error))?;
+    if !metadata.is_file() {
+        return Err(ExecutionError::invalid(
+            "rootfs executable must be a manifest-verified regular file",
+        ));
+    }
+    Ok(real)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManifestFile {
-    path: String,
-    mode: u32,
-    blake3: String,
+/// What a verified rootfs directory is: the tree its manifest names, and
+/// its directories as they are on disk, rootfs-relative (the root is the
+/// empty path), each with its permission bits. For manifest v2 the two
+/// sets of directories are equal; v1 names no directory.
+#[derive(Debug)]
+pub(crate) struct VerifiedTree {
+    pub spec: RootfsSpec,
+    pub directories: BTreeMap<String, u32>,
 }
 
-pub(crate) fn verify_manifest(rootfs: &Path, digest: &DigestRef) -> Result<(), ExecutionError> {
+/// The tree the manifest `digest` names, read from `rootfs`: its bytes are
+/// checked against the digest first, then parsed as the version they name
+/// (v2 only in its canonical form; an unknown version is refused).
+pub(crate) fn read_manifest(
+    rootfs: &Path,
+    digest: &DigestRef,
+) -> Result<RootfsSpec, ExecutionError> {
     let manifest_path = rootfs.join(ROOTFS_MANIFEST);
     let metadata = manifest_path
         .symlink_metadata()
@@ -205,50 +221,95 @@ pub(crate) fn verify_manifest(rootfs: &Path, digest: &DigestRef) -> Result<(), E
             "rootfs manifest digest does not match requested content identity",
         ));
     }
-    let manifest: RootfsManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| ExecutionError::invalid(format!("invalid rootfs manifest: {error}")))?;
-    if manifest.version != 1 {
-        return Err(ExecutionError::invalid(format!(
-            "unsupported rootfs manifest version: {}",
-            manifest.version
-        )));
-    }
+    RootfsSpec::parse(&bytes).map_err(ExecutionError::invalid)
+}
 
-    let mut declared = BTreeSet::new();
-    for entry in manifest.files {
-        validate_relative_path(&entry.path)?;
-        if !declared.insert(PathBuf::from(&entry.path)) {
-            return Err(ExecutionError::invalid(format!(
-                "duplicate rootfs manifest path: {}",
-                entry.path
-            )));
-        }
-        verify_manifest_file(rootfs, &entry)?;
+/// Where a verified tree sits, which decides the directory modes a v2
+/// manifest requires of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A shared CAS entry (or the importer's staging of one): each
+    /// directory at [`cas_directory_mode`] of its declared mode.
+    Cas,
+    /// One run's copy: each directory at its declared mode.
+    RunCopy,
+}
+
+/// Verify `rootfs` against the manifest `digest` names: its regular files,
+/// each with its content and mode, exactly the manifest's; its symbolic
+/// links, each with its target bytes, exactly the manifest's (none, for
+/// v1); and for v2 its directories exactly the manifest's, each at the mode
+/// `placement` requires. v1 names no directory, so its directories are
+/// returned, not judged: the CAS resolver accepts any, and a per-run view
+/// is held to the implied set by
+/// [`verify_ephemeral_rootfs`](super::volume::verify_ephemeral_rootfs).
+/// The tree is walked without following a link before any file is read.
+pub(crate) fn verify_manifest(
+    rootfs: &Path,
+    digest: &DigestRef,
+    placement: Placement,
+) -> Result<VerifiedTree, ExecutionError> {
+    let spec = read_manifest(rootfs, digest)?;
+    let on_disk = collect_rootfs_tree(rootfs)?;
+    if spec.version == 1 && !on_disk.symlinks.is_empty() {
+        return Err(ExecutionError::invalid(
+            "rootfs symbolic links are not supported by rootfs manifest v1",
+        ));
     }
-    if collect_rootfs_files(rootfs)? != declared {
+    if on_disk.symlinks != spec.symlinks {
+        return Err(ExecutionError::invalid(
+            "rootfs symbolic links differ from the content-addressed manifest",
+        ));
+    }
+    if !on_disk.files.iter().eq(spec.files.keys()) {
         return Err(ExecutionError::invalid(
             "rootfs files differ from the content-addressed manifest",
         ));
     }
-
-    Ok(())
+    let required = |declared: u32| match placement {
+        Placement::Cas => cas_directory_mode(declared),
+        Placement::RunCopy => declared,
+    };
+    if spec.version >= 2
+        && !on_disk
+            .directories
+            .iter()
+            .map(|(path, mode)| (path, *mode))
+            .eq(spec
+                .directories
+                .iter()
+                .map(|(path, mode)| (path, required(*mode))))
+    {
+        return Err(ExecutionError::invalid(
+            "rootfs directories or their modes differ from the content-addressed manifest",
+        ));
+    }
+    for (path, file) in &spec.files {
+        verify_manifest_file(rootfs, path, file)?;
+    }
+    Ok(VerifiedTree {
+        spec,
+        directories: on_disk.directories,
+    })
 }
 
-fn verify_manifest_file(rootfs: &Path, entry: &ManifestFile) -> Result<(), ExecutionError> {
-    let path = rootfs.join(&entry.path);
+fn verify_manifest_file(
+    rootfs: &Path,
+    relative: &str,
+    entry: &FileSpec,
+) -> Result<(), ExecutionError> {
+    let path = rootfs.join(relative);
     let metadata = path
         .symlink_metadata()
         .map_err(|error| invalid_io("read rootfs file metadata", error))?;
     if metadata.file_type().is_symlink() {
         return Err(ExecutionError::invalid(format!(
-            "rootfs manifest entry must not be a symbolic link: {}",
-            entry.path
+            "rootfs manifest entry must not be a symbolic link: {relative}"
         )));
     }
     if !metadata.is_file() {
         return Err(ExecutionError::invalid(format!(
-            "rootfs manifest entry is not a regular file: {}",
-            entry.path
+            "rootfs manifest entry is not a regular file: {relative}"
         )));
     }
     let canonical = path
@@ -256,53 +317,76 @@ fn verify_manifest_file(rootfs: &Path, entry: &ManifestFile) -> Result<(), Execu
         .map_err(|error| invalid_io("canonicalize rootfs file", error))?;
     if !canonical.starts_with(rootfs) {
         return Err(ExecutionError::invalid(format!(
-            "rootfs manifest path escapes root: {}",
-            entry.path
+            "rootfs manifest path escapes root: {relative}"
         )));
     }
     if metadata.permissions().mode() & 0o7777 != entry.mode {
         return Err(ExecutionError::invalid(format!(
-            "rootfs mode differs from manifest: {}",
-            entry.path
+            "rootfs mode differs from manifest: {relative}"
         )));
     }
     let bytes = fs::read(&canonical).map_err(|error| invalid_io("read rootfs file", error))?;
     if bytes.as_slice().hash().to_string() != entry.blake3 {
         return Err(ExecutionError::invalid(format!(
-            "rootfs content digest differs from manifest: {}",
-            entry.path
+            "rootfs content digest differs from manifest: {relative}"
         )));
     }
     Ok(())
 }
 
-fn collect_rootfs_files(rootfs: &Path) -> Result<BTreeSet<PathBuf>, ExecutionError> {
-    fn walk(
-        rootfs: &Path,
-        directory: &Path,
-        files: &mut BTreeSet<PathBuf>,
-    ) -> Result<(), ExecutionError> {
+/// A rootfs directory as it is on disk: rootfs-relative `/`-separated
+/// paths, the root manifest left out.
+#[derive(Debug, Default)]
+struct OnDisk {
+    /// Regular files; each one's mode and content are checked against the
+    /// manifest by `verify_manifest_file`.
+    files: BTreeSet<String>,
+    /// Directories, the root as `""`, each with its permission bits.
+    directories: BTreeMap<String, u32>,
+    /// Symbolic links, each with its target, never followed.
+    symlinks: BTreeMap<String, String>,
+}
+
+fn collect_rootfs_tree(rootfs: &Path) -> Result<OnDisk, ExecutionError> {
+    fn walk(directory: &Path, relative: &str, tree: &mut OnDisk) -> Result<(), ExecutionError> {
+        let metadata = directory
+            .symlink_metadata()
+            .map_err(|error| invalid_io("read rootfs directory metadata", error))?;
+        tree.directories
+            .insert(relative.to_string(), metadata.permissions().mode() & 0o7777);
         for entry in
             fs::read_dir(directory).map_err(|error| invalid_io("enumerate rootfs", error))?
         {
             let entry = entry.map_err(|error| invalid_io("enumerate rootfs entry", error))?;
+            let name = entry.file_name().into_string().map_err(|name| {
+                ExecutionError::invalid(format!(
+                    "rootfs entry name is not UTF-8: {}",
+                    name.to_string_lossy()
+                ))
+            })?;
+            let child = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
             let path = entry.path();
             let metadata = path
                 .symlink_metadata()
                 .map_err(|error| invalid_io("read rootfs entry metadata", error))?;
             if metadata.file_type().is_symlink() {
-                return Err(ExecutionError::invalid(
-                    "rootfs symbolic links are not supported",
-                ));
-            }
-            if metadata.is_dir() {
-                walk(rootfs, &path, files)?;
+                let target = fs::read_link(&path)
+                    .map_err(|error| invalid_io("read rootfs link", error))?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| {
+                        ExecutionError::invalid(format!("rootfs link target is not UTF-8: {child}"))
+                    })?;
+                tree.symlinks.insert(child, target);
+            } else if metadata.is_dir() {
+                walk(&path, &child, tree)?;
             } else if metadata.is_file() {
-                let relative = path
-                    .strip_prefix(rootfs)
-                    .map_err(|_| ExecutionError::invalid("rootfs entry escapes root"))?;
-                if relative != Path::new(ROOTFS_MANIFEST) {
-                    files.insert(relative.to_path_buf());
+                if child != ROOTFS_MANIFEST {
+                    tree.files.insert(child);
                 }
             } else {
                 return Err(ExecutionError::invalid(
@@ -313,24 +397,9 @@ fn collect_rootfs_files(rootfs: &Path) -> Result<BTreeSet<PathBuf>, ExecutionErr
         Ok(())
     }
 
-    let mut files = BTreeSet::new();
-    walk(rootfs, rootfs, &mut files)?;
-    Ok(files)
-}
-
-fn validate_relative_path(value: &str) -> Result<(), ExecutionError> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err(ExecutionError::invalid(format!(
-            "rootfs manifest path is not guest-relative: {value}"
-        )));
-    }
-    Ok(())
+    let mut tree = OnDisk::default();
+    walk(rootfs, "", &mut tree)?;
+    Ok(tree)
 }
 
 /// The executable as the guest names it: the rootfs-relative path the request

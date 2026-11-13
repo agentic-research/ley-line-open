@@ -75,10 +75,14 @@ impl Backend for CompletingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -102,10 +106,14 @@ impl Backend for FailingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "failing/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -133,7 +141,11 @@ impl Backend for BlockingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         if self.starts.fetch_add(1, Ordering::SeqCst) != 0 {
             return Err(ExecutionError {
                 code: ErrorCode::BackendFailed,
@@ -149,7 +161,7 @@ impl Backend for BlockingBackend {
         }
         Ok(BackendRun {
             backend_id: "blocking/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -175,14 +187,18 @@ impl Backend for RecordingBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         self.calls
             .lock()
             .expect("recording backend lock")
             .push("start");
         Ok(BackendRun {
             backend_id: "recording/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -266,7 +282,11 @@ impl Backend for NeedsCasRoot {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         unreachable!("provision tests start nothing")
     }
 
@@ -677,10 +697,14 @@ impl Backend for JustFinishedBackend {
         }
     }
 
-    fn start(&self, _request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "just-finished/1".into(),
-            channels: Vec::new(),
+            attached: Vec::new(),
         })
     }
 
@@ -706,4 +730,242 @@ fn cancelling_a_run_that_just_completed_returns_its_terminal_record() {
         .cancel(&record.run_id)
         .expect("cancelling a completed run must project its terminal state");
     assert_eq!(cancelled.state, RunState::Succeeded);
+}
+
+/// A backend whose run reaches a terminal state while `cancel` is in flight:
+/// its supervisor publishes a completion between the cancel request and the
+/// cancel's return, and a concurrent status read projects it. `cancel`
+/// blocks inside the backend until the test has made that read.
+struct CompletesDuringCancelBackend {
+    in_cancel: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+    published: Mutex<bool>,
+    completion: BackendRunStatus,
+}
+
+impl Backend for CompletesDuringCancelBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "completes-during-cancel/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+            unavailable_reason: None,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
+        }
+    }
+
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "completes-during-cancel/1".into(),
+            attached: Vec::new(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        let mut published = self.published.lock().expect("published lock");
+        if *published {
+            *published = false;
+            return Ok(Some(self.completion.clone()));
+        }
+        Ok(None)
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        *self.published.lock().expect("published lock") = true;
+        let entered = self.in_cancel.lock().expect("in_cancel lock").take();
+        let release = self.release.lock().expect("release lock").take();
+        if let (Some(entered), Some(release)) = (entered, release) {
+            entered.send(()).expect("signal cancel entered");
+            release.recv().expect("wait for the concurrent read");
+        }
+        Ok(true)
+    }
+}
+
+/// A run that reaches a terminal state while its cancel is in flight has
+/// exactly one terminal event: the cancel returns the terminal record a
+/// concurrent read projected, and never appends `Cancelled` after it (bead
+/// `ley-line-open-9c6a8f`). Before the fix the lifecycle held two terminal
+/// events, the projected one and then `Cancelled`, the run's state changed
+/// after it was terminal, and the record a reader had seen was overwritten.
+#[test]
+fn a_run_that_ends_while_its_cancel_is_in_flight_has_one_terminal_event() {
+    for completion in [
+        BackendRunStatus::Succeeded,
+        BackendRunStatus::Failed(ExecutionError::backend("worker exited with exit status: 1")),
+    ] {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let service = Arc::new(ExecutionService::new(CompletesDuringCancelBackend {
+            in_cancel: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+            published: Mutex::new(false),
+            completion: completion.clone(),
+        }));
+        let record = service.start(request("cancel-in-flight")).expect("start");
+        let run_id = record.run_id.clone();
+
+        let canceller = {
+            let service = Arc::clone(&service);
+            let run_id = run_id.clone();
+            std::thread::spawn(move || service.cancel(&run_id))
+        };
+        entered_rx.recv().expect("cancel reached the backend");
+        // The concurrent read: it projects the completion the backend
+        // published while the cancel is still in flight.
+        let seen = service
+            .status(&run_id)
+            .expect("status")
+            .expect("record")
+            .state;
+        release_tx.send(()).expect("release the cancel");
+        let cancelled = canceller
+            .join()
+            .expect("cancel thread")
+            .expect("cancel returns the terminal record");
+
+        assert_eq!(
+            cancelled.state, seen,
+            "the cancel returns the terminal state a reader already saw ({completion:?})"
+        );
+        let terminal: Vec<RunState> = service
+            .inspect(&run_id, 0)
+            .expect("events")
+            .events
+            .iter()
+            .map(|event| event.state)
+            .filter(|state| {
+                matches!(
+                    state,
+                    RunState::Succeeded | RunState::Failed | RunState::Cancelled
+                )
+            })
+            .collect();
+        assert_eq!(
+            terminal,
+            vec![seen],
+            "exactly one terminal event ({completion:?})"
+        );
+    }
+}
+
+/// A worker that finishes after `cancel` has refreshed the run but before it
+/// reaches the backend: the backend no longer owns the run (`cancel` returns
+/// false), and its completion is published only then.
+struct FinishesBeforeBackendCancel {
+    cancelled: Mutex<bool>,
+}
+
+impl Backend for FinishesBeforeBackendCancel {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: "finishes-before-backend-cancel/1".into(),
+            backend_class: BackendClass::MicroVm,
+            available: true,
+            unavailable_reason: None,
+            enforced: leyline_runtime::EnforcedCeilings::hypervisor_backed(),
+        }
+    }
+
+    fn start(
+        &self,
+        _request: &ExecutionRequest,
+        _workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
+        Ok(BackendRun {
+            backend_id: "finishes-before-backend-cancel/1".into(),
+            attached: Vec::new(),
+        })
+    }
+
+    fn poll(&self, _run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
+        let mut cancelled = self.cancelled.lock().expect("cancelled lock");
+        if *cancelled {
+            *cancelled = false;
+            return Ok(Some(BackendRunStatus::Succeeded));
+        }
+        Ok(None)
+    }
+
+    fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
+        *self.cancelled.lock().expect("cancelled lock") = true;
+        Ok(false)
+    }
+}
+
+/// Cancelling a run that finished a moment before the backend saw the
+/// cancel returns the run's own terminal record, not a hard
+/// "backend no longer owns the active run" error, whichever side of the
+/// cancel's first refresh the worker finished on.
+#[test]
+fn cancelling_a_run_that_finished_during_the_cancel_returns_its_terminal_record() {
+    let service = ExecutionService::new(FinishesBeforeBackendCancel {
+        cancelled: Mutex::new(false),
+    });
+    let record = service.start(request("finished-in-cancel")).expect("start");
+    let cancelled = service
+        .cancel(&record.run_id)
+        .expect("a run that finished during the cancel is not an error");
+    assert_eq!(cancelled.state, RunState::Succeeded);
+    let terminal: Vec<RunState> = service
+        .inspect(&record.run_id, 0)
+        .expect("events")
+        .events
+        .iter()
+        .map(|event| event.state)
+        .filter(|state| {
+            matches!(
+                state,
+                RunState::Succeeded | RunState::Failed | RunState::Cancelled
+            )
+        })
+        .collect();
+    assert_eq!(terminal, vec![RunState::Succeeded]);
+}
+
+/// The daemon's cancel reply carries the state the run is in after the
+/// request, which for a run that finished first is its own terminal state,
+/// not `cancelled` (execution/v1 README, "Lifecycle"; bead
+/// `ley-line-open-9c6a8f`).
+#[test]
+fn the_cancel_reply_names_a_finished_runs_own_terminal_state() {
+    let service = ExecutionService::new(JustFinishedBackend);
+    let record = service.start(request("cancel-reply")).expect("start");
+    let reply: serde_json::Value = serde_json::from_str(
+        &leyline_runtime::transport::cancel_json(
+            &service,
+            &serde_json::json!({"runId": record.run_id, "idempotencyKey": "cancel-reply-01"})
+                .to_string(),
+        )
+        .expect("cancel JSON"),
+    )
+    .expect("cancel output JSON");
+    assert_eq!(reply["runId"], record.run_id.as_str());
+    assert_eq!(reply["state"], "succeeded");
+}
+
+/// Cancelling a run that was already cleaned up returns its record, as
+/// cancelling any finished run does, instead of asking the backend for a run
+/// it no longer holds.
+#[test]
+fn cancelling_a_cleaned_run_returns_its_record() {
+    let backend = RecordingBackend::default();
+    let service = ExecutionService::new(backend.clone());
+    service.start(request("cancel-cleaned")).expect("start");
+    service.cleanup("run-01").expect("cleanup");
+    let calls = backend.calls().len();
+
+    let cancelled = service
+        .cancel("run-01")
+        .expect("cancelling a cleaned run is not an error");
+    assert_eq!(cancelled.state, RunState::Cleaned);
+    assert_eq!(
+        backend.calls().len(),
+        calls,
+        "the backend is not asked to cancel a cleaned run"
+    );
 }

@@ -8,16 +8,18 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
-use crate::confinement::ConfinementManifest;
 use crate::{ExecutionError, ExecutionRequest};
 
-use super::libkrun::confinement::{Tier, capabilities_from_manifest, confinement_manifest};
-use super::libkrun::plan::{DirectoryRootfsResolver, compile_plan};
+use super::libkrun::confinement::{Tier, capabilities_from_manifest, committed_confinement};
+use super::libkrun::plan::{
+    DirectoryRootfsResolver, compile_plan, executable_in_manifest, guest_executable,
+};
 use super::libkrun::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,33 +116,44 @@ pub fn execute_with_ready(
     on_ready: impl FnOnce(&WorkerEvent) -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
     request.validate()?;
+    // Compared with the grant's commitment before the rootfs is read, the
+    // sandbox applied or the child spawned (bead ley-line-open-7a3109). The
+    // readiness event below is written immediately before the spawn, so the
+    // supervisor's comparison of it cannot by itself stop a drifting run from
+    // starting; this one can. Same function as the microVM tier.
+    //
+    // Same source as the microVM tier, and for the same reason: §4 may only
+    // originate from the document the grant authorized. This tier is where
+    // §4 is strongest — Landlock filters `bind(2)` per port, so the grant
+    // means here exactly what it says.
+    let committed = committed_confinement(request, &options.runtime_files, &[])?;
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
     let mut config = compile_plan(&resolver, request)?;
     config.rootfs = materialize_ephemeral_rootfs(&config.rootfs, &options.run_root)?;
     verify_ephemeral_rootfs(&config.rootfs)?;
+    // The plan names the executable as the guest does; on the host it is the
+    // regular file the manifest reaches through its own links (a rootfs
+    // manifest v2 may route `bin/sh` through `bin -> usr/bin`), resolved
+    // before the sandbox applies and never through a link on the host, where
+    // an absolute target would name the host's own file.
+    let executable = config
+        .rootfs
+        .canonical_path
+        .join(executable_in_manifest(&config.rootfs, &request.executable)?);
+    // The workload's argv[0] is the guest's path of what the request named,
+    // as the microVM tier's kernel gives it (`/bin/sh`, not the host path of
+    // the `busybox` a link reaches), so a multi-call binary picks the same
+    // applet on both tiers (bead `ley-line-open-10c9d0`).
+    let argv0 = guest_executable(&request.executable)?;
 
     // Resolve every host path before nono becomes irreversible. The child
     // process receives no ambient path authority after this call.
-    // One manifest, two uses: the capabilities actually applied, and the
-    // digest attested below. Deriving both from `manifest` is what makes the
-    // attestation true by construction rather than by discipline.
-    // Same source as the microVM tier, and for the same reason: §4 may only
-    // originate from the document the grant authorized. This tier is where
-    // §4 is strongest — Landlock filters `bind(2)` per port, so the grant
-    // means here exactly what it says — which is why it would be wrong to
-    // wire the listener on the tier that needs a port map and leave it
-    // unreachable on the tier whose kernel enforces it directly.
-    let authorized = match &request.confinement_manifest {
-        Some(document) => Some(ConfinementManifest::parse(document).map_err(|error| {
-            ExecutionError::invalid(format!(
-                "RunGrant.confinementManifest did not survive the worker boundary: {error}"
-            ))
-        })?),
-        None => None,
-    };
-    let manifest = confinement_manifest(&options.runtime_files, &[], authorized.as_ref())?;
+    // One committed policy, two uses: the capabilities actually applied, and
+    // the digest attested below. Both come from `committed`, whose policy is
+    // parsed from the bytes its digest covers, so the attestation is true by
+    // construction rather than by discipline.
     let capabilities =
-        capabilities_from_manifest(&manifest, &config.rootfs.canonical_path, Tier::Native)?;
+        capabilities_from_manifest(&committed, &config.rootfs.canonical_path, Tier::Native)?;
     nono::Sandbox::apply_auto(&capabilities).map_err(|error| {
         ExecutionError::backend(format!("apply native nono confinement: {error}"))
     })?;
@@ -150,18 +163,12 @@ pub fn execute_with_ready(
     // intended to be confined by.
     on_ready(&WorkerEvent::Ready {
         run_id: config.run_id.clone(),
-        confinement_digest: manifest.confinement_digest()?,
+        confinement_digest: committed.digest().to_owned(),
     })?;
 
-    // The plan names the executable as the guest does, anchored at `/`
-    // (`guest_executable`); on the host it lives under the rootfs, and
-    // joining an absolute path would replace the rootfs instead.
-    let guest_path = config.executable.as_bytes();
-    let executable = config.rootfs.canonical_path.join(OsStr::from_bytes(
-        guest_path.strip_prefix(b"/").unwrap_or(guest_path),
-    ));
     let mut command = Command::new(&executable);
     command
+        .arg0(OsStr::from_bytes(argv0.as_bytes()))
         .args(
             config
                 .arguments
@@ -305,6 +312,38 @@ mod tests {
         })
         .expect_err("invalid request must fail before rootfs resolution");
         assert!(!ready_called);
+    }
+
+    /// The native worker compares the confinement it will apply with the
+    /// grant's commitment BEFORE the child exists (bead
+    /// `ley-line-open-7a3109`): readiness is written immediately before the
+    /// guest executable is spawned, so the supervisor's comparison alone
+    /// refused a drifting run only after the workload had started. The CAS
+    /// root does not exist, so a worker that reached the rootfs or the sandbox
+    /// would fail on that instead.
+    #[test]
+    fn a_native_worker_refuses_a_drifting_commitment_before_it_reads_the_rootfs() {
+        let options = WorkerOptions {
+            cas_root: PathBuf::from("/nonexistent/leyline-cas"),
+            run_root: PathBuf::from("/nonexistent/leyline-runs"),
+            runtime_files: Vec::new(),
+        };
+        let mut drifting = invalid_request();
+        drifting.rootfs.algorithm = "blake3-256".into();
+        drifting.confinement_digest = format!("blake3-256:{}", "f".repeat(64));
+        let mut ready_called = false;
+        let error = execute_with_ready(options, &drifting, |_| {
+            ready_called = true;
+            Ok(())
+        })
+        .expect_err("a drifting commitment must be refused");
+        assert!(!ready_called);
+        assert_eq!(
+            error.code,
+            crate::ErrorCode::IdentityPolicyMismatch,
+            "{error}"
+        );
+        assert!(error.detail.contains("confinement drift"), "{error}");
     }
 
     #[test]

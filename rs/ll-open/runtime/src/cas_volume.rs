@@ -36,6 +36,23 @@
 //!   creates one) re-attaches it when a provider or daemon starts.
 //!   Removing it is the operator's: detach, then delete the
 //!   `cas.sparsebundle` directory; every rootfs in it is re-importable.
+//!
+//!   Each `hdiutil` run is killed after [`DEFAULT_TOOL_TIMEOUT`] and fails
+//!   by name ([`CasVolumeError::Timeout`]). Provisioning takes a file lock
+//!   (`<state>/cas-volume/provision.lock`) across processes, removes the
+//!   `partial-<pid>.sparsebundle` a crashed provider left (only when that
+//!   process is gone), and uses a volume at `mnt/` only when `hdiutil info -plist`
+//!   names `cas.sparsebundle` as its image ([`CasVolumeError::ForeignVolume`]
+//!   otherwise) (bead `ley-line-open-167b29`).
+//!
+//!   macOS 27 marks `hdiutil create/attach/detach` deprecated in favour of
+//!   `diskutil image` (bead `ley-line-open-168a65`). LLO stays on `hdiutil`:
+//!   `diskutil image create blank` offers no case-sensitive APFS, and
+//!   reaching one through `diskutil` takes four tool runs and a device node
+//!   parsed from output. `tests/cas_volume.rs` pins the exact warnings and
+//!   fails when they change or `diskutil image` gains a case-sensitive
+//!   filesystem; `task runtime:test:cas-volume` runs it, and the recorded
+//!   release suite (`task release:hypervisor:record`) includes it.
 //! - **Linux.** No volume is made. The CAS root is `<state>/cas`; the call
 //!   probes it and succeeds when its filesystem is case-sensitive (ext4,
 //!   xfs, btrfs) and refuses by name otherwise (a casefolded directory,
@@ -48,8 +65,9 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -161,10 +179,37 @@ pub enum CasVolumeError {
     /// case-sensitive one this module creates.
     #[error("the CAS root {} is case-insensitive: {remedy}", .path.display())]
     CaseInsensitive { path: PathBuf, remedy: &'static str },
+    /// The CAS root is case-sensitive but the run root, where each run's
+    /// rootfs is copied, is not: a tree the CAS holds would merge there
+    /// (bead `ley-line-open-741388`).
+    #[error(
+        "the run root {} is case-insensitive, but the CAS root {} is case-sensitive: a rootfs holding names that differ only by case (Pod/ and pod/) cannot be copied there for a run; omit --run-root to use the volume's own, or name one on a case-sensitive filesystem",
+        .run_root.display(),
+        .cas_root.display()
+    )]
+    RunRootCaseInsensitive {
+        run_root: PathBuf,
+        cas_root: PathBuf,
+    },
     #[error("invalid CAS volume configuration: {0}")]
     Config(String),
     #[error("{command} failed: {detail}")]
     Tool { command: String, detail: String },
+    /// A disk-image tool run outlived its bound and was killed.
+    #[error("{command} did not finish within {after:?} and was killed")]
+    Timeout { command: String, after: Duration },
+    /// What is mounted at the volume's mountpoint is not its image.
+    #[error(
+        "{} is not the CAS volume: it is mounted from {}, not {}; detach it and provision again",
+        .mountpoint.display(),
+        .found.as_deref().map_or_else(|| "no attached disk image".to_string(), |path| path.display().to_string()),
+        .expected.display()
+    )]
+    ForeignVolume {
+        mountpoint: PathBuf,
+        expected: PathBuf,
+        found: Option<PathBuf>,
+    },
     #[error("{action} {path}: {source}")]
     Io {
         action: &'static str,
@@ -248,51 +293,379 @@ pub trait DiskImages: Send + Sync {
     fn detach(&self, mountpoint: &Path) -> Result<(), CasVolumeError>;
     /// Whether a filesystem is mounted at `mountpoint`.
     fn is_mounted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError>;
+    /// The disk image whose volume is mounted at `mountpoint`, `None` when
+    /// what is mounted there is no attached image (bead
+    /// `ley-line-open-167b29`). A tool that cannot say refuses, so a
+    /// volume is never trusted on the strength of a mount alone.
+    fn attached_image(&self, mountpoint: &Path) -> Result<Option<PathBuf>, CasVolumeError> {
+        Err(CasVolumeError::Config(format!(
+            "this disk-image tool cannot say which image is attached at {}",
+            mountpoint.display()
+        )))
+    }
+    /// `statfs(2)`'s mount flags for the filesystem at `mountpoint`.
+    fn mount_flags(&self, mountpoint: &Path) -> Result<u64, CasVolumeError> {
+        mount_flags(mountpoint)
+    }
 }
 
+/// `statfs(2)`'s `f_flags` for the filesystem holding `path`: `MNT_*` bits
+/// on macOS, `ST_*` bits on Linux. Read through rustix, whose `StatFs`
+/// carries `f_flags` on both, so one code path serves every host.
+pub fn mount_flags(path: &Path) -> Result<u64, CasVolumeError> {
+    let stat = rustix::fs::statfs(path).map_err(|errno| {
+        io_error("inspect the mount flags of", path)(io::Error::from_raw_os_error(
+            errno.raw_os_error(),
+        ))
+    })?;
+    #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+    Ok(stat.f_flags as u64)
+}
+
+/// The `nodev` and `nosuid` bits of [`mount_flags`].
+#[cfg(target_os = "macos")]
+const MOUNT_NODEV: u64 = libc::MNT_NODEV as u64;
+#[cfg(target_os = "macos")]
+const MOUNT_NOSUID: u64 = libc::MNT_NOSUID as u64;
+// `ST_*` is already a `u64` on 64-bit Linux, not on every target.
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
+const MOUNT_NODEV: u64 = libc::ST_NODEV as u64;
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
+const MOUNT_NOSUID: u64 = libc::ST_NOSUID as u64;
+
+/// Whether mount flags include both `nodev` and `nosuid`.
+fn nodev_and_nosuid(flags: u64) -> bool {
+    flags & MOUNT_NODEV != 0 && flags & MOUNT_NOSUID != 0
+}
+
+/// How long one `hdiutil` run may take before it is killed and provisioning
+/// fails by name: creating a 64 GiB sparsebundle takes seconds, and an
+/// attach or detach less.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// `/usr/bin/hdiutil`, by absolute path (never from `PATH`), as the calling
-/// user, with stdin closed.
+/// user, with stdin closed, each run bounded by a timeout.
 #[derive(Debug, Clone)]
 pub struct Hdiutil {
     program: PathBuf,
+    timeout: Duration,
 }
 
 impl Default for Hdiutil {
     fn default() -> Self {
         Self {
             program: PathBuf::from(HDIUTIL),
+            timeout: DEFAULT_TOOL_TIMEOUT,
         }
     }
 }
 
 impl Hdiutil {
+    /// The real tool with another bound on each run.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..Self::default()
+        }
+    }
+
     fn run(&self, args: &[&std::ffi::OsStr]) -> Result<(), CasVolumeError> {
+        self.output(args).map(drop)
+    }
+
+    /// Run the tool and return its standard output. A run that outlives
+    /// [`Hdiutil::timeout`] is killed (provisioning holds the volume's lock
+    /// while it waits) and fails as [`CasVolumeError::Timeout`].
+    fn output(&self, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, CasVolumeError> {
         let rendered = || {
             std::iter::once(self.program.display().to_string())
                 .chain(args.iter().map(|arg| arg.to_string_lossy().into_owned()))
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let output = Command::new(&self.program)
+        let tool_error = |detail: String| CasVolumeError::Tool {
+            command: rendered(),
+            detail,
+        };
+        use std::os::unix::process::CommandExt;
+        // In its own process group, so a timeout kills whatever it started
+        // too, not only the tool itself.
+        let mut child = Command::new(&self.program)
             .args(args)
             .stdin(Stdio::null())
-            .output()
-            .map_err(|error| CasVolumeError::Tool {
-                command: rendered(),
-                detail: error.to_string(),
-            })?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(CasVolumeError::Tool {
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| tool_error(error.to_string()))?;
+        let group = child.id() as libc::pid_t;
+        let kill_group = || {
+            // SAFETY: signals the process group this call created.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        };
+        let timed_out = || CasVolumeError::Timeout {
             command: rendered(),
-            detail: format!(
-                "{}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        })
+            after: self.timeout,
+        };
+        // Drained on their own threads, so a chatty tool never blocks on a
+        // full pipe while this one waits for it to exit; collected by the
+        // same deadline, since a descendant can hold a pipe open after the
+        // tool exits.
+        let drain = |pipe: Option<Box<dyn io::Read + Send>>| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                let _ = sender.send(bytes);
+            });
+            receiver
+        };
+        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    kill_group();
+                    let _ = child.wait();
+                    return Err(timed_out());
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => return Err(tool_error(error.to_string())),
+            }
+        };
+        let collect = |receiver: std::sync::mpsc::Receiver<Vec<u8>>| {
+            receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        };
+        let (Ok(stdout), Ok(stderr)) = (collect(stdout), collect(stderr)) else {
+            kill_group();
+            return Err(timed_out());
+        };
+        if status.success() {
+            return Ok(stdout);
+        }
+        Err(tool_error(format!(
+            "{status}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )))
     }
+}
+
+/// A property-list value, as far as `hdiutil info -plist` needs reading:
+/// dictionaries, arrays and strings. Anything else (numbers, booleans,
+/// dates, data) is [`Plist::Other`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Plist {
+    Dict(Vec<(String, Plist)>),
+    Array(Vec<Plist>),
+    String(String),
+    Other,
+}
+
+impl Plist {
+    /// The value of `key` in a dictionary.
+    fn get(&self, key: &str) -> Option<&Plist> {
+        match self {
+            Self::Dict(pairs) => pairs
+                .iter()
+                .find_map(|(name, value)| (name == key).then_some(value)),
+            _ => None,
+        }
+    }
+
+    fn items(&self) -> &[Plist] {
+        match self {
+            Self::Array(items) => items,
+            _ => &[],
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// One piece of an XML property list.
+#[derive(Debug, PartialEq, Eq)]
+enum XmlToken<'a> {
+    Open(&'a str),
+    Close(&'a str),
+    /// `<name/>`.
+    Empty(&'a str),
+    Text(String),
+}
+
+/// The five predefined entities and numeric character references, decoded.
+/// An unknown or malformed reference is no text at all.
+fn xml_unescape(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let end = rest[start..].find(';')? + start;
+        let entity = &rest[start + 1..end];
+        out.push(match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => {
+                let code = match entity.strip_prefix("#x") {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                    None => entity.strip_prefix('#')?.parse().ok()?,
+                };
+                char::from_u32(code)?
+            }
+        });
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The tags and text of `xml`, declarations and comments left out. `None`
+/// when a tag is not closed or a reference is malformed.
+fn xml_tokens(xml: &str) -> Option<Vec<XmlToken<'_>>> {
+    let mut tokens = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find('<') {
+        let (before, _) = rest.split_at(open);
+        if !before.is_empty() {
+            tokens.push(XmlToken::Text(xml_unescape(before)?));
+        }
+        let close = rest[open..].find('>')? + open;
+        let tag = &rest[open + 1..close];
+        rest = &rest[close + 1..];
+        if tag.starts_with('?') || tag.starts_with('!') {
+            continue;
+        }
+        tokens.push(if let Some(tag) = tag.strip_prefix('/') {
+            XmlToken::Close(tag_name(tag))
+        } else if let Some(tag) = tag.strip_suffix('/') {
+            XmlToken::Empty(tag_name(tag))
+        } else {
+            XmlToken::Open(tag_name(tag))
+        });
+    }
+    Some(tokens)
+}
+
+/// A tag's name, without its attributes.
+fn tag_name(tag: &str) -> &str {
+    tag.split_whitespace().next().unwrap_or("")
+}
+
+/// How deeply a property list may nest before it is refused.
+const MAX_PLIST_DEPTH: usize = 32;
+
+/// The root value of an XML property list. Structure comes from the tags
+/// alone, so no string's content (a path holding a newline, a `=` rule or
+/// the text of another entry) can pass for another entry.
+fn parse_plist(xml: &str) -> Option<Plist> {
+    fn text<'t, 'a>(tokens: &mut std::slice::Iter<'t, XmlToken<'a>>, tag: &str) -> Option<String> {
+        match tokens.next()? {
+            XmlToken::Close(name) if *name == tag => Some(String::new()),
+            XmlToken::Text(value) => match tokens.next()? {
+                XmlToken::Close(name) if *name == tag => Some(value.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// The value an already-read opening token starts.
+    fn value<'t, 'a>(
+        first: &'t XmlToken<'a>,
+        tokens: &mut std::slice::Iter<'t, XmlToken<'a>>,
+        depth: usize,
+    ) -> Option<Plist> {
+        if depth > MAX_PLIST_DEPTH {
+            return None;
+        }
+        match first {
+            XmlToken::Open("dict") => {
+                let mut pairs = Vec::new();
+                loop {
+                    match tokens.next()? {
+                        XmlToken::Close("dict") => return Some(Plist::Dict(pairs)),
+                        XmlToken::Open("key") => {
+                            let key = text(tokens, "key")?;
+                            let next = tokens.next()?;
+                            pairs.push((key, value(next, tokens, depth + 1)?));
+                        }
+                        XmlToken::Text(space) if space.trim().is_empty() => {}
+                        _ => return None,
+                    }
+                }
+            }
+            XmlToken::Open("array") => {
+                let mut items = Vec::new();
+                loop {
+                    match tokens.next()? {
+                        XmlToken::Close("array") => return Some(Plist::Array(items)),
+                        XmlToken::Text(space) if space.trim().is_empty() => {}
+                        next => items.push(value(next, tokens, depth + 1)?),
+                    }
+                }
+            }
+            XmlToken::Open("string") => text(tokens, "string").map(Plist::String),
+            XmlToken::Empty("string") => Some(Plist::String(String::new())),
+            XmlToken::Empty("dict") => Some(Plist::Dict(Vec::new())),
+            XmlToken::Empty("array") => Some(Plist::Array(Vec::new())),
+            // A scalar this reader does not need: its text, then its close.
+            XmlToken::Open(tag) => text(tokens, tag).map(|_| Plist::Other),
+            XmlToken::Empty(_) => Some(Plist::Other),
+            XmlToken::Text(space) if space.trim().is_empty() => {
+                value(tokens.next()?, tokens, depth)
+            }
+            XmlToken::Close(_) | XmlToken::Text(_) => None,
+        }
+    }
+    let tokens = xml_tokens(xml)?;
+    let mut tokens = tokens.iter();
+    loop {
+        match tokens.next()? {
+            XmlToken::Open("plist") => return value(tokens.next()?, &mut tokens, 0),
+            XmlToken::Text(space) if space.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+}
+
+/// The image `hdiutil info -plist` lists as mounted at `mountpoint`: the
+/// `image-path` of the `images` entry one of whose `system-entities` has
+/// that `mount-point`. Paths are compared canonicalized. `Err` when the
+/// output is not a property list of that shape.
+fn attached_image_in_plist(xml: &str, mountpoint: &Path) -> Result<Option<PathBuf>, &'static str> {
+    let root = parse_plist(xml).ok_or("its output is not an XML property list")?;
+    let Some(Plist::Array(images)) = root.get("images") else {
+        return Err("its output has no `images` array");
+    };
+    let Ok(wanted) = mountpoint.canonicalize() else {
+        return Ok(None);
+    };
+    Ok(images.iter().find_map(|image| {
+        let mounted_here = image
+            .get("system-entities")
+            .map_or(&[][..], Plist::items)
+            .iter()
+            .filter_map(|entity| entity.get("mount-point")?.as_str())
+            .any(|mount| {
+                Path::new(mount)
+                    .canonicalize()
+                    .is_ok_and(|mount| mount == wanted)
+            });
+        let path = image.get("image-path")?.as_str()?;
+        mounted_here.then(|| PathBuf::from(path))
+    }))
 }
 
 /// `hdiutil -size` in mebibytes, rounding up.
@@ -338,6 +711,16 @@ impl DiskImages for Hdiutil {
     fn is_mounted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError> {
         is_mount_point(mountpoint)
     }
+
+    fn attached_image(&self, mountpoint: &Path) -> Result<Option<PathBuf>, CasVolumeError> {
+        let info = self.output(&["info".as_ref(), "-plist".as_ref()])?;
+        let unusable = |detail: &str| CasVolumeError::Tool {
+            command: format!("{} info -plist", self.program.display()),
+            detail: detail.to_string(),
+        };
+        let xml = std::str::from_utf8(&info).map_err(|_| unusable("its output is not UTF-8"))?;
+        attached_image_in_plist(xml, mountpoint).map_err(unusable)
+    }
 }
 
 /// Whether `path` is the root of a mounted filesystem: it is a directory
@@ -367,6 +750,12 @@ pub struct VolumeLayout {
     pub mountpoint: PathBuf,
     /// `<state>/cas-volume/mnt/cas` on macOS; `<state>/cas` on Linux.
     pub cas_root: PathBuf,
+    /// The default parent of each run's ephemeral rootfs: on the same
+    /// case-sensitive filesystem as the CAS root, so a tree the CAS holds
+    /// (`Pod/` beside `pod/`) can be copied for a run (bead
+    /// `ley-line-open-741388`). `<state>/cas-volume/mnt/runs` on macOS;
+    /// `<state>/runs` on Linux.
+    pub run_root: PathBuf,
 }
 
 /// A case-sensitive CAS root beneath one state directory.
@@ -376,6 +765,8 @@ pub struct CasVolume {
     host: HostOs,
     images: Box<dyn DiskImages>,
     probe: fn(&Path) -> io::Result<FilesystemSensitivity>,
+    /// The run root an operator named instead of [`VolumeLayout::run_root`].
+    run_root: Option<PathBuf>,
     /// Serializes this process's provisioning: two `provision` calls must
     /// not both create the image.
     lock: Mutex<()>,
@@ -387,6 +778,7 @@ impl fmt::Debug for CasVolume {
             .field("state_dir", &self.state_dir)
             .field("size_cap_bytes", &self.size_cap_bytes)
             .field("host", &self.host)
+            .field("run_root", &self.run_root())
             .finish_non_exhaustive()
     }
 }
@@ -431,23 +823,96 @@ impl CasVolume {
             host,
             images,
             probe,
+            run_root: None,
             lock: Mutex::new(()),
         })
+    }
+
+    /// The same volume with each run's ephemeral rootfs beneath `run_root`
+    /// (an absolute path) instead of [`VolumeLayout::run_root`]. It must be
+    /// case-sensitive too: [`CasVolume::check_run_root`] and every provision
+    /// refuse it otherwise. It is refused here when it has a `..` component
+    /// (whether it lies on the mountpoint is then a fact about the path, not
+    /// its spelling; `components` already drops each `.`), or when it lies
+    /// inside, or holds, the CAS
+    /// root: each run's writable copy would land among content-addressed
+    /// entries, and a run's leftovers inside one would make it unrunnable.
+    pub fn with_run_root(mut self, run_root: PathBuf) -> Result<Self, CasVolumeError> {
+        if !run_root.is_absolute() {
+            return Err(CasVolumeError::Config(format!(
+                "the run root must be an absolute path, not {}",
+                run_root.display()
+            )));
+        }
+        if run_root
+            .components()
+            .any(|part| part == Component::ParentDir)
+        {
+            return Err(CasVolumeError::Config(format!(
+                "the run root must name no `..` component, not {}",
+                run_root.display()
+            )));
+        }
+        let cas_root = self.cas_root();
+        if run_root.starts_with(&cas_root) || cas_root.starts_with(&run_root) {
+            return Err(CasVolumeError::Config(format!(
+                "the run root {} must be apart from the CAS root {}",
+                run_root.display(),
+                cas_root.display()
+            )));
+        }
+        self.run_root = Some(run_root);
+        Ok(self)
     }
 
     pub fn layout(&self) -> VolumeLayout {
         let dir = self.state_dir.join("cas-volume");
         let mountpoint = dir.join("mnt");
-        let cas_root = match self.host {
-            HostOs::MacOs => mountpoint.join("cas"),
-            _ => self.state_dir.join("cas"),
+        let (cas_root, run_root) = match self.host {
+            HostOs::MacOs => (mountpoint.join("cas"), mountpoint.join("runs")),
+            _ => (self.state_dir.join("cas"), self.state_dir.join("runs")),
         };
         VolumeLayout {
             image: dir.join("cas.sparsebundle"),
             mountpoint,
             cas_root,
+            run_root,
             dir,
         }
+    }
+
+    /// Where each run's ephemeral rootfs is materialized: the run root an
+    /// operator named, else [`VolumeLayout::run_root`].
+    pub fn run_root(&self) -> PathBuf {
+        self.run_root
+            .clone()
+            .unwrap_or_else(|| self.layout().run_root)
+    }
+
+    /// What a daemon calls when it starts: refuse now a run root that is
+    /// not case-sensitive, unless it lies on the volume's mountpoint (macOS),
+    /// where it exists only once the volume is attached and every provision
+    /// checks it. Creates the run root when it is checked.
+    pub fn check_run_root(&self) -> Result<(), CasVolumeError> {
+        let run_root = self.run_root();
+        if self.host == HostOs::MacOs && run_root.starts_with(self.layout().mountpoint) {
+            return Ok(());
+        }
+        self.verify_run_root()
+    }
+
+    /// Make the run root exist and refuse it, naming it and the CAS root,
+    /// unless its filesystem is case-sensitive.
+    fn verify_run_root(&self) -> Result<(), CasVolumeError> {
+        let run_root = self.run_root();
+        fs::create_dir_all(&run_root).map_err(io_error("create", &run_root))?;
+        if !self.probe(&run_root)?.case_sensitive {
+            return Err(CasVolumeError::RunRootCaseInsensitive {
+                run_root,
+                cas_root: self.cas_root(),
+            });
+        }
+        Ok(())
     }
 
     /// The CAS root path this volume provides, whether or not it exists yet.
@@ -492,6 +957,12 @@ impl CasVolume {
         match self.host {
             HostOs::MacOs => {
                 let layout = self.layout();
+                if !layout.dir.is_dir() {
+                    return Ok(false);
+                }
+                // Under the provisioning lock, so a detach never lands between
+                // another process's image check and its use of the volume.
+                let _provisioning = provisioning_lock(&layout.dir)?;
                 if !self.images.is_mounted(&layout.mountpoint)? {
                     return Ok(false);
                 }
@@ -505,11 +976,22 @@ impl CasVolume {
 
     fn provision_macos(&self, create: bool) -> Result<Option<ProvisionedCas>, CasVolumeError> {
         let layout = self.layout();
+        if fs::symlink_metadata(&layout.image).is_err() && !create {
+            return Ok(None);
+        }
+        private_directory(&layout.dir)?;
+        // Across processes too: two providers (or a daemon and the CLI)
+        // provisioning or detaching at once take turns. Released when
+        // `_provisioning` drops.
+        let _provisioning = provisioning_lock(&layout.dir)?;
+        // Read under the lock: another process may have created it.
         let image_exists = fs::symlink_metadata(&layout.image).is_ok();
         if !image_exists && !create {
             return Ok(None);
         }
-        private_directory(&layout.dir)?;
+        if create {
+            remove_stale_partials(&layout.dir)?;
+        }
         let mut created = false;
         if !image_exists {
             created = self.create_image(&layout)?;
@@ -532,6 +1014,25 @@ impl CasVolume {
             }
             attached = true;
         }
+        // A mount at `mnt` is the volume only if it comes from
+        // `cas.sparsebundle`: someone else's image (or any other filesystem)
+        // mounted there first is refused, not written to.
+        let expected = layout
+            .image
+            .canonicalize()
+            .map_err(io_error("resolve", &layout.image))?;
+        let found = self.images.attached_image(&layout.mountpoint)?;
+        if found
+            .as_deref()
+            .and_then(|path| path.canonicalize().ok())
+            .is_none_or(|found| found != expected)
+        {
+            return Err(CasVolumeError::ForeignVolume {
+                mountpoint: layout.mountpoint,
+                expected: layout.image,
+                found,
+            });
+        }
         if fs::symlink_metadata(&layout.cas_root).is_err() {
             fs::create_dir(&layout.cas_root).map_err(io_error("create", &layout.cas_root))?;
             fs::set_permissions(&layout.cas_root, fs::Permissions::from_mode(0o755))
@@ -543,10 +1044,25 @@ impl CasVolume {
             .map_err(io_error("inspect", &layout.cas_root))?;
         let mount =
             fs::metadata(&layout.mountpoint).map_err(io_error("inspect", &layout.mountpoint))?;
-        if !cas.is_dir() || cas.dev() != mount.dev() {
+        // And the volume is still mounted there after `cas/` was made: a
+        // detach in between would leave a `cas/` on the host's own disk,
+        // whose device then equals its parent's.
+        if !cas.is_dir()
+            || cas.dev() != mount.dev()
+            || !self.images.is_mounted(&layout.mountpoint)?
+        {
             return Err(CasVolumeError::Config(format!(
                 "{} must be a directory on the volume attached at {}, not a link or another mount",
                 layout.cas_root.display(),
+                layout.mountpoint.display()
+            )));
+        }
+        // Nothing in the CAS is a device or gains privilege on the host: an
+        // unprivileged attach mounts nodev and nosuid, and a volume mounted
+        // without them (by root, say) is refused.
+        if !nodev_and_nosuid(self.images.mount_flags(&layout.mountpoint)?) {
+            return Err(CasVolumeError::Config(format!(
+                "the volume at {} is not mounted nodev and nosuid; detach it and provision again as an unprivileged user",
                 layout.mountpoint.display()
             )));
         }
@@ -557,6 +1073,7 @@ impl CasVolume {
                 remedy: "what is mounted there is not the case-sensitive volume LLO creates; detach it and provision again",
             });
         }
+        self.verify_run_root()?;
         Ok(Some(ProvisionedCas {
             cas_root: layout.cas_root,
             mountpoint: Some(layout.mountpoint),
@@ -605,6 +1122,7 @@ impl CasVolume {
                 remedy: "on Linux LLO makes no volume; put the state directory (LEYLINE_STATE_DIR) on a case-sensitive filesystem, without casefolding",
             });
         }
+        self.verify_run_root()?;
         Ok(Some(ProvisionedCas {
             cas_root,
             mountpoint: None,
@@ -655,6 +1173,55 @@ impl CasStorage {
     }
 }
 
+/// Take the cross-process provisioning lock (`<dir>/provision.lock`): held
+/// while provisioning or detaching, released when the file drops. Each
+/// holder's tool runs are bounded, so a wait for it is too.
+fn provisioning_lock(dir: &Path) -> Result<fs::File, CasVolumeError> {
+    let lock_path = dir.join("provision.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(io_error("open", &lock_path))?;
+    lock.lock().map_err(io_error("lock", &lock_path))?;
+    Ok(lock)
+}
+
+/// Remove each `partial-<pid>.sparsebundle` in `dir` whose process no longer
+/// exists: what a provider that crashed between `hdiutil create` and the
+/// rename left (bead `ley-line-open-167b29`). A live process's is its own
+/// to finish or remove; a name that is not of that form is left alone.
+fn remove_stale_partials(dir: &Path) -> Result<(), CasVolumeError> {
+    for entry in fs::read_dir(dir).map_err(io_error("list", dir))? {
+        let entry = entry.map_err(io_error("list", dir))?;
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("partial-"))
+            .and_then(|rest| rest.strip_suffix(".sparsebundle"))
+            .and_then(|pid| pid.parse::<std::num::NonZeroU32>().ok())
+            .and_then(|pid| libc::pid_t::try_from(pid.get()).ok())
+        else {
+            continue;
+        };
+        if process_exists(pid) {
+            continue;
+        }
+        let path = entry.path();
+        fs::remove_dir_all(&path).map_err(io_error("remove", &path))?;
+    }
+    Ok(())
+}
+
+/// Whether process `pid` exists: `kill(pid, 0)` succeeds, or fails only
+/// because it belongs to another user.
+fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Create `dir` (and its parents) and make it owner-only. An existing path
 /// must be a directory this user owns.
 fn private_directory(dir: &Path) -> Result<(), CasVolumeError> {
@@ -690,6 +1257,16 @@ mod tests {
         create_races: bool,
         /// The tool reports success and writes nothing.
         create_writes_nothing: bool,
+        /// The image each mountpoint was attached from.
+        images: Arc<Mutex<std::collections::BTreeMap<PathBuf, PathBuf>>>,
+        /// Report this image (or, with `Some(None)`, none) as mounted at
+        /// every mountpoint instead of the one attached.
+        reports_image: Option<Option<PathBuf>>,
+        /// Another process detaches the volume right after its image is
+        /// checked.
+        detached_after_check: bool,
+        /// The mount lacks nodev or nosuid.
+        unrestricted: bool,
     }
 
     impl Fake {
@@ -725,17 +1302,538 @@ mod tests {
             ));
             if !self.attach_mounts_nothing {
                 self.mounted.lock().insert(mountpoint.to_path_buf());
+                self.images
+                    .lock()
+                    .insert(mountpoint.to_path_buf(), bundle.to_path_buf());
             }
             Ok(())
         }
         fn detach(&self, mountpoint: &Path) -> Result<(), CasVolumeError> {
             self.calls.lock().push("detach".into());
             self.mounted.lock().remove(mountpoint);
+            self.images.lock().remove(mountpoint);
             Ok(())
         }
         fn is_mounted(&self, mountpoint: &Path) -> Result<bool, CasVolumeError> {
             Ok(self.mounted.lock().contains(mountpoint))
         }
+        fn attached_image(&self, mountpoint: &Path) -> Result<Option<PathBuf>, CasVolumeError> {
+            if let Some(reported) = &self.reports_image {
+                return Ok(reported.clone());
+            }
+            let image = self.images.lock().get(mountpoint).cloned();
+            if self.detached_after_check {
+                self.mounted.lock().remove(mountpoint);
+            }
+            Ok(image)
+        }
+        fn mount_flags(&self, _: &Path) -> Result<u64, CasVolumeError> {
+            Ok(if self.unrestricted {
+                0
+            } else {
+                MOUNT_NODEV | MOUNT_NOSUID
+            })
+        }
+    }
+
+    /// Review of 167b29 (C1): a detach between the image check and the
+    /// creation of `cas/` would leave `cas/` on the host's own disk; it is
+    /// refused, not reported as the volume.
+    #[test]
+    fn a_volume_detached_mid_provision_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            detached_after_check: true,
+            ..Fake::default()
+        };
+        let error = volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not a link or another mount"),
+            "{error}"
+        );
+    }
+
+    /// Review of 167b29 (N4): a volume mounted without nodev or nosuid is
+    /// refused; the real mount's flags are read with statfs.
+    #[test]
+    fn a_volume_without_nodev_and_nosuid_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake {
+            unrestricted: true,
+            ..Fake::default()
+        };
+        let error = volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap_err();
+        assert!(error.to_string().contains("nodev and nosuid"), "{error}");
+        // Both bits, not either.
+        assert!(nodev_and_nosuid(MOUNT_NODEV | MOUNT_NOSUID | 1));
+        assert!(!nodev_and_nosuid(MOUNT_NODEV));
+        assert!(!nodev_and_nosuid(MOUNT_NOSUID));
+        assert!(!nodev_and_nosuid(0));
+        // The real flags: the root filesystem is the root (macOS
+        // MNT_ROOTFS), Linux mounts procfs nodev and nosuid, a temporary
+        // directory is neither nodev nor nosuid, and a missing path is an
+        // error, for the tool's default too.
+        #[cfg(target_os = "macos")]
+        assert_ne!(
+            Hdiutil::default().mount_flags(Path::new("/")).unwrap() & libc::MNT_ROOTFS as u64,
+            0
+        );
+        #[cfg(target_os = "linux")]
+        assert!(nodev_and_nosuid(
+            Hdiutil::default().mount_flags(Path::new("/proc")).unwrap()
+        ));
+        assert!(!nodev_and_nosuid(mount_flags(state.path()).unwrap()));
+        assert!(mount_flags(&state.path().join("missing")).is_err());
+        assert!(mount_flags(Path::new("a\0b")).is_err());
+    }
+
+    /// `hdiutil info -plist` as macOS 27.2 prints it for the images given as
+    /// `(image path, mount point)`, each with an unmounted whole-disk entity
+    /// before its mounted volume.
+    fn info_plist(images: &[(&str, &str)]) -> String {
+        let escape = |text: &str| {
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n<dict>\n\t<key>framework</key>\n\t<string>710</string>\n\t<key>images</key>\n\t<array>\n",
+        );
+        for (image, mount) in images {
+            xml.push_str(&format!(
+                "\t\t<dict>\n\t\t\t<key>autodiskmount</key>\n\t\t\t<true/>\n\
+                 \t\t\t<key>blockcount</key>\n\t\t\t<integer>2097152</integer>\n\
+                 \t\t\t<key>image-path</key>\n\t\t\t<string>{}</string>\n\
+                 \t\t\t<key>system-entities</key>\n\t\t\t<array>\n\
+                 \t\t\t\t<dict>\n\t\t\t\t\t<key>content-hint</key>\n\t\t\t\t\t<string>GUID_partition_scheme</string>\n\
+                 \t\t\t\t\t<key>dev-entry</key>\n\t\t\t\t\t<string>/dev/disk4</string>\n\t\t\t\t</dict>\n\
+                 \t\t\t\t<dict>\n\t\t\t\t\t<key>dev-entry</key>\n\t\t\t\t\t<string>/dev/disk5s1</string>\n\
+                 \t\t\t\t\t<key>mount-point</key>\n\t\t\t\t\t<string>{}</string>\n\t\t\t\t</dict>\n\
+                 \t\t\t</array>\n\t\t\t<key>writeable</key>\n\t\t\t<true/>\n\t\t</dict>\n",
+                escape(image),
+                escape(mount)
+            ));
+        }
+        xml.push_str(
+            "\t</array>\n\t<key>revision</key>\n\t<string>710</string>\n</dict>\n</plist>\n",
+        );
+        xml
+    }
+
+    /// The real tool's `attached_image` reads `hdiutil info -plist`.
+    #[test]
+    fn the_real_tools_attached_image_comes_from_hdiutil_info() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mnt = scratch.path().join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        let plist = scratch.path().join("info.plist");
+        fs::write(
+            &plist,
+            info_plist(&[("/a/cas.sparsebundle", &mnt.to_string_lossy())]),
+        )
+        .unwrap();
+        let tool = |body: String| Hdiutil {
+            program: script(scratch.path(), "hdiutil-info", &body),
+            timeout: Duration::from_secs(20),
+        };
+        let real = tool(format!(
+            "[ \"$1 $2\" = 'info -plist' ] || exit 9\ncat '{}'",
+            plist.display()
+        ));
+        assert_eq!(
+            real.attached_image(&mnt).unwrap(),
+            Some(PathBuf::from("/a/cas.sparsebundle"))
+        );
+        assert_eq!(real.attached_image(scratch.path()).unwrap(), None);
+        // Output that is no property list refuses; it never reads as
+        // "nothing is attached".
+        for (body, reason) in [
+            (
+                "echo 'image-path : /a/cas.sparsebundle'",
+                "not an XML property list",
+            ),
+            ("printf '<plist><dict></dict></plist>'", "no `images` array"),
+            ("printf '\\377'", "not UTF-8"),
+        ] {
+            let error = tool(body.to_string()).attached_image(&mnt).unwrap_err();
+            assert!(
+                matches!(&error, CasVolumeError::Tool { command, detail }
+                    if command.ends_with("info -plist") && detail.contains(reason)),
+                "{body}: {error}"
+            );
+        }
+    }
+
+    /// Review of 167b29 (C2): a tool that exits while something it started
+    /// still holds its output is bounded by the same timeout, and that
+    /// descendant is killed with it.
+    #[test]
+    fn a_tool_whose_descendant_holds_its_output_is_bounded_too() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pidfile = scratch.path().join("descendant");
+        let tool = Hdiutil {
+            program: script(
+                scratch.path(),
+                "hdiutil-forks",
+                &format!("sleep 30 &\necho $! > '{}'\nexit 0", pidfile.display()),
+            ),
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let error = tool.detach(Path::new("/m")).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(error, CasVolumeError::Timeout { .. }), "{error}");
+        // The whole process group was killed: the descendant is gone (once
+        // its new parent reaps it).
+        let descendant: libc::pid_t = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_exists(descendant) {
+            assert!(
+                Instant::now() < deadline,
+                "descendant {descendant} survived"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A shell script standing in for hdiutil.
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let program = dir.join(name);
+        fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    /// Bead ley-line-open-167b29 (1): a hung hdiutil fails provisioning by
+    /// name within its timeout instead of holding the volume's lock forever.
+    #[test]
+    fn a_tool_run_that_outlives_its_timeout_is_killed_and_named() {
+        let scratch = tempfile::tempdir().unwrap();
+        let hung = Hdiutil {
+            program: script(scratch.path(), "hdiutil-hangs", "exec sleep 30"),
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let error = hung.create(Path::new("/b"), 1 << 30).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&error, CasVolumeError::Timeout { command, after }
+                if command.contains("create") && *after == Duration::from_millis(300)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("did not finish within"),
+            "{error}"
+        );
+
+        let state = tempfile::tempdir().unwrap();
+        let volume = CasVolume::with_parts(
+            state.path(),
+            4 << 30,
+            HostOs::MacOs,
+            Box::new(hung),
+            sensitive,
+        )
+        .unwrap();
+        for attempt in 0..2 {
+            let error = volume.provision().unwrap_err();
+            assert!(
+                matches!(error, CasVolumeError::Timeout { .. }),
+                "attempt {attempt}: {error}"
+            );
+        }
+        assert_eq!(Hdiutil::default().timeout, DEFAULT_TOOL_TIMEOUT);
+        assert_eq!(
+            Hdiutil::with_timeout(Duration::from_secs(7)).timeout,
+            Duration::from_secs(7)
+        );
+    }
+
+    /// A tool that writes more than a pipe holds before exiting is not
+    /// deadlocked by its own output, and its output is returned.
+    #[test]
+    fn a_chatty_tool_is_drained_while_it_runs() {
+        let scratch = tempfile::tempdir().unwrap();
+        let chatty = Hdiutil {
+            program: script(
+                scratch.path(),
+                "hdiutil-chatty",
+                "head -c 200000 /dev/zero | tr '\\0' a; head -c 200000 /dev/zero | tr '\\0' b >&2",
+            ),
+            timeout: Duration::from_secs(20),
+        };
+        let out = chatty.output(&["info".as_ref()]).unwrap();
+        assert_eq!(out.len(), 200_000);
+    }
+
+    /// Bead ley-line-open-167b29 (2): a crash between `hdiutil create` and
+    /// the rename leaves `partial-<pid>.sparsebundle`. Provisioning removes
+    /// every one whose process is gone, and leaves a live provider's alone.
+    #[test]
+    fn stale_partial_bundles_are_removed_and_live_ones_kept() {
+        let state = tempfile::tempdir().unwrap();
+        let base = state.path().join("cas-volume");
+        fs::create_dir_all(&base).unwrap();
+        let mut exited = Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        let live = std::os::unix::process::parent_id();
+        for pid in [dead, live] {
+            let partial = base.join(format!("partial-{pid}.sparsebundle"));
+            fs::create_dir(&partial).unwrap();
+            fs::write(partial.join("Info.plist"), b"half made").unwrap();
+        }
+        fs::create_dir(base.join("partial-notapid.sparsebundle")).unwrap();
+        volume(state.path(), HostOs::MacOs, &Fake::default(), sensitive)
+            .provision()
+            .unwrap();
+        assert!(
+            !base.join(format!("partial-{dead}.sparsebundle")).exists(),
+            "a dead process's partial bundle is removed"
+        );
+        assert!(
+            base.join(format!("partial-{live}.sparsebundle")).exists(),
+            "a live process's partial bundle is left to it"
+        );
+        assert!(base.join("partial-notapid.sparsebundle").exists());
+    }
+
+    /// Bead ley-line-open-167b29 (3): a filesystem mounted at `mnt` that is
+    /// not `cas.sparsebundle` (another image, or no image at all) is refused,
+    /// whether it was already there or the attach produced it.
+    #[test]
+    fn a_mount_not_backed_by_the_cas_image_is_refused() {
+        for reported in [Some(PathBuf::from("/elsewhere/other.sparsebundle")), None] {
+            let state = tempfile::tempdir().unwrap();
+            let fake = Fake {
+                reports_image: Some(reported.clone()),
+                ..Fake::default()
+            };
+            let volume = volume(state.path(), HostOs::MacOs, &fake, sensitive);
+            let error = volume.provision().unwrap_err();
+            assert!(
+                matches!(&error, CasVolumeError::ForeignVolume { found, expected, .. }
+                    if *found == reported && expected.ends_with("cas-volume/cas.sparsebundle")),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("is not the CAS volume"),
+                "{error}"
+            );
+            // Already mounted (by someone else): refused before use.
+            fake.mounted.lock().insert(volume.layout().mountpoint);
+            assert!(matches!(
+                volume.attach_existing(),
+                Err(CasVolumeError::ForeignVolume { .. })
+            ));
+        }
+        // The image at the stable path is accepted, through a symlinked
+        // spelling of the state directory too.
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .provision()
+            .unwrap();
+    }
+
+    #[test]
+    fn hdiutil_info_names_the_image_mounted_at_a_mountpoint() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mnt = scratch.path().join("mnt");
+        let other = scratch.path().join("other");
+        fs::create_dir(&mnt).unwrap();
+        fs::create_dir(&other).unwrap();
+        let (mnt_text, other_text) = (mnt.to_string_lossy(), other.to_string_lossy());
+        let info = info_plist(&[
+            ("/a/other & <more>.dmg", &other_text),
+            ("/a/cas.sparsebundle", &mnt_text),
+        ]);
+        let image = |mountpoint: &Path| attached_image_in_plist(&info, mountpoint).unwrap();
+        assert_eq!(image(&mnt), Some(PathBuf::from("/a/cas.sparsebundle")));
+        assert_eq!(image(&other), Some(PathBuf::from("/a/other & <more>.dmg")));
+        assert_eq!(image(scratch.path()), None);
+        assert_eq!(image(&scratch.path().join("gone")), None);
+        assert_eq!(attached_image_in_plist(&info_plist(&[]), &mnt), Ok(None));
+        for (broken, reason) in [
+            ("", "not an XML property list"),
+            ("framework : 710\n", "not an XML property list"),
+            ("<plist><dict><key>images</key>", "not an XML property list"),
+            (
+                "<plist><dict><key>images</key><string>x</string></dict></plist>",
+                "no `images` array",
+            ),
+            ("<plist><array/></plist>", "no `images` array"),
+        ] {
+            let error = attached_image_in_plist(broken, &mnt).expect_err(broken);
+            assert!(error.contains(reason), "{broken}: {error}");
+        }
+    }
+
+    /// Review of 167b29 (N3): the text form of `hdiutil info` let an
+    /// attached image whose path holds a newline and the text of another
+    /// entry pass for the CAS image mounted at the CAS mountpoint. In the
+    /// property list that text is one string's content, never structure.
+    #[test]
+    fn a_crafted_image_path_cannot_pass_for_another_images_entry() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mnt = scratch.path().join("mnt");
+        let theirs = scratch.path().join("theirs");
+        fs::create_dir(&mnt).unwrap();
+        fs::create_dir(&theirs).unwrap();
+        let forged = format!(
+            "/tmp/x\n================================================\n\
+             image-path      : /state/cas-volume/cas.sparsebundle\n\
+             /dev/disk9s1\t41504653\t{mnt}\n\
+             </string><key>mount-point</key><string>{mnt}",
+            mnt = mnt.display()
+        );
+        let info = info_plist(&[(&forged, &theirs.to_string_lossy())]);
+        assert_eq!(attached_image_in_plist(&info, &mnt), Ok(None));
+        assert_eq!(
+            attached_image_in_plist(&info, &theirs),
+            Ok(Some(PathBuf::from(&forged)))
+        );
+    }
+
+    #[test]
+    fn property_lists_are_read_by_structure() {
+        let parsed = parse_plist(
+            "<?xml version=\"1.0\"?><!-- c --><plist version=\"1.0\"> <dict>\
+             <key>s</key><string>a &amp; b &lt;&gt;&quot;&apos;&#65;&#x42;</string>\
+             <key>empty</key><string></string><key>none</key><string/>\
+             <key>n</key><integer>7</integer><key>t</key><true/>\
+             <key>a</key><array><string>x</string><dict/><array/><real>1.5</real></array>\
+             </dict> </plist>",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.get("s").and_then(Plist::as_str),
+            Some("a & b <>\"'AB")
+        );
+        assert_eq!(parsed.get("empty"), Some(&Plist::String(String::new())));
+        assert_eq!(parsed.get("none"), Some(&Plist::String(String::new())));
+        assert_eq!(parsed.get("n"), Some(&Plist::Other));
+        assert_eq!(parsed.get("t"), Some(&Plist::Other));
+        assert_eq!(
+            parsed.get("a").map(Plist::items),
+            Some(
+                &[
+                    Plist::String("x".into()),
+                    Plist::Dict(Vec::new()),
+                    Plist::Array(Vec::new()),
+                    Plist::Other
+                ][..]
+            )
+        );
+        assert_eq!(parsed.get("absent"), None);
+        // Accessors on the wrong kind of value.
+        assert_eq!(Plist::Other.get("s"), None);
+        assert!(Plist::String("x".into()).items().is_empty());
+        assert_eq!(Plist::Other.as_str(), None);
+        for malformed in [
+            "<plist><dict><key>k</key></dict></plist>",
+            "<plist><dict><string>v</string></dict></plist>",
+            "<plist><dict><key>k</key><string>v</dict></plist>",
+            "<plist><dict><key>k<string>v</string></key></dict></plist>",
+            // A value closed by another tag's name, with text and without.
+            "<plist><dict><key>k</key><string>v</key></dict></plist>",
+            "<plist><dict><key>k</key><string></key></dict></plist>",
+            "<plist><dict><key>k</string><string>v</string></dict></plist>",
+            // Text that is not whitespace, where only structure belongs: in
+            // a dictionary, in an array, and between a key and its value.
+            "<plist><dict>junk<key>k</key><string>v</string></dict></plist>",
+            "<plist><array>junk<string>x</string></array></plist>",
+            "<plist><dict><key>k</key>junk<string>v</string></dict></plist>",
+            "<plist><string>a &bogus; b</string></plist>",
+            "<plist><string>a &#xD800; b</string></plist>",
+            "<plist><string>a & b</string></plist>",
+            "<plist><string>unclosed",
+            "<plist></plist>",
+            "<dict></dict>",
+            "text<plist><dict/></plist>",
+            "<plist></dict></plist>",
+        ] {
+            assert_eq!(parse_plist(malformed), None, "{malformed}");
+        }
+        // Nesting is bounded.
+        let nested = |depth: usize| {
+            format!(
+                "<plist>{}{}</plist>",
+                "<array>".repeat(depth),
+                "</array>".repeat(depth)
+            )
+        };
+        assert!(parse_plist(&nested(MAX_PLIST_DEPTH + 1)).is_some());
+        assert_eq!(parse_plist(&nested(MAX_PLIST_DEPTH + 2)), None);
+        // Through dictionaries too.
+        let nested_dicts = |depth: usize| {
+            format!(
+                "<plist>{}<string>x</string>{}</plist>",
+                "<dict><key>k</key>".repeat(depth),
+                "</dict>".repeat(depth)
+            )
+        };
+        assert!(parse_plist(&nested_dicts(MAX_PLIST_DEPTH)).is_some());
+        assert_eq!(parse_plist(&nested_dicts(MAX_PLIST_DEPTH + 1)), None);
+        // Text before the first tag is kept as text, not dropped.
+        assert_eq!(
+            xml_tokens("a<b>c</b>"),
+            Some(vec![
+                XmlToken::Text("a".into()),
+                XmlToken::Open("b"),
+                XmlToken::Text("c".into()),
+                XmlToken::Close("b"),
+            ])
+        );
+        assert_eq!(
+            xml_tokens("<a x=\"1\"><b/></a>"),
+            Some(vec![
+                XmlToken::Open("a"),
+                XmlToken::Empty("b"),
+                XmlToken::Close("a")
+            ])
+        );
+    }
+
+    #[test]
+    fn a_tool_that_cannot_name_its_image_refuses() {
+        struct Mute;
+        impl DiskImages for Mute {
+            fn create(&self, _: &Path, _: u64) -> Result<(), CasVolumeError> {
+                Ok(())
+            }
+            fn attach(&self, _: &Path, _: &Path) -> Result<(), CasVolumeError> {
+                Ok(())
+            }
+            fn detach(&self, _: &Path) -> Result<(), CasVolumeError> {
+                Ok(())
+            }
+            fn is_mounted(&self, _: &Path) -> Result<bool, CasVolumeError> {
+                Ok(true)
+            }
+        }
+        assert!(matches!(
+            Mute.attached_image(Path::new("/m")),
+            Err(CasVolumeError::Config(detail)) if detail.contains("cannot say")
+        ));
     }
 
     fn sensitive(_: &Path) -> io::Result<FilesystemSensitivity> {
@@ -750,6 +1848,159 @@ mod tests {
             case_sensitive: false,
             normalization_sensitive: false,
         })
+    }
+
+    /// Case-insensitive beneath any directory named `host-disk`, sensitive
+    /// elsewhere: a volume beside the host's default filesystem.
+    fn host_disk_is_insensitive(path: &Path) -> io::Result<FilesystemSensitivity> {
+        Ok(FilesystemSensitivity {
+            case_sensitive: !path
+                .components()
+                .any(|part| part.as_os_str() == "host-disk"),
+            normalization_sensitive: false,
+        })
+    }
+
+    /// Bead ley-line-open-741388: with no run root named, each run's
+    /// rootfs goes on the volume, beside the CAS root, and provisioning
+    /// makes it exist.
+    #[test]
+    fn the_default_run_root_is_on_the_volume_and_made_by_provisioning() {
+        for (host, expected) in [
+            (HostOs::MacOs, "cas-volume/mnt/runs"),
+            (HostOs::Linux, "runs"),
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let volume = volume(
+                state.path(),
+                host,
+                &Fake::default(),
+                host_disk_is_insensitive,
+            );
+            assert_eq!(volume.run_root(), state.path().join(expected));
+            assert_eq!(volume.layout().run_root, state.path().join(expected));
+            volume.check_run_root().unwrap();
+            volume.provision().unwrap();
+            assert!(state.path().join(expected).is_dir(), "{host:?}");
+        }
+    }
+
+    /// An explicit run root on a case-insensitive filesystem is refused,
+    /// naming both paths: at start when it is off the volume, and by every
+    /// provision whatever it is.
+    #[test]
+    fn a_case_insensitive_run_root_is_refused_naming_both_paths() {
+        for host in [HostOs::MacOs, HostOs::Linux] {
+            let state = tempfile::tempdir().unwrap();
+            let run_root = state.path().join("host-disk/runs");
+            let volume = volume(
+                state.path(),
+                host,
+                &Fake::default(),
+                host_disk_is_insensitive,
+            )
+            .with_run_root(run_root.clone())
+            .unwrap();
+            for error in [
+                volume.check_run_root().unwrap_err(),
+                volume.provision().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(&error, CasVolumeError::RunRootCaseInsensitive { run_root: named, cas_root }
+                        if *named == run_root && *cas_root == volume.cas_root()),
+                    "{host:?}: {error}"
+                );
+                let message = error.to_string();
+                assert!(
+                    message.contains(&run_root.display().to_string())
+                        && message.contains(&volume.cas_root().display().to_string()),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// A case-sensitive run root the operator names is accepted: off the
+    /// volume, checked at start; on the macOS volume's mountpoint (where
+    /// Cloister puts it), left until the volume is attached, then checked
+    /// by every provision.
+    #[test]
+    fn a_case_sensitive_run_root_is_accepted_on_or_off_the_volume() {
+        let state = tempfile::tempdir().unwrap();
+        let elsewhere = state.path().join("fast-disk/runs");
+        let volume = volume(
+            state.path(),
+            HostOs::Linux,
+            &Fake::default(),
+            host_disk_is_insensitive,
+        )
+        .with_run_root(elsewhere.clone())
+        .unwrap();
+        volume.check_run_root().unwrap();
+        assert!(elsewhere.is_dir());
+
+        let state = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let on_volume = state.path().join("cas-volume/mnt/cloister-runs");
+        // Even probed as insensitive, it is not checked (or created) at
+        // start: the volume is not attached yet, and a directory made now
+        // would be on the host's disk.
+        let volume = self::volume(state.path(), HostOs::MacOs, &fake, insensitive)
+            .with_run_root(on_volume.clone())
+            .unwrap();
+        volume.check_run_root().unwrap();
+        assert!(!on_volume.exists());
+        assert!(matches!(
+            volume.provision(),
+            Err(CasVolumeError::CaseInsensitive { .. })
+        ));
+        let volume = self::volume(state.path(), HostOs::MacOs, &fake, sensitive)
+            .with_run_root(on_volume.clone())
+            .unwrap();
+        volume.provision().unwrap();
+        assert!(on_volume.is_dir());
+        assert!(matches!(
+            volume.with_run_root(PathBuf::from("relative/runs")),
+            Err(CasVolumeError::Config(detail)) if detail.contains("absolute")
+        ));
+    }
+
+    /// A run root is refused when its name could make it something else:
+    /// a `..` component (so "on the mountpoint" is never a matter of
+    /// path text), or a path inside, or holding, the CAS root, where each
+    /// run's writable copy would land among content-addressed entries.
+    #[test]
+    fn a_run_root_that_escapes_by_dots_or_overlaps_the_cas_root_is_refused() {
+        for host in [HostOs::MacOs, HostOs::Linux] {
+            let state = tempfile::tempdir().unwrap();
+            let fake = Fake::default();
+            let volume = || volume(state.path(), host, &fake, sensitive);
+            let layout = volume().layout();
+            let cas_root = volume().cas_root();
+            for named in [
+                layout.mountpoint.join("../../elsewhere"),
+                cas_root.clone(),
+                cas_root.join("runs"),
+                cas_root.join("0f22c2d1dd70147e2c1de7139de10b7619e789334eae9a8b8c22c958994d913a"),
+                cas_root.parent().unwrap().to_path_buf(),
+                state.path().to_path_buf(),
+            ] {
+                let error = volume()
+                    .with_run_root(named.clone())
+                    .expect_err(&format!("{host:?}: {} is refused", named.display()));
+                assert!(
+                    matches!(&error, CasVolumeError::Config(detail)
+                        if detail.contains(&named.display().to_string())),
+                    "{host:?}: {error}"
+                );
+            }
+            volume()
+                .with_run_root(layout.mountpoint.join("cloister-runs"))
+                .unwrap();
+            volume()
+                .with_run_root(state.path().join("runs-elsewhere"))
+                .unwrap();
+        }
     }
 
     fn volume(
@@ -938,7 +2189,10 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-            Hdiutil { program }
+            Hdiutil {
+                program,
+                timeout: DEFAULT_TOOL_TIMEOUT,
+            }
         };
         let ok = tool(0);
         ok.create(Path::new("/b.sparsebundle"), 2 << 30).unwrap();
@@ -966,6 +2220,7 @@ mod tests {
         }
         let missing = Hdiutil {
             program: scratch.path().join("absent"),
+            timeout: DEFAULT_TOOL_TIMEOUT,
         };
         assert!(matches!(
             missing.detach(Path::new("/m")),

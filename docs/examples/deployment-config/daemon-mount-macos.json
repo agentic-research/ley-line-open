@@ -1,0 +1,10 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "kind": "DaemonConfig",
+  "source": {
+    "path": "~/src/my-project"
+  },
+  "mount": {
+    "path": "~/mnt/my-project"
+  }
+}

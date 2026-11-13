@@ -84,7 +84,7 @@ fn import(layout: &Path, digest: &str, cas_root: &Path) -> String {
             layout,
             reference: digest,
             platform: Platform::linux("arm64"),
-            symlinks: SymlinkPolicy::Resolve,
+            symlinks: SymlinkPolicy::Preserve,
             max_rootfs_bytes: DEFAULT_MAX_ROOTFS_BYTES,
         },
         cas_root,
@@ -114,6 +114,12 @@ fn provision_creates_attaches_and_reattaches_a_case_sensitive_volume() {
         "the volume is mounted"
     );
     assert!(state.join("cas-volume/cas.sparsebundle").is_dir());
+    // An unprivileged attach mounts nodev and nosuid (bead
+    // ley-line-open-1665c9): nothing in the CAS can be a device or gain
+    // privilege on the host, whatever an image held.
+    let flags = mount_flags(&mountpoint);
+    assert_ne!(flags & libc::MNT_NODEV as u32, 0, "nodev: {flags:#x}");
+    assert_ne!(flags & libc::MNT_NOSUID as u32, 0, "nosuid: {flags:#x}");
     // Probed independently of provisioning's own probe.
     let filesystem = probe_sensitivity(&first.cas_root).unwrap();
     assert!(filesystem.case_sensitive, "{filesystem:?}");
@@ -182,6 +188,102 @@ fn provision_creates_attaches_and_reattaches_a_case_sensitive_volume() {
     );
 }
 
+/// `statfs(2)`'s mount flags for the filesystem holding `path`.
+#[cfg(target_os = "macos")]
+fn mount_flags(path: &Path) -> u32 {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` is NUL-terminated and `stat` is written by the call.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statfs(path.as_ptr(), &mut stat) }, 0);
+    stat.f_flags
+}
+
+/// The deprecation warnings `/usr/bin/hdiutil` prints on macOS 27 (bead
+/// `ley-line-open-168a65`), pinned. LLO keeps `hdiutil` because `diskutil
+/// image create blank` cannot make a case-sensitive APFS volume (its `--fs`
+/// takes APFS, ExFAT, MS-DOS or None); getting one through `diskutil`
+/// takes a create, an attach without mounting, a `diskutil apfs
+/// deleteVolume` and `addVolume "Case-sensitive APFS"` on the device node
+/// the attach printed, then a detach. When a warning changes (Apple
+/// announcing a removal date, say) or `diskutil image` gains a
+/// case-sensitive filesystem, this test fails and says to revisit that.
+const PINNED_HDIUTIL_WARNINGS: [&str; 3] = [
+    "hdiutil: WARNING: 'hdiutil create -size -volname ...' is deprecated. Please use 'diskutil image create from/blank -size --volumeName ...' instead.",
+    "hdiutil: WARNING: 'hdiutil attach -nobrowse -owners -mountpoint ...' is deprecated. Please use 'diskutil image attach --mountOptions nobrowse --mountOptions owners --mountPoint ...' instead.",
+    "hdiutil: WARNING: 'hdiutil detach ...' is deprecated. Please use 'diskutil eject ...' instead.",
+];
+
+#[test]
+#[cfg(target_os = "macos")]
+fn hdiutil_says_only_the_pinned_deprecations_and_diskutil_still_lacks_case_sensitive_apfs() {
+    use std::process::Command;
+    if !macos_tests_enabled() {
+        return;
+    }
+    let scratch = TempDir::new().unwrap();
+    let image = scratch.path().join("pin.sparsebundle");
+    let mnt = scratch.path().join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    let run = |args: &[&std::ffi::OsStr]| {
+        let output = Command::new("/usr/bin/hdiutil")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "hdiutil {args:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                PINNED_HDIUTIL_WARNINGS.contains(&line.trim()),
+                "hdiutil {args:?} printed an unpinned message: {line:?}. Revisit bead \
+                 ley-line-open-168a65 (stay on hdiutil, or move to diskutil image)."
+            );
+        }
+    };
+    run(&[
+        "create".as_ref(),
+        "-size".as_ref(),
+        "1g".as_ref(),
+        "-type".as_ref(),
+        "SPARSEBUNDLE".as_ref(),
+        "-fs".as_ref(),
+        "Case-sensitive APFS".as_ref(),
+        "-volname".as_ref(),
+        "Pin".as_ref(),
+        "-nospotlight".as_ref(),
+        image.as_os_str(),
+    ]);
+    run(&[
+        "attach".as_ref(),
+        "-nobrowse".as_ref(),
+        "-noautoopen".as_ref(),
+        "-owners".as_ref(),
+        "on".as_ref(),
+        "-mountpoint".as_ref(),
+        mnt.as_os_str(),
+        image.as_os_str(),
+    ]);
+    run(&["info".as_ref(), "-plist".as_ref()]);
+    run(&["detach".as_ref(), mnt.as_os_str()]);
+
+    // `diskutil image` exists from macOS 27; where it does, its blank-image
+    // filesystems still exclude a case-sensitive one.
+    if let Ok(help) = Command::new("/usr/sbin/diskutil")
+        .args(["image", "create", "blank", "--help"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&help.stdout).to_string()
+            + &String::from_utf8_lossy(&help.stderr);
+        if text.contains("--fs") {
+            assert!(
+                !text.to_ascii_lowercase().contains("case-sensitive"),
+                "diskutil image create blank can now make a case-sensitive volume: \
+                 move CasVolume to it (bead ley-line-open-168a65)\n{text}"
+            );
+        }
+    }
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn first_party_images_import_into_a_provisioned_volume_with_their_known_digests() {
@@ -197,18 +299,19 @@ fn first_party_images_import_into_a_provisioned_volume_with_their_known_digests(
     };
     let provisioned = Provisioned::new();
     let cas_root = provisioned.volume.provision().expect("provision").cas_root;
-    // The digests recorded on bead ley-line-open-fe3d26, imported there on
-    // a case-insensitive TMPDIR.
+    // The rootfs manifest v2 digests (links kept) that tests/oci_rootfs.rs
+    // records for these images on a temporary directory: the volume names
+    // the same trees.
     for (name, digest, expected) in [
         (
             "mache",
             "sha256:8620a0dc2d4c2ae7f6cc1f0ee68d6823a8bc9af6a8cf01d332c08738d9203ac7",
-            "dd52c667ff1c44e151bd8f05392607b0760b204dfe5d8e66d92fd76857ea4810",
+            "644574cf881c0751a9025fb910cdb2abfa616ff4cc2894829bbb885ba12741cf",
         ),
         (
             "rosary",
             "sha256:38aadea5d94b5f96ea43d9decd3c6f46f97c71a765fc73afd5f44387c21800ad",
-            "2982e7d59b5d33d5f1ef26af332e2963f6bbb7596017bc0be0ff0b57b25b6a23",
+            "bc4f1fca6acde26c2636999ccf4fc91720b9e11738a7c168753e0beedb87b9ee",
         ),
     ] {
         let rootfs = import(&Path::new(&dir).join(name), digest, &cas_root);

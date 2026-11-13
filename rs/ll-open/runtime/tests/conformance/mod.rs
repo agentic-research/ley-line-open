@@ -141,8 +141,16 @@ impl Backend for Observed {
         self.0.backend.provision()
     }
 
-    fn start(&self, request: &ExecutionRequest) -> Result<BackendRun, ExecutionError> {
-        self.0.backend.start(request)
+    fn start(
+        &self,
+        request: &ExecutionRequest,
+        workspaces: leyline_runtime::ServedWorkspaces,
+    ) -> Result<BackendRun, ExecutionError> {
+        self.0.backend.start(request, workspaces)
+    }
+
+    fn workspace_capacity(&self) -> usize {
+        self.0.backend.workspace_capacity()
     }
 
     fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
@@ -242,6 +250,17 @@ impl Column {
             trap,
             sockets: 0,
         }
+    }
+
+    /// Serve this column's granted workspaces from `shares`: the service
+    /// opens them and hands them to the backend (bead
+    /// `ley-line-open-1022a8`).
+    pub fn with_workspace_shares(
+        mut self,
+        shares: std::sync::Arc<dyn leyline_runtime::backends::libkrun::share::WorkspaceShares>,
+    ) -> Self {
+        self.service = ExecutionService::new(self.backend.clone()).with_workspace_shares(shares);
+        self
     }
 
     pub fn run_roots(&self) -> usize {
@@ -876,6 +895,15 @@ pub fn spec_and_grant(authority: &GrantSpec<'_>) -> (Vec<u8>, Vec<u8>) {
                     .expect("graphRoot prefix"),
             );
             entry.set_expected_generation(workspace.expected_generation);
+            // No scope is the field left unset; an empty list is refused.
+            if !workspace.write_scope.is_empty() {
+                let mut scope = entry
+                    .reborrow()
+                    .init_write_scope(workspace.write_scope.len() as u32);
+                for (slot, path) in workspace.write_scope.iter().enumerate() {
+                    scope.set(slot as u32, path);
+                }
+            }
             let mut operations = entry.init_operations(workspace.operations.len() as u32);
             for (slot, operation) in workspace.operations.iter().enumerate() {
                 operations.set(
@@ -1864,6 +1892,7 @@ pub fn workspace_grant(graph_root: &str) -> WorkspaceGrant {
             leyline_runtime::WorkspaceOperation::List,
             leyline_runtime::WorkspaceOperation::Mutate,
         ],
+        write_scope: vec!["/".into()],
     }
 }
 
@@ -1903,6 +1932,131 @@ pub struct GraphFixture {
     pub stored: StoredBytes,
 }
 
+/// Authorize and start a probe guest granted `grant`, through execution/v1,
+/// and answer its run id. A workspace share is opened only for a verified
+/// grant (bead `ley-line-open-1022a8`), so a workspace guest starts the way
+/// every transport starts one.
+fn start_workspace_probes(
+    column: &Column,
+    replay_key: &str,
+    grant: &WorkspaceGrant,
+    manifest: &ConfinementManifest,
+    channel: &Channel,
+    probes: &[String],
+) -> String {
+    column.provision();
+    let document = manifest.to_canonical_json().expect("document");
+    let digest = manifest.confinement_digest().expect("digest");
+    let mut authority = GrantSpec::new(column.spec.class, replay_key, &digest, &document);
+    authority.workspaces = vec![grant.clone()];
+    let (spec, signed) = spec_and_grant(&authority);
+    let mut environment = guest_env("probe", Some(channel));
+    environment.push(("CONFORMANCE_PROBES", probes.join(";")));
+    column
+        .service
+        .start_authorized(
+            &spec,
+            &signed,
+            &column.policy(&digest),
+            &column.resolver(&environment),
+        )
+        .unwrap_or_else(|error| panic!("{}: start a workspace guest: {error}", column.spec.name))
+        .run_id
+}
+
+/// What the write-scope row needs from a column that serves workspaces: a
+/// store holding [`SCOPE_FILE`], [`SCOPE_OUTSIDE`] and [`SCOPE_KEPT`], and a
+/// grant of it whose `writeScope` is [`SCOPE_FILE`] and [`SCOPE_TREE`].
+pub struct ScopeFixture {
+    pub grant: WorkspaceGrant,
+    pub stored: StoredBytes,
+}
+
+/// The one file the scoped grant may write.
+pub const SCOPE_FILE: &str = "a.go";
+/// The directory tree the scoped grant may write beneath.
+pub const SCOPE_TREE: &str = "docs/";
+/// A file beside [`SCOPE_FILE`], outside the scope.
+pub const SCOPE_OUTSIDE: &str = "b.go";
+/// A file the store holds inside [`SCOPE_TREE`].
+pub const SCOPE_KEPT: &str = "docs/keep.md";
+
+/// Write scope (bead `ley-line-open-483134`): a guest whose grant names one
+/// file and one directory tree edits the file and creates under the tree,
+/// and is refused `EACCES` for an edit beside the file, a create at the
+/// workspace root, and a rename out of the tree. Nothing refused lands in
+/// the store.
+pub fn row_a_write_scope_bounds_what_the_guest_writes(mut column: Column, scope: ScopeFixture) {
+    let name = column.spec.name;
+    let channel = column.open_channel();
+    let manifest = column.manifest(Some(&channel));
+    let bytes = "scoped\n";
+    let write = |probe: &str, path: &str| format!("{probe}=write:{path}:{}", hex(bytes.as_bytes()));
+    let probes = [
+        write("edit_granted", SCOPE_FILE),
+        write("create_in_tree", "docs/new.md"),
+        write("edit_outside", SCOPE_OUTSIDE),
+        write("create_at_root", "new.md"),
+        format!("rename_out=rename:{SCOPE_KEPT}:keep.md"),
+        format!("read_outside=read:{SCOPE_OUTSIDE}"),
+    ];
+    let outside_before = (scope.stored)(SCOPE_OUTSIDE).expect("the store holds the outside file");
+    let kept_before = (scope.stored)(SCOPE_KEPT).expect("the store holds the kept file");
+    let run_id =
+        start_workspace_probes(&column, "scope", &scope.grant, &manifest, &channel, &probes);
+    let mut accepted = channel.accept(&column, &run_id);
+    let reports = read_probes(&mut accepted);
+    assert_eq!(
+        column.backend.settle(&run_id),
+        BackendRunStatus::Succeeded,
+        "{name}: the scoped guest exits 0; reports: {reports:#?}"
+    );
+
+    for inside in ["edit_granted", "create_in_tree"] {
+        let report = probe(&reports, inside);
+        assert!(
+            report.ok && report.detail == bytes.replace('\n', "\\n"),
+            "{name}: a write inside the scope lands: {report:?}"
+        );
+    }
+    for outside in ["edit_outside", "create_at_root", "rename_out"] {
+        let report = probe(&reports, outside);
+        assert!(!report.ok, "{name}: a change outside the scope: {report:?}");
+        assert_eq!(
+            report.errno,
+            Some(libc::EACCES),
+            "{name}: outside the scope is EACCES: {report:?}"
+        );
+    }
+    // The scope narrows writes, not reads.
+    assert!(probe(&reports, "read_outside").ok, "{name}: {reports:#?}");
+
+    assert_eq!(
+        (scope.stored)(SCOPE_FILE).as_deref(),
+        Some(bytes.as_bytes()),
+        "{name}: the granted edit landed in the store"
+    );
+    assert_eq!(
+        (scope.stored)("docs/new.md").as_deref(),
+        Some(bytes.as_bytes()),
+        "{name}: the file created under the granted tree landed in the store"
+    );
+    assert_eq!(
+        (scope.stored)(SCOPE_OUTSIDE),
+        Some(outside_before),
+        "{name}: the refused edit changed nothing"
+    );
+    assert_eq!(
+        (scope.stored)(SCOPE_KEPT),
+        Some(kept_before),
+        "{name}: the refused rename moved nothing"
+    );
+    assert_eq!((scope.stored)("new.md"), None, "{name}");
+    assert_eq!((scope.stored)("keep.md"), None, "{name}");
+    assert_eq!(column.run_roots(), 0, "{name}");
+    column.finish();
+}
+
 /// Graph I/O: a guest granted a workspace reads the store's bytes through
 /// the mediated share, lists it, writes through it, and the write lands in
 /// the store on the host. The share is the only Graph surface: the store's
@@ -1921,15 +2075,13 @@ pub fn row_graph_io_goes_through_the_mediated_workspace_share(
         format!("graph_write=write:{path}:{}", hex(graph.write.as_bytes())),
         format!("live_db_read=read:{}", graph.live_db.display()),
     ];
-    let mut request = workspace_request(&column, "graph", graph.grant.clone());
-    request.public_environment = BTreeMap::from([
-        ("CONFORMANCE_MODE".to_owned(), "probe".to_owned()),
-        ("CONFORMANCE_DIAL".to_owned(), channel.dial.clone()),
-        ("CONFORMANCE_PROBES".to_owned(), probes.join(";")),
-    ]);
-    request.confinement_manifest = Some(manifest.to_canonical_json().expect("document"));
-    request.confinement_digest = manifest.confinement_digest().expect("digest");
-    let record = column.service.start(request).expect("start a Graph guest");
+    let run_id =
+        start_workspace_probes(&column, "graph", &graph.grant, &manifest, &channel, &probes);
+    let record = column
+        .service
+        .status(&run_id)
+        .expect("status")
+        .expect("the Graph guest is a run");
     let mut accepted = channel.accept(&column, &record.run_id);
     let reports = read_probes(&mut accepted);
     assert_eq!(

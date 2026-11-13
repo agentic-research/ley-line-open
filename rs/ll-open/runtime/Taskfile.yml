@@ -27,6 +27,38 @@ tasks:
       - cargo test -p leyline-krun-worker
       # Builds on the worker binary the line above built.
       - cargo test -p leyline-cli --test agent_in_guest
+      # The recorded run (`task release:hypervisor:record` sets
+      # LEYLINE_REQUIRE_HYPERVISOR=1) also provisions a real CAS volume, so
+      # the release receipt covers hdiutil, not only its fakes (bead
+      # ley-line-open-1665c9).
+      - task: test:cas-volume:required
+
+  test:cas-volume:required:
+    internal: true
+    platforms: [darwin]
+    status:
+      - '[ "${LEYLINE_REQUIRE_HYPERVISOR:-}" != 1 ]'
+    cmds:
+      - task: test:cas-volume
+
+  test:cas-volume:
+    desc: >-
+      Provision real case-sensitive CAS volumes with /usr/bin/hdiutil and run
+      the daemon's provision over its socket (LEYLINE_CAS_VOLUME_TESTS=1):
+      create, attach, re-attach, the nodev/nosuid mount flags, the attached
+      image matched to cas.sparsebundle, and the pinned hdiutil deprecation
+      warnings. macOS only, unprivileged; each test detaches its volume.
+      Set LEYLINE_OCI_ACCEPTANCE_DIR to also import the first-party images.
+      `task runtime:test` runs this when LEYLINE_REQUIRE_HYPERVISOR=1, which
+      `task release:hypervisor:record` sets, so its receipt covers it.
+    dir: '{{.TASKFILE_DIR}}/../..'
+    platforms: [darwin]
+    env:
+      RUSTC_WRAPPER: ''
+      LEYLINE_CAS_VOLUME_TESTS: '1'
+    cmds:
+      - cargo test -p leyline-runtime --test cas_volume
+      - cargo test -p leyline-cli --test execution_cas_volume
 
   oci-fixture:
     desc: >-

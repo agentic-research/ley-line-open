@@ -383,13 +383,19 @@ pub struct ExecutionRequest {
     pub allowed_egress: Vec<String>,
     pub limits: ResourceLimits,
     /// The `confinementDigest` the grant authorized, carried through so the
-    /// supervisor can check the worker's attestation against it.
+    /// worker can compare the policy it is about to apply with it before the
+    /// workload starts, and the supervisor can check the worker's attestation
+    /// against it (bead `ley-line-open-7a3109`).
     ///
-    /// Empty means the resolver declared none, and the worker's attestation
-    /// is then not checked — a state the shipped resolver never produces, and
-    /// which exists only so an embedder-supplied resolver fails loudly at its
-    /// own boundary rather than silently here.
-    #[serde(default)]
+    /// Empty means no commitment: a direct `Backend::start` embedder with no
+    /// grant. The worker then applies the deployment policy and attests it
+    /// with nothing to compare. The service never produces this state (it
+    /// refuses a resolver that changes the digest), and a request carrying a
+    /// `confinement_manifest` with an empty digest is refused by the worker.
+    ///
+    /// Required on the wire, empty or not: a request that omits the key is
+    /// refused rather than read as "no commitment", so that mode is always an
+    /// explicit empty string and never a forgotten field.
     pub confinement_digest: String,
     /// The `confinement/v1` document `confinement_digest` was taken over, when
     /// the grant carried one.
@@ -434,6 +440,14 @@ pub struct WorkspaceGrant {
     pub expected_generation: u64,
     /// Exactly the operations permitted.
     pub operations: Vec<WorkspaceOperation>,
+    /// Where the run may write, create, rename or delete (`execution/v1`
+    /// `WorkspaceGrant.writeScope`, bead `ley-line-open-483134`): exact file
+    /// paths and `/`-terminated directory prefixes, relative to the workspace
+    /// root; the single entry `/` is the whole workspace. Authorization
+    /// refuses a grant unless this is non-empty exactly when `operations`
+    /// permit `mutate` or `commit`. The share the service opens for the
+    /// grant enforces it; reads stay governed by `graph_root`.
+    pub write_scope: Vec<String>,
 }
 
 /// An operation a [`WorkspaceGrant`] permits (`execution/v1`
@@ -466,6 +480,7 @@ impl ExecutionRequest {
             return Err(ExecutionError::invalid("wall_time_ms must be non-zero"));
         }
         self.limits.validate()?;
+        refuse_unrepresentable_environment(&self.public_environment)?;
         if !self.allowed_egress.is_empty() {
             return Err(ExecutionError::unsupported(
                 "the configured execution backend does not yet support egress grants",
@@ -473,6 +488,32 @@ impl ExecutionRequest {
         }
         Ok(())
     }
+}
+
+/// Refuse, by name, an environment no tier can give a workload: a key that
+/// is empty or holds `=` or NUL, or a value that holds NUL. Every tier
+/// passes `KEY=VALUE` to the workload, where the first `=` ends the key and
+/// NUL ends the string, so such an entry would arrive as some other
+/// variable, or not at all. One rule for every tier (bead
+/// `ley-line-open-9d75c9`); a tier adds its own reservations on top (the
+/// microVM tier's `KRUN_` keys and size bounds).
+pub(crate) fn refuse_unrepresentable_environment(
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<(), ExecutionError> {
+    for (key, value) in environment {
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment key {key:?} cannot name an environment variable: it is \
+                 empty or holds `=` or NUL"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(ExecutionError::invalid(format!(
+                "publicEnvironment value of {key:?} holds NUL, which no environment can carry"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_guest_path(value: &str) -> Result<(), ExecutionError> {
@@ -490,13 +531,17 @@ fn validate_guest_path(value: &str) -> Result<(), ExecutionError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BackendRun {
     pub backend_id: String,
-    /// Every channel the run's worker holds beyond its standard streams,
-    /// verified against what the worker declared at readiness. The receipt's
-    /// backend evidence names them ([`BackendEvidenceDocument`]).
-    pub channels: Vec<WorkerChannel>,
+    /// The workspace shares the backend took from the
+    /// [`crate::ServedWorkspaces`] it was handed and attached to its worker,
+    /// verified against what the worker declared at readiness. A backend
+    /// cannot write one of these itself, so it cannot claim a share it did
+    /// not take. The service asserts they are the run's granted workspaces
+    /// exactly, and the receipt's backend evidence names them
+    /// ([`BackendEvidenceDocument`]).
+    pub attached: Vec<crate::AttachedWorkspace>,
 }
 
 /// A channel a backend's worker holds outside its confinement manifest.
@@ -579,6 +624,19 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
 /// Terminal result observed by a backend supervisor.  The service projects
 /// this into the shared execution/v1 lifecycle and receipt stream instead of
 /// leaving a run permanently `Running` after its worker exits.
+///
+/// On the libkrun tier a worker that exits nonzero is `Failed`, its detail
+/// naming the status ("exited with exit status: N"). Status 125 also means
+/// the guest never ran its workload to a recorded end: the guest init
+/// refused to start it (LLO libkrun patch 0015: a mount target that is not
+/// a real directory, a `/tmp` that is not one, a missing exec config), or
+/// the guest stopped without recording any status (patch 0016: init died,
+/// the kernel panicked). Init's reason, when it could state one, is in the
+/// run's [`GuestOutput::stdout_tail`]. A workload that itself exits 125
+/// looks the same, and the reason text is the guest's own untrusted output:
+/// neither authenticates "the runtime refused" (bead
+/// `ley-line-open-7164ec`; a channel the guest cannot write is bead
+/// `ley-line-open-f7bcb3`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendRunStatus {
     Succeeded,
@@ -716,7 +774,36 @@ pub struct RunRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendEvidenceDocument, WorkerChannel};
+    use super::{BackendEvidenceDocument, WorkerChannel, refuse_unrepresentable_environment};
+
+    /// The tier-neutral environment rule refuses only what no environment
+    /// can carry, and admits everything else, `=` inside a value included
+    /// (bead `ley-line-open-9d75c9`; execution/v1 README "Public
+    /// environment").
+    #[test]
+    fn the_environment_rule_refuses_only_the_unrepresentable() {
+        let one = |key: &str, value: &str| {
+            std::collections::BTreeMap::from([(key.to_owned(), value.to_owned())])
+        };
+        for (key, value) in [
+            ("TOKEN", "a=b"),
+            ("lower.case", "v"),
+            ("A B", "\"quoted\" -- \n"),
+            ("KRUN_X", "1"),
+            ("K", ""),
+        ] {
+            assert_eq!(
+                refuse_unrepresentable_environment(&one(key, value)),
+                Ok(()),
+                "{key:?}={value:?} is admitted on every tier"
+            );
+        }
+        for (key, value) in [("", "1"), ("A=B", "1"), ("K\0", "1"), ("K", "v\0")] {
+            let error = refuse_unrepresentable_environment(&one(key, value)).expect_err("refused");
+            assert_eq!(error.code, crate::ErrorCode::InvalidSpec, "{key:?}");
+            assert!(error.detail.starts_with("publicEnvironment"), "{error}");
+        }
+    }
 
     /// The canonical bytes the execution/v1 README's "Backend evidence"
     /// section specifies, pinned: keys in ASCII order at every level

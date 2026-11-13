@@ -20,6 +20,16 @@ use std::path::{Path, PathBuf};
 
 use super::{ConfigRefusal, Reason};
 
+// libc's file-mode constants are `u16` on macOS and `u32` on Linux. Widening
+// them once here keeps every comparison below portable; the cast is a no-op on
+// Linux, which is the only reason the lint is allowed.
+#[allow(clippy::unnecessary_cast)]
+const S_ISVTX: u32 = libc::S_ISVTX as u32;
+#[allow(clippy::unnecessary_cast)]
+const S_IFMT: u32 = libc::S_IFMT as u32;
+#[allow(clippy::unnecessary_cast)]
+const S_IFREG: u32 = libc::S_IFREG as u32;
+
 /// The largest file read: a secret or a document is small.
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
 
@@ -273,7 +283,7 @@ mod imp {
                 st.st_uid
             )));
         }
-        if mode & 0o022 != 0 && mode & (libc::S_ISVTX as u32) == 0 {
+        if mode & 0o022 != 0 && mode & S_ISVTX == 0 {
             return Err(refuse(format!(
                 "directory {} is writable by group or others",
                 shown.display()
@@ -350,7 +360,7 @@ mod imp {
         };
         let st = fstat(&fd).map_err(|e| refuse(format!("{}: {e}", path.display())))?;
         let mode = st.st_mode as u32;
-        if mode & (libc::S_IFMT as u32) != libc::S_IFREG as u32 {
+        if mode & S_IFMT != S_IFREG {
             return Err(refuse(format!("{} is not a regular file", path.display())));
         }
         if st.st_uid != euid() {

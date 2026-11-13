@@ -335,13 +335,43 @@
       "ok": true,
       "columns": ["one"],
       "rows": [
-        {"one": "1"}
+        ["1"]
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
     "response_optional_keys": ["truncated", "limit"],
     "go_binding": "QueryResponse",
-    "go_drift_skip": "Structural: schema declares rows:List(QueryRow) with positional values:List(Text); handler emits column-keyed maps. Can't be reconciled additively without changing the wire shape (would break debug consumers of `op_query`). Tracked as follow-up; this is the only op that genuinely needs a design call rather than a schema bump."
+    "go_drift_skip": null
+  },
+
+  "query_duplicate_columns": {
+    "request": {"op": "query", "sql": "SELECT 1 AS id, 2 AS id"},
+    "response": {
+      "ok": true,
+      "columns": ["id", "id"],
+      "rows": [
+        ["1", "2"]
+      ]
+    },
+    "response_required_keys": ["ok", "columns", "rows"],
+    "response_optional_keys": ["truncated", "limit"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
+  },
+
+  "query_null": {
+    "request": {"op": "query", "sql": "SELECT NULL AS a, '' AS b"},
+    "response": {
+      "ok": true,
+      "columns": ["a", "b"],
+      "rows": [
+        [null, ""]
+      ]
+    },
+    "response_required_keys": ["ok", "columns", "rows"],
+    "response_optional_keys": ["truncated", "limit"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
   },
 
   "query_refused": {

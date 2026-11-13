@@ -584,11 +584,17 @@ Composing the two yields **handler ↔ schema** transitively. Either half
 failing means the chain broke. The fixture file is the deliberate
 intermediate artifact, not an artifact of the implementation.
 
-One op, `query`, is SKIPPED in the Go half, with the drift reason as the
-skip message: the schema declares positional `rows: List(QueryRow)` and the
-handler emits column-keyed maps, which no additive schema change reconciles.
-The Rust half still runs it. Every other fixture's `go_drift_skip` is null;
-bead A-2 (`b631c8`) reconciled the others additively.
+No fixture is skipped in the Go half: every `go_drift_skip` is null. Bead
+A-2 (`b631c8`) reconciled the other ops additively. `query` was the last
+skip, because its handler sent rows as objects keyed by column name while
+the schema declared positional rows; a keyed row also lost a value whenever
+two columns shared a name. Bead `ley-line-open-0a18bc` made the rows
+positional, a wire break: `QueryResponse.rows` (@5, `List(List(Text))`) is
+one array per row in `columns` order, JSON `null` for SQL NULL, and the old
+@2 field is retired as `rowsV0` and never emitted. The `query`,
+`query_duplicate_columns` and `query_null` fixtures are checked for exact
+equality against the daemon over both transports
+(`tests/query_read_only_test.rs`).
 
 ## Rules
 

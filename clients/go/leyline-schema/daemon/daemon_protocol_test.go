@@ -171,10 +171,6 @@ type ref struct {
 	SourceID *string `json:"source_id"`
 }
 
-type queryRow struct {
-	Values []string `json:"values"`
-}
-
 type readContentResponse struct {
 	OK      *bool   `json:"ok"`
 	Content *string `json:"content,omitempty"`
@@ -273,7 +269,7 @@ type queryRefusal struct {
 type queryResponse struct {
 	OK      *bool         `json:"ok"`
 	Columns []string      `json:"columns"`
-	Rows    []queryRow    `json:"rows"`
+	Rows    [][]*string   `json:"rows"`
 	Error   *string       `json:"error,omitempty"`
 	Refusal *queryRefusal `json:"refusal,omitempty"`
 }

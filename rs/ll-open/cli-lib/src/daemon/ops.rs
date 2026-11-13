@@ -974,8 +974,8 @@ impl Drop for ReadProfileTimer {
 /// not provided). Sets `truncated: true` in the response when the cap is
 /// hit, so callers can paginate via `LIMIT/OFFSET` in the SQL itself if
 /// they need everything.
-/// One SQLite value as the `query` op's wire text (schema: `values:
-/// List(Text)`; fixture `daemon-protocol.json` answers `SELECT 1` with
+/// One SQLite value as the `query` op's wire text (schema: `rows:
+/// List(List(Text))`; fixture `daemon-protocol.json` answers `SELECT 1` with
 /// `"1"`): an integer or real in decimal, text as itself, a blob as
 /// lowercase hex, and NULL as JSON null so it stays distinct from the empty
 /// string.
@@ -1015,7 +1015,9 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
 }
 
 /// The `query` op's success response: up to `limit` rows of `stmt`, each an
-/// object keyed by column name.
+/// array of values in `columns` order (schema: `QueryResponse.rows`). A row
+/// keyed by column name would lose a value whenever two columns share a
+/// name (bead `ley-line-open-0a18bc`).
 fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String> {
     let col_count = stmt.column_count();
     let headers: Vec<String> = (0..col_count)
@@ -1033,11 +1035,10 @@ fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String
             truncated = true;
             break;
         }
-        let mut obj = serde_json::Map::new();
-        for (i, col) in headers.iter().enumerate() {
-            obj.insert(col.clone(), sql_value_to_json(row.get_ref(i)?));
-        }
-        rows_out.push(serde_json::Value::Object(obj));
+        let values = (0..col_count)
+            .map(|i| Ok(sql_value_to_json(row.get_ref(i)?)))
+            .collect::<Result<Vec<_>>>()?;
+        rows_out.push(serde_json::Value::Array(values));
     }
 
     let mut response = serde_json::Map::new();
@@ -5519,9 +5520,41 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             parsed["rows"],
-            json!([{"i": "42", "r": "-1.5", "z": null, "b": "00ff", "t": "t",
-                    "inf": "inf", "ninf": "-inf"}]),
+            json!([["42", "-1.5", null, "00ff", "t", "inf", "-inf"]]),
         );
+    }
+
+    /// Bead `ley-line-open-0a18bc`: each row is an array in `columns` order,
+    /// so two columns with one name both keep their value. A row keyed by
+    /// column name lost the first `id`.
+    #[tokio::test]
+    async fn op_query_keeps_every_value_of_a_repeated_column_name() {
+        let (_dir, ctx) = setup();
+        let result = handle_base_op_legacy(
+            &ctx,
+            "query",
+            &json!({"sql": "SELECT 1 AS id, 2 AS id"}),
+        )
+        .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["columns"], json!(["id", "id"]), "{parsed}");
+        assert_eq!(parsed["rows"], json!([["1", "2"]]), "{parsed}");
+    }
+
+    /// Bead `ley-line-open-0a18bc`: SQL NULL is JSON null in its position,
+    /// distinct from the empty string.
+    #[tokio::test]
+    async fn op_query_keeps_null_distinct_from_the_empty_string() {
+        let (_dir, ctx) = setup();
+        let result = handle_base_op_legacy(
+            &ctx,
+            "query",
+            &json!({"sql": "SELECT NULL AS a, '' AS b"}),
+        )
+        .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["columns"], json!(["a", "b"]), "{parsed}");
+        assert_eq!(parsed["rows"], json!([[null, ""]]), "{parsed}");
     }
 
     #[tokio::test]

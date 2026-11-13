@@ -90,6 +90,9 @@ struct Event {
   data   @3 :Text;   # JSON-encoded payload (flexible per topic)
 }
 
+# Retired (bead `ley-line-open-0a18bc`): the row type of
+# `QueryResponse.rowsV0`, which is never emitted. Kept because that field
+# still names it; schema evolution never removes a type a field references.
 struct QueryRow {
   values @0 :List(Text);
 }
@@ -298,9 +301,18 @@ struct QueryRequest {
 struct QueryResponse {
   ok      @0 :Bool;
   columns @1 :List(Text);
-  rows    @2 :List(QueryRow);
+  # Retired, never emitted (bead `ley-line-open-0a18bc`). It declared rows
+  # as `{"values": [...]}` structs while the daemon sent objects keyed by
+  # column name, and a keyed row drops a value whenever two columns share a
+  # name. The ordinal stays reserved; `rows` @5 carries the rows.
+  rowsV0  @2 :List(QueryRow)  $Json.name("rows_v0");
   error   @3 :Text;
   refusal @4 :QueryRefusal;
+  # One element per result row; each row holds one value per entry of
+  # `columns`, in `columns` order. A null element is SQL NULL, distinct from
+  # the empty string. An integer or real is its decimal text, text is
+  # itself, a blob is lowercase hex.
+  rows    @5 :List(List(Text))  $Json.name("rows");
 }
 
 # Why a `query` statement was refused.

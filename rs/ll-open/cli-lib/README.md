@@ -30,7 +30,7 @@ Two transports, single dispatch table:
 - **UDS** (`default.sock`) — line-delimited JSON; shell-debuggable (`echo '{"op":"status"}' | nc -U`).
 - **MCP** (HTTP `/mcp` on `--mcp-port`, which the OCI image sets to 8384; or `--mcp-uds`) — JSON-RPC; consumed by cloister + agentic clients.
 
-Every base-op response except `query`/`lsp_*`/`vec_search` is typed against `daemon.capnp` via [`daemon/wire.rs`](src/daemon/wire.rs) and emitted by `capnp_json::to_json`. The three carve-outs emit ad-hoc JSON (row payloads with method-specific shapes — typing them would add ceremony without buying drift detection beyond what the fixture gate already provides). See [ADR-0014's interim status](../../../docs/adr/0014-capnp-as-protocol.md) for the JSON-as-carrier doctrine; bead `ley-line-open-40df83` tracks the planned binary-capnp wire as the natural step 4.
+Every base-op response except `query`/`lsp_*`/`vec_search` is typed against `daemon.capnp` via [`daemon/wire.rs`](src/daemon/wire.rs) and emitted by `capnp_json::to_json`. The three carve-outs emit ad-hoc JSON (row payloads with method-specific shapes — typing them would add ceremony without buying drift detection beyond what the fixture gate already provides). `query`'s ad-hoc JSON still matches `QueryResponse`: each row is an array of values in `columns` order, JSON `null` for SQL NULL (bead `ley-line-open-0a18bc`), and the fixture gate checks it in both runtimes. See [ADR-0014's interim status](../../../docs/adr/0014-capnp-as-protocol.md) for the JSON-as-carrier doctrine; bead `ley-line-open-40df83` tracks the planned binary-capnp wire as the natural step 4.
 
 ## Used by
 

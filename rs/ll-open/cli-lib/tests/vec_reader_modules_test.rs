@@ -92,7 +92,7 @@ async fn a_pooled_reader_has_sqlite_vec_modules() {
     .await;
     assert_eq!(
         reply["rows"],
-        serde_json::json!([{"value": "1"}, {"value": "2"}]),
+        serde_json::json!([["1"], ["2"]]),
         "a pooled reader must have sqlite-vec's vec_each: {reply}"
     );
     daemon.abort();

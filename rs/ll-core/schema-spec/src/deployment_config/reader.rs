@@ -474,6 +474,56 @@ mod tests {
     }
 
     #[test]
+    fn type_names_are_spelled_out() {
+        let names: Vec<&str> = [
+            Json::Object(vec![]),
+            Json::Array(vec![]),
+            Json::String(Str { raw: vec![] }),
+            Json::Number("1".into()),
+            Json::Bool(true),
+            Json::Null,
+        ]
+        .iter()
+        .map(Json::type_name)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "an object",
+                "an array",
+                "a string",
+                "a number",
+                "a boolean",
+                "null"
+            ]
+        );
+    }
+
+    /// TOML nesting is bounded like JSON's: 16 levels of tables or of arrays
+    /// read, 17 are `malformed`.
+    #[test]
+    fn toml_nesting_limit_is_exact() {
+        let tables = |n: usize| -> String {
+            (1..n)
+                .map(|i| format!("[{}]\n", vec!["t"; i].join(".")))
+                .collect()
+        };
+        assert!(read_toml(tables(MAX_DEPTH).as_bytes()).is_ok());
+        assert_eq!(
+            read_toml(tables(MAX_DEPTH + 1).as_bytes())
+                .unwrap_err()
+                .reason,
+            Reason::Malformed
+        );
+        let arrays = |n: usize| format!("a = {}{}", "[".repeat(n), "]".repeat(n));
+        assert!(read_toml(arrays(MAX_DEPTH - 1).as_bytes()).is_ok());
+        assert_eq!(
+            read_toml(arrays(MAX_DEPTH).as_bytes()).unwrap_err().reason,
+            Reason::Malformed
+        );
+    }
+
+    #[test]
     fn toml_maps_types_and_refuses_floats_and_datetimes() {
         let doc = read_toml(b"a = 1\nb = \"x\"\nc = [true]\n[d]\ne = -2\n").unwrap();
         let Json::Object(members) = doc else { panic!() };

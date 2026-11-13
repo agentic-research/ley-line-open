@@ -40,6 +40,9 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 
+/// The D4 file rules need `openat`, `fstat` and owner ids: Unix only, as LLO
+/// is (macOS and Linux).
+#[cfg(unix)]
 pub mod files;
 mod model;
 mod reader;
@@ -819,6 +822,127 @@ mod tests {
         assert_eq!(Value::opt(None::<u64>, Value::Int), Value::Null);
         assert_eq!(Value::opt(Some(3), Value::Int), Value::Int(3));
         assert_eq!(Value::strs(["x"]), Value::Array(vec![Value::str("x")]));
+    }
+
+    /// Containers inside a list are indented one level past the list.
+    #[test]
+    fn nested_containers_in_a_list_are_indented() {
+        let v = Value::Array(vec![
+            Value::object([("a", Value::Int(1))]),
+            Value::Array(vec![Value::Int(2)]),
+        ]);
+        assert_eq!(
+            String::from_utf8(v.canonical_bytes()).unwrap(),
+            "[\n  {\n    \"a\": 1\n  },\n  [\n    2\n  ]\n]"
+        );
+    }
+
+    fn mac() -> HostFacts {
+        HostFacts {
+            home: Some("/h".into()),
+            xdg_state_home: None,
+            data_dir: Some("/h/data".into()),
+            os: Os::MacOs,
+        }
+    }
+
+    fn resolved(kind: Kind, json: &str) -> Document {
+        resolve(json.as_bytes(), Syntax::Json, &[kind], &mac())
+            .unwrap_or_else(|e| panic!("{json}: {e}"))
+            .document
+    }
+
+    /// Every loosening field is reported, and a default document reports
+    /// none (D5, "Loosening is visible").
+    #[test]
+    fn loosenings_name_each_loosened_field() {
+        let Document::Daemon(d) = resolved(
+            Kind::Daemon,
+            r#"{"apiVersion":"config.leyline/v1","kind":"DaemonConfig",
+                "mcp":{"noAuth":true,"http":{"port":1,"bind":"0.0.0.0","allowPublic":true}}}"#,
+        ) else {
+            panic!()
+        };
+        let fields: Vec<&str> = d.loosenings().into_iter().map(|(f, _)| f).collect();
+        assert_eq!(fields, ["mcp.noAuth", "mcp.http.allowPublic"]);
+        assert!(d.loosenings().iter().all(|(_, n)| !n.is_empty()));
+        let Document::Daemon(d) = resolved(
+            Kind::Daemon,
+            r#"{"apiVersion":"config.leyline/v1","kind":"DaemonConfig"}"#,
+        ) else {
+            panic!()
+        };
+        assert!(d.loosenings().is_empty());
+
+        let exec = |evidence: &str, backend: &str| {
+            let Document::ExecutionDaemon(d) = resolved(
+                Kind::ExecutionDaemon,
+                &format!(
+                    r#"{{"apiVersion":"config.leyline/v1","kind":"ExecutionDaemonConfig",
+                    "cas":{{"directory":{{"root":"/c","runRoot":"/r"}}}},"worker":{{"path":"/w"}},
+                    "catalog":"/k","evidence":{evidence},"backend":{backend}}}"#
+                ),
+            ) else {
+                panic!()
+            };
+            d.loosenings()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            exec(
+                r#"{"unverified":{}}"#,
+                r#"{"microVm":{"tsiHijackInet":true}}"#
+            ),
+            ["evidence.unverified", "backend.microVm.tsiHijackInet"]
+        );
+        let verified = r#"{"verified":{"trustKeys":["/t"],"store":"/s"}}"#;
+        assert!(exec(verified, r#"{"microVm":{}}"#).is_empty());
+        assert!(exec(verified, r#"{"native":{}}"#).is_empty());
+
+        let sign = |auth: bool, allow: bool| {
+            let Document::SignHelper(d) = resolved(
+                Kind::SignHelper,
+                &format!(
+                    r#"{{"apiVersion":"config.leyline/v1","kind":"SignHelperConfig",
+                    "auth":{{"required":{auth},"callerTokens":{{"file":"/t"}}}},
+                    "signAllow":{{"required":{allow},"callers":{{"a":["op://x"]}}}}}}"#
+                ),
+            ) else {
+                panic!()
+            };
+            d.loosenings()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sign(false, false), ["auth.required", "signAllow.required"]);
+        assert!(sign(true, true).is_empty());
+    }
+
+    /// The daemon kinds expose their shared sections; the sign helper has
+    /// none.
+    #[test]
+    fn shared_sections_belong_to_the_daemon_kinds() {
+        let d = resolved(
+            Kind::Daemon,
+            r#"{"apiVersion":"config.leyline/v1","kind":"DaemonConfig",
+                "parser":{"queryMatchLimit":7},"head":{"requireSignature":true},
+                "diagnostics":{"profile":true}}"#,
+        );
+        let (p, h, g) = d.shared_sections().unwrap();
+        assert_eq!(
+            (p.query_match_limit, h.require_signature, g.profile),
+            (7, true, true)
+        );
+        let s = resolved(
+            Kind::SignHelper,
+            r#"{"apiVersion":"config.leyline/v1","kind":"SignHelperConfig",
+                "auth":{"required":false},"signAllow":{"required":false}}"#,
+        );
+        assert!(s.shared_sections().is_none());
+        assert_eq!(s.kind(), Kind::SignHelper);
     }
 
     #[test]

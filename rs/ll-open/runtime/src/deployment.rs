@@ -727,14 +727,39 @@ mod tests {
         let check = check_execution_host(&d);
         assert!(check.refusals.is_empty(), "{:?}", check.refusals);
 
-        write(&seed, b"not a seed");
+        // An existing run-root directory is fine and no longer deferred; a
+        // file in its place is refused.
+        std::fs::create_dir(dir.path().join("runs")).unwrap();
         let check = check_execution_host(&d);
-        assert!(
+        assert!(check.refusals.is_empty(), "{:?}", check.refusals);
+        assert!(check.deferred.is_empty(), "{:?}", check.deferred);
+        std::fs::remove_dir(dir.path().join("runs")).unwrap();
+        write(&dir.path().join("runs"), b"x");
+        let check = check_execution_host(&d);
+        assert_eq!(
             check
                 .refusals
                 .iter()
-                .any(|r| r.field == "head.signingKey" && r.reason == Reason::SecretFileInvalid)
+                .map(|r| r.field.as_str())
+                .collect::<Vec<_>>(),
+            ["cas.directory.runRoot"]
         );
+        std::fs::remove_file(dir.path().join("runs")).unwrap();
+
+        // A seed must be 64 hex characters: a short one and a 64-character
+        // non-hex one are both refused.
+        for bad in ["not a seed".to_owned(), "zz".repeat(32)] {
+            write(&seed, bad.as_bytes());
+            let check = check_execution_host(&d);
+            assert!(
+                check
+                    .refusals
+                    .iter()
+                    .any(|r| r.field == "head.signingKey" && r.reason == Reason::SecretFileInvalid),
+                "{bad}: {:?}",
+                check.refusals
+            );
+        }
     }
 
     #[test]

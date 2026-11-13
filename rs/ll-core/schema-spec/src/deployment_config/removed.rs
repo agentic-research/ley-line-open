@@ -200,6 +200,10 @@ mod tests {
             ["LLO_EXTRACTION_EPOCH", "LLO_INJECTIONS_SCM"]
         );
         assert!(test_seams_set(env(&[])).is_empty());
+        assert!(
+            test_seams_set(env(&[("PATH", "/bin")])).is_empty(),
+            "an unrelated variable is no seam"
+        );
     }
 
     #[test]

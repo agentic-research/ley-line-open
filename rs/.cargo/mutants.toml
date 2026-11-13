@@ -201,4 +201,25 @@ exclude_re = [
     # default for it; the manager's behaviour is `has_broken`, whose mutants
     # are killed by `db_pool`'s tests.
     'db_pool\.rs.*replace <impl r2d2::ManageConnection for ReaderManager>::is_valid -> .* with Ok\(\(\)\)',
+
+    # The deployment-config file rules (bead `ley-line-open-52c177`) build
+    # `openat` flags from `O_*` constants: `O_RDONLY | O_DIRECTORY |
+    # O_NOFOLLOW`, `O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`,
+    # `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`, and `flags | O_CLOEXEC`.
+    # Every operand pair is a disjoint bit flag (`O_RDONLY` is 0; `O_CLOEXEC`
+    # is never in `flags`), so `a | b` and `a ^ b` are the same integer — the
+    # same reasoning as `observe_exit` above. The `| -> &` mutants of the same
+    # expressions are not equivalent and are killed by the no-follow, FIFO and
+    # creation tests in `deployment_config::files`.
+    'deployment_config/files\.rs.*replace \| with \^ in imp::',
+
+    # `imp::fstat`'s `< 0` failure test, mutated to `<= 0`, `== 0` or `> 0`.
+    #
+    # It runs only on a descriptor this module opened and still owns, so
+    # fstat cannot fail: EBADF needs a closed descriptor, EFAULT a bad
+    # buffer (it is a live `MaybeUninit`), EOVERFLOW a 32-bit `stat` (the
+    # supported hosts use the 64-bit one), EIO a stat of an open file that
+    # the kernel serves from the inode. fstat returns 0, and every mutant
+    # takes the same branch the original does.
+    'deployment_config/files\.rs.*replace < with .* in imp::fstat',
 ]

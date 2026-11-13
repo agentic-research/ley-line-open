@@ -38,4 +38,4 @@ cloister, and other clients.
 ## Active threads
 
 - `ley-line-open-40df83` — dual-codec wire (binary capnp + JSON, magic-byte dispatch). The natural step 4 after b0ea2e adopted capnp-json on the JSON carrier.
-- `ley-line-open-b07a79` — `op_query` structural skip: schema declares positional `List(QueryRow)`, handler emits column-keyed maps. Design call pending.
+- `ley-line-open-47d5c5` — `query`'s `truncated`/`limit` ride beside the `QueryResponse` encoding; the schema does not declare them yet. (`b07a79`, the `op_query` structural skip, is resolved: bead `ley-line-open-0a18bc` made rows `List(List(QueryCell))` at wire major 3.)

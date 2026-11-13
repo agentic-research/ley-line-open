@@ -3685,9 +3685,9 @@ mod tests {
         assert_eq!(
             conflict_rows(&ctx, "a.go"),
             vec![serde_json::json!([
-                "a.go",
-                upper_hex(CHECKOUT_EDITED),
-                upper_hex(CHECKOUT_PROPOSED),
+                {"text": "a.go"},
+                {"text": upper_hex(CHECKOUT_EDITED)},
+                {"text": upper_hex(CHECKOUT_PROPOSED)},
             ])],
         );
         drop(ctx);
@@ -3773,7 +3773,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|row| row[0].as_str().unwrap().to_string())
+            .map(|row| row[0]["text"].as_str().unwrap().to_string())
             .collect()
     }
 

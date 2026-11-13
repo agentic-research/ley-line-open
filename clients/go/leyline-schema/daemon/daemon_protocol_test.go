@@ -267,11 +267,11 @@ type queryRefusal struct {
 }
 
 type queryResponse struct {
-	OK      *bool         `json:"ok"`
-	Columns []string      `json:"columns"`
-	Rows    [][]*string   `json:"rows"`
-	Error   *string       `json:"error,omitempty"`
-	Refusal *queryRefusal `json:"refusal,omitempty"`
+	OK      *bool              `json:"ok"`
+	Columns []string           `json:"columns"`
+	Rows    [][]wire.QueryCell `json:"rows"`
+	Error   *string            `json:"error,omitempty"`
+	Refusal *queryRefusal      `json:"refusal,omitempty"`
 }
 
 // ── Sheaf ops (ae7a35) ─────────────────────────────────────────────
@@ -284,9 +284,10 @@ type sheafSetTopologyResponse struct {
 }
 
 type sheafInvalidateResponse struct {
-	Invalidated []uint32 `json:"invalidated"`
-	Count       *uint32  `json:"count"`
-	Generation  *uint64  `json:"generation,string"`
+	Invalidated     []uint32 `json:"invalidated"`
+	Count           *uint32  `json:"count"`
+	Generation      *uint64  `json:"generation,string"`
+	PriorGeneration *uint64  `json:"prior_generation,string"`
 }
 
 type sheafDefectResponse struct {

@@ -974,19 +974,19 @@ impl Drop for ReadProfileTimer {
 /// not provided). Sets `truncated: true` in the response when the cap is
 /// hit, so callers can paginate via `LIMIT/OFFSET` in the SQL itself if
 /// they need everything.
-/// One SQLite value as the `query` op's wire text (schema: `rows:
-/// List(List(Text))`; fixture `daemon-protocol.json` answers `SELECT 1` with
-/// `"1"`): an integer or real in decimal, text as itself, a blob as
-/// lowercase hex, and NULL as JSON null so it stays distinct from the empty
-/// string.
-fn sql_value_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+/// One SQLite value as a `query` cell's text (schema: `QueryCell.text`;
+/// fixture `daemon-protocol.json` answers `SELECT 1` with
+/// `{"text": "1"}`): an integer or real in decimal, text as itself, a blob as
+/// lowercase hex. NULL is `None`, which the cell carries as its `null`
+/// member, so it stays distinct from the empty string.
+fn sql_value_to_text(value: rusqlite::types::ValueRef<'_>) -> Option<String> {
     use rusqlite::types::ValueRef;
     match value {
-        ValueRef::Null => serde_json::Value::Null,
-        ValueRef::Integer(i) => json!(i.to_string()),
-        ValueRef::Real(r) => json!(r.to_string()),
-        ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
-        ValueRef::Blob(b) => json!(hex::encode(b)),
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(r) => Some(r.to_string()),
+        ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Some(hex::encode(b)),
     }
 }
 
@@ -1014,17 +1014,18 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
     }
 }
 
-/// The `query` op's success response: up to `limit` rows of `stmt`, each an
-/// array of values in `columns` order (schema: `QueryResponse.rows`). A row
-/// keyed by column name would lose a value whenever two columns share a
-/// name (bead `ley-line-open-0a18bc`).
+/// The `query` op's success response: up to `limit` rows of `stmt`, each a
+/// list of `QueryCell`s in `columns` order, encoded by the schema's own JSON
+/// codec (`QueryResponse.rows`). A row keyed by column name would lose a
+/// value whenever two columns share a name, and a bare JSON `null` is not a
+/// value the schema's codec reads (bead `ley-line-open-0a18bc`).
 fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String> {
     let col_count = stmt.column_count();
     let headers: Vec<String> = (0..col_count)
         .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
         .collect();
 
-    let mut rows_out: Vec<serde_json::Value> = Vec::new();
+    let mut rows_out: Vec<Vec<Option<String>>> = Vec::new();
     let mut rows = stmt.query([]).context("execute SQL")?;
     let mut truncated = false;
     while let Some(row) = rows.next()? {
@@ -1036,19 +1037,44 @@ fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String
             break;
         }
         let values = (0..col_count)
-            .map(|i| Ok(sql_value_to_json(row.get_ref(i)?)))
+            .map(|i| Ok(sql_value_to_text(row.get_ref(i)?)))
             .collect::<Result<Vec<_>>>()?;
-        rows_out.push(serde_json::Value::Array(values));
+        rows_out.push(values);
     }
 
-    let mut response = serde_json::Map::new();
-    response.insert("ok".into(), json!(true));
-    response.insert("columns".into(), json!(headers));
-    response.insert("rows".into(), json!(rows_out));
-    if truncated {
-        response.insert("truncated".into(), json!(true));
-        response.insert("limit".into(), json!(limit));
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root: leyline_public_schema::daemon_capnp::query_response::Builder =
+        builder.init_root();
+    root.set_ok(true);
+    let mut columns = root.reborrow().init_columns(u32::try_from(headers.len())?);
+    for (i, name) in headers.iter().enumerate() {
+        columns.set(u32::try_from(i)?, name);
     }
+    let mut rows_list = root.init_rows(u32::try_from(rows_out.len())?);
+    for (i, values) in rows_out.iter().enumerate() {
+        let mut cells = rows_list
+            .reborrow()
+            .init(u32::try_from(i)?, u32::try_from(values.len())?);
+        for (j, value) in values.iter().enumerate() {
+            let mut cell = cells.reborrow().get(u32::try_from(j)?);
+            match value {
+                Some(text) => cell.set_text(text),
+                None => cell.set_null(()),
+            }
+        }
+    }
+    let reader = builder
+        .get_root_as_reader::<leyline_public_schema::daemon_capnp::query_response::Reader>()?;
+    let encoded = capnp_json::to_json(reader)?;
+    if !truncated {
+        return Ok(encoded);
+    }
+    // `truncated` and `limit` are not `QueryResponse` fields yet (bead
+    // `ley-line-open-47d5c5`); they ride beside the codec's output as before.
+    let mut response: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&encoded).context("re-read the encoded query response")?;
+    response.insert("truncated".into(), json!(true));
+    response.insert("limit".into(), json!(limit));
     Ok(serde_json::Value::Object(response).to_string())
 }
 
@@ -5520,7 +5546,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             parsed["rows"],
-            json!([["42", "-1.5", null, "00ff", "t", "inf", "-inf"]]),
+            json!([[{"text": "42"}, {"text": "-1.5"}, {"null": null}, {"text": "00ff"}, {"text": "t"}, {"text": "inf"}, {"text": "-inf"}]]),
         );
     }
 
@@ -5535,7 +5561,11 @@ mod tests {
                 .expect("op_query must dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["columns"], json!(["id", "id"]), "{parsed}");
-        assert_eq!(parsed["rows"], json!([["1", "2"]]), "{parsed}");
+        assert_eq!(
+            parsed["rows"],
+            json!([[{"text": "1"}, {"text": "2"}]]),
+            "{parsed}"
+        );
     }
 
     /// Bead `ley-line-open-0a18bc`: SQL NULL is JSON null in its position,
@@ -5548,7 +5578,11 @@ mod tests {
                 .expect("op_query must dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["columns"], json!(["a", "b"]), "{parsed}");
-        assert_eq!(parsed["rows"], json!([[null, ""]]), "{parsed}");
+        assert_eq!(
+            parsed["rows"],
+            json!([[{"null": null}, {"text": ""}]]),
+            "{parsed}"
+        );
     }
 
     #[tokio::test]

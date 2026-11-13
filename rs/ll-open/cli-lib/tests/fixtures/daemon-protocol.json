@@ -335,7 +335,7 @@
       "ok": true,
       "columns": ["one"],
       "rows": [
-        ["1"]
+        [{"text": "1"}]
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
@@ -350,7 +350,7 @@
       "ok": true,
       "columns": ["id", "id"],
       "rows": [
-        ["1", "2"]
+        [{"text": "1"}, {"text": "2"}]
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
@@ -365,7 +365,7 @@
       "ok": true,
       "columns": ["a", "b"],
       "rows": [
-        [null, ""]
+        [{"null": null}, {"text": ""}]
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
@@ -405,6 +405,7 @@
     "response_required_keys": ["ok", "error", "executionError"],
     "response_optional_keys": [],
     "go_binding": "ExecutionErrorResponse",
+    "capnp_struct": "ErrorResponse",
     "go_drift_skip": null
   },
 
@@ -433,7 +434,7 @@
       "regions": [0],
       "stalks": [{"id": 0, "hash": "ff00000000000000000000000000000000000000000000000000000000000000", "data": []}]
     },
-    "response": {"invalidated": [], "count": 0, "generation": "1"},
+    "response": {"invalidated": [], "count": 0, "generation": "1", "prior_generation": "0"},
     "response_required_keys": ["invalidated", "count", "generation"],
     "response_optional_keys": [],
     "go_binding": "SheafInvalidateResponse",

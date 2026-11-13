@@ -371,10 +371,9 @@ type QueryRefusal struct {
 type QueryResponse struct {
 	OK      *bool    `json:"ok"`
 	Columns []string `json:"columns"`
-	// Rows holds one entry per result row, each with one value per entry of
-	// Columns, in Columns order. A nil value is SQL NULL, distinct from the
-	// empty string (LLO bead ley-line-open-0a18bc).
-	Rows    [][]*string   `json:"rows"`
+	// Rows holds one entry per result row, each with one QueryCell per entry
+	// of Columns, in Columns order (LLO bead ley-line-open-0a18bc).
+	Rows    [][]QueryCell `json:"rows"`
 	Error   *string       `json:"error,omitempty"`
 	Refusal *QueryRefusal `json:"refusal,omitempty"`
 }

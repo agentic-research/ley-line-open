@@ -63,13 +63,25 @@ pub const SCHEMA_VERSION: &str = "0.30.0";
 /// - 1: the v0.4.3 wire shape — `data: {...}` nested under `Event`,
 ///   `generation`/`prior_generation` as quoted strings per capnp_json u64
 ///   convention.
-/// - 2: current (ADR-0047 M1, bead `ley-line-open-73c6ee`). `read_source`
+/// - 2: ADR-0047 M1, bead `ley-line-open-73c6ee`. `read_source`
 ///   and `propose` answer `store_root` (the parser-free `storeRoot`) and
 ///   never send `tree_root`. A major-1 client that decodes leniently would
 ///   read the missing `tree_root` as "no root recorded", so the major moves
 ///   and the handshake refuses it instead. ADR-0047 M2 (merkle-ast-v3) does
 ///   not move it: no field is renamed, removed or retyped; `node_hash` values
 ///   change lineage, which `ir_schema_version` on the same handshake names.
+/// - 3: current (bead `ley-line-open-0a18bc`). `query` rows are retyped: a
+///   row was an object keyed by column name, which lost a value whenever two
+///   columns shared a name, and is now a list of `QueryCell`s in `columns`
+///   order, each `{"null": null}` or `{"text": "..."}`. `QueryResponse.rows`
+///   is a new field (@5); the old @2 is retired as `retiredRows`. A
+///   major-2 client that indexes a row by column name reads nothing, so the
+///   major moves and the handshake refuses it, as at 2 (commit `7f5b736e`,
+///   `tree_root` -> `store_root`). [`COMPAT_MIN_SCHEMA_VERSION`] does not
+///   move, as it did not at 2: the major is the refusal, and the Go
+///   schema-client that drops `wire.QueryRow` ships in the same release
+///   that moves it, so no schema-client release speaks major 3 with the
+///   old row type.
 ///
 /// A v0.4.2 daemon at wire-format major 0 would not satisfy a v0.4.3+
 /// client's expectations, even though both predate this constant — the
@@ -93,7 +105,7 @@ pub const SCHEMA_VERSION: &str = "0.30.0";
 /// the fold with `derive_key("leyline/ast-node/v3", …)`; every `node_hash`
 /// moved from its v2 value. The wire carries `node_hash` with the same type
 /// and framing (hex in `validate`'s `emit_ast` rows, member hashes behind a
-/// sheaf region hash), so [`WIRE_FORMAT_MAJOR`] stays 2: this field, on the
+/// sheaf region hash), so [`WIRE_FORMAT_MAJOR`] stayed 2: this field, on the
 /// version handshake, is the lineage signal for a client that reads it (the
 /// daemon does not require the handshake first), and a v2 value compared
 /// with a v3 one is unequal, never a false match.
@@ -251,16 +263,17 @@ pub const PROJECTION_SCHEMA_VERSION: &str = "projection-v13";
 /// Current major of the JSON wire shape; its history is documented above,
 /// beside the module's version facts. Pinned by
 /// `wire_format_major_is_pinned`.
-pub const WIRE_FORMAT_MAJOR: u32 = 2;
+pub const WIRE_FORMAT_MAJOR: u32 = 3;
 
 #[cfg(test)]
 mod pin_tests {
-    /// ADR-0047 M1 retired `tree_root` from two responses: a rename on the
+    /// ADR-0047 M1 retired `tree_root` from two responses (2), and bead
+    /// `ley-line-open-0a18bc` retyped `query` rows (3): each a change on the
     /// wire, so the major moved. Bumping or reverting it is a deliberate
     /// edit of this literal and of the history above.
     #[test]
     fn wire_format_major_is_pinned() {
-        assert_eq!(super::WIRE_FORMAT_MAJOR, 2);
+        assert_eq!(super::WIRE_FORMAT_MAJOR, 3);
     }
 }
 

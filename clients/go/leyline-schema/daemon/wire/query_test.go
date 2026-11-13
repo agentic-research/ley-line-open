@@ -1,12 +1,16 @@
 package wire
 
-// `query` row JSON (bead ley-line-open-0a18bc). Each row is an array in
-// `columns` order. The payloads are the shared daemon protocol fixtures,
-// which the Rust test
+// `query` row JSON (bead ley-line-open-0a18bc). Each row is a list of
+// QueryCell unions in `columns` order. The payloads are the shared daemon
+// protocol fixtures, which the Rust test
 // rs/ll-open/cli-lib/tests/query_read_only_test.rs::the_protocol_fixture_rows_are_what_the_daemon_sends
-// proves the daemon emits byte for byte.
+// proves the daemon emits, and which tools/check_daemon_fixture_codec.py
+// proves the schema's reference JSON codec reads.
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func decodeQueryFixture(t *testing.T, name string) QueryResponse {
 	t.Helper()
@@ -17,7 +21,7 @@ func decodeQueryFixture(t *testing.T, name string) QueryResponse {
 	}
 	for i, row := range got.Rows {
 		if len(row) != len(got.Columns) {
-			t.Fatalf("%s: row %d has %d values for %d columns", name, i, len(row), len(got.Columns))
+			t.Fatalf("%s: row %d has %d cells for %d columns", name, i, len(row), len(got.Columns))
 		}
 	}
 	return got
@@ -32,8 +36,8 @@ func TestQueryResponseKeepsEveryValueOfARepeatedColumnName(t *testing.T) {
 		t.Fatalf("rows: want 1, got %d", len(got.Rows))
 	}
 	row := got.Rows[0]
-	if row[0] == nil || *row[0] != "1" || row[1] == nil || *row[1] != "2" {
-		t.Fatalf("row 0: want [1 2], got %v", row)
+	if row[0].IsNull() || *row[0].Text != "1" || row[1].IsNull() || *row[1].Text != "2" {
+		t.Fatalf("row 0: want [1 2], got %+v", row)
 	}
 }
 
@@ -43,17 +47,33 @@ func TestQueryResponseKeepsNullDistinctFromTheEmptyString(t *testing.T) {
 		t.Fatalf("rows: want 1, got %d", len(got.Rows))
 	}
 	row := got.Rows[0]
-	if row[0] != nil {
-		t.Fatalf("a NULL value decodes to nil; got %q", *row[0])
+	if !row[0].IsNull() {
+		t.Fatalf("a NULL cell decodes as null; got text %q", *row[0].Text)
 	}
-	if row[1] == nil || *row[1] != "" {
-		t.Fatalf("an empty string decodes to a non-nil empty string; got %v", row[1])
+	if row[1].IsNull() || *row[1].Text != "" {
+		t.Fatalf("an empty-string cell decodes as non-null empty text; got %+v", row[1])
 	}
 }
 
 func TestQueryResponseDecodesTheSingleColumnFixture(t *testing.T) {
 	got := decodeQueryFixture(t, "query")
-	if len(got.Rows) != 1 || got.Rows[0][0] == nil || *got.Rows[0][0] != "1" {
-		t.Fatalf("rows: want [[1]], got %v", got.Rows)
+	if len(got.Rows) != 1 || got.Rows[0][0].IsNull() || *got.Rows[0][0].Text != "1" {
+		t.Fatalf("rows: want [[{text 1}]], got %+v", got.Rows)
+	}
+}
+
+// A cell that is not exactly one known member is refused, never read as a
+// value: a bare null or string (the pre-cell shape), an empty or two-member
+// object, a member this type does not know, or a member carrying the wrong
+// JSON type.
+func TestQueryCellRefusesWhatIsNotOneKnownMember(t *testing.T) {
+	for _, bad := range []string{
+		`null`, `"1"`, `{}`, `{"null": null, "text": "1"}`, `{"integer": "1"}`,
+		`{"null": 0}`, `{"text": null}`, `{"text": 1}`,
+	} {
+		var c QueryCell
+		if err := json.Unmarshal([]byte(bad), &c); err == nil {
+			t.Errorf("%s decoded as %+v, want a refusal", bad, c)
+		}
 	}
 }

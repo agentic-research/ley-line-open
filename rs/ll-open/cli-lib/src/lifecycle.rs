@@ -77,14 +77,33 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     // arena_path emptiness — bead `ley-line-open-baee26` removed the
     // V1 `generation == 0` check from the public API. A fresh
     // controller has an empty arena_path and zero-root sentinel.
-    if ctrl.arena_path().is_empty() {
-        let arena_str = arena
-            .canonicalize()
-            .unwrap_or_else(|_| arena.to_path_buf())
-            .to_string_lossy()
-            .to_string();
-        ctrl.set_arena(&arena_str, arena_size)
+    //
+    // Every publish writes the arena at the path the controller records,
+    // so it must be this arena, absolute (`ley-line-open-f68a3a`): a
+    // relative record resolves against the daemon's cwd, and a record of
+    // another arena sends this daemon's writes there.
+    let canonical = arena
+        .canonicalize()
+        .with_context(|| format!("resolve arena path {}", arena.display()))?;
+    let recorded = ctrl.arena_path();
+    if recorded.is_empty() {
+        ctrl.set_arena(&canonical.to_string_lossy(), arena_size)
             .context("set arena in controller")?;
+    } else {
+        let recorded_path = Path::new(&recorded);
+        let same = recorded_path.is_absolute()
+            && recorded_path
+                .canonicalize()
+                .map_or(recorded_path == canonical, |r| r == canonical);
+        if !same {
+            anyhow::bail!(
+                "the controller at {} is registered to arena {recorded:?}, not {}; \
+                 refusing to publish this daemon's arena through it (pass the arena it \
+                 records, or a --control of its own)",
+                ctrl_path.display(),
+                canonical.display(),
+            );
+        }
     }
 
     Ok(ctrl_path)
@@ -299,6 +318,48 @@ mod tests {
             "ctrl path must derive as arena.with_extension(ctrl)",
         );
         assert!(ctrl_path.exists(), "controller file must be created");
+    }
+
+    /// `ley-line-open-f68a3a`: every publish writes the arena at the path
+    /// the controller records, not at `--arena`. A controller registered
+    /// to a relative path (resolved against whatever cwd the daemon runs
+    /// in) or to another arena would send this daemon's writes there, so
+    /// `setup_arena` refuses it by name; one registered to this arena,
+    /// spelled through a symlinked or `..` path, is accepted.
+    #[test]
+    fn setup_arena_refuses_a_controller_registered_to_another_or_relative_path() {
+        use tempfile::TempDir;
+        let td = TempDir::new().unwrap();
+        let arena_path = td.path().join("mine.arena");
+        let ctrl_path = td.path().join("shared.ctrl");
+        let other = td.path().join("other.arena");
+        for recorded in [
+            "rel.arena".to_string(),
+            other.to_string_lossy().into_owned(),
+        ] {
+            {
+                let mut c = Controller::open_or_create(&ctrl_path).unwrap();
+                c.set_arena(&recorded, 4096).unwrap();
+            }
+            let err = setup_arena(&arena_path, 4096, Some(&ctrl_path)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("registered to arena"),
+                "{recorded}: {err:#}"
+            );
+            assert_eq!(
+                Controller::open_or_create(&ctrl_path).unwrap().arena_path(),
+                recorded,
+                "the registration is left as it was"
+            );
+        }
+
+        // The same arena through a non-canonical spelling is accepted.
+        std::fs::remove_file(&ctrl_path).unwrap();
+        setup_arena(&arena_path, 4096, Some(&ctrl_path)).expect("first registration");
+        let roundabout = td.path().join(".").join("mine.arena");
+        setup_arena(&roundabout, 4096, Some(&ctrl_path)).expect("same arena, other spelling");
+        let recorded = Controller::open_or_create(&ctrl_path).unwrap().arena_path();
+        assert!(Path::new(&recorded).is_absolute(), "{recorded}");
     }
 
     #[test]

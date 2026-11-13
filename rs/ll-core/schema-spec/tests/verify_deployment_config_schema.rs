@@ -69,7 +69,11 @@ fn sorted(v: &Value) -> Value {
         Value::Object(m) => {
             let mut keys: Vec<&String> = m.keys().collect();
             keys.sort();
-            Value::Object(keys.into_iter().map(|k| (k.clone(), sorted(&m[k]))).collect())
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), sorted(&m[k])))
+                    .collect(),
+            )
         }
         Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
         other => other.clone(),

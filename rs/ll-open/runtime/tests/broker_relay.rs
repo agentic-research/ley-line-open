@@ -593,7 +593,11 @@ fn a_hundred_passed_descriptors_are_all_closed_and_the_bytes_still_cross() {
         identity(sentinel.as_raw_fd()).is_some(),
         "an unrelated descriptor was closed"
     );
-    assert_eq!(identity(0), stdin_before, "descriptor 0 was closed or replaced");
+    assert_eq!(
+        identity(0),
+        stdin_before,
+        "descriptor 0 was closed or replaced"
+    );
 }
 
 #[test]

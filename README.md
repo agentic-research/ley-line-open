@@ -1,17 +1,23 @@
 # ley-line-open
 
-Ley-line-open (LLO) is a local substrate with two jobs built on
-content-addressed storage. It keeps a repository's source as BLAKE3-addressed
-blobs and turns it into **code facts**: a tree-sitter parse, enriched by
-language servers, served as a SQLite projection over a daemon. That is what
-[mache](https://github.com/agentic-research/mache) consumes. It also runs
-**confined execution**: a signed grant authorizes one run of a
-content-addressed root filesystem in a libkrun microVM or a native `nono`
-sandbox; on the microVM tier the run's workspace is served from the store.
-That is what
-[cloister](https://github.com/agentic-research/cloister) consumes. LLO supplies
-the mechanism; cloister owns the policy that decides what a run may do
-([ADR-0035](docs/adr/0035-confinement-manifest-and-attested-enforcement.md)).
+Ley-line-open (LLO) holds each version of a source tree as one immutable,
+content-addressed value (BLAKE3 blobs under a directory Merkle root,
+`storeRoot`) and serves projections of that value:
+
+- **code facts**: a tree-sitter parse enriched by language servers, served as a
+  SQLite projection over a daemon; this is what
+  [mache](https://github.com/agentic-research/mache) consumes;
+- **a filesystem**: the store mounted (NFS or FUSE, in a build with the `mount`
+  feature), or shared into a microVM as its workspace, where a write to an
+  authored path is a proposal merged back into the store;
+- **a run**: a content-addressed root filesystem executed under a signed grant
+  in a libkrun microVM or a native `nono` sandbox; this is what
+  [cloister](https://github.com/agentic-research/cloister) drives.
+
+A signed head attests which inputs a projection was computed from (`storeRoot`
+and `parserId`); a run receipt attests what ran and under which confinement.
+LLO supplies the mechanism; cloister owns the policy that decides what a run
+may do ([ADR-0035](docs/adr/0035-confinement-manifest-and-attested-enforcement.md)).
 
 Pick your path:
 

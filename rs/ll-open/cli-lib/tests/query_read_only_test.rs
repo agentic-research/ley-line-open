@@ -531,10 +531,7 @@ fn allowed_modules_return_rows() {
             "SELECT count(*) AS n FROM jsonb_each(jsonb('[1, 2]'))",
             json!([["2"]]),
         ),
-        (
-            "SELECT name FROM dbstat WHERE name = 't'",
-            json!([["t"]]),
-        ),
+        ("SELECT name FROM dbstat WHERE name = 't'", json!([["t"]])),
         // A full join's merged column is reported as a read of the
         // subquery's name, which is not a table of the schema.
         (
@@ -639,9 +636,5 @@ fn a_select_still_returns_its_rows() {
     );
     assert_eq!(cte["rows"], json!([["2", "ONE,TWO"]]), "{cte}");
     let cols = d.over_socket("SELECT name FROM pragma_table_info('t') ORDER BY cid");
-    assert_eq!(
-        cols["rows"],
-        json!([["a"], ["b"]]),
-        "{cols}"
-    );
+    assert_eq!(cols["rows"], json!([["a"], ["b"]]), "{cols}");
 }

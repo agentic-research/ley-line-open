@@ -5530,12 +5530,9 @@ mod tests {
     #[tokio::test]
     async fn op_query_keeps_every_value_of_a_repeated_column_name() {
         let (_dir, ctx) = setup();
-        let result = handle_base_op_legacy(
-            &ctx,
-            "query",
-            &json!({"sql": "SELECT 1 AS id, 2 AS id"}),
-        )
-        .expect("op_query must dispatch");
+        let result =
+            handle_base_op_legacy(&ctx, "query", &json!({"sql": "SELECT 1 AS id, 2 AS id"}))
+                .expect("op_query must dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["columns"], json!(["id", "id"]), "{parsed}");
         assert_eq!(parsed["rows"], json!([["1", "2"]]), "{parsed}");
@@ -5546,12 +5543,9 @@ mod tests {
     #[tokio::test]
     async fn op_query_keeps_null_distinct_from_the_empty_string() {
         let (_dir, ctx) = setup();
-        let result = handle_base_op_legacy(
-            &ctx,
-            "query",
-            &json!({"sql": "SELECT NULL AS a, '' AS b"}),
-        )
-        .expect("op_query must dispatch");
+        let result =
+            handle_base_op_legacy(&ctx, "query", &json!({"sql": "SELECT NULL AS a, '' AS b"}))
+                .expect("op_query must dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["columns"], json!(["a", "b"]), "{parsed}");
         assert_eq!(parsed["rows"], json!([[null, ""]]), "{parsed}");

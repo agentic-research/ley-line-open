@@ -248,5 +248,11 @@ jobs:
       - name: Install system deps
         run: task deps:capnp
 
+      # macos-latest moves; the pinned probe table was measured on macOS 27.2,
+      # so the log records the image this run observed it on (the probe also
+      # prints `sw_vers`). A table mismatch after an image bump is a finding.
+      - name: Record the runner OS
+        run: sw_vers
+
       - name: Broker profile, loopback probe and broker suites
         run: task runtime:broker-macos

@@ -79,6 +79,7 @@ tasks:
       - >-
         cargo test -p leyline-runtime --test broker_profile --test broker_loopback_probe
         --test broker_control --test broker_relay --test broker_preflight --test broker_registry
+        -- --nocapture
 
   broker-probe:
     desc: >-
@@ -96,13 +97,25 @@ tasks:
       - cargo test -p leyline-runtime --test broker_loopback_probe -- --nocapture
       - |
         set -eu
-        bin=$(cargo test -p leyline-runtime --test broker_loopback_probe --no-run 2>&1 \
-          | sed -n 's/.*Executable tests\/broker_loopback_probe\.rs (\(.*\))$/\1/p' | tail -n 1)
+        # The artifact's absolute path from cargo's JSON messages: immune to
+        # CARGO_TERM_COLOR and to a relative or absolute CARGO_TARGET_DIR.
+        bin=$(cargo test -p leyline-runtime --test broker_loopback_probe --no-run \
+          --message-format=json \
+          | sed -n 's/.*"executable":"\([^"]*broker_loopback_probe[^"]*\)".*/\1/p' | tail -n 1)
         test -x "$bin" || { echo "broker-probe: cannot find the probe test binary" >&2; exit 1; }
+        log=$(mktemp)
         sudo unshare --net sh -c "
           ip link set lo up &&
           sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 net.ipv6.conf.lo.disable_ipv6=1 &&
-          LEYLINE_PROBE_NO_IPV6=1 LEYLINE_REQUIRE_SANDBOX=1 $(pwd)/$bin --exact the_loopback_table_matches_this_platform --nocapture"
+          LEYLINE_PROBE_NO_IPV6=1 LEYLINE_REQUIRE_SANDBOX=1 '$bin' --exact the_loopback_table_matches_this_platform --nocapture" \
+          | tee "$log"
+        # A skip or a filtered-out run exits 0 too: require the test to have
+        # run and the namespace to have shown its ::1 row as unavailable.
+        grep -q '^test result: ok\. 1 passed' "$log" \
+          || { echo "broker-probe: the namespace run did not pass exactly one test" >&2; exit 1; }
+        grep -q '^  ::1 unavailable$' "$log" \
+          || { echo "broker-probe: the namespace run did not record ::1 unavailable" >&2; exit 1; }
+        rm -f "$log"
 
   oci-fixture:
     desc: >-

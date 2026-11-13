@@ -8,14 +8,18 @@
 //! For each candidate address A, on this platform:
 //! 1. availability: bind a TCP listener on `A:P`; `EADDRNOTAVAIL` records the
 //!    row `unavailable`, never a pass;
-//! 2. allowed: a child confined with port P allowed connects to `A:P`;
-//!    success is `scoped-allowed`, `EPERM` is `profile-blocks`;
-//! 3. port control: a child with only another port Q allowed connects to
-//!    `A:P`; it must get `EPERM`, and success (`port-unscoped`) fails the probe;
-//! 4. address control: neither platform's filter has an address dimension
-//!    (Seatbelt `remote tcp "localhost:N"`, Landlock `ConnectTcp`), so a row
-//!    whose allowed step succeeds is `port-scoped-only` by construction: the
-//!    broker's code alone holds the address (S2).
+//! 2. allowed: a child confined with the profile for a grant naming `A:P`
+//!    connects to `A:P`; success is `scoped-allowed`, `EPERM` is
+//!    `profile-blocks`;
+//! 3. port control: a child confined with the profile for `A:Q` connects to
+//!    `A:P`; it must get `EPERM`, and success (`port-unscoped`) fails the
+//!    probe. Q is the port of a second listener on `A`, held for the whole
+//!    row, so Q is live and distinct from P;
+//! 4. address control: a child confined with the profile for `127.0.0.1:P`
+//!    connects to `A:P`. Success is `port-scoped-only` (the filter has no
+//!    address dimension: Seatbelt `remote tcp "localhost:N"`, Landlock
+//!    `ConnectTcp`), so the broker's code alone holds the address (S2);
+//!    `EPERM` is `address-scoped`.
 //!
 //! The test prints the observed table and asserts the pinned one for this
 //! platform. The confined half re-runs this binary as a child, the
@@ -32,6 +36,8 @@ use std::process::Command;
 
 const PROBE_ENV: &str = "LLO_LOOPBACK_PROBE";
 const CANDIDATES: &[&str] = &["127.0.0.1", "127.0.0.2", "127.255.255.254", "::1"];
+/// The one delivered target address (S6): step 4's profile host.
+const DELIVERED_HOST: &str = "127.0.0.1";
 
 fn sandbox_unavailable(reason: &str) -> ! {
     assert!(
@@ -47,13 +53,14 @@ fn sandbox_unavailable(reason: &str) -> ! {
     std::process::exit(0)
 }
 
+/// The broker profile for a grant with one connection to `host:port`.
 #[cfg(target_os = "macos")]
-fn capabilities(port: u16) -> nono::CapabilitySet {
+fn capabilities(host: IpAddr, port: u16) -> nono::CapabilitySet {
     let document = leyline_schema_spec::connections::ConnectionsDocument::new(vec![
         leyline_schema_spec::connections::Connection {
             name: "probe".into(),
             endpoint_unix: "/private/tmp/llo-probe.sock".into(),
-            host: "127.0.0.1".parse().unwrap(),
+            host,
             port,
         },
     ])
@@ -62,9 +69,10 @@ fn capabilities(port: u16) -> nono::CapabilitySet {
 }
 
 #[cfg(target_os = "linux")]
-fn capabilities(port: u16) -> nono::CapabilitySet {
+fn capabilities(_host: IpAddr, port: u16) -> nono::CapabilitySet {
     // The Linux tier is refused in slice 1; this is the egress rule a Linux
     // broker profile would use (confinement's connectLocal list compile).
+    // Landlock's ConnectTcp has no address, so `host` has nothing to bind to.
     nono::CapabilitySet::new()
         .block_network()
         .allow_tcp_connect(port)
@@ -83,19 +91,20 @@ fn landlock_abi() -> i64 {
     }
 }
 
-/// The confined half: allow one port, connect to another address and port,
-/// report the result.
+/// The confined half: apply the profile for `profile_host:allowed`, connect
+/// to `address:port`, report the result.
 #[test]
 #[ignore = "the confined child of the_loopback_table_matches_this_platform"]
 fn loopback_probe_child() {
     let spec = std::env::var(PROBE_ENV).expect("probe spec");
     let parts: Vec<&str> = spec.split('|').collect();
-    let (address, port, allowed): (IpAddr, u16, u16) = (
+    let (address, port, profile_host, allowed): (IpAddr, u16, IpAddr, u16) = (
         parts[0].parse().unwrap(),
         parts[1].parse().unwrap(),
         parts[2].parse().unwrap(),
+        parts[3].parse().unwrap(),
     );
-    if let Err(error) = nono::Sandbox::apply_auto(&capabilities(allowed)) {
+    if let Err(error) = nono::Sandbox::apply_auto(&capabilities(profile_host, allowed)) {
         println!("PROBE:apply-refused {error}");
         return;
     }
@@ -108,7 +117,9 @@ fn loopback_probe_child() {
     println!("PROBE:{result}");
 }
 
-fn child(address: &str, port: u16, allowed: u16) -> String {
+/// Run one confined child: profile for `profile_host:allowed`, dial
+/// `address:port`. Returns `ok`, `eperm` or `errnoN`.
+fn child(address: &str, port: u16, profile_host: &str, allowed: u16) -> String {
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -117,18 +128,24 @@ fn child(address: &str, port: u16, allowed: u16) -> String {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env(PROBE_ENV, format!("{address}|{port}|{allowed}"))
+        .env(
+            PROBE_ENV,
+            format!("{address}|{port}|{profile_host}|{allowed}"),
+        )
         .output()
         .expect("run the confined child");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the confined child failed ({})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
     let line = stdout
         .lines()
         .find_map(|line| line.split_once("PROBE:").map(|(_, r)| r.to_owned()))
         .unwrap_or_else(|| {
-            panic!(
-                "the child reported nothing\nstdout:\n{stdout}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            )
+            panic!("the child reported nothing\nstdout:\n{stdout}\nstderr:\n{stderr}")
         });
     if let Some(reason) = line.strip_prefix("apply-refused ") {
         sandbox_unavailable(reason);
@@ -156,26 +173,27 @@ fn row(candidate: &str) -> String {
         return format!("{candidate} available abi-below-4");
     }
     let port = listener.local_addr().unwrap().port();
-    let other = TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let allowed = match child(candidate, port, port).as_str() {
+    // Q: a second live listener on the same address, held until the row ends.
+    let other_listener = TcpListener::bind(SocketAddr::new(address, 0)).expect("bind Q");
+    let other = other_listener.local_addr().unwrap().port();
+    assert_ne!(other, port, "the port control needs a port other than P");
+
+    let allowed = match child(candidate, port, candidate, port).as_str() {
         "ok" => "scoped-allowed".to_owned(),
         "eperm" => "profile-blocks".to_owned(),
         other => other.to_owned(),
     };
-    let port_control = match child(candidate, port, other).as_str() {
+    let port_control = match child(candidate, port, candidate, other).as_str() {
         "eperm" => "eperm".to_owned(),
         "ok" => "port-unscoped".to_owned(),
         other => other.to_owned(),
     };
-    let address_control = if allowed == "scoped-allowed" {
-        "port-scoped-only"
-    } else {
-        "n/a"
+    let address_control = match child(candidate, port, DELIVERED_HOST, port).as_str() {
+        "ok" => "port-scoped-only".to_owned(),
+        "eperm" => "address-scoped".to_owned(),
+        other => other.to_owned(),
     };
+    drop(other_listener);
     drop(listener);
     format!("{candidate} available allowed={allowed} port={port_control} address={address_control}")
 }
@@ -218,6 +236,8 @@ fn expected() -> Vec<String> {
 fn the_loopback_table_matches_this_platform() {
     let observed: Vec<String> = CANDIDATES.iter().map(|c| row(c)).collect();
     println!("loopback probe ({}):", std::env::consts::OS);
+    #[cfg(target_os = "macos")]
+    println!("  macOS {}", macos_version());
     #[cfg(target_os = "linux")]
     println!("  landlock ABI {}", landlock_abi());
     for line in &observed {
@@ -229,7 +249,9 @@ fn the_loopback_table_matches_this_platform() {
     );
     assert_eq!(observed, expected(), "the pinned loopback table");
     // The delivered set may hold only addresses whose row is scoped-allowed
-    // with the port control passing.
+    // with the port control passing. Only macOS delivers slice 1 (S6); the
+    // Linux table is evidence for a future tier, not a delivery check.
+    #[cfg(target_os = "macos")]
     for target in leyline_runtime::broker::DELIVERED_TARGETS {
         let row = observed
             .iter()
@@ -240,4 +262,14 @@ fn the_loopback_table_matches_this_platform() {
             "{target} is delivered but its row is {row}"
         );
     }
+}
+
+/// The OS version the table was observed on, recorded in the log.
+#[cfg(target_os = "macos")]
+fn macos_version() -> String {
+    Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|error| format!("unknown ({error})"))
 }

@@ -1050,6 +1050,8 @@ be proven.
   Seatbelt's `localhost:N` matches the IPv6 loopback too.
 - `127.0.0.2` and `127.255.255.254` are unavailable, because lo0 carries only
   `127.0.0.1` unless an alias is configured.
+- The address control reads port-scoped only: the profile for a grant naming
+  `127.0.0.1:P` also reaches `[::1]:P`, so the broker's code alone holds the address (S2).
 - The probe's pinned table holds these rows. `::1` therefore qualifies for the delivered
   set on macOS, and widening waits on the same row passing on every delivering platform.
 

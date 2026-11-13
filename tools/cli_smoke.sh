@@ -268,7 +268,7 @@ os.mkdir(os.path.join(sys.argv[1], "empty"))
     within_deadline "read back through the mount" sh -c "grep -q '^package util' '$W/mnt/util.go'"
     stored_hex() {
         op "{\"op\":\"query\",\"sql\":\"SELECT b.blob_bytes FROM _tree t JOIN source_blobs b ON b.blob_hash = t.blob_hash WHERE t.path = '$1'\"}" |
-            field rows 0 blob_bytes
+            field rows 0 0
     }
     want_hex=$(printf 'package util\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n' | od -An -tx1 | tr -d ' \n')
     got_hex=$(stored_hex util.go)

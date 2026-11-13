@@ -1,0 +1,2 @@
+Section: Security
+- **`tar` 0.4.46: OCI layer PAX header desynchronization fixed (GHSA-3pv8-6f4r-ffg2).** `tar` 0.4.45 applied a PAX `x` header to the next header entry, such as a GNU longname, rather than to the next file entry. A crafted layer could use that to desynchronize member boundaries, so `leyline rootfs import-oci` could import a rootfs that differs from what another tar reader sees in the same image. The lockfile now pins `tar` 0.4.46 (`ley-line-open-184dbd`).

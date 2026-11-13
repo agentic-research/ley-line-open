@@ -19,7 +19,8 @@
 //!    connects to `A:P`. Success is `port-scoped-only` (the filter has no
 //!    address dimension: Seatbelt `remote tcp "localhost:N"`, Landlock
 //!    `ConnectTcp`), so the broker's code alone holds the address (S2);
-//!    `EPERM` is `address-scoped`.
+//!    `EPERM` is `address-scoped`. On `127.0.0.1` itself this step would
+//!    repeat step 2, so that row reads `self`.
 //!
 //! The test prints the observed table and asserts the pinned one for this
 //! platform. The confined half re-runs this binary as a child, the
@@ -188,10 +189,15 @@ fn row(candidate: &str) -> String {
         "ok" => "port-unscoped".to_owned(),
         other => other.to_owned(),
     };
-    let address_control = match child(candidate, port, DELIVERED_HOST, port).as_str() {
-        "ok" => "port-scoped-only".to_owned(),
-        "eperm" => "address-scoped".to_owned(),
-        other => other.to_owned(),
+    // On the delivered host itself step 4 is step 2 again and controls nothing.
+    let address_control = if candidate == DELIVERED_HOST {
+        "self".to_owned()
+    } else {
+        match child(candidate, port, DELIVERED_HOST, port).as_str() {
+            "ok" => "port-scoped-only".to_owned(),
+            "eperm" => "address-scoped".to_owned(),
+            other => other.to_owned(),
+        }
     };
     drop(other_listener);
     drop(listener);
@@ -202,7 +208,12 @@ fn row(candidate: &str) -> String {
 /// a change to what the delivered set may claim).
 fn expected() -> Vec<String> {
     let scoped = |a: &str| {
-        format!("{a} available allowed=scoped-allowed port=eperm address=port-scoped-only")
+        let address = if a == DELIVERED_HOST {
+            "self"
+        } else {
+            "port-scoped-only"
+        };
+        format!("{a} available allowed=scoped-allowed port=eperm address={address}")
     };
     #[cfg(target_os = "macos")]
     {

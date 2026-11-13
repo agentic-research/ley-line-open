@@ -10,7 +10,7 @@ Section: Added
   - whether the profile for another live port on the same address refuses it (a
     wildcard fails the probe);
   - whether the profile for `127.0.0.1` on the same port reaches it, which shows
-    whether the filter scopes by address.
+    whether the filter scopes by address (the `127.0.0.1` row reads `self`).
 
   It asserts a pinned table per platform. Measured on macOS 27.2: `127.0.0.1` and `::1`
   are scoped-allowed with the port control passing; `127.0.0.2` and `127.255.255.254`

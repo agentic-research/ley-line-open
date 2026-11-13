@@ -24,7 +24,6 @@
 //! supervisor is gone, and the broker exits at once.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -253,22 +252,6 @@ pub fn raise_fd_limit(wanted: u64) -> u64 {
     target
 }
 
-/// End this process the moment the lifeline's write end is gone: a read
-/// returns end-of-file (or fails) once no process holds it.
-pub fn watch_lifeline(fd: i32) {
-    thread::spawn(move || {
-        // SAFETY: the broker owns the lifeline descriptor for its whole life;
-        // ManuallyDrop keeps this handle from closing it.
-        let mut lifeline = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-        let mut byte = [0u8; 1];
-        loop {
-            if lifeline_ended(&std::io::Read::read(&mut *lifeline, &mut byte)) {
-                std::process::exit(0);
-            }
-        }
-    });
-}
-
 /// The broker process, after its program name: parse `args`, watch the
 /// lifeline, secure the descriptor limit, then [`serve`] stdin/stdout with
 /// `confine`. Returns the exit status. The shipped `leyline-conn-broker`
@@ -287,8 +270,14 @@ where
         Ok(args) => args,
         Err(detail) => return refuse(detail),
     };
-    // The lifeline first: from here on, a vanished supervisor ends us.
-    watch_lifeline(args.lifeline_fd);
+    // The lifeline first: from here on, a vanished supervisor ends us. A
+    // lifeline number that is not open is refused, not read as an end.
+    if let Err(error) = crate::lifeline::exit_when_ended(args.lifeline_fd, 0) {
+        return refuse(format!(
+            "--lifeline-fd {} is not an open descriptor: {error}",
+            args.lifeline_fd
+        ));
+    }
     // Enough descriptors for the connection cap, or refuse to start rather
     // than refuse connections by EMFILE later.
     let limit = raise_fd_limit(FILE_LIMIT);
@@ -307,30 +296,6 @@ where
         Ok(()) => 0,
         Err(_) => 1,
     }
-}
-
-/// Whether one read of the lifeline means the supervisor is gone: end-of-file
-/// or any error but an interrupted call. A byte (which no supervisor writes)
-/// changes nothing.
-pub fn lifeline_ended(read: &std::io::Result<usize>) -> bool {
-    match read {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(error) => error.kind() != std::io::ErrorKind::Interrupted,
-    }
-}
-
-/// Clear close-on-exec on `fd`, so it crosses the next exec.
-pub fn clear_cloexec(fd: i32) -> std::io::Result<()> {
-    // SAFETY: fcntl on a descriptor number; failure is reported.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: F_SETFD on the descriptor F_GETFD just read; it cannot fail on
-    // an open descriptor.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
-    Ok(())
 }
 
 /// Everything the broker does after its arguments are read: take the start
@@ -466,7 +431,7 @@ where
 pub struct BrokerProcess {
     child: Child,
     stdin: Option<ChildStdin>,
-    lifeline: Option<OwnedFd>,
+    lifeline: Option<crate::lifeline::Lifeline>,
     events: mpsc::Receiver<Event>,
     seen: Vec<Event>,
     bound: Vec<Bound>,
@@ -480,20 +445,8 @@ impl BrokerProcess {
     /// spawn (`POSIX_SPAWN_CLOEXEC_DEFAULT`) is `ley-line-open-528525`: until
     /// then a concurrent spawn between `pipe` and `FD_CLOEXEC` can inherit it.
     pub fn spawn(binary: &Path, peer: PeerPid) -> Result<Self, ExecutionError> {
-        let mut fds = [0; 2];
-        // SAFETY: a valid two-element out array.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(ExecutionError::backend(format!(
-                "lifeline pipe: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: pipe(2) just returned these two descriptors, owned here.
-        let (read_end, write_end) =
-            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        set_cloexec(write_end.as_raw_fd());
-        set_cloexec(read_end.as_raw_fd());
-
+        let (lifeline, read_end) = crate::lifeline::pair()
+            .map_err(|error| ExecutionError::backend(format!("lifeline pipe: {error}")))?;
         let mut command = Command::new(binary);
         command
             .arg("--lifeline-fd")
@@ -510,21 +463,7 @@ impl BrokerProcess {
                 command.arg("--peer-pid").arg(pid.to_string());
             }
         }
-        let raw_read = read_end.as_raw_fd();
-        // SAFETY: async-signal-safe dup2/fcntl in the child before exec. dup2
-        // clears close-on-exec on the new descriptor; when the read end already
-        // is fd 3, dup2 does nothing, so the flag is cleared explicitly.
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(move || {
-                if raw_read == LIFELINE_FD {
-                    clear_cloexec(LIFELINE_FD)?;
-                } else if libc::dup2(raw_read, LIFELINE_FD) != LIFELINE_FD {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        read_end.pass_at(&mut command, LIFELINE_FD);
         let mut child = command.spawn().map_err(|error| {
             ExecutionError::backend(format!("spawn connection broker: {error}"))
         })?;
@@ -545,7 +484,7 @@ impl BrokerProcess {
         Ok(Self {
             stdin: child.stdin.take(),
             child,
-            lifeline: Some(write_end),
+            lifeline: Some(lifeline),
             events,
             seen: Vec::new(),
             bound: Vec::new(),
@@ -683,60 +622,11 @@ impl Drop for BrokerProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Error, ErrorKind};
-
-    #[test]
-    fn only_end_of_file_or_a_real_error_ends_the_lifeline() {
-        assert!(lifeline_ended(&Ok(0)));
-        assert!(!lifeline_ended(&Ok(1)));
-        assert!(!lifeline_ended(&Err(Error::from(ErrorKind::Interrupted))));
-        assert!(lifeline_ended(&Err(Error::from_raw_os_error(libc::EBADF))));
-    }
-
-    #[test]
-    fn clear_cloexec_clears_only_that_flag_and_refuses_a_closed_fd() {
-        let mut fds = [0; 2];
-        // SAFETY: a valid out array.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        // Already clear: clearing succeeds (flags 0 is not an error).
-        clear_cloexec(fds[0]).unwrap();
-        // SAFETY: fcntl on our own descriptor.
-        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, 0);
-        set_cloexec(fds[0]);
-        set_cloexec(fds[0]);
-        // SAFETY: as above. Setting twice keeps exactly the one flag.
-        assert_eq!(
-            unsafe { libc::fcntl(fds[0], libc::F_GETFD) },
-            libc::FD_CLOEXEC
-        );
-        clear_cloexec(fds[0]).unwrap();
-        // SAFETY: as above.
-        assert_eq!(
-            unsafe { libc::fcntl(fds[0], libc::F_GETFD) } & libc::FD_CLOEXEC,
-            0
-        );
-        // SAFETY: closing our own descriptors.
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
-        assert!(clear_cloexec(fds[0]).is_err(), "a closed descriptor");
-    }
 
     #[test]
     fn the_file_limit_covers_four_descriptors_per_connection() {
         assert_eq!(FILE_LIMIT, 4 * 256 + 64);
         assert_eq!(super::super::BUFFER_BYTES, 65_536);
         assert!(raise_fd_limit(64) >= 64, "already above a small floor");
-    }
-}
-
-fn set_cloexec(fd: i32) {
-    // SAFETY: fcntl on a descriptor this process owns.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
     }
 }

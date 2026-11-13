@@ -96,7 +96,9 @@ pub enum Outcome {
 }
 
 /// One connection's final record, or, at drain, an open connection's record
-/// so far (`open: true`).
+/// so far (`open: true`). A copy counts a chunk after its write returns, so
+/// an open record's byte counts are lower bounds: the peer may already hold a
+/// chunk the snapshot has not counted. A final record's counts are exact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub name: String,

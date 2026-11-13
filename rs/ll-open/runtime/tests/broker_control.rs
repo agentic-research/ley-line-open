@@ -224,7 +224,10 @@ fn serve_binds_then_confines_then_attests_relays_and_drains() {
         }
     );
 
-    // A connection still open at drain is reported as open.
+    // A connection still open at drain is reported as open, dialed, with its
+    // byte counts as lower bounds: a copy counts a chunk after its write
+    // returns, so the echoed byte this client already holds may not be
+    // counted yet when the drain snapshots it (seen on Linux CI).
     let mut open = UnixStream::connect(&endpoint).unwrap();
     open.write_all(b"x").unwrap();
     let mut one = [0u8; 1];
@@ -232,16 +235,26 @@ fn serve_binds_then_confines_then_attests_relays_and_drains() {
         .unwrap();
     open.read_exact(&mut one).unwrap();
     broker.send(&Request::Drain);
-    assert_eq!(
-        broker.event(),
+    match broker.event() {
         Event::Connection {
-            name: "api".into(),
-            outcome: WireOutcome::Dialed,
-            bytes_to_target: 1,
-            bytes_from_target: 1,
-            open: true,
+            name,
+            outcome,
+            bytes_to_target,
+            bytes_from_target,
+            open,
+        } => {
+            assert_eq!(
+                (name.as_str(), outcome, open),
+                ("api", WireOutcome::Dialed, true)
+            );
+            assert!(
+                bytes_to_target <= 1 && bytes_from_target <= 1,
+                "an open record never counts more than was copied: \
+                 {bytes_to_target} to, {bytes_from_target} from"
+            );
         }
-    );
+        other => panic!("expected the open connection's record, got {other:?}"),
+    }
     assert_eq!(broker.event(), Event::Drained);
     assert_eq!(broker.served.join().unwrap(), Ok(()));
 }

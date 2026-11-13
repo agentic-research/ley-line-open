@@ -305,8 +305,10 @@ fn wait_for(listener: RawFd, wake: RawFd) -> Option<bool> {
             revents: 0,
         },
     ];
+    // The longest timeout poll takes (about 24 days); its expiry, like an
+    // interrupted call, sets no revents and the caller waits again.
     // SAFETY: two valid pollfds for the duration of the call.
-    unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+    unsafe { libc::poll(fds.as_mut_ptr(), 2, libc::c_int::MAX) };
     if fds[1].revents != 0 {
         return Some(false);
     }

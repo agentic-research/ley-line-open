@@ -457,6 +457,13 @@ fn verify_deployment_config_digest() {
 fn the_standalone_example_resolves_to_its_pinned_file() {
     let examples =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/examples/deployment-config");
+    if !examples.is_dir() {
+        // The examples live outside the crate: a copy of the crate alone (the
+        // mutation scratch build) does not have them. The vectors' own
+        // `standalone-example` case pins the same resolution.
+        eprintln!("SKIPPED (not a pass): {} is absent", examples.display());
+        return;
+    }
     let pinned = fs::read(examples.join("daemon-mount-macos.resolved.json")).unwrap();
     let host = HostFacts {
         home: Some("/Users/fixture".into()),

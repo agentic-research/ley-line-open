@@ -1044,6 +1044,15 @@ control reads port-scoped only by construction; the Linux run matters for `::1`
 availability and for the port control, because Linux CI is where a future Linux tier would
 be proven.
 
+*Measured (2026-11-13, macOS 27.2, `ley-line-open-52deb4`):*
+
+- `127.0.0.1` and `::1` are both scoped-allowed with the port control passing, so
+  Seatbelt's `localhost:N` matches the IPv6 loopback too.
+- `127.0.0.2` and `127.255.255.254` are unavailable, because lo0 carries only
+  `127.0.0.1` unless an alias is configured.
+- The probe's pinned table holds these rows. `::1` therefore qualifies for the delivered
+  set on macOS, and widening waits on the same row passing on every delivering platform.
+
 **What CI needs.**
 
 - **A macOS job on pull requests.** `ci.yml` runs only on `ubuntu-latest`; the one macOS

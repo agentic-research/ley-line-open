@@ -49,14 +49,15 @@ fn sandbox_unavailable(reason: &str) -> ! {
 
 #[cfg(target_os = "macos")]
 fn capabilities(port: u16) -> nono::CapabilitySet {
-    let document =
-        leyline_schema_spec::connections::ConnectionsDocument::new(vec![leyline_schema_spec::connections::Connection {
+    let document = leyline_schema_spec::connections::ConnectionsDocument::new(vec![
+        leyline_schema_spec::connections::Connection {
             name: "probe".into(),
             endpoint_unix: "/private/tmp/llo-probe.sock".into(),
             host: "127.0.0.1".parse().unwrap(),
             port,
-        }])
-        .unwrap();
+        },
+    ])
+    .unwrap();
     leyline_runtime::broker::profile::capabilities(&document).expect("broker profile")
 }
 
@@ -64,7 +65,9 @@ fn capabilities(port: u16) -> nono::CapabilitySet {
 fn capabilities(port: u16) -> nono::CapabilitySet {
     // The Linux tier is refused in slice 1; this is the egress rule a Linux
     // broker profile would use (confinement's connectLocal list compile).
-    nono::CapabilitySet::new().block_network().allow_tcp_connect(port)
+    nono::CapabilitySet::new()
+        .block_network()
+        .allow_tcp_connect(port)
 }
 
 #[cfg(target_os = "linux")]
@@ -180,7 +183,9 @@ fn row(candidate: &str) -> String {
 /// The pinned table for this platform (observed, not assumed: changing it is
 /// a change to what the delivered set may claim).
 fn expected() -> Vec<String> {
-    let scoped = |a: &str| format!("{a} available allowed=scoped-allowed port=eperm address=port-scoped-only");
+    let scoped = |a: &str| {
+        format!("{a} available allowed=scoped-allowed port=eperm address=port-scoped-only")
+    };
     #[cfg(target_os = "macos")]
     {
         vec![
@@ -188,7 +193,9 @@ fn expected() -> Vec<String> {
             // lo0 carries only 127.0.0.1 unless an alias is configured.
             "127.0.0.2 unavailable".to_owned(),
             "127.255.255.254 unavailable".to_owned(),
-            MACOS_IPV6_ROW.to_owned(),
+            // Measured 2026-11-13 (macOS 27.2): Seatbelt's `localhost:N`
+            // matches ::1 too, and the port control holds.
+            scoped("::1"),
         ]
     }
     #[cfg(target_os = "linux")]
@@ -206,10 +213,6 @@ fn expected() -> Vec<String> {
         ]
     }
 }
-
-/// Seatbelt's `localhost:N` and `::1`: the open row S11a names.
-#[cfg(target_os = "macos")]
-const MACOS_IPV6_ROW: &str = "::1 available allowed=MEASURE port=MEASURE address=MEASURE";
 
 #[test]
 fn the_loopback_table_matches_this_platform() {

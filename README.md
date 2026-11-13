@@ -167,10 +167,10 @@ Each contract has its own version, independent of the release version.
   and is a root for nothing. The rootfs digest is BLAKE3 over a
   `rootfs.manifest.json`'s exact bytes; an OCI image's SHA-256 digests are
   provenance and never compared with it.
-- **CDC.** `content_chunks` and `blob_manifest` are private derived indexes.
-  `source_blobs` remains authoritative, no consumer reads the chunk tables, and
-  changes to them do not bump `leyline-schema`. Activate and collect CDC with
-  `leyline cdc`.
+- **CDC.** The `content_chunks` and `blob_manifest` tables are private derived
+  indexes. They never replace the authoritative record (`source_blobs`), no
+  consumer reads them, and changes to them do not bump `leyline-schema`.
+  Activate and collect CDC with `leyline cdc`.
 
 Which identity is authoritative for what is settled by
 [ADR-0032](docs/adr/0032-declared-decompositions.md) §D4 and applied in

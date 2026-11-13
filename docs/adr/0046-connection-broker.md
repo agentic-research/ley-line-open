@@ -697,6 +697,25 @@ macOS) against the run's worker, which hosts the VMM, and closes any other peer 
 dial. The registry covers both tiers; the pid check is a second layer where the run has one
 peer process.
 
+*Implementation notes (2026-11-12, `ley-line-open-52b5b3`, from execution-boundary review):*
+
+- **Registry: resolved paths.** The registry compares paths as the sandbox resolves them,
+  not as they are spelled. nono canonicalizes a §6 grant before Seatbelt sees it, so both
+  sides are resolved through the realpath of their longest existing ancestor, and
+  case-folded on macOS. A non-ASCII §6 grant is refused at registration: a
+  case-insensitive volume folds Unicode case, and a not-yet-bound endpoint cannot be
+  folded through realpath. Endpoints are printable ASCII, so this never refuses a grant
+  that could not name one.
+- **Peer pid.** The broker is spawned before the worker exists (S7 step 3, then step 5),
+  so on the microVM tier it starts with `--await-peer`. It refuses every peer until the
+  supervisor names the worker's pid once over the control pipe (`{"op":"peer"}`), and the
+  pid can never be changed.
+- **Preflight.** A parent carrying an ACL is refused, and so is any ancestor that someone
+  other than root or the daemon's uid owns, or that others can write without the sticky
+  bit; either lets another user swap the parent.
+- **Teardown.** `ready` reports each bound socket's device and inode, and teardown unlinks
+  a path only while it is still that socket.
+
 ### S5. The relay: allow-list enforcement and failure behaviour (proposed)
 
 **The broker dials exactly the committed target and nothing else.**
@@ -724,6 +743,12 @@ peer process.
   after its allows so the deny wins: `process-exec*`, `process-fork`, the mDNSResponder
   path (no resolver, matching "no names"), `file-read*` and `file-write*` everywhere, and
   `mach-lookup` beyond the services the Rust runtime needs (the set is fixed by the spike).
+  *Measured in implementation (2026-11-12, `ley-line-open-52b5b3`):* the mach-lookup
+  allow-set is empty, and the mDNSResponder deny cannot take effect. nono 0.71 emits its
+  network block, which allows that socket for DNS, after every platform rule, so the
+  socket stays reachable. Resolution is still refused (`getaddrinfo` fails under the
+  profile through the `mach-lookup` and file-read denies), and the socket adds no reach.
+  The residual is `ley-line-open-fb5c4b`.
   Outbound TCP is allowed to `localhost:<port>` for each declared port and nothing else;
   no inbound TCP, no TCP listen. Accepting on the already-bound UNIX listener needs no path
   right; S11's positive control proves the confined broker still accepts and relays.
@@ -747,8 +772,14 @@ kernel, and then sees `ECONNRESET` instead of end-of-file. Either way no byte ar
 | broker exits or crashes during the run | the supervisor fails the run (D7 rule 5): cancels the workload, terminal state `failed`, receipt written from what the supervisor holds | end-of-file on open connections; new dials end at once (nothing listens at the path) |
 
 There is no unbounded retry anywhere: the 10 s hold is per connection and only for
-`ECONNREFUSED`. Each direction has a fixed buffer (64 KiB) and is copied with `read(2)` and
-`write(2)` only, so no ancillary data is received or sent (D7, `SCM_RIGHTS`).
+`ECONNREFUSED`. Each direction has a fixed buffer (64 KiB). Nothing is sent with ancillary
+data. *Measured in implementation (2026-11-12, `ley-line-open-52b5b3`):* `read(2)` alone does
+not keep a passed descriptor out. macOS installs an `SCM_RIGHTS` descriptor in the receiving
+process even on `read(2)` or `recv(2)` with no control buffer (Linux discards it). So the
+client direction is read with `recvmsg(2)` and a control buffer, every received right is
+closed at once, and a truncated control message ends the connection. The hold's hang-up
+check uses `FIONREAD`, never a peek, so a descriptor passed during the hold is never read and
+is released when the connection closes (D7, `SCM_RIGHTS`).
 
 **Strength.** The guest side is capability-shaped: an undeclared guest port has no
 listener (Q7). The host hop is `policy` at best *(cloister)*: the broker guarantees which
@@ -854,7 +885,9 @@ crashed), the counts are lower bounds. Every count is attributed to this run bec
 this run's peer is accepted (S4, S5). The broker reports each connection's record over its
 control pipe when the connection ends, and a final record for each open connection at the
 teardown drain (S7), so the receipt is assembled by the supervisor, not by the broker or
-the workload. After a broker crash the receipt carries every record reported before it,
+the workload. An open connection's byte counts at the drain are lower bounds: the broker
+counts a chunk after its write returns, so the workload may already hold a chunk the
+drain has not counted. A connection that ended before the drain has exact counts. After a broker crash the receipt carries every record reported before it,
 `complete` is false, and the run's terminal state is `failed`. The receipt carries no
 payload byte, no guest address and no peer pid.
 
@@ -897,7 +930,7 @@ loopback services; the receipt's accuracy. There is no credential.
 | resource exhaustion | many connections, a stuck upstream | per-run connection cap; per-connection 10 s hold only on `ECONNREFUSED`; fixed buffers (S5) |
 | broker compromise | a bug in the copy loop | no parser, no credential; profile denies the filesystem, exec, fork, the resolver and every port but the targets (S5) |
 | broker outlives the run | supervisor killed; cancel during start; a failure after spawn | lifeline pipe with no inherited copies of its write end; the service's cancel reaches starting runs; every failure after step 3 kills the broker (S7) |
-| descriptor passing | `SCM_RIGHTS` over the UNIX socket | `read(2)`/`write(2)` only (S5) |
+| descriptor passing | `SCM_RIGHTS` over the UNIX socket | received rights closed at once (`recvmsg(2)` with a control buffer; `read(2)` alone installs them on macOS), never forwarded (S5) |
 | a declared connection silently not delivered | tier cannot express it; broker fails to bind | the run is refused by name (S2, S4, S6, S7) |
 
 ### S11. Tests that close it
@@ -953,7 +986,8 @@ enforcement.
 - **Profile** (closes S5; *macOS*): the whole relay suite runs again with the broker
   confined, as the positive control (accept and relay still work). Under the profile the
   broker gets `EPERM` connecting to an undeclared loopback port, opening any file,
-  `execve`, `fork`, connecting to mDNSResponder, and `getaddrinfo` fails. The test pins
+  `execve` and `fork`, and `getaddrinfo` fails (connecting to mDNSResponder is pinned as
+  reachable until `ley-line-open-fb5c4b`). The test pins
   the `mach-lookup` allow-set the spike fixes, so the set cannot grow without a test change.
 - **Lifecycle** (closes S7): SIGKILL the supervising process and the broker is gone within
   a bound; `ExecutionService::cancel` during a stalled ready wait leaves no broker and no

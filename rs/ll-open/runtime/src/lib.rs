@@ -7,6 +7,7 @@
 pub mod artifacts;
 pub mod authorization;
 pub mod backends;
+pub mod broker;
 pub mod cas_evidence;
 pub mod cas_volume;
 mod catalog;

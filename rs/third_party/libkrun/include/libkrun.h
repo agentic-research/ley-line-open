@@ -1042,6 +1042,23 @@ int32_t krun_setgid(uint32_t ctx_id, gid_t gid);
 int32_t krun_set_nested_virt(uint32_t ctx_id, bool enabled);
 
 /**
+ * Sets the exit code of the process when the guest resets instead of powering off.
+ *
+ * By default both end the VMM with exit code 0. With a reset exit code the caller can
+ * tell a reboot from a shutdown and start the VM again. A guest reset reaches the VMM
+ * through PSCI SYSTEM_RESET on aarch64 and the i8042 reset line on x86_64; an exit
+ * code set by the guest init takes precedence.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "code"   - the exit code for a guest reset.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_reset_exit_code(uint32_t ctx_id, uint8_t code);
+
+/**
  * Check the system if Nested Virtualization is supported
  *
  * Returns:
@@ -1050,6 +1067,39 @@ int32_t krun_set_nested_virt(uint32_t ctx_id, bool enabled);
  *  - <0: Failure
  */
 int32_t krun_check_nested_virt(void);
+
+/* Free page reporting modes for krun_set_balloon_free_page_reporting_mode() */
+#define KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT 0
+#define KRUN_FREE_PAGE_REPORTING_MODE_REPLACE 1
+
+/**
+ * Sets how the memory that the guest reports as free through the virtio-balloon
+ * device is given back to the host.
+ *
+ * KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT, the default, madvise()s it. On macOS, this
+ * doesn't release guest memory that the guest has written to.
+ *
+ * KRUN_FREE_PAGE_REPORTING_MODE_REPLACE has the VMM replace the reported pages with
+ * fresh memory on macOS instead, which does release them. This costs a few system
+ * calls per report, and the guest's next access to each page faults it in again.
+ * It also has the VMM map guest RAM in blocks of 2 MiB, one map entry each, and
+ * replace whole blocks only. If it can't map RAM like that, the VM starts anyway
+ * and uses KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT.
+ * Other platforms don't implement it, and use KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT
+ * instead.
+ *
+ * The guest only reports free pages if its kernel has CONFIG_PAGE_REPORTING and the
+ * virtio-balloon driver.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "mode"   - one of the KRUN_FREE_PAGE_REPORTING_MODE_* values.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure. Fails with -ENOTSUP if libkrun
+ *  was built for a TEE, whose VMs have no balloon device.
+ */
+int32_t krun_set_balloon_free_page_reporting_mode(uint32_t ctx_id, uint32_t mode);
 
 /* Feature constants for krun_has_feature() */
 #define KRUN_FEATURE_NET 0

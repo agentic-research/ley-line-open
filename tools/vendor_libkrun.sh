@@ -17,12 +17,12 @@
 #
 # To move to a new upstream release: change TAG and SHA, rebase the patches
 # onto it (dropping any upstream has merged), run `sync`, and record the
-# change in rs/third_party/README.md and CHANGELOG.md.
+# change in rs/third_party/README.md and a changes/<bead-id>.md fragment.
 set -eu
 
-URL=https://github.com/containers/libkrun.git
-TAG=v1.19.6
-SHA=227b2de6ed323fe180e02f871c5f325a90c13cc2
+URL=https://github.com/libkrun/libkrun.git
+TAG=v1.19.8
+SHA=c4d283c233bc0ae1993c289ec2a1b4da2242f1f8
 
 # What cargo needs, plus the license and the C header the Rust API mirrors.
 # Not upstream's root Cargo.toml: it declares only upstream's own [workspace].

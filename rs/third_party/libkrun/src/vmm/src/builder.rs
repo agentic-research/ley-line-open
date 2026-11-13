@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
+#[cfg(target_os = "macos")]
+use std::ops::Range;
 #[cfg(feature = "gpu")]
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
@@ -46,6 +48,8 @@ use devices::legacy::{IoApic, IrqChipT};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
+#[cfg(not(feature = "tee"))]
+use devices::virtio::balloon::FreePageReportingMode;
 use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice, Vsock};
 
 #[cfg(feature = "tee")]
@@ -62,6 +66,8 @@ use crate::vmm_config::block::BlockBuilder;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
+#[cfg(target_os = "macos")]
+use crate::vstate::map_guest_ram_in_blocks;
 #[cfg(target_os = "linux")]
 use crate::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
@@ -89,6 +95,8 @@ use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
+#[cfg(target_os = "macos")]
+use utils::worker_message::RECLAIM_BLOCK_SIZE;
 #[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
 use vm_memory::mmap::MmapRegion;
 use vm_memory::Address;
@@ -186,6 +194,9 @@ pub enum StartMicrovmError {
     PeGzInvalid,
     /// Cannot open the file containing the kernel code.
     RawOpenKernel(io::Error),
+    /// Cannot create the balloon device.
+    #[cfg(not(feature = "tee"))]
+    CreateBalloonDevice(devices::virtio::BalloonError),
     /// Cannot initialize a MMIO Balloon device or add a device to the MMIO Bus.
     RegisterBalloonDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Block Device or add a device to the MMIO Bus.
@@ -375,6 +386,8 @@ impl Display for StartMicrovmError {
             RawOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
             }
+            #[cfg(not(feature = "tee"))]
+            CreateBalloonDevice(ref err) => write!(f, "Cannot create the balloon device: {err:?}"),
             RegisterBalloonDevice(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -777,15 +790,19 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::Internal)?;
 
     #[cfg(target_arch = "x86_64")]
+    let reset_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+
+    #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
-    // x86_64 uses the i8042 reset event as the Vmm exit event.
     let mut pio_device_manager = PortIODeviceManager::new(
         Arc::new(Mutex::new(Cmos::new(
             arch_memory_info.ram_below_gap,
             arch_memory_info.ram_above_gap,
         ))),
         serial_devices,
-        exit_evt
+        reset_evt
             .try_clone()
             .map_err(Error::EventFd)
             .map_err(StartMicrovmError::Internal)?,
@@ -964,12 +981,17 @@ pub fn build_microvm(
         kernel_cmdline,
         vcpus_handles: Vec::new(),
         exit_evt,
+        #[cfg(target_arch = "x86_64")]
+        reset_evt,
+        reset_exit_code: vm_resources.reset_exit_code,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks: payload_config.ram_in_blocks,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -978,7 +1000,14 @@ pub fn build_microvm(
     }
 
     #[cfg(not(feature = "tee"))]
-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    attach_balloon_device(
+        &mut vmm,
+        event_manager,
+        intc.clone(),
+        vm_resources.balloon_free_page_reporting_mode,
+        #[cfg(target_os = "macos")]
+        _sender.clone(),
+    )?;
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
     let mut console_id = 0;
@@ -1431,6 +1460,38 @@ pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
+    /// Whether guest RAM is mapped in blocks, see [`map_guest_ram_in_blocks`].
+    #[cfg(target_os = "macos")]
+    ram_in_blocks: bool,
+}
+
+/// Maps guest RAM in blocks with `map`, and returns whether it worked. If it didn't, the VM still
+/// has all of its RAM, and the balloon madvise()s the pages of free page reports instead of
+/// replacing them, see `Balloon::set_guest_ram_in_blocks()`.
+#[cfg(target_os = "macos")]
+fn map_ram_in_blocks(
+    guest_mem: &GuestMemoryMmap,
+    info: &ArchMemoryInfo,
+    map: impl FnOnce(&GuestMemoryMmap, Range<u64>) -> io::Result<()>,
+) -> bool {
+    let ram = info.ram_start_addr..info.ram_last_addr;
+    match map(guest_mem, ram.clone()) {
+        Ok(()) => {
+            info!(
+                "guest RAM: mapped in {} blocks of {} MiB",
+                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            false
+        }
+    }
 }
 
 pub fn create_guest_memory(
@@ -1517,6 +1578,12 @@ pub fn create_guest_memory(
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
 
+    // Before anything is written to RAM, which this throws away.
+    #[cfg(target_os = "macos")]
+    let ram_in_blocks = vm_resources.balloon_free_page_reporting_mode
+        == FreePageReportingMode::Replace
+        && map_ram_in_blocks(&guest_mem, &arch_mem_info, map_guest_ram_in_blocks);
+
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
@@ -1534,6 +1601,8 @@ pub fn create_guest_memory(
         entry_addr,
         initrd_config,
         kernel_cmdline: cmdline.clone(),
+        #[cfg(target_os = "macos")]
+        ram_in_blocks,
     };
 
     arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
@@ -2216,10 +2285,24 @@ fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    free_page_reporting_mode: FreePageReportingMode,
+    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
+    #[cfg(target_os = "macos")]
+    {
+        let mut balloon = balloon.lock().unwrap();
+        balloon.set_free_page_reporting_mode(free_page_reporting_mode);
+        balloon.set_guest_ram_in_blocks(vmm.ram_in_blocks);
+        balloon
+            .set_map_sender(map_sender)
+            .map_err(CreateBalloonDevice)?;
+    }
+    // Only macOS implements a mode other than the default.
+    #[cfg(not(target_os = "macos"))]
+    let _ = free_page_reporting_mode;
 
     event_manager
         .add_subscriber(balloon.clone())
@@ -2381,6 +2464,48 @@ pub mod tests {
         });
 
         create_guest_memory(mem_size_mib, &vm_resources, &Payload::Empty)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_create_guest_memory_maps_ram_in_blocks_only_when_asked() {
+        const MIB: u64 = 1 << 20;
+        for (mode, entry_size) in [
+            (FreePageReportingMode::Replace, RECLAIM_BLOCK_SIZE),
+            (FreePageReportingMode::Default, 64 * MIB),
+        ] {
+            let mut vm_resources = VmResources::default();
+            vm_resources.balloon_free_page_reporting_mode = mode;
+            let (guest_memory, info, _shm_manager, payload_config) =
+                create_guest_memory(64, &vm_resources, &Payload::Empty).unwrap();
+            assert_eq!(
+                payload_config.ram_in_blocks,
+                mode == FreePageReportingMode::Replace
+            );
+            assert_eq!(info.ram_last_addr - info.ram_start_addr, 64 * MIB);
+            for addr in [info.ram_start_addr, info.ram_last_addr - 1] {
+                let host_addr = guest_memory.get_host_address(GuestAddress(addr)).unwrap();
+                let entry = crate::macos::vm_map::entry(host_addr as u64);
+                assert_eq!(entry.size, entry_size, "{mode:?}, guest {addr:#x}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
+        let (guest_memory, info, _shm_manager, _payload_config) =
+            create_guest_memory(64, &VmResources::default(), &Payload::Empty).unwrap();
+
+        let mut asked = None;
+        let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
+            asked = Some(ram);
+            Err(io::Error::from_raw_os_error(libc::ENOMEM))
+        });
+        assert!(!in_blocks);
+        assert_eq!(asked, Some(info.ram_start_addr..info.ram_last_addr));
+
+        assert!(map_ram_in_blocks(&guest_memory, &info, |_, _| Ok(())));
     }
 
     #[test]

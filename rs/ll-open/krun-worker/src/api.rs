@@ -27,6 +27,17 @@ const ROOT_TAG: &CStr = c"/dev/root";
 /// `krun_start_enter` on a longer one, so the length is checked here instead.
 pub const VIRTIOFS_TAG_MAX: usize = 36;
 
+/// The worker's exit status when the guest stopped without recording one:
+/// init died, the kernel panicked, or a workload run as PID 1 exited (bead
+/// `ley-line-open-7164ec`). The guest's default command line is
+/// `reboot=k panic=-1`, so each of those reaches the VMM as a guest reset,
+/// and [`prepare_vm`] hands this code to `krun_set_reset_exit_code`, which
+/// libkrun exits with on a reset. A status the guest recorded through the
+/// root virtio-fs device, 0 included, still wins. 125 is the code the guest
+/// init itself records when it refuses to start the workload (LLO libkrun
+/// patch 0015), podman's and crun's code for a failure of the runtime.
+pub const NO_GUEST_EXIT_STATUS: u8 = 125;
+
 /// Safe, narrow projection of the libkrun API used by Leyline.
 ///
 /// [`LinkedKrunApi`] owns the unsafe ABI boundary. Tests replace it at this
@@ -35,6 +46,11 @@ pub trait KrunApi: Send + Sync {
     fn create_context(&self) -> Result<u32, ExecutionError>;
     fn free_context(&self, context: u32);
     fn set_vm_config(&self, context: u32, vcpus: u8, ram_mib: u32) -> Result<(), ExecutionError>;
+    /// The process exit status libkrun uses when the guest resets instead of
+    /// powering off and recorded no status of its own (upstream
+    /// `krun_set_reset_exit_code`, libkrun v1.19.8). Without it a reset
+    /// exits 0.
+    fn set_reset_exit_code(&self, context: u32, code: u8) -> Result<(), ExecutionError>;
     fn add_rootfs(
         &self,
         context: u32,
@@ -114,7 +130,7 @@ pub trait KrunApi: Send + Sync {
 }
 
 /// libkrun linked into this binary, built from `rs/third_party/libkrun`: upstream
-/// v1.19.6 plus LLO's patches (ADR-0044). LLO builds the VMM it runs; nothing
+/// v1.19.8 plus LLO's patches (ADR-0044). LLO builds the VMM it runs; nothing
 /// is loaded from an installed libkrun. The guest kernel is still the
 /// installed libkrunfw, which libkrun dlopens at `krun_create_ctx`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -139,6 +155,13 @@ impl KrunApi for LinkedKrunApi {
             "krun_set_vm_config",
             krun::krun_set_vm_config(context, vcpus, ram_mib),
         )
+    }
+
+    fn set_reset_exit_code(&self, context: u32, code: u8) -> Result<(), ExecutionError> {
+        // SAFETY: plain integer arguments; libkrun looks the context up.
+        check_ffi("krun_set_reset_exit_code", unsafe {
+            krun::krun_set_reset_exit_code(context, code)
+        })
     }
 
     fn add_rootfs(
@@ -351,6 +374,13 @@ pub fn prepare_vm<'api>(
     };
 
     api.set_vm_config(context, config.vcpus, config.ram_mib)?;
+    // A guest that stops without recording an exit status must not read as
+    // a success. Upstream libkrun exits 0 on a guest reset unless told
+    // otherwise, and a panic, an init death and init's own restart all
+    // arrive as one. Residual: a guest that powers off (PSCI SYSTEM_OFF)
+    // without recording a status still exits 0; only guest root can do
+    // that, and it could as well record 0 itself.
+    api.set_reset_exit_code(context, NO_GUEST_EXIT_STATUS)?;
     api.add_rootfs(context, &rootfs, false)?;
     api.disable_implicit_vsock(context)?;
 

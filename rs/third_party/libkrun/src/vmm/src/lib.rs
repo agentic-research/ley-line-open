@@ -67,11 +67,6 @@ use vm_memory::GuestMemoryMmap;
 
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
-/// The process exit status when the guest stopped without recording one
-/// (its init records the workload's status, or its own refusal, through the
-/// root virtio-fs device). Init's code for a failure of the runtime itself,
-/// as podman and crun use it.
-pub const NO_GUEST_EXIT_STATUS: i32 = 125;
 /// Generic error exit code.
 pub const FC_EXIT_CODE_GENERIC_ERROR: u8 = 1;
 /// Generic exit code for an error considered not possible to occur if the program logic is sound.
@@ -206,6 +201,9 @@ pub struct Vmm {
 
     vcpus_handles: Vec<VcpuHandle>,
     exit_evt: EventFd,
+    #[cfg(target_arch = "x86_64")]
+    reset_evt: EventFd,
+    reset_exit_code: Option<u8>,
     vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     exit_code: Arc<AtomicI32>,
@@ -214,6 +212,9 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    /// Whether guest RAM is mapped in blocks, see `map_guest_ram_in_blocks()`.
+    #[cfg(target_os = "macos")]
+    ram_in_blocks: bool,
 }
 
 impl Vmm {
@@ -378,6 +379,18 @@ impl Vmm {
         }
     }
 
+    /// Stops with `exit_code` unless the guest's init set one, which takes precedence.
+    fn stop_guest(&mut self, exit_code: u8) {
+        let vmm_exit_code = self.exit_code.load(Ordering::SeqCst);
+        if vmm_exit_code != i32::MAX {
+            debug!("using vmm exit code: {vmm_exit_code}");
+            self.stop(vmm_exit_code);
+        } else {
+            debug!("using vcpu exit code: {exit_code}");
+            self.stop(i32::from(exit_code));
+        }
+    }
+
     /// Returns a reference to the inner KVM Vm object.
     pub fn kvm_vm(&self) -> &Vm {
         &self.vm
@@ -399,6 +412,28 @@ impl Vmm {
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
     }
+
+    #[cfg(target_os = "macos")]
+    pub fn reclaim_memory(&mut self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        let info = &self.arch_memory_info;
+        // Replacing the pages of the firmware or SHM regions, which are guest memory too, would
+        // break them.
+        if guest_addr < info.ram_start_addr || guest_addr + len > info.ram_last_addr {
+            warn!(
+                "Not reclaiming guest memory outside of RAM: guest_addr={guest_addr:x}, len={len}"
+            );
+            reply_sender.send(false).unwrap();
+            return;
+        }
+        match self.vm.reclaim_memory(&self.guest_memory, guest_addr, len) {
+            Ok(reclaimed) => reply_sender.send(reclaimed).unwrap(),
+            Err(e) => {
+                // The guest's accesses to the hole would be emulated as MMIO and lose data.
+                error!("Cannot map reclaimed guest memory back, stopping the VM: {e}");
+                self.stop(i32::from(FC_EXIT_CODE_GENERIC_ERROR));
+            }
+        }
+    }
 }
 
 impl Subscriber for Vmm {
@@ -407,51 +442,45 @@ impl Subscriber for Vmm {
         let source = event.fd();
         let event_set = event.event_set();
 
+        #[cfg(target_arch = "x86_64")]
+        if source == self.reset_evt.as_raw_fd() && event_set == EventSet::IN {
+            let _ = self.reset_evt.read();
+            info!("i8042 reset");
+            self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+            return;
+        }
+
         if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
             let _ = self.exit_evt.read();
             // Query each vcpu for the exit_code.
-            // If the exit_code can't be found on any vcpu, it means that the exit signal
-            // has been issued by the i8042 controller in which case we exit with
-            // FC_EXIT_CODE_OK.
-            //
-            // The exit code set up by the guest takes preference over the one reported
-            // by either a vcpu or the i8042 controller.
             let vcpu_exit_code = self
                 .vcpus_handles
                 .iter()
                 .find_map(|handle| match handle.response_receiver().try_recv() {
                     Ok(VcpuResponse::Exited(exit_code)) => Some(exit_code),
+                    Ok(VcpuResponse::Reset) => {
+                        Some(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK))
+                    }
                     _ => None,
                 })
                 .unwrap_or(FC_EXIT_CODE_OK);
-            let vmm_exit_code = self.exit_code.load(Ordering::SeqCst);
-            let exit_code = if vmm_exit_code != i32::MAX {
-                debug!("using vmm exit code: {vmm_exit_code}");
-                vmm_exit_code
-            } else if vcpu_exit_code == FC_EXIT_CODE_OK {
-                // The guest recorded no exit status: init died, the kernel
-                // panicked, or the VM stopped before the workload's status
-                // was recorded. An "OK" from the vcpu here only means the
-                // guest restarted, so it is not reported as success.
-                eprintln!(
-                    "libkrun: the guest stopped without recording an exit status; \
-                     exiting {NO_GUEST_EXIT_STATUS}"
-                );
-                NO_GUEST_EXIT_STATUS
-            } else {
-                debug!("using vcpu exit code: {vcpu_exit_code}");
-                vcpu_exit_code as i32
-            };
-            self.stop(exit_code);
+            self.stop_guest(vcpu_exit_code);
         } else {
             error!("Spurious EventManager event for handler: Vmm");
         }
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
+        #[allow(unused_mut)]
+        let mut list = vec![EpollEvent::new(
             EventSet::IN,
             self.exit_evt.as_raw_fd() as u64,
-        )]
+        )];
+        #[cfg(target_arch = "x86_64")]
+        list.push(EpollEvent::new(
+            EventSet::IN,
+            self.reset_evt.as_raw_fd() as u64,
+        ));
+        list
     }
 }

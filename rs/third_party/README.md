@@ -10,11 +10,11 @@ and builds the `leyline-krun-worker` binary; no other crate depends on it
 
 | | |
 |---|---|
-| Upstream | https://github.com/containers/libkrun |
-| Tag | `v1.19.6` |
-| Commit | `227b2de6ed323fe180e02f871c5f325a90c13cc2` (2026-09-25); vendored at `v1.19.4` (`728df812`) until bead `ley-line-open-397fa6` |
+| Upstream | https://github.com/libkrun/libkrun (formerly `containers/libkrun`, which redirects there) |
+| Tag | `v1.19.8` |
+| Commit | `c4d283c233bc0ae1993c289ec2a1b4da2242f1f8` (2026-11-06, `stable-1.19.x`); vendored at `v1.19.6` (`227b2de6`) until bead `ley-line-open-b1236b`, and at `v1.19.4` (`728df812`) until bead `ley-line-open-397fa6` |
 | License | Apache-2.0 (`libkrun/LICENSE`); see "License" below |
-| LLO patches | `rs/third_party/libkrun-patches/`, applied in file order |
+| LLO patches | `rs/third_party/libkrun-patches/`, applied in file order: 14, `0002` to `0015` |
 | Writer and verifier | `tools/vendor_libkrun.sh sync` / `check` (`task vmm:vendor:check`) |
 
 ### What the tree holds
@@ -45,15 +45,36 @@ tree, the patches or the script, and weekly (bead `ley-line-open-396d77`).
 
 ### The patches
 
-Prepared as an upstream pull request; not yet submitted. Each is one
-`git format-patch` commit. `0001`–`0006` were written on top of `v1.19.4`
-and apply unchanged to `v1.19.6`; `0007` to `0012` were written on top of
-`v1.19.6`:
+Not yet submitted upstream; bead `ley-line-open-10feaa` holds the triage
+of what goes upstream and what LLO keeps. Each is one `git format-patch`
+commit. `0002`–`0006` were written on top of `v1.19.4`, `0007` to `0016` on
+top of `v1.19.6`. At `v1.19.8` all but two apply unchanged: `0008` gained
+one import line of context (upstream's `use std::io;`), and `0011` one hunk
+of context (upstream's `drain_rxq` in the muxer thread); neither changed its
+logic.
 
-1. `0001` — **libkrun/macos: start the mapping worker for virtio-fs DAX
-   windows.** On macOS a virtio-fs DAX mapping is serviced by the VMM worker
-   thread (`GpuAddMapping` → `hv_vm_map`), which upstream starts only for a virgl
-   GPU. Without the fix a guest's first DAX read hangs.
+Two patches left the series at `v1.19.8` (bead `ley-line-open-b1236b`); the
+numbers of the others are unchanged, so the README, beads and code comments
+that name them stay right:
+
+- `0001` (**libkrun/macos: start the mapping worker for virtio-fs DAX
+  windows**) is upstream: 7519abb ("libkrun: start the VMM worker thread on
+  macOS", stable PR #941; main 221a028, #931) starts the worker on every
+  macOS VM, which covers the virtio-fs DAX windows 0001 started it for.
+- `0016` (**vmm: a guest that records no exit status does not exit 0**) is
+  replaced by upstream's `krun_set_reset_exit_code` (bfd66b9, #986; main
+  `VmmBuilder::reset_exit_code`, #984; issue #892). The worker calls it with
+  125 (`NO_GUEST_EXIT_STATUS`, `rs/ll-open/krun-worker/src/api.rs`) in
+  `prepare_vm`. The guest's default command line is `reboot=k panic=-1`, so
+  a kernel panic, an init death and init's own restart all reach the VMM as
+  a reset and exit 125, and a status the guest recorded, 0 included, still
+  wins. Two differences from 0016: the VMM no longer says why on stderr,
+  and a guest that powers off (PSCI SYSTEM_OFF) without recording a status
+  exits 0. Only guest root can power off, and it could as well record 0
+  itself, so the second widens nothing (bead `ley-line-open-7164ec`).
+
+The series:
+
 2. `0002` — **devices/fs: `DynFileSystem`.** An object-safe trait for a
    virtio-fs backend supplied by the embedding process, an adapter to the
    server's generic `FileSystem`, and a `Custom` server variant.
@@ -209,14 +230,6 @@ and apply unchanged to `v1.19.6`; `0007` to `0012` were written on top of
     used only once the kernel's sysfs and devtmpfs are mounted (checked by
     filesystem magic); a refusal before that (a link at /dev) reaches the
     host as exit status 125 alone.
-16. `0016` — **vmm: a guest that records no exit status does not exit 0.**
-    When the VM stops and the guest recorded no status through the root
-    virtio-fs device, libkrun fell back to the vcpu's code, "OK" whenever
-    the guest merely restarted: after a kernel panic, after init died, or
-    after a workload run as PID 1 exited. The VMM now exits 125
-    (`NO_GUEST_EXIT_STATUS`) in that case and says so on stderr; a status
-    the guest recorded, 0 included, still wins (bead
-    `ley-line-open-7164ec`).
 
 The spike that motivated them is on branch `spike/bb8cc1-virtiofs-backend`
 (bead `ley-line-open-bb8cc1`).
@@ -229,7 +242,7 @@ libkrun embeds `/init.krun`, the first process of every guest, at build time
 at `tools/krun_init_cc.sh`: the host `cc` (static glibc) on a Linux host
 building for its own architecture, otherwise `zig cc` against musl for the
 target's architecture. Nothing is taken from an installed libkrun. With zig
-0.15.2 the aarch64 init is 89,160 bytes (with patches `0001` to `0012`)
+0.15.2 the aarch64 init was 89,160 bytes (at `v1.19.6`, with patches `0001` to `0012`)
 and byte-identical across builds.
 
 ### What stays installed
@@ -253,4 +266,8 @@ file. The LLO patches are offered upstream under Apache-2.0.
 Change `TAG` and `SHA` in `tools/vendor_libkrun.sh`, rebase the patches onto
 the new tag (dropping any upstream merged), run `tools/vendor_libkrun.sh sync`,
 then `task runtime:test` with `LEYLINE_LIBKRUNFW_PATH` set, and record the move
-in `CHANGELOG.md` and this file.
+in a `changes/<bead-id>.md` fragment and this file. A patch that conflicts on
+the new tag is rebased with `git am` onto the old tag and `git rebase` onto
+the new one in an upstream clone, then re-exported; `sync` applies the series
+with plain `git apply`, which takes no fuzz, so a patch whose context moved
+must be re-exported even when a three-way merge would apply it.

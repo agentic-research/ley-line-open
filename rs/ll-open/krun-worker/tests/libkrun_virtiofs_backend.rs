@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use leyline_krun_worker::api::{LinkedKrunApi, prepare_vm};
+use leyline_krun_worker::api::{LinkedKrunApi, NO_GUEST_EXIT_STATUS, prepare_vm};
 use leyline_runtime::DigestRef;
 use leyline_runtime::backends::libkrun::plan::{KrunConfig, ResolvedRootfs};
 use tempfile::TempDir;
@@ -139,11 +139,13 @@ struct Refusal {
 }
 
 /// A guest that stops without recording an exit status does not read as a
-/// success (LLO libkrun patch 0016, bead `ley-line-open-7164ec`). With
-/// KRUN_INIT_PID1 the workload runs as PID 1: it prints and exits 0, the
-/// kernel panics, and nothing records a status. Upstream libkrun then took
-/// the vcpu's "OK" and exited 0, as it did after any init crash or kernel
-/// panic. The VMM must exit 125 and say why on its stderr.
+/// success (bead `ley-line-open-7164ec`). With KRUN_INIT_PID1 the workload
+/// runs as PID 1: it prints and exits 0, the kernel panics, and nothing
+/// records a status. Without a reset exit code libkrun takes the reset that
+/// `panic=-1` makes for a clean stop and exits 0, as after any init crash or
+/// kernel panic. `prepare_vm` sets the reset exit code to
+/// `NO_GUEST_EXIT_STATUS` (upstream `krun_set_reset_exit_code`, which
+/// replaced LLO libkrun patch 0016 at v1.19.8), so the VMM must exit 125.
 #[test]
 fn a_guest_that_records_no_exit_status_ends_as_a_failure() {
     if let Some(rootfs) = std::env::var_os(VMM_CHILD) {
@@ -199,13 +201,9 @@ fn a_guest_that_records_no_exit_status_ends_as_a_failure() {
     );
     assert_eq!(
         output.status.code(),
-        Some(STOP_EXIT_CODE),
+        Some(i32::from(NO_GUEST_EXIT_STATUS)),
         "no recorded status is not a success: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status
-    );
-    assert!(
-        stderr.contains("the guest stopped without recording an exit status"),
-        "the VMM says why it exits 125:\n{stderr}"
     );
 }
 

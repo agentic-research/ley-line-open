@@ -20,7 +20,7 @@ serde_json = { workspace = true }
 # `lib` name `krun`. libkrun dlopens libkrunfw (the guest kernel) at
 # `krun_create_ctx`; that library stays an installed runtime file. The VMM
 # is ADR-0044's (bead ley-line-open-f1c46f): libkrun built from
-# rs/third_party/libkrun, upstream v1.19.6 plus the patches beside it.
+# rs/third_party/libkrun, upstream v1.19.8 plus the patches beside it.
 krun = { package = "libkrun", path = "../../third_party/libkrun/src/libkrun" }
 
 [dev-dependencies]

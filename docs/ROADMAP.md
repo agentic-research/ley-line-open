@@ -206,8 +206,8 @@ an ordinary repository to git, CI, review, editors and build tools.
   shared memory on unified-memory hosts; revalidate by root or generation at open.
 - **Merge gate for the shared tree** (`39c0fc`, `6bbeea`): a clean line merge can
   still break the build; the gate is the owner's design decision.
-- **Upstream libkrun** (`10feaa`): submit LLO's twelve patches to
-  containers/libkrun, on the owner's go-ahead.
+- **Upstream libkrun** (`10feaa`): submit LLO's patches (fourteen since the
+  v1.19.8 re-pin, `b1236b`) to libkrun/libkrun, on the owner's go-ahead.
 
 ## Shipped in v0.30.0 (2026-11-13)
 

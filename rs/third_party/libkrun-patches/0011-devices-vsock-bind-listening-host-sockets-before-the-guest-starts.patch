@@ -46,7 +46,7 @@ index c307c54..4f0e90e 100644
  
  type Result<T> = std::result::Result<T, VsockError>;
 diff --git a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
-index 31822dc..d91f7f5 100644
+index 182d8f5..5065de0 100644
 --- a/src/devices/src/virtio/vsock/muxer.rs
 +++ b/src/devices/src/virtio/vsock/muxer.rs
 @@ -1,4 +1,5 @@
@@ -124,7 +124,7 @@ index 31822dc..d91f7f5 100644
          thread.run();
  
 diff --git a/src/devices/src/virtio/vsock/muxer_thread.rs b/src/devices/src/virtio/vsock/muxer_thread.rs
-index 1a21588..d24d6d9 100644
+index f8ea8ec..314689a 100644
 --- a/src/devices/src/virtio/vsock/muxer_thread.rs
 +++ b/src/devices/src/virtio/vsock/muxer_thread.rs
 @@ -1,6 +1,5 @@
@@ -135,7 +135,7 @@ index 1a21588..d24d6d9 100644
  use std::sync::{Arc, Mutex};
  use std::thread;
  
-@@ -27,7 +26,7 @@ pub struct MuxerThread {
+@@ -28,7 +27,7 @@ pub struct MuxerThread {
      queue: Arc<Mutex<VirtQueue>>,
      interrupt: InterruptTransport,
      reaper_sender: Sender<u64>,
@@ -144,7 +144,7 @@ index 1a21588..d24d6d9 100644
  }
  
  impl MuxerThread {
-@@ -41,7 +40,7 @@ impl MuxerThread {
+@@ -42,7 +41,7 @@ impl MuxerThread {
          queue: Arc<Mutex<VirtQueue>>,
          interrupt: InterruptTransport,
          reaper_sender: Sender<u64>,
@@ -153,7 +153,7 @@ index 1a21588..d24d6d9 100644
      ) -> Self {
          MuxerThread {
              cid,
-@@ -52,7 +51,7 @@ impl MuxerThread {
+@@ -53,7 +52,7 @@ impl MuxerThread {
              queue,
              interrupt,
              reaper_sender,
@@ -162,7 +162,7 @@ index 1a21588..d24d6d9 100644
          }
      }
  
-@@ -149,19 +148,14 @@ impl MuxerThread {
+@@ -175,19 +174,14 @@ impl MuxerThread {
          }
      }
  
@@ -190,7 +190,7 @@ index 1a21588..d24d6d9 100644
              self.proxy_map
                  .write()
                  .unwrap()
-@@ -172,9 +166,9 @@ impl MuxerThread {
+@@ -198,9 +192,9 @@ impl MuxerThread {
          }
      }
  
@@ -200,13 +200,13 @@ index 1a21588..d24d6d9 100644
 -        self.create_lisening_ipc_sockets();
 +        self.serve_listening_ipc_sockets();
          loop {
-             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-             match self
+             if self.drain_rxq() {
+                 self.interrupt.signal_used_queue();
 diff --git a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
-index f88eb70..e947e3c 100644
+index ce0c078..24069f5 100644
 --- a/src/devices/src/virtio/vsock/unix.rs
 +++ b/src/devices/src/virtio/vsock/unix.rs
-@@ -659,7 +659,16 @@ pub struct UnixAcceptorProxy {
+@@ -674,7 +674,16 @@ pub struct UnixAcceptorProxy {
  }
  
  impl UnixAcceptorProxy {
@@ -224,7 +224,7 @@ index f88eb70..e947e3c 100644
          let fd = socket(
              AddressFamily::Unix,
              SockType::Stream,
-@@ -667,14 +676,19 @@ impl UnixAcceptorProxy {
+@@ -682,14 +691,19 @@ impl UnixAcceptorProxy {
              None,
          )
          .map_err(ProxyError::CreatingSocket)?;
@@ -251,10 +251,10 @@ index f88eb70..e947e3c 100644
  }
  
 diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
-index f2ff270..7bea3b0 100644
+index e7b6ce9..a5f88ad 100644
 --- a/src/libkrun/src/lib.rs
 +++ b/src/libkrun/src/lib.rs
-@@ -3026,7 +3026,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+@@ -3069,7 +3069,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                  unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                  tsi_flags: *tsi_flags,
              };
@@ -268,7 +268,7 @@ index f2ff270..7bea3b0 100644
          }
          VsockConfig::Implicit => {
              // Implicit vsock configuration - use heuristics
-@@ -3052,7 +3057,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+@@ -3095,7 +3100,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                      unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                      tsi_flags,
                  };

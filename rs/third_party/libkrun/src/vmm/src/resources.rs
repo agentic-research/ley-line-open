@@ -28,6 +28,8 @@ use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
+#[cfg(not(feature = "tee"))]
+use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "tee")]
@@ -180,6 +182,8 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// The process exit code when the guest resets instead of powering off.
+    pub reset_exit_code: Option<u8>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Do not create an implicit console device in the guest
@@ -192,6 +196,9 @@ pub struct VmResources {
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
     /// Enable the embedded dhcp client in init.c
     pub dhcp_client: bool,
+    /// How the balloon gives the memory of free page reports back to the host.
+    #[cfg(not(feature = "tee"))]
+    pub balloon_free_page_reporting_mode: FreePageReportingMode,
 }
 
 impl VmResources {
@@ -401,6 +408,8 @@ mod tests {
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
     use crate::vmm_config::vsock::tests::{default_config, TempSockFile};
     use crate::vstate::VcpuConfig;
+    #[cfg(not(feature = "tee"))]
+    use devices::virtio::balloon::FreePageReportingMode;
     use utils::tempfile::TempFile;
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
@@ -438,12 +447,15 @@ mod tests {
             console_output: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            reset_exit_code: None,
             split_irqchip: false,
             disable_implicit_console: false,
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,
             dhcp_client: false,
+            #[cfg(not(feature = "tee"))]
+            balloon_free_page_reporting_mode: FreePageReportingMode::Default,
         }
     }
 

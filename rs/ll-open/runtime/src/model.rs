@@ -630,8 +630,9 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
 /// the guest never ran its workload to a recorded end: the guest init
 /// refused to start it (LLO libkrun patch 0015: a mount target that is not
 /// a real directory, a `/tmp` that is not one, a missing exec config), or
-/// the guest stopped without recording any status (patch 0016: init died,
-/// the kernel panicked). Init's reason, when it could state one, is in the
+/// the guest stopped without recording any status (init died, the kernel
+/// panicked: a guest reset, which the worker's `krun_set_reset_exit_code`
+/// call turns into 125). Init's reason, when it could state one, is in the
 /// run's [`GuestOutput::stdout_tail`]. A workload that itself exits 125
 /// looks the same, and the reason text is the guest's own untrusted output:
 /// neither authenticates "the runtime refused" (bead

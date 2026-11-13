@@ -29,8 +29,8 @@ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 use rutabaga_gfx::{
     ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
-    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D, RUTABAGA_CHANNEL_TYPE_WAYLAND,
-    RUTABAGA_MAP_CACHE_MASK,
+    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, RutabagaResult, Transfer3D,
+    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK,
 };
 use rutabaga_gfx::{RutabagaDescriptor, RutabagaFromRawDescriptor};
 #[cfg(target_os = "linux")]
@@ -40,7 +40,7 @@ use rutabaga_gfx::{
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::{GpuError, Result};
 use crate::virtio::display::DisplayInfo;
@@ -147,6 +147,8 @@ impl VirtioGpuResource {
 
 pub struct VirtioGpuScanout {
     resource_id: u32,
+    width: u32,
+    height: u32,
 }
 
 pub struct VirtioGpu {
@@ -499,34 +501,36 @@ impl VirtioGpu {
             format,
         )?;
 
-        *scanout = Some(VirtioGpuScanout { resource_id });
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+        });
         Ok(OkNoData)
     }
 
+    // The resource can be larger than the scanout, but the frame only holds
+    // the scanout.
     fn read_2d_resource(
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
+        scanout: &VirtioGpuScanout,
         output: &mut [u8],
-    ) -> VirtioGpuResult {
+    ) -> RutabagaResult<()> {
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: resource.width,
-            h: resource.height,
+            w: scanout.width.min(resource.width),
+            h: scanout.height.min(resource.height),
             d: 1,
             level: 0,
-            stride: resource.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: scanout.width * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
 
-        rutabaga
-            .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
-
-        Ok(OkNoData)
+        rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
     }
 
     /// If the resource is the scanout resource, flush it to the display.
@@ -541,13 +545,19 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize) else {
+                continue;
+            };
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
+            let read = Self::read_2d_resource(&mut self.rutabaga, resource, scanout, buffer);
+            // Present the frame even if the read failed: the display API has no
+            // way to release it, and a backend may not hand out another one.
+            self.display_backend
+                .present_frame(scanout_id, frame_id, Some(&rect))?;
+            if let Err(e) = read {
                 log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
                 return Err(ErrUnspec);
             }
-            self.display_backend
-                .present_frame(scanout_id, frame_id, Some(&rect))?
         }
 
         #[cfg(windows)]
@@ -598,12 +608,13 @@ impl VirtioGpu {
     /// Can also be used to invalidate caches.
     pub fn transfer_read(
         &mut self,
-        _ctx_id: u32,
-        _resource_id: u32,
-        _transfer: Transfer3D,
-        _buf: Option<VolatileSlice>,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
     ) -> VirtioGpuResult {
-        panic!("virtio_gpu: transfer_read unimplemented");
+        self.rutabaga
+            .transfer_read(ctx_id, resource_id, transfer, None)?;
+        Ok(OkNoData)
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
@@ -974,7 +985,11 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+        // The guest unmaps a blob it asked to map even when the mapping
+        // failed, and there's nothing in the window to take back.
+        let Some(shmem_offset) = resource.shmem_offset else {
+            return Ok(OkNoData);
+        };
 
         let addr = shm_region.host_addr + shmem_offset;
 
@@ -1009,7 +1024,11 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         debug!("resource_unmap_blob");
-        let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+        // The guest unmaps a blob it asked to map even when the mapping
+        // failed, and there's nothing in the window to take back.
+        let Some(shmem_offset) = resource.shmem_offset else {
+            return Ok(OkNoData);
+        };
 
         let guest_addr = shm_region.guest_addr + shmem_offset;
         debug!(
@@ -1105,5 +1124,63 @@ mod test {
             .filter(|&i| i % 2 != 0)
             .for_each(|scanout| scanouts.disable(scanout));
         assert!(!scanouts.has_any_enabled());
+    }
+
+    #[test]
+    fn test_read_2d_resource_larger_than_scanout() {
+        use super::{VirtioGpu, VirtioGpuResource, VirtioGpuScanout};
+        use rutabaga_gfx::{
+            ResourceCreate3D, RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler,
+            RutabagaIovec, Transfer3D, RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
+        };
+
+        let mut rutabaga = RutabagaBuilder::new(0, RutabagaFenceHandler::new(|_| {}))
+            .set_default_component(RutabagaComponentType::Rutabaga2D)
+            .build()
+            .unwrap();
+        let (width, height) = (4, 2);
+        rutabaga
+            .resource_create_3d(
+                1,
+                ResourceCreate3D {
+                    target: RUTABAGA_PIPE_TEXTURE_2D,
+                    format: 0,
+                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
+                    width,
+                    height,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        let mut guest: Vec<u8> = (0..width * height * 4).map(|b| b as u8).collect();
+        rutabaga
+            .attach_backing(
+                1,
+                vec![RutabagaIovec {
+                    base: guest.as_mut_ptr().cast(),
+                    len: guest.len(),
+                }],
+            )
+            .unwrap();
+        rutabaga
+            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height, 0), None)
+            .unwrap();
+
+        let resource = VirtioGpuResource::new(1, width, height, None, 0);
+        let scanout = VirtioGpuScanout {
+            resource_id: 1,
+            width: 2,
+            height: 2,
+        };
+        let mut frame = [0u8; 2 * 2 * 4];
+        VirtioGpu::read_2d_resource(&mut rutabaga, resource, &scanout, &mut frame).unwrap();
+
+        let row = |y: usize| &guest[y * 4 * 4..][..2 * 4];
+        assert_eq!(frame[..2 * 4], *row(0));
+        assert_eq!(frame[2 * 4..], *row(1));
     }
 }

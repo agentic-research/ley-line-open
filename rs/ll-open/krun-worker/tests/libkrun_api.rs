@@ -53,6 +53,10 @@ impl KrunApi for RecordingApi {
         self.record(format!("vm:{context}:{vcpus}:{ram_mib}"))
     }
 
+    fn set_reset_exit_code(&self, context: u32, code: u8) -> Result<(), ExecutionError> {
+        self.record(format!("reset-exit:{context}:{code}"))
+    }
+
     fn add_rootfs(
         &self,
         context: u32,
@@ -175,6 +179,10 @@ fn prepares_a_writable_ephemeral_networkless_vm_without_entering_it() {
         vec![
             "create",
             "vm:42:2:1024",
+            // A guest reset (a kernel panic, init dying, a PID-1 workload
+            // exiting) with no recorded status exits 125, not upstream's 0
+            // (bead ley-line-open-7164ec).
+            "reset-exit:42:125",
             &format!("root:42:false:{}", canonical_rootfs.display()),
             "no-vsock:42",
             // The implicit device is dropped, then re-added explicitly with
@@ -284,6 +292,10 @@ fn every_linked_call_reaches_libkrun() {
 
     let results = [
         ("krun_set_vm_config", api.set_vm_config(freed, 1, 256)),
+        (
+            "krun_set_reset_exit_code",
+            api.set_reset_exit_code(freed, 125),
+        ),
         ("krun_add_virtiofs3", api.add_rootfs(freed, c"/", false)),
         (
             "krun_add_virtiofs_backend",

@@ -623,12 +623,17 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then
     # platform gate is a feature gate cargo-mutants cannot see, so each file
     # is excluded where it does not compile — there every mutant would build
     # unchanged and read as a phantom MISSED — and mutated where it does.
+    # `broker/sys_macos.rs` and `broker/sys_other.rs` (bead
+    # ley-line-open-52b5b3) are the same kind of pair: the connection broker's
+    # ACL and peer-credential queries, one file per platform.
     if [ "$(uname -s)" = Linux ]; then
         run_slice integration --package leyline-runtime --test-workspace=false \
-            --exclude 'll-open/runtime/src/backends/cgroup_fs_other.rs'
+            --exclude 'll-open/runtime/src/backends/cgroup_fs_other.rs' \
+            --exclude 'll-open/runtime/src/broker/sys_macos.rs'
     else
         run_slice integration --package leyline-runtime --test-workspace=false \
-            --exclude 'll-open/runtime/src/backends/cgroup_fs_linux.rs'
+            --exclude 'll-open/runtime/src/backends/cgroup_fs_linux.rs' \
+            --exclude 'll-open/runtime/src/broker/sys_other.rs'
     fi
   fi
   # The worker crate (bead ley-line-open-395e43) is the runtime's libkrun half:

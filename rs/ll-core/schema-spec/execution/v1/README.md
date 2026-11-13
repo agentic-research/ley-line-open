@@ -210,11 +210,14 @@ the derivation; an implementation can compute a run's name locally without
 calling `start`.
 
 A run's rootfs is named by the rootfs digest, `RunReceipt.inputRoots[0]`:
-BLAKE3-256 over the exact bytes of its `rootfs.manifest.json`.
-`test-vectors/rootfs-manifest.json` states the canonical form those bytes
-take and pins one case, the checked-in OCI fixture's linux/arm64 manifest
-and its digest, checked against what `leyline rootfs import-oci` writes
-(ADR-0047 §3, bead `ley-line-open-39309e`).
+BLAKE3-256 over the exact bytes of its `rootfs.manifest.json`, whose
+`version` field names its form. `test-vectors/rootfs-manifest.json` states
+the canonical form of each version and pins the checked-in OCI fixture's
+linux/arm64 manifest and digest under both: v2, which `leyline rootfs
+import-oci` writes and a reader accepts only in those bytes (bead
+`ley-line-open-4f08ea`, `ley-line-open-faba8f`), and v1, frozen (ADR-0047
+§3, bead `ley-line-open-39309e`). Its `escapes-v2` case pins the one way v2
+escapes strings, which a second implementation must match byte for byte.
 
 For in-toto/DSSE evidence, a statement authorizes field `F` of a run only if
 it carries a subject whose `name` is `F`'s field name and whose
@@ -284,6 +287,15 @@ verifier recomputes the document and compares digests.
 `capabilities`, `status`, and `inspect` are read-only. In particular, `status`
 must not create a volume or initialize a backend. `provision`, `start`,
 `cancel`, and `cleanup` are explicit idempotent mutations.
+
+Lifecycle: a run has at most one terminal event (`succeeded`, `failed` or
+`cancelled`); events are appended, never rewritten. `cancel` asks for "this
+run is not executing". `CancelOutput.state` is the state the run is in after
+the request: `cancelled` when the cancel stopped it, or the run's own state
+when it had already finished, including when it finished while the cancel
+was in flight (`succeeded`, `failed`) or had been cleaned up (`cleaned`).
+Each of those is a successful cancel reply, not a refusal. A cancelled run
+is never reported `succeeded` (bead `ley-line-open-9c6a8f`).
 
 `ProvisionOutput.casRoot` (appended 2026-11-10, bead `ley-line-open-ba86d3`)
 is the absolute host path of the content-addressed rootfs store the provider

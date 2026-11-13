@@ -19,10 +19,10 @@
 //! {"rootfs":{"algorithm":"blake3-256","value":"<hex>"},
 //!  "image":{"reference":"sha256:…","manifest":"sha256:…","config":"sha256:…",
 //!           "platform":{"os":"linux","architecture":"arm64"}},
-//!  "files":10,"specialModeBitsCleared":1,"symlinksResolved":2,
+//!  "files":10,"directories":6,"symlinks":2,"specialModeBitsCleared":1,
+//!  "symlinksResolved":0,
 //!  "specialEntriesDropped":[{"layer":0,"path":"dev/console","kind":"char"}],
-//!  "linksDroppedKernelMount":[{"path":"etc/mtab","target":"/proc/mounts"}],
-//!  "linksDroppedDangling":[{"path":"usr/share/zoneinfo/localtime","target":"/etc/localtime"}],
+//!  "linksDroppedKernelMount":[],"linksDroppedDangling":[],
 //!  "unreadableFilesDropped":[{"path":"etc/shadow","mode":0}],
 //!  "imageConfig":{"entrypoint":["/bin/tool"],"cmd":[],"env":[],"workingDir":"/","user":""}}
 //! ```
@@ -83,6 +83,7 @@ pub fn pull_oci(
 
 fn policy(symlinks: SymlinkMode) -> SymlinkPolicy {
     match symlinks {
+        SymlinkMode::Preserve => SymlinkPolicy::Preserve,
         SymlinkMode::Refuse => SymlinkPolicy::Refuse,
         SymlinkMode::Resolve => SymlinkPolicy::Resolve,
     }

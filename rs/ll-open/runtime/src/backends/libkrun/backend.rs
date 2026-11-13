@@ -19,7 +19,7 @@ use super::output::OutputCapture;
 
 use super::super::process::{
     SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
-    finish_failed_start, read_readiness_line, supervise_worker,
+    finish_failed_start, published_status, read_readiness_line, supervise_worker,
 };
 use super::share::{FsService, serve};
 // The share's `worker_end` is created close-on-exec, as every descriptor
@@ -647,16 +647,17 @@ impl Backend for KrunWorkerBackend {
             // keeps the supervisor's classification and also carries the
             // tails in its detail. The live capture is released.
             let output = capture.settle();
-            let status = match result.clone() {
-                Ok(()) => BackendRunStatus::Succeeded,
-                Err(error) => {
-                    BackendRunStatus::Failed(super::output::failure_with_output(error, &output))
-                }
-            };
-            let outcome = crate::RunOutcome {
-                status,
+            // A cancelled run publishes nothing: the shared lifecycle records
+            // it `Cancelled` (bead ley-line-open-9c6a8f).
+            let outcome = published_status(&result).map(|status| crate::RunOutcome {
+                status: match status {
+                    BackendRunStatus::Failed(error) => {
+                        BackendRunStatus::Failed(super::output::failure_with_output(error, &output))
+                    }
+                    other => other,
+                },
                 output: Some(output),
-            };
+            });
             outputs.lock().remove(&run_id);
             // Retire the run and publish its completion as one step, under
             // the lock `wait_for_completion` holds while it reads `children`
@@ -665,10 +666,12 @@ impl Backend for KrunWorkerBackend {
             {
                 let mut completed = completed.lock();
                 children.lock().remove(&run_id);
-                completed.insert(run_id, outcome);
+                if let Some(outcome) = outcome {
+                    completed.insert(run_id, outcome);
+                }
             }
             completion_cv.notify_all();
-            let _ = finished_tx.send(result);
+            let _ = finished_tx.send(result.map(|_| ()));
         });
         Ok(BackendRun {
             backend_id: "libkrun/1".into(),

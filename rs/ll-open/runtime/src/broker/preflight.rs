@@ -23,6 +23,16 @@ pub const SUN_PATH_BYTES: usize = {
     }
 };
 
+/// Whether `path` carries an access-control list beyond its mode bits.
+pub fn has_acl(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(text) => super::sys::has_acl(&text),
+        // A path with an interior NUL cannot be checked: not private.
+        Err(_) => true,
+    }
+}
+
 /// Check one endpoint for the connection `name`, in the order of S4's table.
 /// `euid` is the daemon's effective uid, which must own the parent.
 pub fn check_endpoint(name: &str, endpoint: &Path, euid: u32) -> Result<(), ExecutionError> {
@@ -39,7 +49,11 @@ pub fn check_endpoint(name: &str, endpoint: &Path, euid: u32) -> Result<(), Exec
                 endpoint.display()
             )));
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        // ENOTDIR: a component of the parent is not a directory, which the
+        // parent checks below refuse by name.
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOTDIR) => {}
         Err(error) => return Err(refuse(&format!("cannot inspect the endpoint: {error}"))),
     }
     let parent = endpoint
@@ -62,6 +76,29 @@ pub fn check_endpoint(name: &str, endpoint: &Path, euid: u32) -> Result<(), Exec
     }
     if metadata.uid() != euid || metadata.mode() & 0o7777 != 0o700 {
         return Err(refuse("endpoint parent not private"));
+    }
+    // The mode bits are not the whole permission: an ACL can grant others
+    // entry to a 0700 directory.
+    if has_acl(parent) {
+        return Err(refuse("endpoint parent not private (it carries an ACL)"));
+    }
+    // Nor is the parent alone: whoever can rename it out of an ancestor can
+    // put their own directory in its place.
+    for ancestor in parent.ancestors().skip(1) {
+        let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
+            return Err(refuse(
+                "endpoint parent not private (an ancestor is unreadable)",
+            ));
+        };
+        let owned = metadata.uid() == 0 || metadata.uid() == euid;
+        let others_write = metadata.mode() & 0o022 != 0;
+        let sticky = metadata.mode() & 0o1000 != 0;
+        if !owned || (others_write && !sticky) {
+            return Err(refuse(&format!(
+                "endpoint parent not private (ancestor {} can be renamed by others)",
+                ancestor.display()
+            )));
+        }
     }
     if endpoint.as_os_str().len() >= SUN_PATH_BYTES {
         return Err(refuse("endpoint path too long"));

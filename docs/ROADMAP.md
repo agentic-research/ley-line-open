@@ -5,8 +5,8 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-11-11, at the `integration` tree `9d41b225` (latest tag
-v0.29.0, plus #566, #562 and #568).
+Last updated: 2026-11-13, for the v0.30.0 release (the `integration` tree
+`ffa18f08`).
 
 ## v1.0: single host, portable
 
@@ -24,7 +24,7 @@ v1.0.0 tag is published with its crates on crates.io, and
 | Portable, proven | The in-guest end-to-end test gates every release on Apple silicon (a manual run recorded as a per-tree receipt that tagging requires, `16a994`) and runs on Linux/KVM; the released macOS worker carries the hypervisor entitlement (`984acf`) | `5c2040` (`16a994`, `984acf` done in v0.21.0) |
 | Stable contracts | The `propose` wire, the projection ABI (`_tree`, `_source`, `_parse_diagnostics`), execution/v1 and the share header are frozen under semver, with fixtures that fail on a breaking change; the governing ADRs have a decided status | `b70e44`, `10075e` |
 | Write path for real workloads | Build output stays out of the store; bursts of authored writes commit as one batch; a write is acknowledged after one durable append; a guest write stays under 50 ms | `39998b`, `18bfdd`, `98d0c3` |
-| Fail-closed authority | A run writes only inside its grant's write scope; a backend refuses a workspace it cannot serve | `483134` (`204a94` done in v0.26.0) |
+| Fail-closed authority | A run writes only inside its grant's write scope; a backend refuses a workspace it cannot serve | done: `204a94` in v0.26.0, `483134` in v0.30.0 |
 | Installable | The crates publish to crates.io; a release is a tag, not a git revision | `c3e8c6`, `395e43` |
 | Git compatible at the boundary | Real `git` (status, diff, commit, log, blame, push, fetch) behaves in an agent's working tree as in a plain clone; git object ids are an export-only identity domain | `cf8fdb` |
 | Limits fixed or documented | Two writers on one NFS mount; `.git` in the mount | `5ec040`, `5ee38a` |
@@ -35,46 +35,55 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-- ADR-0046 Slice 1 (accepted 2026-11-11, for v0.30.0): a per-run host broker
+v0.31.0 is the next release. Its work:
+
+- ADR-0046 Slice 1, the remainder (epic `e2c5ce`): a per-run host broker
   joins a declared guest connection to one loopback `127.0.0.1:port`, bytes
-  only, no credential; the parent-death fix ships with it (`e9d940`, `521deb`,
-  `52b5b3`, `5308b7`, `528525`, `52deb4`, `f963e6`; epic `e2c5ce`).
-- ADR-0049 (accepted 2026-11-12, for v0.30.0): each daemon is configured by one
-  versioned document (`apiVersion` `config.leyline/v1`) with a published JSON
-  Schema, `--check-config` and `--print-config`; runtime `LEYLINE_*`/`LLO_*`
+  only, no credential; the parent-death fix ships with it (`52b5b3`,
+  `52deb4`, `f963e6`, `528525`, `5308b7`). The input document (`e9d940`) and
+  the `RunGrant`/`RunReceipt` fields (`521deb`) shipped in v0.30.0.
+- ADR-0049 PR2 and PR3 (`52c177`): each daemon is configured by one
+  versioned document (`apiVersion` `config.leyline/v1`) with
+  `--check-config` and `--print-config`; runtime `LEYLINE_*`/`LLO_*`
   configuration is removed; `configDigest` is recorded in `status`, the
-  `RunReceipt` and `RunOutcome`; release binaries carry the NFS `mount`, so a
-  release download can run the leyline-fs mount (`52c177`; consumers
-  `cloister-55e6cd`, `cloister-0bc3d5`, `mache-0be425`). The spec, vectors,
-  Python reference and the `leyline-runtime` library entry
-  (`resolve_execution_deployment`, `check_removed_environment`) land first;
-  the daemons, the wire fields, the sign helper and the release changes
-  follow.
+  `RunReceipt` and `RunOutcome`; the sign helper adopts its document; release
+  binaries carry the NFS `mount`, so a release download can run the
+  leyline-fs mount (consumers `cloister-55e6cd`, `cloister-0bc3d5`,
+  `mache-0be425`). PR1, the specification, vectors, Python reference and the
+  `leyline-runtime` library entry (`resolve_execution_deployment`,
+  `check_removed_environment`), shipped in v0.30.0.
+- ADR-0048 (accepted, #573), its first slice: non-structural content gains an
+  address and a hash domain (`projection-v14`, extraction epoch 8: `1b5f3c`,
+  `8bcfa7`, `cdb2a3`, `81c06c`), with mache's adoption bead filed before it
+  merges.
+- Gap queue group C: `e6b1bb` (a service run with no wall-time ceiling),
+  `ee5747` (cleanup checks `Cleaned` under the write lock), `73b3de` (the
+  native tier refuses an argument holding NUL before spawn) and C3.
+- Gap queue group D: `dab663` (the native tier cannot hard-link a CAS file
+  into its run copy), `dac894` (stale run directories swept at daemon start,
+  and a free-space floor) and `b1418f` (a per-run write bound on the run
+  root).
 - The follow-up gap queue (epic `ley-line-open-1262af`): every open design or
   correctness follow-up from the v0.26 to v0.29 releases is worked to zero, in
   groups whose files do not overlap. A pull request files a follow-up only for
   work outside its scope, and schedules it into this queue the same day.
   - **A (tooling, daemon, identity documents and Go): done** in v0.29.0
     (#558, #563, #564; see below).
-  - **C (execution service).** `7a3109` is merged (#566, after v0.29.0): a
-    worker compares the confinement it will apply with the grant before the
-    workload starts. Open: `483134` (write scope), `1022a8` (the service
-    materializes workspace shares before spawn), `e32a50` (duplicate
-    `workspaceInputs`), `e592ef` (cancel of a finished run), `f7bcb3` (a
-    worker-event channel the guest cannot write), `eea8e1` (a run's
-    `GuestOutput` on the execution-daemon socket).
-  - **D (image import and storage).** Merged: `38ff59` (#562: the per-run
-    rootfs holds only the directories the manifest implies, at `0755`) and
-    D1 (#568: `b1c18d`, `167b29`, `1665c9`, `168a65`, `2aa5d3`, `cffbb5`).
-    Open: `4f08ea` (rootfs manifest v2: directories with modes, and symbolic
-    links), `faba8f` (canonical manifest bytes are checked) and `18a7a2`.
-  - **B (guest and libkrun).** In the argv PR (group C, with `7410ec`):
+  - **C (execution service).** Shipped in v0.30.0: `7a3109` (#566),
+    `1022a8` and `483134` (#569), `9c6a8f` (#578), `9d75c9` (#580). Open for
+    v0.31.0: `e6b1bb`, `ee5747`, `73b3de` and C3 (above), then `e32a50`
+    (duplicate `workspaceInputs`), `e592ef` (cancel of a finished run),
+    `f7bcb3` (a worker-event channel the guest cannot write) and `eea8e1` (a
+    run's `GuestOutput` on the execution-daemon socket).
+  - **D (image import and storage).** Shipped in v0.30.0: `38ff59` (#562),
+    D1 (#568), `741388` (#571) and rootfs manifest v2 (#575: `4f08ea`,
+    `faba8f`, `18a7a2`). Open for v0.31.0: `dab663`, `dac894`, `b1418f`.
+  - **B (guest and libkrun).** Shipped in v0.30.0 (#577): `7410ec`,
     `d4b07f` and `f7f862`, argv and the environment reach the guest init in an
-    exec config file (libkrun patch `0013`), so the kernel command line
-    carries only worker-chosen tokens and the executable; `2594af`, init
-    mounts only over a real directory (`0014`); and `7164ec`, a boot init
-    refuses, or a guest that records no exit status, ends `Failed` with exit
-    status 125 instead of reading as a success (`0015`, `0016`). Then the loopback relay
+    exec config file (libkrun patch `0013`); `2594af`, init mounts only over a
+    real directory (`0014`); and `7164ec`, a boot init refuses, or a guest
+    that records no exit status, ends `Failed` with exit status 125 (`0015`,
+    `0016`). Next: the loopback relay
     (`ebc78e`, `bb3395`, `156d83`, `b00ae3`), the evidence gaps (`eba800`,
     `3839c9`, `eb8d81`) and `eb3411`.
   - **E (parse and identity).** `cc56e6`, `0ed720`, `1e64c4`, `1e76ba`,
@@ -96,8 +105,6 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 - `18bfdd` — group commit: writes that land close together become one proposal,
   one parse pass, one durable flush and one publish, with each file keeping its
   own base, merge and `ESTALE`.
-- `483134` (group C above) — `WorkspaceGrant` gains a write scope (exact paths
-  and directory prefixes); storefs refuses writes outside it.
 - `5c2040` — VM tests on Linux/KVM. Apple silicon is a manual release gate
   instead of CI (hosted macOS runners lack nested Hypervisor.framework):
   `task release:hypervisor:record` writes the receipt `tools/tag_release.sh`
@@ -202,13 +209,30 @@ an ordinary repository to git, CI, review, editors and build tools.
 - **Upstream libkrun** (`10feaa`): submit LLO's twelve patches to
   containers/libkrun, on the owner's go-ahead.
 
-## Merged since v0.29.0 (unreleased)
+## Shipped in v0.30.0 (2026-11-13)
+
+Images re-import (rootfs manifest v2 changes every rootfs digest), and a
+writing grant names a `writeScope`; arenas do not re-parse
+(`projection-v13`).
 
 | PR | Change | Bead |
 |---|---|---|
 | #566 | A worker compares the confinement it will apply with the grant before the workload starts, on both tiers (`committed_confinement`); the applied policy is parsed from the digested bytes | `7a3109` |
+| #577 | A microVM guest receives argv and environment byte for byte from an exec config file (libkrun patch `0013`); init mounts only over a real directory (`0014`); a run init refuses, or a guest that records no exit status, ends `Failed` with exit status 125 (`0015`, `0016`) | `7410ec`, `d4b07f`, `f7f862`, `2594af`, `7164ec` |
+| #584 | `tar` 0.4.46 for GHSA-3pv8-6f4r-ffg2 (OCI layer PAX header desynchronization) | `184dbd` |
 | #568 | Gap queue D1: a registry pull refuses a token realm or redirect to a non-public address and bounds every request's headers; CAS volume `hdiutil` runs are bounded, a crashed provider's partial image is cleaned and only its own image is used, and the real-`hdiutil` tests run in a recorded gate; an image with a regular file at a kernel mount point is refused at import; absolute tar entry names (Nix `dockerTools`) import from the image root; rustix 1.1.6 for RUSTSEC-2026-0486 | `b1c18d`, `167b29`, `1665c9`, `168a65`, `2aa5d3`, `cffbb5`, `d68536` |
 | #562 | Gap queue D2: the per-run rootfs copy is built from the manifest, holding exactly the directories the files imply, each at `0755`, so a rootfs digest names one guest tree | `38ff59` |
+| #575 | Rootfs manifest v2: directories with modes and symbolic links, canonical bytes only; `import-oci` keeps links by default; every image's rootfs digest changes | `4f08ea`, `faba8f`, `18a7a2` |
+| #569 | The execution service opens a run's workspace shares and hands them to the backend; `WorkspaceGrant.writeScope`, enforced by the store-backed share | `1022a8`, `483134` |
+| #571 | `--cas-volume` puts each run's rootfs on the case-sensitive volume | `741388` |
+| #578 | A cancelled run is never recorded as a success; one terminal event per run | `9c6a8f` |
+| #580 | Both tiers refuse the same unrepresentable environment, by name, before a worker exists | `9d75c9` |
+| #581 | `leyline_runtime::artifacts::oci::Platform` exposes `import-oci`'s platform rule (`FromStr`, `admits`, `select`) | `370b41` |
+| #574 | `cloister/connections/v1`, the connection broker's input document, with vectors and a Python reference (ADR-0046 Slice 1 S2) | `e9d940` |
+| #576 | `RunGrant.connectionsDigest`/`connectionsDocument` and the `RunReceipt` connection fields; a grant with connections is refused at start until the broker lands (Slice 1 S3/S8) | `521deb` |
+| #579, #583 | ADR-0049 accepted; `config.leyline/v1` specification, vectors, Python reference and the `leyline-runtime` library resolver (PR1) | `52c177` |
+| #573 | ADR-0048 accepted: non-structural content | `1b5f3c` |
+| #570 | The documentation matches the v0.29.0 code | `538c5a` |
 
 ## Shipped in v0.29.0 (2026-11-11)
 

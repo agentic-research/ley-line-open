@@ -727,7 +727,7 @@ fn the_cap_is_256_simultaneous_connections() {
                             ErrorKind::ConnectionRefused | ErrorKind::WouldBlock
                         ) =>
                     {
-                        thread::sleep(Duration::from_millis(5));
+                        thread::yield_now();
                     }
                     Err(error) => panic!("connect: {error}"),
                 }
@@ -744,7 +744,7 @@ fn the_cap_is_256_simultaneous_connections() {
                     ErrorKind::ConnectionRefused | ErrorKind::WouldBlock
                 ) =>
             {
-                thread::sleep(Duration::from_millis(5));
+                thread::yield_now();
             }
             Err(error) => panic!("connect: {error}"),
         }

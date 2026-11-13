@@ -6,6 +6,9 @@ use std::ffi::CStr;
 use std::io;
 use std::os::fd::RawFd;
 
+// SAFETY: these are libSystem's ACL functions with their documented C
+// signatures (acl(3)); `acl_get_link_np` returns an ACL the caller frees with
+// `acl_free`, or NULL with errno set.
 unsafe extern "C" {
     fn acl_get_link_np(path: *const libc::c_char, kind: libc::c_int) -> *mut libc::c_void;
     fn acl_free(object: *mut libc::c_void) -> libc::c_int;

@@ -188,7 +188,7 @@ fn the_confined_broker_exits_when_its_lifeline_ends() {
             started.elapsed() < Duration::from_secs(2),
             "the confined broker outlived its supervisor's lifeline"
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 }
 

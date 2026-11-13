@@ -326,7 +326,7 @@ fn the_broker_process_exits_when_its_lifeline_ends() {
             started.elapsed() < Duration::from_secs(2),
             "the broker outlived its supervisor's lifeline"
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 }
 
@@ -595,7 +595,7 @@ fn an_awaiting_broker_refuses_every_peer_until_the_supervisor_names_it() {
             started.elapsed() < Duration::from_secs(5),
             "the named peer is never admitted"
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
     assert!(broker.drain(Duration::from_secs(5)));
     assert!(broker.events().iter().any(|e| matches!(

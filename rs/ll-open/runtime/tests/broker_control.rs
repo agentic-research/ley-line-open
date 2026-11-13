@@ -311,19 +311,25 @@ fn serve_refuses_every_bad_start_by_name() {
 #[test]
 fn the_broker_process_exits_when_its_lifeline_ends() {
     let (_dir, real) = channel_dir();
-    let _doc = document(&real, "127.0.0.1", 9);
-    let mut broker = BrokerProcess::spawn(Path::new(BROKER), PeerPid::Any).expect("spawn");
-    // Nothing sent: the broker sits in its first read until the lifeline ends.
-    thread::sleep(Duration::from_millis(100));
+    let doc = document(&real, "127.0.0.1", 9);
+    // A broker that answered ready is running; ending only its lifeline ends it.
+    let mut broker = BrokerProcess::spawn(Path::new(UNCONFINED), PeerPid::Any).expect("spawn");
+    broker
+        .start(
+            &doc,
+            &format!("blake3-256:{}", doc.digest_hex()),
+            Duration::from_secs(5),
+        )
+        .expect("ready");
     assert!(
         !broker.exited(),
-        "the broker waits while its supervisor lives"
+        "the broker runs while its supervisor lives"
     );
     broker.close_lifeline();
-    let started = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(2);
     while !broker.exited() {
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            Instant::now() < deadline,
             "the broker outlived its supervisor's lifeline"
         );
         thread::yield_now();

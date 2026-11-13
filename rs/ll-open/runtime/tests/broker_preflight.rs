@@ -135,23 +135,39 @@ fn a_parent_carrying_an_acl_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_parent_carrying_a_posix_acl_is_refused() {
+    use leyline_runtime::broker::preflight::has_acl;
+    let setfacl = |args: &[&str], dir: &std::path::Path| {
+        std::process::Command::new("setfacl")
+            .args(args)
+            .arg(dir)
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+
+    // A default ACL leaves the directory's mode at 0700, so only the ACL
+    // check can refuse it: refused for the ACL, by name.
     let (_dir, real) = private_dir();
     check_endpoint("orders-api", &real.join("orders.api.sock"), euid()).expect("no ACL yet");
-    let status = std::process::Command::new("setfacl")
-        .args(["-m", "u:nobody:rx"])
-        .arg(&real)
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
+    if !setfacl(&["-d", "-m", "u:nobody:rx"], &real) {
         // A runner without setfacl or ACL support: nothing was measured.
-        other => {
-            eprintln!("SKIPPED (NOT a pass): setfacl unavailable or refused: {other:?}");
-            return;
-        }
+        eprintln!("SKIPPED (NOT a pass): setfacl unavailable or refused");
+        return;
     }
+    assert!(has_acl(&real), "a default ACL is an ACL");
     let (code, detail) = refusal(&real.join("orders.api.sock"), euid());
     assert_eq!(code, ErrorCode::InvalidGrant);
     assert!(detail.contains("ACL"), "{detail}");
+
+    // An access ACL with a named entry also sets the ACL mask, which POSIX
+    // shows as the mode's group bits: the directory reads 0750 and the mode
+    // check refuses it first, as "not private". Either way it is refused,
+    // and the ACL is still seen.
+    let (_dir, real) = private_dir();
+    assert!(setfacl(&["-m", "u:nobody:rx"], &real));
+    assert!(has_acl(&real), "an access ACL is an ACL");
+    let (code, detail) = refusal(&real.join("orders.api.sock"), euid());
+    assert_eq!(code, ErrorCode::InvalidGrant);
+    assert!(detail.contains("not private"), "{detail}");
 }
 
 #[test]

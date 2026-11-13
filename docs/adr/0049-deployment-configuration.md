@@ -1,7 +1,8 @@
 # ADR-0049 — Deployment configuration: one versioned document per daemon kind
 
-**Status:** Accepted (owner, 2026-11-12), not yet implemented. Nothing in "Decisions" ships;
-implementation is v0.30.0. The owner's answers are recorded under "Decided questions", and the
+**Status:** Accepted (owner, 2026-11-12), partly implemented. The specification, vectors and
+library (`leyline_schema_spec::deployment_config`, `leyline_runtime::deployment`) shipped in
+v0.30.0 (#583); the daemons, the sign helper and the release mount adopt it in v0.31.0. The owner's answers are recorded under "Decided questions", and the
 cloister and mache consumer reviews of the proposed draft (`06cf7501`) are folded in.
 **Bead:** `ley-line-open-52c177`
 **Consumers:** cloister `cloister-55e6cd` (emits `ExecutionDaemonConfig` and `DaemonConfig`

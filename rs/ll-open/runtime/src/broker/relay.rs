@@ -132,9 +132,23 @@ pub struct RelayHandle {
     acceptors: Vec<JoinHandle<()>>,
     reports: mpsc::Sender<Report>,
     peer_pid: Arc<Mutex<PeerPid>>,
+    active: Arc<AtomicUsize>,
+    dial_refusals: Arc<AtomicU64>,
 }
 
 impl RelayHandle {
+    /// Connections in flight now: accepted and not yet finished, held for a
+    /// dial or copying. The cap applies to this.
+    pub fn in_flight(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Dial attempts the upstream has refused (`ECONNREFUSED`) so far, across
+    /// every held connection.
+    pub fn refused_dials(&self) -> u64 {
+        self.dial_refusals.load(Ordering::SeqCst)
+    }
+
     /// Name the one process that may connect, once, on a relay started with
     /// [`PeerPid::Awaiting`]. Refused otherwise, so a running broker's peer
     /// can never be changed or widened.
@@ -197,6 +211,7 @@ pub fn start(
         unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
     let live = Arc::new(Mutex::new(BTreeMap::new()));
     let active = Arc::new(AtomicUsize::new(0));
+    let dial_refusals = Arc::new(AtomicU64::new(0));
     let ids = Arc::new(AtomicU64::new(0));
     let peer_pid = Arc::new(Mutex::new(peers.pid));
     let mut acceptors = Vec::with_capacity(endpoints.len());
@@ -211,6 +226,7 @@ pub fn start(
             reports: reports.clone(),
             uid: peers.uid,
             peer_pid: Arc::clone(&peer_pid),
+            dial_refusals: Arc::clone(&dial_refusals),
             limits,
         };
         let wake = wake_read.as_raw_fd();
@@ -227,6 +243,8 @@ pub fn start(
         acceptors,
         reports,
         peer_pid,
+        active,
+        dial_refusals,
     })
 }
 
@@ -238,6 +256,7 @@ struct Context {
     reports: mpsc::Sender<Report>,
     uid: u32,
     peer_pid: Arc<Mutex<PeerPid>>,
+    dial_refusals: Arc<AtomicU64>,
     limits: Limits,
 }
 
@@ -403,7 +422,7 @@ fn serve(
     tracked: Tracked,
     context: &Context,
 ) {
-    let Some(upstream) = dial(&client, target, context.limits.hold) else {
+    let Some(upstream) = dial(&client, target, context.limits.hold, &context.dial_refusals) else {
         context.finish(id, name, Outcome::Refused, 0, 0);
         return;
     };
@@ -464,7 +483,12 @@ pub fn next_backoff(backoff: Duration) -> Duration {
 /// ending early when the client hangs up; any other error ends at once. Every
 /// attempt is bounded by what is left of the hold, so a full backlog cannot
 /// outlast it. No retry is unbounded.
-fn dial(client: &UnixStream, target: SocketAddr, hold: Duration) -> Option<TcpStream> {
+fn dial(
+    client: &UnixStream,
+    target: SocketAddr,
+    hold: Duration,
+    refusals: &AtomicU64,
+) -> Option<TcpStream> {
     let started = Instant::now();
     let mut backoff = BACKOFF_START;
     loop {
@@ -476,6 +500,7 @@ fn dial(client: &UnixStream, target: SocketAddr, hold: Duration) -> Option<TcpSt
         if error.kind() != ErrorKind::ConnectionRefused {
             return None;
         }
+        refusals.fetch_add(1, Ordering::SeqCst);
         let left = hold.saturating_sub(started.elapsed());
         if left.is_zero() || client_hung_up(client, backoff.min(left)) {
             return None;

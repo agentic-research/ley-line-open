@@ -883,10 +883,10 @@ pub async fn run_daemon_with_options(
 
     // 12. Graceful shutdown: unmount, final snapshot, cleanup.
     drop(mounted);
-    if let Err(e) = publish_living_db(&ctx.live_db, &ctrl_path) {
-        eprintln!("warn: final snapshot failed: {e:#}");
-    } else {
-        eprintln!("final snapshot saved to arena");
+    match publish_final(&ctx.live_db, &live_db_path, &ctrl_path) {
+        Ok(FinalPublish::Published) => eprintln!("final snapshot saved to arena"),
+        Ok(FinalPublish::Skipped(reason)) => eprintln!("warn: final snapshot skipped: {reason}"),
+        Err(e) => eprintln!("warn: final snapshot failed: {e:#}"),
     }
     if let Some(handle) = mcp_handle {
         handle.abort();
@@ -1365,6 +1365,44 @@ pub fn publish_living_db(live_db: &crate::daemon::db_pool::LiveDb, ctrl_path: &P
         .map_err(|e| anyhow::anyhow!("reader pool checkout for a publish failed: {e}"))?;
     snapshot_to_arena(&mut conn, ctrl_path)
 }
+
+/// What the shutdown publish did.
+#[derive(Debug)]
+pub enum FinalPublish {
+    Published,
+    /// Nothing was published, for the stated reason.
+    Skipped(String),
+}
+
+/// The daemon's last publish, at shutdown (`ley-line-open-f69da0`).
+pub fn publish_final(
+    live_db: &crate::daemon::db_pool::LiveDb,
+    live_db_path: &Path,
+    ctrl_path: &Path,
+) -> Result<FinalPublish> {
+    // A live db that is gone (its state directory removed under the
+    // daemon) cannot be published: every pool checkout would try to open
+    // it and block for r2d2's 30 s `connection_timeout`. Skipped by name.
+    if !live_db_path.exists() {
+        return Ok(FinalPublish::Skipped(format!(
+            "the live db {} no longer exists",
+            live_db_path.display()
+        )));
+    }
+    let _publisher = live_db.publish_lock.lock();
+    // Bounded: a shutdown does not wait out the pool's default timeout
+    // for a reader that a vanishing file cannot supply.
+    let mut conn = live_db
+        .reader_pool
+        .get_timeout(FINAL_PUBLISH_CHECKOUT)
+        .map_err(|e| anyhow::anyhow!("reader pool checkout for the final publish failed: {e}"))?;
+    snapshot_to_arena(&mut conn, ctrl_path)?;
+    Ok(FinalPublish::Published)
+}
+
+/// How long the final publish waits for a reader. Idle readers are
+/// checked out at once; the bound only applies when none can be opened.
+const FINAL_PUBLISH_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Publish when anything committed since the last publish this caller made
 /// (`last` is the writer's `total_changes()` then). Returns whether it
@@ -2970,6 +3008,52 @@ mod tests {
             }
             let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
             assert_eq!(c.current_root(), [0u8; 32], "nothing was published");
+        }
+    }
+
+    /// `ley-line-open-f69da0`: a daemon whose state directory was removed
+    /// under it waited 30 s on SIGTERM: the final publish checked out a
+    /// reader, the pool tried to open the vanished `live.db`, and r2d2
+    /// blocked for its default `connection_timeout`. The final publish
+    /// now sees the live db is gone and skips with a named reason, without
+    /// touching the pool; with the directory intact it still publishes.
+    #[test]
+    fn final_publish_skips_a_removed_live_db_and_publishes_an_intact_one() {
+        for remove in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let arena_path = state.join("f69da0.arena");
+            let ctrl_path =
+                crate::lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, None).unwrap();
+            let live_db_path = live_db_path_for(&ctrl_path);
+            let live = crate::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
+            live.writer
+                .lock()
+                .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+                .unwrap();
+
+            if remove {
+                std::fs::remove_dir_all(&state).unwrap();
+                match publish_final(&live, &live_db_path, &ctrl_path).unwrap() {
+                    FinalPublish::Skipped(reason) => assert!(
+                        reason.contains(&live_db_path.display().to_string()),
+                        "the skip names the live db: {reason}"
+                    ),
+                    FinalPublish::Published => panic!("published into a removed directory"),
+                }
+            } else {
+                assert!(matches!(
+                    publish_final(&live, &live_db_path, &ctrl_path).unwrap(),
+                    FinalPublish::Published
+                ));
+                let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+                assert_ne!(
+                    c.current_root(),
+                    [0u8; 32],
+                    "the final publish advanced the root"
+                );
+            }
         }
     }
 

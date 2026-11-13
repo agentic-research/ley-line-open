@@ -44,6 +44,9 @@ const VECTORS_FILES: &[&str] = &[
     // Bead ley-line-open-e9d940: the connection broker's input contract
     // (ADR-0046 Slice 1). The BLAKE3 half lives in verify_connections_digest.
     "connections/v1/VECTORS.sha256",
+    // Bead ley-line-open-52c177: deployment configuration documents
+    // (ADR-0049). The BLAKE3 half lives in verify_deployment_config_vectors.
+    "deployment-config/v1/VECTORS.sha256",
 ];
 
 #[test]

@@ -1,0 +1,9 @@
+apiVersion = "config.leyline/v1"
+kind = "DaemonConfig"
+
+[source]
+path = "~/src/my-project"
+
+[mount]
+path = "~/mnt/my-project"
+# backend defaults to "nfs" on macOS; nfsPort defaults to 0 (the kernel picks a port).

@@ -1,0 +1,145 @@
+{
+  "apiVersion": "config.leyline/v1",
+  "description": "TOML adapter (ADR-0049 D7): each case's `toml` and its JSON twin `json` resolve to the same `canonical` bytes and configDigest. Each reject's TOML is refused with the pinned field and reason. `hosts` are the injected HostFacts each case resolves under (home, XDG_STATE_HOME, the platform data directory, the OS); a null member is unset.",
+  "hosts": {
+    "macos": {
+      "home": "/Users/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/Users/fixture/Library/Application Support",
+      "os": "macos"
+    },
+    "linux": {
+      "home": "/home/fixture",
+      "xdgStateHome": null,
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "linux-xdg": {
+      "home": "/home/fixture",
+      "xdgStateHome": "/home/fixture/.state",
+      "dataDir": "/home/fixture/.local/share",
+      "os": "linux"
+    },
+    "no-home": {
+      "home": null,
+      "xdgStateHome": null,
+      "dataDir": null,
+      "os": "linux"
+    }
+  },
+  "cases": [
+    {
+      "name": "standalone-example",
+      "description": "docs/examples/deployment-config/daemon-mount-macos.toml and its JSON twin.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"DaemonConfig\"\n\n[source]\npath = \"~/src/my-project\"\n\n[mount]\npath = \"~/mnt/my-project\"\n# backend defaults to \"nfs\" on macOS; nfsPort defaults to 0 (the kernel picks a port).\n",
+      "json": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"DaemonConfig\", \"source\": {\"path\": \"~/src/my-project\"}, \"mount\": {\"path\": \"~/mnt/my-project\"}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/Users/fixture/.mache/default.arena\",\n    \"sizeMib\": 64\n  },\n  \"cdc\": {\n    \"enabled\": false,\n    \"target\": \"source-blobs\"\n  },\n  \"control\": \"/Users/fixture/.mache/default.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"DaemonConfig\",\n  \"mcp\": {\n    \"groups\": null,\n    \"http\": null,\n    \"noAuth\": false,\n    \"tokenFile\": {\n      \"file\": \"/Users/fixture/Library/Application Support/leyline/daemon.token\"\n    },\n    \"uds\": null\n  },\n  \"mount\": {\n    \"backend\": \"nfs\",\n    \"nfsPort\": 0,\n    \"path\": \"/Users/fixture/mnt/my-project\"\n  },\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"shutdownAfterSeconds\": null,\n  \"source\": {\n    \"language\": null,\n    \"path\": \"/Users/fixture/src/my-project\"\n  }\n}",
+      "configDigest": "blake3-256:8a1f0fd7f73d4e764351742f2ef6ffe5779f2e609a165453d59631da5c394516"
+    },
+    {
+      "name": "cloister-host-runtime-shape",
+      "description": "Empty TOML tables for a union branch ([cas.volume], [backend.microVm], [evidence.unverified]) select it with every default.",
+      "host": "linux",
+      "kind": "ExecutionDaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"ExecutionDaemonConfig\"\ncatalog = \"/etc/leyline/execution-catalog.json\"\n\n[cas.volume]\n\n[worker]\npath = \"/usr/local/libexec/leyline-krun-worker\"\nruntimeFiles = [\"/usr/local/lib/libkrunfw.so.5\"]\n\n[backend.microVm]\n\n[evidence.unverified]\n",
+      "json": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"ExecutionDaemonConfig\", \"cas\": {\"volume\": {}}, \"worker\": {\"path\": \"/usr/local/libexec/leyline-krun-worker\", \"runtimeFiles\": [\"/usr/local/lib/libkrunfw.so.5\"]}, \"catalog\": \"/etc/leyline/execution-catalog.json\", \"evidence\": {\"unverified\": {}}, \"backend\": {\"microVm\": {}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"arena\": {\n    \"path\": \"/home/fixture/.mache/execution.arena\"\n  },\n  \"backend\": {\n    \"microVm\": {\n      \"devices\": [],\n      \"tsiHijackInet\": false,\n      \"workspace\": {\n        \"changeWindowMs\": 60000,\n        \"changedTtlMs\": 1000,\n        \"ttlMs\": 60000\n      }\n    }\n  },\n  \"cas\": {\n    \"volume\": {\n      \"runRoot\": \"/home/fixture/.local/state/leyline/runs\",\n      \"sizeCapGib\": 64\n    }\n  },\n  \"catalog\": \"/etc/leyline/execution-catalog.json\",\n  \"cdc\": {\n    \"enabled\": false\n  },\n  \"control\": \"/home/fixture/.mache/execution.ctrl\",\n  \"diagnostics\": {\n    \"profile\": false,\n    \"sheafAblationLog\": null\n  },\n  \"enrichment\": {\n    \"sessionCorpus\": null\n  },\n  \"evidence\": {\n    \"unverified\": {}\n  },\n  \"head\": {\n    \"requireSignature\": false,\n    \"signingKey\": null,\n    \"trustedKeys\": []\n  },\n  \"kind\": \"ExecutionDaemonConfig\",\n  \"parser\": {\n    \"queryMatchLimit\": 4096,\n    \"queryProgressBudget\": 100000,\n    \"trustedQueryHashes\": []\n  },\n  \"source\": null,\n  \"stateDir\": \"/home/fixture/.local/state/leyline\",\n  \"worker\": {\n    \"path\": \"/usr/local/libexec/leyline-krun-worker\",\n    \"readyTimeoutMs\": 60000,\n    \"runtimeFiles\": [\n      \"/usr/local/lib/libkrunfw.so.5\"\n    ]\n  }\n}",
+      "configDigest": "blake3-256:1756bb994122a5c2f2a3516cc2ffc93b14d4ff8213a4238bf4ae6581481afe97"
+    },
+    {
+      "name": "sign-helper",
+      "description": "Inline tables and arrays.",
+      "host": "macos",
+      "kind": "SignHelperConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"SignHelperConfig\"\nresolveAllow = [\"keychain://com.cloister/vault-kek-\", \"apple-password://com.cloister/kek-\"]\n\n[auth]\ncallerTokens = { file = \"~/.config/leyline/caller-tokens\" }\n\n[signAllow.callers]\ncloister = [\"op://vault/item\", \"keychain://com.cloister/sk-\"]\nrosary = []\n",
+      "json": "{\"apiVersion\": \"config.leyline/v1\", \"kind\": \"SignHelperConfig\", \"resolveAllow\": [\"keychain://com.cloister/vault-kek-\", \"apple-password://com.cloister/kek-\"], \"auth\": {\"callerTokens\": {\"file\": \"~/.config/leyline/caller-tokens\"}}, \"signAllow\": {\"callers\": {\"cloister\": [\"op://vault/item\", \"keychain://com.cloister/sk-\"], \"rosary\": []}}}",
+      "canonical": "{\n  \"apiVersion\": \"config.leyline/v1\",\n  \"auth\": {\n    \"callerTokens\": {\n      \"file\": \"/Users/fixture/.config/leyline/caller-tokens\"\n    },\n    \"required\": true\n  },\n  \"bind\": \"127.0.0.1:8786\",\n  \"health\": {\n    \"probeUrl\": null\n  },\n  \"keychainAccount\": \"cloister\",\n  \"kind\": \"SignHelperConfig\",\n  \"rateLimitPerSecond\": 1000,\n  \"resolveAllow\": [\n    \"apple-password://com.cloister/kek-\",\n    \"keychain://com.cloister/vault-kek-\"\n  ],\n  \"resolveCache\": {\n    \"maxEntries\": 1024,\n    \"ttlMs\": null\n  },\n  \"signAllow\": {\n    \"callers\": {\n      \"cloister\": [\n        \"keychain://com.cloister/sk-\",\n        \"op://vault/item\"\n      ],\n      \"rosary\": []\n    },\n    \"required\": true\n  },\n  \"subprocess\": {\n    \"opBin\": null,\n    \"securityBin\": null\n  }\n}",
+      "configDigest": "blake3-256:1480dc46578f7cd0fe8ce6ad37ae04a5bf3be722b3230610db0f0753dd15469c"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "float",
+      "description": "A TOML float has no v1 field type.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"DaemonConfig\"\n[arena]\nsizeMib = 64.0\n",
+      "field": "arena.sizeMib",
+      "reason": "toml-type-not-mapped"
+    },
+    {
+      "name": "datetime",
+      "description": "A TOML datetime has no v1 field type.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"DaemonConfig\"\nshutdownAfterSeconds = 1979-05-27T07:32:00Z\n",
+      "field": "shutdownAfterSeconds",
+      "reason": "toml-type-not-mapped"
+    },
+    {
+      "name": "empty-backend-table",
+      "description": "[backend] alone names no branch.",
+      "host": "macos",
+      "kind": "ExecutionDaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"ExecutionDaemonConfig\"\ncatalog = \"/c\"\n[cas.directory]\nroot = \"/x\"\nrunRoot = \"/y\"\n[worker]\npath = \"/w\"\n[evidence.unverified]\n[backend]\n",
+      "field": "backend",
+      "reason": "union-empty"
+    },
+    {
+      "name": "empty-evidence-table",
+      "description": "[evidence] alone names no branch.",
+      "host": "macos",
+      "kind": "ExecutionDaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"ExecutionDaemonConfig\"\ncatalog = \"/c\"\n[cas.directory]\nroot = \"/x\"\nrunRoot = \"/y\"\n[worker]\npath = \"/w\"\n[evidence]\n",
+      "field": "evidence",
+      "reason": "union-empty"
+    },
+    {
+      "name": "empty-cas-table",
+      "description": "[cas] alone names no branch.",
+      "host": "macos",
+      "kind": "ExecutionDaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"ExecutionDaemonConfig\"\ncatalog = \"/c\"\n[cas]\n[worker]\npath = \"/w\"\n[evidence.unverified]\n",
+      "field": "cas",
+      "reason": "union-empty"
+    },
+    {
+      "name": "empty-mount-table",
+      "description": "[mount] alone lacks mount.path.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"DaemonConfig\"\n[mount]\n",
+      "field": "mount.path",
+      "reason": "missing-key"
+    },
+    {
+      "name": "empty-mcp-http-table",
+      "description": "[mcp.http] alone lacks mcp.http.port.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"DaemonConfig\"\n[mcp.http]\n",
+      "field": "mcp.http.port",
+      "reason": "missing-key"
+    },
+    {
+      "name": "duplicate-key",
+      "description": "TOML's own rule refuses a repeated key before mapping.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"DaemonConfig\"\nkind = \"DaemonConfig\"\n",
+      "field": "",
+      "reason": "malformed"
+    },
+    {
+      "name": "negative-integer",
+      "description": "A negative TOML integer is out of range.",
+      "host": "macos",
+      "kind": "DaemonConfig",
+      "toml": "apiVersion = \"config.leyline/v1\"\nkind = \"DaemonConfig\"\nshutdownAfterSeconds = -1\n",
+      "field": "shutdownAfterSeconds",
+      "reason": "out-of-range"
+    }
+  ]
+}

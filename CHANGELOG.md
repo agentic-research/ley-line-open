@@ -14,6 +14,234 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.30.0] — 2026-11-13
+
+**An execution-boundary release: every image re-imports (rootfs manifest
+v2), and writing grants are reissued with a `writeScope`.** Arenas do not
+re-parse: the projection stays `projection-v13`. `SCHEMA_VERSION` is 0.30.0,
+because `execution/v1` gained `WorkspaceGrant.writeScope`, the `RunGrant`
+connection fields and the `RunReceipt` connection fields.
+
+Upgrade steps:
+- **Re-import images.** `leyline rootfs import-oci` writes rootfs manifest
+  v2 (directories with modes, symbolic links kept by default), so every
+  image's rootfs digest changes; v1 manifests stay readable. Cloister
+  adopts it under `cloister-b74da4`.
+- **Reissue writing grants.** A grant with `mutate` or `commit` must name a
+  `writeScope`; `["/"]` keeps the old meaning. Issue a narrower one only to
+  a daemon that advertises `cloister/execution/v1/workspace-write-scope`.
+- **Embedders of `leyline-runtime`.** `Backend::start` takes the
+  `ServedWorkspaces` the service opened, a worker request must carry the
+  `confinementDigest` key, and `OciImportError` and `CasVolumeError` gain
+  variants.
+
+For microVM users:
+- **Fail closed before the workload:** the worker checks the confinement it will
+  apply against the grant before anything runs; a run the guest init
+  refuses, or a guest that records no exit status, ends `Failed` with exit
+  status 125 instead of `Succeeded` (libkrun patches `0015`, `0016`); init
+  mounts only over a real directory (`0014`).
+- **Argv and environment byte for byte:** they reach the guest in an exec
+  config file, not the kernel command line (`0013`), so `--`, quotes and
+  control characters survive.
+- **Cancellation:** a cancelled run is never recorded as a success, and a
+  run has one terminal event.
+- **Images:** Nix `dockerTools` images import, a case-sensitive CAS volume
+  also holds each run's rootfs, and a registry pull refuses a non-public
+  token realm or redirect.
+
+Also: the connection broker's input document (`cloister/connections/v1`)
+and its `RunGrant` fields, with no broker serving them yet (ADR-0046 Slice 1
+continues in v0.31.0); the deployment configuration specification
+(`config.leyline/v1`, ADR-0049) and its library resolver, with the daemons
+adopting it in a following release; `tar` 0.4.46 and rustix 1.1.6 for
+published advisories.
+
+### Security
+
+- **A worker compares the confinement it will apply with the grant before the workload starts** (bead `ley-line-open-7a3109`). Both tiers used to compare only in the supervisor, on the readiness event, which the worker writes immediately before `krun_start_enter` or the child's spawn, so a drifting run was refused after it had started.
+  - **Before anything runs.** The new `committed_confinement` (one function for both tiers) compiles the policy, digests its canonical bytes and compares them with the request's `confinement_digest` before the rootfs is read, the sandbox applied, the VM built or the child spawned. A mismatch is `identity-policy-mismatch`, "confinement drift", naming both digests. The supervisor's comparison stays as a second check.
+  - **The applied policy is parsed from the digested bytes.** `ConfinementManifest::commit` returns a `CommittedConfinement` holding the canonical bytes, their digest and the policy parsed back from them. Both tiers compile their capabilities, port map, vsock mappings and loopback channels from it.
+  - **Breaking (embedders).** `apply_manifest` and `capabilities_from_manifest` take a `&CommittedConfinement`. `confinement::apply` and `ConfinementManifest::assert_matches` are removed; use `committed_confinement` or `ConfinementManifest::commit`. A worker request must carry the `confinementDigest` key: "no commitment" is the explicit empty string, and a request omitting the key is refused.
+  - **The carried document is carried, never chosen.** The service refuses a resolver that changes `confinement_manifest`, as it already did for the digest. A request carrying a document but no digest is refused. A request carrying neither (a direct `Backend::start` embedder) still runs the deployment policy, attested with nothing to compare.
+  - ADR-0035 gains the composition rule: one document, LLO's deployment policy plus the grant-originated dimensions, digested whole and held to equality with the grant.
+
+- **A microVM run the guest init refuses now ends as a failure, never a success** (bead `ley-line-open-7164ec`). Before the workload started, init bailed out with `exit()`: PID 1 exiting panicked the guest kernel and libkrun reported exit status 0, so a run init refused (a `/tmp` that is not a directory, a mount target that is a link, a missing exec config, a channel list it could not set up) was recorded as `Succeeded` with an empty console. Init (new LLO libkrun patch `0015`) now prints the reason on the console ports the host reads, reports exit status 125 and ends the VM, so the run ends `Failed` with the status in its detail and the reason in its `GuestOutput`. A refusal made before `/sys` and `/dev` are mounted (a link at `/dev`) reaches the host as exit status 125 without its text. And when the guest stops without recording any status (init died, the kernel panicked, a workload run as PID 1 exited), libkrun (new patch `0016`) exits 125 and says so on its stderr instead of reporting the guest's restart as exit 0. A workload that exits 125 itself looks the same on the host; the reason text is the guest's own output and authenticates nothing.
+
+- **`tar` 0.4.46: OCI layer PAX header desynchronization fixed (GHSA-3pv8-6f4r-ffg2).** `tar` 0.4.45 applied a PAX `x` header to the next header entry, such as a GNU longname, rather than to the next file entry. A crafted layer could use that to desynchronize member boundaries, so `leyline rootfs import-oci` could import a rootfs that differs from what another tar reader sees in the same image. The lockfile now pins `tar` 0.4.46 (`ley-line-open-184dbd`).
+
+- **A microVM guest's init mounts only over a real directory** (bead `ley-line-open-2594af`, defence in depth for `ley-line-open-10b516`). mount(2) follows a link, so a rootfs holding `work -> bin` with a workspace attached at /work had the workspace mounted over /bin, covering the executable the run verified; a link at `dev`, `proc` or `sys` did the same with init's own mounts. Init (new LLO libkrun patch `0014`) now examines /dev, /proc, /sys and every virtio-fs share target without following links, component by component, and refuses anything but a real directory by name ("/work is not a directory, refusing to mount over it"), stopping the guest before the workload runs; a path with a `.` or `..` component is refused too. A rootfs manifest v1 cannot carry a link, so today such a root is only hand-built; the reader's refusal of a link or file at a reserved top-level name lands with manifest v2 (`ley-line-open-4f08ea`), and this is the backstop behind it.
+
+- **A rootfs digest now names one guest tree: the per-run copy holds exactly the directories the manifest implies, each at `0755`** (bead `ley-line-open-38ff59`). Rootfs manifest v1 authenticates files only, yet `materialize_ephemeral_rootfs` copied every directory of the CAS entry with its mode into the guest, so anyone able to write the CAS root could widen a directory (world-writable, setgid, sticky) or plant one and the digest still resolved. The per-run copy is now built from the manifest: the listed files and their parent directories, every directory (the root included) at `0755`, nothing else; a file in a directory the manifest does not imply is refused as undeclared, and `verify_ephemeral_rootfs`, run again before VM entry, refuses a copy whose directories are not exactly that set at `0755`. `DirectoryRootfsResolver` still accepts any directories in a CAS entry, since v1 does not name them. A guest no longer sees an empty directory a hand-built CAS entry carried: an empty `tmp/`, for one, or a git directory's empty `refs/heads` after `git gc`, without which git refuses the directory as a repository (put a file in such a directory, as the guest harness now puts a `.keep`; rootfs manifest v2, bead `ley-line-open-4f08ea`, carries empty directories). The guest init's own mounts (`/dev`, `/proc`, `/sys`, `/tmp`) are unaffected.
+
+- **A registry pull no longer follows a token realm or redirect to a loopback, private or link-local address, and a header trickle is cut at a deadline** (bead `ley-line-open-b1c18d`). A registry chooses its token realm and its redirects, so it could steer `leyline rootfs import-oci --from-registry` into GETs to the host's own or its network's HTTPS services. A connection to any endpoint other than the registry the reference names, or the loopback authority `--insecure-plain-http-registry` names, must now resolve to public addresses only: loopback, RFC 1918 and unique-local, link-local, CGNAT, unspecified, multicast, documentation, benchmarking and reserved ranges (and an IPv4-mapped or NAT64 form of one) are refused before a socket is opened, on the addresses the connection would use, so a name that resolves to one is refused like a literal. The registry itself may be on a private network, but one that has resolved to public addresses may not resolve to a non-public one on a later request of the same pull. The new `OciImportError::NonPublicDestination { url, address }` names the address; an exhaustive `match` on `OciImportError` must add it. Every request's headers, connecting and the TLS handshake included, now end at `2 × connect_timeout + response_timeout`, enforced on every read and write of the connection: ureq waits up to a second per read once its own phase deadline has passed, so a server sending a header byte at a time was bounded only by the 64 KiB header limit.
+
+- **rustix is 1.1.6, past RUSTSEC-2026-0486** (bead `ley-line-open-d68536`): rustix 1.1.4's xattr functions marked unwritten bytes as initialized when given a zero-length buffer.
+
+### Breaking
+
+- **The execution service opens a run's workspace shares and hands them to the backend** (bead `ley-line-open-1022a8`). The libkrun backend used to open the share itself, and the service then compared the shares the backend reported with the grant, after the worker had started.
+  - **`Backend::start(request, workspaces: ServedWorkspaces)`.** The service opens each granted workspace before it calls the backend. Only the service can construct a non-empty `ServedWorkspaces`, and only for a run started through `start_authorized`. `ServedWorkspaces::none()` is public: it is what a direct `Backend::start` embedder passes.
+  - **`BackendRun.attached` replaces `BackendRun.channels`.** A backend names a share for the receipt only by taking one (`ServedWorkspace::attach` returns the `AttachedWorkspace` proof), so it cannot claim a share the grant never named.
+  - **`ExecutionService::with_workspace_shares` replaces `KrunWorkerBackend::with_workspace_shares`.**
+  - **Refused earlier.** A service with no share provider, or a store that does not hold the granted graph root, refuses the start before the backend is called. A request that names workspaces without a verified grant (`ExecutionService::start`, or `Backend::start` with no shares) is refused `workspaceUnserved`.
+  - **`Backend::workspace_capacity()`** (default 0) says how many workspaces a backend serves one run. The service asks before it opens any share, so a tier that serves none is refused with nothing opened. A backend that serves workspaces must override it; libkrun answers 1.
+  - **One assertion remains.** Each share a backend took must have been opened for this run under this run's whole grant (name, graph root, operations, write scope), and must still be held when `start` returns. A backend that dropped, let go of, or swapped a share is cancelled and refused. No first-party tier can reach it. The proof shows the backend took the run's own shares and something is serving them; wiring the worker's descriptor to the share stays each backend's contract with its worker.
+
+- **A workspace grant names where the run may write** (bead `ley-line-open-483134`). `execution/v1` `WorkspaceGrant` gains `writeScope @4 :List(Text)`: exact file paths and `/`-terminated directory trees, relative to the workspace root, or the single entry `/` for the whole workspace. Before, a grant with `mutate` or `commit` could write anywhere in its workspace.
+  - **A writing grant must name a scope.** Authorization refuses, as `invalidSpec` naming the workspace, a grant that permits `mutate` or `commit` with an empty `writeScope`, and a grant that names a scope while permitting neither. A grant issued before this field existed is refused; reissue it with `writeScope: ["/"]` to keep its old meaning. The field is additive on the wire, so an older reader ignores it.
+  - **A daemon advertises that it enforces the scope.** `llo_execution_capabilities` lists `cloister/execution/v1/workspace-write-scope` at version `1`. A daemon that predates the field ignores it and lets `mutate` write anywhere, so an issuer MUST find that entry before it issues a grant narrower than `/`.
+  - **"No scope" has one encoding.** The field is left unset; an explicit empty list is refused, because it signs different bytes than an unset field. `test-vectors/run-grant-signing.json` is a new known-answer vector for a grant's signing bytes and signature, and pins that pair.
+  - **Entries are literal.** No leading `/`, no empty, `.` or `..` component, no NUL, and no entry twice.
+  - **Enforced by the share.** The store-backed share maps the scope to `source_write::Grant::Scoped`. A write, create, rename or delete outside it is the typed `outside_grant` refusal, `EACCES` in the guest, and lands nothing. A rename needs both names inside the scope. A directory above the scope can be created on the way to a granted path and can never be removed or moved. Reads are unchanged: `read` or `list` shows the whole tree at `graphRoot`.
+  - **Derived paths stay in scratch.** The scope bounds authored paths. A path the ignore rules match (`target/`, derived temp names) is never a proposal, so a run with any write scope may write it and none of it reaches the store.
+  - `leyline_storefs::scope_for` takes the `WorkspaceGrant`, not its operations. `leyline_runtime::WorkspaceGrant` gains `write_scope`.
+
+- **Rootfs manifest v2 authenticates directories with their modes and symbolic links, and `leyline rootfs import-oci` writes it: every image's rootfs digest changes** (beads `ley-line-open-4f08ea`, `ley-line-open-faba8f`; closes `ley-line-open-18a7a2`). The rootfs digest stays BLAKE3 over `rootfs.manifest.json`'s exact bytes, and those bytes are now `{"version":2,"entries":[…]}`: every directory with its mode, every regular file with its mode and content, and every symbolic link with its target bytes, in component-wise path order, each entry's parent a listed directory.
+  - **Canonical bytes only.** A v2 manifest whose bytes are not the ones its content serializes to is refused, so one tree has one digest (`faba8f`).
+  - **v1 stays readable.** It is read in any key order or whitespace and keeps its rules: files only, directories implied at `0755`, no links. One narrowing: a path must be relative and `/`-separated without empty, `.` or `..` components, so `a//b`, `a/./b` and `a/` are now refused; no LLO producer wrote them. A reader that does not know a version refuses it.
+  - **One escaping.** Strings are escaped one way: `\"`, `\\`, `\b \f \n \r \t`, other characters below U+0020 as lowercase `\u00xx`, everything else raw. The shared vector's `escapes-v2` case pins it.
+  - **Mount points.** Only a directory may be at the top-level `dev`, `proc`, `sys`, `tmp` or `work`. This is refused at import and by every v2 reader, because the guest init's `mount(2)` follows a link, so `work -> usr/bin` would put the workspace over the image's executables.
+  - **CAS directory modes.** The shared CAS entry holds each directory with group and other write and the sticky bit cleared (`cas_directory_mode`). Each run's copy has the declared mode.
+  - **Native argv0.** The native tier runs the manifest-resolved executable with the guest path of what the request named as `argv[0]`, as the microVM does.
+  - **Links are kept.** `--symlinks preserve` is the new default. A link's target is never followed at import or on resolve, and each run's copy recreates it, so `open("/etc/mtab")` reaches the guest kernel's `/proc/mounts` instead of failing `ENOENT`, and nothing is dropped as a kernel-mount or dangling link. `refuse` and `resolve` remain.
+  - **Directory modes.** Directories keep their modes, setuid and setgid cleared and owner `rwx` always set, and empty directories are kept.
+  - **What is refused.** A link or a regular file at a mount point (`dev`, `proc`, `sys`, `tmp`, now `work` too) is refused by name. `/.leyline-exec.json`, which the runtime writes into each run's copy, is reserved: an image holding it at its root is refused as the new `OciImportError::ReservedPath`, and a manifest of either version listing it is refused (`rootfs_manifest::RUN_EXEC_SPEC`). An exhaustive `match` on `OciImportError` must add the new variant.
+  - **The executable.** A run's executable is resolved through the manifest's own links as the guest's kernel resolves it (`bin/sh` through `bin -> usr/bin`), never through a host link. The native tier runs the resolved file.
+  - **The import JSON** gains `directories` and `symlinks` counts.
+  - **New known answers, links kept.**
+    - The checked-in fixture: `0848a87a…`.
+    - The first-party acceptance images: `llo` `6b217ac0…`, `mache` `644574cf…`, `rosary` `bc4f1fca…`, `hello-world` `6fbd5b6c…`.
+    - `dolthub/dolt-sql-server` arm64: `11cf2e25…`. Its 14 dangling links, which `resolve` dropped, are kept.
+    - Each is recorded in full in `tests/oci_rootfs.rs` and `tests/oci_registry_pull.rs`. An importer at an earlier version minted different digests for the same images.
+  - **Shared vectors.** `execution/v1/test-vectors/rootfs-manifest.json` pins the v2 bytes and digest beside v1's.
+  - **Cloister** adopts it under `cloister-b74da4`.
+
+### Added
+
+- **`leyline_runtime::artifacts::oci::Platform` exposes the rule `import-oci` selects a platform with** (bead `ley-line-open-370b41`), so a consumer such as Cloister can pick the lock row this host boots without mirroring the rule.
+  - `Platform: FromStr` parses `os/architecture[/variant]` and refuses anything else by name.
+  - `Platform::admits(&Platform)` decides whether this platform runs an image for the candidate platform:
+    - `os` and `architecture` must match, by OCI's names (`amd64`, never `x86_64`);
+    - a platform without a variant admits any variant;
+    - `arm64` without a variant is `arm64/v8`;
+    - an empty variant is no variant.
+  - `Platform::select(&[candidates])` returns the index of the one platform string this platform runs. It refuses none or several as the new `PlatformError::{NoMatch, Ambiguous}`, naming the candidates, and refuses a malformed string as `PlatformError::Malformed`.
+  - `PlatformError` is `#[non_exhaustive]`. `Ambiguous` advises naming a variant only to a platform that names none.
+  - An empty `variant` is now no variant everywhere: `with_variant("")`, `Display`, and the import's selection and config check.
+  - As a result, an index with an `arm64` entry whose variant is `""` beside an `arm64/v8` entry is now refused as `AmbiguousPlatform` under a `--platform`-style `arm64/v8` request, as `arm64` beside `arm64/v8` already was. A config whose variant is `""` is now admitted for `arm64/v8`. `import-oci` requests no variant, so its outcomes are unchanged.
+
+- **`RunGrant` can carry a run's connections: `connectionsDigest @16`,
+  `connectionsDocument @17` and the `credentialBrokerRefs` marker
+  `cloister/connections/v1`** (bead `ley-line-open-521deb`, ADR-0046 Slice 1 S3).
+  Authorization accepts the three only together. It recomputes the BLAKE3-256 digest
+  from the document and refuses a document that is not byte-equal to its canonical
+  form. Any other combination, or a present but empty field, is `invalidGrant`
+  naming what is missing. `credentialBrokerRefs` now means "the broker integrations
+  the run requires"; any entry but exactly the marker keeps the refusal every daemon
+  has returned since execution/v1 shipped. Daemons that predate the fields refuse
+  such a grant: on its signature when they verify, and on the marker when they do
+  not. This daemon has no connection broker yet, so it refuses a grant with
+  connections at start with `unsupportedBackend`, before the resolver runs. It does
+  not advertise `cloister/execution/v1/connections`; that arrives with the broker
+  (`ley-line-open-52b5b3`). `RunReceipt` gains `connectionsDigest @15` and
+  `connections @16` (`ConnectionOutcome`). Nothing writes them yet, and a receipt
+  from a run without connections is byte-identical to before. New pinned vector:
+  `execution/v1/test-vectors/connections-grant.json`, the canonical and signing bytes
+  produced by the capnp CLI and matched by `grant_signing_bytes`.
+
+- **Deployment configuration documents, `config.leyline/v1` (ADR-0049)**
+  (bead `ley-line-open-52c177`). `rs/ll-core/schema-spec/deployment-config/v1/`
+  specifies one versioned document per daemon kind (`DaemonConfig`,
+  `ExecutionDaemonConfig`, `SignHelperConfig`): JSON Schemas with every
+  default stated, a TOML adapter onto the same data model, canonical
+  resolved bytes and their `configDigest` (BLAKE3-256; a fingerprint of one
+  resolved configuration, never an authority), secrets by `{"file": …}`
+  reference only (`keychain` and `vault` reserved), and the published list
+  of removed environment variables (`leyline-removed-variables.json`).
+  Vectors pin every accept case's bytes and digest and every refusal's field
+  and reason; an independent standard-library Python reference reaches the
+  same bytes. `leyline_schema_spec::deployment_config` is the parser,
+  resolver and file rules (no-follow `openat` walk of the realpath'd parent);
+  `leyline_runtime::deployment::resolve_execution_deployment` maps an
+  execution document into the exact `NativeWorkerConfig` or
+  `KrunWorkerConfig` the execution daemon builds, for embedders such as
+  Cloister's host runtime, and `check_removed_environment` gives them the
+  binaries' removed-variable refusal. The daemons adopt the documents in a
+  following change.
+
+- **`cloister/connections/v1`, the connection broker's input document** (bead
+  `ley-line-open-e9d940`, ADR-0046 Slice 1 S2). New spec directory
+  `rs/ll-core/schema-spec/connections/v1/`: README, JSON Schema, canonical form,
+  `connectionsDigest` (BLAKE3-256 over the canonical bytes) pinned for a one- and a
+  three-connection document, 12 accepted cases and 87 refusals, each refusal pinned by
+  connection, field and reason code. `leyline_schema_spec::connections` is the
+  normative implementation that issuers and runners share instead of reimplementing it:
+  `ConnectionsDocument::new` builds a document, `canonical_bytes` and `digest_hex`
+  write and digest it, and `parse` reads it. `leyline-schema-spec` now depends on
+  `blake3`. An independent Python reference (standard library only, with its own reader
+  and BLAKE3) must reach every pinned digest and refusal under
+  `cargo test -p leyline-schema-spec`. Slice 1 accepts only `art.tcp` from a UNIX
+  endpoint to a loopback IP literal. Credentials, TLS, names and every other D2 member
+  are refused by name. Nothing reads the document yet: authorization and the broker
+  arrive with `ley-line-open-521deb` and `ley-line-open-52b5b3`.
+
+### Changed
+
+- **The real-`hdiutil` CAS volume tests now run in a recorded gate** (beads `ley-line-open-1665c9` and `ley-line-open-168a65`). `task runtime:test:cas-volume` (macOS) runs `tests/cas_volume.rs` and the CLI's `execution_cas_volume` test with `LEYLINE_CAS_VOLUME_TESTS=1`. `task runtime:test` runs it whenever `LEYLINE_REQUIRE_HYPERVISOR=1` is set, which `task release:hypervisor:record` sets, so the release receipt covers creating, attaching and re-attaching a real volume as well as the fakes. The tests now assert the `nodev` and `nosuid` mount flags. They also pin macOS 27's `hdiutil` deprecation warnings. LLO keeps `hdiutil`, because `diskutil image create blank` cannot make a case-sensitive APFS volume, and the pinning test fails when a warning changes or when `diskutil image` gains that ability.
+
+- **The documentation matches the v0.29.0 code** (bead `ley-line-open-538c5a`).
+  `docs/ROADMAP.md` records what shipped in v0.28.0 and v0.29.0, and its
+  "Now" is the follow-up gap queue (`ley-line-open-1262af`) and the next
+  mache item (`ley-line-open-69305e`). `docs/ARCHITECTURE.md` gains the
+  daemon lock (`<stem>.daemon-lock`), the read-only `query` module list, the
+  `rootfs` and `--cas-volume` entry points and the microVM worker release
+  asset; its ADR table says twelve libkrun patches and that ADR-0046 Q7 is
+  implemented. `docs/TECHNICAL_OVERVIEW.md` no longer describes a public
+  arena generation and names the execution boundary, the head digest and the
+  rootfs digest. `docs/TABLE_CONTRACT.md` states the `node_edge` rule for
+  comments as the code has it (the comment's parent writes none; a leaf row
+  is shared by kind and text), names `_meta.projection_schema_version`, and
+  corrects the `content_chunks` key, the `_checkout_index` columns and the
+  Cap'n Proto fixture row. `GETTING-STARTED.md` no longer calls the release
+  binary statically linked, names the `find_defs` op, and says which crates
+  crates.io holds (0.14.0 of six). `rs/third_party/README.md` gives the
+  guest init's size with all twelve patches (89,160 bytes, zig 0.15.2,
+  aarch64). The `leyline-cli`, `leyline-cli-lib`, `leyline-schema`,
+  `leyline-core` and `leyline-ts` READMEs describe the current subcommands,
+  `projection-v13` and extraction epoch 7. `AGENTS.md` lists `task audit`
+  and the quiet-host rule for `task release:hypervisor:record`. ADR-0044,
+  ADR-0046 and ADR-0047 carry their current status. One specification text
+  fix: `confinement.schema.json` cited §9 condition 5 for the `bind`
+  refusal, and the README's condition is 6; a consumer that vendors the
+  schema file byte for byte re-syncs it. Two code comments are corrected
+  (`leyline-schema` `FILE_KEYED_TABLES`, `daemon::mcp`); no behavior moves.
+
+### Fixed
+
+- **CAS volume provisioning bounds each `hdiutil` run, cleans up after a crashed provider, and uses only its own image** (bead `ley-line-open-167b29`). Each `hdiutil` run is killed, with whatever it started, after `DEFAULT_TOOL_TIMEOUT` (120 s, `Hdiutil::with_timeout` to change it) and fails as the new `CasVolumeError::Timeout`, instead of hanging provision while it holds the volume's lock. A `partial-<pid>.sparsebundle` left by a provider that crashed between create and rename is removed once that process is gone. A filesystem mounted at `<state>/cas-volume/mnt` is used only when `hdiutil info -plist` names `cas.sparsebundle` as its image, and is otherwise refused as the new `CasVolumeError::ForeignVolume`; one not mounted `nodev` and `nosuid` is refused too. Provisioning and `detach` take a file lock (`<state>/cas-volume/provision.lock`), so two processes take turns, and a volume detached while it is being provisioned is refused, not replaced by a directory on the host's own disk. `DiskImages` gains `attached_image` (its default refuses) and `mount_flags`. An exhaustive `match` on `CasVolumeError` must add the two new variants.
+
+- **`leyline rootfs import-oci` refuses an image with a regular file where the guest init mounts a kernel filesystem** (bead `ley-line-open-2aa5d3`). A regular file at `dev`, `proc`, `sys` or `tmp`, or under `--symlinks resolve` a link there that resolves to a regular file, imported cleanly before this change. The guest then stopped at boot, because `mount(2)` cannot mount over a file. The import now refuses it by name as the new `OciImportError::KernelMountPointNotDirectory { path }`; an exhaustive `match` on `OciImportError` must add it. A device or FIFO at a mount point was already refused.
+
+- **A microVM guest receives its request's argv and environment byte for byte** (beads `ley-line-open-7410ec`, `ley-line-open-d4b07f`, `ley-line-open-f7f862`). libkrun handed both to the guest on the kernel command line, which the kernel and the guest init re-parse. The workload's environment is the request's plus what the guest init already sets (`HOME`, `TERM` and its `KRUN_` settings), as before.
+  - **What broke.** An argument `--` cut the argv there, so an image entrypoint like `tini -- docker-entrypoint.sh` ran with no program. A double quote was consumed or ended its argument (`sh -c 'x="ab"; exit 93'` exited 2). A word inside an environment value, such as `x tsi_hijack y`, could be read as an init token.
+  - **The fix.** The worker writes the workload's argv and environment as JSON to `/.leyline-exec.json` in the run's own root. It writes the file after the root's last verification and before the VM exists, exclusively and never through a link. The guest init execs exactly that (new LLO libkrun patch `0013`, `KRUN_CONFIG_ARGV=1`), removes the file, and unsets its own `KRUN_CONFIG` and `KRUN_CONFIG_ARGV` before the workload runs. The kernel command line keeps only worker-chosen tokens.
+  - **Only the file's own keys configure anything.** Init reads the file with a strict reader: one object, only `Cmd` and `Env`, each an array of strings. libkrun's general config reader matches its key names against every token without regard to case, so an argument such as `uid`, `GID` or `Entrypoint` would have set the guest's uid or prepended to the argv; with the strict reader those are the workload's data. Any other shape stops the guest rather than run something else.
+  - **Every byte arrives.** `"`, `\`, `'`, newlines, tabs, every control character U+0001 to U+001F, `--` and multi-byte UTF-8 arrive byte for byte. Init reads the file until all of it is in.
+  - **A reserved path.** `/.leyline-exec.json` is the worker's: a rootfs that holds it is refused (`invalidSpec`) when a microVM run is prepared. A failure to write it for any other reason is the host's (`backendFailed`).
+  - **Admission.** An environment key may now be any name an environment can hold (lowercase and dots included). What is still refused by name: a key that is empty or holds `=`, a NUL, any `KRUN_` key (the init's own settings), more than 16,000 strings, a string of 128 KiB or more, or more than 1 MiB in all. The executable still rides the command line, so it stays printable ASCII with no space or quote.
+  - The native tier execs argv directly and is unchanged.
+
+- **`leyline execution-daemon --cas-volume` copies each run's rootfs onto the case-sensitive volume, so an image with names differing only by case starts** (bead `ley-line-open-741388`). The CAS root was case-sensitive, but each run's ephemeral rootfs was copied beneath `--run-root` on the host's default APFS, so a Debian image (`usr/share/perl/Pod/` beside `pod/`) imported and then failed at start with "create ephemeral rootfs directory: File exists (os error 17)". With `--cas-volume`, `--run-root` is now optional and defaults to the volume's own run root (`<state>/cas-volume/mnt/runs` on macOS, `<state>/runs` on Linux), which provisioning creates. A `--run-root` given beside a volume must be case-sensitive. One off the volume is refused when the daemon starts, naming the run root and the CAS root; one on the volume's mountpoint, as Cloister passes, is checked by every provision once the volume is attached. One with a `..` component, or inside or holding the CAS root, is refused outright. On the volume, runs share the sparsebundle's size cap with the CAS. Both the native and the microVM tier use it. `--run-root` stays required with `--cas-root`. `CasVolumeError` gains `RunRootCaseInsensitive`, and `CasVolume` gains `with_run_root`, `run_root` and `check_run_root`; an exhaustive `match` on `CasVolumeError` must add the new variant.
+
+- **A cancelled run is never recorded as a success, and a run has one terminal event** (bead `ley-line-open-9c6a8f`). A worker's supervisor returned the same result for a cancel as for a worker that exited 0, so both the libkrun and native backends published `Succeeded` for a cancelled run until the cancel removed it. A status read racing the cancel could record that `Succeeded`, and the cancel then appended `Cancelled` after it: two terminal events, the second overwriting a state a reader had already seen. The supervisor now reports a cancel as its own outcome and publishes no completion for it. `ExecutionService::cancel` re-checks the run's state under its lock and returns a terminal state a concurrent read already projected instead of appending `Cancelled` after it.
+  - **Cancel replies.** Cancelling a run that finished while the cancel was in flight (after its first refresh, before the backend saw it) now returns the run's terminal record instead of the error "backend no longer owns the active run", and cancelling a run already cleaned up returns its `cleaned` record without asking the backend. The execution/v1 README now states the lifecycle rule: at most one terminal event, and `CancelOutput.state` is the state after the request (`cancelled`, or the run's own `succeeded`, `failed` or `cleaned`), each a successful reply.
+
+- **Both tiers refuse the same unrepresentable environment, by name, before a worker exists** (bead `ley-line-open-9d75c9`). A `publicEnvironment` key that is empty or holds `=` or NUL, or a value that holds NUL, is refused (`invalidSpec`) by `ExecutionRequest::validate`, so the service, both backends and the plan compiler share one rule. The native tier used to format `KEY=VALUE` and let the platform split at the first `=`, so `{"A=B": "1"}` ran there as `A="B=1"` and an empty key ran too, while the microVM tier refused both. The microVM tier keeps its own refusals on top: `KRUN_` keys, the size bounds, an argument holding NUL, and the executable's character rule (an argument holding NUL is not yet refused before spawn on the native tier, bead `ley-line-open-73b3de`). The rule is stated in the execution/v1 README, "Public environment".
+  - **Refusal order.** The check runs early, so a request that also fails a later check now gets `invalidSpec` for its environment: before the `allowedEgress` refusal (`unsupportedBackend`), and on the microVM tier before backend availability. On the microVM tier the refusal now comes from `start` itself, before any run record or worker, instead of from the worker after spawn.
+
+- **`leyline rootfs import-oci` imports layers whose entry names are absolute, as every Nix `dockerTools` image's are** (bead `ley-line-open-cffbb5`). A store-path layer names its entries `/nix/store/...`, and the import refused the first one ("absolute paths are refused"), so no Nix-built image imported. A leading `/` in an entry name or a hard-link target is now the image root, as containerd and Docker read it: `/nix/store/x` is `nix/store/x`, and an absolute-name layer gives the same rootfs digest as the identical relative-name layer. The traversal rules apply unchanged after that: a `..` component (`/../etc/passwd`, `/a/../../x`) is still refused by name, as are an entry through a link and the root's `rootfs.manifest.json`. Nix images hold links, which rootfs manifest v2 (above) keeps by default.
+
 ## [0.29.0] — 2026-11-11
 
 **A breaking projection release: arenas must re-parse (`projection-v13`;

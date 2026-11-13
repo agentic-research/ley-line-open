@@ -216,8 +216,9 @@ impl Platform {
         }
     }
 
+    /// This platform with `variant`; an empty variant is none.
     pub fn with_variant(mut self, variant: &str) -> Self {
-        self.variant = Some(variant.into());
+        self.variant = (!variant.is_empty()).then(|| variant.into());
         self
     }
 
@@ -233,28 +234,150 @@ impl Platform {
         }
     }
 
-    /// Whether an image or index entry for `os/architecture/variant` is for
-    /// this platform. A platform without a variant accepts any; `arm64`
-    /// without a variant is `arm64/v8`, as the image spec defines it.
-    fn admits(&self, os: &str, architecture: &str, variant: Option<&str>) -> bool {
+    /// Whether an image (or an index entry) for `candidate` is one this
+    /// platform runs, by the rule `import-oci` selects with: the same `os`
+    /// and `architecture` (OCI's names: `amd64`, never `x86_64`); a platform
+    /// without a variant admits any variant; `arm64` without a variant is
+    /// `arm64/v8`, as the image spec defines it; an empty variant is none.
+    ///
+    /// ```
+    /// use leyline_runtime::artifacts::oci::Platform;
+    ///
+    /// let host: Platform = "linux/arm64".parse().unwrap();
+    /// assert!(host.admits(&"linux/arm64/v8".parse().unwrap()));
+    /// assert!(!host.admits(&"linux/amd64".parse().unwrap()));
+    /// ```
+    pub fn admits(&self, candidate: &Platform) -> bool {
+        self.admits_parts(
+            &candidate.os,
+            &candidate.architecture,
+            candidate.variant.as_deref(),
+        )
+    }
+
+    fn admits_parts(&self, os: &str, architecture: &str, variant: Option<&str>) -> bool {
         fn normalized<'a>(architecture: &str, variant: Option<&'a str>) -> Option<&'a str> {
-            match (architecture, variant) {
+            match (architecture, variant.filter(|variant| !variant.is_empty())) {
                 ("arm64", None) => Some("v8"),
                 (_, variant) => variant,
             }
         }
         self.os == os
             && self.architecture == architecture
-            && self.variant.as_deref().is_none_or(|wanted| {
-                normalized(architecture, variant) == normalized(architecture, Some(wanted))
-            })
+            && self
+                .variant
+                .as_deref()
+                .filter(|wanted| !wanted.is_empty())
+                .is_none_or(|wanted| {
+                    normalized(architecture, variant) == normalized(architecture, Some(wanted))
+                })
     }
+
+    /// The index of the one platform string among `candidates` this
+    /// platform runs ([`Platform::admits`]), as `import-oci` picks the one
+    /// manifest of an index (bead `ley-line-open-370b41`). None, or several,
+    /// is refused, naming the candidates; a string that is not
+    /// `os/architecture[/variant]` is refused by name.
+    ///
+    /// ```
+    /// use leyline_runtime::artifacts::oci::{Platform, PlatformError};
+    ///
+    /// let host = Platform::linux("arm64");
+    /// assert_eq!(host.select(&["linux/amd64", "linux/arm64/v8"]), Ok(1));
+    /// assert!(matches!(
+    ///     host.select(&["linux/arm64", "linux/arm64/v8"]),
+    ///     Err(PlatformError::Ambiguous { .. })
+    /// ));
+    /// ```
+    pub fn select<S: AsRef<str>>(&self, candidates: &[S]) -> Result<usize, PlatformError> {
+        let mut admitted = Vec::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            if self.admits(&candidate.as_ref().parse()?) {
+                admitted.push(index);
+            }
+        }
+        let named = |indexes: &[usize]| {
+            indexes
+                .iter()
+                .map(|index| candidates[*index].as_ref().to_string())
+                .collect()
+        };
+        match admitted.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(PlatformError::NoMatch {
+                platform: self.to_string(),
+                candidates: named(&(0..candidates.len()).collect::<Vec<_>>()),
+            }),
+            several => Err(PlatformError::Ambiguous {
+                platform: self.to_string(),
+                candidates: named(several),
+                advice: if self.variant.as_deref().is_some_and(|v| !v.is_empty()) {
+                    "pin one of them"
+                } else {
+                    "name a variant, or pin one of them"
+                },
+            }),
+        }
+    }
+}
+
+/// `os/architecture[/variant]`, each part non-empty and without whitespace,
+/// as [`Platform`] prints it: parsing what a platform prints gives a
+/// platform that admits it and that it admits (an empty variant prints as
+/// none; a part holding `/` or whitespace, which no OCI platform has, does
+/// not round-trip).
+impl std::str::FromStr for Platform {
+    type Err = PlatformError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let malformed = || PlatformError::Malformed(text.to_string());
+        let parts: Vec<&str> = text.split('/').collect();
+        if !(2..=3).contains(&parts.len())
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || part.chars().any(char::is_whitespace))
+        {
+            return Err(malformed());
+        }
+        let platform = Self {
+            os: parts[0].to_string(),
+            architecture: parts[1].to_string(),
+            variant: None,
+        };
+        Ok(match parts.get(2) {
+            Some(variant) => platform.with_variant(variant),
+            None => platform,
+        })
+    }
+}
+
+/// Why a platform string, or a choice among several, was refused.
+/// Non-exhaustive: a later rule (`os.version`, `os.features`) may add a
+/// reason.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PlatformError {
+    #[error("{0:?} is not an OCI platform os/architecture[/variant]")]
+    Malformed(String),
+    #[error("none of {candidates:?} is for platform {platform}")]
+    NoMatch {
+        platform: String,
+        candidates: Vec<String>,
+    },
+    #[error("several of the candidates are for platform {platform}: {candidates:?}; {advice}")]
+    Ambiguous {
+        platform: String,
+        candidates: Vec<String>,
+        /// What would resolve it: naming a variant helps only a platform
+        /// that names none.
+        advice: &'static str,
+    },
 }
 
 impl fmt::Display for Platform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.os, self.architecture)?;
-        if let Some(variant) = &self.variant {
+        if let Some(variant) = self.variant.as_deref().filter(|v| !v.is_empty()) {
             write!(f, "/{variant}")?;
         }
         Ok(())
@@ -558,7 +681,7 @@ pub fn import_oci_layout(
     )?;
     if !request
         .platform
-        .admits(&config.os, &config.architecture, config.variant.as_deref())
+        .admits_parts(&config.os, &config.architecture, config.variant.as_deref())
     {
         return Err(OciImportError::PlatformMismatch {
             image: config.platform().to_string(),
@@ -1073,7 +1196,7 @@ pub(super) fn select_platform<'a>(
 ) -> Result<&'a Descriptor, OciImportError> {
     let mut candidates = index.manifests.iter().filter(|descriptor| {
         descriptor.platform.as_ref().is_some_and(|candidate| {
-            platform.admits(
+            platform.admits_parts(
                 &candidate.os,
                 &candidate.architecture,
                 candidate.variant.as_deref(),
@@ -1733,6 +1856,183 @@ fn publish(cas_root: &Path, staged: &Path, rootfs: &DigestRef) -> Result<(), Oci
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn platform(text: &str) -> Platform {
+        text.parse()
+            .unwrap_or_else(|error| panic!("{text}: {error}"))
+    }
+
+    /// The public platform rule, as cloister applies it to the platforms
+    /// its lock records (bead `ley-line-open-370b41`): an empty variant is
+    /// no variant, `arm64` without one is `arm64/v8`, a host without a
+    /// variant takes any, and OCI's names are the only names (`x86_64` is
+    /// not `amd64`).
+    #[test]
+    fn a_host_admits_the_platforms_the_oci_image_spec_says_it_runs() {
+        for (host, candidate, admitted) in [
+            ("linux/arm64", "linux/arm64", true),
+            ("linux/arm64", "linux/arm64/v8", true),
+            ("linux/arm64", "linux/arm64/v7", true),
+            ("linux/arm64/v8", "linux/arm64", true),
+            ("linux/arm64/v8", "linux/arm64/v8", true),
+            ("linux/arm64/v8", "linux/arm64/v7", false),
+            ("linux/arm/v7", "linux/arm", false),
+            ("linux/amd64", "linux/amd64", true),
+            ("linux/amd64", "linux/x86_64", false),
+            ("linux/amd64", "linux/arm64", false),
+            ("linux/amd64", "windows/amd64", false),
+        ] {
+            assert_eq!(
+                platform(host).admits(&platform(candidate)),
+                admitted,
+                "{host} admits {candidate}"
+            );
+        }
+        // An empty variant, as an image config may carry, is no variant.
+        let empty = Platform {
+            variant: Some(String::new()),
+            ..Platform::linux("arm64")
+        };
+        assert!(platform("linux/arm64/v8").admits(&empty));
+        assert!(empty.admits(&platform("linux/arm64/v8")));
+    }
+
+    #[test]
+    fn platform_strings_parse_and_print_as_os_architecture_variant() {
+        assert_eq!(platform("linux/arm64"), Platform::linux("arm64"));
+        assert_eq!(
+            platform("linux/arm64/v8"),
+            Platform::linux("arm64").with_variant("v8")
+        );
+        for text in ["linux/arm64", "linux/arm64/v8", "linux/amd64"] {
+            assert_eq!(platform(text).to_string(), text);
+        }
+        for malformed in [
+            "",
+            "linux",
+            "linux/",
+            "/arm64",
+            "linux/arm64/",
+            "linux//v8",
+            "linux/arm64/v8/x",
+            " linux/arm64",
+        ] {
+            assert_eq!(
+                malformed.parse::<Platform>(),
+                Err(PlatformError::Malformed(malformed.to_string())),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    /// An empty variant is no variant everywhere: printing a platform and
+    /// parsing it back gives the same platform, and a `v8` host's index
+    /// with both an `arm64` entry whose variant is empty and an `arm64/v8`
+    /// entry is ambiguous, as one with `arm64` and `arm64/v8` already was
+    /// (contract review of 370b41, F1 and F2).
+    #[test]
+    fn an_empty_variant_is_no_variant_when_printed_parsed_and_selected() {
+        let empty = Platform::linux("arm64").with_variant("");
+        assert_eq!(empty, Platform::linux("arm64"));
+        assert_eq!(empty.to_string(), "linux/arm64");
+        let raw = Platform {
+            variant: Some(String::new()),
+            ..Platform::linux("arm64")
+        };
+        assert_eq!(raw.to_string(), "linux/arm64");
+        for p in [
+            Platform::linux("arm64"),
+            Platform::linux("arm64").with_variant("v8"),
+            Platform::linux("amd64"),
+            raw.clone(),
+        ] {
+            let back: Platform = p.to_string().parse().unwrap();
+            assert!(back.admits(&p) && p.admits(&back), "{p:?}");
+        }
+        let index: Index = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "digest": format!("sha256:{}", "a".repeat(64)), "size": 1,
+                 "platform": {"os": "linux", "architecture": "arm64", "variant": ""}},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "digest": format!("sha256:{}", "b".repeat(64)), "size": 1,
+                 "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}}
+            ]
+        }))
+        .expect("an index");
+        assert!(matches!(
+            select_platform(&index, &Platform::linux("arm64").with_variant("v8")),
+            Err(OciImportError::AmbiguousPlatform(_))
+        ));
+    }
+
+    /// Ambiguity under a host that already names its variant cannot be
+    /// resolved by naming one: the message says to pin the candidate.
+    #[test]
+    fn the_ambiguity_message_fits_the_host() {
+        let unnamed = Platform::linux("arm64")
+            .select(&["linux/arm64", "linux/arm64/v8"])
+            .unwrap_err()
+            .to_string();
+        assert!(unnamed.contains("name a variant"), "{unnamed}");
+        let named = Platform::linux("arm64")
+            .with_variant("v8")
+            .select(&["linux/arm64", "linux/arm64/v8"])
+            .unwrap_err()
+            .to_string();
+        assert!(!named.contains("name a variant"), "{named}");
+        assert!(named.contains("pin one"), "{named}");
+    }
+
+    /// `select` names the one candidate a host runs, and refuses none or
+    /// several by name, never picking one of several.
+    #[test]
+    fn select_picks_the_one_admitted_candidate_or_refuses_by_name() {
+        let host = Platform::linux("arm64");
+        assert_eq!(
+            host.select(&["linux/amd64", "linux/arm64/v8", "linux/arm/v7"]),
+            Ok(1)
+        );
+        assert_eq!(
+            host.select(&["linux/amd64", "linux/x86_64"]),
+            Err(PlatformError::NoMatch {
+                platform: "linux/arm64".into(),
+                candidates: vec!["linux/amd64".into(), "linux/x86_64".into()],
+            })
+        );
+        assert_eq!(
+            host.select(&["linux/arm64", "linux/amd64", "linux/arm64/v8"]),
+            Err(PlatformError::Ambiguous {
+                platform: "linux/arm64".into(),
+                candidates: vec!["linux/arm64".into(), "linux/arm64/v8".into()],
+                advice: "name a variant, or pin one of them",
+            })
+        );
+        assert_eq!(
+            Platform::linux("arm64")
+                .with_variant("v8")
+                .select(&["linux/arm64/v7", "linux/arm64"]),
+            Ok(1)
+        );
+        assert_eq!(
+            host.select(&["linux/arm64", "nonsense"]),
+            Err(PlatformError::Malformed("nonsense".into()))
+        );
+        let none: [&str; 0] = [];
+        assert!(matches!(
+            host.select(&none),
+            Err(PlatformError::NoMatch { .. })
+        ));
+        let message = host
+            .select(&["linux/arm64", "linux/arm64/v8"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("linux/arm64") && message.contains("linux/arm64/v8"),
+            "{message}"
+        );
+    }
 
     const DEFAULT_APFS: FilesystemSensitivity = FilesystemSensitivity {
         case_sensitive: false,

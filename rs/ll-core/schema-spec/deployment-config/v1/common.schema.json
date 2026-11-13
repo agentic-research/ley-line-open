@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/agentic-research/ley-line-open/rs/ll-core/schema-spec/deployment-config/v1/common.schema.json",
+  "title": "deployment-config/v1 shared definitions",
+  "description": "Definitions shared by the three kinds of apiVersion config.leyline/v1 (ADR-0049 D2). The parser in leyline_schema_spec::deployment_config is the stricter side of the pair; README.md is normative. Every optional field states its default with `default`, or with `x-leyline-default` when the default depends on the host.",
+  "$defs": {
+    "path": {
+      "description": "An absolute path, or one beginning `~/`, which resolves against HOME. No empty, `.` or `..` component and no trailing `/`. UTF-8 without U+0000-U+001F, U+007F-U+009F, U+2028, U+2029, `\"` or `\\`.",
+      "type": "string",
+      "pattern": "^~?(/[^/\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\"\\\\]+)+$",
+      "not": {"pattern": "(^|/)\\.\\.?(/|$)"}
+    },
+    "label": {
+      "description": "1 to 64 characters of ASCII letters, digits, `.`, `_` and `-`, starting with a letter. A label is never all digits, so a JavaScript consumer, which orders integer-like object keys first, orders label keys (signAllow.callers) by their bytes.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+    },
+    "ipAddress": {
+      "description": "An IP literal in its one spelling: IPv4 as a dotted quad with no leading zero, IPv6 in RFC 5952 canonical text. The parser refuses any other spelling of a valid address (`non-canonical-address`); this pattern states the alphabet only.",
+      "type": "string",
+      "anyOf": [
+        {"pattern": "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"},
+        {"pattern": "^[0-9a-f:.]*:[0-9a-f:.]*$"}
+      ]
+    },
+    "queryHash": {
+      "description": "A BLAKE3 digest of a tree-sitter query file: 64 lowercase hex characters.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "urlPrefix": {
+      "description": "A keystore URL or URL prefix: a lowercase scheme, `://`, then printable ASCII without space, `\"` or `\\`. At most 2048 bytes.",
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^[a-z][a-z0-9+.-]*://[!#-\\[\\]-~]*$"
+    },
+    "secretRef": {
+      "description": "A reference to a secret; never its value (ADR-0049 D4). v1 delivers `file`. `keychain` and `vault` are reserved: a v1 binary refuses them by name (`secret-ref-not-delivered`). Any other key is `unknown-key`; a string, number, array or other object in a secret field is `secret-inlined`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file"],
+      "properties": {
+        "file": {"$ref": "#/$defs/path"}
+      },
+      "x-leyline-reserved": ["keychain", "vault"]
+    },
+    "source": {
+      "description": "The source tree the daemon's store is parsed from. `null` (the default) means none.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"$ref": "#/$defs/path"},
+        "language": {
+          "description": "A language filter. `null` detects the language per file.",
+          "default": null,
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/label"}]
+        }
+      }
+    },
+    "parser": {
+      "description": "What the parser runs, shared by both daemon kinds and read by `parse`, `verify-head` and `rebuild` from `--config`.",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "trustedQueryHashes": {
+          "description": "BLAKE3 digests of tree-sitter query files the parser may load beyond the compiled set. A set: sorted in the resolved document, a duplicate refused. Replaces LLO_TRUSTED_QUERY_HASHES.",
+          "type": "array",
+          "default": [],
+          "items": {"$ref": "#/$defs/queryHash"}
+        },
+        "queryMatchLimit": {
+          "description": "The tree-sitter query match limit. Replaces LLO_QUERY_MATCH_LIMIT.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536,
+          "default": 4096
+        },
+        "queryProgressBudget": {
+          "description": "The query progress budget. Replaces LLO_QUERY_PROGRESS_BUDGET.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "default": 100000
+        }
+      }
+    },
+    "head": {
+      "description": "How heads are signed and verified.",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "signingKey": {
+          "description": "The Ed25519 seed that signs heads, as a file holding 64 hex characters. `null`: heads are written unsigned. Replaces LEYLINE_HEAD_SIGNING_KEY.",
+          "default": null,
+          "x-leyline-secret": true,
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/secretRef"}]
+        },
+        "trustedKeys": {
+          "description": "Ed25519 public key files a head signature is verified against. A set. Replaces LEYLINE_HEAD_TRUSTED_KEYS.",
+          "type": "array",
+          "default": [],
+          "items": {"$ref": "#/$defs/path"}
+        },
+        "requireSignature": {
+          "description": "Refuse an unsigned head. Replaces LEYLINE_HEAD_REQUIRE_SIGNATURE.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "diagnostics": {
+      "description": "Diagnostic output. Changes what is recorded, not what is computed.",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "profile": {
+          "description": "Log per-phase timings. Replaces LEYLINE_PROFILE.",
+          "type": "boolean",
+          "default": false
+        },
+        "sheafAblationLog": {
+          "description": "Append sheaf ablation records to this file. Replaces LEYLINE_SHEAF_ABLATION_LOG.",
+          "default": null,
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/path"}]
+        }
+      }
+    },
+    "enrichment": {
+      "description": "Optional enrichment passes.",
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "sessionCorpus": {
+          "description": "The session corpus the session-observation pass reads. `null`: the pass does nothing. Replaces LEYLINE_SESSION_CORPUS.",
+          "default": null,
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/path"}]
+        }
+      }
+    }
+  }
+}

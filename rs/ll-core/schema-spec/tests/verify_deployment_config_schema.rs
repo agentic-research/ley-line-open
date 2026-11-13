@@ -60,8 +60,24 @@ fn localize(v: &Value, used: &mut BTreeSet<String>) -> Value {
     }
 }
 
+/// `v` with every object's keys inserted in byte order. Explicit, because
+/// `serde_json::Map` keeps insertion order whenever any crate in the build
+/// enables its `preserve_order` feature (feature unification under a
+/// workspace build), and the published bytes must not depend on that.
+fn sorted(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            Value::Object(keys.into_iter().map(|k| (k.clone(), sorted(&m[k]))).collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
+}
+
 fn pretty(v: &Value) -> String {
-    let mut s = serde_json::to_string_pretty(v).unwrap();
+    let mut s = serde_json::to_string_pretty(&sorted(v)).unwrap();
     s.push('\n');
     s
 }

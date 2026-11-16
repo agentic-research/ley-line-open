@@ -14,5 +14,12 @@ Section: Breaking
   run from before its spawn until readiness: it returns once the worker is
   reaped and its run root removed, answers `true` (or the cleanup's error),
   and the racing `start` ends `cancelled`; `Ok(false)` means no such run and
-  no worker. `ExecutionService::cancel` reaches a starting run separately
-  (`ley-line-open-5308b7`).
+  no worker. A cancel queued while a start fails on its own is answered
+  `false` when no worker was spawned, or with an error naming a run root that
+  could not be removed; the microVM backend answers the same way.
+  `ExecutionService::cancel` reaches a starting run separately
+  (`ley-line-open-5308b7`). Limits: a descendant that forks and calls
+  `setsid` leaves the group and survives (`ley-line-open-492252`); a killed
+  embedder leaves the run root behind (`ley-line-open-62f6c9`); and until
+  `ley-line-open-528525`, a sibling spawned at the moment the stdin pipe is
+  created can briefly inherit its write end.

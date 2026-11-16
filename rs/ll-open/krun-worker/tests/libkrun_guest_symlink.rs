@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use leyline_runtime::artifacts::rootfs_manifest::{FileSpec, RootfsSpec, cas_directory_mode};
-use leyline_runtime::backends::libkrun::worker::inherit_only;
+use leyline_runtime::backends::libkrun::worker::inherit_only_with_lifeline;
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
@@ -154,7 +154,8 @@ fn a_v2_link_to_proc_mounts_opens_in_the_guest() {
         },
     };
     let mut command = Command::new(&worker);
-    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let (_lifeline, _read_end) =
+        inherit_only_with_lifeline(&mut command, &[]).expect("list this process's descriptors");
     let (library_var, library_dir) = hypervisor::library_path_env(&libkrunfw);
     let mut child = command
         .arg("--cas-root")

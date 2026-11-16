@@ -45,6 +45,13 @@ env:
   # Standalone tasks retain the old optional-system-sccache behavior.
   RUSTC_WRAPPER:
     sh: 'if [ -x "{{.SCCACHE_BIN}}" ]; then echo "{{.SCCACHE_BIN}}"; else command -v sccache 2>/dev/null || true; fi'
+  # The pinned sccache talks to its own server on an LLO-specific port, so a
+  # different-version server another build left on the default port (4226)
+  # is never contacted; the two cannot speak each other's protocol (bead
+  # ley-line-open-da5d77). A system sccache keeps the default port. A port
+  # set by hand still wins.
+  SCCACHE_SERVER_PORT:
+    sh: 'if [ -n "${SCCACHE_SERVER_PORT:-}" ]; then echo "$SCCACHE_SERVER_PORT"; elif [ -x "{{.SCCACHE_BIN}}" ]; then echo 4231; else echo 4226; fi'
 
 tasks:
   default:

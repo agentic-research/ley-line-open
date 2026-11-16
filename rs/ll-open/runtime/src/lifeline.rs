@@ -182,16 +182,17 @@ fn set_cloexec(fd: RawFd, on: bool) -> io::Result<()> {
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
+    let flags = rustix::io::FdFlags::from_bits_retain(flags as u32);
     let flags = if on {
-        flags | libc::FD_CLOEXEC
+        flags | rustix::io::FdFlags::CLOEXEC
     } else {
-        flags & !libc::FD_CLOEXEC
+        flags.difference(rustix::io::FdFlags::CLOEXEC)
     };
-    // SAFETY: as above.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    // SAFETY: F_GETFD just answered for `fd`, so it is open; borrowed for
+    // one fcntl. rustix makes the raw syscall, async-signal-safe, so this
+    // also runs in `pass_at`'s forked child.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    rustix::io::fcntl_setfd(fd, flags).map_err(io::Error::from)
 }
 
 #[cfg(test)]

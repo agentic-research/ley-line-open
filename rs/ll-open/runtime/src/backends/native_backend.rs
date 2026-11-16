@@ -1,9 +1,9 @@
 //! Lifecycle backend supervising the first-party native nono worker.
 
+use super::spawn::{ChildIo, Spawn};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -21,8 +21,8 @@ use super::libkrun::backend::StartPoint;
 use super::native::WorkerEvent;
 use super::process::{
     Supervised, SupervisionLabels, WorkerProcess, abort_failed_start, cleanup_tempdir,
-    configure_process_group, finish_failed_start, published_status, read_readiness_line,
-    supervise_worker, terminate_process_group,
+    finish_failed_start, published_status, read_readiness_line, supervise_worker,
+    terminate_process_group,
 };
 
 const LABELS: SupervisionLabels = SupervisionLabels {
@@ -133,7 +133,7 @@ impl Drop for Starting<'_> {
 /// root, answer the cancel with whether the removal worked, and return the
 /// error the start ends with.
 fn cancel_starting(
-    child: &mut std::process::Child,
+    child: &mut super::spawn::Spawned,
     run_root: tempfile::TempDir,
     acknowledge: mpsc::SyncSender<Result<bool, ExecutionError>>,
 ) -> ExecutionError {
@@ -341,15 +341,19 @@ impl Backend for NativeWorkerBackend {
             .prefix("leyline-native-run-")
             .tempdir_in(&self.config.ephemeral_root)
             .map_err(|error| ExecutionError::backend(format!("create native run root: {error}")))?;
-        let mut command = Command::new(&self.config.worker);
+        // Started through `spawn`, which hands the worker its standard
+        // streams and nothing else this process holds, in a process group
+        // of its own (bead ley-line-open-528525).
+        let mut command = Spawn::new(&self.config.worker);
         command
             .arg("--cas-root")
             .arg(&self.config.cas_root)
             .arg("--run-root")
             .arg(run_root.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stdin(ChildIo::Piped)
+            .stdout(ChildIo::Null)
+            .stderr(ChildIo::Piped)
+            .process_group();
         for path in &self.config.runtime_files {
             command.arg("--runtime-file").arg(path);
         }
@@ -357,12 +361,8 @@ impl Backend for NativeWorkerBackend {
         // ley-line-open-62e3b1): after the request, nothing more is written,
         // and this process keeps the write end until the worker is reaped.
         // When this process ends, for any reason, the worker reads
-        // end-of-file and ends, its workload with it. Standard input rather
-        // than a descriptor of its own, because handing over any other
-        // number takes a `pre_exec` hook, which gives up the `posix_spawn`
-        // path `configure_process_group` depends on.
+        // end-of-file and ends, its workload with it.
         command.arg(super::native::LIFELINE_FD_ARG).arg("0");
-        configure_process_group(&mut command);
 
         // Registered before the worker exists, so from its spawn until the
         // run is published a cancel reaches it through `event_tx`: there is
@@ -405,8 +405,7 @@ impl Backend for NativeWorkerBackend {
         // before it materializes the rootfs, applies nono, or spawns the
         // workload, so nothing the run executes starts outside the cgroup,
         // and every process it spawns inherits it. A write to cgroup.procs
-        // here rather than a `pre_exec` hook keeps the `posix_spawn` path
-        // `configure_process_group` depends on.
+        // here, not a hook in the child, keeps the spawn a `posix_spawn`.
         if let Some(run_cgroup) = &run_cgroup
             && let Err(error) = run_cgroup.place(child.id())
         {

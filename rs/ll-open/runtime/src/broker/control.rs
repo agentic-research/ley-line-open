@@ -23,10 +23,10 @@
 //! the supervisor holds (`--lifeline-fd`). End-of-file on it means the
 //! supervisor is gone, and the broker exits at once.
 
+use crate::backends::spawn::{ChildIo, Spawn, Spawned};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -429,8 +429,8 @@ where
 
 /// The supervisor's handle on one broker process.
 pub struct BrokerProcess {
-    child: Child,
-    stdin: Option<ChildStdin>,
+    child: Spawned,
+    stdin: Option<std::fs::File>,
     lifeline: Option<crate::lifeline::Lifeline>,
     events: mpsc::Receiver<Event>,
     seen: Vec<Event>,
@@ -441,19 +441,21 @@ impl BrokerProcess {
     /// Spawn the broker binary. Its stdin and stdout are the control pipe; fd
     /// 3 is the lifeline's read end, and this process keeps the only write end.
     ///
-    /// The descriptor hygiene that keeps the write end out of every other
-    /// spawn (`POSIX_SPAWN_CLOEXEC_DEFAULT`) is `ley-line-open-528525`: until
-    /// then a concurrent spawn between `pipe` and `FD_CLOEXEC` can inherit it.
+    /// Started through [`crate::backends::spawn`], which hands the broker
+    /// exactly those descriptors and nothing else this process holds, so no
+    /// other spawn, on any thread, inherits the lifeline's write end (bead
+    /// `ley-line-open-528525`).
     pub fn spawn(binary: &Path, peer: PeerPid) -> Result<Self, ExecutionError> {
         let (lifeline, read_end) = crate::lifeline::pair()
             .map_err(|error| ExecutionError::backend(format!("lifeline pipe: {error}")))?;
-        let mut command = Command::new(binary);
+        let mut command = Spawn::new(binary);
         command
             .arg("--lifeline-fd")
             .arg(LIFELINE_FD.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stdin(ChildIo::Piped)
+            .stdout(ChildIo::Piped)
+            .stderr(ChildIo::Inherit)
+            .inherit(read_end.raw_fd(), LIFELINE_FD);
         match peer {
             PeerPid::Any => {}
             PeerPid::Awaiting => {
@@ -463,7 +465,6 @@ impl BrokerProcess {
                 command.arg("--peer-pid").arg(pid.to_string());
             }
         }
-        read_end.pass_at(&mut command, LIFELINE_FD);
         let mut child = command.spawn().map_err(|error| {
             ExecutionError::backend(format!("spawn connection broker: {error}"))
         })?;

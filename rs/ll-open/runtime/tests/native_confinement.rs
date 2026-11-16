@@ -764,21 +764,63 @@ fn the_lifecycle_backend_runs_the_guest_under_the_same_confinement() {
 /// of its stdout (every holder of it gone), the worker's exit.
 #[test]
 fn the_worker_and_its_guest_end_when_the_lifeline_ends() {
+    lifeline_ends_worker_and_guest(Leader::Worker);
+}
+
+/// The same, with the worker in its starter's process group rather than one
+/// of its own: the guest is still killed (by pid), and nothing else in that
+/// group is. The starter here is a shell in a group the test made, which
+/// reports that it outlived the worker.
+#[test]
+fn a_worker_without_a_group_of_its_own_ends_only_its_guest_and_itself() {
+    lifeline_ends_worker_and_guest(Leader::Starter);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leader {
+    /// The worker leads its own process group, as the backend spawns it.
+    Worker,
+    /// A shell leads the group and runs the worker as its child.
+    Starter,
+}
+
+/// The line the starter shell prints once its worker has exited.
+const STARTER_OUTLIVED: &str = "LEYLINE-STARTER-OUTLIVED-ITS-WORKER";
+
+fn lifeline_ends_worker_and_guest(leader: Leader) {
     use std::os::unix::process::CommandExt;
     let _serial = common::serial();
     let fixture = Fixture::new();
     let run_root = fixture.runs.join("run-lifeline");
     fs::create_dir(&run_root).expect("run root");
-    let mut command = Command::new(WORKER);
-    command
-        .arg("--cas-root")
-        .arg(&fixture.cas)
-        .arg("--run-root")
-        .arg(&run_root)
-        .args(["--lifeline-fd", "0"]);
+    let mut worker_args: Vec<std::ffi::OsString> = vec![
+        "--cas-root".into(),
+        fixture.cas.clone().into(),
+        "--run-root".into(),
+        run_root.clone().into(),
+        "--lifeline-fd".into(),
+        "0".into(),
+    ];
     for path in guest_runtime_files() {
-        command.arg("--runtime-file").arg(path);
+        worker_args.push("--runtime-file".into());
+        worker_args.push(path.into());
     }
+    let mut command = match leader {
+        Leader::Worker => {
+            let mut command = Command::new(WORKER);
+            command.args(&worker_args);
+            command
+        }
+        Leader::Starter => {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!("\"$0\" \"$@\"; echo {STARTER_OUTLIVED}"))
+                .arg(WORKER)
+                .args(&worker_args);
+            command
+        }
+    };
     let mut child = command
         .process_group(0)
         .stdin(Stdio::piped())
@@ -831,44 +873,57 @@ fn the_worker_and_its_guest_end_when_the_lifeline_ends() {
         }
     });
     let bound = Duration::from_secs(60);
+    let group = child.id() as libc::pid_t;
+    let fail = |child: &mut std::process::Child, why: String| -> ! {
+        // SAFETY: the group this test created.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        let _ = child.wait();
+        panic!("{why}");
+    };
     loop {
         match guest.recv_timeout(bound) {
             Ok(Some(line)) if line.contains(PARKED) => break,
             Ok(Some(_)) => continue,
-            Ok(None) => {
-                let mut rest = String::new();
-                let _ = stderr.read_to_string(&mut rest);
-                panic!("the guest's stdout ended before it parked; worker stderr:\n{rest}")
-            }
-            Err(_) => {
-                let _ = child.kill();
-                panic!("TIMEOUT: the guest did not park within {bound:?}");
-            }
+            Ok(None) => fail(
+                &mut child,
+                "the guest's stdout ended before it parked".into(),
+            ),
+            Err(_) => fail(
+                &mut child,
+                format!("TIMEOUT: the guest did not park within {bound:?}"),
+            ),
         }
     }
 
     // The lifeline ends, as when its supervisor dies.
     drop(lifeline);
 
-    // EVENT 2: the guest's stdout ends: neither it nor the worker holds it.
+    // EVENT 2: the guest's stdout ends: neither it nor the worker holds it
+    // (the starter shell prints its line first, if it outlived them).
+    let mut after = Vec::new();
     loop {
         match guest.recv_timeout(bound) {
-            Ok(Some(_)) => continue,
+            Ok(Some(line)) => after.push(line),
             Ok(None) => break,
-            Err(_) => {
-                let worker = child.try_wait();
-                // SAFETY: the worker's group, which this test created.
-                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
-                let mut rest = String::new();
-                let _ = stderr.read_to_string(&mut rest);
-                panic!(
-                    "TIMEOUT: the guest outlived the lifeline by {bound:?}; worker: {worker:?}; \
-                     stderr:\n{rest}"
-                );
-            }
+            Err(_) => fail(
+                &mut child,
+                format!("TIMEOUT: the guest outlived the lifeline by {bound:?}"),
+            ),
         }
     }
-    // EVENT 3: the worker exits; it ended its group, itself included.
-    let status = child.wait().expect("worker exit");
-    assert!(!status.success(), "{status}");
+    // EVENT 3: the process this test spawned exits.
+    let status = child.wait().expect("exit");
+    match leader {
+        // The worker ended its own group, itself included.
+        Leader::Worker => assert!(!status.success(), "{status}"),
+        // The worker killed only its guest and itself; the shell sharing its
+        // group lived on.
+        Leader::Starter => {
+            assert!(status.success(), "the starter was killed: {status}");
+            assert!(
+                after.iter().any(|line| line.contains(STARTER_OUTLIVED)),
+                "{after:?}"
+            );
+        }
+    }
 }

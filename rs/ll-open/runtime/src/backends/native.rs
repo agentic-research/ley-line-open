@@ -137,7 +137,7 @@ pub fn read_worker_request(reader: impl Read) -> Result<ExecutionRequest, Execut
 
 /// The pid of the workload this worker spawned, `0` before it exists: what
 /// [`end_with_lifeline`] kills when the lifeline ends.
-static WORKLOAD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static WORKLOAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Watch the lifeline at `fd` and, when the process that spawned this worker
 /// is gone, end this worker at once and its workload with it: `SIGKILL` to
@@ -148,13 +148,17 @@ static WORKLOAD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::ne
 /// `fd` is not a readable pipe or socket.
 pub fn end_with_lifeline(fd: i32) -> Result<(), ExecutionError> {
     crate::lifeline::watch(fd, || {
-        let workload = WORKLOAD.load(std::sync::atomic::Ordering::SeqCst);
-        // SAFETY: kill, killpg and _exit take no pointers; the workload pid
-        // is checked positive first, so no group-wide kill(0) is sent.
+        // `None` until the workload exists: never a kill(0), which would
+        // signal this worker's whole process group.
+        let workload =
+            std::num::NonZeroU32::new(WORKLOAD.load(std::sync::atomic::Ordering::SeqCst));
+        // SAFETY: kill, killpg and _exit take no pointers.
         unsafe {
-            if workload > 0 {
-                libc::kill(workload, libc::SIGKILL);
+            if let Some(workload) = workload {
+                libc::kill(workload.get() as libc::pid_t, libc::SIGKILL);
             }
+            // Only a group of its own: a worker started by something other
+            // than the backend may share its starter's group.
             if libc::getpgrp() == libc::getpid() {
                 libc::killpg(libc::getpgrp(), libc::SIGKILL);
             }
@@ -282,7 +286,7 @@ pub fn execute_with_ready(
     let mut child = command.spawn().map_err(|error| {
         ExecutionError::backend(format!("start native guest executable: {error}"))
     })?;
-    WORKLOAD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    WORKLOAD.store(child.id(), std::sync::atomic::Ordering::SeqCst);
     let status = child.wait().map_err(|error| {
         ExecutionError::backend(format!("wait for native guest executable: {error}"))
     })?;

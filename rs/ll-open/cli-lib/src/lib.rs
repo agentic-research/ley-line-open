@@ -30,6 +30,8 @@ pub mod head_claim;
 pub mod lifecycle;
 pub mod merge;
 pub mod source_write;
+#[cfg(unix)]
+pub mod stdio_relay;
 pub mod store_root;
 #[cfg(feature = "sheaf")]
 pub mod topology_pass;

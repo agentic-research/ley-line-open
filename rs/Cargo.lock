@@ -4545,6 +4545,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "leyline-cli-lib",
+ "leyline-core",
  "leyline-envelope",
  "leyline-public-schema",
  "leyline-runtime",

@@ -572,3 +572,252 @@ exit 1
     );
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// A worker never outlives its supervisor (bead ley-line-open-62e3b1, the
+// native tier's half of ley-line-open-f963e6).
+
+/// A bound on a failure only: every wait below ends on an event first.
+const EVENT_BOUND: Duration = Duration::from_secs(30);
+
+/// Whether `pid` names a process (a zombie included).
+fn alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 checks existence and delivers nothing.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn mkfifo(path: &std::path::Path) {
+    let status = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo {}", path.display());
+}
+
+/// The first line written to the named pipe `path`, as a pid: the event a
+/// fake worker raises once it exists. Fails by name past [`EVENT_BOUND`].
+fn pid_from(path: &std::path::Path, what: &str) -> libc::pid_t {
+    let path = path.to_path_buf();
+    let (sender, line) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Opening a named pipe for reading waits for its writer.
+        let _ = sender.send(fs::read_to_string(path));
+    });
+    let line = line
+        .recv_timeout(EVENT_BOUND)
+        .unwrap_or_else(|_| panic!("TIMEOUT: {what} did not report its pid within {EVENT_BOUND:?}"))
+        .expect("read the worker's pid");
+    line.trim().parse().expect("a pid")
+}
+
+/// Kills `pid` on drop if it still exists, so a failing test leaves no
+/// worker behind.
+struct KillOnDrop(libc::pid_t);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if alive(self.0) {
+            // SAFETY: a signal to a pid this test spawned (directly or not).
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+}
+
+/// A cancel that arrives while the worker exists but has not reported
+/// readiness stops it: `cancel` answers `true`, and returns only once the
+/// worker is reaped and its run root removed; the start it raced ends
+/// `Cancelled`. Before the fix it answered "nothing to cancel" while the
+/// worker ran on.
+#[test]
+fn a_cancel_between_spawn_and_readiness_stops_the_worker_and_removes_its_run_root() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    mkfifo(&spawned);
+    // Reads its request, says it exists, and never reports readiness.
+    let (backend, ephemeral_root) = backend(
+        &fixture,
+        &format!(
+            "#!/bin/sh\nIFS= read -r _\necho $$ > '{}'\nexec /usr/bin/tail -f /dev/null\n",
+            spawned.display()
+        ),
+    );
+    let backend = std::sync::Arc::new(backend);
+    let starter = {
+        let backend = std::sync::Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+
+    // EVENT: the worker exists, and is starting.
+    let worker = pid_from(&spawned, "the starting worker");
+    let _cleanup = KillOnDrop(worker);
+    assert!(alive(worker));
+    assert_eq!(fs::read_dir(&ephemeral_root).unwrap().count(), 1);
+
+    assert!(
+        backend.cancel("native-run-01").expect("cancel"),
+        "a starting run was reported as nothing to cancel"
+    );
+    // `cancel` has returned: the worker is reaped and its run root gone.
+    assert!(
+        !alive(worker),
+        "the starting worker {worker} survived its cancel"
+    );
+    assert_eq!(
+        fs::read_dir(&ephemeral_root).unwrap().count(),
+        0,
+        "the cancelled start left its run root"
+    );
+    let error = starter
+        .join()
+        .expect("the start thread")
+        .expect_err("a cancelled start does not start");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::Cancelled,
+        "{error:?}"
+    );
+    assert!(!backend.cancel("native-run-01").expect("second cancel"));
+}
+
+/// Set in the embedding process [`native_lifeline_embedder`] runs as: the
+/// fixture directory holding its fake worker, CAS and run roots.
+const EMBEDDER_ENV: &str = "LEYLINE_TEST_NATIVE_LIFELINE_EMBEDDER";
+
+/// The process embedding the backend, for
+/// `a_native_worker_ends_when_the_process_embedding_its_backend_is_killed`:
+/// starts one run and supervises it until it is killed. Not a test on its own.
+#[test]
+#[ignore = "the embedding process of a lifeline test; run by that test"]
+fn native_lifeline_embedder() {
+    let Some(fixture) = std::env::var_os(EMBEDDER_ENV) else {
+        return;
+    };
+    let fixture = std::path::PathBuf::from(fixture);
+    let backend = NativeWorkerBackend::new(NativeWorkerConfig {
+        worker: fixture.join("leyline-native-worker"),
+        cas_root: fixture.join("cas"),
+        ephemeral_root: fixture.join("runs"),
+        runtime_files: Vec::new(),
+        ready_timeout: Duration::from_secs(10),
+    });
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
+    loop {
+        std::thread::park();
+    }
+}
+
+/// `SIGKILL` the process that embeds the backend mid-run: its worker ends
+/// within a bound, observed as the kernel's exit event for the orphan.
+///
+/// The fake worker does what the real one does with its lifeline: once its
+/// request is read, it reads the descriptor `--lifeline-fd` names until
+/// end-of-file, and ends then. So this holds the backend to its half: the
+/// worker is handed an open read end and no process but the embedder holds
+/// the write end. The real worker's half is in `native_confinement.rs`.
+#[test]
+fn a_native_worker_ends_when_the_process_embedding_its_backend_is_killed() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    mkfifo(&spawned);
+    publish_executable(
+        &fixture.path().join("leyline-native-worker"),
+        &format!(
+            concat!(
+                "#!/bin/sh\n",
+                "lifeline=\n",
+                "while [ \"$#\" -gt 0 ]; do\n",
+                "  if [ \"$1\" = --lifeline-fd ]; then lifeline=\"$2\"; shift 2; else shift; fi\n",
+                "done\n",
+                "IFS= read -r _\n",
+                "printf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"native-run-01\"}}' >&2\n",
+                "echo $$ > '{spawned}'\n",
+                // Without a lifeline, nothing ends this worker: the test's
+                // bound fails, as it would for the orphan the bead reports.
+                "[ -n \"$lifeline\" ] || exec /usr/bin/tail -f /dev/null\n",
+                "exec /bin/cat 0<&\"$lifeline\"\n",
+            ),
+            spawned = spawned.display()
+        ),
+    );
+    fs::create_dir(fixture.path().join("cas")).expect("CAS");
+    fs::create_dir(fixture.path().join("runs")).expect("ephemeral root");
+
+    let mut embedder = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "native_lifeline_embedder",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(EMBEDDER_ENV, fixture.path())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the embedding process");
+    let _embedder_cleanup = KillOnDrop(embedder.id() as libc::pid_t);
+
+    let worker = pid_from(&spawned, "the embedder's worker");
+    let _worker_cleanup = KillOnDrop(worker);
+    assert!(alive(worker));
+
+    // SAFETY: a signal to the child this test spawned.
+    assert_eq!(
+        unsafe { libc::kill(embedder.id() as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    embedder.wait().expect("reap the embedder");
+    common::await_exit(worker, EVENT_BOUND).unwrap_or_else(|error| {
+        panic!("the native worker outlived the process embedding its backend: {error}")
+    });
+}
+
+/// The real worker refuses a lifeline that cannot be one, by name, before it
+/// reads a rootfs or applies a sandbox (the CAS root here does not exist,
+/// so any later failure would name it instead); and refuses to start
+/// without one.
+#[test]
+fn the_native_worker_refuses_a_missing_or_unusable_lifeline() {
+    use std::io::Write;
+    let _serial = common::serial();
+    let run_root = TempDir::new().expect("run root");
+    let failure = |extra: &[&str]| {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_leyline-native-worker"))
+            .args(["--cas-root", "/nonexistent-cas", "--run-root"])
+            .arg(run_root.path())
+            .args(extra)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the native worker");
+        let mut stdin = child.stdin.take().expect("stdin");
+        serde_json::to_writer(&mut stdin, &request()).expect("request");
+        stdin.write_all(b"\n").expect("request");
+        drop(stdin);
+        let output = child.wait_with_output().expect("worker output");
+        assert!(!output.status.success());
+        let event: leyline_runtime::backends::native::WorkerEvent =
+            serde_json::from_slice(&output.stderr).expect("one structured event");
+        match event {
+            leyline_runtime::backends::native::WorkerEvent::Failed { error } => error,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    };
+    for extra in [&[][..], &["--lifeline-fd", "1048576"]] {
+        let error = failure(extra);
+        assert_eq!(
+            error.code,
+            leyline_runtime::ErrorCode::InvalidSpec,
+            "{error:?}"
+        );
+        assert!(
+            error.detail.contains("--lifeline-fd"),
+            "{extra:?}: {error:?}"
+        );
+    }
+}

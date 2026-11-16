@@ -91,6 +91,11 @@ const ENV_RUN_SIBLING: &str = "LEYLINE_PROBE_RUN_SIBLING";
 const ENV_CONNECT: &str = "LEYLINE_PROBE_CONNECT";
 const ENV_SSH: &str = "LEYLINE_PROBE_SSH";
 const ENV_WAIT: &str = "LEYLINE_PROBE_WAIT_FOR_GO";
+/// Set for a guest that only announces itself and then never exits
+/// ([`PARKED`]): what a lifeline test needs a running workload to be.
+const ENV_PARK: &str = "LEYLINE_PROBE_PARK";
+/// The line a parked guest prints before it parks.
+const PARKED: &str = "LEYLINE-GUEST-PARKED";
 const ENV_STRICT: &str = "LEYLINE_PROBE_STRICT";
 
 // ---------------------------------------------------------------------------
@@ -177,6 +182,12 @@ fn confined_guest_entry_point() {
         std::env::var_os(ENV_PROBE).is_some(),
         "{ENTRY_POINT} is the confined guest's entry point; it is meaningless unconfined"
     );
+    if std::env::var_os(ENV_PARK).is_some() {
+        println!("{PARKED}");
+        loop {
+            std::thread::park();
+        }
+    }
     if std::env::var_os(ENV_WAIT).is_some() {
         // The go signal: the parent plants the prefix sibling after the
         // worker reports readiness, then writes one line here.
@@ -484,12 +495,21 @@ fn run_worker_directly(fixture: &Fixture) -> Option<DirectRun> {
     for path in guest_runtime_files() {
         command.arg("--runtime-file").arg(path);
     }
+    // The lifeline at a number of its own, so the worker's standard input
+    // stays the guest's, for the go signal below; held until the worker is
+    // reaped.
+    let (_lifeline, read_end) = leyline_runtime::lifeline::pair().expect("a lifeline");
+    command
+        .arg("--lifeline-fd")
+        .arg(read_end.raw_fd().to_string());
+    read_end.pass_at(&mut command, read_end.raw_fd());
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the first-party native worker");
+    drop(read_end);
     let mut stdin = child.stdin.take().expect("worker stdin");
     let mut stdout = child.stdout.take().expect("worker stdout");
     let mut stderr = BufReader::new(child.stderr.take().expect("worker stderr"));
@@ -734,4 +754,121 @@ fn the_lifecycle_backend_runs_the_guest_under_the_same_confinement() {
     }
     fixture.assert_decoys_intact();
     fixture.assert_listener_untouched();
+}
+
+/// The real worker, spawned as the backend spawns it (its own process
+/// group, its standard input the lifeline), ends with its guest when the
+/// lifeline ends, as when the process that spawned it is killed (bead
+/// `ley-line-open-62e3b1`). The guest announces itself and parks, so only the
+/// lifeline can end it. Every wait is on an event: the guest's line, the end
+/// of its stdout (every holder of it gone), the worker's exit.
+#[test]
+fn the_worker_and_its_guest_end_when_the_lifeline_ends() {
+    use std::os::unix::process::CommandExt;
+    let _serial = common::serial();
+    let fixture = Fixture::new();
+    let run_root = fixture.runs.join("run-lifeline");
+    fs::create_dir(&run_root).expect("run root");
+    let mut command = Command::new(WORKER);
+    command
+        .arg("--cas-root")
+        .arg(&fixture.cas)
+        .arg("--run-root")
+        .arg(&run_root)
+        .args(["--lifeline-fd", "0"]);
+    for path in guest_runtime_files() {
+        command.arg("--runtime-file").arg(path);
+    }
+    let mut child = command
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the first-party native worker");
+    let mut lifeline = child.stdin.take().expect("worker stdin");
+    let stdout = child.stdout.take().expect("worker stdout");
+    let mut stderr = BufReader::new(child.stderr.take().expect("worker stderr"));
+    let request = fixture.request(&[(ENV_PARK, "1")]);
+    serde_json::to_writer(&mut lifeline, &request).expect("send request");
+    lifeline.write_all(b"\n").expect("terminate request");
+    lifeline.flush().expect("flush request");
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = stderr.read_line(&mut line).expect("readiness line");
+        if bytes == 0 || line.trim_start().starts_with('{') {
+            break;
+        }
+    }
+    match serde_json::from_str::<WorkerEvent>(line.trim()) {
+        Ok(WorkerEvent::Ready { .. }) => {}
+        Ok(WorkerEvent::Failed { error }) if is_apply_failure(&error) => {
+            let _ = child.wait();
+            sandbox_unavailable(&error);
+            return;
+        }
+        other => panic!("native worker did not become ready: {other:?}"),
+    }
+
+    // EVENT 1: the guest runs.
+    let (lines, guest) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = lines.send(None);
+                    return;
+                }
+                Ok(_) => {
+                    let _ = lines.send(Some(line.clone()));
+                }
+            }
+        }
+    });
+    let bound = Duration::from_secs(60);
+    loop {
+        match guest.recv_timeout(bound) {
+            Ok(Some(line)) if line.contains(PARKED) => break,
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                let mut rest = String::new();
+                let _ = stderr.read_to_string(&mut rest);
+                panic!("the guest's stdout ended before it parked; worker stderr:\n{rest}")
+            }
+            Err(_) => {
+                let _ = child.kill();
+                panic!("TIMEOUT: the guest did not park within {bound:?}");
+            }
+        }
+    }
+
+    // The lifeline ends, as when its supervisor dies.
+    drop(lifeline);
+
+    // EVENT 2: the guest's stdout ends: neither it nor the worker holds it.
+    loop {
+        match guest.recv_timeout(bound) {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => {
+                let worker = child.try_wait();
+                // SAFETY: the worker's group, which this test created.
+                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+                let mut rest = String::new();
+                let _ = stderr.read_to_string(&mut rest);
+                panic!(
+                    "TIMEOUT: the guest outlived the lifeline by {bound:?}; worker: {worker:?}; \
+                     stderr:\n{rest}"
+                );
+            }
+        }
+    }
+    // EVENT 3: the worker exits; it ended its group, itself included.
+    let status = child.wait().expect("worker exit");
+    assert!(!status.success(), "{status}");
 }

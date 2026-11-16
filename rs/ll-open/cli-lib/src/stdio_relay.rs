@@ -17,7 +17,7 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -46,20 +46,15 @@ struct Relayed {
 pub fn install(fds: &[RawFd]) -> io::Result<StdioRelay> {
     let mut streams = Vec::with_capacity(fds.len());
     for &fd in fds {
-        // SAFETY: fcntl on a descriptor number; failure is reported. The
-        // copy is close-on-exec: no child gets the original through it.
-        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-        if copy < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: fcntl just returned this descriptor, owned here.
-        let original = unsafe { OwnedFd::from_raw_fd(copy) };
+        // A close-on-exec copy (F_DUPFD_CLOEXEC): no child gets the original
+        // through it. A number that is not open fails here.
+        // SAFETY: borrowed for the one duplication; a closed number answers
+        // EBADF.
+        let original = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
         let target = File::from(original.try_clone()?);
         let (mut reader, writer) = io::pipe()?;
         // SAFETY: dup2 onto `fd` replaces it atomically for every thread.
-        if unsafe { libc::dup2(writer.as_raw_fd(), fd) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        checked(unsafe { libc::dup2(writer.as_raw_fd(), fd) })?;
         drop(writer);
         let dead = Arc::new(AtomicBool::new(false));
         let (done, drained) = mpsc::channel();
@@ -75,6 +70,14 @@ pub fn install(fds: &[RawFd]) -> io::Result<StdioRelay> {
         });
     }
     Ok(StdioRelay { streams })
+}
+
+/// A libc return value: `-1` is the error in `errno`, anything else success.
+fn checked(rc: libc::c_int) -> io::Result<libc::c_int> {
+    match rc {
+        -1 => Err(io::Error::last_os_error()),
+        rc => Ok(rc),
+    }
 }
 
 /// Forward everything `reader` yields to `target` until end-of-file; once a
@@ -127,7 +130,7 @@ impl StdioRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{FromRawFd, IntoRawFd};
 
     const BOUND: Duration = Duration::from_secs(10);
 
@@ -154,6 +157,14 @@ mod tests {
             write(fd, b"no reader, and no EPIPE\n").expect("a relayed write never fails");
         }
         relay.finish(BOUND);
+        // SAFETY: an out-parameter of the size fstat writes.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        assert_eq!(
+            stat.st_mode & libc::S_IFMT,
+            libc::S_IFCHR,
+            "finished onto /dev/null, the original's reader being gone"
+        );
         write(fd, b"after finish\n").expect("finished onto /dev/null");
         // SAFETY: the test's own descriptor.
         unsafe { libc::close(fd) };
@@ -174,6 +185,53 @@ mod tests {
         let mut all = String::new();
         reader.read_to_string(&mut all).unwrap();
         assert_eq!(all, "before\nafter\n");
+    }
+
+    #[test]
+    fn a_descriptor_that_is_not_open_is_refused_and_nothing_is_relayed() {
+        assert!(install(&[1 << 20]).is_err());
+    }
+
+    #[test]
+    fn checked_is_an_error_only_for_minus_one() {
+        assert!(checked(-1).is_err());
+        assert_eq!(checked(0).unwrap(), 0);
+        assert_eq!(checked(7).unwrap(), 7);
+    }
+
+    /// An interrupted read is retried; any other read error ends the relay.
+    #[test]
+    fn the_relay_retries_an_interrupted_read_and_ends_on_any_other_error() {
+        struct Script(Vec<io::Result<&'static [u8]>>);
+        impl Read for Script {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                match self.0.remove(0) {
+                    Ok(chunk) => {
+                        buffer[..chunk.len()].copy_from_slice(chunk);
+                        Ok(chunk.len())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        let dead = AtomicBool::new(false);
+        let (done, drained) = mpsc::channel();
+        let mut forwarded = Vec::new();
+        relay(
+            &mut Script(vec![
+                Ok(b"a"),
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(b"b"),
+                Err(io::Error::from(io::ErrorKind::Other)),
+                Ok(b"never read"),
+            ]),
+            &mut forwarded,
+            &dead,
+            &done,
+        );
+        assert_eq!(forwarded, b"ab");
+        assert!(!dead.load(Ordering::SeqCst));
+        drained.try_recv().expect("the relay reports it ended");
     }
 
     #[test]

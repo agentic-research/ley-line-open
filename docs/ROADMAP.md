@@ -40,7 +40,8 @@ v0.31.0 is the next release. Its work:
 - ADR-0046 Slice 1, the remainder (epic `e2c5ce`): a per-run host broker
   joins a declared guest connection to one loopback `127.0.0.1:port`, bytes
   only, no credential; the parent-death fix ships with it (`52b5b3`,
-  `52deb4`, `f963e6`, `528525`, `5308b7`). The input document (`e9d940`) and
+  `52deb4`, `f963e6`, `528525`, `5308b7`). The fix is the lifeline
+  (`f963e6`): a worker or broker ends when the process supervising it does. The input document (`e9d940`) and
   the `RunGrant`/`RunReceipt` fields (`521deb`) shipped in v0.30.0.
 - ADR-0049 PR2 and PR3 (`52c177`): each daemon is configured by one
   versioned document (`apiVersion` `config.leyline/v1`) with

@@ -8,8 +8,8 @@ use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 
 use leyline_runtime::backends::libkrun::worker::{
-    InheritedDescriptor, WORKSPACE_SHARE_FD_ARG, WorkerEvent, WorkerOptions, declared_descriptors,
-    inherit_only,
+    InheritedDescriptor, LIFELINE_EXIT_STATUS, LIFELINE_FD_ARG, WORKSPACE_SHARE_FD_ARG,
+    WorkerEvent, WorkerOptions, declared_descriptors, inherit_only, inherit_only_with_lifeline,
 };
 use leyline_runtime::{
     DigestRef, ErrorCode, ExecutionRequest, ResourceLimits, WorkerChannel, WorkspaceGrant,
@@ -83,7 +83,8 @@ fn first_party_worker_never_falls_back_to_the_krunvm_cli() {
     fs::set_permissions(&krunvm, fs::Permissions::from_mode(0o755)).expect("trap mode");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
-    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let (_lifeline, _read_end) =
+        inherit_only_with_lifeline(&mut command, &[]).expect("list this process's descriptors");
     let mut child = command
         .args([
             "--cas-root",
@@ -141,7 +142,8 @@ fn the_worker_refuses_a_drifting_commitment_before_readiness() {
     let run_root = TempDir::new().expect("run root");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
-    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let (_lifeline, _read_end) =
+        inherit_only_with_lifeline(&mut command, &[]).expect("list this process's descriptors");
     let mut child = command
         .args([
             "--cas-root",
@@ -174,9 +176,16 @@ fn the_worker_refuses_a_drifting_commitment_before_readiness() {
 }
 
 fn base_options() -> Vec<OsString> {
-    ["--cas-root", "/cas", "--run-root", "/run-root"]
-        .map(OsString::from)
-        .to_vec()
+    [
+        "--cas-root",
+        "/cas",
+        "--run-root",
+        "/run-root",
+        LIFELINE_FD_ARG,
+        "3",
+    ]
+    .map(OsString::from)
+    .to_vec()
 }
 
 #[test]
@@ -219,7 +228,8 @@ fn worker_failure_inheriting(
 ) -> leyline_runtime::ExecutionError {
     let run_root = TempDir::new().expect("run root");
     let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
-    inherit_only(&mut command, inherited).expect("list this process's descriptors");
+    let (_lifeline, _read_end) = inherit_only_with_lifeline(&mut command, inherited)
+        .expect("list this process's descriptors");
     let mut child = command
         .args(["--cas-root", "/nonexistent-cas", "--run-root"])
         .arg(run_root.path())
@@ -338,7 +348,7 @@ fn a_worker_holding_an_undeclared_descriptor_refuses_to_start() {
     assert!(
         error.detail.contains(&format!(
             "undeclared inherited descriptor(s) [{stray_fd}]: it declares its standard \
-             streams and [{share_fd}]"
+             streams, its lifeline and [{share_fd}]"
         )),
         "only the stray descriptor is undeclared: {error:?}"
     );
@@ -392,6 +402,8 @@ fn worker_options_require_an_explicit_run_root() {
         OsString::from("/cas"),
         OsString::from("--run-root"),
         OsString::from("/run-root"),
+        OsString::from(LIFELINE_FD_ARG),
+        OsString::from("3"),
     ])
     .expect("explicit run root");
     assert_eq!(options.run_root, std::path::PathBuf::from("/run-root"));
@@ -435,4 +447,110 @@ fn worker_options_refuse_a_repeated_path_option() {
             "{repeated}: {error:?}"
         );
     }
+}
+
+/// A bound on a failure only: a worker whose lifeline ended exits at once.
+const EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for `child` to exit, at most [`EXIT_BOUND`]; a child still running
+/// then fails the test by name.
+fn exit_within_bound(child: std::process::Child, what: &str) -> std::process::Output {
+    let (sender, exited) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    match exited.recv_timeout(EXIT_BOUND) {
+        Ok(output) => output.expect("worker output"),
+        Err(_) => panic!("TIMEOUT: {what} did not exit within {EXIT_BOUND:?}"),
+    }
+}
+
+/// The worker ends when its supervisor's lifeline ends, whatever it is doing:
+/// here it is still waiting for its request, which never comes (bead
+/// `ley-line-open-f963e6`). The supervisor's end is dropped as a supervisor
+/// killed with `SIGKILL` drops it, and nothing else is closed: the worker's
+/// standard input stays open, so its exit is the lifeline's doing.
+#[test]
+fn the_worker_exits_when_its_lifeline_ends() {
+    let _serial = common::serial();
+    let run_root = TempDir::new().expect("run root");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
+    let (lifeline, read_end) =
+        inherit_only_with_lifeline(&mut command, &[]).expect("list this process's descriptors");
+    let mut child = command
+        .args(["--cas-root", "/nonexistent-cas", "--run-root"])
+        .arg(run_root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first-party worker");
+    drop(read_end);
+    // Held open, and never written: the request does not arrive.
+    let stdin = child.stdin.take().expect("worker stdin");
+    drop(lifeline);
+    let output = exit_within_bound(child, "the worker whose lifeline ended");
+    drop(stdin);
+    assert_eq!(
+        output.status.code(),
+        Some(LIFELINE_EXIT_STATUS),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Ended, not refused: no failure event.
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+/// A lifeline number that is not an open descriptor is refused by name at
+/// startup, never read as an immediate end or as "no supervisor".
+#[test]
+fn the_worker_refuses_a_lifeline_that_is_not_open() {
+    let _serial = common::serial();
+    let run_root = TempDir::new().expect("run root");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
+    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let child = command
+        .args(["--cas-root", "/nonexistent-cas", "--run-root"])
+        .arg(run_root.path())
+        // Far above any descriptor the worker holds.
+        .args([LIFELINE_FD_ARG, "1048576"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first-party worker");
+    let output = exit_within_bound(child, "the worker refusing its lifeline");
+    assert!(!output.status.success());
+    let event: WorkerEvent = serde_json::from_slice(&output.stderr).expect("structured error");
+    let WorkerEvent::Failed { error } = event else {
+        panic!("expected a failed worker event, got {event:?}");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidSpec, "{error:?}");
+    assert!(error.detail.contains(LIFELINE_FD_ARG), "{error:?}");
+    assert!(error.detail.contains("1048576"), "{error:?}");
+}
+
+/// A worker started without a lifeline does not start: nothing would end it
+/// if the process that spawned it died.
+#[test]
+fn the_worker_refuses_to_start_without_a_lifeline() {
+    let _serial = common::serial();
+    let run_root = TempDir::new().expect("run root");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leyline-krun-worker"));
+    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let child = command
+        .args(["--cas-root", "/nonexistent-cas", "--run-root"])
+        .arg(run_root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first-party worker");
+    let output = exit_within_bound(child, "the worker without a lifeline");
+    let event: WorkerEvent = serde_json::from_slice(&output.stderr).expect("structured error");
+    let WorkerEvent::Failed { error } = event else {
+        panic!("expected a failed worker event, got {event:?}");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidSpec, "{error:?}");
+    assert!(error.detail.contains(LIFELINE_FD_ARG), "{error:?}");
 }

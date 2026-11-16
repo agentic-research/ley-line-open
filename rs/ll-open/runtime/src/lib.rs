@@ -14,6 +14,7 @@ mod catalog;
 pub mod confinement;
 pub mod deployment;
 mod error;
+pub mod lifeline;
 mod model;
 mod service;
 pub mod transport;

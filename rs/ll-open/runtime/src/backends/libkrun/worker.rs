@@ -23,6 +23,18 @@ use super::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 /// answers the share's FUSE requests (`super::share`).
 pub const WORKSPACE_SHARE_FD_ARG: &str = "--workspace-share-fd";
 
+/// The worker option naming the inherited read end of the lifeline
+/// ([`crate::lifeline`]): a pipe whose only write end the process that
+/// spawned the worker holds. End-of-file on it means that process is gone,
+/// and the worker ends at once, its VM with it (bead `ley-line-open-f963e6`).
+/// Required: a worker nothing supervises does not start.
+pub const LIFELINE_FD_ARG: &str = "--lifeline-fd";
+
+/// The status the worker ends with when its lifeline ends. Nobody is left to
+/// read it; it differs from every status a guest's exit maps to only in
+/// being documented here.
+pub const LIFELINE_EXIT_STATUS: i32 = 1;
+
 /// The virtio-fs tag of the workspace share.
 pub const WORKSPACE_TAG: &str = "work";
 
@@ -323,6 +335,8 @@ pub struct WorkerOptions {
     /// ([`WORKSPACE_SHARE_FD_ARG`]), set by the backend that spawned this
     /// worker for a run granted a workspace.
     pub workspace_share_fd: Option<i32>,
+    /// The inherited read end of the lifeline ([`LIFELINE_FD_ARG`]).
+    pub lifeline_fd: i32,
 }
 
 /// One descriptor a worker holds beyond its standard streams: its number in
@@ -364,16 +378,23 @@ pub fn declared_descriptors(
 /// events): the descriptors every worker holds without declaring them.
 const STANDARD_STREAMS: [i32; 3] = [0, 1, 2];
 
-/// The descriptors in `held` that are neither a standard stream nor
-/// declared.
+/// The descriptors in `held` that are neither a control descriptor (a
+/// standard stream, or the lifeline at `lifeline_fd`) nor declared.
+///
+/// The lifeline is control, like the standard streams, not a channel: no
+/// byte is ever written to it and it reaches nothing, so it is not in the
+/// declaration a receipt's backend evidence digests.
 fn undeclared_descriptors(
     held: &std::collections::BTreeSet<i32>,
     declared: &[InheritedDescriptor],
+    lifeline_fd: i32,
 ) -> Vec<i32> {
     held.iter()
         .copied()
         .filter(|fd| {
-            !STANDARD_STREAMS.contains(fd) && !declared.iter().any(|d| d.descriptor == *fd)
+            !STANDARD_STREAMS.contains(fd)
+                && *fd != lifeline_fd
+                && !declared.iter().any(|d| d.descriptor == *fd)
         })
         .collect()
 }
@@ -417,15 +438,16 @@ fn held_descriptors() -> Result<std::collections::BTreeSet<i32>, ExecutionError>
 /// channel into the run.
 pub fn refuse_undeclared_descriptors(
     declared: &[InheritedDescriptor],
+    lifeline_fd: i32,
 ) -> Result<(), ExecutionError> {
-    let undeclared = undeclared_descriptors(&held_descriptors()?, declared);
+    let undeclared = undeclared_descriptors(&held_descriptors()?, declared, lifeline_fd);
     if undeclared.is_empty() {
         return Ok(());
     }
     let declared: Vec<i32> = declared.iter().map(|d| d.descriptor).collect();
     Err(ExecutionError::identity_mismatch(format!(
         "the worker holds undeclared inherited descriptor(s) {undeclared:?}: it declares \
-         its standard streams and {declared:?}, and starts with nothing else"
+         its standard streams, its lifeline and {declared:?}, and starts with nothing else"
     )))
 }
 
@@ -469,6 +491,29 @@ pub fn inherit_only(command: &mut Command, keep: &[i32]) -> Result<(), Execution
     Ok(())
 }
 
+/// [`inherit_only`], with a new lifeline handed to the worker as well: its
+/// read end kept across the worker's `exec` under its own number and named by
+/// [`LIFELINE_FD_ARG`]. The spawner holds the returned [`Lifeline`] for as
+/// long as it supervises the worker, and the [`ReadEnd`] until `spawn`
+/// returns: the number the child keeps is the read end's number here.
+///
+/// [`Lifeline`]: crate::lifeline::Lifeline
+/// [`ReadEnd`]: crate::lifeline::ReadEnd
+pub fn inherit_only_with_lifeline(
+    command: &mut Command,
+    keep: &[i32],
+) -> Result<(crate::lifeline::Lifeline, crate::lifeline::ReadEnd), ExecutionError> {
+    let (lifeline, read_end) = crate::lifeline::pair()
+        .map_err(|error| ExecutionError::backend(format!("create worker lifeline: {error}")))?;
+    let mut keep = keep.to_vec();
+    keep.push(read_end.raw_fd());
+    command
+        .arg(LIFELINE_FD_ARG)
+        .arg(read_end.raw_fd().to_string());
+    inherit_only(command, &keep)?;
+    Ok((lifeline, read_end))
+}
+
 /// The descriptor flags [`inherit_only`]'s child sets on a descriptor whose
 /// flags are `flags`: close-on-exec cleared when the worker keeps it, set
 /// otherwise, and every other flag unchanged.
@@ -483,6 +528,31 @@ fn child_descriptor_flags(flags: rustix::io::FdFlags, keep: bool) -> rustix::io:
     } else {
         flags | FdFlags::CLOEXEC
     }
+}
+
+/// The lifeline descriptor a worker accepts: given, not a standard stream
+/// (the worker's request, its guest's console and its events), and not the
+/// workspace share's. Each refusal names the option.
+fn checked_lifeline_fd(
+    lifeline_fd: Option<i32>,
+    workspace_share_fd: Option<i32>,
+) -> Result<i32, ExecutionError> {
+    let fd = lifeline_fd.ok_or_else(|| {
+        ExecutionError::invalid(format!(
+            "missing {LIFELINE_FD_ARG} option: a worker starts only under a supervisor's lifeline"
+        ))
+    })?;
+    if STANDARD_STREAMS.contains(&fd) {
+        return Err(ExecutionError::invalid(format!(
+            "{LIFELINE_FD_ARG} {fd} is a standard stream, not a lifeline"
+        )));
+    }
+    if workspace_share_fd == Some(fd) {
+        return Err(ExecutionError::invalid(format!(
+            "{LIFELINE_FD_ARG} {fd} is also the {WORKSPACE_SHARE_FD_ARG} descriptor"
+        )));
+    }
+    Ok(fd)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +585,7 @@ impl WorkerOptions {
 
         let mut tsi_hijack_inet = false;
         let mut workspace_share_fd = None;
+        let mut lifeline_fd = None;
 
         while let Some(argument) = arguments.next() {
             // Checked before a value is consumed: this is the one valueless
@@ -547,6 +618,16 @@ impl WorkerOptions {
                         })?;
                     workspace_share_fd = Some(fd);
                 }
+                Some(LIFELINE_FD_ARG) if lifeline_fd.is_none() => {
+                    let value = value.to_str().ok_or_else(|| {
+                        ExecutionError::invalid(format!(
+                            "{LIFELINE_FD_ARG} {} is not a file descriptor number",
+                            value.to_string_lossy()
+                        ))
+                    })?;
+                    lifeline_fd =
+                        Some(crate::lifeline::parse_fd(value).map_err(ExecutionError::invalid)?);
+                }
                 _ => {
                     return Err(ExecutionError::invalid(format!(
                         "unknown or duplicate worker option: {}",
@@ -565,6 +646,7 @@ impl WorkerOptions {
             devices,
             tsi_hijack_inet,
             workspace_share_fd,
+            lifeline_fd: checked_lifeline_fd(lifeline_fd, workspace_share_fd)?,
         })
     }
 }
@@ -630,7 +712,7 @@ pub fn prepare(
     // Before the rootfs is read or anything else is opened: what this
     // process holds is its standard streams and the declared share.
     let inherited = declared_descriptors(request, options.workspace_share_fd);
-    refuse_undeclared_descriptors(&inherited)?;
+    refuse_undeclared_descriptors(&inherited, options.lifeline_fd)?;
     let resolver = DirectoryRootfsResolver::new(&options.cas_root);
     let mut config = compile_plan(&resolver, request)?;
     // The workload's argv and environment, bounded and refused by name here,
@@ -1286,18 +1368,23 @@ mod tests {
             },
         }];
         let held: BTreeSet<i32> = [0, 1, 2, 5, 7, 9].into();
-        assert_eq!(undeclared_descriptors(&held, &declared), vec![7, 9]);
+        assert_eq!(undeclared_descriptors(&held, &declared, 11), vec![7, 9]);
+        // The lifeline is a control descriptor like the standard streams.
+        assert_eq!(undeclared_descriptors(&held, &declared, 7), vec![9]);
         // Nothing beyond what is declared: nothing undeclared.
         let held: BTreeSet<i32> = [0, 1, 2, 5].into();
-        assert_eq!(undeclared_descriptors(&held, &declared), Vec::<i32>::new());
+        assert_eq!(
+            undeclared_descriptors(&held, &declared, 11),
+            Vec::<i32>::new()
+        );
         // Without the declaration, the share itself is undeclared.
-        assert_eq!(undeclared_descriptors(&held, &[]), vec![5]);
+        assert_eq!(undeclared_descriptors(&held, &[], 11), vec![5]);
     }
 
     #[test]
     fn a_held_descriptor_nothing_declares_is_refused() {
         let file = std::fs::File::open("/dev/null").unwrap();
-        let error = refuse_undeclared_descriptors(&[]).unwrap_err();
+        let error = refuse_undeclared_descriptors(&[], NEVER_OPEN).unwrap_err();
         assert_eq!(error.code, ErrorCode::IdentityPolicyMismatch);
         assert!(
             error.detail.contains(&file.as_raw_fd().to_string()),
@@ -1343,6 +1430,8 @@ mod tests {
             "--tsi-hijack-inet",
             WORKSPACE_SHARE_FD_ARG,
             "3",
+            LIFELINE_FD_ARG,
+            "4",
         ]))
         .unwrap();
         assert_eq!(
@@ -1354,10 +1443,11 @@ mod tests {
                 devices: vec![PathBuf::from("/dev/kvm")],
                 tsi_hijack_inet: true,
                 workspace_share_fd: Some(3),
+                lifeline_fd: 4,
             }
         );
 
-        // Descriptor 0 is a number like any other.
+        // Descriptor 0 is a number like any other for the share.
         let options = WorkerOptions::parse(arguments(&[
             "--cas-root",
             "/cas",
@@ -1365,9 +1455,12 @@ mod tests {
             "/runs",
             WORKSPACE_SHARE_FD_ARG,
             "0",
+            LIFELINE_FD_ARG,
+            "3",
         ]))
         .unwrap();
         assert_eq!(options.workspace_share_fd, Some(0));
+        assert_eq!(options.lifeline_fd, 3);
         assert!(!options.tsi_hijack_inet);
     }
 
@@ -1389,6 +1482,7 @@ mod tests {
             devices: Vec::new(),
             tsi_hijack_inet: false,
             workspace_share_fd: None,
+            lifeline_fd: NEVER_OPEN,
         };
         let mut drifting = request();
         drifting.limits.wall_time_ms = 1_000;
@@ -1423,8 +1517,16 @@ mod tests {
 
     #[test]
     fn worker_options_refuse_duplicates_and_malformed_values() {
-        let base = ["--cas-root", "/cas", "--run-root", "/runs"];
+        let base = [
+            "--cas-root",
+            "/cas",
+            "--run-root",
+            "/runs",
+            LIFELINE_FD_ARG,
+            "3",
+        ];
         for extra in [
+            &[LIFELINE_FD_ARG, "4"][..],
             &["--cas-root", "/other"][..],
             &["--run-root", "/other"][..],
             &[WORKSPACE_SHARE_FD_ARG, "3", WORKSPACE_SHARE_FD_ARG, "4"][..],
@@ -1442,6 +1544,35 @@ mod tests {
             assert!(
                 WorkerOptions::parse(arguments(missing)).is_err(),
                 "{missing:?}"
+            );
+        }
+        // A worker nothing supervises is refused: the lifeline is required,
+        // and a malformed one is refused by name.
+        let error = WorkerOptions::parse(arguments(&base[..4])).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidSpec);
+        assert!(error.detail.contains(LIFELINE_FD_ARG), "{error}");
+        // A standard stream is not a lifeline: the worker's are its request,
+        // its guest's console and its events.
+        for bad in ["-1", "three", "+3", "", "0", "1", "2"] {
+            let mut values = base[..4].to_vec();
+            values.extend_from_slice(&[LIFELINE_FD_ARG, bad]);
+            let error = WorkerOptions::parse(arguments(&values)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidSpec, "{bad:?}");
+            assert!(error.detail.contains(LIFELINE_FD_ARG), "{bad:?}: {error}");
+        }
+        // Nor is the workspace share's descriptor, in either order.
+        for values in [
+            &[WORKSPACE_SHARE_FD_ARG, "5", LIFELINE_FD_ARG, "5"][..],
+            &[LIFELINE_FD_ARG, "5", WORKSPACE_SHARE_FD_ARG, "5"][..],
+        ] {
+            let mut all = base[..4].to_vec();
+            all.extend_from_slice(values);
+            let error = WorkerOptions::parse(arguments(&all)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidSpec, "{values:?}");
+            assert!(
+                error.detail.contains(LIFELINE_FD_ARG)
+                    && error.detail.contains(WORKSPACE_SHARE_FD_ARG),
+                "{values:?}: {error}"
             );
         }
     }

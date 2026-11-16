@@ -22,7 +22,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use leyline_runtime::backends::libkrun::worker::inherit_only;
+use leyline_runtime::backends::libkrun::worker::inherit_only_with_lifeline;
 use leyline_runtime::cas_volume::{CasVolume, MIN_SIZE_CAP_BYTES, probe_sensitivity};
 use leyline_runtime::{DigestRef, ExecutionRequest, ResourceLimits};
 use tempfile::TempDir;
@@ -97,7 +97,8 @@ fn run(
         },
     };
     let mut command = Command::new(worker);
-    inherit_only(&mut command, &[]).expect("list this process's descriptors");
+    let (_lifeline, _read_end) =
+        inherit_only_with_lifeline(&mut command, &[]).expect("list this process's descriptors");
     let (library_var, library_dir) = hypervisor::library_path_env(libkrunfw);
     let mut child = command
         .arg("--cas-root")

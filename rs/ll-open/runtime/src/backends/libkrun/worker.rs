@@ -452,7 +452,10 @@ pub fn refuse_undeclared_descriptors(
 }
 
 /// Have `command`'s child inherit its standard streams and `keep`, and no
-/// other descriptor of this process.
+/// other descriptor of this process. For a worker started with a
+/// `std::process::Command` (tests that drive the worker binary directly);
+/// the backend starts it through [`crate::backends::spawn`] instead (bead
+/// `ley-line-open-528525`).
 ///
 /// Every descriptor Rust's standard library opens is close-on-exec, but a
 /// process can inherit others from its own parent (a build tool's jobserver

@@ -22,10 +22,9 @@ use super::super::process::{
     published_status, read_readiness_line, supervise_worker, terminate_process_group,
 };
 use super::share::{FsService, serve};
-// The share's `worker_end` is created close-on-exec, as every descriptor
-// here is, so a process another thread spawns concurrently does not inherit
-// it; only the worker's child clears the flag, after its fork
-// (`inherit_only`), and the parent holds `worker_end` until spawn returns.
+// The share's `worker_end` and the lifeline's read end reach the worker
+// because `spawn` names them; no other child, on any thread, inherits them
+// (bead ley-line-open-528525). The parent holds both until spawn returns.
 use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors};
 
 const LABELS: SupervisionLabels = SupervisionLabels {

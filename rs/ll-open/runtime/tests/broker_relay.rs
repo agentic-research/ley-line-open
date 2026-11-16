@@ -60,9 +60,17 @@ struct Running {
 impl Running {
     fn connect(&self) -> UnixStream {
         let stream = UnixStream::connect(&self.path).expect("connect endpoint");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
+        // macOS answers EINVAL to SO_RCVTIMEO on a socket whose peer has
+        // already closed it: a connection the broker refused at once (past
+        // the cap) can be closed before this line runs. A read on it then
+        // returns end-of-file at once, so it needs no timeout.
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(20))) {
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINVAL),
+                "set the read timeout: {error}"
+            );
+        }
         stream
     }
 

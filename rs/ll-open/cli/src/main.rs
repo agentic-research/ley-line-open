@@ -346,7 +346,25 @@ enum Cmd {
         /// [`leyline_cli_lib::CdcTarget`]). Ignored without `--cdc`.
         #[arg(long, value_enum, default_value_t = leyline_cli_lib::CdcTarget::SourceBlobs)]
         cdc_target: leyline_cli_lib::CdcTarget,
+
+        /// Shut down when the process that launched this daemon is gone,
+        /// `SIGKILL` included (bead `ley-line-open-f6b525`). The launcher
+        /// creates a pipe, keeps the only write end, and hands this daemon
+        /// the read end under descriptor number N; it never writes to it.
+        /// End-of-file on N runs the same graceful shutdown as SIGTERM:
+        /// unmount, final snapshot, socket cleanup. Works on macOS, which
+        /// has no parent-death signal. A descriptor that is not open for
+        /// reading, or not a pipe or socket, refuses startup. Without the
+        /// flag nothing is watched. A launch action, not configuration: it
+        /// names a descriptor of this one start (ADR-0049 D3).
+        #[arg(long, value_name = "N", allow_hyphen_values = true, value_parser = parse_lifeline_fd)]
+        lifeline_fd: Option<i32>,
     },
+}
+
+/// `--lifeline-fd`: decimal digits only (`leyline_runtime::lifeline::parse_fd`).
+fn parse_lifeline_fd(value: &str) -> Result<i32, String> {
+    leyline_runtime::lifeline::parse_fd(value)
 }
 
 #[derive(Parser)]
@@ -684,6 +702,7 @@ async fn main() -> Result<()> {
             reset_arena,
             cdc,
             cdc_target: leyline_cli_lib::CdcTarget::SourceBlobs,
+            lifeline_fd,
         } => {
             // KNOWN scale limitation: arena_size_mib defaults to 64
             // (see Cmd::Daemon { arena_size_mib, default_value_t = 64 }).
@@ -723,6 +742,7 @@ async fn main() -> Result<()> {
                 leyline_cli_lib::cmd_daemon::DaemonOptions {
                     cdc,
                     host_mount: host_mount(),
+                    lifeline_fd,
                     ..Default::default()
                 },
             )

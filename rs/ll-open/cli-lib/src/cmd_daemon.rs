@@ -157,6 +157,13 @@ pub struct DaemonOptions {
     /// provides it; cli-lib cannot, since storefs depends on cli-lib. A
     /// daemon asked to mount with none is refused before it starts.
     pub host_mount: Option<HostMountRef>,
+    /// The inherited read end of the launcher's lifeline (bead
+    /// `ley-line-open-f6b525`; `leyline daemon --lifeline-fd`). When the
+    /// launcher is gone, `SIGKILL` included, the daemon shuts down as it
+    /// does on SIGTERM: unmount, final publish, socket cleanup. `None`, the
+    /// default, watches nothing. A descriptor that is not a readable pipe
+    /// or socket refuses startup by name.
+    pub lifeline_fd: Option<i32>,
 }
 
 /// The guard of a host mount: dropping it unmounts, and lands what the
@@ -341,7 +348,11 @@ pub async fn run_daemon_with_options(
         .as_deref()
         .map(lifecycle::parse_duration)
         .transpose()?;
-    let mut shutdown_signals = lifecycle::ShutdownSignals::install()?;
+    // The lifeline is watched from here on too, before anything announces
+    // this daemon or spawns a child, so a launcher killed during startup
+    // still ends it, and no child inherits the descriptor.
+    let mut shutdown_signals =
+        lifecycle::ShutdownSignals::install_with_lifeline(options.lifeline_fd)?;
     // Bead `ley-line-open-b7dd03`: gate non-loopback `--mcp-bind` behind
     // an explicit `--mcp-allow-public` flag. The MCP wire now has a
     // shared-secret token gate (ADR-0022 / bead `ley-line-open-b885d1`);
@@ -4397,6 +4408,7 @@ mod execution_discovery_tests {
             cdc: true,
             discovery: SocketDiscovery::Substrate,
             host_mount: None,
+            lifeline_fd: Some(7),
         };
         let effective = execution_daemon_options(caller);
         assert_eq!(
@@ -4407,6 +4419,11 @@ mod execution_discovery_tests {
         // Deliberately the non-default value: the override must keep the
         // caller's unrelated options.
         assert!(effective.cdc, "unrelated caller options must survive");
+        assert_eq!(
+            effective.lifeline_fd,
+            Some(7),
+            "the caller's lifeline survives"
+        );
     }
 
     /// Bead `ley-line-open-80f037`: the watcher's `daemon.sheaf.invalidate`

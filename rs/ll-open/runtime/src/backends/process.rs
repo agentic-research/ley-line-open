@@ -123,7 +123,7 @@ pub(super) fn terminate_process_group(pid: u32) {
 /// `WNOWAIT` leaves the child in a waitable state: the zombie keeps the pid,
 /// and therefore the process-group id, allocated until someone actually reaps.
 /// That is what makes the subsequent group kill safe.
-fn await_exit_without_reaping(pid: u32) -> io::Result<()> {
+pub(super) fn await_exit_without_reaping(pid: u32) -> io::Result<()> {
     retry_while_interrupted(|| observe_exit(pid))
 }
 

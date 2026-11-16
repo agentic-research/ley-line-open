@@ -103,11 +103,6 @@ type Ref struct {
 	SourceID *string `json:"source_id"`
 }
 
-// QueryRow is one row in a `query` op response.
-type QueryRow struct {
-	Values []string `json:"values"`
-}
-
 // ReadContentResponse is the wire shape of the `read_content` op response.
 type ReadContentResponse struct {
 	OK      *bool   `json:"ok"`
@@ -354,6 +349,10 @@ const (
 	// QueryRefusalNotAQuery: the statement is not a read-only SELECT;
 	// [QueryRefusal.Action] is its leading keyword.
 	QueryRefusalNotAQuery QueryRefusalReason = "not_a_query"
+	// QueryRefusalLimitOutOfRange: the request's row limit does not fit
+	// QueryRequest.limit's UInt32; [QueryRefusal.Action] is `limit` and
+	// [QueryRefusal.Subject] the requested value. Nothing ran.
+	QueryRefusalLimitOutOfRange QueryRefusalReason = "limit_out_of_range"
 )
 
 // QueryRefusal is why a `query` statement was refused (LLO bead
@@ -374,11 +373,23 @@ type QueryRefusal struct {
 // one read-only SELECT: OK false with Refusal means the statement was
 // refused, OK false without it is an error running an allowed statement.
 type QueryResponse struct {
-	OK      *bool         `json:"ok"`
-	Columns []string      `json:"columns"`
-	Rows    []QueryRow    `json:"rows"`
+	OK      *bool    `json:"ok"`
+	Columns []string `json:"columns"`
+	// Rows holds one entry per result row, each with one QueryCell per entry
+	// of Columns, in Columns order (LLO bead ley-line-open-0a18bc).
+	Rows    [][]QueryCell `json:"rows"`
 	Error   *string       `json:"error,omitempty"`
 	Refusal *QueryRefusal `json:"refusal,omitempty"`
+	// Truncation is set only when the statement had more rows than the row
+	// limit and Rows holds the first Limit of them; nil otherwise.
+	Truncation *QueryTruncation `json:"truncation,omitempty"`
+}
+
+// QueryTruncation is how a `query` reply was cut short.
+type QueryTruncation struct {
+	// Limit is the row limit that applied: the request's limit, or the
+	// daemon's default when the request named none.
+	Limit *uint32 `json:"limit"`
 }
 
 // ── Sheaf op responses ─────────────────────────────────────────────

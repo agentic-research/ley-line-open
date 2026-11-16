@@ -91,8 +91,16 @@ impl WorkerOptions {
                             value.to_string_lossy()
                         ))
                     })?;
-                    lifeline_fd =
-                        Some(crate::lifeline::parse_fd(value).map_err(ExecutionError::invalid)?);
+                    let fd = crate::lifeline::parse_fd(value).map_err(ExecutionError::invalid)?;
+                    // Standard input is the backend's lifeline; standard
+                    // output and error are the workload's console and this
+                    // worker's events.
+                    if fd == libc::STDOUT_FILENO || fd == libc::STDERR_FILENO {
+                        return Err(ExecutionError::invalid(format!(
+                            "{LIFELINE_FD_ARG} {fd} is standard output or error, not a lifeline"
+                        )));
+                    }
+                    lifeline_fd = Some(fd);
                 }
                 _ => {
                     return Err(ExecutionError::invalid(format!(
@@ -439,7 +447,15 @@ mod tests {
         };
         let error = WorkerOptions::parse(base()).expect_err("no lifeline");
         assert!(error.detail.contains(LIFELINE_FD_ARG), "{error}");
-        for bad in [&["-1"][..], &["three"], &["0", LIFELINE_FD_ARG, "3"]] {
+        // Standard output and error are the workload's console and the
+        // worker's events, never a lifeline; standard input is the backend's.
+        for bad in [
+            &["-1"][..],
+            &["three"],
+            &["1"],
+            &["2"],
+            &["0", LIFELINE_FD_ARG, "3"],
+        ] {
             let mut arguments = base();
             arguments.push(OsString::from(LIFELINE_FD_ARG));
             arguments.extend(bad.iter().map(OsString::from));

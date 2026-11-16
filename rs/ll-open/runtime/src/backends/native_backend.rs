@@ -16,10 +16,13 @@ use crate::{
 };
 
 use super::cgroup::{CgroupRoot, RunCgroup};
+#[cfg(feature = "test-support")]
+use super::libkrun::backend::StartPoint;
 use super::native::WorkerEvent;
 use super::process::{
-    Supervised, SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
-    finish_failed_start, published_status, read_readiness_line, supervise_worker,
+    Supervised, SupervisionLabels, WorkerProcess, abort_failed_start, cleanup_tempdir,
+    configure_process_group, finish_failed_start, published_status, read_readiness_line,
+    supervise_worker, terminate_process_group,
 };
 
 const LABELS: SupervisionLabels = SupervisionLabels {
@@ -54,6 +57,10 @@ pub struct NativeWorkerBackend {
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
     completed: Arc<Mutex<HashMap<String, BackendRunStatus>>>,
     completion_cv: Arc<Condvar>,
+    /// Observes points in `start` and `cancel` a test must order events
+    /// around (`test-support` only).
+    #[cfg(feature = "test-support")]
+    hook: Option<Arc<dyn Fn(StartPoint) + Send + Sync>>,
 }
 
 struct WorkerControl {
@@ -62,11 +69,11 @@ struct WorkerControl {
 }
 
 /// What a starting run's `start` waits on: the worker's readiness line, or a
-/// cancel, answered on its sender once the worker is reaped and its run root
-/// removed.
+/// cancel, answered on its sender once the worker is reaped, with whether its
+/// run root was removed.
 enum StartEvent {
     Readiness(Result<Option<String>, String>),
-    Cancel(mpsc::SyncSender<()>),
+    Cancel(mpsc::SyncSender<Result<(), ExecutionError>>),
 }
 
 /// A starting run's entry in `starting`, removed when the start ends without
@@ -85,13 +92,27 @@ impl Drop for Starting<'_> {
     }
 }
 
-/// The error a start ends with when it is cancelled before readiness.
-fn cancelled_before_readiness() -> ExecutionError {
-    ExecutionError {
+/// End a starting run on a cancel: kill and reap its worker, remove its run
+/// root, answer the cancel with whether the removal worked, and return the
+/// error the start ends with.
+fn cancel_starting(
+    child: &mut std::process::Child,
+    run_root: tempfile::TempDir,
+    acknowledge: mpsc::SyncSender<Result<(), ExecutionError>>,
+) -> ExecutionError {
+    terminate_process_group(child.id());
+    let _ = child.wait();
+    let cleanup = cleanup_tempdir(run_root, LABELS);
+    let _ = acknowledge.send(cleanup.clone());
+    let mut error = ExecutionError {
         code: crate::ErrorCode::Cancelled,
         retryable: false,
         detail: "the run was cancelled before its native worker reported readiness".into(),
+    };
+    if let Err(cleanup) = cleanup {
+        error.detail = format!("{}; cleanup also failed: {}", error.detail, cleanup.detail);
     }
+    error
 }
 
 impl NativeWorkerBackend {
@@ -105,7 +126,17 @@ impl NativeWorkerBackend {
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             completion_cv: Arc::new(Condvar::new()),
+            #[cfg(feature = "test-support")]
+            hook: None,
         }
+    }
+
+    /// Call `hook` at each [`StartPoint`], on the thread that reaches it,
+    /// which waits for it to return. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn with_start_hook(mut self, hook: impl Fn(StartPoint) + Send + Sync + 'static) -> Self {
+        self.hook = Some(Arc::new(hook));
+        self
     }
 
     /// Enforce memory, CPU bandwidth and pids ceilings through `root`, for
@@ -164,10 +195,17 @@ impl NativeWorkerBackend {
             let (acknowledge, acknowledged) = mpsc::sync_channel(1);
             let sent = start.send(StartEvent::Cancel(acknowledge)).is_ok();
             drop(starting);
-            if sent {
-                let _ = acknowledged.recv();
+            #[cfg(feature = "test-support")]
+            if let Some(hook) = &self.hook {
+                hook(StartPoint::CancelSignalled);
             }
-            return Ok(true);
+            // The start's answer is whether the run root went too. No answer
+            // means the start ended on its own failure, which reaps and
+            // cleans up before its receiver is dropped.
+            return match sent.then(|| acknowledged.recv()) {
+                Some(Ok(cleanup)) => cleanup.map(|()| true),
+                _ => Ok(true),
+            };
         };
         drop(starting);
         let _ = control.cancel.send(());
@@ -287,6 +325,19 @@ impl Backend for NativeWorkerBackend {
         command.arg(super::native::LIFELINE_FD_ARG).arg("0");
         configure_process_group(&mut command);
 
+        // Registered before the worker exists, so from its spawn until the
+        // run is published a cancel reaches it through `event_tx`: there is
+        // no moment with a worker and nothing to cancel (bead
+        // ley-line-open-62e3b1). A failed spawn drops `registered`, which
+        // removes the entry.
+        let (event_tx, event_rx) = mpsc::channel();
+        self.starting
+            .lock()
+            .insert(request.run_id.clone(), event_tx.clone());
+        let mut registered = Starting {
+            starting: &self.starting,
+            run_id: Some(request.run_id.clone()),
+        };
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -297,16 +348,10 @@ impl Backend for NativeWorkerBackend {
                 ));
             }
         };
-        // From the spawn until the run is published, a cancel reaches it
-        // through `event_tx` (bead ley-line-open-62e3b1).
-        let (event_tx, event_rx) = mpsc::channel();
-        self.starting
-            .lock()
-            .insert(request.run_id.clone(), event_tx.clone());
-        let mut registered = Starting {
-            starting: &self.starting,
-            run_id: Some(request.run_id.clone()),
-        };
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &self.hook {
+            hook(StartPoint::Spawned);
+        }
         // Place the worker before it has its request. It reads the request
         // before it materializes the rootfs, applies nono, or spawns the
         // workload, so nothing the run executes starts outside the cgroup,
@@ -373,10 +418,7 @@ impl Backend for NativeWorkerBackend {
         });
         let line = match event_rx.recv_timeout(self.config.ready_timeout) {
             Ok(StartEvent::Cancel(acknowledge)) => {
-                let error =
-                    abort_failed_start(&mut child, run_root, LABELS, cancelled_before_readiness());
-                let _ = acknowledge.send(());
-                return Err(error);
+                return Err(cancel_starting(&mut child, run_root, acknowledge));
             }
             Ok(StartEvent::Readiness(Ok(Some(line)))) => line,
             Ok(StartEvent::Readiness(Ok(None))) => {
@@ -498,10 +540,7 @@ impl Backend for NativeWorkerBackend {
         registered.run_id = None;
         while let Ok(event) = event_rx.try_recv() {
             if let StartEvent::Cancel(acknowledge) = event {
-                let error =
-                    abort_failed_start(&mut child, run_root, LABELS, cancelled_before_readiness());
-                let _ = acknowledge.send(());
-                return Err(error);
+                return Err(cancel_starting(&mut child, run_root, acknowledge));
             }
         }
         self.children.lock().insert(

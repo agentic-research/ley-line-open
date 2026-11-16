@@ -821,3 +821,104 @@ fn the_native_worker_refuses_a_missing_or_unusable_lifeline() {
         );
     }
 }
+
+/// What [`a_native_cancel_right_after_spawn_finds_the_run`] observes, in order.
+#[derive(Debug)]
+enum Seen {
+    CancelWaiting,
+    CancelReturned(Result<bool, leyline_runtime::ExecutionError>),
+}
+
+/// A cancel that arrives right after the spawn, before `start` does anything
+/// else, finds the run: it is registered before the spawn (the native half
+/// of the #594 review's COMMENT 1).
+#[test]
+fn a_native_cancel_right_after_spawn_finds_the_run() {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::mpsc;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (spawned_tx, spawned) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (seen_tx, seen) = mpsc::channel();
+    let released = StdMutex::new(released);
+    let hook_seen = seen_tx.clone();
+    let (backend, ephemeral_root) = backend(
+        &fixture,
+        "#!/bin/sh\nIFS= read -r _\nexec /usr/bin/tail -f /dev/null\n",
+    );
+    let backend = std::sync::Arc::new(backend.with_start_hook(move |point| match point {
+        StartPoint::Spawned => {
+            let _ = spawned_tx.send(());
+            let _ = released.lock().unwrap().recv();
+        }
+        StartPoint::CancelSignalled => {
+            let _ = hook_seen.send(Seen::CancelWaiting);
+        }
+    }));
+    let starter = {
+        let backend = std::sync::Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+    spawned
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the worker was never spawned");
+    let canceller = {
+        let backend = std::sync::Arc::clone(&backend);
+        std::thread::spawn(move || {
+            let _ = seen_tx.send(Seen::CancelReturned(backend.cancel("native-run-01")));
+        })
+    };
+    let first = seen
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the cancel neither waited nor returned");
+    let _ = release.send(());
+    assert!(
+        matches!(first, Seen::CancelWaiting),
+        "a cancel right after the spawn did not find the run: {first:?}"
+    );
+    match seen.recv_timeout(EVENT_BOUND) {
+        Ok(Seen::CancelReturned(Ok(true))) => {}
+        other => panic!("the cancel's answer: {other:?}"),
+    }
+    canceller.join().unwrap();
+    let error = starter.join().unwrap().expect_err("a cancelled start");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::Cancelled,
+        "{error:?}"
+    );
+    assert_eq!(fs::read_dir(&ephemeral_root).unwrap().count(), 0);
+}
+
+/// A cancel before readiness whose run root cannot be removed says so (the
+/// native half of the #594 review's COMMENT 2).
+#[test]
+fn a_native_cancel_before_readiness_reports_a_run_root_it_could_not_remove() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    mkfifo(&spawned);
+    let (backend, ephemeral_root) = backend(
+        &fixture,
+        &format!(
+            "#!/bin/sh\nIFS= read -r _\necho $$ > '{}'\nexec /usr/bin/tail -f /dev/null\n",
+            spawned.display()
+        ),
+    );
+    let backend = std::sync::Arc::new(backend);
+    let starter = {
+        let backend = std::sync::Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+    let worker = pid_from(&spawned, "the starting worker");
+    let _cleanup = KillOnDrop(worker);
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o555)).unwrap();
+    let answer = backend.cancel("native-run-01");
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = answer.expect_err("a cancel whose cleanup failed reports it");
+    assert!(error.detail.contains("ephemeral"), "{error:?}");
+    assert!(!alive(worker), "the worker {worker} survived its cancel");
+    assert!(starter.join().unwrap().is_err());
+}

@@ -173,6 +173,11 @@ jobs:
       - name: Loopback probe (host network and no-IPv6 namespace)
         run: task runtime:broker-probe
 
+      # After task ci, never inside it: this rewrites rs/Cargo.lock for its
+      # duration (restored on exit), which task ci's tree attestation refuses.
+      - name: Build leyline-runtime on a fresh dependency resolve
+        run: task deps:fresh-resolve-check
+
       - name: Report sccache statistics
         if: always()
         run: task cache:sccache:stats

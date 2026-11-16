@@ -1,0 +1,2 @@
+Section: Fixed
+- **`leyline-runtime` compiles on a downstream consumer's fresh dependency resolve.** The registry client built ureq's `NextTimeout` as a struct literal naming every field. A consumer whose resolve picked ureq 3.5 (which added `per_read` and `per_write`) failed with E0063, although LLO's own lock (ureq 3.3) built. The client now uses struct update, and CI builds `leyline-runtime` against the newest semver-compatible dependencies after `task ci` (`task deps:fresh-resolve-check`, `ley-line-open-d4ba4b`).

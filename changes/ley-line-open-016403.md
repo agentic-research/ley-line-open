@@ -1,0 +1,2 @@
+Section: Changed
+- **schema-bridge's generated header names the plugin, not a consumer's task.** Zod and Go output used to say "Regenerate with `task cluster:zod`" (or `cluster:go`), a cloister task left over from before the crate moved into LLO. The header now names the plugin binary, `capnpc-schema-bridge-zod` or `capnpc-schema-bridge-go`. Consumers that commit generated files and check them for drift will see this one header line change on their next regenerate (`ley-line-open-016403`).

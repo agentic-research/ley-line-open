@@ -1749,6 +1749,7 @@ fn a_cancel_right_after_spawn_finds_the_run() {
         StartPoint::CancelSignalled => {
             let _ = hook_seen.send(Seen::CancelWaiting);
         }
+        _ => {}
     }));
     let starter = {
         let backend = Arc::clone(&backend);
@@ -1815,4 +1816,111 @@ fn a_cancel_before_readiness_reports_a_run_root_it_could_not_remove() {
     assert!(!alive(worker), "the worker {worker} survived its cancel");
     let started = starter.join().unwrap();
     assert!(started.is_err(), "{started:?}");
+}
+
+/// Cancels queued at a hook point while `start` ends on its own failure: a
+/// `test-support` hook issues the cancel from another thread at `queue_at`,
+/// and returns once that cancel is waiting. Returns the cancel's answer and
+/// the start's result.
+fn cancel_queued_at(
+    backend: KrunWorkerBackend,
+    queue_at: leyline_runtime::backends::libkrun::backend::StartPoint,
+    also_at_spawn: impl Fn() + Send + Sync + 'static,
+) -> (
+    Result<bool, leyline_runtime::ExecutionError>,
+    Result<leyline_runtime::BackendRun, leyline_runtime::ExecutionError>,
+) {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::mpsc;
+    let backend_slot: Arc<StdMutex<Option<Arc<KrunWorkerBackend>>>> = Arc::new(StdMutex::new(None));
+    let (waiting_tx, waiting) = mpsc::channel();
+    let waiting = StdMutex::new(waiting);
+    let (answer_tx, answer) = mpsc::channel();
+    let slot = Arc::clone(&backend_slot);
+    let backend = Arc::new(backend.with_start_hook(move |point| {
+        if point == StartPoint::Spawned {
+            also_at_spawn();
+        }
+        if point == StartPoint::CancelSignalled {
+            let _ = waiting_tx.send(());
+        }
+        if point == queue_at {
+            let backend = slot.lock().unwrap().clone().expect("the backend");
+            let answer_tx = answer_tx.clone();
+            std::thread::spawn(move || {
+                let _ = answer_tx.send(backend.cancel("run-backend-01"));
+            });
+            waiting
+                .lock()
+                .unwrap()
+                .recv_timeout(EVENT_BOUND)
+                .expect("TIMEOUT: the cancel never queued");
+        }
+    }));
+    *backend_slot.lock().unwrap() = Some(Arc::clone(&backend));
+    let started = backend.start(&request(), ServedWorkspaces::none());
+    let answered = answer
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the queued cancel was never answered");
+    *backend_slot.lock().unwrap() = None;
+    (answered, started)
+}
+
+/// A cancel queued after the run is registered and before its spawn, which
+/// then fails, answers that there was nothing to cancel: no worker was ever
+/// started.
+#[test]
+fn a_cancel_queued_before_a_failed_spawn_answers_false() {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) = backend_with_worker(&fixture, "#!/bin/sh\nexit 0\n");
+    // A worker that cannot be executed: the spawn fails.
+    fs::set_permissions(
+        fixture.path().join("leyline-krun-worker"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let (answered, started) = cancel_queued_at(backend, StartPoint::Registered, || {});
+    assert!(started.is_err(), "{started:?}");
+    assert!(
+        matches!(answered, Ok(false)),
+        "a cancel with no worker ever spawned: {answered:?}"
+    );
+    assert_eq!(fs::read_dir(&ephemeral_root).unwrap().count(), 0);
+}
+
+/// A cancel queued while a start fails on its own (here a readiness line
+/// that is not an event), with a run root that cannot be removed, answers
+/// with an error naming that run root, not `Ok(true)`.
+#[test]
+fn a_cancel_queued_while_a_start_fails_reports_its_unremovable_run_root() {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\nIFS= read -r _\nprintf '{not an event\\n' >&2\nexit 0\n",
+    );
+    let root = ephemeral_root.clone();
+    let (answered, started) = cancel_queued_at(backend, StartPoint::Ending, move || {
+        // The run root exists now; its parent stops letting it go.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+    });
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(started.is_err(), "{started:?}");
+    let error = answered.expect_err("the run root remains, and the answer says so");
+    assert!(error.detail.contains("run root"), "{error:?}");
+    let remaining = fs::read_dir(&ephemeral_root)
+        .unwrap()
+        .next()
+        .expect("the run root")
+        .unwrap();
+    assert!(
+        error
+            .detail
+            .contains(&remaining.path().display().to_string()),
+        "{error:?}"
+    );
 }

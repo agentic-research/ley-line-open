@@ -478,6 +478,16 @@ tasks:
     cmds:
       - tools/test_ci_attestation.sh
 
+  land:integration:
+    desc: Fast-forward origin/integration to HEAD, gated on this tree's task ci receipt; refuses a dirty tree, a branch that does not contain integration, or a missing receipt (3a6beb)
+    cmds:
+      - tools/land_integration.sh
+
+  ci:land-integration:fixture-test:
+    desc: Prove land:integration refuses a dirty tree, a branch without integration and a missing or stale receipt, and fast-forwards otherwise (3a6beb)
+    cmds:
+      - tools/test_land_integration.sh
+
   ci:fixture-hooks:fixture-test:
     desc: Prove every committing fixture ignores the developer's global git hooks
     cmds:
@@ -1829,7 +1839,7 @@ tasks:
         echo "public Rust schema crates match binary release $BINARY_VERSION"
 
   ci:
-    desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
+    desc: Common CI gate — run locally before landing (its receipt gates `task land:integration`) and on the runner for PRs into main. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
     deps: [cache:sccache:install]
     cmds:
       # Invalidate any older receipt before the first gate. The final command
@@ -1845,6 +1855,7 @@ tasks:
       - task: lint:workflow-parity
       - task: lint:cache-contract
       - task: ci:attestation:fixture-test
+      - task: ci:land-integration:fixture-test
       - task: ci:fixture-hooks:fixture-test
       - task: ci:workflow-parity:fixture-test
       - task: lint:mutants-cfg-coverage:fixture-test
@@ -1914,7 +1925,7 @@ tasks:
       - tools/ci_attestation.sh finish
 
   ci:full:
-    desc: Full CI pipeline including the release-profile perf regression gate. Runs on main pushes via ci.yml's conditional step; available locally via `task ci:full` for pre-push validation.
+    desc: Full CI pipeline including the release-profile perf regression gate. Runs on main pushes via ci.yml's conditional step; available locally via `task ci:full` before a perf-sensitive landing.
     cmds:
       - task: ci
       - task: test:perf

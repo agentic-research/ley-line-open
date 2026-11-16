@@ -7,7 +7,12 @@ on:
   # entry. The push run also re-verifies the squashed merge result.
   push:
     branches: [main, integration]
+  # Only PRs into main (bead ley-line-open-3a6beb). Work lands on integration
+  # by `task land:integration`, gated on the local `task ci` receipt for the
+  # exact tree, so a PR into integration would only rebuild what the receipt
+  # already proved. The runner runs once per promotion to main.
   pull_request:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,10 +34,12 @@ env:
 #
 # The gate scales with what merging would commit us to, not with the event:
 #
-#   feature -> integration   `task ci`. Fast, run constantly. Integration is
-#                            where work converges; a slow gate here is paid on
-#                            every iteration and buys nothing that the
-#                            promotion gate will not catch.
+#   feature -> integration   `task ci`, run LOCALLY; its receipt gates
+#                            `task land:integration`, and this workflow does
+#                            not run on the PR (bead ley-line-open-3a6beb).
+#                            Integration is where work converges; a slow gate
+#                            here is paid on every iteration and buys nothing
+#                            that the promotion gate will not catch.
 #
 #   * -> main                `task ci` + the release-profile perf gate + the
 #                            version-consistency check. `main` is what releases

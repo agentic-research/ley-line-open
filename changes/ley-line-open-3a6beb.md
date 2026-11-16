@@ -1,0 +1,4 @@
+Section: Changed
+
+- **Work lands on `integration` through `task land:integration`, gated on the local `task ci` receipt, and pull requests into `integration` no longer run `ci.yml`** (bead `ley-line-open-3a6beb`).
+  `tools/land_integration.sh` refuses, each by name, a working tree that differs from HEAD (`dirty-tree`), a branch that does not contain `origin/integration` (`integration-not-in-head`) and a tree with no `task ci` receipt for the current toolchain (`no-receipt`); otherwise it fast-forwards `integration`, never forced. `task ci:land-integration:fixture-test`, run by `task ci`, proves each refusal and the fast-forward. The pre-push receipt gate (`tools/pre_push_ci.sh` and its pre-commit hook) is removed: it never ran under the repository's rsry hooks path, so it guarded nothing. `ci.yml` runs on pull requests into `main` only; pushes to `main` and `integration` are unchanged.

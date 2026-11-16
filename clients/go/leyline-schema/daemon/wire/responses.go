@@ -349,6 +349,10 @@ const (
 	// QueryRefusalNotAQuery: the statement is not a read-only SELECT;
 	// [QueryRefusal.Action] is its leading keyword.
 	QueryRefusalNotAQuery QueryRefusalReason = "not_a_query"
+	// QueryRefusalLimitOutOfRange: the request's row limit does not fit
+	// QueryRequest.limit's UInt32; [QueryRefusal.Action] is `limit` and
+	// [QueryRefusal.Subject] the requested value. Nothing ran.
+	QueryRefusalLimitOutOfRange QueryRefusalReason = "limit_out_of_range"
 )
 
 // QueryRefusal is why a `query` statement was refused (LLO bead
@@ -376,6 +380,16 @@ type QueryResponse struct {
 	Rows    [][]QueryCell `json:"rows"`
 	Error   *string       `json:"error,omitempty"`
 	Refusal *QueryRefusal `json:"refusal,omitempty"`
+	// Truncation is set only when the statement had more rows than the row
+	// limit and Rows holds the first Limit of them; nil otherwise.
+	Truncation *QueryTruncation `json:"truncation,omitempty"`
+}
+
+// QueryTruncation is how a `query` reply was cut short.
+type QueryTruncation struct {
+	// Limit is the row limit that applied: the request's limit, or the
+	// daemon's default when the request named none.
+	Limit *uint32 `json:"limit"`
 }
 
 // ── Sheaf op responses ─────────────────────────────────────────────

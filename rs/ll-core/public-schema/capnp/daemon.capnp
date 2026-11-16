@@ -291,7 +291,12 @@ struct LoadResponse {
 }
 
 struct QueryRequest {
-  sql @0 :Text;
+  sql   @0 :Text;
+  # The most rows to return; absent or 0 (the field's default, which an
+  # absent field reads as) means the daemon's default (1000). A value that
+  # does not fit is refused as `limit_out_of_range`, never clamped (bead
+  # `ley-line-open-0a18bc`).
+  limit @1 :UInt32;
 }
 
 # `query` runs one read-only SELECT (bead `ley-line-open-b7e9a3`). `ok` true
@@ -313,6 +318,17 @@ struct QueryResponse {
   # One element per result row; each row holds one `QueryCell` per entry of
   # `columns`, in `columns` order (bead `ley-line-open-0a18bc`).
   rows    @5 :List(List(QueryCell));
+  # Set only when the statement had more rows than the row limit, and
+  # `rows` holds the first `limit` of them; absent otherwise. A caller that
+  # needs the rest pages with LIMIT/OFFSET in its SQL.
+  truncation @6 :QueryTruncation;
+}
+
+# How a `query` reply was cut short (bead `ley-line-open-0a18bc`).
+struct QueryTruncation {
+  # The row limit that applied: the request's `limit`, or the daemon's
+  # default when the request named none.
+  limit @0 :UInt32;
 }
 
 # One value of a `query` result row. The member names the SQLite value, so
@@ -343,6 +359,9 @@ enum QueryRefusalReason {
   # The statement is not a read-only SELECT (`VACUUM`, a bare `PRAGMA`, an
   # empty statement); `action` is its leading keyword.
   notAQuery          @2 $Json.name("not_a_query");
+  # The request's `limit` does not fit the schema's `UInt32`; `action` is
+  # `limit` and `subject` the requested value. Nothing ran.
+  limitOutOfRange    @3 $Json.name("limit_out_of_range");
 }
 
 struct QueryRefusal {
@@ -355,11 +374,13 @@ struct QueryRefusal {
   # `delete` or `insert` with `subject` `sqlite_master` (`sqlite_temp_master`
   # for a temporary object). For
   # `not_a_query`, the statement's leading keyword, lower case (`vacuum`), or
-  # `empty`. For `multiple_statements`, `statement`.
+  # `empty`. For `multiple_statements`, `statement`. For
+  # `limit_out_of_range`, `limit`.
   action  @1 :Text;
   # What the action names, when it names something: the table, index,
   # trigger, view, pragma or function, or the file an ATTACH names as a
-  # literal. Unset otherwise.
+  # literal; for `limit_out_of_range`, the requested limit in decimal. Unset
+  # otherwise.
   subject @2 :Text;
 }
 

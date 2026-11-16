@@ -266,12 +266,17 @@ type queryRefusal struct {
 	Subject *string `json:"subject,omitempty"`
 }
 
+type queryTruncation struct {
+	Limit *uint32 `json:"limit"`
+}
+
 type queryResponse struct {
-	OK      *bool              `json:"ok"`
-	Columns []string           `json:"columns"`
-	Rows    [][]wire.QueryCell `json:"rows"`
-	Error   *string            `json:"error,omitempty"`
-	Refusal *queryRefusal      `json:"refusal,omitempty"`
+	OK         *bool              `json:"ok"`
+	Columns    []string           `json:"columns"`
+	Rows       [][]wire.QueryCell `json:"rows"`
+	Error      *string            `json:"error,omitempty"`
+	Refusal    *queryRefusal      `json:"refusal,omitempty"`
+	Truncation *queryTruncation   `json:"truncation,omitempty"`
 }
 
 // ── Sheaf ops (ae7a35) ─────────────────────────────────────────────

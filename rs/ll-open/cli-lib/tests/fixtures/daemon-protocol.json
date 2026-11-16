@@ -339,7 +339,7 @@
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
-    "response_optional_keys": ["truncated", "limit"],
+    "response_optional_keys": ["truncation"],
     "go_binding": "QueryResponse",
     "go_drift_skip": null
   },
@@ -354,7 +354,7 @@
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
-    "response_optional_keys": ["truncated", "limit"],
+    "response_optional_keys": ["truncation"],
     "go_binding": "QueryResponse",
     "go_drift_skip": null
   },
@@ -369,7 +369,23 @@
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
-    "response_optional_keys": ["truncated", "limit"],
+    "response_optional_keys": ["truncation"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
+  },
+
+  "query_truncated": {
+    "request": {"op": "query", "sql": "SELECT 1 AS n UNION ALL SELECT 2", "limit": 1},
+    "response": {
+      "ok": true,
+      "columns": ["n"],
+      "rows": [
+        [{"text": "1"}]
+      ],
+      "truncation": {"limit": 1}
+    },
+    "response_required_keys": ["ok", "columns", "rows", "truncation"],
+    "response_optional_keys": [],
     "go_binding": "QueryResponse",
     "go_drift_skip": null
   },
@@ -443,7 +459,7 @@
 
   "sheaf_defect": {
     "request": {"op": "sheaf_defect"},
-    "response": {"defect": 0.0, "generation": "0", "valid": 0, "total": 0},
+    "response": {"defect": 0, "generation": "0", "valid": 0, "total": 0},
     "response_required_keys": ["defect", "generation", "valid", "total"],
     "response_optional_keys": [],
     "go_binding": "SheafDefectResponse",
@@ -452,7 +468,7 @@
 
   "sheaf_status": {
     "request": {"op": "sheaf_status"},
-    "response": {"generation": "0", "valid": 0, "total": 0, "defect": 0.0, "tracked_edges": 0},
+    "response": {"generation": "0", "valid": 0, "total": 0, "defect": 0, "tracked_edges": 0},
     "response_required_keys": ["generation", "valid", "total", "defect", "tracked_edges"],
     "response_optional_keys": [],
     "go_binding": "SheafStatusResponse",

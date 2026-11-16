@@ -919,7 +919,7 @@ fn op_snapshot(ctx: &DaemonContext) -> Result<String> {
 /// hundreds-of-MB JSON response, locking the daemon and the client.
 /// Callers that legitimately need more rows pass `limit` explicitly
 /// (with the understanding that they're opting into the cost).
-pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: usize = 1000;
+pub(crate) const OP_QUERY_DEFAULT_ROW_LIMIT: u32 = 1000;
 
 /// ADR-0026 Phase 2.0 — read-side wall-time profiling scope
 /// (bead `ley-line-open-335d34`).
@@ -968,12 +968,6 @@ impl Drop for ReadProfileTimer {
     }
 }
 
-/// Raw SQL query — for ad-hoc inspection.
-///
-/// Caps row output at `req["limit"]` (or `OP_QUERY_DEFAULT_ROW_LIMIT` if
-/// not provided). Sets `truncated: true` in the response when the cap is
-/// hit, so callers can paginate via `LIMIT/OFFSET` in the SQL itself if
-/// they need everything.
 /// One SQLite value as a `query` cell's text (schema: `QueryCell.text`;
 /// fixture `daemon-protocol.json` answers `SELECT 1` with
 /// `{"text": "1"}`): an integer or real in decimal, text as itself, a blob as
@@ -990,8 +984,30 @@ fn sql_value_to_text(value: rusqlite::types::ValueRef<'_>) -> Option<String> {
     }
 }
 
-fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<String> {
-    let limit = limit.unwrap_or(OP_QUERY_DEFAULT_ROW_LIMIT);
+/// Raw SQL query — for ad-hoc inspection.
+///
+/// Caps row output at the request's `limit` (or `OP_QUERY_DEFAULT_ROW_LIMIT`
+/// if not provided). Sets `truncation` in the response when the cap is hit,
+/// so callers can paginate via `LIMIT/OFFSET` in the SQL itself if they need
+/// everything.
+fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<u64>) -> Result<String> {
+    // `QueryRequest.limit` is a `UInt32`; a wider request is refused by name
+    // before anything runs, never clamped (bead `ley-line-open-0a18bc`). 0 is
+    // the field's capnp default, the value an absent field reads as, so it
+    // means the daemon's default too: the JSON and binary readings agree.
+    let limit = match limit {
+        None | Some(0) => OP_QUERY_DEFAULT_ROW_LIMIT,
+        Some(requested) => match u32::try_from(requested) {
+            Ok(limit) => limit,
+            Err(_) => {
+                return query_refusal_response(&super::sql_read_only::Refusal {
+                    reason: super::sql_read_only::RefusalReason::LimitOutOfRange,
+                    action: "limit".into(),
+                    subject: requested.to_string(),
+                });
+            }
+        },
+    };
     // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`): profile the
     // whole op path when `LEYLINE_PROFILE=1`. Zero-cost when unset.
     // Drops at function return so the timer covers SQL prepare +
@@ -1019,7 +1035,7 @@ fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<usize>) -> Result<Stri
 /// codec (`QueryResponse.rows`). A row keyed by column name would lose a
 /// value whenever two columns share a name, and a bare JSON `null` is not a
 /// value the schema's codec reads (bead `ley-line-open-0a18bc`).
-fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String> {
+fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: u32) -> Result<String> {
     let col_count = stmt.column_count();
     let headers: Vec<String> = (0..col_count)
         .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
@@ -1029,7 +1045,7 @@ fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String
     let mut rows = stmt.query([]).context("execute SQL")?;
     let mut truncated = false;
     while let Some(row) = rows.next()? {
-        if rows_out.len() >= limit {
+        if rows_out.len() >= limit as usize {
             // Stop iterating: SQLite has more rows but the caller
             // capped the response. Mark as truncated so clients can
             // paginate with an explicit LIMIT/OFFSET in their SQL.
@@ -1050,7 +1066,7 @@ fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String
     for (i, name) in headers.iter().enumerate() {
         columns.set(u32::try_from(i)?, name);
     }
-    let mut rows_list = root.init_rows(u32::try_from(rows_out.len())?);
+    let mut rows_list = root.reborrow().init_rows(u32::try_from(rows_out.len())?);
     for (i, values) in rows_out.iter().enumerate() {
         let mut cells = rows_list
             .reborrow()
@@ -1063,19 +1079,12 @@ fn query_rows(stmt: &mut rusqlite::Statement<'_>, limit: usize) -> Result<String
             }
         }
     }
+    if truncated {
+        root.init_truncation().set_limit(limit);
+    }
     let reader = builder
         .get_root_as_reader::<leyline_public_schema::daemon_capnp::query_response::Reader>()?;
-    let encoded = capnp_json::to_json(reader)?;
-    if !truncated {
-        return Ok(encoded);
-    }
-    // `truncated` and `limit` are not `QueryResponse` fields yet (bead
-    // `ley-line-open-47d5c5`); they ride beside the codec's output as before.
-    let mut response: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&encoded).context("re-read the encoded query response")?;
-    response.insert("truncated".into(), json!(true));
-    response.insert("limit".into(), json!(limit));
-    Ok(serde_json::Value::Object(response).to_string())
+    Ok(capnp_json::to_json(reader)?)
 }
 
 /// The `query` op's refusal: `ok` false, the refusal's message as `error`,
@@ -1093,6 +1102,7 @@ fn query_refusal_response(refusal: &super::sql_read_only::Refusal) -> Result<Str
         Ours::DeniedAction => Wire::DeniedAction,
         Ours::MultipleStatements => Wire::MultipleStatements,
         Ours::NotAQuery => Wire::NotAQuery,
+        Ours::LimitOutOfRange => Wire::LimitOutOfRange,
     });
     out.set_action(&refusal.action);
     if !refusal.subject.is_empty() {
@@ -5410,8 +5420,8 @@ mod tests {
         // Insert a probe table with > OP_QUERY_DEFAULT_ROW_LIMIT rows;
         // run an unbounded SELECT * via op_query; assert:
         //   - rows length == default cap
-        //   - truncated: true is set
-        //   - limit field reports the cap that was applied
+        //   - truncation is set
+        //   - truncation.limit reports the cap that was applied
         let (_dir, ctx) = setup();
         {
             let conn = ctx.live_db.writer.lock();
@@ -5439,12 +5449,12 @@ mod tests {
         let rows = parsed["rows"].as_array().expect("rows must be an array");
         assert_eq!(
             rows.len(),
-            OP_QUERY_DEFAULT_ROW_LIMIT,
+            OP_QUERY_DEFAULT_ROW_LIMIT as usize,
             "default row cap must apply when caller omits `limit`",
         );
-        assert_eq!(parsed["truncated"], true, "truncated flag must be set");
         assert_eq!(
-            parsed["limit"], OP_QUERY_DEFAULT_ROW_LIMIT as u64,
+            parsed["truncation"],
+            json!({"limit": OP_QUERY_DEFAULT_ROW_LIMIT}),
             "response must report the cap that was applied",
         );
     }
@@ -5472,8 +5482,9 @@ mod tests {
         .expect("op_query must dispatch");
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["rows"].as_array().unwrap().len(), 10);
-        assert_eq!(parsed["truncated"], true);
-        assert_eq!(parsed["limit"], 10);
+        assert_eq!(parsed["truncation"], json!({"limit": 10}), "{parsed}");
+        assert!(parsed.get("truncated").is_none(), "{parsed}");
+        assert!(parsed.get("limit").is_none(), "{parsed}");
     }
 
     /// Bead `ley-line-open-b7e9a3`: a refused statement's wire shape. The
@@ -5501,9 +5512,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn op_query_omits_truncated_when_under_limit() {
+    async fn op_query_omits_truncation_when_under_limit() {
         // A query that returns fewer rows than the cap MUST NOT carry
-        // the truncated flag — clients use the *presence* of the key
+        // `truncation` — clients use the *presence* of the key
         // to decide whether to paginate. Set-when-not-needed would
         // cause unnecessary follow-up queries.
         let (_dir, ctx) = setup();
@@ -5520,12 +5531,90 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["rows"].as_array().unwrap().len(), 5);
         assert!(
-            parsed.get("truncated").is_none(),
-            "under-limit response must omit `truncated` field, got {parsed}",
+            parsed.get("truncation").is_none(),
+            "under-limit response must omit `truncation`, got {parsed}",
         );
-        assert!(
-            parsed.get("limit").is_none(),
-            "under-limit response must omit `limit` field, got {parsed}",
+    }
+
+    /// Bead `ley-line-open-0a18bc`: a text cell holding NUL, control
+    /// characters, a quote, a backslash and U+2028 comes back unchanged
+    /// through the capnp-json encoding.
+    #[tokio::test]
+    async fn op_query_text_cells_keep_control_characters_and_nul() {
+        let (_dir, ctx) = setup();
+        let result = handle_base_op_legacy(
+            &ctx,
+            "query",
+            &json!({"sql": "SELECT 'a' || char(0) || 'b' || char(1, 9, 10, 31) || '\"\\' \
+                            || char(8232) AS t"}),
+        )
+        .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["rows"],
+            json!([[{"text": "a\u{0}b\u{1}\t\n\u{1f}\"\\\u{2028}"}]]),
+            "{result}"
+        );
+    }
+
+    /// Bead `ley-line-open-0a18bc`: `QueryRequest.limit` is a `UInt32`. A
+    /// limit that does not fit is refused by name before the statement runs,
+    /// never clamped; the largest that fits is taken.
+    #[tokio::test]
+    async fn op_query_refuses_a_limit_that_does_not_fit() {
+        let (_dir, ctx) = setup();
+        let run = |limit: u64| -> serde_json::Value {
+            let out = handle_base_op_legacy(
+                &ctx,
+                "query",
+                &json!({"sql": "SELECT 1 AS one", "limit": limit}),
+            )
+            .expect("op_query must dispatch");
+            serde_json::from_str(&out).unwrap()
+        };
+        let too_big = u64::from(u32::MAX) + 1;
+        assert_eq!(
+            run(too_big),
+            json!({
+                "ok": false,
+                "error": format!(
+                    "query refused (limit_out_of_range): the row limit `{too_big}` is \
+                     larger than the query op takes ({})",
+                    u32::MAX
+                ),
+                "refusal": {
+                    "reason": "limit_out_of_range",
+                    "action": "limit",
+                    "subject": too_big.to_string(),
+                },
+            })
+        );
+        let fits = run(u64::from(u32::MAX));
+        assert_eq!(fits["rows"], json!([[{"text": "1"}]]), "{fits}");
+        assert!(fits.get("truncation").is_none(), "{fits}");
+    }
+
+    /// Bead `ley-line-open-0a18bc`: `limit: 0` is `QueryRequest.limit`'s
+    /// capnp default, what an absent field reads as, so it applies the
+    /// daemon's default cap rather than answering zero rows.
+    #[tokio::test]
+    async fn op_query_limit_zero_is_the_default_cap() {
+        let (_dir, ctx) = setup();
+        let sql = format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+             WHERE i < {}) SELECT i FROM n",
+            OP_QUERY_DEFAULT_ROW_LIMIT + 1
+        );
+        let out = handle_base_op_legacy(&ctx, "query", &json!({"sql": sql, "limit": 0}))
+            .expect("op_query must dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["rows"].as_array().unwrap().len(),
+            OP_QUERY_DEFAULT_ROW_LIMIT as usize
+        );
+        assert_eq!(
+            parsed["truncation"],
+            json!({"limit": OP_QUERY_DEFAULT_ROW_LIMIT})
         );
     }
 

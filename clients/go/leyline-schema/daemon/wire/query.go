@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 )
 
 // QueryCell is one value of a `query` result row, the JSON form of
@@ -23,32 +24,56 @@ type QueryCell struct {
 // IsNull reports whether the cell is SQL NULL.
 func (c QueryCell) IsNull() bool { return c.Text == nil }
 
-// UnmarshalJSON accepts exactly one known union member.
+// UnmarshalJSON accepts exactly one known union member. It reads the object
+// token by token, so a member repeated under the same key (which a map
+// decode would collapse, last one winning) is refused too.
 func (c *QueryCell) UnmarshalJSON(data []byte) error {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(data, &members); err != nil {
-		return fmt.Errorf("query cell: %w", err)
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return fmt.Errorf("query cell: want an object with one of null or text, got %s", data)
 	}
-	if members == nil || len(members) != 1 {
-		return fmt.Errorf("query cell: want exactly one of null or text, got %s", data)
-	}
-	for name, raw := range members {
+	var member string
+	var text *string
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("query cell: %w", err)
+		}
+		name, _ := tok.(string)
+		if member != "" {
+			return fmt.Errorf("query cell: want exactly one of null or text, got %s", data)
+		}
+		member = name
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return fmt.Errorf("query cell: %w", err)
+		}
+		isNull := bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 		switch name {
 		case "null":
-			if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			if !isNull {
 				return fmt.Errorf("query cell: null member carries %s, want null", raw)
 			}
-			c.Text = nil
 		case "text":
-			var text string
-			if err := json.Unmarshal(raw, &text); err != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			var s string
+			if isNull || json.Unmarshal(raw, &s) != nil {
 				return fmt.Errorf("query cell: text member carries %s, want a string", raw)
 			}
-			c.Text = &text
+			text = &s
 		default:
 			return fmt.Errorf("query cell: unknown member %q", name)
 		}
 	}
+	if member == "" {
+		return fmt.Errorf("query cell: want exactly one of null or text, got %s", data)
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return fmt.Errorf("query cell: malformed object %s", data)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("query cell: trailing content after %s", data)
+	}
+	c.Text = text
 	return nil
 }
 

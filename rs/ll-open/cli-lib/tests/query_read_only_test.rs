@@ -72,8 +72,13 @@ impl Daemon {
 
     /// The `query` op's response over the control socket.
     fn over_socket(&self, sql: &str) -> Value {
+        self.request_over_socket(&json!({"op": "query", "sql": sql}))
+    }
+
+    /// The response to one request line over the control socket.
+    fn request_over_socket(&self, request: &Value) -> Value {
         let mut stream = UnixStream::connect(&self.control).expect("connect control socket");
-        let line = json!({"op": "query", "sql": sql}).to_string();
+        let line = request.to_string();
         stream.write_all(line.as_bytes()).unwrap();
         stream.write_all(b"\n").unwrap();
         let mut reply = String::new();
@@ -84,9 +89,14 @@ impl Daemon {
     /// The `query` tool's response over MCP: the op's JSON, which MCP carries
     /// as the text content, and whether MCP flagged it an error.
     fn over_mcp(&self, sql: &str) -> (Value, bool) {
+        self.arguments_over_mcp(json!({"sql": sql}))
+    }
+
+    /// The `query` tool's response over MCP to `arguments`.
+    fn arguments_over_mcp(&self, arguments: Value) -> (Value, bool) {
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "query", "arguments": {"sql": sql}},
+            "params": {"name": "query", "arguments": arguments},
         })
         .to_string();
         let (code, reply) = common::post_mcp_over_uds(&self.mcp, &body, Some(TOKEN));
@@ -379,18 +389,32 @@ fn the_protocol_fixture_refusal_is_what_the_daemon_sends() {
 
 /// The protocol fixtures' row bodies are exactly what the daemon sends over
 /// both transports, so the Go decode of those fixtures checks the real wire:
-/// a repeated column name keeps both values, and SQL NULL stays distinct
-/// from the empty string (bead `ley-line-open-0a18bc`).
+/// a repeated column name keeps both values, SQL NULL stays distinct from
+/// the empty string, and a reply cut short by the row limit carries
+/// `truncation` (bead `ley-line-open-0a18bc`).
 #[test]
 fn the_protocol_fixture_rows_are_what_the_daemon_sends() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/daemon-protocol.json");
     let fixtures: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let d = Daemon::start();
-    for name in ["query", "query_duplicate_columns", "query_null"] {
+    for name in [
+        "query",
+        "query_duplicate_columns",
+        "query_null",
+        "query_truncated",
+    ] {
         let fixture = &fixtures[name];
-        let sql = fixture["request"]["sql"].as_str().unwrap();
-        assert_eq!(d.over_socket(sql), fixture["response"], "socket: {name}");
-        assert_eq!(d.over_mcp(sql).0, fixture["response"], "mcp: {name}");
+        let request = &fixture["request"];
+        assert_eq!(
+            d.request_over_socket(request),
+            fixture["response"],
+            "socket: {name}"
+        );
+        let mut arguments = request.clone();
+        arguments.as_object_mut().unwrap().remove("op");
+        let (mcp, is_error) = d.arguments_over_mcp(arguments);
+        assert_eq!(mcp, fixture["response"], "mcp: {name}");
+        assert!(!is_error, "mcp: {name}");
     }
 }
 

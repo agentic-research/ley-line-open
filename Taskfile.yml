@@ -507,12 +507,12 @@ tasks:
       - tools/test_go_schema_consumer.sh
 
   schema:daemon-fixture-codec:
-    desc: Every daemon-protocol.json response round-trips through daemon.capnp under the reference capnp JSON codec, against its go_binding (or capnp_struct) struct (0a18bc)
+    desc: Every daemon-protocol.json response round-trips through daemon.capnp under the reference capnp JSON codec, type for type, as the struct the binding table pairs with its go_binding; the table must match the Go gate's decoders (0a18bc)
     cmds:
       - python3 -I tools/check_daemon_fixture_codec.py
 
   schema:daemon-fixture-codec:fixture-test:
-    desc: Prove the daemon fixture codec gate refuses a bare null cell, an undeclared key, an omitted default and a binding that is no struct (0a18bc)
+    desc: Prove the daemon fixture codec gate refuses a bare null cell, an undeclared key, an omitted default, a retired_* key, 0.0 for 0, an unpaired binding or capnp_struct and Go/table binding drift, and passes NUL/control-character text and a truncated reply (0a18bc)
     cmds:
       - python3 -I tools/check_daemon_fixture_codec.py --self-test
 

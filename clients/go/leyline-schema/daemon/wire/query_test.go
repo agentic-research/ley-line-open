@@ -64,16 +64,53 @@ func TestQueryResponseDecodesTheSingleColumnFixture(t *testing.T) {
 
 // A cell that is not exactly one known member is refused, never read as a
 // value: a bare null or string (the pre-cell shape), an empty or two-member
-// object, a member this type does not know, or a member carrying the wrong
-// JSON type.
+// object, a member repeated under one key, a member this type does not
+// know, or a member carrying the wrong JSON type.
 func TestQueryCellRefusesWhatIsNotOneKnownMember(t *testing.T) {
 	for _, bad := range []string{
 		`null`, `"1"`, `{}`, `{"null": null, "text": "1"}`, `{"integer": "1"}`,
 		`{"null": 0}`, `{"text": null}`, `{"text": 1}`,
+		`{"text": "a", "text": "b"}`, `{"null": null, "null": null}`, `[]`,
 	} {
 		var c QueryCell
 		if err := json.Unmarshal([]byte(bad), &c); err == nil {
 			t.Errorf("%s decoded as %+v, want a refusal", bad, c)
 		}
+	}
+}
+
+// A reply cut short by the row limit carries truncation with the limit that
+// applied; a full reply carries none.
+func TestQueryResponseCarriesTruncationOnlyWhenCut(t *testing.T) {
+	got := decodeQueryFixture(t, "query_truncated")
+	if got.Truncation == nil || got.Truncation.Limit == nil || *got.Truncation.Limit != 1 {
+		t.Fatalf("truncation: want {limit 1}, got %+v", got.Truncation)
+	}
+	if len(got.Rows) != 1 || *got.Rows[0][0].Text != "1" {
+		t.Fatalf("rows: want [[{text 1}]], got %+v", got.Rows)
+	}
+	if full := decodeQueryFixture(t, "query"); full.Truncation != nil {
+		t.Fatalf("a full reply carries no truncation; got %+v", full.Truncation)
+	}
+}
+
+// Text cells holding control characters and NUL survive the decode
+// unchanged.
+func TestQueryCellKeepsControlCharactersAndNul(t *testing.T) {
+	want := "a\x00b\tc\nd\x1fe\u2028"
+	data, err := json.Marshal(QueryCell{Text: &want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got QueryCell
+	if err := json.Unmarshal([]byte(`{"text":"a\u0000b\tc\nd\u001fe\u2028"}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.IsNull() || *got.Text != want {
+		t.Fatalf("decoded %q, want %q", *got.Text, want)
+	}
+	var again QueryCell
+	if err := json.Unmarshal(data, &again); err != nil || *again.Text != want {
+		t.Fatalf("round trip of %s gave %+v, %v", data, again, err)
 	}
 }

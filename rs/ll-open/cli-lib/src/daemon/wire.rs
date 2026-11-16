@@ -184,8 +184,10 @@ pub enum BaseRequest {
     },
     Query {
         sql: String,
+        /// Read wider than `QueryRequest.limit`'s `UInt32` so a value that
+        /// does not fit is refused by name, not by a parse error or a clamp.
         #[serde(default)]
-        limit: Option<usize>,
+        limit: Option<u64>,
     },
     Reparse {
         #[serde(default)]

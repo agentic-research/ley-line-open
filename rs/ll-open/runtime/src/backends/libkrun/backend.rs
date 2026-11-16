@@ -1,9 +1,9 @@
+use crate::backends::spawn::{ChildIo, Spawn};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -18,18 +18,15 @@ use crate::{
 use super::output::OutputCapture;
 
 use super::super::process::{
-    SupervisionLabels, WorkerProcess, abort_failed_start, cleanup_tempdir, configure_process_group,
-    finish_failed_start, published_status, read_readiness_line, supervise_worker,
-    terminate_process_group,
+    SupervisionLabels, WorkerProcess, abort_failed_start, cleanup_tempdir, finish_failed_start,
+    published_status, read_readiness_line, supervise_worker, terminate_process_group,
 };
 use super::share::{FsService, serve};
 // The share's `worker_end` is created close-on-exec, as every descriptor
 // here is, so a process another thread spawns concurrently does not inherit
 // it; only the worker's child clears the flag, after its fork
 // (`inherit_only`), and the parent holds `worker_end` until spawn returns.
-use super::worker::{
-    WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors, inherit_only_with_lifeline,
-};
+use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors};
 
 const LABELS: SupervisionLabels = SupervisionLabels {
     worker: "libkrun worker",
@@ -180,7 +177,7 @@ impl Drop for Starting<'_> {
 /// root, answer the cancel with whether the removal worked, and return the
 /// error the start ends with.
 fn cancel_starting(
-    child: &mut std::process::Child,
+    child: &mut crate::backends::spawn::Spawned,
     rootfs: tempfile::TempDir,
     acknowledge: mpsc::SyncSender<Result<bool, ExecutionError>>,
 ) -> ExecutionError {
@@ -481,18 +478,22 @@ impl Backend for KrunWorkerBackend {
                 ExecutionError::backend(format!("create ephemeral rootfs volume: {error}"))
             })?;
 
-        let mut command = Command::new(&self.config.worker);
+        // Started through `spawn`, which hands the worker exactly its
+        // standard streams and the descriptors named below, in a process
+        // group of its own (bead ley-line-open-528525).
+        let mut command = Spawn::new(&self.config.worker);
         command
             .arg("--cas-root")
             .arg(&self.config.cas_root)
             .arg("--run-root")
             .arg(rootfs.path())
-            .stdin(Stdio::piped())
+            .stdin(ChildIo::Piped)
             // The guest's console. Read from spawn on, so a guest that
             // prints never blocks on a full pipe, and kept bounded
             // (`output::OutputCapture`).
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(ChildIo::Piped)
+            .stderr(ChildIo::Piped)
+            .process_group();
         for path in &self.config.runtime_files {
             command.arg("--runtime-file").arg(path);
         }
@@ -505,7 +506,6 @@ impl Backend for KrunWorkerBackend {
         if self.config.tsi_hijack_inet {
             command.arg("--tsi-hijack-inet");
         }
-        configure_process_group(&mut command);
         // The workspace share: one end of a connected socket pair is
         // inherited by the worker, whose virtio-fs device sends the guest's
         // requests down it; this process answers them from the store.
@@ -540,11 +540,23 @@ impl Backend for KrunWorkerBackend {
         // This process keeps the lifeline's only write end for as long as it
         // supervises the worker: when it ends, for any reason, the worker
         // ends too (bead ley-line-open-f963e6).
-        let keep: Vec<i32> = declared.iter().map(|d| d.descriptor).collect();
-        let (lifeline, lifeline_read_end) = match inherit_only_with_lifeline(&mut command, &keep) {
+        for descriptor in &declared {
+            command.inherit(descriptor.descriptor, descriptor.descriptor);
+        }
+        let (lifeline, lifeline_read_end) = match crate::lifeline::pair() {
             Ok(lifeline) => lifeline,
-            Err(error) => return Err(finish_failed_start(rootfs, LABELS, error)),
+            Err(error) => {
+                return Err(finish_failed_start(
+                    rootfs,
+                    LABELS,
+                    ExecutionError::backend(format!("create worker lifeline: {error}")),
+                ));
+            }
         };
+        command
+            .arg(super::worker::LIFELINE_FD_ARG)
+            .arg(lifeline_read_end.raw_fd().to_string())
+            .inherit(lifeline_read_end.raw_fd(), lifeline_read_end.raw_fd());
 
         // Registered before the worker exists, so from its spawn until the
         // run is published a cancel reaches it through `event_tx`: there is

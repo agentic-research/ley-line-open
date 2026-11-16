@@ -443,3 +443,123 @@ mod platform {
         Ok(spawned)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether `pid` leads its own process group.
+    fn leads_its_group(pid: u32) -> bool {
+        // SAFETY: getpgid reads a process's group.
+        unsafe { libc::getpgid(pid as libc::pid_t) == pid as libc::pid_t }
+    }
+
+    #[test]
+    fn a_process_group_child_leads_its_own_group_and_another_does_not() {
+        for own_group in [true, false] {
+            let mut spawn = Spawn::new("/bin/cat");
+            spawn.stdin(ChildIo::Piped);
+            if own_group {
+                spawn.process_group();
+            }
+            let mut child = spawn.spawn().unwrap();
+            assert_eq!(
+                leads_its_group(child.id()),
+                own_group,
+                "own group: {own_group}"
+            );
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    /// Piped streams reach the child, and the child's exit status comes
+    /// back; waiting again answers the same status.
+    #[test]
+    fn piped_streams_carry_bytes_and_wait_reports_the_status() {
+        use std::io::{Read, Write};
+        let mut spawn = Spawn::new("/bin/sh");
+        spawn
+            .arg("-c")
+            .arg("read line; echo \"got $line\"; echo err >&2; exit 3")
+            .stdin(ChildIo::Piped)
+            .stdout(ChildIo::Piped)
+            .stderr(ChildIo::Piped);
+        let mut child = spawn.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert_eq!(out, "got hello\n");
+        assert_eq!(err, "err\n");
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+        assert_eq!(child.try_wait().unwrap().map(|s| s.code()), Some(Some(3)));
+    }
+
+    /// `try_wait` answers `None` while the child runs, `kill` ends it, and a
+    /// kill after the reap does nothing.
+    #[test]
+    fn try_wait_kill_and_reap() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut spawn = Spawn::new("/bin/cat");
+        spawn.stdin(ChildIo::Piped);
+        let mut child = spawn.spawn().unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        child.kill().unwrap();
+    }
+
+    /// A child that cannot be started is an error, not a pid.
+    #[test]
+    fn a_program_that_cannot_run_is_an_error() {
+        assert!(Spawn::new("/nonexistent/program").spawn().is_err());
+    }
+
+    /// The child's standard input is `/dev/null` unless asked otherwise, and
+    /// `SIGPIPE` is at its default: a child writing into a pipe nobody reads
+    /// dies of it, as one started by the standard library does.
+    #[test]
+    fn a_child_gets_dev_null_and_the_default_sigpipe() {
+        use std::io::Read;
+        use std::os::unix::process::ExitStatusExt;
+        let mut spawn = Spawn::new("/bin/sh");
+        spawn
+            .arg("-c")
+            .arg("if read x; then echo read; else echo eof; fi")
+            .stdout(ChildIo::Piped);
+        let mut child = spawn.spawn().unwrap();
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        assert_eq!(out, "eof\n");
+        child.wait().unwrap();
+
+        let mut spawn = Spawn::new("/bin/sh");
+        spawn
+            .arg("-c")
+            .arg("while :; do echo x; done")
+            .stdout(ChildIo::Piped);
+        let mut child = spawn.spawn().unwrap();
+        drop(child.stdout.take());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGPIPE));
+    }
+}

@@ -95,12 +95,11 @@ fn descriptors(pids: &[u32]) -> Vec<(u32, RawFd, Option<String>)> {
         let mut all = Vec::new();
         let mut pid = 0u32;
         let mut current: Option<(RawFd, bool, Option<String>)> = None;
-        let mut flush =
-            |pid: u32, current: Option<(RawFd, bool, Option<String>)>, all: &mut Vec<_>| {
-                if let Some((fd, pipe, device)) = current {
-                    all.push((pid, fd, device.filter(|_| pipe)));
-                }
-            };
+        let flush = |pid: u32, current: Option<(RawFd, bool, Option<String>)>, all: &mut Vec<_>| {
+            if let Some((fd, pipe, device)) = current {
+                all.push((pid, fd, device.filter(|_| pipe)));
+            }
+        };
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let (tag, value) = line.split_at(1);
             match tag {

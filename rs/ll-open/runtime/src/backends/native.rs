@@ -159,7 +159,7 @@ pub fn end_with_lifeline(fd: i32) -> Result<(), ExecutionError> {
             }
             // Only a group of its own: a worker started by something other
             // than the backend may share its starter's group.
-            if libc::getpgrp() == libc::getpid() {
+            if leads_own_group() {
                 libc::killpg(libc::getpgrp(), libc::SIGKILL);
             }
             libc::_exit(LIFELINE_EXIT_STATUS)
@@ -170,6 +170,14 @@ pub fn end_with_lifeline(fd: i32) -> Result<(), ExecutionError> {
             "{LIFELINE_FD_ARG} {fd} cannot be a lifeline: {error}"
         ))
     })
+}
+
+/// Whether this process leads its process group, as the backend spawns the
+/// worker. Async-signal-safe (two system calls), so the lifeline's end may
+/// call it.
+fn leads_own_group() -> bool {
+    // SAFETY: getpgrp and getpid take no arguments and cannot fail.
+    unsafe { libc::getpgrp() == libc::getpid() }
 }
 
 /// [`execute_with_ready`], reporting readiness and failure as JSON lines on
@@ -321,6 +329,44 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// Set in the probe process [`leads_own_group_probe`] runs as.
+    const GROUP_PROBE_ENV: &str = "LEYLINE_TEST_GROUP_PROBE";
+
+    #[test]
+    #[ignore = "the probe process of a_process_leads_its_group_only_when_spawned_into_its_own"]
+    fn leads_own_group_probe() {
+        if std::env::var_os(GROUP_PROBE_ENV).is_some() {
+            std::process::exit(if super::leads_own_group() { 10 } else { 20 });
+        }
+    }
+
+    /// The lifeline's end kills the worker's process group only when the
+    /// worker leads it: a process spawned into a group of its own leads it,
+    /// and one spawned into its parent's group does not.
+    #[test]
+    fn a_process_leads_its_group_only_when_spawned_into_its_own() {
+        use std::os::unix::process::CommandExt;
+        let probe = |own_group: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "backends::native::tests::leads_own_group_probe",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(GROUP_PROBE_ENV, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if own_group {
+                command.process_group(0);
+            }
+            command.status().unwrap().code()
+        };
+        assert_eq!(probe(true), Some(10), "spawned into its own group");
+        assert_eq!(probe(false), Some(20), "spawned into its parent's group");
+    }
 
     #[test]
     fn worker_options_require_trusted_roots() {

@@ -736,7 +736,21 @@ async fn main() -> Result<()> {
                 mcp_groups,
                 reset_arena,
             };
-            leyline_cli_lib::cmd_daemon::run_daemon_with_options(
+            // With a lifeline, the launcher may be the only reader of this
+            // process's standard output and error, and may die first: relay
+            // both through pipes this process reads, so no thread's write
+            // can ever fail with EPIPE (bead ley-line-open-f6b525).
+            let relay = match lifeline_fd {
+                Some(_) => Some(
+                    leyline_cli_lib::stdio_relay::install(&[
+                        libc::STDOUT_FILENO,
+                        libc::STDERR_FILENO,
+                    ])
+                    .context("relay standard output and error")?,
+                ),
+                None => None,
+            };
+            let ran = leyline_cli_lib::cmd_daemon::run_daemon_with_options(
                 config,
                 Arc::new(leyline_cli_lib::daemon::NoExt),
                 leyline_cli_lib::cmd_daemon::DaemonOptions {
@@ -746,7 +760,11 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 },
             )
-            .await
+            .await;
+            if let Some(relay) = relay {
+                relay.finish(std::time::Duration::from_secs(2));
+            }
+            ran
         }
     }
 }

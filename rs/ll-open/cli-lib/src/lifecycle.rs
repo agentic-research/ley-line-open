@@ -156,12 +156,6 @@ impl ShutdownSignals {
                 Some(fd) => {
                     let (ended, receiver) = tokio::sync::watch::channel(false);
                     leyline_runtime::lifeline::watch(fd, move || {
-                        // Before anything else logs: the launcher is gone,
-                        // and a pipe it read our output through now fails
-                        // every write with EPIPE, on which `eprintln!`
-                        // panics, ending the daemon before its final
-                        // publish (bead `ley-line-open-f6b525`).
-                        silence_pipes(&[libc::STDOUT_FILENO, libc::STDERR_FILENO]);
                         let _ = ended.send(true);
                     })
                     .with_context(|| format!("--lifeline-fd {fd} cannot be a lifeline"))?;
@@ -221,37 +215,6 @@ impl ShutdownSignals {
             }
         }
     }
-}
-
-/// Point each of `fds` that is a pipe or a socket at `/dev/null`. Called
-/// with standard output and error when the lifeline ends: a launcher reads a
-/// child's output through a pipe, and once that launcher is dead the pipe
-/// has no reader left, so every write to it fails with EPIPE (Rust ignores
-/// SIGPIPE) and `eprintln!` panics. A file or a terminal is left as it is: it
-/// outlives the launcher. Best effort, each step reported nowhere, because
-/// there is nowhere left to report it.
-#[cfg(unix)]
-fn silence_pipes(fds: &[i32]) {
-    use std::os::fd::AsRawFd;
-    let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") else {
-        return;
-    };
-    for &fd in fds {
-        // SAFETY: an out-parameter of the size fstat writes; dup2 onto `fd`
-        // replaces it atomically.
-        unsafe {
-            let mut stat: libc::stat = std::mem::zeroed();
-            if libc::fstat(fd, &mut stat) == 0 && is_pipe_or_socket(stat.st_mode) {
-                libc::dup2(null.as_raw_fd(), fd);
-            }
-        }
-    }
-}
-
-/// Whether a file of mode `mode` is a pipe (FIFO) or a socket.
-#[cfg(unix)]
-fn is_pipe_or_socket(mode: libc::mode_t) -> bool {
-    matches!(mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK)
 }
 
 /// Wait for Ctrl+C, SIGTERM or an optional timeout, whichever comes first.
@@ -373,51 +336,6 @@ mod tests {
             let message = format!("{error:#}");
             assert!(message.contains("--lifeline-fd"), "{message}");
             assert!(message.contains(&fd.to_string()), "{message}");
-        }
-    }
-
-    /// A pipe or socket among the descriptors is pointed at `/dev/null`;
-    /// a regular file is left as it is.
-    #[cfg(unix)]
-    #[test]
-    fn silence_pipes_replaces_pipes_and_sockets_and_keeps_files() {
-        use std::os::fd::{AsRawFd, IntoRawFd};
-        let kind = |fd: i32| {
-            // SAFETY: an out-parameter of the size fstat writes.
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
-            stat.st_mode & libc::S_IFMT
-        };
-        let (_read, write) = std::io::pipe().unwrap();
-        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let file = tempfile::tempfile().unwrap();
-        let fds = [write.into_raw_fd(), socket.into_raw_fd(), file.as_raw_fd()];
-        assert_eq!(kind(fds[0]), libc::S_IFIFO);
-        assert_eq!(kind(fds[1]), libc::S_IFSOCK);
-        silence_pipes(&fds);
-        assert_eq!(kind(fds[0]), libc::S_IFCHR, "the pipe is /dev/null now");
-        assert_eq!(kind(fds[1]), libc::S_IFCHR, "the socket is /dev/null now");
-        assert_eq!(kind(fds[2]), libc::S_IFREG, "the file is kept");
-        // SAFETY: closing the two descriptors this test took ownership of.
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_pipes_and_sockets_are_launcher_pipes() {
-        assert!(is_pipe_or_socket(libc::S_IFIFO | 0o600));
-        assert!(is_pipe_or_socket(libc::S_IFSOCK | 0o777));
-        for kind in [
-            libc::S_IFREG,
-            libc::S_IFCHR,
-            libc::S_IFDIR,
-            libc::S_IFLNK,
-            libc::S_IFBLK,
-        ] {
-            assert!(!is_pipe_or_socket(kind | 0o644), "{kind:o}");
         }
     }
 

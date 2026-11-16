@@ -7,12 +7,17 @@ use std::io;
 use std::os::fd::RawFd;
 
 /// Whether `path` carries a POSIX ACL (an access or default ACL xattr).
+///
+/// Any readable ACL xattr counts, whatever its size: the size query returns
+/// -1 only when there is none (or none can be read), so the test is against
+/// -1, with no size boundary. A zero-length one, which the kernel does not
+/// store, would be refused as an ACL rather than passed.
 pub(crate) fn has_acl(path: &CStr) -> bool {
     [c"system.posix_acl_access", c"system.posix_acl_default"]
         .iter()
         .any(|name| {
             // SAFETY: a size query (null buffer, length 0) on NUL-terminated strings.
-            unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) > 0 }
+            unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) != -1 }
         })
 }
 

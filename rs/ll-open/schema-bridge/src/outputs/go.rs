@@ -36,7 +36,7 @@ pub fn emit(schema: &Schema, package_name: &str) -> Result<String> {
         .expect("write! to String is infallible");
     writeln!(
         out,
-        "// Regenerate with `task cluster:go` (runs the schema-bridge plugin)."
+        "// Regenerate by running the `capnpc-schema-bridge-go` plugin over the source schema."
     )
     .expect("write! to String is infallible");
     writeln!(out, "//").expect("write! to String is infallible");

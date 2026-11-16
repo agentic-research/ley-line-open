@@ -37,8 +37,11 @@ pub struct ReadEnd {
 }
 
 /// A new lifeline: both ends close-on-exec. On Linux the pipe is created
-/// close-on-exec (`pipe2(O_CLOEXEC)`); on macOS, which has no `pipe2`, the
-/// flag is set just after, the window `ley-line-open-528525` closes.
+/// close-on-exec (`pipe2(O_CLOEXEC)`). macOS has no `pipe2`, so the flag is
+/// set just after the pipe is created; a process another thread spawns in
+/// between can still inherit a copy of the write end. That window stays open
+/// until every daemon spawn uses `POSIX_SPAWN_CLOEXEC_DEFAULT`, which is
+/// `ley-line-open-528525`'s work, not this function's.
 pub fn pair() -> io::Result<(Lifeline, ReadEnd)> {
     let (read_end, write_end) = io::pipe()?;
     let (read_end, write_end) = (OwnedFd::from(read_end), OwnedFd::from(write_end));

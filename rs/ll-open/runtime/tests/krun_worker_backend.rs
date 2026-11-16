@@ -1712,3 +1712,107 @@ fn a_worker_ends_when_the_process_embedding_its_backend_is_killed() {
         panic!("the worker outlived the process embedding its backend: {error}")
     });
 }
+
+/// What [`a_cancel_right_after_spawn_finds_the_run`] observes, in order.
+#[derive(Debug)]
+enum Seen {
+    CancelWaiting,
+    CancelReturned(Result<bool, ExecutionError>),
+}
+
+/// A cancel that arrives after the worker is spawned and before `start`
+/// does anything else finds the run: the run is registered before the spawn,
+/// so there is no moment with a worker and nothing to cancel. `start` is
+/// paused right after the spawn (a `test-support` hook) while the cancel is
+/// issued; before the fix the cancel answered `Ok(false)` there at once.
+#[test]
+fn a_cancel_right_after_spawn_finds_the_run() {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::mpsc;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (spawned_tx, spawned) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (seen_tx, seen) = mpsc::channel();
+    let released = StdMutex::new(released);
+    let hook_seen = seen_tx.clone();
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\nIFS= read -r _\nexec /usr/bin/tail -f /dev/null\n",
+    );
+    let backend = Arc::new(backend.with_start_hook(move |point| match point {
+        StartPoint::Spawned => {
+            let _ = spawned_tx.send(());
+            let _ = released.lock().unwrap().recv();
+        }
+        StartPoint::CancelSignalled => {
+            let _ = hook_seen.send(Seen::CancelWaiting);
+        }
+    }));
+    let starter = {
+        let backend = Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+    spawned
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the worker was never spawned");
+    let canceller = {
+        let backend = Arc::clone(&backend);
+        std::thread::spawn(move || {
+            let _ = seen_tx.send(Seen::CancelReturned(backend.cancel("run-backend-01")));
+        })
+    };
+    let first = seen
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the cancel neither waited nor returned");
+    let _ = release.send(());
+    assert!(
+        matches!(first, Seen::CancelWaiting),
+        "a cancel right after the spawn did not find the run: {first:?}"
+    );
+    match seen.recv_timeout(EVENT_BOUND) {
+        Ok(Seen::CancelReturned(Ok(true))) => {}
+        other => panic!("the cancel's answer: {other:?}"),
+    }
+    canceller.join().unwrap();
+    let error = starter
+        .join()
+        .unwrap()
+        .expect_err("a cancelled start does not start");
+    assert_eq!(error.code, ErrorCode::Cancelled, "{error:?}");
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// A cancel before readiness whose run root cannot be removed says so: the
+/// cleanup's failure is its answer, not `Ok(true)`.
+#[test]
+fn a_cancel_before_readiness_reports_a_run_root_it_could_not_remove() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    mkfifo(&spawned);
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        &format!(
+            "#!/bin/sh\nIFS= read -r _\necho $$ > '{}'\nexec /usr/bin/tail -f /dev/null\n",
+            spawned.display()
+        ),
+    );
+    let backend = Arc::new(backend);
+    let starter = {
+        let backend = Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+    let worker = pid_from(&spawned, "the starting worker");
+    let _cleanup = KillOnDrop(worker);
+    // The run root's parent no longer lets an entry be removed.
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o555)).unwrap();
+    let answer = backend.cancel("run-backend-01");
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = answer.expect_err("a cancel whose cleanup failed reports it");
+    assert!(error.detail.contains("ephemeral"), "{error:?}");
+    assert!(!alive(worker), "the worker {worker} survived its cancel");
+    let started = starter.join().unwrap();
+    assert!(started.is_err(), "{started:?}");
+}

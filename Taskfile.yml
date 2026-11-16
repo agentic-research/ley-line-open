@@ -531,6 +531,32 @@ tasks:
     cmds:
       - go test -count=1 ./sigma/
 
+  deps:capnpc-go:
+    desc: Install capnpc-go pinned to go.mod's capnp runtime (v3.1.0-alpha.2), which clients/go/leyline-schema/regen.sh needs on PATH (3a6beb)
+    status:
+      - go version -m "$(go env GOPATH)/bin/capnpc-go" 2>/dev/null | grep -Eq 'mod[[:space:]]+capnproto.org/go/capnp/v3[[:space:]]+v3.1.0-alpha.2[[:space:]]'
+    cmds:
+      - go install capnproto.org/go/capnp/v3/capnpc-go@v3.1.0-alpha.2
+
+  schema:go:regen-check:
+    desc: The committed Go bindings equal regen.sh output; formerly leyline-schema-go.yml's regen-diff step, now in task ci (3a6beb)
+    deps: [deps:capnpc-go]
+    cmds:
+      - clients/go/leyline-schema/regen.sh
+      - |
+        if ! git diff --exit-code -- clients/go/leyline-schema/; then
+          echo "clients/go/leyline-schema/ has drift; run regen.sh and commit" >&2
+          exit 1
+        fi
+
+  schema:go:test:
+    desc: go test ./... over the Go schema module (cross-runtime fixture decode, the Go half of the daemon protocol drift gate, daemon/wire); formerly leyline-schema-go.yml's test step, now in task ci (3a6beb)
+    dir: clients/go/leyline-schema
+    env:
+      GOWORK: "off"
+    cmds:
+      - go test -count=1 ./...
+
   schema:execution-asset-consumer-test:
     desc: Compile the execution/v1 schema release assets standalone to zod RunSpec/RunGrant/RunReceipt (6d811a)
     cmds:
@@ -1872,6 +1898,8 @@ tasks:
       - task: guest-tools:fixture-test
       - task: schema:consumer-fixture-test
       - task: schema:go-sigma-vectors
+      - task: schema:go:regen-check
+      - task: schema:go:test
       - task: schema:execution-asset-consumer-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check

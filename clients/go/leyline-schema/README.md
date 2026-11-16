@@ -111,7 +111,9 @@ clients/go/leyline-schema/regen.sh
 That script re-runs `capnp compile -ogo` for all six schemas and runs
 `go build ./...` to catch cross-package import drift.
 
-CI (`.github/workflows/leyline-schema-go.yml`) gates this:
+`task ci` gates this through `task schema:go:regen-check` and
+`task schema:go:test`, as does `.github/workflows/leyline-schema-go.yml`
+on pull requests into `main`:
 
 1. Reruns `regen.sh`.
 2. `git diff --exit-code clients/go/leyline-schema/` — fails if the

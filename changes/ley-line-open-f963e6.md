@@ -6,7 +6,8 @@ Section: Fixed
   When the embedding process ends for any reason, `SIGKILL` included, the
   worker reads end-of-file and exits at once, taking its VM with it; this works
   on macOS, which has no `PR_SET_PDEATHSIG`. The worker requires the option and
-  refuses, by name, a missing, malformed or closed lifeline descriptor. A run
+  refuses, by name, a missing or malformed lifeline, and a descriptor that is
+  closed, not readable, or not a pipe or socket. A run
   can now be cancelled between spawn and readiness: `cancel` stops the worker,
   returns once it is reaped and its ephemeral run root removed, and answers
   `true`; the racing `start` ends `cancelled`. `Ok(false)` now means no such

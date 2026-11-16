@@ -112,15 +112,17 @@ pub fn ended(read: &io::Result<usize>) -> bool {
 }
 
 /// Watch the inherited read end `fd` on a thread of its own and run `on_end`
-/// once the supervisor is gone. Refused when `fd` is not an open descriptor,
-/// so a wrong number fails at startup instead of reading as an immediate end.
+/// once the supervisor is gone.
 ///
-/// The watcher owns `fd` for the rest of the process's life.
+/// Refused, and left untouched, unless `fd` is open for reading and is a pipe
+/// or a socket: a wrong number fails at startup instead of reading as an
+/// immediate end, and so does a descriptor that could never be a lifeline (a
+/// regular file or `/dev/null` reads end-of-file at once, a write end fails
+/// at once).
+///
+/// Once accepted, the watcher owns `fd` for the rest of the process's life.
 pub fn watch(fd: RawFd, on_end: impl FnOnce() + Send + 'static) -> io::Result<()> {
-    // SAFETY: fcntl on a descriptor number; failure is reported.
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    check_usable(fd)?;
     // The child's own exec must not hand the lifeline on.
     set_cloexec(fd, true)?;
     // SAFETY: the caller hands `fd` over; nothing else in this process uses
@@ -146,6 +148,34 @@ pub fn exit_when_ended(fd: RawFd, status: i32) -> io::Result<()> {
     })
 }
 
+/// `Ok` when `fd` is open for reading and is a pipe (FIFO) or a socket.
+fn check_usable(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor number; failure is reported.
+    let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if status & libc::O_ACCMODE == libc::O_WRONLY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("descriptor {fd} is not open for reading"),
+        ));
+    }
+    // SAFETY: an out-parameter of the size fstat writes.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat on a descriptor number into a live stat.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFIFO | libc::S_IFSOCK => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("descriptor {fd} is not a pipe or socket"),
+        )),
+    }
+}
+
 fn set_cloexec(fd: RawFd, on: bool) -> io::Result<()> {
     // SAFETY: fcntl on a descriptor number; failure is reported.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -167,6 +197,7 @@ fn set_cloexec(fd: RawFd, on: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
     use std::sync::mpsc;
 
     #[test]
@@ -292,6 +323,37 @@ mod tests {
             let error = parse_fd(bad).unwrap_err();
             assert!(error.contains("--lifeline-fd"), "{bad:?}: {error}");
         }
+    }
+
+    /// A descriptor that cannot be a lifeline's read end is refused, not
+    /// watched: a regular file or `/dev/null` reads end-of-file at once, and a
+    /// write end reads an error at once, so either would end the child the
+    /// moment it started. Each stays open and unclaimed.
+    #[test]
+    fn watching_a_descriptor_that_is_not_a_readable_pipe_or_socket_is_refused() {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let error = watch(null.as_raw_fd(), || {}).unwrap_err();
+        assert!(error.to_string().contains("pipe or socket"), "{error}");
+        let (lifeline, read_end) = pair().unwrap();
+        let error = watch(lifeline._write_end.as_raw_fd(), || {}).unwrap_err();
+        assert!(
+            error.to_string().contains("not open for reading"),
+            "{error}"
+        );
+        // A socket's end is accepted, as a pipe's read end is.
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (sender, ended) = mpsc::channel();
+        watch(theirs.into_raw_fd(), move || sender.send(()).unwrap()).unwrap();
+        drop(ours);
+        ended
+            .recv()
+            .expect("a socket lifeline ends when its peer closes");
+        // Refused descriptors are left as they were: still open.
+        for fd in [null.as_raw_fd(), lifeline._write_end.as_raw_fd()] {
+            // SAFETY: fcntl on descriptors this test holds.
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0, "fd {fd}");
+        }
+        drop(read_end);
     }
 
     #[test]

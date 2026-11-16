@@ -230,7 +230,10 @@ There is no third source and no merge:
   and `daemon --reset-arena`,
   which is a one-time action on this start ("drop the live db and parse cold",
   `cmd_daemon.rs:131-137`), not a state the deployment holds. Putting it in a persistent
-  document would reset the arena on every restart.
+  document would reset the arena on every restart. `daemon --lifeline-fd N` (added after
+  acceptance, bead `ley-line-open-f6b525`) is one too: it names a descriptor the launcher
+  hands this one process, which no later start inherits, so a document holding it would
+  name a descriptor that does not exist.
 - **Environment: no configuration.** After v0.30.0 no daemon, and no one-shot subcommand,
   reads a `LEYLINE_*` or `LLO_*` variable as configuration. Each one either becomes a document
   field or is removed (Migration table). Three host conventions are still read, only to compute
@@ -851,7 +854,7 @@ Every configuration flag of the three processes, and every environment variable 
 binary reads at runtime. Keys are dotted from the document root. "Host default" means the
 schema states a rule (D2 `x-leyline-default`) and `--print-config` shows its value.
 
-### `leyline daemon` → `DaemonConfig` (18 flags)
+### `leyline daemon` → `DaemonConfig` (19 flags)
 
 | Flag | Key | Type | Default | Notes |
 |---|---|---|---|---|
@@ -871,6 +874,7 @@ schema states a rule (D2 `x-leyline-default`) and `--print-config` shows its val
 | `--mcp-uds` | `mcp.uds` | path | `null` (no UDS listener) | |
 | `--mcp-groups` | `mcp.groups` | list of labels, sorted | `null` (every group) | Comma list becomes an array. Default reasoned in D5 ("Q4"). |
 | `--reset-arena` | (none) | | | **CLI-only**: an action on one start (D3). Combines with `--config`. |
+| `--lifeline-fd` | (none) | | | **CLI-only**: a descriptor of one start (D3; bead `ley-line-open-f6b525`). `DaemonOptions::lifeline_fd` in the library. Combines with `--config`. |
 | `--cdc` | `cdc.enabled` | boolean | `false` | |
 | `--cdc-target` | `cdc.target` | `"source-blobs"` | `"source-blobs"` | Inert when `cdc.enabled` is false (`main.rs:807-817`). |
 
@@ -975,7 +979,8 @@ Test-only (read only by `#[cfg(test)]` code or `tests/`): `LEYLINE_BENCH_FILES`,
 `LEYLINE_TEST_VIRTIOFS_VMM_ROOTFS`, `LEYLINE_WASM_ARTIFACT`, `LLO_CONNECT_PROBE`,
 `LLO_PERF_GATES`, `LLO_TEST_CGROUP_ROOT`.
 
-**Counts:** 46 flags (18 + 23 + 5), of which 44 map to keys, 1 is CLI-only (`--reset-arena`)
+**Counts:** 47 flags (19 + 23 + 5), of which 44 map to keys, 2 are CLI-only (`--reset-arena`,
+`--lifeline-fd`)
 and 1 is removed (`--foreground`); one further key (`stateDir`) carries `--cas-volume`'s
 optional value. 24 runtime environment variables, of which 19 map to keys (all removed and
 refused when set), 1 becomes a flag of a one-shot command, 2 test seams stay (recorded in

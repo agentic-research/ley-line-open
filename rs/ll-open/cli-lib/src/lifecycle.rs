@@ -115,6 +115,9 @@ pub enum Shutdown {
     Interrupt,
     Terminate,
     Timeout,
+    /// The launcher's lifeline ended: the process that started this one,
+    /// and passed `--lifeline-fd`, is gone (bead `ley-line-open-f6b525`).
+    LifelineEnded,
 }
 
 /// The signals that stop a long-running command: Ctrl+C (SIGINT) and, on
@@ -126,21 +129,51 @@ pub struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
+    /// Turns `true` once the launcher's lifeline has ended; `None` without
+    /// one.
+    #[cfg(unix)]
+    lifeline: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl ShutdownSignals {
     pub fn install() -> Result<Self> {
+        Self::install_with_lifeline(None)
+    }
+
+    /// [`Self::install`], and when `lifeline_fd` is given, watch that
+    /// inherited descriptor as the read end of the launcher's lifeline
+    /// (`leyline_runtime::lifeline`): its end, as when the launcher is killed
+    /// with `SIGKILL`, ends the wait with [`Shutdown::LifelineEnded`], and the
+    /// caller's graceful shutdown runs. A descriptor that is not open for
+    /// reading, or is not a pipe or socket, is refused by name. The watcher
+    /// marks it close-on-exec, so no process this one spawns holds it.
+    pub fn install_with_lifeline(lifeline_fd: Option<i32>) -> Result<Self> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
+            let lifeline = match lifeline_fd {
+                None => None,
+                Some(fd) => {
+                    let (ended, receiver) = tokio::sync::watch::channel(false);
+                    leyline_runtime::lifeline::watch(fd, move || {
+                        let _ = ended.send(true);
+                    })
+                    .with_context(|| format!("--lifeline-fd {fd} cannot be a lifeline"))?;
+                    Some(receiver)
+                }
+            };
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt()).context("install the SIGINT handler")?,
                 terminate: signal(SignalKind::terminate())
                     .context("install the SIGTERM handler")?,
+                lifeline,
             })
         }
         #[cfg(not(unix))]
         {
+            if let Some(fd) = lifeline_fd {
+                anyhow::bail!("--lifeline-fd {fd}: a lifeline needs a unix host");
+            }
             Ok(Self {})
         }
     }
@@ -155,9 +188,22 @@ impl ShutdownSignals {
         };
         #[cfg(unix)]
         {
+            let lifeline = async {
+                match self.lifeline.as_mut() {
+                    // An error means the watcher is gone without an end,
+                    // which it never is: it lives as long as the process.
+                    Some(ended) => {
+                        if ended.wait_for(|ended| *ended).await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 _ = self.interrupt.recv() => Shutdown::Interrupt,
                 _ = self.terminate.recv() => Shutdown::Terminate,
+                _ = lifeline => Shutdown::LifelineEnded,
                 _ = timer => Shutdown::Timeout,
             }
         }
@@ -194,6 +240,7 @@ pub async fn wait_for(signals: &mut ShutdownSignals, timeout: Option<Duration>) 
         Shutdown::Interrupt => eprintln!("\nreceived Ctrl+C, shutting down"),
         Shutdown::Terminate => eprintln!("received SIGTERM, shutting down"),
         Shutdown::Timeout => eprintln!("timeout reached, shutting down"),
+        Shutdown::LifelineEnded => eprintln!("the launcher's lifeline ended, shutting down"),
     }
     ended
 }
@@ -245,6 +292,51 @@ mod tests {
             .await
             .expect("SIGTERM must end the wait");
         assert_eq!(which, Shutdown::Terminate);
+    }
+
+    /// A launcher's lifeline ends the wait when its write end is gone, as it
+    /// is when the launcher is killed (bead `ley-line-open-f6b525`); held, it
+    /// does not, and the timeout still ends the wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_end_of_a_launchers_lifeline_ends_the_wait() {
+        let _serial = SIGNAL_TESTS.lock().await;
+        let (lifeline, read_end) = leyline_runtime::lifeline::pair().unwrap();
+        let fd = read_end.raw_fd();
+        // Handed over, as the daemon is handed an inherited number.
+        std::mem::forget(read_end);
+        let mut signals =
+            ShutdownSignals::install_with_lifeline(Some(fd)).expect("install with a lifeline");
+        let which = tokio::time::timeout(
+            Duration::from_secs(5),
+            signals.wait(Some(Duration::from_millis(10))),
+        )
+        .await
+        .expect("a 10ms timeout must end the wait");
+        assert_eq!(which, Shutdown::Timeout, "a held lifeline ends nothing");
+        drop(lifeline);
+        let which = tokio::time::timeout(Duration::from_secs(5), signals.wait(None))
+            .await
+            .expect("the end of the lifeline must end the wait");
+        assert_eq!(which, Shutdown::LifelineEnded);
+    }
+
+    /// A lifeline that is not a readable pipe or socket is refused by name,
+    /// before anything waits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unusable_lifeline_is_refused_by_name() {
+        use std::os::fd::AsRawFd;
+        let _serial = SIGNAL_TESTS.lock().await;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        for fd in [null.as_raw_fd(), 1 << 20] {
+            let error = ShutdownSignals::install_with_lifeline(Some(fd))
+                .err()
+                .expect("an unusable lifeline is refused");
+            let message = format!("{error:#}");
+            assert!(message.contains("--lifeline-fd"), "{message}");
+            assert!(message.contains(&fd.to_string()), "{message}");
+        }
     }
 
     #[test]

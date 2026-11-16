@@ -990,23 +990,27 @@ fn sql_value_to_text(value: rusqlite::types::ValueRef<'_>) -> Option<String> {
 /// if not provided). Sets `truncation` in the response when the cap is hit,
 /// so callers can paginate via `LIMIT/OFFSET` in the SQL itself if they need
 /// everything.
-fn op_query(ctx: &DaemonContext, sql: &str, limit: Option<u64>) -> Result<String> {
-    // `QueryRequest.limit` is a `UInt32`; a wider request is refused by name
-    // before anything runs, never clamped (bead `ley-line-open-0a18bc`). 0 is
-    // the field's capnp default, the value an absent field reads as, so it
-    // means the daemon's default too: the JSON and binary readings agree.
+fn op_query(
+    ctx: &DaemonContext,
+    sql: &str,
+    limit: Option<super::wire::QueryLimit>,
+) -> Result<String> {
+    use super::wire::QueryLimit;
+    // `QueryRequest.limit` is a `UInt32`; any other value (negative,
+    // fractional, too wide, not a number) is refused by name before anything
+    // runs, never clamped (bead `ley-line-open-0a18bc`). 0 is the field's
+    // capnp default, the value an absent field reads as, so it means the
+    // daemon's default too: the JSON and binary readings agree.
     let limit = match limit {
-        None | Some(0) => OP_QUERY_DEFAULT_ROW_LIMIT,
-        Some(requested) => match u32::try_from(requested) {
-            Ok(limit) => limit,
-            Err(_) => {
-                return query_refusal_response(&super::sql_read_only::Refusal {
-                    reason: super::sql_read_only::RefusalReason::LimitOutOfRange,
-                    action: "limit".into(),
-                    subject: requested.to_string(),
-                });
-            }
-        },
+        None | Some(QueryLimit::Rows(0)) => OP_QUERY_DEFAULT_ROW_LIMIT,
+        Some(QueryLimit::Rows(limit)) => limit,
+        Some(QueryLimit::OutOfRange(requested)) => {
+            return query_refusal_response(&super::sql_read_only::Refusal {
+                reason: super::sql_read_only::RefusalReason::LimitOutOfRange,
+                action: "limit".into(),
+                subject: requested,
+            });
+        }
     };
     // ADR-0026 Phase 2.0 (bead `ley-line-open-335d34`): profile the
     // whole op path when `LEYLINE_PROFILE=1`. Zero-cost when unset.
@@ -5563,7 +5567,7 @@ mod tests {
     #[tokio::test]
     async fn op_query_refuses_a_limit_that_does_not_fit() {
         let (_dir, ctx) = setup();
-        let run = |limit: u64| -> serde_json::Value {
+        let run = |limit: serde_json::Value| -> serde_json::Value {
             let out = handle_base_op_legacy(
                 &ctx,
                 "query",
@@ -5573,25 +5577,73 @@ mod tests {
             serde_json::from_str(&out).unwrap()
         };
         let too_big = u64::from(u32::MAX) + 1;
-        assert_eq!(
-            run(too_big),
-            json!({
-                "ok": false,
-                "error": format!(
-                    "query refused (limit_out_of_range): the row limit `{too_big}` is \
-                     larger than the query op takes ({})",
-                    u32::MAX
-                ),
-                "refusal": {
-                    "reason": "limit_out_of_range",
-                    "action": "limit",
-                    "subject": too_big.to_string(),
-                },
-            })
-        );
-        let fits = run(u64::from(u32::MAX));
+        assert_eq!(run(json!(too_big)), limit_refusal(&too_big.to_string()));
+        let fits = run(json!(u64::from(u32::MAX)));
         assert_eq!(fits["rows"], json!([[{"text": "1"}]]), "{fits}");
         assert!(fits.get("truncation").is_none(), "{fits}");
+    }
+
+    /// The typed `limit_out_of_range` refusal for a request `limit` whose
+    /// JSON text is `subject`.
+    fn limit_refusal(subject: &str) -> serde_json::Value {
+        json!({
+            "ok": false,
+            "error": format!(
+                "query refused (limit_out_of_range): the row limit `{subject}` is not \
+                 an integer from 0 to {}",
+                u32::MAX
+            ),
+            "refusal": {
+                "reason": "limit_out_of_range",
+                "action": "limit",
+                "subject": subject,
+            },
+        })
+    }
+
+    /// Bead `ley-line-open-0a18bc`: every malformed `limit` (negative,
+    /// fractional, wider than u64, not a number) is the same typed refusal,
+    /// decided before the statement runs, never the untyped
+    /// `query: invalid value` envelope. A statement that would fail proves
+    /// nothing ran: the refusal, not the SQL error, comes back.
+    #[tokio::test]
+    async fn op_query_refuses_every_malformed_limit_by_name() {
+        let (_dir, ctx) = setup();
+        for (limit, subject) in [
+            (json!(-1), "-1"),
+            (json!(1.5), "1.5"),
+            (json!(10.0), "10.0"),
+            (json!(1e30), "1e+30"),
+            (json!("10"), "\"10\""),
+            (json!(true), "true"),
+            (json!([1]), "[1]"),
+        ] {
+            let out = handle_base_op_legacy(
+                &ctx,
+                "query",
+                &json!({"sql": "SELECT * FROM no_such_table", "limit": limit}),
+            )
+            .expect("op_query must dispatch");
+            let got: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(got, limit_refusal(subject), "limit {limit}");
+        }
+        // A number wider than u64 in the raw request text.
+        let out = handle_base_op(
+            &ctx,
+            r#"{"op":"query","sql":"SELECT 1","limit":18446744073709551616}"#,
+        )
+        .expect("op_query must dispatch");
+        let got: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(got["refusal"]["reason"], "limit_out_of_range", "{got}");
+        // `null` is an absent limit: the default applies.
+        let out = handle_base_op_legacy(
+            &ctx,
+            "query",
+            &json!({"sql": "SELECT 1 AS one", "limit": null}),
+        )
+        .expect("op_query must dispatch");
+        let got: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(got["rows"], json!([[{"text": "1"}]]), "{got}");
     }
 
     /// Bead `ley-line-open-0a18bc`: `limit: 0` is `QueryRequest.limit`'s

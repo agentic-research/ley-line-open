@@ -178,7 +178,7 @@ pub fn tool_registry() -> Vec<McpTool> {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": u32::MAX,
-                        "description": "Max rows returned. Absent or 0 means the default, 1000. A value above the maximum is refused as `limit_out_of_range`."
+                        "description": "Max rows returned. Absent or 0 means the default, 1000. Any other value that is not an integer from 0 to the maximum is refused as `limit_out_of_range`."
                     }
                 },
                 "required": ["sql"]

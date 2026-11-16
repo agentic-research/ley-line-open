@@ -407,6 +407,23 @@
     "go_drift_skip": null
   },
 
+  "query_limit_out_of_range": {
+    "request": {"op": "query", "sql": "SELECT 1", "limit": -1},
+    "response": {
+      "ok": false,
+      "error": "query refused (limit_out_of_range): the row limit `-1` is not an integer from 0 to 4294967295",
+      "refusal": {
+        "reason": "limit_out_of_range",
+        "action": "limit",
+        "subject": "-1"
+      }
+    },
+    "response_required_keys": ["ok", "error", "refusal"],
+    "response_optional_keys": [],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
+  },
+
   "llo_execution_status_unconfigured": {
     "request": {"op": "llo_execution_status", "runId": ""},
     "response": {

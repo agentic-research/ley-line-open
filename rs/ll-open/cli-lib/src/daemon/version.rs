@@ -74,8 +74,19 @@ pub const SCHEMA_VERSION: &str = "0.30.0";
 ///   row was an object keyed by column name, which lost a value whenever two
 ///   columns shared a name, and is now a list of `QueryCell`s in `columns`
 ///   order, each `{"null": null}` or `{"text": "..."}`. `QueryResponse.rows`
-///   is a new field (@5); the old @2 is retired as `retiredRows`. A
-///   major-2 client that indexes a row by column name reads nothing, so the
+///   is a new field (@5); the old @2 is retired as `retiredRows`. The same
+///   major carries the rest of `query`'s break (folding in bead
+///   `ley-line-open-47d5c5`):
+///   - the top-level `truncated: true` and `limit: N` reply keys are
+///     removed; a reply cut short carries `truncation: {"limit": N}`
+///     (`QueryResponse.truncation` @6) instead;
+///   - the request `limit` is a `UInt32` (`QueryRequest.limit` @1): a
+///     value above `u32::MAX`, which major 2 accepted, and any negative,
+///     fractional or non-number value, which major 2 answered with an
+///     untyped parse error, are refused as `limit_out_of_range`;
+///   - `limit: 0` answered zero rows marked truncated at major 2 and now
+///     means the default cap of 1000, since 0 is the field's capnp default.
+///   A major-2 client that indexes a row by column name reads nothing, so the
 ///   major moves and the handshake refuses it, as at 2 (commit `7f5b736e`,
 ///   `tree_root` -> `store_root`). [`COMPAT_MIN_SCHEMA_VERSION`] does not
 ///   move, as it did not at 2: the major is the refusal, and the Go

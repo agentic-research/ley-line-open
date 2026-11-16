@@ -162,6 +162,29 @@ const BASE_OP_NAMES_STORAGE: [&str; BASE_OP_NAMES_LEN] = concat_base_op_names();
 /// Nothing indexes this slice, so the splice point is free to sit at the tail.
 pub const BASE_OP_NAMES: &[&str] = &BASE_OP_NAMES_STORAGE;
 
+/// A `query` request's `limit` as it arrived (bead `ley-line-open-0a18bc`).
+/// Any JSON value deserializes, so a malformed limit reaches `op_query` and
+/// is refused there as `limit_out_of_range` before the statement runs,
+/// instead of failing the whole request parse with an untyped error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryLimit {
+    /// An integer that fits `QueryRequest.limit`'s `UInt32`.
+    Rows(u32),
+    /// Anything else (negative, fractional, too wide, not a number), as
+    /// its JSON text.
+    OutOfRange(String),
+}
+
+impl<'de> Deserialize<'de> for QueryLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(rows) => Self::Rows(rows),
+            None => Self::OutOfRange(value.to_string()),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request enum — typed dispatch surface for socket.rs.
 //
@@ -184,10 +207,11 @@ pub enum BaseRequest {
     },
     Query {
         sql: String,
-        /// Read wider than `QueryRequest.limit`'s `UInt32` so a value that
-        /// does not fit is refused by name, not by a parse error or a clamp.
+        /// Read as any JSON value so a value that does not fit
+        /// `QueryRequest.limit`'s `UInt32` is refused by name, not by a
+        /// parse error or a clamp. `null` is an absent limit.
         #[serde(default)]
-        limit: Option<u64>,
+        limit: Option<QueryLimit>,
     },
     Reparse {
         #[serde(default)]

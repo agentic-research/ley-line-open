@@ -293,9 +293,10 @@ struct LoadResponse {
 struct QueryRequest {
   sql   @0 :Text;
   # The most rows to return; absent or 0 (the field's default, which an
-  # absent field reads as) means the daemon's default (1000). A value that
-  # does not fit is refused as `limit_out_of_range`, never clamped (bead
-  # `ley-line-open-0a18bc`).
+  # absent field reads as) means the daemon's default (1000). Any other
+  # value that is not an integer fitting `UInt32` (too wide, negative,
+  # fractional, not a number) is refused as `limit_out_of_range` before the
+  # statement runs, never clamped (bead `ley-line-open-0a18bc`).
   limit @1 :UInt32;
 }
 
@@ -359,8 +360,9 @@ enum QueryRefusalReason {
   # The statement is not a read-only SELECT (`VACUUM`, a bare `PRAGMA`, an
   # empty statement); `action` is its leading keyword.
   notAQuery          @2 $Json.name("not_a_query");
-  # The request's `limit` does not fit the schema's `UInt32`; `action` is
-  # `limit` and `subject` the requested value. Nothing ran.
+  # The request's `limit` is not an integer that fits the schema's `UInt32`;
+  # `action` is `limit` and `subject` the requested value as JSON text
+  # (`-1`, `1.5`, `"10"`). Nothing ran.
   limitOutOfRange    @3 $Json.name("limit_out_of_range");
 }
 

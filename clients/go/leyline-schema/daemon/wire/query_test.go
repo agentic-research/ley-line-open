@@ -114,3 +114,21 @@ func TestQueryCellKeepsControlCharactersAndNul(t *testing.T) {
 		t.Fatalf("round trip of %s gave %+v, %v", data, again, err)
 	}
 }
+
+// A malformed request limit comes back as the typed limit_out_of_range
+// refusal, its subject the requested value, with no rows.
+func TestQueryResponseDecodesTheLimitRefusal(t *testing.T) {
+	var got QueryResponse
+	data := loadFixture(t, "query_limit_out_of_range").Response
+	if err := strictDecode(data, &got); err != nil {
+		t.Fatalf("strict decode: %v\n%s", err, data)
+	}
+	if got.OK == nil || *got.OK || got.Rows != nil || got.Truncation != nil {
+		t.Fatalf("want ok:false with no rows or truncation, got %+v", got)
+	}
+	r := got.Refusal
+	if r == nil || r.Reason == nil || *r.Reason != QueryRefusalLimitOutOfRange ||
+		r.Action == nil || *r.Action != "limit" || r.Subject == nil || *r.Subject != "-1" {
+		t.Fatalf("want refusal {limit_out_of_range limit -1}, got %+v", r)
+	}
+}

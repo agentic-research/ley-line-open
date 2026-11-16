@@ -349,9 +349,10 @@ const (
 	// QueryRefusalNotAQuery: the statement is not a read-only SELECT;
 	// [QueryRefusal.Action] is its leading keyword.
 	QueryRefusalNotAQuery QueryRefusalReason = "not_a_query"
-	// QueryRefusalLimitOutOfRange: the request's row limit does not fit
-	// QueryRequest.limit's UInt32; [QueryRefusal.Action] is `limit` and
-	// [QueryRefusal.Subject] the requested value. Nothing ran.
+	// QueryRefusalLimitOutOfRange: the request's row limit is not an
+	// integer that fits QueryRequest.limit's UInt32 (negative, fractional,
+	// too wide, not a number); [QueryRefusal.Action] is `limit` and
+	// [QueryRefusal.Subject] the requested value as JSON text. Nothing ran.
 	QueryRefusalLimitOutOfRange QueryRefusalReason = "limit_out_of_range"
 )
 

@@ -418,6 +418,28 @@ fn the_protocol_fixture_rows_are_what_the_daemon_sends() {
     }
 }
 
+/// The `query_limit_out_of_range` fixture is exactly what the daemon sends
+/// over both transports for a malformed `limit`: the typed refusal, not the
+/// untyped `query: invalid value` envelope (bead `ley-line-open-0a18bc`).
+#[test]
+fn the_protocol_fixture_limit_refusal_is_what_the_daemon_sends() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/daemon-protocol.json");
+    let fixtures: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let fixture = &fixtures["query_limit_out_of_range"];
+    let d = Daemon::start();
+    let request = &fixture["request"];
+    assert_eq!(
+        d.request_over_socket(request),
+        fixture["response"],
+        "socket"
+    );
+    let mut arguments = request.clone();
+    arguments.as_object_mut().unwrap().remove("op");
+    let (mcp, is_error) = d.arguments_over_mcp(arguments);
+    assert_eq!(mcp, fixture["response"], "mcp");
+    assert!(is_error, "mcp flags a refusal as an error");
+}
+
 /// The schema carries NULL itself: the `query_null` and
 /// `query_duplicate_columns` fixtures decode through `daemon.capnp` with the
 /// Rust capnp-json codec into `QueryCell` unions, the NULL cell as its `null`

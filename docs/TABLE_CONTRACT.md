@@ -594,9 +594,11 @@ wire break that moved `wire_format_major` to 3: `QueryResponse.rows` (@5,
 `{"null": null}` for SQL NULL or `{"text": "..."}`, and the old @2 field is
 retired as `retiredRows` and never emitted. A reply cut short by the row
 limit carries `truncation` (@6, `{"limit": N}`), absent otherwise, and
-`QueryRequest.limit` is a `UInt32`; a larger value is refused as
-`limit_out_of_range`. The `query`, `query_duplicate_columns`, `query_null`
-and `query_truncated` fixtures are checked for exact equality against the
+`QueryRequest.limit` is a `UInt32` (absent or 0: the default of 1000); any
+other value that is not an integer fitting it is refused as
+`limit_out_of_range` before the statement runs. The `query`,
+`query_duplicate_columns`, `query_null`, `query_truncated` and
+`query_limit_out_of_range` fixtures are checked for exact equality against the
 daemon over both transports (`tests/query_read_only_test.rs`).
 
 A third gate closes the chain from the schema's side: `task

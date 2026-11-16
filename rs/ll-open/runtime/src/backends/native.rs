@@ -188,29 +188,6 @@ fn leads_own_group() -> bool {
     unsafe { libc::getpgrp() == libc::getpid() }
 }
 
-/// Block until the child `pid` has exited, leaving it unreaped
-/// (`waitid(WEXITED | WNOWAIT)`). A failure other than an interrupted call
-/// returns at once; the caller's reaping wait then reports it.
-fn await_exit_unreaped(pid: u32) {
-    loop {
-        // SAFETY: an out-parameter of the size waitid writes.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: waitid on this process's own child; WNOWAIT leaves it
-        // waitable.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
-        }
-    }
-}
-
 /// [`execute_with_ready`], reporting readiness and failure as JSON lines on
 /// `writer` (the worker's standard error).
 pub fn execute_request_with_events(
@@ -329,7 +306,8 @@ pub fn execute_with_ready(
     // Wait for the workload's exit without reaping it, so its pid cannot be
     // reused yet; only then clear WORKLOAD, and only then reap. The
     // lifeline's end never signals a pid that by then names another process.
-    await_exit_unreaped(child.id());
+    // A failure here leaves the pid set; the reaping wait below reports it.
+    let _ = super::process::await_exit_without_reaping(child.id());
     WORKLOAD.store(0, std::sync::atomic::Ordering::SeqCst);
     let status = child.wait().map_err(|error| {
         ExecutionError::backend(format!("wait for native guest executable: {error}"))
@@ -414,7 +392,7 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         std::thread::spawn(move || drop(stdin));
-        super::await_exit_unreaped(child.id());
+        super::super::process::await_exit_without_reaping(child.id()).unwrap();
         let status = child
             .try_wait()
             .unwrap()

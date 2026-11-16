@@ -530,6 +530,31 @@ fn child_descriptor_flags(flags: rustix::io::FdFlags, keep: bool) -> rustix::io:
     }
 }
 
+/// The lifeline descriptor a worker accepts: given, not a standard stream
+/// (the worker's request, its guest's console and its events), and not the
+/// workspace share's. Each refusal names the option.
+fn checked_lifeline_fd(
+    lifeline_fd: Option<i32>,
+    workspace_share_fd: Option<i32>,
+) -> Result<i32, ExecutionError> {
+    let fd = lifeline_fd.ok_or_else(|| {
+        ExecutionError::invalid(format!(
+            "missing {LIFELINE_FD_ARG} option: a worker starts only under a supervisor's lifeline"
+        ))
+    })?;
+    if STANDARD_STREAMS.contains(&fd) {
+        return Err(ExecutionError::invalid(format!(
+            "{LIFELINE_FD_ARG} {fd} is a standard stream, not a lifeline"
+        )));
+    }
+    if workspace_share_fd == Some(fd) {
+        return Err(ExecutionError::invalid(format!(
+            "{LIFELINE_FD_ARG} {fd} is also the {WORKSPACE_SHARE_FD_ARG} descriptor"
+        )));
+    }
+    Ok(fd)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerEvent {
@@ -621,11 +646,7 @@ impl WorkerOptions {
             devices,
             tsi_hijack_inet,
             workspace_share_fd,
-            lifeline_fd: lifeline_fd.ok_or_else(|| {
-                ExecutionError::invalid(format!(
-                    "missing {LIFELINE_FD_ARG} option: a worker starts only under a supervisor's lifeline"
-                ))
-            })?,
+            lifeline_fd: checked_lifeline_fd(lifeline_fd, workspace_share_fd)?,
         })
     }
 }
@@ -1426,7 +1447,7 @@ mod tests {
             }
         );
 
-        // Descriptor 0 is a number like any other.
+        // Descriptor 0 is a number like any other for the share.
         let options = WorkerOptions::parse(arguments(&[
             "--cas-root",
             "/cas",
@@ -1435,11 +1456,11 @@ mod tests {
             WORKSPACE_SHARE_FD_ARG,
             "0",
             LIFELINE_FD_ARG,
-            "0",
+            "3",
         ]))
         .unwrap();
         assert_eq!(options.workspace_share_fd, Some(0));
-        assert_eq!(options.lifeline_fd, 0);
+        assert_eq!(options.lifeline_fd, 3);
         assert!(!options.tsi_hijack_inet);
     }
 
@@ -1530,12 +1551,29 @@ mod tests {
         let error = WorkerOptions::parse(arguments(&base[..4])).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidSpec);
         assert!(error.detail.contains(LIFELINE_FD_ARG), "{error}");
-        for bad in ["-1", "three", "+3", ""] {
+        // A standard stream is not a lifeline: the worker's are its request,
+        // its guest's console and its events.
+        for bad in ["-1", "three", "+3", "", "0", "1", "2"] {
             let mut values = base[..4].to_vec();
             values.extend_from_slice(&[LIFELINE_FD_ARG, bad]);
             let error = WorkerOptions::parse(arguments(&values)).unwrap_err();
             assert_eq!(error.code, ErrorCode::InvalidSpec, "{bad:?}");
             assert!(error.detail.contains(LIFELINE_FD_ARG), "{bad:?}: {error}");
+        }
+        // Nor is the workspace share's descriptor, in either order.
+        for values in [
+            &[WORKSPACE_SHARE_FD_ARG, "5", LIFELINE_FD_ARG, "5"][..],
+            &[LIFELINE_FD_ARG, "5", WORKSPACE_SHARE_FD_ARG, "5"][..],
+        ] {
+            let mut all = base[..4].to_vec();
+            all.extend_from_slice(values);
+            let error = WorkerOptions::parse(arguments(&all)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidSpec, "{values:?}");
+            assert!(
+                error.detail.contains(LIFELINE_FD_ARG)
+                    && error.detail.contains(WORKSPACE_SHARE_FD_ARG),
+                "{values:?}: {error}"
+            );
         }
     }
 }

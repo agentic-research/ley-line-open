@@ -156,6 +156,7 @@ impl ShutdownSignals {
                 Some(fd) => {
                     let (ended, receiver) = tokio::sync::watch::channel(false);
                     leyline_runtime::lifeline::watch(fd, move || {
+                        LIFELINE_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = ended.send(true);
                     })
                     .with_context(|| format!("--lifeline-fd {fd} cannot be a lifeline"))?;
@@ -215,6 +216,18 @@ impl ShutdownSignals {
             }
         }
     }
+}
+
+/// Set once a lifeline [`ShutdownSignals::install_with_lifeline`] watches has
+/// ended: its launcher is gone, and so, possibly, the only reader of this
+/// process's standard output and error.
+static LIFELINE_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a watched lifeline has ended in this process (bead
+/// `ley-line-open-f6b525`): what tells `leyline daemon` to finish its
+/// output relay onto `/dev/null` rather than hand back a pipe with no reader.
+pub fn lifeline_ended() -> bool {
+    LIFELINE_ENDED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Wait for Ctrl+C, SIGTERM or an optional timeout, whichever comes first.
@@ -314,11 +327,13 @@ mod tests {
         .await
         .expect("a 10ms timeout must end the wait");
         assert_eq!(which, Shutdown::Timeout, "a held lifeline ends nothing");
+        assert!(!lifeline_ended());
         drop(lifeline);
         let which = tokio::time::timeout(Duration::from_secs(5), signals.wait(None))
             .await
             .expect("the end of the lifeline must end the wait");
         assert_eq!(which, Shutdown::LifelineEnded);
+        assert!(lifeline_ended(), "the end is recorded for the output relay");
     }
 
     /// A lifeline that is not a readable pipe or socket is refused by name,

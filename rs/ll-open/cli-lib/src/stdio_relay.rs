@@ -105,15 +105,18 @@ fn relay(
 }
 
 impl StdioRelay {
-    /// Hand each descriptor back and flush what its relay holds: the
-    /// original when it still has a reader, `/dev/null` when it does not, so
-    /// no later write can fail either. Waits for each relay to forward what
-    /// was written before, at most `bound` (a child that inherited the
-    /// relay's pipe keeps it open past that).
-    pub fn finish(self, bound: Duration) {
+    /// Hand each descriptor back and flush what its relay holds, so no
+    /// later write can fail either: `/dev/null` when `launcher_gone` (the
+    /// launcher's lifeline ended, and it may have been the original's only
+    /// reader, even if nothing was written through the relay since it died)
+    /// or when a forward already failed; the original otherwise. Waits for
+    /// each relay to forward what was written before, at most `bound` (a
+    /// child that inherited the relay's pipe keeps it open past that).
+    pub fn finish(self, bound: Duration, launcher_gone: bool) {
         let null = std::fs::OpenOptions::new().write(true).open("/dev/null");
         for stream in &self.streams {
-            let target = match (&null, stream.dead.load(Ordering::SeqCst)) {
+            let reader_gone = launcher_gone || stream.dead.load(Ordering::SeqCst);
+            let target = match (&null, reader_gone) {
                 (Ok(null), true) => null.as_raw_fd(),
                 _ => stream.original.as_raw_fd(),
             };
@@ -156,7 +159,7 @@ mod tests {
         for _ in 0..1000 {
             write(fd, b"no reader, and no EPIPE\n").expect("a relayed write never fails");
         }
-        relay.finish(BOUND);
+        relay.finish(BOUND, false);
         // SAFETY: an out-parameter of the size fstat writes.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
@@ -178,13 +181,29 @@ mod tests {
         let fd = writer.into_raw_fd();
         let relay = install(&[fd]).unwrap();
         write(fd, b"before\n").unwrap();
-        relay.finish(BOUND);
+        relay.finish(BOUND, false);
         write(fd, b"after\n").unwrap();
         // SAFETY: the test's own descriptor; closing it ends the pipe.
         unsafe { libc::close(fd) };
         let mut all = String::new();
         reader.read_to_string(&mut all).unwrap();
         assert_eq!(all, "before\nafter\n");
+    }
+
+    /// A reader that died without a write through the relay leaves it
+    /// unaware: finish must not hand back the dead original after the
+    /// launcher's lifeline ended, or a teardown write fails with EPIPE.
+    #[test]
+    fn after_the_lifeline_ends_finish_never_hands_back_a_reader_less_pipe() {
+        let (reader, writer) = io::pipe().unwrap();
+        let fd = writer.into_raw_fd();
+        let relay = install(&[fd]).unwrap();
+        // The launcher's reader dies, and nothing is written meanwhile.
+        drop(reader);
+        relay.finish(BOUND, true);
+        write(fd, b"teardown\n").expect("a teardown write after the launcher died");
+        // SAFETY: the test's own descriptor.
+        unsafe { libc::close(fd) };
     }
 
     #[test]

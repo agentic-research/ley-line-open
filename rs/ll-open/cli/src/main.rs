@@ -762,7 +762,13 @@ async fn main() -> Result<()> {
             )
             .await;
             if let Some(relay) = relay {
-                relay.finish(std::time::Duration::from_secs(2));
+                // After a lifeline end, never hand back a descriptor whose
+                // only reader may have died with the launcher, written to
+                // since or not.
+                relay.finish(
+                    std::time::Duration::from_secs(2),
+                    leyline_cli_lib::lifecycle::lifeline_ended(),
+                );
             }
             ran
         }

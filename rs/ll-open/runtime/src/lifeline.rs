@@ -36,16 +36,14 @@ pub struct ReadEnd {
     fd: OwnedFd,
 }
 
-/// A new lifeline: both ends close-on-exec.
+/// A new lifeline: both ends close-on-exec. On Linux the pipe is created
+/// close-on-exec (`pipe2(O_CLOEXEC)`); on macOS, which has no `pipe2`, the
+/// flag is set just after, the window `ley-line-open-528525` closes.
 pub fn pair() -> io::Result<(Lifeline, ReadEnd)> {
-    let mut fds = [0; 2];
-    // SAFETY: a valid two-element out array.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: pipe(2) just returned these two descriptors, owned here.
-    let (read_end, write_end) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (read_end, write_end) = io::pipe()?;
+    let (read_end, write_end) = (OwnedFd::from(read_end), OwnedFd::from(write_end));
+    // Already set by the standard library on every platform; checked here
+    // because the guarantee above rests on it.
     set_cloexec(read_end.as_raw_fd(), true)?;
     set_cloexec(write_end.as_raw_fd(), true)?;
     Ok((
@@ -54,6 +52,20 @@ pub fn pair() -> io::Result<(Lifeline, ReadEnd)> {
         },
         ReadEnd { fd: read_end },
     ))
+}
+
+/// The descriptor number a `--lifeline-fd` argument names: decimal digits
+/// only, within `RawFd`. Anything else is refused by name, never read as "no
+/// lifeline".
+pub fn parse_fd(value: &str) -> Result<RawFd, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "--lifeline-fd {value:?} is not a file descriptor number"
+        ));
+    }
+    value
+        .parse()
+        .map_err(|_| format!("--lifeline-fd {value:?} is not a file descriptor number"))
 }
 
 impl ReadEnd {
@@ -186,7 +198,10 @@ mod tests {
         // SAFETY: fcntl on the descriptor the watcher now owns.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
-        assert!(ended.try_recv().is_err(), "ended while the lifeline is held");
+        assert!(
+            ended.try_recv().is_err(),
+            "ended while the lifeline is held"
+        );
         drop(lifeline);
         ended.recv().expect("the watcher saw the lifeline end");
     }
@@ -231,6 +246,51 @@ mod tests {
                 "same number: {same_number}"
             );
             drop(lifeline);
+        }
+    }
+
+    /// A watched read end is not handed on: a process the child spawns after
+    /// [`watch`] does not hold it, so the child's own children cannot keep
+    /// its supervisor's lifeline open or read it.
+    #[test]
+    fn a_process_spawned_after_watch_does_not_inherit_the_lifeline() {
+        let (lifeline, read_end) = pair().unwrap();
+        let fd = read_end.raw_fd();
+        // As the child holds it after exec: the read end without close-on-exec.
+        set_cloexec(fd, false).unwrap();
+        std::mem::forget(read_end);
+        watch(fd, || {}).unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("[ -e /dev/fd/{fd} ] && echo held || echo absent"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "absent");
+        drop(lifeline);
+    }
+
+    /// The write end never crosses an exec: a child given the read end does
+    /// not hold the write end, so its exit is not what keeps it alive.
+    #[test]
+    fn a_child_given_the_read_end_does_not_hold_the_write_end() {
+        let (lifeline, read_end) = pair().unwrap();
+        let write_fd = lifeline._write_end.as_raw_fd();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!(
+            "[ -e /dev/fd/{write_fd} ] && echo held || echo absent"
+        ));
+        read_end.pass_at(&mut command, read_end.raw_fd());
+        let output = command.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "absent");
+    }
+
+    #[test]
+    fn a_lifeline_argument_is_a_descriptor_number_or_refused_by_name() {
+        assert_eq!(parse_fd("3"), Ok(3));
+        assert_eq!(parse_fd("0"), Ok(0));
+        for bad in ["", "-1", "three", "3 ", "+3", "99999999999"] {
+            let error = parse_fd(bad).unwrap_err();
+            assert!(error.contains("--lifeline-fd"), "{bad:?}: {error}");
         }
     }
 

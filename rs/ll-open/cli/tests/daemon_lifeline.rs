@@ -7,13 +7,14 @@
 //! the read end; the launcher's death closes the write end, and the daemon
 //! runs the same graceful shutdown SIGTERM runs.
 //!
-//! The launcher here is this test binary run again as [`launcher`]: it
-//! starts the real `leyline` binary as its own child, as mache does, and
-//! waits to be killed. The daemon's standard error is a named pipe this test
-//! reads, so the daemon outlives its launcher without writing into a closed
-//! pipe, and end-of-file on it is the daemon closing its last descriptor.
-//! Every wait ends on an event (a line, an exit); [`GUARD`] only bounds a
-//! failure.
+//! The launcher in the first test is this test binary run again as
+//! [`launcher`]: it starts the real `leyline` binary as its own child, as
+//! mache does, and waits to be killed. In the second, the launcher holds the
+//! only reader of the daemon's standard error, as mache does, so the daemon
+//! writes into a pipe with no reader once it is killed. Both are judged from
+//! state (exit, socket, the published arena), not from log lines: once its
+//! lifeline ends the daemon points any piped output at `/dev/null`. Every
+//! wait ends on an event (a line, an exit); [`GUARD`] only bounds a failure.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -71,6 +72,8 @@ fn launcher() {
     let (lifeline, read_end) = leyline_runtime::lifeline::pair().expect("a lifeline");
     let mut command = daemon(&home, &work);
     command
+        .arg("--source")
+        .arg(work.join("src"))
         .arg("--lifeline-fd")
         .arg(read_end.raw_fd().to_string())
         .stderr(stderr);
@@ -109,6 +112,8 @@ fn a_sigkilled_launcher_makes_its_daemon_shut_down_cleanly() {
     let home = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(home.path().join(".mache")).unwrap();
     let work = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(work.path().join("src")).unwrap();
+    std::fs::write(work.path().join("src/a.go"), "package a\n").unwrap();
     let stderr_pipe = work.path().join("daemon.stderr");
     let status = Command::new("/usr/bin/mkfifo")
         .arg(&stderr_pipe)
@@ -178,29 +183,54 @@ fn a_sigkilled_launcher_makes_its_daemon_shut_down_cleanly() {
     }
     let socket = work.path().join("lifeline.sock");
     assert!(socket.exists(), "the ready daemon's socket");
+    if let Err(reply) = propose_b(&socket) {
+        // SAFETY: signals to processes this test started.
+        unsafe {
+            libc::kill(daemon_pid, libc::SIGKILL);
+            libc::kill(launcher_pid, libc::SIGKILL);
+        }
+        panic!("the write was refused: {reply}");
+    }
 
     // SAFETY: a signal to the child this test spawned.
     assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGKILL) }, 0);
     launcher.wait().expect("reap the launcher");
 
-    // EVENT 2: the daemon's stderr ends, and the daemon exits.
-    while let Ok(line) = log.recv_timeout(GUARD) {
-        seen.push(line);
-    }
+    // EVENT 2: the daemon's stderr ends (it points its pipes at /dev/null
+    // once the lifeline ends, since a launcher's pipe may have no reader
+    // left), and the daemon exits.
+    while log.recv_timeout(GUARD).is_ok() {}
     if let Err(error) = common::await_exit(daemon_pid, GUARD) {
         // SAFETY: a signal to the leftover daemon, so a failure leaves none.
         unsafe { libc::kill(daemon_pid, libc::SIGKILL) };
         panic!("the daemon outlived its launcher: {error}");
     }
-    let log = seen.join("\n");
-    assert!(
-        log.contains("the launcher's lifeline ended, shutting down"),
-        "{log}"
-    );
-    // The graceful path: the final publish, then the socket removed.
-    assert!(log.contains("final snapshot saved to arena"), "{log}");
-    assert!(!log.contains("panicked"), "{log}");
+    // The graceful path, from state: the final publish holds the write, and
+    // the socket is removed.
     assert!(!socket.exists(), "the daemon left its socket behind");
+    assert!(
+        published_tree(work.path()).contains(&"b.go".to_owned()),
+        "the arena does not hold the write made before the kill: no final publish"
+    );
+}
+
+/// Create `b.go` through the daemon at `socket`: `Err` holds the reply of a
+/// refused write.
+fn propose_b(socket: &Path) -> Result<(), String> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).expect("connect");
+    stream
+        .write_all(
+            b"{\"op\":\"propose\",\"writes\":[{\"path\":\"b.go\",\"base\":\"absent\",\
+              \"kind\":\"create\",\"content\":\"package b\\n\"}]}\n",
+        )
+        .unwrap();
+    let mut reply = String::new();
+    BufReader::new(&stream).read_line(&mut reply).unwrap();
+    if reply.contains("\"ok\":true") {
+        Ok(())
+    } else {
+        Err(reply)
+    }
 }
 
 /// A lifeline that is not a readable pipe or socket refuses startup by
@@ -229,4 +259,146 @@ fn an_unusable_or_malformed_lifeline_refuses_startup() {
             "{fd}: a refused daemon bound its socket"
         );
     }
+}
+
+/// The launcher held the only reader of the daemon's standard error, as mache
+/// does (`cmd.Stderr` is a pipe it reads). Once the launcher is killed, a
+/// write to that stderr fails with EPIPE, and Rust's `eprintln!` panics on a
+/// failed write: the daemon must still run its whole graceful shutdown.
+///
+/// Asserted from state, not from log lines (the log has no reader): the
+/// daemon exits successfully, its socket is gone, and the root its
+/// controller publishes is the root of its live database as it stands after
+/// a write made just before the kill, so the final publish ran.
+///
+/// The daemon is this test's child, so its exit status is observable; the
+/// launcher's two roles (only writer of the lifeline, only reader of the
+/// daemon's stderr) are held by a shell that this test kills.
+#[test]
+fn a_dead_launchers_closed_stderr_does_not_cost_the_final_publish() {
+    let _serial = common::serial();
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join(".mache")).unwrap();
+    let work = tempfile::TempDir::new().unwrap();
+    let source = work.path().join("src");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("a.go"), "package a\n").unwrap();
+
+    let (lifeline_read, lifeline_write) = std::io::pipe().unwrap();
+    let (stderr_read, stderr_write) = std::io::pipe().unwrap();
+    // The launcher: reads the daemon's stderr and says when it is ready; its
+    // own stderr is the lifeline's only write end, which it never writes.
+    let mut launcher = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "while IFS= read -r line; do case \"$line\" in \
+             *'daemon ready'*) echo READY;; esac; done",
+        )
+        .stdin(Stdio::from(stderr_read))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(lifeline_write))
+        .spawn()
+        .expect("spawn the launcher");
+    let launcher_pid = launcher.id() as libc::pid_t;
+    let mut daemon = daemon(home.path(), work.path())
+        .arg("--source")
+        .arg(&source)
+        .args(["--lifeline-fd", "0"])
+        .stdin(Stdio::from(lifeline_read))
+        .stderr(Stdio::from(stderr_write))
+        .spawn()
+        .expect("spawn the daemon");
+    let daemon_pid = daemon.id() as libc::pid_t;
+    let kill_both = || {
+        // SAFETY: signals to the children this test spawned.
+        unsafe {
+            libc::kill(daemon_pid, libc::SIGKILL);
+            libc::kill(launcher_pid, libc::SIGKILL);
+        }
+    };
+
+    // EVENT 1: the daemon is up.
+    let ready = {
+        let stdout = launcher.stdout.take().expect("launcher stdout");
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        rx.recv_timeout(GUARD)
+    };
+    if !matches!(&ready, Ok(line) if line.trim() == "READY") {
+        kill_both();
+        panic!("TIMEOUT: the daemon never became ready: {ready:?}");
+    }
+    let socket = work.path().join("lifeline.sock");
+
+    // A write, made just before the launcher dies.
+    if let Err(reply) = propose_b(&socket) {
+        kill_both();
+        panic!("the write was refused: {reply}");
+    }
+
+    // SAFETY: a signal to the child this test spawned.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGKILL) }, 0);
+    launcher.wait().expect("reap the launcher");
+
+    // EVENT 2: the daemon exits, and exits well.
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(daemon.wait());
+    });
+    let status = match rx.recv_timeout(GUARD) {
+        Ok(status) => status.expect("wait for the daemon"),
+        Err(_) => {
+            kill_both();
+            panic!("TIMEOUT: the daemon outlived its launcher by {GUARD:?}");
+        }
+    };
+    assert!(status.success(), "the daemon's shutdown failed: {status}");
+    assert!(!socket.exists(), "the daemon left its socket behind");
+
+    // The final publish: the image the controller names holds the write.
+    assert!(
+        published_tree(work.path()).contains(&"b.go".to_owned()),
+        "the arena does not hold the write made before the kill: no final publish"
+    );
+}
+
+/// The `_tree` paths of the image the daemon last published: the arena the
+/// controller names, its active buffer, `data_size` bytes of it, checked
+/// against the controller's root, and read as a SQLite database.
+fn published_tree(work: &Path) -> Vec<String> {
+    let controller = leyline_core::Controller::open_or_create(&work.join("lifeline.ctrl"))
+        .expect("the daemon's controller");
+    let arena = std::fs::read(controller.arena_path()).expect("the published arena");
+    let header = arena_header(&arena);
+    let offset = header
+        .active_buffer_offset(arena.len() as u64)
+        .expect("a valid arena header") as usize;
+    let image = &arena[offset..offset + header.data_size as usize];
+    assert_eq!(
+        leyline_cli_lib::cmd_daemon::image_root(image),
+        controller.current_root(),
+        "the controller's root names the arena's active image"
+    );
+    let mut db = rusqlite::Connection::open_in_memory().unwrap();
+    db.deserialize_read_exact("main", std::io::Cursor::new(image), image.len(), true)
+        .expect("the published image is a database");
+    let mut statement = db.prepare("SELECT path FROM _tree ORDER BY path").unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The arena header at the start of `arena`, copied out of the bytes.
+fn arena_header(arena: &[u8]) -> leyline_core::ArenaHeader {
+    let size = std::mem::size_of::<leyline_core::ArenaHeader>();
+    assert!(arena.len() >= size, "a truncated arena");
+    // SAFETY: ArenaHeader is a plain-old-data repr(C) struct, the length is
+    // checked above, and an unaligned read copies it out.
+    unsafe { std::ptr::read_unaligned(arena.as_ptr() as *const leyline_core::ArenaHeader) }
 }

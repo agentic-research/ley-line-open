@@ -156,6 +156,12 @@ impl ShutdownSignals {
                 Some(fd) => {
                     let (ended, receiver) = tokio::sync::watch::channel(false);
                     leyline_runtime::lifeline::watch(fd, move || {
+                        // Before anything else logs: the launcher is gone,
+                        // and a pipe it read our output through now fails
+                        // every write with EPIPE, on which `eprintln!`
+                        // panics, ending the daemon before its final
+                        // publish (bead `ley-line-open-f6b525`).
+                        silence_streams_the_launcher_read();
                         let _ = ended.send(true);
                     })
                     .with_context(|| format!("--lifeline-fd {fd} cannot be a lifeline"))?;
@@ -212,6 +218,34 @@ impl ShutdownSignals {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => Shutdown::Interrupt,
                 _ = timer => Shutdown::Timeout,
+            }
+        }
+    }
+}
+
+/// Point standard output and error at `/dev/null` where each is a pipe or a
+/// socket: what a launcher reads a child's output through, and which, once
+/// that launcher is dead, has no reader left, so every write to it fails
+/// with EPIPE (Rust ignores SIGPIPE) and `eprintln!` panics. A file or a
+/// terminal is left as it is: it outlives the launcher. Best effort, each
+/// step reported nowhere, because there is nowhere left to report it.
+#[cfg(unix)]
+fn silence_streams_the_launcher_read() {
+    use std::os::fd::AsRawFd;
+    let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") else {
+        return;
+    };
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: an out-parameter of the size fstat writes, on a fixed
+        // descriptor number; dup2 onto it replaces it atomically.
+        unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut stat) != 0 {
+                continue;
+            }
+            let kind = stat.st_mode & libc::S_IFMT;
+            if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
+                libc::dup2(null.as_raw_fd(), fd);
             }
         }
     }

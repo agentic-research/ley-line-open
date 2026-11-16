@@ -8,5 +8,7 @@ Section: Added
   publish, socket cleanup). It works on macOS, which has no parent-death signal.
   A descriptor that is not open for reading, or is not a pipe or socket, and a
   value that is not a descriptor number, refuse startup by name. Without the
-  flag nothing changes. Embedders set `DaemonOptions::lifeline_fd`. ADR-0049
+  flag nothing changes. Once the lifeline ends, piped standard output and
+  error go to `/dev/null`, so a launcher that read them (mache) cannot turn
+  the shutdown into a panic on EPIPE before the final publish. Embedders set `DaemonOptions::lifeline_fd`. ADR-0049
   lists the flag as a launch action (CLI-only), not a configuration key.

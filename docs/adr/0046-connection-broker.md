@@ -1092,7 +1092,10 @@ be proven.
 - **Every daemon spawn moves to `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` (S7).**
   `std::process::Command` cannot set that flag, so the existing spawn paths in
   `native_backend.rs` and `libkrun/backend.rs` (`configure_process_group`) change too, not
-  only the broker's. This is the widest part of the slice.
+  only the broker's. This is the widest part of the slice. Shipped as `backends::spawn`
+  (bead `ley-line-open-528525`): `posix_spawn` with that flag on macOS; on Linux, where
+  `pipe2` closes the window, `Command` with a `pre_exec` hook that marks every unnamed
+  descriptor close-on-exec (`close_range`), whose fork-to-exec hold the module documents.
 - **No libkrun patch.** Patch 0010's dial channel already joins guest loopback to the host
   path through vsock; the broker is the listener at that path.
 - Cloister: emit the document, the digest and the marker; check the capability; read

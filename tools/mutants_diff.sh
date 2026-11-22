@@ -636,15 +636,20 @@ if [ "$SCOPE" = all ] || [ "$SCOPE" = runtime ]; then
     # unchanged and read as a phantom MISSED — and mutated where it does.
     # `broker/sys_macos.rs` and `broker/sys_other.rs` (bead
     # ley-line-open-52b5b3) are the same kind of pair: the connection broker's
-    # ACL and peer-credential queries, one file per platform.
+    # ACL and peer-credential queries, one file per platform. So are
+    # `backends/spawn/macos.rs` (`posix_spawn`) and `backends/spawn/linux.rs`
+    # (`Command` + `pre_exec`) (bead ley-line-open-528525): on Linux the macOS
+    # file's mutants built unchanged and read as six phantom MISSED.
     if [ "$(uname -s)" = Linux ]; then
         run_slice integration --package leyline-runtime --test-workspace=false \
             --exclude 'll-open/runtime/src/backends/cgroup_fs_other.rs' \
-            --exclude 'll-open/runtime/src/broker/sys_macos.rs'
+            --exclude 'll-open/runtime/src/broker/sys_macos.rs' \
+            --exclude 'll-open/runtime/src/backends/spawn/macos.rs'
     else
         run_slice integration --package leyline-runtime --test-workspace=false \
             --exclude 'll-open/runtime/src/backends/cgroup_fs_linux.rs' \
-            --exclude 'll-open/runtime/src/broker/sys_other.rs'
+            --exclude 'll-open/runtime/src/broker/sys_other.rs' \
+            --exclude 'll-open/runtime/src/backends/spawn/linux.rs'
     fi
   fi
   # The worker crate (bead ley-line-open-395e43) is the runtime's libkrun half:

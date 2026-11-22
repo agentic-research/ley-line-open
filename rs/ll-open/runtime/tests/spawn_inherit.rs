@@ -11,7 +11,7 @@
 //! no child, is absent in every child.
 
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Barrier};
 
 use leyline_runtime::backends::spawn::{ChildIo, Spawn, Spawned};
@@ -212,7 +212,7 @@ fn concurrent_spawns_each_inherit_only_their_own_write_end() {
                 spawn
                     .stdin(ChildIo::Piped)
                     .stdout(ChildIo::Piped)
-                    .inherit(writer.as_raw_fd(), CHILD_FD)
+                    .inherit(writer.as_fd(), CHILD_FD)
                     .process_group();
                 let child = spawn.spawn().expect("spawn");
                 (child, reader, writer)
@@ -261,11 +261,67 @@ fn concurrent_spawns_each_inherit_only_their_own_write_end() {
     }
 }
 
+/// The krun worker's shape: a descriptor that is close-on-exec here,
+/// inherited at its own number (`posix_spawn_file_actions_addinherit_np` on
+/// macOS, the flag cleared in the child on Linux). The child holds it, at
+/// that number, after its exec.
 #[test]
-fn an_inherited_descriptor_on_a_standard_stream_or_named_twice_is_refused() {
-    for inherit in [&[(5, 1)][..], &[(5, 4), (6, 4)]] {
-        let mut spawn = Spawn::new("/bin/true");
-        for &(from, to) in inherit {
+fn a_close_on_exec_descriptor_inherited_at_its_own_number_reaches_the_child() {
+    let _serial = common::serial();
+    let (_reader, writer) = std::io::pipe().unwrap();
+    let writer = OwnedFd::from(writer);
+    // SAFETY: F_GETFD on a live descriptor.
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFD) };
+    assert_ne!(
+        flags & libc::FD_CLOEXEC,
+        0,
+        "the pipe is close-on-exec here"
+    );
+    let mut spawn = Spawn::new("/bin/cat");
+    spawn
+        .stdin(ChildIo::Piped)
+        .stdout(ChildIo::Piped)
+        .inherit(writer.as_fd(), writer.as_raw_fd());
+    let mut child = spawn.spawn().expect("spawn");
+    await_exec(&mut child);
+    let me = std::process::id();
+    let id = pipe_id(me, writer.as_raw_fd());
+    let mut held = holders(&id, &[me, child.id()]);
+    held.sort();
+    let mut expected = vec![(me, writer.as_raw_fd()), (child.id(), writer.as_raw_fd())];
+    expected.sort();
+    assert_eq!(held, expected, "write end {id}");
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+}
+
+/// Each refusal happens before anything is spawned and names what is
+/// wrong: an inherited descriptor placed on a standard stream's number or
+/// named twice, a source that is a standard stream (the child's new one by
+/// then), a source that is another entry's target (applied in order, the
+/// moves could hand over that entry's descriptor instead), and a program
+/// that is no absolute path
+/// (it would be looked up on `PATH` or in the working directory).
+#[test]
+fn a_spawn_that_would_not_hand_over_what_it_names_is_refused_by_name() {
+    let (a, b) = std::io::pipe().unwrap();
+    let (a, b) = (OwnedFd::from(a), OwnedFd::from(b));
+    let (fa, fb) = (a.as_raw_fd(), b.as_raw_fd());
+    let (stdin, stderr) = (std::io::stdin(), std::io::stderr());
+    let cases: Vec<(Vec<(std::os::fd::BorrowedFd<'_>, RawFd)>, &str)> = vec![
+        (vec![(a.as_fd(), 0)], "standard stream"),
+        (vec![(a.as_fd(), 2)], "standard stream"),
+        (vec![(a.as_fd(), 40), (b.as_fd(), 40)], "named twice"),
+        (vec![(stdin.as_fd(), 40)], "standard stream"),
+        (vec![(stderr.as_fd(), 40)], "standard stream"),
+        // fa -> fb runs first and overwrites fb, so fb -> 41 would hand the
+        // child fa's pipe end as 41.
+        (vec![(a.as_fd(), fb), (b.as_fd(), 41)], "another entry"),
+        (vec![(b.as_fd(), 41), (a.as_fd(), fb)], "another entry"),
+    ];
+    for (inherit, reason) in cases {
+        let mut spawn = Spawn::new("/bin/cat");
+        for &(from, to) in &inherit {
             spawn.inherit(from, to);
         }
         let error = spawn.spawn().expect_err("refused");
@@ -274,5 +330,21 @@ fn an_inherited_descriptor_on_a_standard_stream_or_named_twice_is_refused() {
             std::io::ErrorKind::InvalidInput,
             "{inherit:?}"
         );
+        assert!(
+            error.to_string().contains(reason),
+            "{inherit:?}: {error} (expected {reason:?}; descriptors {fa}, {fb})"
+        );
     }
+    for program in ["true", "bin/true", "./true"] {
+        let error = Spawn::new(program).spawn().expect_err("refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{program}");
+        assert!(
+            error.to_string().contains("absolute path") && error.to_string().contains(program),
+            "{program}: {error}"
+        );
+    }
+    // The same descriptor at its own number, and moved, is accepted.
+    let mut spawn = Spawn::new("/bin/cat");
+    spawn.inherit(a.as_fd(), fa).inherit(b.as_fd(), 40);
+    assert!(spawn.spawn().unwrap().wait().unwrap().success());
 }

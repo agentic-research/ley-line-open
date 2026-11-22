@@ -404,8 +404,9 @@ impl Backend for NativeWorkerBackend {
         // Place the worker before it has its request. It reads the request
         // before it materializes the rootfs, applies nono, or spawns the
         // workload, so nothing the run executes starts outside the cgroup,
-        // and every process it spawns inherits it. A write to cgroup.procs
-        // here, not a hook in the child, keeps the spawn a `posix_spawn`.
+        // and every process it spawns inherits it. Placement is a write to
+        // cgroup.procs from here, not a hook in the child: `backends::spawn`
+        // runs no code of its callers between fork and exec.
         if let Some(run_cgroup) = &run_cgroup
             && let Err(error) = run_cgroup.place(child.id())
         {

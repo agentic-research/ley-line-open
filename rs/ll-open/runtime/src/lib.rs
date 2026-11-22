@@ -17,6 +17,8 @@ mod error;
 pub mod lifeline;
 mod model;
 mod service;
+#[cfg(test)]
+mod test_support;
 pub mod transport;
 mod workspaces;
 

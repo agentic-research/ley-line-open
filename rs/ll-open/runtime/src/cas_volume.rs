@@ -66,7 +66,6 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -389,15 +388,16 @@ impl Hdiutil {
             command: rendered(),
             detail,
         };
-        use std::os::unix::process::CommandExt;
+        use crate::backends::spawn::{ChildIo, Spawn};
         // In its own process group, so a timeout kills whatever it started
-        // too, not only the tool itself.
-        let mut child = Command::new(&self.program)
+        // too, not only the tool itself. Through `spawn`, like every child
+        // the daemon starts, so the tool holds no other run's lifeline write
+        // end (bead ley-line-open-528525).
+        let mut child = Spawn::new(&self.program)
             .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
+            .stdout(ChildIo::Piped)
+            .stderr(ChildIo::Piped)
+            .process_group()
             .spawn()
             .map_err(|error| tool_error(error.to_string()))?;
         let group = child.id() as libc::pid_t;
@@ -1513,36 +1513,8 @@ mod tests {
     /// A shell script standing in for hdiutil.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let program = dir.join(name);
-        write_executable(&program, &format!("#!/bin/sh\n{body}\n"));
+        crate::test_support::write_executable(&program, &format!("#!/bin/sh\n{body}\n"));
         program
-    }
-
-    /// Write `contents` to `path`, mode 0755, without this process ever
-    /// holding the file open for writing. `execve` fails with `ETXTBSY`
-    /// while any process holds the file open for writing, and libtest runs
-    /// these tests beside others that spawn: a child forked by another
-    /// thread while this one wrote with `fs::write` would hold a copy of
-    /// the write descriptor until its own exec (bead
-    /// `ley-line-open-cdfaf4`, where the integration binaries take a lock
-    /// instead). Here a `/bin/sh` child writes the file and exits before
-    /// anything runs it, and nothing forked from this process can hold that
-    /// child's descriptor.
-    fn write_executable(path: &Path, contents: &str) {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let mut writer = Command::new("/bin/sh")
-            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        writer
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(contents.as_bytes())
-            .unwrap();
-        assert!(writer.wait().unwrap().success(), "write {}", path.display());
     }
 
     /// Bead ley-line-open-167b29 (1): a hung hdiutil fails provisioning by
@@ -1619,7 +1591,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let base = state.path().join("cas-volume");
         fs::create_dir_all(&base).unwrap();
-        let mut exited = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut exited = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         let dead = exited.id();
         exited.wait().unwrap();
         let live = std::os::unix::process::parent_id();
@@ -2207,7 +2179,7 @@ mod tests {
         let log = scratch.path().join("args");
         let tool = |exit: u8| {
             let program = scratch.path().join(format!("hdiutil-{exit}"));
-            write_executable(
+            crate::test_support::write_executable(
                 &program,
                 &format!(
                     "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\necho refused >&2\nexit {exit}\n",

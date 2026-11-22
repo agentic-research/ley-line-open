@@ -705,8 +705,9 @@ Per run, the backend creates `<root>/<run cgroup>`, writes the requested ceiling
 moves the worker into it **before** writing the request to the worker's stdin. The worker
 reads that request before it materializes the rootfs, applies nono or spawns the
 workload, so nothing the run executes is outside the cgroup. Placement is a write to
-`cgroup.procs` from the supervisor, not a `pre_exec` hook, so the worker keeps the
-`posix_spawn` path `configure_process_group` documents. Teardown writes `cgroup.kill`,
+`cgroup.procs` from the supervisor, not a `pre_exec` hook: the worker is started through
+`backends::spawn` (bead `ley-line-open-528525`), which runs no caller code between fork and
+exec. Teardown writes `cgroup.kill`,
 waits for `cgroup.events` to report `populated 0`, and removes the directory.
 
 The kernel's migration rule applies: the daemon must be able to write `cgroup.procs` in

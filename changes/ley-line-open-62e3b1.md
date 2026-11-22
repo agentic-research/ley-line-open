@@ -6,7 +6,7 @@ Section: Breaking
   standard input is its lifeline (`--lifeline-fd 0`): `NativeWorkerBackend`
   keeps its write end until the worker is reaped, and when the embedding
   process ends, `SIGKILL` included, the worker kills its workload and its
-  process group and exits. Spawning still takes the `posix_spawn` path. The
+  process group and exits. The
   worker refuses, by name, a missing or malformed lifeline, standard output
   or error as one, and a descriptor that is not a readable pipe or socket.
   The workload's standard input is `/dev/null` when the worker's is the

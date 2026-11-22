@@ -1,5 +1,6 @@
-//! The one way the daemon starts a child: workers and the connection broker
-//! (ADR-0046 Slice 1 S7; bead `ley-line-open-528525`).
+//! The one way the daemon starts a child: workers, the connection broker and
+//! the tools it runs (`codesign`, `hdiutil`) (ADR-0046 Slice 1 S7; bead
+//! `ley-line-open-528525`).
 //!
 //! A child inherits exactly what [`Spawn`] names: its three standard streams
 //! and the descriptors in its inherit list, each at the number given. Nothing
@@ -10,32 +11,48 @@
 //! otherwise inherit, say, another run's lifeline write end and keep that
 //! run's worker or broker alive after its supervisor died.
 //!
-//! - **macOS:** `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so no
-//!   descriptor is inherited unless a file action names it: `dup2` for the
-//!   standard streams and for a descriptor moved to another number,
+//! The program is run by its absolute path, never looked up on `PATH` or in
+//! the working directory, and the inherit list is checked before anything is
+//! spawned (each refusal names what is wrong): no target on a standard
+//! stream's number or named twice, no source that is a standard stream (the
+//! child's new one by then), and no source that is another entry's target,
+//! since the moves are applied in order.
+//!
+//! - **macOS** (`spawn/macos.rs`): `posix_spawn` with
+//!   `POSIX_SPAWN_CLOEXEC_DEFAULT`, so no descriptor is inherited unless a
+//!   file action names it: `dup2` for the standard streams and for a
+//!   descriptor moved to another number,
 //!   `posix_spawn_file_actions_addinherit_np` for one kept at its own number.
 //!   The kernel builds the child from the file actions; the child never runs
 //!   holding anything else.
-//! - **Linux:** every pipe and socket the standard library makes is created
-//!   close-on-exec atomically (`pipe2`, `SOCK_CLOEXEC`), so there is no
-//!   moment in which a descriptor exists without the flag. The child marks
-//!   close-on-exec, before exec, every descriptor this process held when it
-//!   listed them just before the spawn, except the ones named: the same
-//!   effect for a descriptor some other code opened without the flag. One
-//!   opened without the flag by another thread after that listing and before
-//!   the fork is not covered.
+//! - **Linux** (`spawn/linux.rs`): every pipe and socket the standard library
+//!   makes is created close-on-exec atomically (`pipe2`, `SOCK_CLOEXEC`), so
+//!   there is no moment in which such a descriptor exists without the flag.
+//!   Before exec the child marks every descriptor from 3 up close-on-exec
+//!   with `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, then clears the flag on,
+//!   or `dup2`s, exactly the named ones: the same effect as macOS for a
+//!   descriptor some other code opened without the flag. Where the kernel
+//!   refuses `close_range` (before 5.11, or under a seccomp filter that does
+//!   not know it) the child marks instead the descriptors this process held
+//!   when it listed `/proc/self/fd` just before the spawn; one opened
+//!   without the flag by another thread after that listing and before the
+//!   fork is then not covered.
 //!
 //! **The Linux fork-to-exec hold.** A Linux spawn forks (the standard
 //! library's `pre_exec` path). From the fork until its exec, the child is a
 //! copy of this process and holds every descriptor this process held at the
 //! fork, other runs' lifeline write ends among them. Those copies are
 //! close-on-exec and close at the child's exec (or its exit, if the exec
-//! fails), and [`Spawn::spawn`] returns only after that: the standard
-//! library blocks on a close-on-exec socket until the child execs. So the
-//! hold is transient and bounded by the sibling's exec, but it is real: a
-//! supervisor that dies inside it is seen by its own child only once the
-//! sibling has exec'd. After every exec, a child holds exactly what it was
-//! named, as on macOS.
+//! fails). [`Spawn::spawn`] returns only after that (the standard library
+//! blocks on a close-on-exec socket until the child execs), except in one
+//! case: an entry moved to a number free in this process can land on that
+//! socket's number in the child and replace it, and the spawn then returns
+//! at that `dup2` instead, reporting a failed exec as the child's abnormal
+//! exit rather than as an error. The hold is transient and ends at the
+//! exec, but it is real: a write end closed (or a supervisor that died)
+//! while children forked before that are still between fork and exec is
+//! seen at its far end only once the last of them has exec'd. After every
+//! exec, a child holds exactly what it was named, as on macOS.
 //!
 //! Both keep the process-group setup (`POSIX_SPAWN_SETPGROUP` /
 //! `Command::process_group`), reset `SIGPIPE` to its default in the child,
@@ -44,9 +61,18 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Output};
+
+#[cfg(not(target_os = "macos"))]
+mod linux;
+#[cfg(not(target_os = "macos"))]
+use linux as platform;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as platform;
 
 /// What a child's standard stream is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,20 +86,23 @@ pub enum ChildIo {
 }
 
 /// A child to start: program, arguments, standard streams, the descriptors
-/// it inherits and whether it leads a process group of its own.
+/// it inherits and whether it leads a process group of its own. Each
+/// inherited descriptor is borrowed for `'fd`, so it stays open until the
+/// spawn is done with it.
 #[derive(Debug, Clone)]
-pub struct Spawn {
+pub struct Spawn<'fd> {
     program: PathBuf,
     args: Vec<OsString>,
     stdio: [ChildIo; 3],
-    inherit: Vec<(RawFd, RawFd)>,
+    inherit: Vec<(BorrowedFd<'fd>, RawFd)>,
     process_group: bool,
 }
 
-impl Spawn {
-    /// `program`, by path (never searched for on `PATH`), with no arguments,
-    /// its standard streams at `/dev/null`, inheriting nothing and in this
-    /// process's group.
+impl<'fd> Spawn<'fd> {
+    /// `program`, which must be an absolute path (it is never looked up on
+    /// `PATH` or in the working directory; [`Self::spawn`] refuses another),
+    /// with no arguments, its standard streams at `/dev/null`, inheriting
+    /// nothing and in this process's group.
     pub fn new(program: impl AsRef<Path>) -> Self {
         Self {
             program: program.as_ref().to_path_buf(),
@@ -86,6 +115,13 @@ impl Spawn {
 
     pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
         self.args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    pub fn args<I: IntoIterator<Item = A>, A: AsRef<OsStr>>(&mut self, args: I) -> &mut Self {
+        for arg in args {
+            self.arg(arg);
+        }
         self
     }
 
@@ -105,9 +141,8 @@ impl Spawn {
     }
 
     /// Hand the child this process's descriptor `fd` as its descriptor
-    /// `child_fd` (the same number or another above 2). `fd` must stay open
-    /// until [`Self::spawn`] returns.
-    pub fn inherit(&mut self, fd: RawFd, child_fd: RawFd) -> &mut Self {
+    /// `child_fd`: the same number, or another above the standard streams.
+    pub fn inherit(&mut self, fd: BorrowedFd<'fd>, child_fd: RawFd) -> &mut Self {
         self.inherit.push((fd, child_fd));
         self
     }
@@ -119,26 +154,91 @@ impl Spawn {
         self
     }
 
-    /// Start the child. Refused before anything is spawned when an inherited
-    /// descriptor is a standard stream's number or named twice.
+    /// Start the child. Refused, by name and before anything is spawned,
+    /// when the program is no absolute path or the inherit list would not
+    /// hand over exactly what it names (see the module documentation).
     pub fn spawn(&self) -> io::Result<Spawned> {
-        let mut targets: Vec<RawFd> = self.inherit.iter().map(|&(_, to)| to).collect();
-        targets.sort_unstable();
-        let unique = {
-            let mut seen = targets.clone();
-            seen.dedup();
-            seen.len()
+        self.refusal().map_or(Ok(()), |reason| {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, reason))
+        })?;
+        platform::spawn(self)
+    }
+
+    /// Start the child with its standard output and error piped, collect
+    /// both and wait for it, as `std::process::Command::output` does.
+    pub fn output(&self) -> io::Result<Output> {
+        use std::io::Read;
+        let mut spawn = self.clone();
+        spawn.stdout(ChildIo::Piped).stderr(ChildIo::Piped);
+        let mut child = spawn.spawn()?;
+        // On its own thread, so neither stream blocks the child while the
+        // other is read.
+        let stderr = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes).map(|_| bytes)
+            })
+        });
+        let mut stdout = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .map_or(Ok(0), |mut pipe| pipe.read_to_end(&mut stdout));
+        let stderr = match stderr {
+            Some(reader) => reader
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("stderr reader panicked"))),
+            None => Ok(Vec::new()),
         };
-        if targets.iter().any(|&to| to <= 2) || unique != targets.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "a child inherits each descriptor once, above its standard streams: {:?}",
-                    self.inherit
-                ),
+        let status = child.wait()?;
+        read?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr: stderr?,
+        })
+    }
+
+    /// Why this spawn would not run exactly `program` holding exactly what
+    /// it names, or `None`.
+    fn refusal(&self) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        if !self.program.is_absolute() {
+            return Some(format!(
+                "program {} is not an absolute path: a spawn never looks one up on PATH or in \
+                 the working directory",
+                self.program.display()
             ));
         }
-        platform::spawn(self)
+        for (index, &(from, to)) in self.inherit.iter().enumerate() {
+            let from = from.as_raw_fd();
+            if to <= 2 {
+                return Some(format!(
+                    "descriptor {from} cannot be inherited as {to}, a standard stream's number"
+                ));
+            }
+            if from <= 2 {
+                return Some(format!(
+                    "descriptor {from} cannot be inherited: it is a standard stream, which the \
+                     child's own replaces first"
+                ));
+            }
+            for (other, &(_, other_to)) in self.inherit.iter().enumerate() {
+                if other == index {
+                    continue;
+                }
+                if other_to == to {
+                    return Some(format!("child descriptor {to} is named twice"));
+                }
+                if other_to == from {
+                    return Some(format!(
+                        "descriptor {from} cannot be inherited as {to}: another entry places a \
+                         descriptor at {from}, and the moves are applied in order"
+                    ));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -211,257 +311,6 @@ fn waitpid(pid: u32, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
             0 => return Ok(None),
             _ => return Ok(Some(ExitStatus::from_raw(status))),
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod platform {
-    use super::{ChildIo, Spawn, Spawned};
-    use std::ffi::CString;
-    use std::fs::File;
-    use std::io;
-    use std::os::fd::{AsRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    // SAFETY: the declaration matches `<spawn.h>` on macOS 10.7+:
-    // `int posix_spawn_file_actions_addinherit_np(posix_spawn_file_actions_t
-    // *, int)`. It is called only with an initialized `Actions` and a
-    // descriptor number, and its return value is checked.
-    unsafe extern "C" {
-        /// Keep `fd` open, at its own number, in a child spawned with
-        /// `POSIX_SPAWN_CLOEXEC_DEFAULT` (`<spawn.h>`, macOS 10.7+; not in
-        /// the `libc` crate).
-        fn posix_spawn_file_actions_addinherit_np(
-            actions: *mut libc::posix_spawn_file_actions_t,
-            fd: libc::c_int,
-        ) -> libc::c_int;
-    }
-
-    /// A `posix_spawn*` return value: 0 or the error number.
-    fn check(rc: libc::c_int) -> io::Result<()> {
-        match rc {
-            0 => Ok(()),
-            errno => Err(io::Error::from_raw_os_error(errno)),
-        }
-    }
-
-    struct Actions(libc::posix_spawn_file_actions_t);
-    impl Drop for Actions {
-        fn drop(&mut self) {
-            // SAFETY: initialized in `spawn`, destroyed once.
-            unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
-        }
-    }
-
-    struct Attributes(libc::posix_spawnattr_t);
-    impl Drop for Attributes {
-        fn drop(&mut self) {
-            // SAFETY: initialized in `spawn`, destroyed once.
-            unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
-        }
-    }
-
-    pub(super) fn spawn(request: &Spawn) -> io::Result<Spawned> {
-        let program = CString::new(request.program.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "program holds NUL"))?;
-        let mut argv_owned = vec![program.clone()];
-        for arg in &request.args {
-            argv_owned.push(CString::new(arg.as_bytes()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "an argument holds NUL")
-            })?);
-        }
-        let mut argv: Vec<*mut libc::c_char> = argv_owned
-            .iter()
-            .map(|arg| arg.as_ptr() as *mut _)
-            .collect();
-        argv.push(std::ptr::null_mut());
-
-        // SAFETY: zeroed storage the init calls overwrite; each is destroyed
-        // by its guard.
-        let mut actions = Actions(unsafe { std::mem::zeroed() });
-        check(unsafe { libc::posix_spawn_file_actions_init(&mut actions.0) })?;
-        let mut attributes = Attributes(unsafe { std::mem::zeroed() });
-        check(unsafe { libc::posix_spawnattr_init(&mut attributes.0) })?;
-
-        // The standard streams: the parent's ends are kept, the child's are
-        // moved onto 0, 1, 2 (a dup2 action makes its target inherited).
-        let mut parent_ends: [Option<File>; 3] = [None, None, None];
-        let mut child_ends: Vec<OwnedFd> = Vec::new();
-        let null = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")?;
-        for (number, io) in request.stdio.iter().enumerate() {
-            let number = number as libc::c_int;
-            let source = match io {
-                ChildIo::Null => null.as_raw_fd(),
-                ChildIo::Inherit => number,
-                ChildIo::Piped => {
-                    let (reader, writer) = io::pipe()?;
-                    let (parent, child): (OwnedFd, OwnedFd) = if number == 0 {
-                        (writer.into(), reader.into())
-                    } else {
-                        (reader.into(), writer.into())
-                    };
-                    parent_ends[number as usize] = Some(File::from(parent));
-                    let raw = child.as_raw_fd();
-                    child_ends.push(child);
-                    raw
-                }
-            };
-            // SAFETY: valid actions and descriptor numbers.
-            check(unsafe {
-                if source == number {
-                    posix_spawn_file_actions_addinherit_np(&mut actions.0, number)
-                } else {
-                    libc::posix_spawn_file_actions_adddup2(&mut actions.0, source, number)
-                }
-            })?;
-        }
-        for &(from, to) in &request.inherit {
-            // SAFETY: valid actions and descriptor numbers.
-            check(unsafe {
-                if from == to {
-                    posix_spawn_file_actions_addinherit_np(&mut actions.0, to)
-                } else {
-                    libc::posix_spawn_file_actions_adddup2(&mut actions.0, from, to)
-                }
-            })?;
-        }
-
-        let mut flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT
-            | libc::POSIX_SPAWN_SETSIGDEF
-            | libc::POSIX_SPAWN_SETSIGMASK;
-        if request.process_group {
-            flags |= libc::POSIX_SPAWN_SETPGROUP;
-            // SAFETY: valid attributes; 0 means "the child's own pid".
-            check(unsafe { libc::posix_spawnattr_setpgroup(&mut attributes.0, 0) })?;
-        }
-        // SAFETY: sigset_t storage the calls initialize.
-        unsafe {
-            let mut default: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut default);
-            libc::sigaddset(&mut default, libc::SIGPIPE);
-            check(libc::posix_spawnattr_setsigdefault(
-                &mut attributes.0,
-                &default,
-            ))?;
-            let mut empty: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut empty);
-            check(libc::posix_spawnattr_setsigmask(&mut attributes.0, &empty))?;
-            check(libc::posix_spawnattr_setflags(
-                &mut attributes.0,
-                flags as libc::c_short,
-            ))?;
-        }
-
-        let mut pid: libc::pid_t = 0;
-        // SAFETY: argv is NUL-terminated and outlives the call; the
-        // environment is this process's, as `Command` passes it by default.
-        check(unsafe {
-            libc::posix_spawn(
-                &mut pid,
-                program.as_ptr(),
-                &actions.0,
-                &attributes.0,
-                argv.as_ptr(),
-                *libc::_NSGetEnviron(),
-            )
-        })?;
-        drop(child_ends);
-        let [stdin, stdout, stderr] = parent_ends;
-        Ok(Spawned {
-            pid: pid as u32,
-            stdin,
-            stdout,
-            stderr,
-            status: None,
-        })
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-mod platform {
-    use super::{ChildIo, Spawn, Spawned};
-    use std::fs::File;
-    use std::io;
-    use std::os::fd::OwnedFd;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    fn stdio(io: ChildIo) -> Stdio {
-        match io {
-            ChildIo::Null => Stdio::null(),
-            ChildIo::Piped => Stdio::piped(),
-            ChildIo::Inherit => Stdio::inherit(),
-        }
-    }
-
-    /// Every descriptor open in this process above the standard streams.
-    fn held() -> io::Result<Vec<i32>> {
-        Ok(std::fs::read_dir("/proc/self/fd")?
-            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|fd: &i32| *fd > 2)
-            .collect())
-    }
-
-    pub(super) fn spawn(request: &Spawn) -> io::Result<Spawned> {
-        let mut command = Command::new(&request.program);
-        command
-            .args(&request.args)
-            .stdin(stdio(request.stdio[0]))
-            .stdout(stdio(request.stdio[1]))
-            .stderr(stdio(request.stdio[2]));
-        if request.process_group {
-            command.process_group(0);
-        }
-        let held = held()?;
-        let inherit = request.inherit.clone();
-        // SAFETY: the closure runs in the forked child before exec and makes
-        // only fcntl and dup2 calls, which are async-signal-safe.
-        unsafe {
-            command.pre_exec(move || {
-                for &fd in &held {
-                    if !inherit.iter().any(|&(_, to)| to == fd) {
-                        let flags = libc::fcntl(fd, libc::F_GETFD);
-                        if flags >= 0 {
-                            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-                        }
-                    }
-                }
-                for &(from, to) in &inherit {
-                    if from == to {
-                        let flags = libc::fcntl(to, libc::F_GETFD);
-                        if flags < 0
-                            || libc::fcntl(to, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                        {
-                            return Err(io::Error::last_os_error());
-                        }
-                    } else if libc::dup2(from, to) != to {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn()?;
-        let spawned = Spawned {
-            pid: child.id(),
-            stdin: child.stdin.take().map(|end| File::from(OwnedFd::from(end))),
-            stdout: child
-                .stdout
-                .take()
-                .map(|end| File::from(OwnedFd::from(end))),
-            stderr: child
-                .stderr
-                .take()
-                .map(|end| File::from(OwnedFd::from(end))),
-            status: None,
-        };
-        // Reaped through `Spawned`; dropping a `Child` neither waits nor
-        // signals.
-        drop(child);
-        Ok(spawned)
     }
 }
 
@@ -582,5 +431,119 @@ mod tests {
         let mut child = spawn.spawn().unwrap();
         drop(child.stdout.take());
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGPIPE));
+    }
+
+    /// `output` collects both streams and the status, as
+    /// `Command::output` does, with the standard input at `/dev/null`.
+    #[test]
+    fn output_collects_both_streams_and_the_status() {
+        let mut spawn = Spawn::new("/bin/sh");
+        spawn.args([
+            "-c",
+            "if read x; then echo read; else echo eof; fi; echo err >&2; exit 4",
+        ]);
+        let output = spawn.output().unwrap();
+        assert_eq!(output.stdout, b"eof\n");
+        assert_eq!(output.stderr, b"err\n");
+        assert_eq!(output.status.code(), Some(4));
+        assert!(Spawn::new("/nonexistent/program").output().is_err());
+    }
+
+    /// The listing the Linux fallback marks: every descriptor open here
+    /// above the standard streams, and none of those.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_listing_holds_every_descriptor_above_the_standard_streams() {
+        use std::os::fd::AsRawFd;
+        let stray = unnamed_descriptor();
+        let held = linux::held().unwrap();
+        assert!(held.contains(&stray.as_raw_fd()), "{held:?}");
+        for standard in 0..=2 {
+            assert!(!held.contains(&standard), "{held:?}");
+        }
+    }
+
+    /// A descriptor held here without close-on-exec, at a number nothing
+    /// names, far above the standard streams.
+    #[cfg(not(target_os = "macos"))]
+    fn unnamed_descriptor() -> std::os::fd::OwnedFd {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let null = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: F_DUPFD duplicates a live descriptor, leaving
+        // close-on-exec clear; the result is owned below.
+        let raw = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 64) };
+        assert!(raw >= 64);
+        // SAFETY: a fresh descriptor nothing else owns.
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
+    }
+
+    /// Whether a child spawned with this sweep holds `fd` after its exec,
+    /// while a descriptor it is named at its own number still reaches it.
+    #[cfg(not(target_os = "macos"))]
+    fn child_holds(fd: RawFd, try_close_range: bool, listing: Vec<RawFd>) -> bool {
+        use std::io::Read;
+        use std::os::fd::{AsFd, AsRawFd};
+        let (_reader, named) = std::io::pipe().unwrap();
+        // Without close-on-exec, so naming it must leave it that way.
+        // SAFETY: fcntl on a live descriptor this test owns.
+        unsafe { libc::fcntl(named.as_raw_fd(), libc::F_SETFD, 0) };
+        let mut spawn = Spawn::new("/bin/sh");
+        spawn
+            .arg("-c")
+            .arg(format!(
+                "[ -e /proc/self/fd/{} ] || exit 9; [ -e /proc/self/fd/{fd} ] && echo held || echo absent",
+                named.as_raw_fd()
+            ))
+            .stdout(ChildIo::Piped)
+            .inherit(named.as_fd(), named.as_raw_fd());
+        let mut child = linux::spawn_with(&spawn, try_close_range, listing).unwrap();
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "the named descriptor reached the child"
+        );
+        match out.as_str() {
+            "held\n" => true,
+            "absent\n" => false,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Linux: `close_range` keeps from the child a descriptor the listing
+    /// missed (one opened after it); without `close_range`, the listing
+    /// keeps one it holds; with neither, the descriptor crosses the exec,
+    /// which is the gap the module documentation names. Needs Linux 5.11+
+    /// and no seccomp filter refusing `close_range`.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn close_range_and_the_listing_each_keep_an_unnamed_descriptor_from_the_child() {
+        use std::os::fd::AsRawFd;
+        let stray = unnamed_descriptor();
+        let fd = stray.as_raw_fd();
+        assert!(
+            !child_holds(fd, true, Vec::new()),
+            "close_range (Linux 5.11+) marks what no listing named"
+        );
+        assert!(
+            !child_holds(fd, false, vec![fd]),
+            "the listing marks what it names"
+        );
+        assert!(
+            child_holds(fd, false, Vec::new()),
+            "nothing marked it: it crosses"
+        );
+        // One already close-on-exec stays so when the listing names it.
+        let (_reader, cloexec) = std::io::pipe().unwrap();
+        let cloexec = cloexec.as_raw_fd();
+        assert!(
+            !child_holds(cloexec, false, vec![cloexec]),
+            "kept close-on-exec"
+        );
     }
 }

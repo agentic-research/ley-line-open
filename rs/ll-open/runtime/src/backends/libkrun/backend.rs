@@ -1,7 +1,7 @@
 use crate::backends::spawn::{ChildIo, Spawn};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
@@ -539,8 +539,22 @@ impl Backend for KrunWorkerBackend {
         // This process keeps the lifeline's only write end for as long as it
         // supervises the worker: when it ends, for any reason, the worker
         // ends too (bead ley-line-open-f963e6).
+        // The declared descriptors are the share's worker end, the one
+        // descriptor a worker is ever declared to hold beyond its standard
+        // streams; it is borrowed from `share`, which outlives the spawn.
+        let worker_end = share.as_ref().map(|(_, _, worker_end)| worker_end.as_fd());
         for descriptor in &declared {
-            command.inherit(descriptor.descriptor, descriptor.descriptor);
+            let Some(fd) = worker_end.filter(|fd| fd.as_raw_fd() == descriptor.descriptor) else {
+                return Err(finish_failed_start(
+                    rootfs,
+                    LABELS,
+                    ExecutionError::backend(format!(
+                        "declared descriptor {} is not the workspace share's",
+                        descriptor.descriptor
+                    )),
+                ));
+            };
+            command.inherit(fd, descriptor.descriptor);
         }
         let (lifeline, lifeline_read_end) = match crate::lifeline::pair() {
             Ok(lifeline) => lifeline,
@@ -555,7 +569,7 @@ impl Backend for KrunWorkerBackend {
         command
             .arg(super::worker::LIFELINE_FD_ARG)
             .arg(lifeline_read_end.raw_fd().to_string())
-            .inherit(lifeline_read_end.raw_fd(), lifeline_read_end.raw_fd());
+            .inherit(lifeline_read_end.as_fd(), lifeline_read_end.raw_fd());
 
         // Registered before the worker exists, so from its spawn until the
         // run is published a cancel reaches it through `event_tx`: there is
@@ -1009,7 +1023,6 @@ mod tests {
         crate::workspaces::Opened,
     ) {
         use crate::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
-        use std::os::unix::fs::PermissionsExt;
 
         struct Share;
         impl FsService for Share {
@@ -1030,9 +1043,9 @@ mod tests {
 
         let fixture = tempfile::tempdir().expect("fixture");
         let worker = fixture.path().join("worker");
-        std::fs::write(
+        crate::test_support::write_executable(
             &worker,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 fd=
 prev=
@@ -1045,9 +1058,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
 {after_ready}
 "#
             ),
-        )
-        .expect("worker script");
-        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        );
         let (cas_root, ephemeral_root) = (fixture.path().join("cas"), fixture.path().join("runs"));
         std::fs::create_dir(&cas_root).expect("cas");
         std::fs::create_dir(&ephemeral_root).expect("runs");

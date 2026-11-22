@@ -15,7 +15,7 @@
 //! tested on every platform (the mutation gate runs on Linux).
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
 /// The entitlement Hypervisor.framework requires of a VMM process.
 pub const HYPERVISOR_ENTITLEMENT: &str = "com.apple.security.hypervisor";
@@ -32,10 +32,13 @@ pub fn hypervisor_entitlement(os: &str, worker: &Path) -> Result<(), String> {
     if os != "macos" {
         return Ok(());
     }
-    let inspection = Command::new(CODESIGN)
+    // Through `spawn`, like every child the daemon starts: `codesign` runs
+    // on every krun start, and a `std::process::Command` here could take a
+    // copy of another run's lifeline write end in the moment between
+    // `pipe(2)` and `FD_CLOEXEC` (bead ley-line-open-528525).
+    let inspection = crate::backends::spawn::Spawn::new(CODESIGN)
         .args(["-d", "--entitlements", "-", "--xml"])
         .arg(worker)
-        .stdin(Stdio::null())
         .output();
     verdict(worker, inspection)
 }

@@ -25,6 +25,7 @@
 
 use crate::backends::spawn::{ChildIo, Spawn, Spawned};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::mpsc;
@@ -455,7 +456,7 @@ impl BrokerProcess {
             .stdin(ChildIo::Piped)
             .stdout(ChildIo::Piped)
             .stderr(ChildIo::Inherit)
-            .inherit(read_end.raw_fd(), LIFELINE_FD);
+            .inherit(read_end.as_fd(), LIFELINE_FD);
         match peer {
             PeerPid::Any => {}
             PeerPid::Awaiting => {

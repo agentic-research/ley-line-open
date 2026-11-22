@@ -13,6 +13,11 @@ on:
   # already proved. The runner runs once per promotion to main.
   pull_request:
     branches: [main]
+  # The local receipt covers the developer's platform only (its contract
+  # hashes `uname`). A change with platform-specific code asks the runner for
+  # Linux evidence on its branch before landing:
+  # `gh workflow run ci.yml --ref <branch>`.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

@@ -765,10 +765,7 @@ async fn main() -> Result<()> {
                 // After a lifeline end, never hand back a descriptor whose
                 // only reader may have died with the launcher, written to
                 // since or not.
-                relay.finish(
-                    std::time::Duration::from_secs(2),
-                    leyline_cli_lib::lifecycle::lifeline_ended(),
-                );
+                relay.finish_after_daemon(std::time::Duration::from_secs(2));
             }
             ran
         }

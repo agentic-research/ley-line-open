@@ -230,6 +230,17 @@ pub fn lifeline_ended() -> bool {
     LIFELINE_ENDED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Tests that read or set [`LIFELINE_ENDED`] hold this, so the process-wide
+/// flag one test sets is never what another test observes.
+#[cfg(test)]
+pub(crate) static LIFELINE_FLAG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Set [`LIFELINE_ENDED`] from a test holding [`LIFELINE_FLAG_TESTS`].
+#[cfg(test)]
+pub(crate) fn set_lifeline_ended_for_test(ended: bool) {
+    LIFELINE_ENDED.store(ended, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Wait for Ctrl+C, SIGTERM or an optional timeout, whichever comes first.
 pub async fn wait_for_shutdown(timeout: Option<&str>) -> Result<()> {
     let timeout_dur = match timeout {
@@ -314,6 +325,8 @@ mod tests {
     #[tokio::test]
     async fn the_end_of_a_launchers_lifeline_ends_the_wait() {
         let _serial = SIGNAL_TESTS.lock().await;
+        let _flag = LIFELINE_FLAG_TESTS.lock().await;
+        set_lifeline_ended_for_test(false);
         let (lifeline, read_end) = leyline_runtime::lifeline::pair().unwrap();
         let fd = read_end.raw_fd();
         // Handed over, as the daemon is handed an inherited number.
@@ -334,6 +347,7 @@ mod tests {
             .expect("the end of the lifeline must end the wait");
         assert_eq!(which, Shutdown::LifelineEnded);
         assert!(lifeline_ended(), "the end is recorded for the output relay");
+        set_lifeline_ended_for_test(false);
     }
 
     /// A lifeline that is not a readable pipe or socket is refused by name,

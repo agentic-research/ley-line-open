@@ -88,4 +88,67 @@ test "$(integration_tip)" = "$(git -C "$fixture" rev-parse HEAD)"
 # Landing again is a no-op, not an error.
 (cd "$fixture" && tools/land_integration.sh) | grep -q "nothing to land"
 
-echo "land:integration fixture proved the dirty-tree, integration-not-in-head and no-receipt refusals and a receipt-gated fast-forward"
+# A git shim on PATH acts between land's checks and its push, the way another
+# writer in the same worktree or on the same remote could.
+real_git=$(command -v git)
+mkdir -p "$tmp_dir/shim"
+cat > "$tmp_dir/shim/git" <<'SHIM'
+#!/bin/sh
+case "$1" in
+fetch)
+    if [ -n "${SHIM_WRITE_FILE:-}" ]; then
+        printf '%s\n' "$SHIM_WRITE_TEXT" > "$SHIM_WRITE_FILE"
+    fi
+    ;;
+push)
+    if [ -n "${SHIM_ADVANCE_FROM:-}" ]; then
+        "$SHIM_REAL_GIT" -C "$SHIM_ADVANCE_FROM" push -q origin integration
+    fi
+    ;;
+esac
+exec "$SHIM_REAL_GIT" "$@"
+SHIM
+chmod +x "$tmp_dir/shim/git"
+
+# The remote moves between land's ancestry check and its push: the push is a
+# fast-forward only, so it fails and the other landing survives. A forced
+# push would overwrite it.
+printf '%s\n' "next feature" > "$fixture/tracked.txt"
+git -C "$fixture" commit -qam "next feature"
+attest
+git -C "$other" pull -q --no-rebase origin integration
+printf '%s\n' "landed during the push" > "$other/race.txt"
+git -C "$other" add race.txt
+git -C "$other" -c user.name=o -c user.email=o@example.test commit -q -m "landed concurrently"
+concurrent=$(git -C "$other" rev-parse HEAD)
+if (cd "$fixture" && PATH="$tmp_dir/shim:$PATH" SHIM_REAL_GIT="$real_git" \
+    SHIM_ADVANCE_FROM="$other" tools/land_integration.sh) > /dev/null 2>&1; then
+    echo "land succeeded over a concurrent landing" >&2
+    exit 1
+fi
+test "$(integration_tip)" = "$concurrent"
+
+# The receipt binds to the tree of the commit pushed, not to the worktree.
+# task ci passed on uncommitted bytes ("fixed") while HEAD holds others
+# ("broken"); the file is restored, so the tree is clean when land starts, and
+# a writer puts "fixed" back while land fetches. A working-tree check would
+# now match the receipt and push "broken".
+git -C "$fixture" fetch -q origin integration
+git -C "$fixture" merge -q --no-edit FETCH_HEAD
+printf '%s\n' "broken" > "$fixture/tracked.txt"
+git -C "$fixture" commit -qam "broken"
+printf '%s\n' "fixed" > "$fixture/tracked.txt"
+attest
+git -C "$fixture" restore tracked.txt
+before=$(integration_tip)
+if (cd "$fixture" && PATH="$tmp_dir/shim:$PATH" SHIM_REAL_GIT="$real_git" \
+    SHIM_WRITE_FILE="$fixture/tracked.txt" SHIM_WRITE_TEXT="fixed" \
+    tools/land_integration.sh) 2> "$tmp_dir/err" > /dev/null; then
+    echo "land pushed a commit whose tree no receipt names" >&2
+    exit 1
+fi
+grep -q "land: refused (no-receipt)" "$tmp_dir/err"
+test "$(integration_tip)" = "$before"
+git -C "$fixture" restore tracked.txt
+
+echo "land:integration fixture proved the dirty-tree, integration-not-in-head and no-receipt refusals, a receipt-gated fast-forward, a non-forced push that loses to a concurrent landing, and a receipt bound to the pushed commit's tree"

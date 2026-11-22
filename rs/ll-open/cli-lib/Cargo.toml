@@ -121,12 +121,14 @@ tempfile = { workspace = true }
 # without a matching gitignore entry.
 ignore = "0.4"
 # ADR-0045 T5: the three-way merge a proposal against a moved base gets —
-# gitoxide's builtin text driver, in process. Exact pins: 0.17.0 is the
-# gix-merge release built on the same gix-* set as the gix 0.84 jj-lib
-# already brings (gix-diff 0.64, gix-object 0.61, gix-hash 0.25), so no
-# second copy of gitoxide lands. MIT OR Apache-2.0, as is gix-imara-diff,
-# which computes the conflict ranges with gix-merge's own overlap rule.
-gix-merge = { version = "=0.17.0", default-features = false, features = ["sha1"] }
+# gix-merge 0.17.0's builtin text driver, vendored in
+# rs/third_party/gix-merge-text (MIT OR Apache-2.0). gix-merge itself is not
+# a dependency: 0.17's gix-* set reaches heapless 0.8 (RUSTSEC-2026-0574..0582)
+# and 0.24, the release clear of it, merges adjacent edits as a conflict,
+# which would change the conflict ranges on the daemon wire (bead
+# ley-line-open-ed4736). gix-imara-diff (exact pin, the driver's own diff)
+# computes the conflict ranges with the driver's overlap rule.
+gix-merge-text = { path = "../../third_party/gix-merge-text" }
 imara-diff = { package = "gix-imara-diff", version = "=0.2.3" }
 
 # Unix-only: flock(2) for daemon arena admission control

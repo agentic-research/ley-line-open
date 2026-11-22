@@ -254,3 +254,56 @@ Change `TAG` and `SHA` in `tools/vendor_libkrun.sh`, rebase the patches onto
 the new tag (dropping any upstream merged), run `tools/vendor_libkrun.sh sync`,
 then `task runtime:test` with `LEYLINE_LIBKRUNFW_PATH` set, and record the move
 in `CHANGELOG.md` and this file.
+
+## gix-merge-text — the three-way merge driver of ADR-0045 T5
+
+`rs/third_party/gix-merge-text/` is the builtin text merge driver of
+`gix-merge` 0.17.0, vendored (bead `ley-line-open-ed4736`).
+`leyline-cli-lib` (`merge.rs`) runs it to merge a proposal whose base moved.
+
+| | |
+|---|---|
+| Upstream | https://github.com/GitoxideLabs/gitoxide, crate `gix-merge` 0.17.0 from crates.io |
+| crates.io checksum | `7543e1eceb25fbbd1a29459c794148d8bafc1c77555eb386617a2d99b5371971` |
+| License | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`, copied from the crate) |
+| LLO patches | none |
+
+### What the tree holds
+
+`src/blob/builtin_driver/text/` (`mod.rs`, `function.rs`, `utils.rs`) is the
+crate's directory of that name, byte for byte. `src/lib.rs` is LLO's: it
+declares the module path those files name (`crate::blob::builtin_driver::text`)
+and `blob::Resolution`, copied from upstream's `src/blob/mod.rs`.
+`Cargo.toml` is LLO's, with the two dependencies the driver uses: `bstr` and
+`gix-imara-diff`, pinned `=0.2.3`, the release `gix-merge` 0.17.0 was locked
+against in LLO.
+
+### Why vendored
+
+`gix-merge` 0.17 depends on `gix-hash` 0.25, which reaches `heapless` 0.8
+through `faster-hex` 0.10 (RUSTSEC-2026-0574 to 0582). `leyline-cli` ships it,
+so `deny.toml` does not allow an ignore. `gix-merge` 0.24, the first release
+on `gix-hash` 0.29 and `faster-hex` 2, rewrote this driver: it reports a
+conflict for one side changing a line while the other inserts right after
+it, a case 0.17 merges cleanly. The daemon wire carries the conflict ranges
+(`daemon.capnp` `LineRange`), so the driver stays 0.17's. The rest of
+`gix-merge` (tree merges, drivers, pipelines) is not used and is not here,
+so the shipped closure holds no gitoxide crate.
+
+### Verifying
+
+```sh
+cargo fetch   # with gix-merge = "=0.17.0" in any scratch manifest
+diff -r ~/.cargo/registry/src/*/gix-merge-0.17.0/src/blob/builtin_driver/text \
+        rs/third_party/gix-merge-text/src/blob/builtin_driver/text
+```
+
+`rs/Cargo.toml` excludes `third_party`, so workspace lints, `cargo fmt`,
+tests and mutation testing do not reach this crate. Its behaviour is pinned
+by the `merge.rs` tests in `leyline-cli-lib` and by the daemon-protocol
+fixture test (`daemon_protocol_gate_proposals_produce_the_fixture_shapes`).
+
+### Updating
+
+Replace the driver only together with a decision on the conflict ranges the
+wire carries: a newer driver changes which proposals merge.

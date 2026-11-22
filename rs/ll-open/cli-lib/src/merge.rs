@@ -1,8 +1,9 @@
 //! ADR-0045 T5 — the three-way merge a proposal against a moved base gets.
 //!
 //! `base` is the blob the writer read, `ours` the bytes it proposes,
-//! `theirs` what the path holds now. The merge is `gix-merge`'s builtin
-//! text driver (Myers over lines), run in process. A clean merge is the
+//! `theirs` what the path holds now. The merge is gix-merge 0.17.0's builtin
+//! text driver (Myers over lines), vendored in `rs/third_party/gix-merge-text`
+//! and run in process. A clean merge is the
 //! proposal's write; overlapping hunks are a conflict, reported as the base
 //! line ranges where the two sides overlap. Bytes that are not UTF-8 never
 //! merge.
@@ -28,7 +29,7 @@ pub enum Merged {
 
 /// Merge `ours` and `theirs`, both changed from `base`.
 pub fn merge(base: &[u8], ours: &[u8], theirs: &[u8]) -> Merged {
-    use gix_merge::blob::{Resolution, builtin_driver::text};
+    use gix_merge_text::blob::{Resolution, builtin_driver::text};
     if [base, ours, theirs]
         .iter()
         .any(|side| std::str::from_utf8(side).is_err())
@@ -37,7 +38,7 @@ pub fn merge(base: &[u8], ours: &[u8], theirs: &[u8]) -> Merged {
     }
     let mut out = Vec::new();
     let mut input = imara_diff::InternedInput::default();
-    let resolution = gix_merge::blob::builtin_driver::text(
+    let resolution = gix_merge_text::blob::builtin_driver::text(
         &mut out,
         &mut input,
         text::Labels::default(),
@@ -280,6 +281,22 @@ mod tests {
         assert_eq!(
             merge(BASE.as_bytes(), ours.as_bytes(), theirs.as_bytes()),
             Merged::Conflict(vec![LineRange { start: 6, end: 7 }])
+        );
+    }
+
+    /// One side changes a line and the other inserts right after it: the
+    /// hunks touch but do not overlap, so the merge is clean. gix-merge 0.24
+    /// reports this as a conflict, which is why the 0.17 driver is vendored
+    /// (bead ley-line-open-ed4736); the daemon wire's conflict ranges follow
+    /// this rule.
+    #[test]
+    fn an_insertion_after_a_line_the_other_side_changed_merges_cleanly() {
+        let base = "fn main() {}\n";
+        let theirs = "fn main() { let _ = 1; }\n";
+        let ours = "fn main() {}\n\nfn ours() {}\n";
+        assert_eq!(
+            merge(base.as_bytes(), ours.as_bytes(), theirs.as_bytes()),
+            Merged::Clean(b"fn main() { let _ = 1; }\n\nfn ours() {}\n".to_vec())
         );
     }
 

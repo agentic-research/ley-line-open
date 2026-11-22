@@ -185,7 +185,7 @@ no longer refused outright:
 
 | case | outcome |
 |---|---|
-| `Write` against a moved base, all three of base (`b`), ours (the proposal's bytes) and theirs (`c`) UTF-8, both entries non-symlink | three-way merge with `gix-merge`'s builtin text driver (`blob::builtin_driver::text`, Myers, line tokens), in process |
+| `Write` against a moved base, all three of base (`b`), ours (the proposal's bytes) and theirs (`c`) UTF-8, both entries non-symlink | three-way merge with `gix-merge` 0.17.0's builtin text driver (`blob::builtin_driver::text`, Myers, line tokens), vendored, in process |
 | — clean merge | the merged bytes land as the proposal's write for that path; `Accepted::merged` names it |
 | — overlapping hunks | refused `stale`; the path's `moved` entry carries `conflicts`: the base line ranges where the two sides overlap, 0-based and half-open (`[start, end)`; two insertions at one line are the empty range `[line, line)`), as `daemon.capnp` `LineRange` and `merge::LineRange` define them |
 | any of the three not UTF-8 ("binary"), or either side a symlink, or the base blob no longer stored | refused `stale` (no merge) |
@@ -210,11 +210,15 @@ deleting the first line and another deleting the second both propose `a\n`; the 
 and the merge lands `a\n`, not the empty file. The rule is stated over bytes: a clean merge is
 the result both sides' bytes determine, independent of arrival order.
 
-`gix-merge` is pinned `=0.17.0`, the release that shares its `gix-*` dependency set with the
-`gix 0.84` already in the build (MIT OR Apache-2.0). `gix-imara-diff` (`=0.2.3`, already in the
-build) computes the conflict ranges with `gix-merge`'s own overlap rule: a hunk of one side
-whose base range contains the start of the other side's hunk, or two insertions at one base
-line.
+The driver is `gix-merge` 0.17.0's `blob::builtin_driver::text` module, vendored byte for byte
+in `rs/third_party/gix-merge-text` (MIT OR Apache-2.0); `gix-merge` itself is not a dependency.
+The crate's 0.17 release reaches `heapless` 0.8 through `gix-hash` 0.25 and `faster-hex` 0.10
+(RUSTSEC-2026-0574 to 0582, in the shipped closure), and 0.24, the first release clear of it,
+rewrote the driver: it reports a conflict where 0.17 merges cleanly (one side changing a line,
+the other inserting right after it), which would move the conflict ranges this decision puts
+on the wire (bead `ley-line-open-ed4736`). `gix-imara-diff` (`=0.2.3`, the driver's own diff) computes the
+conflict ranges with the driver's overlap rule: a hunk of one side whose base range contains
+the start of the other side's hunk, or two insertions at one base line.
 
 ### T6 — The write-time `ESTALE` of `e650d7` is reversed: writes stage, flush decides
 

@@ -121,15 +121,15 @@ tempfile = { workspace = true }
 # without a matching gitignore entry.
 ignore = "0.4"
 # ADR-0045 T5: the three-way merge a proposal against a moved base gets —
-# gix-merge 0.17.0's builtin text driver, vendored in
-# rs/third_party/gix-merge-text (MIT OR Apache-2.0). gix-merge itself is not
-# a dependency: 0.17's gix-* set reaches heapless 0.8 (RUSTSEC-2026-0574..0582)
-# and 0.24, the release clear of it, merges adjacent edits as a conflict,
-# which would change the conflict ranges on the daemon wire (bead
-# ley-line-open-ed4736). gix-imara-diff (exact pin, the driver's own diff)
-# computes the conflict ranges with the driver's overlap rule.
-gix-merge-text = { path = "../../third_party/gix-merge-text" }
-imara-diff = { package = "gix-imara-diff", version = "=0.2.3" }
+# gitoxide's builtin text driver (gix-merge 0.24, Myers over lines), in
+# process. MIT OR Apache-2.0. 0.24 is on gix-hash 0.29 / faster-hex 2, clear
+# of heapless 0.8 (RUSTSEC-2026-0574..0582); it is its own gix-* set, apart
+# from the gix 0.90 leyline-vcs brings through jj-lib (bead
+# ley-line-open-ed4736). gix-imara-diff is the driver's own diff, at the
+# release the driver takes, so the conflict ranges are computed over the
+# hunks the driver merged.
+gix-merge = { version = "0.24", default-features = false, features = ["sha1"] }
+imara-diff = { package = "gix-imara-diff", version = "0.3.4" }
 
 # Unix-only: flock(2) for daemon arena admission control
 # (bead ley-line-open-0cba88). Kept as a direct dep so the fcntl call

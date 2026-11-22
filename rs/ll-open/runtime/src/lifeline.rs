@@ -14,11 +14,16 @@
 //! list). Every worker and broker the daemon starts goes through
 //! [`crate::backends::spawn`], which hands a child exactly what it names
 //! (`POSIX_SPAWN_CLOEXEC_DEFAULT` on macOS; bead `ley-line-open-528525`), so
-//! none of them can inherit another run's write end, even one created a
-//! moment before on another thread. A process started some other way (a
-//! `std::process::Command`, such as `codesign` checking the worker's
-//! entitlement) could still inherit one in the moment between `pipe(2)` and
-//! `FD_CLOEXEC` on macOS, until it exits.
+//! none of them holds another run's write end after its exec, even one
+//! created a moment before on another thread. On Linux a spawn forks, and
+//! from the fork to its exec the new child holds a copy of every descriptor
+//! this process held, another run's write end among them; that copy is
+//! close-on-exec, so it closes at the child's exec, and the spawn returns
+//! only after that exec. Another run's child therefore sees its supervisor's
+//! death late by at most one sibling's fork-to-exec. A process started some
+//! other way (a `std::process::Command`, such as `codesign` checking the
+//! worker's entitlement) could still inherit one in the moment between
+//! `pipe(2)` and `FD_CLOEXEC` on macOS, until it exits.
 //!
 //! Used by the connection broker (`--lifeline-fd`), the libkrun worker
 //! (`--lifeline-fd`) and the daemon a launcher starts (`ley-line-open-f6b525`).

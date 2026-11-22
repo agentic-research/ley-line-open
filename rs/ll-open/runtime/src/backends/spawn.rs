@@ -14,11 +14,28 @@
 //!   descriptor is inherited unless a file action names it: `dup2` for the
 //!   standard streams and for a descriptor moved to another number,
 //!   `posix_spawn_file_actions_addinherit_np` for one kept at its own number.
+//!   The kernel builds the child from the file actions; the child never runs
+//!   holding anything else.
 //! - **Linux:** every pipe and socket the standard library makes is created
-//!   close-on-exec atomically (`pipe2`, `SOCK_CLOEXEC`), so the window does
-//!   not exist; the child marks every other descriptor it holds close-on-exec
-//!   before exec, to the same effect for a descriptor some other code opened
-//!   without the flag.
+//!   close-on-exec atomically (`pipe2`, `SOCK_CLOEXEC`), so there is no
+//!   moment in which a descriptor exists without the flag. The child marks
+//!   close-on-exec, before exec, every descriptor this process held when it
+//!   listed them just before the spawn, except the ones named: the same
+//!   effect for a descriptor some other code opened without the flag. One
+//!   opened without the flag by another thread after that listing and before
+//!   the fork is not covered.
+//!
+//! **The Linux fork-to-exec hold.** A Linux spawn forks (the standard
+//! library's `pre_exec` path). From the fork until its exec, the child is a
+//! copy of this process and holds every descriptor this process held at the
+//! fork, other runs' lifeline write ends among them. Those copies are
+//! close-on-exec and close at the child's exec (or its exit, if the exec
+//! fails), and [`Spawn::spawn`] returns only after that: the standard
+//! library blocks on a close-on-exec socket until the child execs. So the
+//! hold is transient and bounded by the sibling's exec, but it is real: a
+//! supervisor that dies inside it is seen by its own child only once the
+//! sibling has exec'd. After every exec, a child holds exactly what it was
+//! named, as on macOS.
 //!
 //! Both keep the process-group setup (`POSIX_SPAWN_SETPGROUP` /
 //! `Command::process_group`), reset `SIGPIPE` to its default in the child,
@@ -206,6 +223,10 @@ mod platform {
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
 
+    // SAFETY: the declaration matches `<spawn.h>` on macOS 10.7+:
+    // `int posix_spawn_file_actions_addinherit_np(posix_spawn_file_actions_t
+    // *, int)`. It is called only with an initialized `Actions` and a
+    // descriptor number, and its return value is checked.
     unsafe extern "C" {
         /// Keep `fd` open, at its own number, in a child spawned with
         /// `POSIX_SPAWN_CLOEXEC_DEFAULT` (`<spawn.h>`, macOS 10.7+; not in

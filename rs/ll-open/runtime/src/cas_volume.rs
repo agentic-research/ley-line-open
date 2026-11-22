@@ -1513,9 +1513,36 @@ mod tests {
     /// A shell script standing in for hdiutil.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let program = dir.join(name);
-        fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&program, &format!("#!/bin/sh\n{body}\n"));
         program
+    }
+
+    /// Write `contents` to `path`, mode 0755, without this process ever
+    /// holding the file open for writing. `execve` fails with `ETXTBSY`
+    /// while any process holds the file open for writing, and libtest runs
+    /// these tests beside others that spawn: a child forked by another
+    /// thread while this one wrote with `fs::write` would hold a copy of
+    /// the write descriptor until its own exec (bead
+    /// `ley-line-open-cdfaf4`, where the integration binaries take a lock
+    /// instead). Here a `/bin/sh` child writes the file and exits before
+    /// anything runs it, and nothing forked from this process can hold that
+    /// child's descriptor.
+    fn write_executable(path: &Path, contents: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success(), "write {}", path.display());
     }
 
     /// Bead ley-line-open-167b29 (1): a hung hdiutil fails provisioning by
@@ -2180,15 +2207,13 @@ mod tests {
         let log = scratch.path().join("args");
         let tool = |exit: u8| {
             let program = scratch.path().join(format!("hdiutil-{exit}"));
-            fs::write(
+            write_executable(
                 &program,
-                format!(
+                &format!(
                     "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\necho refused >&2\nexit {exit}\n",
                     log.display()
                 ),
-            )
-            .unwrap();
-            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            );
             Hdiutil {
                 program,
                 timeout: DEFAULT_TOOL_TIMEOUT,

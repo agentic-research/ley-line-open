@@ -352,9 +352,14 @@ mod tests {
             }
             all
         }
-        let bases = files(&["a", "b"]);
-        // Each side also without its last newline: a final line the driver
-        // tokenizes unterminated.
+        // The base, and each side, also without its last newline: a final
+        // line the driver tokenizes unterminated.
+        let mut bases = files(&["a", "b"]);
+        let unterminated_bases: Vec<String> = bases
+            .iter()
+            .filter_map(|f| f.strip_suffix('\n').map(str::to_string))
+            .collect();
+        bases.extend(unterminated_bases);
         let mut sides = files(&["a", "b", "c"]);
         let unterminated: Vec<String> = sides
             .iter()

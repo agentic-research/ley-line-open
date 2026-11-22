@@ -127,9 +127,12 @@ ignore = "0.4"
 # from the gix 0.90 leyline-vcs brings through jj-lib (bead
 # ley-line-open-ed4736). gix-imara-diff is the driver's own diff, at the
 # release the driver takes, so the conflict ranges are computed over the
-# hunks the driver merged.
-gix-merge = { version = "0.24", default-features = false, features = ["sha1"] }
-imara-diff = { package = "gix-imara-diff", version = "0.3.4" }
+# hunks the driver merged. Both are exact pins: merge.rs `conflict_ranges`
+# mirrors the driver's region rule, so a patch release that changes that
+# rule must be a deliberate bump, re-checked by
+# `a_conflict_always_names_its_base_ranges`.
+gix-merge = { version = "=0.24.0", default-features = false, features = ["sha1"] }
+imara-diff = { package = "gix-imara-diff", version = "=0.3.4" }
 
 # Unix-only: flock(2) for daemon arena admission control
 # (bead ley-line-open-0cba88). Kept as a direct dep so the fcntl call

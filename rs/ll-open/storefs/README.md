@@ -6,7 +6,7 @@ guest's file syscalls become, from the store, and lands writes, creates,
 deletes, renames, directories, modes and symlinks as proposals (ADR-0042,
 ADR-0045). The store holds every file the guest makes, in any language, with
 its git mode; a write against a file another writer moved since it was read
-is merged three ways at FLUSH, and only overlapping edits are refused
+is merged three ways at FLUSH, and only overlapping or touching edits are refused
 (bead `ley-line-open-bb8aa6`). Every answer is data or a **Linux** errno: the
 guest is Linux whatever the host is (macOS `ESTALE` is 70; the guest needs
 116).
@@ -77,7 +77,7 @@ rules; the `leyline` binary injects the mount into the daemon as
 | OPEN `(inode, flags)` | a handle that serves the blob the file holds at open, read from the store at every OPEN, with `keep_cache` and `direct_io` (see "Read freshness"). Opened for writing (`O_WRONLY`/`O_RDWR`), that blob is the handle's **base**; `EACCES` when the scope may not propose the path; `O_TRUNC` stages an empty file; `EISDIR` on a directory |
 | READ `(handle, offset, size)` | bytes the handle serves: its base, or what it staged |
 | WRITE `(handle, offset, data)` | stages `data` on the handle (a gap reads as zeros), whatever the store holds now: another writer's change is decided at FLUSH (ADR-0045 T6, reversing the WRITE-time `ESTALE` of bead `e650d7`); `EBADF` on a handle not opened for writing |
-| FLUSH / FSYNC `(handle)` | proposes the staged bytes (and a staged mode) against the base through `source_write::propose`, on the store's one writer. When the file moved since the base, the store merges the two three ways: a clean merge lands, the handle serves the merged bytes from then on, and the next read-only open drops the guest's pages; overlapping edits are `ESTALE`. A file that does not parse lands with a diagnostic. Accepted: the base advances to the blob written, and an attached checkout is brought up to it. Nothing staged: no proposal, `Ok` |
+| FLUSH / FSYNC `(handle)` | proposes the staged bytes (and a staged mode) against the base through `source_write::propose`, on the store's one writer. When the file moved since the base, the store merges the two three ways: a clean merge lands, the handle serves the merged bytes from then on, and the next read-only open drops the guest's pages; overlapping or touching edits are `ESTALE` (ADR-0045 T5). A file that does not parse lands with a diagnostic. Accepted: the base advances to the blob written, and an attached checkout is brought up to it. Nothing staged: no proposal, `Ok` |
 | RELEASE `(handle)` | drops the handle and any bytes no FLUSH landed |
 | SETATTR `(inode, handle?, {size, mode, uid, gid})` | a size with a handle stages on it (`ftruncate`); a size without one is a proposal of its own against the file's current blob (`truncate`), `EACCES` outside the proposal scope. A mode with a write handle stages on it (`fchmod`); without one it is a proposal of the file's git mode against its current blob (`chmod`: executable when any execute bit is set, regular otherwise); a directory's or symlink's mode changes nothing. uid/gid are `EPERM`; times are not carried; `EISDIR` for a directory's size |
 | CREATE `(parent, name, flags)` | the new file's entry and a handle whose base is "no file"; the file exists for the guest at once, and its first FLUSH proposes a **create** (bead `ley-line-open-47fb03`, ADR-0042 P1a). `EEXIST` when the name exists, `EACCES` outside the proposal scope |

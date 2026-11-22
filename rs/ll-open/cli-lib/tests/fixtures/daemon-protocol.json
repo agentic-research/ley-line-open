@@ -110,7 +110,7 @@
     },
     "response": {
       "ok": false,
-      "error": "proposal refused: 'src/main.rs' moved since it was read (read blob 3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a, now blob 0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9), and its changes overlap the other writer's at base lines 1..2",
+      "error": "proposal refused: 'src/main.rs' moved since it was read (read blob 3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a, now blob 0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9), and its changes overlap or touch the other writer's at base lines 1..2",
       "refusal": {
         "reason": "stale",
         "moved": [
@@ -135,7 +135,7 @@
       "writes": [
         {
           "path": "src/main.rs",
-          "base": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
+          "base": "7d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c",
           "content": "fn main() {}\n\nfn ours() {}\n"
         }
       ]

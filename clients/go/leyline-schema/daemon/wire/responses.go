@@ -199,8 +199,9 @@ type StaleRefusal struct {
 	Expected *string `json:"expected"`
 	Current  *string `json:"current"`
 	// Conflicts is set when the write was merged three ways and both sides
-	// changed overlapping lines: the lines of Expected where they overlap.
-	// Empty when the path could not be merged at all.
+	// changed overlapping or touching lines (ADR-0045 T5): the lines of
+	// Expected where they collide. Empty when the path could not be merged
+	// at all.
 	Conflicts []LineRange `json:"conflicts,omitempty"`
 }
 

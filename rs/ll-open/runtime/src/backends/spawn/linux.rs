@@ -27,42 +27,52 @@ pub(super) fn held() -> io::Result<Vec<RawFd>> {
         .collect())
 }
 
-/// Mark every descriptor from 3 up close-on-exec with one
-/// `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` (Linux 5.11+), a raw system
-/// call and so async-signal-safe. `false` when the kernel refuses it
-/// (`ENOSYS` before 5.11, `EINVAL` before 5.11's flag, `EPERM` under a
-/// seccomp filter that does not know it): the caller falls back to its
-/// listing.
-fn close_range_cloexec() -> bool {
+/// The range [`spawn`] sweeps: every descriptor from 3 up.
+pub(super) const EVERY_DESCRIPTOR_ABOVE_THE_STANDARD_STREAMS: (libc::c_uint, libc::c_uint) =
+    (3, libc::c_uint::MAX);
+
+/// Mark the descriptors `first..=last` close-on-exec with one
+/// `close_range(first, last, CLOSE_RANGE_CLOEXEC)` (Linux 5.11+), a raw
+/// system call and so async-signal-safe. `false` when the kernel refuses it
+/// (`ENOSYS` before 5.11, `EINVAL` before 5.11's flag or for `first > last`,
+/// `EPERM` under a seccomp filter that does not know it): the caller falls
+/// back to its listing.
+fn close_range_cloexec((first, last): (libc::c_uint, libc::c_uint)) -> bool {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: a system call taking three integers and no memory.
         unsafe {
             libc::syscall(
                 libc::SYS_close_range,
-                3 as libc::c_uint,
-                libc::c_uint::MAX,
+                first,
+                last,
                 libc::CLOSE_RANGE_CLOEXEC,
             ) == 0
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = (first, last);
         false
     }
 }
 
 pub(super) fn spawn(request: &Spawn<'_>) -> io::Result<Spawned> {
-    spawn_with(request, true, held()?)
+    spawn_with(
+        request,
+        Some(EVERY_DESCRIPTOR_ABOVE_THE_STANDARD_STREAMS),
+        held()?,
+    )
 }
 
-/// [`spawn`], with the sweep chosen: `close_range` first when
-/// `try_close_range` and the kernel has it, else `listing` (the descriptors
-/// this process held just before the spawn). Split out so a test can tell
-/// the two apart: only `close_range` reaches a descriptor the listing missed.
+/// [`spawn`], with the sweep chosen: `close_range` over `close_range` when
+/// given and the kernel accepts it, else `listing` (the descriptors this
+/// process held just before the spawn). Split out so a test can tell the
+/// two apart (only `close_range` reaches a descriptor the listing missed)
+/// and make `close_range` fail (a range whose first is past its last).
 pub(super) fn spawn_with(
     request: &Spawn<'_>,
-    try_close_range: bool,
+    close_range: Option<(libc::c_uint, libc::c_uint)>,
     listing: Vec<RawFd>,
 ) -> io::Result<Spawned> {
     let mut command = Command::new(&request.program);
@@ -87,7 +97,7 @@ pub(super) fn spawn_with(
         command.pre_exec(move || {
             // Everything unnamed is close-on-exec from here on: by one
             // system call, or by the listing where the kernel lacks it.
-            if !(try_close_range && close_range_cloexec()) {
+            if !close_range.is_some_and(close_range_cloexec) {
                 for &fd in &listing {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
                     // Closed since the listing: nothing to inherit.

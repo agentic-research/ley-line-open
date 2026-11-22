@@ -480,7 +480,11 @@ mod tests {
     /// Whether a child spawned with this sweep holds `fd` after its exec,
     /// while a descriptor it is named at its own number still reaches it.
     #[cfg(not(target_os = "macos"))]
-    fn child_holds(fd: RawFd, try_close_range: bool, listing: Vec<RawFd>) -> bool {
+    fn child_holds(
+        fd: RawFd,
+        close_range: Option<(libc::c_uint, libc::c_uint)>,
+        listing: Vec<RawFd>,
+    ) -> bool {
         use std::io::Read;
         use std::os::fd::{AsFd, AsRawFd};
         let (_reader, named) = std::io::pipe().unwrap();
@@ -496,7 +500,7 @@ mod tests {
             ))
             .stdout(ChildIo::Piped)
             .inherit(named.as_fd(), named.as_raw_fd());
-        let mut child = linux::spawn_with(&spawn, try_close_range, listing).unwrap();
+        let mut child = linux::spawn_with(&spawn, close_range, listing).unwrap();
         let mut out = String::new();
         child
             .stdout
@@ -516,34 +520,69 @@ mod tests {
     }
 
     /// Linux: `close_range` keeps from the child a descriptor the listing
-    /// missed (one opened after it); without `close_range`, the listing
-    /// keeps one it holds; with neither, the descriptor crosses the exec,
-    /// which is the gap the module documentation names. Needs Linux 5.11+
-    /// and no seccomp filter refusing `close_range`.
+    /// missed (one opened after it); without `close_range`, or when the
+    /// kernel refuses it, the listing keeps one it holds; with neither, the
+    /// descriptor crosses the exec, which is the gap the module documentation
+    /// names. Needs Linux 5.11+ and no seccomp filter refusing `close_range`.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn close_range_and_the_listing_each_keep_an_unnamed_descriptor_from_the_child() {
         use std::os::fd::AsRawFd;
+        let every = Some(linux::EVERY_DESCRIPTOR_ABOVE_THE_STANDARD_STREAMS);
+        // First past last: `close_range` answers EINVAL and marks nothing.
+        let refused = Some((libc::c_uint::MAX, 3));
         let stray = unnamed_descriptor();
         let fd = stray.as_raw_fd();
         assert!(
-            !child_holds(fd, true, Vec::new()),
+            !child_holds(fd, every, Vec::new()),
             "close_range (Linux 5.11+) marks what no listing named"
         );
         assert!(
-            !child_holds(fd, false, vec![fd]),
+            !child_holds(fd, None, vec![fd]),
             "the listing marks what it names"
         );
         assert!(
-            child_holds(fd, false, Vec::new()),
+            !child_holds(fd, refused, vec![fd]),
+            "a refused close_range falls back to the listing"
+        );
+        assert!(
+            child_holds(fd, None, Vec::new()),
             "nothing marked it: it crosses"
+        );
+        assert!(
+            child_holds(fd, refused, Vec::new()),
+            "a refused close_range marked nothing"
         );
         // One already close-on-exec stays so when the listing names it.
         let (_reader, cloexec) = std::io::pipe().unwrap();
         let cloexec = cloexec.as_raw_fd();
         assert!(
-            !child_holds(cloexec, false, vec![cloexec]),
+            !child_holds(cloexec, None, vec![cloexec]),
             "kept close-on-exec"
         );
+    }
+
+    /// Reap `child` behind its back, so its pid names no child of this
+    /// process any more.
+    fn reap_behind_its_back(child: &Spawned) {
+        let mut status = 0;
+        // SAFETY: waitpid on this process's own child, into a live int.
+        let rc = unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, 0) };
+        assert_eq!(rc, child.id() as libc::pid_t);
+    }
+
+    /// `wait` and `try_wait` report `waitpid`'s error (`ECHILD` for a pid
+    /// that is no child of this process) instead of a status, and `kill`
+    /// reports `kill`'s (`ESRCH` once the pid is reaped).
+    #[test]
+    fn wait_try_wait_and_kill_report_the_system_call_errors() {
+        let mut child = Spawn::new("/bin/cat").spawn().unwrap();
+        reap_behind_its_back(&child);
+        let error = child.wait().expect_err("no such child");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD), "{error}");
+        let error = child.try_wait().expect_err("no such child");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD), "{error}");
+        let error = child.kill().expect_err("no such process");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH), "{error}");
     }
 }

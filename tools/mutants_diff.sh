@@ -27,8 +27,6 @@
 #                            its result to $MUTANTS_BASELINE_RECORD.
 #   MUTANTS_BASELINE=reuse   run the mutants against that record: no baseline,
 #                            an explicit timeout derived from the recorded one.
-#   MUTANTS_SEED_TARGET=1    CI only: carry the baseline's dependency builds to
-#                            the shards through ./target.
 #
 # Unset, every slice runs its own baseline, which is what a local run wants.
 # The baseline block below says why.
@@ -256,7 +254,6 @@ fi
 # mutant is still stopped.
 BASELINE_MODE=${MUTANTS_BASELINE:-run}
 BASELINE_RECORD=${MUTANTS_BASELINE_RECORD:-}
-SEED_TARGET=${MUTANTS_SEED_TARGET:-}
 case "$BASELINE_MODE" in
     run|record|reuse) ;;
     *)
@@ -271,38 +268,6 @@ fi
 if [ "$BASELINE_MODE" = record ] && [ -n "${MUTANTS_SHARD:-}" ]; then
     echo "MUTANTS_BASELINE=record covers every shard; it cannot run with MUTANTS_SHARD" >&2
     exit 1
-fi
-# MUTANTS_SEED_TARGET moves the recording run's target directory to ./target
-# and has the shards copy it into their build directories (`--copy-target`).
-# cargo-mutants builds in copies of the tree, each with an empty target, so
-# without this every build directory of every shard compiles the dependencies
-# from nothing.
-#
-# It is refused outside CI because ./target then holds what a probe mutant
-# built. Cargo decides freshness by mtime, and a copied tree's mtimes are the
-# copy's: an artifact of mutated source can read as fresh and be linked into
-# the next build. Two things keep that out of the shards. The record step
-# deletes the fingerprint of every path package (the workspace and the vendored
-# crates) before the directory is kept, so cargo rebuilds them wherever the
-# directory is copied. And the CI cache that carries the directory drops those
-# packages' artifacts (rust-cache without `cache-workspace-crates`). Only
-# registry dependencies, which no mutant touches, are reused.
-case "$SEED_TARGET" in
-    ''|1) ;;
-    *) echo "MUTANTS_SEED_TARGET must be 1 (or unset), got '$SEED_TARGET'" >&2; exit 1 ;;
-esac
-if [ -n "$SEED_TARGET" ]; then
-    if [ "$BASELINE_MODE" = run ]; then
-        echo "MUTANTS_SEED_TARGET needs MUTANTS_BASELINE=record or reuse" >&2
-        exit 1
-    fi
-    if [ -z "${CI:-}" ]; then
-        {
-            echo "MUTANTS_SEED_TARGET is for a throwaway CI checkout: it leaves"
-            echo "probe-mutant artifacts in ./target. Refusing outside CI."
-        } >&2
-        exit 1
-    fi
 fi
 
 # A record names the diff it was made for. The same slice arguments recur
@@ -501,26 +466,11 @@ assert_excluded_packages_were_covered() {
     done
 }
 
-# Delete the fingerprint of every path package (the workspace's and the
-# vendored crates') from a target directory, so cargo rebuilds them wherever
-# the directory is used next. What is left is reusable only for registry
-# dependencies. Fails if the package list cannot be read: a directory that may
-# hold a probe mutant's build must not be kept.
-drop_path_package_fingerprints() {
-    path_packages=$(cargo metadata --format-version 1 2>/dev/null \
-        | jq -r '.packages[] | select(.source == null) | .name' 2>/dev/null) || path_packages=''
-    [ -n "$path_packages" ] || return 1
-    for name in $path_packages; do
-        rm -rf "$1"/*/.fingerprint/"$name"-* "$1"/*/*/.fingerprint/"$name"-*
-    done
-}
-
 # MUTANTS_BASELINE=record for one slice. "$@" is the slice's arguments.
 record_baseline() {
-    # One location per mutated package, from the slice's own unsharded
-    # listing. `--list --json` names each mutant's package; the first
-    # mutant of each gives a `path:line:column: ` prefix for `--re`, which
-    # cargo-mutants matches against the mutant's name.
+    # One mutant per mutated package, from the slice's own unsharded listing.
+    # `--list --json` names each mutant and its package; the first of each
+    # package is selected by its exact name with `--re`.
     if ! listed=$(cargo mutants --in-diff "$DIFF" "$@" --list --json 2>/dev/null); then
         echo "MISCONFIGURED: could not list this slice's mutants to record its baseline: $*" >&2
         exit 1
@@ -528,8 +478,7 @@ record_baseline() {
     probes=''
     if [ -n "$listed" ]; then
         if ! probes=$(printf '%s\n' "$listed" | jq -r '
-                group_by(.package) | .[] | .[0]
-                | "\(.file):\(.span.start.line):\(.span.start.column): "'); then
+                group_by(.package) | .[] | .[0].name'); then
             echo "MISCONFIGURED: cargo mutants --list --json did not print a mutant list: $*" >&2
             exit 1
         fi
@@ -543,38 +492,22 @@ record_baseline() {
     while IFS= read -r probe; do
         [ -n "$probe" ] || continue
         probe_count=$((probe_count + 1))
-        set -- "$@" --re "^$(printf '%s' "$probe" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+        set -- "$@" --re "^$(printf '%s' "$probe" | sed 's/[][\.*^$+?(){}|]/\\&/g')\$"
     done <<PROBES
 $probes
 PROBES
-    # One build directory, so the baseline and the probes are the only builds
-    # and the kept target directory (below) is the baseline's.
+    # One build directory: the baseline and the probes are all this run
+    # builds, so more would only copy the tree again.
     set -- "$@" --jobs 1
-    seed_marker=''
-    if [ -n "$SEED_TARGET" ]; then
-        set -- "$@" --leak-dirs
-        if [ -d target ]; then
-            set -- "$@" --copy-target=true
-        fi
-        seed_marker=$(mktemp)
-    fi
     echo "baseline record: $probe_count mutated package(s) in this slice"
     set +e
     cargo mutants --in-diff "$DIFF" "$@"
     rc=$?
     set -e
-    leaked=''
-    if [ -n "$seed_marker" ]; then
-        leaked=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cargo-mutants-*' -newer "$seed_marker")
-        rm -f "$seed_marker"
-    fi
     baseline_summary=$(jq -r '[.outcomes[] | select(.scenario == "Baseline")][0].summary // "absent"' \
         mutants.out/outcomes.json 2>/dev/null) || baseline_summary=absent
     if [ "$rc" -eq 4 ] || [ "$baseline_summary" != Success ]; then
         printf 'slice %s failed\n' "$slice_key" >> "$BASELINE_RECORD"
-        if [ -n "$leaked" ]; then
-            printf '%s\n' "$leaked" | while IFS= read -r dir; do rm -rf "$dir"; done
-        fi
         {
             echo "BASELINE BROKEN: the unmutated tree failed its own tests in the"
             echo "                 mutants scratch build (cargo-mutants exit $rc,"
@@ -615,23 +548,6 @@ PROBES
         }')
     printf 'slice %s ok %s %s %s\n' "$slice_key" "$timeout" "$baseline_build" "$baseline_test" >> "$BASELINE_RECORD"
     echo "BASELINE RECORDED: unmutated build ${baseline_build}s + test ${baseline_test}s; shards run --baseline=skip --timeout $timeout"
-
-    if [ -n "$SEED_TARGET" ]; then
-        # Keep the build directory's target as ./target, for the cache and
-        # for the next slice of this run. Exactly one directory was leaked
-        # (`--jobs 1`); anything else is not a state this knows how to keep.
-        if [ -n "$leaked" ] && [ "$(printf '%s\n' "$leaked" | wc -l | tr -d ' ')" -eq 1 ] \
-            && [ -d "$leaked/target" ] && drop_path_package_fingerprints "$leaked/target"; then
-            rm -rf target
-            mv "$leaked/target" target
-            echo "baseline record: kept the baseline's dependency builds in ./target"
-        else
-            echo "baseline record: could not keep the baseline's target directory; the shards build their dependencies from nothing" >&2
-        fi
-    fi
-    if [ -n "$leaked" ]; then
-        printf '%s\n' "$leaked" | while IFS= read -r dir; do rm -rf "$dir"; done
-    fi
 }
 
 run_slice() {
@@ -707,9 +623,6 @@ RECORDED
                 exit 4
                 ;;
         esac
-        if [ -n "$SEED_TARGET" ] && [ -d target ]; then
-            set -- "$@" --copy-target=true
-        fi
     fi
     # MUTANTS_SHARD=k/n runs one of n shards of the slice. CI splits a slow
     # slice across runners this way instead of lifting a job's time limit; a

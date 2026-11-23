@@ -89,9 +89,12 @@ fn reader_hung_up(fd: RawFd) -> bool {
         revents: 0,
     };
     // SAFETY: one pollfd this frame owns, a zero timeout; poll writes only
-    // its revents.
-    let ready = unsafe { libc::poll(&mut entry, 1, 0) };
-    ready > 0 && entry.revents & (libc::POLLHUP | libc::POLLERR) != 0
+    // its revents. Its return value is not needed: revents starts at 0, and
+    // poll leaves it 0 both when nothing is ready and when it fails.
+    unsafe { libc::poll(&mut entry, 1, 0) };
+    let hung_up = entry.revents & libc::POLLHUP != 0;
+    let errored = entry.revents & libc::POLLERR != 0;
+    hung_up || errored
 }
 
 /// A libc return value: `-1` is the error in `errno`, anything else success.
@@ -266,6 +269,16 @@ mod tests {
         let relay = install(&[fd]).unwrap();
         relay.finish_after_daemon(BOUND);
         crate::lifecycle::set_lifeline_ended_for_test(false);
+        // Finished, not merely left on the relay (whose thread would also
+        // swallow the write below): the descriptor is /dev/null.
+        // SAFETY: an out-parameter of the size fstat writes.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        assert_eq!(
+            stat.st_mode & libc::S_IFMT,
+            libc::S_IFCHR,
+            "finish_after_daemon put the descriptor on /dev/null"
+        );
         drop(reader);
         write(fd, b"teardown\n").expect("finished onto /dev/null after the lifeline ended");
         // SAFETY: the test's own descriptor.

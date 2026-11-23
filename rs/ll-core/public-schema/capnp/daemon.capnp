@@ -501,9 +501,11 @@ struct StaleRefusal {
   # The blob the path holds now, or `absent`.
   current   @2 :Text;
   # Set when the write was merged three ways with `current` and the two
-  # sides changed overlapping lines (ADR-0045 T5): the lines of `expected`
-  # where they overlap. Unset when the path could not be merged at all (a
-  # delete, a create, a symlink, bytes that are not UTF-8).
+  # sides changed overlapping or touching lines (ADR-0045 T5, amended
+  # 2026-11-22: a change and an edit right next to it conflict, as in git):
+  # the lines of `expected` where they collide. Unset when the path could
+  # not be merged at all (a delete, a create, a symlink, bytes that are not
+  # UTF-8).
   conflicts @3 :List(LineRange);
 }
 

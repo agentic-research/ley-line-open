@@ -20,10 +20,16 @@ use super::*;
 use crate::tests::{A, A_BROKEN, A_OTHER, Fixture, fixture};
 use crate::{ROOT_INODE, StoreFs};
 
-/// A tail line under `A`'s function: an edit to other lines than `A_OTHER`'s.
+/// A tail line under `A`'s function: a one-line edit that lands alone, or
+/// beside an edit of the package line.
 const A_TAILED: &str = "package a\n\nfunc A() int { return 1 }\n// tail\n";
-/// `A_OTHER`'s change and `A_TAILED`'s, merged.
-const A_MERGED: &str = "package a\n\nfunc A() int { return 3 }\n// tail\n";
+/// A head line over `A`'s package clause: an edit two unchanged lines away
+/// from `A_OTHER`'s. `A_TAILED`'s line sits right under `A_OTHER`'s, so
+/// the two only touch, and touching edits conflict (ADR-0045 T5, amended
+/// 2026-11-22).
+const A_HEADED: &str = "// head\npackage a\n\nfunc A() int { return 1 }\n";
+/// `A_OTHER`'s change and `A_HEADED`'s, merged.
+const A_MERGED: &str = "// head\npackage a\n\nfunc A() int { return 3 }\n";
 
 /// The NFS adapter over a cold-parsed store holding `a.go`, `pkg/b.go`,
 /// `pkg/sub/c.go` and `secret/d.go`.
@@ -378,7 +384,7 @@ async fn a_save_over_a_disjoint_landed_change_merges_at_commit() {
     let id = h.id("a.go").await;
     assert_eq!(h.read_all(id).await, A.as_bytes());
     h.other_writer("a.go", A_OTHER);
-    h.save(id, A_TAILED).await.unwrap();
+    h.save(id, A_HEADED).await.unwrap();
     h.nfs.commit(id, 0, 0).await.unwrap();
     assert_eq!(h.stored_text("a.go").as_deref(), Some(A_MERGED));
     assert_eq!(

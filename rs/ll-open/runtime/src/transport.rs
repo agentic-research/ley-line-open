@@ -42,6 +42,17 @@ pub const WORKSPACE_WRITE_SCOPE_CAPABILITY: &str = "cloister/execution/v1/worksp
 /// directory trees, and `/` alone for the whole workspace.
 pub const WORKSPACE_WRITE_SCOPE_REVISION: &str = "1";
 
+/// The capability a daemon advertises when it serves a grant's connections
+/// (ADR-0046 S3, "Capability discovery"): it reads `connectionsDigest @16`
+/// and `connectionsDocument @17` and has a broker. A daemon without a broker
+/// advertises no such entry and refuses such a grant by name. A client MUST
+/// find this name at [`CONNECTIONS_REVISION`] in `llo_execution_capabilities`
+/// before it sends a grant with connections.
+pub const CONNECTIONS_CAPABILITY: &str = crate::ConnectionsCapability::NAME;
+
+/// The connections extension's layout revision.
+pub const CONNECTIONS_REVISION: &str = crate::ConnectionsCapability::REVISION;
+
 pub fn capabilities_json<B: crate::Backend>(
     service: &ExecutionService<B>,
 ) -> Result<String, ExecutionError> {
@@ -50,7 +61,16 @@ pub fn capabilities_json<B: crate::Backend>(
     let capabilities = service.capabilities();
     // Advertise only backends actually owned by this service. A placeholder
     // native entry would make capability discovery lie to Cloister.
-    let mut entries = output.reborrow().init_capabilities(4);
+    // The connections entry is the service's own answer to "do you have a
+    // broker", so the two cannot disagree: absent without one.
+    let connections = service.connections();
+    let mut entries = output
+        .reborrow()
+        .init_capabilities(4 + u32::from(connections.is_some()));
+    if let Some(connections) = &connections {
+        entries.reborrow().get(4).set_name(CONNECTIONS_CAPABILITY);
+        entries.reborrow().get(4).set_version(&connections.version);
+    }
     entries
         .reborrow()
         .get(3)
@@ -432,6 +452,29 @@ pub fn collect_json<B: crate::Backend>(
     );
     receipt.set_started_at_unix_ms(receipt_data.started_at_unix_ms);
     receipt.set_completed_at_unix_ms(receipt_data.completed_at_unix_ms);
+    // ADR-0046 S8: written only for a run with connections, so a receipt
+    // without them keeps the bytes a pre-connections reader expects.
+    if let Some(outcome) = &receipt_data.connections {
+        set_digest(
+            receipt.reborrow().init_connections_digest(),
+            &outcome.digest,
+        )?;
+        let mut connections = receipt
+            .reborrow()
+            .init_connections(outcome.connections.len() as u32);
+        for (index, summary) in outcome.connections.iter().enumerate() {
+            let mut entry = connections.reborrow().get(index as u32);
+            entry.set_name(&summary.name);
+            entry.set_target(&summary.target);
+            entry.set_accepted(summary.accepted);
+            entry.set_dialed(summary.dialed);
+            entry.set_refused(summary.refused);
+            entry.set_foreign_peers(summary.foreign_peers);
+            entry.set_complete(summary.complete);
+            entry.set_bytes_to_target(summary.bytes_to_target);
+            entry.set_bytes_from_target(summary.bytes_from_target);
+        }
+    }
     encode_collect(output_message)
 }
 

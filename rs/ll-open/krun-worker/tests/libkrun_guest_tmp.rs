@@ -281,7 +281,7 @@ fn a_run_init_refuses_ends_failed_with_the_reason_in_its_output() {
         },
     };
     backend
-        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .start(&request, leyline_runtime::ServedWorkspaces::none(), leyline_runtime::RunConnections::none())
         .expect("the worker starts the VM");
     let outcome = backend
         .wait_for_outcome("refused-tmp")

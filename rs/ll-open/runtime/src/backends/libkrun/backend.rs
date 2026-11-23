@@ -432,8 +432,14 @@ impl Backend for KrunWorkerBackend {
         &self,
         request: &ExecutionRequest,
         workspaces: ServedWorkspaces,
+        connections: crate::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
+        // The run's connections are served before this call (ADR-0046 S7):
+        // their endpoints are bound, and this backend's one duty is to name
+        // its worker to the broker. Connections nothing serves are refused
+        // here, before anything is created.
+        let connections = connections.served_for(request, "libkrun/1")?;
         // ADR-0035 §4 at the backend as well as the service, so a direct
         // call cannot route around it.
         self.capabilities().enforced.check(&request.limits)?;
@@ -610,6 +616,14 @@ impl Backend for KrunWorkerBackend {
         #[cfg(feature = "test-support")]
         if let Some(hook) = &self.hook {
             hook(StartPoint::Spawned);
+        }
+        // The worker hosts the VMM, so it is the one process that connects
+        // to the run's broker. Named before the worker has its request: no
+        // guest exists yet, so no connection can arrive first (ADR-0046 S4).
+        if let Some(connections) = &connections
+            && let Err(error) = connections.name_worker(child.id())
+        {
+            return Err(abort_failed_start(&mut child, rootfs, LABELS, error));
         }
         // What the run prints, from its first byte. Both drains end at the
         // worker's exit, when the process group is killed and its pipes
@@ -891,6 +905,7 @@ impl Backend for KrunWorkerBackend {
                     other => other,
                 },
                 output: Some(output),
+                connections: None,
             });
             outputs.lock().remove(&run_id);
             // Retire the run and publish its completion as one step, under
@@ -983,6 +998,7 @@ mod tests {
             crate::RunOutcome {
                 status: BackendRunStatus::Succeeded,
                 output: None,
+                connections: None,
             },
         );
         assert!(matches!(
@@ -1124,7 +1140,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
         let (backend, _fixture, request, shares, opened) =
             share_backend("printf 'entering the guest failed\\n' >&2\nexit 1");
         let started = backend
-            .start(&request, shares)
+            .start(&request, shares, crate::RunConnections::none())
             .expect("the worker was ready");
 
         // The worker has exited and its completion is published: the
@@ -1164,7 +1180,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
         let (backend, _fixture, request, shares, _opened) =
             share_backend("exec /usr/bin/tail -f /dev/null");
         backend
-            .start(&request, shares)
+            .start(&request, shares, crate::RunConnections::none())
             .expect("the worker was ready");
         assert!(
             backend.poll_outcome("run-1").expect("poll").is_none(),
@@ -1186,7 +1202,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
     fn waiting_for_a_runs_outcome_releases_its_share() {
         let (backend, _fixture, request, shares, _opened) = share_backend("exit 0");
         backend
-            .start(&request, shares)
+            .start(&request, shares, crate::RunConnections::none())
             .expect("the worker was ready");
         let outcome = backend
             .wait_for_outcome("run-1")

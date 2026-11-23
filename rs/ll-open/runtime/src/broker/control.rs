@@ -114,7 +114,8 @@ impl From<&Record> for Event {
 }
 
 /// One connection's receipt outcome (RunReceipt `ConnectionOutcome`, S8).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectionSummary {
     pub name: String,
     pub target: String,
@@ -436,6 +437,8 @@ pub struct BrokerProcess {
     events: mpsc::Receiver<Event>,
     seen: Vec<Event>,
     bound: Vec<Bound>,
+    /// Whether a ready report arrived, whatever its digest.
+    ready: bool,
 }
 
 impl BrokerProcess {
@@ -447,6 +450,19 @@ impl BrokerProcess {
     /// other spawn, on any thread, inherits the lifeline's write end (bead
     /// `ley-line-open-528525`).
     pub fn spawn(binary: &Path, peer: PeerPid) -> Result<Self, ExecutionError> {
+        Self::spawn_watched(binary, peer, || {})
+    }
+
+    /// [`Self::spawn`], with `on_end` called once, on the thread that reads
+    /// the broker's reports, when the broker's side of the control pipe
+    /// closes: the broker has exited, or will send nothing more. A supervisor
+    /// uses it to fail a live run the moment its broker is gone (ADR-0046 D7
+    /// rule 5) instead of at the next poll.
+    pub fn spawn_watched(
+        binary: &Path,
+        peer: PeerPid,
+        on_end: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, ExecutionError> {
         let (lifeline, read_end) = crate::lifeline::pair()
             .map_err(|error| ExecutionError::backend(format!("lifeline pipe: {error}")))?;
         let mut command = Spawn::new(binary);
@@ -482,6 +498,10 @@ impl BrokerProcess {
                     break;
                 }
             }
+            // The receiver sees the end before the hook runs, so a start
+            // waiting on a ready report is released first.
+            drop(sender);
+            on_end();
         });
         Ok(Self {
             stdin: child.stdin.take(),
@@ -490,7 +510,15 @@ impl BrokerProcess {
             events,
             seen: Vec::new(),
             bound: Vec::new(),
+            ready: false,
         })
+    }
+
+    /// Whether the broker reported ready. Until it does, the supervisor does
+    /// not know which sockets it bound ([`Self::shutdown`] unlinks only
+    /// reported ones).
+    pub fn reported_ready(&self) -> bool {
+        self.ready
     }
 
     pub fn pid(&self) -> u32 {
@@ -519,6 +547,7 @@ impl BrokerProcess {
                     // Kept before the digest check: a broker that bound
                     // sockets and then disagreed still leaves them to unlink.
                     self.bound = bound;
+                    self.ready = true;
                     if connections_digest == expected {
                         return Ok(());
                     }
@@ -532,9 +561,14 @@ impl BrokerProcess {
                     )));
                 }
                 Ok(other) => self.seen.push(other),
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(ExecutionError::backend(
                         "connection broker sent no ready report within the bound",
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ExecutionError::backend(
+                        "connection broker exited before it reported ready",
                     ));
                 }
             }

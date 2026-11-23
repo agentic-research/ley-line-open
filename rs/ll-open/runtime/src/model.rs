@@ -698,6 +698,10 @@ impl Default for GuestOutput {
 pub struct RunOutcome {
     pub status: BackendRunStatus,
     pub output: Option<GuestOutput>,
+    /// What the run's connections carried (ADR-0046 S8), from
+    /// [`crate::Brokered`]; `None` for a run without connections, and from a
+    /// backend nothing brokers.
+    pub connections: Option<crate::ConnectionsOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -761,6 +765,12 @@ pub struct RunReceiptData {
     pub enforced: EnforcedCeilings,
     pub started_at_unix_ms: u64,
     pub completed_at_unix_ms: u64,
+    /// The receipt's `connectionsDigest @15` and `connections @16` (ADR-0046
+    /// S8): the digest the run's broker attested and one outcome per declared
+    /// connection. `None` for a run without connections, whose receipt then
+    /// carries neither field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<crate::ConnectionsOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

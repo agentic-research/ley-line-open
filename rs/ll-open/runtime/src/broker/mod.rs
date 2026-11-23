@@ -15,9 +15,11 @@
 //! - [`control`]: the control-pipe protocol, the supervisor's process handle,
 //!   and receipt aggregation.
 //!
-//! The binary is `leyline-conn-broker`. `ExecutionService` integration (spawn,
-//! start ordering, teardown) is `ley-line-open-5308b7`; until then the service
-//! refuses grants with connections by name.
+//! - [`supervisor`]: the broker's place in a run's lifecycle: the checks
+//!   before anything is spawned, the start order, teardown and the receipt's
+//!   outcomes ([`supervisor::Brokered`], which `ExecutionService` is built on).
+//!
+//! The binary is `leyline-conn-broker`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -31,6 +33,7 @@ pub mod preflight;
 pub mod profile;
 pub mod registry;
 pub mod relay;
+pub mod supervisor;
 
 // Platform queries, one file per platform so the mutation gate can mutate each
 // where it compiles (tools/mutants_diff.sh excludes the other).

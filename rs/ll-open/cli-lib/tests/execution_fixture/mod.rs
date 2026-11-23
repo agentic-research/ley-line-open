@@ -38,6 +38,7 @@ impl Backend for CompletingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "transport-test/1".into(),

@@ -145,8 +145,9 @@ impl Backend for Observed {
         &self,
         request: &ExecutionRequest,
         workspaces: leyline_runtime::ServedWorkspaces,
+        connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
-        self.0.backend.start(request, workspaces)
+        self.0.backend.start(request, workspaces, connections)
     }
 
     fn workspace_capacity(&self) -> usize {
@@ -761,6 +762,10 @@ pub struct GrantSpec<'a> {
     /// of both messages when all zero. A run resolved from the grant (as
     /// `CatalogResolver` resolves it) is held to these.
     pub limits: ResourceLimits,
+    /// A canonical `cloister/connections/v1` document: the grant then carries
+    /// `connectionsDigest @16`, `connectionsDocument @17` and the
+    /// `credentialBrokerRefs` marker, all three (ADR-0046 S3).
+    pub connections: Option<&'a str>,
 }
 
 impl<'a> GrantSpec<'a> {
@@ -785,6 +790,7 @@ impl<'a> GrantSpec<'a> {
                 "c".repeat(64),
             ),
             limits: ResourceLimits::default(),
+            connections: None,
         }
     }
 }
@@ -928,6 +934,17 @@ pub fn spec_and_grant(authority: &GrantSpec<'_>) -> (Vec<u8>, Vec<u8>) {
                 );
             }
         }
+    }
+    if let Some(document) = authority.connections {
+        set_digest(
+            grant.reborrow().init_connections_digest(),
+            blake3::hash(document.as_bytes()).to_hex().as_str(),
+        );
+        grant.set_connections_document(document);
+        grant
+            .reborrow()
+            .init_credential_broker_refs(1)
+            .set(0, leyline_runtime::authorization::CONNECTIONS_BROKER_REF);
     }
     let mut capability = grant.reborrow().init_capabilities(1).get(0);
     capability.set_grant(EXECUTION_CAPABILITY);

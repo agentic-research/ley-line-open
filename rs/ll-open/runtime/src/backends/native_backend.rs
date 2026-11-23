@@ -290,8 +290,15 @@ impl Backend for NativeWorkerBackend {
         &self,
         request: &ExecutionRequest,
         workspaces: crate::ServedWorkspaces,
+        connections: crate::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
+        // The run's connections are served before this call (ADR-0046 S7):
+        // the workload dials each bound endpoint through its §6 grant, and
+        // this tier's broker checks the peer's uid, so there is no worker to
+        // name. Connections nothing serves are refused here, before anything
+        // is created.
+        let _served = connections.served_for(request, "native-nono/1")?;
         // ADR-0035 §4 again, at the backend: `ExecutionService::start` checks
         // too, but this is a public type an embedder can call directly, and a
         // direct call once accepted `memory_mib: 64` and applied nothing.

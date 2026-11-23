@@ -203,7 +203,7 @@ fn the_guest_receives_its_argv_and_environment_byte_for_byte() {
         },
     };
     backend
-        .start(&request, leyline_runtime::ServedWorkspaces::none())
+        .start(&request, leyline_runtime::ServedWorkspaces::none(), leyline_runtime::RunConnections::none())
         .expect("the guest starts");
     let outcome = backend
         .wait_for_outcome("argv-probe")

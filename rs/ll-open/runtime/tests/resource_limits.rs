@@ -263,6 +263,7 @@ fn the_native_backend_called_directly_refuses_memory_and_cpu_it_cannot_apply() {
         let error = match backend.start(
             &native_request(only(field)),
             leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
         ) {
             Ok(_) => panic!("{field} accepted by a tier that applies nothing"),
             Err(error) => error,
@@ -275,6 +276,7 @@ fn the_native_backend_called_directly_refuses_memory_and_cpu_it_cannot_apply() {
     let error = match backend.start(
         &native_request(only("wallTimeMs")),
         leyline_runtime::ServedWorkspaces::none(),
+        leyline_runtime::RunConnections::none(),
     ) {
         Ok(_) => panic!("an unconfigured backend cannot start"),
         Err(error) => error,
@@ -303,6 +305,7 @@ impl Backend for VectorBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "vector/1".into(),
@@ -483,6 +486,7 @@ fn the_microvm_tier_refuses_an_unsized_guest() {
         let error = match backend.start(
             &native_request(limits),
             leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
         ) {
             Ok(_) => panic!("an unsized microVM must not start"),
             Err(error) => error,
@@ -493,6 +497,7 @@ fn the_microvm_tier_refuses_an_unsized_guest() {
     let error = match backend.start(
         &native_request(only("pids.limit")),
         leyline_runtime::ServedWorkspaces::none(),
+        leyline_runtime::RunConnections::none(),
     ) {
         Ok(_) => panic!("pids on the microVM"),
         Err(error) => error,

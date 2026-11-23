@@ -1174,6 +1174,7 @@ impl Backend for RecordingBackend {
         &self,
         request: &ExecutionRequest,
         _workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: format!("test/{}", request.run_id),
@@ -1205,6 +1206,7 @@ impl Backend for CompletingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
@@ -1406,6 +1408,7 @@ impl Backend for SharingBackend {
         &self,
         _request: &ExecutionRequest,
         workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "sharing/1".into(),
@@ -1684,6 +1687,7 @@ impl Backend for DroppingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         self.starts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1836,6 +1840,7 @@ fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
             &self,
             _request: &ExecutionRequest,
             _workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             self.starts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2175,13 +2180,14 @@ fn the_service_opens_each_granted_workspace_and_hands_it_to_the_backend() {
             &self,
             request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             assert!(workspaces.serve_exactly(request));
             self.handed.lock().unwrap().push((
                 self.shares.opened.lock().unwrap().len(),
                 workspaces.grants().cloned().collect(),
             ));
-            SharingBackend.start(request, workspaces)
+            SharingBackend.start(request, workspaces, connections)
         }
         fn workspace_capacity(&self) -> usize {
             1
@@ -2246,6 +2252,7 @@ fn a_share_kept_from_another_grant_cannot_stand_in_for_this_runs() {
             &self,
             _request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             let mut stash = self.stash.lock().unwrap();
             if stash.is_empty() {
@@ -2321,6 +2328,7 @@ fn two_proofs_for_one_granted_workspace_are_refused() {
             &self,
             _request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             let mut kept = self.kept.lock().unwrap();
             if kept.is_empty() {
@@ -2385,6 +2393,7 @@ fn a_share_the_backend_took_and_let_go_is_not_served() {
             &self,
             _request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             Ok(BackendRun {
                 backend_id: "letting-go/1".into(),
@@ -2602,6 +2611,7 @@ fn capabilities_projection_uses_declared_backend_class() {
             &self,
             _request: &ExecutionRequest,
             _workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<leyline_runtime::BackendRun, ExecutionError> {
             unreachable!("unavailable backend must not start")
         }
@@ -3116,6 +3126,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
             &self,
             _request: &ExecutionRequest,
             _workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             panic!("start must not be reached: the ceiling is unenforceable here");
         }

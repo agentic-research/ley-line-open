@@ -12,6 +12,7 @@ pub mod cas_evidence;
 pub mod cas_volume;
 mod catalog;
 pub mod confinement;
+mod connections;
 pub mod deployment;
 mod error;
 pub mod lifeline;
@@ -28,7 +29,12 @@ pub use authorization::{
     MetadataOnlyEvidenceVerifier, RejectUnverifiedEvidence, SchemaIntent, SignedGrant,
     WorkspaceInput,
 };
+pub use broker::supervisor::{BrokerConfig, Brokered};
 pub use catalog::{CatalogBuilder, CatalogResolver};
+pub use connections::{
+    ConnectionsCapability, ConnectionsOutcome, RunConnections, ServedConnections,
+    VerifiedConnections,
+};
 pub use error::{ErrorCode, ExecutionError};
 pub use model::{
     BackendCapabilities, BackendClass, BackendEvidenceDocument, BackendRun, BackendRunStatus,

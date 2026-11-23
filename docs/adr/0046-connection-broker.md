@@ -919,9 +919,9 @@ life is thus in the receipt (S8).
   supervisor was never told about. The preflight saw each endpoint path absent and the
   registry holds it for this run alone, so the supervisor unlinks a socket found at a
   declared endpoint path then, and nothing that is not a socket.
-- **A broker exit during the run** is seen two ways: the thread reading the broker's reports
-  reaches end-of-file and fails the run at once (the workload is cancelled without waiting
-  for a poll), and every poll checks the broker's process too. The run's terminal state is
+- **A broker exit during the run** is seen by the thread reading the broker's reports: it
+  reaches end-of-file and fails the run at once, cancelling the workload without waiting
+  for a poll. A poll made while that is in progress waits for it. The run's terminal state is
   `failed`, and its outcome keeps every record reported before the exit with `complete`
   false.
 - **Order at a terminal state.** The workload ends first (it exited, or the cancel killed

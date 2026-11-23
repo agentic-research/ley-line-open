@@ -197,6 +197,12 @@ fn cancel_during_a_stalled_ready_wait_leaves_no_broker_and_no_endpoint() {
             .expect("start thread")
             .expect_err("cancelled");
         assert_eq!(error.code, ErrorCode::Cancelled, "{error}");
+        // The answer is the cancel, and it keeps what the wait saw.
+        assert!(
+            error.detail.contains("cancelled while it was starting")
+                && error.detail.contains("exited before it reported ready"),
+            "{error}"
+        );
     });
     assert_eq!(host.worker_pid(), None, "no worker was ever spawned");
     assert_eq!(

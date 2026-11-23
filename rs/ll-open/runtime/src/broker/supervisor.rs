@@ -67,6 +67,8 @@ pub struct BrokerConfig {
     pub drain_timeout: Duration,
     /// Skip the tier check (`test-support` only).
     unverified_delivery: bool,
+    /// The host the tier check asks about: this one, outside a test.
+    host_os: &'static str,
 }
 
 impl BrokerConfig {
@@ -76,7 +78,16 @@ impl BrokerConfig {
             ready_timeout: READY_TIMEOUT,
             drain_timeout: DRAIN_TIMEOUT,
             unverified_delivery: false,
+            host_os: std::env::consts::OS,
         }
+    }
+
+    /// Run the tier check as on `os`, so the refusal a Linux host gives is
+    /// exercised on every host. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn with_host_os(mut self, os: &'static str) -> Self {
+        self.host_os = os;
+        self
     }
 
     /// Treat this host as a delivering tier, for a test that drives the
@@ -311,15 +322,6 @@ impl<B: Backend> Brokered<B> {
         }
     }
 
-    /// The pid of a live run's broker (`test-support` only).
-    #[cfg(feature = "test-support")]
-    pub fn broker_pid(&self, run_id: &str) -> Option<u32> {
-        match self.shared.runs.lock().get(run_id) {
-            Some(Entry::Live(live)) => Some(live.broker.lock().pid()),
-            _ => None,
-        }
-    }
-
     /// Steps 3 to 5. `slot` holds the broker from its spawn, so the caller
     /// tears it down on any error.
     fn start_brokered(
@@ -351,10 +353,9 @@ impl<B: Backend> Brokered<B> {
         let broker = Arc::new(Mutex::new(broker));
         *slot = Some(Arc::clone(&broker));
         // Step 3: recorded as starting with its broker before the ready wait.
+        // A cancel that came before this is honored where the run would be
+        // published, below.
         match self.shared.runs.lock().get_mut(run_id) {
-            Some(Entry::Starting {
-                cancelled: true, ..
-            }) => return Err(cancelled_during_start().into()),
             Some(Entry::Starting {
                 broker: spawned, ..
             }) => *spawned = Some(pid),
@@ -518,22 +519,6 @@ impl<B: Backend> Brokered<B> {
         );
         self.shared.changed.notify_all();
         None
-    }
-
-    /// A live run whose broker has exited is failed here too, so a poll never
-    /// reports such a run as running or succeeded.
-    fn fail_if_broker_ended(&self, run_id: &str) {
-        let ended = match self.shared.runs.lock().get(run_id) {
-            Some(Entry::Live(live)) => live.broker.lock().exited(),
-            _ => false,
-        };
-        if ended {
-            broker_ended(
-                &Arc::downgrade(&self.shared),
-                &Arc::downgrade(&self.inner),
-                run_id,
-            );
-        }
     }
 
     /// The failure a poll reports for a run whose broker ended under it.
@@ -722,7 +707,7 @@ impl<B: Backend> Backend for Brokered<B> {
         let document = connections.document();
         let class = self.inner.capabilities().backend_class;
         if !config.unverified_delivery
-            && let Err(reason) = tier_delivers(class, std::env::consts::OS)
+            && let Err(reason) = tier_delivers(class, config.host_os)
         {
             return Err(ExecutionError::unsupported(format!(
                 "connection `{}`: {reason}",
@@ -821,7 +806,6 @@ impl<B: Backend> Backend for Brokered<B> {
     }
 
     fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
-        self.fail_if_broker_ended(run_id);
         if let Some(failure) = self.pending_failure(run_id) {
             // The workload was cancelled when its broker ended; a completion
             // it published first is not this run's result.
@@ -844,7 +828,6 @@ impl<B: Backend> Backend for Brokered<B> {
     /// As [`Backend::poll`], and the finished run's connections are taken
     /// into the outcome.
     fn poll_outcome(&self, run_id: &str) -> Result<Option<RunOutcome>, ExecutionError> {
-        self.fail_if_broker_ended(run_id);
         if let Some(failure) = self.pending_failure(run_id) {
             let output = self
                 .inner
@@ -874,10 +857,7 @@ impl<B: Backend> Backend for Brokered<B> {
         let starting = match self.shared.runs.lock().get_mut(run_id) {
             Some(Entry::Starting { broker, cancelled }) => {
                 *cancelled = true;
-                if let Some(pid) = *broker
-                    && let Ok(pid) = libc::pid_t::try_from(pid)
-                    && pid > 1
-                {
+                if let Some(pid) = broker.and_then(crate::backends::spawn::child_pid) {
                     // SAFETY: the broker is this process's own child, and it
                     // is not reaped while its entry is `Starting`, which the
                     // lock held here guarantees it still is.

@@ -566,7 +566,7 @@ cross-runtime fixture suite in CI:
 | **Cap'n Proto segment root** — `BindingRecord` (`bindings.capnp`) and `CacheLockfile` records, and `Head` messages through the sigma/v1 `headMessage` vectors; `ast.capnp` and `source.capnp` records have no cross-runtime fixture | canonical capnp binary | `rs/ll-core/schema-capnp/tests/fixtures/*.bin`; `rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json` | `clients/go/leyline-schema/binding/binding_test.go`, `cache/cache_test.go` and `sigma/sigma_vectors_test.go` decode via the typed capnp Go bindings | T8.10 / `6b7d43`; `a46711` |
 | **Daemon protocol** — UDS request/response JSON per `daemon.capnp` | JSON-as-carrier (per cloister `interlace-spec/0.1.0/README.md`) over UDS | `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` | `clients/go/leyline-schema/daemon/daemon_protocol_test.go` decodes via hand-written JSON-tagged structs that mirror `daemon.capnp` | A-1 / `b5a77b` |
 
-Both gates' Go halves run in `.github/workflows/leyline-schema-go.yml`; the daemon gate's Rust half runs in the workspace tests under `task ci`. The
+Both gates' Go halves run under `task ci` (`task schema:go:test`) and in `.github/workflows/leyline-schema-go.yml`; the daemon gate's Rust half runs in the workspace tests under `task ci`. The
 Cap'n Proto segment root gate asserts byte-equality on canonical encoding (T8.10's
 falsifiable claim F8.6.4 — direct: byte-equal decode in both runtimes).
 

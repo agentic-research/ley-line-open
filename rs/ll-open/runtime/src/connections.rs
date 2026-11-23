@@ -124,11 +124,6 @@ impl RunConnections {
         self.state
     }
 
-    /// Whether the run declares no connection.
-    pub fn is_none(&self) -> bool {
-        matches!(self.state, State::None)
-    }
-
     /// What a backend takes before it spawns anything: the served
     /// connections of `request`'s run, or `None` for a run without any.
     ///

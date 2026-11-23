@@ -546,8 +546,22 @@ fn the_registry_keeps_one_run_from_another_runs_broker() {
     // B ends: the endpoint is free.
     assert!(backend.cancel("run-b").expect("cancel B"));
     start(&backend, "run-a4", Some(&own), &declared).expect("A after B ended");
+
+    // A live run whose workload cannot be cancelled: its broker is stopped
+    // and its socket unlinked, and its endpoint stays reserved (the workload
+    // may still be alive) until a cancel succeeds.
+    probe.cancel_fails.store(true, Ordering::SeqCst);
+    backend
+        .cancel("run-a4")
+        .expect_err("the workload's cancel failed");
+    assert!(!std::path::Path::new(&endpoint(&dir, "api")).exists());
+    let error = start_b().expect_err("A's endpoint is still reserved");
+    assert!(error.detail.contains("another run (run-a4)"), "{error}");
+    probe.cancel_fails.store(false, Ordering::SeqCst);
     assert!(backend.cancel("run-a4").expect("cancel A"));
     assert!(backend.take_connections("run-a4").is_some());
+    start_b().expect("released by the cancel that succeeded");
+    assert!(backend.cancel("run-b").expect("cancel B"));
 }
 
 fn microvm_grant(dir: &Path) -> ConfinementManifest {

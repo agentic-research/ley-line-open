@@ -90,6 +90,10 @@ struct Event {
   data   @3 :Text;   # JSON-encoded payload (flexible per topic)
 }
 
+# Retired (bead `ley-line-open-0a18bc`): the row type of
+# `QueryResponse.retiredRows`, which is never emitted. Kept because that
+# field still names it; schema evolution never removes a type a field
+# references.
 struct QueryRow {
   values @0 :List(Text);
 }
@@ -287,7 +291,13 @@ struct LoadResponse {
 }
 
 struct QueryRequest {
-  sql @0 :Text;
+  sql   @0 :Text;
+  # The most rows to return; absent or 0 (the field's default, which an
+  # absent field reads as) means the daemon's default (1000). Any other
+  # value that is not an integer fitting `UInt32` (too wide, negative,
+  # fractional, not a number) is refused as `limit_out_of_range` before the
+  # statement runs, never clamped (bead `ley-line-open-0a18bc`).
+  limit @1 :UInt32;
 }
 
 # `query` runs one read-only SELECT (bead `ley-line-open-b7e9a3`). `ok` true
@@ -298,9 +308,44 @@ struct QueryRequest {
 struct QueryResponse {
   ok      @0 :Bool;
   columns @1 :List(Text);
-  rows    @2 :List(QueryRow);
+  # Retired, never emitted (bead `ley-line-open-0a18bc`, ADR-0014 §2). It
+  # declared rows as `{"values": [...]}` structs while the daemon sent
+  # objects keyed by column name, and a keyed row drops a value whenever two
+  # columns share a name. The ordinal stays reserved; `rows` @5 carries the
+  # rows.
+  retiredRows @2 :List(QueryRow)  $Json.name("retired_rows");
   error   @3 :Text;
   refusal @4 :QueryRefusal;
+  # One element per result row; each row holds one `QueryCell` per entry of
+  # `columns`, in `columns` order (bead `ley-line-open-0a18bc`).
+  rows    @5 :List(List(QueryCell));
+  # Set only when the statement had more rows than the row limit, and
+  # `rows` holds the first `limit` of them; absent otherwise. A caller that
+  # needs the rest pages with LIMIT/OFFSET in its SQL.
+  truncation @6 :QueryTruncation;
+}
+
+# How a `query` reply was cut short (bead `ley-line-open-0a18bc`).
+struct QueryTruncation {
+  # The row limit that applied: the request's `limit`, or the daemon's
+  # default when the request named none.
+  limit @0 :UInt32;
+}
+
+# One value of a `query` result row. The member names the SQLite value, so
+# SQL NULL is carried by the schema itself, distinct from the empty string.
+# On the JSON wire a cell is `{"null": null}` or `{"text": "..."}`.
+#
+# `text` carries every non-NULL value as text: an integer or real in
+# decimal, text as itself, a blob as lowercase hex. Typed members
+# (`integer`, `real`, `blob`) are the intended extension; adding one is
+# additive, and a reader that meets a member it does not know must refuse
+# the cell rather than guess.
+struct QueryCell {
+  union {
+    null @0 :Void;
+    text @1 :Text;
+  }
 }
 
 # Why a `query` statement was refused.
@@ -315,6 +360,10 @@ enum QueryRefusalReason {
   # The statement is not a read-only SELECT (`VACUUM`, a bare `PRAGMA`, an
   # empty statement); `action` is its leading keyword.
   notAQuery          @2 $Json.name("not_a_query");
+  # The request's `limit` is not an integer that fits the schema's `UInt32`;
+  # `action` is `limit` and `subject` the requested value as JSON text
+  # (`-1`, `1.5`, `"10"`). Nothing ran.
+  limitOutOfRange    @3 $Json.name("limit_out_of_range");
 }
 
 struct QueryRefusal {
@@ -327,11 +376,13 @@ struct QueryRefusal {
   # `delete` or `insert` with `subject` `sqlite_master` (`sqlite_temp_master`
   # for a temporary object). For
   # `not_a_query`, the statement's leading keyword, lower case (`vacuum`), or
-  # `empty`. For `multiple_statements`, `statement`.
+  # `empty`. For `multiple_statements`, `statement`. For
+  # `limit_out_of_range`, `limit`.
   action  @1 :Text;
   # What the action names, when it names something: the table, index,
   # trigger, view, pragma or function, or the file an ATTACH names as a
-  # literal. Unset otherwise.
+  # literal; for `limit_out_of_range`, the requested limit in decimal. Unset
+  # otherwise.
   subject @2 :Text;
 }
 
@@ -450,9 +501,11 @@ struct StaleRefusal {
   # The blob the path holds now, or `absent`.
   current   @2 :Text;
   # Set when the write was merged three ways with `current` and the two
-  # sides changed overlapping lines (ADR-0045 T5): the lines of `expected`
-  # where they overlap. Unset when the path could not be merged at all (a
-  # delete, a create, a symlink, bytes that are not UTF-8).
+  # sides changed overlapping or touching lines (ADR-0045 T5, amended
+  # 2026-11-22: a change and an edit right next to it conflict, as in git):
+  # the lines of `expected` where they collide. Unset when the path could
+  # not be merged at all (a delete, a create, a symlink, bytes that are not
+  # UTF-8).
   conflicts @3 :List(LineRange);
 }
 

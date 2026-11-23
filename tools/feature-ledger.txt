@@ -138,10 +138,13 @@ ll-open/ts            go                 ships-optin     enable  -
 # whose single phantom MISSED surfaced the whole feature-routing defect.
 ll-open/ts            pyproject          not-shipping    enable  ley-line-open-988b93
 
-# leyline-vcs is not a CLI dependency at all. mutants=skip: an accepted
-# hole — a diff touching sqlite-gated vcs code will enumerate phantoms until
-# someone routes the feature.
-ll-open/vcs           sqlite             not-shipping    skip    -
+# leyline-vcs is not a CLI dependency at all. mutants=enable since
+# ley-line-open-ed4736: its graph round trip (commit_snapshot, revert_to_commit,
+# restore_tree_to_graph) is tested only against the sqlite-backed graph,
+# MemoryGraph being read-only, so without the feature a mutation of
+# restore_tree_to_graph survived the jj-lib 0.47 port. The routing closes the
+# hole the old skip row accepted.
+ll-open/vcs           sqlite             not-shipping    enable  ley-line-open-ed4736
 
 # ley-line-open-aed167 — mount SHIPS but zero test files gate on it at any
 # level. Two BUILD checks exist; neither proves a mount serves correct bytes.

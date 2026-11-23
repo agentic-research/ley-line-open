@@ -14,18 +14,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::StreamExt as _;
 use futures::io::AsyncReadExt as _;
 use jj_lib::backend::{CopyId, TreeValue};
 use jj_lib::config::StackedConfig;
+use jj_lib::default_backend_factories::{
+    default_backend_factories, default_working_copy_factories, default_workspace_loader_factory,
+};
 use jj_lib::local_working_copy::LocalWorkingCopyFactory;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::{WorkspaceName, WorkspaceNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo as _};
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
-use jj_lib::tree_builder::TreeBuilder;
-use jj_lib::workspace::{Workspace, default_working_copy_factories};
+use jj_lib::store::Store;
+use jj_lib::workspace::Workspace;
 use leyline_core::Controller;
 use pollster::FutureExt as _;
 use tokio::sync::mpsc;
@@ -137,9 +142,21 @@ pub struct JjIntegration {
     settings: UserSettings,
 }
 
+/// Load the workspace rooted at `root` with jj-lib's default store and
+/// working-copy factories (the Git backend among them, under the `git`
+/// feature).
+fn load_workspace(settings: &UserSettings, root: &Path) -> Result<Workspace> {
+    let workspace = default_workspace_loader_factory().create(root)?.load(
+        settings,
+        &default_backend_factories(),
+        &default_working_copy_factories(),
+    )?;
+    Ok(workspace)
+}
+
 impl JjIntegration {
     fn make_settings() -> Result<UserSettings> {
-        UserSettings::from_config(StackedConfig::with_defaults())
+        UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)
             .map_err(|e| anyhow::anyhow!("settings: {e}"))
     }
 
@@ -148,7 +165,7 @@ impl JjIntegration {
         std::fs::create_dir_all(jj_dir)?;
         let settings = Self::make_settings()?;
 
-        Workspace::init_simple(&settings, jj_dir)
+        Workspace::init_simple(&settings, jj_dir, WorkspaceName::DEFAULT)
             .block_on()
             .map_err(|e| anyhow::anyhow!("jj init failed: {e}"))?;
 
@@ -165,13 +182,7 @@ impl JjIntegration {
         let settings = Self::make_settings()?;
 
         // Verify we can load it
-        Workspace::load(
-            &settings,
-            jj_dir,
-            &Default::default(),
-            &default_working_copy_factories(),
-        )
-        .map_err(|e| anyhow::anyhow!("jj open failed: {e}"))?;
+        load_workspace(&settings, jj_dir).map_err(|e| anyhow::anyhow!("jj open failed: {e}"))?;
 
         Ok(Self {
             jj_dir: jj_dir.to_path_buf(),
@@ -197,18 +208,16 @@ impl JjIntegration {
         let store = repo.store().clone();
 
         // Build a jj tree from the graph
-        let empty_tree_id = store.empty_tree_id().clone();
-        let mut tree_builder = TreeBuilder::new(store.clone(), empty_tree_id);
+        let mut tree_builder = MergedTreeBuilder::new(store.empty_merged_tree());
 
-        self.walk_graph_into_tree(graph, "", &mut tree_builder)?;
+        self.walk_graph_into_tree(graph, "", &store, &mut tree_builder)?;
 
-        let tree_id = tree_builder
+        // Every override is a resolved file value on a resolved empty base, so
+        // the result is one resolved tree.
+        let merged_tree = tree_builder
             .write_tree()
             .block_on()
             .map_err(|e| anyhow::anyhow!("write tree: {e}"))?;
-
-        // Wrap TreeId into MergedTree for new_commit
-        let merged_tree = MergedTree::resolved(store.clone(), tree_id);
 
         // Linear history: parent on the current head (or root if first commit)
         let heads: Vec<_> = repo.view().heads().iter().cloned().collect();
@@ -321,7 +330,8 @@ impl JjIntegration {
         _parent_id: &str,
         tree: &MergedTree,
     ) -> Result<()> {
-        for (path, value_result) in tree.entries() {
+        let entries: Vec<_> = tree.entries().collect().block_on();
+        for (path, value_result) in entries {
             let value = match value_result {
                 Ok(v) => v,
                 Err(e) => {
@@ -459,17 +469,12 @@ impl JjIntegration {
     }
 
     fn load_repo(&self) -> Result<Arc<ReadonlyRepo>> {
-        let workspace = Workspace::load(
-            &self.settings,
-            &self.jj_dir,
-            &Default::default(),
-            &default_working_copy_factories(),
-        )
-        .map_err(|e| anyhow::anyhow!("load workspace: {e}"))?;
+        let workspace = load_workspace(&self.settings, &self.jj_dir)
+            .map_err(|e| anyhow::anyhow!("load workspace: {e}"))?;
 
         workspace
             .repo_loader()
-            .load_at_head()
+            .load_at_head(None)
             .block_on()
             .map_err(|e| anyhow::anyhow!("load repo: {e}"))
     }
@@ -499,17 +504,12 @@ impl JjIntegration {
         std::fs::create_dir_all(root)?;
 
         // Load the shared repo (this integration's store + current head).
-        let primary = Workspace::load(
-            &self.settings,
-            &self.jj_dir,
-            &Default::default(),
-            &default_working_copy_factories(),
-        )
-        .map_err(|e| anyhow::anyhow!("load primary workspace: {e}"))?;
+        let primary = load_workspace(&self.settings, &self.jj_dir)
+            .map_err(|e| anyhow::anyhow!("load primary workspace: {e}"))?;
         let repo_path = primary.repo_path().to_path_buf();
         let repo = primary
             .repo_loader()
-            .load_at_head()
+            .load_at_head(None)
             .block_on()
             .map_err(|e| anyhow::anyhow!("load shared repo: {e}"))?;
 
@@ -529,6 +529,7 @@ impl JjIntegration {
             &repo,
             &factory,
             WorkspaceNameBuf::from(name),
+            None,
         )
         .block_on()
         .map_err(|e| anyhow::anyhow!("init agent workspace {name:?}: {e}"))?;
@@ -590,20 +591,12 @@ impl JjIntegration {
     /// Does NOT delete the workspace's directory — that is the caller's, since
     /// only the caller knows whether the files still matter.
     pub fn forget_workspace(&self, name: &str) -> Result<()> {
-        use jj_lib::workspace_store::{SimpleWorkspaceStore, WorkspaceStore as _};
-
         let ws_name = WorkspaceNameBuf::from(name);
-        let primary = Workspace::load(
-            &self.settings,
-            &self.jj_dir,
-            &Default::default(),
-            &default_working_copy_factories(),
-        )
-        .map_err(|e| anyhow::anyhow!("load primary workspace: {e}"))?;
-        let repo_path = primary.repo_path().to_path_buf();
+        let primary = load_workspace(&self.settings, &self.jj_dir)
+            .map_err(|e| anyhow::anyhow!("load primary workspace: {e}"))?;
         let repo = primary
             .repo_loader()
-            .load_at_head()
+            .load_at_head(None)
             .block_on()
             .map_err(|e| anyhow::anyhow!("load shared repo: {e}"))?;
         if repo.view().get_wc_commit_id(&ws_name).is_none() {
@@ -612,7 +605,7 @@ impl JjIntegration {
 
         let mut tx = repo.start_transaction();
         tx.repo_mut()
-            .remove_wc_commit(&ws_name)
+            .remove_workspace(&ws_name)
             .block_on()
             .map_err(|e| anyhow::anyhow!("forget workspace {name:?}: {e}"))?;
         tx.repo_mut()
@@ -625,9 +618,9 @@ impl JjIntegration {
 
         // The view and the workspace-name index are separate records; dropping
         // only the working-copy commit would leave a dangling name behind.
-        let store = SimpleWorkspaceStore::load(&repo_path)
-            .map_err(|e| anyhow::anyhow!("load workspace store: {e}"))?;
-        store
+        primary
+            .repo_loader()
+            .workspace_store()
             .forget(&[&ws_name])
             .map_err(|e| anyhow::anyhow!("forget {name:?} from workspace store: {e}"))?;
 
@@ -652,7 +645,8 @@ impl JjIntegration {
         &self,
         graph: &dyn Graph,
         parent_id: &str,
-        tree_builder: &mut TreeBuilder,
+        store: &Arc<Store>,
+        tree_builder: &mut MergedTreeBuilder,
     ) -> Result<()> {
         let children = graph.list_children(parent_id)?;
         for child in &children {
@@ -660,7 +654,7 @@ impl JjIntegration {
                 continue;
             }
             if child.is_dir {
-                self.walk_graph_into_tree(graph, &child.id, tree_builder)?;
+                self.walk_graph_into_tree(graph, &child.id, store, tree_builder)?;
             } else {
                 // Read content
                 let mut buf = vec![0u8; child.size.max(1) as usize];
@@ -671,8 +665,7 @@ impl JjIntegration {
                     .map_err(|e| anyhow::anyhow!("invalid path '{}': {e}", child.id))?;
 
                 // write_file is async — use pollster to block
-                let blob_id = tree_builder
-                    .store()
+                let blob_id = store
                     .write_file(&path, &mut buf.as_slice())
                     .block_on()
                     .map_err(|e| anyhow::anyhow!("write blob: {e}"))?;
@@ -2227,9 +2220,14 @@ mod tests {
 
         std::fs::create_dir_all(primary).unwrap();
         let settings = JjIntegration::make_settings().unwrap();
-        Workspace::init_internal_git(&settings, primary)
-            .block_on()
-            .expect("init_internal_git requires jj-lib's `git` feature");
+        Workspace::init_internal_git(
+            &settings,
+            primary,
+            WorkspaceName::DEFAULT,
+            gix::hash::Kind::Sha1,
+        )
+        .block_on()
+        .expect("init_internal_git requires jj-lib's `git` feature");
 
         let jj = JjIntegration::open(primary).expect("open a git-backed repo");
 

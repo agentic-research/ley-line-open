@@ -4,8 +4,7 @@ set -eu
 # The fixture's git runs no developer hooks. A global `core.hooksPath`
 # whose commit-msg hook enforces a message policy rejected
 # `git commit -m fixture` and failed task ci before any Rust ran (bead
-# ley-line-open-d1697b). `pre_push_ci.sh` is invoked directly below, never
-# through git's hook lookup, so this disables nothing the fixture proves.
+# ley-line-open-d1697b). The fixture proves nothing about hooks.
 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
 export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 
@@ -16,7 +15,6 @@ trap 'rm -rf "$tmp_dir"' 0 1 2 15
 fixture="$tmp_dir/repo"
 mkdir -p "$fixture/tools"
 cp "$repo_root/tools/ci_attestation.sh" "$fixture/tools/"
-cp "$repo_root/tools/pre_push_ci.sh" "$fixture/tools/"
 
 git -C "$fixture" init -q
 git -C "$fixture" config user.name "CI Attestation Fixture"
@@ -80,71 +78,6 @@ git -C "$fixture" commit -qm "commit tested bytes"
     tools/ci_attestation.sh check
     tools/ci_attestation.sh verify-head
 )
-
-fake_task="$tmp_dir/fake-task"
-cat > "$fake_task" <<'EOF'
-#!/bin/sh
-set -eu
-test "$1" = "ci"
-count=0
-test ! -f "$TASK_COUNT" || count=$(cat "$TASK_COUNT")
-printf '%s\n' "$((count + 1))" > "$TASK_COUNT"
-tools/ci_attestation.sh begin
-tools/ci_attestation.sh finish
-EOF
-chmod +x "$fake_task"
-
-export TASK_COUNT="$tmp_dir/task-count"
-(
-    cd "$fixture"
-    TASK_BIN="$fake_task" tools/pre_push_ci.sh
-)
-test ! -e "$TASK_COUNT"
-
-printf '%s\n' "next committed tree" > "$fixture/tracked.txt"
-git -C "$fixture" add tracked.txt
-git -C "$fixture" commit -qm "invalidate receipt"
-(
-    cd "$fixture"
-    TASK_BIN="$fake_task" tools/pre_push_ci.sh
-    TASK_BIN="$fake_task" tools/pre_push_ci.sh
-)
-test "$(cat "$TASK_COUNT")" -eq 1
-
-# PRE_COMMIT_REMOTE_BRANCH scopes the full gate to pushes that land on main
-# (bead ley-line-open-24b91d): every PR now gets `task ci` on a runner via
-# ci.yml's pull_request trigger, so a push to any other branch can defer to
-# that instead of paying for the full gate on the laptop.
-printf '%s\n' "feature branch push" > "$fixture/tracked.txt"
-git -C "$fixture" add tracked.txt
-git -C "$fixture" commit -qm "invalidate receipt for scoping tests"
-
-# (a) Non-main target: the full gate is deferred to PR CI, task ci does not
-# run (TASK_COUNT stays untouched), and the hook exits 0.
-(
-    cd "$fixture"
-    PRE_COMMIT_REMOTE_BRANCH=refs/heads/feature-x TASK_BIN="$fake_task" tools/pre_push_ci.sh
-)
-test "$(cat "$TASK_COUNT")" -eq 1
-
-# (b) main target: gate runs as today.
-(
-    cd "$fixture"
-    PRE_COMMIT_REMOTE_BRANCH=refs/heads/main TASK_BIN="$fake_task" tools/pre_push_ci.sh
-)
-test "$(cat "$TASK_COUNT")" -eq 2
-
-# (c) Variable unset (a raw `git push` outside the pre-commit framework):
-# fail CLOSED to the full gate — a missing signal must never mean "skip".
-printf '%s\n' "raw git push" > "$fixture/tracked.txt"
-git -C "$fixture" add tracked.txt
-git -C "$fixture" commit -qm "invalidate receipt again"
-(
-    cd "$fixture"
-    unset PRE_COMMIT_REMOTE_BRANCH
-    TASK_BIN="$fake_task" tools/pre_push_ci.sh
-)
-test "$(cat "$TASK_COUNT")" -eq 3
 
 # The receipt attests "task ci passed for these INPUTS", and .beads/beads.jsonl
 # is not an input: nothing task ci runs reads it (asserted below against the

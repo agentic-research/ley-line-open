@@ -120,6 +120,13 @@ enum Cmd {
         #[arg(long)]
         worker: PathBuf,
 
+        /// The connection broker executable, leyline-conn-broker (ADR-0046
+        /// Slice 1). With it the daemon serves a grant's connections and
+        /// advertises `cloister/execution/v1/connections`; without it a grant
+        /// with connections is refused by name. It must be an existing file.
+        #[arg(long, value_name = "PATH")]
+        connection_broker: Option<PathBuf>,
+
         /// Trusted artifact/workspace-to-rootfs catalog JSON document.
         #[arg(long)]
         catalog: PathBuf,
@@ -511,6 +518,7 @@ async fn main() -> Result<()> {
             cas_volume_size_cap_gib,
             run_root,
             worker,
+            connection_broker,
             catalog,
             backend: backend_kind,
             devices,
@@ -541,6 +549,16 @@ async fn main() -> Result<()> {
                     worker.display()
                 );
             }
+            // A named broker that is not there is a startup error: the daemon
+            // would advertise connections it cannot serve.
+            let connection_broker = match connection_broker {
+                Some(path) if !path.is_file() => bail!(
+                    "--connection-broker is not an executable file: {}",
+                    path.display()
+                ),
+                Some(path) => Some(leyline_runtime::BrokerConfig::new(path)),
+                None => None,
+            };
             // Both tiers materialize each run's rootfs beneath `run_root`.
             let (storage, run_root) =
                 execution_cas_storage(cas_root, cas_volume, cas_volume_size_cap_gib, run_root)?;
@@ -599,9 +617,12 @@ async fn main() -> Result<()> {
                         ),
                         None => backend,
                     };
-                    let service = Arc::new(
-                        leyline_runtime::ExecutionService::new(backend).with_cas_storage(storage),
-                    );
+                    let service =
+                        leyline_runtime::ExecutionService::new(backend).with_cas_storage(storage);
+                    let service = Arc::new(match connection_broker {
+                        Some(config) => service.with_connection_broker(config),
+                        None => service,
+                    });
                     let policy = leyline_runtime::authorization::AuthorizationPolicy {
                         required_backend: leyline_runtime::BackendClass::Native,
                         ..Default::default()
@@ -652,6 +673,10 @@ async fn main() -> Result<()> {
                     let context = leyline_cli_lib::daemon::ContextSlot::default();
                     let service =
                         leyline_runtime::ExecutionService::new(backend).with_cas_storage(storage);
+                    let service = match connection_broker {
+                        Some(config) => service.with_connection_broker(config),
+                        None => service,
+                    };
                     let service = Arc::new(if source.is_some() {
                         service.with_workspace_shares(Arc::new(leyline_storefs::DaemonShares::new(
                             Arc::clone(&context),

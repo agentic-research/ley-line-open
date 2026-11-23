@@ -206,7 +206,12 @@ fn cancel_during_a_stalled_ready_wait_leaves_no_broker_and_no_endpoint() {
     );
     // Nothing of the run is left in the registry: the same endpoint and
     // grant start again, on a broker that reports ready.
-    let again = Run::new(host.backend(UNTIL_CANCELLED), host.broker(None), &dir, echo());
+    let again = Run::new(
+        host.backend(UNTIL_CANCELLED),
+        host.broker(None),
+        &dir,
+        echo(),
+    );
     let authority = again.authority("after-the-cancel");
     let record = again.start(&authority).expect("the endpoint is free");
     again.service.cancel(&record.run_id).expect("cancel");
@@ -230,7 +235,12 @@ fn a_failure_at_step_five_leaves_no_broker_and_no_endpoint() {
     assert_eq!(run.service.status(&authority.run_id).expect("status"), None);
 
     // The registry entry went with it: the same endpoint starts again.
-    let again = Run::new(host.backend(UNTIL_CANCELLED), host.broker(None), &dir, echo());
+    let again = Run::new(
+        host.backend(UNTIL_CANCELLED),
+        host.broker(None),
+        &dir,
+        echo(),
+    );
     let record = again
         .start(&again.authority("after-the-failure"))
         .expect("the endpoint is free");
@@ -242,7 +252,12 @@ fn a_broker_killed_mid_run_fails_the_run_with_an_incomplete_receipt() {
     let _serial = common::serial();
     let host = Host::new();
     let (_keep, dir) = channel_dir();
-    let run = Run::new(host.backend(UNTIL_CANCELLED), host.broker(None), &dir, echo());
+    let run = Run::new(
+        host.backend(UNTIL_CANCELLED),
+        host.broker(None),
+        &dir,
+        echo(),
+    );
     let record = run.start(&run.authority("killed")).expect("running");
     assert_eq!(record.state, RunState::Running);
     let socket = endpoint(&dir, "api");
@@ -277,7 +292,12 @@ fn a_broker_killed_mid_run_fails_the_run_with_an_incomplete_receipt() {
     assert_eq!(connection["complete"], false, "{receipt}");
     // Lower bounds: at most the one connection made before the kill.
     assert!(
-        connection["accepted"].as_str().unwrap().parse::<u64>().unwrap() <= 1,
+        connection["accepted"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            <= 1,
         "{receipt}"
     );
     run.service.cleanup(&record.run_id).expect("cleanup");
@@ -309,16 +329,26 @@ fn a_connection_open_across_workload_exit_is_in_the_receipt_complete() {
         "a service with a broker advertises connections: {capabilities}"
     );
 
-    let record = run.start(&run.authority("open-across-exit")).expect("running");
+    let record = run
+        .start(&run.authority("open-across-exit"))
+        .expect("running");
     let socket = endpoint(&dir, "api");
     drop(round_trip(&socket, b"closed before exit"));
     // Held open for the rest of the run, and past the workload's exit.
     let held = round_trip(&socket, b"open across exit");
     let broker = host.broker_pid().expect("broker pid");
 
-    drop(std::fs::OpenOptions::new().write(true).open(&exit).expect("release the workload"));
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&exit)
+            .expect("release the workload"),
+    );
     // EVENT: the worker has exited and its completion is published.
-    assert_eq!(run.backend.settle(&record.run_id), BackendRunStatus::Succeeded);
+    assert_eq!(
+        run.backend.settle(&record.run_id),
+        BackendRunStatus::Succeeded
+    );
     let status = run.service.status(&record.run_id).expect("status").unwrap();
     assert_eq!(status.state, RunState::Succeeded);
     // The terminal transition drained the broker and tore it down.
@@ -344,7 +374,10 @@ fn a_connection_open_across_workload_exit_is_in_the_receipt_complete() {
     // UInt64 is a decimal string in the JSON carrier.
     assert_eq!(connection["accepted"], "2", "{receipt}");
     assert_eq!(connection["dialed"], "2");
-    assert!(connection.get("refused").is_none_or(|v| v == "0"), "{receipt}");
+    assert!(
+        connection.get("refused").is_none_or(|v| v == "0"),
+        "{receipt}"
+    );
     let sent = (b"closed before exit".len() + b"open across exit".len()) as u64;
     for key in ["bytesToTarget", "bytesFromTarget"] {
         assert_eq!(
@@ -357,7 +390,12 @@ fn a_connection_open_across_workload_exit_is_in_the_receipt_complete() {
 
     // A cancelled run's receipt is assembled the same way.
     let (_keep, dir) = channel_dir();
-    let run = Run::new(host.backend(UNTIL_CANCELLED), host.broker(None), &dir, echo());
+    let run = Run::new(
+        host.backend(UNTIL_CANCELLED),
+        host.broker(None),
+        &dir,
+        echo(),
+    );
     let record = run.start(&run.authority("cancelled")).expect("running");
     let held = round_trip(&endpoint(&dir, "api"), b"open at the cancel");
     let cancelled = run.service.cancel(&record.run_id).expect("cancel");
@@ -398,9 +436,16 @@ fn a_run_without_connections_has_neither_receipt_field() {
         grant,
     };
     let record = run.start(&authority).expect("running");
-    assert_eq!(run.backend.settle(&record.run_id), BackendRunStatus::Succeeded);
+    assert_eq!(
+        run.backend.settle(&record.run_id),
+        BackendRunStatus::Succeeded
+    );
     run.service.status(&record.run_id).expect("status");
-    assert_eq!(host.broker_pid(), None, "no broker for a run without connections");
+    assert_eq!(
+        host.broker_pid(),
+        None,
+        "no broker for a run without connections"
+    );
     let receipt = run.receipt(&record.run_id);
     for key in ["connectionsDigest", "connections"] {
         assert!(receipt.get(key).is_none(), "no {key}: {receipt}");
@@ -440,8 +485,8 @@ fn broker_lifeline_embedder() {
     let port: u16 = parts.next().unwrap().parse().unwrap();
     std::fs::create_dir(host.path("cas")).unwrap();
     std::fs::create_dir(host.path("runs")).unwrap();
-    let service =
-        ExecutionService::new(host.backend(UNTIL_CANCELLED)).with_connection_broker(host.broker(None));
+    let service = ExecutionService::new(host.backend(UNTIL_CANCELLED))
+        .with_connection_broker(host.broker(None));
     let granted = manifest(vec![native_grant(&dir, "api")]);
     service
         .start_with_connections(
@@ -505,7 +550,9 @@ fn the_broker_ends_when_the_process_supervising_it_is_killed() {
     let pids = started
         .recv_timeout(BOUND)
         .expect("TIMEOUT: the embedder's start never returned");
-    let mut pids = pids.split(' ').map(|pid| pid.parse::<libc::pid_t>().unwrap());
+    let mut pids = pids
+        .split(' ')
+        .map(|pid| pid.parse::<libc::pid_t>().unwrap());
     let (broker, worker) = (pids.next().unwrap(), pids.next().unwrap());
     let _broker_cleanup = KillOnDrop(broker);
     let _worker_cleanup = KillOnDrop(worker);

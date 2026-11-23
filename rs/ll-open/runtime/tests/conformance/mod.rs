@@ -228,6 +228,9 @@ pub struct ColumnSpec {
     /// Whether a start error means the host could not apply the native
     /// sandbox at all (a named skip), as opposed to a failure.
     pub sandbox_refusal: fn(&ExecutionError) -> bool,
+    /// The shipped `leyline-conn-broker`: the column's service serves
+    /// connections with it, confined by its own profile (ADR-0046 Slice 1).
+    pub broker: PathBuf,
 }
 
 pub struct Column {
@@ -244,7 +247,8 @@ impl Column {
         let trap = SubprocessTrap::install(&fixture.root.join("trap"));
         let backend = Observed::new(backend);
         Self {
-            service: ExecutionService::new(backend.clone()),
+            service: ExecutionService::new(backend.clone())
+                .with_connection_broker(leyline_runtime::BrokerConfig::new(&spec.broker)),
             backend,
             spec,
             fixture,
@@ -260,7 +264,9 @@ impl Column {
         mut self,
         shares: std::sync::Arc<dyn leyline_runtime::backends::libkrun::share::WorkspaceShares>,
     ) -> Self {
-        self.service = ExecutionService::new(self.backend.clone()).with_workspace_shares(shares);
+        self.service = ExecutionService::new(self.backend.clone())
+            .with_connection_broker(leyline_runtime::BrokerConfig::new(&self.spec.broker))
+            .with_workspace_shares(shares);
         self
     }
 
@@ -344,30 +350,8 @@ impl Column {
         manifest: &ConfinementManifest,
         environment: &[(&str, String)],
     ) -> Option<Started> {
-        let document = manifest.to_canonical_json().expect("canonical document");
-        let digest = manifest.confinement_digest().expect("confinement digest");
-        let (spec, grant) = spec_and_grant(&GrantSpec::new(
-            self.spec.class,
-            replay_key,
-            &digest,
-            &document,
-        ));
-        match self.service.start_authorized(
-            &spec,
-            &grant,
-            &self.policy(&digest),
-            &self.resolver(environment),
-        ) {
-            Ok(record) => {
-                assert_eq!(record.state, RunState::Running, "{}", self.spec.name);
-                assert_eq!(record.backend_id, self.spec.backend_id);
-                Some(Started {
-                    run_id: record.run_id,
-                    spec,
-                    grant,
-                    digest,
-                })
-            }
+        match self.try_start(replay_key, manifest, environment, None) {
+            Ok(started) => Some(started),
             Err(error) if (self.spec.sandbox_refusal)(&error) => {
                 sandbox_unavailable(self.spec.name, &error);
                 None
@@ -377,6 +361,37 @@ impl Column {
                 self.spec.name
             ),
         }
+    }
+
+    /// [`Self::start`] with the start's own answer, and with the grant
+    /// carrying `connections` (a canonical `cloister/connections/v1`
+    /// document) when given.
+    pub fn try_start(
+        &self,
+        replay_key: &str,
+        manifest: &ConfinementManifest,
+        environment: &[(&str, String)],
+        connections: Option<&str>,
+    ) -> Result<Started, ExecutionError> {
+        let document = manifest.to_canonical_json().expect("canonical document");
+        let digest = manifest.confinement_digest().expect("confinement digest");
+        let mut authority = GrantSpec::new(self.spec.class, replay_key, &digest, &document);
+        authority.connections = connections;
+        let (spec, grant) = spec_and_grant(&authority);
+        let record = self.service.start_authorized(
+            &spec,
+            &grant,
+            &self.policy(&digest),
+            &self.resolver(environment),
+        )?;
+        assert_eq!(record.state, RunState::Running, "{}", self.spec.name);
+        assert_eq!(record.backend_id, self.spec.backend_id);
+        Ok(Started {
+            run_id: record.run_id,
+            spec,
+            grant,
+            digest,
+        })
     }
 
     /// The row passed without reaching for a forbidden subprocess.
@@ -1058,6 +1073,162 @@ pub fn sandbox_unavailable(column: &str, error: &ExecutionError) {
 }
 
 // ---------------------------------------------------------------------------
+// The connection broker (ADR-0046 Slice 1).
+
+/// The guest loopback port the microVM tier presents the row's connection on.
+const CONNECTION_GUEST_PORT: u16 = 13306;
+
+/// One declared connection, `api`, reaches its one loopback target through
+/// the run's broker on every tier that delivers connections, and the receipt
+/// records it; a tier that does not deliver them refuses the run by name
+/// before anything is spawned (ADR-0046 S6, S7, S8).
+///
+/// The target is a TCP listener in this process, in the API's place. The
+/// guest dials what its tier presents (the endpoint path on the native tier,
+/// `127.0.0.1:<guestPort>` in a microVM) and writes one line; the listener's
+/// `accept` and that line arriving are the events.
+pub fn row_a_declared_connection_reaches_its_target_through_the_broker(column: Column) {
+    let name = column.spec.name;
+    column.provision();
+    let target = TcpListener::bind("127.0.0.1:0").expect("the connection's target");
+    let port = target.local_addr().expect("target address").port();
+    // The issuer's channel directory: private, named by its real path, and
+    // short (a socket path is capped near 104 bytes).
+    let channel = tempfile::Builder::new()
+        .prefix("cb")
+        .tempdir_in("/tmp")
+        .expect("channel directory");
+    fs::set_permissions(channel.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+    let endpoint = channel
+        .path()
+        .canonicalize()
+        .expect("real path")
+        .join("c.api.sock")
+        .display()
+        .to_string();
+    let (grant, dial) = match column.spec.class {
+        BackendClass::MicroVm => (
+            UnixSocketGrant::connect(&endpoint)
+                .with_guest_port(CONNECTION_GUEST_PORT)
+                .expect("guestPort"),
+            format!("tcp:127.0.0.1:{CONNECTION_GUEST_PORT}"),
+        ),
+        BackendClass::Native => (
+            UnixSocketGrant::connect(&endpoint),
+            format!("unix:{endpoint}"),
+        ),
+    };
+    let manifest = column
+        .manifest(None)
+        .with_unix_socket(grant)
+        .expect("the endpoint's §6 grant");
+    // The canonical document, written out: authorization refuses any other
+    // spelling, so this is also a check of the form.
+    let declared = format!(
+        "{{\n  \"connections\": [\n    {{\n      \"appProtocol\": \"art.tcp\",\n      \
+         \"endpoint\": {{\n        \"unix\": \"{endpoint}\"\n      }},\n      \
+         \"name\": \"api\",\n      \"target\": {{\n        \"tcp\": {{\n          \
+         \"host\": \"127.0.0.1\",\n          \"port\": {port}\n        }}\n      }}\n    }}\n  ],\n  \
+         \"version\": \"cloister/connections/v1\"\n}}"
+    );
+    let environment = vec![
+        ("CONFORMANCE_MODE", "block".to_owned()),
+        ("CONFORMANCE_DIAL", dial),
+    ];
+    let started = match column.try_start("connection", &manifest, &environment, Some(&declared)) {
+        Ok(started) => started,
+        Err(error) if !cfg!(target_os = "macos") => {
+            // Slice 1 delivers on macOS only (S6): refused by name, with
+            // nothing spawned and nothing bound.
+            assert_eq!(error.code, ErrorCode::UnsupportedBackend, "{name}: {error}");
+            assert!(error.detail.contains("connection `api`"), "{name}: {error}");
+            assert!(
+                error.detail.contains("does not deliver connections"),
+                "{name}: {error}"
+            );
+            assert_eq!(
+                column.run_roots(),
+                0,
+                "{name}: a refused run left a run root"
+            );
+            assert!(!Path::new(&endpoint).exists(), "{name}: nothing was bound");
+            column.finish();
+            return;
+        }
+        Err(error) if (column.spec.sandbox_refusal)(&error) => {
+            sandbox_unavailable(name, &error);
+            return;
+        }
+        Err(error) => panic!("{name}: start a run with a declared connection: {error}"),
+    };
+    assert!(
+        cfg!(target_os = "macos"),
+        "{name}: a tier that does not deliver connections started one"
+    );
+
+    // EVENT: the guest's dial arrives at the target, through the broker.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(target.accept().map(|(stream, _)| stream));
+    });
+    let stream = match receiver.recv_timeout(DIAL_BOUND) {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => panic!("{name}: accept at the target: {error}"),
+        Err(_) => panic!(
+            "{name}: the guest's connection never reached its target within {DIAL_BOUND:?}; \
+             run state: {:?}",
+            column.service.status(&started.run_id)
+        ),
+    };
+    stream
+        .set_read_timeout(Some(DIAL_BOUND))
+        .expect("read bound");
+    let mut line = String::new();
+    BufReader::new(&stream)
+        .read_line(&mut line)
+        .expect("the guest's line, relayed");
+    assert!(line.starts_with("blocked pid="), "{name}: {line:?}");
+
+    let cancelled = column.service.cancel(&started.run_id).expect("cancel");
+    assert_eq!(cancelled.state, RunState::Cancelled, "{name}");
+    assert!(
+        !Path::new(&endpoint).exists(),
+        "{name}: the endpoint is unlinked at teardown"
+    );
+    let receipt = column.service.collect(&started.run_id).expect("collect");
+    assert_receipt(&column, &started, &receipt, RunState::Cancelled);
+    let recorded = receipt
+        .connections
+        .as_ref()
+        .unwrap_or_else(|| panic!("{name}: the receipt records the run's connections"));
+    assert_eq!(
+        recorded.digest,
+        format!("blake3-256:{}", blake3::hash(declared.as_bytes()).to_hex()),
+        "{name}: the receipt names the document the broker attested"
+    );
+    assert_eq!(recorded.connections.len(), 1, "{name}");
+    let connection = &recorded.connections[0];
+    assert_eq!(connection.name, "api");
+    assert_eq!(connection.target, format!("127.0.0.1:{port}"));
+    assert_eq!(
+        (connection.accepted, connection.dialed, connection.refused),
+        (1, 1, 0),
+        "{name}: {connection:?}"
+    );
+    assert_eq!(connection.foreign_peers, 0, "{name}");
+    assert!(
+        connection.complete,
+        "{name}: the teardown drained the broker"
+    );
+    assert_eq!(
+        connection.bytes_to_target,
+        line.len() as u64,
+        "{name}: {connection:?}"
+    );
+    column.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Receipts.
 
 /// What every collected receipt must say, on every backend.
@@ -1197,6 +1368,16 @@ macro_rules! conformance_rows {
             let _serial = $serial;
             if let Some(column) = $column {
                 conformance::row_cancel_ends_a_blocked_guest_and_everything_it_ran(column);
+            }
+        }
+
+        #[test]
+        fn a_declared_connection_reaches_its_target_through_the_broker() {
+            let _serial = $serial;
+            if let Some(column) = $column {
+                conformance::row_a_declared_connection_reaches_its_target_through_the_broker(
+                    column,
+                );
             }
         }
 

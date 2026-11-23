@@ -128,7 +128,11 @@ fn a_failed_guest_reports_what_it_printed() {
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, FAILING, "output-failing");
     backend
-        .start(&request, leyline_runtime::ServedWorkspaces::none(), leyline_runtime::RunConnections::none())
+        .start(
+            &request,
+            leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("the guest starts");
     let outcome = backend
         .wait_for_outcome(&request.run_id)
@@ -178,7 +182,11 @@ fn a_finished_guest_reports_what_it_printed() {
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, SUCCEEDING, "output-ok");
     backend
-        .start(&request, leyline_runtime::ServedWorkspaces::none(), leyline_runtime::RunConnections::none())
+        .start(
+            &request,
+            leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("the guest starts");
     let outcome = backend
         .wait_for_outcome(&request.run_id)
@@ -221,7 +229,11 @@ fn a_guest_cannot_classify_its_own_failure() {
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, FORGING, "output-forging");
     backend
-        .start(&request, leyline_runtime::ServedWorkspaces::none(), leyline_runtime::RunConnections::none())
+        .start(
+            &request,
+            leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("the guest starts");
     let status = backend
         .wait_for_completion(&request.run_id)
@@ -255,7 +267,11 @@ fn a_serving_guest_announcement_is_readable_while_it_runs() {
     let root = fixture.path().canonicalize().expect("canonical fixture");
     let (backend, request) = backend_and_request(&root, &libkrunfw, SERVING, "output-serving");
     backend
-        .start(&request, leyline_runtime::ServedWorkspaces::none(), leyline_runtime::RunConnections::none())
+        .start(
+            &request,
+            leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("the guest starts");
     let seen = backend
         .wait_for_output(

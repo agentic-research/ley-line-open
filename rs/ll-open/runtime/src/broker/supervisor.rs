@@ -145,7 +145,8 @@ pub fn cross_document(
             .filter(|grant| grant.path() == endpoint && !grant.permits_bind())
             .collect();
         for grant in manifest.unix_sockets() {
-            if grant.permits_bind() && SocketGrant(grant.path().to_owned()).covers(Path::new(endpoint))
+            if grant.permits_bind()
+                && SocketGrant(grant.path().to_owned()).covers(Path::new(endpoint))
             {
                 return Err(refuse(format!(
                     "the confinement manifest's §6 {} grant {} lets the workload bind the \
@@ -232,7 +233,10 @@ enum Entry {
     /// From registration until the run is published or its start has ended.
     /// `broker` is the broker's pid once it is spawned: it stays unreaped
     /// while the entry is in this state, so a cancel may signal it.
-    Starting { broker: Option<u32>, cancelled: bool },
+    Starting {
+        broker: Option<u32>,
+        cancelled: bool,
+    },
     /// A start that failed, a finish or a broker failure is tearing down.
     Ending,
     Live(Live),
@@ -351,7 +355,9 @@ impl<B: Backend> Brokered<B> {
             Some(Entry::Starting {
                 cancelled: true, ..
             }) => return Err(cancelled_during_start().into()),
-            Some(Entry::Starting { broker: spawned, .. }) => *spawned = Some(pid),
+            Some(Entry::Starting {
+                broker: spawned, ..
+            }) => *spawned = Some(pid),
             _ => {
                 return Err(
                     ExecutionError::internal("a starting run lost its broker entry").into(),
@@ -359,9 +365,11 @@ impl<B: Backend> Brokered<B> {
             }
         }
         // Step 4.
-        broker
-            .lock()
-            .start(connections.document(), connections.digest(), config.ready_timeout)?;
+        broker.lock().start(
+            connections.document(),
+            connections.digest(),
+            config.ready_timeout,
+        )?;
         // Step 5.
         let named = Arc::new(AtomicBool::new(false));
         let served = ServedConnections {
@@ -464,8 +472,7 @@ impl<B: Backend> Brokered<B> {
                 match runs.get_mut(run_id) {
                     Some(Entry::Ending) => self.shared.changed.wait(&mut runs),
                     Some(Entry::Live(_)) => {
-                        let Some(Entry::Live(live)) =
-                            runs.insert(run_id.to_owned(), Entry::Ending)
+                        let Some(Entry::Live(live)) = runs.insert(run_id.to_owned(), Entry::Ending)
                         else {
                             unreachable!("matched a live entry under the lock");
                         };

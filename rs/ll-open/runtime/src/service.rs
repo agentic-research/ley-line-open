@@ -671,7 +671,10 @@ impl<B: Backend> ExecutionService<B> {
         // declared connections do not exist, so it refuses by name before
         // the resolver or the backend runs; it advertises no
         // `cloister/execution/v1/connections` capability either.
-        let connections = authorized.connections.clone().map(VerifiedConnections::from);
+        let connections = authorized
+            .connections
+            .clone()
+            .map(VerifiedConnections::from);
         if let Some(connections) = &connections
             && self.backend.connections().is_none()
         {

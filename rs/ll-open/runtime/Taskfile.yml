@@ -22,6 +22,11 @@ tasks:
       RUSTC_WRAPPER: ''
     cmds:
       - cargo test -p leyline-runtime
+      # The worker crate's real-guest tests start runs with a declared
+      # connection, which need the shipped broker beside the worker binary
+      # (ADR-0046 Slice 1, bead ley-line-open-5308b7). The line above built
+      # it; this states the dependency instead of relying on that.
+      - cargo build -p leyline-runtime --bin leyline-conn-broker
       # The worker crate links the vendored libkrun and builds the
       # leyline-krun-worker binary (bead ley-line-open-395e43).
       - cargo test -p leyline-krun-worker

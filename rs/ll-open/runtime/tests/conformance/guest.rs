@@ -24,10 +24,12 @@
 //!   and exits 0.
 //!
 //! `CONFORMANCE_DIAL` names the channel: `tcp:<host>:<port>` (the native
-//! tier's §3 `connectLocal`) or `vsock:<port>` (the microVM tier's §6
+//! tier's §3 `connectLocal`, and a §6 `guestPort` presentation on the
+//! microVM guest's loopback), `vsock:<port>` (the microVM tier's §6
 //! `unixSocket.allow`, which the VMM delivers as a vsock port muxed to the
-//! host socket). Either way the host's `accept` returning is the event the
-//! matrix waits on; nothing here sleeps.
+//! host socket) or `unix:<path>` (the native tier's §6 connect grant, the
+//! path a connection broker listens on). Either way the host's `accept`
+//! returning is the event the matrix waits on; nothing here sleeps.
 //!
 //! A probe is `name=kind:argument`, probes separated by `;`:
 //!
@@ -171,6 +173,15 @@ fn dial() -> Box<dyn Write> {
     }
     if let Some(port) = spec.strip_prefix("vsock:") {
         return vsock(port.parse().unwrap_or(0));
+    }
+    if let Some(path) = spec.strip_prefix("unix:") {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(stream) => return Box::new(stream),
+            Err(error) => {
+                eprintln!("conformance guest: dial {path}: {error}");
+                std::process::exit(GUEST_BROKEN);
+            }
+        }
     }
     eprintln!("conformance guest: unknown {DIAL} {spec:?}");
     std::process::exit(GUEST_BROKEN);

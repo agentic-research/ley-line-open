@@ -83,13 +83,10 @@ impl Backend for Probe {
 
     fn poll(&self, run_id: &str) -> Result<Option<BackendRunStatus>, ExecutionError> {
         let mut finished = self.finished.lock().unwrap();
-        Ok(finished
-            .iter()
-            .position(|id| id == run_id)
-            .map(|index| {
-                finished.remove(index);
-                BackendRunStatus::Succeeded
-            }))
+        Ok(finished.iter().position(|id| id == run_id).map(|index| {
+            finished.remove(index);
+            BackendRunStatus::Succeeded
+        }))
     }
 
     fn cancel(&self, _run_id: &str) -> Result<bool, ExecutionError> {
@@ -126,7 +123,11 @@ fn refused(
     let error = result.expect_err("refused");
     assert_eq!(error.code, code, "{error}");
     for name in names {
-        assert!(error.detail.contains(name), "{name:?} in {:?}", error.detail);
+        assert!(
+            error.detail.contains(name),
+            "{name:?} in {:?}",
+            error.detail
+        );
     }
     assert_eq!(probe.starts.load(Ordering::SeqCst), 0, "no backend start");
     assert_eq!(host.broker_pid(), None, "no broker was spawned");
@@ -217,7 +218,12 @@ fn every_cross_document_mismatch_is_refused_naming_the_connection() {
 
     let (native, native_probe) = brokered(&host, BackendClass::Native);
     let (microvm, microvm_probe) = brokered(&host, BackendClass::MicroVm);
-    let native_ok = || vec![UnixSocketGrant::connect(&api), UnixSocketGrant::connect(&db)];
+    let native_ok = || {
+        vec![
+            UnixSocketGrant::connect(&api),
+            UnixSocketGrant::connect(&db),
+        ]
+    };
     let read_write = |path: &str| {
         manifest(native_ok())
             .with_fs_grant(FsGrant::read_write(path))
@@ -261,14 +267,20 @@ fn every_cross_document_mismatch_is_refused_naming_the_connection() {
             "the microVM spelling on the native tier",
             &native,
             &native_probe,
-            Some(manifest(vec![with_port(&api, 13306), UnixSocketGrant::connect(&db)])),
+            Some(manifest(vec![
+                with_port(&api, 13306),
+                UnixSocketGrant::connect(&db),
+            ])),
             vec!["connection `api`", "guestPort 13306", "native tier"],
         ),
         (
             "the native spelling on the microVM tier",
             &microvm,
             &microvm_probe,
-            Some(manifest(vec![with_port(&api, 13306), UnixSocketGrant::connect(&db)])),
+            Some(manifest(vec![
+                with_port(&api, 13306),
+                UnixSocketGrant::connect(&db),
+            ])),
             vec!["connection `db`", "no guestPort", "microVM tier"],
         ),
         (
@@ -280,7 +292,11 @@ fn every_cross_document_mismatch_is_refused_naming_the_connection() {
                 UnixSocketGrant::connect(&db),
                 UnixSocketGrant::bind(&db),
             ])),
-            vec!["connection `db`", "§6 bind grant", "bind the broker's socket"],
+            vec![
+                "connection `db`",
+                "§6 bind grant",
+                "bind the broker's socket",
+            ],
         ),
         (
             "a connect-bind grant in place of the connect grant",
@@ -453,7 +469,10 @@ fn the_registry_keeps_one_run_from_another_runs_broker() {
     start_b().expect("B alone holds a peer channel");
     let error = start(&backend, "run-a3", Some(&own), &declared).expect_err("held by B");
     assert_eq!(error.code, ErrorCode::ResourceConflict, "{error}");
-    assert!(error.detail.contains("held by another run (run-b)"), "{error}");
+    assert!(
+        error.detail.contains("held by another run (run-b)"),
+        "{error}"
+    );
     // B ends: the endpoint is free.
     assert!(backend.cancel("run-b").expect("cancel B"));
     start(&backend, "run-a4", Some(&own), &declared).expect("A after B ended");
@@ -480,7 +499,10 @@ fn a_microvm_backend_that_names_no_worker_is_refused_and_torn_down() {
     let backend = Brokered::new(probe.clone(), host.broker(None));
     let error = start(&backend, "run-unnamed", Some(&granted), &declared).expect_err("refused");
     assert_eq!(error.code, ErrorCode::BackendFailed, "{error}");
-    assert!(error.detail.contains("without naming its worker"), "{error}");
+    assert!(
+        error.detail.contains("without naming its worker"),
+        "{error}"
+    );
     let broker = host.broker_pid().expect("a broker was spawned");
     common::await_exit(broker, broker_fixture::BOUND).expect("the broker is gone");
     assert!(!std::path::Path::new(&endpoint(&dir, "api")).exists());
@@ -557,5 +579,8 @@ fn connections_nothing_serves_are_refused_by_name_on_every_path() {
     assert_eq!(error.code, ErrorCode::InvalidGrant);
     assert!(error.detail.contains("not in canonical form"), "{error}");
     let error = VerifiedConnections::from_canonical(b"{}").expect_err("not a document");
-    assert!(error.detail.contains("not a valid cloister/connections/v1"), "{error}");
+    assert!(
+        error.detail.contains("not a valid cloister/connections/v1"),
+        "{error}"
+    );
 }

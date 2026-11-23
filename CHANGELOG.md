@@ -14,6 +14,212 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.31.0] — 2026-11-23
+
+**A wire break and a supervision release: the daemon speaks
+`wire_format_major` 3, and every worker, the broker and the daemon itself
+can be tied to the life of the process that supervises it.** Arenas do not
+re-parse: the projection stays `projection-v13`. `SCHEMA_VERSION` is
+0.31.0, because `daemon.capnp` changed (`QueryCell`, `QueryTruncation`,
+`QueryResponse.rows` @5 and `truncation` @6).
+
+Upgrade steps:
+- **Daemon clients: read rows by position (wire major 3, #593).** A
+  `query` row is a list of `QueryCell` unions in `columns` order
+  (`{"text": "..."}` or `{"null": null}`), not an object keyed by column
+  name. A reply cut short carries `truncation: {"limit": N}`.
+  `QueryRequest.limit` is a `UInt32`; a value that does not fit is refused
+  with `limit_out_of_range` before anything runs, and `limit: 0` now means
+  the default of 1000 rows. A major-2 client fails the version handshake
+  instead of misreading rows. Go clients move to `wire.QueryCell` and
+  `wire.QueryTruncation`.
+- **Proposal writers: touching edits now conflict (ADR-0045 T5
+  amendment).** An edit on a line adjacent to another writer's change is
+  refused `stale`, where it used to merge; edits with an unchanged line
+  between them still merge. Read the current bytes and propose again.
+- **Upgrade the workers with `leyline-runtime`.** `leyline-krun-worker`
+  and `leyline-native-worker` require `--lifeline-fd`: an older worker
+  refuses the option, and these workers refuse an older backend that does
+  not pass it. An embedder built against `leyline-runtime` 0.31.0 runs
+  `leyline-krun-worker-darwin-arm64` from this release and a
+  `leyline-native-worker` built from 0.31.0. Anything that spawns a worker
+  itself must pass the option.
+- **Launchers: `leyline daemon --lifeline-fd N`.** A launcher that keeps
+  the only write end of a pipe and passes its read end makes the daemon
+  shut down gracefully (unmount, final publish, socket cleanup) when the
+  launcher dies, `SIGKILL` included. Without the flag nothing changes.
+
+Also: the connection broker (`leyline-conn-broker`, ADR-0046 Slice 1),
+with nothing spawning it until the service integration in v0.32.0, so
+grants with connections are still refused at start; the native worker and
+the krun worker end with their supervisor, and a starting run can be
+cancelled on both tiers; `gix-merge` 0.24, jj-lib 0.47.1, quinn-udp 0.5.16
+and url 2.5.9 for published advisories. For contributors, work now lands
+on `integration` by the local `task ci` receipt (`task land:integration`);
+pull requests into `main` still run the runner.
+
+### Security
+
+- **quinn-udp 0.5.16 (RUSTSEC-2026-0538).** quinn-udp 0.5.15's receive loop could spin after a truncated datagram. It reached `leyline-runtime` through nono, sigstore, reqwest and quinn. The lock moves to the semver-compatible 0.5.16 (`ley-line-open-a76ea7`).
+
+- **`heapless` 0.8 out of the shipped closure, url 2.5.9, and leyline-vcs on jj-lib 0.47.1 (RUSTSEC-2026-0574 to 0582, RUSTSEC-2026-0592, RUSTSEC-2026-0543)** (bead `ley-line-open-ed4736`). `leyline-cli` reached `heapless` 0.8, which has nine soundness advisories, through `gix-merge` 0.17, `gix-hash` 0.25 and `faster-hex` 0.10. The three-way merge of a proposal against a moved base (ADR-0045 T5) moves to `gix-merge` 0.24 (`gix-hash` 0.29, `faster-hex` 2), which merges touching edits differently (see Changed). `url` moves to 2.5.9 in the lock. `leyline-vcs` moves from jj-lib 0.42 to 0.47.1 (gix 0.90), which drops `chrono` from its closure. Its public API is unchanged. jj-lib 0.47.1 still reaches `heapless` 0.8 through gix 0.90's `gix-hash` 0.28, and `chrono` still arrives through witchcraft in the not-shipping `engine-witchcraft` feature. Neither crate ships.
+  `deny.toml` carries dated ignores for those two paths (bead `ley-line-open-fd42ee`, expiring 2027-02-22), which `tools/lint_deny_ignores.sh` confirms are off the shipped closure.
+
+### Breaking
+
+- **Wire break, `wire_format_major` 3: `query` rows are lists of typed cells in `columns` order, not objects keyed by column name, and truncation is a declared field** (beads `ley-line-open-0a18bc`, `ley-line-open-47d5c5`). A keyed row lost a value whenever two columns shared a name: `SELECT 1 AS id, 2 AS id` answered `[{"id": "2"}]`. Each row is now a list of `QueryCell` unions, one per column in `columns` order, so that query answers `[[{"text": "1"}, {"text": "2"}]]`. A cell is `{"null": null}` for SQL NULL or `{"text": "..."}` for every other value, so NULL is carried by the schema and stays distinct from `""`. Values keep their text rendering (integers and reals in decimal, blobs as lowercase hex); typed members are the intended additive extension. A client that reads `row[column_name]` must read `row[i]` for the column's index and branch on the cell's member. In `daemon.capnp`, `QueryResponse.rows` is a new field (@5, `List(List(QueryCell))`), and the old @2 is retired as `retiredRows` (`retired_rows`), never emitted. A reply cut short by the row limit now carries `truncation: {"limit": N}` (`QueryResponse.truncation` @6, struct `QueryTruncation`), absent otherwise; the undeclared `truncated: true` and `limit: N` keys are gone. `QueryRequest.limit` is declared as `UInt32`: absent or 0 means the default of 1000, and any other value that is not an integer fitting `UInt32` (wider than `UInt32`, negative, fractional, or not a number) is refused with the new refusal reason `limit_out_of_range` (`action` `limit`, `subject` the requested value as JSON text) before anything runs, never clamped. Before, a value above `UInt32` was accepted, a negative, fractional or non-number value got an untyped `query: invalid value` error, and `limit: 0` answered zero rows marked truncated; a client that sent `limit: 0` to get only `columns` now gets up to 1000 rows and should put `LIMIT 0` in its SQL instead. The daemon encodes the whole `query` success response with the schema's JSON codec and no longer patches its JSON. `wire_format_major` moves from 2 to 3, so a major-2 client fails the version handshake instead of misreading rows; `compat_min_schema_version` stays 0.6.0, because the major does the refusal. In the Go module, `wire.QueryResponse.Rows` is `[][]wire.QueryCell`, `wire.QueryResponse.Truncation` is a `*wire.QueryTruncation`, `wire.QueryRow` is removed, and `wire.QueryCell` refuses anything but exactly one known member, a member repeated under one key included. The Go drift gate no longer skips `query`. A new gate, `task schema:daemon-fixture-codec`, round-trips every daemon protocol fixture through `daemon.capnp` with the reference capnp JSON codec and requires the same JSON types back (`0` is not `0.0`), refuses a `retired_*` key, and looks each fixture's struct up in a declared table pairing every Go binding with its capnp struct, which must match the Go gate's decoders. It found that the `sheaf_invalidate` fixture and the Go test mirror both omitted `prior_generation`, which the daemon sends, and that the `sheaf_defect` and `sheaf_status` fixtures wrote `defect` as `0.0` where the daemon writes `0`; all are fixed. Text cells holding NUL and control characters round-trip through the Rust codec, the reference codec and the Go decode.
+
+- **`leyline-native-worker` now requires `--lifeline-fd`; the worker binary and `leyline-runtime` must be upgraded together** (bead `ley-line-open-62e3b1`).
+  A native worker and its workload no longer outlive the process supervising
+  them, as the microVM tier's since `ley-line-open-f963e6`. The worker's
+  standard input is its lifeline (`--lifeline-fd 0`): `NativeWorkerBackend`
+  keeps its write end until the worker is reaped, and when the embedding
+  process ends, `SIGKILL` included, the worker kills its workload and its
+  process group and exits. Spawning still takes the `posix_spawn` path. The
+  worker refuses, by name, a missing or malformed lifeline, standard output
+  or error as one, and a descriptor that is not a readable pipe or socket.
+  The workload's standard input is `/dev/null` when the worker's is the
+  lifeline. In the backend API, `NativeWorkerBackend::cancel` now reaches a
+  run from before its spawn until readiness: it returns once the worker is
+  reaped and its run root removed, answers `true` (or the cleanup's error),
+  and the racing `start` ends `cancelled`; `Ok(false)` means no such run and
+  no worker. A cancel queued while a start fails on its own is answered
+  `false` when no worker was spawned, or with an error naming a run root that
+  could not be removed; the microVM backend answers the same way.
+  `ExecutionService::cancel` reaches a starting run separately
+  (`ley-line-open-5308b7`). Limits: a descendant that forks and calls
+  `setsid` leaves the group and survives (`ley-line-open-492252`); a killed
+  embedder leaves the run root behind (`ley-line-open-62f6c9`); and until
+  `ley-line-open-528525`, a sibling spawned at the moment the stdin pipe is
+  created can briefly inherit its write end.
+
+- **`leyline-krun-worker` now requires `--lifeline-fd`; the worker binary and `leyline-runtime` must be upgraded together** (bead `ley-line-open-f963e6`).
+  A libkrun worker and its VM no longer outlive the process supervising
+  them. `KrunWorkerBackend` hands each worker the read end of a lifeline pipe
+  (`--lifeline-fd`) and keeps its only write end until the worker is reaped.
+  When the embedding process ends for any reason, `SIGKILL` included, the
+  worker reads end-of-file and exits at once, taking its VM with it; this works
+  on macOS, which has no `PR_SET_PDEATHSIG`. The worker refuses, by name, a
+  missing or malformed lifeline, a standard stream (0-2), the workspace
+  share's descriptor, and a descriptor that is closed, not readable, or not a
+  pipe or socket. An older worker given `--lifeline-fd` refuses it as an
+  unknown option, and this worker refuses an older backend that does not pass
+  it. Anything that spawns `leyline-krun-worker` itself must pass the option
+  (`worker::inherit_only_with_lifeline` does so). In the backend API,
+  `KrunWorkerBackend::cancel` now reaches a run between spawn and readiness:
+  it returns once the worker is reaped and its ephemeral run root removed,
+  answers `true` (or the cleanup's error), and the racing `start` ends
+  `cancelled`; `Ok(false)` means no such run and no worker.
+  `ExecutionService::cancel` reaches a starting run separately
+  (`ley-line-open-5308b7`). The lifeline is one module
+  (`leyline_runtime::lifeline`), shared with the connection broker.
+
+### Added
+
+- **The connection broker: the `leyline-conn-broker` binary and
+  `leyline_runtime::broker`** (bead `ley-line-open-52b5b3`, ADR-0046 Slice 1 S4, S5).
+  One broker per run listens on each declared UNIX endpoint and joins every accepted
+  connection to that connection's one committed loopback target. It copies bytes with
+  every descriptor a client passes closed on arrival: it reads with `recvmsg(2)`,
+  because macOS installs an `SCM_RIGHTS` descriptor even on a plain `read(2)`. It has no parser, no
+  resolver and no credential.
+  - **Peers:** it accepts only the daemon's uid, and on the microVM tier only the run's
+    worker pid. Any other peer is closed and counted as foreign.
+  - **Hold and cap:** an `ECONNREFUSED` upstream is held with 5–200 ms backoff for at
+    most 10 s, ending early when the client hangs up. The run's cap is 256 simultaneous
+    connections.
+  - **Bind, then confine:** it binds every endpoint, then confines itself on macOS with
+    nono's base profile plus denies (exec, fork, all file reads and writes, the
+    `mach-lookup`), so name resolution fails, with outbound TCP only to the declared
+    ports. The mDNSResponder socket stays reachable, because nono emits its DNS allow
+    after every platform rule (`ley-line-open-fb5c4b`).
+    Then it reports ready with the `connectionsDigest` it bound, which the supervisor
+    compares with the grant's.
+  - **Lifecycle:** it exits the moment its lifeline pipe ends, and drains open
+    connections into its records on request; an open connection's byte counts there are
+    lower bounds.
+  - **Supporting pieces:** the endpoint preflight (path absent, parent a private,
+    non-symlinked directory owned by the daemon, `sun_path` fits), the endpoint registry
+    that refuses whichever of two overlapping runs registers second, the delivered-target
+    check (`127.0.0.1` only, others refused as "loopback address not delivered by this
+    runtime") and receipt aggregation.
+  - **Not wired up yet:** nothing spawns the broker until the service integration
+    (`ley-line-open-5308b7`), so grants with connections are still refused at start.
+
+- **The loopback probe, and a macOS CI job for the connection broker** (bead
+  `ley-line-open-52deb4`, ADR-0046 Slice 1 S11a). `tests/broker_loopback_probe.rs`
+  measures, for `127.0.0.1`, `127.0.0.2`, `127.255.255.254` and `::1` on each platform,
+  four things:
+  - whether the address is available (an unavailable row is never a pass);
+  - whether a child confined by the broker profile for a grant naming that address
+    reaches it on the allowed port;
+  - whether the profile for another live port on the same address refuses it (a
+    wildcard fails the probe);
+  - whether the profile for `127.0.0.1` on the same port reaches it, which shows
+    whether the filter scopes by address (the `127.0.0.1` row reads `self`).
+
+  It asserts a pinned table per platform. Measured on macOS 27.2: `127.0.0.1` and `::1`
+  are scoped-allowed with the port control passing; `127.0.0.2` and `127.255.255.254`
+  are unavailable, since lo0 carries only `127.0.0.1`. Neither platform's filter scopes
+  by address, so the broker's code alone holds the address. Widening the delivered set
+  (`broker::DELIVERED_TARGETS`, still `127.0.0.1`) is a one-commit gate flip once a row
+  passes on every delivering platform.
+
+  New tasks: `task runtime:broker-macos` runs the probe and every broker suite with
+  `LEYLINE_REQUIRE_SANDBOX=1`, locally and in a new `macos-latest` job in `ci.yml`;
+  the job and the probe record the macOS version the table was observed on.
+  `task runtime:broker-probe` runs the probe on Linux on the host network and again in
+  a network namespace with IPv6 disabled, where the run must pass one test and record
+  `::1` unavailable; it is a step in the ubuntu job and records the Landlock ABI.
+
+- **`leyline daemon --lifeline-fd N`: the daemon shuts down when its launcher dies** (bead `ley-line-open-f6b525`).
+  A launcher that runs the daemon in its own process group (mache) had no way
+  to stop it after a `SIGKILL`. With the flag, the launcher keeps the only write
+  end of a pipe and passes the read end as descriptor N; when the launcher is
+  gone, the daemon runs the same graceful shutdown as SIGTERM (unmount, final
+  publish, socket cleanup). It works on macOS, which has no parent-death signal.
+  A descriptor that is not open for reading, or is not a pipe or socket, and a
+  value that is not a descriptor number, refuse startup by name. Without the
+  flag nothing changes. With the flag, standard output and error are relayed
+  through pipes the daemon reads, which forward to the originals and discard
+  once their reader is gone, so no thread's write can fail with EPIPE and
+  panic when a launcher that read them (mache) dies first. Embedders set `DaemonOptions::lifeline_fd`. ADR-0049
+  lists the flag as a launch action (CLI-only), not a configuration key.
+
+### Changed
+
+- **schema-bridge's generated header names the plugin, not a consumer's task.** Zod and Go output used to say "Regenerate with `task cluster:zod`" (or `cluster:go`), a cloister task left over from before the crate moved into LLO. The header now names the plugin binary, `capnpc-schema-bridge-zod` or `capnpc-schema-bridge-go`. Consumers that commit generated files and check them for drift will see this one header line change on their next regenerate (`ley-line-open-016403`).
+
+- **Work lands on `integration` through `task land:integration`, gated on the local `task ci` receipt, and pull requests into `integration` no longer run `ci.yml` or `leyline-schema-go.yml`** (bead `ley-line-open-3a6beb`).
+  `tools/land_integration.sh` refuses, each by name, a working tree that differs from HEAD (`dirty-tree`), a branch that does not contain `origin/integration` (`integration-not-in-head`) and a tree with no `task ci` receipt for the current toolchain (`no-receipt`); otherwise it fast-forwards `integration`, never forced. `task ci:land-integration:fixture-test`, run by `task ci`, proves each refusal and the fast-forward. `task ci` now also runs the Go schema module's regen diff and full `go test ./...` (`schema:go:regen-check`, `schema:go:test`, with `deps:capnpc-go` installing the pinned generator), which before ran only in `leyline-schema-go.yml`. The pre-push receipt gate (`tools/pre_push_ci.sh` and its pre-commit hook) is removed: it never ran under the repository's rsry hooks path, so it guarded nothing. `ci.yml` and `leyline-schema-go.yml` run on pull requests into `main` only; their push triggers are unchanged. `ci.yml` gains `workflow_dispatch`: the receipt covers only the platform `task ci` ran on, so a change with platform-specific code asks the runner for Linux evidence on its branch before landing (`gh workflow run ci.yml --ref <branch>`). The receipt is checked against the tree of the exact commit pushed (`tools/ci_attestation.sh check-tree <tree>`), not the worktree, so a write to the worktree during a landing cannot change what lands; the receipt's toolchain contract (now `leyline-task-ci-receipt-v2`) adds `go version`, since `task ci` runs Go. Mutation testing is not gated: landing opens no pull request and `task rs:mutants:pr` writes no receipt, so it is the author's run before landing until per-task receipts exist (`rosary-3a84a9`). Files git ignores are outside the receipt. `task ci` on Linux, `runtime:broker-probe`, `deps:fresh-resolve-check` and `runtime:broker-macos` now first run on the `integration` push, after landing, unless the branch dispatches `ci.yml` first; AGENTS.md lists them. The gate is client-side: `integration` has no required checks.
+
+- **A proposal whose edit only touches the other writer's now conflicts: edits on adjacent lines are refused `stale`, where they used to merge** (bead `ley-line-open-ed4736`, ADR-0045 T5 amendment of 2026-11-22). The merge driver moved from `gix-merge` 0.17 to 0.24, which takes git's rule: two hunks that touch (one side changes a line and the other inserts right before or after it, or both insert at one line) form one region, and a region both sides changed differently is a conflict. Before, the change-plus-adjacent-insertion case merged cleanly. The wire shape is unchanged: the refusal is the existing `stale` with the path's `moved` entry carrying `conflicts`, and every conflict now names at least one base line range (the change plus insertion case names the changed line). Edits with an unchanged line between them still merge. A writer that hits the new refusal reads the current bytes and proposes again. The same rule decides a storefs FLUSH or FSYNC (`ESTALE`) and a host-mount save (`NFS3ERR_STALE`). A false conflict costs one retry, where a false clean merge would land an interleaving neither side wrote; construct-level merge is the intended successor (bead `ley-line-open-067487`).
+
+### Fixed
+
+- **`leyline-runtime` compiles on a downstream consumer's fresh dependency resolve.** The registry client built ureq's `NextTimeout` as a struct literal naming every field. A consumer whose resolve picked ureq 3.5 (which added `per_read` and `per_write`) failed with E0063, although LLO's own lock (ureq 3.3) built. The client now uses struct update, and CI builds `leyline-runtime` against the newest semver-compatible dependencies after `task ci` (`task deps:fresh-resolve-check`, `ley-line-open-d4ba4b`).
+
+- **The Taskfile's pinned sccache runs its own server on port 4231, not the default 4226** (bead `ley-line-open-da5d77`).
+  A different-version sccache server left on the default port by another build (for example a Homebrew 0.19 server) answers the pinned 0.15 client in a protocol it cannot read, so every Rust build task failed with `error reading compile response from server`. Tasks now set `SCCACHE_SERVER_PORT` to 4231 when the pinned binary is the wrapper, keep 4226 when a system sccache is, and leave a port set by hand alone.
+
+- **The daemon writes its arena only at an absolute path it registered.** Every publish writes the arena at the path the controller records. A controller with no arena registered recorded an empty path, so a growing publish built `.grow` in the daemon's working directory, which was the caller's source tree. A relative record resolved the same way. `write_grown_arena` now refuses an empty or relative path (`GrowRefused::PathNotAbsolute`), and `snapshot_to_arena` refuses one by name before writing anything. `setup_arena` records the canonical arena path and refuses a controller registered to a relative path or to a different arena (`ley-line-open-f68a3a`).
+
+- **A daemon whose state directory was removed now shuts down at once instead of after 30 s.** The final publish checked out a reader connection, the pool tried to reopen the vanished `live.db`, and r2d2 blocked for its default 30 s `connection_timeout`. Shutdown now skips the final publish with `warn: final snapshot skipped: the live db … no longer exists`, and otherwise bounds its reader checkout to 2 s (`ley-line-open-f69da0`).
+
+- **`leyline daemon --lifeline-fd`: a teardown write cannot meet a dead launcher's pipe** (bead `ley-line-open-f6b525`).
+  When the launcher's lifeline has ended, the daemon's output relay now
+  finishes onto `/dev/null` whether or not a write had already found the
+  launcher's reader gone. Before, a reader that died with nothing written
+  through the relay since (or a forward still in flight) left `finish` handing
+  the dead pipe back, and a later teardown write failed with EPIPE, turning
+  exit 0 into 101. On any stop, a descriptor also finishes onto `/dev/null`
+  when a forward already found its reader gone or when the original reports
+  its reader hung up (POLLHUP on macOS, POLLERR on Linux), so a SIGTERM whose
+  launcher also died is covered. Otherwise the original goes back to a
+  reader that is still there. A reader that dies after `finish` checks is not
+  seen. `/dev/null` is opened when the relay is installed, so finishing has
+  no failure path that falls back to the original.
+
 ## [0.30.0] — 2026-11-13
 
 **An execution-boundary release: every image re-imports (rootfs manifest

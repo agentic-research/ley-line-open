@@ -156,6 +156,7 @@ impl ShutdownSignals {
                 Some(fd) => {
                     let (ended, receiver) = tokio::sync::watch::channel(false);
                     leyline_runtime::lifeline::watch(fd, move || {
+                        LIFELINE_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = ended.send(true);
                     })
                     .with_context(|| format!("--lifeline-fd {fd} cannot be a lifeline"))?;
@@ -215,6 +216,29 @@ impl ShutdownSignals {
             }
         }
     }
+}
+
+/// Set once a lifeline [`ShutdownSignals::install_with_lifeline`] watches has
+/// ended: its launcher is gone, and so, possibly, the only reader of this
+/// process's standard output and error.
+static LIFELINE_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a watched lifeline has ended in this process (bead
+/// `ley-line-open-f6b525`): what tells `leyline daemon` to finish its
+/// output relay onto `/dev/null` rather than hand back a pipe with no reader.
+pub fn lifeline_ended() -> bool {
+    LIFELINE_ENDED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Tests that read or set [`LIFELINE_ENDED`] hold this, so the process-wide
+/// flag one test sets is never what another test observes.
+#[cfg(test)]
+pub(crate) static LIFELINE_FLAG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Set [`LIFELINE_ENDED`] from a test holding [`LIFELINE_FLAG_TESTS`].
+#[cfg(test)]
+pub(crate) fn set_lifeline_ended_for_test(ended: bool) {
+    LIFELINE_ENDED.store(ended, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Wait for Ctrl+C, SIGTERM or an optional timeout, whichever comes first.
@@ -301,6 +325,8 @@ mod tests {
     #[tokio::test]
     async fn the_end_of_a_launchers_lifeline_ends_the_wait() {
         let _serial = SIGNAL_TESTS.lock().await;
+        let _flag = LIFELINE_FLAG_TESTS.lock().await;
+        set_lifeline_ended_for_test(false);
         let (lifeline, read_end) = leyline_runtime::lifeline::pair().unwrap();
         let fd = read_end.raw_fd();
         // Handed over, as the daemon is handed an inherited number.
@@ -314,11 +340,14 @@ mod tests {
         .await
         .expect("a 10ms timeout must end the wait");
         assert_eq!(which, Shutdown::Timeout, "a held lifeline ends nothing");
+        assert!(!lifeline_ended());
         drop(lifeline);
         let which = tokio::time::timeout(Duration::from_secs(5), signals.wait(None))
             .await
             .expect("the end of the lifeline must end the wait");
         assert_eq!(which, Shutdown::LifelineEnded);
+        assert!(lifeline_ended(), "the end is recorded for the output relay");
+        set_lifeline_ended_for_test(false);
     }
 
     /// A lifeline that is not a readable pipe or socket is refused by name,

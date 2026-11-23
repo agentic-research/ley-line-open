@@ -13,10 +13,13 @@ use super::open_flags::{O_RDONLY, O_RDWR, O_TRUNC};
 use super::tests::{A, A_BROKEN, A_OTHER, Fixture, fixture, fixture_with, ino, on_disk, whole};
 use super::*;
 
-/// A tail line under `A`'s function: an edit to other lines than `A_OTHER`'s.
-const A_TAILED: &str = "package a\n\nfunc A() int { return 1 }\n// tail\n";
-/// `A_OTHER`'s change and `A_TAILED`'s, merged.
-const A_MERGED: &str = "package a\n\nfunc A() int { return 3 }\n// tail\n";
+/// A head line over `A`'s package clause: an edit two unchanged lines away
+/// from `A_OTHER`'s. An edit that only touches `A_OTHER`'s line, such as a
+/// line inserted right under it, conflicts (ADR-0045 T5, amended
+/// 2026-11-22).
+const A_HEADED: &str = "// head\npackage a\n\nfunc A() int { return 1 }\n";
+/// `A_OTHER`'s change and `A_HEADED`'s, merged.
+const A_MERGED: &str = "// head\npackage a\n\nfunc A() int { return 3 }\n";
 
 fn entry(f: &Fixture, path: &str) -> Option<StoreEntry> {
     f.fs.store()
@@ -74,7 +77,7 @@ fn a_write_against_a_moved_file_stages_and_the_flush_lands_the_merge() {
     let a = ino(&f, "a.go");
     let h = f.fs.open(a, O_RDWR | O_TRUNC).unwrap().handle;
     other_writer(&f, "a.go", A_OTHER);
-    assert_eq!(f.fs.write(h, 0, A_TAILED.as_bytes()), Ok(A_TAILED.len()));
+    assert_eq!(f.fs.write(h, 0, A_HEADED.as_bytes()), Ok(A_HEADED.len()));
     assert_eq!(f.fs.flush(h), Ok(()));
     assert_eq!(stored_text(&f, "a.go").as_deref(), Some(A_MERGED));
     assert_eq!(on_disk(&f, "a.go").as_deref(), Some(A_MERGED));
@@ -344,10 +347,10 @@ fn a_checked_write_that_merges_is_staged_and_its_flush_lands_the_merge() {
     let h = f.fs.open(ino(&f, "a.go"), O_RDWR | O_TRUNC).unwrap().handle;
     other_writer(&f, "a.go", A_OTHER);
     assert_eq!(
-        f.fs.write_checked(h, 0, A_TAILED.as_bytes()),
-        Ok(A_TAILED.len())
+        f.fs.write_checked(h, 0, A_HEADED.as_bytes()),
+        Ok(A_HEADED.len())
     );
-    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), A_TAILED.as_bytes());
+    assert_eq!(f.fs.read(h, 0, u32::MAX).unwrap(), A_HEADED.as_bytes());
     assert_eq!(f.fs.flush(h), Ok(()));
     assert_eq!(stored_text(&f, "a.go").as_deref(), Some(A_MERGED));
 }

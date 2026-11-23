@@ -478,6 +478,16 @@ tasks:
     cmds:
       - tools/test_ci_attestation.sh
 
+  land:integration:
+    desc: Fast-forward origin/integration to HEAD, gated on this tree's task ci receipt; refuses a dirty tree, a branch that does not contain integration, or a missing receipt (3a6beb)
+    cmds:
+      - tools/land_integration.sh
+
+  ci:land-integration:fixture-test:
+    desc: Prove land:integration refuses a dirty tree, a branch without integration and a missing or stale receipt, and fast-forwards otherwise (3a6beb)
+    cmds:
+      - tools/test_land_integration.sh
+
   ci:fixture-hooks:fixture-test:
     desc: Prove every committing fixture ignores the developer's global git hooks
     cmds:
@@ -513,6 +523,16 @@ tasks:
     cmds:
       - tools/test_go_schema_consumer.sh
 
+  schema:daemon-fixture-codec:
+    desc: Every daemon-protocol.json response round-trips through daemon.capnp under the reference capnp JSON codec, type for type, as the struct the binding table pairs with its go_binding; the table must match the Go gate's decoders (0a18bc)
+    cmds:
+      - python3 -I tools/check_daemon_fixture_codec.py
+
+  schema:daemon-fixture-codec:fixture-test:
+    desc: Prove the daemon fixture codec gate refuses a bare null cell, an undeclared key, an omitted default, a retired_* key, 0.0 for 0, an unpaired binding or capnp_struct and Go/table binding drift, and passes NUL/control-character text and a truncated reply (0a18bc)
+    cmds:
+      - python3 -I tools/check_daemon_fixture_codec.py --self-test
+
   schema:go-sigma-vectors:
     desc: Go reproduces the sigma/v1 known-answer vectors (storeRoot, head digest v3, PartitionSpec, node_hash v3) and refuses the v2 Head message by version, as the Rust tests do (73c6ee, 73add7, a46711)
     dir: clients/go/leyline-schema
@@ -520,6 +540,32 @@ tasks:
       GOWORK: "off"
     cmds:
       - go test -count=1 ./sigma/
+
+  deps:capnpc-go:
+    desc: Install capnpc-go pinned to go.mod's capnp runtime (v3.1.0-alpha.2), which clients/go/leyline-schema/regen.sh needs on PATH (3a6beb)
+    status:
+      - go version -m "$(go env GOPATH)/bin/capnpc-go" 2>/dev/null | grep -Eq 'mod[[:space:]]+capnproto.org/go/capnp/v3[[:space:]]+v3.1.0-alpha.2[[:space:]]'
+    cmds:
+      - go install capnproto.org/go/capnp/v3/capnpc-go@v3.1.0-alpha.2
+
+  schema:go:regen-check:
+    desc: The committed Go bindings equal regen.sh output; formerly leyline-schema-go.yml's regen-diff step, now in task ci (3a6beb)
+    deps: [deps:capnpc-go]
+    cmds:
+      - clients/go/leyline-schema/regen.sh
+      - |
+        if ! git diff --exit-code -- clients/go/leyline-schema/; then
+          echo "clients/go/leyline-schema/ has drift; run regen.sh and commit" >&2
+          exit 1
+        fi
+
+  schema:go:test:
+    desc: go test ./... over the Go schema module (cross-runtime fixture decode, the Go half of the daemon protocol drift gate, daemon/wire); formerly leyline-schema-go.yml's test step, now in task ci (3a6beb)
+    dir: clients/go/leyline-schema
+    env:
+      GOWORK: "off"
+    cmds:
+      - go test -count=1 ./...
 
   schema:execution-asset-consumer-test:
     desc: Compile the execution/v1 schema release assets standalone to zod RunSpec/RunGrant/RunReceipt (6d811a)
@@ -1829,7 +1875,7 @@ tasks:
         echo "public Rust schema crates match binary release $BINARY_VERSION"
 
   ci:
-    desc: Common CI gate — runs on every PR. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
+    desc: Common CI gate — run locally before landing (its receipt gates `task land:integration`) and on the runner for PRs into main. Excludes `test:perf` (release-profile rebuild adds ~90-120s; main-push-only via ci.yml's conditional `test:perf` step). For the full main-push gate locally, run `task ci:full`.
     deps: [cache:sccache:install]
     cmds:
       # Invalidate any older receipt before the first gate. The final command
@@ -1845,6 +1891,7 @@ tasks:
       - task: lint:workflow-parity
       - task: lint:cache-contract
       - task: ci:attestation:fixture-test
+      - task: ci:land-integration:fixture-test
       - task: ci:fixture-hooks:fixture-test
       - task: ci:workflow-parity:fixture-test
       - task: lint:mutants-cfg-coverage:fixture-test
@@ -1860,7 +1907,11 @@ tasks:
       - task: release:hypervisor:fixture-test
       - task: guest-tools:fixture-test
       - task: schema:consumer-fixture-test
+      - task: schema:daemon-fixture-codec:fixture-test
+      - task: schema:daemon-fixture-codec
       - task: schema:go-sigma-vectors
+      - task: schema:go:regen-check
+      - task: schema:go:test
       - task: schema:execution-asset-consumer-test
       - task: schema:mcp-protocol-pin-test
       - task: release:version-check
@@ -1914,7 +1965,7 @@ tasks:
       - tools/ci_attestation.sh finish
 
   ci:full:
-    desc: Full CI pipeline including the release-profile perf regression gate. Runs on main pushes via ci.yml's conditional step; available locally via `task ci:full` for pre-push validation.
+    desc: Full CI pipeline including the release-profile perf regression gate. Runs on main pushes via ci.yml's conditional step; available locally via `task ci:full` before a perf-sensitive landing.
     cmds:
       - task: ci
       - task: test:perf

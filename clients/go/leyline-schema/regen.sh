@@ -5,7 +5,8 @@
 # This script invokes `capnp compile -ogo` against each .capnp file and drops
 # the generated *.capnp.go into its sibling Go package directory.
 #
-# CI invariant (.github/workflows/leyline-schema-go.yml):
+# CI invariant (`task schema:go:regen-check`, run by `task ci` and by
+# .github/workflows/leyline-schema-go.yml):
 #   regen → `git diff --exit-code clients/go/leyline-schema/`
 #
 # So: re-run this whenever a .capnp file changes, then commit the diff.

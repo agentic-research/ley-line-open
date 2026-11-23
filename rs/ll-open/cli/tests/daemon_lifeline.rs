@@ -528,3 +528,103 @@ fn no_thread_meets_epipe_when_the_stderr_reader_dies_before_the_lifeline() {
         "the arena does not hold the write: no final publish"
     );
 }
+
+/// The launcher's stderr reader dies first, silently (nothing reaches the
+/// relay before its lifeline ends), then the lifeline: teardown writes
+/// after the relay finishes must not meet that dead reader. The daemon
+/// exits 0, its socket is gone, and the write is published. (The
+/// deterministic check that `finish` never hands back a reader-less pipe
+/// after a lifeline end is `stdio_relay`'s unit test; here the shutdown's
+/// own log lines usually reach the relay first.)
+#[test]
+fn a_silent_reader_death_before_the_lifeline_ends_costs_nothing_at_teardown() {
+    let _serial = common::serial();
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join(".mache")).unwrap();
+    let work = tempfile::TempDir::new().unwrap();
+    let source = work.path().join("src");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("a.go"), "package a\n").unwrap();
+    let (lifeline_read, lifeline_write) = std::io::pipe().unwrap();
+    let (stderr_read, stderr_write) = std::io::pipe().unwrap();
+    let mut holder = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec /bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(lifeline_write))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the lifeline holder");
+    let mut reader = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "while IFS= read -r line; do case \"$line\" in \
+             *'daemon ready'*) echo READY;; esac; done",
+        )
+        .stdin(Stdio::from(stderr_read))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the stderr reader");
+    let mut daemon = daemon(home.path(), work.path())
+        .arg("--source")
+        .arg(&source)
+        .args(["--lifeline-fd", "0"])
+        .stdin(Stdio::from(lifeline_read))
+        .stderr(Stdio::from(stderr_write))
+        .spawn()
+        .expect("spawn the daemon");
+    let pids = [
+        daemon.id() as libc::pid_t,
+        holder.id() as libc::pid_t,
+        reader.id() as libc::pid_t,
+    ];
+    let kill_all = || {
+        for pid in pids {
+            // SAFETY: signals to the children this test spawned.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    };
+    let ready = {
+        let stdout = reader.stdout.take().expect("reader stdout");
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        rx.recv_timeout(GUARD)
+    };
+    if !matches!(&ready, Ok(line) if line.trim() == "READY") {
+        kill_all();
+        panic!("TIMEOUT: the daemon never became ready: {ready:?}");
+    }
+    let socket = work.path().join("lifeline.sock");
+    if let Err(reply) = propose_b(&socket) {
+        kill_all();
+        panic!("the write was refused: {reply}");
+    }
+    // The reader dies without anything written after it; then the lifeline.
+    // SAFETY: a signal to the child this test spawned.
+    assert_eq!(unsafe { libc::kill(pids[2], libc::SIGKILL) }, 0);
+    reader.wait().expect("reap the reader");
+    drop(holder.stdin.take());
+    holder.wait().expect("reap the holder");
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(daemon.wait());
+    });
+    let status = match rx.recv_timeout(GUARD) {
+        Ok(status) => status.expect("wait for the daemon"),
+        Err(_) => {
+            kill_all();
+            panic!("TIMEOUT: the daemon outlived its lifeline by {GUARD:?}");
+        }
+    };
+    assert!(status.success(), "the daemon's teardown failed: {status}");
+    assert!(!socket.exists(), "the daemon left its socket behind");
+    assert!(
+        published_tree(work.path()).contains(&"b.go".to_owned()),
+        "the arena does not hold the write: no final publish"
+    );
+}

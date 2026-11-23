@@ -197,6 +197,16 @@ jobs:
   # it once (`MUTANTS_BASELINE=record`); the shards below read its record and
   # run `--baseline=skip` with the timeout that baseline gives.
   #
+  # Two limits, both in tools/mutants_diff.sh. The generic slice's
+  # multi-package remainder is not recorded: each of its shards keeps its own
+  # baseline, because a joint one would hide a tree that breaks only when a
+  # shard's packages build alone. And a shard's timeout is 1.5 x the value
+  # cargo-mutants would set, because the baseline ran on another runner.
+  #
+  # What this costs: every shard now waits for this job, so wall clock grows by
+  # its length. What it saves is the repeated baseline TEST; the repeated
+  # baseline build mostly moves to each shard's first mutants.
+  #
   # It is also the ONLY job that saves this scope's cache, so one copy is kept
   # per scope and no two jobs can race writing it: the shards start after this
   # job ends and never save. The cache carries the cargo-mutants binary and the
@@ -212,7 +222,10 @@ jobs:
     needs: plan
     if: needs.plan.outputs.any == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The shards' ceiling, not a measured one. The runtime scope's baseline
+    # job took 172 s with a warm cache and 353 s cold; a scope with several
+    # recorded slices (generic's featured packages) has not been measured.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

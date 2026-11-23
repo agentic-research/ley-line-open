@@ -27,6 +27,8 @@
 #                            its result to $MUTANTS_BASELINE_RECORD.
 #   MUTANTS_BASELINE=reuse   run the mutants against that record: no baseline,
 #                            an explicit timeout derived from the recorded one.
+#                            The multi-package generic remainder is exempt
+#                            from both and always runs its own baseline.
 #
 # Unset, every slice runs its own baseline, which is what a local run wants.
 # The baseline block below says why.
@@ -228,9 +230,8 @@ fi
 #   record  run each slice's baseline once and write one line per slice to
 #           $MUTANTS_BASELINE_RECORD. cargo-mutants has no baseline-only mode
 #           and runs no baseline for an empty mutant list, so the run carries
-#           one probe location per mutated package: its baseline then covers
-#           exactly the packages an unsharded run's would. The probes'
-#           own outcomes are ignored; the shards test those mutants again.
+#           one probe mutant. The probe's own outcome is ignored; the shards
+#           test that mutant again.
 #   reuse   run the slice with `--baseline=skip --timeout <recorded>`.
 #
 # `--baseline=skip` makes the record load-bearing. cargo-mutants trusts a
@@ -240,18 +241,35 @@ fi
 # a record of another diff, a missing slice and a failed slice all exit 4, the
 # code a broken baseline has always had here.
 #
-# The timeout is cargo-mutants' own rule (27.1.0 `timeouts.rs`), applied to the
-# recorded baseline test time: `max(minimum, ceil(test seconds x multiplier))`,
-# with the multiplier `timeout_multiplier` from .cargo/mutants.toml or 5, and
-# the minimum CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT or 20. Without an explicit
-# timeout a skipped baseline falls back to a flat 300 s. There is no build
-# timeout in either case, as before.
+# A recorded baseline is ONE package's. cargo-mutants baselines the packages
+# of the mutants a run draws, so a shard of a multi-package slice used to
+# build only its own packages, and a joint baseline builds them all together,
+# where cargo unifies their features. A tree that breaks only when some of
+# them build alone would pass the joint baseline and then fail in the shard,
+# with every mutant there reported caught. This gate has met that class twice
+# (bead ley-line-open-c1f8bc; the binary-only shard). The one multi-package
+# slice, the generic remainder, therefore keeps its own baseline in every
+# shard (`slice_baseline=own` at its call), and recording refuses any other
+# slice that lists two packages. Recording the remainder per package instead
+# would save little: slice sharding hands each shard a contiguous run of
+# packages, so its shards together already baseline each package about once.
 #
-# One difference from a sharded baseline: a shard used to baseline only the
-# packages whose mutants it drew, so its timeout came from those packages'
-# tests. The recorded baseline tests every mutated package of the slice, as an
-# unsharded run does, so a multi-package slice's timeout can be longer. A hung
-# mutant is still stopped.
+# The timeout DEPARTS from cargo-mutants' rule on purpose. cargo-mutants
+# (27.1.0 `timeouts.rs`) sets `max(minimum, ceil(test seconds x multiplier))`
+# from the baseline it has just run on the same machine, with the multiplier
+# `timeout_multiplier` from .cargo/mutants.toml or 5 and the minimum
+# CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT or 20. Here the baseline ran on another
+# runner, and a mutant whose tests are cut off is counted as detected, so a
+# slower shard runner could turn a surviving mutant into a timeout. Shards get
+# that value x 1.5, rounded up. Measured on the runtime slice (runs
+# 45089874724, 45220086882): baseline tests 31 to 37 s, the slowest test run
+# that finished 121 s (3.9 x the baseline on its runner), surviving mutants'
+# 70 to 87 s; baselines of one tree differed 1.2 x in test time and 1.5 x in
+# build time between runners. 7.5 x the baseline leaves room for a shard
+# runner 1.9 x slower than the baseline's. The cost is that each mutant that
+# does hang takes half as long again to stop. Without an explicit timeout a
+# skipped baseline falls back to a flat 300 s. There is no build timeout, as
+# before.
 BASELINE_MODE=${MUTANTS_BASELINE:-run}
 BASELINE_RECORD=${MUTANTS_BASELINE_RECORD:-}
 case "$BASELINE_MODE" in
@@ -468,44 +486,58 @@ assert_excluded_packages_were_covered() {
 
 # MUTANTS_BASELINE=record for one slice. "$@" is the slice's arguments.
 record_baseline() {
-    # One mutant per mutated package, from the slice's own unsharded listing.
-    # `--list --json` names each mutant and its package; the first of each
-    # package is selected by its exact name with `--re`.
+    # The first mutant of the slice's own unsharded listing, selected by its
+    # exact name with `--re`. `--list --json` names each mutant and its
+    # package.
     if ! listed=$(cargo mutants --in-diff "$DIFF" "$@" --list --json 2>/dev/null); then
         echo "MISCONFIGURED: could not list this slice's mutants to record its baseline: $*" >&2
         exit 1
     fi
-    probes=''
+    probe=''
+    packages=0
     if [ -n "$listed" ]; then
-        if ! probes=$(printf '%s\n' "$listed" | jq -r '
-                group_by(.package) | .[] | .[0].name'); then
+        if ! probe=$(printf '%s\n' "$listed" | jq -r '.[0].name // empty') \
+            || ! packages=$(printf '%s\n' "$listed" | jq -r '[.[].package] | unique | length'); then
             echo "MISCONFIGURED: cargo mutants --list --json did not print a mutant list: $*" >&2
             exit 1
         fi
     fi
-    if [ -z "$probes" ]; then
+    if [ -z "$probe" ]; then
         echo "baseline record: no mutants in this slice ($*)"
         printf 'slice %s none\n' "$slice_key" >> "$BASELINE_RECORD"
         return 0
     fi
-    probe_count=0
-    while IFS= read -r probe; do
-        [ -n "$probe" ] || continue
-        probe_count=$((probe_count + 1))
-        set -- "$@" --re "^$(printf '%s' "$probe" | sed 's/[][\.*^$+?(){}|]/\\&/g')\$"
-    done <<PROBES
-$probes
-PROBES
-    # One build directory: the baseline and the probes are all this run
-    # builds, so more would only copy the tree again.
-    set -- "$@" --jobs 1
-    echo "baseline record: $probe_count mutated package(s) in this slice"
+    if [ "$packages" -ne 1 ]; then
+        {
+            echo "MISCONFIGURED: this slice mutates $packages packages, and one recorded"
+            echo "               baseline would build them together. A shard builds only"
+            echo "               the packages it draws. Give the slice its own baseline"
+            echo "               (slice_baseline=own): $*"
+        } >&2
+        exit 1
+    fi
+    # One build directory: the baseline and the probe are all this run builds,
+    # so more would only copy the tree again.
+    set -- "$@" --re "^$(printf '%s' "$probe" | sed 's/[][\.*^$+?(){}|]/\\&/g')\$" --jobs 1
+    # cargo-mutants exits 0 on "No mutants to filter" before it opens its
+    # output directory. The outcomes read below must be THIS invocation's, not
+    # the slice before's, whose `Baseline: Success` would otherwise be recorded
+    # for a slice whose baseline never ran.
+    rm -rf mutants.out
     set +e
     cargo mutants --in-diff "$DIFF" "$@"
     rc=$?
     set -e
-    baseline_summary=$(jq -r '[.outcomes[] | select(.scenario == "Baseline")][0].summary // "absent"' \
-        mutants.out/outcomes.json 2>/dev/null) || baseline_summary=absent
+    # A pass is exactly one baseline, reported as passed, and the one probe's
+    # outcome after it. Anything else is not the run that was asked for.
+    baseline_summary=$(jq -r '
+        [.outcomes[] | select(.scenario == "Baseline")] as $baselines
+        | [.outcomes[] | select(.scenario != "Baseline")] as $probes
+        | if ($baselines | length) != 1 then "reported \($baselines | length) times"
+          elif $baselines[0].summary != "Success" then $baselines[0].summary
+          elif ($probes | length) != 1 then "Success, with \($probes | length) probe outcomes"
+          else "Success" end' mutants.out/outcomes.json 2>/dev/null) || baseline_summary=''
+    : "${baseline_summary:=absent}"
     if [ "$rc" -eq 4 ] || [ "$baseline_summary" != Success ]; then
         printf 'slice %s failed\n' "$slice_key" >> "$BASELINE_RECORD"
         {
@@ -517,7 +549,7 @@ PROBES
         } >&2
         exit 4
     fi
-    # The probes' outcomes are not this run's result: 2 is a probe that
+    # The probe's outcome is not this run's result: 2 is a probe that
     # survived and 3 one that timed out, and the shards report both. Anything
     # else is cargo-mutants failing to run.
     case "$rc" in
@@ -535,8 +567,9 @@ PROBES
             exit 1
             ;;
     esac
-    # cargo-mutants' rule for the timeout it would have set from this baseline
-    # (27.1.0 timeouts.rs `test_timeout`).
+    # cargo-mutants' value for this baseline (27.1.0 timeouts.rs
+    # `test_timeout`), then half as much again for a shard on a slower runner.
+    # The block above the baseline modes says why.
     multiplier=$(sed -n 's/^[[:space:]]*timeout_multiplier[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' .cargo/mutants.toml 2>/dev/null | head -n 1)
     timeout=$(awk -v test="$baseline_test" -v multiplier="${multiplier:-5}" \
         -v minimum="${CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT:-20}" 'BEGIN {
@@ -544,11 +577,17 @@ PROBES
             timeout = int(scaled)
             if (timeout < scaled) timeout++
             if (timeout < minimum) timeout = int(minimum)
+            slack = timeout * 1.5
+            timeout = int(slack)
+            if (timeout < slack) timeout++
             print timeout
         }')
     printf 'slice %s ok %s %s %s\n' "$slice_key" "$timeout" "$baseline_build" "$baseline_test" >> "$BASELINE_RECORD"
     echo "BASELINE RECORDED: unmutated build ${baseline_build}s + test ${baseline_test}s; shards run --baseline=skip --timeout $timeout"
 }
+
+# `own` for a slice that spans packages; set at the call, reset after it.
+slice_baseline=shared
 
 run_slice() {
     mode=$1
@@ -581,11 +620,15 @@ run_slice() {
     # recording run and a shard (the diff's path, the shard, the baseline
     # flags added below).
     slice_key=$(printf '%s\n' "$*" | cksum | awk '{ print $1 "-" $2 }')
-    if [ "$BASELINE_MODE" = record ]; then
+    if [ "$slice_baseline" = own ] && [ "$BASELINE_MODE" != run ]; then
+        echo "this slice spans packages: every shard runs its own baseline"
+        if [ "$BASELINE_MODE" = record ]; then
+            return 0
+        fi
+    elif [ "$BASELINE_MODE" = record ]; then
         record_baseline "$@"
         return 0
-    fi
-    if [ "$BASELINE_MODE" = reuse ]; then
+    elif [ "$BASELINE_MODE" = reuse ]; then
         recorded=$(awk -v key="$slice_key" '$1 == "slice" && $2 == key { line = $0 } END { print line }' "$BASELINE_RECORD")
         # A record line is `slice <key> <status> <timeout> <build s> <test s>`.
         recorded_status=''
@@ -816,8 +859,11 @@ CHANGED_PATHS
     for pkg in $owned_packages $featured_packages $bin_only_packages; do
         set -- "$@" --exclude "$pkg/**"
     done
+    # The one slice that spans packages: it keeps its own baseline.
+    slice_baseline=own
     # shellcheck disable=SC2086
     run_slice lib $exclude_file_args "$@"
+    slice_baseline=shared
 fi
 
 # schema-bridge is the same case runtime and cli-lib are, in its purest form:

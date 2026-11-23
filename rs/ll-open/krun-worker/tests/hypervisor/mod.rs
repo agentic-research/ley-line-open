@@ -155,11 +155,11 @@ fn run_sign_script(args: &[&str], binary: &Path) {
 }
 
 /// The shipped `leyline-conn-broker`, which `leyline-runtime` builds: cargo
-/// puts it beside this crate's worker binary. A test that boots a guest with
-/// a declared connection fails here, by name, when it was not built.
+/// puts it beside the cargo-built `worker` binary. A test that boots a guest
+/// with a declared connection fails here, by name, when it was not built.
 #[allow(dead_code)] // each test binary uses a subset of this module
-pub fn connection_broker() -> PathBuf {
-    let broker = Path::new(env!("CARGO_BIN_EXE_leyline-krun-worker"))
+pub fn connection_broker(worker: &Path) -> PathBuf {
+    let broker = worker
         .parent()
         .expect("the worker's directory")
         .join("leyline-conn-broker");

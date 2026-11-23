@@ -252,7 +252,9 @@ impl Host {
             ready_timeout: Duration::from_secs(30),
             tsi_hijack_inet: false,
         }))
-        .with_connection_broker(BrokerConfig::new(hypervisor::connection_broker()));
+        .with_connection_broker(BrokerConfig::new(hypervisor::connection_broker(Path::new(
+            env!("CARGO_BIN_EXE_leyline-krun-worker"),
+        ))));
         service
             .provision(BackendClass::MicroVm, "provision-broker")
             .expect("the worker can enter the hypervisor");

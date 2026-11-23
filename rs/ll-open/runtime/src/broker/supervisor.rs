@@ -476,11 +476,10 @@ impl<B: Backend> Brokered<B> {
                         else {
                             unreachable!("matched a live entry under the lock");
                         };
-                        break Some(live);
+                        break live;
                     }
                     Some(Entry::Ended { failure, .. }) => {
                         let failure = failure.take();
-                        drop(runs);
                         if !keep_registered {
                             self.shared.registry.remove(run_id);
                         }
@@ -488,29 +487,36 @@ impl<B: Backend> Brokered<B> {
                     }
                     // A start owns its own registration until it publishes.
                     Some(Entry::Starting { .. }) => return None,
-                    None => break None,
+                    // A run without connections: only its §6 grants are
+                    // registered. Removed under the lock a start registers
+                    // under, so a start of the same run id that begins now
+                    // keeps the registration it makes.
+                    None => {
+                        if !keep_registered {
+                            self.shared.registry.remove(run_id);
+                        }
+                        return None;
+                    }
                 }
             }
         };
-        if let Some(live) = live {
-            let drain = self
-                .shared
-                .config
-                .as_ref()
-                .map_or(DRAIN_TIMEOUT, |config| config.drain_timeout);
-            let outcome = end_broker(&live, Some(drain));
-            self.shared.runs.lock().insert(
-                run_id.to_owned(),
-                Entry::Ended {
-                    outcome: Some(outcome),
-                    failure: None,
-                },
-            );
-            self.shared.changed.notify_all();
-        }
+        let drain = self
+            .shared
+            .config
+            .as_ref()
+            .map_or(DRAIN_TIMEOUT, |config| config.drain_timeout);
+        let outcome = end_broker(&live, Some(drain));
         if !keep_registered {
             self.shared.registry.remove(run_id);
         }
+        self.shared.runs.lock().insert(
+            run_id.to_owned(),
+            Entry::Ended {
+                outcome: Some(outcome),
+                failure: None,
+            },
+        );
+        self.shared.changed.notify_all();
         None
     }
 
@@ -699,7 +705,10 @@ impl<B: Backend> Backend for Brokered<B> {
                     .inner
                     .start(request, workspaces, RunConnections::none());
             }
-            self.shared.registry.register(run_id, &[], &grants)?;
+            {
+                let _runs = self.shared.runs.lock();
+                self.shared.registry.register(run_id, &[], &grants)?;
+            }
             let started = self
                 .inner
                 .start(request, workspaces, RunConnections::none());

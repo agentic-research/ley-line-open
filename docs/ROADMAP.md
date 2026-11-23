@@ -38,15 +38,21 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 v0.32.0 is the next release. Its work:
 
 - ADR-0046 Slice 1, the remainder (epic `e2c5ce`): `ExecutionService` owns
-  the broker (`5308b7`): start order, tier and delivery checks, the
-  cross-document rule, cancel of a starting run, failure teardown, drain and
-  receipt assembly, with the hypervisor end-to-end test; the service's
-  interim refusal of a grant with connections goes away with it. Daemon
-  spawns hand a child exactly the descriptors it names (`528525`, PR #598,
-  `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`), which closes the window
-  in which a sibling can inherit a lifeline's write end. The broker binary
-  (`52b5b3`), the loopback probe (`52deb4`) and the lifeline (`f963e6`,
-  `62e3b1`) shipped in v0.31.0.
+  the broker (`5308b7`, in review, stacked on `528525`): start order, tier
+  and delivery checks, the cross-document rule, cancel of a starting run,
+  failure teardown, drain and receipt assembly, with the hypervisor
+  end-to-end test. A daemon started with `--connection-broker` serves a
+  grant's connections and advertises `cloister/execution/v1/connections`; an
+  embedder with no daemon gets the same through `Brokered` and the
+  `Backend::start` connections argument (cloister's adoption:
+  `cloister-f40a86`, `cloister-55424e`). Daemon spawns hand a child exactly
+  the descriptors it names (`528525`, PR #598, `posix_spawn` with
+  `POSIX_SPAWN_CLOEXEC_DEFAULT`), which closes the window in which a sibling
+  can inherit a lifeline's write end. The broker binary (`52b5b3`), the
+  loopback probe (`52deb4`) and the lifeline (`f963e6`, `62e3b1`) shipped in
+  v0.31.0. Still open in the slice: `leyline-conn-broker` as a release asset
+  (`caa20b`), and the broker's path in the deployment configuration
+  document with `52c177`.
 - ADR-0049 PR2 and PR3 (`52c177`), the daemons adopt the deployment
   configuration: each daemon is configured by one versioned document
   (`apiVersion` `config.leyline/v1`) with `--check-config` and

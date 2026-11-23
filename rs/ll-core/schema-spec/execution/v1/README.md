@@ -431,11 +431,24 @@ document or a non-canonical one is `invalidGrant`. A document whose digest is no
 `connectionsDigest` is `identityPolicyMismatch`. The marker beside any other entry,
 `broker://` references included, keeps the `unsupportedBackend` refusal above.
 
-**Until a broker ships.** A daemon that reads these fields but has no connection
-broker authorizes them and then refuses the start with `unsupportedBackend`, "RunGrant
-carries connections (cloister/connections/v1), but this daemon has no connection
+**A daemon without a broker.** A daemon that reads these fields but was started with
+no connection broker (`execution-daemon` without `--connection-broker`) authorizes them
+and then refuses the start with `unsupportedBackend`, "connection `<name>`: RunGrant
+carries connections (cloister/connections/v1), and this daemon has no connection
 broker", before anything is resolved or spawned. It does not advertise the capability
 below. A client therefore gates on the capability entry, never on an LLO version.
+
+**At start.** A daemon with a broker checks the document against the run before it
+spawns anything, and each refusal names the connection: a tier that does not deliver
+connections (`unsupportedBackend`; slice 1 delivers the microVM and native tiers on
+macOS), a target other than `127.0.0.1` (`unsupportedBackend`), an endpoint without
+exactly one confinement/v1 §6 connect grant on its path in the tier's spelling (the
+object form with `guestPort` on the microVM tier, the bare string on the native tier),
+a bind-capable §6 grant or a §2 write grant that reaches it (`invalidGrant`), an
+endpoint path that exists (`resourceConflict`) or whose directory is not private
+(`invalidGrant`), and an endpoint another live run holds or reaches (`resourceConflict`,
+`invalidGrant`). A §6 connect grant with no connection is not refused: it is a peer
+channel.
 
 **Capability.** A daemon that reads `@16`/`@17` and has a broker advertises
 `{name: "cloister/execution/v1/connections", version: "1"}` in

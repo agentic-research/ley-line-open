@@ -1136,7 +1136,8 @@ pub fn row_a_declared_connection_reaches_its_target_through_the_broker(column: C
         ("CONFORMANCE_DIAL", dial),
     ];
     let started = match column.try_start("connection", &manifest, &environment, Some(&declared)) {
-        Ok(started) => started,
+        Ok(started) if cfg!(target_os = "macos") => started,
+        Ok(_) => panic!("{name}: a tier that does not deliver connections started one"),
         Err(error) if !cfg!(target_os = "macos") => {
             // Slice 1 delivers on macOS only (S6): refused by name, with
             // nothing spawned and nothing bound.
@@ -1161,10 +1162,6 @@ pub fn row_a_declared_connection_reaches_its_target_through_the_broker(column: C
         }
         Err(error) => panic!("{name}: start a run with a declared connection: {error}"),
     };
-    assert!(
-        cfg!(target_os = "macos"),
-        "{name}: a tier that does not deliver connections started one"
-    );
 
     // EVENT: the guest's dial arrives at the target, through the broker.
     let (sender, receiver) = mpsc::channel();

@@ -157,8 +157,7 @@ fn the_tier_check_runs_before_anything_is_spawned() {
     let manifest = manifest(vec![native_grant(&dir, "api")]);
     let probe = Probe::new(BackendClass::Native);
     // `BrokerConfig::new`, as a daemon builds it: no test override.
-    let mut config = leyline_runtime::BrokerConfig::new(host.path("broker"));
-    config.binary = host.broker(None).binary;
+    let config = leyline_runtime::BrokerConfig::new(host.broker(None).binary);
     let backend = Brokered::new(probe.clone(), config);
     let result = start(&backend, "run-tier", Some(&manifest), &declared);
     if cfg!(target_os = "macos") {

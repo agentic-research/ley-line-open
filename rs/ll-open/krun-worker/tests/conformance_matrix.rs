@@ -131,7 +131,9 @@ fn libkrun() -> Option<Column> {
             // The VMM's own confinement is not the workload's: a host that
             // cannot boot a guest is the hypervisor gate's to report.
             sandbox_refusal: |_| false,
-            broker: hypervisor::connection_broker(),
+            broker: hypervisor::connection_broker(Path::new(env!(
+                "CARGO_BIN_EXE_leyline-krun-worker"
+            ))),
         },
         backend,
     ))

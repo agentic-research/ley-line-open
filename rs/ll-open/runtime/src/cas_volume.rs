@@ -400,10 +400,14 @@ impl Hdiutil {
             .process_group()
             .spawn()
             .map_err(|error| tool_error(error.to_string()))?;
-        let group = child.id() as libc::pid_t;
+        // Never 0 or 1, whose groups are this process's own and every
+        // process it may signal (`child_pid`).
+        let group = crate::backends::spawn::child_pid(child.id());
         let kill_group = || {
-            // SAFETY: signals the process group this call created.
-            unsafe { libc::kill(-group, libc::SIGKILL) };
+            if let Some(group) = group {
+                // SAFETY: signals the process group this call created.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
         };
         let timed_out = || CasVolumeError::Timeout {
             command: rendered(),

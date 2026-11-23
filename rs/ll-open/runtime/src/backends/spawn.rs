@@ -285,12 +285,27 @@ impl Spawned {
         if self.status.is_some() {
             return Ok(());
         }
+        let pid = child_pid(self.pid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pid {} names no child", self.pid),
+            )
+        })?;
         // SAFETY: a signal to this process's own, unreaped child.
-        if unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) } == -1 {
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
+}
+
+/// `pid` as a `pid_t` that can name a child of this process, or `None`.
+/// Every `kill` of a child or its group goes through this: 0 and 1 never
+/// name a child, and signalling them is never contained. `kill(0, s)` and
+/// `kill(-0, s)` signal the caller's own process group, `kill(1, s)` init,
+/// and `kill(-1, s)` every process the caller may signal.
+pub(crate) fn child_pid(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 1)
 }
 
 /// `waitpid(pid, options)`, retried on `EINTR`: `None` when `WNOHANG` found
@@ -560,6 +575,19 @@ mod tests {
             !child_holds(cloexec, None, vec![cloexec]),
             "kept close-on-exec"
         );
+    }
+
+    /// 0 and 1 never name a child, whatever the caller holds; every other
+    /// pid that fits a `pid_t` does. Checked as a table, never by signalling:
+    /// a test that signalled 0 or 1 would, under a mutant of the guard, be
+    /// the very `kill(-1)` the guard exists to prevent.
+    #[test]
+    fn pid_0_and_1_never_name_a_child() {
+        assert_eq!(child_pid(0), None);
+        assert_eq!(child_pid(1), None);
+        assert_eq!(child_pid(2), Some(2));
+        assert_eq!(child_pid(4242), Some(4242));
+        assert_eq!(child_pid(u32::MAX), None, "no pid_t is that large");
     }
 
     /// Reap `child` behind its back, so its pid names no child of this

@@ -132,14 +132,19 @@ pub(super) fn terminate_process_group(pid: u32) {
     // forker is the microVM/vsock confinement boundary's problem, not this
     // function's; this closes the honest-worker window that was leaking.
     //
+    // A pid of 0 or 1 is refused: `kill(-0)` would be this process's own
+    // group and `kill(-1)` every process it may signal (`child_pid`).
+    let Some(leader) = super::spawn::child_pid(pid) else {
+        return;
+    };
     // SAFETY: `pid` came directly from a live Child. A negative pid
     // addresses the process group established before exec; the direct-pid
     // fallback still reaps a worker if group setup failed at the OS
     // boundary.
     unsafe {
-        let process_group = -(pid as libc::pid_t);
+        let process_group = -leader;
         if libc::kill(process_group, libc::SIGKILL) == -1 {
-            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            let _ = libc::kill(leader, libc::SIGKILL);
         }
         if await_exit_without_reaping(pid).is_ok() {
             let _ = libc::kill(process_group, libc::SIGKILL);

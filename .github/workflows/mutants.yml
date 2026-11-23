@@ -197,22 +197,16 @@ jobs:
   # it once (`MUTANTS_BASELINE=record`); the shards below read its record and
   # run `--baseline=skip` with the timeout that baseline gives.
   #
-  # It is also the ONLY job that saves this scope's build cache, so one copy is
-  # kept per scope and no two jobs can race writing it: the shards start after
-  # this job ends and never save. What the cache carries to them is the
-  # cargo-mutants binary, the registry, and the baseline's dependency builds in
-  # rs/target (`MUTANTS_SEED_TARGET`). Before this, a leg's cache held no
-  # build at all: cargo-mutants builds in copies of the tree, never in
-  # rs/target, so each of a shard's build directories compiled every
-  # dependency from nothing.
-  #
-  # `cache-workspace-crates` stays off, and that is load-bearing. The shards
-  # copy rs/target into their build directories, where cargo decides freshness
-  # by mtime and every mtime is the copy's. A workspace crate's artifact from
-  # another commit, or from a probe mutant of this job, could read as fresh
-  # there and be linked into a mutant's test build. rust-cache's default drops
-  # every package under rs/ before saving; tools/mutants_diff.sh deletes their
-  # fingerprints as well.
+  # It is also the ONLY job that saves this scope's cache, so one copy is kept
+  # per scope and no two jobs can race writing it: the shards start after this
+  # job ends and never save. The cache carries the cargo-mutants binary and the
+  # registry, so a shard no longer builds cargo-mutants from source (~70 s) on
+  # a pull request's first run. It carries no build of the tree, and cannot
+  # usefully: cargo-mutants builds in copies of rs/, never in rs/target, and a
+  # target copied in with `--copy-target` gets the copy's mtimes in walk order,
+  # so cargo rebuilds a dependency whenever one of its own dependencies happens
+  # to be copied later (run 45116489387: 160 of 518 units recompiled). Hence no
+  # `cache-workspace-crates`: there is nothing in rs/target to keep.
   baseline:
     name: cargo mutants baseline (${{ matrix.scope }})
     needs: plan
@@ -237,7 +231,6 @@ jobs:
           # `shared-key`, not `key`: `key` is joined with the job's id, so this
           # job and the shards would each compute a different cache key.
           shared-key: mutants-${{ matrix.scope }}
-          cache-workspace-crates: "false"
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
           version: 3.49.1
@@ -260,7 +253,6 @@ jobs:
         env:
           MUTANTS_BASELINE: record
           MUTANTS_BASELINE_RECORD: ${{ runner.temp }}/mutants-baseline/record.txt
-          MUTANTS_SEED_TARGET: "1"
         run: task mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=${{ matrix.scope }}
 
       # Uploaded on failure too: a record that says `failed` is how every
@@ -374,7 +366,6 @@ jobs:
           MUTANTS_SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }}
           MUTANTS_BASELINE: reuse
           MUTANTS_BASELINE_RECORD: ${{ runner.temp }}/mutants-baseline/record.txt
-          MUTANTS_SEED_TARGET: "1"
         run: task mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=${{ matrix.scope }}
 
       - name: Upload mutants report

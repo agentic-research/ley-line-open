@@ -1,18 +1,18 @@
 # Self-contained validation wiring (taskfile-ci-parity).
 #
-# The pre-push hook runs `task ci` — the SAME gate CI runs (ci.yml:
-# `run: task ci`) — so "passes locally" and "passes CI" cannot disagree:
-# they invoke one definition. Neither this file nor CI re-implements the
-# underlying commands; both point at Taskfile targets.
+# The commit hook runs a Taskfile target, as CI does (ci.yml: `run: task
+# ci`), so neither this file nor CI re-implements the underlying commands.
 #
 # Install once (does NOT touch the rsry-managed commit-msg/post-merge/
-# post-push hooks — pre-commit owns pre-commit + pre-push only):
+# post-push hooks — pre-commit owns pre-commit only):
 #
-#   pre-commit install --hook-type pre-commit --hook-type pre-push
+#   pre-commit install --hook-type pre-commit
 #
-# After that you never run check/clippy/fmt/blake3-lint by hand: `git commit`
-# runs the Taskfile's fast commit gate, `git push` runs the full gate and
-# blocks a push CI would reject.
+# There is no pre-push gate. A client hook is skipped whenever the repo's
+# core.hooksPath points elsewhere (the rsry hooks dir does), so it cannot
+# guard a branch. Work lands on integration through `task land:integration`,
+# which refuses a dirty tree, a branch that does not contain integration,
+# and a tree with no `task ci` receipt (bead ley-line-open-3a6beb).
 repos:
   - repo: local
     hooks:
@@ -26,27 +26,3 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-commit]
-
-      # Reuse a successful task-ci receipt only when it addresses the exact
-      # committed tree and toolchain. Otherwise run the same full gate as CI.
-      - id: task-ci
-        name: task ci (exact-tree receipt or full gate)
-        # `env -u GIT_DIR -u GIT_INDEX_FILE` is load-bearing for the 1:1 claim.
-        # git exports GIT_DIR (and GIT_INDEX_FILE) into hook processes, and it
-        # is inherited all the way down into test subprocesses. Tests that shell
-        # out to git in a tempdir (cli-lib's `cmd_daemon` git_* / watcher_*
-        # tests) then operate on THIS repo instead: `git init -q` fails and
-        # `git_head(tempdir)` returns this repo's HEAD. Result: 7 tests fail at
-        # push time and pass in CI — exactly the local/CI disagreement this
-        # file exists to prevent. CI has no GIT_DIR, so unsetting it here is
-        # what makes the two environments equal.
-        entry: env -u GIT_DIR -u GIT_INDEX_FILE tools/pre_push_ci.sh
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [pre-push]
-        # pre-commit captures hook output and prints it only on failure, so a
-        # clean `git push` looked hung for the several minutes `task ci` takes.
-        # `verbose` surfaces the log — but only after the hook finishes, which
-        # is why the script also writes a live line straight to /dev/tty.
-        verbose: true

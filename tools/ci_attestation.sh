@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    echo "usage: $0 begin|finish|check|snapshot|verify-head" >&2
+    echo "usage: $0 begin|finish|check|check-tree <tree>|snapshot|verify-head" >&2
     exit 2
 }
 
@@ -32,10 +32,13 @@ ci_snapshot() (
 
 ci_contract() {
     {
-        printf '%s\n' "leyline-task-ci-receipt-v1"
+        # v2: task ci runs the Go schema module's regen diff and tests
+        # (schema:go:regen-check, schema:go:test), so Go is an input.
+        printf '%s\n' "leyline-task-ci-receipt-v2"
         task --version 2>/dev/null || printf '%s\n' "task unavailable"
         rustc --version --verbose 2>/dev/null || printf '%s\n' "rustc unavailable"
         cargo --version 2>/dev/null || printf '%s\n' "cargo unavailable"
+        go version 2>/dev/null || printf '%s\n' "go unavailable"
         git --version
         uname -sm
     } | git hash-object --stdin
@@ -97,6 +100,25 @@ case "$command" in
             exit 1
         fi
         echo "task ci receipt matches tree $current_snapshot"
+        ;;
+    check-tree)
+        # Whether the receipt names exactly <tree> under the current
+        # toolchain contract. Reads no working tree: a caller that pushes a
+        # commit binds the receipt to that commit's tree, so nothing written
+        # to the worktree between the check and the push can change what
+        # was checked (tools/land_integration.sh).
+        tree=${2:-}
+        test -n "$tree" || usage
+        if ! read_record "$receipt_file"; then
+            echo "no successful task ci receipt for this worktree" >&2
+            exit 1
+        fi
+        if [ "$record_snapshot" != "$tree" ] ||
+            [ "$record_contract" != "$(ci_contract)" ]; then
+            echo "task ci receipt does not name tree $tree under the current toolchain" >&2
+            exit 1
+        fi
+        echo "task ci receipt matches tree $tree"
         ;;
     snapshot)
         # The tree a receipt names, for other receipts that must name trees

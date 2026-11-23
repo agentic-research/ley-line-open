@@ -28,6 +28,9 @@ use std::time::Duration;
 #[must_use = "finish() flushes what the relay holds before the process exits"]
 pub struct StdioRelay {
     streams: Vec<Relayed>,
+    /// Opened at install, so handing a descriptor to `/dev/null` at finish
+    /// has no failure path that falls back to a reader-less original.
+    null: File,
 }
 
 struct Relayed {
@@ -44,6 +47,10 @@ struct Relayed {
 /// a pipe this process reads. Call it before anything writes to them that
 /// could outlive their reader.
 pub fn install(fds: &[RawFd]) -> io::Result<StdioRelay> {
+    let null = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .map_err(|error| io::Error::new(error.kind(), format!("open /dev/null: {error}")))?;
     let mut streams = Vec::with_capacity(fds.len());
     for &fd in fds {
         // A close-on-exec copy (F_DUPFD_CLOEXEC): no child gets the original
@@ -69,7 +76,25 @@ pub fn install(fds: &[RawFd]) -> io::Result<StdioRelay> {
             drained,
         });
     }
-    Ok(StdioRelay { streams })
+    Ok(StdioRelay { streams, null })
+}
+
+/// Whether `fd` is the write end of a pipe or socket whose reader is gone:
+/// `poll` reports POLLHUP for it on macOS and POLLERR on Linux. A terminal,
+/// a file or a live pipe reports neither.
+fn reader_hung_up(fd: RawFd) -> bool {
+    let mut entry = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one pollfd this frame owns, a zero timeout; poll writes only
+    // its revents. Its return value is not needed: revents starts at 0, and
+    // poll leaves it 0 both when nothing is ready and when it fails.
+    unsafe { libc::poll(&mut entry, 1, 0) };
+    let hung_up = entry.revents & libc::POLLHUP != 0;
+    let errored = entry.revents & libc::POLLERR != 0;
+    hung_up || errored
 }
 
 /// A libc return value: `-1` is the error in `errno`, anything else success.
@@ -105,17 +130,31 @@ fn relay(
 }
 
 impl StdioRelay {
-    /// Hand each descriptor back and flush what its relay holds: the
-    /// original when it still has a reader, `/dev/null` when it does not, so
-    /// no later write can fail either. Waits for each relay to forward what
-    /// was written before, at most `bound` (a child that inherited the
-    /// relay's pipe keeps it open past that).
-    pub fn finish(self, bound: Duration) {
-        let null = std::fs::OpenOptions::new().write(true).open("/dev/null");
+    /// [`finish`](Self::finish) after `leyline daemon` returns: the
+    /// launcher is gone when its lifeline ended in this process
+    /// ([`crate::lifecycle::lifeline_ended`]).
+    pub fn finish_after_daemon(self, bound: Duration) {
+        self.finish(bound, crate::lifecycle::lifeline_ended());
+    }
+
+    /// Hand each descriptor back and flush what its relay holds, so no
+    /// later write can fail either. A descriptor goes to `/dev/null` when
+    /// its original's reader is or may be gone: `launcher_gone` (the
+    /// launcher's lifeline ended, and it may have been the only reader,
+    /// written to since or not), a forward already failed, or the original
+    /// reports its reader hung up. Otherwise it goes back to the original.
+    /// A reader that dies after this check is not seen. Waits for each relay
+    /// to forward what was written before, at most `bound` (a child that
+    /// inherited the relay's pipe keeps it open past that).
+    pub fn finish(self, bound: Duration, launcher_gone: bool) {
         for stream in &self.streams {
-            let target = match (&null, stream.dead.load(Ordering::SeqCst)) {
-                (Ok(null), true) => null.as_raw_fd(),
-                _ => stream.original.as_raw_fd(),
+            let reader_gone = launcher_gone
+                || stream.dead.load(Ordering::SeqCst)
+                || reader_hung_up(stream.original.as_raw_fd());
+            let target = if reader_gone {
+                self.null.as_raw_fd()
+            } else {
+                stream.original.as_raw_fd()
             };
             // SAFETY: dup2 onto the relayed descriptor; this drops this
             // process's last copy of the relay's write end.
@@ -156,7 +195,7 @@ mod tests {
         for _ in 0..1000 {
             write(fd, b"no reader, and no EPIPE\n").expect("a relayed write never fails");
         }
-        relay.finish(BOUND);
+        relay.finish(BOUND, false);
         // SAFETY: an out-parameter of the size fstat writes.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
@@ -178,13 +217,72 @@ mod tests {
         let fd = writer.into_raw_fd();
         let relay = install(&[fd]).unwrap();
         write(fd, b"before\n").unwrap();
-        relay.finish(BOUND);
+        relay.finish(BOUND, false);
         write(fd, b"after\n").unwrap();
         // SAFETY: the test's own descriptor; closing it ends the pipe.
         unsafe { libc::close(fd) };
         let mut all = String::new();
         reader.read_to_string(&mut all).unwrap();
         assert_eq!(all, "before\nafter\n");
+    }
+
+    /// A reader that died without a write through the relay leaves it
+    /// unaware: finish must not hand back the dead original after the
+    /// launcher's lifeline ended, or a teardown write fails with EPIPE.
+    #[test]
+    fn after_the_lifeline_ends_finish_never_hands_back_a_reader_less_pipe() {
+        let (reader, writer) = io::pipe().unwrap();
+        let fd = writer.into_raw_fd();
+        let relay = install(&[fd]).unwrap();
+        // The launcher's reader dies, and nothing is written meanwhile.
+        drop(reader);
+        relay.finish(BOUND, true);
+        write(fd, b"teardown\n").expect("a teardown write after the launcher died");
+        // SAFETY: the test's own descriptor.
+        unsafe { libc::close(fd) };
+    }
+
+    /// A reader that died silently is seen at finish even when the stop was
+    /// not a lifeline end (a SIGTERM whose launcher died too): the original
+    /// reports its reader hung up, so the descriptor goes to `/dev/null`.
+    #[test]
+    fn finish_never_hands_back_a_pipe_whose_reader_hung_up() {
+        let (reader, writer) = io::pipe().unwrap();
+        let fd = writer.into_raw_fd();
+        let relay = install(&[fd]).unwrap();
+        drop(reader);
+        relay.finish(BOUND, false);
+        write(fd, b"teardown\n").expect("a reader that hung up is never handed back");
+        // SAFETY: the test's own descriptor.
+        unsafe { libc::close(fd) };
+    }
+
+    /// What `leyline daemon` calls: after a lifeline end, a descriptor whose
+    /// reader is still alive at finish but dies afterwards (the probe cannot
+    /// see it yet) still goes to `/dev/null`, so the later write succeeds.
+    #[test]
+    fn after_a_lifeline_end_the_daemon_finish_hands_no_descriptor_back() {
+        let _flag = crate::lifecycle::LIFELINE_FLAG_TESTS.blocking_lock();
+        crate::lifecycle::set_lifeline_ended_for_test(true);
+        let (reader, writer) = io::pipe().unwrap();
+        let fd = writer.into_raw_fd();
+        let relay = install(&[fd]).unwrap();
+        relay.finish_after_daemon(BOUND);
+        crate::lifecycle::set_lifeline_ended_for_test(false);
+        // Finished, not merely left on the relay (whose thread would also
+        // swallow the write below): the descriptor is /dev/null.
+        // SAFETY: an out-parameter of the size fstat writes.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        assert_eq!(
+            stat.st_mode & libc::S_IFMT,
+            libc::S_IFCHR,
+            "finish_after_daemon put the descriptor on /dev/null"
+        );
+        drop(reader);
+        write(fd, b"teardown\n").expect("finished onto /dev/null after the lifeline ended");
+        // SAFETY: the test's own descriptor.
+        unsafe { libc::close(fd) };
     }
 
     #[test]

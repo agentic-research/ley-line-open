@@ -37,12 +37,18 @@ use leyline_storefs::{Derived, Options, Scope, Store, StoreFs};
 use tempfile::TempDir;
 
 const A: &str = "package a\n\nfunc A() int { return 1 }\n";
-/// `A` with a tail line: an edit to other lines than `A_OTHER`'s.
+/// `A` with a tail line under its function: a one-line edit that lands
+/// alone, or beside an edit of the package line.
 const A_TAILED: &str = "package a\n\nfunc A() int { return 1 }\n// tail\n";
 /// Another writer's change to `A`'s function line.
 const A_OTHER: &str = "package a\n\nfunc A() int { return 3 }\n";
-/// `A_OTHER` and `A_TAILED`, merged.
-const A_MERGED: &str = "package a\n\nfunc A() int { return 3 }\n// tail\n";
+/// `A` with a head line: an edit two unchanged lines away from
+/// `A_OTHER`'s. `A_TAILED`'s line sits right under `A_OTHER`'s, so the two
+/// only touch, and touching edits conflict (ADR-0045 T5, amended
+/// 2026-11-22).
+const A_HEADED: &str = "// head\npackage a\n\nfunc A() int { return 1 }\n";
+/// `A_OTHER` and `A_HEADED`, merged.
+const A_MERGED: &str = "// head\npackage a\n\nfunc A() int { return 3 }\n";
 /// `A` with its package line changed: an edit of other lines than
 /// `A_TAILED`'s, made to `A`.
 const A_PACKAGED: &str = "package z\n\nfunc A() int { return 1 }\n";
@@ -316,7 +322,7 @@ async fn a_host_process_edits_the_store_through_the_mount() {
     // A save over a disjoint change another writer landed merges.
     f.other_writer("a.go", A_OTHER);
     with_kernel_deadline("disjoint save", &m.path, move || {
-        save_through(file, A_TAILED)
+        save_through(file, A_HEADED)
     })
     .unwrap();
     assert_eq!(f.stored("a.go").as_deref(), Some(A_MERGED));

@@ -418,7 +418,7 @@ impl std::fmt::Display for Refusal {
                                 .map(|r| format!("{}..{}", r.start + 1, r.end + 1))
                                 .collect();
                             format!(
-                                "{m}, and its changes overlap the other writer's at base lines {}",
+                                "{m}, and its changes overlap or touch the other writer's at base lines {}",
                                 lines.join(", ")
                             )
                         }

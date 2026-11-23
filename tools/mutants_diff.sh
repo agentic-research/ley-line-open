@@ -19,6 +19,19 @@
 # from the repo root carries `a/rs/ll-core/...`, matches nothing, prints
 # "No mutants to filter", and EXITS 0 — a permanently green check that tests
 # nothing, from a path prefix. Generate with `git diff --relative=rs`.
+#
+# Environment:
+#
+#   MUTANTS_SHARD=k/n        run one of n shards of every slice.
+#   MUTANTS_BASELINE=record  run each slice's unmutated baseline ONCE and write
+#                            its result to $MUTANTS_BASELINE_RECORD.
+#   MUTANTS_BASELINE=reuse   run the mutants against that record: no baseline,
+#                            an explicit timeout derived from the recorded one.
+#   MUTANTS_SEED_TARGET=1    CI only: carry the baseline's dependency builds to
+#                            the shards through ./target.
+#
+# Unset, every slice runs its own baseline, which is what a local run wants.
+# The baseline block below says why.
 set -eu
 
 # cargo-mutants builds a copy of rs/ outside the repository, where the
@@ -208,6 +221,115 @@ if [ "$SCOPE" = list-scopes ]; then
     exit 0
 fi
 
+# ONE unmutated baseline per (run, scope) (bead ley-line-open-35780f).
+#
+# cargo-mutants builds and tests the unmutated tree before it mutates anything,
+# and a slice split into n shards did that n times: same commit, same packages,
+# same answer. Over one week that was 10.7 of 96 runner-hours (GitHub #607).
+#
+#   record  run each slice's baseline once and write one line per slice to
+#           $MUTANTS_BASELINE_RECORD. cargo-mutants has no baseline-only mode
+#           and runs no baseline for an empty mutant list, so the run carries
+#           one probe location per mutated package: its baseline then covers
+#           exactly the packages an unsharded run's would. The probes'
+#           own outcomes are ignored; the shards test those mutants again.
+#   reuse   run the slice with `--baseline=skip --timeout <recorded>`.
+#
+# `--baseline=skip` makes the record load-bearing. cargo-mutants trusts a
+# skipped baseline: were the unmutated tests failing, every mutant would be
+# reported CAUGHT by failures it did not cause. So reuse refuses to run on
+# anything but a recorded pass for THIS diff and THIS slice — a missing record,
+# a record of another diff, a missing slice and a failed slice all exit 4, the
+# code a broken baseline has always had here.
+#
+# The timeout is cargo-mutants' own rule (27.1.0 `timeouts.rs`), applied to the
+# recorded baseline test time: `max(minimum, ceil(test seconds x multiplier))`,
+# with the multiplier `timeout_multiplier` from .cargo/mutants.toml or 5, and
+# the minimum CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT or 20. Without an explicit
+# timeout a skipped baseline falls back to a flat 300 s. There is no build
+# timeout in either case, as before.
+#
+# One difference from a sharded baseline: a shard used to baseline only the
+# packages whose mutants it drew, so its timeout came from those packages'
+# tests. The recorded baseline tests every mutated package of the slice, as an
+# unsharded run does, so a multi-package slice's timeout can be longer. A hung
+# mutant is still stopped.
+BASELINE_MODE=${MUTANTS_BASELINE:-run}
+BASELINE_RECORD=${MUTANTS_BASELINE_RECORD:-}
+SEED_TARGET=${MUTANTS_SEED_TARGET:-}
+case "$BASELINE_MODE" in
+    run|record|reuse) ;;
+    *)
+        echo "MUTANTS_BASELINE must be record or reuse (or unset), got '$BASELINE_MODE'" >&2
+        exit 1
+        ;;
+esac
+if [ "$BASELINE_MODE" != run ] && [ -z "$BASELINE_RECORD" ]; then
+    echo "MUTANTS_BASELINE=$BASELINE_MODE needs MUTANTS_BASELINE_RECORD=<file>" >&2
+    exit 1
+fi
+if [ "$BASELINE_MODE" = record ] && [ -n "${MUTANTS_SHARD:-}" ]; then
+    echo "MUTANTS_BASELINE=record covers every shard; it cannot run with MUTANTS_SHARD" >&2
+    exit 1
+fi
+# MUTANTS_SEED_TARGET moves the recording run's target directory to ./target
+# and has the shards copy it into their build directories (`--copy-target`).
+# cargo-mutants builds in copies of the tree, each with an empty target, so
+# without this every build directory of every shard compiles the dependencies
+# from nothing.
+#
+# It is refused outside CI because ./target then holds what a probe mutant
+# built. Cargo decides freshness by mtime, and a copied tree's mtimes are the
+# copy's: an artifact of mutated source can read as fresh and be linked into
+# the next build. Two things keep that out of the shards. The record step
+# deletes the fingerprint of every path package (the workspace and the vendored
+# crates) before the directory is kept, so cargo rebuilds them wherever the
+# directory is copied. And the CI cache that carries the directory drops those
+# packages' artifacts (rust-cache without `cache-workspace-crates`). Only
+# registry dependencies, which no mutant touches, are reused.
+case "$SEED_TARGET" in
+    ''|1) ;;
+    *) echo "MUTANTS_SEED_TARGET must be 1 (or unset), got '$SEED_TARGET'" >&2; exit 1 ;;
+esac
+if [ -n "$SEED_TARGET" ]; then
+    if [ "$BASELINE_MODE" = run ]; then
+        echo "MUTANTS_SEED_TARGET needs MUTANTS_BASELINE=record or reuse" >&2
+        exit 1
+    fi
+    if [ -z "${CI:-}" ]; then
+        {
+            echo "MUTANTS_SEED_TARGET is for a throwaway CI checkout: it leaves"
+            echo "probe-mutant artifacts in ./target. Refusing outside CI."
+        } >&2
+        exit 1
+    fi
+fi
+
+# A record names the diff it was made for. The same slice arguments recur
+# across diffs, so the slice key alone would accept another run's baseline.
+baseline_diff_id=$(cksum < "$DIFF" | awk '{ print $1 "-" $2 }')
+if [ "$BASELINE_MODE" = record ]; then
+    mkdir -p "$(dirname -- "$BASELINE_RECORD")"
+    printf 'diff %s\n' "$baseline_diff_id" > "$BASELINE_RECORD"
+fi
+if [ "$BASELINE_MODE" = reuse ]; then
+    if [ ! -f "$BASELINE_RECORD" ]; then
+        {
+            echo "BASELINE MISSING: no baseline record at $BASELINE_RECORD."
+            echo "                  The baseline for this scope did not finish, so"
+            echo "                  NOTHING was mutated. This is not a pass."
+        } >&2
+        exit 4
+    fi
+    if ! grep -qx "diff $baseline_diff_id" "$BASELINE_RECORD"; then
+        {
+            echo "BASELINE MISSING: $BASELINE_RECORD records the baseline of a"
+            echo "                  different diff, so NOTHING was mutated."
+        } >&2
+        exit 4
+    fi
+fi
+
 # Decided from the diff itself, not from cargo-mutants' output, so "did this
 # change Rust?" and "did enumeration work?" stay independent questions. Folding
 # them together is what makes the misconfigured case look like the skipped one.
@@ -379,6 +501,139 @@ assert_excluded_packages_were_covered() {
     done
 }
 
+# Delete the fingerprint of every path package (the workspace's and the
+# vendored crates') from a target directory, so cargo rebuilds them wherever
+# the directory is used next. What is left is reusable only for registry
+# dependencies. Fails if the package list cannot be read: a directory that may
+# hold a probe mutant's build must not be kept.
+drop_path_package_fingerprints() {
+    path_packages=$(cargo metadata --format-version 1 2>/dev/null \
+        | jq -r '.packages[] | select(.source == null) | .name' 2>/dev/null) || path_packages=''
+    [ -n "$path_packages" ] || return 1
+    for name in $path_packages; do
+        rm -rf "$1"/*/.fingerprint/"$name"-* "$1"/*/*/.fingerprint/"$name"-*
+    done
+}
+
+# MUTANTS_BASELINE=record for one slice. "$@" is the slice's arguments.
+record_baseline() {
+    # One location per mutated package, from the slice's own unsharded
+    # listing. `--list --json` names each mutant's package; the first
+    # mutant of each gives a `path:line:column: ` prefix for `--re`, which
+    # cargo-mutants matches against the mutant's name.
+    if ! listed=$(cargo mutants --in-diff "$DIFF" "$@" --list --json 2>/dev/null); then
+        echo "MISCONFIGURED: could not list this slice's mutants to record its baseline: $*" >&2
+        exit 1
+    fi
+    probes=''
+    if [ -n "$listed" ]; then
+        if ! probes=$(printf '%s\n' "$listed" | jq -r '
+                group_by(.package) | .[] | .[0]
+                | "\(.file):\(.span.start.line):\(.span.start.column): "'); then
+            echo "MISCONFIGURED: cargo mutants --list --json did not print a mutant list: $*" >&2
+            exit 1
+        fi
+    fi
+    if [ -z "$probes" ]; then
+        echo "baseline record: no mutants in this slice ($*)"
+        printf 'slice %s none\n' "$slice_key" >> "$BASELINE_RECORD"
+        return 0
+    fi
+    probe_count=0
+    while IFS= read -r probe; do
+        [ -n "$probe" ] || continue
+        probe_count=$((probe_count + 1))
+        set -- "$@" --re "^$(printf '%s' "$probe" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+    done <<PROBES
+$probes
+PROBES
+    # One build directory, so the baseline and the probes are the only builds
+    # and the kept target directory (below) is the baseline's.
+    set -- "$@" --jobs 1
+    seed_marker=''
+    if [ -n "$SEED_TARGET" ]; then
+        set -- "$@" --leak-dirs
+        if [ -d target ]; then
+            set -- "$@" --copy-target=true
+        fi
+        seed_marker=$(mktemp)
+    fi
+    echo "baseline record: $probe_count mutated package(s) in this slice"
+    set +e
+    cargo mutants --in-diff "$DIFF" "$@"
+    rc=$?
+    set -e
+    leaked=''
+    if [ -n "$seed_marker" ]; then
+        leaked=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cargo-mutants-*' -newer "$seed_marker")
+        rm -f "$seed_marker"
+    fi
+    baseline_summary=$(jq -r '[.outcomes[] | select(.scenario == "Baseline")][0].summary // "absent"' \
+        mutants.out/outcomes.json 2>/dev/null) || baseline_summary=absent
+    if [ "$rc" -eq 4 ] || [ "$baseline_summary" != Success ]; then
+        printf 'slice %s failed\n' "$slice_key" >> "$BASELINE_RECORD"
+        if [ -n "$leaked" ]; then
+            printf '%s\n' "$leaked" | while IFS= read -r dir; do rm -rf "$dir"; done
+        fi
+        {
+            echo "BASELINE BROKEN: the unmutated tree failed its own tests in the"
+            echo "                 mutants scratch build (cargo-mutants exit $rc,"
+            echo "                 baseline $baseline_summary), so NOTHING will be"
+            echo "                 mutated in this slice. This is not a surviving"
+            echo "                 mutant. Usually a test reading files outside its crate."
+        } >&2
+        exit 4
+    fi
+    # The probes' outcomes are not this run's result: 2 is a probe that
+    # survived and 3 one that timed out, and the shards report both. Anything
+    # else is cargo-mutants failing to run.
+    case "$rc" in
+        0|2|3) ;;
+        *)
+            echo "cargo mutants exited $rc while recording this slice's baseline" >&2
+            exit "$rc"
+            ;;
+    esac
+    baseline_build=$(jq -r '[.outcomes[] | select(.scenario == "Baseline")][0].phase_results[] | select(.phase == "Build") | .duration' mutants.out/outcomes.json)
+    baseline_test=$(jq -r '[.outcomes[] | select(.scenario == "Baseline")][0].phase_results[] | select(.phase == "Test") | .duration' mutants.out/outcomes.json)
+    case "$baseline_test" in
+        ''|*[!0-9.]*)
+            echo "MISCONFIGURED: the recorded baseline has no test duration ('$baseline_test')" >&2
+            exit 1
+            ;;
+    esac
+    # cargo-mutants' rule for the timeout it would have set from this baseline
+    # (27.1.0 timeouts.rs `test_timeout`).
+    multiplier=$(sed -n 's/^[[:space:]]*timeout_multiplier[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' .cargo/mutants.toml 2>/dev/null | head -n 1)
+    timeout=$(awk -v test="$baseline_test" -v multiplier="${multiplier:-5}" \
+        -v minimum="${CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT:-20}" 'BEGIN {
+            scaled = test * multiplier
+            timeout = int(scaled)
+            if (timeout < scaled) timeout++
+            if (timeout < minimum) timeout = int(minimum)
+            print timeout
+        }')
+    printf 'slice %s ok %s %s %s\n' "$slice_key" "$timeout" "$baseline_build" "$baseline_test" >> "$BASELINE_RECORD"
+    echo "BASELINE RECORDED: unmutated build ${baseline_build}s + test ${baseline_test}s; shards run --baseline=skip --timeout $timeout"
+
+    if [ -n "$SEED_TARGET" ]; then
+        # Keep the build directory's target as ./target, for the cache and
+        # for the next slice of this run. Exactly one directory was leaked
+        # (`--jobs 1`); anything else is not a state this knows how to keep.
+        if [ -n "$leaked" ] && [ "$(printf '%s\n' "$leaked" | wc -l | tr -d ' ')" -eq 1 ] \
+            && [ -d "$leaked/target" ] && drop_path_package_fingerprints "$leaked/target"; then
+            rm -rf target
+            mv "$leaked/target" target
+            echo "baseline record: kept the baseline's dependency builds in ./target"
+        else
+            echo "baseline record: could not keep the baseline's target directory; the shards build their dependencies from nothing" >&2
+        fi
+    fi
+    if [ -n "$leaked" ]; then
+        printf '%s\n' "$leaked" | while IFS= read -r dir; do rm -rf "$dir"; done
+    fi
+}
+
 run_slice() {
     mode=$1
     shift
@@ -398,6 +653,64 @@ run_slice() {
     # Clearing it first makes the check able to see only THIS slice's result,
     # which is the difference between a gate and a rumour.
     rm -f mutants.out/missed.txt
+    if [ "$mode" = lib ]; then
+        set -- -C --lib -E 'replace main' "$@"
+    elif [ "$mode" = bins ]; then
+        set -- -C --bins -E 'replace main' "$@"
+    else
+        set -- -E 'replace main' "$@"
+    fi
+    # What names this slice in a baseline record: every argument that decides
+    # what its baseline builds and tests, and nothing that differs between the
+    # recording run and a shard (the diff's path, the shard, the baseline
+    # flags added below).
+    slice_key=$(printf '%s\n' "$*" | cksum | awk '{ print $1 "-" $2 }')
+    if [ "$BASELINE_MODE" = record ]; then
+        record_baseline "$@"
+        return 0
+    fi
+    if [ "$BASELINE_MODE" = reuse ]; then
+        recorded=$(awk -v key="$slice_key" '$1 == "slice" && $2 == key { line = $0 } END { print line }' "$BASELINE_RECORD")
+        # A record line is `slice <key> <status> <timeout> <build s> <test s>`.
+        recorded_status=''
+        recorded_timeout=''
+        recorded_test=''
+        IFS=' ' read -r _ _ recorded_status recorded_timeout _ recorded_test <<RECORDED
+$recorded
+RECORDED
+        case "$recorded_status" in
+            ok)
+                echo "baseline reused: unmutated tests took ${recorded_test}s in this run's baseline; --baseline=skip --timeout $recorded_timeout"
+                set -- "$@" --baseline=skip --timeout "$recorded_timeout"
+                ;;
+            none)
+                # The recording run enumerated no mutant here, so it had no
+                # baseline to run. No shard should find one either; if one
+                # does, cargo-mutants runs its own baseline, as it always did.
+                echo "baseline record: no mutants in this slice"
+                ;;
+            failed)
+                {
+                    echo "BASELINE BROKEN: the unmutated tree failed its own tests in this"
+                    echo "                 run's baseline for this slice, so NOTHING was"
+                    echo "                 mutated. This is not a surviving mutant; the"
+                    echo "                 baseline job's log has the failure."
+                } >&2
+                exit 4
+                ;;
+            *)
+                {
+                    echo "BASELINE MISSING: $BASELINE_RECORD has no baseline for this"
+                    echo "                  slice ($slice_key: $*), so NOTHING"
+                    echo "                  was mutated. This is not a pass."
+                } >&2
+                exit 4
+                ;;
+        esac
+        if [ -n "$SEED_TARGET" ] && [ -d target ]; then
+            set -- "$@" --copy-target=true
+        fi
+    fi
     # MUTANTS_SHARD=k/n runs one of n shards of the slice. CI splits a slow
     # slice across runners this way instead of lifting a job's time limit; a
     # slice too slow to fit is a slice doing too much (mutants.yml).
@@ -405,13 +718,7 @@ run_slice() {
         set -- "$@" --shard "$MUTANTS_SHARD"
     fi
     set +e
-    if [ "$mode" = lib ]; then
-        cargo mutants --in-diff "$DIFF" -C --lib -E 'replace main' "$@"
-    elif [ "$mode" = bins ]; then
-        cargo mutants --in-diff "$DIFF" -C --bins -E 'replace main' "$@"
-    else
-        cargo mutants --in-diff "$DIFF" -E 'replace main' "$@"
-    fi
+    cargo mutants --in-diff "$DIFF" "$@"
     rc=$?
     set -e
     if [ "$rc" -eq 4 ]; then

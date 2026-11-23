@@ -39,4 +39,22 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant 4 (unmaintained) via keyring 3 secret-service in not-shipping leyline-sign host features; bead ley-line-open-275db8; expires 2027-02-09" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names 3 (unmaintained) via keyring 3 secret-service in not-shipping leyline-sign host features; bead ley-line-open-275db8; expires 2027-02-09" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 4 (unmaintained) via keyring 3 secret-service in not-shipping leyline-sign host features; bead ley-line-open-275db8; expires 2027-02-09" },
+    # chrono 0.4.44, unmaintained, no safe upgrade. Reached only through
+    # witchcraft -> leyline-text-search[engine-witchcraft], a not-shipping
+    # feature (jj-lib 0.47 no longer depends on it).
+    { id = "RUSTSEC-2026-0543", reason = "chrono (unmaintained) via witchcraft in the not-shipping engine-witchcraft feature; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    # heapless 0.8.0, unsound. Reached only through leyline-vcs -> jj-lib
+    # 0.47.1 (the newest) -> gix 0.90 -> gix-hash 0.28 -> faster-hex 0.10;
+    # leyline-vcs is not in the shipped closure (leyline-cli no longer
+    # depends on any gitoxide crate, bead ley-line-open-ed4736). Clears when
+    # jj-lib moves to gix >= 0.91 (gix-hash 0.29, faster-hex 2).
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.8 (unsound) via leyline-vcs jj-lib gix 0.90, not shipped; bead ley-line-open-fd42ee; expires 2027-02-22" },
 ]

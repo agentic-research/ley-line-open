@@ -306,9 +306,9 @@ diff --git a/ll-open/sign/src/lib.rs b/ll-open/sign/src/lib.rs
 diff --git a/ll-open/ts/src/lib.rs b/ll-open/ts/src/lib.rs
 --- a/ll-open/ts/src/lib.rs
 +++ b/ll-open/ts/src/lib.rs
-diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
---- a/ll-open/vcs/src/lib.rs
-+++ b/ll-open/vcs/src/lib.rs
+diff --git a/ll-open/cache/src/lib.rs b/ll-open/cache/src/lib.rs
+--- a/ll-open/cache/src/lib.rs
++++ b/ll-open/cache/src/lib.rs
 DIFF
 : > "$log"
 PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
@@ -343,7 +343,7 @@ if [ "$(wc -l < "$fixture_dir/featured.log" | tr -d ' ')" -ne 3 ]; then
     cat "$fixture_dir/featured.log" >&2
     exit 1
 fi
-# The rest of the generic slice (ll-open/vcs here) runs once, featureless,
+# The rest of the generic slice (ll-open/cache here) runs once, featureless,
 # with the packages mutated above excluded so no mutant is run twice.
 assert_call "mutants .* -C --lib .*--exclude ll-open/runtime/\*\* .*--exclude ll-core/core/\*\* --exclude ll-open/sign/\*\* --exclude ll-open/ts/\*\*" \
     'the featureless remainder excludes the packages mutated with their features'
@@ -355,9 +355,9 @@ fi
 # A diff whose generic packages carry no enable rows is unchanged: exactly one
 # featureless generic invocation.
 cat > "$fixture_dir/generic-plain.diff" <<'DIFF'
-diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
---- a/ll-open/vcs/src/lib.rs
-+++ b/ll-open/vcs/src/lib.rs
+diff --git a/ll-open/cache/src/lib.rs b/ll-open/cache/src/lib.rs
+--- a/ll-open/cache/src/lib.rs
++++ b/ll-open/cache/src/lib.rs
 DIFF
 : > "$log"
 PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
@@ -374,20 +374,20 @@ fi
 # BROKEN. It runs its binary's tests in an invocation of its own, and the
 # library remainder excludes it. Run from a directory where both packages'
 # manifests resolve, as the real gate runs from rs/.
-mkdir -p "$fixture_dir/ws/tools/projector/src" "$fixture_dir/ws/ll-open/vcs/src"
+mkdir -p "$fixture_dir/ws/tools/projector/src" "$fixture_dir/ws/ll-open/cache/src"
 printf '[package]\nname = "projector"\n\n[[bin]]\nname = "projector"\npath = "src/main.rs"\n' \
     > "$fixture_dir/ws/tools/projector/Cargo.toml"
 : > "$fixture_dir/ws/tools/projector/src/main.rs"
-printf '[package]\nname = "vcs"\n' > "$fixture_dir/ws/ll-open/vcs/Cargo.toml"
-: > "$fixture_dir/ws/ll-open/vcs/src/lib.rs"
+printf '[package]\nname = "cache"\n' > "$fixture_dir/ws/ll-open/cache/Cargo.toml"
+: > "$fixture_dir/ws/ll-open/cache/src/lib.rs"
 printf '[workspace]\n' > "$fixture_dir/ws/Cargo.toml"
 cat > "$fixture_dir/generic-bin-only.diff" <<'DIFF'
 diff --git a/tools/projector/src/main.rs b/tools/projector/src/main.rs
 --- a/tools/projector/src/main.rs
 +++ b/tools/projector/src/main.rs
-diff --git a/ll-open/vcs/src/lib.rs b/ll-open/vcs/src/lib.rs
---- a/ll-open/vcs/src/lib.rs
-+++ b/ll-open/vcs/src/lib.rs
+diff --git a/ll-open/cache/src/lib.rs b/ll-open/cache/src/lib.rs
+--- a/ll-open/cache/src/lib.rs
++++ b/ll-open/cache/src/lib.rs
 DIFF
 : > "$log"
 (
@@ -403,7 +403,7 @@ if grep -- ' -C --lib ' "$log" | grep -q -- '--file tools/projector/'; then
     echo 'a binary-only package was mutated under -C --lib' >&2
     exit 1
 fi
-if grep -q -- '--file ll-open/vcs/\|--file \./' "$log"; then
+if grep -q -- '--file ll-open/cache/\|--file \./' "$log"; then
     echo 'a library package or the workspace root was routed as binary-only:' >&2
     cat "$log" >&2
     exit 1

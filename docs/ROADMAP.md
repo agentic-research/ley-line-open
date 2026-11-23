@@ -5,8 +5,8 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-11-13, for the v0.30.0 release (the `integration` tree
-`ffa18f08`).
+Last updated: 2026-11-23, for the v0.31.0 release (cut from the
+`integration` commit `8907b793`).
 
 ## v1.0: single host, portable
 
@@ -35,27 +35,38 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-v0.31.0 is the next release. Its work:
+v0.32.0 is the next release. Its work:
 
-- ADR-0046 Slice 1, the remainder (epic `e2c5ce`): a per-run host broker
-  joins a declared guest connection to one loopback `127.0.0.1:port`, bytes
-  only, no credential; the parent-death fix ships with it (`52b5b3`,
-  `52deb4`, `f963e6`, `528525`, `5308b7`). The input document (`e9d940`) and
-  the `RunGrant`/`RunReceipt` fields (`521deb`) shipped in v0.30.0.
-- ADR-0049 PR2 and PR3 (`52c177`): each daemon is configured by one
-  versioned document (`apiVersion` `config.leyline/v1`) with
-  `--check-config` and `--print-config`; runtime `LEYLINE_*`/`LLO_*`
-  configuration is removed; `configDigest` is recorded in `status`, the
-  `RunReceipt` and `RunOutcome`; the sign helper adopts its document; release
-  binaries carry the NFS `mount`, so a release download can run the
-  leyline-fs mount (consumers `cloister-55e6cd`, `cloister-0bc3d5`,
-  `mache-0be425`). PR1, the specification, vectors, Python reference and the
-  `leyline-runtime` library entry (`resolve_execution_deployment`,
-  `check_removed_environment`), shipped in v0.30.0.
+- ADR-0046 Slice 1, the remainder (epic `e2c5ce`): `ExecutionService` owns
+  the broker (`5308b7`): start order, tier and delivery checks, the
+  cross-document rule, cancel of a starting run, failure teardown, drain and
+  receipt assembly, with the hypervisor end-to-end test; the service's
+  interim refusal of a grant with connections goes away with it. Daemon
+  spawns hand a child exactly the descriptors it names (`528525`, PR #598,
+  `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`), which closes the window
+  in which a sibling can inherit a lifeline's write end. The broker binary
+  (`52b5b3`), the loopback probe (`52deb4`) and the lifeline (`f963e6`,
+  `62e3b1`) shipped in v0.31.0.
+- ADR-0049 PR2 and PR3 (`52c177`), the daemons adopt the deployment
+  configuration: each daemon is configured by one versioned document
+  (`apiVersion` `config.leyline/v1`) with `--check-config` and
+  `--print-config`; runtime `LEYLINE_*`/`LLO_*` configuration is removed;
+  `configDigest` is recorded in `status`, the `RunReceipt` and
+  `RunOutcome`; the sign helper adopts its document; release binaries carry
+  the NFS `mount`, so a release download can run the leyline-fs mount
+  (consumers `cloister-55e6cd`, `cloister-0bc3d5`, `mache-0be425`). PR1, the
+  specification, vectors, Python reference and the `leyline-runtime`
+  library entry, shipped in v0.30.0.
 - ADR-0048 (accepted, #573), its first slice: non-structural content gains an
   address and a hash domain (`projection-v14`, extraction epoch 8: `1b5f3c`,
   `8bcfa7`, `cdb2a3`, `81c06c`), with mache's adoption bead filed before it
   merges.
+- Construct-level proposal merge, as design (`067487`): an ADR that keeps
+  text at the interface and construct identity underneath (identity,
+  conflict rule, wire payload, fallback). v0.31.0's line merge refuses
+  touching edits (ADR-0045 T5 amendment); a construct merge is the intended
+  successor that lets two edits to different functions on adjacent lines
+  merge. Design only in v0.32.0; the implementation follows the ADR.
 - Gap queue group C: `e6b1bb` (a service run with no wall-time ceiling),
   `ee5747` (cleanup checks `Cleaned` under the write lock), `73b3de` (the
   native tier refuses an argument holding NUL before spawn) and C3.
@@ -71,13 +82,13 @@ v0.31.0 is the next release. Its work:
     (#558, #563, #564; see below).
   - **C (execution service).** Shipped in v0.30.0: `7a3109` (#566),
     `1022a8` and `483134` (#569), `9c6a8f` (#578), `9d75c9` (#580). Open for
-    v0.31.0: `e6b1bb`, `ee5747`, `73b3de` and C3 (above), then `e32a50`
+    v0.32.0: `e6b1bb`, `ee5747`, `73b3de` and C3 (above), then `e32a50`
     (duplicate `workspaceInputs`), `e592ef` (cancel of a finished run),
     `f7bcb3` (a worker-event channel the guest cannot write) and `eea8e1` (a
     run's `GuestOutput` on the execution-daemon socket).
   - **D (image import and storage).** Shipped in v0.30.0: `38ff59` (#562),
     D1 (#568), `741388` (#571) and rootfs manifest v2 (#575: `4f08ea`,
-    `faba8f`, `18a7a2`). Open for v0.31.0: `dab663`, `dac894`, `b1418f`.
+    `faba8f`, `18a7a2`). Open for v0.32.0: `dab663`, `dac894`, `b1418f`.
   - **B (guest and libkrun).** Shipped in v0.30.0 (#577): `7410ec`,
     `d4b07f` and `f7f862`, argv and the environment reach the guest init in an
     exec config file (libkrun patch `0013`); `2594af`, init mounts only over a
@@ -208,6 +219,29 @@ an ordinary repository to git, CI, review, editors and build tools.
   still break the build; the gate is the owner's design decision.
 - **Upstream libkrun** (`10feaa`): submit LLO's twelve patches to
   containers/libkrun, on the owner's go-ahead.
+
+## Shipped in v0.31.0 (2026-11-23)
+
+The daemon wire moves to `wire_format_major` 3 (`query` rows are
+`QueryCell` lists), touching proposal edits conflict, and the workers and
+the daemon take a lifeline; arenas do not re-parse (`projection-v13`).
+
+| PR | Change | Bead |
+|---|---|---|
+| #593 | Wire major 3: `query` rows are lists of `QueryCell` unions in `columns` order, a short reply carries `truncation`, `QueryRequest.limit` is a `UInt32` refused with `limit_out_of_range` when out of range; `task schema:daemon-fixture-codec` round-trips every daemon fixture through `daemon.capnp` | `0a18bc`, `47d5c5` |
+| — (landed by receipt) | `gix-merge` 0.24: touching edits conflict (ADR-0045 T5 amendment); `heapless` 0.8 out of the shipped closure; jj-lib 0.47.1, url 2.5.9 | `ed4736` |
+| #591 | quinn-udp 0.5.16 for RUSTSEC-2026-0538 | `a76ea7` |
+| #594 | `leyline-krun-worker` ends with its supervisor (`--lifeline-fd`); a starting microVM run can be cancelled | `f963e6` |
+| #597 | `leyline-native-worker` ends with its supervisor (`--lifeline-fd 0`); a starting native run can be cancelled | `62e3b1` |
+| #595, — (landed by receipt) | `leyline daemon --lifeline-fd N`: the daemon shuts down gracefully when its launcher dies; the output relay finishes onto `/dev/null` once the launcher's reader is gone | `f6b525` |
+| #582 | The connection broker, `leyline-conn-broker` and `leyline_runtime::broker` (ADR-0046 Slice 1 S4, S5); nothing spawns it until `5308b7` | `52b5b3` |
+| #589 | The loopback probe with the measured macOS table, and a macOS CI job for the broker (Slice 1 S11a) | `52deb4` |
+| — (landed by receipt) | Work lands on `integration` through `task land:integration`, gated on the local `task ci` receipt; pull requests into `main` run the runner | `3a6beb` |
+| #588 | The daemon writes its arena only at the absolute path it registered | `f68a3a` |
+| #590 | A daemon whose state directory was removed shuts down at once | `f69da0` |
+| #587 | `leyline-runtime` compiles on a downstream fresh resolve (ureq `NextTimeout`); `task deps:fresh-resolve-check` | `d4ba4b` |
+| #596 | The pinned sccache runs its own server on port 4231 | `da5d77` |
+| #592 | schema-bridge's generated header names the plugin | `016403` |
 
 ## Shipped in v0.30.0 (2026-11-13)
 

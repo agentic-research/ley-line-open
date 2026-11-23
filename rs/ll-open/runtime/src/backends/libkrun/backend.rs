@@ -18,15 +18,18 @@ use crate::{
 use super::output::OutputCapture;
 
 use super::super::process::{
-    SupervisionLabels, WorkerProcess, abort_failed_start, configure_process_group,
+    SupervisionLabels, WorkerProcess, abort_failed_start, cleanup_tempdir, configure_process_group,
     finish_failed_start, published_status, read_readiness_line, supervise_worker,
+    terminate_process_group,
 };
 use super::share::{FsService, serve};
 // The share's `worker_end` is created close-on-exec, as every descriptor
 // here is, so a process another thread spawns concurrently does not inherit
 // it; only the worker's child clears the flag, after its fork
 // (`inherit_only`), and the parent holds `worker_end` until spawn returns.
-use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors, inherit_only};
+use super::worker::{
+    WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors, inherit_only_with_lifeline,
+};
 
 const LABELS: SupervisionLabels = SupervisionLabels {
     worker: "libkrun worker",
@@ -64,6 +67,13 @@ pub struct KrunWorkerBackend {
     /// the worker. Only the `test-support` hooks below change it.
     entitlement_platform: Option<&'static str>,
     start_lock: Mutex<()>,
+    /// Runs whose worker is spawned and has not reported readiness, each
+    /// with the channel its `start` waits on, so `cancel` can stop a run in
+    /// that window instead of answering "nothing to cancel" while its worker
+    /// runs (bead `ley-line-open-f963e6`). Taken before `children` wherever
+    /// both are held, and a run leaves this map for `children` under it, so
+    /// a cancel always finds a spawned run in one of the two.
+    starting: Mutex<HashMap<String, mpsc::Sender<StartEvent>>>,
     children: Arc<Mutex<HashMap<String, WorkerControl>>>,
     cleanup_errors: Arc<Mutex<Vec<ExecutionError>>>,
     completed: Arc<Mutex<HashMap<String, crate::RunOutcome>>>,
@@ -78,11 +88,115 @@ pub struct KrunWorkerBackend {
     /// service would refuse a run that in fact started and failed (bead
     /// `ley-line-open-1022a8`).
     shares: Mutex<HashMap<String, Arc<dyn FsService>>>,
+    /// Observes points in `start` and `cancel` a test must order events
+    /// around (`test-support` only).
+    #[cfg(feature = "test-support")]
+    hook: Option<Arc<dyn Fn(StartPoint) + Send + Sync>>,
+}
+
+/// A point in `start` or `cancel` that a `test-support` hook observes
+/// ([`KrunWorkerBackend::with_start_hook`]).
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartPoint {
+    /// `start` has registered the run, and has not yet spawned its worker.
+    Registered,
+    /// `start` has spawned the worker, and has not yet read its readiness.
+    Spawned,
+    /// `start` failed, has cleaned up, and is about to answer the cancels
+    /// queued for it.
+    Ending,
+    /// `cancel` has asked a starting run to stop, and waits for it.
+    CancelSignalled,
 }
 
 struct WorkerControl {
     cancel: mpsc::Sender<()>,
     finished: mpsc::Receiver<Result<(), ExecutionError>>,
+}
+
+/// What a starting run's `start` waits on: the worker's readiness line, or a
+/// cancel, answered on its sender once the worker is reaped, with whether
+/// its run root was removed.
+enum StartEvent {
+    Readiness(Result<Option<String>, String>),
+    Cancel(mpsc::SyncSender<Result<bool, ExecutionError>>),
+}
+
+/// A starting run's entry in `starting`, removed when the start ends without
+/// publishing the run. Publication removes it itself, under the same lock as
+/// the insert into `children`, and disarms this.
+///
+/// A start that ends without publishing answers every cancel still queued
+/// for it with what is true once it has cleaned up: `Ok(false)` when no
+/// worker was ever spawned, an error naming the run root when that root
+/// remains, and `Ok(true)` otherwise.
+struct Starting<'a> {
+    starting: &'a Mutex<HashMap<String, mpsc::Sender<StartEvent>>>,
+    run_id: Option<String>,
+    /// What `start` waits on: readiness, or a cancel.
+    events: mpsc::Receiver<StartEvent>,
+    /// Whether the worker was spawned.
+    spawned: bool,
+    /// The run root the start removes when it fails.
+    run_root: std::path::PathBuf,
+    #[cfg(feature = "test-support")]
+    hook: Option<Arc<dyn Fn(StartPoint) + Send + Sync>>,
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &self.hook {
+            hook(StartPoint::Ending);
+        }
+        // Under the lock a cancel holds while it queues, so every cancel
+        // queued for this run is in `events` once the entry is gone.
+        let mut starting = self.starting.lock();
+        starting.remove(&run_id);
+        let answer = if !self.spawned {
+            Ok(false)
+        } else if self.run_root.exists() {
+            Err(ExecutionError::backend(format!(
+                "the run was cancelled while its start failed, and its run root {} could not be removed",
+                self.run_root.display()
+            )))
+        } else {
+            Ok(true)
+        };
+        while let Ok(event) = self.events.try_recv() {
+            if let StartEvent::Cancel(acknowledge) = event {
+                let _ = acknowledge.send(answer.clone());
+            }
+        }
+        drop(starting);
+    }
+}
+
+/// End a starting run on a cancel: kill and reap its worker, remove its run
+/// root, answer the cancel with whether the removal worked, and return the
+/// error the start ends with.
+fn cancel_starting(
+    child: &mut std::process::Child,
+    rootfs: tempfile::TempDir,
+    acknowledge: mpsc::SyncSender<Result<bool, ExecutionError>>,
+) -> ExecutionError {
+    terminate_process_group(child.id());
+    let _ = child.wait();
+    let cleanup = cleanup_tempdir(rootfs, LABELS);
+    let _ = acknowledge.send(cleanup.clone().map(|()| true));
+    let mut error = ExecutionError {
+        code: crate::ErrorCode::Cancelled,
+        retryable: false,
+        detail: "the run was cancelled before its libkrun worker reported readiness".into(),
+    };
+    if let Err(cleanup) = cleanup {
+        error.detail = format!("{}; cleanup also failed: {}", error.detail, cleanup.detail);
+    }
+    error
 }
 
 impl KrunWorkerBackend {
@@ -91,13 +205,25 @@ impl KrunWorkerBackend {
             config,
             entitlement_platform: Some(std::env::consts::OS),
             start_lock: Mutex::new(()),
+            starting: Mutex::new(HashMap::new()),
             children: Arc::new(Mutex::new(HashMap::new())),
             cleanup_errors: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             completion_cv: Arc::new(Condvar::new()),
             outputs: Arc::new(Mutex::new(HashMap::new())),
             shares: Mutex::new(HashMap::new()),
+            #[cfg(feature = "test-support")]
+            hook: None,
         }
+    }
+
+    /// Call `hook` at each [`StartPoint`], on the thread that reaches it,
+    /// which waits for it to return: a test pauses `start` there, or learns
+    /// that a cancel is waiting. `test-support` only.
+    #[cfg(feature = "test-support")]
+    pub fn with_start_hook(mut self, hook: impl Fn(StartPoint) + Send + Sync + 'static) -> Self {
+        self.hook = Some(Arc::new(hook));
+        self
     }
 
     /// Wait, at most `timeout`, until what the active run `run_id` has
@@ -203,13 +329,43 @@ impl KrunWorkerBackend {
     }
 
     /// Stop one backend run and release its parent-owned ephemeral rootfs.
+    ///
+    /// `Ok(true)` once the run's worker is reaped and its run root removed,
+    /// whether the run was running or still starting; `Ok(false)` only when
+    /// there is no such run and no worker for it.
     pub fn cancel(&self, run_id: &str) -> Result<bool, ExecutionError> {
         // A cancelled run is retired whatever state it was in: its share is
         // let go.
         self.shares.lock().remove(run_id);
-        let Some(control) = self.children.lock().remove(run_id) else {
-            return Ok(false);
+        let starting = self.starting.lock();
+        let control = self.children.lock().remove(run_id);
+        let Some(control) = control else {
+            // Spawned, and not yet ready: its `start` owns the worker. Ask it
+            // to stop, and wait until it has. A start that is already ending
+            // for another reason has dropped its receiver only after reaping
+            // the worker and removing the run root, so either answer from
+            // the acknowledgement means the same.
+            let Some(start) = starting.get(run_id) else {
+                return Ok(false);
+            };
+            let (acknowledge, acknowledged) = mpsc::sync_channel(1);
+            let sent = start.send(StartEvent::Cancel(acknowledge)).is_ok();
+            drop(starting);
+            #[cfg(feature = "test-support")]
+            if let Some(hook) = &self.hook {
+                hook(StartPoint::CancelSignalled);
+            }
+            // The start's answer is whether the run root went too. No
+            // answer means the start ended on its own failure, which reaps
+            // and cleans up before its receiver is dropped.
+            return match sent.then(|| acknowledged.recv()) {
+                Some(Ok(answer)) => answer,
+                // Unreachable: a start answers every queued cancel before
+                // it drops its receiver (`Starting`).
+                _ => Ok(true),
+            };
         };
+        drop(starting);
         let _ = control.cancel.send(());
         control.finished.recv().map_err(|_| {
             ExecutionError::backend("libkrun worker supervisor stopped before cleanup completed")
@@ -379,14 +535,43 @@ impl Backend for KrunWorkerBackend {
                 .as_ref()
                 .map(|(_, _, worker_end)| worker_end.as_raw_fd()),
         );
-        // The worker inherits its standard streams and the declared share,
-        // and nothing else this process holds.
+        // The worker inherits its standard streams, the declared share and
+        // the read end of its lifeline, and nothing else this process holds.
+        // This process keeps the lifeline's only write end for as long as it
+        // supervises the worker: when it ends, for any reason, the worker
+        // ends too (bead ley-line-open-f963e6).
         let keep: Vec<i32> = declared.iter().map(|d| d.descriptor).collect();
-        if let Err(error) = inherit_only(&mut command, &keep) {
-            return Err(finish_failed_start(rootfs, LABELS, error));
-        }
+        let (lifeline, lifeline_read_end) = match inherit_only_with_lifeline(&mut command, &keep) {
+            Ok(lifeline) => lifeline,
+            Err(error) => return Err(finish_failed_start(rootfs, LABELS, error)),
+        };
 
-        let mut child = match command.spawn() {
+        // Registered before the worker exists, so from its spawn until the
+        // run is published a cancel reaches it through `event_tx`: there is
+        // no moment with a worker and nothing to cancel (bead
+        // ley-line-open-f963e6). A failed spawn drops `registered`, which
+        // removes the entry.
+        let (event_tx, event_rx) = mpsc::channel();
+        self.starting
+            .lock()
+            .insert(request.run_id.clone(), event_tx.clone());
+        let mut registered = Starting {
+            starting: &self.starting,
+            run_id: Some(request.run_id.clone()),
+            events: event_rx,
+            spawned: false,
+            run_root: rootfs.path().to_path_buf(),
+            #[cfg(feature = "test-support")]
+            hook: self.hook.clone(),
+        };
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &self.hook {
+            hook(StartPoint::Registered);
+        }
+        let spawned = command.spawn();
+        // The worker holds the read end now (or never will).
+        drop(lifeline_read_end);
+        let mut child = match spawned {
             Ok(child) => child,
             Err(error) => {
                 return Err(finish_failed_start(
@@ -396,6 +581,11 @@ impl Backend for KrunWorkerBackend {
                 ));
             }
         };
+        registered.spawned = true;
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &self.hook {
+            hook(StartPoint::Spawned);
+        }
         // What the run prints, from its first byte. Both drains end at the
         // worker's exit, when the process group is killed and its pipes
         // close.
@@ -473,21 +663,23 @@ impl Backend for KrunWorkerBackend {
                 ));
             }
         };
-        let (event_tx, event_rx) = mpsc::sync_channel(1);
         let worker_capture = Arc::clone(&capture);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             let result = read_readiness_line(&mut reader);
-            let _ = event_tx.send(result);
+            let _ = event_tx.send(StartEvent::Readiness(result));
             // After readiness: the worker's terminal `failed` event, if it
             // fails, and libkrun's diagnostics, kept bounded. The reader's
             // buffer may already hold some of it.
             worker_capture.drain_worker(reader);
         });
 
-        let line = match event_rx.recv_timeout(self.config.ready_timeout) {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => {
+        let line = match registered.events.recv_timeout(self.config.ready_timeout) {
+            Ok(StartEvent::Cancel(acknowledge)) => {
+                return Err(cancel_starting(&mut child, rootfs, acknowledge));
+            }
+            Ok(StartEvent::Readiness(Ok(Some(line)))) => line,
+            Ok(StartEvent::Readiness(Ok(None))) => {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
@@ -495,7 +687,7 @@ impl Backend for KrunWorkerBackend {
                     ExecutionError::backend("libkrun worker closed stderr before readiness"),
                 ));
             }
-            Ok(Err(error)) => {
+            Ok(StartEvent::Readiness(Err(error))) => {
                 return Err(abort_failed_start(
                     &mut child,
                     rootfs,
@@ -613,6 +805,20 @@ impl Backend for KrunWorkerBackend {
         let (cancel_tx, cancel_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let run_id = request.run_id.clone();
+        // The run moves from `starting` to `children` under the `starting`
+        // lock, which a cancel holds while it looks in both, so no cancel
+        // finds it in neither. A cancel that arrived after readiness, before
+        // this lock, is waiting in `event_rx`, and is honored here.
+        let mut starting = self.starting.lock();
+        starting.remove(&run_id);
+        registered.run_id = None;
+        while let Ok(event) = registered.events.try_recv() {
+            if let StartEvent::Cancel(acknowledge) = event {
+                // Still under the lock: a second cancel waits for this one
+                // instead of finding no run while its worker is being reaped.
+                return Err(cancel_starting(&mut child, rootfs, acknowledge));
+            }
+        }
         self.outputs
             .lock()
             .insert(run_id.clone(), Arc::clone(&capture));
@@ -626,12 +832,15 @@ impl Backend for KrunWorkerBackend {
                 finished: finished_rx,
             },
         );
+        drop(starting);
         let outputs = Arc::clone(&self.outputs);
         let children = Arc::clone(&self.children);
         let cleanup_errors = Arc::clone(&self.cleanup_errors);
         let completed = Arc::clone(&self.completed);
         let completion_cv = Arc::clone(&self.completion_cv);
         std::thread::spawn(move || {
+            // Held until the worker is reaped; this process ending drops it.
+            let _lifeline = lifeline;
             let result = supervise_worker(
                 WorkerProcess::new(child),
                 rootfs,

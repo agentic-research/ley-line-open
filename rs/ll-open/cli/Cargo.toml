@@ -1,6 +1,6 @@
 [package]
 name = "leyline-cli"
-version = "0.30.0"
+version = "0.31.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -73,5 +73,8 @@ leyline-envelope = { path = "../envelope" }
 # tests/agent_in_guest.rs (d): reads the daemon's `_parse_diagnostics` row
 # for the half-written file the guest saved (ADR-0045 T3).
 rusqlite = { workspace = true, features = ["bundled"] }
+# tests/daemon_lifeline.rs: reads the root the daemon published to its
+# controller after its launcher was killed.
+leyline-core = { path = "../../ll-core/core" }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

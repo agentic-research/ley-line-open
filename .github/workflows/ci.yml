@@ -4,10 +4,22 @@ on:
   # the only run that can SAVE a cache entry other runs can read. A PR run's
   # cache scope is its own ref plus its base branch and `main`; with no push
   # runs on `integration`, every PR into it restored the one frozen `main`
-  # entry. The push run also re-verifies the squashed merge result.
+  # entry. The push run also re-verifies, on Linux, the tree each landing
+  # fast-forwarded `integration` to, which the local receipt proved only on
+  # the author's platform.
   push:
     branches: [main, integration]
+  # Only PRs into main (bead ley-line-open-3a6beb). Work lands on integration
+  # by `task land:integration`, gated on the local `task ci` receipt for the
+  # exact tree, so a PR into integration would only rebuild what the receipt
+  # already proved. The runner runs once per promotion to main.
   pull_request:
+    branches: [main]
+  # The local receipt covers the developer's platform only (its contract
+  # hashes `uname`). A change with platform-specific code asks the runner for
+  # Linux evidence on its branch before landing:
+  # `gh workflow run ci.yml --ref <branch>`.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,10 +41,12 @@ env:
 #
 # The gate scales with what merging would commit us to, not with the event:
 #
-#   feature -> integration   `task ci`. Fast, run constantly. Integration is
-#                            where work converges; a slow gate here is paid on
-#                            every iteration and buys nothing that the
-#                            promotion gate will not catch.
+#   feature -> integration   `task ci`, run LOCALLY; its receipt gates
+#                            `task land:integration`, and this workflow does
+#                            not run on the PR (bead ley-line-open-3a6beb).
+#                            Integration is where work converges; a slow gate
+#                            here is paid on every iteration and buys nothing
+#                            that the promotion gate will not catch.
 #
 #   * -> main                `task ci` + the release-profile perf gate + the
 #                            version-consistency check. `main` is what releases
@@ -167,6 +181,17 @@ jobs:
       - name: Run task ci (check + clippy + fmt + FFI staticlib + tier isolation + test)
         run: task ci
 
+      # ADR-0046 S11a (bead ley-line-open-52deb4): the loopback probe on the
+      # host network and again in a network namespace without IPv6, where ::1
+      # must read unavailable. Reuses what `task ci` just compiled.
+      - name: Loopback probe (host network and no-IPv6 namespace)
+        run: task runtime:broker-probe
+
+      # After task ci, never inside it: this rewrites rs/Cargo.lock for its
+      # duration (restored on exit), which task ci's tree attestation refuses.
+      - name: Build leyline-runtime on a fresh dependency resolve
+        run: task deps:fresh-resolve-check
+
       - name: Report sccache statistics
         if: always()
         run: task cache:sccache:stats
@@ -183,7 +208,8 @@ jobs:
           key: sccache-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('rs/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Perf regression gate — the release-profile build adds ~90-120s, so a
-      # PR targeting `integration` does not pay it. A PR targeting `main` does:
+      # push to `integration` or a dispatched branch run does not pay it. A PR
+      # targeting `main` does:
       # that is the promotion into the branch releases are cut from, and it is
       # the last point where stopping a regression is cheap. Still runs on push
       # to main as a backstop for anything that reaches main without a PR.
@@ -207,3 +233,46 @@ jobs:
           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
           (github.event_name == 'pull_request' && github.base_ref == 'main')
         run: task release:version-check
+
+  # ADR-0046 Slice 1 is delivered on macOS, and Linux CI shows only its
+  # refusals, so macOS enforcement needs a macOS runner (S11, S11a; beads
+  # ley-line-open-52b5b3, ley-line-open-52deb4). `task runtime:broker-macos`
+  # is the same target a developer runs: the confined broker relays (the
+  # positive control), its profile refuses every undeclared port, file, exec,
+  # fork and the resolver, and the loopback probe matches its pinned table.
+  # LEYLINE_REQUIRE_SANDBOX=1 inside the task makes a runner that cannot apply
+  # the profile fail by name rather than print a skip and go green.
+  broker-macos:
+    name: Connection broker profile + loopback probe (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+          cache-targets: false
+
+      - name: Install system deps
+        run: task deps:capnp
+
+      # macos-latest moves; the pinned probe table was measured on macOS 27.2,
+      # so the log records the image this run observed it on (the probe also
+      # prints `sw_vers`). A table mismatch after an image bump is a finding.
+      - name: Record the runner OS
+        run: sw_vers
+
+      - name: Broker profile, loopback probe and broker suites
+        run: task runtime:broker-macos

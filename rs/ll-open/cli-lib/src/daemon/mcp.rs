@@ -169,10 +169,18 @@ pub fn tool_registry() -> Vec<McpTool> {
         },
         McpTool {
             name: "query",
-            description: "Run one read-only SELECT against the living db and return its rows. Any other statement (a write, DDL, ATTACH, VACUUM, a pragma, a second statement) is refused with a typed `refusal` and changes nothing. Cloister group `sql`.",
+            description: "Run one read-only SELECT against the living db and return its rows, each a list of cells in `columns` order (`{\"null\": null}` or `{\"text\": ...}`), at most `limit` of them (default 1000); a reply cut short carries `truncation`. Any other statement (a write, DDL, ATTACH, VACUUM, a pragma, a second statement) is refused with a typed `refusal` and changes nothing. Cloister group `sql`.",
             schema: json!({
                 "type": "object",
-                "properties": {"sql": {"type": "string"}},
+                "properties": {
+                    "sql": {"type": "string"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": u32::MAX,
+                        "description": "Max rows returned. Absent or 0 means the default, 1000. Any other value that is not an integer from 0 to the maximum is refused as `limit_out_of_range`."
+                    }
+                },
                 "required": ["sql"]
             }),
         },

@@ -339,6 +339,8 @@ struct Booted {
 struct Guest {
     child: Child,
     stderr: Option<JoinHandle<String>>,
+    /// Held while the worker runs: its supervisor's end.
+    _lifeline: leyline_runtime::lifeline::Lifeline,
 }
 
 impl Guest {
@@ -510,7 +512,11 @@ impl<'a> Run<'a> {
         };
 
         let mut command = Command::new(&worker);
-        leyline_runtime::backends::libkrun::worker::inherit_only(&mut command, &[])
+        let (lifeline, _read_end) =
+            leyline_runtime::backends::libkrun::worker::inherit_only_with_lifeline(
+                &mut command,
+                &[],
+            )
             .expect("list this process's descriptors");
         if self.hijack {
             command.arg("--tsi-hijack-inet");
@@ -577,6 +583,7 @@ impl<'a> Run<'a> {
         let mut guest = Guest {
             child,
             stderr: Some(stderr),
+            _lifeline: lifeline,
         };
         let console = match report_rx.recv_timeout(REPORT_BOUND) {
             Ok(Ok(report)) => {

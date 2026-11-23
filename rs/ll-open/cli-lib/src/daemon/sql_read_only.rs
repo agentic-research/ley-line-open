@@ -313,6 +313,12 @@ pub enum RefusalReason {
     /// The statement is not a read-only `SELECT`; `action` is its leading
     /// keyword.
     NotAQuery,
+    /// The request's row limit is not an integer that fits
+    /// `QueryRequest.limit`'s `UInt32` (negative, fractional, too wide, not a
+    /// number); `action` is `limit` and `subject` the requested value as JSON
+    /// text. Nothing ran
+    /// (bead `ley-line-open-0a18bc`).
+    LimitOutOfRange,
 }
 
 impl RefusalReason {
@@ -322,6 +328,7 @@ impl RefusalReason {
             Self::DeniedAction => "denied_action",
             Self::MultipleStatements => "multiple_statements",
             Self::NotAQuery => "not_a_query",
+            Self::LimitOutOfRange => "limit_out_of_range",
         }
     }
 }
@@ -365,6 +372,12 @@ impl fmt::Display for Refusal {
                 f,
                 "the query op runs only a read-only SELECT, not `{}`",
                 self.action
+            ),
+            RefusalReason::LimitOutOfRange => write!(
+                f,
+                "the row limit `{}` is not an integer from 0 to {}",
+                self.subject,
+                u32::MAX
             ),
         }
     }

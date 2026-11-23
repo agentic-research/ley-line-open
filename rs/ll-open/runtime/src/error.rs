@@ -94,6 +94,16 @@ impl ExecutionError {
         }
     }
 
+    /// A resource another run or process already holds
+    /// ([`ErrorCode::ResourceConflict`]).
+    pub(crate) fn resource_conflict(detail: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::ResourceConflict,
+            retryable: false,
+            detail: detail.into(),
+        }
+    }
+
     pub(crate) fn unsupported(detail: impl Into<String>) -> Self {
         Self {
             code: ErrorCode::UnsupportedBackend,

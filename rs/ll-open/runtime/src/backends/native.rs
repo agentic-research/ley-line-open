@@ -22,11 +22,25 @@ use super::libkrun::plan::{
 };
 use super::libkrun::volume::{materialize_ephemeral_rootfs, verify_ephemeral_rootfs};
 
+/// The worker option naming the inherited read end of its lifeline
+/// ([`crate::lifeline`]), whose only write end the process that spawned the
+/// worker holds. `NativeWorkerBackend` passes `0`: the worker's standard
+/// input, on which nothing follows the request. Once the request is read,
+/// end-of-file on it means that process is gone, and the worker ends at once,
+/// its workload with it (bead `ley-line-open-62e3b1`). Required.
+pub const LIFELINE_FD_ARG: &str = "--lifeline-fd";
+
+/// The status the worker ends with when its lifeline ends. Nobody is left to
+/// read it.
+pub const LIFELINE_EXIT_STATUS: i32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerOptions {
     pub cas_root: PathBuf,
     pub run_root: PathBuf,
     pub runtime_files: Vec<PathBuf>,
+    /// The inherited read end of the lifeline ([`LIFELINE_FD_ARG`]).
+    pub lifeline_fd: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +71,7 @@ impl WorkerOptions {
         let mut cas_root = None;
         let mut run_root = None;
         let mut runtime_files = Vec::new();
+        let mut lifeline_fd = None;
 
         while let Some(argument) = arguments.next() {
             let value = arguments.next().ok_or_else(|| {
@@ -69,6 +84,24 @@ impl WorkerOptions {
                 Some("--cas-root") if cas_root.is_none() => cas_root = Some(value.into()),
                 Some("--run-root") if run_root.is_none() => run_root = Some(value.into()),
                 Some("--runtime-file") => runtime_files.push(value.into()),
+                Some(LIFELINE_FD_ARG) if lifeline_fd.is_none() => {
+                    let value = value.to_str().ok_or_else(|| {
+                        ExecutionError::invalid(format!(
+                            "{LIFELINE_FD_ARG} {} is not a file descriptor number",
+                            value.to_string_lossy()
+                        ))
+                    })?;
+                    let fd = crate::lifeline::parse_fd(value).map_err(ExecutionError::invalid)?;
+                    // Standard input is the backend's lifeline; standard
+                    // output and error are the workload's console and this
+                    // worker's events.
+                    if fd == libc::STDOUT_FILENO || fd == libc::STDERR_FILENO {
+                        return Err(ExecutionError::invalid(format!(
+                            "{LIFELINE_FD_ARG} {fd} is standard output or error, not a lifeline"
+                        )));
+                    }
+                    lifeline_fd = Some(fd);
+                }
                 _ => {
                     return Err(ExecutionError::invalid(format!(
                         "unknown or duplicate native worker option: {}",
@@ -84,6 +117,11 @@ impl WorkerOptions {
             run_root: run_root
                 .ok_or_else(|| ExecutionError::invalid("missing --run-root option"))?,
             runtime_files,
+            lifeline_fd: lifeline_fd.ok_or_else(|| {
+                ExecutionError::invalid(format!(
+                    "missing {LIFELINE_FD_ARG} option: a worker starts only under a supervisor's lifeline"
+                ))
+            })?,
         })
     }
 }
@@ -91,13 +129,73 @@ impl WorkerOptions {
 pub fn execute_from_reader_with_events(
     options: WorkerOptions,
     reader: impl Read,
+    writer: impl Write,
+) -> Result<(), ExecutionError> {
+    let request = read_worker_request(reader)?;
+    execute_request_with_events(options, &request, writer)
+}
+
+/// The worker's request, read from `reader` (its standard input): one JSON
+/// [`ExecutionRequest`], complete at its closing brace.
+pub fn read_worker_request(reader: impl Read) -> Result<ExecutionRequest, ExecutionError> {
+    crate::backends::process::read_request(reader).map_err(|error| {
+        ExecutionError::invalid(format!("invalid native worker request JSON: {error}"))
+    })
+}
+
+/// The pid of the workload this worker spawned, `0` before it exists: what
+/// [`end_with_lifeline`] kills when the lifeline ends.
+static WORKLOAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Watch the lifeline at `fd` and, when the process that spawned this worker
+/// is gone, end this worker at once and its workload with it: `SIGKILL` to
+/// the workload, then to this worker's process group when it leads one (the
+/// backend spawns it as a group leader, and the workload is in that group),
+/// then `_exit`. The worker binary calls this once its request is read,
+/// since the backend's lifeline is its standard input. Refused by name when
+/// `fd` is not a readable pipe or socket.
+pub fn end_with_lifeline(fd: i32) -> Result<(), ExecutionError> {
+    crate::lifeline::watch(fd, || {
+        // `None` until the workload exists: never a kill(0), which would
+        // signal this worker's whole process group.
+        let workload =
+            std::num::NonZeroU32::new(WORKLOAD.load(std::sync::atomic::Ordering::SeqCst));
+        // SAFETY: kill, killpg and _exit take no pointers.
+        unsafe {
+            if let Some(workload) = workload {
+                libc::kill(workload.get() as libc::pid_t, libc::SIGKILL);
+            }
+            // Only a group of its own: a worker started by something other
+            // than the backend may share its starter's group.
+            if leads_own_group() {
+                libc::killpg(libc::getpgrp(), libc::SIGKILL);
+            }
+            libc::_exit(LIFELINE_EXIT_STATUS)
+        }
+    })
+    .map_err(|error| {
+        ExecutionError::invalid(format!(
+            "{LIFELINE_FD_ARG} {fd} cannot be a lifeline: {error}"
+        ))
+    })
+}
+
+/// Whether this process leads its process group, as the backend spawns the
+/// worker. Async-signal-safe (two system calls), so the lifeline's end may
+/// call it.
+fn leads_own_group() -> bool {
+    // SAFETY: getpgrp and getpid take no arguments and cannot fail.
+    unsafe { libc::getpgrp() == libc::getpid() }
+}
+
+/// [`execute_with_ready`], reporting readiness and failure as JSON lines on
+/// `writer` (the worker's standard error).
+pub fn execute_request_with_events(
+    options: WorkerOptions,
+    request: &ExecutionRequest,
     mut writer: impl Write,
 ) -> Result<(), ExecutionError> {
-    let request: ExecutionRequest =
-        crate::backends::process::read_request(reader).map_err(|error| {
-            ExecutionError::invalid(format!("invalid native worker request JSON: {error}"))
-        })?;
-    execute_with_ready(options, &request, |event| {
+    execute_with_ready(options, request, |event| {
         serde_json::to_writer(&mut writer, event).map_err(|error| {
             ExecutionError::backend(format!("write native worker event: {error}"))
         })?;
@@ -154,6 +252,16 @@ pub fn execute_with_ready(
     // construction rather than by discipline.
     let capabilities =
         capabilities_from_manifest(&committed, &config.rootfs.canonical_path, Tier::Native)?;
+    // The workload's standard input when this worker's is its lifeline:
+    // `/dev/null`, opened now, because the sandbox below grants no path
+    // outside the rootfs, `/dev/null` included.
+    let workload_stdin = if options.lifeline_fd == 0 {
+        Some(std::fs::File::open("/dev/null").map_err(|error| {
+            ExecutionError::backend(format!("open /dev/null for the workload: {error}"))
+        })?)
+    } else {
+        None
+    };
     nono::Sandbox::apply_auto(&capabilities).map_err(|error| {
         ExecutionError::backend(format!("apply native nono confinement: {error}"))
     })?;
@@ -177,14 +285,32 @@ pub fn execute_with_ready(
         )
         .current_dir(&config.rootfs.canonical_path)
         .env_clear()
+        // When this worker's standard input is its lifeline (the backend's
+        // shape), the workload gets none: the lifeline stays with this
+        // process alone, and the watcher has marked it close-on-exec (bead
+        // ley-line-open-62e3b1). Otherwise the workload inherits it.
+        .stdin(match workload_stdin {
+            Some(null) => Stdio::from(null),
+            None => Stdio::inherit(),
+        })
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     for entry in &config.environment {
         let (key, value) = split_environment_entry(entry.as_bytes())?;
         command.env(OsStr::from_bytes(key), OsStr::from_bytes(value));
     }
-    let status = command.status().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         ExecutionError::backend(format!("start native guest executable: {error}"))
+    })?;
+    WORKLOAD.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+    // Wait for the workload's exit without reaping it, so its pid cannot be
+    // reused yet; only then clear WORKLOAD, and only then reap. The
+    // lifeline's end never signals a pid that by then names another process.
+    // A failure here leaves the pid set; the reaping wait below reports it.
+    let _ = super::process::await_exit_without_reaping(child.id());
+    WORKLOAD.store(0, std::sync::atomic::Ordering::SeqCst);
+    let status = child.wait().map_err(|error| {
+        ExecutionError::backend(format!("wait for native guest executable: {error}"))
     })?;
     guest_exit_result(status)
 }
@@ -209,14 +335,70 @@ fn guest_exit_result(status: std::process::ExitStatus) -> Result<(), ExecutionEr
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkerOptions, execute_from_reader_with_events, execute_with_ready, guest_exit_result,
-        split_environment_entry,
+        LIFELINE_FD_ARG, WorkerOptions, execute_from_reader_with_events, execute_with_ready,
+        guest_exit_result, split_environment_entry,
     };
     use crate::{DigestRef, ExecutionRequest, ResourceLimits};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// Set in the probe process [`leads_own_group_probe`] runs as.
+    const GROUP_PROBE_ENV: &str = "LEYLINE_TEST_GROUP_PROBE";
+
+    #[test]
+    #[ignore = "the probe process of a_process_leads_its_group_only_when_spawned_into_its_own"]
+    fn leads_own_group_probe() {
+        if std::env::var_os(GROUP_PROBE_ENV).is_some() {
+            std::process::exit(if super::leads_own_group() { 10 } else { 20 });
+        }
+    }
+
+    /// The lifeline's end kills the worker's process group only when the
+    /// worker leads it: a process spawned into a group of its own leads it,
+    /// and one spawned into its parent's group does not.
+    #[test]
+    fn a_process_leads_its_group_only_when_spawned_into_its_own() {
+        use std::os::unix::process::CommandExt;
+        let probe = |own_group: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "backends::native::tests::leads_own_group_probe",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(GROUP_PROBE_ENV, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if own_group {
+                command.process_group(0);
+            }
+            command.status().unwrap().code()
+        };
+        assert_eq!(probe(true), Some(10), "spawned into its own group");
+        assert_eq!(probe(false), Some(20), "spawned into its parent's group");
+    }
+
+    /// `await_exit_unreaped` returns once the child has exited and leaves it
+    /// to be reaped: its status is still there to collect.
+    #[test]
+    fn a_child_awaited_unreaped_has_exited_and_is_still_waitable() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        std::thread::spawn(move || drop(stdin));
+        super::super::process::await_exit_without_reaping(child.id()).unwrap();
+        let status = child
+            .try_wait()
+            .unwrap()
+            .expect("exited, and not yet reaped");
+        assert!(status.success(), "{status}");
+    }
 
     #[test]
     fn worker_options_require_trusted_roots() {
@@ -247,8 +429,11 @@ mod tests {
             OsString::from("lib-a"),
             OsString::from("--runtime-file"),
             OsString::from("lib-b"),
+            OsString::from(LIFELINE_FD_ARG),
+            OsString::from("0"),
         ])
         .expect("valid worker options");
+        assert_eq!(options.lifeline_fd, 0);
         assert_eq!(options.cas_root, PathBuf::from("cas"));
         assert_eq!(options.run_root, PathBuf::from("run"));
         assert_eq!(
@@ -268,6 +453,39 @@ mod tests {
             let error = WorkerOptions::parse(arguments)
                 .expect_err("duplicate trusted root must fail closed");
             assert!(error.detail.contains("unknown or duplicate"));
+        }
+    }
+
+    /// A worker nothing supervises does not start: the lifeline is required,
+    /// given once, and a value that is not a descriptor number is refused by
+    /// name (bead `ley-line-open-62e3b1`).
+    #[test]
+    fn worker_options_require_one_well_formed_lifeline() {
+        let base = || {
+            vec![
+                OsString::from("--cas-root"),
+                OsString::from("cas"),
+                OsString::from("--run-root"),
+                OsString::from("run"),
+            ]
+        };
+        let error = WorkerOptions::parse(base()).expect_err("no lifeline");
+        assert!(error.detail.contains(LIFELINE_FD_ARG), "{error}");
+        // Standard output and error are the workload's console and the
+        // worker's events, never a lifeline; standard input is the backend's.
+        for bad in [
+            &["-1"][..],
+            &["three"],
+            &["1"],
+            &["2"],
+            &["0", LIFELINE_FD_ARG, "3"],
+        ] {
+            let mut arguments = base();
+            arguments.push(OsString::from(LIFELINE_FD_ARG));
+            arguments.extend(bad.iter().map(OsString::from));
+            let error = WorkerOptions::parse(arguments).expect_err("refused");
+            assert_eq!(error.code, crate::ErrorCode::InvalidSpec, "{bad:?}");
+            assert!(error.detail.contains(LIFELINE_FD_ARG), "{bad:?}: {error}");
         }
     }
 
@@ -299,6 +517,7 @@ mod tests {
             cas_root: PathBuf::from("missing-cas"),
             run_root: PathBuf::from("missing-run"),
             runtime_files: Vec::new(),
+            lifeline_fd: 0,
         };
         let error =
             execute_from_reader_with_events(options.clone(), b"not-json".as_slice(), Vec::new())
@@ -327,6 +546,7 @@ mod tests {
             cas_root: PathBuf::from("/nonexistent/leyline-cas"),
             run_root: PathBuf::from("/nonexistent/leyline-runs"),
             runtime_files: Vec::new(),
+            lifeline_fd: 0,
         };
         let mut drifting = invalid_request();
         drifting.rootfs.algorithm = "blake3-256".into();

@@ -77,14 +77,33 @@ pub fn setup_arena(arena: &Path, arena_size: u64, control: Option<&Path>) -> Res
     // arena_path emptiness — bead `ley-line-open-baee26` removed the
     // V1 `generation == 0` check from the public API. A fresh
     // controller has an empty arena_path and zero-root sentinel.
-    if ctrl.arena_path().is_empty() {
-        let arena_str = arena
-            .canonicalize()
-            .unwrap_or_else(|_| arena.to_path_buf())
-            .to_string_lossy()
-            .to_string();
-        ctrl.set_arena(&arena_str, arena_size)
+    //
+    // Every publish writes the arena at the path the controller records,
+    // so it must be this arena, absolute (`ley-line-open-f68a3a`): a
+    // relative record resolves against the daemon's cwd, and a record of
+    // another arena sends this daemon's writes there.
+    let canonical = arena
+        .canonicalize()
+        .with_context(|| format!("resolve arena path {}", arena.display()))?;
+    let recorded = ctrl.arena_path();
+    if recorded.is_empty() {
+        ctrl.set_arena(&canonical.to_string_lossy(), arena_size)
             .context("set arena in controller")?;
+    } else {
+        let recorded_path = Path::new(&recorded);
+        let same = recorded_path.is_absolute()
+            && recorded_path
+                .canonicalize()
+                .map_or(recorded_path == canonical, |r| r == canonical);
+        if !same {
+            anyhow::bail!(
+                "the controller at {} is registered to arena {recorded:?}, not {}; \
+                 refusing to publish this daemon's arena through it (pass the arena it \
+                 records, or a --control of its own)",
+                ctrl_path.display(),
+                canonical.display(),
+            );
+        }
     }
 
     Ok(ctrl_path)
@@ -96,6 +115,9 @@ pub enum Shutdown {
     Interrupt,
     Terminate,
     Timeout,
+    /// The launcher's lifeline ended: the process that started this one,
+    /// and passed `--lifeline-fd`, is gone (bead `ley-line-open-f6b525`).
+    LifelineEnded,
 }
 
 /// The signals that stop a long-running command: Ctrl+C (SIGINT) and, on
@@ -107,21 +129,52 @@ pub struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
+    /// Turns `true` once the launcher's lifeline has ended; `None` without
+    /// one.
+    #[cfg(unix)]
+    lifeline: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl ShutdownSignals {
     pub fn install() -> Result<Self> {
+        Self::install_with_lifeline(None)
+    }
+
+    /// [`Self::install`], and when `lifeline_fd` is given, watch that
+    /// inherited descriptor as the read end of the launcher's lifeline
+    /// (`leyline_runtime::lifeline`): its end, as when the launcher is killed
+    /// with `SIGKILL`, ends the wait with [`Shutdown::LifelineEnded`], and the
+    /// caller's graceful shutdown runs. A descriptor that is not open for
+    /// reading, or is not a pipe or socket, is refused by name. The watcher
+    /// marks it close-on-exec, so no process this one spawns holds it.
+    pub fn install_with_lifeline(lifeline_fd: Option<i32>) -> Result<Self> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
+            let lifeline = match lifeline_fd {
+                None => None,
+                Some(fd) => {
+                    let (ended, receiver) = tokio::sync::watch::channel(false);
+                    leyline_runtime::lifeline::watch(fd, move || {
+                        LIFELINE_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = ended.send(true);
+                    })
+                    .with_context(|| format!("--lifeline-fd {fd} cannot be a lifeline"))?;
+                    Some(receiver)
+                }
+            };
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt()).context("install the SIGINT handler")?,
                 terminate: signal(SignalKind::terminate())
                     .context("install the SIGTERM handler")?,
+                lifeline,
             })
         }
         #[cfg(not(unix))]
         {
+            if let Some(fd) = lifeline_fd {
+                anyhow::bail!("--lifeline-fd {fd}: a lifeline needs a unix host");
+            }
             Ok(Self {})
         }
     }
@@ -136,9 +189,22 @@ impl ShutdownSignals {
         };
         #[cfg(unix)]
         {
+            let lifeline = async {
+                match self.lifeline.as_mut() {
+                    // An error means the watcher is gone without an end,
+                    // which it never is: it lives as long as the process.
+                    Some(ended) => {
+                        if ended.wait_for(|ended| *ended).await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 _ = self.interrupt.recv() => Shutdown::Interrupt,
                 _ = self.terminate.recv() => Shutdown::Terminate,
+                _ = lifeline => Shutdown::LifelineEnded,
                 _ = timer => Shutdown::Timeout,
             }
         }
@@ -150,6 +216,29 @@ impl ShutdownSignals {
             }
         }
     }
+}
+
+/// Set once a lifeline [`ShutdownSignals::install_with_lifeline`] watches has
+/// ended: its launcher is gone, and so, possibly, the only reader of this
+/// process's standard output and error.
+static LIFELINE_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a watched lifeline has ended in this process (bead
+/// `ley-line-open-f6b525`): what tells `leyline daemon` to finish its
+/// output relay onto `/dev/null` rather than hand back a pipe with no reader.
+pub fn lifeline_ended() -> bool {
+    LIFELINE_ENDED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Tests that read or set [`LIFELINE_ENDED`] hold this, so the process-wide
+/// flag one test sets is never what another test observes.
+#[cfg(test)]
+pub(crate) static LIFELINE_FLAG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Set [`LIFELINE_ENDED`] from a test holding [`LIFELINE_FLAG_TESTS`].
+#[cfg(test)]
+pub(crate) fn set_lifeline_ended_for_test(ended: bool) {
+    LIFELINE_ENDED.store(ended, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Wait for Ctrl+C, SIGTERM or an optional timeout, whichever comes first.
@@ -175,6 +264,7 @@ pub async fn wait_for(signals: &mut ShutdownSignals, timeout: Option<Duration>) 
         Shutdown::Interrupt => eprintln!("\nreceived Ctrl+C, shutting down"),
         Shutdown::Terminate => eprintln!("received SIGTERM, shutting down"),
         Shutdown::Timeout => eprintln!("timeout reached, shutting down"),
+        Shutdown::LifelineEnded => eprintln!("the launcher's lifeline ended, shutting down"),
     }
     ended
 }
@@ -226,6 +316,56 @@ mod tests {
             .await
             .expect("SIGTERM must end the wait");
         assert_eq!(which, Shutdown::Terminate);
+    }
+
+    /// A launcher's lifeline ends the wait when its write end is gone, as it
+    /// is when the launcher is killed (bead `ley-line-open-f6b525`); held, it
+    /// does not, and the timeout still ends the wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_end_of_a_launchers_lifeline_ends_the_wait() {
+        let _serial = SIGNAL_TESTS.lock().await;
+        let _flag = LIFELINE_FLAG_TESTS.lock().await;
+        set_lifeline_ended_for_test(false);
+        let (lifeline, read_end) = leyline_runtime::lifeline::pair().unwrap();
+        let fd = read_end.raw_fd();
+        // Handed over, as the daemon is handed an inherited number.
+        std::mem::forget(read_end);
+        let mut signals =
+            ShutdownSignals::install_with_lifeline(Some(fd)).expect("install with a lifeline");
+        let which = tokio::time::timeout(
+            Duration::from_secs(5),
+            signals.wait(Some(Duration::from_millis(10))),
+        )
+        .await
+        .expect("a 10ms timeout must end the wait");
+        assert_eq!(which, Shutdown::Timeout, "a held lifeline ends nothing");
+        assert!(!lifeline_ended());
+        drop(lifeline);
+        let which = tokio::time::timeout(Duration::from_secs(5), signals.wait(None))
+            .await
+            .expect("the end of the lifeline must end the wait");
+        assert_eq!(which, Shutdown::LifelineEnded);
+        assert!(lifeline_ended(), "the end is recorded for the output relay");
+        set_lifeline_ended_for_test(false);
+    }
+
+    /// A lifeline that is not a readable pipe or socket is refused by name,
+    /// before anything waits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unusable_lifeline_is_refused_by_name() {
+        use std::os::fd::AsRawFd;
+        let _serial = SIGNAL_TESTS.lock().await;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        for fd in [null.as_raw_fd(), 1 << 20] {
+            let error = ShutdownSignals::install_with_lifeline(Some(fd))
+                .err()
+                .expect("an unusable lifeline is refused");
+            let message = format!("{error:#}");
+            assert!(message.contains("--lifeline-fd"), "{message}");
+            assert!(message.contains(&fd.to_string()), "{message}");
+        }
     }
 
     #[test]
@@ -299,6 +439,48 @@ mod tests {
             "ctrl path must derive as arena.with_extension(ctrl)",
         );
         assert!(ctrl_path.exists(), "controller file must be created");
+    }
+
+    /// `ley-line-open-f68a3a`: every publish writes the arena at the path
+    /// the controller records, not at `--arena`. A controller registered
+    /// to a relative path (resolved against whatever cwd the daemon runs
+    /// in) or to another arena would send this daemon's writes there, so
+    /// `setup_arena` refuses it by name; one registered to this arena,
+    /// spelled through a symlinked or `..` path, is accepted.
+    #[test]
+    fn setup_arena_refuses_a_controller_registered_to_another_or_relative_path() {
+        use tempfile::TempDir;
+        let td = TempDir::new().unwrap();
+        let arena_path = td.path().join("mine.arena");
+        let ctrl_path = td.path().join("shared.ctrl");
+        let other = td.path().join("other.arena");
+        for recorded in [
+            "rel.arena".to_string(),
+            other.to_string_lossy().into_owned(),
+        ] {
+            {
+                let mut c = Controller::open_or_create(&ctrl_path).unwrap();
+                c.set_arena(&recorded, 4096).unwrap();
+            }
+            let err = setup_arena(&arena_path, 4096, Some(&ctrl_path)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("registered to arena"),
+                "{recorded}: {err:#}"
+            );
+            assert_eq!(
+                Controller::open_or_create(&ctrl_path).unwrap().arena_path(),
+                recorded,
+                "the registration is left as it was"
+            );
+        }
+
+        // The same arena through a non-canonical spelling is accepted.
+        std::fs::remove_file(&ctrl_path).unwrap();
+        setup_arena(&arena_path, 4096, Some(&ctrl_path)).expect("first registration");
+        let roundabout = td.path().join(".").join("mine.arena");
+        setup_arena(&roundabout, 4096, Some(&ctrl_path)).expect("same arena, other spelling");
+        let recorded = Controller::open_or_create(&ctrl_path).unwrap().arena_path();
+        assert!(Path::new(&recorded).is_absolute(), "{recorded}");
     }
 
     #[test]

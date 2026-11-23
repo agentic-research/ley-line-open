@@ -187,7 +187,7 @@ no longer refused outright:
 |---|---|
 | `Write` against a moved base, all three of base (`b`), ours (the proposal's bytes) and theirs (`c`) UTF-8, both entries non-symlink | three-way merge with `gix-merge`'s builtin text driver (`blob::builtin_driver::text`, Myers, line tokens), in process |
 | — clean merge | the merged bytes land as the proposal's write for that path; `Accepted::merged` names it |
-| — overlapping hunks | refused `stale`; the path's `moved` entry carries `conflicts`: the base line ranges where the two sides overlap, 0-based and half-open (`[start, end)`; two insertions at one line are the empty range `[line, line)`), as `daemon.capnp` `LineRange` and `merge::LineRange` define them |
+| — overlapping or touching hunks | refused `stale`; the path's `moved` entry carries `conflicts`, never empty: the base line ranges where the two sides collide, 0-based and half-open (`[start, end)`; two insertions at one line are the empty range `[line, line)`), as `daemon.capnp` `LineRange` and `merge::LineRange` define them |
 | any of the three not UTF-8 ("binary"), or either side a symlink, or the base blob no longer stored | refused `stale` (no merge) |
 | `Delete` against a moved base | refused `stale` |
 | create (`Absent`) where the path holds a file | refused `stale` (`expected: absent`), unless the file holds the same bytes and mode: then it is accepted and changes nothing |
@@ -210,11 +210,31 @@ deleting the first line and another deleting the second both propose `a\n`; the 
 and the merge lands `a\n`, not the empty file. The rule is stated over bytes: a clean merge is
 the result both sides' bytes determine, independent of arrival order.
 
-`gix-merge` is pinned `=0.17.0`, the release that shares its `gix-*` dependency set with the
-`gix 0.84` already in the build (MIT OR Apache-2.0). `gix-imara-diff` (`=0.2.3`, already in the
-build) computes the conflict ranges with `gix-merge`'s own overlap rule: a hunk of one side
-whose base range contains the start of the other side's hunk, or two insertions at one base
-line.
+The driver is `gix-merge` 0.24's `blob::builtin_driver::text` (MIT OR Apache-2.0). It is its
+own `gix-*` set (`gix-hash` 0.29, `gix-object` 0.67, `gix-diff` 0.71, `faster-hex` 2), a second
+copy beside the `gix` 0.90 set (`gix-hash` 0.28) that `leyline-vcs` reaches through jj-lib; the
+two share only leaf crates (`gix-path`, `gix-trace`, `gix-utils`, `gix-imara-diff` and the
+like). `leyline-cli` reaches the 0.24 set alone, which is clear of `heapless` 0.8 (bead
+`ley-line-open-ed4736`). `gix-imara-diff` (0.3, the driver's own
+diff) computes the conflict ranges with the driver's region rule, below.
+
+**Amendment (2026-11-22, bead `ley-line-open-ed4736`): touching hunks conflict.** Until LLO
+0.31 the driver was `gix-merge` 0.17, whose rule let two hunks that only touch merge: one side
+changing line `n` and the other inserting right after it (at `n + 1`) landed both. `gix-merge`
+0.17 reaches `heapless` 0.8 (RUSTSEC-2026-0574 to 0582) in the shipped closure; 0.24, clear of
+it, adopts git's rule, and LLO takes that rule rather than keep a vendored copy of the old
+driver. The rule: the hunks of both sides, in base order, group while a hunk starts at or
+before the group's end, so a change and an insertion at its edge, or two insertions at one
+line, are one region; a region both sides changed, to different lines, is a conflict, and its
+base range is the conflict range on the wire. Every conflict names at least one range
+(`merge::tests::a_conflict_always_names_its_base_ranges` checks it over every file of up to
+three lines on a small alphabet). The wire shape is unchanged; the outcome changes: proposals
+whose edits sit on adjacent lines are refused `stale` with their conflict range where they
+used to merge. The trade is deliberate. A false conflict costs an agent one retry against the
+current bytes; a false clean merge lands an interleaving neither side wrote and nothing
+reports it. Line adjacency is a poor proxy for whether two edits interfere; the intended
+successor is a construct-level merge that decides by the syntax constructs each side changed,
+not by line distance (bead `ley-line-open-067487`).
 
 ### T6 — The write-time `ESTALE` of `e650d7` is reversed: writes stage, flush decides
 

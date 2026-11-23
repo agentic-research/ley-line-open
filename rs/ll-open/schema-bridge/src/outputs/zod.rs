@@ -17,7 +17,7 @@ pub fn emit(schema: &Schema) -> Result<String> {
         .expect("write! to String is infallible");
     writeln!(
         out,
-        "// Regenerate with `task cluster:zod` (runs the schema-bridge plugin)."
+        "// Regenerate by running the `capnpc-schema-bridge-zod` plugin over the source schema."
     )
     .expect("write! to String is infallible");
     writeln!(out, "//").expect("write! to String is infallible");

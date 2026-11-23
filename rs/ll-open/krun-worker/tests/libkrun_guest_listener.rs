@@ -874,6 +874,8 @@ struct Guest {
     /// What followed [`REPORT`] on the guest console.
     report: String,
     stderr: Option<JoinHandle<String>>,
+    /// Held while the worker runs: its supervisor's end.
+    _lifeline: leyline_runtime::lifeline::Lifeline,
 }
 
 impl Guest {
@@ -956,7 +958,11 @@ impl Guest {
 
         let mut worker = Command::new(&signed_worker);
         // Its standard streams and nothing else, as the backend spawns it.
-        leyline_runtime::backends::libkrun::worker::inherit_only(&mut worker, &[])
+        let (lifeline, _read_end) =
+            leyline_runtime::backends::libkrun::worker::inherit_only_with_lifeline(
+                &mut worker,
+                &[],
+            )
             .expect("list this process's descriptors");
         if hijack_inet {
             worker.arg("--tsi-hijack-inet");
@@ -1041,6 +1047,7 @@ impl Guest {
             child,
             report: String::new(),
             stderr: Some(stderr),
+            _lifeline: lifeline,
         };
         guest.report = match report_rx.recv_timeout(REPORT_BOUND) {
             Ok(Ok(report)) => report,

@@ -1502,3 +1502,425 @@ fn a_worker_without_the_hypervisor_entitlement_is_unavailable() {
         assert!(backend.capabilities().available);
     }
 }
+
+// ---------------------------------------------------------------------------
+// A worker never outlives its supervisor (bead ley-line-open-f963e6).
+
+/// A bound on a failure only: every wait below ends on an event first.
+const EVENT_BOUND: Duration = Duration::from_secs(30);
+
+/// Whether `pid` names a process (a zombie included).
+fn alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 checks existence and delivers nothing.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// A named pipe at `path`.
+fn mkfifo(path: &std::path::Path) {
+    let status = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo {}", path.display());
+}
+
+/// The first line written to the named pipe `path`, as a pid: the event a
+/// fake worker raises once it exists. Fails by name past [`EVENT_BOUND`].
+fn pid_from(path: &std::path::Path, what: &str) -> libc::pid_t {
+    let path = path.to_path_buf();
+    let (sender, line) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Opening a named pipe for reading waits for its writer.
+        let _ = sender.send(fs::read_to_string(path));
+    });
+    let line = line
+        .recv_timeout(EVENT_BOUND)
+        .unwrap_or_else(|_| panic!("TIMEOUT: {what} did not report its pid within {EVENT_BOUND:?}"))
+        .expect("read the worker's pid");
+    line.trim().parse().expect("a pid")
+}
+
+/// Kills `pid` on drop if it still exists, so a failing test leaves no
+/// worker behind.
+struct KillOnDrop(libc::pid_t);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if alive(self.0) {
+            // SAFETY: a signal to a pid this test spawned (directly or not).
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+}
+
+/// A cancel that arrives while the worker exists but has not reported
+/// readiness stops it: `cancel` answers `true`, and returns only once the
+/// worker is reaped and its ephemeral run root removed; the start it raced
+/// ends `Cancelled`. Before the fix it answered "nothing to cancel" while
+/// the worker ran on.
+#[test]
+fn a_cancel_between_spawn_and_readiness_stops_the_worker_and_removes_its_run_root() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    mkfifo(&spawned);
+    // Reads its request, says it exists, and never reports readiness.
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        &format!(
+            "#!/bin/sh\nIFS= read -r _\necho $$ > '{}'\nexec /usr/bin/tail -f /dev/null\n",
+            spawned.display()
+        ),
+    );
+    let backend = Arc::new(backend);
+    let starter = {
+        let backend = Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+
+    // EVENT: the worker exists, and is starting.
+    let worker = pid_from(&spawned, "the starting worker");
+    let _cleanup = KillOnDrop(worker);
+    assert!(alive(worker));
+    assert_eq!(run_root_count(&ephemeral_root), 1);
+
+    assert!(
+        backend.cancel("run-backend-01").expect("cancel"),
+        "a starting run was reported as nothing to cancel"
+    );
+    // `cancel` has returned: the worker is reaped and its run root gone.
+    assert!(
+        !alive(worker),
+        "the starting worker {worker} survived its cancel"
+    );
+    assert_eq!(
+        run_root_count(&ephemeral_root),
+        0,
+        "the cancelled start left its ephemeral run root"
+    );
+    let error = starter
+        .join()
+        .expect("the start thread")
+        .expect_err("a cancelled start does not start");
+    assert_eq!(error.code, ErrorCode::Cancelled, "{error:?}");
+    // Retired: nothing is left to cancel.
+    assert!(!backend.cancel("run-backend-01").expect("second cancel"));
+}
+
+/// Set in the embedding process [`lifeline_embedder`] runs as: the fixture
+/// directory holding its fake worker, CAS and run roots.
+const EMBEDDER_ENV: &str = "LEYLINE_TEST_LIFELINE_EMBEDDER";
+
+/// The process embedding the backend, for
+/// `a_worker_ends_when_the_process_embedding_its_backend_is_killed`: starts
+/// one run and supervises it until it is killed. Not a test on its own.
+#[test]
+#[ignore = "the embedding process of a lifeline test; run by that test"]
+fn lifeline_embedder() {
+    let Some(fixture) = std::env::var_os(EMBEDDER_ENV) else {
+        return;
+    };
+    let fixture = std::path::PathBuf::from(fixture);
+    let backend = fake_worker_backend(KrunWorkerConfig {
+        worker: fixture.join("leyline-krun-worker"),
+        cas_root: fixture.join("cas"),
+        ephemeral_root: fixture.join("runs"),
+        runtime_files: Vec::new(),
+        devices: Vec::new(),
+        ready_timeout: READY_TIMEOUT,
+        tsi_hijack_inet: false,
+    });
+    backend
+        .start(&request(), ServedWorkspaces::none())
+        .expect("ready worker");
+    // Supervising, until this process is killed.
+    loop {
+        std::thread::park();
+    }
+}
+
+/// `SIGKILL` the process that embeds the backend mid-run: its worker ends
+/// within a bound, observed as the kernel's exit event for the orphan.
+///
+/// The fake worker does what the real one does with its lifeline: it reads
+/// the descriptor `--lifeline-fd` names until end-of-file and ends then. So
+/// the test holds the backend to its half: the worker is handed an open read
+/// end, and no process but the embedder holds a write end (a copy leaked into
+/// the worker itself would keep it alive forever). The real worker's half is
+/// `krun-worker/tests/krun_worker.rs`, and both together, with a booted
+/// guest, `krun-worker/tests/libkrun_guest_lifeline.rs`.
+#[test]
+fn a_worker_ends_when_the_process_embedding_its_backend_is_killed() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    mkfifo(&spawned);
+    let worker = fixture.path().join("leyline-krun-worker");
+    fs::write(
+        &worker,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "lifeline=\n",
+                "while [ \"$#\" -gt 0 ]; do\n",
+                "  if [ \"$1\" = --lifeline-fd ]; then lifeline=\"$2\"; shift 2; else shift; fi\n",
+                "done\n",
+                "IFS= read -r _\n",
+                "printf '%s\\n' '{{\"type\":\"ready\",\"run_id\":\"run-backend-01\"}}' >&2\n",
+                "echo $$ > '{spawned}'\n",
+                // Without a lifeline, nothing ends this worker: the test's
+                // bound fails, as it would for the orphan the bead reports.
+                "[ -n \"$lifeline\" ] || exec /usr/bin/tail -f /dev/null\n",
+                "exec /bin/cat 0<&\"$lifeline\"\n",
+            ),
+            spawned = spawned.display()
+        ),
+    )
+    .expect("fake worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("worker mode");
+    fs::create_dir(fixture.path().join("cas")).expect("CAS");
+    fs::create_dir(fixture.path().join("runs")).expect("ephemeral root");
+
+    let mut embedder = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "lifeline_embedder",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(EMBEDDER_ENV, fixture.path())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the embedding process");
+    let _embedder_cleanup = KillOnDrop(embedder.id() as libc::pid_t);
+
+    // EVENT: the run is started, under the embedder's supervision.
+    let worker = pid_from(&spawned, "the embedder's worker");
+    let _worker_cleanup = KillOnDrop(worker);
+    assert!(alive(worker));
+
+    // SAFETY: a signal to the child this test spawned.
+    assert_eq!(
+        unsafe { libc::kill(embedder.id() as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    embedder.wait().expect("reap the embedder");
+    // EVENT: the orphaned worker's exit.
+    common::await_exit(worker, EVENT_BOUND).unwrap_or_else(|error| {
+        panic!("the worker outlived the process embedding its backend: {error}")
+    });
+}
+
+/// What [`a_cancel_right_after_spawn_finds_the_run`] observes, in order.
+#[derive(Debug)]
+enum Seen {
+    CancelWaiting,
+    CancelReturned(Result<bool, ExecutionError>),
+}
+
+/// A cancel that arrives after the worker is spawned and before `start`
+/// does anything else finds the run: the run is registered before the spawn,
+/// so there is no moment with a worker and nothing to cancel. `start` is
+/// paused right after the spawn (a `test-support` hook) while the cancel is
+/// issued; before the fix the cancel answered `Ok(false)` there at once.
+#[test]
+fn a_cancel_right_after_spawn_finds_the_run() {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::mpsc;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (spawned_tx, spawned) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (seen_tx, seen) = mpsc::channel();
+    let released = StdMutex::new(released);
+    let hook_seen = seen_tx.clone();
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\nIFS= read -r _\nexec /usr/bin/tail -f /dev/null\n",
+    );
+    let backend = Arc::new(backend.with_start_hook(move |point| match point {
+        StartPoint::Spawned => {
+            let _ = spawned_tx.send(());
+            let _ = released.lock().unwrap().recv();
+        }
+        StartPoint::CancelSignalled => {
+            let _ = hook_seen.send(Seen::CancelWaiting);
+        }
+        _ => {}
+    }));
+    let starter = {
+        let backend = Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+    spawned
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the worker was never spawned");
+    let canceller = {
+        let backend = Arc::clone(&backend);
+        std::thread::spawn(move || {
+            let _ = seen_tx.send(Seen::CancelReturned(backend.cancel("run-backend-01")));
+        })
+    };
+    let first = seen
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the cancel neither waited nor returned");
+    let _ = release.send(());
+    assert!(
+        matches!(first, Seen::CancelWaiting),
+        "a cancel right after the spawn did not find the run: {first:?}"
+    );
+    match seen.recv_timeout(EVENT_BOUND) {
+        Ok(Seen::CancelReturned(Ok(true))) => {}
+        other => panic!("the cancel's answer: {other:?}"),
+    }
+    canceller.join().unwrap();
+    let error = starter
+        .join()
+        .unwrap()
+        .expect_err("a cancelled start does not start");
+    assert_eq!(error.code, ErrorCode::Cancelled, "{error:?}");
+    assert_eq!(run_root_count(&ephemeral_root), 0);
+}
+
+/// A cancel before readiness whose run root cannot be removed says so: the
+/// cleanup's failure is its answer, not `Ok(true)`.
+#[test]
+fn a_cancel_before_readiness_reports_a_run_root_it_could_not_remove() {
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let spawned = fixture.path().join("spawned");
+    mkfifo(&spawned);
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        &format!(
+            "#!/bin/sh\nIFS= read -r _\necho $$ > '{}'\nexec /usr/bin/tail -f /dev/null\n",
+            spawned.display()
+        ),
+    );
+    let backend = Arc::new(backend);
+    let starter = {
+        let backend = Arc::clone(&backend);
+        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+    };
+    let worker = pid_from(&spawned, "the starting worker");
+    let _cleanup = KillOnDrop(worker);
+    // The run root's parent no longer lets an entry be removed.
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o555)).unwrap();
+    let answer = backend.cancel("run-backend-01");
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = answer.expect_err("a cancel whose cleanup failed reports it");
+    assert!(error.detail.contains("ephemeral"), "{error:?}");
+    assert!(!alive(worker), "the worker {worker} survived its cancel");
+    let started = starter.join().unwrap();
+    assert!(started.is_err(), "{started:?}");
+}
+
+/// Cancels queued at a hook point while `start` ends on its own failure: a
+/// `test-support` hook issues the cancel from another thread at `queue_at`,
+/// and returns once that cancel is waiting. Returns the cancel's answer and
+/// the start's result.
+fn cancel_queued_at(
+    backend: KrunWorkerBackend,
+    queue_at: leyline_runtime::backends::libkrun::backend::StartPoint,
+    also_at_spawn: impl Fn() + Send + Sync + 'static,
+) -> (
+    Result<bool, leyline_runtime::ExecutionError>,
+    Result<leyline_runtime::BackendRun, leyline_runtime::ExecutionError>,
+) {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::mpsc;
+    let backend_slot: Arc<StdMutex<Option<Arc<KrunWorkerBackend>>>> = Arc::new(StdMutex::new(None));
+    let (waiting_tx, waiting) = mpsc::channel();
+    let waiting = StdMutex::new(waiting);
+    let (answer_tx, answer) = mpsc::channel();
+    let slot = Arc::clone(&backend_slot);
+    let backend = Arc::new(backend.with_start_hook(move |point| {
+        if point == StartPoint::Spawned {
+            also_at_spawn();
+        }
+        if point == StartPoint::CancelSignalled {
+            let _ = waiting_tx.send(());
+        }
+        if point == queue_at {
+            let backend = slot.lock().unwrap().clone().expect("the backend");
+            let answer_tx = answer_tx.clone();
+            std::thread::spawn(move || {
+                let _ = answer_tx.send(backend.cancel("run-backend-01"));
+            });
+            waiting
+                .lock()
+                .unwrap()
+                .recv_timeout(EVENT_BOUND)
+                .expect("TIMEOUT: the cancel never queued");
+        }
+    }));
+    *backend_slot.lock().unwrap() = Some(Arc::clone(&backend));
+    let started = backend.start(&request(), ServedWorkspaces::none());
+    let answered = answer
+        .recv_timeout(EVENT_BOUND)
+        .expect("TIMEOUT: the queued cancel was never answered");
+    *backend_slot.lock().unwrap() = None;
+    (answered, started)
+}
+
+/// A cancel queued after the run is registered and before its spawn, which
+/// then fails, answers that there was nothing to cancel: no worker was ever
+/// started.
+#[test]
+fn a_cancel_queued_before_a_failed_spawn_answers_false() {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) = backend_with_worker(&fixture, "#!/bin/sh\nexit 0\n");
+    // A worker that cannot be executed: the spawn fails.
+    fs::set_permissions(
+        fixture.path().join("leyline-krun-worker"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let (answered, started) = cancel_queued_at(backend, StartPoint::Registered, || {});
+    assert!(started.is_err(), "{started:?}");
+    assert!(
+        matches!(answered, Ok(false)),
+        "a cancel with no worker ever spawned: {answered:?}"
+    );
+    assert_eq!(fs::read_dir(&ephemeral_root).unwrap().count(), 0);
+}
+
+/// A cancel queued while a start fails on its own (here a readiness line
+/// that is not an event), with a run root that cannot be removed, answers
+/// with an error naming that run root, not `Ok(true)`.
+#[test]
+fn a_cancel_queued_while_a_start_fails_reports_its_unremovable_run_root() {
+    use leyline_runtime::backends::libkrun::backend::StartPoint;
+    let _serial = common::serial();
+    let fixture = TempDir::new().expect("fixture");
+    let (backend, ephemeral_root) = backend_with_worker(
+        &fixture,
+        "#!/bin/sh\nIFS= read -r _\nprintf '{not an event\\n' >&2\nexit 0\n",
+    );
+    let root = ephemeral_root.clone();
+    let (answered, started) = cancel_queued_at(backend, StartPoint::Ending, move || {
+        // The run root exists now; its parent stops letting it go.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+    });
+    fs::set_permissions(&ephemeral_root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(started.is_err(), "{started:?}");
+    let error = answered.expect_err("the run root remains, and the answer says so");
+    assert!(error.detail.contains("run root"), "{error:?}");
+    let remaining = fs::read_dir(&ephemeral_root)
+        .unwrap()
+        .next()
+        .expect("the run root")
+        .unwrap();
+    assert!(
+        error
+            .detail
+            .contains(&remaining.path().display().to_string()),
+        "{error:?}"
+    );
+}

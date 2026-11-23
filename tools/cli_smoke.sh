@@ -232,9 +232,9 @@ ready() { [ "$(op '{"op":"status"}' 2>/dev/null | field phase 2>/dev/null)" = re
 
 start_daemon
 expect_eq "$(op '{"op":"leyline_version"}' | field binary_version)" "$(echo "$version" | cut -d' ' -f2)" "leyline_version op"
-expect_eq "$(op '{"op":"query","sql":"SELECT count(*) AS n FROM _source"}' | field rows 0 n)" 2 "query op count(*)"
-expect_eq "$(op '{"op":"query","sql":"SELECT NULL AS z, x'"'"'00ff'"'"' AS b"}' | field rows 0 z)" null "query op NULL"
-expect_eq "$(op '{"op":"query","sql":"SELECT x'"'"'00ff'"'"' AS b"}' | field rows 0 b)" 00ff "query op blob"
+expect_eq "$(op '{"op":"query","sql":"SELECT count(*) AS n FROM _source"}' | field rows 0 0 text)" 2 "query op count(*)"
+expect_eq "$(op '{"op":"query","sql":"SELECT NULL AS z, x'"'"'00ff'"'"' AS b"}' | field rows 0 0 null)" null "query op NULL"
+expect_eq "$(op '{"op":"query","sql":"SELECT x'"'"'00ff'"'"' AS b"}' | field rows 0 0 text)" 00ff "query op blob"
 stop_daemon
 step "daemon: status, leyline_version and typed query answers; SIGTERM shuts it down cleanly"
 
@@ -268,7 +268,7 @@ os.mkdir(os.path.join(sys.argv[1], "empty"))
     within_deadline "read back through the mount" sh -c "grep -q '^package util' '$W/mnt/util.go'"
     stored_hex() {
         op "{\"op\":\"query\",\"sql\":\"SELECT b.blob_bytes FROM _tree t JOIN source_blobs b ON b.blob_hash = t.blob_hash WHERE t.path = '$1'\"}" |
-            field rows 0 blob_bytes
+            field rows 0 0 text
     }
     want_hex=$(printf 'package util\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n' | od -An -tx1 | tr -d ' \n')
     got_hex=$(stored_hex util.go)
@@ -277,7 +277,7 @@ os.mkdir(os.path.join(sys.argv[1], "empty"))
     want_hex=$(printf 'notes\n' | od -An -tx1 | tr -d ' \n')
     got_hex=$(stored_hex NOTES.txt)
     [ "$got_hex" = "$want_hex" ] || fail "NOTES.txt is not stored as written: $got_hex"
-    empty_mode=$(op '{"op":"query","sql":"SELECT mode FROM _tree WHERE path = '"'"'empty'"'"'"}' | field rows 0 mode)
+    empty_mode=$(op '{"op":"query","sql":"SELECT mode FROM _tree WHERE path = '"'"'empty'"'"'"}' | field rows 0 0 text)
     expect_eq "$empty_mode" 16384 "the empty directory's entry"
     stop_daemon
     wait_for "the mount to detach" sh -c "! mount | grep -qF '$W/mnt'"

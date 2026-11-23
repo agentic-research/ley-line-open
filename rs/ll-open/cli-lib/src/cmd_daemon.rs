@@ -157,6 +157,13 @@ pub struct DaemonOptions {
     /// provides it; cli-lib cannot, since storefs depends on cli-lib. A
     /// daemon asked to mount with none is refused before it starts.
     pub host_mount: Option<HostMountRef>,
+    /// The inherited read end of the launcher's lifeline (bead
+    /// `ley-line-open-f6b525`; `leyline daemon --lifeline-fd`). When the
+    /// launcher is gone, `SIGKILL` included, the daemon shuts down as it
+    /// does on SIGTERM: unmount, final publish, socket cleanup. `None`, the
+    /// default, watches nothing. A descriptor that is not a readable pipe
+    /// or socket refuses startup by name.
+    pub lifeline_fd: Option<i32>,
 }
 
 /// The guard of a host mount: dropping it unmounts, and lands what the
@@ -341,7 +348,11 @@ pub async fn run_daemon_with_options(
         .as_deref()
         .map(lifecycle::parse_duration)
         .transpose()?;
-    let mut shutdown_signals = lifecycle::ShutdownSignals::install()?;
+    // The lifeline is watched from here on too, before anything announces
+    // this daemon or spawns a child, so a launcher killed during startup
+    // still ends it, and no child inherits the descriptor.
+    let mut shutdown_signals =
+        lifecycle::ShutdownSignals::install_with_lifeline(options.lifeline_fd)?;
     // Bead `ley-line-open-b7dd03`: gate non-loopback `--mcp-bind` behind
     // an explicit `--mcp-allow-public` flag. The MCP wire now has a
     // shared-secret token gate (ADR-0022 / bead `ley-line-open-b885d1`);
@@ -883,10 +894,10 @@ pub async fn run_daemon_with_options(
 
     // 12. Graceful shutdown: unmount, final snapshot, cleanup.
     drop(mounted);
-    if let Err(e) = publish_living_db(&ctx.live_db, &ctrl_path) {
-        eprintln!("warn: final snapshot failed: {e:#}");
-    } else {
-        eprintln!("final snapshot saved to arena");
+    match publish_final(&ctx.live_db, &live_db_path, &ctrl_path) {
+        Ok(FinalPublish::Published) => eprintln!("final snapshot saved to arena"),
+        Ok(FinalPublish::Skipped(reason)) => eprintln!("warn: final snapshot skipped: {reason}"),
+        Err(e) => eprintln!("warn: final snapshot failed: {e:#}"),
     }
     if let Some(handle) = mcp_handle {
         handle.abort();
@@ -1366,6 +1377,44 @@ pub fn publish_living_db(live_db: &crate::daemon::db_pool::LiveDb, ctrl_path: &P
     snapshot_to_arena(&mut conn, ctrl_path)
 }
 
+/// What the shutdown publish did.
+#[derive(Debug)]
+pub enum FinalPublish {
+    Published,
+    /// Nothing was published, for the stated reason.
+    Skipped(String),
+}
+
+/// The daemon's last publish, at shutdown (`ley-line-open-f69da0`).
+pub fn publish_final(
+    live_db: &crate::daemon::db_pool::LiveDb,
+    live_db_path: &Path,
+    ctrl_path: &Path,
+) -> Result<FinalPublish> {
+    // A live db that is gone (its state directory removed under the
+    // daemon) cannot be published: every pool checkout would try to open
+    // it and block for r2d2's 30 s `connection_timeout`. Skipped by name.
+    if !live_db_path.exists() {
+        return Ok(FinalPublish::Skipped(format!(
+            "the live db {} no longer exists",
+            live_db_path.display()
+        )));
+    }
+    let _publisher = live_db.publish_lock.lock();
+    // Bounded: a shutdown does not wait out the pool's default timeout
+    // for a reader that a vanishing file cannot supply.
+    let mut conn = live_db
+        .reader_pool
+        .get_timeout(FINAL_PUBLISH_CHECKOUT)
+        .map_err(|e| anyhow::anyhow!("reader pool checkout for the final publish failed: {e}"))?;
+    snapshot_to_arena(&mut conn, ctrl_path)?;
+    Ok(FinalPublish::Published)
+}
+
+/// How long the final publish waits for a reader. Idle readers are
+/// checked out at once; the bound only applies when none can be opened.
+const FINAL_PUBLISH_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Publish when anything committed since the last publish this caller made
 /// (`last` is the writer's `total_changes()` then). Returns whether it
 /// published. A contended writer reads as "unknown": nothing is published
@@ -1497,6 +1546,19 @@ pub fn snapshot_to_arena(conn: &mut rusqlite::Connection, ctrl_path: &Path) -> R
         leyline_core::Controller::open_or_create(ctrl_path).context("open controller")?;
     let arena_path = ctrl.arena_path();
     let arena_size = ctrl.arena_size();
+    // The arena is written at the RECORDED path. Empty (no arena
+    // registered) or relative, it resolves against the daemon's cwd, which
+    // is the caller's directory, not the daemon's state
+    // (`ley-line-open-f68a3a`). `setup_arena` records an absolute path.
+    if !Path::new(&arena_path).is_absolute() {
+        anyhow::bail!(
+            "the controller at {} records arena path {arena_path:?}, which is not an \
+             absolute path; refusing to write an arena relative to the working directory \
+             (start the daemon with --arena, or remove the controller so it is \
+             registered afresh)",
+            ctrl_path.display(),
+        );
+    }
 
     let new_size = arena_size_for(arena_size, db_bytes.len() as u64);
 
@@ -2922,6 +2984,90 @@ mod tests {
         assert_eq!(live_mode.to_lowercase(), "wal", "the live db stays WAL");
     }
 
+    /// `ley-line-open-f68a3a`: the publish writes the arena at the
+    /// controller's RECORDED path. Recorded empty (no arena registered) or
+    /// relative, that path resolves against the daemon's cwd, and mache
+    /// found a 2 MiB `.grow` in its source tree. Both are refused by name,
+    /// before any arena file is written, on both the same-size and the
+    /// grow branch.
+    #[test]
+    fn snapshot_to_arena_refuses_an_unregistered_or_relative_arena_path() {
+        for (recorded, size) in [("", 0u64), ("rel.arena", 2 * 1024 * 1024)] {
+            let dir = TempDir::new().unwrap();
+            let ctrl_path = dir.path().join("f68a3a.ctrl");
+            {
+                let mut c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+                if !recorded.is_empty() {
+                    c.set_arena(recorded, size).unwrap();
+                }
+            }
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+                .unwrap();
+
+            let err = snapshot_to_arena(&mut conn, &ctrl_path).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not an absolute path"),
+                "{recorded:?}: the refusal names the cause: {msg}"
+            );
+            for stray in [".grow", "rel.arena", "rel.arena.grow"] {
+                assert!(
+                    !std::path::Path::new(stray).exists(),
+                    "{recorded:?}: {stray} was created in the cwd"
+                );
+            }
+            let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+            assert_eq!(c.current_root(), [0u8; 32], "nothing was published");
+        }
+    }
+
+    /// `ley-line-open-f69da0`: a daemon whose state directory was removed
+    /// under it waited 30 s on SIGTERM: the final publish checked out a
+    /// reader, the pool tried to open the vanished `live.db`, and r2d2
+    /// blocked for its default `connection_timeout`. The final publish
+    /// now sees the live db is gone and skips with a named reason, without
+    /// touching the pool; with the directory intact it still publishes.
+    #[test]
+    fn final_publish_skips_a_removed_live_db_and_publishes_an_intact_one() {
+        for remove in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let arena_path = state.join("f69da0.arena");
+            let ctrl_path =
+                crate::lifecycle::setup_arena(&arena_path, 2 * 1024 * 1024, None).unwrap();
+            let live_db_path = live_db_path_for(&ctrl_path);
+            let live = crate::daemon::db_pool::LiveDb::open_fresh_for_test(&live_db_path);
+            live.writer
+                .lock()
+                .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+                .unwrap();
+
+            if remove {
+                std::fs::remove_dir_all(&state).unwrap();
+                match publish_final(&live, &live_db_path, &ctrl_path).unwrap() {
+                    FinalPublish::Skipped(reason) => assert!(
+                        reason.contains(&live_db_path.display().to_string()),
+                        "the skip names the live db: {reason}"
+                    ),
+                    FinalPublish::Published => panic!("published into a removed directory"),
+                }
+            } else {
+                assert!(matches!(
+                    publish_final(&live, &live_db_path, &ctrl_path).unwrap(),
+                    FinalPublish::Published
+                ));
+                let c = leyline_core::Controller::open_or_create(&ctrl_path).unwrap();
+                assert_ne!(
+                    c.current_root(),
+                    [0u8; 32],
+                    "the final publish advanced the root"
+                );
+            }
+        }
+    }
+
     #[test]
     fn snapshot_to_arena_works_with_wal_backed_connection() {
         // Load-bearing 15a invariant (per bead ley-line-open-98fb67):
@@ -3549,11 +3695,11 @@ mod tests {
         );
         assert_eq!(
             conflict_rows(&ctx, "a.go"),
-            vec![serde_json::json!({
-                "path": "a.go",
-                "disk": upper_hex(CHECKOUT_EDITED),
-                "stored": upper_hex(CHECKOUT_PROPOSED),
-            })],
+            vec![serde_json::json!([
+                {"text": "a.go"},
+                {"text": upper_hex(CHECKOUT_EDITED)},
+                {"text": upper_hex(CHECKOUT_PROPOSED)},
+            ])],
         );
         drop(ctx);
 
@@ -3638,7 +3784,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|row| row["path"].as_str().unwrap().to_string())
+            .map(|row| row[0]["text"].as_str().unwrap().to_string())
             .collect()
     }
 
@@ -4262,6 +4408,7 @@ mod execution_discovery_tests {
             cdc: true,
             discovery: SocketDiscovery::Substrate,
             host_mount: None,
+            lifeline_fd: Some(7),
         };
         let effective = execution_daemon_options(caller);
         assert_eq!(
@@ -4272,6 +4419,11 @@ mod execution_discovery_tests {
         // Deliberately the non-default value: the override must keep the
         // caller's unrelated options.
         assert!(effective.cdc, "unrelated caller options must survive");
+        assert_eq!(
+            effective.lifeline_fd,
+            Some(7),
+            "the caller's lifeline survives"
+        );
     }
 
     /// Bead `ley-line-open-80f037`: the watcher's `daemon.sheaf.invalidate`

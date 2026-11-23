@@ -566,7 +566,7 @@ cross-runtime fixture suite in CI:
 | **Cap'n Proto segment root** — `BindingRecord` (`bindings.capnp`) and `CacheLockfile` records, and `Head` messages through the sigma/v1 `headMessage` vectors; `ast.capnp` and `source.capnp` records have no cross-runtime fixture | canonical capnp binary | `rs/ll-core/schema-capnp/tests/fixtures/*.bin`; `rs/ll-core/schema-spec/sigma/v1/test-vectors/constructions.json` | `clients/go/leyline-schema/binding/binding_test.go`, `cache/cache_test.go` and `sigma/sigma_vectors_test.go` decode via the typed capnp Go bindings | T8.10 / `6b7d43`; `a46711` |
 | **Daemon protocol** — UDS request/response JSON per `daemon.capnp` | JSON-as-carrier (per cloister `interlace-spec/0.1.0/README.md`) over UDS | `rs/ll-open/cli-lib/tests/fixtures/daemon-protocol.json` | `clients/go/leyline-schema/daemon/daemon_protocol_test.go` decodes via hand-written JSON-tagged structs that mirror `daemon.capnp` | A-1 / `b5a77b` |
 
-Both gates' Go halves run in `.github/workflows/leyline-schema-go.yml`; the daemon gate's Rust half runs in the workspace tests under `task ci`. The
+Both gates' Go halves run under `task ci` (`task schema:go:test`) and in `.github/workflows/leyline-schema-go.yml`; the daemon gate's Rust half runs in the workspace tests under `task ci`. The
 Cap'n Proto segment root gate asserts byte-equality on canonical encoding (T8.10's
 falsifiable claim F8.6.4 — direct: byte-equal decode in both runtimes).
 
@@ -584,11 +584,36 @@ Composing the two yields **handler ↔ schema** transitively. Either half
 failing means the chain broke. The fixture file is the deliberate
 intermediate artifact, not an artifact of the implementation.
 
-One op, `query`, is SKIPPED in the Go half, with the drift reason as the
-skip message: the schema declares positional `rows: List(QueryRow)` and the
-handler emits column-keyed maps, which no additive schema change reconciles.
-The Rust half still runs it. Every other fixture's `go_drift_skip` is null;
-bead A-2 (`b631c8`) reconciled the others additively.
+No fixture is skipped in the Go half: every `go_drift_skip` is null. Bead
+A-2 (`b631c8`) reconciled the other ops additively. `query` was the last
+skip, because its handler sent rows as objects keyed by column name while
+the schema declared positional rows; a keyed row also lost a value whenever
+two columns shared a name. Bead `ley-line-open-0a18bc` retyped the rows, a
+wire break that moved `wire_format_major` to 3: `QueryResponse.rows` (@5,
+`List(List(QueryCell))`) is one list per row in `columns` order, each cell
+`{"null": null}` for SQL NULL or `{"text": "..."}`, and the old @2 field is
+retired as `retiredRows` and never emitted. A reply cut short by the row
+limit carries `truncation` (@6, `{"limit": N}`), absent otherwise, and
+`QueryRequest.limit` is a `UInt32` (absent or 0: the default of 1000); any
+other value that is not an integer fitting it is refused as
+`limit_out_of_range` before the statement runs. The `query`,
+`query_duplicate_columns`, `query_null`, `query_truncated` and
+`query_limit_out_of_range` fixtures are checked for exact equality against the
+daemon over both transports (`tests/query_read_only_test.rs`).
+
+A third gate closes the chain from the schema's side: `task
+schema:daemon-fixture-codec` (`tools/check_daemon_fixture_codec.py`, run by
+`task ci`) round-trips every fixture `response` through `daemon.capnp` with
+the reference capnp JSON codec (`capnp convert`) as the struct its
+`go_binding` is paired with in the gate's binding table (whose bindings
+must be exactly the Go gate's decoders), and requires the
+result to equal the fixture, JSON type for JSON type (`0` is not `0.0`). The
+codec drops a field the schema does not declare, so a key the schema lacks
+fails too, and a `retired_*` key fails because a retired field is never
+written. Neither mirror proves this: a bare JSON
+`null` in a `List(Text)` row satisfied both hand-written mirrors and no
+schema reader. `task schema:daemon-fixture-codec:fixture-test` proves the
+gate refuses each drift it exists to catch.
 
 ## Rules
 

@@ -625,3 +625,52 @@ fn an_awaiting_broker_refuses_every_peer_until_the_supervisor_names_it() {
         }
     )));
 }
+
+/// A ready report is believed only about the document's own endpoints
+/// (review of PR #613): one that names any other path refuses the start, and
+/// teardown never unlinks that path, even when the device and inode it
+/// reports are the node's own.
+#[test]
+fn a_ready_report_naming_a_path_outside_the_document_is_refused_and_never_unlinked() {
+    let (_keep, dir) = channel_dir();
+    let document = document(&dir, "127.0.0.1", 4000);
+    let digest = format!("blake3-256:{}", document.digest_hex());
+    let (_other_keep, other) = channel_dir();
+    let victim = other.join("victim.sock");
+    let _listening = std::os::unix::net::UnixListener::bind(&victim).expect("another socket");
+    let metadata = std::fs::symlink_metadata(&victim).expect("its node");
+    // A stand-in broker: it reads the start request, attests the right
+    // digest, and claims to have bound the victim.
+    let script = dir.join("lying-broker");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{{\"event\":\"ready\",\"connectionsDigest\":\"{digest}\",\"bound\":[{{\"path\":\"{}\",\"device\":{},\"inode\":{}}}]}}'\nexec cat > /dev/null\n",
+            victim.display(),
+            metadata.dev(),
+            metadata.ino()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let mut broker = BrokerProcess::spawn(&script, PeerPid::Any).expect("spawn");
+    let error = broker
+        .start(&document, &digest, Duration::from_secs(30))
+        .expect_err("a report about another path");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        "{error}"
+    );
+    assert!(
+        error.detail.contains(victim.to_str().unwrap())
+            && error.detail.contains("not an endpoint of the document"),
+        "{error}"
+    );
+    assert!(broker.reported(), "it did answer the start");
+    broker.shutdown();
+    assert!(
+        victim.exists(),
+        "teardown unlinked a path the document never named"
+    );
+}

@@ -4,7 +4,8 @@ Section: Breaking
   takes the run's connections, and a daemon with a broker advertises
   `cloister/execution/v1/connections`** (bead `ley-line-open-5308b7`,
   ADR-0046 Slice 1 S2, S6, S7, S8). Start `execution-daemon` with
-  `--connection-broker <path to leyline-conn-broker>`: a `RunGrant` carrying
+  `--connection-broker <path to leyline-conn-broker>` (an executable file,
+  or the daemon refuses to start): a `RunGrant` carrying
   `connectionsDigest`, `connectionsDocument` and the `credentialBrokerRefs`
   marker then gets one broker for its run, and the workload reaches each
   declared loopback target through it (`127.0.0.1:<guestPort>` in a microVM,

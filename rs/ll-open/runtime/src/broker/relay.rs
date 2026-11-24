@@ -30,21 +30,37 @@ pub struct Endpoint {
     pub target: SocketAddr,
 }
 
-/// Bind every endpoint in the document, in document order. Nothing is bound
-/// unless everything binds: a failure drops (closes) the earlier listeners;
-/// the caller unlinks the paths.
+/// Bind every endpoint in the document, in document order. Nothing stays
+/// bound unless everything binds: on a failure the earlier listeners are
+/// closed and their socket nodes unlinked here, by the process that made
+/// them, and the error names the endpoint that failed. The path that failed
+/// to bind is never touched: whatever is there is not this broker's.
 pub fn bind(document: &ConnectionsDocument) -> io::Result<Vec<Endpoint>> {
-    document
-        .connections()
-        .iter()
-        .map(|connection| {
-            Ok(Endpoint {
+    let mut endpoints: Vec<Endpoint> = Vec::with_capacity(document.connections().len());
+    for connection in document.connections() {
+        match UnixListener::bind(&connection.endpoint_unix) {
+            Ok(listener) => endpoints.push(Endpoint {
                 name: connection.name.clone(),
-                listener: UnixListener::bind(&connection.endpoint_unix)?,
+                listener,
                 target: SocketAddr::new(connection.host, connection.port),
-            })
-        })
-        .collect()
+            }),
+            Err(error) => {
+                let bound = endpoints.len();
+                drop(endpoints);
+                for earlier in &document.connections()[..bound] {
+                    let _ = std::fs::remove_file(&earlier.endpoint_unix);
+                }
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{}: {error}; this broker unlinked the {bound} endpoint(s) it had bound",
+                        connection.endpoint_unix
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(endpoints)
 }
 
 /// Which process may connect, besides the uid check.

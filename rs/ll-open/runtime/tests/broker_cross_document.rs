@@ -53,6 +53,15 @@ struct Probe {
     /// One entry per cancel that reached this backend.
     cancels: Arc<Mutex<Vec<String>>>,
     cancelled: Option<mpsc::Sender<()>>,
+    /// What a cancel that does not fail answers: whether it stopped a run.
+    cancel_answer: bool,
+    capability_calls: Arc<AtomicUsize>,
+    /// The `capabilities()` call (1-based) that reports on `parked` and
+    /// waits for `resume`: a point inside a start, before the broker layer
+    /// has registered the run.
+    park_capabilities_at: usize,
+    parked: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    resume: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
 }
 
 impl Probe {
@@ -66,6 +75,11 @@ impl Probe {
             cancel_fails: Arc::default(),
             cancels: Arc::default(),
             cancelled: None,
+            cancel_answer: true,
+            capability_calls: Arc::default(),
+            park_capabilities_at: 0,
+            parked: Arc::default(),
+            resume: Arc::default(),
         }
     }
 
@@ -87,6 +101,15 @@ impl Probe {
 
 impl Backend for Probe {
     fn capabilities(&self) -> BackendCapabilities {
+        let call = self.capability_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.park_capabilities_at {
+            if let Some(parked) = self.parked.lock().unwrap().take() {
+                let _ = parked.send(());
+            }
+            if let Some(resume) = self.resume.lock().unwrap().take() {
+                let _ = resume.recv();
+            }
+        }
         BackendCapabilities {
             backend_id: "probe/1".into(),
             backend_class: self.class,
@@ -146,7 +169,7 @@ impl Backend for Probe {
         if self.cancel_fails.load(Ordering::SeqCst) {
             return Err(ExecutionError::backend("the probe's cancel failed"));
         }
-        Ok(true)
+        Ok(self.cancel_answer)
     }
 }
 
@@ -395,6 +418,13 @@ fn every_cross_document_mismatch_is_refused_naming_the_connection() {
             &native_probe,
             Some(read_write(dir.to_str().unwrap())),
             vec!["connection `api`", "§2 read-write grant"],
+        ),
+        (
+            "a §2 write grant on the endpoint path itself",
+            &native,
+            &native_probe,
+            Some(read_write(&api)),
+            vec!["connection `api`", "§2 read-write grant", &api],
         ),
         (
             "a §2 write grant on an ancestor of it",
@@ -968,5 +998,350 @@ fn connections_nothing_serves_are_refused_by_name_on_every_path() {
     assert!(
         error.detail.contains("not a valid cloister/connections/v1"),
         "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review of PR #613 (bead `ley-line-open-5308b7`, findings B1, C1 to C4 and
+// the notes).
+
+/// B1. A cancel that arrives while a run WITHOUT connections is starting,
+/// and that the wrapped backend answers `false` (it does not know the run
+/// yet), must not drop the run's §6 registration: the run goes live, and a
+/// later run's endpoint under its grant is still refused.
+#[test]
+fn a_cancel_during_a_no_connections_start_keeps_its_registration() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let (entered, in_start) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let mut probe = Probe::new(BackendClass::Native).on_start(move |request, _| {
+        // Only B's start parks; a start of A reaching the backend at all is
+        // the failure this test exists for.
+        assert_eq!(request.run_id, "run-b", "run A reached the backend");
+        let _ = entered.send(());
+        let _ = released.lock().unwrap().recv();
+        Ok(())
+    });
+    probe.cancel_answer = false;
+    let backend = Brokered::new(probe, host.broker(None));
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    std::thread::scope(|scope| {
+        let starting = scope.spawn(|| {
+            backend.start(
+                &request("run-b", Some(&granted)),
+                ServedWorkspaces::none(),
+                RunConnections::none(),
+            )
+        });
+        in_start
+            .recv_timeout(broker_fixture::BOUND)
+            .expect("B is starting");
+        assert!(
+            !backend.cancel("run-b").expect("cancel"),
+            "the wrapped backend stopped nothing"
+        );
+        release.send(()).expect("release B");
+        starting.join().unwrap().expect("B is live");
+    });
+    let error = start(
+        &backend,
+        "run-a",
+        Some(&granted),
+        &connections(&dir, &["api"], "127.0.0.1", 4000),
+    )
+    .expect_err("A's endpoint lies under live run B's grant");
+    assert_eq!(error.code, ErrorCode::ResourceConflict, "{error}");
+    assert!(
+        error.detail.contains("held by another run (run-b)"),
+        "{error}"
+    );
+    assert_eq!(host.broker_pid(), None, "no broker for the refused run");
+}
+
+/// C1. The broker layer refuses a start whose workload it then cannot
+/// cancel. Under `ExecutionService` that run is recorded `failed` and stays
+/// addressable, its endpoint stays reserved while the workload may be alive,
+/// and `cleanup` releases it once a cancel succeeds (ADR-0046 S7).
+#[test]
+fn a_refused_start_whose_cancel_failed_is_recorded_failed_until_cleanup() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = microvm_grant(&dir);
+    // Refused after the workload started: the worker is never named.
+    let probe = Probe::new(BackendClass::MicroVm).on_start(|_, _| Ok(()));
+    probe.cancel_fails.store(true, Ordering::SeqCst);
+    let service = ExecutionService::new(probe.clone()).with_connection_broker(host.broker(None));
+    let error = service
+        .start_with_connections(request("run-stuck", Some(&granted)), declared.clone())
+        .expect_err("refused");
+    assert!(
+        error.detail.contains("without naming its worker"),
+        "{error}"
+    );
+    assert!(
+        error.detail.contains("`cleanup` retries the cancel"),
+        "{error}"
+    );
+    let record = service
+        .status("run-stuck")
+        .expect("status")
+        .expect("a run whose workload may be alive is recorded");
+    assert_eq!(record.state, RunState::Failed);
+    assert_eq!(record.backend_id, "probe/1");
+    let events = service.inspect("run-stuck", 0).expect("inspect").events;
+    assert_eq!(
+        events.last().map(|event| event.state),
+        Some(RunState::Failed)
+    );
+    assert!(events.last().unwrap().detail_digest.is_some());
+    // Its run id refuses a second start, and its endpoint another run.
+    let again = service
+        .start_with_connections(request("run-stuck", Some(&granted)), declared.clone())
+        .expect_err("the run id is taken");
+    assert_eq!(again.code, ErrorCode::ResourceConflict, "{again}");
+    let other = service
+        .start_with_connections(request("run-other", Some(&granted)), declared.clone())
+        .expect_err("the endpoint is reserved");
+    assert!(other.detail.contains("another run (run-stuck)"), "{other}");
+    // A cleanup whose cancel still fails changes nothing.
+    service.cleanup("run-stuck").expect_err("the cancel fails");
+    service
+        .start_with_connections(request("run-other", Some(&granted)), declared.clone())
+        .expect_err("still reserved");
+    // One that succeeds releases the endpoint.
+    probe.cancel_fails.store(false, Ordering::SeqCst);
+    let cleaned = service.cleanup("run-stuck").expect("cleanup");
+    assert_eq!(cleaned.state, RunState::Cleaned);
+    let released = service
+        .start_with_connections(request("run-other", Some(&granted)), declared)
+        .expect_err("this probe never names its worker, so the start is refused again");
+    assert!(
+        released.detail.contains("without naming its worker"),
+        "past the registry this time: {released}"
+    );
+}
+
+/// C2. A service cancel received before the broker layer has registered the
+/// run: no broker is spawned and the backend is never asked to start.
+#[test]
+fn a_cancel_received_before_the_broker_spawn_starts_nothing() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    // The number of `capabilities()` calls one start makes; the last is the
+    // broker layer's own, made before it registers the run.
+    let calls = {
+        let probe = Probe::new(BackendClass::Native);
+        let service =
+            ExecutionService::new(probe.clone()).with_connection_broker(host.broker(None));
+        service
+            .start_with_connections(request("run-count", Some(&granted)), declared.clone())
+            .expect("a start, counted");
+        let calls = probe.capability_calls.load(Ordering::SeqCst);
+        service.cancel("run-count").expect("cancel");
+        std::fs::remove_file(host.path("broker.pid")).expect("pid file");
+        calls
+    };
+    let mut probe = Probe::new(BackendClass::Native);
+    probe.park_capabilities_at = calls;
+    let (parked, at_the_park) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    *probe.parked.lock().unwrap() = Some(parked);
+    *probe.resume.lock().unwrap() = Some(resumed);
+    let (cancelled, cancel_seen) = mpsc::channel();
+    probe.cancelled = Some(cancelled);
+    let service = ExecutionService::new(probe.clone()).with_connection_broker(host.broker(None));
+    std::thread::scope(|scope| {
+        let starting = scope.spawn(|| {
+            service.start_with_connections(request("run-early", Some(&granted)), declared.clone())
+        });
+        at_the_park
+            .recv_timeout(broker_fixture::BOUND)
+            .expect("the start is parked before registration");
+        let cancelling = scope.spawn(|| service.cancel("run-early"));
+        // EVENT: the cancel is marked and has gone through the broker layer.
+        cancel_seen
+            .recv_timeout(broker_fixture::BOUND)
+            .expect("the cancel reached the backend");
+        resume.send(()).expect("resume the start");
+        let error = starting.join().unwrap().expect_err("cancelled");
+        assert_eq!(error.code, ErrorCode::Cancelled, "{error}");
+        let record = cancelling.join().unwrap().expect("cancel");
+        assert_eq!(record.state, RunState::Cancelled);
+    });
+    assert_eq!(host.broker_pid(), None, "no broker after the cancel");
+    assert_eq!(
+        probe.starts.load(Ordering::SeqCst),
+        0,
+        "the backend was never asked to start"
+    );
+    assert!(!Path::new(&endpoint(&dir, "api")).exists());
+}
+
+/// C3. A socket that appears at the endpoint after the preflight and before
+/// the broker binds: the broker fails to bind, and the supervisor does not
+/// unlink a socket its broker never bound. A two-endpoint document: the
+/// broker unlinks the one it did bind before it reports the failure.
+#[test]
+fn a_broker_that_fails_to_bind_leaves_a_foreign_socket_alone() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    // `api` binds first (name order); `db` is squatted.
+    let declared = connections(&dir, &["api", "db"], "127.0.0.1", 4000);
+    let granted = manifest(vec![native_grant(&dir, "api"), native_grant(&dir, "db")]);
+    let squatted = endpoint(&dir, "db");
+    let squatter: Arc<Mutex<Option<UnixListener>>> = Arc::default();
+    // The broker wrapper is started after the preflight; it asks this test,
+    // over a FIFO pair, to bind the squatter, and execs the broker after.
+    let (ask, done) = (host.path("ask"), host.path("done"));
+    broker_fixture::fifo(&ask);
+    broker_fixture::fifo(&done);
+    let config = host.broker_with(&format!(
+        ": > '{}'\ncat '{}' > /dev/null",
+        ask.display(),
+        done.display()
+    ));
+    let probe = Probe::new(BackendClass::Native);
+    let backend = Brokered::new(probe.clone(), config);
+    std::thread::scope(|scope| {
+        let starting = scope.spawn(|| start(&backend, "run-squatted", Some(&granted), &declared));
+        // EVENT: the wrapper opened `ask`: the preflight has passed.
+        drop(std::fs::File::open(&ask).expect("the wrapper asks"));
+        *squatter.lock().unwrap() = Some(UnixListener::bind(&squatted).expect("squat"));
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&done)
+                .expect("answer the wrapper"),
+        );
+        let error = starting
+            .join()
+            .unwrap()
+            .expect_err("the broker cannot bind");
+        assert_eq!(error.code, ErrorCode::BackendFailed, "{error}");
+        assert!(error.detail.contains("bind endpoint"), "{error}");
+    });
+    assert!(
+        Path::new(&squatted).exists(),
+        "the supervisor unlinked a socket its broker never bound"
+    );
+    assert!(
+        UnixStream::connect(&squatted).is_ok(),
+        "the squatter still listens there"
+    );
+    assert!(
+        !Path::new(&endpoint(&dir, "api")).exists(),
+        "the broker unlinked the endpoint it had bound"
+    );
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 0);
+}
+
+/// A panic in the wrapped backend's `start` is not a `Starting` entry a
+/// cancel waits on forever: the broker is torn down as for any failure.
+#[test]
+fn a_panic_in_the_wrapped_start_tears_the_broker_down() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    let probe = Probe::new(BackendClass::Native).on_start(|_, _| panic!("the backend panicked"));
+    let backend = Brokered::new(probe, host.broker(None));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        start(&backend, "run-panic", Some(&granted), &declared)
+    }));
+    assert!(panicked.is_err(), "the panic propagates");
+    let broker = host.broker_pid().expect("a broker was spawned");
+    common::await_exit(broker, broker_fixture::BOUND).expect("the broker is gone");
+    assert!(!Path::new(&endpoint(&dir, "api")).exists());
+    // The workload's state is unknown after a panic, so the endpoint stays
+    // reserved until a cancel succeeds. That cancel returns: nothing of the
+    // run is left starting for it to wait on.
+    let error = backend
+        .start(
+            &request("run-after", Some(&granted)),
+            ServedWorkspaces::none(),
+            RunConnections::none(),
+        )
+        .expect_err("reserved while the panicked run's workload may live");
+    assert!(error.detail.contains("another run (run-panic)"), "{error}");
+    assert!(backend.cancel("run-panic").expect("cancel"));
+    // Released: a run holding a grant on the endpoint is admitted (and this
+    // probe panics again when it is asked to start it).
+    let admitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.start(
+            &request("run-after", Some(&granted)),
+            ServedWorkspaces::none(),
+            RunConnections::none(),
+        )
+    }));
+    assert!(admitted.is_err(), "past the registry, into the backend");
+}
+
+/// The drain's timeout arm: a broker that does not answer the drain within
+/// the bound is killed, and the outcome says `complete: false`, keeping the
+/// records reported before.
+#[test]
+fn a_broker_that_does_not_drain_in_time_gives_an_incomplete_outcome() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    let mut config = host.broker(None);
+    config.drain_timeout = std::time::Duration::from_millis(200);
+    let backend = Brokered::new(Probe::new(BackendClass::Native), config);
+    start(&backend, "run-slow", Some(&granted), &declared).expect("started");
+    assert_eq!(dial(&dir).as_deref(), Some(&b"ping"[..]));
+    let broker = host.broker_pid().expect("broker pid");
+    // Stopped: it reads no drain request and reports nothing more.
+    // SAFETY: a signal to the broker this test's backend spawned.
+    assert_eq!(unsafe { libc::kill(broker, libc::SIGSTOP) }, 0);
+    assert!(backend.cancel("run-slow").expect("cancel"));
+    common::await_exit(broker, broker_fixture::BOUND).expect("killed after the bound");
+    let outcome = backend.take_connections("run-slow").expect("outcome");
+    assert!(!outcome.connections[0].complete, "{outcome:?}");
+    assert!(outcome.connections[0].accepted <= 1, "{outcome:?}");
+    assert!(
+        !Path::new(&endpoint(&dir, "api")).exists(),
+        "still unlinked"
+    );
+}
+
+/// The direct path's contract for a finished run's outcome: it waits until
+/// it is taken, and a new run under the same id replaces it.
+#[test]
+fn a_run_id_reused_on_the_direct_path_replaces_the_untaken_outcome() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    let backend = Brokered::new(Probe::new(BackendClass::Native), host.broker(None));
+    start(&backend, "run-again", Some(&granted), &declared).expect("first");
+    assert_eq!(dial(&dir).as_deref(), Some(&b"ping"[..]));
+    assert!(backend.cancel("run-again").expect("cancel"));
+    // Not taken. The same id starts again, on the same endpoint.
+    start(&backend, "run-again", Some(&granted), &declared).expect("second");
+    assert!(
+        backend.take_connections("run-again").is_none(),
+        "a live run has no outcome, and the first run's is gone"
+    );
+    assert!(backend.cancel("run-again").expect("cancel"));
+    let outcome = backend
+        .take_connections("run-again")
+        .expect("the second run's");
+    assert_eq!(outcome.connections[0].accepted, 0, "{outcome:?}");
+    assert!(
+        backend.take_connections("run-again").is_none(),
+        "taken once"
     );
 }

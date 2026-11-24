@@ -367,7 +367,15 @@ where
                 device: metadata.dev(),
                 inode: metadata.ino(),
             }),
-            Err(error) => return fail(format!("inspect bound endpoint: {error}")),
+            Err(error) => {
+                // Still unconfined, and no ready report will follow: remove
+                // every socket this broker bound before refusing.
+                drop(endpoints);
+                for connection in parsed.connections() {
+                    let _ = std::fs::remove_file(&connection.endpoint_unix);
+                }
+                return fail(format!("inspect bound endpoint: {error}"));
+            }
         }
     }
     if let Err(error) = confine(&parsed) {
@@ -388,7 +396,15 @@ where
         sender,
     ) {
         Ok(handle) => handle,
-        Err(error) => return fail(format!("start relay: {error}")),
+        // Confined by now, so this process can no longer unlink: the
+        // sockets it bound stay, named here, and the next run naming them is
+        // refused "endpoint exists" until they are removed.
+        Err(error) => {
+            let left: Vec<&str> = bound.iter().map(|socket| socket.path.as_str()).collect();
+            return fail(format!(
+                "start relay: {error}; this broker bound and could not unlink {left:?}"
+            ));
+        }
     };
     emit(&Event::Ready {
         connections_digest: format!("blake3-256:{}", parsed.digest_hex()),
@@ -437,8 +453,11 @@ pub struct BrokerProcess {
     events: mpsc::Receiver<Event>,
     seen: Vec<Event>,
     bound: Vec<Bound>,
-    /// Whether a ready report arrived, whatever its digest.
-    ready: bool,
+    /// Whether the broker answered the start at all: a ready report, or an
+    /// error report. A broker that reports an error has unlinked what it
+    /// bound itself (or names what it could not); only one that reported
+    /// nothing leaves the supervisor not knowing what it bound.
+    reported: bool,
 }
 
 impl BrokerProcess {
@@ -510,15 +529,17 @@ impl BrokerProcess {
             events,
             seen: Vec::new(),
             bound: Vec::new(),
-            ready: false,
+            reported: false,
         })
     }
 
-    /// Whether the broker reported ready. Until it does, the supervisor does
-    /// not know which sockets it bound ([`Self::shutdown`] unlinks only
-    /// reported ones).
-    pub fn reported_ready(&self) -> bool {
-        self.ready
+    /// Whether the broker answered its start, with a ready report or an
+    /// error report. [`Self::shutdown`] unlinks exactly the sockets a ready
+    /// report named. A broker that reported an error unlinked its own. One
+    /// that reported nothing (killed or stalled before either) may have
+    /// bound sockets the supervisor was never told about.
+    pub fn reported(&self) -> bool {
+        self.reported
     }
 
     pub fn pid(&self) -> u32 {
@@ -544,10 +565,30 @@ impl BrokerProcess {
                     connections_digest,
                     bound,
                 }) => {
+                    self.reported = true;
+                    // Only the document's own endpoints are ever unlinked on
+                    // this report's word: a report naming any other path is
+                    // refused, and that entry is dropped, not kept.
+                    let declared = |path: &str| {
+                        document
+                            .connections()
+                            .iter()
+                            .any(|connection| connection.endpoint_unix == path)
+                    };
+                    let foreign = bound.iter().find(|socket| !declared(&socket.path));
+                    let foreign = foreign.map(|socket| socket.path.clone());
                     // Kept before the digest check: a broker that bound
                     // sockets and then disagreed still leaves them to unlink.
-                    self.bound = bound;
-                    self.ready = true;
+                    self.bound = bound
+                        .into_iter()
+                        .filter(|socket| declared(&socket.path))
+                        .collect();
+                    if let Some(path) = foreign {
+                        return Err(ExecutionError::identity_mismatch(format!(
+                            "connection broker reported binding {path}, which is not an \
+                             endpoint of the document it was sent"
+                        )));
+                    }
                     if connections_digest == expected {
                         return Ok(());
                     }
@@ -556,6 +597,7 @@ impl BrokerProcess {
                     )));
                 }
                 Ok(Event::Error { detail }) => {
+                    self.reported = true;
                     return Err(ExecutionError::backend(format!(
                         "connection broker: {detail}"
                     )));

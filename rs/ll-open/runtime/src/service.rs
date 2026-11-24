@@ -206,6 +206,43 @@ impl Drop for StartEnds {
     }
 }
 
+/// Record a run whose start was refused while its workload may still be
+/// running, and return the refusal. Forgetting such a run would leave a live
+/// workload nothing can address and free its run_id for a second start. It is
+/// recorded `Failed` instead: terminal, so it is never polled or receipted
+/// (it has no receipt context), its run_id refuses another start, and
+/// `cleanup` retries the cancel.
+fn record_failed_start(
+    state: &mut ServiceState,
+    request: &ExecutionRequest,
+    backend_id: String,
+    error: ExecutionError,
+) -> ExecutionError {
+    let detail_digest = serde_json::to_vec(&error)
+        .ok()
+        .map(|bytes| format!("blake3-256:{}", bytes.hash()));
+    state.runs.insert(
+        request.run_id.clone(),
+        RunRecord {
+            run_id: request.run_id.clone(),
+            replay_key: request.replay_key.clone(),
+            state: RunState::Failed,
+            backend_id,
+        },
+    );
+    state.events.insert(
+        request.run_id.clone(),
+        vec![
+            event(1, RunState::Accepted),
+            event(2, RunState::Provisioning),
+            event(3, RunState::Ready),
+            event(4, RunState::Running),
+            event_with_detail(5, RunState::Failed, detail_digest),
+        ],
+    );
+    error
+}
+
 fn cancelled_while_starting() -> ExecutionError {
     ExecutionError {
         code: crate::ErrorCode::Cancelled,
@@ -506,17 +543,49 @@ impl<B: Backend> ExecutionService<B> {
         // report before it calls the backend, and tears the broker down if
         // anything after that fails.
         let connections = connections.map_or_else(RunConnections::none, RunConnections::verified);
-        let started = workspaces.and_then(|(workspaces, opened)| {
-            Ok((
-                self.backend.start(&request, workspaces, connections)?,
-                opened,
-            ))
-        });
+        //
+        // The gate's mark goes with the call, so a cancel that arrives
+        // before the broker layer has registered the run is still seen by
+        // it: nothing is spawned and the backend is never asked to start.
+        let started = workspaces
+            .map_err(crate::broker::supervisor::StartRefusal::from)
+            .and_then(|(workspaces, opened)| {
+                Ok((
+                    self.backend.start_cancellable(
+                        &request,
+                        workspaces,
+                        connections,
+                        &gate.cancelled,
+                    )?,
+                    opened,
+                ))
+            });
         let (started, opened) = match started {
             Ok(started) => started,
-            Err(error) => {
-                self.state.write().starting.remove(&request.run_id);
-                return Err(error);
+            Err(refusal) => {
+                let mut state = self.state.write();
+                state.starting.remove(&request.run_id);
+                if !refusal.workload_may_live {
+                    return Err(refusal.error);
+                }
+                // The broker layer refused the start after the workload was
+                // started, and could not cancel it (ADR-0046 S7). Its broker
+                // is gone and its endpoints stay reserved; the run is
+                // recorded, so `cleanup` can retry the cancel that releases
+                // them.
+                let backend_id = self.backend.capabilities().backend_id;
+                return Err(record_failed_start(
+                    &mut state,
+                    &request,
+                    backend_id,
+                    ExecutionError {
+                        detail: format!(
+                            "{}; the run is recorded failed and `cleanup` retries the cancel",
+                            refusal.error.detail
+                        ),
+                        ..refusal.error
+                    },
+                ));
             }
         };
         let channels: Vec<crate::WorkerChannel> = started
@@ -561,42 +630,19 @@ impl<B: Backend> ExecutionService<B> {
             let Err(cancel) = cancel else {
                 return Err(error);
             };
-            // The workload may still be running. Forgetting it would leave a
-            // live run nothing can address and free its run_id for a second
-            // start. It is recorded `Failed` instead: terminal, so it is never
-            // polled or receipted (it has no receipt context), its run_id
-            // refuses another start, and `cleanup` retries the cancel.
-            let error = ExecutionError {
-                detail: format!(
-                    "{}; cancelling the run also failed, so it is recorded failed \
-                     and `cleanup` retries the cancel: {cancel}",
-                    error.detail
-                ),
-                ..error
-            };
-            let detail_digest = serde_json::to_vec(&error)
-                .ok()
-                .map(|bytes| format!("blake3-256:{}", bytes.hash()));
-            state.runs.insert(
-                request.run_id.clone(),
-                RunRecord {
-                    run_id: request.run_id.clone(),
-                    replay_key: request.replay_key.clone(),
-                    state: RunState::Failed,
-                    backend_id: started.backend_id,
+            return Err(record_failed_start(
+                &mut state,
+                &request,
+                started.backend_id,
+                ExecutionError {
+                    detail: format!(
+                        "{}; cancelling the run also failed, so it is recorded failed \
+                         and `cleanup` retries the cancel: {cancel}",
+                        error.detail
+                    ),
+                    ..error
                 },
-            );
-            state.events.insert(
-                request.run_id,
-                vec![
-                    event(1, RunState::Accepted),
-                    event(2, RunState::Provisioning),
-                    event(3, RunState::Ready),
-                    event(4, RunState::Running),
-                    event_with_detail(5, RunState::Failed, detail_digest),
-                ],
-            );
-            return Err(error);
+            ));
         }
         let record = RunRecord {
             run_id: request.run_id.clone(),

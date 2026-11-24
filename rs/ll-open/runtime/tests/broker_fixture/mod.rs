@@ -191,6 +191,16 @@ impl Host {
     /// wrapper that records its pid. With `stall`, the broker binds every
     /// endpoint, writes its pid to that FIFO and never reports ready.
     pub fn broker(&self, stall: Option<&Path>) -> BrokerConfig {
+        self.broker_script("", stall)
+    }
+
+    /// [`Self::broker`], with the shell lines `before` run in the wrapper
+    /// after it records its pid and before it becomes the broker.
+    pub fn broker_with(&self, before: &str) -> BrokerConfig {
+        self.broker_script(before, None)
+    }
+
+    fn broker_script(&self, before: &str, stall: Option<&Path>) -> BrokerConfig {
         let wrapper = self.path("broker");
         let stall = stall
             .map(|fifo| format!("LEYLINE_TEST_BROKER_STALL='{}' ", fifo.display()))
@@ -198,7 +208,7 @@ impl Host {
         publish(
             &wrapper,
             &format!(
-                "#!/bin/sh\necho $$ > '{}'\n{stall}exec '{UNCONFINED}' \"$@\"\n",
+                "#!/bin/sh\necho $$ > '{}'\n{before}\n{stall}exec '{UNCONFINED}' \"$@\"\n",
                 self.path("broker.pid").display()
             ),
         );

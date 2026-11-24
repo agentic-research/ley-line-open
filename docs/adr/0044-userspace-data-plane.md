@@ -65,7 +65,7 @@ trait that a libkrun patch adds beside libkrun's private, generic `FileSystem` (
   `ESTALE` for a moved base, `EIO` for a syntax refusal. The Linux FUSE client returns FLUSH and
   FSYNC errors to `close` and `fsync`, so every refusal reaches the agent. The spike measured this
   on macOS. *Amended by ADR-0045:* a file that does not parse is stored with a diagnostic, not
-  refused, and a moved base is merged three ways; only overlapping edits are `ESTALE`.
+  refused, and a moved base is merged three ways; only overlapping or touching edits are `ESTALE` (ADR-0045 T5, amended 2026-11-22).
 
 ### V3 — Reads come from immutable blobs; only the write path is served per operation
 

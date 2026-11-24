@@ -110,7 +110,7 @@
     },
     "response": {
       "ok": false,
-      "error": "proposal refused: 'src/main.rs' moved since it was read (read blob 3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a, now blob 0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9), and its changes overlap the other writer's at base lines 1..2",
+      "error": "proposal refused: 'src/main.rs' moved since it was read (read blob 3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a, now blob 0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9), and its changes overlap or touch the other writer's at base lines 1..2",
       "refusal": {
         "reason": "stale",
         "moved": [
@@ -135,7 +135,7 @@
       "writes": [
         {
           "path": "src/main.rs",
-          "base": "3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a",
+          "base": "7d1e2f3a3c2f6a5b8d1e4f7a9b0c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c",
           "content": "fn main() {}\n\nfn ours() {}\n"
         }
       ]
@@ -335,13 +335,59 @@
       "ok": true,
       "columns": ["one"],
       "rows": [
-        {"one": "1"}
+        [{"text": "1"}]
       ]
     },
     "response_required_keys": ["ok", "columns", "rows"],
-    "response_optional_keys": ["truncated", "limit"],
+    "response_optional_keys": ["truncation"],
     "go_binding": "QueryResponse",
-    "go_drift_skip": "Structural: schema declares rows:List(QueryRow) with positional values:List(Text); handler emits column-keyed maps. Can't be reconciled additively without changing the wire shape (would break debug consumers of `op_query`). Tracked as follow-up; this is the only op that genuinely needs a design call rather than a schema bump."
+    "go_drift_skip": null
+  },
+
+  "query_duplicate_columns": {
+    "request": {"op": "query", "sql": "SELECT 1 AS id, 2 AS id"},
+    "response": {
+      "ok": true,
+      "columns": ["id", "id"],
+      "rows": [
+        [{"text": "1"}, {"text": "2"}]
+      ]
+    },
+    "response_required_keys": ["ok", "columns", "rows"],
+    "response_optional_keys": ["truncation"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
+  },
+
+  "query_null": {
+    "request": {"op": "query", "sql": "SELECT NULL AS a, '' AS b"},
+    "response": {
+      "ok": true,
+      "columns": ["a", "b"],
+      "rows": [
+        [{"null": null}, {"text": ""}]
+      ]
+    },
+    "response_required_keys": ["ok", "columns", "rows"],
+    "response_optional_keys": ["truncation"],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
+  },
+
+  "query_truncated": {
+    "request": {"op": "query", "sql": "SELECT 1 AS n UNION ALL SELECT 2", "limit": 1},
+    "response": {
+      "ok": true,
+      "columns": ["n"],
+      "rows": [
+        [{"text": "1"}]
+      ],
+      "truncation": {"limit": 1}
+    },
+    "response_required_keys": ["ok", "columns", "rows", "truncation"],
+    "response_optional_keys": [],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
   },
 
   "query_refused": {
@@ -361,6 +407,23 @@
     "go_drift_skip": null
   },
 
+  "query_limit_out_of_range": {
+    "request": {"op": "query", "sql": "SELECT 1", "limit": -1},
+    "response": {
+      "ok": false,
+      "error": "query refused (limit_out_of_range): the row limit `-1` is not an integer from 0 to 4294967295",
+      "refusal": {
+        "reason": "limit_out_of_range",
+        "action": "limit",
+        "subject": "-1"
+      }
+    },
+    "response_required_keys": ["ok", "error", "refusal"],
+    "response_optional_keys": [],
+    "go_binding": "QueryResponse",
+    "go_drift_skip": null
+  },
+
   "llo_execution_status_unconfigured": {
     "request": {"op": "llo_execution_status", "runId": ""},
     "response": {
@@ -375,6 +438,7 @@
     "response_required_keys": ["ok", "error", "executionError"],
     "response_optional_keys": [],
     "go_binding": "ExecutionErrorResponse",
+    "capnp_struct": "ErrorResponse",
     "go_drift_skip": null
   },
 
@@ -403,7 +467,7 @@
       "regions": [0],
       "stalks": [{"id": 0, "hash": "ff00000000000000000000000000000000000000000000000000000000000000", "data": []}]
     },
-    "response": {"invalidated": [], "count": 0, "generation": "1"},
+    "response": {"invalidated": [], "count": 0, "generation": "1", "prior_generation": "0"},
     "response_required_keys": ["invalidated", "count", "generation"],
     "response_optional_keys": [],
     "go_binding": "SheafInvalidateResponse",
@@ -412,7 +476,7 @@
 
   "sheaf_defect": {
     "request": {"op": "sheaf_defect"},
-    "response": {"defect": 0.0, "generation": "0", "valid": 0, "total": 0},
+    "response": {"defect": 0, "generation": "0", "valid": 0, "total": 0},
     "response_required_keys": ["defect", "generation", "valid", "total"],
     "response_optional_keys": [],
     "go_binding": "SheafDefectResponse",
@@ -421,7 +485,7 @@
 
   "sheaf_status": {
     "request": {"op": "sheaf_status"},
-    "response": {"generation": "0", "valid": 0, "total": 0, "defect": 0.0, "tracked_edges": 0},
+    "response": {"generation": "0", "valid": 0, "total": 0, "defect": 0, "tracked_edges": 0},
     "response_required_keys": ["generation", "valid", "total", "defect", "tracked_edges"],
     "response_optional_keys": [],
     "go_binding": "SheafStatusResponse",

@@ -1,0 +1,134 @@
+package wire
+
+// `query` row JSON (bead ley-line-open-0a18bc). Each row is a list of
+// QueryCell unions in `columns` order. The payloads are the shared daemon
+// protocol fixtures, which the Rust test
+// rs/ll-open/cli-lib/tests/query_read_only_test.rs::the_protocol_fixture_rows_are_what_the_daemon_sends
+// proves the daemon emits, and which tools/check_daemon_fixture_codec.py
+// proves the schema's reference JSON codec reads.
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func decodeQueryFixture(t *testing.T, name string) QueryResponse {
+	t.Helper()
+	var got QueryResponse
+	roundTrip(t, loadFixture(t, name).Response, &got)
+	if got.OK == nil || !*got.OK {
+		t.Fatalf("%s: want ok:true, got %v", name, got.OK)
+	}
+	for i, row := range got.Rows {
+		if len(row) != len(got.Columns) {
+			t.Fatalf("%s: row %d has %d cells for %d columns", name, i, len(row), len(got.Columns))
+		}
+	}
+	return got
+}
+
+func TestQueryResponseKeepsEveryValueOfARepeatedColumnName(t *testing.T) {
+	got := decodeQueryFixture(t, "query_duplicate_columns")
+	if len(got.Columns) != 2 || got.Columns[0] != "id" || got.Columns[1] != "id" {
+		t.Fatalf("columns: want [id id], got %v", got.Columns)
+	}
+	if len(got.Rows) != 1 {
+		t.Fatalf("rows: want 1, got %d", len(got.Rows))
+	}
+	row := got.Rows[0]
+	if row[0].IsNull() || *row[0].Text != "1" || row[1].IsNull() || *row[1].Text != "2" {
+		t.Fatalf("row 0: want [1 2], got %+v", row)
+	}
+}
+
+func TestQueryResponseKeepsNullDistinctFromTheEmptyString(t *testing.T) {
+	got := decodeQueryFixture(t, "query_null")
+	if len(got.Rows) != 1 {
+		t.Fatalf("rows: want 1, got %d", len(got.Rows))
+	}
+	row := got.Rows[0]
+	if !row[0].IsNull() {
+		t.Fatalf("a NULL cell decodes as null; got text %q", *row[0].Text)
+	}
+	if row[1].IsNull() || *row[1].Text != "" {
+		t.Fatalf("an empty-string cell decodes as non-null empty text; got %+v", row[1])
+	}
+}
+
+func TestQueryResponseDecodesTheSingleColumnFixture(t *testing.T) {
+	got := decodeQueryFixture(t, "query")
+	if len(got.Rows) != 1 || got.Rows[0][0].IsNull() || *got.Rows[0][0].Text != "1" {
+		t.Fatalf("rows: want [[{text 1}]], got %+v", got.Rows)
+	}
+}
+
+// A cell that is not exactly one known member is refused, never read as a
+// value: a bare null or string (the pre-cell shape), an empty or two-member
+// object, a member repeated under one key, a member this type does not
+// know, or a member carrying the wrong JSON type.
+func TestQueryCellRefusesWhatIsNotOneKnownMember(t *testing.T) {
+	for _, bad := range []string{
+		`null`, `"1"`, `{}`, `{"null": null, "text": "1"}`, `{"integer": "1"}`,
+		`{"null": 0}`, `{"text": null}`, `{"text": 1}`,
+		`{"text": "a", "text": "b"}`, `{"null": null, "null": null}`, `[]`,
+	} {
+		var c QueryCell
+		if err := json.Unmarshal([]byte(bad), &c); err == nil {
+			t.Errorf("%s decoded as %+v, want a refusal", bad, c)
+		}
+	}
+}
+
+// A reply cut short by the row limit carries truncation with the limit that
+// applied; a full reply carries none.
+func TestQueryResponseCarriesTruncationOnlyWhenCut(t *testing.T) {
+	got := decodeQueryFixture(t, "query_truncated")
+	if got.Truncation == nil || got.Truncation.Limit == nil || *got.Truncation.Limit != 1 {
+		t.Fatalf("truncation: want {limit 1}, got %+v", got.Truncation)
+	}
+	if len(got.Rows) != 1 || *got.Rows[0][0].Text != "1" {
+		t.Fatalf("rows: want [[{text 1}]], got %+v", got.Rows)
+	}
+	if full := decodeQueryFixture(t, "query"); full.Truncation != nil {
+		t.Fatalf("a full reply carries no truncation; got %+v", full.Truncation)
+	}
+}
+
+// Text cells holding control characters and NUL survive the decode
+// unchanged.
+func TestQueryCellKeepsControlCharactersAndNul(t *testing.T) {
+	want := "a\x00b\tc\nd\x1fe\u2028"
+	data, err := json.Marshal(QueryCell{Text: &want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got QueryCell
+	if err := json.Unmarshal([]byte(`{"text":"a\u0000b\tc\nd\u001fe\u2028"}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.IsNull() || *got.Text != want {
+		t.Fatalf("decoded %q, want %q", *got.Text, want)
+	}
+	var again QueryCell
+	if err := json.Unmarshal(data, &again); err != nil || *again.Text != want {
+		t.Fatalf("round trip of %s gave %+v, %v", data, again, err)
+	}
+}
+
+// A malformed request limit comes back as the typed limit_out_of_range
+// refusal, its subject the requested value, with no rows.
+func TestQueryResponseDecodesTheLimitRefusal(t *testing.T) {
+	var got QueryResponse
+	data := loadFixture(t, "query_limit_out_of_range").Response
+	if err := strictDecode(data, &got); err != nil {
+		t.Fatalf("strict decode: %v\n%s", err, data)
+	}
+	if got.OK == nil || *got.OK || got.Rows != nil || got.Truncation != nil {
+		t.Fatalf("want ok:false with no rows or truncation, got %+v", got)
+	}
+	r := got.Refusal
+	if r == nil || r.Reason == nil || *r.Reason != QueryRefusalLimitOutOfRange ||
+		r.Action == nil || *r.Action != "limit" || r.Subject == nil || *r.Subject != "-1" {
+		t.Fatalf("want refusal {limit_out_of_range limit -1}, got %+v", r)
+	}
+}

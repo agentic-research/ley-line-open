@@ -10,8 +10,8 @@
 //! This gate runs only when `LLO_PERF_GATES=1` is set in the environment
 //! (same convention as `topology_pass_test.rs`'s gates, per Copilot
 //! finding 9 on PR #20). `task ci` sets the env var; bare `cargo test`
-//! does not — keeps fast-iteration loops snappy while making the local
-//! pre-push gate enforce perf.
+//! does not — keeps fast-iteration loops snappy while making the `task ci`
+//! run whose receipt gates landing enforce perf.
 //!
 //! Two assertions:
 //!

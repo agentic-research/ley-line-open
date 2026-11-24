@@ -1,7 +1,8 @@
 # THE toolchain, for CI and for you.
 #
-# rustup reads this file automatically, so `cargo`, `task ci`, and the pre-push
-# hook all use the same compiler the GitHub runners do. Without it, "green
+# rustup reads this file automatically, so `cargo` and `task ci` (whose
+# receipt gates `task land:integration`) use the same compiler the GitHub
+# runners do. Without it, "green
 # locally" and "green in CI" are different claims — that gap bit PR #259, where
 # `unnecessary_sort_by` in splice-gated code passed `cargo clippy -D warnings`
 # locally (stable 1.94) and failed the runner (nightly).

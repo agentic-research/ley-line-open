@@ -3507,7 +3507,11 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     let ctx = Arc::new(default_test_ctx(ctrl_path.clone()));
     let src = dir.path().join("tree");
     std::fs::create_dir_all(src.join("src")).unwrap();
-    std::fs::write(src.join("src/main.rs"), "fn main() {}\n").unwrap();
+    // Two items a blank line apart: an edit to one does not touch the other,
+    // so the merge below is clean under the driver's git-compatible rule,
+    // where hunks that only touch still conflict (ADR-0045 T5, amended
+    // 2026-11-22).
+    std::fs::write(src.join("src/main.rs"), "fn main() {}\n\nfn other() {}\n").unwrap();
     std::fs::write(src.join("src/old.rs"), "fn old() {}\n").unwrap();
     {
         let guard = ctx.live_db.writer.lock();
@@ -3536,14 +3540,14 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     // so the merge conflicts on the one line both changed (ADR-0045 T5).
     let moved = uds_round_trip(
         &sock_path,
-        r#"{"op": "propose", "writes": [{"path": "src/main.rs", "base": "any", "content": "fn main() { let _ = 1; }\n"}]}"#,
+        r#"{"op": "propose", "writes": [{"path": "src/main.rs", "base": "any", "content": "fn main() { let _ = 1; }\n\nfn other() {}\n"}]}"#,
     )
     .await;
     assert_eq!(moved["ok"], true, "{moved}");
     let stale = uds_round_trip(
         &sock_path,
         &serde_json::json!({"op": "propose", "writes": [
-            {"path": "src/main.rs", "base": base, "content": "fn main() { let _ = 2; }\n"}
+            {"path": "src/main.rs", "base": base, "content": "fn main() { let _ = 2; }\n\nfn other() {}\n"}
         ]})
         .to_string(),
     )
@@ -3556,7 +3560,28 @@ async fn daemon_protocol_gate_proposals_produce_the_fixture_shapes() {
     );
     check("propose", &stale);
 
-    // An edit that touches other lines against the same moved base merges.
+    // An insertion right after the line the other writer changed touches
+    // its hunk: refused `stale`, the conflict naming that line, as git
+    // merges it (ADR-0045 T5, amended 2026-11-22). The refusal changes
+    // nothing, so the merge below still runs against the same base.
+    let adjacent = uds_round_trip(
+        &sock_path,
+        &serde_json::json!({"op": "propose", "writes": [
+            {"path": "src/main.rs", "base": base, "content": "fn main() {}\n// ours\n\nfn other() {}\n"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(adjacent["refusal"]["reason"], "stale", "{adjacent}");
+    assert_eq!(
+        adjacent["refusal"]["moved"][0]["conflicts"],
+        serde_json::json!([{"start": 0, "end": 1}]),
+        "{adjacent}"
+    );
+    check("propose", &adjacent);
+
+    // An edit to a line the other writer's change does not touch (one
+    // unchanged line apart), against the same moved base, merges.
     let merged = uds_round_trip(
         &sock_path,
         &serde_json::json!({"op": "propose", "writes": [

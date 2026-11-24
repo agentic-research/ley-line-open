@@ -90,6 +90,31 @@ impl BrokerConfig {
         self
     }
 
+    /// [`Self::new`] for a path an operator named, refused unless it is an
+    /// existing regular file with an execute bit: a runtime configured with
+    /// anything else would report a connections capability it cannot serve.
+    ///
+    /// This does not prove the file is `leyline-conn-broker`. The operator
+    /// names the binary; the first run's ready report, which must echo the
+    /// document's digest within the bound, is the check that it speaks the
+    /// broker's protocol, and a binary that does not fails that run by name.
+    pub fn executable(binary: impl Into<PathBuf>) -> Result<Self, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = binary.into();
+        match std::fs::metadata(&binary) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+                Ok(Self::new(binary))
+            }
+            Ok(metadata) if metadata.is_file() => Err(format!(
+                "{} is not executable (mode {:o})",
+                binary.display(),
+                metadata.permissions().mode() & 0o7777
+            )),
+            Ok(_) => Err(format!("{} is not a regular file", binary.display())),
+            Err(error) => Err(format!("{}: {error}", binary.display())),
+        }
+    }
+
     /// Treat this host as a delivering tier, for a test that drives the
     /// lifecycle with the unconfined test broker where the shipped one
     /// refuses (Linux). `test-support` only: no shipping build can skip the

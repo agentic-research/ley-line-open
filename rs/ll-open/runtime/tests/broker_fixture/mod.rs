@@ -157,6 +157,7 @@ impl Host {
             &format!(
                 "#!/bin/sh\n\
                  echo $$ > '{pid}'\n\
+                 echo $$ >> '{pid}s'\n\
                  IFS= read -r request\n\
                  run=$(printf '%s' \"$request\" | sed 's/.*\"runId\":\"\\([^\"]*\\)\".*/\\1/')\n\
                  digest=$(printf '%s' \"$request\" | sed 's/.*\"confinementDigest\":\"\\([^\"]*\\)\".*/\\1/')\n\
@@ -208,8 +209,8 @@ impl Host {
         publish(
             &wrapper,
             &format!(
-                "#!/bin/sh\necho $$ > '{}'\n{before}\n{stall}exec '{UNCONFINED}' \"$@\"\n",
-                self.path("broker.pid").display()
+                "#!/bin/sh\necho $$ > '{pid}'\necho $$ >> '{pid}s'\n{before}\n{stall}exec '{UNCONFINED}' \"$@\"\n",
+                pid = self.path("broker.pid").display()
             ),
         );
         let mut config = BrokerConfig::new(wrapper).with_unverified_delivery();
@@ -228,6 +229,16 @@ impl Host {
     /// The pid the broker wrapper recorded, if a broker was ever spawned.
     pub fn broker_pid(&self) -> Option<libc::pid_t> {
         self.pid("broker.pid")
+    }
+
+    /// Every pid the wrapper of that kind recorded, one per spawn
+    /// (`broker` or `worker`).
+    pub fn pids(&self, kind: &str) -> Vec<libc::pid_t> {
+        std::fs::read_to_string(self.path(&format!("{kind}.pids")))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
     }
 
     /// The worker fixture's pid, if a worker was ever spawned.

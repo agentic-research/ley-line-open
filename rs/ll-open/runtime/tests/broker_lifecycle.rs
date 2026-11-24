@@ -576,3 +576,231 @@ fn the_broker_ends_when_the_process_supervising_it_is_killed() {
     gone(broker, "the broker of a supervisor that was killed");
     gone(worker, "the worker of a supervisor that was killed");
 }
+
+// ---------------------------------------------------------------------------
+// The lifeline under concurrent starts (ADR-0046 S7, S11; review C5).
+
+/// How many runs the concurrent embedder starts at once.
+const CONCURRENT: usize = 8;
+
+/// Set in the process [`broker_concurrent_embedder`] runs as: the host
+/// directory and the echo's port, `:`-separated.
+const CONCURRENT_ENV: &str = "LEYLINE_TEST_BROKER_CONCURRENT_EMBEDDER";
+
+/// The embedding process of
+/// `under_concurrent_starts_every_broker_still_ends_with_its_supervisor`:
+/// starts [`CONCURRENT`] runs with connections at the same moment, each with
+/// its own channel directory, says so, and supervises them until it is
+/// killed. The workers IGNORE their own lifeline (they `exec sleep`), so one
+/// that inherited a broker's lifeline write end would hold it open after
+/// this process is gone. Not a test on its own.
+#[test]
+#[ignore = "the embedding process of a lifeline test; run by that test"]
+fn broker_concurrent_embedder() {
+    let Some(fixture) = std::env::var_os(CONCURRENT_ENV) else {
+        return;
+    };
+    let fixture = fixture.into_string().expect("UTF-8");
+    let (root, port) = fixture.split_once(':').expect("root:port");
+    let port: u16 = port.parse().expect("port");
+    let host = Host {
+        dir: tempfile::TempDir::with_prefix_in("embedder", root).unwrap(),
+    };
+    std::fs::create_dir(host.path("cas")).unwrap();
+    std::fs::create_dir(host.path("runs")).unwrap();
+    let service = ExecutionService::new(host.backend("exec sleep 600"))
+        .with_connection_broker(host.broker(None));
+    let channels: Vec<_> = (0..CONCURRENT).map(|_| channel_dir()).collect();
+    let barrier = std::sync::Barrier::new(CONCURRENT);
+    std::thread::scope(|scope| {
+        for (index, (_, dir)) in channels.iter().enumerate() {
+            let (service, barrier) = (&service, &barrier);
+            scope.spawn(move || {
+                let granted = manifest(vec![native_grant(dir, "api")]);
+                // Every start leaves the barrier together, so brokers and
+                // workers are spawned on overlapping threads.
+                barrier.wait();
+                service
+                    .start_with_connections(
+                        request(&format!("run-{index}"), Some(&granted)),
+                        connections(dir, &["api"], "127.0.0.1", port),
+                    )
+                    .expect("a concurrent run starts");
+            });
+        }
+    });
+    println!("EMBEDDER-STARTED {}", host.dir.path().display());
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Every pipe end `pid` holds, as the kernel names it: on macOS `lsof`'s
+/// address of the end itself; on Linux the pipe's inode, which both ends
+/// share.
+fn pipe_ends(pid: libc::pid_t) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap_or_else(|error| panic!("list the descriptors of {pid}: {error}"))
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .map(|link| link.display().to_string())
+            .filter(|link| link.starts_with("pipe:"))
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        lsof_pipes(pid).into_iter().map(|(_, end, _)| end).collect()
+    }
+}
+
+/// `lsof`'s PIPE rows for `pid`: the descriptor, this end's address and the
+/// other end's.
+#[cfg(not(target_os = "linux"))]
+fn lsof_pipes(pid: libc::pid_t) -> Vec<(String, String, String)> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-n", "-P", "-p", &pid.to_string()])
+        .output()
+        .expect("run lsof");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            // COMMAND PID USER FD TYPE DEVICE SIZE/OFF NAME, NAME `->0x…`.
+            (columns.get(4) == Some(&"PIPE")).then(|| {
+                (
+                    columns[3].trim_end_matches(char::is_alphabetic).to_owned(),
+                    columns[5].to_owned(),
+                    columns.last().unwrap().trim_start_matches("->").to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// What names the WRITE end of `broker`'s lifeline (its descriptor 3 is the
+/// read end): on macOS that end's own address, on Linux the pipe's inode.
+fn lifeline_write_end(broker: libc::pid_t) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{broker}/fd/3"))
+            .unwrap_or_else(|error| panic!("the lifeline of broker {broker}: {error}"))
+            .display()
+            .to_string()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        lsof_pipes(broker)
+            .into_iter()
+            .find(|(descriptor, _, _)| descriptor == "3")
+            .map(|(_, _, other_end)| other_end)
+            .unwrap_or_else(|| panic!("broker {broker} holds no pipe at descriptor 3"))
+    }
+}
+
+/// N concurrent starts leave each broker's lifeline write end held by the
+/// supervising process alone (ADR-0046 S7, S11). Asked of the kernel: no
+/// worker and no other broker holds the write end of any broker's lifeline.
+/// The workers ignore their own lifeline, so they are still there to be
+/// asked, and to hold open whatever they inherited. Then the supervising
+/// process is killed and every broker ends, with every worker still alive.
+///
+/// The second half alone would not prove the first: a broker also ends when
+/// its control pipe closes, so a leaked lifeline would go unseen.
+#[test]
+fn under_concurrent_starts_every_broker_still_ends_with_its_supervisor() {
+    let _serial = common::serial();
+    let scratch = tempfile::TempDir::new().expect("scratch");
+    let mut embedder = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "broker_concurrent_embedder",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            CONCURRENT_ENV,
+            format!("{}:{}", scratch.path().display(), echo()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the embedding process");
+    let _embedder_cleanup = KillOnDrop(embedder.id() as libc::pid_t);
+
+    // EVENT: every start has returned in the embedder.
+    let (sender, started) = std::sync::mpsc::channel();
+    let stdout = embedder.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, directory)) = line.split_once("EMBEDDER-STARTED ") {
+                let _ = sender.send(directory.to_owned());
+                return;
+            }
+        }
+    });
+    let directory = PathBuf::from(
+        started
+            .recv_timeout(BOUND)
+            .expect("TIMEOUT: the embedder's starts never returned"),
+    );
+    let pids = |kind: &str| -> Vec<libc::pid_t> {
+        std::fs::read_to_string(directory.join(format!("{kind}.pids")))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    };
+    let (brokers, workers) = (pids("broker"), pids("worker"));
+    let _cleanup: Vec<KillOnDrop> = brokers
+        .iter()
+        .chain(&workers)
+        .map(|pid| KillOnDrop(*pid))
+        .collect();
+    assert_eq!(brokers.len(), CONCURRENT, "one broker per run");
+    assert_eq!(workers.len(), CONCURRENT, "one worker per run");
+    for pid in brokers.iter().chain(&workers) {
+        assert!(alive(*pid), "{pid} is running under its supervisor");
+    }
+    // One listing per process, taken while all of them are alive.
+    let held: Vec<(libc::pid_t, Vec<String>)> = workers
+        .iter()
+        .chain(&brokers)
+        .map(|pid| (*pid, pipe_ends(*pid)))
+        .collect();
+    let supervisor = pipe_ends(embedder.id() as libc::pid_t);
+    for broker in &brokers {
+        let write_end = lifeline_write_end(*broker);
+        for (other, ends) in held.iter().filter(|(other, _)| other != broker) {
+            assert!(
+                !ends.contains(&write_end),
+                "process {other} inherited the write end ({write_end}) of broker {broker}'s \
+                 lifeline; only the supervisor may hold it"
+            );
+        }
+        // The control: the supervisor does hold it.
+        assert!(
+            supervisor.contains(&write_end),
+            "the supervisor holds the write end of broker {broker}'s lifeline"
+        );
+    }
+
+    // SAFETY: a signal to the embedder this test spawned.
+    assert_eq!(
+        unsafe { libc::kill(embedder.id() as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    embedder.wait().expect("reap the embedder");
+    // EVENT: each broker's exit, bounded.
+    for broker in &brokers {
+        gone(*broker, "a broker whose supervisor was killed");
+    }
+    // The workers outlived it all: none of them was what ended a broker, and
+    // none of them held a broker's lifeline open.
+    for worker in &workers {
+        assert!(
+            alive(*worker),
+            "worker {worker} ignores its lifeline and must still be running"
+        );
+    }
+}

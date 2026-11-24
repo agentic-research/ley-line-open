@@ -123,7 +123,8 @@ enum Cmd {
         /// The connection broker executable, leyline-conn-broker (ADR-0046
         /// Slice 1). With it the daemon serves a grant's connections and
         /// advertises `cloister/execution/v1/connections`; without it a grant
-        /// with connections is refused by name. It must be an existing file.
+        /// with connections is refused by name. It must be an existing
+        /// executable file, or the daemon refuses to start.
         #[arg(long, value_name = "PATH")]
         connection_broker: Option<PathBuf>,
 
@@ -549,16 +550,15 @@ async fn main() -> Result<()> {
                     worker.display()
                 );
             }
-            // A named broker that is not there is a startup error: the daemon
-            // would advertise connections it cannot serve.
-            let connection_broker = match connection_broker {
-                Some(path) if !path.is_file() => bail!(
-                    "--connection-broker is not an executable file: {}",
-                    path.display()
-                ),
-                Some(path) => Some(leyline_runtime::BrokerConfig::new(path)),
-                None => None,
-            };
+            // A named broker that is missing or not executable is a startup
+            // error: the daemon would advertise connections it cannot serve.
+            let connection_broker = connection_broker
+                .map(|path| {
+                    leyline_runtime::BrokerConfig::executable(path).map_err(|reason| {
+                        anyhow::anyhow!("--connection-broker is not an executable file: {reason}")
+                    })
+                })
+                .transpose()?;
             // Both tiers materialize each run's rootfs beneath `run_root`.
             let (storage, run_root) =
                 execution_cas_storage(cas_root, cas_volume, cas_volume_size_cap_gib, run_root)?;

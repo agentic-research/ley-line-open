@@ -856,7 +856,14 @@ mod tests {
     /// as an id. `kill(-pid)` therefore fails with ESRCH and only the
     /// fallback can reach it. That makes the group kill's error check the
     /// entire subject of this test: invert it, or make it never match, and
-    /// this child outlives the call.
+    /// nothing signals this child.
+    ///
+    /// The assertion is HOW the child died, not that it is gone.
+    /// `terminate_process_group` waits for the leader's exit before its
+    /// second sweep, so with the fallback broken it returns only once the
+    /// fixture has slept its 30 seconds out and exited 0 on its own: "the
+    /// child is gone after the call" then holds either way, and only the
+    /// `SIGKILL` in its status tells the two apart.
     ///
     /// The comment on `terminate_process_group` claims the fallback "still
     /// reaps a worker if group setup failed at the OS boundary". Nothing
@@ -864,6 +871,7 @@ mod tests {
     /// the group first, so they all exercise the success path.
     #[test]
     fn terminating_a_worker_with_no_group_of_its_own_falls_back_to_the_pid() {
+        use std::os::unix::process::ExitStatusExt;
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -874,11 +882,13 @@ mod tests {
 
         let status = child
             .wait_timeout(Duration::from_secs(5))
-            .expect("wait on the fixture");
-        assert!(
-            status.is_some(),
-            "the direct-pid fallback must reap a worker that has no process \
-             group of its own; without it this child sleeps out the timeout"
+            .expect("wait on the fixture")
+            .expect("the fixture has exited once the call returns");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the direct-pid fallback must kill a worker that has no process \
+             group of its own; this one ended on its own instead: {status}"
         );
     }
 

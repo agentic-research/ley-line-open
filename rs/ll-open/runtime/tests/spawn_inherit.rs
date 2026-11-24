@@ -7,8 +7,9 @@
 //! and `fcntl(FD_CLOEXEC)`: a spawn that let anything unnamed cross the exec
 //! would hand every sibling's write end to every child. Once every child has
 //! exec'd, each write end is held only by this process and its own child,
-//! and a descriptor this process holds without close-on-exec, and names to
-//! no child, is absent in every child.
+//! a descriptor this process holds without close-on-exec, and names to no
+//! child, is absent in every child, and every child's descriptors are its
+//! standard streams and the one it was named, nothing more (ADR-0046 S11).
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -246,7 +247,17 @@ fn concurrent_spawns_each_inherit_only_their_own_write_end() {
             "write end {id} must be held only by this process and child {}",
             child.id()
         );
-        let in_child = open_fds(child.id());
+        // The whole of what the child holds: its three standard streams and
+        // the one descriptor it was named, with sixteen spawns in flight at
+        // once and nothing else, named or not, from this process.
+        let mut in_child = open_fds(child.id());
+        in_child.sort();
+        assert_eq!(
+            in_child,
+            [0, 1, 2, CHILD_FD],
+            "child {} holds a descriptor it was not given",
+            child.id()
+        );
         assert!(
             !in_child.contains(&stray.as_raw_fd()),
             "child {} holds descriptor {}, which nothing named: {in_child:?}",

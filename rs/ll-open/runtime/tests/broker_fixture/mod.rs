@@ -253,3 +253,22 @@ pub fn fifo(path: &Path) {
     // SAFETY: a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(text.as_ptr(), 0o600) }, 0, "mkfifo");
 }
+
+/// Ends the whole test binary, failed, when a test that can only hang on a
+/// defect (a cancel that waits on a start that never ends) outlives its
+/// bound. Dropping it disarms it. The bound is a failure's: nothing waits on
+/// it when the code is right.
+pub struct Watchdog(std::sync::mpsc::Sender<()>);
+
+pub fn watchdog(test: &'static str) -> Watchdog {
+    let (disarm, armed) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if armed.recv_timeout(Duration::from_secs(45))
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            eprintln!("TIMEOUT: {test} is stuck; a cancel or a start never returned");
+            std::process::exit(101);
+        }
+    });
+    Watchdog(disarm)
+}

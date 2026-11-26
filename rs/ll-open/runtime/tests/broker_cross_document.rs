@@ -587,6 +587,12 @@ fn the_registry_keeps_one_run_from_another_runs_broker() {
     assert!(!std::path::Path::new(&endpoint(&dir, "api")).exists());
     let error = start_b().expect_err("A's endpoint is still reserved");
     assert!(error.detail.contains("another run (run-a4)"), "{error}");
+    // A second cancel that fails changes nothing: still reserved.
+    backend
+        .cancel("run-a4")
+        .expect_err("the cancel fails again");
+    let error = start_b().expect_err("reserved until a cancel succeeds");
+    assert!(error.detail.contains("another run (run-a4)"), "{error}");
     probe.cancel_fails.store(false, Ordering::SeqCst);
     assert!(backend.cancel("run-a4").expect("cancel A"));
     assert!(backend.take_connections("run-a4").is_some());
@@ -818,6 +824,9 @@ fn a_failure_after_ready_tears_down_only_what_the_broker_bound() {
 #[test]
 fn a_cancel_during_step_five_is_honored_before_the_run_is_published() {
     let _serial = common::serial();
+    let _watchdog = broker_fixture::watchdog(
+        "a_cancel_during_step_five_is_honored_before_the_run_is_published",
+    );
     let host = Host::new();
     let (_keep, dir) = channel_dir();
     let declared = connections(&dir, &["api"], "127.0.0.1", echo());
@@ -870,6 +879,7 @@ fn a_cancel_during_step_five_is_honored_before_the_run_is_published() {
 #[test]
 fn a_service_cancel_waits_for_the_starting_run_to_end() {
     let _serial = common::serial();
+    let _watchdog = broker_fixture::watchdog("a_service_cancel_waits_for_the_starting_run_to_end");
     let (entered, in_start) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
@@ -1012,6 +1022,8 @@ fn connections_nothing_serves_are_refused_by_name_on_every_path() {
 #[test]
 fn a_cancel_during_a_no_connections_start_keeps_its_registration() {
     let _serial = common::serial();
+    let _watchdog =
+        broker_fixture::watchdog("a_cancel_during_a_no_connections_start_keeps_its_registration");
     let host = Host::new();
     let (_keep, dir) = channel_dir();
     let (entered, in_start) = mpsc::channel();
@@ -1131,6 +1143,8 @@ fn a_refused_start_whose_cancel_failed_is_recorded_failed_until_cleanup() {
 #[test]
 fn a_cancel_received_before_the_broker_spawn_starts_nothing() {
     let _serial = common::serial();
+    let _watchdog =
+        broker_fixture::watchdog("a_cancel_received_before_the_broker_spawn_starts_nothing");
     let host = Host::new();
     let (_keep, dir) = channel_dir();
     let declared = connections(&dir, &["api"], "127.0.0.1", echo());
@@ -1249,6 +1263,7 @@ fn a_broker_that_fails_to_bind_leaves_a_foreign_socket_alone() {
 #[test]
 fn a_panic_in_the_wrapped_start_tears_the_broker_down() {
     let _serial = common::serial();
+    let _watchdog = broker_fixture::watchdog("a_panic_in_the_wrapped_start_tears_the_broker_down");
     let host = Host::new();
     let (_keep, dir) = channel_dir();
     let declared = connections(&dir, &["api"], "127.0.0.1", echo());
@@ -1344,4 +1359,38 @@ fn a_run_id_reused_on_the_direct_path_replaces_the_untaken_outcome() {
         backend.take_connections("run-again").is_none(),
         "taken once"
     );
+}
+
+/// `BrokerConfig::executable`, the check behind `--connection-broker`: an
+/// existing regular file with an execute bit, or a refusal that says which
+/// of those it is not.
+#[test]
+fn a_broker_path_must_be_an_executable_regular_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = Host::new();
+    let file = host.path("candidate");
+    std::fs::write(&file, "#!/bin/sh\n").expect("file");
+    let mode = |mode: u32| {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("mode");
+        leyline_runtime::BrokerConfig::executable(&file)
+    };
+    for executable in [0o755, 0o700, 0o100, 0o010, 0o001] {
+        let config = mode(executable).unwrap_or_else(|error| panic!("{executable:o}: {error}"));
+        assert_eq!(config.binary, file);
+        assert_eq!(config, leyline_runtime::BrokerConfig::new(&file));
+    }
+    for plain in [0o644, 0o600, 0o000] {
+        let error = mode(plain).expect_err("no execute bit");
+        assert!(
+            error.contains(&format!("is not executable (mode {plain:o})")),
+            "{plain:o}: {error}"
+        );
+    }
+    // A directory has execute bits and is not a file.
+    let directory =
+        leyline_runtime::BrokerConfig::executable(host.dir.path()).expect_err("a directory");
+    assert!(directory.contains("is not a regular file"), "{directory}");
+    let missing =
+        leyline_runtime::BrokerConfig::executable(host.path("missing")).expect_err("nothing there");
+    assert!(missing.contains("missing"), "{missing}");
 }

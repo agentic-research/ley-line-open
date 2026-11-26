@@ -157,6 +157,9 @@ fn round_trip(endpoint: &str, payload: &[u8]) -> UnixStream {
 #[test]
 fn cancel_during_a_stalled_ready_wait_leaves_no_broker_and_no_endpoint() {
     let _serial = common::serial();
+    let _watchdog = broker_fixture::watchdog(
+        "cancel_during_a_stalled_ready_wait_leaves_no_broker_and_no_endpoint",
+    );
     let host = Host::new();
     let (_keep, dir) = channel_dir();
     let stalled = host.path("stalled");

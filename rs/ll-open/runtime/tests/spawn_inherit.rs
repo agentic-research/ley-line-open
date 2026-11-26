@@ -154,6 +154,51 @@ fn open_fds(pid: u32) -> Vec<RawFd> {
     }
 }
 
+/// Those of `in_child`, the descriptors `pid` (a `cat` spawned with
+/// [`CHILD_FD`]) holds, that it was not named and that came from this
+/// process, each with what it is.
+///
+/// macOS: every one beyond the standard streams and [`CHILD_FD`]. The
+/// kernel builds the child from the file actions and `/bin/cat` opens
+/// nothing itself.
+///
+/// Linux: those that are also something this process holds (the same
+/// `/proc/<pid>/fd` link: the same pipe, socket or path). `cat` may open
+/// descriptors of its own after its exec (the Rust coreutils `cat` of
+/// Ubuntu 26.04 makes a pipe to `splice` through), and `/proc` does not say
+/// which descriptors crossed the exec; a pipe `cat` made is one this
+/// process never held.
+fn inherited_without_being_named(pid: u32, in_child: &[RawFd]) -> Vec<(RawFd, String)> {
+    let not_named = in_child
+        .iter()
+        .copied()
+        .filter(|fd| ![0, 1, 2, CHILD_FD].contains(fd));
+    #[cfg(target_os = "linux")]
+    {
+        let link = |pid: u32, fd: RawFd| std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok();
+        let me = std::process::id();
+        let mine: Vec<std::path::PathBuf> = open_fds(me)
+            .into_iter()
+            .filter(|fd| *fd > 2)
+            .filter_map(|fd| link(me, fd))
+            .collect();
+        not_named
+            .filter_map(|fd| {
+                let held = link(pid, fd)?;
+                mine.contains(&held)
+                    .then(|| (fd, held.display().to_string()))
+            })
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = pid;
+        not_named
+            .map(|fd| (fd, "cat opens nothing itself".to_owned()))
+            .collect()
+    }
+}
+
 /// Clear `fd`'s close-on-exec flag.
 fn clear_cloexec(fd: RawFd) {
     // SAFETY: fcntl on a descriptor the caller owns; no memory is passed.
@@ -247,15 +292,21 @@ fn concurrent_spawns_each_inherit_only_their_own_write_end() {
             "write end {id} must be held only by this process and child {}",
             child.id()
         );
-        // The whole of what the child holds: its three standard streams and
-        // the one descriptor it was named, with sixteen spawns in flight at
-        // once and nothing else, named or not, from this process.
-        let mut in_child = open_fds(child.id());
-        in_child.sort();
-        assert_eq!(
-            in_child,
-            [0, 1, 2, CHILD_FD],
-            "child {} holds a descriptor it was not given",
+        // The whole of what the child holds, with sixteen spawns in flight
+        // at once: its three standard streams, the one descriptor it was
+        // named, and nothing else that came from this process.
+        let in_child = open_fds(child.id());
+        for given in [0, 1, 2, CHILD_FD] {
+            assert!(
+                in_child.contains(&given),
+                "child {} lacks descriptor {given}: {in_child:?}",
+                child.id()
+            );
+        }
+        let not_given = inherited_without_being_named(child.id(), &in_child);
+        assert!(
+            not_given.is_empty(),
+            "child {} holds descriptors it was not given: {not_given:?} (all: {in_child:?})",
             child.id()
         );
         assert!(

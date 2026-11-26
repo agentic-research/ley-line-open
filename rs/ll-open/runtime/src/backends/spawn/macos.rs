@@ -67,6 +67,8 @@ pub(super) fn spawn(request: &Spawn<'_>) -> io::Result<Spawned> {
     let mut actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
     check(unsafe { libc::posix_spawn_file_actions_init(&mut actions) })?;
     let mut actions = Destroyed(actions, libc::posix_spawn_file_actions_destroy);
+    // SAFETY: as for the file actions above: zeroed storage its init call
+    // overwrites, wrapped only once that has succeeded.
     let mut attributes: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
     check(unsafe { libc::posix_spawnattr_init(&mut attributes) })?;
     let mut attributes = Destroyed(attributes, libc::posix_spawnattr_destroy);

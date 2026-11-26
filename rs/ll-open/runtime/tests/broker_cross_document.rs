@@ -593,6 +593,14 @@ fn the_registry_keeps_one_run_from_another_runs_broker() {
         .expect_err("the cancel fails again");
     let error = start_b().expect_err("reserved until a cancel succeeds");
     assert!(error.detail.contains("another run (run-a4)"), "{error}");
+    // Nor is the run's own id free while its workload may be alive: refused
+    // by this layer's own account of the run, before anything else looks.
+    let error = start(&backend, "run-a4", Some(&own), &declared).expect_err("run id in use");
+    assert_eq!(error.code, ErrorCode::ResourceConflict, "{error}");
+    assert!(
+        error.detail.contains("run run-a4 already holds endpoints"),
+        "{error}"
+    );
     // Taking the outcome does not release the reservation either.
     assert!(backend.take_connections("run-a4").is_some());
     assert!(backend.take_connections("run-a4").is_none(), "taken once");
@@ -1590,6 +1598,10 @@ fn a_run_id_is_refused_while_its_previous_teardown_is_in_progress() {
             )
             .expect_err("the run id is in teardown");
         assert_eq!(error.code, ErrorCode::ResourceConflict, "{error}");
+        assert!(
+            error.detail.contains("its teardown is in progress"),
+            "{error}"
+        );
         // SAFETY: as above.
         assert_eq!(unsafe { libc::kill(broker, libc::SIGKILL) }, 0);
         assert!(cancelling.join().unwrap().expect("cancel"));

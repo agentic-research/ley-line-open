@@ -926,7 +926,8 @@ life is thus in the receipt (S8).
 - **What the supervisor unlinks.** Never a socket the broker did not bind, as far as it can
   know. A ready report names each bound socket by device and inode; the supervisor
   believes it only about the document's own endpoint paths (a report naming any other path
-  refuses the start) and unlinks a path only while it is still that node. A broker that
+  refuses the start, and so does one that names fewer endpoints than the document
+  declares) and unlinks a path only while it is still that node. A broker that
   fails before ready unlinks what it bound itself, while it still can, and reports the
   error; the supervisor then unlinks nothing, so a socket another process bound at an
   endpoint after the preflight (the cause of an `EADDRINUSE`) is left alone. Only a broker
@@ -935,13 +936,17 @@ life is thus in the receipt (S8).
   then each declared endpoint path that holds a socket node is unlinked. That can remove a
   socket a same-uid process bound there after the preflight (the S10 residual; it is
   indistinguishable); it cannot remove a non-socket or any path the document does not
-  declare. A broker that fails after confining itself cannot unlink, names the sockets it
-  left, and the next run naming them is refused "endpoint exists".
+  declare. A broker that fails after confining itself cannot unlink: its error report
+  carries what it bound, by device and inode, and the supervisor, which is not confined,
+  unlinks those nodes under the same two rules as for a ready report.
 - **A broker exit during the run** is seen by the thread reading the broker's reports: it
   reaches end-of-file and fails the run at once, cancelling the workload without waiting
   for a poll. A poll made while that is in progress waits for it. The run's terminal state is
   `failed`, and its outcome keeps every record reported before the exit with `complete`
   false.
+- **A cancel after the broker died.** A broker exit during the run is the run's failure
+  (D7 rule 5), and a cancel that arrives after it does not change that: the cancel answers
+  that no active run was left, and the run's terminal state is `failed`, not `cancelled`.
 - **Order at a terminal state.** The workload ends first (it exited, or the cancel killed
   it), then the drain, so a connection that was open when the workload ended has its final
   record and `complete` is true.
@@ -966,7 +971,7 @@ life is thus in the receipt (S8).
   certainly unreaped, so a cancel never signals a recycled pid.
 - **The broker binary's path** is configuration: `BrokerConfig` for an embedder,
   `execution-daemon --connection-broker` for the daemon, which refuses to start unless the
-  path is an existing regular file with an execute bit. Nothing verifies that the file is
+  path is an existing regular file the daemon itself may execute (`access(2)`, `X_OK`). Nothing verifies that the file is
   `leyline-conn-broker`: the operator names the binary, and the first run's ready report
   (the document's digest echoed within the bound) is the check that it speaks the broker's
   protocol; a binary that does not fails that run by name, having been handed only the

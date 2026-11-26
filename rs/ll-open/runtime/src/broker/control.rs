@@ -84,8 +84,14 @@ pub enum Event {
         open: bool,
     },
     Drained,
+    /// `bound` is what the broker had bound and could not unlink itself
+    /// (it fails after confining itself): the supervisor unlinks those
+    /// nodes, by device and inode. Empty, and absent on the wire, when the
+    /// broker bound nothing or unlinked its own.
     Error {
         detail: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bound: Vec<Bound>,
     },
 }
 
@@ -264,7 +270,13 @@ where
 {
     let refuse = |detail: String| {
         let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(line(&Event::Error { detail }).as_bytes());
+        let _ = stdout.write_all(
+            line(&Event::Error {
+                detail,
+                bound: Vec::new(),
+            })
+            .as_bytes(),
+        );
         let _ = stdout.flush();
         2
     };
@@ -332,6 +344,7 @@ where
     let fail = |detail: String| {
         emit(&Event::Error {
             detail: detail.clone(),
+            bound: Vec::new(),
         });
         Err(detail)
     };
@@ -396,14 +409,16 @@ where
         sender,
     ) {
         Ok(handle) => handle,
-        // Confined by now, so this process can no longer unlink: the
-        // sockets it bound stay, named here, and the next run naming them is
-        // refused "endpoint exists" until they are removed.
+        // Confined by now, so this process can no longer unlink. The error
+        // report carries what it bound, by device and inode, and the
+        // supervisor, which is not confined, unlinks exactly those nodes.
         Err(error) => {
-            let left: Vec<&str> = bound.iter().map(|socket| socket.path.as_str()).collect();
-            return fail(format!(
-                "start relay: {error}; this broker bound and could not unlink {left:?}"
-            ));
+            let detail = format!("start relay: {error}");
+            emit(&Event::Error {
+                detail: detail.clone(),
+                bound,
+            });
+            return Err(detail);
         }
     };
     emit(&Event::Ready {
@@ -431,7 +446,10 @@ where
                 Ok(Request::Drain) => break,
                 Ok(Request::Peer { pid }) => {
                     if let Err(detail) = handle.set_peer_pid(pid) {
-                        emit(&Event::Error { detail });
+                        emit(&Event::Error {
+                            detail,
+                            bound: Vec::new(),
+                        });
                     }
                 }
                 _ => {}
@@ -512,6 +530,7 @@ impl BrokerProcess {
                 let Ok(line) = line else { break };
                 let event = serde_json::from_str(&line).unwrap_or_else(|error| Event::Error {
                     detail: format!("unreadable broker event {line:?}: {error}"),
+                    bound: Vec::new(),
                 });
                 if sender.send(event).is_err() {
                     break;
@@ -577,7 +596,7 @@ impl BrokerProcess {
                     };
                     let foreign = bound.iter().find(|socket| !declared(&socket.path));
                     let foreign = foreign.map(|socket| socket.path.clone());
-                    // Kept before the digest check: a broker that bound
+                    // Kept before the checks below: a broker that bound
                     // sockets and then disagreed still leaves them to unlink.
                     self.bound = bound
                         .into_iter()
@@ -589,6 +608,21 @@ impl BrokerProcess {
                              endpoint of the document it was sent"
                         )));
                     }
+                    // And every endpoint, not some: a broker that is not
+                    // listening at one is a declared connection that would
+                    // never be served.
+                    if let Some(missing) = document.connections().iter().find(|connection| {
+                        !self
+                            .bound
+                            .iter()
+                            .any(|socket| socket.path == connection.endpoint_unix)
+                    }) {
+                        return Err(ExecutionError::identity_mismatch(format!(
+                            "connection `{}`: the connection broker reported ready and did \
+                             not report binding its endpoint {}",
+                            missing.name, missing.endpoint_unix
+                        )));
+                    }
                     if connections_digest == expected {
                         return Ok(());
                     }
@@ -596,8 +630,20 @@ impl BrokerProcess {
                         "connection broker attested {connections_digest}, but the grant's connectionsDigest is {expected}"
                     )));
                 }
-                Ok(Event::Error { detail }) => {
+                Ok(Event::Error { detail, bound }) => {
                     self.reported = true;
+                    // What it could not unlink itself: believed, like a ready
+                    // report, only about the document's own endpoints, and
+                    // unlinked at shutdown by device and inode.
+                    self.bound = bound
+                        .into_iter()
+                        .filter(|socket| {
+                            document
+                                .connections()
+                                .iter()
+                                .any(|connection| connection.endpoint_unix == socket.path)
+                        })
+                        .collect();
                     return Err(ExecutionError::backend(format!(
                         "connection broker: {detail}"
                     )));

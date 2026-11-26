@@ -665,6 +665,13 @@ fn lsof_pipes(pid: libc::pid_t) -> Vec<(String, String, String)> {
         .args(["-n", "-P", "-p", &pid.to_string()])
         .output()
         .expect("run lsof");
+    // A listing that failed proves nothing about what the process holds.
+    assert!(
+        output.status.success(),
+        "lsof -p {pid} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
@@ -772,6 +779,12 @@ fn under_concurrent_starts_every_broker_still_ends_with_its_supervisor() {
         .map(|pid| (*pid, pipe_ends(*pid)))
         .collect();
     let supervisor = pipe_ends(embedder.id() as libc::pid_t);
+    // Every process was listed and holds pipes (a worker its standard input
+    // and error, a broker its control pipe and lifeline): an empty listing
+    // would pass the check below without having looked.
+    for (pid, ends) in &held {
+        assert!(!ends.is_empty(), "no pipe was listed for process {pid}");
+    }
     for broker in &brokers {
         let write_end = lifeline_write_end(*broker);
         for (other, ends) in held.iter().filter(|(other, _)| other != broker) {

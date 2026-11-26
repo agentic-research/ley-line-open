@@ -1378,15 +1378,28 @@ fn a_broker_path_must_be_an_executable_regular_file() {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("mode");
         leyline_runtime::BrokerConfig::executable(&file)
     };
-    for executable in [0o755, 0o700, 0o100, 0o010, 0o001] {
+    for executable in [0o755, 0o700, 0o100] {
         let config = mode(executable).unwrap_or_else(|error| panic!("{executable:o}: {error}"));
         assert_eq!(config.binary, file);
         assert_eq!(config, leyline_runtime::BrokerConfig::new(&file));
     }
-    for plain in [0o644, 0o600, 0o000] {
-        let error = mode(plain).expect_err("no execute bit");
+    // What counts is whether THIS process may execute it. The file is this
+    // uid's, so an execute bit for the group or for others alone does not
+    // let the daemon run it (root may execute a file with any execute bit,
+    // so those two rows are not asked of root).
+    // SAFETY: geteuid cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    let unusable: &[u32] = if root {
+        &[0o644, 0o600, 0o000]
+    } else {
+        &[0o644, 0o600, 0o000, 0o010, 0o001, 0o011]
+    };
+    for &plain in unusable {
+        let error = mode(plain).expect_err("this process cannot execute it");
         assert!(
-            error.contains(&format!("is not executable (mode {plain:o})")),
+            error.contains(&format!(
+                "is not executable by this process (mode {plain:o})"
+            )),
             "{plain:o}: {error}"
         );
     }
@@ -1451,4 +1464,138 @@ fn a_peer_runs_registration_follows_its_workload() {
     // drained and its endpoint unlinked.)
     assert!(!backend.cancel("run-a").expect("cancel"));
     assert!(!Path::new(&endpoint(&dir, "api")).exists());
+}
+
+/// Second review, item 1. A panic in the wrapped start of a run WITHOUT
+/// connections does not leave a registration nothing can release: the run's
+/// §6 grant stays reserved (its workload's state is unknown) until one
+/// cancel, which releases it.
+#[test]
+fn a_panic_in_a_peer_runs_start_is_released_by_one_cancel() {
+    let _serial = common::serial();
+    let _watchdog = broker_fixture::watchdog("a_panic_in_a_peer_runs_start");
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    let mut probe = Probe::new(BackendClass::Native).on_start(|request, _| {
+        if request.run_id == "run-panic" {
+            panic!("the backend panicked");
+        }
+        Ok(())
+    });
+    // As a backend answers for a run it never published.
+    probe.cancel_answer = false;
+    let backend = Brokered::new(probe, host.broker(None));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.start(
+            &request("run-panic", Some(&granted)),
+            ServedWorkspaces::none(),
+            RunConnections::none(),
+        )
+    }));
+    assert!(panicked.is_err(), "the panic propagates");
+    // Reserved while the workload's state is unknown.
+    let error = start(&backend, "run-a", Some(&granted), &declared).expect_err("reserved");
+    assert!(
+        error.detail.contains("held by another run (run-panic)"),
+        "{error}"
+    );
+    // One cancel releases it, whatever the backend answers.
+    assert!(!backend.cancel("run-panic").expect("cancel"));
+    start(&backend, "run-a", Some(&granted), &declared).expect("the grant is released");
+    backend.cancel("run-a").expect("cancel");
+    // And the run id is free again.
+    backend
+        .start(
+            &request("run-panic-2", Some(&granted)),
+            ServedWorkspaces::none(),
+            RunConnections::none(),
+        )
+        .expect("a peer run starts");
+}
+
+/// Second review, item 6. A cancel that arrives after the run's broker died
+/// does not turn the run's failure into a cancellation: the cancel answers
+/// "no active run", and the next poll reports the failure (ADR-0046 D7 rule
+/// 5, a broker exit during the run is a run failure).
+#[test]
+fn a_cancel_after_the_broker_died_leaves_the_runs_failure_to_the_poll() {
+    let _serial = common::serial();
+    let _watchdog = broker_fixture::watchdog("a_cancel_after_the_broker_died");
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    let (cancelled, cancel_seen) = mpsc::channel();
+    let mut probe = Probe::new(BackendClass::Native);
+    probe.cancelled = Some(cancelled);
+    let backend = Brokered::new(probe.clone(), host.broker(None));
+    start(&backend, "run-dead", Some(&granted), &declared).expect("started");
+    let broker = host.broker_pid().expect("broker pid");
+    // SAFETY: a signal to the broker this test's backend spawned.
+    assert_eq!(unsafe { libc::kill(broker, libc::SIGKILL) }, 0);
+    // EVENT: the broker's end has been seen and the workload cancelled for it.
+    cancel_seen
+        .recv_timeout(broker_fixture::BOUND)
+        .expect("the workload is cancelled when its broker dies");
+    assert!(
+        !backend.cancel("run-dead").expect("cancel"),
+        "the run already failed: there is nothing left to cancel"
+    );
+    match backend.poll("run-dead").expect("poll") {
+        Some(BackendRunStatus::Failed(error)) => {
+            assert!(error.detail.contains("connection broker exited"), "{error}");
+        }
+        other => panic!("the run's failure was lost to the cancel: {other:?}"),
+    }
+    let outcome = backend.take_connections("run-dead").expect("outcome");
+    assert!(!outcome.connections[0].complete);
+}
+
+/// Second review, the run-id look. While a run's teardown is in progress,
+/// its run id is not free: a peer run under the same id is refused rather
+/// than registered over the teardown, which would leak its registration.
+#[test]
+fn a_run_id_is_refused_while_its_previous_teardown_is_in_progress() {
+    let _serial = common::serial();
+    let _watchdog = broker_fixture::watchdog("a_run_id_is_refused_while_teardown");
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    let (cancelled, cancel_seen) = mpsc::channel();
+    let mut probe = Probe::new(BackendClass::Native);
+    probe.cancelled = Some(cancelled);
+    let mut config = host.broker(None);
+    // Long: the teardown's drain is what this test stands inside.
+    config.drain_timeout = broker_fixture::BOUND;
+    let backend = Brokered::new(probe, config);
+    start(&backend, "run-slow", Some(&granted), &declared).expect("started");
+    let broker = host.broker_pid().expect("broker pid");
+    // Stopped, so the drain waits; killed below, which ends the wait.
+    // SAFETY: signals to the broker this test's backend spawned.
+    assert_eq!(unsafe { libc::kill(broker, libc::SIGSTOP) }, 0);
+    std::thread::scope(|scope| {
+        let cancelling = scope.spawn(|| backend.cancel("run-slow"));
+        // EVENT: the cancel has reached the workload; the drain comes next.
+        cancel_seen
+            .recv_timeout(broker_fixture::BOUND)
+            .expect("the cancel is under way");
+        let error = backend
+            .start(
+                &request("run-slow", Some(&granted)),
+                ServedWorkspaces::none(),
+                RunConnections::none(),
+            )
+            .expect_err("the run id is in teardown");
+        assert_eq!(error.code, ErrorCode::ResourceConflict, "{error}");
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(broker, libc::SIGKILL) }, 0);
+        assert!(cancelling.join().unwrap().expect("cancel"));
+    });
+    // Torn down: the same id and endpoint start again.
+    assert!(backend.take_connections("run-slow").is_some());
+    start(&backend, "run-slow", Some(&granted), &declared).expect("free again");
+    backend.cancel("run-slow").expect("cancel");
 }

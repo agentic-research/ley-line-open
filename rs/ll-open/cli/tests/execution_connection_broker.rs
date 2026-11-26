@@ -49,7 +49,7 @@ fn a_connection_broker_that_is_not_an_executable_file_refuses_startup() {
     let stderr = refused(fixture.path(), &plain);
     assert!(
         stderr.contains("--connection-broker is not an executable file")
-            && stderr.contains("is not executable (mode 644)"),
+            && stderr.contains("is not executable by this process (mode 644)"),
         "{stderr}"
     );
 

@@ -91,22 +91,29 @@ impl BrokerConfig {
     }
 
     /// [`Self::new`] for a path an operator named, refused unless it is an
-    /// existing regular file with an execute bit: a runtime configured with
-    /// anything else would report a connections capability it cannot serve.
+    /// existing regular file this process may execute (`access(2)` with
+    /// `X_OK`, so the permission is the effective one, not any execute bit):
+    /// a runtime configured with anything else would report a connections
+    /// capability it cannot serve.
     ///
     /// This does not prove the file is `leyline-conn-broker`. The operator
     /// names the binary; the first run's ready report, which must echo the
     /// document's digest within the bound, is the check that it speaks the
     /// broker's protocol, and a binary that does not fails that run by name.
     pub fn executable(binary: impl Into<PathBuf>) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
         let binary = binary.into();
+        let may_execute = || {
+            std::ffi::CString::new(binary.as_os_str().as_bytes()).is_ok_and(|path| {
+                // SAFETY: a valid NUL-terminated path.
+                unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+            })
+        };
         match std::fs::metadata(&binary) {
-            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
-                Ok(Self::new(binary))
-            }
+            Ok(metadata) if metadata.is_file() && may_execute() => Ok(Self::new(binary)),
             Ok(metadata) if metadata.is_file() => Err(format!(
-                "{} is not executable (mode {:o})",
+                "{} is not executable by this process (mode {:o})",
                 binary.display(),
                 metadata.permissions().mode() & 0o7777
             )),
@@ -341,6 +348,42 @@ impl From<ExecutionError> for StartRefusal {
     }
 }
 
+/// A run id is free for a new start only when this layer holds nothing live
+/// for it: no start, no teardown in progress, no broker, no registration. An
+/// outcome nobody took is not in the way.
+fn refuse_busy(run_id: &str, entry: Option<&Entry>) -> Result<(), ExecutionError> {
+    match entry {
+        None
+        | Some(Entry::Ended {
+            registered: false, ..
+        }) => Ok(()),
+        Some(_) => Err(ExecutionError::resource_conflict(format!(
+            "run {run_id} already holds endpoints or a connection broker, or its teardown is \
+             in progress"
+        ))),
+    }
+}
+
+/// Dropped only by an unwind out of the wrapped backend's `start` for a run
+/// without connections: marks the run's registration as a started run's, so
+/// a cancel the backend answers "no such run" releases it.
+struct MarkStarted<'a> {
+    shared: &'a Shared,
+    run_id: &'a str,
+    armed: bool,
+}
+
+impl Drop for MarkStarted<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(Entry::Registered { started }) =
+                self.shared.runs.lock().get_mut(self.run_id)
+        {
+            *started = true;
+        }
+    }
+}
+
 /// Tears down a start with connections that did not publish its run, on an
 /// error and on a panic alike, so no `Starting` entry outlives its start.
 struct Abandon<'a, B: Backend> {
@@ -497,6 +540,7 @@ impl<B: Backend> Brokered<B> {
             };
             if !grants.is_empty() {
                 let mut runs = self.shared.runs.lock();
+                refuse_busy(run_id, runs.get(run_id))?;
                 self.shared.registry.register(run_id, &[], &grants)?;
                 // Replaces an untaken outcome of an earlier run of this id.
                 runs.insert(run_id.to_owned(), Entry::Registered { started: false });
@@ -504,8 +548,19 @@ impl<B: Backend> Brokered<B> {
             let started = if cancelled() {
                 Err(cancelled_during_start())
             } else {
-                self.inner
-                    .start(request, workspaces, RunConnections::none())
+                // A panic in the wrapped start leaves the workload's state
+                // unknown: the registration stays, marked started, so that
+                // one cancel releases it.
+                let unwinding = MarkStarted {
+                    shared: &self.shared,
+                    run_id,
+                    armed: !grants.is_empty(),
+                };
+                let started = self
+                    .inner
+                    .start(request, workspaces, RunConnections::none());
+                std::mem::forget(unwinding);
+                started
             };
             if !grants.is_empty() {
                 let mut runs = self.shared.runs.lock();
@@ -576,24 +631,7 @@ impl<B: Backend> Brokered<B> {
             .collect();
         {
             let mut runs = self.shared.runs.lock();
-            if matches!(
-                runs.get(run_id),
-                Some(
-                    Entry::Starting { .. }
-                        | Entry::Ending
-                        | Entry::Live(_)
-                        | Entry::Registered { .. }
-                        | Entry::Ended {
-                            registered: true,
-                            ..
-                        }
-                )
-            ) {
-                return Err(ExecutionError::resource_conflict(format!(
-                    "run {run_id} already holds endpoints or a connection broker"
-                ))
-                .into());
-            }
+            refuse_busy(run_id, runs.get(run_id))?;
             self.shared
                 .registry
                 .register(run_id, &endpoints, &socket_grants(&manifest))?;
@@ -1107,7 +1145,7 @@ impl<B: Backend> Backend for Brokered<B> {
         // The workload first, then the drain, so a connection that was open
         // when the workload ended has its final record.
         let cancelled = self.inner.cancel(run_id);
-        self.finish(
+        let failed = self.finish(
             run_id,
             match &cancelled {
                 Ok(true) => Workload::Gone,
@@ -1115,6 +1153,18 @@ impl<B: Backend> Backend for Brokered<B> {
                 Err(_) => Workload::MayLive,
             },
         );
+        // A run whose broker ended under it had already failed when this
+        // cancel arrived (D7 rule 5): the workload was cancelled for that,
+        // not for this. The failure goes back for the next poll to report,
+        // and the answer here is that no active run was left to cancel.
+        if let Some(failure) = failed {
+            if let Some(Entry::Ended { failure: slot, .. }) =
+                self.shared.runs.lock().get_mut(run_id)
+            {
+                *slot = Some(failure);
+            }
+            return cancelled.map(|_| false);
+        }
         cancelled
     }
 }

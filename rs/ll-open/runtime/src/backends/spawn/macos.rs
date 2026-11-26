@@ -31,19 +31,17 @@ fn check(rc: libc::c_int) -> io::Result<()> {
     }
 }
 
-struct Actions(libc::posix_spawn_file_actions_t);
-impl Drop for Actions {
+/// A libc object and the function that destroys it, run exactly once, when
+/// this drops: on every return from [`spawn`], an early error among them.
+/// One guard for both `posix_spawn` objects, with the destroyer a value, so
+/// a test can see it run (the block libc frees is not otherwise observable).
+struct Destroyed<T>(T, unsafe extern "C" fn(*mut T) -> libc::c_int);
+impl<T> Drop for Destroyed<T> {
     fn drop(&mut self) {
-        // SAFETY: initialized in `spawn`, destroyed once.
-        unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
-    }
-}
-
-struct Attributes(libc::posix_spawnattr_t);
-impl Drop for Attributes {
-    fn drop(&mut self) {
-        // SAFETY: initialized in `spawn`, destroyed once.
-        unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
+        // SAFETY: the object was initialized before it was wrapped (`spawn`
+        // wraps each only after its init call succeeded) and is destroyed
+        // here only.
+        unsafe { (self.1)(&mut self.0) };
     }
 }
 
@@ -64,12 +62,16 @@ pub(super) fn spawn(request: &Spawn<'_>) -> io::Result<Spawned> {
         .collect();
     argv.push(std::ptr::null_mut());
 
-    // SAFETY: zeroed storage the init calls overwrite; each is destroyed
-    // by its guard.
-    let mut actions = Actions(unsafe { std::mem::zeroed() });
-    check(unsafe { libc::posix_spawn_file_actions_init(&mut actions.0) })?;
-    let mut attributes = Attributes(unsafe { std::mem::zeroed() });
-    check(unsafe { libc::posix_spawnattr_init(&mut attributes.0) })?;
+    // SAFETY: zeroed storage the init calls overwrite. Each is wrapped, and
+    // so destroyed, only once its init has succeeded.
+    let mut actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::posix_spawn_file_actions_init(&mut actions) })?;
+    let mut actions = Destroyed(actions, libc::posix_spawn_file_actions_destroy);
+    // SAFETY: as for the file actions above: zeroed storage its init call
+    // overwrites, wrapped only once that has succeeded.
+    let mut attributes: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::posix_spawnattr_init(&mut attributes) })?;
+    let mut attributes = Destroyed(attributes, libc::posix_spawnattr_destroy);
 
     // The standard streams: the parent's ends are kept, the child's are
     // moved onto 0, 1, 2 (a dup2 action makes its target inherited).
@@ -169,4 +171,33 @@ pub(super) fn spawn(request: &Spawn<'_>) -> io::Result<Spawned> {
         stderr,
         status: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Destroyed;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A destroyer that counts its calls in the counter its object points at.
+    unsafe extern "C" fn count(object: *mut *const AtomicUsize) -> libc::c_int {
+        // SAFETY: the test below wraps a pointer to a counter that outlives
+        // the guard.
+        unsafe { (**object).fetch_add(1, Ordering::SeqCst) };
+        0
+    }
+
+    /// The guard destroys its object when it drops, once, and not before:
+    /// what keeps a spawn from leaking its file actions and attributes.
+    #[test]
+    fn the_guard_destroys_its_object_exactly_once_when_it_drops() {
+        let destroyed = AtomicUsize::new(0);
+        let guard = Destroyed(&destroyed as *const AtomicUsize, count);
+        assert_eq!(destroyed.load(Ordering::SeqCst), 0, "alive: not destroyed");
+        drop(guard);
+        assert_eq!(
+            destroyed.load(Ordering::SeqCst),
+            1,
+            "dropped: destroyed once"
+        );
+    }
 }

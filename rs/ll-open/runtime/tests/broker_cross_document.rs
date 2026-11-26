@@ -593,9 +593,13 @@ fn the_registry_keeps_one_run_from_another_runs_broker() {
         .expect_err("the cancel fails again");
     let error = start_b().expect_err("reserved until a cancel succeeds");
     assert!(error.detail.contains("another run (run-a4)"), "{error}");
+    // Taking the outcome does not release the reservation either.
+    assert!(backend.take_connections("run-a4").is_some());
+    assert!(backend.take_connections("run-a4").is_none(), "taken once");
+    let error = start_b().expect_err("reserved after the outcome was taken");
+    assert!(error.detail.contains("another run (run-a4)"), "{error}");
     probe.cancel_fails.store(false, Ordering::SeqCst);
     assert!(backend.cancel("run-a4").expect("cancel A"));
-    assert!(backend.take_connections("run-a4").is_some());
     start_b().expect("released by the cancel that succeeded");
     assert!(backend.cancel("run-b").expect("cancel B"));
 }
@@ -1393,4 +1397,58 @@ fn a_broker_path_must_be_an_executable_regular_file() {
     let missing =
         leyline_runtime::BrokerConfig::executable(host.path("missing")).expect_err("nothing there");
     assert!(missing.contains("missing"), "{missing}");
+}
+
+/// A run without connections holds its §6 registration exactly as long as it
+/// may be running: a start the backend refuses leaves none, and a started
+/// run the backend no longer knows (it finished) is released by a cancel.
+#[test]
+fn a_peer_runs_registration_follows_its_workload() {
+    let _serial = common::serial();
+    let host = Host::new();
+    let (_keep, dir) = channel_dir();
+    let declared = connections(&dir, &["api"], "127.0.0.1", echo());
+    let granted = manifest(vec![native_grant(&dir, "api")]);
+    let peer = |backend: &Brokered<Probe>, run_id: &str| {
+        backend.start(
+            &request(run_id, Some(&granted)),
+            ServedWorkspaces::none(),
+            RunConnections::none(),
+        )
+    };
+
+    // The backend refuses the peer run's start: nothing stays registered,
+    // so a run declaring an endpoint under that grant starts.
+    let refusing = Probe::new(BackendClass::Native).on_start(|request, _| {
+        if request.run_id == "run-refused" {
+            return Err(ExecutionError::backend("the workload did not start"));
+        }
+        Ok(())
+    });
+    let backend = Brokered::new(refusing, host.broker(None));
+    peer(&backend, "run-refused").expect_err("refused by the backend");
+    start(&backend, "run-a", Some(&granted), &declared).expect("nothing holds the grant");
+    assert!(backend.cancel("run-a").expect("cancel"));
+
+    // A started peer run that the backend answers "no such run" for has
+    // ended: the cancel releases its registration.
+    let mut finished = Probe::new(BackendClass::Native);
+    finished.cancel_answer = false;
+    let backend = Brokered::new(finished, host.broker(None));
+    peer(&backend, "run-b").expect("started");
+    let error = start(&backend, "run-a", Some(&granted), &declared).expect_err("held by B");
+    assert!(
+        error.detail.contains("held by another run (run-b)"),
+        "{error}"
+    );
+    assert!(
+        !backend
+            .cancel("run-b")
+            .expect("the backend has no such run")
+    );
+    start(&backend, "run-a", Some(&granted), &declared).expect("B's registration is gone");
+    // (This probe answers every cancel "no such run"; the broker is still
+    // drained and its endpoint unlinked.)
+    assert!(!backend.cancel("run-a").expect("cancel"));
+    assert!(!Path::new(&endpoint(&dir, "api")).exists());
 }

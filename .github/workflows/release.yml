@@ -103,6 +103,9 @@ jobs:
             # The microVM worker, staged ad-hoc signed with
             # com.apple.security.hypervisor (ley-line-open-984acf).
             krun_worker_asset: leyline-krun-worker-darwin-arm64
+            # The connection broker a daemon started with
+            # `--connection-broker` spawns per run (ley-line-open-caa20b).
+            conn_broker_asset: leyline-conn-broker-darwin-arm64
     steps:
       # SHA-pinned: actions/checkout@v6.0.2 (matches ci.yml).
       # `persist-credentials: false` so the GITHUB_TOKEN written by
@@ -238,12 +241,24 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: task krun-worker:release:target
 
+      # ---- connection broker (ley-line-open-caa20b) ----
+      # ADR-0046 Slice 1: one confined broker process per run whose grant
+      # carries a connections document. macOS only (its profile is Seatbelt),
+      # no entitlement: it ships with the linker's ad-hoc signature, as the
+      # leyline CLI does.
+      - name: Build leyline-conn-broker
+        if: matrix.conn_broker_asset
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: task release:conn-broker:target
+
       - name: Stage exact build outputs and checksum manifest
         env:
           BUILD_TARGET: ${{ matrix.target }}
           ASSET_NAME: ${{ matrix.asset }}
           LIB_ASSET: ${{ matrix.lib_asset }}
           KRUN_WORKER_ASSET: ${{ matrix.krun_worker_asset }}
+          CONN_BROKER_ASSET: ${{ matrix.conn_broker_asset }}
           INCLUDE_HEADER: ${{ matrix.include_header }}
           INCLUDE_TOOLDEFS: ${{ matrix.include_tooldefs }}
           # Staged as `<bin>-<suffix>`; the suffix derives from ASSET_NAME.
@@ -258,6 +273,14 @@ jobs:
             leyline-mcp-descriptor
           WASM_ASSETS: ${{ matrix.wasm_assets }}
         run: task release:artifacts:stage
+
+      # The staged broker bytes run, and refuse a bad argument by name.
+      - name: Smoke the staged connection broker
+        if: matrix.conn_broker_asset
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          CONN_BROKER_ASSET: ${{ matrix.conn_broker_asset }}
+        run: task release:conn-broker:smoke BIN="$PWD/.artifacts/staged/$ASSET_NAME/$CONN_BROKER_ASSET"
 
       # Against the STAGED bytes, not the build output — what this proves is
       # that the files entering the SHA256SUMS chain export the surface

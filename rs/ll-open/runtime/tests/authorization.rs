@@ -1174,6 +1174,7 @@ impl Backend for RecordingBackend {
         &self,
         request: &ExecutionRequest,
         _workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: format!("test/{}", request.run_id),
@@ -1205,6 +1206,7 @@ impl Backend for CompletingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
@@ -1406,6 +1408,7 @@ impl Backend for SharingBackend {
         &self,
         _request: &ExecutionRequest,
         workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "sharing/1".into(),
@@ -1684,6 +1687,7 @@ impl Backend for DroppingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         self.starts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1836,6 +1840,7 @@ fn a_dropped_workspace_whose_cancel_fails_is_still_refused_and_says_so() {
             &self,
             _request: &ExecutionRequest,
             _workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             self.starts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2175,13 +2180,14 @@ fn the_service_opens_each_granted_workspace_and_hands_it_to_the_backend() {
             &self,
             request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             assert!(workspaces.serve_exactly(request));
             self.handed.lock().unwrap().push((
                 self.shares.opened.lock().unwrap().len(),
                 workspaces.grants().cloned().collect(),
             ));
-            SharingBackend.start(request, workspaces)
+            SharingBackend.start(request, workspaces, connections)
         }
         fn workspace_capacity(&self) -> usize {
             1
@@ -2246,6 +2252,7 @@ fn a_share_kept_from_another_grant_cannot_stand_in_for_this_runs() {
             &self,
             _request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             let mut stash = self.stash.lock().unwrap();
             if stash.is_empty() {
@@ -2321,6 +2328,7 @@ fn two_proofs_for_one_granted_workspace_are_refused() {
             &self,
             _request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             let mut kept = self.kept.lock().unwrap();
             if kept.is_empty() {
@@ -2385,6 +2393,7 @@ fn a_share_the_backend_took_and_let_go_is_not_served() {
             &self,
             _request: &ExecutionRequest,
             workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             Ok(BackendRun {
                 backend_id: "letting-go/1".into(),
@@ -2602,6 +2611,7 @@ fn capabilities_projection_uses_declared_backend_class() {
             &self,
             _request: &ExecutionRequest,
             _workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<leyline_runtime::BackendRun, ExecutionError> {
             unreachable!("unavailable backend must not start")
         }
@@ -3116,6 +3126,7 @@ fn a_memory_ceiling_the_native_tier_cannot_enforce_is_rejected() {
             &self,
             _request: &ExecutionRequest,
             _workspaces: ServedWorkspaces,
+            _connections: leyline_runtime::RunConnections,
         ) -> Result<BackendRun, ExecutionError> {
             panic!("start must not be reached: the ceiling is unenforceable here");
         }
@@ -3599,10 +3610,33 @@ fn any_broker_entry_but_exactly_the_marker_keeps_the_shipped_refusal() {
     }
 }
 
-/// Until the broker ships (52b5b3), a daemon refuses a run with connections
-/// before the resolver or the backend runs, and advertises no capability.
+/// A broker that is never spawned: every start below is refused by a check
+/// that runs before the spawn.
+fn broker_config() -> leyline_runtime::BrokerConfig {
+    leyline_runtime::BrokerConfig::new("/nonexistent/leyline-conn-broker")
+}
+
+fn connections_grant() -> (Vec<u8>, Vec<u8>) {
+    let hex = connections_digest_hex();
+    let spec = spec_bytes();
+    let grant = with_connections(
+        &grant_bytes(&spec, true, 2_000, 0),
+        &Connections {
+            digest: Some(("blake3-256", &hex)),
+            document: Some(CONNECTIONS_DOCUMENT),
+            brokers: &[MARKER],
+        },
+    );
+    (spec, grant)
+}
+
+/// The connections capability is the daemon's broker (ADR-0046 S3; inverted
+/// from `ley-line-open-521deb` by `ley-line-open-5308b7`). Without one, a
+/// grant with connections is refused by name before the resolver runs and no
+/// entry is advertised. With one, the entry is found by name, and the grant
+/// goes past authorization and the resolver to the broker layer's own checks.
 #[test]
-fn the_service_refuses_connections_before_resolving_until_a_broker_exists() {
+fn the_connections_capability_is_advertised_exactly_when_the_service_has_a_broker() {
     struct NeverResolve;
     impl ExecutionResolver for NeverResolve {
         fn resolve(
@@ -3612,52 +3646,89 @@ fn the_service_refuses_connections_before_resolving_until_a_broker_exists() {
             panic!("a grant with connections must be refused before the resolver runs");
         }
     }
-    let hex = connections_digest_hex();
-    let spec = spec_bytes();
-    let grant = with_connections(
-        &grant_bytes(&spec, true, 2_000, 0),
-        &Connections {
-            digest: Some(("blake3-256", &hex)),
-            document: Some(CONNECTIONS_DOCUMENT),
-            brokers: &[MARKER],
-        },
-    );
-    let service = ExecutionService::new(RecordingBackend);
-    service
+    let (spec, grant) = connections_grant();
+    let entries = |capabilities: &str| -> Vec<(String, String)> {
+        let value: serde_json::Value = serde_json::from_str(capabilities).expect("JSON");
+        value["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().unwrap().to_owned(),
+                    entry["version"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    let without = ExecutionService::new(RecordingBackend);
+    without
         .provision(BackendClass::MicroVm, "provision-01")
         .expect("provision backend");
-    let error = service
+    let error = without
         .start_authorized(&spec, &grant, &connections_policy(), &NeverResolve)
         .expect_err("no broker");
     assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
     assert!(
-        error.detail.contains("no connection broker"),
+        error.detail.contains("no connection broker")
+            && error.detail.contains("connection `orders-api`"),
         "{}",
         error.detail
     );
-
-    let capabilities = capabilities_json(&service).expect("capabilities");
+    let advertised = entries(&capabilities_json(&without).expect("capabilities"));
+    assert_eq!(advertised.len(), 4, "{advertised:?}");
     assert!(
-        !capabilities.contains("cloister/execution/v1/connections"),
-        "a daemon must not advertise what it cannot serve: {capabilities}"
+        advertised
+            .iter()
+            .all(|(name, _)| name != "cloister/execution/v1/connections"),
+        "a daemon must not advertise what it cannot serve: {advertised:?}"
+    );
+
+    let with = ExecutionService::new(RecordingBackend).with_connection_broker(broker_config());
+    with.provision(BackendClass::MicroVm, "provision-01")
+        .expect("provision backend");
+    let advertised = entries(&capabilities_json(&with).expect("capabilities"));
+    assert_eq!(advertised.len(), 5, "{advertised:?}");
+    assert!(
+        advertised.contains(&(
+            "cloister/execution/v1/connections".to_owned(),
+            "1".to_owned()
+        )),
+        "{advertised:?}"
+    );
+    assert!(
+        advertised.contains(&(
+            leyline_runtime::transport::RESOURCE_LIMITS_CAPABILITY.to_owned(),
+            leyline_runtime::transport::RESOURCE_LIMITS_REVISION.to_owned()
+        )),
+        "{advertised:?}"
+    );
+    // The interim refusal is gone: the grant is resolved, and what refuses
+    // it now is the broker layer, by connection, before anything is spawned
+    // (this fixture's run has no §6 grant for the endpoint; off macOS the
+    // tier check comes first).
+    let error = with
+        .start_authorized(&spec, &grant, &connections_policy(), &TestResolver)
+        .expect_err("refused by the broker layer's checks");
+    assert!(
+        !error.detail.contains("no connection broker"),
+        "{}",
+        error.detail
+    );
+    assert!(
+        error.detail.contains("connection `orders-api`"),
+        "{}",
+        error.detail
     );
 }
 
 /// The JSON carrier end to end: the current decoder keeps `connectionsDigest`
-/// and `connectionsDocument`, authorization verifies them, and the service
-/// refuses the start because no broker exists yet.
+/// and `connectionsDocument`, authorization verifies them, and the grant
+/// reaches the service's broker layer.
 #[test]
-fn a_connections_grant_over_json_reaches_the_no_broker_refusal() {
-    let hex = connections_digest_hex();
-    let spec = spec_bytes();
-    let grant = with_connections(
-        &grant_bytes(&spec, true, 2_000, 0),
-        &Connections {
-            digest: Some(("blake3-256", &hex)),
-            document: Some(CONNECTIONS_DOCUMENT),
-            brokers: &[MARKER],
-        },
-    );
+fn a_connections_grant_over_json_reaches_the_broker_layer() {
+    let (spec, grant) = connections_grant();
     let grant_value: serde_json::Value = serde_json::from_str(&grant_json(&grant)).unwrap();
     assert_eq!(
         grant_value["connectionsDocument"], CONNECTIONS_DOCUMENT,
@@ -3668,23 +3739,35 @@ fn a_connections_grant_over_json_reaches_the_no_broker_refusal() {
         "grant": grant_value,
     })
     .to_string();
-    let service = ExecutionService::new(RecordingBackend);
-    leyline_runtime::transport::provision_json(
-        &service,
-        r#"{"backendClass":"microVm","idempotencyKey":"provision-01"}"#,
-    )
-    .expect("provision JSON");
-    let error = start_json_with_verifier(
-        &service,
-        &input,
-        &connections_policy(),
-        &TestResolver,
-        &MetadataOnlyEvidenceVerifier,
-    )
-    .expect_err("no broker");
+    let start = |service: &ExecutionService<RecordingBackend>, input: &str| {
+        leyline_runtime::transport::provision_json(
+            service,
+            r#"{"backendClass":"microVm","idempotencyKey":"provision-01"}"#,
+        )
+        .expect("provision JSON");
+        start_json_with_verifier(
+            service,
+            input,
+            &connections_policy(),
+            &TestResolver,
+            &MetadataOnlyEvidenceVerifier,
+        )
+    };
+
+    let without = ExecutionService::new(RecordingBackend);
+    let error = start(&without, &input).expect_err("no broker");
     assert_eq!(error.code, leyline_runtime::ErrorCode::UnsupportedBackend);
     assert!(
         error.detail.contains("no connection broker"),
+        "{}",
+        error.detail
+    );
+
+    let with = ExecutionService::new(RecordingBackend).with_connection_broker(broker_config());
+    let error = start(&with, &input).expect_err("the broker layer's checks");
+    assert!(
+        !error.detail.contains("no connection broker")
+            && error.detail.contains("connection `orders-api`"),
         "{}",
         error.detail
     );
@@ -3696,14 +3779,7 @@ fn a_connections_grant_over_json_reaches_the_no_broker_refusal() {
         .as_object_mut()
         .unwrap()
         .remove("connectionsDocument");
-    let error = start_json_with_verifier(
-        &service,
-        &partial.to_string(),
-        &connections_policy(),
-        &TestResolver,
-        &MetadataOnlyEvidenceVerifier,
-    )
-    .expect_err("partial");
+    let error = start(&with, &partial.to_string()).expect_err("partial");
     assert_eq!(error.code, leyline_runtime::ErrorCode::InvalidGrant);
 }
 

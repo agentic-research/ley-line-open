@@ -283,7 +283,7 @@ fn refused(input: &str, confine_fails: bool) -> String {
     broker.to_broker.write_all(input.as_bytes()).unwrap();
     // serve may already have refused and closed its end.
     let _ = broker.to_broker.shutdown(Shutdown::Write);
-    let Event::Error { detail } = broker.event() else {
+    let Event::Error { detail, .. } = broker.event() else {
         panic!("expected an error event");
     };
     assert_eq!(broker.served.join().unwrap(), Err(detail.clone()));
@@ -497,7 +497,7 @@ fn hard_limit() -> u64 {
 fn the_shipped_broker_refuses_bad_arguments_and_a_short_descriptor_limit() {
     use leyline_runtime::broker::control::FILE_LIMIT;
     let error = |line: Option<String>| match line.map(|l| serde_json::from_str::<Event>(&l)) {
-        Some(Ok(Event::Error { detail })) => detail,
+        Some(Ok(Event::Error { detail, .. })) => detail,
         other => panic!("expected an error event, got {other:?}"),
     };
     assert!(
@@ -624,4 +624,164 @@ fn an_awaiting_broker_refuses_every_peer_until_the_supervisor_names_it() {
             ..
         }
     )));
+}
+
+/// A ready report is believed only about the document's own endpoints
+/// (review of PR #613): one that names any other path refuses the start, and
+/// teardown never unlinks that path, even when the device and inode it
+/// reports are the node's own.
+#[test]
+fn a_ready_report_naming_a_path_outside_the_document_is_refused_and_never_unlinked() {
+    let (_keep, dir) = channel_dir();
+    let document = document(&dir, "127.0.0.1", 4000);
+    let digest = format!("blake3-256:{}", document.digest_hex());
+    let (_other_keep, other) = channel_dir();
+    let victim = other.join("victim.sock");
+    let _listening = std::os::unix::net::UnixListener::bind(&victim).expect("another socket");
+    let metadata = std::fs::symlink_metadata(&victim).expect("its node");
+    // A stand-in broker: it reads the start request, attests the right
+    // digest, and claims to have bound the victim.
+    let script = dir.join("lying-broker");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{{\"event\":\"ready\",\"connectionsDigest\":\"{digest}\",\"bound\":[{{\"path\":\"{}\",\"device\":{},\"inode\":{}}}]}}'\nexec cat > /dev/null\n",
+            victim.display(),
+            metadata.dev(),
+            metadata.ino()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let mut broker = BrokerProcess::spawn(&script, PeerPid::Any).expect("spawn");
+    let error = broker
+        .start(&document, &digest, Duration::from_secs(30))
+        .expect_err("a report about another path");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        "{error}"
+    );
+    assert!(
+        error.detail.contains(victim.to_str().unwrap())
+            && error.detail.contains("not an endpoint of the document"),
+        "{error}"
+    );
+    assert!(broker.reported(), "it did answer the start");
+    broker.shutdown();
+    assert!(
+        victim.exists(),
+        "teardown unlinked a path the document never named"
+    );
+}
+
+/// A stand-in broker: it reads the start request, prints `report`, and stays
+/// until its supervisor ends it.
+fn stand_in(dir: &Path, name: &str, report: &str) -> BrokerProcess {
+    let script = dir.join(name);
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{report}'\nexec cat > /dev/null\n"),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    BrokerProcess::spawn(&script, PeerPid::Any).expect("spawn")
+}
+
+fn two_endpoints(dir: &Path) -> ConnectionsDocument {
+    ConnectionsDocument::new(
+        ["api", "db"]
+            .into_iter()
+            .map(|name| Connection {
+                name: name.into(),
+                endpoint_unix: dir.join(format!("b.{name}.sock")).to_str().unwrap().into(),
+                host: "127.0.0.1".parse().unwrap(),
+                port: 4000,
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn bound_entry(path: &Path) -> String {
+    let metadata = std::fs::symlink_metadata(path).expect("the node");
+    format!(
+        "{{\"path\":\"{}\",\"device\":{},\"inode\":{}}}",
+        path.display(),
+        metadata.dev(),
+        metadata.ino()
+    )
+}
+
+/// Second review, item 5. A ready report must name every endpoint the
+/// document declares: one that names fewer attests a broker that is not
+/// listening where the run was promised, and the start is refused. What it
+/// did name is still unlinked at teardown.
+#[test]
+fn a_ready_report_that_names_fewer_endpoints_than_the_document_is_refused() {
+    let (_keep, dir) = channel_dir();
+    let document = two_endpoints(&dir);
+    let digest = format!("blake3-256:{}", document.digest_hex());
+    let api = dir.join("b.api.sock");
+    let _listening = std::os::unix::net::UnixListener::bind(&api).expect("api only");
+    let mut broker = stand_in(
+        &dir,
+        "partial-broker",
+        &format!(
+            "{{\"event\":\"ready\",\"connectionsDigest\":\"{digest}\",\"bound\":[{}]}}",
+            bound_entry(&api)
+        ),
+    );
+    let error = broker
+        .start(&document, &digest, Duration::from_secs(30))
+        .expect_err("one endpoint of two");
+    assert_eq!(
+        error.code,
+        leyline_runtime::ErrorCode::IdentityPolicyMismatch,
+        "{error}"
+    );
+    assert!(
+        error.detail.contains("b.db.sock") && error.detail.contains("did not report binding"),
+        "{error}"
+    );
+    broker.shutdown();
+    assert!(!api.exists(), "the socket it did report is unlinked");
+}
+
+/// Second review, item 2. A broker that fails after it has bound (it has
+/// confined itself and can no longer unlink) names what it bound in its
+/// error report, and the supervisor unlinks exactly those nodes: by device
+/// and inode, among the document's own endpoints only.
+#[test]
+fn an_error_report_names_what_the_broker_bound_and_teardown_unlinks_exactly_that() {
+    let (_keep, dir) = channel_dir();
+    let document = two_endpoints(&dir);
+    let digest = format!("blake3-256:{}", document.digest_hex());
+    let (api, db) = (dir.join("b.api.sock"), dir.join("b.db.sock"));
+    // `api` is the broker's; `db` is another process's socket at a declared
+    // path, which the report names with an inode that is not its own.
+    let _ours = std::os::unix::net::UnixListener::bind(&api).expect("api");
+    let _foreign = std::os::unix::net::UnixListener::bind(&db).expect("db");
+    let (_other_keep, other) = channel_dir();
+    let undeclared = other.join("victim.sock");
+    let _victim = std::os::unix::net::UnixListener::bind(&undeclared).expect("victim");
+    let wrong_inode = format!("{{\"path\":\"{}\",\"device\":1,\"inode\":1}}", db.display());
+    let mut broker = stand_in(
+        &dir,
+        "failing-broker",
+        &format!(
+            "{{\"event\":\"error\",\"detail\":\"start relay: no threads\",\"bound\":[{},{wrong_inode},{}]}}",
+            bound_entry(&api),
+            bound_entry(&undeclared)
+        ),
+    );
+    let error = broker
+        .start(&document, &digest, Duration::from_secs(30))
+        .expect_err("the broker's error");
+    assert!(error.detail.contains("start relay: no threads"), "{error}");
+    assert!(broker.reported());
+    broker.shutdown();
+    assert!(!api.exists(), "the socket the broker bound is unlinked");
+    assert!(db.exists(), "a node that is not the one reported stays");
+    assert!(undeclared.exists(), "a path the document never named stays");
 }

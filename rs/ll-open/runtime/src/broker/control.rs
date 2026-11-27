@@ -23,10 +23,11 @@
 //! the supervisor holds (`--lifeline-fd`). End-of-file on it means the
 //! supervisor is gone, and the broker exits at once.
 
+use crate::backends::spawn::{ChildIo, Spawn, Spawned};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -83,8 +84,14 @@ pub enum Event {
         open: bool,
     },
     Drained,
+    /// `bound` is what the broker had bound and could not unlink itself
+    /// (it fails after confining itself): the supervisor unlinks those
+    /// nodes, by device and inode. Empty, and absent on the wire, when the
+    /// broker bound nothing or unlinked its own.
     Error {
         detail: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bound: Vec<Bound>,
     },
 }
 
@@ -113,7 +120,8 @@ impl From<&Record> for Event {
 }
 
 /// One connection's receipt outcome (RunReceipt `ConnectionOutcome`, S8).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectionSummary {
     pub name: String,
     pub target: String,
@@ -262,7 +270,13 @@ where
 {
     let refuse = |detail: String| {
         let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(line(&Event::Error { detail }).as_bytes());
+        let _ = stdout.write_all(
+            line(&Event::Error {
+                detail,
+                bound: Vec::new(),
+            })
+            .as_bytes(),
+        );
         let _ = stdout.flush();
         2
     };
@@ -330,6 +344,7 @@ where
     let fail = |detail: String| {
         emit(&Event::Error {
             detail: detail.clone(),
+            bound: Vec::new(),
         });
         Err(detail)
     };
@@ -365,7 +380,15 @@ where
                 device: metadata.dev(),
                 inode: metadata.ino(),
             }),
-            Err(error) => return fail(format!("inspect bound endpoint: {error}")),
+            Err(error) => {
+                // Still unconfined, and no ready report will follow: remove
+                // every socket this broker bound before refusing.
+                drop(endpoints);
+                for connection in parsed.connections() {
+                    let _ = std::fs::remove_file(&connection.endpoint_unix);
+                }
+                return fail(format!("inspect bound endpoint: {error}"));
+            }
         }
     }
     if let Err(error) = confine(&parsed) {
@@ -386,7 +409,17 @@ where
         sender,
     ) {
         Ok(handle) => handle,
-        Err(error) => return fail(format!("start relay: {error}")),
+        // Confined by now, so this process can no longer unlink. The error
+        // report carries what it bound, by device and inode, and the
+        // supervisor, which is not confined, unlinks exactly those nodes.
+        Err(error) => {
+            let detail = format!("start relay: {error}");
+            emit(&Event::Error {
+                detail: detail.clone(),
+                bound,
+            });
+            return Err(detail);
+        }
     };
     emit(&Event::Ready {
         connections_digest: format!("blake3-256:{}", parsed.digest_hex()),
@@ -413,7 +446,10 @@ where
                 Ok(Request::Drain) => break,
                 Ok(Request::Peer { pid }) => {
                     if let Err(detail) = handle.set_peer_pid(pid) {
-                        emit(&Event::Error { detail });
+                        emit(&Event::Error {
+                            detail,
+                            bound: Vec::new(),
+                        });
                     }
                 }
                 _ => {}
@@ -429,31 +465,51 @@ where
 
 /// The supervisor's handle on one broker process.
 pub struct BrokerProcess {
-    child: Child,
-    stdin: Option<ChildStdin>,
+    child: Spawned,
+    stdin: Option<std::fs::File>,
     lifeline: Option<crate::lifeline::Lifeline>,
     events: mpsc::Receiver<Event>,
     seen: Vec<Event>,
     bound: Vec<Bound>,
+    /// Whether the broker answered the start at all: a ready report, or an
+    /// error report. A broker that reports an error has unlinked what it
+    /// bound itself (or names what it could not); only one that reported
+    /// nothing leaves the supervisor not knowing what it bound.
+    reported: bool,
 }
 
 impl BrokerProcess {
     /// Spawn the broker binary. Its stdin and stdout are the control pipe; fd
     /// 3 is the lifeline's read end, and this process keeps the only write end.
     ///
-    /// The descriptor hygiene that keeps the write end out of every other
-    /// spawn (`POSIX_SPAWN_CLOEXEC_DEFAULT`) is `ley-line-open-528525`: until
-    /// then a concurrent spawn between `pipe` and `FD_CLOEXEC` can inherit it.
+    /// Started through [`crate::backends::spawn`], which hands the broker
+    /// exactly those descriptors and nothing else this process holds, so no
+    /// other spawn, on any thread, inherits the lifeline's write end (bead
+    /// `ley-line-open-528525`).
     pub fn spawn(binary: &Path, peer: PeerPid) -> Result<Self, ExecutionError> {
+        Self::spawn_watched(binary, peer, || {})
+    }
+
+    /// [`Self::spawn`], with `on_end` called once, on the thread that reads
+    /// the broker's reports, when the broker's side of the control pipe
+    /// closes: the broker has exited, or will send nothing more. A supervisor
+    /// uses it to fail a live run the moment its broker is gone (ADR-0046 D7
+    /// rule 5) instead of at the next poll.
+    pub fn spawn_watched(
+        binary: &Path,
+        peer: PeerPid,
+        on_end: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, ExecutionError> {
         let (lifeline, read_end) = crate::lifeline::pair()
             .map_err(|error| ExecutionError::backend(format!("lifeline pipe: {error}")))?;
-        let mut command = Command::new(binary);
+        let mut command = Spawn::new(binary);
         command
             .arg("--lifeline-fd")
             .arg(LIFELINE_FD.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stdin(ChildIo::Piped)
+            .stdout(ChildIo::Piped)
+            .stderr(ChildIo::Inherit)
+            .inherit(read_end.as_fd(), LIFELINE_FD);
         match peer {
             PeerPid::Any => {}
             PeerPid::Awaiting => {
@@ -463,7 +519,6 @@ impl BrokerProcess {
                 command.arg("--peer-pid").arg(pid.to_string());
             }
         }
-        read_end.pass_at(&mut command, LIFELINE_FD);
         let mut child = command.spawn().map_err(|error| {
             ExecutionError::backend(format!("spawn connection broker: {error}"))
         })?;
@@ -475,11 +530,16 @@ impl BrokerProcess {
                 let Ok(line) = line else { break };
                 let event = serde_json::from_str(&line).unwrap_or_else(|error| Event::Error {
                     detail: format!("unreadable broker event {line:?}: {error}"),
+                    bound: Vec::new(),
                 });
                 if sender.send(event).is_err() {
                     break;
                 }
             }
+            // The receiver sees the end before the hook runs, so a start
+            // waiting on a ready report is released first.
+            drop(sender);
+            on_end();
         });
         Ok(Self {
             stdin: child.stdin.take(),
@@ -488,7 +548,17 @@ impl BrokerProcess {
             events,
             seen: Vec::new(),
             bound: Vec::new(),
+            reported: false,
         })
+    }
+
+    /// Whether the broker answered its start, with a ready report or an
+    /// error report. [`Self::shutdown`] unlinks exactly the sockets a ready
+    /// report named. A broker that reported an error unlinked its own. One
+    /// that reported nothing (killed or stalled before either) may have
+    /// bound sockets the supervisor was never told about.
+    pub fn reported(&self) -> bool {
+        self.reported
     }
 
     pub fn pid(&self) -> u32 {
@@ -514,9 +584,45 @@ impl BrokerProcess {
                     connections_digest,
                     bound,
                 }) => {
-                    // Kept before the digest check: a broker that bound
+                    self.reported = true;
+                    // Only the document's own endpoints are ever unlinked on
+                    // this report's word: a report naming any other path is
+                    // refused, and that entry is dropped, not kept.
+                    let declared = |path: &str| {
+                        document
+                            .connections()
+                            .iter()
+                            .any(|connection| connection.endpoint_unix == path)
+                    };
+                    let foreign = bound.iter().find(|socket| !declared(&socket.path));
+                    let foreign = foreign.map(|socket| socket.path.clone());
+                    // Kept before the checks below: a broker that bound
                     // sockets and then disagreed still leaves them to unlink.
-                    self.bound = bound;
+                    self.bound = bound
+                        .into_iter()
+                        .filter(|socket| declared(&socket.path))
+                        .collect();
+                    if let Some(path) = foreign {
+                        return Err(ExecutionError::identity_mismatch(format!(
+                            "connection broker reported binding {path}, which is not an \
+                             endpoint of the document it was sent"
+                        )));
+                    }
+                    // And every endpoint, not some: a broker that is not
+                    // listening at one is a declared connection that would
+                    // never be served.
+                    if let Some(missing) = document.connections().iter().find(|connection| {
+                        !self
+                            .bound
+                            .iter()
+                            .any(|socket| socket.path == connection.endpoint_unix)
+                    }) {
+                        return Err(ExecutionError::identity_mismatch(format!(
+                            "connection `{}`: the connection broker reported ready and did \
+                             not report binding its endpoint {}",
+                            missing.name, missing.endpoint_unix
+                        )));
+                    }
                     if connections_digest == expected {
                         return Ok(());
                     }
@@ -524,15 +630,33 @@ impl BrokerProcess {
                         "connection broker attested {connections_digest}, but the grant's connectionsDigest is {expected}"
                     )));
                 }
-                Ok(Event::Error { detail }) => {
+                Ok(Event::Error { detail, bound }) => {
+                    self.reported = true;
+                    // What it could not unlink itself: believed, like a ready
+                    // report, only about the document's own endpoints, and
+                    // unlinked at shutdown by device and inode.
+                    self.bound = bound
+                        .into_iter()
+                        .filter(|socket| {
+                            document
+                                .connections()
+                                .iter()
+                                .any(|connection| connection.endpoint_unix == socket.path)
+                        })
+                        .collect();
                     return Err(ExecutionError::backend(format!(
                         "connection broker: {detail}"
                     )));
                 }
                 Ok(other) => self.seen.push(other),
-                Err(_) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(ExecutionError::backend(
                         "connection broker sent no ready report within the bound",
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ExecutionError::backend(
+                        "connection broker exited before it reported ready",
                     ));
                 }
             }

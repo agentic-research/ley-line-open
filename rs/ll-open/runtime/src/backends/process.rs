@@ -10,9 +10,37 @@
 use std::fs;
 use std::io::{self, BufRead};
 use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::Child;
+#[cfg(test)]
+use std::process::Command;
+
+/// A child process this module can signal and reap: one [`super::spawn`]
+/// started, or a standard-library `Child` (tests).
+pub(super) trait Reapable: Send {
+    fn id(&self) -> u32;
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
+}
+
+impl Reapable for Child {
+    fn id(&self) -> u32 {
+        Child::id(self)
+    }
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        Child::wait(self)
+    }
+}
+
+impl Reapable for super::spawn::Spawned {
+    fn id(&self) -> u32 {
+        super::spawn::Spawned::id(self)
+    }
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        super::spawn::Spawned::wait(self)
+    }
+}
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
@@ -67,6 +95,12 @@ pub(super) struct SupervisionLabels {
 /// fast path, so no such pipe is ever created and the window does not exist.
 /// A failure to set the group still fails the spawn — libc reports it — which
 /// is the property `a_worker_lands_in_its_own_process_group` pins directly.
+///
+/// Daemon spawns no longer take this path: they go through
+/// [`super::spawn::Spawn::process_group`] (bead `ley-line-open-528525`),
+/// which is `posix_spawn` with `POSIX_SPAWN_SETPGROUP` on macOS. This stays
+/// for this module's own fixtures.
+#[cfg(test)]
 pub(super) fn configure_process_group(command: &mut Command) {
     // 0 means "the child's own pid", matching `setpgid(0, 0)`.
     command.process_group(0);
@@ -98,14 +132,19 @@ pub(super) fn terminate_process_group(pid: u32) {
     // forker is the microVM/vsock confinement boundary's problem, not this
     // function's; this closes the honest-worker window that was leaking.
     //
+    // A pid of 0 or 1 is refused: `kill(-0)` would be this process's own
+    // group and `kill(-1)` every process it may signal (`child_pid`).
+    let Some(leader) = super::spawn::child_pid(pid) else {
+        return;
+    };
     // SAFETY: `pid` came directly from a live Child. A negative pid
     // addresses the process group established before exec; the direct-pid
     // fallback still reaps a worker if group setup failed at the OS
     // boundary.
     unsafe {
-        let process_group = -(pid as libc::pid_t);
+        let process_group = -leader;
         if libc::kill(process_group, libc::SIGKILL) == -1 {
-            let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            let _ = libc::kill(leader, libc::SIGKILL);
         }
         if await_exit_without_reaping(pid).is_ok() {
             let _ = libc::kill(process_group, libc::SIGKILL);
@@ -168,13 +207,13 @@ fn retry_while_interrupted(mut observe: impl FnMut() -> io::Result<()>) -> io::R
 
 /// Kill the group, then reap. **This ordering is the module's one rule** and
 /// every terminal path goes through here so it is stated exactly once.
-fn kill_group_then_reap(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+fn kill_group_then_reap(child: &mut dyn Reapable) -> io::Result<std::process::ExitStatus> {
     terminate_process_group(child.id());
     child.wait()
 }
 
 enum ProcessState {
-    Live(Child),
+    Live(Box<dyn Reapable>),
     Reaped,
 }
 
@@ -213,10 +252,10 @@ impl TerminationSignal {
 }
 
 impl WorkerProcess {
-    pub(super) fn new(child: Child) -> Self {
+    pub(super) fn new(child: impl Reapable + 'static) -> Self {
         let pid = child.id();
         Self {
-            state: Arc::new(Mutex::new(ProcessState::Live(child))),
+            state: Arc::new(Mutex::new(ProcessState::Live(Box::new(child)))),
             pid,
         }
     }
@@ -241,7 +280,7 @@ impl WorkerProcess {
         let mut state = self.state.lock();
         match std::mem::replace(&mut *state, ProcessState::Reaped) {
             ProcessState::Live(mut child) => {
-                let status = kill_group_then_reap(&mut child);
+                let status = kill_group_then_reap(child.as_mut());
                 awaited.and(status)
             }
             ProcessState::Reaped => Err(io::Error::other("worker was already reaped")),
@@ -252,7 +291,7 @@ impl WorkerProcess {
     pub(super) fn terminate_and_reap(&self) -> io::Result<std::process::ExitStatus> {
         let mut state = self.state.lock();
         match std::mem::replace(&mut *state, ProcessState::Reaped) {
-            ProcessState::Live(mut child) => kill_group_then_reap(&mut child),
+            ProcessState::Live(mut child) => kill_group_then_reap(child.as_mut()),
             ProcessState::Reaped => Err(io::Error::other("worker was already reaped")),
         }
     }
@@ -491,7 +530,7 @@ pub(super) fn cleanup_tempdir(
 
 /// Terminate a worker that never reached readiness, then clean up.
 pub(super) fn abort_failed_start(
-    child: &mut Child,
+    child: &mut dyn Reapable,
     run_root: TempDir,
     labels: SupervisionLabels,
     error: ExecutionError,
@@ -817,7 +856,14 @@ mod tests {
     /// as an id. `kill(-pid)` therefore fails with ESRCH and only the
     /// fallback can reach it. That makes the group kill's error check the
     /// entire subject of this test: invert it, or make it never match, and
-    /// this child outlives the call.
+    /// nothing signals this child.
+    ///
+    /// The assertion is HOW the child died, not that it is gone.
+    /// `terminate_process_group` waits for the leader's exit before its
+    /// second sweep, so with the fallback broken it returns only once the
+    /// fixture has slept its 30 seconds out and exited 0 on its own: "the
+    /// child is gone after the call" then holds either way, and only the
+    /// `SIGKILL` in its status tells the two apart.
     ///
     /// The comment on `terminate_process_group` claims the fallback "still
     /// reaps a worker if group setup failed at the OS boundary". Nothing
@@ -825,6 +871,7 @@ mod tests {
     /// the group first, so they all exercise the success path.
     #[test]
     fn terminating_a_worker_with_no_group_of_its_own_falls_back_to_the_pid() {
+        use std::os::unix::process::ExitStatusExt;
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -835,11 +882,13 @@ mod tests {
 
         let status = child
             .wait_timeout(Duration::from_secs(5))
-            .expect("wait on the fixture");
-        assert!(
-            status.is_some(),
-            "the direct-pid fallback must reap a worker that has no process \
-             group of its own; without it this child sleeps out the timeout"
+            .expect("wait on the fixture")
+            .expect("the fixture has exited once the call returns");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the direct-pid fallback must kill a worker that has no process \
+             group of its own; this one ended on its own instead: {status}"
         );
     }
 

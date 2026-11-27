@@ -165,6 +165,7 @@ tasks:
         test -x tools/publish_release_assets.sh
         test -x tools/release_publish.sh
         test -x tools/recover_release_manifest.sh
+        test -x tools/conn_broker_smoke.sh
         test -f tools/release-assets.txt
         test -f tools/release-version-manifests.txt
         grep -q 'release:artifacts:stage:' Taskfile.yml
@@ -834,6 +835,26 @@ tasks:
         cargo build --release --target "{{.BUILD_TARGET}}"
         -p leyline-mcp-descriptor --bin leyline-mcp-descriptor
 
+  release:conn-broker:target:
+    desc: Build leyline-conn-broker, the connection broker a daemon spawns per run, for BUILD_TARGET (used by release.yml's darwin-arm64 leg)
+    deps: [cache:sccache:install]
+    requires:
+      vars: [BUILD_TARGET]
+    dir: rs
+    # `--bin leyline-conn-broker` only: its test-only sibling
+    # leyline-conn-broker-unconfined needs the `test-support` feature, which
+    # this build does not enable, and staging refuses it by name
+    # (ley-line-open-caa20b).
+    cmds:
+      - cargo build --release --target "{{.BUILD_TARGET}}" -p leyline-runtime --bin leyline-conn-broker
+
+  release:conn-broker:smoke:
+    desc: Smoke a built or staged leyline-conn-broker (BIN) — it runs and refuses each bad argument by name
+    requires:
+      vars: [BIN]
+    cmds:
+      - tools/conn_broker_smoke.sh "{{.BIN}}"
+
   release:artifacts:stage:
     desc: Stage one target's exact release outputs and SHA-256 manifest
     requires:
@@ -883,11 +904,18 @@ tasks:
       # (ley-line-open-984acf). Empty by default; release.yml sets it on the
       # darwin-arm64 leg, which builds it with `krun-worker:release:target`.
       KRUN_WORKER_ASSET: '{{.KRUN_WORKER_ASSET | default ""}}'
+      # The connection broker (ley-line-open-caa20b). Empty by default;
+      # release.yml sets it on the darwin-arm64 leg, which builds it with
+      # `release:conn-broker:target`.
+      CONN_BROKER_ASSET: '{{.CONN_BROKER_ASSET | default ""}}'
     cmds:
       - |
         set -eu
         if [ -n "${KRUN_WORKER_ASSET:-}" ]; then
           export KRUN_WORKER_SOURCE='{{.KRUN_WORKER_SOURCE | default (printf "%s/rs/target/%s/release/leyline-krun-worker" .ROOT_DIR .BUILD_TARGET)}}'
+        fi
+        if [ -n "${CONN_BROKER_ASSET:-}" ]; then
+          export CONN_BROKER_SOURCE='{{.CONN_BROKER_SOURCE | default (printf "%s/rs/target/%s/release/leyline-conn-broker" .ROOT_DIR .BUILD_TARGET)}}'
         fi
         if [ -n "${LIB_ASSET:-}" ]; then
           export STATICLIB_SOURCE='{{.STATICLIB_SOURCE | default .DEFAULT_STATICLIB_SOURCE}}'

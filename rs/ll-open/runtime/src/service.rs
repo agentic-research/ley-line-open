@@ -1,14 +1,17 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use leyline_core::ContentAddressed;
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::backends::libkrun::share::WorkspaceShares;
 use crate::{
-    BackendCapabilities, BackendRun, BackendRunStatus, ExecutionError, ExecutionRequest,
-    ReceiptContext, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
-    ServedWorkspaces,
+    BackendCapabilities, BackendRun, BackendRunStatus, BrokerConfig, Brokered,
+    ConnectionsCapability, ConnectionsOutcome, ExecutionError, ExecutionRequest, ReceiptContext,
+    RunConnections, RunEventRecord, RunInspection, RunReceiptData, RunRecord, RunState,
+    ServedWorkspaces, VerifiedConnections,
     authorization::{AuthorizationPolicy, AuthorizedExecution},
 };
 
@@ -57,11 +60,32 @@ pub trait Backend: Send + Sync + 'static {
     /// must also refuse a `request` whose `workspaces` differ from the shares
     /// it is handed ([`ServedWorkspaces::serve_exactly`]), since the request
     /// is what its worker is told.
+    ///
+    /// `connections` is the run's declared connections (ADR-0046 Slice 1):
+    /// [`RunConnections::none`], or a value [`Brokered`] has already served,
+    /// whose endpoints are bound before this call. A backend takes it with
+    /// [`RunConnections::served_for`] before it spawns anything, which
+    /// refuses connections nothing serves, and names its worker to the
+    /// broker ([`crate::ServedConnections::name_worker`]) when the worker is
+    /// the process that connects (the microVM tier). An embedder with no
+    /// service calls this on a [`Brokered`] backend with
+    /// [`RunConnections::verified`].
     fn start(
         &self,
         request: &ExecutionRequest,
         workspaces: ServedWorkspaces,
+        connections: RunConnections,
     ) -> Result<BackendRun, ExecutionError>;
+
+    /// Whether this backend serves a run's connections, and at which
+    /// revision. The default is that it does not; [`Brokered`] reports it for
+    /// a backend it wraps with a broker. A caller that finds `None` refuses a
+    /// run with connections and never infers support from a version; the
+    /// daemon's `cloister/execution/v1/connections` capability entry is this
+    /// value.
+    fn connections(&self) -> Option<ConnectionsCapability> {
+        None
+    }
 
     /// How many workspaces this backend serves one run. The service asks
     /// before it opens any share: a run granted more is refused
@@ -93,6 +117,7 @@ pub trait Backend: Send + Sync + 'static {
         Ok(self.poll(run_id)?.map(|status| crate::RunOutcome {
             status,
             output: None,
+            connections: None,
         }))
     }
 
@@ -128,8 +153,12 @@ struct ServiceState {
     /// Run identities reserved while the backend performs startup.  Backend
     /// startup may materialize a rootfs or wait for worker readiness, so it
     /// must not happen while the lifecycle state lock is held.  Reservations
-    /// preserve run-id/replay-key uniqueness during that lock-free interval.
-    starting: HashMap<String, String>,
+    /// preserve run-id/replay-key uniqueness during that lock-free interval,
+    /// and carry the gate a cancel of the starting run waits on.
+    starting: HashMap<String, StartingRun>,
+    /// What each finished run's connections carried, taken from the broker
+    /// layer at the run's terminal transition (ADR-0046 S8).
+    connections: HashMap<String, ConnectionsOutcome>,
     events: HashMap<String, Vec<RunEventRecord>>,
     receipts: HashMap<String, ReceiptContext>,
     /// The channels each run's worker held beyond its confinement manifest,
@@ -142,9 +171,91 @@ struct ServiceState {
     provisioned_cas_root: Option<std::path::PathBuf>,
 }
 
+/// A run between its reservation and the end of its start.
+struct StartingRun {
+    replay_key: String,
+    gate: Arc<StartGate>,
+}
+
+/// What a cancel of a starting run and that run's start share: the cancel
+/// marks it and waits; the start checks the mark before it publishes the run
+/// and opens the gate when it has ended, whichever way.
+#[derive(Default)]
+struct StartGate {
+    cancelled: AtomicBool,
+    ended: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl StartGate {
+    fn wait(&self) {
+        let mut ended = self.ended.lock();
+        while !*ended {
+            self.changed.wait(&mut ended);
+        }
+    }
+}
+
+/// Opens a [`StartGate`] when the start returns, by any path.
+struct StartEnds(Arc<StartGate>);
+
+impl Drop for StartEnds {
+    fn drop(&mut self) {
+        *self.0.ended.lock() = true;
+        self.0.changed.notify_all();
+    }
+}
+
+/// Record a run whose start was refused while its workload may still be
+/// running, and return the refusal. Forgetting such a run would leave a live
+/// workload nothing can address and free its run_id for a second start. It is
+/// recorded `Failed` instead: terminal, so it is never polled or receipted
+/// (it has no receipt context), its run_id refuses another start, and
+/// `cleanup` retries the cancel.
+fn record_failed_start(
+    state: &mut ServiceState,
+    request: &ExecutionRequest,
+    backend_id: String,
+    error: ExecutionError,
+) -> ExecutionError {
+    let detail_digest = serde_json::to_vec(&error)
+        .ok()
+        .map(|bytes| format!("blake3-256:{}", bytes.hash()));
+    state.runs.insert(
+        request.run_id.clone(),
+        RunRecord {
+            run_id: request.run_id.clone(),
+            replay_key: request.replay_key.clone(),
+            state: RunState::Failed,
+            backend_id,
+        },
+    );
+    state.events.insert(
+        request.run_id.clone(),
+        vec![
+            event(1, RunState::Accepted),
+            event(2, RunState::Provisioning),
+            event(3, RunState::Ready),
+            event(4, RunState::Running),
+            event_with_detail(5, RunState::Failed, detail_digest),
+        ],
+    );
+    error
+}
+
+fn cancelled_while_starting() -> ExecutionError {
+    ExecutionError {
+        code: crate::ErrorCode::Cancelled,
+        retryable: false,
+        detail: "the run was cancelled while it was starting".into(),
+    }
+}
+
 /// One lifecycle implementation used by every transport adapter.
 pub struct ExecutionService<B> {
-    backend: B,
+    /// The backend behind the layer that serves each run's connections
+    /// (ADR-0046 S7): every start, authorized or direct, goes through it.
+    backend: Brokered<B>,
     /// Where the backend's CAS root comes from. `provision` makes it exist
     /// before the backend checks its readiness (bead `ley-line-open-ba86d3`).
     storage: Option<crate::cas_volume::CasStorage>,
@@ -157,11 +268,25 @@ pub struct ExecutionService<B> {
 impl<B: Backend> ExecutionService<B> {
     pub fn new(backend: B) -> Self {
         Self {
-            backend,
+            backend: Brokered::without_broker(backend),
             storage: None,
             shares: None,
             state: RwLock::new(ServiceState::default()),
         }
+    }
+
+    /// Serve each run's declared connections with the broker `config` names
+    /// (ADR-0046 Slice 1). Without one, a run that declares connections is
+    /// refused by name and the service reports no connections capability.
+    pub fn with_connection_broker(mut self, config: BrokerConfig) -> Self {
+        self.backend = self.backend.with_broker(config);
+        self
+    }
+
+    /// Whether this service serves connections: it has a broker
+    /// ([`Self::with_connection_broker`]).
+    pub fn connections(&self) -> Option<ConnectionsCapability> {
+        self.backend.connections()
     }
 
     /// Serve each authorized run's granted workspaces from `shares`
@@ -273,7 +398,27 @@ impl<B: Backend> ExecutionService<B> {
                 grant.name
             )));
         }
-        self.start_run(request, false)
+        self.start_run(request, false, None)
+    }
+
+    /// [`Self::start`] for a request that declares connections. The embedder
+    /// is the host here: it chose the confinement and it states the
+    /// connections, as a value built only from a canonical document. The run
+    /// goes through the same checks, start order and teardown as an
+    /// authorized one (ADR-0046 S7).
+    pub fn start_with_connections(
+        &self,
+        request: ExecutionRequest,
+        connections: VerifiedConnections,
+    ) -> Result<RunRecord, ExecutionError> {
+        if let Some(grant) = request.workspaces.first() {
+            return Err(ExecutionError::workspace_unserved(format!(
+                "the request names workspace {:?} without a verified grant; a workspace \
+                 share is opened only for a run started through `start_authorized`",
+                grant.name
+            )));
+        }
+        self.start_run(request, false, Some(connections))
     }
 
     /// Refuse, before any share is opened, a run granted more workspaces
@@ -299,6 +444,7 @@ impl<B: Backend> ExecutionService<B> {
         &self,
         request: ExecutionRequest,
         verified: bool,
+        connections: Option<VerifiedConnections>,
     ) -> Result<RunRecord, ExecutionError> {
         request.validate()?;
         // ADR-0035 §4: a ceiling the selected tier cannot enforce is a
@@ -311,6 +457,7 @@ impl<B: Backend> ExecutionService<B> {
             .enforced
             .check(&request.limits)?;
 
+        let gate = Arc::new(StartGate::default());
         {
             let mut state = self.state.write();
             if let Some(run_id) = state.replay.get(&request.replay_key) {
@@ -328,7 +475,7 @@ impl<B: Backend> ExecutionService<B> {
             if state
                 .starting
                 .values()
-                .any(|replay| replay == &request.replay_key)
+                .any(|starting| starting.replay_key == request.replay_key)
             {
                 return Err(ExecutionError {
                     code: crate::ErrorCode::ResourceConflict,
@@ -350,10 +497,18 @@ impl<B: Backend> ExecutionService<B> {
                     detail: format!("run_id is already starting: {}", request.run_id),
                 });
             }
-            state
-                .starting
-                .insert(request.run_id.clone(), request.replay_key.clone());
+            state.starting.insert(
+                request.run_id.clone(),
+                StartingRun {
+                    replay_key: request.replay_key.clone(),
+                    gate: Arc::clone(&gate),
+                },
+            );
         }
+        // Declared after the reservation and dropped when this call returns,
+        // after every state guard below: a cancel waiting on the gate wakes
+        // once the start has ended and the reservation is gone.
+        let _ends = StartEnds(Arc::clone(&gate));
 
         // Rootfs materialization and worker readiness are deliberately outside
         // the service lock.  The reservation above keeps identity uniqueness
@@ -382,14 +537,55 @@ impl<B: Backend> ExecutionService<B> {
             // `start` refused a request naming workspaces already.
             ServedWorkspaces::materialize(None, &request.run_id, &[])
         };
-        let started = workspaces.and_then(|(workspaces, opened)| {
-            Ok((self.backend.start(&request, workspaces)?, opened))
-        });
+        // The run's connections go to the broker layer with the request
+        // (ADR-0046 S7): it checks them against the request's confinement
+        // manifest, binds every endpoint and waits for the broker's ready
+        // report before it calls the backend, and tears the broker down if
+        // anything after that fails.
+        let connections = connections.map_or_else(RunConnections::none, RunConnections::verified);
+        //
+        // The gate's mark goes with the call, so a cancel that arrives
+        // before the broker layer has registered the run is still seen by
+        // it: nothing is spawned and the backend is never asked to start.
+        let started = workspaces
+            .map_err(crate::broker::supervisor::StartRefusal::from)
+            .and_then(|(workspaces, opened)| {
+                Ok((
+                    self.backend.start_cancellable(
+                        &request,
+                        workspaces,
+                        connections,
+                        &gate.cancelled,
+                    )?,
+                    opened,
+                ))
+            });
         let (started, opened) = match started {
             Ok(started) => started,
-            Err(error) => {
-                self.state.write().starting.remove(&request.run_id);
-                return Err(error);
+            Err(refusal) => {
+                let mut state = self.state.write();
+                state.starting.remove(&request.run_id);
+                if !refusal.workload_may_live {
+                    return Err(refusal.error);
+                }
+                // The broker layer refused the start after the workload was
+                // started, and could not cancel it (ADR-0046 S7). Its broker
+                // is gone and its endpoints stay reserved; the run is
+                // recorded, so `cleanup` can retry the cancel that releases
+                // them.
+                let backend_id = self.backend.capabilities().backend_id;
+                return Err(record_failed_start(
+                    &mut state,
+                    &request,
+                    backend_id,
+                    ExecutionError {
+                        detail: format!(
+                            "{}; the run is recorded failed and `cleanup` retries the cancel",
+                            refusal.error.detail
+                        ),
+                        ..refusal.error
+                    },
+                ));
             }
         };
         let channels: Vec<crate::WorkerChannel> = started
@@ -409,51 +605,44 @@ impl<B: Backend> ExecutionService<B> {
         // For one that does, the run is cancelled and never recorded, so it
         // cannot complete, be collected, or claim the workspace's graph root
         // as an input.
-        if let Err(error) = opened.held(&started.attached) {
+        //
+        // A cancel that reached this run while it was starting is the second
+        // refusal (ADR-0046 S7). Its mark is read under the state lock the
+        // cancel set it under and the run is published under, so a cancel
+        // either finds the run starting and is honored here, or finds it
+        // published below and cancels it as a running run.
+        let held = opened.held(&started.attached).err();
+        let mut state = self.state.write();
+        let refusal = held.or_else(|| {
+            gate.cancelled
+                .load(Ordering::SeqCst)
+                .then(cancelled_while_starting)
+        });
+        if let Some(error) = refusal {
+            drop(state);
             // The refusal is the answer either way; a cancel that also fails
             // is named in it rather than masking it.
             let cancel = self.backend.cancel(&request.run_id);
+            // Nothing collects a run that was never recorded.
+            let _ = self.backend.take_connections(&request.run_id);
             let mut state = self.state.write();
             state.starting.remove(&request.run_id);
             let Err(cancel) = cancel else {
                 return Err(error);
             };
-            // The workload may still be running. Forgetting it would leave a
-            // live run nothing can address and free its run_id for a second
-            // start. It is recorded `Failed` instead: terminal, so it is never
-            // polled or receipted (it has no receipt context), its run_id
-            // refuses another start, and `cleanup` retries the cancel.
-            let error = ExecutionError {
-                detail: format!(
-                    "{}; cancelling the run also failed, so it is recorded failed \
-                     and `cleanup` retries the cancel: {cancel}",
-                    error.detail
-                ),
-                ..error
-            };
-            let detail_digest = serde_json::to_vec(&error)
-                .ok()
-                .map(|bytes| format!("blake3-256:{}", bytes.hash()));
-            state.runs.insert(
-                request.run_id.clone(),
-                RunRecord {
-                    run_id: request.run_id.clone(),
-                    replay_key: request.replay_key.clone(),
-                    state: RunState::Failed,
-                    backend_id: started.backend_id,
+            return Err(record_failed_start(
+                &mut state,
+                &request,
+                started.backend_id,
+                ExecutionError {
+                    detail: format!(
+                        "{}; cancelling the run also failed, so it is recorded failed \
+                         and `cleanup` retries the cancel: {cancel}",
+                        error.detail
+                    ),
+                    ..error
                 },
-            );
-            state.events.insert(
-                request.run_id,
-                vec![
-                    event(1, RunState::Accepted),
-                    event(2, RunState::Provisioning),
-                    event(3, RunState::Ready),
-                    event(4, RunState::Running),
-                    event_with_detail(5, RunState::Failed, detail_digest),
-                ],
-            );
-            return Err(error);
+            ));
         }
         let record = RunRecord {
             run_id: request.run_id.clone(),
@@ -461,7 +650,6 @@ impl<B: Backend> ExecutionService<B> {
             state: RunState::Running,
             backend_id: started.backend_id,
         };
-        let mut state = self.state.write();
         state.starting.remove(&request.run_id);
         state
             .replay
@@ -524,16 +712,23 @@ impl<B: Backend> ExecutionService<B> {
             policy,
             verifier,
         )?;
-        // ADR-0046 S3: a grant may now carry verified connections, but this
-        // daemon has no connection broker yet (bead ley-line-open-52b5b3), so
-        // a declared connection would never be served. Refuse by name before
-        // the resolver or the backend runs, rather than start a run whose
-        // connections silently do not exist. The daemon does not advertise
-        // `cloister/execution/v1/connections` until it can serve them.
-        if authorized.connections.is_some() {
-            return Err(ExecutionError::unsupported(
-                "RunGrant carries connections (cloister/connections/v1), but this daemon has no connection broker",
-            ));
+        // ADR-0046 S3, S7: a grant's verified connections are served by this
+        // service's broker. A service without one would start a run whose
+        // declared connections do not exist, so it refuses by name before
+        // the resolver or the backend runs; it advertises no
+        // `cloister/execution/v1/connections` capability either.
+        let connections = authorized
+            .connections
+            .clone()
+            .map(VerifiedConnections::from);
+        if let Some(connections) = &connections
+            && self.backend.connections().is_none()
+        {
+            return Err(ExecutionError::unsupported(format!(
+                "connection `{}`: RunGrant carries connections (cloister/connections/v1), \
+                 and this daemon has no connection broker",
+                crate::connections::first_name(connections.document())
+            )));
         }
         let request = resolver.resolve(&authorized)?;
         if request.run_id != authorized.run_id {
@@ -590,7 +785,7 @@ impl<B: Backend> ExecutionService<B> {
         // backends verify the materialized tree against this digest before
         // the workload runs), not from anything the caller asked for.
         let rootfs = format!("{}:{}", request.rootfs.algorithm, request.rootfs.value);
-        let record = self.start_run(request, true)?;
+        let record = self.start_run(request, true, connections)?;
         // A replayed start answers an existing run, possibly under other
         // authority (another spec, grant or input roots sharing its replay
         // key). That run's receipt stays the one it was started under: it is
@@ -661,6 +856,7 @@ impl<B: Backend> ExecutionService<B> {
             context,
             started_at_unix_ms,
             completed_at_unix_ms,
+            connections: state.connections.get(run_id).cloned(),
         })
     }
 
@@ -679,6 +875,7 @@ impl<B: Backend> ExecutionService<B> {
             return Ok(existing);
         }
         let _ = self.backend.cancel(run_id)?;
+        self.record_connections(run_id);
         let mut state = self.state.write();
         let record = {
             let record = state
@@ -702,6 +899,9 @@ impl<B: Backend> ExecutionService<B> {
         // caller's decision and its request surfaces as a hard backend error
         // ("no longer owns the active run") while `cleanup` on the same run
         // succeeds — a benign race reported as a failure.
+        if let Some(record) = self.cancel_starting(run_id)? {
+            return Ok(record);
+        }
         self.refresh_run(run_id)?;
         let existing = self
             .state
@@ -717,7 +917,11 @@ impl<B: Backend> ExecutionService<B> {
         if !is_active(existing.state) {
             return Ok(existing);
         }
-        if !self.backend.cancel(run_id)? {
+        let cancelled = self.backend.cancel(run_id);
+        // The broker is drained and gone either way; its outcome is the
+        // receipt's.
+        self.record_connections(run_id);
+        if !cancelled? {
             // The worker finished after the refresh above and before the
             // backend saw the cancel: project its completion and return the
             // terminal record, as for a run that finished before the cancel.
@@ -764,6 +968,53 @@ impl<B: Backend> ExecutionService<B> {
 }
 
 impl<B: Backend> ExecutionService<B> {
+    /// Keep what a finished run's connections carried, for its receipt.
+    /// Recorded once: a later teardown of the same run has nothing to add.
+    fn record_connections(&self, run_id: &str) {
+        if let Some(outcome) = self.backend.take_connections(run_id) {
+            self.state
+                .write()
+                .connections
+                .entry(run_id.to_owned())
+                .or_insert(outcome);
+        }
+    }
+
+    /// Cancel a run that is still starting (ADR-0046 S7): mark it, stop its
+    /// broker and its worker where they stand, and wait for its start to
+    /// end. `None` when the run is not starting.
+    ///
+    /// A cancelled start is not recorded, like any start that failed, so the
+    /// answer is a record of what was cancelled and a later `status` finds no
+    /// run. The exception is a start whose workload could not be cancelled:
+    /// it is recorded `Failed`, and that record is the answer.
+    fn cancel_starting(&self, run_id: &str) -> Result<Option<RunRecord>, ExecutionError> {
+        // Marked under the write lock the start publishes under, so the mark
+        // is seen by the start or the run is already published.
+        let starting = {
+            let state = self.state.write();
+            state.starting.get(run_id).map(|starting| {
+                starting.gate.cancelled.store(true, Ordering::SeqCst);
+                (starting.replay_key.clone(), Arc::clone(&starting.gate))
+            })
+        };
+        let Some((replay_key, gate)) = starting else {
+            return Ok(None);
+        };
+        let interrupted = self.backend.cancel(run_id);
+        gate.wait();
+        if let Some(record) = self.state.read().runs.get(run_id).cloned() {
+            return Ok(Some(record));
+        }
+        interrupted?;
+        Ok(Some(RunRecord {
+            run_id: run_id.to_owned(),
+            replay_key,
+            state: RunState::Cancelled,
+            backend_id: self.backend.capabilities().backend_id,
+        }))
+    }
+
     /// Project one backend completion into the shared append-only lifecycle.
     /// This is deliberately called by read paths, so UDS, CLI, and MCP all
     /// observe the same terminal transition without a transport-specific
@@ -781,6 +1032,9 @@ impl<B: Backend> ExecutionService<B> {
         let Some(outcome) = self.backend.poll(run_id)? else {
             return Ok(());
         };
+        // A terminal state: the broker layer drained the run's broker before
+        // it answered, so the outcome is there to take (ADR-0046 S7, S8).
+        self.record_connections(run_id);
         let (terminal, detail_digest) = match outcome {
             BackendRunStatus::Succeeded => (RunState::Succeeded, None),
             BackendRunStatus::Failed(error) => (

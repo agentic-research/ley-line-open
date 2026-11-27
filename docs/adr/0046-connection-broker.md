@@ -3,8 +3,8 @@
 **Status:** Proposed (2026-10-27). Acceptance of the whole ADR is the user's decision; see
 *Open questions*. Decided so far: Q7 (2026-11-10; implemented by `ley-line-open-be3711`, and
 D5's microVM channel shipped with it) and *Slice 1* (Accepted 2026-11-11, which answers Q1,
-Q3 and Q8 for the credential-free relay; being implemented, and no broker ships yet). D3,
-D4 and Q2, Q4, Q5, Q6 remain proposals.
+Q3 and Q8 for the credential-free relay; implemented, with the service integration in
+`ley-line-open-5308b7`). D3, D4 and Q2, Q4, Q5, Q6 remain proposals.
 **Bead:** `ley-line-open-e2c5ce`
 **Related:**
 - cloister ADR-0069 (Proposed; bead `cloister-77870d`): declared connections, the declaration half
@@ -533,6 +533,22 @@ mismatch refuses the run naming the connection and the grant:
 The guest address stays where Q7 put it: `guestPort` in the confinement manifest, committed
 by `confinementDigest`. The connections document does not repeat it.
 
+*Decided 2026-11-13 (owner, with cloister's review; recorded on `ley-line-open-5308b7`):*
+the rule is one-way, document ⊆ grants. Cloister emits §6 connect grants with `guestPort`
+for microVM-to-microVM peer channels, where the other VM binds the socket and there is no
+broker and no document entry (the S0 shared-path join). So:
+
+- every connection's `endpoint.unix` has exactly one §6 connect grant on that exact path, in
+  the tier's spelling, or the run is refused naming the connection;
+- no connection's endpoint is a path the same manifest grants `bind` or `connect-bind` on,
+  or that a bind-capable directory grant contains, and no §2 write grant covers its
+  directory;
+- a connect grant with no document entry stays legal. Whether it reaches another run's
+  endpoint is the registry's to refuse (S4), not a document rule.
+
+The rule is enforced identically for a run started from a grant and for one an embedder
+starts with no grant (S7).
+
 ### S3. Q3 — authorizing the document (proposed wire change)
 
 **Additive `RunGrant` fields, on the `confinementDigest @8` / `confinementManifest @15`
@@ -609,7 +625,12 @@ already notes.
 `{name: "cloister/execution/v1/connections", version: "1"}` (constant beside
 `RESOURCE_LIMITS_CAPABILITY` in `transport.rs`), advertised by a daemon that reads `@16`/`@17`
 and has a broker, whatever its tier; a tier that cannot serve a connection refuses at start
-by name (S6). A client MUST find the entry before sending a grant with connections. Its
+by name (S6). The entry is not a separate switch: `Backend::connections()` reports it
+(`None` by default, `Some` from a backend wrapped with a broker), `capabilities_json` writes
+that value, and the same value is the probe an embedder with no daemon uses. Absent means
+refuse; support is never inferred from a version. The daemon gets its broker from
+`execution-daemon --connection-broker <path>`; without the flag it advertises nothing and
+refuses a grant with connections by name ("this daemon has no connection broker"). A client MUST find the entry before sending a grant with connections. Its
 absence means a daemon older than the first LLO release that ships this slice, and the
 client's refusal names that minimum version *(cloister: as the `casRoot` refusal does)*.
 The old daemon's own refusal is one of the fixed texts in the table above; it cannot name
@@ -804,14 +825,43 @@ the broker is tier-specific: only the cross-document rule's expected §6 spellin
 
 ### S7. Lifecycle (proposed)
 
-**The broker is owned by `ExecutionService`, not by a backend.** `ExecutionService::start`
-is the chokepoint the direct-request path cannot route around, and the broker is
-tier-agnostic (S6), so the service spawns and supervises it and the connections document
-travels on `ExecutionRequest` beside the confinement manifest. A backend sees only a
-confinement whose §6 paths are already bound.
+**The broker is owned by the layer every start goes through, not by a backend.** As
+proposed, that layer was `ExecutionService`. As decided on 2026-11-13 and built (below),
+it is `Brokered`, the wrapper `ExecutionService` is built on and an embedder with no
+service uses directly: `ExecutionService::start` cannot route around it, and the broker
+is tier-agnostic (S6). A backend sees only a confinement whose §6 paths are already
+bound.
 
-Ordering inside `ExecutionService::start`, each step refusing the run on failure before the
-next:
+*Decided 2026-11-13 (owner, from cloister's question; recorded on `ley-line-open-5308b7`)
+and as built:* cloister's `cluster up` embeds a backend and calls `Backend::start` with no
+service and no `RunGrant`. Such an embedder is the host: it already chooses the confinement
+and the workspaces, so a grant adds no authority there, and connections reach the backend
+on that path too. One implementation serves both paths:
+
+- **`leyline_runtime::Brokered<B>`** wraps any `Backend` and is one. It holds the endpoint
+  registry and each run's broker, and performs steps 2 to 5 below, the failure teardown,
+  the drain and the outcome assembly. `ExecutionService` is built on it (every service
+  start, authorized or direct, goes through it), and an embedder with no service wraps its
+  backend in it. Nothing about it is tier-specific.
+- **`Backend::start` takes the run's connections** as a third argument, `RunConnections`,
+  beside the request and the workspace shares, not as a field of `ExecutionRequest`: the
+  request is what a resolver builds and a worker is sent, and neither chooses or needs the
+  document. An embedder states `RunConnections::verified(VerifiedConnections)`, a value
+  built only from a parsed canonical document, never from raw fields. `Brokered` serves it
+  and hands the wrapped backend a served value: the endpoints are bound and the broker has
+  attested the digest. A backend handed an unserved value (it was called with no `Brokered`
+  around it) refuses the run by name before it spawns anything.
+- **The wrapped backend has one duty**: on the microVM tier it names its worker's pid to the
+  broker as soon as the worker is spawned, before the worker has its request
+  (`ServedConnections::name_worker`). A backend that starts the run without doing so is
+  refused and the run cancelled, because its broker would refuse every connection.
+- **`RunOutcome` and `RunReceiptData` carry `connectionsDigest` and the per-connection
+  outcomes** on both paths: `Brokered::poll_outcome` for an embedder, the receipt for the
+  service.
+
+Ordering of a start, each step refusing the run on failure before the next. Step 1 is
+`ExecutionService`'s (an embedder with no grant has none); steps 2 to 5 are `Brokered`'s,
+and the service's resolver runs between 1 and 2:
 
 1. authorize the grant, including S3's all-or-nothing rule and the digest check;
 2. parse the document (S2); check the tier (S6); run the cross-document rule (S2) and the
@@ -830,7 +880,9 @@ kills the broker, unlinks its endpoints and removes the run from the registry be
 start returns. One exception: on the failed-cancel path the run is recorded `failed` while
 its worker may still be alive, so its registry entry stays until `cleanup`'s cancel
 succeeds; dropping it at the terminal state would let another run claim an endpoint the
-old VMM can still dial. **Cancel during start** acts on a starting run: today `service.cancel` looks
+old VMM can still dial. (Under `ExecutionService` the run is recorded `failed` and stays
+addressable whichever layer found the workload uncancellable; an embedder with no service
+gets the refusal, and a later `Brokered::cancel` that succeeds releases the entry.) **Cancel during start** acts on a starting run: today `service.cancel` looks
 only at `state.runs`, and a starting run lives in `state.starting` until `backend.start`
 returns, so the service's cancel must also reach `starting` and kill the broker (and the
 worker, if spawned). `ley-line-open-f963e6` names the same window one layer down, in
@@ -855,8 +907,80 @@ broker's control pipe follows the same rule.
 **Teardown drains before it kills.** At every terminal state the supervisor asks the broker
 over the control pipe to stop accepting and report a final record for every connection,
 open ones included; it waits a bound (proposed: 1 s), then closes the lifeline, kills the
-broker's process group and unlinks the endpoints. A connection open for the run's whole
+broker (as built, by pid: see "Process" below) and unlinks the endpoints. A connection open for the run's whole
 life is thus in the receipt (S8).
+
+*Implementation notes (2026-11-23, `ley-line-open-5308b7`):*
+
+- **Cancel of a starting run.** `ExecutionService::cancel` marks the starting run under the
+  lock its start publishes under, cancels through the broker layer, and waits for the start
+  to end. The mark travels with the start into the broker layer, which reads it (and its
+  own mark, for a run it has registered) before it spawns the broker and again immediately
+  before it asks the backend to start the workload: a cancel received before the spawn
+  leaves no broker and no backend start. A cancel during the ready wait kills the broker
+  where it stands; one during step 5 also asks the wrapped backend to cancel its starting
+  worker, and a start that finishes anyway sees the mark and cancels the run before it is
+  published. The cancel returns with no broker process and no endpoint. A cancelled start
+  is not recorded, like any failed start: the cancel answers with a `cancelled` record and
+  a later `status` finds no run.
+- **What the supervisor unlinks.** Never a socket the broker did not bind, as far as it can
+  know. A ready report names each bound socket by device and inode; the supervisor
+  believes it only about the document's own endpoint paths (a report naming any other path
+  refuses the start, and so does one that names fewer endpoints than the document
+  declares) and unlinks a path only while it is still that node. A broker that
+  fails before ready unlinks what it bound itself, while it still can, and reports the
+  error; the supervisor then unlinks nothing, so a socket another process bound at an
+  endpoint after the preflight (the cause of an `EADDRINUSE`) is left alone. Only a broker
+  stopped having reported nothing at all (killed by a cancel or the ready bound while it
+  was binding or confining itself) leaves sockets the supervisor was never told about:
+  then each declared endpoint path that holds a socket node is unlinked. That can remove a
+  socket a same-uid process bound there after the preflight (the S10 residual; it is
+  indistinguishable); it cannot remove a non-socket or any path the document does not
+  declare. A broker that fails after confining itself cannot unlink: its error report
+  carries what it bound, by device and inode, and the supervisor, which is not confined,
+  unlinks those nodes under the same two rules as for a ready report.
+- **A broker exit during the run** is seen by the thread reading the broker's reports: it
+  reaches end-of-file and fails the run at once, cancelling the workload without waiting
+  for a poll. A poll made while that is in progress waits for it. The run's terminal state is
+  `failed`, and its outcome keeps every record reported before the exit with `complete`
+  false.
+- **A cancel after the broker died.** A broker exit during the run is the run's failure
+  (D7 rule 5), and a cancel that arrives after it does not change that: the cancel answers
+  that no active run was left, and the run's terminal state is `failed`, not `cancelled`.
+- **Order at a terminal state.** The workload ends first (it exited, or the cancel killed
+  it), then the drain, so a connection that was open when the workload ended has its final
+  record and `complete` is true.
+- **The failed-cancel path.** When a started workload cannot be cancelled, the broker is
+  still stopped and its endpoints unlinked, and only the registry entry stays, until a
+  later cancel (from `cleanup`) succeeds. `ExecutionService` records the run `failed`, with
+  its events and a content-addressed detail, in both places the path arises: the service's
+  own refusal after a start (a workspace share not held, a cancel during start) and the
+  broker layer's (a worker never named, a broker that died while the workload started).
+  A panic in the wrapped backend's `start` is treated the same way: the broker is torn
+  down and the endpoints stay reserved until a cancel succeeds.
+- **Runs without connections** register their §6 grants in the same registry when the
+  runtime has a broker, so the both-orders rule of S4 holds whichever run starts first.
+  The registration is released when the run's end is observed (a poll that reports it, or
+  a cancel that stopped it). A cancel the wrapped backend answers "no such run" does not
+  release a run that is still starting, since that run may yet go live.
+- **Process, not process group.** S7 proposed killing the broker's process group. As built
+  the broker is not started in a group of its own and is killed by pid: its profile denies
+  `fork` and `exec`, so it has no descendants to reach, and D7's "in the run's process
+  group / cgroup" row is met for slice 1 by the supervised lifecycle and the lifeline. The
+  supervisor's record of a starting broker names its pid only while that process is
+  certainly unreaped, so a cancel never signals a recycled pid.
+- **The broker binary's path** is configuration: `BrokerConfig` for an embedder,
+  `execution-daemon --connection-broker` for the daemon, which refuses to start unless the
+  path is an existing regular file the daemon itself may execute (`access(2)`, `X_OK`). Nothing verifies that the file is
+  `leyline-conn-broker`: the operator names the binary, and the first run's ready report
+  (the document's digest echoed within the bound) is the check that it speaks the broker's
+  protocol; a binary that does not fails that run by name, having been handed only the
+  control pipe, the lifeline and one run's document. The release attaches the binary as
+  `leyline-conn-broker-darwin-arm64` (`ley-line-open-caa20b`), with the linker's ad-hoc
+  signature and no entitlement; the test-only `leyline-conn-broker-unconfined` is refused
+  by name at staging and release verification. The deployment configuration
+  document (ADR-0049) gains the field with the daemons' adoption of it
+  (`ley-line-open-52c177`).
 
 ### S8. The receipt (proposed)
 
@@ -993,7 +1117,13 @@ enforcement.
   a bound; `ExecutionService::cancel` during a stalled ready wait leaves no broker and no
   endpoint; a forced failure at step 5 leaves no broker and no endpoint; a broker killed
   mid-run fails the run; N concurrent starts leave each lifeline write end held only by
-  the supervisor (checked with `lsof`).
+  the supervisor (checked with `lsof`). As built
+  (`broker_lifecycle::under_concurrent_starts_every_broker_still_ends_with_its_supervisor`):
+  eight concurrent starts whose workers ignore their own lifeline; `lsof` on macOS and
+  `/proc/<pid>/fd` on Linux show that no worker and no other broker holds the write end of
+  any broker's lifeline and that the supervisor does; then the supervisor is killed and
+  every broker ends with every worker still alive. The kill alone would not prove it, since
+  a broker also ends when its control pipe closes.
 - **Receipt** (closes S8): counts match a scripted sequence of accepted, dialed, refused and
   foreign-peer connections; a connection held open across workload exit appears with
   `complete` true; after a broker kill, `complete` is false.
@@ -1083,7 +1213,8 @@ be proven.
   `run-grant.md`, the connections grant vector and `VECTORS.sha256`.
 - `leyline-runtime`: authorization (S3); the transport capability entry; `ExecutionService`
   start ordering, the endpoint registry, cancel of starting runs and failure teardown (S4,
-  S7); `ExecutionRequest` carrying the document; a broker module (preflight, relay, profile,
+  S7); the run's connections reaching `Backend::start` as its own argument (as proposed,
+  `ExecutionRequest` carrying the document; S7 records why not); a broker module (preflight, relay, profile,
   control pipe, drain) and receipt assembly (S5, S8); a new LLO binary beside
   `leyline-native-worker`. The lifeline pipe is shared with `ley-line-open-f963e6`, which
   ships in the same release (S-Q5).
@@ -1092,7 +1223,10 @@ be proven.
 - **Every daemon spawn moves to `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` (S7).**
   `std::process::Command` cannot set that flag, so the existing spawn paths in
   `native_backend.rs` and `libkrun/backend.rs` (`configure_process_group`) change too, not
-  only the broker's. This is the widest part of the slice.
+  only the broker's. This is the widest part of the slice. Shipped as `backends::spawn`
+  (bead `ley-line-open-528525`): `posix_spawn` with that flag on macOS; on Linux, where
+  `pipe2` closes the window, `Command` with a `pre_exec` hook that marks every unnamed
+  descriptor close-on-exec (`close_range`), whose fork-to-exec hold the module documents.
 - **No libkrun patch.** Patch 0010's dial channel already joins guest loopback to the host
   path through vsock; the broker is the listener at that path.
 - Cloister: emit the document, the digest and the marker; check the capability; read
@@ -1220,7 +1354,10 @@ Slice 1 (Accepted 2026-11-11), filed for v0.30.0, each blocking `ley-line-open-e
 - `ley-line-open-52b5b3`: the broker binary and module, its profile, preflight, the
   endpoint registry and the peer-pid check (S4, S5).
 - `ley-line-open-5308b7`: `ExecutionService` start order, teardown, receipt assembly and
-  the hypervisor end-to-end test (S2, S6, S7, S8).
+  the hypervisor end-to-end test (S2, S6, S7, S8). Done: `Brokered`, the `Backend::start`
+  connections argument, cancel of starting runs, the capability entry and the receipt
+  fields; `runtime/tests/broker_lifecycle.rs`, `broker_cross_document.rs`, the conformance
+  row and `krun-worker/tests/libkrun_guest_broker.rs`.
 - `ley-line-open-528525`: daemon spawns through `posix_spawn` (S7).
 - `ley-line-open-52deb4`: the loopback probe and the macOS CI job (S11a).
 - `ley-line-open-f963e6`: the parent-death fix, same release (S-Q5).

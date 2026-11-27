@@ -115,6 +115,7 @@ fn native() -> Option<Column> {
             undeliverable,
             undeliverable_name: UNDELIVERABLE,
             sandbox_refusal: native_guest::is_apply_failure,
+            broker: PathBuf::from(env!("CARGO_BIN_EXE_leyline-conn-broker")),
         },
         backend,
     ))

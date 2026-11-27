@@ -11,9 +11,24 @@
 //! The guarantee holds only while no other process holds a copy of the write
 //! end. Both ends are created close-on-exec, and the read end crosses exactly
 //! one exec, the child's ([`ReadEnd::pass_at`] or the spawner's own inherit
-//! list). A concurrent spawn between `pipe(2)` and `FD_CLOEXEC` can still
-//! inherit a copy until every daemon spawn uses `POSIX_SPAWN_CLOEXEC_DEFAULT`
-//! (`ley-line-open-528525`).
+//! list). Every child this crate starts (workers, brokers, `codesign` and
+//! `hdiutil`) goes through [`crate::backends::spawn`], which hands a child
+//! exactly what it names (`POSIX_SPAWN_CLOEXEC_DEFAULT` on macOS; bead
+//! `ley-line-open-528525`), so none of them holds another run's write end
+//! after its exec, even one created a moment before on another thread.
+//!
+//! On Linux a spawn forks, and from the fork to its exec the new child holds
+//! a copy of every descriptor this process held at the fork, a write end
+//! among them; that copy is close-on-exec and closes at the child's exec (or
+//! its exit). A write end dropped, or a supervisor that died, is therefore
+//! seen by its child only once every child forked while that write end was
+//! open has exec'd: the bound is the union of those overlapping fork-to-exec
+//! windows, not one of them. No fork after the write end closes copies it.
+//!
+//! A process the embedding program starts some other way (a
+//! `std::process::Command` outside this crate) can still take a copy on
+//! macOS in the moment between `pipe(2)` and `FD_CLOEXEC`, and hold it until
+//! it exits.
 //!
 //! Used by the connection broker (`--lifeline-fd`), the libkrun worker
 //! (`--lifeline-fd`) and the daemon a launcher starts (`ley-line-open-f6b525`).
@@ -38,10 +53,10 @@ pub struct ReadEnd {
 
 /// A new lifeline: both ends close-on-exec. On Linux the pipe is created
 /// close-on-exec (`pipe2(O_CLOEXEC)`). macOS has no `pipe2`, so the flag is
-/// set just after the pipe is created; a process another thread spawns in
-/// between can still inherit a copy of the write end. That window stays open
-/// until every daemon spawn uses `POSIX_SPAWN_CLOEXEC_DEFAULT`, which is
-/// `ley-line-open-528525`'s work, not this function's.
+/// set just after the pipe is created; a child started through
+/// [`crate::backends::spawn`] inherits nothing it is not given, so it cannot
+/// take a copy in between, but a process started some other way can (see the
+/// module documentation).
 pub fn pair() -> io::Result<(Lifeline, ReadEnd)> {
     let (read_end, write_end) = io::pipe()?;
     let (read_end, write_end) = (OwnedFd::from(read_end), OwnedFd::from(write_end));
@@ -69,6 +84,14 @@ pub fn parse_fd(value: &str) -> Result<RawFd, String> {
     value
         .parse()
         .map_err(|_| format!("--lifeline-fd {value:?} is not a file descriptor number"))
+}
+
+impl std::os::fd::AsFd for ReadEnd {
+    /// The read end, borrowed: what [`crate::backends::spawn::Spawn::inherit`]
+    /// takes, so the read end stays open until the spawn is done with it.
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 impl ReadEnd {

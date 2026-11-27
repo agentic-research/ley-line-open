@@ -52,6 +52,14 @@ for artifact_dir in "$artifact_root"/*; do
         -exec basename {} \; > "$actual_names_raw"
     LC_ALL=C sort "$actual_names_raw" > "$actual_names"
     test -s "$actual_names"
+    # leyline-conn-broker-unconfined is the broker with no OS profile, built
+    # only under `test-support` (ley-line-open-caa20b). A set carrying it is
+    # refused by name even when its own SHA256SUMS lists it.
+    unconfined=$(grep -x 'leyline-conn-broker-unconfined.*' "$actual_names" || true)
+    if [ -n "$unconfined" ]; then
+        echo "refusing a release artifact set containing the test-only unconfined broker: $unconfined ($artifact_dir)" >&2
+        exit 1
+    fi
     diff -u "$expected_names" "$actual_names"
 
     (

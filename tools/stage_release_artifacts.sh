@@ -280,6 +280,68 @@ if [ -n "${KRUN_WORKER_SOURCE:-}" ] || [ -n "${KRUN_WORKER_ASSET:-}" ]; then
     esac
 fi
 
+# The connection broker (ley-line-open-caa20b; ADR-0046 Slice 1).
+#
+# leyline-conn-broker is the process a daemon started with
+# `execution-daemon --connection-broker <path>` spawns for each run whose grant
+# carries a connections document. It confines itself with a macOS profile and
+# refuses by name before reporting ready anywhere else (ADR-0046 S6), so only a
+# darwin broker is staged. It needs no entitlement: it is staged exactly as the
+# leyline CLI is, with the linker's ad-hoc signature and nothing added.
+#
+# Its sibling leyline-conn-broker-unconfined is the same broker with no OS
+# profile, built only under the `test-support` feature for the supervisor's
+# tests. It must never ship: a source or asset of that name is refused here,
+# and the staged-name guard below refuses one that arrives any other way.
+if [ -n "${CONN_BROKER_SOURCE:-}" ] || [ -n "${CONN_BROKER_ASSET:-}" ]; then
+    : "${CONN_BROKER_SOURCE:?CONN_BROKER_SOURCE is required with CONN_BROKER_ASSET}"
+    : "${CONN_BROKER_ASSET:?CONN_BROKER_ASSET is required with CONN_BROKER_SOURCE}"
+    case "$(basename "$CONN_BROKER_SOURCE")" in
+        leyline-conn-broker-unconfined*)
+            echo "refusing to stage the test-only unconfined broker: $CONN_BROKER_SOURCE" >&2
+            exit 1
+            ;;
+    esac
+    case "$CONN_BROKER_ASSET" in
+        *[!A-Za-z0-9._-]*)
+            echo "unsafe connection broker asset name: $CONN_BROKER_ASSET" >&2
+            exit 1
+            ;;
+        leyline-conn-broker-unconfined*)
+            echo "refusing to stage the test-only unconfined broker as $CONN_BROKER_ASSET" >&2
+            exit 1
+            ;;
+        leyline-conn-broker-darwin-*) ;;
+        *)
+            echo "connection broker asset must be leyline-conn-broker-darwin-<arch>:" >&2
+            echo "the broker serves connections only on macOS (ADR-0046 S6): $CONN_BROKER_ASSET" >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -f "$CONN_BROKER_SOURCE" ]; then
+        echo "connection broker not built: $CONN_BROKER_SOURCE" >&2
+        echo "run 'task release:conn-broker:target' for this BUILD_TARGET" >&2
+        exit 1
+    fi
+    if [ -e "$OUTPUT_DIR/$CONN_BROKER_ASSET" ]; then
+        echo "release asset names would collide: $CONN_BROKER_ASSET" >&2
+        exit 1
+    fi
+    cp "$CONN_BROKER_SOURCE" "$OUTPUT_DIR/$CONN_BROKER_ASSET"
+    chmod +x "$OUTPUT_DIR/$CONN_BROKER_ASSET"
+fi
+
+# No staged name may be the unconfined test broker, whichever input put it
+# there (a generator list, an asset name): SHA256SUMS never digests it.
+for staged_file in "$OUTPUT_DIR"/*; do
+    case "$(basename "$staged_file")" in
+        leyline-conn-broker-unconfined*)
+            echo "refusing a staging directory containing the test-only unconfined broker: $(basename "$staged_file")" >&2
+            exit 1
+            ;;
+    esac
+done
+
 manifest_tmp="$OUTPUT_DIR/.SHA256SUMS.tmp.$$"
 manifest_unsorted="$OUTPUT_DIR/.SHA256SUMS.unsorted.$$"
 trap 'rm -f "$manifest_tmp" "$manifest_unsorted"' 0 1 2 15

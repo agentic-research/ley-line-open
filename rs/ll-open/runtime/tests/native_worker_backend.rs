@@ -148,7 +148,11 @@ fn worker_exit_is_observable_and_run_root_is_removed() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
     );
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("worker readiness");
     let status = backend
         .wait_for_completion("native-run-01")
@@ -169,7 +173,11 @@ fn failed_worker_is_reported_and_cleaned() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexit 7\n",
     );
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("worker readiness");
     let status = backend
         .wait_for_completion("native-run-01")
@@ -207,7 +215,11 @@ fn a_cancel_after_observed_failure_is_a_no_op() {
     );
     for _ in 0..200 {
         backend
-            .start(&request(), ServedWorkspaces::none())
+            .start(
+                &request(),
+                ServedWorkspaces::none(),
+                leyline_runtime::RunConnections::none(),
+            )
             .expect("worker readiness");
         assert!(matches!(
             backend
@@ -232,7 +244,11 @@ fn readiness_for_another_run_is_rejected_and_cleaned() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"other-run\"}' >&2\n",
     );
     let error = backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect_err("worker readiness must bind to the requested run");
     assert!(error.detail.contains("unexpected run"));
     assert_eq!(fs::read_dir(runs).expect("runs").count(), 0);
@@ -263,7 +279,11 @@ fn a_granted_workspace_is_refused_before_the_worker_is_spawned() {
         write_scope: Vec::new(),
     }];
     let error = backend
-        .start(&request, ServedWorkspaces::none())
+        .start(
+            &request,
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect_err("a workspace grant the native tier cannot serve");
     // Typed, not the generic `unsupportedBackend`: the code alone tells
     // Cloister to route the run to a tier that serves workspaces (bead
@@ -291,7 +311,11 @@ fn native_cleanup_restores_guest_created_permissions() {
         "#!/bin/sh\nIFS= read -r _\nmkdir -p \"$4/locked\"\nprintf x > \"$4/locked/file\"\nchmod 000 \"$4/locked\"\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\n",
     );
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("worker readiness");
     backend
         .wait_for_completion("native-run-01")
@@ -327,7 +351,11 @@ fn an_environment_no_tier_can_carry_is_refused_by_name_before_spawn() {
             .public_environment
             .insert(key.to_owned(), value.to_owned());
         let error = backend
-            .start(&request, ServedWorkspaces::none())
+            .start(
+                &request,
+                ServedWorkspaces::none(),
+                leyline_runtime::RunConnections::none(),
+            )
             .expect_err("an environment no tier can carry is refused");
         assert_eq!(
             error.code,
@@ -357,7 +385,11 @@ fn cancel_kills_worker_and_removes_run_root() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("worker readiness");
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
     assert!(backend.cancel("native-run-01").expect("cancel"));
@@ -388,7 +420,11 @@ fn a_reader_of_a_cancelled_run_never_sees_it_complete() {
             "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
         );
         backend
-            .start(&request(), ServedWorkspaces::none())
+            .start(
+                &request(),
+                ServedWorkspaces::none(),
+                leyline_runtime::RunConnections::none(),
+            )
             .expect("worker readiness");
         let done = AtomicBool::new(false);
         let seen = std::thread::scope(|scope| {
@@ -421,13 +457,21 @@ fn backend_trait_cancel_delegates_and_drop_waits_for_cleanup() {
         "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"ready\",\"run_id\":\"native-run-01\"}' >&2\nexec /usr/bin/tail -f /dev/null\n",
     );
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("worker readiness");
     assert!(Backend::cancel(&backend, "native-run-01").expect("trait cancel"));
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 0);
 
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("second worker readiness");
     assert_eq!(fs::read_dir(&runs).expect("runs").count(), 1);
     drop(backend);
@@ -465,7 +509,11 @@ sleep 30
     request.confinement_digest = format!("blake3-256:{}", "a".repeat(64));
 
     let error = backend
-        .start(&request, ServedWorkspaces::none())
+        .start(
+            &request,
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect_err("a worker attesting an unauthorized policy must not start");
     assert!(
         format!("{error:?}").contains("confinement drift"),
@@ -499,7 +547,11 @@ sleep 30
 
     // `request()` leaves `confinement_digest` empty: nothing was authorized.
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("an unauthorized-policy grant must not refuse an attesting worker");
     assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
 }
@@ -535,7 +587,11 @@ sleep 30
     request.confinement_digest = authorized;
 
     backend
-        .start(&request, ServedWorkspaces::none())
+        .start(
+            &request,
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("a worker attesting exactly the authorized policy must start");
     assert!(Backend::cancel(&backend, "native-run-01").expect("cancel"));
 }
@@ -564,7 +620,11 @@ exit 1
 "#,
     );
     let error = backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect_err("a worker that could not confine must not start");
     assert!(
         error.detail.contains("apply native nono confinement"),
@@ -646,7 +706,13 @@ fn a_cancel_between_spawn_and_readiness_stops_the_worker_and_removes_its_run_roo
     let backend = std::sync::Arc::new(backend);
     let starter = {
         let backend = std::sync::Arc::clone(&backend);
-        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+        std::thread::spawn(move || {
+            backend.start(
+                &request(),
+                ServedWorkspaces::none(),
+                leyline_runtime::RunConnections::none(),
+            )
+        })
     };
 
     // EVENT: the worker exists, and is starting.
@@ -708,7 +774,11 @@ fn native_lifeline_embedder() {
         ready_timeout: Duration::from_secs(10),
     });
     backend
-        .start(&request(), ServedWorkspaces::none())
+        .start(
+            &request(),
+            ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
+        )
         .expect("ready worker");
     println!("EMBEDDER-STARTED");
     loop {
@@ -952,7 +1022,13 @@ fn a_native_cancel_right_after_spawn_finds_the_run() {
     }));
     let starter = {
         let backend = std::sync::Arc::clone(&backend);
-        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+        std::thread::spawn(move || {
+            backend.start(
+                &request(),
+                ServedWorkspaces::none(),
+                leyline_runtime::RunConnections::none(),
+            )
+        })
     };
     spawned
         .recv_timeout(EVENT_BOUND)
@@ -1003,7 +1079,13 @@ fn a_native_cancel_before_readiness_reports_a_run_root_it_could_not_remove() {
     let backend = std::sync::Arc::new(backend);
     let starter = {
         let backend = std::sync::Arc::clone(&backend);
-        std::thread::spawn(move || backend.start(&request(), ServedWorkspaces::none()))
+        std::thread::spawn(move || {
+            backend.start(
+                &request(),
+                ServedWorkspaces::none(),
+                leyline_runtime::RunConnections::none(),
+            )
+        })
     };
     let worker = pid_from(&spawned, "the starting worker");
     let _cleanup = KillOnDrop(worker);
@@ -1058,7 +1140,11 @@ fn cancel_queued_at(
         }
     }));
     *backend_slot.lock().unwrap() = Some(std::sync::Arc::clone(&backend));
-    let started = backend.start(&request(), ServedWorkspaces::none());
+    let started = backend.start(
+        &request(),
+        ServedWorkspaces::none(),
+        leyline_runtime::RunConnections::none(),
+    );
     let answered = answer
         .recv_timeout(EVENT_BOUND)
         .expect("TIMEOUT: the queued cancel was never answered");

@@ -156,6 +156,7 @@ fn a_delegated_root_places_the_worker_in_a_run_cgroup_carrying_each_ceiling() {
         .start(
             &request(run_id, limits),
             leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
         )
         .expect("start");
     assert!(matches!(
@@ -214,6 +215,7 @@ fn a_delegated_root_enforces_pids_and_its_teardown_kills_what_left_the_group() {
         .start(
             &request(run_id, limits),
             leyline_runtime::ServedWorkspaces::none(),
+            leyline_runtime::RunConnections::none(),
         )
         .expect("start");
     let _ = backend.wait_for_completion(run_id).expect("complete");

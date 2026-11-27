@@ -45,7 +45,9 @@ pub fn check_endpoint(name: &str, endpoint: &Path, euid: u32) -> Result<(), Exec
     match std::fs::symlink_metadata(endpoint) {
         Ok(_) => {
             return Err(ExecutionError::resource_conflict(format!(
-                "connection `{name}`: endpoint {}: endpoint exists",
+                "connection `{name}`: endpoint {}: endpoint exists (another run's socket, a \
+                 squatter's, or one a previous broker left behind; remove it once nothing \
+                 listens there)",
                 endpoint.display()
             )));
         }

@@ -1,9 +1,9 @@
+use crate::backends::spawn::{ChildIo, Spawn};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -18,18 +18,14 @@ use crate::{
 use super::output::OutputCapture;
 
 use super::super::process::{
-    SupervisionLabels, WorkerProcess, abort_failed_start, cleanup_tempdir, configure_process_group,
-    finish_failed_start, published_status, read_readiness_line, supervise_worker,
-    terminate_process_group,
+    SupervisionLabels, WorkerProcess, abort_failed_start, cleanup_tempdir, finish_failed_start,
+    published_status, read_readiness_line, supervise_worker, terminate_process_group,
 };
 use super::share::{FsService, serve};
-// The share's `worker_end` is created close-on-exec, as every descriptor
-// here is, so a process another thread spawns concurrently does not inherit
-// it; only the worker's child clears the flag, after its fork
-// (`inherit_only`), and the parent holds `worker_end` until spawn returns.
-use super::worker::{
-    WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors, inherit_only_with_lifeline,
-};
+// The share's `worker_end` and the lifeline's read end reach the worker
+// because `spawn` names them; no other child, on any thread, inherits them
+// (bead ley-line-open-528525). The parent holds both until spawn returns.
+use super::worker::{WORKSPACE_SHARE_FD_ARG, WorkerEvent, declared_descriptors};
 
 const LABELS: SupervisionLabels = SupervisionLabels {
     worker: "libkrun worker",
@@ -180,7 +176,7 @@ impl Drop for Starting<'_> {
 /// root, answer the cancel with whether the removal worked, and return the
 /// error the start ends with.
 fn cancel_starting(
-    child: &mut std::process::Child,
+    child: &mut crate::backends::spawn::Spawned,
     rootfs: tempfile::TempDir,
     acknowledge: mpsc::SyncSender<Result<bool, ExecutionError>>,
 ) -> ExecutionError {
@@ -436,8 +432,14 @@ impl Backend for KrunWorkerBackend {
         &self,
         request: &ExecutionRequest,
         workspaces: ServedWorkspaces,
+        connections: crate::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         request.validate()?;
+        // The run's connections are served before this call (ADR-0046 S7):
+        // their endpoints are bound, and this backend's one duty is to name
+        // its worker to the broker. Connections nothing serves are refused
+        // here, before anything is created.
+        let connections = connections.served_for(request, "libkrun/1")?;
         // ADR-0035 §4 at the backend as well as the service, so a direct
         // call cannot route around it.
         self.capabilities().enforced.check(&request.limits)?;
@@ -481,18 +483,22 @@ impl Backend for KrunWorkerBackend {
                 ExecutionError::backend(format!("create ephemeral rootfs volume: {error}"))
             })?;
 
-        let mut command = Command::new(&self.config.worker);
+        // Started through `spawn`, which hands the worker exactly its
+        // standard streams and the descriptors named below, in a process
+        // group of its own (bead ley-line-open-528525).
+        let mut command = Spawn::new(&self.config.worker);
         command
             .arg("--cas-root")
             .arg(&self.config.cas_root)
             .arg("--run-root")
             .arg(rootfs.path())
-            .stdin(Stdio::piped())
+            .stdin(ChildIo::Piped)
             // The guest's console. Read from spawn on, so a guest that
             // prints never blocks on a full pipe, and kept bounded
             // (`output::OutputCapture`).
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(ChildIo::Piped)
+            .stderr(ChildIo::Piped)
+            .process_group();
         for path in &self.config.runtime_files {
             command.arg("--runtime-file").arg(path);
         }
@@ -505,7 +511,6 @@ impl Backend for KrunWorkerBackend {
         if self.config.tsi_hijack_inet {
             command.arg("--tsi-hijack-inet");
         }
-        configure_process_group(&mut command);
         // The workspace share: one end of a connected socket pair is
         // inherited by the worker, whose virtio-fs device sends the guest's
         // requests down it; this process answers them from the store.
@@ -540,11 +545,37 @@ impl Backend for KrunWorkerBackend {
         // This process keeps the lifeline's only write end for as long as it
         // supervises the worker: when it ends, for any reason, the worker
         // ends too (bead ley-line-open-f963e6).
-        let keep: Vec<i32> = declared.iter().map(|d| d.descriptor).collect();
-        let (lifeline, lifeline_read_end) = match inherit_only_with_lifeline(&mut command, &keep) {
+        // The declared descriptors are the share's worker end, the one
+        // descriptor a worker is ever declared to hold beyond its standard
+        // streams; it is borrowed from `share`, which outlives the spawn.
+        let worker_end = share.as_ref().map(|(_, _, worker_end)| worker_end.as_fd());
+        for descriptor in &declared {
+            let Some(fd) = worker_end.filter(|fd| fd.as_raw_fd() == descriptor.descriptor) else {
+                return Err(finish_failed_start(
+                    rootfs,
+                    LABELS,
+                    ExecutionError::backend(format!(
+                        "declared descriptor {} is not the workspace share's",
+                        descriptor.descriptor
+                    )),
+                ));
+            };
+            command.inherit(fd, descriptor.descriptor);
+        }
+        let (lifeline, lifeline_read_end) = match crate::lifeline::pair() {
             Ok(lifeline) => lifeline,
-            Err(error) => return Err(finish_failed_start(rootfs, LABELS, error)),
+            Err(error) => {
+                return Err(finish_failed_start(
+                    rootfs,
+                    LABELS,
+                    ExecutionError::backend(format!("create worker lifeline: {error}")),
+                ));
+            }
         };
+        command
+            .arg(super::worker::LIFELINE_FD_ARG)
+            .arg(lifeline_read_end.raw_fd().to_string())
+            .inherit(lifeline_read_end.as_fd(), lifeline_read_end.raw_fd());
 
         // Registered before the worker exists, so from its spawn until the
         // run is published a cancel reaches it through `event_tx`: there is
@@ -585,6 +616,14 @@ impl Backend for KrunWorkerBackend {
         #[cfg(feature = "test-support")]
         if let Some(hook) = &self.hook {
             hook(StartPoint::Spawned);
+        }
+        // The worker hosts the VMM, so it is the one process that connects
+        // to the run's broker. Named before the worker has its request: no
+        // guest exists yet, so no connection can arrive first (ADR-0046 S4).
+        if let Some(connections) = &connections
+            && let Err(error) = connections.name_worker(child.id())
+        {
+            return Err(abort_failed_start(&mut child, rootfs, LABELS, error));
         }
         // What the run prints, from its first byte. Both drains end at the
         // worker's exit, when the process group is killed and its pipes
@@ -866,6 +905,7 @@ impl Backend for KrunWorkerBackend {
                     other => other,
                 },
                 output: Some(output),
+                connections: None,
             });
             outputs.lock().remove(&run_id);
             // Retire the run and publish its completion as one step, under
@@ -958,6 +998,7 @@ mod tests {
             crate::RunOutcome {
                 status: BackendRunStatus::Succeeded,
                 output: None,
+                connections: None,
             },
         );
         assert!(matches!(
@@ -998,7 +1039,6 @@ mod tests {
         crate::workspaces::Opened,
     ) {
         use crate::backends::libkrun::share::{FsService, Reply, Request, WorkspaceShares};
-        use std::os::unix::fs::PermissionsExt;
 
         struct Share;
         impl FsService for Share {
@@ -1019,9 +1059,9 @@ mod tests {
 
         let fixture = tempfile::tempdir().expect("fixture");
         let worker = fixture.path().join("worker");
-        std::fs::write(
+        crate::test_support::write_executable(
             &worker,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 fd=
 prev=
@@ -1034,9 +1074,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
 {after_ready}
 "#
             ),
-        )
-        .expect("worker script");
-        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        );
         let (cas_root, ephemeral_root) = (fixture.path().join("cas"), fixture.path().join("runs"));
         std::fs::create_dir(&cas_root).expect("cas");
         std::fs::create_dir(&ephemeral_root).expect("runs");
@@ -1102,7 +1140,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
         let (backend, _fixture, request, shares, opened) =
             share_backend("printf 'entering the guest failed\\n' >&2\nexit 1");
         let started = backend
-            .start(&request, shares)
+            .start(&request, shares, crate::RunConnections::none())
             .expect("the worker was ready");
 
         // The worker has exited and its completion is published: the
@@ -1142,7 +1180,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
         let (backend, _fixture, request, shares, _opened) =
             share_backend("exec /usr/bin/tail -f /dev/null");
         backend
-            .start(&request, shares)
+            .start(&request, shares, crate::RunConnections::none())
             .expect("the worker was ready");
         assert!(
             backend.poll_outcome("run-1").expect("poll").is_none(),
@@ -1164,7 +1202,7 @@ printf '%s\n' "{{\"type\":\"ready\",\"run_id\":\"run-1\",\"inherited\":[{{\"desc
     fn waiting_for_a_runs_outcome_releases_its_share() {
         let (backend, _fixture, request, shares, _opened) = share_backend("exit 0");
         backend
-            .start(&request, shares)
+            .start(&request, shares, crate::RunConnections::none())
             .expect("the worker was ready");
         let outcome = backend
             .wait_for_outcome("run-1")

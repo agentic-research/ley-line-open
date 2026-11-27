@@ -66,7 +66,6 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -389,21 +388,26 @@ impl Hdiutil {
             command: rendered(),
             detail,
         };
-        use std::os::unix::process::CommandExt;
+        use crate::backends::spawn::{ChildIo, Spawn};
         // In its own process group, so a timeout kills whatever it started
-        // too, not only the tool itself.
-        let mut child = Command::new(&self.program)
+        // too, not only the tool itself. Through `spawn`, like every child
+        // the daemon starts, so the tool holds no other run's lifeline write
+        // end (bead ley-line-open-528525).
+        let mut child = Spawn::new(&self.program)
             .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
+            .stdout(ChildIo::Piped)
+            .stderr(ChildIo::Piped)
+            .process_group()
             .spawn()
             .map_err(|error| tool_error(error.to_string()))?;
-        let group = child.id() as libc::pid_t;
+        // Never 0 or 1, whose groups are this process's own and every
+        // process it may signal (`child_pid`).
+        let group = crate::backends::spawn::child_pid(child.id());
         let kill_group = || {
-            // SAFETY: signals the process group this call created.
-            unsafe { libc::kill(-group, libc::SIGKILL) };
+            if let Some(group) = group {
+                // SAFETY: signals the process group this call created.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
         };
         let timed_out = || CasVolumeError::Timeout {
             command: rendered(),
@@ -1513,8 +1517,7 @@ mod tests {
     /// A shell script standing in for hdiutil.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let program = dir.join(name);
-        fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&program, &format!("#!/bin/sh\n{body}\n"));
         program
     }
 
@@ -1592,7 +1595,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let base = state.path().join("cas-volume");
         fs::create_dir_all(&base).unwrap();
-        let mut exited = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut exited = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         let dead = exited.id();
         exited.wait().unwrap();
         let live = std::os::unix::process::parent_id();
@@ -2180,15 +2183,13 @@ mod tests {
         let log = scratch.path().join("args");
         let tool = |exit: u8| {
             let program = scratch.path().join(format!("hdiutil-{exit}"));
-            fs::write(
+            crate::test_support::write_executable(
                 &program,
-                format!(
+                &format!(
                     "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\necho refused >&2\nexit {exit}\n",
                     log.display()
                 ),
-            )
-            .unwrap();
-            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            );
             Hdiutil {
                 program,
                 timeout: DEFAULT_TOOL_TIMEOUT,

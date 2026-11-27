@@ -61,7 +61,9 @@ pub fn resolved(path: &Path) -> String {
 }
 
 impl SocketGrant {
-    fn covers(&self, endpoint: &Path) -> bool {
+    /// Whether this grant reaches `endpoint`: the same resolved path, or a
+    /// directory grant containing it.
+    pub(crate) fn covers(&self, endpoint: &Path) -> bool {
         let endpoint = resolved(endpoint);
         let grant = self.0.as_str();
         if let Some(directory) = grant.strip_suffix('/') {

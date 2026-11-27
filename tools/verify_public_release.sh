@@ -58,6 +58,15 @@ find "$publication_dir" -maxdepth 1 -type f ! -name SHA256SUMS \
 LC_ALL=C sort "$actual_assets_raw" > "$actual_assets"
 test -s "$actual_assets"
 
+# The test-only unconfined broker (ley-line-open-caa20b) is refused by name,
+# whether the asset contract, the manifest or the directory names it.
+unconfined=$(cat "$expected_assets" "$manifest_assets" "$actual_assets" |
+    grep -x 'leyline-conn-broker-unconfined.*' || true)
+if [ -n "$unconfined" ]; then
+    echo "refusing a release naming the test-only unconfined broker: $(printf '%s\n' "$unconfined" | sed -n '1p')" >&2
+    exit 1
+fi
+
 diff -u "$expected_assets" "$manifest_assets"
 diff -u "$expected_assets" "$actual_assets"
 

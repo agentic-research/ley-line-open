@@ -79,6 +79,7 @@ impl Backend for CompletingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completing/1".into(),
@@ -110,6 +111,7 @@ impl Backend for FailingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "failing/1".into(),
@@ -145,6 +147,7 @@ impl Backend for BlockingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         if self.starts.fetch_add(1, Ordering::SeqCst) != 0 {
             return Err(ExecutionError {
@@ -191,6 +194,7 @@ impl Backend for RecordingBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         self.calls
             .lock()
@@ -286,6 +290,7 @@ impl Backend for NeedsCasRoot {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         unreachable!("provision tests start nothing")
     }
@@ -701,6 +706,7 @@ impl Backend for JustFinishedBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "just-finished/1".into(),
@@ -758,6 +764,7 @@ impl Backend for CompletesDuringCancelBackend {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "completes-during-cancel/1".into(),
@@ -875,6 +882,7 @@ impl Backend for FinishesBeforeBackendCancel {
         &self,
         _request: &ExecutionRequest,
         _workspaces: leyline_runtime::ServedWorkspaces,
+        _connections: leyline_runtime::RunConnections,
     ) -> Result<BackendRun, ExecutionError> {
         Ok(BackendRun {
             backend_id: "finishes-before-backend-cancel/1".into(),

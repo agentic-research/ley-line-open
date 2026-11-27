@@ -7,11 +7,30 @@
 //! teardown) is exercised as a real child process on every platform, including
 //! Linux, where the shipped broker refuses at its profile. Nothing confines
 //! it: it must never ship. Bead `ley-line-open-52b5b3`.
+//!
+//! `LEYLINE_TEST_BROKER_STALL=<fifo>` makes it stall where the shipped broker
+//! applies its profile: every endpoint is bound and no ready report follows.
+//! It writes its pid to the FIFO first, which is the event a test waits on
+//! before it cancels the stalled start (bead `ley-line-open-5308b7`).
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use leyline_runtime::broker::control;
 
 fn main() -> ExitCode {
-    ExitCode::from(control::run_broker(std::env::args().skip(1), |_| Ok(())))
+    let stall = std::env::var_os("LEYLINE_TEST_BROKER_STALL");
+    ExitCode::from(control::run_broker(std::env::args().skip(1), move |_| {
+        if let Some(fifo) = &stall {
+            // Opening the FIFO waits for the test's reader; the write is the
+            // event. Then nothing: only the lifeline or a signal ends this.
+            if let Ok(mut fifo) = std::fs::OpenOptions::new().write(true).open(fifo) {
+                let _ = writeln!(fifo, "{}", std::process::id());
+            }
+            loop {
+                std::thread::park();
+            }
+        }
+        Ok(())
+    }))
 }

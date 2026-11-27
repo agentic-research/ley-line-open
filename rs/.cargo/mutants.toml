@@ -157,6 +157,17 @@ exclude_re = [
     # and `macos_rename_flags_reach_the_filesystem_in_linux_values`.
     'fuse_abi\.rs.*replace (\| with \^|\|= with \^=) in (linux_open_flags|macos_rename_flags)',
 
+    # The macOS spawn's attribute flags (`backends/spawn/macos.rs`, bead
+    # `ley-line-open-528525`): `POSIX_SPAWN_CLOEXEC_DEFAULT |
+    # POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK` (0x4000, 0x04, 0x08 in
+    # `<spawn.h>`), then `flags |= POSIX_SPAWN_SETPGROUP` (0x02), which none of
+    # them holds. Disjoint operands again, so `a | b` and `a ^ b` (and `|=`,
+    # `^=`) are the same integer and the same request to `posix_spawn`. The
+    # `| -> &` siblings drop the flags and are killed by `spawn_inherit` (no
+    # `POSIX_SPAWN_CLOEXEC_DEFAULT`: every sibling holds every write end) and
+    # by the process-group and `SIGPIPE` tests.
+    'spawn/macos\.rs.*replace (\| with \^|\|= with \^=) in spawn',
+
     # The scratch directory's open flags (storefs `derived.rs` and the
     # scratch paths of `lib.rs`, bead `ley-line-open-39998b`), each `|`
     # mutated to `^`.

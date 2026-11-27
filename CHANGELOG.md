@@ -14,6 +14,121 @@ Pending entries live in [`changes/`](changes/README.md), one file per
 change. Do not add entries here: `tools/bump_release_version.sh` assembles
 the fragments into the next release's section.
 
+## [0.32.0] — 2026-11-27
+
+**A connections release: the execution service serves a grant's declared
+connections through a per-run broker, and the broker ships as a release
+asset.** Nothing changes on the daemon wire: `wire_format_major` stays 3,
+the projection stays `projection-v13`, and `SCHEMA_VERSION` stays 0.31.0,
+because the public schema surface (the Go client, the schema-spec IDL and
+vectors) is unchanged since `clients/go/leyline-schema/v0.31.0`.
+
+Upgrade steps:
+- **`Backend` implementors: `Backend::start` takes a third argument,
+  `RunConnections` (`5308b7`).** A backend that serves no connections passes
+  `RunConnections::none()` through and keeps its behavior. `RunOutcome` and
+  `RunReceiptData` gained a `connections` field, so a struct literal of
+  either needs it. An embedder with no daemon that wants connections wraps
+  its backend in `Brokered::new(backend, BrokerConfig::new(path))` and
+  passes `RunConnections::verified(..)`.
+- **Operators: `execution-daemon --connection-broker <path>`.** The path is
+  an executable `leyline-conn-broker`; the daemon refuses to start on a
+  path that is not one. With the flag the daemon advertises the capability
+  `cloister/execution/v1/connections` and serves a `RunGrant` that carries
+  `connectionsDigest` and `connectionsDocument`; without it nothing
+  changes, and such a grant is refused by name as before.
+- **Download the broker with the release: `leyline-conn-broker-darwin-arm64`
+  (new asset, listed in `SHA256SUMS`).** Only a darwin broker ships; the
+  broker refuses before ready off macOS in this slice.
+
+Also: every child the runtime starts (workers, brokers, `codesign`,
+`hdiutil`) is spawned through one helper that hands it exactly the
+descriptors it names (`posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` on
+macOS, `close_range` on Linux), so no sibling inherits another run's
+lifeline write end; `cancel` reaches a run that is still starting.
+
+### Breaking
+
+- **The execution service serves a grant's connections: `Backend::start`
+  takes the run's connections, and a daemon with a broker advertises
+  `cloister/execution/v1/connections`** (bead `ley-line-open-5308b7`,
+  ADR-0046 Slice 1 S2, S6, S7, S8). Start `execution-daemon` with
+  `--connection-broker <path to leyline-conn-broker>` (an executable file,
+  or the daemon refuses to start): a `RunGrant` carrying
+  `connectionsDigest`, `connectionsDocument` and the `credentialBrokerRefs`
+  marker then gets one broker for its run, and the workload reaches each
+  declared loopback target through it (`127.0.0.1:<guestPort>` in a microVM,
+  the endpoint path on the native tier; macOS only in this slice). Without
+  the flag the daemon advertises no such capability and refuses the grant by
+  name, as before. Before anything is spawned the run is checked and refused
+  by connection name: a tier that does not deliver connections, a target
+  other than `127.0.0.1`, an endpoint without exactly one confinement/v1 §6
+  connect grant in the tier's spelling, a bind-capable §6 grant or a §2
+  write grant that reaches an endpoint, an endpoint path that exists or
+  whose directory is not private, and an endpoint another live run holds. A
+  §6 connect grant with no connection stays legal. The broker is spawned,
+  must report ready within 5 s with the document's digest, and only then is
+  the workload started; any failure after the spawn kills it and unlinks its
+  endpoints. `cancel` now reaches a run that is still starting. A broker
+  that exits during a run fails the run and cancels its workload. At every
+  terminal state the broker is drained first, so the receipt carries
+  `connectionsDigest` and one `connections` outcome per declared connection
+  (`complete` false only after a broker crash); a receipt for a run without
+  connections is unchanged. **Breaking for embedders:** `Backend::start` has
+  a third parameter, `RunConnections` (pass `RunConnections::none()`), and
+  `RunOutcome` and `RunReceiptData` gained a `connections` field. An
+  embedder with no daemon wraps its backend in `Brokered::new(backend,
+  BrokerConfig::new(path))`, passes `RunConnections::verified(..)`, probes
+  `Backend::connections()` (absent means refuse), and observes the run's end
+  through the wrapper. Limits: the broker's path is a flag until the
+  daemons adopt the deployment configuration document
+  (`ley-line-open-52c177`). The broker binary ships with this release as
+  `leyline-conn-broker-darwin-arm64` (`ley-line-open-caa20b`, below).
+
+### Added
+
+- **The release attaches `leyline-conn-broker-darwin-arm64`** (bead `ley-line-open-caa20b`; ADR-0046 Slice 1).
+  A daemon serves a grant's connections only when started with
+  `execution-daemon --connection-broker <path>`, and an embedder needs
+  `BrokerConfig { binary }`; until now that binary came only from a source
+  build. The release's darwin-arm64 leg builds it
+  (`task release:conn-broker:target`), stages it with the linker's ad-hoc
+  signature and no entitlement, as the `leyline` CLI ships, lists it in
+  `SHA256SUMS`, and runs the staged copy's refusals
+  (`task release:conn-broker:smoke`): a bad `--lifeline-fd`, a missing
+  value, an unknown flag and a descriptor that is not open are each refused
+  by name with exit status 2. Only a darwin broker ships, because the broker
+  refuses before ready off macOS. The test-only
+  `leyline-conn-broker-unconfined` is refused by name by staging, by
+  per-target artifact verification and by public release verification, even
+  when a manifest and the asset contract both list it.
+
+### Fixed
+
+- **Every child the runtime starts inherits exactly what it names** (bead `ley-line-open-528525`; ADR-0046 Slice 1 S7).
+  Native workers, libkrun workers, connection brokers and the `codesign` and
+  `hdiutil` runs are now spawned through one helper
+  (`leyline_runtime::backends::spawn`). On macOS it is `posix_spawn` with
+  `POSIX_SPAWN_CLOEXEC_DEFAULT` and file actions for the standard streams and
+  the inherit list. On Linux, where pipes are close-on-exec atomically, the
+  child marks every descriptor from 3 up close-on-exec with `close_range`
+  before exec, then hands over exactly the named ones; on a kernel without
+  `close_range` (before 5.11) it marks the descriptors listed just before the
+  spawn instead. Before, a child spawned on one thread at the moment another
+  thread had created a lifeline pipe but not yet marked it close-on-exec
+  (macOS has no `pipe2`) inherited that run's write end and kept its worker
+  or broker alive after its supervisor died. The process group, `SIGPIPE`
+  default and empty signal mask are kept. On Linux a spawn forks, and from
+  the fork to its exec the new child holds a copy of every descriptor the
+  daemon held, another run's lifeline write end among them; the copy closes
+  at that exec. A write end closed while children forked before that are
+  still between fork and exec is seen at its far end once the last of them
+  has exec'd. After every exec, a child holds exactly what it was named, on
+  both platforms. In the API, `Spawn::inherit` takes a `BorrowedFd`, so a
+  descriptor stays open until the spawn is done with it, and `Spawn::spawn`
+  refuses, by name, a program that is no absolute path and an inherit entry
+  whose source is a standard stream or another entry's target.
+
 ## [0.31.0] — 2026-11-23
 
 **A wire break and a supervision release: the daemon speaks

@@ -5,8 +5,8 @@ each line here names the bead that owns it, and a bead's acceptance criteria are
 the definition of done. When a bead closes or the plan changes, update this file
 in the same pull request.
 
-Last updated: 2026-11-23, for the v0.31.0 release (cut from the
-`integration` commit `8907b793`).
+Last updated: 2026-11-27, for the v0.32.0 release (cut from the
+`integration` commit `3b1f06a1`).
 
 ## v1.0: single host, portable
 
@@ -35,11 +35,12 @@ Out of v1: the remote or multi-host store (`a7b9d9`), blob-mapped guest reads
 ## Order of work
 
 **Now**
-v0.32.0 is the next release. Its work:
+v0.33.0 is the next release. Its work:
 
-- ADR-0046 Slice 1, the remainder (epic `e2c5ce`): `ExecutionService` owns
-  the broker (`5308b7`, in review, stacked on `528525`): start order, tier
-  and delivery checks, the cross-document rule, cancel of a starting run,
+- ADR-0046 Slice 1, the remainder (epic `e2c5ce`): the broker's path in the
+  deployment configuration document, with `52c177`. Shipped in v0.32.0:
+  `ExecutionService` owns the broker (`5308b7`): start order, tier and
+  delivery checks, the cross-document rule, cancel of a starting run,
   failure teardown, drain and receipt assembly, with the hypervisor
   end-to-end test. A daemon started with `--connection-broker` serves a
   grant's connections and advertises `cloister/execution/v1/connections`; an
@@ -48,12 +49,10 @@ v0.32.0 is the next release. Its work:
   `cloister-f40a86`, `cloister-55424e`). Daemon spawns hand a child exactly
   the descriptors it names (`528525`, PR #598, `posix_spawn` with
   `POSIX_SPAWN_CLOEXEC_DEFAULT`), which closes the window in which a sibling
-  can inherit a lifeline's write end. The broker binary (`52b5b3`), the
-  loopback probe (`52deb4`) and the lifeline (`f963e6`, `62e3b1`) shipped in
-  v0.31.0. The release attaches the broker as
-  `leyline-conn-broker-darwin-arm64` (`caa20b`, in review). Still open in
-  the slice: the broker's path in the deployment configuration document
-  with `52c177`.
+  can inherit a lifeline's write end. The release attaches the broker as
+  `leyline-conn-broker-darwin-arm64` (`caa20b`). The broker binary
+  (`52b5b3`), the loopback probe (`52deb4`) and the lifeline (`f963e6`,
+  `62e3b1`) shipped in v0.31.0.
 - ADR-0049 PR2 and PR3 (`52c177`), the daemons adopt the deployment
   configuration: each daemon is configured by one versioned document
   (`apiVersion` `config.leyline/v1`) with `--check-config` and
@@ -73,7 +72,7 @@ v0.32.0 is the next release. Its work:
   conflict rule, wire payload, fallback). v0.31.0's line merge refuses
   touching edits (ADR-0045 T5 amendment); a construct merge is the intended
   successor that lets two edits to different functions on adjacent lines
-  merge. Design only in v0.32.0; the implementation follows the ADR.
+  merge. Design only in v0.33.0; the implementation follows the ADR.
 - Gap queue group C: `e6b1bb` (a service run with no wall-time ceiling),
   `ee5747` (cleanup checks `Cleaned` under the write lock), `73b3de` (the
   native tier refuses an argument holding NUL before spawn) and C3.
@@ -89,13 +88,13 @@ v0.32.0 is the next release. Its work:
     (#558, #563, #564; see below).
   - **C (execution service).** Shipped in v0.30.0: `7a3109` (#566),
     `1022a8` and `483134` (#569), `9c6a8f` (#578), `9d75c9` (#580). Open for
-    v0.32.0: `e6b1bb`, `ee5747`, `73b3de` and C3 (above), then `e32a50`
+    v0.33.0: `e6b1bb`, `ee5747`, `73b3de` and C3 (above), then `e32a50`
     (duplicate `workspaceInputs`), `e592ef` (cancel of a finished run),
     `f7bcb3` (a worker-event channel the guest cannot write) and `eea8e1` (a
     run's `GuestOutput` on the execution-daemon socket).
   - **D (image import and storage).** Shipped in v0.30.0: `38ff59` (#562),
     D1 (#568), `741388` (#571) and rootfs manifest v2 (#575: `4f08ea`,
-    `faba8f`, `18a7a2`). Open for v0.32.0: `dab663`, `dac894`, `b1418f`.
+    `faba8f`, `18a7a2`). Open for v0.33.0: `dab663`, `dac894`, `b1418f`.
   - **B (guest and libkrun).** Shipped in v0.30.0 (#577): `7410ec`,
     `d4b07f` and `f7f862`, argv and the environment reach the guest init in an
     exec config file (libkrun patch `0013`); `2594af`, init mounts only over a
@@ -226,6 +225,19 @@ an ordinary repository to git, CI, review, editors and build tools.
   still break the build; the gate is the owner's design decision.
 - **Upstream libkrun** (`10feaa`): submit LLO's twelve patches to
   containers/libkrun, on the owner's go-ahead.
+
+## Shipped in v0.32.0 (2026-11-27)
+
+The execution service serves a grant's connections through a per-run broker,
+and the broker ships as a release asset. `Backend::start` takes a third
+argument, `RunConnections`, which breaks `Backend` implementors; the daemon
+wire stays `wire_format_major` 3 and `SCHEMA_VERSION` stays 0.31.0.
+
+| PR | Change | Bead |
+|---|---|---|
+| #613 | `ExecutionService` owns the broker: start order, tier and delivery checks, the cross-document rule, cancel of a starting run, teardown, drain and receipt assembly; `execution-daemon --connection-broker <path>` advertises `cloister/execution/v1/connections`; `Brokered` for embedders; hypervisor end-to-end through the broker | `5308b7` |
+| #598 | Every runtime child is spawned through `backends::spawn` and inherits exactly what it names (`posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` on macOS, `close_range` on Linux) | `528525` |
+| #614 | The release attaches `leyline-conn-broker-darwin-arm64`, smoke-tested at staging | `caa20b` |
 
 ## Shipped in v0.31.0 (2026-11-23)
 

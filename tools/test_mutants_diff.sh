@@ -16,6 +16,96 @@ cat > "$fixture_dir/bin/cargo" <<'SH'
 set -eu
 printf '%s\n' "$*" >> "$MUTANTS_FIXTURE_LOG"
 case " $* " in
+  *" --list --json "*)
+    # The unsharded listing a recording run picks its probes from.
+    case "$*" in
+      *baseline-none.diff*)
+        printf '%s\n' '[]'
+        ;;
+      *baseline-twopkg.diff*)
+        cat <<'JSON'
+[
+  {"name": "ll-open/runtime/src/a.rs:7:5: replace a", "package": "leyline-runtime",
+   "file": "ll-open/runtime/src/a.rs", "span": {"start": {"line": 7, "column": 5}}},
+  {"name": "ll-open/krun-worker/src/b.rs:3:11: replace b", "package": "leyline-krun-worker",
+   "file": "ll-open/krun-worker/src/b.rs", "span": {"start": {"line": 3, "column": 11}}}
+]
+JSON
+        ;;
+      *)
+        cat <<'JSON'
+[
+  {"name": "ll-open/runtime/src/authorization.rs:65:9: replace f -> [u8] with a+b", "package": "leyline-runtime",
+   "file": "ll-open/runtime/src/authorization.rs", "span": {"start": {"line": 65, "column": 9}}},
+  {"name": "ll-open/runtime/src/service.rs:1:1: fixture mutant", "package": "leyline-runtime",
+   "file": "ll-open/runtime/src/service.rs", "span": {"start": {"line": 1, "column": 1}}}
+]
+JSON
+        ;;
+    esac
+    ;;
+  *" --re "*)
+    # A recording run: the unmutated baseline plus its probes. It writes the
+    # outcomes cargo-mutants 27.1.0 writes.
+    case "$*" in
+      *baseline-silent.diff*--package\ leyline-krun-worker*) ;;
+      *) mkdir -p mutants.out ;;
+    esac
+    case "$*" in
+      *baseline-broken.diff*)
+        cat > mutants.out/outcomes.json <<'JSON'
+{"outcomes": [{"scenario": "Baseline", "summary": "Failure",
+  "phase_results": [{"phase": "Build", "duration": 61.5, "process_status": "Success"},
+                    {"phase": "Test", "duration": 12.25, "process_status": {"Failure": 101}}]}]}
+JSON
+        exit 4
+        ;;
+      *baseline-silent.diff*--package\ leyline-krun-worker*)
+        # cargo-mutants 27.1.0 on "No mutants to filter": exit 0 before it
+        # opens its output directory, so it writes nothing at all.
+        exit 0
+        ;;
+      *baseline-noprobe.diff*)
+        # A passing baseline and no mutant outcome: not the run that was asked for.
+        cat > mutants.out/outcomes.json <<'JSON'
+{"outcomes": [{"scenario": "Baseline", "summary": "Success",
+  "phase_results": [{"phase": "Build", "duration": 61.5, "process_status": "Success"},
+                    {"phase": "Test", "duration": 12.25, "process_status": "Success"}]}]}
+JSON
+        exit 0
+        ;;
+      *baseline-twice.diff*)
+        # Two baselines: not the one run that was asked for.
+        cat > mutants.out/outcomes.json <<'JSON'
+{"outcomes": [
+  {"scenario": "Baseline", "summary": "Success",
+   "phase_results": [{"phase": "Test", "duration": 12.25, "process_status": "Success"}]},
+  {"scenario": "Baseline", "summary": "Success",
+   "phase_results": [{"phase": "Test", "duration": 12.25, "process_status": "Success"}]},
+  {"scenario": {"Mutant": {"name": "a probe"}}, "summary": "CaughtMutant", "phase_results": []}
+]}
+JSON
+        exit 0
+        ;;
+      *baseline-unreported.diff*)
+        # Exit 0 and no baseline outcome: nothing says the tree passed.
+        printf '%s\n' '{"outcomes": []}' > mutants.out/outcomes.json
+        exit 0
+        ;;
+    esac
+    cat > mutants.out/outcomes.json <<JSON
+{"outcomes": [
+  {"scenario": "Baseline", "summary": "Success",
+   "phase_results": [{"phase": "Build", "duration": 111.2, "process_status": "Success"},
+                     {"phase": "Test", "duration": ${MUTANTS_FIXTURE_BASELINE_TEST:-37.1}, "process_status": "Success"}]},
+  {"scenario": {"Mutant": {"name": "a probe"}}, "summary": "MissedMutant",
+   "phase_results": [{"phase": "Build", "duration": 9.0, "process_status": "Success"},
+                     {"phase": "Test", "duration": 999.0, "process_status": "Success"}]}
+]}
+JSON
+    # A probe survived. That is the shards' finding to report, not this run's.
+    exit 2
+    ;;
   *" --list "*)
     case "$*" in
       *cli-mutants-only.diff*|*runtime-tests-only.diff*)
@@ -410,6 +500,293 @@ if grep -q -- '--file ll-open/cache/\|--file \./' "$log"; then
 fi
 
 # --------------------------------------------------------------------------
+# One baseline per (run, scope) (bead ley-line-open-35780f): a recording run
+# and the shards that reuse its record.
+# --------------------------------------------------------------------------
+
+record="$fixture_dir/baseline/record.txt"
+# Runs from the fixture directory: cargo-mutants writes ./mutants.out there.
+baseline_run() {
+    (
+        cd "$fixture_dir"
+        PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+          MUTANTS_BASELINE_RECORD="$record" "$@"
+    )
+}
+# The invocations that ran mutants or a baseline: everything but a listing.
+runs_in_log() {
+    grep -v -- ' --list' "$log" || true
+}
+
+# With nothing set, a slice runs its own baseline and takes its timeout from
+# it: no baseline flag, no timeout. That is `task rs:mutants:pr`.
+: > "$log"
+PATH="$fixture_dir/bin:$PATH" MUTANTS_FIXTURE_LOG="$log" \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+if grep -q -- '--baseline\|--timeout\|--re \|--jobs' "$log"; then
+    echo 'a run with no baseline mode passed a baseline, timeout or probe flag:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+
+# record: the baseline runs once, unsharded, with one probe mutant and one
+# build directory. A surviving probe (the fake's
+# exit 2) is not the recording run's failure.
+: > "$log"
+baseline_run env MUTANTS_BASELINE=record \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+assert_call 'mutants .*--package leyline-runtime .*--list --json' \
+    'a recording run lists its slice to pick probes'
+assert_call 'mutants .*--package leyline-runtime .*--re \^ll-open/runtime/src/authorization\\\.rs:65:9: replace f -> \\\[u8\\\] with a\\\+b\$ --jobs 1$' \
+    'a recording run probes one mutant, its name matched literally, in one build directory'
+if [ "$(runs_in_log | grep -c -- ' --re ')" -ne 1 ] || [ "$(runs_in_log | wc -l | tr -d ' ')" -ne 1 ]; then
+    echo 'a recording run did not run exactly one baseline invocation:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+if runs_in_log | grep -q -- '--baseline\|--timeout\|--shard'; then
+    echo 'a recording run skipped its baseline or sharded:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+# The timeout is cargo-mutants' value for the recorded test time (37.1 s x 5,
+# rounded up: 186 s) with half as much again, rounded up: a shard's runner is
+# not the baseline's.
+if ! grep -qE '^slice [0-9]+-[0-9]+ ok 279 111\.2 37\.1$' "$record" \
+    || [ "$(wc -l < "$record" | tr -d ' ')" -ne 2 ] || ! grep -qE '^diff [0-9]+-[0-9]+$' "$record"; then
+    echo 'the baseline record is not one diff line and one passing slice with a 279 s timeout:' >&2
+    cat "$record" >&2
+    exit 1
+fi
+
+# reuse: every shard skips the baseline and carries the recorded timeout.
+for shard in 0/4 3/4; do
+    : > "$log"
+    baseline_run env MUTANTS_BASELINE=reuse MUTANTS_SHARD=$shard \
+      "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+    assert_call "mutants .*--package leyline-runtime .*--baseline=skip --timeout 279 --shard $shard\$" \
+        "shard $shard reuses the recorded baseline and its timeout"
+    if runs_in_log | grep -q -- '--re \|--jobs'; then
+        echo "shard $shard ran probes or changed the job count:" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+done
+
+# The minimum is cargo-mutants' too: a short baseline is floored at
+# CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT (20 s when unset), and the multiplier
+# is .cargo/mutants.toml's `timeout_multiplier` when it sets one.
+recorded_timeout() {
+    sed -n 's/^slice [^ ]* ok \([0-9]*\) .*/\1/p' "$record"
+}
+baseline_run env MUTANTS_BASELINE=record MUTANTS_FIXTURE_BASELINE_TEST=2.01 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+[ "$(recorded_timeout)" = 30 ] || { echo "a 2.01 s baseline did not floor at 20 s x 1.5: $(recorded_timeout)" >&2; exit 1; }
+baseline_run env MUTANTS_BASELINE=record MUTANTS_FIXTURE_BASELINE_TEST=2.01 CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT=60 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+[ "$(recorded_timeout)" = 90 ] || { echo "the minimum test timeout was not honoured: $(recorded_timeout)" >&2; exit 1; }
+baseline_run env MUTANTS_BASELINE=record MUTANTS_FIXTURE_BASELINE_TEST=20.01 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+[ "$(recorded_timeout)" = 152 ] || { echo "20.01 s x 5 did not round up to 101 s, then x 1.5 to 152 s: $(recorded_timeout)" >&2; exit 1; }
+mkdir -p "$fixture_dir/.cargo"
+printf 'timeout_multiplier = 2.5\n' > "$fixture_dir/.cargo/mutants.toml"
+baseline_run env MUTANTS_BASELINE=record MUTANTS_FIXTURE_BASELINE_TEST=40 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+[ "$(recorded_timeout)" = 150 ] || { echo "the configured timeout multiplier was not used: $(recorded_timeout)" >&2; exit 1; }
+rm -rf "$fixture_dir/.cargo"
+
+# The generic slice's remainder spans packages, and a shard of it draws only
+# some of them. One joint baseline would build them together, where cargo
+# unifies their features, and miss a tree that breaks only when a shard's
+# packages build alone (bead ley-line-open-c1f8bc was that). So the remainder
+# is never recorded and never reused: each shard runs its own baseline, even
+# against a record that claims a pass for it.
+cat > "$fixture_dir/baseline-generic.diff" <<'DIFF'
+diff --git a/ll-open/cache/src/lib.rs b/ll-open/cache/src/lib.rs
+--- a/ll-open/cache/src/lib.rs
++++ b/ll-open/cache/src/lib.rs
+diff --git a/ll-open/cdc/src/lib.rs b/ll-open/cdc/src/lib.rs
+--- a/ll-open/cdc/src/lib.rs
++++ b/ll-open/cdc/src/lib.rs
+DIFF
+: > "$log"
+baseline_run env MUTANTS_BASELINE=record \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-generic.diff" generic
+if [ -n "$(runs_in_log)" ] || grep -q '^slice ' "$record"; then
+    echo 'the multi-package remainder slice was given a joint baseline:' >&2
+    cat "$log" "$record" >&2
+    exit 1
+fi
+: > "$log"
+baseline_run env MUTANTS_BASELINE=reuse MUTANTS_SHARD=0/4 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-generic.diff" generic
+# The joint pass, written as a recording run would have written it.
+remainder_args=$(runs_in_log | sed -n 's|^mutants --in-diff [^ ]* \(.*\) --shard 0/4$|\1|p')
+[ -n "$remainder_args" ] || { echo 'the remainder shard did not run:' >&2; cat "$log" >&2; exit 1; }
+printf 'slice %s ok 999 1 1\n' "$(printf '%s\n' "$remainder_args" | cksum | awk '{ print $1 "-" $2 }')" >> "$record"
+: > "$log"
+baseline_run env MUTANTS_BASELINE=reuse MUTANTS_SHARD=0/4 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-generic.diff" generic
+assert_call 'mutants .* -C --lib .*--shard 0/4$' 'the remainder shard runs'
+if runs_in_log | grep -q -- '--baseline\|--timeout'; then
+    echo 'a shard of the multi-package remainder skipped its own baseline on a joint pass:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+
+# A recorded baseline is one package's. A slice that lists mutants of two is
+# refused, not baselined jointly.
+cp "$fixture_dir/runtime-deletion.diff" "$fixture_dir/baseline-twopkg.diff"
+: > "$log"
+if baseline_run env MUTANTS_BASELINE=record \
+    "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-twopkg.diff" runtime 2>/dev/null \
+    || [ -n "$(runs_in_log)" ]; then
+    echo 'a slice spanning two packages was given one recorded baseline' >&2
+    exit 1
+fi
+
+# A slice with no mutants has no baseline to run, and says so in the record;
+# its shards run as they always did.
+cp "$fixture_dir/runtime-deletion.diff" "$fixture_dir/baseline-none.diff"
+: > "$log"
+baseline_run env MUTANTS_BASELINE=record \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-none.diff" runtime
+if [ -n "$(runs_in_log)" ] || ! grep -qE '^slice [0-9]+-[0-9]+ none$' "$record"; then
+    echo 'a slice with no mutants ran a baseline or was not recorded as empty:' >&2
+    cat "$log" "$record" >&2
+    exit 1
+fi
+: > "$log"
+baseline_run env MUTANTS_BASELINE=reuse MUTANTS_SHARD=0/4 \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-none.diff" runtime
+if runs_in_log | grep -q -- '--baseline\|--timeout'; then
+    echo 'a shard skipped a baseline that was never run:' >&2
+    cat "$log" >&2
+    exit 1
+fi
+
+# A failing baseline fails the recording run AND every shard of the scope,
+# with the code a broken baseline has always had, and no shard runs a mutant:
+# with the baseline skipped, cargo-mutants would report each one caught.
+cp "$fixture_dir/runtime-deletion.diff" "$fixture_dir/baseline-broken.diff"
+: > "$log"
+rc=0
+baseline_run env MUTANTS_BASELINE=record \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-broken.diff" runtime 2>/dev/null || rc=$?
+if [ "$rc" -ne 4 ] || ! grep -qE '^slice [0-9]+-[0-9]+ failed$' "$record"; then
+    echo "a failing baseline was not recorded as failed with exit 4 (exit $rc):" >&2
+    cat "$record" >&2
+    exit 1
+fi
+for shard in 0/4 1/4 2/4 3/4; do
+    : > "$log"
+    rc=0
+    out=$(baseline_run env MUTANTS_BASELINE=reuse MUTANTS_SHARD=$shard \
+      "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-broken.diff" runtime 2>&1) || rc=$?
+    if [ "$rc" -ne 4 ] || [ -n "$(runs_in_log)" ]; then
+        echo "shard $shard of a scope whose baseline failed exited $rc, or ran mutants:" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    case "$out" in
+        *"BASELINE BROKEN"*) ;;
+        *) echo "shard $shard did not say the baseline was broken: $out" >&2; exit 1 ;;
+    esac
+done
+
+# The record says `ok` only for a baseline cargo-mutants reported as passed.
+# An exit code alone is not that report.
+cp "$fixture_dir/runtime-deletion.diff" "$fixture_dir/baseline-unreported.diff"
+rc=0
+baseline_run env MUTANTS_BASELINE=record \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-unreported.diff" runtime 2>/dev/null || rc=$?
+if [ "$rc" -ne 4 ] || ! grep -qE '^slice [0-9]+-[0-9]+ failed$' "$record" || grep -q ' ok ' "$record"; then
+    echo "a run that reported no baseline outcome was recorded as a pass (exit $rc):" >&2
+    cat "$record" >&2
+    exit 1
+fi
+
+# Nor is a pass read from another slice's output. cargo-mutants exits 0 on
+# "No mutants to filter" before it opens mutants.out, so a slice that ran
+# nothing leaves the previous slice's `Baseline: Success` in place. Here the
+# runtime slice passes and the krun-worker slice after it writes nothing.
+cat > "$fixture_dir/baseline-silent.diff" <<'DIFF'
+diff --git a/ll-open/runtime/src/obsolete.rs b/ll-open/runtime/src/obsolete.rs
+--- a/ll-open/runtime/src/obsolete.rs
++++ /dev/null
+diff --git a/ll-open/krun-worker/src/obsolete.rs b/ll-open/krun-worker/src/obsolete.rs
+--- a/ll-open/krun-worker/src/obsolete.rs
++++ /dev/null
+DIFF
+rc=0
+baseline_run env MUTANTS_BASELINE=record \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-silent.diff" runtime 2>/dev/null || rc=$?
+if [ "$rc" -ne 4 ] || [ "$(grep -c ' ok ' "$record")" -ne 1 ] || [ "$(grep -c ' failed$' "$record")" -ne 1 ]; then
+    echo "a slice that ran no baseline was recorded from the slice before it (exit $rc):" >&2
+    cat "$record" >&2
+    exit 1
+fi
+# Nor is anything but exactly one baseline and the one probe's outcome.
+for odd in noprobe twice; do
+    cp "$fixture_dir/runtime-deletion.diff" "$fixture_dir/baseline-$odd.diff"
+    rc=0
+    baseline_run env MUTANTS_BASELINE=record \
+      "$repo_root/tools/mutants_diff.sh" "$fixture_dir/baseline-$odd.diff" runtime 2>/dev/null || rc=$?
+    if [ "$rc" -ne 4 ] || grep -q ' ok ' "$record"; then
+        echo "outcomes that are not one baseline and one probe ($odd) were recorded as a pass (exit $rc):" >&2
+        cat "$record" >&2
+        exit 1
+    fi
+done
+
+# Nor does a shard run on anything else that is not a recorded pass for this
+# diff and this slice: no record (the baseline job died), a record of another
+# diff, a record without this slice.
+expect_baseline_missing() {
+    : > "$log"
+    rc=0
+    out=$(baseline_run env MUTANTS_BASELINE=reuse MUTANTS_SHARD=0/4 \
+      "$repo_root/tools/mutants_diff.sh" "$2" runtime 2>&1) || rc=$?
+    if [ "$rc" -ne 4 ] || [ -n "$(runs_in_log)" ]; then
+        echo "a shard ran with $1 (exit $rc):" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    case "$out" in
+        *"BASELINE MISSING"*) ;;
+        *) echo "a shard with $1 did not say the baseline was missing: $out" >&2; exit 1 ;;
+    esac
+}
+baseline_run env MUTANTS_BASELINE=record \
+  "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime
+expect_baseline_missing 'the record of another diff' "$fixture_dir/uncovered-package.diff"
+grep -v '^slice ' "$record" > "$record.tmp"
+mv -f "$record.tmp" "$record"
+expect_baseline_missing 'a record that lacks its slice' "$fixture_dir/runtime-deletion.diff"
+rm -f "$record"
+expect_baseline_missing 'no record' "$fixture_dir/runtime-deletion.diff"
+
+# Misuse is refused before anything runs.
+refused() {
+    what=$1
+    shift
+    : > "$log"
+    if baseline_run env "$@" \
+        "$repo_root/tools/mutants_diff.sh" "$fixture_dir/runtime-deletion.diff" runtime 2>/dev/null; then
+        echo "$what was accepted" >&2
+        exit 1
+    fi
+    if [ -s "$log" ]; then
+        echo "$what was refused only after cargo ran:" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+}
+refused 'an unknown baseline mode' MUTANTS_BASELINE=skip
+refused 'a sharded recording run' MUTANTS_BASELINE=record MUTANTS_SHARD=0/4
+refused 'a baseline mode without a record path' MUTANTS_BASELINE=record MUTANTS_BASELINE_RECORD=
+
+# --------------------------------------------------------------------------
 # `list-scopes`: the plan the CI matrix is built from. Runs no cargo.
 # --------------------------------------------------------------------------
 
@@ -512,3 +889,4 @@ echo 'diff mutation fixture proved package-specific integration-test routing'
 echo 'diff mutation fixture proved excluded packages must be claimed by a slice'
 echo 'diff mutation fixture proved the fs and storefs slices enable what they mutate'
 echo 'diff mutation fixture proved each generic package is built with its own features'
+echo 'diff mutation fixture proved one recorded baseline serves every shard, and a failed or missing one fails them all'

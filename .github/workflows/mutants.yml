@@ -190,9 +190,114 @@ jobs:
           path: rs/mutants.out/
           if-no-files-found: ignore
 
+  # ONE unmutated baseline per scope (bead ley-line-open-35780f, GitHub #607).
+  # cargo-mutants builds and tests the unmutated tree before it mutates
+  # anything, and every shard of a scope did that for the same commit and the
+  # same packages: 10.7 of 96 runner-hours in one measured week. This job does
+  # it once (`MUTANTS_BASELINE=record`); the shards below read its record and
+  # run `--baseline=skip` with the timeout that baseline gives.
+  #
+  # Two limits, both in tools/mutants_diff.sh. The generic slice's
+  # multi-package remainder is not recorded: each of its shards keeps its own
+  # baseline, because a joint one would hide a tree that breaks only when a
+  # shard's packages build alone. And a shard's timeout is 1.5 x the value
+  # cargo-mutants would set, because the baseline ran on another runner.
+  #
+  # What this costs: every shard now waits for this job, so wall clock grows by
+  # its length. What it saves is the repeated baseline TEST; the repeated
+  # baseline build mostly moves to each shard's first mutants.
+  #
+  # It is also the ONLY job that saves this scope's cache, so one copy is kept
+  # per scope and no two jobs can race writing it: the shards start after this
+  # job ends and never save. The cache carries the cargo-mutants binary and the
+  # registry, so a shard no longer builds cargo-mutants from source (~70 s) on
+  # a pull request's first run. It carries no build of the tree, and cannot
+  # usefully: cargo-mutants builds in copies of rs/, never in rs/target, and a
+  # target copied in with `--copy-target` gets the copy's mtimes in walk order,
+  # so cargo rebuilds a dependency whenever one of its own dependencies happens
+  # to be copied later (run 45116489387: 160 of 518 units recompiled). Hence no
+  # `cache-workspace-crates`: there is nothing in rs/target to keep.
+  baseline:
+    name: cargo mutants baseline (${{ matrix.scope }})
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    # The shards' ceiling, not a measured one. The runtime scope's baseline
+    # job took 172 s with a warm cache and 353 s cold; a scope with several
+    # recorded slices (generic's featured packages) has not been measured.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: ${{ fromJSON(needs.plan.outputs.scopes) }}
+    steps:
+      # SHA-pinned: actions/checkout@v6.0.2 (Node 24)
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.1  # must equal rust-toolchain.toml (task lint:toolchain-parity)
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
+        with:
+          workspaces: rs
+          # `shared-key`, not `key`: `key` is joined with the job's id, so this
+          # job and the shards would each compute a different cache key.
+          shared-key: mutants-${{ matrix.scope }}
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
+        with:
+          version: 3.49.1
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install system deps
+        run: task deps:ci
+      - name: Install cargo-mutants
+        run: task deps:cargo-mutants
+
+      - name: Generate workspace-relative diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          git diff --relative=rs "$BASE_SHA...$HEAD_SHA" -- rs/ > /tmp/pr.diff
+          wc -l < /tmp/pr.diff
+
+      - name: task mutants:diff (${{ matrix.scope }} baseline)
+        env:
+          MUTANTS_BASELINE: record
+          MUTANTS_BASELINE_RECORD: ${{ runner.temp }}/mutants-baseline/record.txt
+        run: task mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=${{ matrix.scope }}
+
+      # Uploaded on failure too: a record that says `failed` is how every
+      # shard of this scope reports BASELINE BROKEN. With no record at all the
+      # shards' download fails, which fails them as well.
+      - name: Upload baseline record
+        if: always()
+        # SHA-pinned: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutants-baseline-${{ matrix.scope }}
+          path: ${{ runner.temp }}/mutants-baseline/record.txt
+          if-no-files-found: ignore
+
+      - name: Upload mutants report
+        if: always()
+        # SHA-pinned: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutants-report-${{ matrix.scope }}-baseline
+          path: rs/mutants.out/
+          if-no-files-found: ignore
+
   # One leg per scope with work. `fail-fast: false` so a survivor in one slice
   # does not cancel the others — the report from every slice is the point, and
   # cancelling siblings would hide whether the failure was isolated.
+  #
+  # `!cancelled()`, not the default `success()`: one scope's failed baseline
+  # must not skip another scope's shards. Each shard downloads its own scope's
+  # record and fails on a failed or missing one (BASELINE BROKEN / BASELINE
+  # MISSING, exit 4), so a broken baseline still fails every shard of that
+  # scope and no other.
   #
   # 60, not 90: this ceiling now bounds ONE slice rather than the whole gate.
   # The worst single slice measured is cli-lib at 49 min on the projection-v5
@@ -202,8 +307,8 @@ jobs:
   # not lifting the number: a slice too slow to fit is a slice doing too much.
   diff:
     name: cargo mutants (${{ matrix.scope }} ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }})
-    needs: plan
-    if: needs.plan.outputs.any == 'true'
+    needs: [plan, baseline]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.any == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -230,9 +335,12 @@ jobs:
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0
         with:
           workspaces: rs
-          # Legs share a cache key by default and would race writing it. Keyed
-          # per scope so each leg reuses its own warm target dir instead.
-          key: mutants-${{ matrix.scope }}-${{ matrix.shard }}
+          # The scope's one cache, restored and never saved here. Legs that
+          # each saved a shared key would race writing it; legs keyed per
+          # shard kept four to eight copies of the same cache. The baseline
+          # job is the only writer, and it has finished before a shard starts.
+          shared-key: mutants-${{ matrix.scope }}
+          save-if: "false"
       - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611
         with:
           version: 3.49.1
@@ -257,9 +365,20 @@ jobs:
           git diff --relative=rs "$BASE_SHA...$HEAD_SHA" -- rs/ > /tmp/pr.diff
           wc -l < /tmp/pr.diff
 
+      # This scope's baseline record, from the baseline job of this run. A
+      # missing artifact fails the step, and with it the shard.
+      # SHA-pinned: actions/download-artifact@v8.0.1 (Node 24)
+      - name: Download baseline record
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: mutants-baseline-${{ matrix.scope }}
+          path: ${{ runner.temp }}/mutants-baseline
+
       - name: task mutants:diff (${{ matrix.scope }} ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }})
         env:
           MUTANTS_SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }}
+          MUTANTS_BASELINE: reuse
+          MUTANTS_BASELINE_RECORD: ${{ runner.temp }}/mutants-baseline/record.txt
         run: task mutants:diff DIFF=/tmp/pr.diff MUTANTS_SCOPE=${{ matrix.scope }}
 
       - name: Upload mutants report
@@ -283,7 +402,7 @@ jobs:
     # the run had covered the CDC allowlist and nothing the PR changed
     # (`ley-line-open-085dff`).
     name: cargo mutants (allowlist + this PR's diff)
-    needs: [plan, allowlist, diff]
+    needs: [plan, allowlist, baseline, diff]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -292,16 +411,17 @@ jobs:
         env:
           PLAN: ${{ needs.plan.result }}
           ALLOWLIST: ${{ needs.allowlist.result }}
+          BASELINE: ${{ needs.baseline.result }}
           DIFF: ${{ needs.diff.result }}
         run: |
           set -eu
-          echo "plan=$PLAN allowlist=$ALLOWLIST diff=$DIFF"
+          echo "plan=$PLAN allowlist=$ALLOWLIST baseline=$BASELINE diff=$DIFF"
           # `plan` must actually have run: it carries the pairing assertion.
           if [ "$PLAN" != success ]; then
             echo "planning failed — no mutation coverage was decided" >&2
             exit 1
           fi
-          for result in "$ALLOWLIST" "$DIFF"; do
+          for result in "$ALLOWLIST" "$BASELINE" "$DIFF"; do
             case "$result" in
               success|skipped) ;;
               *) echo "a mutation job reported '$result'" >&2; exit 1 ;;

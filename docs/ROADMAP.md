@@ -50,9 +50,10 @@ v0.32.0 is the next release. Its work:
   `POSIX_SPAWN_CLOEXEC_DEFAULT`), which closes the window in which a sibling
   can inherit a lifeline's write end. The broker binary (`52b5b3`), the
   loopback probe (`52deb4`) and the lifeline (`f963e6`, `62e3b1`) shipped in
-  v0.31.0. Still open in the slice: `leyline-conn-broker` as a release asset
-  (`caa20b`), and the broker's path in the deployment configuration
-  document with `52c177`.
+  v0.31.0. The release attaches the broker as
+  `leyline-conn-broker-darwin-arm64` (`caa20b`, in review). Still open in
+  the slice: the broker's path in the deployment configuration document
+  with `52c177`.
 - ADR-0049 PR2 and PR3 (`52c177`), the daemons adopt the deployment
   configuration: each daemon is configured by one versioned document
   (`apiVersion` `config.leyline/v1`) with `--check-config` and

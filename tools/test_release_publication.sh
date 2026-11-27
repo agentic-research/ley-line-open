@@ -159,6 +159,13 @@ else
     export RELEASE_FIXTURE_UNCHECKED_WORKER
 fi
 
+# The connection broker (ley-line-open-caa20b) rides the same leg. Its
+# stand-in is fabricated bytes: staging adds no signature to it, so the
+# property under test is the inventory and the unconfined refusal.
+broker_asset=leyline-conn-broker-darwin-arm64
+make_source "$tmp_dir/leyline-conn-broker" '#!/bin/sh'
+chmod +x "$tmp_dir/leyline-conn-broker"
+
 OUTPUT_DIR="$tmp_dir/staged/leyline-darwin-arm64" \
 CLI_SOURCE="$tmp_dir/leyline" \
 ASSET_NAME="leyline-darwin-arm64" \
@@ -167,11 +174,56 @@ LIB_ASSET="libleyline_fs-darwin-arm64.a" \
 STATICLIB_SOURCE="$tmp_dir/libleyline_fs.a" \
 KRUN_WORKER_SOURCE="$tmp_dir/leyline-krun-worker" \
 KRUN_WORKER_ASSET="$worker_asset" \
+CONN_BROKER_SOURCE="$tmp_dir/leyline-conn-broker" \
+CONN_BROKER_ASSET="$broker_asset" \
     "$repo_root/tools/stage_release_artifacts.sh"
 
 staged_worker="$tmp_dir/staged/leyline-darwin-arm64/$worker_asset"
 grep -q "  $worker_asset\$" "$tmp_dir/staged/leyline-darwin-arm64/SHA256SUMS" ||
     fail "the staged SHA256SUMS does not list $worker_asset"
+grep -q "  $broker_asset\$" "$tmp_dir/staged/leyline-darwin-arm64/SHA256SUMS" ||
+    fail "the staged SHA256SUMS does not list $broker_asset"
+cmp "$tmp_dir/staged/leyline-darwin-arm64/$broker_asset" "$tmp_dir/leyline-conn-broker" ||
+    fail "staged $broker_asset differs from its build output"
+test -x "$tmp_dir/staged/leyline-darwin-arm64/$broker_asset" ||
+    fail "staged $broker_asset is not executable"
+
+# The test-only unconfined broker is never staged, whichever input names it.
+make_source "$tmp_dir/leyline-conn-broker-unconfined" '#!/bin/sh'
+stage_broker_case() {
+    case_name=$1
+    shift
+    env OUTPUT_DIR="$tmp_dir/broker-case-$case_name" \
+        CLI_SOURCE="$tmp_dir/leyline" \
+        ASSET_NAME="leyline-darwin-arm64" \
+        GENERATOR_BINS= \
+        "$@" \
+        "$repo_root/tools/stage_release_artifacts.sh"
+}
+expect_failure unconfined-broker-source \
+    stage_broker_case source \
+    CONN_BROKER_SOURCE="$tmp_dir/leyline-conn-broker-unconfined" \
+    CONN_BROKER_ASSET="$broker_asset"
+expect_failure unconfined-broker-asset \
+    stage_broker_case asset \
+    CONN_BROKER_SOURCE="$tmp_dir/leyline-conn-broker" \
+    CONN_BROKER_ASSET=leyline-conn-broker-unconfined-darwin-arm64
+mkdir -p "$tmp_dir/unconfined-generator"
+make_source "$tmp_dir/unconfined-generator/leyline-conn-broker-unconfined" '#!/bin/sh'
+expect_failure unconfined-broker-generator \
+    stage_broker_case generator \
+    GENERATOR_BINS=leyline-conn-broker-unconfined \
+    GENERATOR_SOURCE_DIR="$tmp_dir/unconfined-generator" \
+    GENERATOR_SUFFIX=darwin-arm64
+for case_name in source asset generator; do
+    test ! -e "$tmp_dir/broker-case-$case_name/SHA256SUMS" ||
+        fail "refused broker staging ($case_name) wrote a SHA256SUMS"
+done
+# Only a darwin broker is staged: off macOS it refuses before ready.
+expect_failure linux-broker-asset \
+    stage_broker_case linux \
+    CONN_BROKER_SOURCE="$tmp_dir/leyline-conn-broker" \
+    CONN_BROKER_ASSET=leyline-conn-broker-linux-arm64
 if [ "$worker_check" = codesign ]; then
     /usr/bin/codesign -d --entitlements - --xml "$staged_worker" 2>/dev/null |
         tr -d ' \t\r\n' |
@@ -294,6 +346,66 @@ case_dir=$(mutation_case missing-krun-worker)
 rm "$case_dir/$worker_asset"
 expect_failure missing-krun-worker \
     "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
+
+# The broker rides one leg too (ley-line-open-caa20b), and is digest-listed.
+grep -q "  $broker_asset\$" "$publication/SHA256SUMS" ||
+    fail "published SHA256SUMS does not list $broker_asset"
+case_dir=$(mutation_case missing-conn-broker)
+rm "$case_dir/$broker_asset"
+expect_failure missing-conn-broker \
+    "$repo_root/tools/verify_public_release.sh" "$case_dir" "$assets_file"
+
+# A staging directory containing the unconfined broker is refused by name,
+# even when everything else agrees: its own SHA256SUMS lists it and so does
+# the asset contract handed to preparation. Only the name guard can refuse it.
+unconfined_asset=leyline-conn-broker-unconfined-darwin-arm64
+cp "$assets_file" "$tmp_dir/assets-with-unconfined"
+echo "$unconfined_asset" >> "$tmp_dir/assets-with-unconfined"
+cp -R "$tmp_dir/staged" "$tmp_dir/unconfined-staged"
+unconfined_dir="$tmp_dir/unconfined-staged/leyline-darwin-arm64"
+make_source "$unconfined_dir/$unconfined_asset" '#!/bin/sh'
+(
+    cd "$unconfined_dir"
+    for file in *; do
+        test "$file" = SHA256SUMS && continue
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$file"
+        else
+            shasum -a 256 "$file"
+        fi
+    done | LC_ALL=C sort -k 2 > SHA256SUMS
+)
+grep -q "  $unconfined_asset\$" "$unconfined_dir/SHA256SUMS" ||
+    fail "fixture: the unconfined case's SHA256SUMS does not list it"
+expect_failure unconfined-staged-verify \
+    "$repo_root/tools/verify_release_artifacts.sh" "$tmp_dir/unconfined-staged"
+expect_failure unconfined-staged-prepare \
+    "$repo_root/tools/prepare_public_release.sh" \
+    "$tmp_dir/unconfined-staged" "$tmp_dir/unconfined-must-not-exist" \
+    "$tmp_dir/assets-with-unconfined"
+test ! -e "$tmp_dir/unconfined-must-not-exist" ||
+    fail "failed preparation mutated its destination"
+# The refusal names the binary.
+"$repo_root/tools/verify_release_artifacts.sh" "$tmp_dir/unconfined-staged" \
+    >/dev/null 2>"$tmp_dir/unconfined-refusal" || true
+grep -q "test-only unconfined broker: $unconfined_asset" "$tmp_dir/unconfined-refusal" ||
+    fail "the unconfined refusal does not name $unconfined_asset"
+
+# The same name in a publication set, listed in its SHA256SUMS and in the
+# asset contract, is refused at verification and so before any upload.
+case_dir=$(mutation_case unconfined-public)
+make_source "$case_dir/$unconfined_asset" '#!/bin/sh'
+(
+    cd "$case_dir"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$unconfined_asset"
+    else
+        shasum -a 256 "$unconfined_asset"
+    fi >> SHA256SUMS
+)
+expect_failure unconfined-public \
+    "$repo_root/tools/verify_public_release.sh" \
+    "$case_dir" "$tmp_dir/assets-with-unconfined"
 
 case_dir=$(mutation_case extra-file)
 make_source "$case_dir/extra" extra

@@ -39,6 +39,12 @@ on:
       - 'rs/ll-open/krun-worker/**'
       - 'tools/sign_krun_worker.sh'
       - 'entitlements.plist'
+      # The connection broker asset (ley-line-open-caa20b).
+      - 'rs/ll-open/runtime/Cargo.toml'
+      - 'rs/ll-open/runtime/src/bin/leyline-conn-broker.rs'
+      - 'rs/ll-open/runtime/src/broker/**'
+      - 'tools/conn_broker_smoke.sh'
+      - 'tools/verify_release_artifacts.sh'
       # The crates behind the published wasm artifacts (ley-line-open-a2099a,
       # ley-line-open-be5f86).
       - 'rs/ll-open/sign/**'
@@ -232,7 +238,7 @@ jobs:
   # guest init, neither of which the Linux stage job above exercises, so
   # without this job the tag would be the first run of either.
   krun-worker:
-    name: build + sign + stage krun worker (macOS, no publish)
+    name: build + sign + stage krun worker and conn broker (macOS, no publish)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -265,15 +271,31 @@ jobs:
           BUILD_TARGET: aarch64-apple-darwin
         run: task krun-worker:release:target
 
+      # The connection broker rides the same leg (ley-line-open-caa20b).
+      - name: Build leyline-conn-broker
+        env:
+          BUILD_TARGET: aarch64-apple-darwin
+        run: task release:conn-broker:target
+
       # The worker stands in for the CLI here: this job proves the worker
-      # leg of staging, and the stage job above proves the CLI's.
-      - name: Stage the worker as release.yml does
+      # and broker legs of staging, and the stage job above proves the CLI's.
+      - name: Stage the worker and broker as release.yml does
         env:
           BUILD_TARGET: aarch64-apple-darwin
           ASSET_NAME: leyline-darwin-arm64
           CLI_SOURCE: ${{ github.workspace }}/rs/target/aarch64-apple-darwin/release/leyline-krun-worker
           KRUN_WORKER_ASSET: leyline-krun-worker-darwin-arm64
+          CONN_BROKER_ASSET: leyline-conn-broker-darwin-arm64
         run: task release:artifacts:stage
+
+      # The staged broker bytes run and refuse a bad --lifeline-fd (and every
+      # other bad argument) by name; SHA256SUMS digests them.
+      - name: Smoke the staged connection broker
+        run: |
+          set -eu
+          staged=.artifacts/staged/leyline-darwin-arm64
+          grep -q '  leyline-conn-broker-darwin-arm64$' "$staged/SHA256SUMS"
+          task release:conn-broker:smoke BIN="$PWD/$staged/leyline-conn-broker-darwin-arm64"
 
       - name: Assert the staged worker carries the hypervisor entitlement
         run: |

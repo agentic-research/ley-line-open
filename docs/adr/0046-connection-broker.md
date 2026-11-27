@@ -975,7 +975,10 @@ life is thus in the receipt (S8).
   `leyline-conn-broker`: the operator names the binary, and the first run's ready report
   (the document's digest echoed within the bound) is the check that it speaks the broker's
   protocol; a binary that does not fails that run by name, having been handed only the
-  control pipe, the lifeline and one run's document. The deployment configuration
+  control pipe, the lifeline and one run's document. The release attaches the binary as
+  `leyline-conn-broker-darwin-arm64` (`ley-line-open-caa20b`), with the linker's ad-hoc
+  signature and no entitlement; the test-only `leyline-conn-broker-unconfined` is refused
+  by name at staging and release verification. The deployment configuration
   document (ADR-0049) gains the field with the daemons' adoption of it
   (`ley-line-open-52c177`).
 
